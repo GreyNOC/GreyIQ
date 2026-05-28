@@ -49,6 +49,9 @@ SEED_FILES = (
     "solin_inference_config.json",
     "solin_runtime_config.json",
 )
+SEED_DATA_FILES = (
+    "greyiq_starter_knowledge.txt",
+)
 
 
 class ChatRequest(BaseModel):
@@ -405,8 +408,16 @@ def default_training_text() -> str:
         "When a user teaches a preference, GreyIQ treats it as a local training signal.",
         "A preferred GreyIQ answer is concise when the task is simple and detailed when the task is complex.",
         "GreyIQ can explain tradeoffs, inspect assumptions, and stay calm under messy technical problems.",
+        "GreyIQ separates facts, assumptions, inferences, and recommendations.",
+        "GreyIQ is trustworthy because it names uncertainty instead of hiding it.",
+        "GreyIQ uses local notes, imported documents, and personal examples as the highest-value knowledge.",
+        "GreyIQ has useful starter knowledge for software engineering, data analysis, research synthesis, writing, planning, and troubleshooting.",
+        "GreyIQ answers broad questions by making a useful map: context, options, risks, recommendation, and next check.",
+        "GreyIQ answers technical questions with inputs, expected outputs, failure modes, and verification steps.",
+        "GreyIQ answers research questions by separating evidence from interpretation and by marking what still needs a source.",
+        "GreyIQ answers personal preference questions by remembering the user's taste and adapting future responses.",
     ]
-    return "\n".join(lines * 80)
+    return "\n".join(lines * 60)
 
 
 def ensure_runtime() -> None:
@@ -415,6 +426,11 @@ def ensure_runtime() -> None:
     for name in SEED_FILES:
         src = SEED_DIR / name
         dst = RUNTIME_DIR / name
+        if src.exists() and not dst.exists():
+            shutil.copy2(src, dst)
+    for name in SEED_DATA_FILES:
+        src = SEED_DIR / name
+        dst = RUNTIME_DIR / "data" / name
         if src.exists() and not dst.exists():
             shutil.copy2(src, dst)
     train_path = RUNTIME_DIR / "train.txt"
@@ -437,8 +453,9 @@ def friendly_branding(text: str) -> str:
 def fallback_reply(message: str) -> str:
     words = " ".join(str(message).strip().split()[:18])
     return (
-        "I can work with that. The local engine is warming up, so here is the steady path: "
-        f"focus on {words or 'the request'}, choose one useful next move, and refine from your feedback."
+        "I can work with that. The local engine is still warming up, so here is the trustworthy first pass: "
+        f"treat {words or 'the request'} as the focus, separate what we know from what we need to check, "
+        "choose one useful next move, and refine from your feedback."
     )
 
 

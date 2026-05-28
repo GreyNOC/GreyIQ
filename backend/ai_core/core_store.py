@@ -12,6 +12,34 @@ AI_CORE_STORE_FILE = "ai_cores.json"
 DEFAULT_CORE_ID = "core_greyiq_companion"
 DEFAULT_DEPLOYMENT_CHANNEL = "GreyIQ Chat"
 
+GREYIQ_TRUST_CONTRACT = {
+    "privacy": "Prefer local memory and user-provided sources; do not imply cloud knowledge is available.",
+    "uncertainty": "Separate what is known, what is inferred, and what needs verification.",
+    "citations": "Cite local documents when they influence an answer.",
+    "judgment": "Give a clear recommendation when there is enough signal, with the reason behind it.",
+    "limits": "Name important limits without becoming timid or evasive.",
+}
+
+GREYIQ_RESPONSE_CONTRACT = [
+    "lead_with_the_answer",
+    "explain_the_reasoning_when_it_changes_the_decision",
+    "offer_the_next_useful_action",
+    "match_depth_to_risk_and_complexity",
+    "stay_warm_precise_and_non_performative",
+]
+
+GREYIQ_STARTER_KNOWLEDGE = [
+    "software_engineering",
+    "systems_troubleshooting",
+    "local_ai_and_training",
+    "research_synthesis",
+    "writing_and_editing",
+    "planning_and_decision_support",
+    "data_analysis",
+    "security_basics",
+    "personal_preference_learning",
+]
+
 
 def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -42,44 +70,144 @@ def default_templates() -> list[dict[str, Any]]:
                 "remembers useful preferences, and helps with serious work without becoming cold."
             ),
             "personality": "warm",
-            "skills": ["conversation", "coding", "research", "planning", "local_training"],
+            "skills": [
+                "conversation",
+                "coding",
+                "research",
+                "planning",
+                "writing",
+                "debugging",
+                "local_training",
+                "knowledge_retrieval",
+            ],
             "safetyMode": "open_local",
             "confidencePolicy": [
                 "plain_language",
                 "use_local_memory",
                 "name_uncertainty",
+                "separate_fact_from_inference",
+                "cite_local_sources",
             ],
-            "sourceIds": ["src_personal_choices", "src_preferred_examples", "src_local_notes"],
+            "trustContract": GREYIQ_TRUST_CONTRACT,
+            "responseContract": GREYIQ_RESPONSE_CONTRACT,
+            "starterKnowledge": GREYIQ_STARTER_KNOWLEDGE,
+            "sourceIds": [
+                "src_starter_knowledge",
+                "src_personal_choices",
+                "src_preferred_examples",
+                "src_local_notes",
+            ],
         },
         {
             "id": "tpl_greyiq_builder",
             "name": "GreyIQ Builder",
             "mode": "Build Partner",
             "type": "builder",
-            "description": "A practical maker that can plan, code, debug, and turn fuzzy goals into working systems.",
+            "description": (
+                "A practical maker that can plan, code, debug, test, document, and turn fuzzy goals "
+                "into working systems with sober tradeoff calls."
+            ),
             "personality": "direct",
-            "skills": ["coding", "debugging", "architecture", "automation", "release"],
+            "skills": [
+                "coding",
+                "debugging",
+                "architecture",
+                "automation",
+                "release",
+                "testing",
+                "systems_design",
+            ],
             "safetyMode": "open_local",
-            "confidencePolicy": ["show_next_step", "verify_with_tests", "stay_concrete"],
-            "sourceIds": ["src_preferred_examples", "src_imported_docs"],
+            "confidencePolicy": [
+                "show_next_step",
+                "verify_with_tests",
+                "state_assumptions",
+                "stay_concrete",
+            ],
+            "trustContract": {
+                **GREYIQ_TRUST_CONTRACT,
+                "verification": "Prefer commands, checks, and observable results over vibes.",
+            },
+            "responseContract": [
+                "define_the_boundary",
+                "name_the_likely_fault_or_design_choice",
+                "give_the_smallest_test_or_patch",
+                "explain_tradeoffs_briefly",
+            ],
+            "starterKnowledge": [
+                "software_engineering",
+                "debugging",
+                "architecture",
+                "automation",
+                "release_management",
+                "local_development",
+            ],
+            "sourceIds": ["src_starter_knowledge", "src_preferred_examples", "src_imported_docs"],
         },
         {
             "id": "tpl_greyiq_researcher",
             "name": "GreyIQ Researcher",
             "mode": "Deep Research",
             "type": "researcher",
-            "description": "A patient research partner for documents, notes, comparisons, summaries, and careful synthesis.",
+            "description": (
+                "A patient research partner for documents, notes, comparisons, summaries, and careful "
+                "synthesis that marks evidence quality."
+            ),
             "personality": "curious",
-            "skills": ["research", "summarization", "comparison", "writing", "knowledge_base"],
+            "skills": [
+                "research",
+                "summarization",
+                "comparison",
+                "writing",
+                "knowledge_base",
+                "source_review",
+                "decision_memos",
+            ],
             "safetyMode": "open_local",
-            "confidencePolicy": ["cite_local_sources", "separate_fact_from_guess"],
-            "sourceIds": ["src_imported_docs", "src_local_notes"],
+            "confidencePolicy": [
+                "cite_local_sources",
+                "separate_fact_from_guess",
+                "mark_source_quality",
+                "show_open_questions",
+            ],
+            "trustContract": {
+                **GREYIQ_TRUST_CONTRACT,
+                "evidence": "Rank claims by source strength and say when the answer is synthesis.",
+            },
+            "responseContract": [
+                "summarize_the_answer_first",
+                "separate_evidence_from_interpretation",
+                "compare_options_when_useful",
+                "end_with_open_questions_or_next_checks",
+            ],
+            "starterKnowledge": [
+                "research_synthesis",
+                "document_analysis",
+                "writing_and_editing",
+                "data_analysis",
+                "planning",
+            ],
+            "sourceIds": ["src_starter_knowledge", "src_imported_docs", "src_local_notes"],
         },
     ]
 
 
 def default_sources() -> list[dict[str, Any]]:
     return [
+        {
+            "id": "src_starter_knowledge",
+            "name": "Starter Knowledge",
+            "type": "seed",
+            "icon": "doc",
+            "connection": "connected",
+            "permission": "local_seed",
+            "records": 9,
+            "lastSyncedAt": None,
+            "lastTrainedAt": None,
+            "includedCores": [DEFAULT_CORE_ID],
+            "trustLevel": "curated_seed",
+            "sensitivity": "public_general",
+        },
         {
             "id": "src_personal_choices",
             "name": "Personal Choices",
@@ -150,6 +278,9 @@ def core_from_template(template: dict[str, Any], *, core_id: str, name: str | No
         "skills": list(template.get("skills") or []),
         "safetyMode": str(template.get("safetyMode") or "open_local"),
         "confidencePolicy": list(template.get("confidencePolicy") or ["plain_language"]),
+        "trustContract": copy.deepcopy(template.get("trustContract") or GREYIQ_TRUST_CONTRACT),
+        "responseContract": list(template.get("responseContract") or GREYIQ_RESPONSE_CONTRACT),
+        "starterKnowledge": list(template.get("starterKnowledge") or []),
         "status": "online",
         "activeVersion": "0.1.0",
         "trainingEnabled": True,
@@ -167,7 +298,7 @@ def default_state() -> dict[str, Any]:
     default_core.update(
         {
             "activeVersion": "1.0.0",
-            "readinessScore": 0.78,
+            "readinessScore": 0.86,
             "createdAt": None,
             "updatedAt": None,
         }
@@ -184,11 +315,15 @@ def default_state() -> dict[str, Any]:
                 "version": "1.0.0",
                 "trainedAt": None,
                 "trainedBy": "system",
-                "sourcesUsed": ["src_personal_choices", "src_preferred_examples"],
+                "sourcesUsed": [
+                    "src_starter_knowledge",
+                    "src_personal_choices",
+                    "src_preferred_examples",
+                ],
                 "sourceSnapshotIds": [],
                 "modelProvider": "greyiq-local",
                 "embeddingModel": "greyiq-memory-v1",
-                "retrievalConfig": {"topK": 6, "rerank": True},
+                "retrievalConfig": {"topK": 8, "rerank": True, "sourceQuality": True},
                 "safetyPolicyVersion": "open-local",
                 "evaluationScore": None,
                 "deploymentStatus": "production",
@@ -309,6 +444,9 @@ class AICoreStore:
                 "skills": [],
                 "safetyMode": "open_local",
                 "confidencePolicy": ["plain_language"],
+                "trustContract": copy.deepcopy(GREYIQ_TRUST_CONTRACT),
+                "responseContract": list(GREYIQ_RESPONSE_CONTRACT),
+                "starterKnowledge": [],
                 "status": "draft",
                 "activeVersion": "0.1.0",
                 "trainingEnabled": True,
@@ -484,16 +622,48 @@ class AICoreStore:
         for key, value in defaults.items():
             if not isinstance(state.get(key), list):
                 state[key] = copy.deepcopy(value)
-        existing_template_ids = {item.get("id") for item in state["templates"]}
+        templates_by_id = {item.get("id"): item for item in state["templates"]}
         for template in default_templates():
-            if template["id"] not in existing_template_ids:
-                state["templates"].append(template)
+            existing = templates_by_id.get(template["id"])
+            if existing is None:
+                state["templates"].append(copy.deepcopy(template))
+            else:
+                existing.update(copy.deepcopy(template))
         if not state["cores"]:
             state["cores"] = defaults["cores"]
-        existing_source_ids = {item.get("id") for item in state["sources"]}
+        default_core = self._find_core(state, DEFAULT_CORE_ID)
+        if default_core is not None:
+            fresh_default = copy.deepcopy(defaults["cores"][0])
+            for key in (
+                "name",
+                "mode",
+                "type",
+                "description",
+                "personality",
+                "skills",
+                "safetyMode",
+                "confidencePolicy",
+                "trustContract",
+                "responseContract",
+                "starterKnowledge",
+                "templateId",
+            ):
+                default_core[key] = fresh_default[key]
+            default_core.setdefault("activeVersion", fresh_default["activeVersion"])
+            default_core["readinessScore"] = max(float(default_core.get("readinessScore") or 0.0), 0.86)
+        sources_by_id = {item.get("id"): item for item in state["sources"]}
         for source in default_sources():
-            if source["id"] not in existing_source_ids:
-                state["sources"].append(source)
+            existing = sources_by_id.get(source["id"])
+            if existing is None:
+                state["sources"].append(copy.deepcopy(source))
+            else:
+                for key, value in source.items():
+                    if key not in {"includedCores", "lastSyncedAt", "lastTrainedAt", "records"}:
+                        existing[key] = copy.deepcopy(value)
+                if source["id"] == "src_starter_knowledge":
+                    included = set(existing.get("includedCores") or [])
+                    included.add(DEFAULT_CORE_ID)
+                    existing["includedCores"] = sorted(included)
 
     def _find_core(self, state: dict[str, Any], core_id: str) -> dict[str, Any] | None:
         return next((core for core in state.get("cores", []) if core.get("id") == core_id), None)

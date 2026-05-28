@@ -1,4 +1,5 @@
 const STORE_KEY = "greyiq.local.ai.v1";
+const BOT_DEFAULT_REVISION = 2;
 const DIMENSIONS = 384;
 const MAX_MEMORY_ITEMS = 32;
 const API_TIMEOUT_MS = 45000;
@@ -10,13 +11,15 @@ const DEFAULT_BOTS = [
     name: "Astra",
     color: COLORS[0],
     style: "direct",
-    temperature: 42,
+    temperature: 46,
     persona:
-      "Astra is concise, tactical, and practical. It turns fuzzy requests into concrete next moves and keeps answers grounded.",
+      "Astra is a smart, trustworthy generalist. It gives the direct answer first, separates facts from assumptions, and turns broad requests into practical next moves.",
     corpus: [
-      "Start with the constraint that matters most, then choose the smallest useful action.",
-      "A good answer names the next command, the expected result, and the decision after that.",
-      "When the request is broad, narrow it into a useful working version and keep moving."
+      "Start with the strongest signal, name the assumption, then choose the smallest useful action.",
+      "A trustworthy answer says what is known, what is inferred, and what should be checked.",
+      "A good technical answer names the next command, the expected result, and the decision after that.",
+      "For planning, compare the tradeoffs and recommend the path that reduces risk fastest.",
+      "Use local memory and user-provided sources when available, and cite them when they matter."
     ],
     weights: []
   },
@@ -25,13 +28,15 @@ const DEFAULT_BOTS = [
     name: "Mira",
     color: COLORS[1],
     style: "warm",
-    temperature: 58,
+    temperature: 54,
     persona:
-      "Mira is warm, reflective, and steady. It helps the user feel oriented while still giving crisp practical help.",
+      "Mira is warm, steady, and deeply useful. It helps the user feel oriented, keeps uncertainty honest, and makes complex work feel manageable.",
     corpus: [
       "Hold the feeling and the practical step at the same time.",
       "A steady answer can be kind without becoming vague.",
-      "Reflect the goal, reduce the pressure, and offer one clean way forward."
+      "Reflect the goal, reduce the pressure, and offer one clean way forward.",
+      "When stakes are high, slow down, name the risk, and give the safest next check.",
+      "Trust grows when the assistant is clear about confidence and does not overclaim."
     ],
     weights: []
   },
@@ -40,17 +45,26 @@ const DEFAULT_BOTS = [
     name: "Forge",
     color: COLORS[2],
     style: "technical",
-    temperature: 36,
+    temperature: 34,
     persona:
-      "Forge is technical, skeptical, and systems-minded. It checks assumptions, traces failures, and favors verifiable fixes.",
+      "Forge is technical, skeptical, and systems-minded. It traces failures, explains tradeoffs, and favors verifiable fixes over confident guesses.",
     corpus: [
       "Inspect the boundary first because bugs often hide where two systems meet.",
       "Prefer evidence over hunches, but use the hunch to pick the first test.",
-      "A repair is not done until the failure mode is exercised again."
+      "A repair is not done until the failure mode is exercised again.",
+      "For architecture, separate state, interfaces, data flow, and failure recovery.",
+      "For data or research, distinguish source evidence from interpretation."
     ],
     weights: []
   }
 ];
+
+const LEGACY_DEFAULT_PERSONAS = {
+  astra: "Astra is concise, tactical, and practical. It turns fuzzy requests into concrete next moves and keeps answers grounded.",
+  mira: "Mira is warm, reflective, and steady. It helps the user feel oriented while still giving crisp practical help.",
+  Forge: "Forge is technical, skeptical, and systems-minded. It checks assumptions, traces failures, and favors verifiable fixes.",
+  forge: "Forge is technical, skeptical, and systems-minded. It checks assumptions, traces failures, and favors verifiable fixes."
+};
 
 const state = loadState();
 let backend = null;
@@ -257,7 +271,8 @@ function loadState() {
     activeBotId: DEFAULT_BOTS[0].id,
     chats: {},
     memories: {},
-    backendPreference: "cpu"
+    backendPreference: "cpu",
+    botDefaultRevision: BOT_DEFAULT_REVISION
   };
 
   try {
@@ -269,7 +284,8 @@ function loadState() {
     return {
       ...fallback,
       ...saved,
-      bots: saved.bots.map((bot) => ({
+      botDefaultRevision: BOT_DEFAULT_REVISION,
+      bots: migrateDefaultBots(saved.bots, saved.botDefaultRevision).map((bot) => ({
         ...bot,
         weights: normalizeWeights(bot.weights)
       }))
@@ -277,6 +293,28 @@ function loadState() {
   } catch {
     return fallback;
   }
+}
+
+function migrateDefaultBots(bots, revision) {
+  if (Number(revision || 0) >= BOT_DEFAULT_REVISION) {
+    return bots;
+  }
+
+  const defaultsById = new Map(DEFAULT_BOTS.map((bot) => [bot.id, bot]));
+  return bots.map((bot) => {
+    const nextDefault = defaultsById.get(bot.id);
+    const legacyPersona = LEGACY_DEFAULT_PERSONAS[bot.id];
+    if (!nextDefault || bot.persona !== legacyPersona) {
+      return bot;
+    }
+    return {
+      ...bot,
+      style: nextDefault.style,
+      temperature: nextDefault.temperature,
+      persona: nextDefault.persona,
+      corpus: structuredClone(nextDefault.corpus)
+    };
+  });
 }
 
 function saveState() {
@@ -381,12 +419,46 @@ function coreFromBot(bot) {
     type: "local_chat_bot",
     description: bot.persona || "Soft, friendly, powerful local AI.",
     personality: bot.style || "warm",
-    skills: ["conversation", "coding", "research", "planning", "local_training"],
+    skills: [
+      "conversation",
+      "coding",
+      "research",
+      "planning",
+      "writing",
+      "debugging",
+      "local_training",
+      "knowledge_retrieval"
+    ],
     safetyMode: "open_local",
-    confidencePolicy: ["plain_language", "cite_when_available"],
+    confidencePolicy: [
+      "plain_language",
+      "cite_when_available",
+      "separate_fact_from_inference",
+      "name_uncertainty"
+    ],
+    trustContract: {
+      privacy: "Use local memory and user-provided sources first.",
+      uncertainty: "Say what is known, inferred, and worth checking.",
+      citations: "Cite local documents when they shape the answer.",
+      judgment: "Make a recommendation when the signal is strong enough."
+    },
+    responseContract: [
+      "lead_with_the_answer",
+      "give_reasons_without_padding",
+      "offer_the_next_useful_action",
+      "match_depth_to_risk"
+    ],
+    starterKnowledge: [
+      "software_engineering",
+      "systems_troubleshooting",
+      "research_synthesis",
+      "writing_and_editing",
+      "planning",
+      "data_analysis"
+    ],
     status: "online",
     trainingEnabled: true,
-    readinessScore: bot.trainedAt ? 0.82 : 0.42
+    readinessScore: bot.trainedAt ? 0.88 : 0.58
   };
 }
 
@@ -704,28 +776,28 @@ function inferIntent(text) {
 function styleSentence(style, topic, intent) {
   const table = {
     direct: {
-      question: `Short answer: I would reduce ${topic} to the decision you need next, then test that decision.`,
-      debug: `I would isolate ${topic}, run the smallest check, and only widen the search when that check passes.`,
-      build: `I would ship the smallest usable version of ${topic}, then train the details from your feedback.`,
+      question: `Short answer: I would separate what is known about ${topic} from the assumption, then test the decision you need next.`,
+      debug: `I would isolate ${topic}, run the smallest check, and only widen the search when that check gives evidence.`,
+      build: `I would ship the smallest usable version of ${topic}, verify the risky part, then train the details from your feedback.`,
       preference: `I will treat ${topic} as a preference signal and weight future replies toward it.`,
-      general: `I can work with ${topic}; the useful move is to make it specific and act on the next step.`
+      general: `I can work with ${topic}; the useful move is to state the assumption, make it specific, and act on the next step.`
     },
     warm: {
-      question: `The center of this is ${topic}; I would answer it plainly and keep the next step manageable.`,
+      question: `The center of this is ${topic}; I would answer it plainly, name my confidence, and keep the next step manageable.`,
       debug: `For ${topic}, I would slow the problem down, find the first reliable signal, and move from there.`,
       build: `For ${topic}, I would make a version that feels usable now and let your taste refine it.`,
       preference: `I will remember ${topic} as part of how you like the conversation to feel.`,
-      general: `I am with you on ${topic}; let us turn it into something concrete enough to use.`
+      general: `I am with you on ${topic}; let us turn it into something concrete enough to use and honest enough to trust.`
     },
     technical: {
-      question: `For ${topic}, I would define the inputs, expected output, and the check that proves the answer.`,
+      question: `For ${topic}, I would define the inputs, expected output, confidence level, and the check that proves the answer.`,
       debug: `For ${topic}, start at the failing boundary, capture evidence, then change one variable at a time.`,
       build: `For ${topic}, separate the interface, state, training loop, and acceleration path before expanding scope.`,
       preference: `I will encode ${topic} as a weighted local feature for response ranking.`,
       general: `For ${topic}, I need the constraint, the current state, and the measurable result.`
     },
     creative: {
-      question: `For ${topic}, I would find the sharpest angle first, then shape the answer around that pulse.`,
+      question: `For ${topic}, I would find the sharpest angle first, then mark what is fact and what is interpretation.`,
       debug: `For ${topic}, I would follow the strange edge first because that is where the hidden rule usually shows itself.`,
       build: `For ${topic}, I would make the first version tangible, responsive, and easy to reshape.`,
       preference: `I will fold ${topic} into the bot's taste so future answers lean closer to you.`,
