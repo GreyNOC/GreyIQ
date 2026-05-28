@@ -1,6 +1,7 @@
 const STORE_KEY = "greyiq.local.ai.v1";
 const DIMENSIONS = 384;
 const MAX_MEMORY_ITEMS = 32;
+const API_TIMEOUT_MS = 45000;
 const COLORS = ["#0e7c7b", "#6c5ce7", "#c95542", "#d69b2d", "#31572c", "#8f3985"];
 
 const DEFAULT_BOTS = [
@@ -53,6 +54,14 @@ const DEFAULT_BOTS = [
 
 const state = loadState();
 let backend = null;
+let service = {
+  available: false,
+  checked: false,
+  status: null,
+  lastError: ""
+};
+let servicePoll = null;
+let coreSyncTimer = null;
 
 const els = {
   botList: document.querySelector("#botList"),
@@ -272,6 +281,160 @@ function loadState() {
 
 function saveState() {
   localStorage.setItem(STORE_KEY, JSON.stringify(state));
+}
+
+async function apiFetch(path, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs || API_TIMEOUT_MS);
+  const { timeoutMs: _timeoutMs, ...requestOptions } = options;
+  const headers = {
+    Accept: "application/json",
+    ...(requestOptions.body ? { "Content-Type": "application/json" } : {}),
+    ...(requestOptions.headers || {})
+  };
+
+  try {
+    const response = await fetch(path, {
+      ...requestOptions,
+      headers,
+      signal: controller.signal
+    });
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.includes("application/json")) {
+      throw new Error("GreyIQ service is not serving the local API.");
+    }
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.error || response.statusText);
+    }
+    return payload;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function refreshServiceStatus({ silent = false } = {}) {
+  try {
+    const status = await apiFetch("/api/status", { timeoutMs: 2500 });
+    service = {
+      available: true,
+      checked: true,
+      status,
+      lastError: ""
+    };
+    ensureServicePolling();
+    if (!silent) {
+      render();
+    } else {
+      renderBackend();
+      renderTraining();
+    }
+    return true;
+  } catch (error) {
+    service = {
+      ...service,
+      available: false,
+      checked: true,
+      lastError: error.message || "GreyIQ service unavailable"
+    };
+    if (!silent) {
+      renderBackend();
+    }
+    return false;
+  }
+}
+
+function ensureServicePolling() {
+  if (servicePoll || !service.available) {
+    return;
+  }
+  servicePoll = window.setInterval(() => {
+    void refreshServiceStatus({ silent: true });
+  }, 5000);
+}
+
+function serializableBot(bot) {
+  return {
+    id: bot.id,
+    name: bot.name,
+    color: bot.color,
+    style: bot.style,
+    temperature: bot.temperature,
+    persona: bot.persona,
+    corpus: bot.corpus || []
+  };
+}
+
+function coreIdForBot(bot) {
+  const slug = String(bot.id || bot.name || "greyiq")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return `core_${slug || "greyiq"}`;
+}
+
+function coreFromBot(bot) {
+  return {
+    id: coreIdForBot(bot),
+    name: bot.name || "GreyIQ",
+    mode: "Friendly Power",
+    type: "local_chat_bot",
+    description: bot.persona || "Soft, friendly, powerful local AI.",
+    personality: bot.style || "warm",
+    skills: ["conversation", "coding", "research", "planning", "local_training"],
+    safetyMode: "open_local",
+    confidencePolicy: ["plain_language", "cite_when_available"],
+    status: "online",
+    trainingEnabled: true,
+    readinessScore: bot.trainedAt ? 0.82 : 0.42
+  };
+}
+
+function queueCoreSync() {
+  if (!service.available) {
+    return;
+  }
+  window.clearTimeout(coreSyncTimer);
+  coreSyncTimer = window.setTimeout(() => {
+    void syncActiveCore();
+  }, 500);
+}
+
+async function syncActiveCore() {
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    return;
+  }
+  try {
+    const bot = activeBot();
+    const status = await apiFetch("/api/cores", {
+      method: "POST",
+      timeoutMs: 8000,
+      body: JSON.stringify({ core: coreFromBot(bot) })
+    });
+    service.status = { ...(service.status || {}), ai_core: status };
+    service.available = true;
+  } catch (error) {
+    service.lastError = error.message || "AI core sync failed";
+  }
+}
+
+async function recordPreference(payload) {
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    return;
+  }
+  try {
+    await apiFetch("/api/preferences", {
+      method: "POST",
+      timeoutMs: 8000,
+      body: JSON.stringify({
+        bot: serializableBot(activeBot()),
+        ...payload
+      })
+    });
+  } catch (error) {
+    service.lastError = error.message || "Preference sync failed";
+    renderBackend();
+  }
 }
 
 function activeBot() {
@@ -600,6 +763,35 @@ function makeCandidates(bot, userText, memories) {
 }
 
 async function replyFor(userText) {
+  if (service.available || (await refreshServiceStatus({ silent: true }))) {
+    try {
+      const bot = activeBot();
+      const response = await apiFetch("/api/chat", {
+        method: "POST",
+        timeoutMs: 60000,
+        body: JSON.stringify({
+          message: userText,
+          bot: serializableBot(bot),
+          memories: activeMemories(),
+          max_new_tokens: 160,
+          temperature: Math.max(0.05, Math.min(1.2, bot.temperature / 100)),
+          auto_capture: true
+        })
+      });
+      service.available = true;
+      service.lastError = "";
+      void refreshServiceStatus({ silent: true });
+      return response.message || "I am here with you. Give me a little more to work with and I will shape it.";
+    } catch (error) {
+      service.available = false;
+      service.lastError = error.message || "GreyIQ service fell back to browser mode";
+      renderBackend();
+    }
+  }
+  return browserReplyFor(userText);
+}
+
+async function browserReplyFor(userText) {
   const bot = activeBot();
   const memories = activeMemories();
   const candidates = makeCandidates(bot, userText, memories);
@@ -653,6 +845,7 @@ function renderBots() {
     `;
     button.addEventListener("click", () => {
       state.activeBotId = bot.id;
+      queueCoreSync();
       render();
     });
     els.botList.append(button);
@@ -679,6 +872,7 @@ function renderEditor() {
     button.ariaLabel = "Bot color";
     button.addEventListener("click", () => {
       bot.color = color;
+      queueCoreSync();
       render();
     });
     els.swatchRow.append(button);
@@ -715,9 +909,15 @@ function renderChat() {
 
 function renderTraining() {
   const memories = activeMemories();
+  const training = service.status?.training;
+  const trainingStatus = training?.status?.status || training?.status?.stage || "";
   els.exampleCount.textContent = memories.filter((memory) => memory.kind === "example").length;
   els.choiceCount.textContent = memories.filter((memory) => memory.kind === "preference").length;
-  els.modelState.textContent = activeBot().trainedAt ? "Trained" : "Fresh";
+  els.modelState.textContent = training?.active
+    ? "Training"
+    : trainingStatus === "complete" || activeBot().trainedAt
+      ? "Trained"
+      : "Fresh";
   els.memoryList.replaceChildren();
 
   for (const memory of memories.slice().reverse().slice(0, 10)) {
@@ -746,18 +946,47 @@ function renderTraining() {
 }
 
 function renderBackend() {
-  els.backendStatus.textContent = backend?.status || "CPU ready";
-  els.cpuButton.classList.toggle("is-active", backend?.mode !== "gpu");
-  els.gpuButton.classList.toggle("is-active", backend?.mode === "gpu");
+  const status = service.status;
+  const training = status?.training;
+  if (service.available && status) {
+    const trainingStage = training?.status?.stage || training?.status?.status || "";
+    if (training?.active) {
+      els.backendStatus.textContent = `Training - ${trainingStage || "running"}`;
+    } else if (status.engine_ready) {
+      els.backendStatus.textContent = `${status.model_name || "GreyIQ"} - ${status.device || "local"}`;
+    } else if (status.engine_error) {
+      els.backendStatus.textContent = "GreyIQ fallback";
+    } else {
+      els.backendStatus.textContent = "GreyIQ service ready";
+    }
+  } else {
+    els.backendStatus.textContent = backend?.status || "Browser CPU ready";
+  }
+  els.cpuButton.classList.toggle("is-active", state.backendPreference !== "gpu");
+  els.gpuButton.classList.toggle("is-active", state.backendPreference === "gpu");
 }
 
 function rateMessage(id, rating) {
-  const message = activeChat().find((item) => item.id === id);
+  const chat = activeChat();
+  const messageIndex = chat.findIndex((item) => item.id === id);
+  const message = chat[messageIndex];
   if (!message) {
     return;
   }
   message.rating = message.rating === rating ? null : rating;
+  if (message.role === "bot" && message.rating) {
+    const userMessage = chat
+      .slice(0, messageIndex)
+      .reverse()
+      .find((item) => item.role === "user");
+    void recordPreference({
+      user: userMessage?.text || "",
+      assistant: message.text,
+      rating: message.rating
+    });
+  }
   trainBot(activeBot());
+  queueCoreSync();
   render();
 }
 
@@ -768,6 +997,13 @@ function addMemory(memory) {
     memories.splice(0, memories.length - MAX_MEMORY_ITEMS);
   }
   trainBot(activeBot());
+  if (memory.kind === "preference") {
+    void recordPreference({ preference: memory.text });
+  }
+  if (memory.kind === "example") {
+    void recordPreference({ user: memory.user, assistant: memory.bot });
+  }
+  queueCoreSync();
   render();
 }
 
@@ -777,6 +1013,7 @@ function removeMemory(id) {
   if (index >= 0) {
     memories.splice(index, 1);
     trainBot(activeBot());
+    queueCoreSync();
     render();
   }
 }
@@ -805,6 +1042,7 @@ function updateBotFromEditor() {
   bot.style = els.botStyle.value;
   bot.temperature = Number(els.botTemperature.value);
   trainBot(bot);
+  queueCoreSync();
   render();
 }
 
@@ -824,9 +1062,19 @@ els.composer.addEventListener("submit", async (event) => {
   saveState();
 
   els.sendButton.disabled = true;
-  const answer = await replyFor(text);
-  chat.push({ id: crypto.randomUUID(), role: "bot", text: answer, createdAt: Date.now() });
-  els.sendButton.disabled = false;
+  try {
+    const answer = await replyFor(text);
+    chat.push({ id: crypto.randomUUID(), role: "bot", text: answer, createdAt: Date.now() });
+  } catch (error) {
+    chat.push({
+      id: crypto.randomUUID(),
+      role: "bot",
+      text: `I hit a local runtime snag: ${error.message || "unknown error"}. The browser model is still available.`,
+      createdAt: Date.now()
+    });
+  } finally {
+    els.sendButton.disabled = false;
+  }
   render();
 });
 
@@ -859,13 +1107,50 @@ els.exampleForm.addEventListener("submit", (event) => {
   addMemory({ kind: "example", user, bot, text: `${user} ${bot}` });
 });
 
-els.trainButton.addEventListener("click", () => {
-  trainBot(activeBot());
+els.trainButton.addEventListener("click", async () => {
+  const bot = activeBot();
+  trainBot(bot);
+  queueCoreSync();
+  render();
+
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    return;
+  }
+
+  try {
+    els.modelState.textContent = "Training";
+    await apiFetch("/api/train/start", {
+      method: "POST",
+      timeoutMs: 10000,
+      body: JSON.stringify({
+        max_iters: 160,
+        eval_interval: 40,
+        device_preference: state.backendPreference === "gpu" ? "cuda" : "cpu",
+        fresh_start: false
+      })
+    });
+    await refreshServiceStatus({ silent: true });
+  } catch (error) {
+    service.lastError = error.message || "Training did not start";
+    await refreshServiceStatus({ silent: true });
+  }
   render();
 });
 
 els.cpuButton.addEventListener("click", async () => {
   state.backendPreference = "cpu";
+  if (service.available || (await refreshServiceStatus({ silent: true }))) {
+    try {
+      await apiFetch("/api/runtime/device", {
+        method: "POST",
+        timeoutMs: 10000,
+        body: JSON.stringify({ preference: "cpu" })
+      });
+      await refreshServiceStatus({ silent: true });
+    } catch (error) {
+      service.lastError = error.message || "CPU preference failed";
+    }
+  }
   await backend.setMode("cpu");
   render();
 });
@@ -873,6 +1158,18 @@ els.cpuButton.addEventListener("click", async () => {
 els.gpuButton.addEventListener("click", async () => {
   state.backendPreference = "gpu";
   els.backendStatus.textContent = "GPU starting";
+  if (service.available || (await refreshServiceStatus({ silent: true }))) {
+    try {
+      await apiFetch("/api/runtime/device", {
+        method: "POST",
+        timeoutMs: 10000,
+        body: JSON.stringify({ preference: "cuda" })
+      });
+      await refreshServiceStatus({ silent: true });
+    } catch (error) {
+      service.lastError = error.message || "GPU preference failed";
+    }
+  }
   await backend.setMode("gpu");
   render();
 });
@@ -900,6 +1197,7 @@ els.newBotButton.addEventListener("click", () => {
   state.bots.push(bot);
   state.activeBotId = id;
   trainBot(bot);
+  queueCoreSync();
   render();
 });
 
@@ -913,6 +1211,10 @@ async function boot() {
     }
   }
 
+  await refreshServiceStatus({ silent: true });
+  if (service.available) {
+    void syncActiveCore();
+  }
   render();
 }
 

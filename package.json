@@ -4,9 +4,15 @@
   "private": true,
   "type": "module",
   "description": "GreyIQ local-first AI chat UI with editable bots, personal preference training, CPU fallback, and WebGPU acceleration.",
+  "main": "electron/main.cjs",
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check public/app.js"
+    "backend": "python -m backend.greyiq_api",
+    "desktop": "electron .",
+    "check": "node --check server.mjs && node --check public/app.js && node --check electron/main.cjs && node --check electron/preload.cjs && python -c \"from pathlib import Path; p=Path('backend/greyiq_api.py'); compile(p.read_text(encoding='utf-8'), str(p), 'exec')\""
+  },
+  "devDependencies": {
+    "electron": "^33.2.1"
   },
   "engines": {
     "node": ">=18"

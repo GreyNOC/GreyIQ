@@ -1,0 +1,15 @@
+{
+  "internet_enabled": false,
+  "device_preference": "auto",
+  "memory_learning": true,
+  "download_dir": "",
+  "code_router": {
+    "template_enabled": true,
+    "remote_enabled": false,
+    "remote_url": "",
+    "remote_model": "",
+    "remote_api_key": "",
+    "remote_timeout_s": 60.0
+  }
+}
+

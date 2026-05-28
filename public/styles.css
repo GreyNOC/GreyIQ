@@ -202,7 +202,11 @@ button:focus-visible {
   white-space: nowrap;
 }
 
-.bot-item span {
+.bot-item > span:not(.bot-avatar) {
+  min-width: 0;
+}
+
+.bot-item > span:not(.bot-avatar) span {
   display: block;
   overflow: hidden;
   color: var(--muted);
@@ -266,6 +270,13 @@ label {
 .chat-header > div:nth-child(2) {
   min-width: 0;
   margin-right: auto;
+}
+
+.chat-header .eyebrow {
+  max-width: min(34rem, 46vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .bot-mark {
@@ -510,9 +521,20 @@ label {
     padding: 0.85rem;
   }
 
+  .chat-header {
+    display: grid;
+    grid-template-columns: 2.8rem minmax(0, 1fr);
+    align-items: center;
+  }
+
+  .chat-header .eyebrow {
+    max-width: 100%;
+  }
+
   .header-actions {
+    grid-column: 2;
     flex-wrap: wrap;
-    justify-content: flex-end;
+    justify-content: flex-start;
   }
 
   .message-stream {
