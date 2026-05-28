@@ -411,13 +411,21 @@ label {
 }
 
 .meter-wrap,
-.memory-list {
+.memory-list,
+.source-picker {
   display: grid;
   gap: 0.55rem;
 }
 
+.source-heading {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
 .meter-row,
-.memory-item {
+.memory-item,
+.source-option {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -426,6 +434,36 @@ label {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--surface);
+}
+
+.source-option {
+  justify-content: flex-start;
+  color: var(--ink);
+  font-size: 0.8rem;
+}
+
+.source-option input {
+  width: 1rem;
+  height: 1rem;
+  flex: 0 0 auto;
+}
+
+.source-option span {
+  display: grid;
+  gap: 0.12rem;
+  min-width: 0;
+}
+
+.source-option strong,
+.source-option small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-option small {
+  color: var(--muted);
+  font-weight: 700;
 }
 
 .meter-row span {

@@ -52,6 +52,13 @@ SEED_FILES = (
 SEED_DATA_FILES = (
     "greyiq_starter_knowledge.txt",
 )
+TRAINING_SOURCE_FILES = {
+    "src_starter_knowledge": "greyiq_starter_knowledge.txt",
+    "src_personal_choices": "greyiq_personal_choices.txt",
+    "src_preferred_examples": "greyiq_preferred_examples.txt",
+    "src_local_notes": "greyiq_local_notes.txt",
+    "src_imported_docs": "greyiq_imported_docs.txt",
+}
 
 
 class ChatRequest(BaseModel):
@@ -70,6 +77,9 @@ class PreferenceRequest(BaseModel):
     user: str | None = Field(default=None, max_length=8000)
     assistant: str | None = Field(default=None, max_length=8000)
     rating: str | None = Field(default=None, max_length=40)
+    source_id: str | None = Field(default=None, max_length=120)
+    source_name: str | None = Field(default=None, max_length=160)
+    training_text: str | None = Field(default=None, max_length=200_000)
 
 
 class TrainingRequest(BaseModel):
@@ -77,6 +87,7 @@ class TrainingRequest(BaseModel):
     eval_interval: int = Field(default=40, ge=1, le=100_000)
     learning_rate: float = Field(default=DEFAULT_LEARNING_RATE, gt=0.0, le=1.0)
     device_preference: str = Field(default="auto", max_length=20)
+    source_ids: list[str] = Field(default_factory=list)
     fresh_start: bool = False
     dataset_char_cap: int = Field(default=MAX_TRAINING_CHARS, ge=0, le=100_000_000)
 
@@ -327,6 +338,7 @@ class GreyIQRuntime:
             skip_pdf_ingest=True,
             max_cycles=1,
             device_preference=normalize_device(request.device_preference),
+            source_ids=normalize_source_ids(request.source_ids),
             dataset_char_cap=request.dataset_char_cap,
             fresh_start=request.fresh_start,
         )
@@ -384,6 +396,26 @@ class GreyIQRuntime:
 def normalize_device(value: str | None) -> str:
     normalized = str(value or "auto").strip().lower()
     return normalized if normalized in {"auto", "cpu", "cuda"} else "auto"
+
+
+def normalize_source_ids(values: list[str] | None) -> list[str]:
+    valid = set(TRAINING_SOURCE_FILES)
+    seen: set[str] = set()
+    selected: list[str] = []
+    for value in values or []:
+        source_id = str(value or "").strip()
+        if source_id in valid and source_id not in seen:
+            selected.append(source_id)
+            seen.add(source_id)
+    return selected
+
+
+def source_training_file(source_id: str | None) -> str:
+    clean = str(source_id or "src_local_notes").strip()
+    if clean in TRAINING_SOURCE_FILES and clean != "src_starter_knowledge":
+        return TRAINING_SOURCE_FILES[clean]
+    safe = "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in clean).strip("_")
+    return f"greyiq_{safe or 'local_notes'}.txt"
 
 
 def read_json(path: Path, fallback: Any) -> Any:
@@ -504,16 +536,22 @@ def preferences(request: PreferenceRequest) -> dict[str, Any]:
     bot = request.bot or {}
     bot_name = str(bot.get("name") or "GreyIQ").strip()
     chunks: list[str] = []
+    target_file = "greyiq_personal_choices.txt"
     if request.preference:
         chunks.append(f"{bot_name} should prefer: {request.preference}")
     if request.user and request.assistant:
+        target_file = "greyiq_preferred_examples.txt"
         chunks.append(
             f"<START_CONVO>\n<USER>\n{request.user.strip()}\n<ASSISTANT>\n{request.assistant.strip()}\n<END_CONVO>"
         )
+    if request.training_text:
+        target_file = source_training_file(request.source_id)
+        source_name = request.source_name or request.source_id or "Training Data"
+        chunks.append(f"Source: {source_name}\n{request.training_text.strip()}")
     if request.rating:
         chunks.append(f"Feedback rating: {request.rating}")
-    path = append_training_text("greyiq_personal_choices.txt", "\n".join(chunks))
-    return {"ok": True, "path": str(path)}
+    path = append_training_text(target_file, "\n".join(chunks))
+    return {"ok": True, "path": str(path), "source_id": request.source_id}
 
 
 def validate_payload(model: type[BaseModel], payload: dict[str, Any]) -> BaseModel:

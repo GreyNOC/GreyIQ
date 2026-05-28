@@ -18,6 +18,17 @@ from solin_core import TinyGPT, detect_best_device, find_model_path, save_config
 ROOT_TRAIN_FILE = "train.txt"
 DATA_FOLDER = "data"
 COMBINED_FILE = "combined_train.txt"
+SOURCE_TEXT_FILES = {
+    "src_starter_knowledge": ["greyiq_starter_knowledge.txt"],
+    "src_personal_choices": ["greyiq_personal_choices.txt", "greyiq_profile.txt"],
+    "src_preferred_examples": ["greyiq_preferred_examples.txt"],
+    "src_local_notes": ["greyiq_local_notes.txt"],
+    "src_imported_docs": ["greyiq_imported_docs.txt"],
+}
+GENERATED_TEXT_FILES = {
+    "combined_train.txt",
+    "greyiq_selected_sources.txt",
+}
 CHECKPOINT_FILE = "solin_checkpoint.pt"
 BEST_MODEL_FILE = "best_model.pt"
 STABLE_MODELS_DIR = "StableModels"
@@ -117,6 +128,7 @@ class TrainingSettings:
     device_preference: str = "auto"
     batch_size_override: int = 0
     dataset_char_cap: int = MAX_TRAINING_CHARS
+    source_ids: list[str] = field(default_factory=list)
     fresh_start: bool = False
     validation: ValidationMonitorSettings = field(default_factory=ValidationMonitorSettings)
 
@@ -242,10 +254,35 @@ def _normalize_root_chat_text(text: str) -> str:
     return "\n\n".join(conversations) if conversations else text
 
 
+def _selected_text_paths(data_dir: Path, source_ids: list[str] | None) -> list[Path]:
+    if not source_ids:
+        return [
+            path
+            for path in sorted(data_dir.glob("*.txt"))
+            if path.name not in GENERATED_TEXT_FILES
+        ]
+
+    selected = set(source_ids)
+    names: set[str] = set()
+    for source_id in selected:
+        names.update(SOURCE_TEXT_FILES.get(source_id, []))
+
+    paths = {data_dir / name for name in names}
+    if "src_imported_docs" in selected:
+        known_names = {name for names_for_source in SOURCE_TEXT_FILES.values() for name in names_for_source}
+        paths.update(
+            path
+            for path in data_dir.glob("*.txt")
+            if path.name not in known_names and path.name not in GENERATED_TEXT_FILES
+        )
+    return sorted(path for path in paths if path.exists())
+
+
 def load_all_text(
     base_dir: Path,
     logger: Logger | None = None,
     max_training_chars: int = MAX_TRAINING_CHARS,
+    source_ids: list[str] | None = None,
 ) -> str:
     chunks = []
     loaded_chars = 0
@@ -272,7 +309,10 @@ def load_all_text(
         chunks.append(chunk)
         loaded_chars += len(chunk)
 
-    if root_train.exists():
+    selected = set(source_ids or [])
+    include_root_train = not selected or "src_starter_knowledge" in selected
+
+    if include_root_train and root_train.exists():
         text = root_train.read_text(encoding="utf-8").strip()
         if text:
             text = _normalize_root_chat_text(text)
@@ -281,7 +321,12 @@ def load_all_text(
 
     data_dir = base_dir / DATA_FOLDER
     data_dir.mkdir(parents=True, exist_ok=True)
-    txt_paths = [] if max_training_chars > 0 and loaded_chars >= max_training_chars else sorted(data_dir.glob("*.txt"))
+    txt_paths = [] if max_training_chars > 0 and loaded_chars >= max_training_chars else _selected_text_paths(
+        data_dir,
+        source_ids,
+    )
+    if selected:
+        _log(logger, f"Selected training sources: {', '.join(sorted(selected))}")
     for txt_path in txt_paths:
         try:
             text = txt_path.read_text(encoding="utf-8").strip()
@@ -615,7 +660,12 @@ def _train_cycle_inner(
     )
 
     _raise_if_stopping(should_stop)
-    text = load_all_text(base_dir, logger=logger, max_training_chars=settings.dataset_char_cap)
+    text = load_all_text(
+        base_dir,
+        logger=logger,
+        max_training_chars=settings.dataset_char_cap,
+        source_ids=settings.source_ids,
+    )
     _raise_if_stopping(should_stop)
     _emit_runtime_status(
         status_callback,

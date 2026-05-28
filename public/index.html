@@ -95,7 +95,7 @@
         <header class="panel-header">
           <div>
             <p class="eyebrow">Training</p>
-            <h2>Personal Choices</h2>
+            <h2>Training Data</h2>
           </div>
           <button class="icon-button" id="trainButton" type="button" title="Train" aria-label="Train">
             <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -115,22 +115,25 @@
           <button class="text-button" type="submit">Add preference</button>
         </form>
 
-        <form class="choice-form" id="exampleForm">
+        <form class="choice-form" id="trainingDataForm">
           <label>
-            <span>User phrase</span>
-            <input id="exampleUser" autocomplete="off" placeholder="When I ask for debugging help">
+            <span>Source</span>
+            <select id="trainingDataSource" name="trainingDataSource"></select>
           </label>
           <label>
-            <span>Preferred answer</span>
-            <textarea id="exampleBot" rows="4" placeholder="Start with the likely fault, then give one test command."></textarea>
+            <span>Training data</span>
+            <textarea id="trainingDataInput" rows="5" placeholder="Paste notes, examples, facts, preferred answers, or source text."></textarea>
           </label>
-          <button class="text-button" type="submit">Add example</button>
+          <button class="text-button" type="submit">Add training data</button>
         </form>
+
+        <div class="source-heading">Train on</div>
+        <section class="source-picker" id="trainingSourceList" aria-label="Training sources"></section>
 
         <section class="meter-wrap" aria-label="Training stats">
           <div class="meter-row">
-            <span>Examples</span>
-            <strong id="exampleCount">0</strong>
+            <span>Data</span>
+            <strong id="trainingDataCount">0</strong>
           </div>
           <div class="meter-row">
             <span>Choices</span>

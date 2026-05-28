@@ -4,6 +4,39 @@ const DIMENSIONS = 384;
 const MAX_MEMORY_ITEMS = 32;
 const API_TIMEOUT_MS = 45000;
 const COLORS = ["#0e7c7b", "#6c5ce7", "#c95542", "#d69b2d", "#31572c", "#8f3985"];
+const DEFAULT_SELECTED_TRAINING_SOURCES = [
+  "src_starter_knowledge",
+  "src_personal_choices",
+  "src_preferred_examples"
+];
+
+const TRAINING_SOURCES = [
+  {
+    id: "src_starter_knowledge",
+    name: "Starter Knowledge",
+    description: "General knowledge and GreyIQ behavior seed."
+  },
+  {
+    id: "src_personal_choices",
+    name: "Personal Choices",
+    description: "Preferences, ratings, tone, and style."
+  },
+  {
+    id: "src_preferred_examples",
+    name: "Preferred Examples",
+    description: "Good answer patterns and sample exchanges."
+  },
+  {
+    id: "src_local_notes",
+    name: "Local Notes",
+    description: "Notes, plans, facts, and project context."
+  },
+  {
+    id: "src_imported_docs",
+    name: "Imported Documents",
+    description: "Longer pasted or ingested document text."
+  }
+];
 
 const DEFAULT_BOTS = [
   {
@@ -99,11 +132,12 @@ const els = {
   sendButton: document.querySelector("#sendButton"),
   choiceForm: document.querySelector("#choiceForm"),
   choiceInput: document.querySelector("#choiceInput"),
-  exampleForm: document.querySelector("#exampleForm"),
-  exampleUser: document.querySelector("#exampleUser"),
-  exampleBot: document.querySelector("#exampleBot"),
+  trainingDataForm: document.querySelector("#trainingDataForm"),
+  trainingDataSource: document.querySelector("#trainingDataSource"),
+  trainingDataInput: document.querySelector("#trainingDataInput"),
+  trainingSourceList: document.querySelector("#trainingSourceList"),
   trainButton: document.querySelector("#trainButton"),
-  exampleCount: document.querySelector("#exampleCount"),
+  trainingDataCount: document.querySelector("#trainingDataCount"),
   choiceCount: document.querySelector("#choiceCount"),
   modelState: document.querySelector("#modelState"),
   memoryList: document.querySelector("#memoryList")
@@ -272,7 +306,8 @@ function loadState() {
     chats: {},
     memories: {},
     backendPreference: "cpu",
-    botDefaultRevision: BOT_DEFAULT_REVISION
+    botDefaultRevision: BOT_DEFAULT_REVISION,
+    selectedTrainingSources: [...DEFAULT_SELECTED_TRAINING_SOURCES]
   };
 
   try {
@@ -285,6 +320,7 @@ function loadState() {
       ...fallback,
       ...saved,
       botDefaultRevision: BOT_DEFAULT_REVISION,
+      selectedTrainingSources: normalizeSelectedTrainingSources(saved.selectedTrainingSources),
       bots: migrateDefaultBots(saved.bots, saved.botDefaultRevision).map((bot) => ({
         ...bot,
         weights: normalizeWeights(bot.weights)
@@ -315,6 +351,18 @@ function migrateDefaultBots(bots, revision) {
       corpus: structuredClone(nextDefault.corpus)
     };
   });
+}
+
+function normalizeSelectedTrainingSources(value) {
+  const valid = new Set(TRAINING_SOURCES.map((source) => source.id));
+  const selected = Array.isArray(value)
+    ? value.filter((sourceId) => valid.has(sourceId))
+    : [];
+  return selected.length > 0 ? selected : [...DEFAULT_SELECTED_TRAINING_SOURCES];
+}
+
+function trainingSourceName(sourceId) {
+  return TRAINING_SOURCES.find((source) => source.id === sourceId)?.name || "Training Data";
 }
 
 function saveState() {
@@ -458,7 +506,8 @@ function coreFromBot(bot) {
     ],
     status: "online",
     trainingEnabled: true,
-    readinessScore: bot.trainedAt ? 0.88 : 0.58
+    readinessScore: bot.trainedAt ? 0.88 : 0.58,
+    sourceIds: normalizeSelectedTrainingSources(state.selectedTrainingSources)
   };
 }
 
@@ -649,6 +698,9 @@ function collectTrainingExamples(bot) {
     if (memory.kind === "example") {
       examples.push({ label: 1, text: `${memory.user} ${memory.bot}` });
     }
+    if (memory.kind === "training_data") {
+      examples.push({ label: 1, text: `${trainingSourceName(memory.sourceId)} ${memory.text}` });
+    }
   }
 
   for (const message of chat) {
@@ -808,12 +860,17 @@ function styleSentence(style, topic, intent) {
 }
 
 function memorySentence(memories) {
-  const latest = memories.slice().reverse().find((memory) => memory.kind === "preference" || memory.kind === "example");
+  const latest = memories.slice().reverse().find((memory) =>
+    memory.kind === "preference" || memory.kind === "example" || memory.kind === "training_data"
+  );
   if (!latest) {
     return "No personal preference signals are loaded yet.";
   }
   if (latest.kind === "example") {
     return `I am weighting answers toward: ${latest.bot}`;
+  }
+  if (latest.kind === "training_data") {
+    return `I am using ${trainingSourceName(latest.sourceId)} as training context.`;
   }
   return `I am weighting answers toward: ${latest.text}`;
 }
@@ -901,6 +958,7 @@ function render() {
   renderEditor();
   renderChat();
   renderTraining();
+  renderTrainingSources();
   renderBackend();
   saveState();
 }
@@ -983,7 +1041,7 @@ function renderTraining() {
   const memories = activeMemories();
   const training = service.status?.training;
   const trainingStatus = training?.status?.status || training?.status?.stage || "";
-  els.exampleCount.textContent = memories.filter((memory) => memory.kind === "example").length;
+  els.trainingDataCount.textContent = memories.filter((memory) => memory.kind === "training_data" || memory.kind === "example").length;
   els.choiceCount.textContent = memories.filter((memory) => memory.kind === "preference").length;
   els.modelState.textContent = training?.active
     ? "Training"
@@ -995,14 +1053,14 @@ function renderTraining() {
   for (const memory of memories.slice().reverse().slice(0, 10)) {
     const item = document.createElement("article");
     item.className = "memory-item";
-    const text =
-      memory.kind === "example"
-        ? `${memory.user} -> ${memory.bot}`
-        : memory.text;
+    const text = memory.kind === "example"
+      ? `${memory.user} -> ${memory.bot}`
+      : memory.text;
+    const source = memory.sourceId ? `${trainingSourceName(memory.sourceId)} ` : "";
     item.innerHTML = `
       <p>${escapeHtml(text)}</p>
       <span class="memory-actions">
-        <small>${escapeHtml(memory.kind)}</small>
+        <small>${escapeHtml(`${source}${memory.kind.replaceAll("_", " ")}`.trim())}</small>
         <button class="memory-delete" type="button" title="Remove" aria-label="Remove training item">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M3 6h18"></path>
@@ -1014,6 +1072,45 @@ function renderTraining() {
     `;
     item.querySelector(".memory-delete").addEventListener("click", () => removeMemory(memory.id));
     els.memoryList.append(item);
+  }
+}
+
+function renderTrainingSources() {
+  els.trainingDataSource.replaceChildren();
+  for (const source of TRAINING_SOURCES.filter((item) => item.id !== "src_starter_knowledge")) {
+    const option = document.createElement("option");
+    option.value = source.id;
+    option.textContent = source.name;
+    els.trainingDataSource.append(option);
+  }
+
+  els.trainingSourceList.replaceChildren();
+  const selected = new Set(normalizeSelectedTrainingSources(state.selectedTrainingSources));
+  for (const source of TRAINING_SOURCES) {
+    const id = `source-${source.id}`;
+    const label = document.createElement("label");
+    label.className = "source-option";
+    label.htmlFor = id;
+    label.innerHTML = `
+      <input id="${escapeHtml(id)}" type="checkbox" value="${escapeHtml(source.id)}" ${selected.has(source.id) ? "checked" : ""}>
+      <span>
+        <strong>${escapeHtml(source.name)}</strong>
+        <small>${escapeHtml(source.description)}</small>
+      </span>
+    `;
+    label.querySelector("input").addEventListener("change", (event) => {
+      const next = new Set(normalizeSelectedTrainingSources(state.selectedTrainingSources));
+      if (event.target.checked) {
+        next.add(source.id);
+      } else {
+        next.delete(source.id);
+      }
+      state.selectedTrainingSources = normalizeSelectedTrainingSources([...next]);
+      queueCoreSync();
+      renderTrainingSources();
+      saveState();
+    });
+    els.trainingSourceList.append(label);
   }
 }
 
@@ -1074,6 +1171,13 @@ function addMemory(memory) {
   }
   if (memory.kind === "example") {
     void recordPreference({ user: memory.user, assistant: memory.bot });
+  }
+  if (memory.kind === "training_data") {
+    void recordPreference({
+      source_id: memory.sourceId,
+      source_name: trainingSourceName(memory.sourceId),
+      training_text: memory.text
+    });
   }
   queueCoreSync();
   render();
@@ -1167,16 +1271,19 @@ els.choiceForm.addEventListener("submit", (event) => {
   addMemory({ kind: "preference", text });
 });
 
-els.exampleForm.addEventListener("submit", (event) => {
+els.trainingDataForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  const user = els.exampleUser.value.trim();
-  const bot = els.exampleBot.value.trim();
-  if (!user || !bot) {
+  const sourceId = els.trainingDataSource.value || "src_local_notes";
+  const text = els.trainingDataInput.value.trim();
+  if (!text) {
     return;
   }
-  els.exampleUser.value = "";
-  els.exampleBot.value = "";
-  addMemory({ kind: "example", user, bot, text: `${user} ${bot}` });
+  els.trainingDataInput.value = "";
+  state.selectedTrainingSources = normalizeSelectedTrainingSources([
+    ...state.selectedTrainingSources,
+    sourceId
+  ]);
+  addMemory({ kind: "training_data", sourceId, text });
 });
 
 els.trainButton.addEventListener("click", async () => {
@@ -1198,6 +1305,7 @@ els.trainButton.addEventListener("click", async () => {
         max_iters: 160,
         eval_interval: 40,
         device_preference: state.backendPreference === "gpu" ? "cuda" : "cpu",
+        source_ids: normalizeSelectedTrainingSources(state.selectedTrainingSources),
         fresh_start: false
       })
     });
