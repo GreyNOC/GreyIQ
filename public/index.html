@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>GreyIQ</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="bot-panel" aria-label="Bot roster and persona">
+        <header class="brand-row">
+          <div>
+            <p class="eyebrow">GreyNOC</p>
+            <h1>GreyIQ</h1>
+          </div>
+          <button class="icon-button" id="newBotButton" type="button" title="New bot" aria-label="New bot">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 5v14M5 12h14"></path>
+            </svg>
+          </button>
+        </header>
+
+        <section class="bot-list" id="botList" aria-label="Bots"></section>
+
+        <form class="bot-editor" id="botEditor">
+          <label>
+            <span>Name</span>
+            <input id="botName" name="name" maxlength="28" autocomplete="off">
+          </label>
+
+          <label>
+            <span>Persona</span>
+            <textarea id="botPersona" name="persona" rows="6"></textarea>
+          </label>
+
+          <div class="field-grid">
+            <label>
+              <span>Style</span>
+              <select id="botStyle" name="style">
+                <option value="direct">Direct</option>
+                <option value="warm">Warm</option>
+                <option value="technical">Technical</option>
+                <option value="creative">Creative</option>
+              </select>
+            </label>
+
+            <label>
+              <span>Variation</span>
+              <input id="botTemperature" name="temperature" type="range" min="0" max="100" step="1">
+            </label>
+          </div>
+
+          <div class="swatch-row" id="swatchRow" aria-label="Bot color"></div>
+        </form>
+      </aside>
+
+      <section class="chat-panel" aria-label="Chat">
+        <header class="chat-header">
+          <div class="bot-mark" id="activeBotMark">AI</div>
+          <div>
+            <p class="eyebrow" id="backendStatus">CPU ready</p>
+            <h2 id="activeBotName">GreyIQ</h2>
+          </div>
+          <div class="header-actions">
+            <div class="segmented" role="group" aria-label="Acceleration">
+              <button id="cpuButton" class="segment is-active" type="button">CPU</button>
+              <button id="gpuButton" class="segment" type="button">GPU</button>
+            </div>
+            <button class="icon-button" id="clearChatButton" type="button" title="Clear chat" aria-label="Clear chat">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3 6h18"></path>
+                <path d="M8 6V4h8v2"></path>
+                <path d="M7 6l1 14h8l1-14"></path>
+              </svg>
+            </button>
+          </div>
+        </header>
+
+        <div class="message-stream" id="messageStream" aria-live="polite"></div>
+
+        <form class="composer" id="composer">
+          <textarea id="promptInput" rows="2" placeholder="Message the bot"></textarea>
+          <button class="send-button" id="sendButton" type="submit" title="Send" aria-label="Send">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M22 2 11 13"></path>
+              <path d="m22 2-7 20-4-9-9-4 20-7Z"></path>
+            </svg>
+          </button>
+        </form>
+      </section>
+
+      <aside class="training-panel" aria-label="Training">
+        <header class="panel-header">
+          <div>
+            <p class="eyebrow">Training</p>
+            <h2>Personal Choices</h2>
+          </div>
+          <button class="icon-button" id="trainButton" type="button" title="Train" aria-label="Train">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 3v18"></path>
+              <path d="M5 8h14"></path>
+              <path d="M7 14h10"></path>
+              <path d="M9 20h6"></path>
+            </svg>
+          </button>
+        </header>
+
+        <form class="choice-form" id="choiceForm">
+          <label>
+            <span>Preference</span>
+            <textarea id="choiceInput" rows="4" placeholder="I prefer short answers with concrete next steps."></textarea>
+          </label>
+          <button class="text-button" type="submit">Add preference</button>
+        </form>
+
+        <form class="choice-form" id="exampleForm">
+          <label>
+            <span>User phrase</span>
+            <input id="exampleUser" autocomplete="off" placeholder="When I ask for debugging help">
+          </label>
+          <label>
+            <span>Preferred answer</span>
+            <textarea id="exampleBot" rows="4" placeholder="Start with the likely fault, then give one test command."></textarea>
+          </label>
+          <button class="text-button" type="submit">Add example</button>
+        </form>
+
+        <section class="meter-wrap" aria-label="Training stats">
+          <div class="meter-row">
+            <span>Examples</span>
+            <strong id="exampleCount">0</strong>
+          </div>
+          <div class="meter-row">
+            <span>Choices</span>
+            <strong id="choiceCount">0</strong>
+          </div>
+          <div class="meter-row">
+            <span>Model</span>
+            <strong id="modelState">Fresh</strong>
+          </div>
+        </section>
+
+        <section class="memory-list" id="memoryList" aria-label="Training memory"></section>
+      </aside>
+    </main>
+
+    <template id="messageTemplate">
+      <article class="message">
+        <div class="message-meta"></div>
+        <div class="message-body"></div>
+        <div class="rating-bar">
+          <button class="rate-button like" type="button" title="Prefer" aria-label="Prefer response">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M7 10v11"></path>
+              <path d="M15 5 12 10h7l-2 11H8V10h4"></path>
+            </svg>
+          </button>
+          <button class="rate-button dislike" type="button" title="Avoid" aria-label="Avoid response">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M7 14V3"></path>
+              <path d="m15 19-3-5h7L17 3H8v11h4"></path>
+            </svg>
+          </button>
+        </div>
+      </article>
+    </template>
+
+    <script src="./app.js" type="module"></script>
+  </body>
+</html>

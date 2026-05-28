@@ -1,0 +1,14 @@
+{
+  "name": "greyiq",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GreyIQ local-first AI chat UI with editable bots, personal preference training, CPU fallback, and WebGPU acceleration.",
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs && node --check public/app.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
