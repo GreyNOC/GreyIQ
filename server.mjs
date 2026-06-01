@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { extname, join, normalize, relative, resolve, sep } from "node:path";
+import { extname, join, normalize, relative, resolve } from "node:path";
 
 const port = Number.parseInt(process.env.PORT || "4173", 10);
 const root = resolve("public");
@@ -16,7 +16,7 @@ const mimeTypes = new Map([
 
 function isInsideRoot(filePath) {
   const relativePath = relative(root, filePath);
-  return relativePath === "" || (!relativePath.startsWith("..") && !relativePath.startsWith(sep) && !resolve(relativePath).startsWith(resolve("..")));
+  return relativePath === "" || (!relativePath.startsWith("..") && !relativePath.includes(":\\"));
 }
 
 function resolvePublicPath(url) {
