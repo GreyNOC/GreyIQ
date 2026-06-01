@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { extname, join, normalize, resolve } from "node:path";
+import { extname, join, normalize, relative, resolve, sep } from "node:path";
 
 const port = Number.parseInt(process.env.PORT || "4173", 10);
 const root = resolve("public");
@@ -14,12 +14,17 @@ const mimeTypes = new Map([
   [".ico", "image/x-icon"]
 ]);
 
+function isInsideRoot(filePath) {
+  const relativePath = relative(root, filePath);
+  return relativePath === "" || (!relativePath.startsWith("..") && !relativePath.startsWith(sep) && !resolve(relativePath).startsWith(resolve("..")));
+}
+
 function resolvePublicPath(url) {
   const requestUrl = new URL(url, `http://localhost:${port}`);
   const pathname = requestUrl.pathname === "/" ? "/index.html" : requestUrl.pathname;
-  const filePath = normalize(join(root, decodeURIComponent(pathname)));
+  const filePath = resolve(normalize(join(root, decodeURIComponent(pathname))));
 
-  if (!filePath.startsWith(root)) {
+  if (!isInsideRoot(filePath)) {
     return null;
   }
 
