@@ -37,6 +37,11 @@ from training_runtime import (  # noqa: E402
     TrainingSettings,
     run_training_loop,
 )
+from bughunter.scan_service import run_code_scan  # noqa: E402
+from bughunter.web_scan_service import run_web_scan  # noqa: E402
+from bughunter.live_scan_service import run_live_scan  # noqa: E402
+from bughunter.triage import triage  # noqa: E402
+from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
 
 
 APP_NAME = "GreyIQ"
@@ -58,6 +63,56 @@ TRAINING_SOURCE_FILES = {
     "src_preferred_examples": "greyiq_preferred_examples.txt",
     "src_local_notes": "greyiq_local_notes.txt",
     "src_imported_docs": "greyiq_imported_docs.txt",
+}
+
+BUGHUNTER_CORE_ID = "core_greyiq_bughunter"
+BUGHUNTER_CORE: dict[str, Any] = {
+    "id": BUGHUNTER_CORE_ID,
+    "name": "GreyIQ BugHunter",
+    "mode": "Find, Prove, Fix",
+    "type": "security_auditor",
+    "description": (
+        "Authorized bug and vulnerability finder for code (and, as more engines "
+        "land, live apps). Runs GreyIQ's local static scanner, then explains, "
+        "prioritizes, and proposes fixes - always citing file and line."
+    ),
+    "personality": "direct",
+    "skills": [
+        "code_scanning",
+        "vulnerability_triage",
+        "secure_code_review",
+        "exploit_reasoning",
+        "remediation",
+        "debugging",
+    ],
+    "safetyMode": "open_local",
+    "confidencePolicy": [
+        "cite_file_and_line",
+        "separate_proven_from_suspected",
+        "rank_by_severity_and_exploitability",
+        "give_minimal_repro_or_fix",
+        "name_uncertainty",
+    ],
+    "responseContract": [
+        "state_the_finding_and_where",
+        "explain_why_it_is_exploitable",
+        "rate_severity_and_confidence",
+        "give_the_smallest_fix",
+        "note_what_to_verify_next",
+    ],
+    "starterKnowledge": [
+        "GreyIQ's local code scanner flags command injection, eval/exec on "
+        "dynamic input, hardcoded secrets, weak crypto, vulnerable dependencies, "
+        "risky CI workflows, suspicious network calls, and backdoor patterns.",
+        "Only scan code you own or are explicitly authorized to review.",
+        "A finding is a lead, not a verdict: confirm exploitability before "
+        "calling something critical.",
+    ],
+    "sourceIds": [
+        "src_starter_knowledge",
+        "src_local_notes",
+        "src_imported_docs",
+    ],
 }
 
 
@@ -98,6 +153,23 @@ class DeviceRequest(BaseModel):
 
 class CoreSaveRequest(BaseModel):
     core: dict[str, Any]
+
+
+class ScanCodeRequest(BaseModel):
+    target: str = Field(min_length=1, max_length=4000)
+    target_type: str = Field(default="path", max_length=20)
+    max_files: int = Field(default=5000, ge=1, le=100_000)
+    include_globs: list[str] = Field(default_factory=list)
+    exclude_globs: list[str] = Field(default_factory=list)
+
+
+class WebScanRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+
+
+class LiveScanRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+    wait_seconds: float = Field(default=6.0, ge=0.0, le=30.0)
 
 
 class HTTPError(Exception):
@@ -174,6 +246,7 @@ class GreyIQRuntime:
         self.store = AICoreStore(RUNTIME_DIR)
         ensure_runtime()
         self._rewrite_core_defaults()
+        self._ensure_bughunter_core()
 
     def _rewrite_core_defaults(self) -> None:
         state = self.store.load()
@@ -199,6 +272,12 @@ class GreyIQRuntime:
                 changed = True
         if changed:
             self.store.save(state)
+
+    def _ensure_bughunter_core(self) -> None:
+        state = self.store.load()
+        if any(core.get("id") == BUGHUNTER_CORE_ID for core in state.get("cores", [])):
+            return
+        self.store.save_core(dict(BUGHUNTER_CORE), who="greyiq")
 
     def log(self, message: str) -> None:
         stamp = datetime.now(UTC).strftime("%H:%M:%S")
@@ -273,7 +352,37 @@ class GreyIQRuntime:
                 self.engine.safety = OpenPolicy()
         return self.status()
 
+    def _code_router_config(self) -> dict[str, Any]:
+        payload = read_json(RUNTIME_DIR / "solin_runtime_config.json", {})
+        config = payload.get("code_router") if isinstance(payload, dict) else None
+        return config if isinstance(config, dict) else {}
+
+    def _maybe_scan_reply(self, request: ChatRequest) -> dict[str, Any] | None:
+        command = detect_scan_command(request.message)
+        if command is None:
+            return None
+        kind, target = command
+        result = run_scan(kind, target)
+        triaged = triage(result, self._code_router_config())
+        return {
+            "request_id": uuid4().hex,
+            "message": friendly_branding(triaged["summary"]),
+            "used_fallback": not bool(result.get("ok")),
+            "captured_for_training": False,
+            "model_name": "bughunter" + ("+remote" if triaged["used_remote"] else ""),
+            "device": "scanner",
+            "citations": triaged["citations"],
+            "ai_core": self.store.load(),
+            "scan": {
+                key: result.get(key)
+                for key in ("ok", "scan_type", "risk", "score", "finding_count", "target")
+            },
+        }
+
     def chat(self, request: ChatRequest) -> dict[str, Any]:
+        scan_reply = self._maybe_scan_reply(request)
+        if scan_reply is not None:
+            return scan_reply
         try:
             engine = self.get_engine()
             engine.safety = OpenPolicy()
@@ -658,6 +767,31 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/chat":
             request = validate_payload(ChatRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.chat, request))
+            return
+        if method == "POST" and path == "/api/scan/code":
+            request = validate_payload(ScanCodeRequest, await read_json_body(receive))
+            await send_json(
+                send,
+                await asyncio.to_thread(
+                    run_code_scan,
+                    request.target,
+                    request.target_type,
+                    request.max_files,
+                    tuple(request.include_globs),
+                    tuple(request.exclude_globs),
+                ),
+            )
+            return
+        if method == "POST" and path == "/api/scan/web":
+            request = validate_payload(WebScanRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(run_web_scan, request.url))
+            return
+        if method == "POST" and path == "/api/scan/live":
+            request = validate_payload(LiveScanRequest, await read_json_body(receive))
+            await send_json(
+                send,
+                await asyncio.to_thread(run_live_scan, request.url, request.wait_seconds),
+            )
             return
         if method == "GET" and path == "/api/cores":
             await send_json(send, await asyncio.to_thread(runtime.store.load))
