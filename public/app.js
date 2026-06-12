@@ -135,6 +135,10 @@ const els = {
   trainingDataForm: document.querySelector("#trainingDataForm"),
   trainingDataSource: document.querySelector("#trainingDataSource"),
   trainingDataInput: document.querySelector("#trainingDataInput"),
+  repoIngestForm: document.querySelector("#repoIngestForm"),
+  repoSourcesInput: document.querySelector("#repoSourcesInput"),
+  repoIngestButton: document.querySelector("#repoIngestButton"),
+  repoIngestStatus: document.querySelector("#repoIngestStatus"),
   trainingSourceList: document.querySelector("#trainingSourceList"),
   trainButton: document.querySelector("#trainButton"),
   trainingDataCount: document.querySelector("#trainingDataCount"),
@@ -1284,6 +1288,55 @@ els.trainingDataForm.addEventListener("submit", (event) => {
     sourceId
   ]);
   addMemory({ kind: "training_data", sourceId, text });
+});
+
+els.repoIngestForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const sources = els.repoSourcesInput.value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (sources.length === 0) {
+    els.repoIngestStatus.textContent = "Add at least one repo path or URL.";
+    return;
+  }
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.repoIngestStatus.textContent = "Start the GreyIQ backend before ingesting repositories.";
+    return;
+  }
+
+  els.repoIngestButton.disabled = true;
+  els.repoIngestStatus.textContent = "Ingesting repositories...";
+  try {
+    const payload = await apiFetch("/api/repos/ingest", {
+      method: "POST",
+      timeoutMs: 240000,
+      body: JSON.stringify({
+        sources,
+        max_total_chars: 4000000,
+        max_files_per_repo: 900
+      })
+    });
+    const summary = payload.summary || {};
+    state.selectedTrainingSources = normalizeSelectedTrainingSources([
+      ...state.selectedTrainingSources,
+      "src_imported_docs"
+    ]);
+    addMemory({
+      kind: "training_data",
+      sourceId: "src_imported_docs",
+      text: `Repository ingest: ${summary.ingested || 0} repo(s), ${summary.files_added || 0} file(s), ${summary.characters_added || 0} characters.`
+    });
+    els.repoIngestStatus.textContent = `Ingested ${summary.ingested || 0} repo(s), ${summary.files_added || 0} file(s).`;
+    await refreshServiceStatus({ silent: true });
+  } catch (error) {
+    els.repoIngestStatus.textContent = error.message || "Repository ingest failed.";
+  } finally {
+    els.repoIngestButton.disabled = false;
+    renderTrainingSources();
+    renderBackend();
+    saveState();
+  }
 });
 
 els.trainButton.addEventListener("click", async () => {

@@ -410,6 +410,20 @@ label {
   font-weight: 800;
 }
 
+.text-button:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
+.inline-status {
+  min-height: 1rem;
+  margin: -0.25rem 0 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
 .meter-wrap,
 .memory-list,
 .source-picker {

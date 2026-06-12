@@ -34,6 +34,23 @@ CHAT_TRAIN_FILE = "chat_training_auto.txt"
 CHAT_MEMORY_FILE = "chat_memory.jsonl"
 MAX_RECENT_TURNS = 6
 
+SOURCE_ID_BY_FILE = {
+    "train.txt": "src_starter_knowledge",
+    "greyiq_starter_knowledge.txt": "src_starter_knowledge",
+    "greyiq_personal_choices.txt": "src_personal_choices",
+    "greyiq_profile.txt": "src_personal_choices",
+    "greyiq_preferred_examples.txt": "src_preferred_examples",
+    "greyiq_local_notes.txt": "src_local_notes",
+    "greyiq_imported_docs.txt": "src_imported_docs",
+    "greyiq_repo_knowledge.txt": "src_imported_docs",
+}
+GENERATED_KNOWLEDGE_FILES = {
+    "chat_memory.jsonl",
+    "chat_training_auto.txt",
+    "combined_train.txt",
+    "greyiq_selected_sources.txt",
+}
+
 
 class _OpenPolicyResult:
     allowed = True
@@ -524,6 +541,7 @@ class SourceMatch:
     source: str
     score: float
     excerpt: str
+    source_id: str = ""
 
 
 @dataclass(slots=True)
@@ -1646,6 +1664,58 @@ def _sentence_similarity(left: str, right: str) -> float:
     return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
 
 
+def _source_id_for_file_name(file_name: str) -> str:
+    name = Path(file_name).name
+    if name in SOURCE_ID_BY_FILE:
+        return SOURCE_ID_BY_FILE[name]
+    if name in GENERATED_KNOWLEDGE_FILES:
+        return "src_local_notes"
+    return "src_imported_docs"
+
+
+def _normalize_source_filter(source_ids: list[str] | tuple[str, ...] | set[str] | None) -> set[str]:
+    return {str(source_id).strip() for source_id in source_ids or [] if str(source_id).strip()}
+
+
+def _format_core_contract(core_contract: dict[str, Any] | None) -> str:
+    if not isinstance(core_contract, dict):
+        return ""
+
+    pieces: list[str] = []
+    mode = clean_text(str(core_contract.get("mode") or ""))
+    personality = clean_text(str(core_contract.get("personality") or ""))
+    if mode or personality:
+        pieces.append("mode " + ", ".join(part for part in (mode, personality) if part))
+
+    response_contract = [
+        str(item).replace("_", " ").strip()
+        for item in core_contract.get("responseContract") or []
+        if str(item).strip()
+    ][:3]
+    if response_contract:
+        pieces.append("respond by " + ", ".join(response_contract))
+
+    confidence_policy = [
+        str(item).replace("_", " ").strip()
+        for item in core_contract.get("confidencePolicy") or []
+        if str(item).strip()
+    ][:3]
+    if confidence_policy:
+        pieces.append("confidence: " + ", ".join(confidence_policy))
+
+    trust_contract = core_contract.get("trustContract")
+    if isinstance(trust_contract, dict):
+        trust_notes = [
+            clean_text(str(trust_contract.get(key) or ""))
+            for key in ("uncertainty", "citations", "judgment")
+        ]
+        trust_notes = [note for note in trust_notes if note][:2]
+        if trust_notes:
+            pieces.append("trust: " + " ".join(trust_notes))
+
+    return "; ".join(pieces)
+
+
 class KnowledgeBase:
     def __init__(self, base_dir: str | Path = ".", data_folder: str = DEFAULT_DATA_FOLDER):
         self.base_dir = Path(base_dir)
@@ -1689,6 +1759,7 @@ class KnowledgeBase:
                     {
                         "source": txt_path.name,
                         "source_lower": txt_path.name.lower(),
+                        "source_id": _source_id_for_file_name(txt_path.name),
                         "text": chunk,
                         "search_text": chunk.lower(),
                         "tokens": None,
@@ -1709,6 +1780,7 @@ class KnowledgeBase:
                         {
                             "source": root_train.name,
                             "source_lower": root_train.name.lower(),
+                            "source_id": _source_id_for_file_name(root_train.name),
                             "text": chunk,
                             "search_text": chunk.lower(),
                             "tokens": None,
@@ -1730,11 +1802,19 @@ class KnowledgeBase:
             chunk["chargrams"] = chargrams
         return chargrams
 
-    def search(self, query: str, limit: int = 3, min_score: float = 0.45) -> list[SourceMatch]:
+    def search(
+        self,
+        query: str,
+        limit: int = 3,
+        min_score: float = 0.45,
+        *,
+        source_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> list[SourceMatch]:
         query = query.strip()
         if not query or not self.chunks:
             return []
 
+        allowed_source_ids = _normalize_source_filter(source_ids)
         lowered_query = query.lower()
         query_terms = _tokenize_search_terms(lowered_query)
         query_term_set = set(query_terms)
@@ -1745,6 +1825,9 @@ class KnowledgeBase:
 
         scored: list[SourceMatch] = []
         for chunk in self.chunks:
+            chunk_source_id = str(chunk.get("source_id") or _source_id_for_file_name(str(chunk.get("source", ""))))
+            if allowed_source_ids and chunk_source_id not in allowed_source_ids:
+                continue
             text = str(chunk["search_text"])
             source_name = str(chunk.get("source_lower") or chunk["source"]).lower()
             # Lazy: tokens are built on first scan and cached on the chunk.
@@ -1805,6 +1888,7 @@ class KnowledgeBase:
                         source=str(chunk["source"]),
                         score=score,
                         excerpt=excerpt,
+                        source_id=chunk_source_id,
                     )
                 )
 
@@ -2454,10 +2538,22 @@ class SolinEngine:
             sequences.append(list(sequence))
         self._stop_sequences = sequences
 
-    def search_documents(self, query: str, limit: int = 3, *, mode: str | None = None) -> list[SourceMatch]:
+    def search_documents(
+        self,
+        query: str,
+        limit: int = 3,
+        *,
+        mode: str | None = None,
+        source_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> list[SourceMatch]:
         with self._engine_lock:
             settings = self._mode_settings(mode)
-            return self.knowledge_base.search(query, limit=limit, min_score=float(settings["retrieval_threshold"]))
+            return self.knowledge_base.search(
+                query,
+                limit=limit,
+                min_score=float(settings["retrieval_threshold"]),
+                source_ids=source_ids,
+            )
 
     def status_summary(self) -> str:
         with self._engine_lock:
@@ -2556,7 +2652,12 @@ class SolinEngine:
         return "I don't have enough to give a confident answer yet. A bit more context would help."
 
     def _build_system_prompt(
-        self, intent: QueryIntent, has_context: bool, has_memory: bool = False, user_input: str = ""
+        self,
+        intent: QueryIntent,
+        has_context: bool,
+        has_memory: bool = False,
+        user_input: str = "",
+        core_contract: dict[str, Any] | None = None,
     ) -> str:
         if _is_casual_intent(intent.label):
             style = self._casual_style_instruction(intent, user_input)
@@ -2575,6 +2676,9 @@ class SolinEngine:
         else:
             context_note = "do not over-explain"
         prompt = f"{style}; {context_note}"
+        core_note = _format_core_contract(core_contract)
+        if core_note:
+            prompt = f"{prompt}; core: {core_note}"
         safety_note = self.safety.system_prompt_addendum() if hasattr(self, "safety") else ""
         if safety_note:
             prompt = f"{prompt}; {safety_note}"
@@ -2768,10 +2872,15 @@ class SolinEngine:
         context_summary: str = "",
         memory_summary: str = "",
         note_summary: str = "",
+        core_contract: dict[str, Any] | None = None,
     ) -> str:
         has_memory = bool(memory_summary or note_summary)
         style_note = self._build_system_prompt(
-            intent, has_context=bool(context_summary), has_memory=has_memory, user_input=user_input
+            intent,
+            has_context=bool(context_summary),
+            has_memory=has_memory,
+            user_input=user_input,
+            core_contract=core_contract,
         )
         recent_history = self._build_recent_history_snapshot(user_input, limit=3)
         prompt_budget = max(self.block_size, 24)
@@ -3153,6 +3262,7 @@ class SolinEngine:
         intent: QueryIntent,
         *,
         mode: str | None = None,
+        source_ids: list[str] | tuple[str, ...] | set[str] | None = None,
     ) -> list[SourceMatch]:
         if not intent.use_retrieval:
             return []
@@ -3163,10 +3273,20 @@ class SolinEngine:
         if intent.label == QUERY_INTENT_DOCUMENT:
             min_score = min(min_score, 0.2)
         limit = int(settings["retrieval_limit"])
-        matches = self.knowledge_base.search(retrieval_query, limit=limit, min_score=min_score)
+        matches = self.knowledge_base.search(
+            retrieval_query,
+            limit=limit,
+            min_score=min_score,
+            source_ids=source_ids,
+        )
         if not matches and retrieval_query != user_input:
             fallback_threshold = min(min_score, 0.18 if intent.label == QUERY_INTENT_DOCUMENT else 0.3)
-            matches = self.knowledge_base.search(user_input, limit=limit, min_score=fallback_threshold)
+            matches = self.knowledge_base.search(
+                user_input,
+                limit=limit,
+                min_score=fallback_threshold,
+                source_ids=source_ids,
+            )
         return matches
 
     def _compress_context(
@@ -3523,6 +3643,8 @@ class SolinEngine:
         temperature: float = 0.32,
         auto_capture: bool = False,
         mode: str | None = None,
+        core_contract: dict[str, Any] | None = None,
+        source_ids: list[str] | tuple[str, ...] | set[str] | None = None,
     ) -> tuple[str, list[SourceMatch], ReplyDiagnostics]:
         with self._engine_lock:
             cleaned_input = clean_text(user_input)
@@ -3589,7 +3711,12 @@ class SolinEngine:
                     auto_capture=auto_capture,
                     remembered_note=remembered_note,
                 )
-            matches = self._retrieve_supporting_context(understood_input, intent, mode=resolved_mode)
+            matches = self._retrieve_supporting_context(
+                understood_input,
+                intent,
+                mode=resolved_mode,
+                source_ids=source_ids,
+            )
             note_matches: list[NoteMatch] = []
             if self._should_use_note_memory(understood_input, intent):
                 note_matches = self.chat_memory.search_notes(
@@ -3691,6 +3818,7 @@ class SolinEngine:
                 context_summary=context_summary,
                 memory_summary=memory_summary,
                 note_summary=note_summary,
+                core_contract=core_contract,
             )
             input_ids = self.encode(prompt)
             if not input_ids:

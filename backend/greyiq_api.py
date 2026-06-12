@@ -27,7 +27,8 @@ RUNTIME_DIR = Path(os.getenv("GREYIQ_RUNTIME_DIR", PROJECT_ROOT / "runtime")).re
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from ai_core.core_store import AICoreStore  # noqa: E402
+from ai_core.core_store import AICoreStore, DEFAULT_CORE_ID, slugify  # noqa: E402
+from repo_ingest import ingest_repositories  # noqa: E402
 from solin_core import SolinEngine  # noqa: E402
 from training_runtime import (  # noqa: E402
     DEFAULT_EVAL_INTERVAL,
@@ -94,6 +95,12 @@ class TrainingRequest(BaseModel):
 
 class DeviceRequest(BaseModel):
     preference: str = Field(default="auto", max_length=20)
+
+
+class RepoIngestRequest(BaseModel):
+    sources: list[str] = Field(default_factory=list)
+    max_total_chars: int = Field(default=4_000_000, ge=50_000, le=50_000_000)
+    max_files_per_repo: int = Field(default=900, ge=10, le=10_000)
 
 
 class CoreSaveRequest(BaseModel):
@@ -277,6 +284,8 @@ class GreyIQRuntime:
         try:
             engine = self.get_engine()
             engine.safety = OpenPolicy()
+            core = active_core_for_request(self.store, request)
+            source_ids = normalize_source_ids(core.get("sourceIds") or request.bot.get("sourceIds") or [])
             seed_training_note(request)
             response, citations, diagnostics = engine.generate_reply(
                 request.message,
@@ -284,6 +293,8 @@ class GreyIQRuntime:
                 temperature=request.temperature,
                 auto_capture=request.auto_capture,
                 mode=request.mode,
+                core_contract=core,
+                source_ids=source_ids,
             )
             response = friendly_branding(response)
             return {
@@ -296,6 +307,7 @@ class GreyIQRuntime:
                 "citations": [
                     {
                         "source": match.source,
+                        "source_id": match.source_id,
                         "score": match.score,
                         "excerpt": match.excerpt,
                     }
@@ -408,6 +420,37 @@ def normalize_source_ids(values: list[str] | None) -> list[str]:
             selected.append(source_id)
             seen.add(source_id)
     return selected
+
+
+def core_id_for_bot(bot: dict[str, Any] | None) -> str:
+    if not isinstance(bot, dict):
+        return DEFAULT_CORE_ID
+    explicit = str(bot.get("coreId") or bot.get("core_id") or "").strip()
+    if explicit:
+        return explicit
+    raw_id = str(bot.get("id") or bot.get("name") or "").strip()
+    if not raw_id:
+        return DEFAULT_CORE_ID
+    return f"core_{slugify(raw_id, 'greyiq')}"
+
+
+def active_core_for_request(store: AICoreStore, request: ChatRequest) -> dict[str, Any]:
+    state = store.load()
+    cores = [core for core in state.get("cores", []) if isinstance(core, dict)]
+    requested_id = core_id_for_bot(request.bot)
+    core = next((item for item in cores if item.get("id") == requested_id), None)
+    if core is None:
+        deployment = next(
+            (
+                item
+                for item in state.get("deployments", [])
+                if item.get("channel") == "GreyIQ Chat"
+            ),
+            None,
+        )
+        deployed_core_id = str((deployment or {}).get("coreId") or DEFAULT_CORE_ID)
+        core = next((item for item in cores if item.get("id") == deployed_core_id), None)
+    return core or (cores[0] if cores else {})
 
 
 def source_training_file(source_id: str | None) -> str:
@@ -554,6 +597,19 @@ def preferences(request: PreferenceRequest) -> dict[str, Any]:
     return {"ok": True, "path": str(path), "source_id": request.source_id}
 
 
+def repo_ingest(request: RepoIngestRequest) -> dict[str, Any]:
+    clean_sources = [source.strip() for source in request.sources if str(source or "").strip()]
+    if not clean_sources:
+        raise HTTPError(422, "At least one repository path or Git URL is required.")
+    return ingest_repositories(
+        clean_sources,
+        runtime_dir=RUNTIME_DIR,
+        max_total_chars=request.max_total_chars,
+        max_files_per_repo=request.max_files_per_repo,
+        logger=runtime.log,
+    )
+
+
 def validate_payload(model: type[BaseModel], payload: dict[str, Any]) -> BaseModel:
     try:
         validator = getattr(model, "model_validate", None)
@@ -669,6 +725,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/preferences":
             request = validate_payload(PreferenceRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(preferences, request))
+            return
+        if method == "POST" and path == "/api/repos/ingest":
+            request = validate_payload(RepoIngestRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(repo_ingest, request))
             return
         if method == "POST" and path == "/api/train/start":
             request = validate_payload(TrainingRequest, await read_json_body(receive))
