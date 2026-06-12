@@ -39,6 +39,7 @@ from training_runtime import (  # noqa: E402
 )
 from bughunter.scan_service import run_code_scan  # noqa: E402
 from bughunter.web_scan_service import run_web_scan  # noqa: E402
+from bughunter.live_scan_service import run_live_scan  # noqa: E402
 
 
 APP_NAME = "GreyIQ"
@@ -162,6 +163,11 @@ class ScanCodeRequest(BaseModel):
 
 class WebScanRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
+
+
+class LiveScanRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+    wait_seconds: float = Field(default=6.0, ge=0.0, le=30.0)
 
 
 class HTTPError(Exception):
@@ -747,6 +753,13 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/scan/web":
             request = validate_payload(WebScanRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(run_web_scan, request.url))
+            return
+        if method == "POST" and path == "/api/scan/live":
+            request = validate_payload(LiveScanRequest, await read_json_body(receive))
+            await send_json(
+                send,
+                await asyncio.to_thread(run_live_scan, request.url, request.wait_seconds),
+            )
             return
         if method == "GET" and path == "/api/cores":
             await send_json(send, await asyncio.to_thread(runtime.store.load))
