@@ -57,6 +57,7 @@ def _result_to_dict(result: ScanResult) -> dict[str, Any]:
     )
     return {
         "ok": True,
+        "scan_type": "code",
         "target": result.target,
         "target_type": result.target_type.value,
         "risk": result.risk,

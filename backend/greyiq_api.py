@@ -40,6 +40,8 @@ from training_runtime import (  # noqa: E402
 from bughunter.scan_service import run_code_scan  # noqa: E402
 from bughunter.web_scan_service import run_web_scan  # noqa: E402
 from bughunter.live_scan_service import run_live_scan  # noqa: E402
+from bughunter.triage import triage  # noqa: E402
+from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
 
 
 APP_NAME = "GreyIQ"
@@ -350,7 +352,37 @@ class GreyIQRuntime:
                 self.engine.safety = OpenPolicy()
         return self.status()
 
+    def _code_router_config(self) -> dict[str, Any]:
+        payload = read_json(RUNTIME_DIR / "solin_runtime_config.json", {})
+        config = payload.get("code_router") if isinstance(payload, dict) else None
+        return config if isinstance(config, dict) else {}
+
+    def _maybe_scan_reply(self, request: ChatRequest) -> dict[str, Any] | None:
+        command = detect_scan_command(request.message)
+        if command is None:
+            return None
+        kind, target = command
+        result = run_scan(kind, target)
+        triaged = triage(result, self._code_router_config())
+        return {
+            "request_id": uuid4().hex,
+            "message": friendly_branding(triaged["summary"]),
+            "used_fallback": not bool(result.get("ok")),
+            "captured_for_training": False,
+            "model_name": "bughunter" + ("+remote" if triaged["used_remote"] else ""),
+            "device": "scanner",
+            "citations": triaged["citations"],
+            "ai_core": self.store.load(),
+            "scan": {
+                key: result.get(key)
+                for key in ("ok", "scan_type", "risk", "score", "finding_count", "target")
+            },
+        }
+
     def chat(self, request: ChatRequest) -> dict[str, Any]:
+        scan_reply = self._maybe_scan_reply(request)
+        if scan_reply is not None:
+            return scan_reply
         try:
             engine = self.get_engine()
             engine.safety = OpenPolicy()
