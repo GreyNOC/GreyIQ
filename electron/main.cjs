@@ -22,6 +22,26 @@ let backendReady = false;
 let startupError = '';
 let quitting = false;
 
+function parseUrl(rawUrl) {
+  try {
+    return new URL(rawUrl);
+  } catch (_) {
+    return null;
+  }
+}
+
+function isAllowedExternalUrl(rawUrl) {
+  const parsed = parseUrl(rawUrl);
+  return Boolean(parsed && (parsed.protocol === 'https:' || parsed.protocol === 'http:' || parsed.protocol === 'mailto:'));
+}
+
+function isTrustedBackendUrl(rawUrl) {
+  const parsed = parseUrl(rawUrl);
+  if (!parsed) return false;
+  if (!backendReady && parsed.protocol === 'data:') return true;
+  return parsed.protocol === 'http:' && parsed.hostname === HOST && Number(parsed.port) === backendPort;
+}
+
 function isPortFree(port) {
   return new Promise((resolve) => {
     const server = net.createServer();
@@ -143,13 +163,27 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
     },
   });
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    if (isAllowedExternalUrl(url)) {
+      void shell.openExternal(url);
+    }
     return { action: 'deny' };
+  });
+
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!isTrustedBackendUrl(url)) {
+      event.preventDefault();
+    }
+  });
+
+  mainWindow.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => {
+    callback(false);
   });
 
   if (backendReady) {

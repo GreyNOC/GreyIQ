@@ -8,25 +8,47 @@ prove statically. The remediation always reads "audit the data flow".
 
 from __future__ import annotations
 
+import ast
 import re
+from collections.abc import Iterable
 
-from bughunter.code_scanner.model import Confidence, Severity
-from bughunter.code_scanner.rules.base import RegexRule
+from bughunter.code_scanner.model import Confidence, Finding, Severity
+from bughunter.code_scanner.rules.base import RegexRule, Rule
+
+
+class PythonEvalExecRule(Rule):
+    def scan(self, *, path: str, text: str) -> Iterable[Finding]:
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return
+
+        lines = text.splitlines()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Name) or node.func.id not in {"eval", "exec"}:
+                continue
+            line_start = int(getattr(node, "lineno", 1) or 1)
+            line_end = int(getattr(node, "end_lineno", line_start) or line_start)
+            snippet = lines[line_start - 1].strip() if 0 < line_start <= len(lines) else node.func.id
+            yield Finding(
+                rule_id=self.rule_id,
+                title=self.title,
+                description=self.description,
+                severity=self.severity,
+                confidence=self.confidence,
+                category=self.category,
+                file_path=path,
+                line_start=line_start,
+                line_end=line_end,
+                snippet=snippet[:240],
+                remediation=self.remediation,
+            )
+
 
 _RULES_RAW = [
     # ---------- Python ----------
-    (
-        "py.eval-on-input",
-        "Python eval() / exec() on a dynamic argument",
-        "eval(...) and exec(...) execute arbitrary Python; any path from user input to the argument is RCE.",
-        Severity.CRITICAL,
-        Confidence.HIGH,
-        "injection",
-        "Replace with a typed parser (json.loads, ast.literal_eval) or a constrained DSL.",
-        ("python",),
-        (),
-        r"\b(?:eval|exec)\s*\(",
-    ),
     (
         "py.pickle-loads",
         "Python pickle.loads / cPickle.loads on untrusted bytes",
@@ -152,7 +174,18 @@ _RULES_RAW = [
 ]
 
 
-RULES = tuple(
+RULES = (
+    PythonEvalExecRule(
+        rule_id="py.eval-on-input",
+        title="Python eval() / exec() on a dynamic argument",
+        description="eval(...) and exec(...) execute arbitrary Python; any path from user input to the argument is RCE.",
+        severity=Severity.CRITICAL,
+        confidence=Confidence.HIGH,
+        category="injection",
+        remediation="Replace with a typed parser (json.loads, ast.literal_eval) or a constrained DSL.",
+        languages=("python",),
+    ),
+) + tuple(
     RegexRule(
         rule_id=rid,
         title=title,

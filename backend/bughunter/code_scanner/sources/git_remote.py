@@ -1,6 +1,6 @@
 """Remote git source — shallow-clone a public URL into a tempdir, scan, clean up.
 
-Only http(s) URLs are accepted, and a strict allowlist of hosts is
+Only HTTPS URLs are accepted, and a strict allowlist of hosts is
 enforced. Cloning is shallow (depth=1) and bandwidth-capped to the
 configured max-total-bytes setting. Authentication is intentionally
 not supported in v1 — pass a local clone via ``git_local`` if you need
@@ -28,14 +28,16 @@ _HOST_ALLOWLIST = frozenset(
         "git.sr.ht",
     }
 )
-_URL_RE = re.compile(r"^https?://[^\s]+$")
+_URL_RE = re.compile(r"^https://[^\s]+$", re.IGNORECASE)
 
 
 def _validate_url(url: str) -> str:
     url = url.strip()
     if not _URL_RE.match(url):
-        raise ValueError("Remote git URL must be http(s).")
+        raise ValueError("Remote git URL must use https.")
     parsed = urlparse(url)
+    if parsed.scheme.lower() != "https":
+        raise ValueError("Remote git URL must use https.")
     host = (parsed.hostname or "").lower()
     if host not in _HOST_ALLOWLIST:
         raise ValueError(

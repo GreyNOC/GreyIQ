@@ -42,6 +42,20 @@ npm run desktop
 npm run check
 ```
 
+## Local Security Defaults
+
+GreyIQ binds local services to `127.0.0.1` by default. Set `GREYIQ_HOST`
+or `HOST` only when you intentionally want another interface.
+
+The Python API rejects browser requests whose `Origin` does not match the
+running service. If you intentionally serve a separate trusted frontend, set
+`GREYIQ_ALLOWED_ORIGINS` to a comma-separated list such as
+`http://127.0.0.1:4173`.
+
+Local code scans can be restricted to one folder with
+`GREYIQ_CODE_SCAN_BASE_PATH`. Remote repository scans require HTTPS URLs from
+the built-in host allowlist.
+
 ## How Training Works
 
 Each bot owns browser-side preference weights for instant fallback behavior. When the GreyIQ backend is running, preferences, rated examples, and source-specific training data are also written into the local runtime training data. The trainer can run against one or more selected sources, and the AI core store tracks the active bot as a local core. Data stays on the machine unless you explicitly move it.

@@ -8,11 +8,12 @@ import shutil
 import sys
 import threading
 import traceback
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 import uvicorn
@@ -45,7 +46,27 @@ from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
 
 
 APP_NAME = "GreyIQ"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
+_CURRENT_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar("greyiq_current_scope", default=None)
+_CSP = (
+    "default-src 'self'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "connect-src 'self'; "
+    "font-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "frame-ancestors 'none'"
+)
+_SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"no-referrer"),
+    (b"x-frame-options", b"DENY"),
+    (b"cross-origin-opener-policy", b"same-origin"),
+    (b"cross-origin-resource-policy", b"same-origin"),
+    (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"),
+)
 SEED_FILES = (
     "best_model.pt",
     "solin_checkpoint.pt",
@@ -696,14 +717,89 @@ async def read_json_body(receive: Any) -> dict[str, Any]:
     return payload
 
 
-def response_headers(content_type: str, content_length: int = 0) -> list[tuple[bytes, bytes]]:
+def _header(scope: dict[str, Any] | None, name: str) -> str:
+    if not scope:
+        return ""
+    expected = name.lower().encode("ascii")
+    for key, value in scope.get("headers", []):
+        if key.lower() == expected:
+            return value.decode("latin-1", errors="replace")
+    return ""
+
+
+def _normalize_origin(value: str) -> str:
+    raw = value.strip()
+    if not raw or raw == "null":
+        return ""
+    try:
+        parsed = urlparse(raw)
+        port = parsed.port
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    if parsed.username or parsed.password:
+        return ""
+    try:
+        hostname = parsed.hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return ""
+    netloc = hostname if port is None else f"{hostname}:{port}"
+    return f"{parsed.scheme}://{netloc}"
+
+
+def _configured_origins() -> set[str]:
+    raw = os.getenv("GREYIQ_ALLOWED_ORIGINS", "")
+    return {
+        normalized
+        for normalized in (_normalize_origin(part) for part in raw.split(","))
+        if normalized
+    }
+
+
+def _same_origin(scope: dict[str, Any] | None) -> str:
+    host = _header(scope, "host").strip().lower()
+    if not host:
+        return ""
+    scheme = str((scope or {}).get("scheme") or "http").lower()
+    return f"{scheme}://{host}"
+
+
+def _request_origin_allowed(scope: dict[str, Any] | None = None) -> bool:
+    scope = scope or _CURRENT_SCOPE.get()
+    origin = _header(scope, "origin")
+    if not origin:
+        return True
+    normalized = _normalize_origin(origin)
+    if not normalized:
+        return False
+    return normalized == _same_origin(scope) or normalized in _configured_origins()
+
+
+def _cors_headers(scope: dict[str, Any] | None) -> list[tuple[bytes, bytes]]:
+    origin = _header(scope, "origin")
+    if not origin or not _request_origin_allowed(scope):
+        return []
+    normalized = _normalize_origin(origin)
     return [
-        (b"content-type", content_type.encode("utf-8")),
-        (b"content-length", str(content_length).encode("ascii")),
-        (b"access-control-allow-origin", b"*"),
+        (b"access-control-allow-origin", normalized.encode("ascii")),
         (b"access-control-allow-methods", b"GET,POST,OPTIONS"),
         (b"access-control-allow-headers", b"content-type,accept"),
+        (b"access-control-max-age", b"600"),
+        (b"vary", b"Origin"),
     ]
+
+
+def response_headers(content_type: str, content_length: int = 0) -> list[tuple[bytes, bytes]]:
+    headers = [
+        (b"content-type", content_type.encode("utf-8")),
+        (b"content-length", str(content_length).encode("ascii")),
+    ]
+    if content_type.startswith("text/html"):
+        headers.append((b"content-security-policy", _CSP.encode("utf-8")))
+    headers.extend(_SECURITY_HEADERS)
+    headers.extend(_cors_headers(_CURRENT_SCOPE.get()))
+    return headers
 
 
 async def send_json(send: Any, payload: Any, status_code: int = 200) -> None:
@@ -747,11 +843,19 @@ async def send_empty(send: Any, status_code: int = 204) -> None:
 
 
 async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
+    _CURRENT_SCOPE.set(scope)
     method = str(scope.get("method") or "GET").upper()
     path = str(scope.get("path") or "/")
 
     if method == "OPTIONS":
+        if not _request_origin_allowed(scope):
+            await send_json(send, {"error": "origin not allowed"}, 403)
+            return
         await send_empty(send)
+        return
+
+    if not _request_origin_allowed(scope):
+        await send_json(send, {"error": "origin not allowed"}, 403)
         return
 
     try:
@@ -876,7 +980,14 @@ app = GreyIQASGI()
 def main() -> None:
     host = os.getenv("GREYIQ_HOST", "127.0.0.1")
     port = int(os.getenv("GREYIQ_PORT", os.getenv("PORT", "8766")))
-    uvicorn.run("backend.greyiq_api:app", host=host, port=port, reload=False, log_level="info")
+    uvicorn.run(
+        "backend.greyiq_api:app",
+        host=host,
+        port=port,
+        reload=False,
+        log_level="info",
+        server_header=False,
+    )
 
 
 if __name__ == "__main__":
