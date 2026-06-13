@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, shell } = require('electron');
+const { app, BrowserWindow, shell, ipcMain, dialog } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const http = require('node:http');
@@ -280,7 +280,22 @@ function showApp() {
   }
 }
 
+function registerIpcHandlers() {
+  // Native folder picker for "Add a local folder" in the training panel.
+  ipcMain.handle('greyiq:pick-folder', async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose a folder to add to GreyIQ training data',
+      properties: ['openDirectory'],
+    });
+    if (result.canceled || !result.filePaths || result.filePaths.length === 0) {
+      return null;
+    }
+    return result.filePaths[0];
+  });
+}
+
 async function boot() {
+  registerIpcHandlers();
   createWindow();
   await startBackend();
   showApp();

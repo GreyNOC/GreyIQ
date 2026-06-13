@@ -135,6 +135,11 @@ const els = {
   trainingDataForm: document.querySelector("#trainingDataForm"),
   trainingDataSource: document.querySelector("#trainingDataSource"),
   trainingDataInput: document.querySelector("#trainingDataInput"),
+  trainingFolderForm: document.querySelector("#trainingFolderForm"),
+  trainingFolderInput: document.querySelector("#trainingFolderInput"),
+  trainingFolderBrowse: document.querySelector("#trainingFolderBrowse"),
+  trainingFolderSubmit: document.querySelector("#trainingFolderSubmit"),
+  trainingFolderStatus: document.querySelector("#trainingFolderStatus"),
   trainingSourceList: document.querySelector("#trainingSourceList"),
   trainButton: document.querySelector("#trainButton"),
   trainingDataCount: document.querySelector("#trainingDataCount"),
@@ -1284,6 +1289,80 @@ els.trainingDataForm.addEventListener("submit", (event) => {
     sourceId
   ]);
   addMemory({ kind: "training_data", sourceId, text });
+});
+
+const desktopFolderPicker =
+  typeof window !== "undefined" &&
+  window.greyiqDesktop &&
+  typeof window.greyiqDesktop.pickFolder === "function";
+
+if (desktopFolderPicker && els.trainingFolderBrowse) {
+  els.trainingFolderBrowse.hidden = false;
+}
+
+async function chooseTrainingFolder() {
+  if (!desktopFolderPicker) {
+    return null;
+  }
+  try {
+    return await window.greyiqDesktop.pickFolder();
+  } catch (_) {
+    return null;
+  }
+}
+
+els.trainingFolderBrowse?.addEventListener("click", async () => {
+  const picked = await chooseTrainingFolder();
+  if (picked) {
+    els.trainingFolderInput.value = picked;
+  }
+});
+
+els.trainingFolderForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  let folder = els.trainingFolderInput.value.trim();
+  if (!folder) {
+    const picked = await chooseTrainingFolder();
+    if (picked) {
+      folder = picked;
+      els.trainingFolderInput.value = picked;
+    }
+  }
+  if (!folder) {
+    els.trainingFolderStatus.textContent = desktopFolderPicker
+      ? "Choose a folder first."
+      : "Paste a folder path first.";
+    return;
+  }
+
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.trainingFolderStatus.textContent = "Local GreyIQ service is not running.";
+    return;
+  }
+
+  els.trainingFolderSubmit.disabled = true;
+  els.trainingFolderStatus.textContent = "Reading folder and ingesting files… this can take a while for large folders.";
+  try {
+    const result = await apiFetch("/api/train/folder", {
+      method: "POST",
+      timeoutMs: 300000,
+      body: JSON.stringify({ folder })
+    });
+    els.trainingFolderStatus.textContent = result.message || "Folder added to training data.";
+    // Ingested files count as Imported Documents — make sure they're included next train.
+    state.selectedTrainingSources = normalizeSelectedTrainingSources([
+      ...state.selectedTrainingSources,
+      "src_imported_docs"
+    ]);
+    saveState();
+    renderTrainingSources();
+    await refreshServiceStatus({ silent: true });
+  } catch (error) {
+    els.trainingFolderStatus.textContent = error.message || "Could not add that folder.";
+  } finally {
+    els.trainingFolderSubmit.disabled = false;
+  }
+  render();
 });
 
 els.trainButton.addEventListener("click", async () => {

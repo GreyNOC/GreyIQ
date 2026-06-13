@@ -127,6 +127,18 @@
           <button class="text-button" type="submit">Add training data</button>
         </form>
 
+        <form class="choice-form" id="trainingFolderForm">
+          <label>
+            <span>Add a local folder</span>
+            <input id="trainingFolderInput" name="trainingFolder" type="text" autocomplete="off" spellcheck="false" placeholder="Choose a folder, or paste its path">
+          </label>
+          <div class="folder-actions">
+            <button class="text-button" type="button" id="trainingFolderBrowse" hidden>Choose folder…</button>
+            <button class="text-button" type="submit" id="trainingFolderSubmit">Add folder</button>
+          </div>
+          <p class="folder-status" id="trainingFolderStatus" aria-live="polite"></p>
+        </form>
+
         <div class="source-heading">Train on</div>
         <section class="source-picker" id="trainingSourceList" aria-label="Training sources"></section>
 
