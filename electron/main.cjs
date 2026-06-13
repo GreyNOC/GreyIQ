@@ -10,8 +10,12 @@ const { spawn } = require('node:child_process');
 const APP_NAME = 'GreyIQ';
 const HOST = '127.0.0.1';
 const DEFAULT_PORT = parseInt(process.env.GREYIQ_PORT || '8766', 10);
-const STARTUP_TIMEOUT_MS = 60_000;
-const HEALTH_POLL_MS = 400;
+// The frozen backend's first launch is slow: the portable build unpacks ~1 GB to
+// a temp dir and torch/model import is cold (measured ~200 s on a fresh run, less
+// on later launches once the unpack is cached). Wait well past that before giving
+// up so a working backend is never killed by an impatient timeout.
+const STARTUP_TIMEOUT_MS = parseInt(process.env.GREYIQ_STARTUP_TIMEOUT_MS || '360000', 10);
+const HEALTH_POLL_MS = 500;
 const PROJECT_ROOT = app.isPackaged ? path.join(process.resourcesPath, 'app') : path.resolve(__dirname, '..');
 // The PyInstaller-frozen backend is shipped as an extraResource at
 // <resources>/backend/greyiq-backend(.exe). Present only in packaged builds.
@@ -22,8 +26,18 @@ let mainWindow = null;
 let backendProcess = null;
 let backendPort = DEFAULT_PORT;
 let backendReady = false;
+let backendExited = false;
 let startupError = '';
 let quitting = false;
+let logStream = null;
+
+function backendLogPath() {
+  try {
+    return path.join(app.getPath('userData'), 'backend.log');
+  } catch (_) {
+    return '';
+  }
+}
 
 function parseUrl(rawUrl) {
   try {
@@ -128,12 +142,26 @@ function probeHealth(port) {
 async function waitForBackend(port) {
   const deadline = Date.now() + STARTUP_TIMEOUT_MS;
   while (Date.now() < deadline) {
+    // If the backend process died, stop waiting immediately instead of burning
+    // the whole timeout — the error page should appear right away.
+    if (backendExited) return false;
     // eslint-disable-next-line no-await-in-loop
     if (await probeHealth(port)) return true;
     // eslint-disable-next-line no-await-in-loop
     await new Promise((resolve) => setTimeout(resolve, HEALTH_POLL_MS));
   }
   return false;
+}
+
+function teeBackendOutput(chunk) {
+  process.stdout.write(`[GreyIQ] ${chunk}`);
+  if (logStream) {
+    try {
+      logStream.write(chunk);
+    } catch (_) {
+      // Logging is best-effort; never let it crash startup.
+    }
+  }
 }
 
 async function startBackend() {
@@ -147,6 +175,15 @@ async function startBackend() {
     PYTHONUTF8: '1',
   };
 
+  // Mirror backend output to a log file so failures are diagnosable even though
+  // a packaged GUI app has no attached console.
+  try {
+    logStream = fs.createWriteStream(backendLogPath(), { flags: 'a' });
+    logStream.write(`\n===== GreyIQ backend start ${new Date().toISOString()} (${command.exe}) =====\n`);
+  } catch (_) {
+    logStream = null;
+  }
+
   backendProcess = spawn(command.exe, command.args, {
     cwd: command.cwd || PROJECT_ROOT,
     env,
@@ -154,18 +191,44 @@ async function startBackend() {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
-  backendProcess.stdout.on('data', (chunk) => process.stdout.write(`[GreyIQ] ${chunk}`));
-  backendProcess.stderr.on('data', (chunk) => process.stderr.write(`[GreyIQ] ${chunk}`));
+  backendProcess.on('error', (err) => {
+    backendExited = true;
+    if (!startupError) startupError = `Failed to launch backend: ${err.message}`;
+  });
+  backendProcess.stdout.on('data', teeBackendOutput);
+  backendProcess.stderr.on('data', teeBackendOutput);
   backendProcess.on('exit', (code, signal) => {
+    backendExited = true;
     if (!quitting && !backendReady) {
-      startupError = `Backend exited before ready (code=${code} signal=${signal})`;
+      startupError = `Backend exited before ready (code=${code} signal=${signal}). See ${backendLogPath()}`;
     }
   });
 
   backendReady = await waitForBackend(backendPort);
   if (!backendReady && !startupError) {
-    startupError = 'Backend did not become ready in time.';
+    startupError = `Backend did not become ready within ${Math.round(STARTUP_TIMEOUT_MS / 1000)}s.`;
   }
+}
+
+function loadingHtml() {
+  return `data:text/html;charset=utf-8,${encodeURIComponent(`
+    <body style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#f6f7f4;color:#1d2430">
+      <div style="text-align:center;max-width:440px;padding:24px">
+        <div style="width:42px;height:42px;border:4px solid #d6dad0;border-top-color:#3b7a57;border-radius:50%;margin:0 auto 22px;animation:spin 1s linear infinite"></div>
+        <h1 style="font-size:20px;font-weight:500;margin:0 0 10px">Starting GreyIQ…</h1>
+        <p style="color:#5f6b5a;font-size:14px;line-height:1.65;margin:0">The local AI engine is warming up. The first launch can take a few minutes while it unpacks and loads the model — later launches are much faster. This window will open automatically when it's ready.</p>
+      </div>
+      <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
+    </body>`)}`;
+}
+
+function errorHtml() {
+  return `data:text/html;charset=utf-8,${encodeURIComponent(`
+    <body style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:32px;background:#f6f7f4;color:#1d2430">
+      <h1 style="font-size:20px;font-weight:500">GreyIQ backend did not start</h1>
+      <p style="color:#5f6b5a;line-height:1.6">${startupError || 'Unknown startup error.'}</p>
+      <p style="color:#5f6b5a;line-height:1.6">The first launch is the slowest. Try closing and reopening GreyIQ — the engine unpacks once and starts faster afterwards. A log is at:<br><code>${backendLogPath()}</code></p>
+    </body>`)}`;
 }
 
 function createWindow() {
@@ -203,21 +266,24 @@ function createWindow() {
     callback(false);
   });
 
+  // Show a loading screen immediately so the user sees the app is alive while the
+  // backend warms up, rather than nothing at all for the duration of startup.
+  mainWindow.loadURL(loadingHtml());
+}
+
+function showApp() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
   if (backendReady) {
     mainWindow.loadURL(`http://${HOST}:${backendPort}/`);
   } else {
-    mainWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(`
-      <body style="font-family:system-ui;margin:32px;background:#f6f7f4;color:#1d2430">
-        <h1>GreyIQ backend did not start</h1>
-        <p>${startupError || 'Unknown startup error.'}</p>
-      </body>
-    `)}`);
+    mainWindow.loadURL(errorHtml());
   }
 }
 
 async function boot() {
-  await startBackend();
   createWindow();
+  await startBackend();
+  showApp();
 }
 
 app.whenReady().then(boot);
@@ -230,5 +296,12 @@ app.on('before-quit', () => {
   quitting = true;
   if (backendProcess && !backendProcess.killed) {
     backendProcess.kill();
+  }
+  if (logStream) {
+    try {
+      logStream.end();
+    } catch (_) {
+      // ignore
+    }
   }
 });
