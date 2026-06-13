@@ -55,7 +55,7 @@ from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
 
 
 APP_NAME = "GreyIQ"
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 _CURRENT_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar("greyiq_current_scope", default=None)
 _CSP = (
     "default-src 'self'; "
