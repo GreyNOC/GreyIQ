@@ -10,7 +10,9 @@ import os
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(SPECPATH)))  # noqa: F821 (SPECPATH injected)
+# SPECPATH is the directory containing this spec (i.e. <repo>/build), so the
+# repo root is one level up.
+ROOT = os.path.dirname(os.path.abspath(SPECPATH))  # noqa: F821 (SPECPATH injected)
 BACKEND = os.path.join(ROOT, "backend")
 
 datas = [
