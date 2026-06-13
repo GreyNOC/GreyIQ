@@ -1214,19 +1214,27 @@ class TinyGPT(nn.Module):
         return logits, loss
 
     @staticmethod
-    def _tail_is_degenerate(sequence: torch.Tensor, window: int = 12) -> bool:
-        """True when the tail is a short repeating cycle (period 1-6), i.e. the
-        generation is stuck looping. Requires the full window to be periodic, so
-        it does not fire on ordinary repeated short patterns mid-sentence."""
+    def _tail_is_degenerate(
+        sequence: torch.Tensor,
+        max_period: int = 6,
+        min_repeats: int = 3,
+        min_span: int = 8,
+    ) -> bool:
+        """True when the tail is a short repeating cycle (period 1..max_period),
+        i.e. generation is stuck looping. Each period is checked against its own
+        window of ``period * repeats`` tokens — so unlike a single fixed window,
+        this covers every period (including 5). Short periods require more repeats
+        (``span >= min_span``: e.g. 8 identical tokens for period 1), so it does
+        not fire on ordinary short patterns like "..." or "===" mid-sentence."""
         length = int(sequence.shape[0])
-        if length < window:
-            return False
-        tail = sequence[-window:]
-        for period in (1, 2, 3, 4, 6):
-            if window % period:
+        for period in range(1, max_period + 1):
+            repeats = max(min_repeats, -(-min_span // period))  # ceil(min_span / period)
+            span = period * repeats
+            if length < span:
                 continue
+            tail = sequence[-span:]
             block = tail[:period]
-            if torch.equal(tail, block.repeat(window // period)):
+            if torch.equal(tail, block.repeat(repeats)):
                 return True
         return False
 
