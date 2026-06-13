@@ -1,20 +1,59 @@
 {
   "name": "greyiq",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "GreyIQ local-first AI chat UI with editable bots, personal preference training, CPU fallback, and WebGPU acceleration.",
+  "author": "GreyNOC",
   "main": "electron/main.cjs",
   "scripts": {
     "start": "node server.mjs",
     "backend": "python -m backend.greyiq_api",
     "desktop": "electron .",
+    "freeze:backend": "pyinstaller --noconfirm --clean build/greyiq-backend.spec",
+    "dist": "electron-builder --win portable nsis",
     "check": "node --check server.mjs && node --check public/app.js && node --check electron/main.cjs && node --check electron/preload.cjs && python -c \"from pathlib import Path; p=Path('backend/greyiq_api.py'); compile(p.read_text(encoding='utf-8'), str(p), 'exec')\""
   },
   "devDependencies": {
-    "electron": "^42.3.3"
+    "electron": "^42.3.3",
+    "electron-builder": "^26.15.3"
   },
   "engines": {
     "node": ">=18"
+  },
+  "build": {
+    "appId": "com.greynoc.greyiq",
+    "productName": "GreyIQ",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "dist/greyiq-backend",
+        "to": "backend"
+      }
+    ],
+    "win": {
+      "target": [
+        "portable",
+        "nsis"
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "GreyIQ-${version}-portable.exe"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "include": "build/installer.nsh",
+      "artifactName": "GreyIQ-Setup-${version}.exe"
+    }
   }
 }

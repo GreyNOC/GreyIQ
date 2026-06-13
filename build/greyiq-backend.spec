@@ -1,0 +1,80 @@
+# PyInstaller spec for the GreyIQ backend (onedir).
+#
+# Freezes backend/run_frozen.py into a self-contained backend the Electron shell
+# launches when packaged. onedir (COLLECT) is used rather than onefile because it
+# is far more reliable for a torch-heavy app and avoids slow per-launch unpacking.
+#
+# Invoke from the repo root:  pyinstaller build/greyiq-backend.spec
+# Output:  dist/greyiq-backend/greyiq-backend.exe (+ supporting libraries)
+import os
+
+from PyInstaller.utils.hooks import collect_all, collect_submodules
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(SPECPATH)))  # noqa: F821 (SPECPATH injected)
+BACKEND = os.path.join(ROOT, "backend")
+
+datas = [
+    (os.path.join(BACKEND, "seed"), "seed"),
+    (os.path.join(ROOT, "public"), "public"),
+]
+binaries = []
+hiddenimports = [
+    "solin_core",
+    "solin_typo",
+    "solin_bpe",
+    "document_ingest",
+    "training_runtime",
+    "ai_core.core_store",
+]
+
+# torch and the ASGI stack load a lot dynamically; pull everything in.
+for package in ("torch", "uvicorn", "pydantic", "pydantic_core", "pypdf"):
+    pkg_datas, pkg_binaries, pkg_hidden = collect_all(package)
+    datas += pkg_datas
+    binaries += pkg_binaries
+    hiddenimports += pkg_hidden
+
+hiddenimports += collect_submodules("uvicorn")
+hiddenimports += collect_submodules("bughunter")
+
+block_cipher = None
+
+a = Analysis(  # noqa: F821
+    [os.path.join(BACKEND, "run_frozen.py")],
+    pathex=[BACKEND],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=["tkinter", "matplotlib", "pytest", "PyQt5", "PySide2"],
+    noarchive=False,
+    cipher=block_cipher,
+)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)  # noqa: F821
+
+exe = EXE(  # noqa: F821
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name="greyiq-backend",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=True,
+    disable_windowed_traceback=False,
+)
+
+coll = COLLECT(  # noqa: F821
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name="greyiq-backend",
+)
