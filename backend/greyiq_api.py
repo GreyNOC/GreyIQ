@@ -38,6 +38,12 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from ai_core.core_store import AICoreStore  # noqa: E402
+from document_ingest import (  # noqa: E402
+    collect_supported_files,
+    ingest_source_files,
+    summarize_ingest,
+    supported_extensions,
+)
 from solin_core import SolinEngine  # noqa: E402
 from training_runtime import (  # noqa: E402
     DEFAULT_EVAL_INTERVAL,
@@ -55,7 +61,7 @@ from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
 
 
 APP_NAME = "GreyIQ"
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 _CURRENT_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar("greyiq_current_scope", default=None)
 _CSP = (
     "default-src 'self'; "
@@ -203,6 +209,12 @@ class WebScanRequest(BaseModel):
 class LiveScanRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
     wait_seconds: float = Field(default=6.0, ge=0.0, le=30.0)
+
+
+class TrainFolderRequest(BaseModel):
+    folder: str = Field(min_length=1, max_length=4000)
+    recursive: bool = True
+    max_files: int = Field(default=2000, ge=1, le=20000)
 
 
 class HTTPError(Exception):
@@ -667,6 +679,63 @@ def append_training_text(file_name: str, text: str) -> Path:
     return path
 
 
+def ingest_training_folder(request: TrainFolderRequest) -> dict[str, Any]:
+    """Read a local folder and add its supported files to the training data.
+
+    Extracts text from PDFs, images (OCR if available), DOCX, and plain-text
+    files into RUNTIME_DIR/data, where the trainer reads it. Re-ingesting is
+    cheap: the manifest skips files whose contents have not changed. The ingested
+    text counts as "Imported Documents" (src_imported_docs) for training.
+    """
+    folder = Path(request.folder).expanduser()
+    if not folder.exists() or not folder.is_dir():
+        raise HTTPError(400, f"Not a folder: {request.folder}")
+
+    files = collect_supported_files(folder, recursive=request.recursive)
+    if not files:
+        return {
+            "ok": True,
+            "folder": str(folder),
+            "scanned": 0,
+            "truncated": False,
+            "summary": {"converted": 0, "unchanged": 0, "failed": 0},
+            "supported_extensions": list(supported_extensions()),
+            "message": "No supported files found in that folder.",
+        }
+
+    truncated = len(files) > request.max_files
+    selected = files[: request.max_files]
+
+    data_dir = RUNTIME_DIR / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    results = ingest_source_files(
+        source_files=selected,
+        output_folder=data_dir,
+        manifest_path=RUNTIME_DIR / "pdf_manifest.json",
+        method="auto",
+        logger=runtime.log,
+    )
+    summary = summarize_ingest(results)
+    added = summary.get("converted", 0) + summary.get("unchanged", 0)
+    message = (
+        f"Added {added} file(s) from {folder.name or folder}"
+        f" ({summary.get('converted', 0)} new, {summary.get('unchanged', 0)} already current,"
+        f" {summary.get('failed', 0)} skipped)."
+    )
+    if truncated:
+        message += f" Limited to the first {request.max_files} of {len(files)} files — run again to continue."
+    return {
+        "ok": True,
+        "folder": str(folder),
+        "scanned": len(selected),
+        "total_found": len(files),
+        "truncated": truncated,
+        "summary": summary,
+        "supported_extensions": list(supported_extensions()),
+        "message": message,
+    }
+
+
 runtime = GreyIQRuntime()
 
 
@@ -923,6 +992,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/train/start":
             request = validate_payload(TrainingRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.start_training, request))
+            return
+        if method == "POST" and path == "/api/train/folder":
+            request = validate_payload(TrainFolderRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(ingest_training_folder, request))
             return
         if method == "GET" and path == "/api/train/status":
             await send_json(send, runtime.training_payload())

@@ -410,6 +410,33 @@ label {
   font-weight: 800;
 }
 
+.text-button:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.folder-actions {
+  display: flex;
+  gap: 0.6rem;
+}
+
+.folder-actions .text-button {
+  flex: 1;
+}
+
+#trainingFolderBrowse {
+  background: transparent;
+  color: var(--teal);
+}
+
+.folder-status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.76rem;
+  line-height: 1.4;
+  min-height: 1em;
+}
+
 .meter-wrap,
 .memory-list,
 .source-picker {
