@@ -1,0 +1,4 @@
+# Build-time dependencies for freezing the GreyIQ backend.
+# Install on top of the CPU-only torch wheel (see release workflow) plus the
+# normal runtime requirements.
+pyinstaller>=6.6,<7.0

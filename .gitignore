@@ -7,6 +7,10 @@ __pycache__/
 node_modules/
 release/
 dist/
-build/
+# build/ holds electron-builder input resources (committed), not build output.
+build/*
+!build/greyiq-backend.spec
+!build/installer.nsh
+!build/requirements-build.txt
 *.log
 

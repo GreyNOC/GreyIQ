@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag/version label for the release (e.g. v0.3.0)'
+        required: true
+        default: 'v0.0.0-dev'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Build Windows portable + installer
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Python runtime + build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r build/requirements-build.txt
+
+      - name: Freeze backend (PyInstaller)
+        run: pyinstaller --noconfirm --clean build/greyiq-backend.spec
+
+      - name: Sanity-check frozen backend exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/greyiq-backend/greyiq-backend.exe")) {
+            throw "Frozen backend not found at dist/greyiq-backend/greyiq-backend.exe"
+          }
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build portable + installer (electron-builder)
+        run: npx electron-builder --win portable nsis --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: List build artifacts
+        shell: pwsh
+        run: Get-ChildItem release -Filter *.exe | Select-Object Name, Length
+
+      - name: Upload artifacts to workflow run
+        uses: actions/upload-artifact@v4
+        with:
+          name: greyiq-windows
+          path: release/*.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          name: GreyIQ ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            release/GreyIQ-*-portable.exe
+            release/GreyIQ-Setup-*.exe

@@ -13,6 +13,9 @@ const DEFAULT_PORT = parseInt(process.env.GREYIQ_PORT || '8766', 10);
 const STARTUP_TIMEOUT_MS = 60_000;
 const HEALTH_POLL_MS = 400;
 const PROJECT_ROOT = app.isPackaged ? path.join(process.resourcesPath, 'app') : path.resolve(__dirname, '..');
+// The PyInstaller-frozen backend is shipped as an extraResource at
+// <resources>/backend/greyiq-backend(.exe). Present only in packaged builds.
+const BACKEND_RESOURCE_DIR = app.isPackaged ? path.join(process.resourcesPath, 'backend') : null;
 const RUNTIME_DIR = path.join(app.getPath('userData'), 'runtime');
 
 let mainWindow = null;
@@ -86,6 +89,20 @@ function resolvePython() {
   return { exe: 'python3', args: ['-m', 'backend.greyiq_api'] };
 }
 
+function resolveBackendCommand() {
+  // Prefer the self-contained frozen backend in packaged builds; fall back to a
+  // local Python interpreter for `electron .` development runs.
+  if (app.isPackaged && BACKEND_RESOURCE_DIR) {
+    const exeName = process.platform === 'win32' ? 'greyiq-backend.exe' : 'greyiq-backend';
+    const frozen = path.join(BACKEND_RESOURCE_DIR, exeName);
+    if (fs.existsSync(frozen)) {
+      return { exe: frozen, args: [], cwd: BACKEND_RESOURCE_DIR };
+    }
+  }
+  const py = resolvePython();
+  return { exe: py.exe, args: py.args, cwd: PROJECT_ROOT };
+}
+
 function probeHealth(port) {
   return new Promise((resolve) => {
     const req = http.get(
@@ -121,7 +138,7 @@ async function waitForBackend(port) {
 
 async function startBackend() {
   backendPort = await findFreePort(DEFAULT_PORT);
-  const command = resolvePython();
+  const command = resolveBackendCommand();
   const env = {
     ...process.env,
     GREYIQ_HOST: HOST,
@@ -131,7 +148,7 @@ async function startBackend() {
   };
 
   backendProcess = spawn(command.exe, command.args, {
-    cwd: PROJECT_ROOT,
+    cwd: command.cwd || PROJECT_ROOT,
     env,
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],

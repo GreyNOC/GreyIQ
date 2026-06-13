@@ -19,10 +19,19 @@ from uuid import uuid4
 import uvicorn
 from pydantic import BaseModel, Field
 
-BACKEND_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BACKEND_DIR.parent
-PUBLIC_DIR = PROJECT_ROOT / "public"
-SEED_DIR = BACKEND_DIR / "seed"
+if getattr(sys, "frozen", False):
+    # PyInstaller bundle: source, public/ and seed/ are unpacked under _MEIPASS.
+    # RUNTIME_DIR still comes from the environment so user data stays writable.
+    BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    BACKEND_DIR = BUNDLE_DIR
+    PROJECT_ROOT = BUNDLE_DIR
+    PUBLIC_DIR = BUNDLE_DIR / "public"
+    SEED_DIR = BUNDLE_DIR / "seed"
+else:
+    BACKEND_DIR = Path(__file__).resolve().parent
+    PROJECT_ROOT = BACKEND_DIR.parent
+    PUBLIC_DIR = PROJECT_ROOT / "public"
+    SEED_DIR = BACKEND_DIR / "seed"
 RUNTIME_DIR = Path(os.getenv("GREYIQ_RUNTIME_DIR", PROJECT_ROOT / "runtime")).resolve()
 
 if str(BACKEND_DIR) not in sys.path:
@@ -46,7 +55,7 @@ from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
 
 
 APP_NAME = "GreyIQ"
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 _CURRENT_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar("greyiq_current_scope", default=None)
 _CSP = (
     "default-src 'self'; "
@@ -77,6 +86,9 @@ SEED_FILES = (
 )
 SEED_DATA_FILES = (
     "greyiq_starter_knowledge.txt",
+    # Native-text extract of the Manual_pdfs library, bundled so the local model
+    # trains on it on first run (copied into RUNTIME_DIR/data by ensure_runtime).
+    "greyiq_manual_pdfs.txt",
 )
 TRAINING_SOURCE_FILES = {
     "src_starter_knowledge": "greyiq_starter_knowledge.txt",
