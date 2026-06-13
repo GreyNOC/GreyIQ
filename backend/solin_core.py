@@ -988,26 +988,54 @@ class MultiHeadAttention(nn.Module):
     def _reshape_heads(self, tensor: torch.Tensor, batch: int, time_steps: int) -> torch.Tensor:
         return tensor.view(batch, time_steps, self.num_heads, self.head_size).transpose(1, 2).contiguous()
 
-    def forward(self, x):
+    def forward(self, x, *, layer_past=None, use_cache=False):
         batch, time_steps, channels = x.shape
         q = self._reshape_heads(self.q_proj(x), batch, time_steps)
         k = self._reshape_heads(self.k_proj(x), batch, time_steps)
         v = self._reshape_heads(self.v_proj(x), batch, time_steps)
 
+        if layer_past is not None:
+            past_k, past_v = layer_past
+            k = torch.cat((past_k, k), dim=2)
+            v = torch.cat((past_v, v), dim=2)
+
+        present = (k, v) if use_cache else None
+        query_len = q.shape[2]
+        key_len = k.shape[2]
+
         if self.use_sdpa:
             default_scale = self.head_size**-0.5
             if abs(self.attention_scale - default_scale) > 1e-12:
                 q = q * (self.attention_scale / default_scale)
-            out = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                dropout_p=self.dropout_p if self.training else 0.0,
-                is_causal=True,
-            )
+            if query_len == key_len:
+                # Prefill / training: standard square causal attention.
+                out = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    dropout_p=self.dropout_p if self.training else 0.0,
+                    is_causal=True,
+                )
+            else:
+                # Cached decode (query_len < key_len): the new queries sit at the
+                # tail of the sequence and may attend to every cached key, which is
+                # already causal. is_causal=True applies a top-left aligned mask and
+                # would be wrong here, so build an explicit bottom-right causal mask.
+                attn_mask = torch.ones(
+                    query_len, key_len, device=x.device, dtype=torch.bool
+                ).tril(diagonal=key_len - query_len)
+                out = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=attn_mask,
+                    dropout_p=self.dropout_p if self.training else 0.0,
+                )
         else:
             weights = q @ k.transpose(-2, -1) * self.attention_scale
-            causal_mask = torch.ones(time_steps, time_steps, device=x.device, dtype=torch.bool).tril()
+            causal_mask = torch.ones(query_len, key_len, device=x.device, dtype=torch.bool).tril(
+                diagonal=key_len - query_len
+            )
             weights = weights.masked_fill(~causal_mask, float("-inf"))
             weights = F.softmax(weights, dim=-1)
             weights = F.dropout(weights, p=self.dropout_p, training=self.training)
@@ -1015,7 +1043,7 @@ class MultiHeadAttention(nn.Module):
 
         out = out.transpose(1, 2).contiguous().view(batch, time_steps, channels)
         out = self.proj(out)
-        return self.dropout(out)
+        return self.dropout(out), present
 
 
 def _build_activation(name: str) -> nn.Module:
@@ -1059,10 +1087,11 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
+    def forward(self, x, *, layer_past=None, use_cache=False):
+        attn_out, present = self.sa(self.ln1(x), layer_past=layer_past, use_cache=use_cache)
+        x = x + attn_out
         x = x + self.ffwd(self.ln2(x))
-        return x
+        return x, present
 
 
 class TinyGPT(nn.Module):
@@ -1141,18 +1170,34 @@ class TinyGPT(nn.Module):
             **extra_kwargs,
         )
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, *, past_key_values=None, use_cache=False):
         _, time_steps = idx.shape
-        if time_steps > self.block_size:
+
+        past_length = 0
+        if past_key_values is not None and past_key_values[0] is not None:
+            # Cache entries are (k, v) shaped (batch, n_head, T_past, head_size).
+            past_length = past_key_values[0][0].shape[2]
+
+        if past_length + time_steps > self.block_size:
             raise ValueError(
-                f"Sequence length {time_steps} exceeds block_size {self.block_size}. "
+                f"Sequence length {past_length + time_steps} exceeds block_size {self.block_size}. "
                 "Crop the input or increase block_size before training."
             )
 
         tok = self.token_embedding(idx)
-        pos = self.position_embedding(torch.arange(time_steps, device=idx.device)).unsqueeze(0)
+        # Offset positions by the cached length so a single decoded token lands at
+        # its true absolute position rather than position 0.
+        positions = torch.arange(past_length, past_length + time_steps, device=idx.device)
+        pos = self.position_embedding(positions).unsqueeze(0)
         x = tok + pos
-        x = self.blocks(x)
+
+        new_cache = [] if use_cache else None
+        for index, block in enumerate(self.blocks):
+            layer_past = past_key_values[index] if past_key_values is not None else None
+            x, present = block(x, layer_past=layer_past, use_cache=use_cache)
+            if use_cache:
+                new_cache.append(present)
+
         x = self.ln(x)
         logits = self.head(x)
 
@@ -1164,7 +1209,26 @@ class TinyGPT(nn.Module):
                 targets.reshape(batch * steps),
             )
 
+        if use_cache:
+            return logits, loss, new_cache
         return logits, loss
+
+    @staticmethod
+    def _tail_is_degenerate(sequence: torch.Tensor, window: int = 12) -> bool:
+        """True when the tail is a short repeating cycle (period 1-6), i.e. the
+        generation is stuck looping. Requires the full window to be periodic, so
+        it does not fire on ordinary repeated short patterns mid-sentence."""
+        length = int(sequence.shape[0])
+        if length < window:
+            return False
+        tail = sequence[-window:]
+        for period in (1, 2, 3, 4, 6):
+            if window % period:
+                continue
+            block = tail[:period]
+            if torch.equal(tail, block.repeat(window // period)):
+                return True
+        return False
 
     def generate(
         self,
@@ -1174,6 +1238,7 @@ class TinyGPT(nn.Module):
         top_k: int = 40,
         top_p: float = 0.0,
         repetition_penalty: float = 1.08,
+        no_repeat_ngram_size: int = 0,
         stop_sequences: list[list[int]] | None = None,
     ):
         compiled_stops = [
@@ -1181,43 +1246,81 @@ class TinyGPT(nn.Module):
             for sequence in (stop_sequences or [])
             if sequence
         ]
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.block_size :]
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :]
+        # Incremental K/V cache. Valid only while the whole sequence still fits
+        # inside block_size: with learned absolute position embeddings a sliding
+        # window changes which token sits at each position, so once we cross
+        # block_size we drop the cache and recompute the cropped window (the
+        # original behaviour). Switching to rotary embeddings would lift this.
+        past_key_values = None
 
-            if repetition_penalty > 1.0:
-                for batch_index in range(idx_cond.shape[0]):
-                    recent_tokens = torch.unique(idx_cond[batch_index])
-                    logits[batch_index, recent_tokens] = logits[batch_index, recent_tokens] / repetition_penalty
+        for _ in range(max_new_tokens):
+            seq_len = idx.shape[1]
+            if seq_len <= self.block_size:
+                if past_key_values is None:
+                    logits, _, past_key_values = self(idx, use_cache=True)
+                else:
+                    logits, _, past_key_values = self(
+                        idx[:, -1:], past_key_values=past_key_values, use_cache=True
+                    )
+            else:
+                past_key_values = None
+                logits, _ = self(idx[:, -self.block_size :], use_cache=False)
+
+            logits = logits[:, -1, :]
+            recent = idx[:, -self.block_size :]
+
+            if repetition_penalty and repetition_penalty != 1.0:
+                for batch_index in range(idx.shape[0]):
+                    recent_tokens = torch.unique(recent[batch_index])
+                    selected = logits[batch_index, recent_tokens]
+                    # Sign-aware penalty: plain division only suppresses positive
+                    # logits — a negative logit divided by penalty>1 grows toward
+                    # zero and becomes *more* likely, inverting the intent.
+                    logits[batch_index, recent_tokens] = torch.where(
+                        selected < 0,
+                        selected * repetition_penalty,
+                        selected / repetition_penalty,
+                    )
+
+            if no_repeat_ngram_size and no_repeat_ngram_size > 1 and seq_len >= no_repeat_ngram_size:
+                ngram = no_repeat_ngram_size
+                for batch_index in range(idx.shape[0]):
+                    tokens = idx[batch_index].tolist()
+                    prefix = tuple(tokens[-(ngram - 1) :])
+                    banned = {
+                        tokens[start + ngram - 1]
+                        for start in range(len(tokens) - ngram + 1)
+                        if tuple(tokens[start : start + ngram - 1]) == prefix
+                    }
+                    if banned and len(banned) < logits.shape[-1]:
+                        logits[batch_index, list(banned)] = float("-inf")
 
             if temperature <= 0:
                 next_token = torch.argmax(logits, dim=-1, keepdim=True)
-                idx = torch.cat((idx, next_token), dim=1)
-                continue
+            else:
+                logits = logits / max(temperature, 1e-6)
 
-            logits = logits / max(temperature, 1e-6)
+                if top_k and 0 < top_k < logits.shape[-1]:
+                    top_values, _ = torch.topk(logits, top_k)
+                    cutoff = top_values[:, [-1]]
+                    logits = logits.masked_fill(logits < cutoff, float("-inf"))
 
-            if top_k and 0 < top_k < logits.shape[-1]:
-                top_values, _ = torch.topk(logits, top_k)
-                cutoff = top_values[:, [-1]]
-                logits = logits.masked_fill(logits < cutoff, float("-inf"))
+                if top_p and 0.0 < top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                    sorted_probs = F.softmax(sorted_logits, dim=-1)
+                    cumulative_probs = sorted_probs.cumsum(dim=-1)
 
-            if top_p and 0.0 < top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-                sorted_probs = F.softmax(sorted_logits, dim=-1)
-                cumulative_probs = sorted_probs.cumsum(dim=-1)
+                    sorted_remove = cumulative_probs > top_p
+                    sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
+                    sorted_remove[..., 0] = False
 
-                sorted_remove = cumulative_probs > top_p
-                sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
-                sorted_remove[..., 0] = False
+                    remove_mask = torch.zeros_like(logits, dtype=torch.bool)
+                    remove_mask.scatter_(1, sorted_indices, sorted_remove)
+                    logits = logits.masked_fill(remove_mask, float("-inf"))
 
-                remove_mask = torch.zeros_like(logits, dtype=torch.bool)
-                remove_mask.scatter_(1, sorted_indices, sorted_remove)
-                logits = logits.masked_fill(remove_mask, float("-inf"))
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
 
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, next_token), dim=1)
 
             if idx.shape[0] == 1:
@@ -1229,7 +1332,7 @@ class TinyGPT(nn.Module):
                         and torch.equal(idx[0, -stop_length:], stop_sequence)
                     ):
                         return idx
-                if idx.shape[1] >= 10 and torch.unique(idx[0, -10:]).numel() == 1:
+                if self._tail_is_degenerate(idx[0]):
                     return idx
 
         return idx
