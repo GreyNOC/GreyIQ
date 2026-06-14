@@ -437,6 +437,11 @@ label {
   min-height: 1em;
 }
 
+/* label rows use display:grid, which overrides the [hidden] attribute */
+.brain-form [data-brain-field][hidden] {
+  display: none;
+}
+
 .meter-wrap,
 .memory-list,
 .source-picker {

@@ -107,6 +107,35 @@
           </button>
         </header>
 
+        <form class="choice-form brain-form" id="brainForm">
+          <label>
+            <span>Coding brain</span>
+            <select id="brainProvider" name="brainProvider">
+              <option value="off">Off — local TinyGPT only</option>
+              <option value="local">Local model (Ollama)</option>
+              <option value="anthropic">Claude API</option>
+              <option value="openai">OpenAI-compatible</option>
+            </select>
+          </label>
+          <label data-brain-field="model">
+            <span>Model</span>
+            <input id="brainModel" name="brainModel" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. qwen2.5-coder:7b">
+          </label>
+          <label data-brain-field="base_url">
+            <span>Server URL</span>
+            <input id="brainBaseUrl" name="brainBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:11434/v1">
+          </label>
+          <label data-brain-field="api_key">
+            <span>API key</span>
+            <input id="brainApiKey" name="brainApiKey" type="password" autocomplete="off" placeholder="paste API key">
+          </label>
+          <div class="folder-actions">
+            <button class="text-button" type="button" id="brainTest">Test</button>
+            <button class="text-button" type="submit" id="brainSave">Save brain</button>
+          </div>
+          <p class="folder-status" id="brainStatus" aria-live="polite"></p>
+        </form>
+
         <form class="choice-form" id="choiceForm">
           <label>
             <span>Preference</span>

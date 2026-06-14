@@ -27,11 +27,13 @@ hiddenimports = [
     "document_ingest",
     "training_runtime",
     "ai_core.core_store",
+    "coder",
 ]
 
 # torch and the ASGI stack load a lot dynamically; pull everything in. numpy is
 # included so torch initializes it (otherwise torch logs a NumPy import warning).
-for package in ("torch", "numpy", "uvicorn", "pydantic", "pydantic_core", "pypdf"):
+# anthropic is the Claude coding-brain client.
+for package in ("torch", "numpy", "anthropic", "uvicorn", "pydantic", "pydantic_core", "pypdf"):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(package)
     datas += pkg_datas
     binaries += pkg_binaries
