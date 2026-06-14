@@ -37,6 +37,7 @@ RUNTIME_DIR = Path(os.getenv("GREYIQ_RUNTIME_DIR", PROJECT_ROOT / "runtime")).re
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+import agent as coding_agent  # noqa: E402
 import coder  # noqa: E402
 from ai_core.core_store import AICoreStore  # noqa: E402
 from document_ingest import (  # noqa: E402
@@ -62,7 +63,7 @@ from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
 
 
 APP_NAME = "GreyIQ"
-VERSION = "0.3.2"
+VERSION = "0.4.0"
 _CURRENT_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar("greyiq_current_scope", default=None)
 _CSP = (
     "default-src 'self'; "
@@ -169,6 +170,12 @@ class ChatRequest(BaseModel):
 
 class CoderConfigRequest(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=8000)
+    workspace: str = Field(min_length=1, max_length=4000)
+    history: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class PreferenceRequest(BaseModel):
@@ -434,6 +441,26 @@ class GreyIQRuntime:
             return {"ok": True, "provider": result["provider"], "model": result["model"], "reply": result["text"][:200]}
         except coder.CoderError as exc:
             return {"ok": False, "error": str(exc)}
+
+    def run_agent(self, request: AgentRequest) -> dict[str, Any]:
+        try:
+            result = coding_agent.run_agent(
+                request.message,
+                request.history,
+                request.workspace,
+                self._coder_config(),
+            )
+            return {
+                "ok": True,
+                "request_id": uuid4().hex,
+                "message": friendly_branding(result["text"]),
+                "transcript": result["transcript"],
+                "steps": result["steps"],
+                "model_name": f"{result['provider']}:{result['model']}",
+                "provider": result["provider"],
+            }
+        except coding_agent.AgentError as exc:
+            return {"ok": False, "request_id": uuid4().hex, "message": str(exc), "transcript": [], "steps": 0}
 
     def _build_coder_messages(self, request: ChatRequest, limit: int) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
@@ -1132,6 +1159,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             return
         if method == "POST" and path == "/api/coder/test":
             await send_json(send, await asyncio.to_thread(runtime.coder_test))
+            return
+        if method == "POST" and path == "/api/agent":
+            request = validate_payload(AgentRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.run_agent, request))
             return
         if path.startswith("/api/"):
             await send_json(send, {"error": "not found"}, 404)
