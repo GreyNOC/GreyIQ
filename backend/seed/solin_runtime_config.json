@@ -37,7 +37,9 @@
     "agent": {
       "allow_commands": false,
       "max_steps": 25,
-      "command_timeout_s": 60.0
+      "command_timeout_s": 60.0,
+      "verify_command": "",
+      "skills_enabled": true
     }
   }
 }
