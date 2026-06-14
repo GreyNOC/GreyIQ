@@ -37,6 +37,7 @@ RUNTIME_DIR = Path(os.getenv("GREYIQ_RUNTIME_DIR", PROJECT_ROOT / "runtime")).re
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+import coder  # noqa: E402
 from ai_core.core_store import AICoreStore  # noqa: E402
 from document_ingest import (  # noqa: E402
     collect_supported_files,
@@ -159,10 +160,15 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
     bot: dict[str, Any] = Field(default_factory=dict)
     memories: list[dict[str, Any]] = Field(default_factory=list)
+    history: list[dict[str, Any]] = Field(default_factory=list)
     max_new_tokens: int = Field(default=96, ge=1, le=512)
     temperature: float = Field(default=0.32, ge=0.0, le=2.0)
     auto_capture: bool = True
     mode: str | None = None
+
+
+class CoderConfigRequest(BaseModel):
+    config: dict[str, Any] = Field(default_factory=dict)
 
 
 class PreferenceRequest(BaseModel):
@@ -402,6 +408,102 @@ class GreyIQRuntime:
         config = payload.get("code_router") if isinstance(payload, dict) else None
         return config if isinstance(config, dict) else {}
 
+    def _coder_config(self) -> dict[str, Any]:
+        payload = read_json(RUNTIME_DIR / "solin_runtime_config.json", {})
+        config = payload.get("coder") if isinstance(payload, dict) else None
+        return config if isinstance(config, dict) else {}
+
+    def save_coder_config(self, update: dict[str, Any]) -> dict[str, Any]:
+        runtime_path = RUNTIME_DIR / "solin_runtime_config.json"
+        payload = read_json(runtime_path, {})
+        if not isinstance(payload, dict):
+            payload = {}
+        payload["coder"] = coder.merge_update(payload.get("coder"), update)
+        write_json(runtime_path, payload)
+        return coder.public_config(payload["coder"])
+
+    def coder_status(self) -> dict[str, Any]:
+        return coder.public_config(self._coder_config())
+
+    def coder_test(self) -> dict[str, Any]:
+        try:
+            result = coder.generate(
+                [{"role": "user", "content": "Reply with exactly: OK"}],
+                self._coder_config(),
+            )
+            return {"ok": True, "provider": result["provider"], "model": result["model"], "reply": result["text"][:200]}
+        except coder.CoderError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def _build_coder_messages(self, request: ChatRequest, limit: int) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = []
+        for turn in (request.history or [])[-max(limit, 0):]:
+            if not isinstance(turn, dict):
+                continue
+            role = str(turn.get("role") or "").strip()
+            content = str(turn.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": request.message})
+        # Anthropic requires the first message to be a user turn.
+        while messages and messages[0]["role"] != "user":
+            messages.pop(0)
+        return messages
+
+    def _coder_system_prompt(self, request: ChatRequest, cfg: dict[str, Any]) -> str:
+        base = str(cfg.get("system_prompt") or coder.DEFAULT_SYSTEM_PROMPT)
+        bot = request.bot or {}
+        extras: list[str] = []
+        persona = str(bot.get("persona") or "").strip()
+        style = str(bot.get("style") or "").strip()
+        if persona:
+            extras.append(f"Persona: {persona}")
+        if style:
+            extras.append(f"Preferred style: {style}")
+        for memory in (request.memories or [])[-8:]:
+            if isinstance(memory, dict) and memory.get("kind") == "preference" and memory.get("text"):
+                extras.append(f"User preference: {memory['text']}")
+        return base + ("\n\n" + "\n".join(extras) if extras else "")
+
+    def _coder_reply(self, request: ChatRequest) -> dict[str, Any] | None:
+        raw = self._coder_config()
+        if not coder.coder_enabled(raw):
+            return None
+        cfg = coder.coder_config(raw)
+        messages = self._build_coder_messages(request, int(cfg.get("history_turns") or 12))
+        # The coding brain runs with a coding-focused system prompt; bot persona,
+        # style, and stored preferences are layered on top.
+        cfg = dict(cfg)
+        cfg["system_prompt"] = self._coder_system_prompt(request, cfg)
+        try:
+            result = coder.generate(messages, cfg)
+        except coder.CoderError as exc:
+            self.log(f"Coding brain error: {exc}")
+            return {
+                "request_id": uuid4().hex,
+                "message": (
+                    f"The coding brain ({cfg.get('provider')}) could not respond: {exc}\n\n"
+                    "Check the brain settings (provider, model, API key / server), or turn it off "
+                    "to use the local fallback."
+                ),
+                "used_fallback": True,
+                "captured_for_training": False,
+                "model_name": f"coder:{cfg.get('provider')}:error",
+                "device": "remote",
+                "citations": [],
+                "ai_core": self.store.load(),
+            }
+        return {
+            "request_id": uuid4().hex,
+            "message": friendly_branding(result["text"]),
+            "used_fallback": False,
+            "captured_for_training": False,
+            "model_name": f"{result['provider']}:{result['model']}",
+            "device": "remote" if result["provider"] == "anthropic" else "local-model",
+            "citations": [],
+            "ai_core": self.store.load(),
+        }
+
     def _maybe_scan_reply(self, request: ChatRequest) -> dict[str, Any] | None:
         command = detect_scan_command(request.message)
         if command is None:
@@ -428,6 +530,11 @@ class GreyIQRuntime:
         scan_reply = self._maybe_scan_reply(request)
         if scan_reply is not None:
             return scan_reply
+        # A configured coding brain (local model or Claude) answers instead of the
+        # tiny offline model. TinyGPT is the last-resort fallback below.
+        coder_reply = self._coder_reply(request)
+        if coder_reply is not None:
+            return coder_reply
         try:
             engine = self.get_engine()
             engine.safety = OpenPolicy()
@@ -1015,6 +1122,16 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/runtime/device":
             request = validate_payload(DeviceRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.set_device, request.preference))
+            return
+        if method == "GET" and path == "/api/coder":
+            await send_json(send, await asyncio.to_thread(runtime.coder_status))
+            return
+        if method == "POST" and path == "/api/coder":
+            request = validate_payload(CoderConfigRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.save_coder_config, request.config))
+            return
+        if method == "POST" and path == "/api/coder/test":
+            await send_json(send, await asyncio.to_thread(runtime.coder_test))
             return
         if path.startswith("/api/"):
             await send_json(send, {"error": "not found"}, 404)

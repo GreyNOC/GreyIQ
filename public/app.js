@@ -140,6 +140,14 @@ const els = {
   trainingFolderBrowse: document.querySelector("#trainingFolderBrowse"),
   trainingFolderSubmit: document.querySelector("#trainingFolderSubmit"),
   trainingFolderStatus: document.querySelector("#trainingFolderStatus"),
+  brainForm: document.querySelector("#brainForm"),
+  brainProvider: document.querySelector("#brainProvider"),
+  brainModel: document.querySelector("#brainModel"),
+  brainBaseUrl: document.querySelector("#brainBaseUrl"),
+  brainApiKey: document.querySelector("#brainApiKey"),
+  brainTest: document.querySelector("#brainTest"),
+  brainSave: document.querySelector("#brainSave"),
+  brainStatus: document.querySelector("#brainStatus"),
   trainingSourceList: document.querySelector("#trainingSourceList"),
   trainButton: document.querySelector("#trainButton"),
   trainingDataCount: document.querySelector("#trainingDataCount"),
@@ -900,13 +908,21 @@ async function replyFor(userText) {
   if (service.available || (await refreshServiceStatus({ silent: true }))) {
     try {
       const bot = activeBot();
+      // Prior turns (excluding the message we're about to send) give the coding
+      // brain conversation context for multi-turn coding.
+      const history = (activeChat() || [])
+        .slice(0, -1)
+        .slice(-12)
+        .map((message) => ({ role: message.role === "bot" ? "assistant" : "user", content: message.text }))
+        .filter((message) => message.content);
       const response = await apiFetch("/api/chat", {
         method: "POST",
-        timeoutMs: 60000,
+        timeoutMs: 120000,
         body: JSON.stringify({
           message: userText,
           bot: serializableBot(bot),
           memories: activeMemories(),
+          history,
           max_new_tokens: 160,
           temperature: Math.max(0.05, Math.min(1.2, bot.temperature / 100)),
           auto_capture: true
@@ -1396,6 +1412,119 @@ els.trainButton.addEventListener("click", async () => {
   render();
 });
 
+// ---- Coding brain (local model / Claude / OpenAI-compatible) ----
+let coderConfig = null;
+const BRAIN_FIELDS = {
+  off: [],
+  local: ["model", "base_url"],
+  anthropic: ["model", "api_key"],
+  openai: ["model", "base_url", "api_key"]
+};
+
+function brainBlockFor(provider) {
+  if (!coderConfig || provider === "off") return {};
+  return coderConfig[provider] || {};
+}
+
+function applyBrainFields(provider, repopulate) {
+  const fields = BRAIN_FIELDS[provider] || [];
+  els.brainForm.querySelectorAll("[data-brain-field]").forEach((row) => {
+    row.hidden = !fields.includes(row.dataset.brainField);
+  });
+  if (els.brainTest) {
+    els.brainTest.hidden = provider === "off";
+  }
+  if (repopulate) {
+    const block = brainBlockFor(provider);
+    els.brainModel.value = block.model || "";
+    els.brainBaseUrl.value = block.base_url || "";
+    els.brainApiKey.value = "";
+    els.brainApiKey.placeholder = block.has_api_key ? "saved — leave blank to keep" : "paste API key";
+  }
+}
+
+function renderBrainForm() {
+  if (!els.brainForm) return;
+  const provider = coderConfig && coderConfig.enabled && coderConfig.provider ? coderConfig.provider : "off";
+  els.brainProvider.value = ["off", "local", "anthropic", "openai"].includes(provider) ? provider : "off";
+  applyBrainFields(els.brainProvider.value, true);
+}
+
+function buildBrainBlock(provider) {
+  const block = {};
+  if (BRAIN_FIELDS[provider].includes("model")) block.model = els.brainModel.value.trim();
+  if (BRAIN_FIELDS[provider].includes("base_url")) block.base_url = els.brainBaseUrl.value.trim();
+  if (BRAIN_FIELDS[provider].includes("api_key")) block.api_key = els.brainApiKey.value; // blank = keep saved
+  return block;
+}
+
+async function loadCoderConfig() {
+  if (!els.brainForm) return;
+  try {
+    coderConfig = await apiFetch("/api/coder", { timeoutMs: 4000 });
+    renderBrainForm();
+  } catch (_) {
+    // Local service not up yet; the form keeps its defaults.
+  }
+}
+
+els.brainProvider?.addEventListener("change", () => {
+  applyBrainFields(els.brainProvider.value, true);
+});
+
+els.brainForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.brainStatus.textContent = "Local GreyIQ service is not running.";
+    return;
+  }
+  const provider = els.brainProvider.value;
+  const update = provider === "off"
+    ? { enabled: false }
+    : { enabled: true, provider, [provider]: buildBrainBlock(provider) };
+  els.brainSave.disabled = true;
+  els.brainStatus.textContent = "Saving…";
+  try {
+    coderConfig = await apiFetch("/api/coder", {
+      method: "POST",
+      timeoutMs: 10000,
+      body: JSON.stringify({ config: update })
+    });
+    renderBrainForm();
+    els.brainStatus.textContent = provider === "off"
+      ? "Coding brain off — using the local model."
+      : `Saved. Brain: ${provider}. Use Test to verify.`;
+  } catch (error) {
+    els.brainStatus.textContent = error.message || "Could not save brain settings.";
+  } finally {
+    els.brainSave.disabled = false;
+  }
+});
+
+els.brainTest?.addEventListener("click", async () => {
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.brainStatus.textContent = "Local GreyIQ service is not running.";
+    return;
+  }
+  els.brainTest.disabled = true;
+  els.brainStatus.textContent = "Testing… (save first if you changed settings)";
+  try {
+    const result = await apiFetch("/api/coder/test", { method: "POST", timeoutMs: 60000 });
+    els.brainStatus.textContent = result.ok
+      ? `OK — ${result.provider} (${result.model}) replied.`
+      : `Failed: ${result.error}`;
+  } catch (error) {
+    els.brainStatus.textContent = error.message || "Test failed.";
+  } finally {
+    els.brainTest.disabled = false;
+  }
+});
+
+if (els.brainForm) {
+  // Sensible initial state before the saved config loads from the backend.
+  applyBrainFields(els.brainProvider.value, false);
+}
+
 els.cpuButton.addEventListener("click", async () => {
   state.backendPreference = "cpu";
   if (service.available || (await refreshServiceStatus({ silent: true }))) {
@@ -1474,6 +1603,7 @@ async function boot() {
   if (service.available) {
     void syncActiveCore();
   }
+  void loadCoderConfig();
   render();
 }
 
