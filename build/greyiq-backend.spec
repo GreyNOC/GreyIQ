@@ -29,6 +29,7 @@ hiddenimports = [
     "ai_core.core_store",
     "coder",
     "agent",
+    "skills",
 ]
 
 # torch and the ASGI stack load a lot dynamically; pull everything in. numpy is

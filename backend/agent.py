@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import coder
+import skills as skills_lib
 
 AGENT_DEFAULTS: dict[str, Any] = {
     "allow_commands": False,
@@ -29,16 +30,24 @@ AGENT_DEFAULTS: dict[str, Any] = {
     "command_timeout_s": 60.0,
     "max_file_bytes": 100_000,
     "max_tool_output": 8_000,
+    "verify_command": "",
+    "skills_enabled": True,
 }
+
+# Auto-run verify at most this many times when the model tries to finish with
+# touched-but-unverified files.
+_AUTO_VERIFY_CAP = 2
 
 AGENT_SYSTEM_PROMPT = (
     "You are GreyIQ, an autonomous coding agent working inside a fixed workspace "
     "folder. Use the provided tools to read, search, edit, and create files, and "
     "to run commands when that is enabled. Work in small, verifiable steps: look "
-    "before you edit, make the change, then verify (re-read the file or run a "
-    "test/command). All paths are relative to the workspace root. When the task is "
-    "done, stop calling tools and give a short summary of what you changed and how "
-    "you verified it. If something is ambiguous or risky, explain it instead of "
+    "before you edit, make one focused change, then call the `verify` tool. If "
+    "verify reports FAILED, fix the problem and verify again — never finish with a "
+    "broken file. All paths are relative to the workspace root. If playbooks are "
+    "given below, follow their steps. When the task is done and verify passes, stop "
+    "calling tools and give a short summary of what you changed (file:line) and the "
+    "verification result. If something is ambiguous or risky, explain it instead of "
     "guessing."
 )
 
@@ -108,6 +117,15 @@ _TOOLS: list[dict[str, Any]] = [
             "required": ["command"],
         },
     },
+    {
+        "name": "verify",
+        "description": (
+            "Check the files you have changed. Syntax-checks touched .py/.json files and, "
+            "if a verify command is configured, runs it. Returns VERIFY PASSED or FAILED. "
+            "Call this after edits and before finishing."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
 ]
 
 
@@ -136,6 +154,9 @@ class ToolBox:
         self.command_timeout = float(settings.get("command_timeout_s", 60.0))
         self.max_file_bytes = int(settings.get("max_file_bytes", 100_000))
         self.max_output = int(settings.get("max_tool_output", 8_000))
+        self.verify_command = str(settings.get("verify_command") or "").strip()
+        self.touched: set[str] = set()  # rel paths written/edited this run
+        self.verified_ok = False  # True after a passing verify; reset on any write/edit
 
     def _resolve(self, rel_path: str) -> Path:
         candidate = (self.root / str(rel_path or ".")).resolve()
@@ -182,11 +203,16 @@ class ToolBox:
             )
         return target.read_text(encoding="utf-8", errors="replace")
 
+    def _mark_touched(self, target: Path) -> None:
+        self.touched.add(target.relative_to(self.root).as_posix())
+        self.verified_ok = False
+
     def _tool_write_file(self, args: dict[str, Any]) -> str:
         target = self._resolve(args["path"])
         target.parent.mkdir(parents=True, exist_ok=True)
         content = str(args.get("content", ""))
         target.write_text(content, encoding="utf-8")
+        self._mark_touched(target)
         return f"Wrote {len(content)} chars to {target.relative_to(self.root).as_posix()}"
 
     def _tool_edit_file(self, args: dict[str, Any]) -> str:
@@ -204,6 +230,7 @@ class ToolBox:
         if count > 1:
             raise ToolError(f"old_string is not unique ({count} matches); include more context.")
         target.write_text(text.replace(old, new, 1), encoding="utf-8")
+        self._mark_touched(target)
         return f"Edited {target.relative_to(self.root).as_posix()}"
 
     def _tool_grep(self, args: dict[str, Any]) -> str:
@@ -251,6 +278,60 @@ class ToolBox:
         out = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
         return f"exit={proc.returncode}\n{out.strip()}"
 
+    def _tool_verify(self, args: dict[str, Any]) -> str:
+        lines: list[str] = []
+        failed = False
+        examined = 0
+        # In-process syntax checks on touched files (frozen-safe: no python/node needed).
+        for rel in sorted(self.touched):
+            path = self._resolve(rel)
+            if not path.is_file():
+                continue
+            suffix = path.suffix.lower()
+            if suffix not in (".py", ".json"):
+                continue
+            examined += 1
+            try:
+                if suffix == ".py":
+                    compile(path.read_text(encoding="utf-8", errors="replace"), str(path), "exec")
+                else:
+                    json.loads(path.read_text(encoding="utf-8", errors="replace"))
+                lines.append(f"OK   {rel}")
+            except (SyntaxError, ValueError) as exc:
+                failed = True
+                lines.append(f"FAIL {rel}: {exc}")
+        # Optional project verify command (runs code, so it needs commands enabled).
+        if self.verify_command:
+            if not self.allow_commands:
+                lines.append(f"(verify command '{self.verify_command}' set, but commands are disabled — skipped)")
+            else:
+                try:
+                    proc = subprocess.run(  # noqa: S602 - user-configured, workspace-scoped
+                        self.verify_command,
+                        shell=True,
+                        cwd=str(self.root),
+                        capture_output=True,
+                        text=True,
+                        timeout=self.command_timeout,
+                    )
+                    cmd_out = ((proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")).strip()
+                    lines.append(f"$ {self.verify_command}\nexit={proc.returncode}\n{cmd_out}")
+                    if proc.returncode != 0:
+                        failed = True
+                except subprocess.TimeoutExpired:
+                    failed = True
+                    lines.append(f"verify command timed out after {self.command_timeout:.0f}s")
+
+        if examined == 0 and not self.verify_command:
+            self.verified_ok = True
+            return "Nothing to verify (no .py/.json files changed; set agent.verify_command to run tests)."
+
+        self.verified_ok = not failed
+        report = ("VERIFY PASSED\n" if not failed else "VERIFY FAILED\n") + "\n".join(lines)
+        if failed:
+            raise ToolError(report)
+        return report
+
 
 def _anthropic_tools() -> list[dict[str, Any]]:
     return [{"name": t["name"], "description": t["description"], "input_schema": t["parameters"]} for t in _TOOLS]
@@ -263,11 +344,26 @@ def _openai_tools() -> list[dict[str, Any]]:
     ]
 
 
+def _auto_verify(toolbox: "ToolBox", transcript: list[dict[str, Any]], auto_verifies: int) -> str | None:
+    """When the model tries to finish with touched-but-unverified files, run verify
+    once. Returns continuation feedback if verification failed (so the loop keeps
+    going to fix it), or None to allow the run to finish."""
+    if not toolbox.touched or toolbox.verified_ok or auto_verifies >= _AUTO_VERIFY_CAP:
+        return None
+    output, is_error = toolbox.run("verify", {})
+    transcript.append({"tool": "verify", "input": {}, "output": output, "is_error": is_error})
+    if is_error:
+        return f"Automated check before finishing:\n{output}\nFix these issues, then continue."
+    return None
+
+
 def run_agent(
     message: str,
     history: list[dict[str, str]],
     workspace: str,
     coder_cfg: dict[str, Any],
+    runtime_dir: str | Path | None = None,
+    seed_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run the agent loop. Returns {text, transcript, steps, model, provider}."""
     root = Path(str(workspace or "")).expanduser()
@@ -293,6 +389,17 @@ def run_agent(
         messages.pop(0)
 
     system_prompt = f"{AGENT_SYSTEM_PROMPT}\n\nWorkspace root: {root}\nCommands enabled: {toolbox.allow_commands}"
+
+    # Inject matching skill playbooks so the model follows a vetted procedure.
+    if settings.get("skills_enabled", True) and runtime_dir is not None and seed_dir is not None:
+        try:
+            available = skills_lib.load_skills(runtime_dir, seed_dir, root)
+            chosen = skills_lib.select_skills(message, available)
+            block = skills_lib.skills_prompt(chosen, available)
+            if block:
+                system_prompt += "\n\n" + block
+        except Exception:  # noqa: BLE001 - skills are best-effort, never block a run
+            pass
 
     if provider == "anthropic":
         return _run_anthropic(messages, system_prompt, cfg, settings, toolbox)
@@ -325,6 +432,7 @@ def _run_anthropic(
     tools = _anthropic_tools()
     transcript: list[dict[str, Any]] = []
     max_steps = int(settings["max_steps"])
+    auto_verifies = 0
 
     for _ in range(max_steps):
         try:
@@ -341,6 +449,12 @@ def _run_anthropic(
         text = "".join(b.text for b in response.content if getattr(b, "type", "") == "text").strip()
         tool_uses = [b for b in response.content if getattr(b, "type", "") == "tool_use"]
         if response.stop_reason != "tool_use" or not tool_uses:
+            feedback = _auto_verify(toolbox, transcript, auto_verifies)
+            if feedback is not None:
+                auto_verifies += 1
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({"role": "user", "content": feedback})
+                continue
             return {
                 "text": text or "(done)",
                 "transcript": transcript,
@@ -389,6 +503,7 @@ def _run_openai(
     convo: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}, *messages]
     transcript: list[dict[str, Any]] = []
     max_steps = int(settings["max_steps"])
+    auto_verifies = 0
 
     def _call(payload: dict[str, Any]) -> dict[str, Any]:
         request = urllib.request.Request(
@@ -429,6 +544,12 @@ def _run_openai(
 
         tool_calls = choice.get("tool_calls") or []
         if not tool_calls:
+            feedback = _auto_verify(toolbox, transcript, auto_verifies)
+            if feedback is not None:
+                auto_verifies += 1
+                convo.append({"role": "assistant", "content": choice.get("content") or ""})
+                convo.append({"role": "user", "content": feedback})
+                continue
             return {
                 "text": str(choice.get("content") or "(done)").strip(),
                 "transcript": transcript,

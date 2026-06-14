@@ -61,6 +61,8 @@ CODER_DEFAULTS: dict[str, Any] = {
         "allow_commands": False,
         "max_steps": 25,
         "command_timeout_s": 60.0,
+        "verify_command": "",
+        "skills_enabled": True,
     },
 }
 

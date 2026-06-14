@@ -449,6 +449,8 @@ class GreyIQRuntime:
                 request.history,
                 request.workspace,
                 self._coder_config(),
+                runtime_dir=RUNTIME_DIR,
+                seed_dir=SEED_DIR,
             )
             return {
                 "ok": True,
