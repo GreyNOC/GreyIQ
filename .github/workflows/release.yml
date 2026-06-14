@@ -53,6 +53,26 @@ jobs:
             throw "Frozen backend not found at dist/greyiq-backend/greyiq-backend.exe"
           }
 
+      - name: Smoke-test frozen backend (must answer /api/health)
+        shell: pwsh
+        run: |
+          $env:GREYIQ_HOST = "127.0.0.1"
+          $env:GREYIQ_PORT = "8799"
+          $env:GREYIQ_RUNTIME_DIR = "$env:RUNNER_TEMP/greyiq-smoke"
+          $proc = Start-Process -FilePath "dist/greyiq-backend/greyiq-backend.exe" -PassThru -NoNewWindow
+          $ok = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Seconds 3
+            if ($proc.HasExited) { throw "Frozen backend exited early (exit code $($proc.ExitCode)) — the bundle is broken." }
+            try {
+              $h = Invoke-WebRequest "http://127.0.0.1:8799/api/health" -UseBasicParsing -TimeoutSec 3
+              if ($h.StatusCode -eq 200) { $ok = $true; break }
+            } catch {}
+          }
+          if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+          if (-not $ok) { throw "Frozen backend did not answer /api/health within 180s." }
+          Write-Output "Frozen backend launched and answered /api/health."
+
       - name: Install npm dependencies
         run: npm ci
 
