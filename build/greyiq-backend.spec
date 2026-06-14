@@ -8,7 +8,7 @@
 # Output:  dist/greyiq-backend/greyiq-backend.exe (+ supporting libraries)
 import os
 
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs, collect_submodules
 
 # SPECPATH is the directory containing this spec (i.e. <repo>/build), so the
 # repo root is one level up.
@@ -42,6 +42,12 @@ for package in ("torch", "numpy", "anthropic", "uvicorn", "pydantic", "pydantic_
 
 hiddenimports += collect_submodules("uvicorn")
 hiddenimports += collect_submodules("bughunter")
+
+# pydantic_core ships a compiled extension (_pydantic_core). collect_all does not
+# reliably place it for newer versions (pulled in by anthropic), which crashes the
+# frozen backend with "No module named 'pydantic_core._pydantic_core'". Force it.
+binaries += collect_dynamic_libs("pydantic_core")
+hiddenimports += ["pydantic_core._pydantic_core"]
 
 block_cipher = None
 
