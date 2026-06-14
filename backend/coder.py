@@ -43,7 +43,7 @@ CODER_DEFAULTS: dict[str, Any] = {
     "history_turns": 12,
     "local": {
         "base_url": "http://127.0.0.1:11434/v1",
-        "model": "qwen2.5-coder:7b",
+        "model": "qwen2.5-coder:14b",
         "api_key": "",
     },
     "anthropic": {
