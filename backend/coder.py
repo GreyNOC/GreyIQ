@@ -57,6 +57,11 @@ CODER_DEFAULTS: dict[str, Any] = {
         "model": "",
         "api_key": "",
     },
+    "agent": {
+        "allow_commands": False,
+        "max_steps": 25,
+        "command_timeout_s": 60.0,
+    },
 }
 
 _PROVIDERS_OFF = {"", "off", "none", "disabled"}

@@ -148,6 +148,9 @@ const els = {
   brainTest: document.querySelector("#brainTest"),
   brainSave: document.querySelector("#brainSave"),
   brainStatus: document.querySelector("#brainStatus"),
+  agentToggle: document.querySelector("#agentToggle"),
+  agentWorkspace: document.querySelector("#agentWorkspace"),
+  agentWsPath: document.querySelector("#agentWsPath"),
   trainingSourceList: document.querySelector("#trainingSourceList"),
   trainButton: document.querySelector("#trainButton"),
   trainingDataCount: document.querySelector("#trainingDataCount"),
@@ -320,7 +323,9 @@ function loadState() {
     memories: {},
     backendPreference: "cpu",
     botDefaultRevision: BOT_DEFAULT_REVISION,
-    selectedTrainingSources: [...DEFAULT_SELECTED_TRAINING_SOURCES]
+    selectedTrainingSources: [...DEFAULT_SELECTED_TRAINING_SOURCES],
+    agentMode: false,
+    agentWorkspace: ""
   };
 
   try {
@@ -980,6 +985,7 @@ function render() {
   renderChat();
   renderTraining();
   renderTrainingSources();
+  renderAgentBar();
   renderBackend();
   saveState();
 }
@@ -1260,7 +1266,7 @@ els.composer.addEventListener("submit", async (event) => {
 
   els.sendButton.disabled = true;
   try {
-    const answer = await replyFor(text);
+    const answer = state.agentMode && state.agentWorkspace ? await runAgent(text) : await replyFor(text);
     chat.push({ id: crypto.randomUUID(), role: "bot", text: answer, createdAt: Date.now() });
   } catch (error) {
     chat.push({
@@ -1524,6 +1530,82 @@ if (els.brainForm) {
   // Sensible initial state before the saved config loads from the backend.
   applyBrainFields(els.brainProvider.value, false);
 }
+
+// ---- Coding agent mode (reads/edits files + runs commands in a workspace) ----
+function shortAgentArgs(input) {
+  if (!input || typeof input !== "object") return "";
+  return String(input.path || input.command || input.pattern || "").slice(0, 48);
+}
+
+async function chooseWorkspace() {
+  if (desktopFolderPicker) {
+    return await chooseTrainingFolder();
+  }
+  const typed = window.prompt("Workspace folder path for the agent to work in:", state.agentWorkspace || "");
+  return typed ? typed.trim() : null;
+}
+
+function renderAgentBar() {
+  if (!els.agentToggle) return;
+  els.agentToggle.textContent = state.agentMode ? "Agent: on" : "Agent: off";
+  els.agentToggle.setAttribute("aria-pressed", String(Boolean(state.agentMode)));
+  els.agentToggle.classList.toggle("is-active", Boolean(state.agentMode));
+  if (els.agentWsPath) {
+    els.agentWsPath.textContent = state.agentWorkspace || "no workspace set";
+    els.agentWsPath.title = state.agentWorkspace || "";
+  }
+}
+
+async function runAgent(userText) {
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    return "The local GreyIQ service is not running.";
+  }
+  const history = (activeChat() || [])
+    .slice(0, -1)
+    .slice(-12)
+    .map((message) => ({ role: message.role === "bot" ? "assistant" : "user", content: message.text }))
+    .filter((message) => message.content);
+  try {
+    const res = await apiFetch("/api/agent", {
+      method: "POST",
+      timeoutMs: 600000,
+      body: JSON.stringify({ message: userText, workspace: state.agentWorkspace, history })
+    });
+    if (res.ok === false) {
+      return res.message || "The agent could not run.";
+    }
+    let text = res.message || "(done)";
+    if (Array.isArray(res.transcript) && res.transcript.length) {
+      const steps = res.transcript
+        .map((t) => `${t.is_error ? "⚠ " : ""}${t.tool}(${shortAgentArgs(t.input)})`)
+        .join("  ·  ");
+      text += `\n\n— ${res.model_name || "agent"} ran ${res.transcript.length} step(s): ${steps}`;
+    }
+    return text;
+  } catch (error) {
+    return `Agent failed: ${error.message || error}`;
+  }
+}
+
+els.agentToggle?.addEventListener("click", async () => {
+  if (!state.agentMode && !state.agentWorkspace) {
+    const picked = await chooseWorkspace();
+    if (!picked) return;
+    state.agentWorkspace = picked;
+  }
+  state.agentMode = !state.agentMode;
+  saveState();
+  renderAgentBar();
+});
+
+els.agentWorkspace?.addEventListener("click", async () => {
+  const picked = await chooseWorkspace();
+  if (picked) {
+    state.agentWorkspace = picked;
+    saveState();
+    renderAgentBar();
+  }
+});
 
 els.cpuButton.addEventListener("click", async () => {
   state.backendPreference = "cpu";

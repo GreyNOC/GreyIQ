@@ -80,6 +80,12 @@
 
         <div class="message-stream" id="messageStream" aria-live="polite"></div>
 
+        <div class="agent-bar" id="agentBar">
+          <button class="agent-toggle" id="agentToggle" type="button" aria-pressed="false" title="Let the brain read, edit, and run things in a workspace folder">Agent: off</button>
+          <button class="agent-ws-button" id="agentWorkspace" type="button" title="Set the folder the agent works in">Workspace</button>
+          <span class="agent-ws-path" id="agentWsPath">no workspace set</span>
+        </div>
+
         <form class="composer" id="composer">
           <textarea id="promptInput" rows="2" placeholder="Message the bot"></textarea>
           <button class="send-button" id="sendButton" type="submit" title="Send" aria-label="Send">
