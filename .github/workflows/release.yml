@@ -97,12 +97,14 @@ jobs:
         shell: pwsh
         run: Get-ChildItem release -Filter *.exe | Select-Object Name, Length
 
-      - name: Upload artifacts to workflow run
-        uses: actions/upload-artifact@v7
-        with:
-          name: greyiq-windows
-          path: release/*.exe
-          if-no-files-found: error
+      # NOTE: we intentionally do NOT upload the .exe files as Actions artifacts.
+      # Each build is ~2.8 GB and Actions artifact storage is a small, quota-
+      # limited bucket — accumulating these exhausts the quota and (because the
+      # upload step ran before publishing) silently blocked the release. The
+      # GitHub Release below carries the same files in separate storage that
+      # does not count against the artifact quota, so the run-page copy is pure
+      # redundant cost. Re-add a `continue-on-error` upload only if you ever
+      # need the binaries on the run page for debugging.
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
