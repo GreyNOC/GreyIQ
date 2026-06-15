@@ -63,7 +63,7 @@ from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
 
 
 APP_NAME = "GreyIQ"
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 _CURRENT_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar("greyiq_current_scope", default=None)
 _CSP = (
     "default-src 'self'; "
@@ -301,6 +301,10 @@ class GreyIQRuntime:
         self.engine: SolinEngine | None = None
         self.engine_error = ""
         self.training = TrainingState()
+        self.model_pull: dict[str, Any] = {
+            "active": False, "model": "", "status": "", "percent": 0,
+            "completed": 0, "total": 0, "done": False, "error": "",
+        }
         self.store = AICoreStore(RUNTIME_DIR)
         ensure_runtime()
         self._rewrite_core_defaults()
@@ -441,6 +445,65 @@ class GreyIQRuntime:
             return {"ok": True, "provider": result["provider"], "model": result["model"], "reply": result["text"][:200]}
         except coder.CoderError as exc:
             return {"ok": False, "error": str(exc)}
+
+    def _local_brain(self) -> tuple[str, str]:
+        cfg = coder.coder_config(self._coder_config())
+        block = cfg.get("local") or {}
+        return coder.ollama_host(block.get("base_url")), str(block.get("model") or "").strip()
+
+    def list_local_models(self) -> dict[str, Any]:
+        host, model = self._local_brain()
+        try:
+            installed = coder.ollama_list_models(host)
+            return {
+                "ok": True,
+                "installed": installed,
+                "configured": model,
+                "present": bool(model) and coder.model_installed(installed, model),
+            }
+        except coder.CoderError as exc:
+            return {"ok": False, "error": str(exc), "configured": model, "installed": [], "present": False}
+
+    def model_pull_status(self) -> dict[str, Any]:
+        with self.lock:
+            return dict(self.model_pull)
+
+    def start_model_pull(self, model: str = "") -> dict[str, Any]:
+        host, configured = self._local_brain()
+        target = (model or configured).strip()
+        if not target:
+            return {"ok": False, "error": "No local model is configured."}
+        with self.lock:
+            if self.model_pull.get("active"):
+                return {"ok": False, "error": "A model download is already in progress.", **self.model_pull}
+            self.model_pull = {
+                "active": True, "model": target, "status": "starting", "percent": 0,
+                "completed": 0, "total": 0, "done": False, "error": "",
+            }
+
+        def worker() -> None:
+            def progress(event: dict[str, Any]) -> None:
+                with self.lock:
+                    if event.get("status"):
+                        self.model_pull["status"] = str(event["status"])
+                    total = int(event.get("total") or 0)
+                    completed = int(event.get("completed") or 0)
+                    if total > 0:
+                        self.model_pull["total"] = total
+                        self.model_pull["completed"] = completed
+                        self.model_pull["percent"] = min(100, int(completed * 100 / total))
+
+            try:
+                coder.ollama_pull(host, target, timeout=3600.0, progress_cb=progress)
+                with self.lock:
+                    self.model_pull.update({"active": False, "done": True, "status": "success", "percent": 100})
+            except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+                self.log(f"Model pull failed: {exc}")
+                with self.lock:
+                    self.model_pull.update({"active": False, "done": True, "error": str(exc), "status": "error"})
+
+        threading.Thread(target=worker, name="ollama-pull", daemon=True).start()
+        return {"ok": True, "active": True, "model": target}
 
     def run_agent(self, request: AgentRequest) -> dict[str, Any]:
         try:
@@ -1161,6 +1224,17 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             return
         if method == "POST" and path == "/api/coder/test":
             await send_json(send, await asyncio.to_thread(runtime.coder_test))
+            return
+        if method == "GET" and path == "/api/coder/models":
+            await send_json(send, await asyncio.to_thread(runtime.list_local_models))
+            return
+        if method == "POST" and path == "/api/coder/pull":
+            body = await read_json_body(receive)
+            model = str((body or {}).get("model") or "")
+            await send_json(send, await asyncio.to_thread(runtime.start_model_pull, model))
+            return
+        if method == "GET" and path == "/api/coder/pull":
+            await send_json(send, runtime.model_pull_status())
             return
         if method == "POST" and path == "/api/agent":
             request = validate_payload(AgentRequest, await read_json_body(receive))
