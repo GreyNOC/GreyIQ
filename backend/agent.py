@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import coder
+import repomap
 import skills as skills_lib
 
 AGENT_DEFAULTS: dict[str, Any] = {
@@ -32,6 +33,7 @@ AGENT_DEFAULTS: dict[str, Any] = {
     "max_tool_output": 8_000,
     "verify_command": "",
     "skills_enabled": True,
+    "repo_map": True,
 }
 
 # Auto-run verify at most this many times when the model tries to finish with
@@ -106,6 +108,19 @@ _TOOLS: list[dict[str, Any]] = [
                 "path": {"type": "string", "description": "Relative dir or file to search; defaults to '.'"},
             },
             "required": ["pattern"],
+        },
+    },
+    {
+        "name": "find_code",
+        "description": (
+            "Find where something lives by relevance. Ranks whole files across the repo by how well "
+            "they match your search terms (path, symbol names, and content) and returns the best files "
+            "with matching lines. Use this to locate a feature/function before reading files."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "What to find, e.g. 'login handler' or 'parse config'"}},
+            "required": ["query"],
         },
     },
     {
@@ -256,6 +271,12 @@ class ToolBox:
                 continue
         return "\n".join(hits) if hits else "(no matches)"
 
+    def _tool_find_code(self, args: dict[str, Any]) -> str:
+        query = str(args.get("query", "")).strip()
+        if not query:
+            raise ToolError("query must not be empty.")
+        return repomap.search_repo(self.root, query, max_bytes=self.max_file_bytes)
+
     def _tool_run_command(self, args: dict[str, Any]) -> str:
         if not self.allow_commands:
             raise ToolError(
@@ -399,6 +420,15 @@ def run_agent(
             if block:
                 system_prompt += "\n\n" + block
         except Exception:  # noqa: BLE001 - skills are best-effort, never block a run
+            pass
+
+    # Inject a compact repo map so the model is oriented from step one.
+    if settings.get("repo_map", True):
+        try:
+            repo_map = repomap.build_repo_map(root)
+            if repo_map:
+                system_prompt += "\n\n" + repo_map
+        except Exception:  # noqa: BLE001 - best-effort, never block a run
             pass
 
     if provider == "anthropic":

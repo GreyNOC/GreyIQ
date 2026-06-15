@@ -63,6 +63,7 @@ CODER_DEFAULTS: dict[str, Any] = {
         "command_timeout_s": 60.0,
         "verify_command": "",
         "skills_enabled": True,
+        "repo_map": True,
     },
 }
 
