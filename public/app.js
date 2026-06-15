@@ -148,6 +148,9 @@ const els = {
   brainTest: document.querySelector("#brainTest"),
   brainSave: document.querySelector("#brainSave"),
   brainStatus: document.querySelector("#brainStatus"),
+  brainModelRow: document.querySelector("#brainModelRow"),
+  brainModelStatus: document.querySelector("#brainModelStatus"),
+  brainDownload: document.querySelector("#brainDownload"),
   agentToggle: document.querySelector("#agentToggle"),
   agentWorkspace: document.querySelector("#agentWorkspace"),
   agentWsPath: document.querySelector("#agentWsPath"),
@@ -1440,6 +1443,12 @@ function applyBrainFields(provider, repopulate) {
   if (els.brainTest) {
     els.brainTest.hidden = provider === "off";
   }
+  if (els.brainModelRow) {
+    els.brainModelRow.hidden = provider !== "local";
+    if (provider === "local") {
+      void refreshModelStatus();
+    }
+  }
   if (repopulate) {
     const block = brainBlockFor(provider);
     els.brainModel.value = block.model || "";
@@ -1504,6 +1513,81 @@ els.brainForm?.addEventListener("submit", async (event) => {
     els.brainStatus.textContent = error.message || "Could not save brain settings.";
   } finally {
     els.brainSave.disabled = false;
+  }
+});
+
+async function refreshModelStatus() {
+  if (!els.brainModelStatus) return;
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.brainModelStatus.textContent = "Local service not running.";
+    return;
+  }
+  try {
+    const info = await apiFetch("/api/coder/models", { timeoutMs: 6000 });
+    if (info.ok === false) {
+      els.brainModelStatus.textContent = info.error || "Ollama not reachable — is it running?";
+      els.brainDownload.hidden = false;
+      return;
+    }
+    if (info.present) {
+      els.brainModelStatus.textContent = `Model installed: ${info.configured} ✓`;
+      els.brainDownload.hidden = true;
+    } else {
+      els.brainModelStatus.textContent = `${info.configured || "Model"} not installed.`;
+      els.brainDownload.hidden = false;
+    }
+  } catch (error) {
+    els.brainModelStatus.textContent = error.message || "Could not check the model.";
+  }
+}
+
+let modelPullTimer = null;
+
+function pollModelPull() {
+  if (modelPullTimer) {
+    clearInterval(modelPullTimer);
+  }
+  modelPullTimer = setInterval(async () => {
+    let status;
+    try {
+      status = await apiFetch("/api/coder/pull", { timeoutMs: 6000 });
+    } catch (_) {
+      return; // transient — keep polling
+    }
+    if (status.active) {
+      const pct = status.percent ? ` ${status.percent}%` : "";
+      els.brainModelStatus.textContent = `Downloading ${status.model}…${pct} ${status.status || ""}`.trim();
+      return;
+    }
+    clearInterval(modelPullTimer);
+    modelPullTimer = null;
+    els.brainDownload.disabled = false;
+    if (status.error) {
+      els.brainModelStatus.textContent = `Download failed: ${status.error}`;
+    } else {
+      void refreshModelStatus();
+    }
+  }, 2000);
+}
+
+els.brainDownload?.addEventListener("click", async () => {
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.brainModelStatus.textContent = "Local service not running.";
+    return;
+  }
+  els.brainDownload.disabled = true;
+  els.brainModelStatus.textContent = "Starting download… (the 14B model is ~9 GB, downloaded once)";
+  try {
+    const res = await apiFetch("/api/coder/pull", { method: "POST", timeoutMs: 10000, body: JSON.stringify({}) });
+    if (res.ok === false) {
+      els.brainModelStatus.textContent = res.error || "Could not start the download.";
+      els.brainDownload.disabled = false;
+      return;
+    }
+    pollModelPull();
+  } catch (error) {
+    els.brainModelStatus.textContent = error.message || "Download failed to start.";
+    els.brainDownload.disabled = false;
   }
 });
 

@@ -205,6 +205,61 @@ def ollama_chat(
     return (body or {}).get("message") or {}
 
 
+def ollama_list_models(host: str, timeout: float = 10.0) -> list[str]:
+    """Names of models already pulled into the local Ollama store (/api/tags)."""
+    endpoint = host.rstrip("/") + "/api/tags"
+    try:
+        with urllib.request.urlopen(endpoint, timeout=timeout) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise CoderError(
+            f"Could not reach Ollama at {host} ({exc.reason}). Start it with `ollama serve`."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise CoderError(f"Ollama request failed: {exc}") from exc
+    return [str(m.get("name") or m.get("model") or "") for m in (body.get("models") or []) if isinstance(m, dict)]
+
+
+def model_installed(installed: list[str], model: str) -> bool:
+    """Match a configured model name against installed names, tolerating the
+    implicit ':latest' tag Ollama adds to untagged names."""
+    wanted = {model, f"{model}:latest"} if ":" not in model else {model}
+    have = set(installed) | {n.split(":")[0] for n in installed if n.endswith(":latest")}
+    return bool(wanted & set(installed)) or model in have
+
+
+def ollama_pull(host: str, model: str, timeout: float, progress_cb) -> None:
+    """Stream `ollama pull <model>` via /api/pull, calling progress_cb(event) for
+    each status line. Blocks until done; raises CoderError on failure."""
+    endpoint = host.rstrip("/") + "/api/pull"
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps({"model": model, "stream": True}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            for raw in response:
+                line = raw.decode("utf-8", "ignore").strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict) and event.get("error"):
+                    raise CoderError(f"Ollama pull failed: {event['error']}")
+                progress_cb(event)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "ignore") if hasattr(exc, "read") else ""
+        raise CoderError(f"Ollama pull HTTP {exc.code}: {detail[:300] or exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise CoderError(
+            f"Could not reach Ollama at {host} ({exc.reason}). Start it with `ollama serve`."
+        ) from exc
+
+
 def _generate_ollama(
     messages: list[dict[str, str]],
     system_prompt: str,
