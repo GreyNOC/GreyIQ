@@ -147,6 +147,42 @@
           <p class="folder-status" id="brainStatus" aria-live="polite"></p>
         </form>
 
+        <form class="choice-form bounty-form" id="bountyForm">
+          <div class="source-heading">Bug bounty hunt</div>
+          <label>
+            <span>Bounty type</span>
+            <select id="bountyProfile" name="bountyProfile"></select>
+          </label>
+          <p class="folder-status" id="bountyProfileHint"></p>
+          <label>
+            <span>Focus class (optional)</span>
+            <select id="bountyClass" name="bountyClass">
+              <option value="">Any class found</option>
+            </select>
+          </label>
+          <label>
+            <span>Target (URL or folder/repo)</span>
+            <input id="bountyTarget" name="bountyTarget" type="text" autocomplete="off" spellcheck="false" placeholder="https://example.com  or  C:\path\to\repo">
+          </label>
+          <label>
+            <span>Scope / program notes</span>
+            <input id="bountyScope" name="bountyScope" type="text" autocomplete="off" placeholder="e.g. HackerOne acme — *.example.com in scope">
+          </label>
+          <label>
+            <span>Report output folder</span>
+            <input id="bountyOutput" name="bountyOutput" type="text" autocomplete="off" spellcheck="false" placeholder="default: app reports folder">
+          </label>
+          <div class="folder-actions">
+            <button class="text-button" type="button" id="bountyOutputBrowse" hidden>Choose folder…</button>
+          </div>
+          <label class="bounty-auth" for="bountyAuthorized">
+            <input id="bountyAuthorized" type="checkbox">
+            <span>I'm authorized to test this target (in scope).</span>
+          </label>
+          <button class="text-button" type="submit" id="bountyRun">Run hunt &amp; write report</button>
+          <p class="folder-status" id="bountyStatus" aria-live="polite"></p>
+        </form>
+
         <form class="choice-form" id="choiceForm">
           <label>
             <span>Preference</span>

@@ -61,6 +61,7 @@ from bughunter.web_scan_service import run_web_scan  # noqa: E402
 from bughunter.live_scan_service import run_live_scan  # noqa: E402
 from bughunter.triage import triage  # noqa: E402
 from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
+from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt  # noqa: E402
 
 
 APP_NAME = "GreyIQ"
@@ -239,6 +240,17 @@ class WebScanRequest(BaseModel):
 class LiveScanRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
     wait_seconds: float = Field(default=6.0, ge=0.0, le=30.0)
+
+
+class BountyScanRequest(BaseModel):
+    target: str = Field(min_length=1, max_length=4000)
+    profile: str = Field(default="full-sweep", max_length=60)
+    vuln_class: str | None = Field(default=None, max_length=60)
+    output_dir: str | None = Field(default=None, max_length=4000)
+    scope: str = Field(default="", max_length=2000)
+    authorized: bool = False
+    run_live: bool = False
+    max_files: int = Field(default=5000, ge=1, le=100_000)
 
 
 class TrainFolderRequest(BaseModel):
@@ -554,6 +566,23 @@ class GreyIQRuntime:
                 "touched_files": [],
             }
 
+    def run_bounty(self, request: "BountyScanRequest") -> dict[str, Any]:
+        return run_bounty_hunt(
+            request.target,
+            request.profile,
+            request.vuln_class,
+            request.output_dir,
+            request.scope,
+            request.authorized,
+            self._coder_config(),
+            default_reports_dir=RUNTIME_DIR / "reports",
+            seed_dir=SEED_DIR,
+            runtime_dir=RUNTIME_DIR,
+            version=VERSION,
+            run_live=request.run_live,
+            max_files=request.max_files,
+        )
+
     def _build_coder_messages(self, request: ChatRequest, limit: int) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
         for turn in (request.history or [])[-max(limit, 0):]:
@@ -845,6 +874,18 @@ def ensure_runtime() -> None:
         dst = RUNTIME_DIR / "data" / name
         if src.exists() and not dst.exists():
             shutil.copy2(src, dst)
+    # Bounty: default reports folder + seed the .md playbooks (user-editable;
+    # no clobber so edits survive upgrades). bounty._load_playbook falls back to
+    # the bundled seed copy if a runtime copy is missing.
+    (RUNTIME_DIR / "reports").mkdir(parents=True, exist_ok=True)
+    seed_bounty = SEED_DIR / "bounty"
+    if seed_bounty.is_dir():
+        dst_bounty = RUNTIME_DIR / "bounty"
+        dst_bounty.mkdir(parents=True, exist_ok=True)
+        for playbook in seed_bounty.glob("*.md"):
+            dst_playbook = dst_bounty / playbook.name
+            if not dst_playbook.exists():
+                shutil.copy2(playbook, dst_playbook)
     train_path = RUNTIME_DIR / "train.txt"
     if not train_path.exists():
         train_path.write_text(default_training_text(), encoding="utf-8")
@@ -1203,6 +1244,13 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
                 send,
                 await asyncio.to_thread(run_live_scan, request.url, request.wait_seconds),
             )
+            return
+        if method == "GET" and path == "/api/bounty/types":
+            await send_json(send, bounty_profiles())
+            return
+        if method == "POST" and path == "/api/bounty/scan":
+            request = validate_payload(BountyScanRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.run_bounty, request))
             return
         if method == "GET" and path == "/api/cores":
             await send_json(send, await asyncio.to_thread(runtime.store.load))
