@@ -236,28 +236,33 @@
         <section class="memory-list" id="memoryList" aria-label="Training memory"></section>
       </aside>
 
+      <div class="workbench-divider" id="workbenchDivider" role="separator" aria-orientation="horizontal" aria-label="Resize workbench — drag, or focus and use the arrow keys" tabindex="0"></div>
+
       <section class="workbench" id="workbench" hidden aria-label="Agent workbench">
         <aside class="workbench-files">
           <div class="workbench-header">
             <strong>Workspace</strong>
             <button id="workspaceRefresh" type="button" title="Reload the file list">Refresh</button>
           </div>
-          <input id="workspaceSearch" type="search" placeholder="Filter files" autocomplete="off" spellcheck="false">
-          <div id="workspaceTree" class="workspace-tree"></div>
+          <input id="workspaceSearch" type="search" placeholder="Filter files" autocomplete="off" spellcheck="false" aria-label="Filter workspace files">
+          <div id="workspaceTree" class="workspace-tree" role="tree" aria-label="Workspace files"></div>
         </aside>
 
         <section class="workbench-main">
-          <div class="workbench-tabs" role="tablist">
-            <button type="button" data-workbench-tab="preview" class="is-active">Preview</button>
-            <button type="button" data-workbench-tab="changes">Changes</button>
-            <button type="button" data-workbench-tab="steps">Agent Steps</button>
-            <button type="button" data-workbench-tab="verify">Verify</button>
+          <div class="workbench-tabs">
+            <div class="workbench-tablist" role="tablist" aria-label="Workbench panels">
+              <button type="button" role="tab" id="wbtab-preview" aria-controls="filePreviewPanel" aria-selected="true" data-workbench-tab="preview" class="is-active">Preview</button>
+              <button type="button" role="tab" id="wbtab-changes" aria-controls="changesPanel" aria-selected="false" tabindex="-1" data-workbench-tab="changes">Changes</button>
+              <button type="button" role="tab" id="wbtab-steps" aria-controls="agentStepsPanel" aria-selected="false" tabindex="-1" data-workbench-tab="steps">Agent Steps</button>
+              <button type="button" role="tab" id="wbtab-verify" aria-controls="verifyPanel" aria-selected="false" tabindex="-1" data-workbench-tab="verify">Verify</button>
+            </div>
+            <button type="button" id="workbenchMaximize" class="workbench-maximize" title="Maximize workbench" aria-label="Maximize workbench" aria-pressed="false">⤢</button>
           </div>
 
-          <div id="filePreviewPanel" class="workbench-panel"></div>
-          <div id="changesPanel" class="workbench-panel" hidden></div>
-          <div id="agentStepsPanel" class="workbench-panel" hidden></div>
-          <div id="verifyPanel" class="workbench-panel" hidden></div>
+          <div id="filePreviewPanel" class="workbench-panel" role="tabpanel" aria-labelledby="wbtab-preview" tabindex="0"></div>
+          <div id="changesPanel" class="workbench-panel" role="tabpanel" aria-labelledby="wbtab-changes" tabindex="0" hidden></div>
+          <div id="agentStepsPanel" class="workbench-panel" role="tabpanel" aria-labelledby="wbtab-steps" tabindex="0" hidden></div>
+          <div id="verifyPanel" class="workbench-panel" role="tabpanel" aria-labelledby="wbtab-verify" tabindex="0" hidden></div>
         </section>
       </section>
     </main>

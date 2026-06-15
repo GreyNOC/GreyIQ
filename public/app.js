@@ -161,7 +161,11 @@ const els = {
   modelState: document.querySelector("#modelState"),
   memoryList: document.querySelector("#memoryList"),
   themeToggle: document.querySelector("#themeToggle"),
+  appShell: document.querySelector(".app-shell"),
   workbench: document.querySelector("#workbench"),
+  workbenchDivider: document.querySelector("#workbenchDivider"),
+  workbenchMaximize: document.querySelector("#workbenchMaximize"),
+  workbenchTablist: document.querySelector(".workbench-tablist"),
   workspaceRefresh: document.querySelector("#workspaceRefresh"),
   workspaceSearch: document.querySelector("#workspaceSearch"),
   workspaceTree: document.querySelector("#workspaceTree"),
@@ -354,6 +358,9 @@ function loadState() {
     workbenchActiveFile: "",
     workbenchSearch: "",
     workbenchTree: [],
+    workbenchHeight: null,
+    workbenchMaximized: false,
+    workbenchWrap: false,
     lastAgentTranscript: [],
     lastAgentChanges: [],
     lastAgentOutput: "",
@@ -1717,12 +1724,43 @@ function makeHint(text, isError = false) {
   return p;
 }
 
+const WORKBENCH_TABS = ["preview", "changes", "steps", "verify"];
+
+function applyWorkbenchSize() {
+  if (!els.appShell) return;
+  let height;
+  if (state.workbenchMaximized) {
+    height = Math.round(window.innerHeight * 0.86);
+  } else if (typeof state.workbenchHeight === "number" && state.workbenchHeight > 0) {
+    height = state.workbenchHeight;
+  } else {
+    height = Math.round(window.innerHeight * 0.44);
+  }
+  els.appShell.style.setProperty("--workbench-h", `${height}px`);
+  if (els.workbenchDivider) {
+    // Expose the splitter's value/bounds so screen readers announce resizing.
+    els.workbenchDivider.setAttribute("aria-valuemin", String(8 * 16));
+    els.workbenchDivider.setAttribute("aria-valuemax", String(Math.round(window.innerHeight * 0.88)));
+    els.workbenchDivider.setAttribute("aria-valuenow", String(height));
+  }
+  if (els.workbenchMaximize) {
+    const max = Boolean(state.workbenchMaximized);
+    els.workbenchMaximize.setAttribute("aria-pressed", String(max));
+    els.workbenchMaximize.textContent = max ? "⤡" : "⤢";
+    const label = max ? "Restore workbench size" : "Maximize workbench";
+    els.workbenchMaximize.title = label;
+    els.workbenchMaximize.setAttribute("aria-label", label);
+  }
+}
+
 function renderWorkbench() {
   if (!els.workbench) return;
   const on = Boolean(state.agentMode);
   els.workbench.hidden = !on;
+  els.appShell?.classList.toggle("is-agent", on);
   document.body.classList.toggle("agent-active", on);
   if (!on) return;
+  applyWorkbenchSize();
   setWorkbenchTab(state.workbenchTab || "preview");
   renderWorkspaceTree(state.workbenchTree);
   if (state.workbenchActiveFile && els.filePreviewPanel?.dataset.loadedPath) {
@@ -1735,12 +1773,15 @@ function renderWorkbench() {
   renderVerifyPanel(state.lastAgentTranscript);
 }
 
-function setWorkbenchTab(tabName) {
-  const valid = ["preview", "changes", "steps", "verify"];
-  const tab = valid.includes(tabName) ? tabName : "preview";
+function setWorkbenchTab(tabName, focusTab = false) {
+  const tab = WORKBENCH_TABS.includes(tabName) ? tabName : "preview";
   state.workbenchTab = tab;
   document.querySelectorAll("[data-workbench-tab]").forEach((btn) => {
-    btn.classList.toggle("is-active", btn.dataset.workbenchTab === tab);
+    const active = btn.dataset.workbenchTab === tab;
+    btn.classList.toggle("is-active", active);
+    btn.setAttribute("aria-selected", String(active));
+    btn.tabIndex = active ? 0 : -1;
+    if (active && focusTab) btn.focus();
   });
   const panels = {
     preview: els.filePreviewPanel,
@@ -1805,20 +1846,30 @@ function renderWorkspaceTree(entries, truncated = false) {
     return;
   }
 
-  for (const entry of filtered) {
+  // The item that should hold the single tab stop (roving tabindex): the active
+  // file if it's visible, otherwise the first item.
+  const activeIdx = filtered.findIndex((entry) => entry.path === state.workbenchActiveFile);
+  const tabStop = activeIdx >= 0 ? activeIdx : 0;
+
+  filtered.forEach((entry, index) => {
     const isFile = entry.type === "file";
     const node = document.createElement(isFile ? "button" : "div");
     const depth = search ? 0 : Math.max(0, entry.path.split("/").length - 1);
-    node.className = `workspace-tree-item${isFile ? "" : " is-dir"}${entry.path === state.workbenchActiveFile ? " is-active" : ""}`;
+    const isActive = entry.path === state.workbenchActiveFile;
+    node.className = `workspace-tree-item${isFile ? "" : " is-dir"}${isActive ? " is-active" : ""}`;
     node.style.paddingLeft = `${0.4 + depth * 0.85}rem`;
     node.title = entry.path;
     node.textContent = search ? entry.path : (isFile ? entry.name : `${entry.name}/`);
+    node.setAttribute("role", "treeitem");
+    node.setAttribute("aria-level", String(depth + 1));
+    node.tabIndex = index === tabStop ? 0 : -1;
+    if (isActive) node.setAttribute("aria-current", "true");
     if (isFile) {
       node.type = "button";
       node.addEventListener("click", () => openWorkspaceFile(entry.path));
     }
     els.workspaceTree.append(node);
-  }
+  });
   if (truncated) {
     els.workspaceTree.append(makeHint("… list truncated (large workspace)."));
   }
@@ -1848,6 +1899,88 @@ async function openWorkspaceFile(path) {
   }
 }
 
+// ---- Lightweight, safe syntax highlighting (no external library) ----
+const HL_KEYWORDS = {
+  js: new Set(
+    ("const let var function return if else for while do switch case break continue new class extends " +
+      "super this typeof instanceof in of try catch finally throw async await yield import export from " +
+      "default null undefined true false void delete static get set").split(" ")
+  ),
+  py: new Set(
+    ("def return if elif else for while break continue class import from as try except finally raise with " +
+      "lambda yield global nonlocal pass assert del in is not and or None True False async await print self").split(" ")
+  ),
+  shell: new Set("if then else elif fi for while do done case esac function in return export local set echo".split(" ")),
+  config: new Set("true false null yes no on off".split(" "))
+};
+// Languages we colorize; anything else renders as plain (escaped) text.
+const HL_LANGS = new Set(["js", "py", "shell", "config", "json", "css"]);
+
+function langFromPath(path) {
+  const ext = String(path || "").split(".").pop().toLowerCase();
+  if (["js", "mjs", "cjs", "jsx", "ts", "tsx"].includes(ext)) return "js";
+  if (ext === "json") return "json";
+  if (ext === "py") return "py";
+  if (["css", "scss", "less", "sass"].includes(ext)) return "css";
+  if (["sh", "bash", "zsh", "ps1", "bat", "cmd"].includes(ext)) return "shell";
+  if (["yml", "yaml", "toml", "ini", "cfg", "conf", "properties", "env"].includes(ext)) return "config";
+  return "";
+}
+
+function highlightCode(text, lang) {
+  if (!HL_LANGS.has(lang)) return escapeHtml(text);
+  const kw = HL_KEYWORDS[lang];
+  const rules = [];
+  if (lang === "js" || lang === "css") rules.push(["comment", /\/\*[\s\S]*?\*\/|\/\/[^\n]*/y]);
+  else if (lang === "py" || lang === "shell" || lang === "config") rules.push(["comment", /#[^\n]*/y]);
+  rules.push(["string", /"(?:\\.|[^"\\\n])*"?|'(?:\\.|[^'\\\n])*'?|`(?:\\.|[^`\\])*`?/y]);
+  rules.push(["number", /\b\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?\b/y]);
+  rules.push(["ident", /[A-Za-z_$][\w$]*/y]);
+  rules.push(["space", /\s+/y]);
+  rules.push(["other", /[^]/y]);
+
+  let out = "";
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    let consumed = false;
+    for (const [type, re] of rules) {
+      re.lastIndex = i;
+      const m = re.exec(text);
+      if (!m || m.index !== i || m[0].length === 0) continue;
+      const chunk = m[0];
+      let cls = "";
+      if (type === "comment") cls = "tok-comment";
+      else if (type === "string") {
+        cls = "tok-string";
+        if (lang === "json") {
+          let j = i + chunk.length;
+          while (j < n && (text[j] === " " || text[j] === "\t")) j += 1;
+          if (text[j] === ":") cls = "tok-key";
+        }
+      } else if (type === "number") cls = "tok-number";
+      else if (type === "ident") {
+        if (kw && kw.has(chunk)) cls = "tok-keyword";
+        else {
+          let j = i + chunk.length;
+          while (j < n && text[j] === " ") j += 1;
+          if (text[j] === "(") cls = "tok-func";
+        }
+      }
+      const safe = escapeHtml(chunk);
+      out += cls ? `<span class="${cls}">${safe}</span>` : safe;
+      i += chunk.length;
+      consumed = true;
+      break;
+    }
+    if (!consumed) {
+      out += escapeHtml(text[i]);
+      i += 1;
+    }
+  }
+  return out;
+}
+
 function renderFilePreview(file) {
   if (!els.filePreviewPanel) return;
   els.filePreviewPanel.replaceChildren();
@@ -1856,24 +1989,67 @@ function renderFilePreview(file) {
     els.filePreviewPanel.append(makeHint("Select a file from the workspace to preview it here."));
     return;
   }
-  const head = document.createElement("div");
-  head.className = "code-preview-head";
-  head.textContent = file.path || state.workbenchActiveFile || "";
-  els.filePreviewPanel.append(head);
+
+  const bar = document.createElement("div");
+  bar.className = "code-toolbar";
+  const pathEl = document.createElement("span");
+  pathEl.className = "code-path";
+  pathEl.textContent = file.path || state.workbenchActiveFile || "";
+  bar.append(pathEl);
+
   if (file.ok === false) {
     els.filePreviewPanel.dataset.loadedPath = "";
-    els.filePreviewPanel.append(makeHint(file.error || "Could not read this file.", true));
+    els.filePreviewPanel.append(bar, makeHint(file.error || "Could not read this file.", true));
     return;
   }
-  const pre = document.createElement("pre");
-  pre.className = "code-preview";
+
+  const wrapBtn = document.createElement("button");
+  wrapBtn.type = "button";
+  wrapBtn.className = "code-wrap-toggle";
+  const setWrapLabel = () => {
+    wrapBtn.textContent = state.workbenchWrap ? "Wrap: on" : "Wrap: off";
+    wrapBtn.setAttribute("aria-pressed", String(Boolean(state.workbenchWrap)));
+  };
+  setWrapLabel();
+  bar.append(wrapBtn);
+  els.filePreviewPanel.append(bar);
+
+  const content = file.content || "";
+  const lines = content.split("\n");
+  const view = document.createElement("div");
+  view.className = `code-view${state.workbenchWrap ? " is-wrap" : ""}`;
+
+  const gutter = document.createElement("pre");
+  gutter.className = "code-gutter";
+  gutter.setAttribute("aria-hidden", "true");
+  gutter.textContent = lines.map((_, index) => index + 1).join("\n");
+
+  const body = document.createElement("pre");
+  body.className = "code-body";
   const code = document.createElement("code");
-  code.textContent = file.content || "";
-  pre.append(code);
-  els.filePreviewPanel.append(pre);
+  const lang = langFromPath(file.path || "");
+  // Guard the highlighter against pathological files (keeps the UI responsive).
+  const tooBig = lines.length > 2500 || content.length > 100000;
+  if (tooBig || !lang) {
+    code.textContent = content;
+  } else {
+    code.innerHTML = highlightCode(content, lang);
+  }
+  body.append(code);
+  view.append(gutter, body);
+  els.filePreviewPanel.append(view);
+
   if (file.truncated) {
     els.filePreviewPanel.append(makeHint(`Preview truncated — showing the start of ${file.size} bytes.`));
   }
+
+  wrapBtn.addEventListener("click", () => {
+    state.workbenchWrap = !state.workbenchWrap;
+    saveState();
+    view.classList.toggle("is-wrap", state.workbenchWrap);
+    setWrapLabel();
+  });
+
   els.filePreviewPanel.dataset.loadedPath = file.path || "";
 }
 
@@ -1893,7 +2069,13 @@ function renderAgentSteps(transcript) {
     const head = document.createElement("button");
     head.type = "button";
     head.className = "agent-step-head";
+    head.setAttribute("aria-expanded", "false");
+    head.setAttribute(
+      "aria-label",
+      `${step.tool || "tool"} ${shortAgentArgs(step.input)} — ${step.is_error ? "error" : "ok"}; show output`
+    );
     head.innerHTML =
+      `<span class="agent-step-status" aria-hidden="true">${step.is_error ? "✕" : "✓"}</span>` +
       `<span class="agent-step-tool">${escapeHtml(step.tool || "tool")}</span>` +
       `<span class="agent-step-arg">${escapeHtml(shortAgentArgs(step.input))}</span>`;
 
@@ -1909,6 +2091,7 @@ function renderAgentSteps(transcript) {
     head.addEventListener("click", () => {
       full.hidden = !full.hidden;
       preview.hidden = !full.hidden;
+      head.setAttribute("aria-expanded", String(!full.hidden));
     });
 
     card.append(head, preview, full);
@@ -1933,7 +2116,17 @@ function renderVerifyPanel(transcript) {
     block.className = `verify-output${failed ? " is-error" : ""}`;
     const label = document.createElement("div");
     label.className = "verify-label";
-    label.textContent = step.tool === "verify" ? "verify" : `run: ${shortAgentArgs(step.input)}`;
+    const status = document.createElement("span");
+    status.className = "verify-status";
+    status.setAttribute("aria-hidden", "true");
+    status.textContent = failed ? "✕" : "✓";
+    // Status word for screen readers (the glyph is decorative + color isn't enough).
+    const srStatus = document.createElement("span");
+    srStatus.className = "visually-hidden";
+    srStatus.textContent = failed ? "failed: " : "passed: ";
+    const labelText = document.createElement("span");
+    labelText.textContent = step.tool === "verify" ? "verify" : `run: ${shortAgentArgs(step.input)}`;
+    label.append(status, srStatus, labelText);
     const pre = document.createElement("pre");
     pre.textContent = out || "(no output)";
     block.append(label, pre);
@@ -2035,6 +2228,8 @@ function renderChangesPanel(changes) {
     const head = document.createElement("button");
     head.type = "button";
     head.className = "change-file-head";
+    head.setAttribute("aria-expanded", "false");
+    head.setAttribute("aria-label", `${op} ${change.path || ""} — show diff`);
     head.innerHTML =
       `<span class="change-op">${escapeHtml(op)}</span>` +
       `<span class="change-path">${escapeHtml(change.path || "")}</span>`;
@@ -2044,6 +2239,7 @@ function renderChangesPanel(changes) {
     body.append(buildDiffView(change));
     head.addEventListener("click", () => {
       body.hidden = !body.hidden;
+      head.setAttribute("aria-expanded", String(!body.hidden));
     });
     card.append(head, body);
     els.changesPanel.append(card);
@@ -2107,6 +2303,92 @@ els.workspaceRefresh?.addEventListener("click", () => {
 els.workspaceSearch?.addEventListener("input", (event) => {
   state.workbenchSearch = event.target.value || "";
   renderWorkspaceTree(state.workbenchTree);
+});
+
+// Tab keyboard navigation (WAI-ARIA tabs pattern).
+els.workbenchTablist?.addEventListener("keydown", (event) => {
+  const idx = WORKBENCH_TABS.indexOf(state.workbenchTab);
+  let next = -1;
+  if (event.key === "ArrowRight") next = (idx + 1) % WORKBENCH_TABS.length;
+  else if (event.key === "ArrowLeft") next = (idx - 1 + WORKBENCH_TABS.length) % WORKBENCH_TABS.length;
+  else if (event.key === "Home") next = 0;
+  else if (event.key === "End") next = WORKBENCH_TABS.length - 1;
+  else return;
+  event.preventDefault();
+  setWorkbenchTab(WORKBENCH_TABS[next], true);
+});
+
+// File-tree roving focus (arrow keys move the single tab stop).
+els.workspaceTree?.addEventListener("keydown", (event) => {
+  const items = [...els.workspaceTree.querySelectorAll(".workspace-tree-item")];
+  if (!items.length) return;
+  let idx = items.indexOf(document.activeElement);
+  if (idx < 0) idx = 0;
+  if (event.key === "ArrowDown") idx = Math.min(items.length - 1, idx + 1);
+  else if (event.key === "ArrowUp") idx = Math.max(0, idx - 1);
+  else if (event.key === "Home") idx = 0;
+  else if (event.key === "End") idx = items.length - 1;
+  else return;
+  event.preventDefault();
+  items.forEach((item, k) => {
+    item.tabIndex = k === idx ? 0 : -1;
+  });
+  items[idx].focus();
+});
+
+// Resizable chat <-> workbench split (drag the divider, or arrow keys).
+function setWorkbenchHeightPx(px) {
+  const min = 8 * 16;
+  const max = Math.round(window.innerHeight * 0.88);
+  state.workbenchHeight = Math.max(min, Math.min(max, Math.round(px)));
+  state.workbenchMaximized = false;
+  applyWorkbenchSize();
+}
+
+if (els.workbenchDivider) {
+  let dragging = false;
+  const onMove = (event) => {
+    if (!dragging) return;
+    setWorkbenchHeightPx(window.innerHeight - event.clientY);
+  };
+  const stop = (event) => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove("is-resizing");
+    els.workbenchDivider.releasePointerCapture?.(event.pointerId);
+    saveState();
+  };
+  els.workbenchDivider.addEventListener("pointerdown", (event) => {
+    dragging = true;
+    document.body.classList.add("is-resizing");
+    els.workbenchDivider.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+  });
+  els.workbenchDivider.addEventListener("pointermove", onMove);
+  els.workbenchDivider.addEventListener("pointerup", stop);
+  els.workbenchDivider.addEventListener("pointercancel", stop);
+  els.workbenchDivider.addEventListener("keydown", (event) => {
+    const current =
+      (typeof state.workbenchHeight === "number" && state.workbenchHeight) ||
+      Math.round(window.innerHeight * 0.44);
+    if (event.key === "ArrowUp") setWorkbenchHeightPx(current + 24);
+    else if (event.key === "ArrowDown") setWorkbenchHeightPx(current - 24);
+    else if (event.key === "Home") setWorkbenchHeightPx(window.innerHeight * 0.88);
+    else if (event.key === "End") setWorkbenchHeightPx(8 * 16);
+    else return;
+    event.preventDefault();
+    saveState();
+  });
+}
+
+els.workbenchMaximize?.addEventListener("click", () => {
+  state.workbenchMaximized = !state.workbenchMaximized;
+  applyWorkbenchSize();
+  saveState();
+});
+
+window.addEventListener("resize", () => {
+  if (state.agentMode) applyWorkbenchSize();
 });
 
 els.agentToggle?.addEventListener("click", async () => {
