@@ -172,7 +172,22 @@ const els = {
   filePreviewPanel: document.querySelector("#filePreviewPanel"),
   changesPanel: document.querySelector("#changesPanel"),
   agentStepsPanel: document.querySelector("#agentStepsPanel"),
-  verifyPanel: document.querySelector("#verifyPanel")
+  verifyPanel: document.querySelector("#verifyPanel"),
+  bountyForm: document.querySelector("#bountyForm"),
+  bountyProfile: document.querySelector("#bountyProfile"),
+  bountyProfileHint: document.querySelector("#bountyProfileHint"),
+  bountyClass: document.querySelector("#bountyClass"),
+  bountyTarget: document.querySelector("#bountyTarget"),
+  bountyScope: document.querySelector("#bountyScope"),
+  bountyOutput: document.querySelector("#bountyOutput"),
+  bountyOutputBrowse: document.querySelector("#bountyOutputBrowse"),
+  bountyAuthorized: document.querySelector("#bountyAuthorized"),
+  bountyPerFinding: document.querySelector("#bountyPerFinding"),
+  bountyRun: document.querySelector("#bountyRun"),
+  bountyStatus: document.querySelector("#bountyStatus"),
+  bountyReport: document.querySelector("#bountyReport"),
+  bountyReportActions: document.querySelector("#bountyReportActions"),
+  bountyCopyReport: document.querySelector("#bountyCopyReport")
 };
 
 class AccelerationBackend {
@@ -352,7 +367,12 @@ function loadState() {
     workbenchWrap: false,
     lastAgentTranscript: [],
     lastAgentChanges: [],
-    lastAgentOutput: ""
+    lastAgentOutput: "",
+    bountyProfile: "full-sweep",
+    bountyClass: "",
+    bountyScope: "",
+    bountyOutput: "",
+    bountyPerFinding: false
   };
 
   try {
@@ -2470,6 +2490,170 @@ els.newBotButton.addEventListener("click", () => {
   render();
 });
 
+// ---- Bug bounty hunt (scan a target → report with attack plans) ----
+let bountyProfilesData = [];
+
+async function loadBountyProfiles() {
+  if (!els.bountyProfile) return;
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) return;
+  let info;
+  try {
+    info = await apiFetch("/api/bounty/types", { timeoutMs: 6000 });
+  } catch (_) {
+    return;
+  }
+  if (!info || info.ok === false) return;
+  bountyProfilesData = Array.isArray(info.profiles) ? info.profiles : [];
+  els.bountyProfile.replaceChildren();
+  for (const profile of bountyProfilesData) {
+    const option = document.createElement("option");
+    option.value = profile.id;
+    option.textContent = profile.name;
+    els.bountyProfile.append(option);
+  }
+  if (bountyProfilesData.some((p) => p.id === state.bountyProfile)) {
+    els.bountyProfile.value = state.bountyProfile;
+  } else if (bountyProfilesData.length) {
+    state.bountyProfile = bountyProfilesData[0].id;
+  }
+  if (els.bountyClass) {
+    const classes = Array.isArray(info.classes) ? info.classes : [];
+    els.bountyClass.replaceChildren();
+    const any = document.createElement("option");
+    any.value = "";
+    any.textContent = "Any class found";
+    els.bountyClass.append(any);
+    for (const cls of classes) {
+      const option = document.createElement("option");
+      option.value = cls.id;
+      option.textContent = cls.name;
+      els.bountyClass.append(option);
+    }
+    els.bountyClass.value = state.bountyClass || "";
+  }
+  if (els.bountyScope) els.bountyScope.value = state.bountyScope || "";
+  if (els.bountyOutput) els.bountyOutput.value = state.bountyOutput || "";
+  if (els.bountyPerFinding) els.bountyPerFinding.checked = Boolean(state.bountyPerFinding);
+  updateBountyHint();
+}
+
+function updateBountyHint() {
+  if (!els.bountyProfileHint) return;
+  const profile = bountyProfilesData.find((p) => p.id === els.bountyProfile?.value);
+  els.bountyProfileHint.textContent = profile ? profile.description : "";
+}
+
+els.bountyProfile?.addEventListener("change", () => {
+  state.bountyProfile = els.bountyProfile.value;
+  saveState();
+  updateBountyHint();
+});
+
+els.bountyClass?.addEventListener("change", () => {
+  state.bountyClass = els.bountyClass.value;
+  saveState();
+});
+
+if (desktopFolderPicker && els.bountyOutputBrowse) {
+  els.bountyOutputBrowse.hidden = false;
+}
+
+els.bountyOutputBrowse?.addEventListener("click", async () => {
+  const picked = await chooseTrainingFolder();
+  if (picked) {
+    els.bountyOutput.value = picked;
+    state.bountyOutput = picked;
+    saveState();
+  }
+});
+
+els.bountyForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const target = (els.bountyTarget?.value || "").trim();
+  if (!target) {
+    els.bountyStatus.textContent = "Enter a target URL or folder/repo path.";
+    return;
+  }
+  if (!els.bountyAuthorized?.checked) {
+    els.bountyStatus.textContent = "Confirm you're authorized to test this target (tick the box).";
+    return;
+  }
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.bountyStatus.textContent = "Local GreyIQ service is not running.";
+    return;
+  }
+  state.bountyProfile = els.bountyProfile.value;
+  state.bountyClass = els.bountyClass.value;
+  state.bountyScope = (els.bountyScope?.value || "").trim();
+  state.bountyOutput = (els.bountyOutput?.value || "").trim();
+  state.bountyPerFinding = Boolean(els.bountyPerFinding?.checked);
+  saveState();
+  els.bountyRun.disabled = true;
+  els.bountyStatus.textContent = "Hunting… running scanners and writing the report (this can take a minute).";
+  if (els.bountyReport) els.bountyReport.hidden = true;
+  if (els.bountyReportActions) els.bountyReportActions.hidden = true;
+  try {
+    const res = await apiFetch("/api/bounty/scan", {
+      method: "POST",
+      timeoutMs: 600000,
+      body: JSON.stringify({
+        target,
+        profile: state.bountyProfile,
+        vuln_class: state.bountyClass || null,
+        scope: state.bountyScope,
+        output_dir: state.bountyOutput || null,
+        authorized: true,
+        per_finding: state.bountyPerFinding
+      })
+    });
+    if (res.ok === false) {
+      els.bountyStatus.textContent = res.error || "The hunt could not run.";
+    } else {
+      const counts = res.severity_counts || {};
+      const sev = `${counts.critical || 0}C / ${counts.high || 0}H / ${counts.medium || 0}M`;
+      const brain = res.used_brain ? ` · analysis by ${res.brain_model}` : " · deterministic (no brain configured)";
+      const warn = Array.isArray(res.scan_errors) && res.scan_errors.length
+        ? `⚠ ${res.scan_errors.length} scanner(s) failed — results are partial. `
+        : "";
+      const perFiles = Array.isArray(res.per_finding_paths) && res.per_finding_paths.length
+        ? ` + ${res.per_finding_paths.length} per-finding file(s)`
+        : "";
+      els.bountyStatus.textContent =
+        `${warn}Done — risk ${String(res.risk).toUpperCase()}, ${res.finding_count} finding(s) [${sev}]${brain}. Report saved to: ${res.report_path}${perFiles}`;
+      lastBountyReportMarkdown = res.report_markdown || "";
+      if (els.bountyReport && lastBountyReportMarkdown) {
+        els.bountyReport.textContent = lastBountyReportMarkdown;
+        els.bountyReport.hidden = false;
+        if (els.bountyReportActions) els.bountyReportActions.hidden = false;
+      }
+    }
+  } catch (error) {
+    els.bountyStatus.textContent = error.message || "The hunt failed.";
+  } finally {
+    els.bountyRun.disabled = false;
+  }
+});
+
+let lastBountyReportMarkdown = "";
+
+els.bountyCopyReport?.addEventListener("click", async () => {
+  if (!lastBountyReportMarkdown) return;
+  try {
+    await navigator.clipboard.writeText(lastBountyReportMarkdown);
+    els.bountyCopyReport.textContent = "Copied ✓";
+    setTimeout(() => {
+      if (els.bountyCopyReport) els.bountyCopyReport.textContent = "Copy report";
+    }, 1500);
+  } catch (_) {
+    // Clipboard blocked — select the text so the user can copy manually.
+    const range = document.createRange();
+    range.selectNodeContents(els.bountyReport);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+});
+
 async function boot() {
   applyTheme();
   backend = new AccelerationBackend();
@@ -2486,6 +2670,7 @@ async function boot() {
     void syncActiveCore();
   }
   void loadCoderConfig();
+  void loadBountyProfiles();
   render();
   renderWorkbench();
   if (state.agentMode && state.agentWorkspace) {
