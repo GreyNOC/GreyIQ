@@ -25,6 +25,13 @@
   --diff-del-bg: rgba(201, 85, 66, 0.14);
   --diff-del-fg: #b34234;
   --code-font: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  /* Syntax-highlighting tokens (light) — tuned for AA contrast on --panel-2. */
+  --tok-comment: #6a7480;
+  --tok-string: #0a6b3b;
+  --tok-keyword: #b3245f;
+  --tok-number: #b0560f;
+  --tok-key: #0b5d80;
+  --tok-func: #6a3fc0;
   color-scheme: light;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
@@ -44,10 +51,27 @@ body[data-theme="dark"] {
   --violet: #8a7bf0;
   --sun: #e0ad4a;
   --focus: #3bb39c;
+  /* Re-point the generic aliases at the dark base tokens. A var() inside a custom
+     property is resolved where that property is DECLARED — so the :root aliases
+     keep their light-resolved values and must be redeclared here, or workbench
+     surfaces render light-on-light in dark mode. */
+  --panel: var(--surface);
+  --panel-2: var(--surface-2);
+  --text: var(--ink);
+  --border: var(--line);
+  --accent: var(--teal);
+  --danger: var(--coral);
   --diff-add-bg: rgba(46, 160, 67, 0.18);
   --diff-add-fg: #7ee787;
   --diff-del-bg: rgba(248, 81, 73, 0.16);
   --diff-del-fg: #ffa198;
+  /* Syntax-highlighting tokens (dark) — GitHub-dark-style, high contrast. */
+  --tok-comment: #8b949e;
+  --tok-string: #a5d6ff;
+  --tok-keyword: #ff7b72;
+  --tok-number: #79c0ff;
+  --tok-key: #7ee787;
+  --tok-func: #d2a8ff;
   color-scheme: dark;
   background:
     linear-gradient(180deg, rgba(46, 163, 160, 0.07), transparent 32rem),
@@ -101,6 +125,20 @@ button {
   cursor: pointer;
 }
 
+/* Screen-reader-only text: present in the accessibility tree, invisible on screen. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 textarea,
 input,
 select {
@@ -138,13 +176,27 @@ button:focus-visible {
   display: grid;
   grid-template-columns: minmax(17rem, 20rem) minmax(24rem, 1fr) minmax(18rem, 22rem);
   /* Fixed-viewport shell: each column scrolls on its own so the chat composer
-     stays docked at the bottom while the side panels scroll independently.
-     When the workbench (4th child) is shown in Agent mode it auto-places into a
-     second row, splitting the viewport so the IDE layer sits below the chat. */
+     stays docked at the bottom while the side panels scroll independently. */
   grid-template-rows: minmax(0, 1fr);
-  grid-auto-rows: minmax(0, 1fr);
   height: 100vh;
   overflow: hidden;
+}
+
+/* Agent mode: chat row (flexible) + a draggable divider + the workbench, whose
+   height is driven by --workbench-h (set by the divider drag and the maximize
+   button). The IDE layer sits below the chat and the user controls the split. */
+.app-shell.is-agent {
+  grid-template-rows: minmax(5rem, 1fr) auto clamp(8rem, var(--workbench-h, 44vh), 88vh);
+}
+
+.app-shell.is-agent .workbench-divider {
+  display: block;
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+
+.app-shell.is-agent .workbench {
+  grid-row: 3;
 }
 
 .bot-panel,
@@ -740,22 +792,23 @@ label {
   display: flex;
   flex: 1;
   flex-direction: column;
-  gap: 1px;
+  gap: 2px;
   min-height: 0;
   overflow: auto;
-  font-size: 0.8rem;
+  font-size: 0.86rem;
 }
 
 .workspace-tree-item {
   display: block;
   width: 100%;
   overflow: hidden;
-  padding: 0.28rem 0.4rem;
+  padding: 0.36rem 0.5rem;
   border: 0;
   border-radius: 5px;
   background: transparent;
   color: var(--ink);
   font: inherit;
+  line-height: 1.35;
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -763,6 +816,11 @@ label {
 
 button.workspace-tree-item:hover {
   background: var(--surface);
+}
+
+button.workspace-tree-item:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
 }
 
 .workspace-tree-item.is-dir {
@@ -774,6 +832,7 @@ button.workspace-tree-item:hover {
 .workspace-tree-item.is-active {
   background: var(--teal-2);
   color: var(--ink);
+  font-weight: 700;
 }
 
 .workspace-search-result {
@@ -794,27 +853,60 @@ button.workspace-tree-item:hover {
 
 .workbench-tabs {
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-  padding: 0.5rem 0.6rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.45rem 0.6rem;
   border-bottom: 1px solid var(--line);
   background: var(--panel-2);
 }
 
+.workbench-tablist {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  min-width: 0;
+}
+
 .workbench-tabs button {
   width: auto;
-  padding: 0.34rem 0.72rem;
+  padding: 0.45rem 0.85rem;
   border: 1px solid transparent;
   border-radius: 6px;
   background: transparent;
   color: var(--muted);
-  font-size: 0.78rem;
+  font-size: 0.82rem;
   font-weight: 800;
 }
 
-.workbench-tabs button.is-active {
+.workbench-tabs button.is-active,
+.workbench-tabs button[aria-selected="true"] {
   border-color: var(--line);
   background: var(--surface);
+  color: var(--ink);
+}
+
+.workbench-tabs button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.workbench-maximize {
+  flex: 0 0 auto;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.workbench-maximize:hover {
   color: var(--ink);
 }
 
@@ -822,6 +914,14 @@ button.workspace-tree-item:hover {
   min-height: 0;
   padding: 0.75rem;
   overflow: auto;
+}
+
+/* Only the preview panel is a flex column, so its toolbar stays pinned while the
+   code view fills the remaining height and scrolls. List panels stay plain
+   blocks so their cards keep their height and the panel scrolls. */
+#filePreviewPanel:not([hidden]) {
+  display: flex;
+  flex-direction: column;
 }
 
 .workbench-panel[hidden] {
@@ -856,8 +956,8 @@ button.workspace-tree-item:hover {
   background: var(--panel-2);
   color: var(--ink);
   font-family: var(--code-font);
-  font-size: 0.78rem;
-  line-height: 1.5;
+  font-size: 0.86rem;
+  line-height: 1.6;
   white-space: pre;
   overflow-x: auto;
 }
@@ -1054,11 +1154,165 @@ button.workspace-tree-item:hover {
   padding: 0.6rem;
   color: var(--ink);
   font-family: var(--code-font);
-  font-size: 0.74rem;
-  line-height: 1.45;
+  font-size: 0.78rem;
+  line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
   overflow: auto;
+}
+
+/* ---- Resize divider (chat <-> workbench split) ---- */
+.workbench-divider {
+  display: none;
+  position: relative;
+  height: 0.6rem;
+  background: var(--panel-2);
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  cursor: row-resize;
+  touch-action: none;
+}
+
+.workbench-divider::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 2.6rem;
+  height: 3px;
+  border-radius: 3px;
+  background: var(--muted);
+  opacity: 0.5;
+}
+
+.workbench-divider:hover::after,
+.workbench-divider:focus-visible::after {
+  background: var(--accent);
+  opacity: 0.95;
+}
+
+.workbench-divider:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+body.is-resizing {
+  cursor: row-resize;
+  user-select: none;
+}
+
+/* ---- Code preview: toolbar + line-numbered, highlighted body ---- */
+.code-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: 0 0 auto;
+  gap: 0.6rem;
+  margin-bottom: 0.5rem;
+}
+
+.code-path {
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--code-font);
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.code-wrap-toggle {
+  flex: 0 0 auto;
+  width: auto;
+  padding: 0.28rem 0.62rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.code-wrap-toggle:hover {
+  color: var(--ink);
+}
+
+.code-view {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  flex: 1 1 auto;
+  min-height: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  overflow: auto;
+}
+
+.code-view pre {
+  margin: 0;
+  font-family: var(--code-font);
+  font-size: 0.86rem;
+  line-height: 1.6;
+  tab-size: 2;
+}
+
+.code-gutter {
+  position: sticky;
+  left: 0;
+  padding: 0.7rem 0.55rem;
+  border-right: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--muted);
+  text-align: right;
+  white-space: pre;
+  user-select: none;
+}
+
+.code-body {
+  padding: 0.7rem 0.9rem;
+  color: var(--ink);
+  white-space: pre;
+}
+
+.code-body code {
+  font: inherit;
+}
+
+.code-view.is-wrap .code-gutter {
+  display: none;
+}
+
+.code-view.is-wrap .code-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Lightweight syntax-highlighting tokens (see highlightCode in app.js) */
+.tok-comment { color: var(--tok-comment); font-style: italic; }
+.tok-string { color: var(--tok-string); }
+.tok-keyword { color: var(--tok-keyword); font-weight: 600; }
+.tok-number { color: var(--tok-number); }
+.tok-key { color: var(--tok-key); }
+.tok-func { color: var(--tok-func); }
+
+/* ---- Status glyphs on agent step + verify cards ---- */
+.agent-step-status,
+.verify-status {
+  flex: 0 0 auto;
+  font-weight: 900;
+  color: var(--accent);
+}
+
+.agent-step.is-error .agent-step-status,
+.verify-output.is-error .verify-status {
+  color: var(--coral);
+}
+
+.verify-label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
 }
 
 @media (max-width: 1180px) {
@@ -1091,6 +1345,19 @@ button.workspace-tree-item:hover {
   .workbench {
     grid-column: 1 / -1;
     min-height: 30rem;
+  }
+
+  /* Stacked/page-scroll layout: drop the fixed split + drag divider. */
+  .app-shell.is-agent {
+    grid-template-rows: none;
+  }
+
+  .app-shell.is-agent .workbench-divider {
+    display: none;
+  }
+
+  .app-shell.is-agent .workbench {
+    grid-row: auto;
   }
 }
 
