@@ -21,7 +21,8 @@
     "local": {
       "base_url": "http://127.0.0.1:11434/v1",
       "model": "qwen2.5-coder:14b",
-      "api_key": ""
+      "api_key": "",
+      "num_ctx": 16384
     },
     "anthropic": {
       "model": "claude-opus-4-8",
