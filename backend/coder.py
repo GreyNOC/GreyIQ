@@ -45,6 +45,7 @@ CODER_DEFAULTS: dict[str, Any] = {
         "base_url": "http://127.0.0.1:11434/v1",
         "model": "qwen2.5-coder:14b",
         "api_key": "",
+        "num_ctx": 16384,
     },
     "anthropic": {
         "model": DEFAULT_ANTHROPIC_MODEL,
@@ -141,12 +142,97 @@ def generate(messages: list[dict[str, str]], raw_config: dict[str, Any] | None) 
         raise CoderError("The coding brain is turned off.")
     if provider == "anthropic":
         return _generate_anthropic(messages, system_prompt, cfg["anthropic"], max_tokens, timeout)
-    if provider in ("local", "openai"):
-        block = cfg["local"] if provider == "local" else cfg["openai"]
+    if provider == "local":
+        return _generate_ollama(messages, system_prompt, cfg["local"], max_tokens, temperature, timeout)
+    if provider == "openai":
         return _generate_openai_compatible(
-            messages, system_prompt, block, max_tokens, temperature, timeout, provider
+            messages, system_prompt, cfg["openai"], max_tokens, temperature, timeout, provider
         )
     raise CoderError(f"Unknown coding-brain provider: {provider}")
+
+
+def ollama_host(base_url: str | None) -> str:
+    """Native Ollama host from a base URL (strip the OpenAI-compat /v1 suffix)."""
+    host = str(base_url or "").strip().rstrip("/")
+    if host.endswith("/v1"):
+        host = host[:-3]
+    return host or "http://127.0.0.1:11434"
+
+
+def ollama_chat(
+    host: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    options: dict[str, Any] | None = None,
+    timeout: float = 120.0,
+    api_key: str = "",
+) -> dict[str, Any]:
+    """Call Ollama's native /api/chat — the only endpoint that lets us set the
+    context window (options.num_ctx). Returns the response 'message' dict. Raises
+    CoderError with actionable guidance (model not pulled, server down)."""
+    payload: dict[str, Any] = {"model": model, "messages": messages, "stream": False}
+    if options:
+        payload["options"] = options
+    if tools:
+        payload["tools"] = tools
+    endpoint = host.rstrip("/") + "/api/chat"
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    if api_key:
+        request.add_header("Authorization", f"Bearer {api_key}")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "ignore") if hasattr(exc, "read") else ""
+        if exc.code == 404 or "not found" in (detail or "").lower():
+            raise CoderError(f"Ollama model '{model}' is not available. Pull it first: ollama pull {model}") from exc
+        raise CoderError(f"Ollama HTTP {exc.code}: {detail[:400] or exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise CoderError(
+            f"Could not reach Ollama at {host} ({exc.reason}). "
+            "Start it with `ollama serve` and make sure the model is pulled."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise CoderError(f"Ollama request failed: {exc}") from exc
+    if isinstance(body, dict) and body.get("error"):
+        raise CoderError(f"Ollama error: {body['error']}")
+    return (body or {}).get("message") or {}
+
+
+def _generate_ollama(
+    messages: list[dict[str, str]],
+    system_prompt: str,
+    block: dict[str, Any],
+    max_tokens: int,
+    temperature: float,
+    timeout: float,
+) -> dict[str, Any]:
+    model = str(block.get("model") or "").strip()
+    if not model:
+        raise CoderError("Ollama model is not set.")
+    options = {
+        "temperature": temperature,
+        "num_ctx": int(block.get("num_ctx") or 16384),
+        "num_predict": max_tokens,
+    }
+    message = ollama_chat(
+        ollama_host(block.get("base_url")),
+        model,
+        [{"role": "system", "content": system_prompt}, *messages],
+        options=options,
+        timeout=timeout,
+        api_key=str(block.get("api_key") or ""),
+    )
+    text = str(message.get("content") or "").strip()
+    if not text:
+        raise CoderError("Ollama returned an empty response.")
+    return {"text": text, "model": model, "provider": "local"}
 
 
 def _generate_anthropic(

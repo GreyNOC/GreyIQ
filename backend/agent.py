@@ -409,7 +409,14 @@ def run_agent(
     while messages and messages[0]["role"] != "user":
         messages.pop(0)
 
-    system_prompt = f"{AGENT_SYSTEM_PROMPT}\n\nWorkspace root: {root}\nCommands enabled: {toolbox.allow_commands}"
+    # Workspace goes FIRST and prominent — it must survive context limits and be
+    # unmistakable. Relative paths in every tool are relative to this folder.
+    system_prompt = (
+        f"WORKSPACE: you are working inside this folder:\n  {root}\n"
+        f"Every file path you pass to a tool is relative to this workspace. "
+        f"Commands enabled: {toolbox.allow_commands}.\n\n"
+        + AGENT_SYSTEM_PROMPT
+    )
 
     # Inject matching skill playbooks so the model follows a vetted procedure.
     if settings.get("skills_enabled", True) and runtime_dir is not None and seed_dir is not None:
@@ -435,10 +442,59 @@ def run_agent(
         return _run_anthropic(messages, system_prompt, cfg, settings, toolbox)
     if provider in ("local", "openai"):
         block = cfg["local"] if provider == "local" else cfg["openai"]
-        return _run_openai(messages, system_prompt, cfg, block, settings, toolbox, provider)
+        return _run_tool_loop(messages, system_prompt, cfg, block, settings, toolbox, provider)
     raise AgentError(
         "No coding brain is configured. Set up a brain (Local model or Claude) first — the agent needs one to think."
     )
+
+
+_TOOL_NAMES = {t["name"] for t in _TOOLS}
+
+
+def _normalize_tool_calls(raw_calls: Any) -> list[dict[str, Any]]:
+    """Normalize OpenAI (args = JSON string) and Ollama-native (args = dict) tool
+    calls to a uniform [{id, name, arguments: dict}]."""
+    normalized: list[dict[str, Any]] = []
+    for call in raw_calls or []:
+        fn = call.get("function") or {}
+        name = str(fn.get("name") or "").strip()
+        if not name:
+            continue
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args or "{}")
+            except json.JSONDecodeError:
+                args = {}
+        if not isinstance(args, dict):
+            args = {}
+        normalized.append({"id": call.get("id"), "name": name, "arguments": args})
+    return normalized
+
+
+_TEXT_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>|```(?:json|tool_code)?\s*(\{.*?\})\s*```", re.DOTALL)
+
+
+def _parse_text_tool_calls(text: str) -> list[dict[str, Any]]:
+    """Recover tool calls that a (often local) model emitted as text instead of
+    structured tool_calls — e.g. Qwen's <tool_call>{...}</tool_call> or a fenced
+    JSON block. Only known tool names are accepted, so prose is never misread."""
+    if not text or ("<tool_call>" not in text and "```" not in text):
+        return []
+    calls: list[dict[str, Any]] = []
+    for match in _TEXT_CALL_RE.finditer(text):
+        raw = match.group(1) or match.group(2)
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        name = obj.get("name") or obj.get("tool") or obj.get("function")
+        args = obj.get("arguments") or obj.get("parameters") or obj.get("args") or {}
+        if isinstance(name, str) and name in _TOOL_NAMES and isinstance(args, dict):
+            calls.append({"id": None, "name": name, "arguments": args})
+    return calls
 
 
 def _run_anthropic(
@@ -512,7 +568,7 @@ def _run_anthropic(
     }
 
 
-def _run_openai(
+def _run_tool_loop(
     messages: list[dict[str, Any]],
     system_prompt: str,
     cfg: dict[str, Any],
@@ -521,21 +577,56 @@ def _run_openai(
     toolbox: ToolBox,
     provider: str,
 ) -> dict[str, Any]:
-    base_url = str(block.get("base_url") or "").strip().rstrip("/")
+    """Tool-calling loop for local (Ollama native /api/chat) and OpenAI-compatible
+    providers. `local` uses the native endpoint specifically so we can set the
+    context window (num_ctx) — without that, the workspace + repo map fall out of
+    Ollama's small default context and the model 'forgets' where it is."""
+    native = provider == "local"
+    label = "Ollama" if native else provider
     model = str(block.get("model") or "").strip()
-    api_key = str(block.get("api_key") or "").strip()
-    label = "Ollama" if provider == "local" else provider
-    if not base_url or not model:
-        raise AgentError(f"{label} base URL and model must be set.")
-    endpoint = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
+    if not model:
+        raise AgentError(f"{label} model is not set.")
     timeout = float(cfg.get("timeout_s") or 120.0)
-    tools = _openai_tools()
+    api_key = str(block.get("api_key") or "").strip()
+    max_tokens = int(cfg.get("max_tokens") or 8192)
+    temperature = float(cfg.get("temperature", 0.2))
+    tools = _openai_tools()  # {type:function, function:{...}} — accepted by both
     convo: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}, *messages]
     transcript: list[dict[str, Any]] = []
     max_steps = int(settings["max_steps"])
     auto_verifies = 0
 
-    def _call(payload: dict[str, Any]) -> dict[str, Any]:
+    if native:
+        host = coder.ollama_host(block.get("base_url"))
+        options = {
+            "temperature": temperature,
+            "num_ctx": int(block.get("num_ctx") or 16384),
+            "num_predict": max_tokens,
+        }
+    else:
+        base_url = str(block.get("base_url") or "").strip().rstrip("/")
+        if not base_url:
+            raise AgentError(f"{label} base URL is not set.")
+        endpoint = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
+
+    def _chat_once() -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
+        if native:
+            message = coder.ollama_chat(
+                host, model, convo, tools=tools, options=options, timeout=timeout, api_key=api_key
+            )
+            raw = {"role": "assistant", "content": message.get("content") or ""}
+            if message.get("tool_calls"):
+                raw["tool_calls"] = message["tool_calls"]
+            return raw, str(message.get("content") or ""), _normalize_tool_calls(message.get("tool_calls"))
+        payload = {
+            "model": model,
+            "messages": convo,
+            "tools": tools,
+            "tool_choice": "auto",
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": False,
+        }
         request = urllib.request.Request(
             endpoint,
             data=json.dumps(payload).encode("utf-8"),
@@ -546,62 +637,64 @@ def _run_openai(
             request.add_header("Authorization", f"Bearer {api_key}")
         try:
             with urllib.request.urlopen(request, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                body = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "ignore")[:400] if hasattr(exc, "read") else ""
             raise AgentError(f"{label} HTTP {exc.code}: {detail or exc.reason}") from exc
         except urllib.error.URLError as exc:
-            raise AgentError(f"Could not reach {label} at {base_url} ({exc.reason}). Is it running?") from exc
+            raise AgentError(f"Could not reach {label} ({exc.reason}). Is it running?") from exc
         except Exception as exc:  # noqa: BLE001
             raise AgentError(f"{label} request failed: {exc}") from exc
-
-    for _ in range(max_steps):
-        body = _call(
-            {
-                "model": model,
-                "messages": convo,
-                "tools": tools,
-                "tool_choice": "auto",
-                "max_tokens": int(cfg.get("max_tokens") or 8192),
-                "temperature": float(cfg.get("temperature", 0.2)),
-                "stream": False,
-            }
-        )
         try:
-            choice = body["choices"][0]["message"]
+            message = body["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as exc:
             raise AgentError(f"{label} returned an unexpected response shape.") from exc
+        return message, str(message.get("content") or ""), _normalize_tool_calls(message.get("tool_calls"))
 
-        tool_calls = choice.get("tool_calls") or []
+    for _ in range(max_steps):
+        raw_assistant, text, tool_calls = _chat_once()
+        from_text = False
+        if not tool_calls:
+            recovered = _parse_text_tool_calls(text)
+            if recovered:
+                tool_calls, from_text = recovered, True
+
         if not tool_calls:
             feedback = _auto_verify(toolbox, transcript, auto_verifies)
             if feedback is not None:
                 auto_verifies += 1
-                convo.append({"role": "assistant", "content": choice.get("content") or ""})
+                convo.append({"role": "assistant", "content": text})
                 convo.append({"role": "user", "content": feedback})
                 continue
             return {
-                "text": str(choice.get("content") or "(done)").strip(),
+                "text": text.strip() or "(done)",
                 "transcript": transcript,
                 "steps": len(transcript),
                 "model": model,
                 "provider": provider,
             }
 
-        # Echo the assistant turn (with tool_calls) then each tool result.
-        convo.append({"role": "assistant", "content": choice.get("content") or "", "tool_calls": tool_calls})
-        for call in tool_calls:
-            fn = call.get("function") or {}
-            name = str(fn.get("name") or "")
-            try:
-                args = json.loads(fn.get("arguments") or "{}")
-                if not isinstance(args, dict):
-                    args = {}
-            except json.JSONDecodeError:
-                args = {}
-            output, is_error = toolbox.run(name, args)
-            transcript.append({"tool": name, "input": args, "output": output, "is_error": is_error})
-            convo.append({"role": "tool", "tool_call_id": call.get("id"), "content": output})
+        if from_text:
+            # Model emitted tool calls as text — thread results back as a plain
+            # user turn (no tool_call_id to satisfy), which any server accepts.
+            convo.append({"role": "assistant", "content": text})
+            blobs = []
+            for tc in tool_calls:
+                output, is_error = toolbox.run(tc["name"], tc["arguments"])
+                transcript.append({"tool": tc["name"], "input": tc["arguments"], "output": output, "is_error": is_error})
+                blobs.append(f"[{tc['name']}] {output}")
+            convo.append({"role": "user", "content": "Tool results:\n" + "\n\n".join(blobs)})
+        else:
+            convo.append(raw_assistant)
+            for tc in tool_calls:
+                output, is_error = toolbox.run(tc["name"], tc["arguments"])
+                transcript.append({"tool": tc["name"], "input": tc["arguments"], "output": output, "is_error": is_error})
+                tool_msg: dict[str, Any] = {"role": "tool", "content": output}
+                if tc.get("id"):
+                    tool_msg["tool_call_id"] = tc["id"]
+                if native:
+                    tool_msg["tool_name"] = tc["name"]
+                convo.append(tool_msg)
 
     return {
         "text": "Reached the step limit before finishing. Re-run to continue.",
