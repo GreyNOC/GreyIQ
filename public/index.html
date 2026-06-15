@@ -64,6 +64,7 @@
             <h2 id="activeBotName">GreyIQ</h2>
           </div>
           <div class="header-actions">
+            <button class="theme-toggle" id="themeToggle" type="button" aria-pressed="false" title="Switch theme">Dark</button>
             <div class="segmented" role="group" aria-label="Acceleration">
               <button id="cpuButton" class="segment is-active" type="button">CPU</button>
               <button id="gpuButton" class="segment" type="button">GPU</button>
@@ -198,6 +199,31 @@
 
         <section class="memory-list" id="memoryList" aria-label="Training memory"></section>
       </aside>
+
+      <section class="workbench" id="workbench" hidden aria-label="Agent workbench">
+        <aside class="workbench-files">
+          <div class="workbench-header">
+            <strong>Workspace</strong>
+            <button id="workspaceRefresh" type="button" title="Reload the file list">Refresh</button>
+          </div>
+          <input id="workspaceSearch" type="search" placeholder="Filter files" autocomplete="off" spellcheck="false">
+          <div id="workspaceTree" class="workspace-tree"></div>
+        </aside>
+
+        <section class="workbench-main">
+          <div class="workbench-tabs" role="tablist">
+            <button type="button" data-workbench-tab="preview" class="is-active">Preview</button>
+            <button type="button" data-workbench-tab="changes">Changes</button>
+            <button type="button" data-workbench-tab="steps">Agent Steps</button>
+            <button type="button" data-workbench-tab="verify">Verify</button>
+          </div>
+
+          <div id="filePreviewPanel" class="workbench-panel"></div>
+          <div id="changesPanel" class="workbench-panel" hidden></div>
+          <div id="agentStepsPanel" class="workbench-panel" hidden></div>
+          <div id="verifyPanel" class="workbench-panel" hidden></div>
+        </section>
+      </section>
     </main>
 
     <template id="messageTemplate">

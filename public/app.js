@@ -159,7 +159,16 @@ const els = {
   trainingDataCount: document.querySelector("#trainingDataCount"),
   choiceCount: document.querySelector("#choiceCount"),
   modelState: document.querySelector("#modelState"),
-  memoryList: document.querySelector("#memoryList")
+  memoryList: document.querySelector("#memoryList"),
+  themeToggle: document.querySelector("#themeToggle"),
+  workbench: document.querySelector("#workbench"),
+  workspaceRefresh: document.querySelector("#workspaceRefresh"),
+  workspaceSearch: document.querySelector("#workspaceSearch"),
+  workspaceTree: document.querySelector("#workspaceTree"),
+  filePreviewPanel: document.querySelector("#filePreviewPanel"),
+  changesPanel: document.querySelector("#changesPanel"),
+  agentStepsPanel: document.querySelector("#agentStepsPanel"),
+  verifyPanel: document.querySelector("#verifyPanel")
 };
 
 class AccelerationBackend {
@@ -328,7 +337,15 @@ function loadState() {
     botDefaultRevision: BOT_DEFAULT_REVISION,
     selectedTrainingSources: [...DEFAULT_SELECTED_TRAINING_SOURCES],
     agentMode: false,
-    agentWorkspace: ""
+    agentWorkspace: "",
+    theme: "light",
+    workbenchTab: "preview",
+    workbenchActiveFile: "",
+    workbenchSearch: "",
+    workbenchTree: [],
+    lastAgentTranscript: [],
+    lastAgentChanges: [],
+    lastAgentOutput: ""
   };
 
   try {
@@ -387,7 +404,21 @@ function trainingSourceName(sourceId) {
 }
 
 function saveState() {
-  localStorage.setItem(STORE_KEY, JSON.stringify(state));
+  // Volatile/heavy workbench data (file tree, agent transcript, before/after
+  // diffs) is kept in memory only — persisting it could blow the localStorage
+  // quota and it is cheap to refetch. Theme and workbench UI prefs do persist.
+  const {
+    workbenchTree: _tree,
+    lastAgentTranscript: _transcript,
+    lastAgentChanges: _changes,
+    lastAgentOutput: _output,
+    ...persist
+  } = state;
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify(persist));
+  } catch (_) {
+    // Storage full or unavailable — non-fatal; the app keeps working in memory.
+  }
 }
 
 async function apiFetch(path, options = {}) {
@@ -1615,10 +1646,33 @@ if (els.brainForm) {
   applyBrainFields(els.brainProvider.value, false);
 }
 
+// ---- Theme (light / dark) ----
+function applyTheme() {
+  const theme = state.theme === "dark" ? "dark" : "light";
+  document.body.dataset.theme = theme;
+  const meta = document.querySelector('meta[name="color-scheme"]');
+  if (meta) {
+    meta.setAttribute("content", theme === "dark" ? "dark" : "light");
+  }
+  if (els.themeToggle) {
+    els.themeToggle.textContent = theme === "dark" ? "Light" : "Dark";
+    els.themeToggle.setAttribute("aria-pressed", String(theme === "dark"));
+    els.themeToggle.title = theme === "dark" ? "Switch to light theme" : "Switch to dark theme";
+  }
+}
+
+function toggleTheme() {
+  state.theme = state.theme === "dark" ? "light" : "dark";
+  applyTheme();
+  saveState();
+}
+
+els.themeToggle?.addEventListener("click", toggleTheme);
+
 // ---- Coding agent mode (reads/edits files + runs commands in a workspace) ----
 function shortAgentArgs(input) {
   if (!input || typeof input !== "object") return "";
-  return String(input.path || input.command || input.pattern || "").slice(0, 48);
+  return String(input.path || input.command || input.pattern || input.query || "").slice(0, 64);
 }
 
 async function chooseWorkspace() {
@@ -1640,6 +1694,347 @@ function renderAgentBar() {
   }
 }
 
+// ---- Workbench (IDE-style layer shown only in Agent mode) ----
+function makeHint(text, isError = false) {
+  const p = document.createElement("p");
+  p.className = `workbench-hint${isError ? " is-error" : ""}`;
+  p.textContent = text;
+  return p;
+}
+
+function renderWorkbench() {
+  if (!els.workbench) return;
+  const on = Boolean(state.agentMode);
+  els.workbench.hidden = !on;
+  document.body.classList.toggle("agent-active", on);
+  if (!on) return;
+  setWorkbenchTab(state.workbenchTab || "preview");
+  renderWorkspaceTree(state.workbenchTree);
+  if (state.workbenchActiveFile && els.filePreviewPanel?.dataset.loadedPath) {
+    // keep the currently previewed file as-is
+  } else {
+    renderFilePreview(null);
+  }
+  renderChangesPanel(state.lastAgentChanges);
+  renderAgentSteps(state.lastAgentTranscript);
+  renderVerifyPanel(state.lastAgentTranscript);
+}
+
+function setWorkbenchTab(tabName) {
+  const valid = ["preview", "changes", "steps", "verify"];
+  const tab = valid.includes(tabName) ? tabName : "preview";
+  state.workbenchTab = tab;
+  document.querySelectorAll("[data-workbench-tab]").forEach((btn) => {
+    btn.classList.toggle("is-active", btn.dataset.workbenchTab === tab);
+  });
+  const panels = {
+    preview: els.filePreviewPanel,
+    changes: els.changesPanel,
+    steps: els.agentStepsPanel,
+    verify: els.verifyPanel
+  };
+  for (const [name, panel] of Object.entries(panels)) {
+    if (panel) panel.hidden = name !== tab;
+  }
+}
+
+async function refreshWorkspaceTree() {
+  if (!els.workspaceTree) return;
+  if (!state.agentWorkspace) {
+    state.workbenchTree = [];
+    renderWorkspaceTree([]);
+    return;
+  }
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.workspaceTree.replaceChildren(makeHint("Local GreyIQ service is not running.", true));
+    return;
+  }
+  els.workspaceTree.replaceChildren(makeHint("Loading files…"));
+  try {
+    const res = await apiFetch("/api/workspace/tree", {
+      method: "POST",
+      timeoutMs: 15000,
+      body: JSON.stringify({ workspace: state.agentWorkspace })
+    });
+    if (res.ok === false) {
+      state.workbenchTree = [];
+      els.workspaceTree.replaceChildren(makeHint(res.error || "Could not list the workspace.", true));
+      return;
+    }
+    state.workbenchTree = Array.isArray(res.entries) ? res.entries : [];
+    renderWorkspaceTree(state.workbenchTree, Boolean(res.truncated));
+  } catch (error) {
+    els.workspaceTree.replaceChildren(makeHint(error.message || "Could not list the workspace.", true));
+  }
+}
+
+function renderWorkspaceTree(entries, truncated = false) {
+  if (!els.workspaceTree) return;
+  const list = Array.isArray(entries) ? entries : [];
+  const search = (state.workbenchSearch || "").trim().toLowerCase();
+  const filtered = search
+    ? list.filter((entry) => entry.type === "file" && entry.path.toLowerCase().includes(search))
+    : list;
+
+  els.workspaceTree.replaceChildren();
+  if (!filtered.length) {
+    els.workspaceTree.append(
+      makeHint(
+        !state.agentWorkspace
+          ? "Set a workspace folder to browse its files."
+          : search
+            ? "No files match your filter."
+            : "No files to show."
+      )
+    );
+    return;
+  }
+
+  for (const entry of filtered) {
+    const isFile = entry.type === "file";
+    const node = document.createElement(isFile ? "button" : "div");
+    const depth = search ? 0 : Math.max(0, entry.path.split("/").length - 1);
+    node.className = `workspace-tree-item${isFile ? "" : " is-dir"}${entry.path === state.workbenchActiveFile ? " is-active" : ""}`;
+    node.style.paddingLeft = `${0.4 + depth * 0.85}rem`;
+    node.title = entry.path;
+    node.textContent = search ? entry.path : (isFile ? entry.name : `${entry.name}/`);
+    if (isFile) {
+      node.type = "button";
+      node.addEventListener("click", () => openWorkspaceFile(entry.path));
+    }
+    els.workspaceTree.append(node);
+  }
+  if (truncated) {
+    els.workspaceTree.append(makeHint("… list truncated (large workspace)."));
+  }
+}
+
+async function openWorkspaceFile(path) {
+  state.workbenchActiveFile = path;
+  setWorkbenchTab("preview");
+  saveState();
+  renderWorkspaceTree(state.workbenchTree);
+  if (!els.filePreviewPanel) return;
+  els.filePreviewPanel.dataset.loadedPath = "";
+  els.filePreviewPanel.replaceChildren(makeHint(`Loading ${path}…`));
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    renderFilePreview({ ok: false, error: "Local GreyIQ service is not running.", path });
+    return;
+  }
+  try {
+    const res = await apiFetch("/api/workspace/file", {
+      method: "POST",
+      timeoutMs: 20000,
+      body: JSON.stringify({ workspace: state.agentWorkspace, path })
+    });
+    renderFilePreview(res);
+  } catch (error) {
+    renderFilePreview({ ok: false, error: error.message || "Could not read that file.", path });
+  }
+}
+
+function renderFilePreview(file) {
+  if (!els.filePreviewPanel) return;
+  els.filePreviewPanel.replaceChildren();
+  if (!file) {
+    els.filePreviewPanel.dataset.loadedPath = "";
+    els.filePreviewPanel.append(makeHint("Select a file from the workspace to preview it here."));
+    return;
+  }
+  const head = document.createElement("div");
+  head.className = "code-preview-head";
+  head.textContent = file.path || state.workbenchActiveFile || "";
+  els.filePreviewPanel.append(head);
+  if (file.ok === false) {
+    els.filePreviewPanel.dataset.loadedPath = "";
+    els.filePreviewPanel.append(makeHint(file.error || "Could not read this file.", true));
+    return;
+  }
+  const pre = document.createElement("pre");
+  pre.className = "code-preview";
+  const code = document.createElement("code");
+  code.textContent = file.content || "";
+  pre.append(code);
+  els.filePreviewPanel.append(pre);
+  if (file.truncated) {
+    els.filePreviewPanel.append(makeHint(`Preview truncated — showing the start of ${file.size} bytes.`));
+  }
+  els.filePreviewPanel.dataset.loadedPath = file.path || "";
+}
+
+function renderAgentSteps(transcript) {
+  if (!els.agentStepsPanel) return;
+  const steps = Array.isArray(transcript) ? transcript : [];
+  els.agentStepsPanel.replaceChildren();
+  if (!steps.length) {
+    els.agentStepsPanel.append(makeHint("Run an agent task and each tool step will appear here."));
+    return;
+  }
+  steps.forEach((step) => {
+    const out = typeof step.output === "string" ? step.output : JSON.stringify(step.output, null, 2);
+    const card = document.createElement("div");
+    card.className = `agent-step${step.is_error ? " is-error" : ""}`;
+
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "agent-step-head";
+    head.innerHTML =
+      `<span class="agent-step-tool">${escapeHtml(step.tool || "tool")}</span>` +
+      `<span class="agent-step-arg">${escapeHtml(shortAgentArgs(step.input))}</span>`;
+
+    const preview = document.createElement("div");
+    preview.className = "agent-step-preview";
+    preview.textContent = (out || "").split("\n")[0].slice(0, 200) || "(no output)";
+
+    const full = document.createElement("pre");
+    full.className = "agent-step-output";
+    full.textContent = out || "(no output)";
+    full.hidden = true;
+
+    head.addEventListener("click", () => {
+      full.hidden = !full.hidden;
+      preview.hidden = !full.hidden;
+    });
+
+    card.append(head, preview, full);
+    els.agentStepsPanel.append(card);
+  });
+}
+
+function renderVerifyPanel(transcript) {
+  if (!els.verifyPanel) return;
+  const steps = (Array.isArray(transcript) ? transcript : []).filter(
+    (step) => step.tool === "verify" || step.tool === "run_command"
+  );
+  els.verifyPanel.replaceChildren();
+  if (!steps.length) {
+    els.verifyPanel.append(makeHint("Verification and command output from the agent will show here."));
+    return;
+  }
+  steps.forEach((step) => {
+    const out = typeof step.output === "string" ? step.output : JSON.stringify(step.output, null, 2);
+    const failed = Boolean(step.is_error) || /VERIFY FAILED|FAIL\s|exit=[1-9]/.test(out);
+    const block = document.createElement("div");
+    block.className = `verify-output${failed ? " is-error" : ""}`;
+    const label = document.createElement("div");
+    label.className = "verify-label";
+    label.textContent = step.tool === "verify" ? "verify" : `run: ${shortAgentArgs(step.input)}`;
+    const pre = document.createElement("pre");
+    pre.textContent = out || "(no output)";
+    block.append(label, pre);
+    els.verifyPanel.append(block);
+  });
+}
+
+function lineDiff(before, after) {
+  const a = before ? before.split("\n") : [];
+  const b = after ? after.split("\n") : [];
+  const n = a.length;
+  const m = b.length;
+  const dp = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const rows = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      rows.push({ type: "ctx", text: a[i] });
+      i += 1;
+      j += 1;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      rows.push({ type: "del", text: a[i] });
+      i += 1;
+    } else {
+      rows.push({ type: "add", text: b[j] });
+      j += 1;
+    }
+  }
+  while (i < n) {
+    rows.push({ type: "del", text: a[i] });
+    i += 1;
+  }
+  while (j < m) {
+    rows.push({ type: "add", text: b[j] });
+    j += 1;
+  }
+  return rows;
+}
+
+function makeDiffBlock(label, text, cls) {
+  const wrap = document.createElement("div");
+  const head = document.createElement("div");
+  head.className = "diff-block-label";
+  head.textContent = label;
+  const pre = document.createElement("pre");
+  pre.className = `code-preview diff-block diff-${cls}`;
+  pre.textContent = text || "(empty)";
+  wrap.append(head, pre);
+  return wrap;
+}
+
+function buildDiffView(change) {
+  const wrap = document.createElement("div");
+  const before = change.before || "";
+  const after = change.after || "";
+  const a = before ? before.split("\n") : [];
+  const b = after ? after.split("\n") : [];
+  // Guard the O(n*m) diff against pathological file sizes — fall back to plain
+  // before/after blocks for very large or truncated content.
+  const tooBig = a.length > 2000 || b.length > 2000 || a.length * b.length > 2_000_000;
+  if (tooBig || change.before_truncated || change.after_truncated) {
+    if (change.existed) wrap.append(makeDiffBlock("before", before, "del"));
+    wrap.append(makeDiffBlock("after", after, "add"));
+    return wrap;
+  }
+  const rows = change.existed ? lineDiff(before, after) : b.map((text) => ({ type: "add", text }));
+  const pre = document.createElement("pre");
+  pre.className = "diff";
+  for (const row of rows) {
+    const sign = row.type === "add" ? "+" : row.type === "del" ? "-" : " ";
+    const line = document.createElement("span");
+    line.className = `diff-line diff-${row.type}`;
+    line.textContent = `${sign} ${row.text}`;
+    pre.append(line);
+  }
+  wrap.append(pre);
+  return wrap;
+}
+
+function renderChangesPanel(changes) {
+  if (!els.changesPanel) return;
+  const list = Array.isArray(changes) ? changes : [];
+  els.changesPanel.replaceChildren();
+  if (!list.length) {
+    els.changesPanel.append(makeHint("Files the agent creates or edits will be listed here for review."));
+    return;
+  }
+  list.forEach((change) => {
+    const op =
+      change.operation === "write_file" ? (change.existed ? "rewrote" : "created") : "edited";
+    const card = document.createElement("div");
+    card.className = "change-file";
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "change-file-head";
+    head.innerHTML =
+      `<span class="change-op">${escapeHtml(op)}</span>` +
+      `<span class="change-path">${escapeHtml(change.path || "")}</span>`;
+    const body = document.createElement("div");
+    body.className = "change-preview";
+    body.hidden = true;
+    body.append(buildDiffView(change));
+    head.addEventListener("click", () => {
+      body.hidden = !body.hidden;
+    });
+    card.append(head, body);
+    els.changesPanel.append(card);
+  });
+}
+
 async function runAgent(userText) {
   if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
     return "The local GreyIQ service is not running.";
@@ -1655,21 +2050,49 @@ async function runAgent(userText) {
       timeoutMs: 600000,
       body: JSON.stringify({ message: userText, workspace: state.agentWorkspace, history })
     });
+    // Feed the Workbench from the structured transcript + change set.
+    state.lastAgentTranscript = Array.isArray(res.transcript) ? res.transcript : [];
+    state.lastAgentChanges = Array.isArray(res.changes) ? res.changes : [];
+    state.lastAgentOutput = state.lastAgentTranscript
+      .filter((step) => step.tool === "verify" || step.tool === "run_command")
+      .map((step) => (typeof step.output === "string" ? step.output : ""))
+      .join("\n\n");
+    if (state.lastAgentChanges.length) {
+      void refreshWorkspaceTree();
+    }
+    renderWorkbench();
+
     if (res.ok === false) {
       return res.message || "The agent could not run.";
     }
     let text = res.message || "(done)";
-    if (Array.isArray(res.transcript) && res.transcript.length) {
-      const steps = res.transcript
+    if (state.lastAgentTranscript.length) {
+      const steps = state.lastAgentTranscript
         .map((t) => `${t.is_error ? "⚠ " : ""}${t.tool}(${shortAgentArgs(t.input)})`)
         .join("  ·  ");
-      text += `\n\n— ${res.model_name || "agent"} ran ${res.transcript.length} step(s): ${steps}`;
+      text += `\n\n— ${res.model_name || "agent"} ran ${state.lastAgentTranscript.length} step(s): ${steps}`;
+    }
+    if (state.lastAgentChanges.length) {
+      text += `\n\nChanged ${state.lastAgentChanges.length} file(s) — open the Changes tab in the Workbench to review.`;
     }
     return text;
   } catch (error) {
     return `Agent failed: ${error.message || error}`;
   }
 }
+
+document.querySelectorAll("[data-workbench-tab]").forEach((btn) => {
+  btn.addEventListener("click", () => setWorkbenchTab(btn.dataset.workbenchTab));
+});
+
+els.workspaceRefresh?.addEventListener("click", () => {
+  void refreshWorkspaceTree();
+});
+
+els.workspaceSearch?.addEventListener("input", (event) => {
+  state.workbenchSearch = event.target.value || "";
+  renderWorkspaceTree(state.workbenchTree);
+});
 
 els.agentToggle?.addEventListener("click", async () => {
   if (!state.agentMode && !state.agentWorkspace) {
@@ -1680,14 +2103,24 @@ els.agentToggle?.addEventListener("click", async () => {
   state.agentMode = !state.agentMode;
   saveState();
   renderAgentBar();
+  renderWorkbench();
+  if (state.agentMode) {
+    void refreshWorkspaceTree();
+  }
 });
 
 els.agentWorkspace?.addEventListener("click", async () => {
   const picked = await chooseWorkspace();
   if (picked) {
     state.agentWorkspace = picked;
+    state.workbenchActiveFile = "";
+    if (els.filePreviewPanel) els.filePreviewPanel.dataset.loadedPath = "";
     saveState();
     renderAgentBar();
+    if (state.agentMode) {
+      renderWorkbench();
+      void refreshWorkspaceTree();
+    }
   }
 });
 
@@ -1756,6 +2189,7 @@ els.newBotButton.addEventListener("click", () => {
 });
 
 async function boot() {
+  applyTheme();
   backend = new AccelerationBackend();
   await backend.setMode(state.backendPreference || "cpu");
 
@@ -1771,6 +2205,10 @@ async function boot() {
   }
   void loadCoderConfig();
   render();
+  renderWorkbench();
+  if (state.agentMode && state.agentWorkspace) {
+    void refreshWorkspaceTree();
+  }
 }
 
 boot();
