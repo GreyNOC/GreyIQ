@@ -1,6 +1,6 @@
 {
   "name": "greyiq",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "description": "GreyIQ local-first AI chat UI with editable bots, personal preference training, CPU fallback, and WebGPU acceleration.",
@@ -36,6 +36,10 @@
       {
         "from": "dist/greyiq-backend",
         "to": "backend"
+      },
+      {
+        "from": "ollama",
+        "to": "ollama"
       }
     ],
     "win": {

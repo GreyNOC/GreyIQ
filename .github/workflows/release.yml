@@ -76,6 +76,18 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      - name: Bundle Ollama runtime (zero-setup local brain)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64.zip"
+          New-Item -ItemType Directory -Force -Path ollama | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile ollama.zip
+          Expand-Archive -Path ollama.zip -DestinationPath ollama -Force
+          Remove-Item ollama.zip
+          if (-not (Test-Path "ollama/ollama.exe")) { throw "ollama.exe not found after extracting the runtime." }
+          $mb = [math]::Round((Get-ChildItem ollama -Recurse | Measure-Object Length -Sum).Sum / 1MB)
+          Write-Output "Bundled Ollama runtime: $mb MB"
+
       - name: Build portable + installer (electron-builder)
         run: npx electron-builder --win portable nsis --publish never
         env:

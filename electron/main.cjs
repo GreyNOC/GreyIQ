@@ -21,9 +21,13 @@ const PROJECT_ROOT = app.isPackaged ? path.join(process.resourcesPath, 'app') : 
 // <resources>/backend/greyiq-backend(.exe). Present only in packaged builds.
 const BACKEND_RESOURCE_DIR = app.isPackaged ? path.join(process.resourcesPath, 'backend') : null;
 const RUNTIME_DIR = path.join(app.getPath('userData'), 'runtime');
+// Bundled Ollama runtime (zero-setup local brain). Present only in packaged builds.
+const BUNDLED_OLLAMA = app.isPackaged ? path.join(process.resourcesPath, 'ollama', 'ollama.exe') : null;
+const OLLAMA_PORT = 11434;
 
 let mainWindow = null;
 let backendProcess = null;
+let ollamaProcess = null;
 let backendPort = DEFAULT_PORT;
 let backendReady = false;
 let backendExited = false;
@@ -280,6 +284,48 @@ function showApp() {
   }
 }
 
+function ollamaResponding() {
+  return new Promise((resolve) => {
+    const req = http.get(
+      { host: '127.0.0.1', port: OLLAMA_PORT, path: '/api/tags', timeout: 1500 },
+      (res) => {
+        res.resume();
+        resolve(true);
+      },
+    );
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+}
+
+async function startBundledOllama() {
+  // Zero-setup local brain: start the bundled Ollama, unless a system Ollama is
+  // already serving on the port (then we just use that). No-op in dev (no bundle).
+  if (!BUNDLED_OLLAMA || !fs.existsSync(BUNDLED_OLLAMA)) return;
+  if (await ollamaResponding()) return;
+  const modelsDir = path.join(app.getPath('userData'), 'ollama-models');
+  try {
+    fs.mkdirSync(modelsDir, { recursive: true });
+  } catch (_) {
+    // ignore
+  }
+  try {
+    ollamaProcess = spawn(BUNDLED_OLLAMA, ['serve'], {
+      env: { ...process.env, OLLAMA_HOST: `127.0.0.1:${OLLAMA_PORT}`, OLLAMA_MODELS: modelsDir },
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    ollamaProcess.stdout.on('data', (chunk) => process.stdout.write(`[Ollama] ${chunk}`));
+    ollamaProcess.stderr.on('data', (chunk) => process.stdout.write(`[Ollama] ${chunk}`));
+    ollamaProcess.on('error', (err) => process.stderr.write(`[Ollama] failed to start: ${err.message}\n`));
+  } catch (err) {
+    process.stderr.write(`[Ollama] spawn error: ${err.message}\n`);
+  }
+}
+
 function registerIpcHandlers() {
   // Native folder picker for "Add a local folder" in the training panel.
   ipcMain.handle('greyiq:pick-folder', async () => {
@@ -296,6 +342,8 @@ function registerIpcHandlers() {
 
 async function boot() {
   registerIpcHandlers();
+  // Warm up the bundled local runtime in the background (don't block the window).
+  void startBundledOllama();
   createWindow();
   await startBackend();
   showApp();
@@ -311,6 +359,9 @@ app.on('before-quit', () => {
   quitting = true;
   if (backendProcess && !backendProcess.killed) {
     backendProcess.kill();
+  }
+  if (ollamaProcess && !ollamaProcess.killed) {
+    ollamaProcess.kill();
   }
   if (logStream) {
     try {
