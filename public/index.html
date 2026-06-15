@@ -12,7 +12,7 @@
       <aside class="bot-panel" aria-label="Bot roster and persona">
         <header class="brand-row">
           <div>
-            <p class="eyebrow">Local AI Studio</p>
+            <p class="eyebrow">GreyNOC-IQ</p>
             <h1>GreyIQ</h1>
           </div>
           <button class="icon-button" id="newBotButton" type="button" title="New bot" aria-label="New bot">
@@ -189,6 +189,25 @@
             <button class="text-button" type="button" id="bountyCopyReport">Copy report</button>
           </div>
           <pre class="bounty-report" id="bountyReport" hidden></pre>
+        </form>
+
+        <form class="choice-form redteam-form" id="redteamForm">
+          <div class="source-heading">Agent security test</div>
+          <p class="folder-status">Red-team GreyIQ's own coding agent — sandbox isolation, tool policy, and prompt injection. Runs in a throwaway sandbox; your files aren't touched.</p>
+          <label class="bounty-auth" for="redteamBehavioral">
+            <input id="redteamBehavioral" type="checkbox">
+            <span>Include behavioral probes (uses your coding brain).</span>
+          </label>
+          <label class="bounty-auth" for="redteamAuthorized">
+            <input id="redteamAuthorized" type="checkbox">
+            <span>Yes, red-team my GreyIQ agent.</span>
+          </label>
+          <button class="text-button" type="submit" id="redteamRun">Run security test</button>
+          <p class="folder-status" id="redteamStatus" aria-live="polite"></p>
+          <div class="folder-actions bounty-report-actions" id="redteamReportActions" hidden>
+            <button class="text-button" type="button" id="redteamCopyReport">Copy report</button>
+          </div>
+          <pre class="bounty-report" id="redteamReport" hidden></pre>
         </form>
 
         <form class="choice-form" id="choiceForm">
