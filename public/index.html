@@ -175,12 +175,20 @@
           <div class="folder-actions">
             <button class="text-button" type="button" id="bountyOutputBrowse" hidden>Choose folder…</button>
           </div>
+          <label class="bounty-auth" for="bountyPerFinding">
+            <input id="bountyPerFinding" type="checkbox">
+            <span>Also write one file per finding (for submission).</span>
+          </label>
           <label class="bounty-auth" for="bountyAuthorized">
             <input id="bountyAuthorized" type="checkbox">
             <span>I'm authorized to test this target (in scope).</span>
           </label>
           <button class="text-button" type="submit" id="bountyRun">Run hunt &amp; write report</button>
           <p class="folder-status" id="bountyStatus" aria-live="polite"></p>
+          <div class="folder-actions bounty-report-actions" id="bountyReportActions" hidden>
+            <button class="text-button" type="button" id="bountyCopyReport">Copy report</button>
+          </div>
+          <pre class="bounty-report" id="bountyReport" hidden></pre>
         </form>
 
         <form class="choice-form" id="choiceForm">

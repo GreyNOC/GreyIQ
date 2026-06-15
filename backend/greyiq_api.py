@@ -65,7 +65,7 @@ from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt  
 
 
 APP_NAME = "GreyIQ"
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 _CURRENT_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar("greyiq_current_scope", default=None)
 _CSP = (
     "default-src 'self'; "
@@ -250,6 +250,7 @@ class BountyScanRequest(BaseModel):
     scope: str = Field(default="", max_length=2000)
     authorized: bool = False
     run_live: bool = False
+    per_finding: bool = False
     max_files: int = Field(default=5000, ge=1, le=100_000)
 
 
@@ -581,6 +582,7 @@ class GreyIQRuntime:
             version=VERSION,
             run_live=request.run_live,
             max_files=request.max_files,
+            per_finding=request.per_finding,
         )
 
     def _build_coder_messages(self, request: ChatRequest, limit: int) -> list[dict[str, str]]:

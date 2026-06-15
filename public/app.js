@@ -182,8 +182,12 @@ const els = {
   bountyOutput: document.querySelector("#bountyOutput"),
   bountyOutputBrowse: document.querySelector("#bountyOutputBrowse"),
   bountyAuthorized: document.querySelector("#bountyAuthorized"),
+  bountyPerFinding: document.querySelector("#bountyPerFinding"),
   bountyRun: document.querySelector("#bountyRun"),
-  bountyStatus: document.querySelector("#bountyStatus")
+  bountyStatus: document.querySelector("#bountyStatus"),
+  bountyReport: document.querySelector("#bountyReport"),
+  bountyReportActions: document.querySelector("#bountyReportActions"),
+  bountyCopyReport: document.querySelector("#bountyCopyReport")
 };
 
 class AccelerationBackend {
@@ -367,7 +371,8 @@ function loadState() {
     bountyProfile: "full-sweep",
     bountyClass: "",
     bountyScope: "",
-    bountyOutput: ""
+    bountyOutput: "",
+    bountyPerFinding: false
   };
 
   try {
@@ -2528,6 +2533,7 @@ async function loadBountyProfiles() {
   }
   if (els.bountyScope) els.bountyScope.value = state.bountyScope || "";
   if (els.bountyOutput) els.bountyOutput.value = state.bountyOutput || "";
+  if (els.bountyPerFinding) els.bountyPerFinding.checked = Boolean(state.bountyPerFinding);
   updateBountyHint();
 }
 
@@ -2580,9 +2586,12 @@ els.bountyForm?.addEventListener("submit", async (event) => {
   state.bountyClass = els.bountyClass.value;
   state.bountyScope = (els.bountyScope?.value || "").trim();
   state.bountyOutput = (els.bountyOutput?.value || "").trim();
+  state.bountyPerFinding = Boolean(els.bountyPerFinding?.checked);
   saveState();
   els.bountyRun.disabled = true;
   els.bountyStatus.textContent = "Hunting… running scanners and writing the report (this can take a minute).";
+  if (els.bountyReport) els.bountyReport.hidden = true;
+  if (els.bountyReportActions) els.bountyReportActions.hidden = true;
   try {
     const res = await apiFetch("/api/bounty/scan", {
       method: "POST",
@@ -2593,7 +2602,8 @@ els.bountyForm?.addEventListener("submit", async (event) => {
         vuln_class: state.bountyClass || null,
         scope: state.bountyScope,
         output_dir: state.bountyOutput || null,
-        authorized: true
+        authorized: true,
+        per_finding: state.bountyPerFinding
       })
     });
     if (res.ok === false) {
@@ -2605,13 +2615,42 @@ els.bountyForm?.addEventListener("submit", async (event) => {
       const warn = Array.isArray(res.scan_errors) && res.scan_errors.length
         ? `⚠ ${res.scan_errors.length} scanner(s) failed — results are partial. `
         : "";
+      const perFiles = Array.isArray(res.per_finding_paths) && res.per_finding_paths.length
+        ? ` + ${res.per_finding_paths.length} per-finding file(s)`
+        : "";
       els.bountyStatus.textContent =
-        `${warn}Done — risk ${String(res.risk).toUpperCase()}, ${res.finding_count} finding(s) [${sev}]${brain}. Report saved to: ${res.report_path}`;
+        `${warn}Done — risk ${String(res.risk).toUpperCase()}, ${res.finding_count} finding(s) [${sev}]${brain}. Report saved to: ${res.report_path}${perFiles}`;
+      lastBountyReportMarkdown = res.report_markdown || "";
+      if (els.bountyReport && lastBountyReportMarkdown) {
+        els.bountyReport.textContent = lastBountyReportMarkdown;
+        els.bountyReport.hidden = false;
+        if (els.bountyReportActions) els.bountyReportActions.hidden = false;
+      }
     }
   } catch (error) {
     els.bountyStatus.textContent = error.message || "The hunt failed.";
   } finally {
     els.bountyRun.disabled = false;
+  }
+});
+
+let lastBountyReportMarkdown = "";
+
+els.bountyCopyReport?.addEventListener("click", async () => {
+  if (!lastBountyReportMarkdown) return;
+  try {
+    await navigator.clipboard.writeText(lastBountyReportMarkdown);
+    els.bountyCopyReport.textContent = "Copied ✓";
+    setTimeout(() => {
+      if (els.bountyCopyReport) els.bountyCopyReport.textContent = "Copy report";
+    }, 1500);
+  } catch (_) {
+    // Clipboard blocked — select the text so the user can copy manually.
+    const range = document.createRange();
+    range.selectNodeContents(els.bountyReport);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
   }
 });
 

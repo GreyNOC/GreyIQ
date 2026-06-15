@@ -391,6 +391,7 @@ def run_bounty_hunt(
     version: str = "",
     run_live: bool = False,
     max_files: int = 5000,
+    per_finding: bool = False,
 ) -> dict[str, Any]:
     """Run a bounty hunt end to end and write a Markdown + JSON report.
 
@@ -528,11 +529,24 @@ def run_bounty_hunt(
     except OSError as exc:
         return {"ok": False, "error": f"Could not write the report: {exc}"}
 
+    # Optional: one self-contained, submission-ready file per finding.
+    per_finding_paths: list[str] = []
+    if per_finding:
+        for finding in display:
+            fstem = f"{stem}-{finding.get('ref', 'F')}-{_safe_slug(finding.get('title', ''), 'finding')}"
+            fpath = out_dir / f"{fstem}.md"
+            try:
+                fpath.write_text(report_lib.build_finding_markdown(ctx, finding), encoding="utf-8")
+                per_finding_paths.append(str(fpath))
+            except OSError:
+                continue
+
     counts = report_lib.severity_counts(display)
     return {
         "ok": True,
         "report_path": str(md_path),
         "json_path": str(json_path),
+        "per_finding_paths": per_finding_paths,
         "output_dir": str(out_dir),
         "target": clean_target,
         "profile": profile_id,

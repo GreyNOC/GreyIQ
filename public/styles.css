@@ -589,6 +589,30 @@ label {
   word-break: break-word;
 }
 
+.bounty-report-actions[hidden] {
+  display: none;
+}
+
+.bounty-report {
+  max-height: 22rem;
+  margin: 0;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--ink);
+  font-family: var(--code-font);
+  font-size: 0.76rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: auto;
+}
+
+.bounty-report[hidden] {
+  display: none;
+}
+
 /* label rows use display:grid, which overrides the [hidden] attribute */
 .brain-form [data-brain-field][hidden] {
   display: none;
