@@ -39,6 +39,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 import agent as coding_agent  # noqa: E402
 import coder  # noqa: E402
+import workspace as workspace_fs  # noqa: E402
 from ai_core.core_store import AICoreStore  # noqa: E402
 from document_ingest import (  # noqa: E402
     collect_supported_files,
@@ -63,7 +64,7 @@ from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
 
 
 APP_NAME = "GreyIQ"
-VERSION = "0.6.1"
+VERSION = "0.7.0"
 _CURRENT_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar("greyiq_current_scope", default=None)
 _CSP = (
     "default-src 'self'; "
@@ -176,6 +177,22 @@ class AgentRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
     workspace: str = Field(min_length=1, max_length=4000)
     history: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class WorkspaceTreeRequest(BaseModel):
+    workspace: str = Field(min_length=1, max_length=4000)
+    max_entries: int = Field(default=1000, ge=1, le=20000)
+
+
+class WorkspaceFileRequest(BaseModel):
+    workspace: str = Field(min_length=1, max_length=4000)
+    path: str = Field(min_length=1, max_length=4000)
+
+
+class WorkspaceSearchRequest(BaseModel):
+    workspace: str = Field(min_length=1, max_length=4000)
+    query: str = Field(min_length=1, max_length=400)
+    max_results: int = Field(default=100, ge=1, le=1000)
 
 
 class PreferenceRequest(BaseModel):
@@ -521,11 +538,21 @@ class GreyIQRuntime:
                 "message": friendly_branding(result["text"]),
                 "transcript": result["transcript"],
                 "steps": result["steps"],
+                "changes": result.get("changes", []),
+                "touched_files": result.get("touched_files", []),
                 "model_name": f"{result['provider']}:{result['model']}",
                 "provider": result["provider"],
             }
         except coding_agent.AgentError as exc:
-            return {"ok": False, "request_id": uuid4().hex, "message": str(exc), "transcript": [], "steps": 0}
+            return {
+                "ok": False,
+                "request_id": uuid4().hex,
+                "message": str(exc),
+                "transcript": [],
+                "steps": 0,
+                "changes": [],
+                "touched_files": [],
+            }
 
     def _build_coder_messages(self, request: ChatRequest, limit: int) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
@@ -1239,6 +1266,29 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/agent":
             request = validate_payload(AgentRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.run_agent, request))
+            return
+        if method == "POST" and path == "/api/workspace/tree":
+            request = validate_payload(WorkspaceTreeRequest, await read_json_body(receive))
+            await send_json(
+                send,
+                await asyncio.to_thread(workspace_fs.list_tree, request.workspace, request.max_entries),
+            )
+            return
+        if method == "POST" and path == "/api/workspace/file":
+            request = validate_payload(WorkspaceFileRequest, await read_json_body(receive))
+            await send_json(
+                send,
+                await asyncio.to_thread(workspace_fs.read_file, request.workspace, request.path),
+            )
+            return
+        if method == "POST" and path == "/api/workspace/search":
+            request = validate_payload(WorkspaceSearchRequest, await read_json_body(receive))
+            await send_json(
+                send,
+                await asyncio.to_thread(
+                    workspace_fs.search_files, request.workspace, request.query, request.max_results
+                ),
+            )
             return
         if path.startswith("/api/"):
             await send_json(send, {"error": "not found"}, 404)

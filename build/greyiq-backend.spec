@@ -31,6 +31,7 @@ hiddenimports = [
     "agent",
     "skills",
     "repomap",
+    "workspace",
 ]
 
 # torch and the ASGI stack load a lot dynamically; pull everything in. numpy is

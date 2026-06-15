@@ -40,6 +40,19 @@ AGENT_DEFAULTS: dict[str, Any] = {
 # touched-but-unverified files.
 _AUTO_VERIFY_CAP = 2
 
+# Per-file content cap for the change payload sent to the Workbench. Beyond this
+# the before/after text is clipped and a *_truncated flag is set, so a huge
+# generated file can't bloat the /api/agent response.
+_MAX_CHANGE_CHARS = 120_000
+
+
+def _clip_change(text: str | None) -> str:
+    if not text:
+        return ""
+    if len(text) > _MAX_CHANGE_CHARS:
+        return text[:_MAX_CHANGE_CHARS] + f"\n... [truncated, {len(text)} chars total]"
+    return text
+
 AGENT_SYSTEM_PROMPT = (
     "You are GreyIQ, an autonomous coding agent working inside a fixed workspace "
     "folder. Use the provided tools to read, search, edit, and create files, and "
@@ -172,6 +185,10 @@ class ToolBox:
         self.verify_command = str(settings.get("verify_command") or "").strip()
         self.touched: set[str] = set()  # rel paths written/edited this run
         self.verified_ok = False  # True after a passing verify; reset on any write/edit
+        # Lightweight before/after capture per touched file, for the Workbench
+        # Changes/diff panel. Repeated edits to one file collapse to a single
+        # entry: earliest "before", latest "after".
+        self.changes: list[dict[str, Any]] = []
 
     def _resolve(self, rel_path: str) -> Path:
         candidate = (self.root / str(rel_path or ".")).resolve()
@@ -222,12 +239,46 @@ class ToolBox:
         self.touched.add(target.relative_to(self.root).as_posix())
         self.verified_ok = False
 
+    def _safe_read(self, target: Path) -> str | None:
+        if not target.is_file():
+            return None
+        try:
+            return target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+    def _record_change(self, target: Path, operation: str, before: str | None, after: str) -> None:
+        rel = target.relative_to(self.root).as_posix()
+        for existing in self.changes:
+            if existing["path"] == rel:
+                # A later edit/write to the same file: keep the original "before",
+                # update "after" to the latest content.
+                existing["after"] = _clip_change(after)
+                existing["after_size"] = len(after)
+                existing["after_truncated"] = len(after) > _MAX_CHANGE_CHARS
+                return
+        self.changes.append(
+            {
+                "path": rel,
+                "operation": operation,
+                "existed": before is not None,
+                "before": _clip_change(before),
+                "after": _clip_change(after),
+                "before_size": len(before) if before is not None else 0,
+                "after_size": len(after),
+                "before_truncated": before is not None and len(before) > _MAX_CHANGE_CHARS,
+                "after_truncated": len(after) > _MAX_CHANGE_CHARS,
+            }
+        )
+
     def _tool_write_file(self, args: dict[str, Any]) -> str:
         target = self._resolve(args["path"])
         target.parent.mkdir(parents=True, exist_ok=True)
         content = str(args.get("content", ""))
+        before = self._safe_read(target)
         target.write_text(content, encoding="utf-8")
         self._mark_touched(target)
+        self._record_change(target, "write_file", before, content)
         return f"Wrote {len(content)} chars to {target.relative_to(self.root).as_posix()}"
 
     def _tool_edit_file(self, args: dict[str, Any]) -> str:
@@ -244,9 +295,15 @@ class ToolBox:
             raise ToolError("old_string was not found in the file.")
         if count > 1:
             raise ToolError(f"old_string is not unique ({count} matches); include more context.")
-        target.write_text(text.replace(old, new, 1), encoding="utf-8")
+        new_text = text.replace(old, new, 1)
+        target.write_text(new_text, encoding="utf-8")
         self._mark_touched(target)
+        self._record_change(target, "edit_file", text, new_text)
         return f"Edited {target.relative_to(self.root).as_posix()}"
+
+    def change_payload(self) -> list[dict[str, Any]]:
+        """The before/after change list for the Workbench Changes panel."""
+        return list(self.changes)
 
     def _tool_grep(self, args: dict[str, Any]) -> str:
         try:
@@ -439,13 +496,18 @@ def run_agent(
             pass
 
     if provider == "anthropic":
-        return _run_anthropic(messages, system_prompt, cfg, settings, toolbox)
-    if provider in ("local", "openai"):
+        result = _run_anthropic(messages, system_prompt, cfg, settings, toolbox)
+    elif provider in ("local", "openai"):
         block = cfg["local"] if provider == "local" else cfg["openai"]
-        return _run_tool_loop(messages, system_prompt, cfg, block, settings, toolbox, provider)
-    raise AgentError(
-        "No coding brain is configured. Set up a brain (Local model or Claude) first — the agent needs one to think."
-    )
+        result = _run_tool_loop(messages, system_prompt, cfg, block, settings, toolbox, provider)
+    else:
+        raise AgentError(
+            "No coding brain is configured. Set up a brain (Local model or Claude) first — the agent needs one to think."
+        )
+    # Attach change tracking (touched files + before/after) for the Workbench.
+    result["changes"] = toolbox.change_payload()
+    result["touched_files"] = sorted(toolbox.touched)
+    return result
 
 
 _TOOL_NAMES = {t["name"] for t in _TOOLS}
