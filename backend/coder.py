@@ -8,7 +8,7 @@ Providers (OpenAI-compatible ones share a client; Claude uses its official SDK):
   - "local"     : OpenAI-compatible endpoint, defaults to a local Ollama server
                   (offline, free, private — runs a code model on your own GPU).
   - "anthropic" : Claude via the official `anthropic` SDK (closest to Claude Code).
-  - "openai"    : any other OpenAI-compatible endpoint.
+  - "openai"    : OpenAI / ChatGPT (api.openai.com) or any OpenAI-compatible endpoint.
   - "off"/"none": disabled — the caller falls back to the local TinyGPT engine.
 
 Secrets (API keys) live in the runtime config and are never echoed back to the UI
@@ -54,8 +54,8 @@ CODER_DEFAULTS: dict[str, Any] = {
         "thinking": True,
     },
     "openai": {
-        "base_url": "",
-        "model": "",
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-4o",
         "api_key": "",
     },
     "agent": {
@@ -190,8 +190,24 @@ def ollama_chat(
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "ignore") if hasattr(exc, "read") else ""
-        if exc.code == 404 or "not found" in (detail or "").lower():
-            raise CoderError(f"Ollama model '{model}' is not available. Pull it first: ollama pull {model}") from exc
+        low = (detail or "").lower()
+        # Ollama's model-not-found body names the model ("model 'x' not found, try
+        # pulling it"); a bare "404 page not found" is a missing endpoint, not a
+        # missing model — keep those distinct so we don't tell the user to re-pull.
+        if "pull" in low or "no such model" in low or ("model" in low and "not found" in low):
+            # Ollama explicitly reports the model is missing.
+            raise CoderError(
+                f"Ollama model '{model}' isn't available. Pull it with `ollama pull {model}`. "
+                "If it IS already pulled (shows under 'Model installed'), your Ollama is likely outdated "
+                "or the model failed to load — update Ollama, or switch the coding brain to OpenAI/Claude."
+            ) from exc
+        if exc.code == 404:
+            # A bare 404 on /api/chat usually means an outdated Ollama that lacks the
+            # endpoint — NOT a missing model (don't tell the user to re-pull it).
+            raise CoderError(
+                f"Ollama returned 404 for /api/chat (model '{model}'). Your Ollama is likely outdated and "
+                "missing the /api/chat endpoint — update Ollama, or switch the coding brain to OpenAI/Claude."
+            ) from exc
         raise CoderError(f"Ollama HTTP {exc.code}: {detail[:400] or exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise CoderError(
