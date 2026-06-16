@@ -1,10 +1,19 @@
 {
   "version": 1,
   "source": {
-    "name": "awesome-pentest",
-    "url": "https://github.com/enaqx/awesome-pentest",
-    "license": "CC-BY-4.0",
-    "attribution": "Curated from the awesome-pentest list by enaqx and contributors, used under CC-BY 4.0."
+    "attribution": "Curated from the awesome-pentest list (enaqx, CC-BY 4.0) and the awesome-osint list (jivoi, MIT).",
+    "sources": [
+      {
+        "name": "awesome-pentest",
+        "url": "https://github.com/enaqx/awesome-pentest",
+        "license": "CC-BY-4.0"
+      },
+      {
+        "name": "awesome-osint",
+        "url": "https://github.com/jivoi/awesome-osint",
+        "license": "MIT"
+      }
+    ]
   },
   "categories": [
     {
@@ -14,52 +23,58 @@
       "order": 0
     },
     {
+      "id": "osint",
+      "label": "OSINT & Reconnaissance",
+      "description": "Open-source intelligence: people, usernames, emails, breaches, domains, and asset discovery",
+      "order": 1
+    },
+    {
       "id": "web",
       "label": "Web Exploitation",
       "description": "Proxies, web scanners, fuzzers, injection and auth testing",
-      "order": 1
+      "order": 2
     },
     {
       "id": "exploit-frameworks",
       "label": "Exploitation Frameworks & Dev",
       "description": "Exploit development, shellcoding, multi-paradigm frameworks",
-      "order": 2
+      "order": 3
     },
     {
       "id": "password-hash",
       "label": "Password & Hash Attacks",
       "description": "Credential and hash cracking, brute-force",
-      "order": 3
+      "order": 4
     },
     {
       "id": "reverse-static",
       "label": "Reverse Engineering & Static Analysis",
       "description": "Disassembly, decompilers, static analyzers, file/hex analysis",
-      "order": 4
+      "order": 5
     },
     {
       "id": "post-exploitation",
       "label": "Post-Exploitation & Evasion",
       "description": "Privilege escalation, exfiltration, AV evasion (authorized testing only)",
-      "order": 5
+      "order": 6
     },
     {
       "id": "cloud-mobile-host",
       "label": "Cloud, Mobile & Host",
       "description": "Cloud attack tools, mobile/OS utilities, ICS/SCADA",
-      "order": 6
+      "order": 7
     },
     {
       "id": "social-physical",
       "label": "Social Eng., Physical & Stego",
       "description": "Social engineering, physical access, lock picking, steganography, side-channel",
-      "order": 7
+      "order": 8
     },
     {
       "id": "platforms-training",
       "label": "Platforms, Labs & Resources",
       "description": "OS distros, vulnerable labs, CTF tools, courses, vuln databases, reference",
-      "order": 8
+      "order": 9
     }
   ],
   "tools": [
@@ -416,6 +431,546 @@
         "traffic-monitoring",
         "PCAP"
       ]
+    },
+    {
+      "name": "BuiltWith",
+      "description": "Identify the technology stack, analytics, and frameworks a website is built with.",
+      "url": "https://builtwith.com/",
+      "kind": "tool",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "tech-fingerprinting",
+        "stack",
+        "recon"
+      ],
+      "maps_to": [
+        "disclosure",
+        "dependency"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "crt.sh",
+      "description": "Search Certificate Transparency logs to discover subdomains and issued certificates.",
+      "url": "https://crt.sh/",
+      "kind": "database",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "certificates",
+        "subdomains",
+        "ct-logs"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Dehashed",
+      "description": "Search engine for leaked credentials and breach records by email, username, or domain.",
+      "url": "https://www.dehashed.com/",
+      "kind": "database",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "breaches",
+        "credentials",
+        "leaks"
+      ],
+      "maps_to": [
+        "secrets",
+        "auth"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "DNSDumpster",
+      "description": "Free domain research mapping hosts, DNS records, and infrastructure for a target.",
+      "url": "https://dnsdumpster.com/",
+      "kind": "tool",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "dns",
+        "subdomains",
+        "mapping"
+      ],
+      "maps_to": [
+        "disclosure",
+        "network"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "FOFA",
+      "description": "Internet asset search engine for fingerprinting exposed hosts and services.",
+      "url": "https://en.fofa.info/",
+      "kind": "database",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "asset-search",
+        "fingerprinting",
+        "exposure"
+      ],
+      "maps_to": [
+        "disclosure",
+        "network"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "GHunt",
+      "description": "Investigate Google accounts — emails, IDs, and public profile/document data.",
+      "url": "https://github.com/mxrch/GHunt",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "google",
+        "email",
+        "people"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Google Hacking Database (GHDB)",
+      "description": "Curated index of Google dork queries that surface exposed files and misconfigurations.",
+      "url": "https://www.exploit-db.com/google-hacking-database",
+      "kind": "resource",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "google-dorks",
+        "exposure",
+        "disclosure"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "h8mail",
+      "description": "Email OSINT and breach-hunting tool that finds leaked passwords for a target email.",
+      "url": "https://github.com/khast3x/h8mail",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "breaches",
+        "email",
+        "credentials"
+      ],
+      "maps_to": [
+        "secrets",
+        "auth"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Have I Been Pwned",
+      "description": "Check whether an email or password appears in known data breaches.",
+      "url": "https://haveibeenpwned.com/",
+      "kind": "database",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "breaches",
+        "credentials",
+        "email"
+      ],
+      "maps_to": [
+        "secrets",
+        "auth"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Holehe",
+      "description": "Check whether an email is registered on 120+ sites via password-reset / sign-up flows.",
+      "url": "https://github.com/megadose/holehe",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "email",
+        "account-discovery",
+        "registration"
+      ],
+      "maps_to": [
+        "disclosure",
+        "auth"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Hunter.io",
+      "description": "Find professional email addresses and patterns associated with a company domain.",
+      "url": "https://hunter.io/",
+      "kind": "tool",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "email",
+        "company",
+        "contacts"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Intelligence X",
+      "description": "Search engine and archive for leaks, dark web, domains, emails, and documents.",
+      "url": "https://intelx.io/",
+      "kind": "database",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "leaks",
+        "darkweb",
+        "archive"
+      ],
+      "maps_to": [
+        "disclosure",
+        "secrets"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Maigret",
+      "description": "Collect a dossier on a person by username across thousands of sites.",
+      "url": "https://github.com/soxoj/maigret",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "username",
+        "people",
+        "social-media"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Maltego",
+      "description": "Graphical link-analysis platform mapping relationships between people, domains, and infrastructure.",
+      "url": "https://www.maltego.com/",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "link-analysis",
+        "graph",
+        "investigations"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Metagoofil",
+      "description": "Extract metadata from public documents (pdf/doc/xls) to reveal users, paths, and software.",
+      "url": "https://github.com/laramies/metagoofil",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "metadata",
+        "documents",
+        "footprint"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "OSINT Framework",
+      "description": "Web directory of OSINT tools and resources organized by data type.",
+      "url": "https://osintframework.com/",
+      "kind": "resource",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "directory",
+        "reference",
+        "methodology"
+      ],
+      "maps_to": [],
+      "category": "osint"
+    },
+    {
+      "name": "OWASP Amass",
+      "description": "In-depth attack-surface mapping and subdomain enumeration via passive and active sources.",
+      "url": "https://github.com/owasp-amass/amass",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "subdomains",
+        "attack-surface",
+        "dns"
+      ],
+      "maps_to": [
+        "disclosure",
+        "network"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "PhoneInfoga",
+      "description": "OSINT framework for scanning international phone numbers and mapping their footprint.",
+      "url": "https://github.com/sundowndev/PhoneInfoga",
+      "kind": "framework",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "phone",
+        "footprint",
+        "recon"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Photon",
+      "description": "Fast web crawler that extracts URLs, emails, secrets, and endpoints for OSINT.",
+      "url": "https://github.com/s0md3v/Photon",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "crawler",
+        "endpoints",
+        "scraping"
+      ],
+      "maps_to": [
+        "disclosure",
+        "secrets"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Recon-ng",
+      "description": "Modular web reconnaissance framework with a Metasploit-style workflow for OSINT.",
+      "url": "https://github.com/lanmaster53/recon-ng",
+      "kind": "framework",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "framework",
+        "recon",
+        "modules"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "SecurityTrails",
+      "description": "Current and historical DNS, WHOIS, and subdomain data for a domain or IP.",
+      "url": "https://securitytrails.com/",
+      "kind": "database",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "dns",
+        "whois",
+        "historical"
+      ],
+      "maps_to": [
+        "disclosure",
+        "network"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Sherlock",
+      "description": "Hunt down a person's accounts by username across 400+ social networks.",
+      "url": "https://github.com/sherlock-project/sherlock",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "username",
+        "social-media",
+        "people"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Social-Analyzer",
+      "description": "Find and analyze a person's profiles across 1000+ social media sites.",
+      "url": "https://github.com/qeeqbox/social-analyzer",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "social-media",
+        "people",
+        "profiles"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "SpiderFoot",
+      "description": "Automated OSINT reconnaissance engine querying 200+ data sources for a target.",
+      "url": "https://github.com/smicallef/spiderfoot",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "automation",
+        "footprinting",
+        "recon"
+      ],
+      "maps_to": [
+        "disclosure",
+        "network"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Sublist3r",
+      "description": "Fast subdomain enumeration using search engines and public sources.",
+      "url": "https://github.com/aboul3la/Sublist3r",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "subdomains",
+        "enumeration",
+        "recon"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "theHarvester",
+      "description": "Gathers emails, subdomains, hosts, and names from public sources for a domain.",
+      "url": "https://github.com/laramies/theHarvester",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "email-harvesting",
+        "subdomains",
+        "recon"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "urlscan.io",
+      "description": "Scan and analyze a website's requests, resources, and screenshots in a sandbox.",
+      "url": "https://urlscan.io/",
+      "kind": "tool",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "website-analysis",
+        "sandbox",
+        "recon"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "VirusTotal",
+      "description": "Analyze files, URLs, domains, and IPs against dozens of AV engines and threat feeds.",
+      "url": "https://www.virustotal.com/",
+      "kind": "database",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "malware",
+        "reputation",
+        "threat-intel"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Wappalyzer",
+      "description": "Fingerprint web technologies, CMSes, and libraries used by a site.",
+      "url": "https://www.wappalyzer.com/",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "web"
+      ],
+      "tags": [
+        "tech-fingerprinting",
+        "cms",
+        "libraries"
+      ],
+      "maps_to": [
+        "disclosure",
+        "dependency"
+      ],
+      "category": "osint"
     },
     {
       "name": "Acunetix",
