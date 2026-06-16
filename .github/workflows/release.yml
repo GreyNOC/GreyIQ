@@ -40,6 +40,11 @@ jobs:
       - name: Install Python runtime + build dependencies
         run: |
           python -m pip install --upgrade pip
+          # CPU-only torch: the default Linux torch wheel bundles ~2.5 GB of CUDA
+          # libraries, which (with Ollama's runtimes) push release assets past
+          # GitHub's 2 GiB per-asset limit. The app only uses torch for the small
+          # CPU TinyGPT model; coding-brain GPU acceleration comes via Ollama.
+          pip install "torch>=2.2,<2.8" --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
           pip install -r build/requirements-build.txt
 
@@ -153,6 +158,11 @@ jobs:
       - name: Install Python runtime + build dependencies
         run: |
           python -m pip install --upgrade pip
+          # CPU-only torch: the default Linux torch wheel bundles ~2.5 GB of CUDA
+          # libraries, which (with Ollama's runtimes) push release assets past
+          # GitHub's 2 GiB per-asset limit. The app only uses torch for the small
+          # CPU TinyGPT model; coding-brain GPU acceleration comes via Ollama.
+          pip install "torch>=2.2,<2.8" --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
           pip install -r build/requirements-build.txt
 
@@ -192,6 +202,10 @@ jobs:
           mkdir -p ollama
           tar --zstd -xf ollama.tar.zst -C ollama
           rm -f ollama.tar.zst
+          # Drop bundled GPU runtimes (CUDA/ROCm, several GB) to keep the AppImage
+          # under GitHub's 2 GiB asset limit — the CPU runtime stays. GPU users can
+          # install Ollama natively.
+          rm -rf ollama/lib/ollama/cuda* ollama/lib/ollama/rocm* 2>/dev/null || true
           if [ ! -x ollama/bin/ollama ]; then
             echo "ollama binary not found at ollama/bin/ollama after extracting the runtime."
             exit 1
