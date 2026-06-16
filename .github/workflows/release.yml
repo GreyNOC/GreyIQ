@@ -202,10 +202,9 @@ jobs:
           mkdir -p ollama
           tar --zstd -xf ollama.tar.zst -C ollama
           rm -f ollama.tar.zst
-          # Drop bundled GPU runtimes (CUDA/ROCm, several GB) to keep the AppImage
-          # under GitHub's 2 GiB asset limit — the CPU runtime stays. GPU users can
-          # install Ollama natively.
-          rm -rf ollama/lib/ollama/cuda* ollama/lib/ollama/rocm* 2>/dev/null || true
+          # Keep the bundled CUDA runner so NVIDIA GPUs work out of the box — the
+          # CPU-only torch wheel already keeps assets under GitHub's 2 GiB cap, so
+          # no Ollama pruning is needed. (AMD/ROCm is fetched at first run by the app.)
           if [ ! -x ollama/bin/ollama ]; then
             echo "ollama binary not found at ollama/bin/ollama after extracting the runtime."
             exit 1

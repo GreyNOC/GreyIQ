@@ -9,7 +9,7 @@ It includes:
 - **Agent mode + the Workbench IDE** — let the brain read, edit, and (optionally) run things in a workspace folder, with a file explorer, code preview, diffs, agent steps, and verification output.
 - **BugHunter** — a static/passive security scanner, a **bug-bounty hunt** that writes reports with attack plans, and an **agent security red-team** that tests GreyIQ's own agent.
 - Personal training from preferences, source-specific data, and 👍/👎 feedback; folder ingestion (PDF/DOCX/text/OCR).
-- Browser fallback (CPU/WebGPU) when the Python service isn't running, plus an Electron launcher that boots the backend (and a bundled Ollama runtime) and opens the UI.
+- Browser fallback (CPU/WebGPU) when the Python service isn't running, plus an Electron launcher that boots the backend and a **GPU-accelerated** bundled Ollama runtime — NVIDIA (CUDA) works out of the box; AMD (ROCm) is auto-provisioned on first run.
 
 ## Run
 
@@ -47,7 +47,7 @@ npm run check
 In the **Coding brain** panel (training column) pick a provider:
 
 - **Off** — local TinyGPT only (offline fallback).
-- **Local model (Ollama)** — e.g. `qwen2.5-coder:14b`. The desktop build bundles an Ollama runtime and offers one-click model download.
+- **Local model (Ollama)** — e.g. `qwen2.5-coder:14b`. The desktop build bundles an Ollama runtime, offers one-click model download, and uses your GPU automatically: NVIDIA (CUDA) is bundled; on an AMD box GreyIQ fetches Ollama's ROCm runtime once on first run. No supported GPU → it runs on CPU.
 - **Claude API** — paste an Anthropic key (default model `claude-opus-4-8`).
 - **OpenAI-compatible** — any `/v1/chat/completions` endpoint.
 
