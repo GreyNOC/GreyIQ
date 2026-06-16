@@ -1,9 +1,9 @@
 {
   "name": "greyiq",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "private": true,
   "type": "module",
-  "description": "GreyIQ local-first AI chat UI with editable bots, personal preference training, CPU fallback, and WebGPU acceleration.",
+  "description": "GreyIQ local-first AI chat UI with editable bots, personal preference training, an Ollama/Claude/OpenAI coding brain with out-of-the-box GPU acceleration (NVIDIA bundled, AMD auto-provisioned), and a browser CPU/WebGPU fallback.",
   "author": "GreyNOC",
   "main": "electron/main.cjs",
   "scripts": {

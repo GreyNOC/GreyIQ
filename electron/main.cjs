@@ -4,6 +4,7 @@ const { app, BrowserWindow, shell, ipcMain, dialog } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const http = require('node:http');
+const https = require('node:https');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
 
@@ -24,12 +25,20 @@ const RUNTIME_DIR = path.join(app.getPath('userData'), 'runtime');
 // Bundled Ollama runtime (zero-setup local brain). Present only in packaged
 // builds. The Windows zip puts ollama.exe at the root; the Linux tarball puts
 // the binary under bin/ (with its libs alongside under lib/).
-const BUNDLED_OLLAMA = app.isPackaged
+const OLLAMA_RES_DIR = app.isPackaged ? path.join(process.resourcesPath, 'ollama') : null;
+const BUNDLED_OLLAMA = OLLAMA_RES_DIR
   ? (process.platform === 'win32'
-      ? path.join(process.resourcesPath, 'ollama', 'ollama.exe')
-      : path.join(process.resourcesPath, 'ollama', 'bin', 'ollama'))
+      ? path.join(OLLAMA_RES_DIR, 'ollama.exe')
+      : path.join(OLLAMA_RES_DIR, 'bin', 'ollama'))
   : null;
 const OLLAMA_PORT = 11434;
+// NVIDIA (CUDA) is included in the bundled Ollama runtime. AMD GPUs need Ollama's
+// ROCm runner, which ships as a separate ~1 GB package — too big to bundle under
+// GitHub's 2 GiB asset cap — so we fetch it once on first run when an AMD GPU is
+// detected and overlay it onto a writable copy of the bundled runtime.
+const OLLAMA_ROCM_URL = process.platform === 'win32'
+  ? 'https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64-rocm.zip'
+  : 'https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64-rocm.tar.zst';
 
 // extraResources can drop the executable bit on non-Windows; restore it
 // best-effort before we spawn a bundled binary.
@@ -319,12 +328,158 @@ function ollamaResponding() {
   });
 }
 
+// ---- GPU acceleration for the bundled local model (Ollama) ----
+// NVIDIA (CUDA) ships in the bundled runtime and Ollama auto-detects it. AMD
+// (ROCm) is fetched on first run. Everything here is best-effort: any failure
+// falls back to the bundled runtime so the app never breaks over GPU setup.
+let detectedGpu = 'unknown';         // 'nvidia' | 'amd' | 'other' | 'unknown'
+let activeOllamaRuntime = 'bundled'; // 'bundled' | 'rocm'
+let gpuVendorCache = null;
+
+function logGpu(message) {
+  process.stdout.write(`[GPU] ${message}\n`);
+}
+
+function detectGpuVendor() {
+  return new Promise((resolve) => {
+    try {
+      if (process.platform === 'linux') {
+        let vendors = '';
+        try {
+          for (const entry of fs.readdirSync('/sys/class/drm')) {
+            if (!/^card\d+$/.test(entry)) continue;
+            try {
+              vendors += fs.readFileSync(path.join('/sys/class/drm', entry, 'device', 'vendor'), 'utf8');
+            } catch (_) { /* card without a vendor file */ }
+          }
+        } catch (_) { /* no DRM info available */ }
+        if (/0x10de/i.test(vendors)) return resolve('nvidia'); // prefer NVIDIA (CUDA bundled)
+        if (/0x1002/i.test(vendors)) return resolve('amd');
+        return resolve('other');
+      }
+      if (process.platform === 'win32') {
+        const ps = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', '(Get-CimInstance Win32_VideoController).Name'], { windowsHide: true });
+        let out = '';
+        ps.stdout.on('data', (chunk) => { out += chunk; });
+        ps.on('error', () => resolve('other'));
+        ps.on('exit', () => {
+          if (/NVIDIA|GeForce|RTX|Quadro/i.test(out)) return resolve('nvidia');
+          if (/AMD|Radeon/i.test(out)) return resolve('amd');
+          resolve('other');
+        });
+        return;
+      }
+      resolve('other');
+    } catch (_) {
+      resolve('other');
+    }
+  });
+}
+
+async function gpuVendor() {
+  if (gpuVendorCache === null) gpuVendorCache = await detectGpuVendor();
+  return gpuVendorCache;
+}
+
+function downloadFile(url, dest, redirects = 5) {
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith('https:') ? https : http;
+    const req = lib.get(url, { timeout: 60000 }, (res) => {
+      const status = res.statusCode || 0;
+      if (status >= 300 && status < 400 && res.headers.location) {
+        res.resume();
+        if (redirects <= 0) { reject(new Error('too many redirects')); return; }
+        resolve(downloadFile(new URL(res.headers.location, url).toString(), dest, redirects - 1));
+        return;
+      }
+      if (status !== 200) { res.resume(); reject(new Error(`HTTP ${status}`)); return; }
+      const out = fs.createWriteStream(dest);
+      res.pipe(out);
+      out.on('finish', () => out.close(() => resolve(dest)));
+      out.on('error', reject);
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('download timed out')); });
+  });
+}
+
+function extractArchive(archivePath, destDir) {
+  return new Promise((resolve, reject) => {
+    // Linux ships a .tar.zst (tar --zstd); Windows ships a .zip (bundled bsdtar reads zip).
+    const args = process.platform === 'win32'
+      ? ['-xf', archivePath, '-C', destDir]
+      : ['--zstd', '-xf', archivePath, '-C', destDir];
+    const child = spawn('tar', args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    let err = '';
+    child.stderr.on('data', (chunk) => { err += chunk; });
+    child.on('error', reject);
+    child.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`tar exit ${code}: ${String(err).slice(0, 200)}`))));
+  });
+}
+
+async function ensureRocmRuntime() {
+  // Provision (once) and return the path to a ROCm-capable ollama binary, or null.
+  if (!OLLAMA_RES_DIR) return null;
+  const rocmDir = path.join(app.getPath('userData'), 'ollama-rocm');
+  const rocmBin = process.platform === 'win32'
+    ? path.join(rocmDir, 'ollama.exe')
+    : path.join(rocmDir, 'bin', 'ollama');
+  const sentinel = path.join(rocmDir, '.rocm-ready');
+  if (fs.existsSync(sentinel) && fs.existsSync(rocmBin)) return rocmBin;
+
+  logGpu('AMD GPU detected — provisioning Ollama ROCm runtime (one-time ~1 GB download)…');
+  const archive = path.join(app.getPath('userData'), process.platform === 'win32' ? 'ollama-rocm.zip' : 'ollama-rocm.tar.zst');
+  try {
+    fs.rmSync(rocmDir, { recursive: true, force: true });
+    fs.mkdirSync(rocmDir, { recursive: true });
+    // Writable copy of the bundled runtime (binary + CPU runner), minus the CUDA
+    // libs an AMD box won't use; the ROCm overlay is extracted on top next.
+    fs.cpSync(OLLAMA_RES_DIR, rocmDir, {
+      recursive: true,
+      filter: (src) => !/[\\/]lib[\\/]ollama[\\/]cuda/i.test(src),
+    });
+    await downloadFile(OLLAMA_ROCM_URL, archive);
+    await extractArchive(archive, rocmDir);
+    fs.rmSync(archive, { force: true });
+    if (!fs.existsSync(rocmBin)) throw new Error('ROCm runtime binary missing after extraction');
+    ensureExecutable(rocmBin);
+    fs.writeFileSync(sentinel, new Date().toISOString());
+    logGpu('Ollama ROCm runtime ready.');
+    return rocmBin;
+  } catch (err) {
+    logGpu(`ROCm provisioning failed (${err.message}); falling back to the bundled runtime.`);
+    try { fs.rmSync(archive, { force: true }); } catch (_) { /* ignore */ }
+    return null;
+  }
+}
+
+async function resolveOllamaRuntime() {
+  try {
+    detectedGpu = await gpuVendor();
+    logGpu(`GPU vendor: ${detectedGpu}`);
+    if (detectedGpu === 'amd') {
+      const rocmBin = await ensureRocmRuntime();
+      if (rocmBin && fs.existsSync(rocmBin)) {
+        activeOllamaRuntime = 'rocm';
+        return rocmBin;
+      }
+    }
+  } catch (err) {
+    logGpu(`GPU runtime resolution failed (${err.message}); using bundled runtime.`);
+  }
+  activeOllamaRuntime = 'bundled';
+  return BUNDLED_OLLAMA;
+}
+
 async function startBundledOllama() {
   // Zero-setup local brain: start the bundled Ollama, unless a system Ollama is
   // already serving on the port (then we just use that). No-op in dev (no bundle).
   if (!BUNDLED_OLLAMA || !fs.existsSync(BUNDLED_OLLAMA)) return;
-  ensureExecutable(BUNDLED_OLLAMA);
   if (await ollamaResponding()) return;
+  // Pick a GPU-capable runtime (NVIDIA is bundled; AMD is fetched once), always
+  // falling back to the bundled binary.
+  const ollamaBin = (await resolveOllamaRuntime()) || BUNDLED_OLLAMA;
+  ensureExecutable(ollamaBin);
   const modelsDir = path.join(app.getPath('userData'), 'ollama-models');
   try {
     fs.mkdirSync(modelsDir, { recursive: true });
@@ -332,7 +487,7 @@ async function startBundledOllama() {
     // ignore
   }
   try {
-    ollamaProcess = spawn(BUNDLED_OLLAMA, ['serve'], {
+    ollamaProcess = spawn(ollamaBin, ['serve'], {
       env: { ...process.env, OLLAMA_HOST: `127.0.0.1:${OLLAMA_PORT}`, OLLAMA_MODELS: modelsDir },
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -356,6 +511,13 @@ function registerIpcHandlers() {
       return null;
     }
     return result.filePaths[0];
+  });
+
+  // Report local-model GPU acceleration status so the UI can confirm it works.
+  ipcMain.handle('greyiq:gpu-info', async () => {
+    const vendor = await gpuVendor();
+    const accelerated = vendor === 'nvidia' || (vendor === 'amd' && activeOllamaRuntime === 'rocm');
+    return { vendor, runtime: activeOllamaRuntime, accelerated };
   });
 }
 

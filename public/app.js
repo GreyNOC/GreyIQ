@@ -3149,6 +3149,27 @@ els.toolkitCategory?.addEventListener("change", renderToolkit);
 els.toolkitClass?.addEventListener("change", renderToolkit);
 els.toolkitSearch?.addEventListener("input", renderToolkit);
 
+// Show local-model (Ollama) GPU acceleration status — desktop builds only.
+async function renderGpuAccel() {
+  const el = document.querySelector("#brainAccel");
+  if (!el || !window.greyiqDesktop || typeof window.greyiqDesktop.gpuInfo !== "function") return;
+  try {
+    const info = await window.greyiqDesktop.gpuInfo();
+    if (!info) return;
+    if (info.accelerated) {
+      const how = info.runtime === "rocm" ? "ROCm" : "CUDA";
+      const vendor = info.vendor === "amd" ? "AMD" : "NVIDIA";
+      el.textContent = `Local model GPU: ${vendor} (${how}) ✓`;
+    } else if (info.vendor === "amd") {
+      el.textContent = "Local model GPU: AMD detected — setting up ROCm (first run)…";
+    } else {
+      el.textContent = "Local model: CPU (no supported GPU detected)";
+    }
+  } catch (_) {
+    // browser / non-desktop: no GPU info available
+  }
+}
+
 async function boot() {
   applyTheme();
   backend = new AccelerationBackend();
@@ -3167,6 +3188,7 @@ async function boot() {
   void loadCoderConfig();
   void loadBountyProfiles();
   void loadToolkit();
+  void renderGpuAccel();
   render();
   renderWorkbench();
   if (state.agentMode && state.agentWorkspace) {
