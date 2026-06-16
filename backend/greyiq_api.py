@@ -8,26 +8,45 @@ import shutil
 import sys
 import threading
 import traceback
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 import uvicorn
 from pydantic import BaseModel, Field
 
-BACKEND_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BACKEND_DIR.parent
-PUBLIC_DIR = PROJECT_ROOT / "public"
-SEED_DIR = BACKEND_DIR / "seed"
+if getattr(sys, "frozen", False):
+    # PyInstaller bundle: source, public/ and seed/ are unpacked under _MEIPASS.
+    # RUNTIME_DIR still comes from the environment so user data stays writable.
+    BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    BACKEND_DIR = BUNDLE_DIR
+    PROJECT_ROOT = BUNDLE_DIR
+    PUBLIC_DIR = BUNDLE_DIR / "public"
+    SEED_DIR = BUNDLE_DIR / "seed"
+else:
+    BACKEND_DIR = Path(__file__).resolve().parent
+    PROJECT_ROOT = BACKEND_DIR.parent
+    PUBLIC_DIR = PROJECT_ROOT / "public"
+    SEED_DIR = BACKEND_DIR / "seed"
 RUNTIME_DIR = Path(os.getenv("GREYIQ_RUNTIME_DIR", PROJECT_ROOT / "runtime")).resolve()
 
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+import agent as coding_agent  # noqa: E402
+import coder  # noqa: E402
+import workspace as workspace_fs  # noqa: E402
 from ai_core.core_store import AICoreStore, DEFAULT_CORE_ID, slugify  # noqa: E402
+from document_ingest import (  # noqa: E402
+    collect_supported_files,
+    ingest_source_files,
+    summarize_ingest,
+    supported_extensions,
+)
 from repo_ingest import ingest_repositories  # noqa: E402
 from solin_core import SolinEngine  # noqa: E402
 from training_runtime import (  # noqa: E402
@@ -38,10 +57,38 @@ from training_runtime import (  # noqa: E402
     TrainingSettings,
     run_training_loop,
 )
+from bughunter.scan_service import run_code_scan  # noqa: E402
+from bughunter.web_scan_service import run_web_scan  # noqa: E402
+from bughunter.live_scan_service import run_live_scan  # noqa: E402
+from bughunter.triage import triage  # noqa: E402
+from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
+from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names  # noqa: E402
+from bughunter import toolkit as toolkit_lib  # noqa: E402
+from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E402
 
 
 APP_NAME = "GreyIQ"
-VERSION = "0.2.0"
+VERSION = "0.9.3"
+_CURRENT_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar("greyiq_current_scope", default=None)
+_CSP = (
+    "default-src 'self'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "connect-src 'self'; "
+    "font-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "frame-ancestors 'none'"
+)
+_SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"no-referrer"),
+    (b"x-frame-options", b"DENY"),
+    (b"cross-origin-opener-policy", b"same-origin"),
+    (b"cross-origin-resource-policy", b"same-origin"),
+    (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"),
+)
 SEED_FILES = (
     "best_model.pt",
     "solin_checkpoint.pt",
@@ -52,6 +99,9 @@ SEED_FILES = (
 )
 SEED_DATA_FILES = (
     "greyiq_starter_knowledge.txt",
+    # Native-text extract of the Manual_pdfs library, bundled so the local model
+    # trains on it on first run (copied into RUNTIME_DIR/data by ensure_runtime).
+    "greyiq_manual_pdfs.txt",
 )
 TRAINING_SOURCE_FILES = {
     "src_starter_knowledge": "greyiq_starter_knowledge.txt",
@@ -61,15 +111,86 @@ TRAINING_SOURCE_FILES = {
     "src_imported_docs": "greyiq_imported_docs.txt",
 }
 
+BUGHUNTER_CORE_ID = "core_greyiq_bughunter"
+BUGHUNTER_CORE: dict[str, Any] = {
+    "id": BUGHUNTER_CORE_ID,
+    "name": "GreyIQ BugHunter",
+    "mode": "Find, Prove, Fix",
+    "type": "security_auditor",
+    "description": (
+        "Authorized bug and vulnerability finder for code (and, as more engines "
+        "land, live apps). Runs GreyIQ's local static scanner, then explains, "
+        "prioritizes, and proposes fixes - always citing file and line."
+    ),
+    "personality": "direct",
+    "skills": [
+        "code_scanning",
+        "vulnerability_triage",
+        "secure_code_review",
+        "exploit_reasoning",
+        "remediation",
+        "debugging",
+    ],
+    "safetyMode": "open_local",
+    "confidencePolicy": [
+        "cite_file_and_line",
+        "separate_proven_from_suspected",
+        "rank_by_severity_and_exploitability",
+        "give_minimal_repro_or_fix",
+        "name_uncertainty",
+    ],
+    "responseContract": [
+        "state_the_finding_and_where",
+        "explain_why_it_is_exploitable",
+        "rate_severity_and_confidence",
+        "give_the_smallest_fix",
+        "note_what_to_verify_next",
+    ],
+    "starterKnowledge": [
+        "GreyIQ's local code scanner flags command injection, eval/exec on "
+        "dynamic input, hardcoded secrets, weak crypto, vulnerable dependencies, "
+        "risky CI workflows, suspicious network calls, and backdoor patterns.",
+        "Only scan code you own or are explicitly authorized to review.",
+        "A finding is a lead, not a verdict: confirm exploitability before "
+        "calling something critical.",
+    ],
+    "sourceIds": [
+        "src_starter_knowledge",
+        "src_local_notes",
+        "src_imported_docs",
+    ],
+}
+
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
     bot: dict[str, Any] = Field(default_factory=dict)
     memories: list[dict[str, Any]] = Field(default_factory=list)
+    history: list[dict[str, Any]] = Field(default_factory=list)
     max_new_tokens: int = Field(default=96, ge=1, le=512)
     temperature: float = Field(default=0.32, ge=0.0, le=2.0)
     auto_capture: bool = True
     mode: str | None = None
+
+
+class CoderConfigRequest(BaseModel):
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=8000)
+    workspace: str = Field(min_length=1, max_length=4000)
+    history: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class WorkspaceTreeRequest(BaseModel):
+    workspace: str = Field(min_length=1, max_length=4000)
+    max_entries: int = Field(default=1000, ge=1, le=20000)
+
+
+class WorkspaceFileRequest(BaseModel):
+    workspace: str = Field(min_length=1, max_length=4000)
+    path: str = Field(min_length=1, max_length=4000)
 
 
 class PreferenceRequest(BaseModel):
@@ -105,6 +226,46 @@ class RepoIngestRequest(BaseModel):
 
 class CoreSaveRequest(BaseModel):
     core: dict[str, Any]
+
+
+class ScanCodeRequest(BaseModel):
+    target: str = Field(min_length=1, max_length=4000)
+    target_type: str = Field(default="path", max_length=20)
+    max_files: int = Field(default=5000, ge=1, le=100_000)
+    include_globs: list[str] = Field(default_factory=list)
+    exclude_globs: list[str] = Field(default_factory=list)
+
+
+class WebScanRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+
+
+class LiveScanRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+    wait_seconds: float = Field(default=6.0, ge=0.0, le=30.0)
+
+
+class BountyScanRequest(BaseModel):
+    target: str = Field(min_length=1, max_length=4000)
+    profile: str = Field(default="full-sweep", max_length=60)
+    vuln_class: str | None = Field(default=None, max_length=60)
+    output_dir: str | None = Field(default=None, max_length=4000)
+    scope: str = Field(default="", max_length=2000)
+    authorized: bool = False
+    run_live: bool = False
+    per_finding: bool = False
+    max_files: int = Field(default=5000, ge=1, le=100_000)
+
+
+class AgentRedteamRequest(BaseModel):
+    authorized: bool = False
+    include_behavioral: bool = False
+
+
+class TrainFolderRequest(BaseModel):
+    folder: str = Field(min_length=1, max_length=4000)
+    recursive: bool = True
+    max_files: int = Field(default=2000, ge=1, le=20000)
 
 
 class HTTPError(Exception):
@@ -178,9 +339,14 @@ class GreyIQRuntime:
         self.engine: SolinEngine | None = None
         self.engine_error = ""
         self.training = TrainingState()
+        self.model_pull: dict[str, Any] = {
+            "active": False, "model": "", "status": "", "percent": 0,
+            "completed": 0, "total": 0, "done": False, "error": "",
+        }
         self.store = AICoreStore(RUNTIME_DIR)
         ensure_runtime()
         self._rewrite_core_defaults()
+        self._ensure_bughunter_core()
 
     def _rewrite_core_defaults(self) -> None:
         state = self.store.load()
@@ -206,6 +372,12 @@ class GreyIQRuntime:
                 changed = True
         if changed:
             self.store.save(state)
+
+    def _ensure_bughunter_core(self) -> None:
+        state = self.store.load()
+        if any(core.get("id") == BUGHUNTER_CORE_ID for core in state.get("cores", [])):
+            return
+        self.store.save_core(dict(BUGHUNTER_CORE), who="greyiq")
 
     def log(self, message: str) -> None:
         stamp = datetime.now(UTC).strftime("%H:%M:%S")
@@ -280,7 +452,259 @@ class GreyIQRuntime:
                 self.engine.safety = OpenPolicy()
         return self.status()
 
+    def _code_router_config(self) -> dict[str, Any]:
+        payload = read_json(RUNTIME_DIR / "solin_runtime_config.json", {})
+        config = payload.get("code_router") if isinstance(payload, dict) else None
+        return config if isinstance(config, dict) else {}
+
+    def _coder_config(self) -> dict[str, Any]:
+        payload = read_json(RUNTIME_DIR / "solin_runtime_config.json", {})
+        config = payload.get("coder") if isinstance(payload, dict) else None
+        return config if isinstance(config, dict) else {}
+
+    def save_coder_config(self, update: dict[str, Any]) -> dict[str, Any]:
+        runtime_path = RUNTIME_DIR / "solin_runtime_config.json"
+        payload = read_json(runtime_path, {})
+        if not isinstance(payload, dict):
+            payload = {}
+        payload["coder"] = coder.merge_update(payload.get("coder"), update)
+        write_json(runtime_path, payload)
+        return coder.public_config(payload["coder"])
+
+    def coder_status(self) -> dict[str, Any]:
+        return coder.public_config(self._coder_config())
+
+    def coder_test(self) -> dict[str, Any]:
+        try:
+            result = coder.generate(
+                [{"role": "user", "content": "Reply with exactly: OK"}],
+                self._coder_config(),
+            )
+            return {"ok": True, "provider": result["provider"], "model": result["model"], "reply": result["text"][:200]}
+        except coder.CoderError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def _local_brain(self) -> tuple[str, str]:
+        cfg = coder.coder_config(self._coder_config())
+        block = cfg.get("local") or {}
+        return coder.ollama_host(block.get("base_url")), str(block.get("model") or "").strip()
+
+    def list_local_models(self) -> dict[str, Any]:
+        host, model = self._local_brain()
+        try:
+            installed = coder.ollama_list_models(host)
+            return {
+                "ok": True,
+                "installed": installed,
+                "configured": model,
+                "present": bool(model) and coder.model_installed(installed, model),
+            }
+        except coder.CoderError as exc:
+            return {"ok": False, "error": str(exc), "configured": model, "installed": [], "present": False}
+
+    def model_pull_status(self) -> dict[str, Any]:
+        with self.lock:
+            return dict(self.model_pull)
+
+    def start_model_pull(self, model: str = "") -> dict[str, Any]:
+        host, configured = self._local_brain()
+        target = (model or configured).strip()
+        if not target:
+            return {"ok": False, "error": "No local model is configured."}
+        with self.lock:
+            if self.model_pull.get("active"):
+                return {"ok": False, "error": "A model download is already in progress.", **self.model_pull}
+            self.model_pull = {
+                "active": True, "model": target, "status": "starting", "percent": 0,
+                "completed": 0, "total": 0, "done": False, "error": "",
+            }
+
+        def worker() -> None:
+            def progress(event: dict[str, Any]) -> None:
+                with self.lock:
+                    if event.get("status"):
+                        self.model_pull["status"] = str(event["status"])
+                    total = int(event.get("total") or 0)
+                    completed = int(event.get("completed") or 0)
+                    if total > 0:
+                        self.model_pull["total"] = total
+                        self.model_pull["completed"] = completed
+                        self.model_pull["percent"] = min(100, int(completed * 100 / total))
+
+            try:
+                coder.ollama_pull(host, target, timeout=3600.0, progress_cb=progress)
+                with self.lock:
+                    self.model_pull.update({"active": False, "done": True, "status": "success", "percent": 100})
+            except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+                self.log(f"Model pull failed: {exc}")
+                with self.lock:
+                    self.model_pull.update({"active": False, "done": True, "error": str(exc), "status": "error"})
+
+        threading.Thread(target=worker, name="ollama-pull", daemon=True).start()
+        return {"ok": True, "active": True, "model": target}
+
+    def run_agent(self, request: AgentRequest) -> dict[str, Any]:
+        try:
+            result = coding_agent.run_agent(
+                request.message,
+                request.history,
+                request.workspace,
+                self._coder_config(),
+                runtime_dir=RUNTIME_DIR,
+                seed_dir=SEED_DIR,
+            )
+            return {
+                "ok": True,
+                "request_id": uuid4().hex,
+                "message": friendly_branding(result["text"]),
+                "transcript": result["transcript"],
+                "steps": result["steps"],
+                "changes": result.get("changes", []),
+                "touched_files": result.get("touched_files", []),
+                "model_name": f"{result['provider']}:{result['model']}",
+                "provider": result["provider"],
+            }
+        except coding_agent.AgentError as exc:
+            return {
+                "ok": False,
+                "request_id": uuid4().hex,
+                "message": str(exc),
+                "transcript": [],
+                "steps": 0,
+                "changes": [],
+                "touched_files": [],
+            }
+
+    def run_bounty(self, request: "BountyScanRequest") -> dict[str, Any]:
+        return run_bounty_hunt(
+            request.target,
+            request.profile,
+            request.vuln_class,
+            request.output_dir,
+            request.scope,
+            request.authorized,
+            self._coder_config(),
+            default_reports_dir=RUNTIME_DIR / "reports",
+            seed_dir=SEED_DIR,
+            runtime_dir=RUNTIME_DIR,
+            version=VERSION,
+            run_live=request.run_live,
+            max_files=request.max_files,
+            per_finding=request.per_finding,
+        )
+
+    def run_agent_redteam(self, request: "AgentRedteamRequest") -> dict[str, Any]:
+        return run_agent_redteam(
+            None,  # red-team always writes to the runtime reports dir (no caller-chosen path)
+            request.authorized,
+            self._coder_config(),
+            default_reports_dir=RUNTIME_DIR / "reports",
+            runtime_dir=RUNTIME_DIR,
+            seed_dir=SEED_DIR,
+            version=VERSION,
+            include_behavioral=request.include_behavioral,
+        )
+
+    def _build_coder_messages(self, request: ChatRequest, limit: int) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = []
+        for turn in (request.history or [])[-max(limit, 0):]:
+            if not isinstance(turn, dict):
+                continue
+            role = str(turn.get("role") or "").strip()
+            content = str(turn.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": request.message})
+        # Anthropic requires the first message to be a user turn.
+        while messages and messages[0]["role"] != "user":
+            messages.pop(0)
+        return messages
+
+    def _coder_system_prompt(self, request: ChatRequest, cfg: dict[str, Any]) -> str:
+        base = str(cfg.get("system_prompt") or coder.DEFAULT_SYSTEM_PROMPT)
+        bot = request.bot or {}
+        extras: list[str] = []
+        persona = str(bot.get("persona") or "").strip()
+        style = str(bot.get("style") or "").strip()
+        if persona:
+            extras.append(f"Persona: {persona}")
+        if style:
+            extras.append(f"Preferred style: {style}")
+        for memory in (request.memories or [])[-8:]:
+            if isinstance(memory, dict) and memory.get("kind") == "preference" and memory.get("text"):
+                extras.append(f"User preference: {memory['text']}")
+        return base + ("\n\n" + "\n".join(extras) if extras else "")
+
+    def _coder_reply(self, request: ChatRequest) -> dict[str, Any] | None:
+        raw = self._coder_config()
+        if not coder.coder_enabled(raw):
+            return None
+        cfg = coder.coder_config(raw)
+        messages = self._build_coder_messages(request, int(cfg.get("history_turns") or 12))
+        # The coding brain runs with a coding-focused system prompt; bot persona,
+        # style, and stored preferences are layered on top.
+        cfg = dict(cfg)
+        cfg["system_prompt"] = self._coder_system_prompt(request, cfg)
+        try:
+            result = coder.generate(messages, cfg)
+        except coder.CoderError as exc:
+            self.log(f"Coding brain error: {exc}")
+            return {
+                "request_id": uuid4().hex,
+                "message": (
+                    f"The coding brain ({cfg.get('provider')}) could not respond: {exc}\n\n"
+                    "Check the brain settings (provider, model, API key / server), or turn it off "
+                    "to use the local fallback."
+                ),
+                "used_fallback": True,
+                "captured_for_training": False,
+                "model_name": f"coder:{cfg.get('provider')}:error",
+                "device": "remote",
+                "citations": [],
+                "ai_core": self.store.load(),
+            }
+        return {
+            "request_id": uuid4().hex,
+            "message": friendly_branding(result["text"]),
+            "used_fallback": False,
+            "captured_for_training": False,
+            "model_name": f"{result['provider']}:{result['model']}",
+            "device": "remote" if result["provider"] == "anthropic" else "local-model",
+            "citations": [],
+            "ai_core": self.store.load(),
+        }
+
+    def _maybe_scan_reply(self, request: ChatRequest) -> dict[str, Any] | None:
+        command = detect_scan_command(request.message)
+        if command is None:
+            return None
+        kind, target = command
+        result = run_scan(kind, target)
+        triaged = triage(result, self._code_router_config())
+        return {
+            "request_id": uuid4().hex,
+            "message": friendly_branding(triaged["summary"]),
+            "used_fallback": not bool(result.get("ok")),
+            "captured_for_training": False,
+            "model_name": "bughunter" + ("+remote" if triaged["used_remote"] else ""),
+            "device": "scanner",
+            "citations": triaged["citations"],
+            "ai_core": self.store.load(),
+            "scan": {
+                key: result.get(key)
+                for key in ("ok", "scan_type", "risk", "score", "finding_count", "target")
+            },
+        }
+
     def chat(self, request: ChatRequest) -> dict[str, Any]:
+        scan_reply = self._maybe_scan_reply(request)
+        if scan_reply is not None:
+            return scan_reply
+        # A configured coding brain (local model or Claude) answers instead of the
+        # tiny offline model. TinyGPT is the last-resort fallback below.
+        coder_reply = self._coder_reply(request)
+        if coder_reply is not None:
+            return coder_reply
         try:
             engine = self.get_engine()
             engine.safety = OpenPolicy()
@@ -530,6 +954,18 @@ def ensure_runtime() -> None:
         dst = RUNTIME_DIR / "data" / name
         if src.exists() and not dst.exists():
             shutil.copy2(src, dst)
+    # Bounty: default reports folder + seed the .md playbooks (user-editable;
+    # no clobber so edits survive upgrades). bounty._load_playbook falls back to
+    # the bundled seed copy if a runtime copy is missing.
+    (RUNTIME_DIR / "reports").mkdir(parents=True, exist_ok=True)
+    seed_bounty = SEED_DIR / "bounty"
+    if seed_bounty.is_dir():
+        dst_bounty = RUNTIME_DIR / "bounty"
+        dst_bounty.mkdir(parents=True, exist_ok=True)
+        for playbook in seed_bounty.glob("*.md"):
+            dst_playbook = dst_bounty / playbook.name
+            if not dst_playbook.exists():
+                shutil.copy2(playbook, dst_playbook)
     train_path = RUNTIME_DIR / "train.txt"
     if not train_path.exists():
         train_path.write_text(default_training_text(), encoding="utf-8")
@@ -613,11 +1049,75 @@ def append_training_text(file_name: str, text: str) -> Path:
     return path
 
 
+def ingest_training_folder(request: TrainFolderRequest) -> dict[str, Any]:
+    """Read a local folder and add its supported files to the training data.
+
+    Extracts text from PDFs, images (OCR if available), DOCX, and plain-text
+    files into RUNTIME_DIR/data, where the trainer reads it. Re-ingesting is
+    cheap: the manifest skips files whose contents have not changed. The ingested
+    text counts as "Imported Documents" (src_imported_docs) for training.
+    """
+    folder = Path(request.folder).expanduser()
+    if not folder.exists() or not folder.is_dir():
+        raise HTTPError(400, f"Not a folder: {request.folder}")
+
+    files = collect_supported_files(folder, recursive=request.recursive)
+    if not files:
+        return {
+            "ok": True,
+            "folder": str(folder),
+            "scanned": 0,
+            "truncated": False,
+            "summary": {"converted": 0, "unchanged": 0, "failed": 0},
+            "supported_extensions": list(supported_extensions()),
+            "message": "No supported files found in that folder.",
+        }
+
+    truncated = len(files) > request.max_files
+    selected = files[: request.max_files]
+
+    data_dir = RUNTIME_DIR / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    results = ingest_source_files(
+        source_files=selected,
+        output_folder=data_dir,
+        manifest_path=RUNTIME_DIR / "pdf_manifest.json",
+        method="auto",
+        logger=runtime.log,
+    )
+    summary = summarize_ingest(results)
+    added = summary.get("converted", 0) + summary.get("unchanged", 0)
+    message = (
+        f"Added {added} file(s) from {folder.name or folder}"
+        f" ({summary.get('converted', 0)} new, {summary.get('unchanged', 0)} already current,"
+        f" {summary.get('failed', 0)} skipped)."
+    )
+    if truncated:
+        message += f" Limited to the first {request.max_files} of {len(files)} files — run again to continue."
+    return {
+        "ok": True,
+        "folder": str(folder),
+        "scanned": len(selected),
+        "total_found": len(files),
+        "truncated": truncated,
+        "summary": summary,
+        "supported_extensions": list(supported_extensions()),
+        "message": message,
+    }
+
+
 runtime = GreyIQRuntime()
 
 
 def health() -> dict[str, Any]:
     return {"status": "ok", "app": APP_NAME, "version": VERSION}
+
+
+def toolkit_catalog() -> dict[str, Any]:
+    """Curated Pentest Toolkit catalog plus friendly vuln-class names for UI badges."""
+    payload = toolkit_lib.catalog_payload(SEED_DIR, RUNTIME_DIR)
+    payload["vuln_classes"] = vuln_class_names()
+    return payload
 
 
 def normalize_rating(value: str | None) -> str:
@@ -718,14 +1218,89 @@ async def read_json_body(receive: Any) -> dict[str, Any]:
     return payload
 
 
-def response_headers(content_type: str, content_length: int = 0) -> list[tuple[bytes, bytes]]:
+def _header(scope: dict[str, Any] | None, name: str) -> str:
+    if not scope:
+        return ""
+    expected = name.lower().encode("ascii")
+    for key, value in scope.get("headers", []):
+        if key.lower() == expected:
+            return value.decode("latin-1", errors="replace")
+    return ""
+
+
+def _normalize_origin(value: str) -> str:
+    raw = value.strip()
+    if not raw or raw == "null":
+        return ""
+    try:
+        parsed = urlparse(raw)
+        port = parsed.port
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    if parsed.username or parsed.password:
+        return ""
+    try:
+        hostname = parsed.hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return ""
+    netloc = hostname if port is None else f"{hostname}:{port}"
+    return f"{parsed.scheme}://{netloc}"
+
+
+def _configured_origins() -> set[str]:
+    raw = os.getenv("GREYIQ_ALLOWED_ORIGINS", "")
+    return {
+        normalized
+        for normalized in (_normalize_origin(part) for part in raw.split(","))
+        if normalized
+    }
+
+
+def _same_origin(scope: dict[str, Any] | None) -> str:
+    host = _header(scope, "host").strip().lower()
+    if not host:
+        return ""
+    scheme = str((scope or {}).get("scheme") or "http").lower()
+    return f"{scheme}://{host}"
+
+
+def _request_origin_allowed(scope: dict[str, Any] | None = None) -> bool:
+    scope = scope or _CURRENT_SCOPE.get()
+    origin = _header(scope, "origin")
+    if not origin:
+        return True
+    normalized = _normalize_origin(origin)
+    if not normalized:
+        return False
+    return normalized == _same_origin(scope) or normalized in _configured_origins()
+
+
+def _cors_headers(scope: dict[str, Any] | None) -> list[tuple[bytes, bytes]]:
+    origin = _header(scope, "origin")
+    if not origin or not _request_origin_allowed(scope):
+        return []
+    normalized = _normalize_origin(origin)
     return [
-        (b"content-type", content_type.encode("utf-8")),
-        (b"content-length", str(content_length).encode("ascii")),
-        (b"access-control-allow-origin", b"*"),
+        (b"access-control-allow-origin", normalized.encode("ascii")),
         (b"access-control-allow-methods", b"GET,POST,OPTIONS"),
         (b"access-control-allow-headers", b"content-type,accept"),
+        (b"access-control-max-age", b"600"),
+        (b"vary", b"Origin"),
     ]
+
+
+def response_headers(content_type: str, content_length: int = 0) -> list[tuple[bytes, bytes]]:
+    headers = [
+        (b"content-type", content_type.encode("utf-8")),
+        (b"content-length", str(content_length).encode("ascii")),
+    ]
+    if content_type.startswith("text/html"):
+        headers.append((b"content-security-policy", _CSP.encode("utf-8")))
+    headers.extend(_SECURITY_HEADERS)
+    headers.extend(_cors_headers(_CURRENT_SCOPE.get()))
+    return headers
 
 
 async def send_json(send: Any, payload: Any, status_code: int = 200) -> None:
@@ -769,11 +1344,19 @@ async def send_empty(send: Any, status_code: int = 204) -> None:
 
 
 async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
+    _CURRENT_SCOPE.set(scope)
     method = str(scope.get("method") or "GET").upper()
     path = str(scope.get("path") or "/")
 
     if method == "OPTIONS":
+        if not _request_origin_allowed(scope):
+            await send_json(send, {"error": "origin not allowed"}, 403)
+            return
         await send_empty(send)
+        return
+
+    if not _request_origin_allowed(scope):
+        await send_json(send, {"error": "origin not allowed"}, 403)
         return
 
     try:
@@ -789,6 +1372,45 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/chat":
             request = validate_payload(ChatRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.chat, request))
+            return
+        if method == "POST" and path == "/api/scan/code":
+            request = validate_payload(ScanCodeRequest, await read_json_body(receive))
+            await send_json(
+                send,
+                await asyncio.to_thread(
+                    run_code_scan,
+                    request.target,
+                    request.target_type,
+                    request.max_files,
+                    tuple(request.include_globs),
+                    tuple(request.exclude_globs),
+                ),
+            )
+            return
+        if method == "POST" and path == "/api/scan/web":
+            request = validate_payload(WebScanRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(run_web_scan, request.url))
+            return
+        if method == "POST" and path == "/api/scan/live":
+            request = validate_payload(LiveScanRequest, await read_json_body(receive))
+            await send_json(
+                send,
+                await asyncio.to_thread(run_live_scan, request.url, request.wait_seconds),
+            )
+            return
+        if method == "GET" and path == "/api/bounty/types":
+            await send_json(send, bounty_profiles())
+            return
+        if method == "GET" and path == "/api/toolkit":
+            await send_json(send, toolkit_catalog())
+            return
+        if method == "POST" and path == "/api/bounty/scan":
+            request = validate_payload(BountyScanRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.run_bounty, request))
+            return
+        if method == "POST" and path == "/api/agent/redteam":
+            request = validate_payload(AgentRedteamRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.run_agent_redteam, request))
             return
         if method == "GET" and path == "/api/cores":
             await send_json(send, await asyncio.to_thread(runtime.store.load))
@@ -809,6 +1431,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             request = validate_payload(TrainingRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.start_training, request))
             return
+        if method == "POST" and path == "/api/train/folder":
+            request = validate_payload(TrainFolderRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(ingest_training_folder, request))
+            return
         if method == "GET" and path == "/api/train/status":
             await send_json(send, runtime.training_payload())
             return
@@ -827,6 +1453,45 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/runtime/device":
             request = validate_payload(DeviceRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.set_device, request.preference))
+            return
+        if method == "GET" and path == "/api/coder":
+            await send_json(send, await asyncio.to_thread(runtime.coder_status))
+            return
+        if method == "POST" and path == "/api/coder":
+            request = validate_payload(CoderConfigRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.save_coder_config, request.config))
+            return
+        if method == "POST" and path == "/api/coder/test":
+            await send_json(send, await asyncio.to_thread(runtime.coder_test))
+            return
+        if method == "GET" and path == "/api/coder/models":
+            await send_json(send, await asyncio.to_thread(runtime.list_local_models))
+            return
+        if method == "POST" and path == "/api/coder/pull":
+            body = await read_json_body(receive)
+            model = str((body or {}).get("model") or "")
+            await send_json(send, await asyncio.to_thread(runtime.start_model_pull, model))
+            return
+        if method == "GET" and path == "/api/coder/pull":
+            await send_json(send, runtime.model_pull_status())
+            return
+        if method == "POST" and path == "/api/agent":
+            request = validate_payload(AgentRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.run_agent, request))
+            return
+        if method == "POST" and path == "/api/workspace/tree":
+            request = validate_payload(WorkspaceTreeRequest, await read_json_body(receive))
+            await send_json(
+                send,
+                await asyncio.to_thread(workspace_fs.list_tree, request.workspace, request.max_entries),
+            )
+            return
+        if method == "POST" and path == "/api/workspace/file":
+            request = validate_payload(WorkspaceFileRequest, await read_json_body(receive))
+            await send_json(
+                send,
+                await asyncio.to_thread(workspace_fs.read_file, request.workspace, request.path),
+            )
             return
         if path.startswith("/api/"):
             await send_json(send, {"error": "not found"}, 404)
@@ -877,7 +1542,14 @@ app = GreyIQASGI()
 def main() -> None:
     host = os.getenv("GREYIQ_HOST", "127.0.0.1")
     port = int(os.getenv("GREYIQ_PORT", os.getenv("PORT", "8766")))
-    uvicorn.run("backend.greyiq_api:app", host=host, port=port, reload=False, log_level="info")
+    uvicorn.run(
+        "backend.greyiq_api:app",
+        host=host,
+        port=port,
+        reload=False,
+        log_level="info",
+        server_header=False,
+    )
 
 
 if __name__ == "__main__":

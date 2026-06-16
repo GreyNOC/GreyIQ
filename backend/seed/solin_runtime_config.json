@@ -10,6 +10,39 @@
     "remote_model": "",
     "remote_api_key": "",
     "remote_timeout_s": 60.0
+  },
+  "coder": {
+    "enabled": false,
+    "provider": "local",
+    "max_tokens": 8192,
+    "temperature": 0.2,
+    "timeout_s": 120.0,
+    "history_turns": 12,
+    "local": {
+      "base_url": "http://127.0.0.1:11434/v1",
+      "model": "qwen2.5-coder:14b",
+      "api_key": "",
+      "num_ctx": 16384
+    },
+    "anthropic": {
+      "model": "claude-opus-4-8",
+      "api_key": "",
+      "effort": "high",
+      "thinking": true
+    },
+    "openai": {
+      "base_url": "",
+      "model": "",
+      "api_key": ""
+    },
+    "agent": {
+      "allow_commands": false,
+      "max_steps": 25,
+      "command_timeout_s": 60.0,
+      "verify_command": "",
+      "skills_enabled": true,
+      "repo_map": true
+    }
   }
 }
 

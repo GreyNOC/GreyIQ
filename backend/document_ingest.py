@@ -493,7 +493,7 @@ def _output_name_for_source(source_path: Path) -> str:
 
     tag = suffix.lstrip(".") or "file"
     safe_stem = source_path.stem.strip() or "source"
-    digest = hashlib.md5(str(source_path.resolve()).encode("utf-8")).hexdigest()[:8]
+    digest = hashlib.sha256(str(source_path.resolve()).encode("utf-8")).hexdigest()[:8]
     return f"{safe_stem}__{tag}__{digest}.txt"
 
 

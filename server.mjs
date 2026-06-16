@@ -1,9 +1,30 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { extname, resolve, sep } from "node:path";
+import { extname, isAbsolute, join, normalize, relative, resolve } from "node:path";
 
+const host = process.env.HOST || process.env.GREYIQ_HOST || "127.0.0.1";
 const port = Number.parseInt(process.env.PORT || "4173", 10);
 const root = resolve("public");
+const securityHeaders = {
+  "Content-Security-Policy": [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "font-src 'self'",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "frame-ancestors 'none'"
+  ].join("; "),
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Embedder-Policy": "require-corp",
+  "Cross-Origin-Resource-Policy": "same-origin",
+  "Referrer-Policy": "no-referrer",
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=()"
+};
 
 const mimeTypes = new Map([
   [".html", "text/html; charset=utf-8"],
@@ -13,6 +34,11 @@ const mimeTypes = new Map([
   [".svg", "image/svg+xml; charset=utf-8"],
   [".ico", "image/x-icon"]
 ]);
+
+function isInsideRoot(filePath) {
+  const relativePath = relative(root, filePath);
+  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+}
 
 function resolvePublicPath(url) {
   let requestUrl;
@@ -30,9 +56,9 @@ function resolvePublicPath(url) {
     return null;
   }
 
-  const filePath = resolve(root, `.${decodedPathname}`);
+  const filePath = resolve(normalize(join(root, decodedPathname)));
 
-  if (filePath !== root && !filePath.startsWith(`${root}${sep}`)) {
+  if (!isInsideRoot(filePath)) {
     return null;
   }
 
@@ -51,19 +77,19 @@ const server = createServer(async (request, response) => {
 
     const body = await readFile(filePath);
     response.writeHead(200, {
+      ...securityHeaders,
       "Content-Type": mimeTypes.get(extname(filePath)) || "application/octet-stream",
-      "Cross-Origin-Opener-Policy": "same-origin",
-      "Cross-Origin-Embedder-Policy": "require-corp"
     });
     response.end(body);
   } catch (error) {
     response.writeHead(error.code === "ENOENT" ? 404 : 500, {
+      ...securityHeaders,
       "Content-Type": "text/plain; charset=utf-8"
     });
     response.end(error.code === "ENOENT" ? "Not found" : "Server error");
   }
 });
 
-server.listen(port, () => {
-  console.log(`GreyIQ is running at http://localhost:${port}`);
+server.listen(port, host, () => {
+  console.log(`GreyIQ is running at http://${host}:${port}`);
 });

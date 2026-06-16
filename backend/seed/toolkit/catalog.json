@@ -1,0 +1,3380 @@
+{
+  "version": 1,
+  "source": {
+    "attribution": "Curated from the awesome-pentest list (enaqx, CC-BY 4.0) and the awesome-osint list (jivoi, MIT).",
+    "sources": [
+      {
+        "name": "awesome-pentest",
+        "url": "https://github.com/enaqx/awesome-pentest",
+        "license": "CC-BY-4.0"
+      },
+      {
+        "name": "awesome-osint",
+        "url": "https://github.com/jivoi/awesome-osint",
+        "license": "MIT"
+      }
+    ]
+  },
+  "categories": [
+    {
+      "id": "recon-network",
+      "label": "Recon & Network",
+      "description": "Discovery, port/host scanning, traffic analysis, anonymity",
+      "order": 0
+    },
+    {
+      "id": "osint",
+      "label": "OSINT & Reconnaissance",
+      "description": "Open-source intelligence: people, usernames, emails, breaches, domains, and asset discovery",
+      "order": 1
+    },
+    {
+      "id": "web",
+      "label": "Web Exploitation",
+      "description": "Proxies, web scanners, fuzzers, injection and auth testing",
+      "order": 2
+    },
+    {
+      "id": "exploit-frameworks",
+      "label": "Exploitation Frameworks & Dev",
+      "description": "Exploit development, shellcoding, multi-paradigm frameworks",
+      "order": 3
+    },
+    {
+      "id": "password-hash",
+      "label": "Password & Hash Attacks",
+      "description": "Credential and hash cracking, brute-force",
+      "order": 4
+    },
+    {
+      "id": "reverse-static",
+      "label": "Reverse Engineering & Static Analysis",
+      "description": "Disassembly, decompilers, static analyzers, file/hex analysis",
+      "order": 5
+    },
+    {
+      "id": "post-exploitation",
+      "label": "Post-Exploitation & Evasion",
+      "description": "Privilege escalation, exfiltration, AV evasion (authorized testing only)",
+      "order": 6
+    },
+    {
+      "id": "cloud-mobile-host",
+      "label": "Cloud, Mobile & Host",
+      "description": "Cloud attack tools, mobile/OS utilities, ICS/SCADA",
+      "order": 7
+    },
+    {
+      "id": "social-physical",
+      "label": "Social Eng., Physical & Stego",
+      "description": "Social engineering, physical access, lock picking, steganography, side-channel",
+      "order": 8
+    },
+    {
+      "id": "platforms-training",
+      "label": "Platforms, Labs & Resources",
+      "description": "OS distros, vulnerable labs, CTF tools, courses, vuln databases, reference",
+      "order": 9
+    }
+  ],
+  "tools": [
+    {
+      "name": "Censys",
+      "description": "Public Internet scanning platform for certificate, IP, and domain enumeration.",
+      "url": "https://censys.io",
+      "kind": "database",
+      "category": "recon-network",
+      "maps_to": [
+        "disclosure"
+      ],
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "SSL/TLS",
+        "reconnaissance",
+        "certificate-data"
+      ]
+    },
+    {
+      "name": "CrackMapExec",
+      "description": "Swiss army knife for pentesting Windows/Active Directory networks; allows credential testing and lateral movement.",
+      "url": "https://github.com/byt3bl33d3r/CrackMapExec",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "tags": [
+        "Windows",
+        "Active Directory",
+        "post-exploitation"
+      ],
+      "maps_to": [
+        "auth",
+        "access-control"
+      ],
+      "category": "recon-network"
+    },
+    {
+      "name": "dnstwist",
+      "description": "Domain name permutation engine for detecting typo squatting, phishing, and corporate espionage.",
+      "url": "https://github.com/elceef/dnstwist",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "DNS",
+        "reconnaissance",
+        "phishing detection"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "recon-network"
+    },
+    {
+      "name": "I2P (Invisible Internet Project)",
+      "description": "Network layer enabling censorship-resistant and anonymous communication for distributed applications.",
+      "url": "https://geti2p.net/",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "anonymity",
+        "privacy",
+        "decentralized"
+      ],
+      "maps_to": [],
+      "category": "recon-network"
+    },
+    {
+      "name": "impacket",
+      "description": "Python collection for working with network protocols; widely used for exploit development and network testing.",
+      "url": "https://github.com/CoreSecurity/impacket",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "network protocols",
+        "library",
+        "exploit development"
+      ],
+      "maps_to": [
+        "network",
+        "rce"
+      ],
+      "category": "recon-network"
+    },
+    {
+      "name": "Legion",
+      "description": "Graphical semi-automated penetration testing framework based on Python 3; orchestrates scanning and enumeration tools.",
+      "url": "https://github.com/GoVanguard/legion",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "reconnaissance",
+        "automation",
+        "GUI"
+      ],
+      "maps_to": [
+        "network"
+      ],
+      "category": "recon-network"
+    },
+    {
+      "name": "Masscan",
+      "description": "TCP port scanner that can scan entire internet at 100M+ packets/sec.",
+      "url": "https://github.com/robertdavidgraham/masscan",
+      "kind": "tool",
+      "category": "recon-network",
+      "maps_to": [
+        "network"
+      ],
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "tags": [
+        "port-scanning",
+        "reconnaissance",
+        "network-mapping"
+      ]
+    },
+    {
+      "name": "Metadata Anonymization Toolkit (MAT2)",
+      "description": "Metadata removal tool supporting common file formats for privacy protection.",
+      "url": "https://0xacab.org/jvoisin/mat2",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "metadata",
+        "privacy",
+        "file sanitization"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "recon-network"
+    },
+    {
+      "name": "nmap",
+      "description": "Industry-standard network discovery and port scanning tool; detects hosts, services, and operating systems.",
+      "url": "https://nmap.org/",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "network",
+        "reconnaissance",
+        "scanning",
+        "network scanning",
+        "port discovery"
+      ],
+      "maps_to": [
+        "network"
+      ],
+      "category": "recon-network"
+    },
+    {
+      "name": "OpenVAS",
+      "description": "Free vulnerability assessment system; open-source alternative to Nessus for comprehensive network vulnerability scanning.",
+      "url": "http://www.openvas.org/",
+      "kind": "tool",
+      "platforms": [
+        "linux"
+      ],
+      "tags": [
+        "vulnerability scanning",
+        "network assessment",
+        "open source"
+      ],
+      "maps_to": [
+        "network"
+      ],
+      "category": "recon-network"
+    },
+    {
+      "name": "PRET (Printer Exploitation Toolkit)",
+      "description": "Specialized tool for printer security testing supporting IP/USB connectivity, fuzzing, and PostScript/PJL/PCL exploitation.",
+      "url": "https://github.com/RUB-NDS/PRET",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "printer security",
+        "device exploitation",
+        "fuzzing"
+      ],
+      "maps_to": [
+        "rce"
+      ],
+      "category": "recon-network"
+    },
+    {
+      "name": "Shodan",
+      "description": "Search engine for Internet-connected devices; essential for external reconnaissance.",
+      "url": "https://www.shodan.io",
+      "kind": "database",
+      "category": "recon-network",
+      "maps_to": [
+        "disclosure"
+      ],
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "IoT",
+        "reconnaissance",
+        "device-discovery"
+      ]
+    },
+    {
+      "name": "Subfinder",
+      "description": "Fast subdomain discovery tool using passive sources and APIs.",
+      "url": "https://github.com/projectdiscovery/subfinder",
+      "kind": "tool",
+      "category": "recon-network",
+      "maps_to": [
+        "disclosure"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "subdomain-enumeration",
+        "OSINT",
+        "reconnaissance"
+      ]
+    },
+    {
+      "name": "Suricata",
+      "description": "IDS/IPS engine providing network threat detection with multi-threaded processing.",
+      "url": "https://suricata.io",
+      "kind": "tool",
+      "category": "recon-network",
+      "maps_to": [
+        "network"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "IDS",
+        "IPS",
+        "threat-detection",
+        "PCAP"
+      ]
+    },
+    {
+      "name": "Tor Browser",
+      "description": "Browser bundle providing anonymous internet access through the Tor network.",
+      "url": "https://www.torproject.org/",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "anonymity",
+        "privacy",
+        "network"
+      ],
+      "maps_to": [],
+      "category": "recon-network"
+    },
+    {
+      "name": "Tsunami Security Scanner",
+      "description": "Google-maintained general purpose network security scanner with extensible plugins for high-severity vulnerability detection.",
+      "url": "https://github.com/google/tsunami-security-scanner",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "vulnerability scanning",
+        "network assessment",
+        "plugin system"
+      ],
+      "maps_to": [
+        "network"
+      ],
+      "category": "recon-network"
+    },
+    {
+      "name": "Wireshark",
+      "description": "Network protocol analyzer for capturing and inspecting network traffic in real-time.",
+      "url": "https://www.wireshark.org/",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "packet analysis",
+        "network monitoring",
+        "reconnaissance"
+      ],
+      "maps_to": [
+        "network"
+      ],
+      "category": "recon-network"
+    },
+    {
+      "name": "Zeek (Bro)",
+      "description": "Network analysis framework for real-time traffic intelligence and IDS capabilities.",
+      "url": "https://zeek.org",
+      "kind": "tool",
+      "category": "recon-network",
+      "maps_to": [
+        "network"
+      ],
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "tags": [
+        "IDS",
+        "network-analysis",
+        "traffic-monitoring",
+        "PCAP"
+      ]
+    },
+    {
+      "name": "BuiltWith",
+      "description": "Identify the technology stack, analytics, and frameworks a website is built with.",
+      "url": "https://builtwith.com/",
+      "kind": "tool",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "tech-fingerprinting",
+        "stack",
+        "recon"
+      ],
+      "maps_to": [
+        "disclosure",
+        "dependency"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "crt.sh",
+      "description": "Search Certificate Transparency logs to discover subdomains and issued certificates.",
+      "url": "https://crt.sh/",
+      "kind": "database",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "certificates",
+        "subdomains",
+        "ct-logs"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Dehashed",
+      "description": "Search engine for leaked credentials and breach records by email, username, or domain.",
+      "url": "https://www.dehashed.com/",
+      "kind": "database",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "breaches",
+        "credentials",
+        "leaks"
+      ],
+      "maps_to": [
+        "secrets",
+        "auth"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "DNSDumpster",
+      "description": "Free domain research mapping hosts, DNS records, and infrastructure for a target.",
+      "url": "https://dnsdumpster.com/",
+      "kind": "tool",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "dns",
+        "subdomains",
+        "mapping"
+      ],
+      "maps_to": [
+        "disclosure",
+        "network"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "FOFA",
+      "description": "Internet asset search engine for fingerprinting exposed hosts and services.",
+      "url": "https://en.fofa.info/",
+      "kind": "database",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "asset-search",
+        "fingerprinting",
+        "exposure"
+      ],
+      "maps_to": [
+        "disclosure",
+        "network"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "GHunt",
+      "description": "Investigate Google accounts — emails, IDs, and public profile/document data.",
+      "url": "https://github.com/mxrch/GHunt",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "google",
+        "email",
+        "people"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Google Hacking Database (GHDB)",
+      "description": "Curated index of Google dork queries that surface exposed files and misconfigurations.",
+      "url": "https://www.exploit-db.com/google-hacking-database",
+      "kind": "resource",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "google-dorks",
+        "exposure",
+        "disclosure"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "h8mail",
+      "description": "Email OSINT and breach-hunting tool that finds leaked passwords for a target email.",
+      "url": "https://github.com/khast3x/h8mail",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "breaches",
+        "email",
+        "credentials"
+      ],
+      "maps_to": [
+        "secrets",
+        "auth"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Have I Been Pwned",
+      "description": "Check whether an email or password appears in known data breaches.",
+      "url": "https://haveibeenpwned.com/",
+      "kind": "database",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "breaches",
+        "credentials",
+        "email"
+      ],
+      "maps_to": [
+        "secrets",
+        "auth"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Holehe",
+      "description": "Check whether an email is registered on 120+ sites via password-reset / sign-up flows.",
+      "url": "https://github.com/megadose/holehe",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "email",
+        "account-discovery",
+        "registration"
+      ],
+      "maps_to": [
+        "disclosure",
+        "auth"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Hunter.io",
+      "description": "Find professional email addresses and patterns associated with a company domain.",
+      "url": "https://hunter.io/",
+      "kind": "tool",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "email",
+        "company",
+        "contacts"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Intelligence X",
+      "description": "Search engine and archive for leaks, dark web, domains, emails, and documents.",
+      "url": "https://intelx.io/",
+      "kind": "database",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "leaks",
+        "darkweb",
+        "archive"
+      ],
+      "maps_to": [
+        "disclosure",
+        "secrets"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Maigret",
+      "description": "Collect a dossier on a person by username across thousands of sites.",
+      "url": "https://github.com/soxoj/maigret",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "username",
+        "people",
+        "social-media"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Maltego",
+      "description": "Graphical link-analysis platform mapping relationships between people, domains, and infrastructure.",
+      "url": "https://www.maltego.com/",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "link-analysis",
+        "graph",
+        "investigations"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Metagoofil",
+      "description": "Extract metadata from public documents (pdf/doc/xls) to reveal users, paths, and software.",
+      "url": "https://github.com/laramies/metagoofil",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "metadata",
+        "documents",
+        "footprint"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "OSINT Framework",
+      "description": "Web directory of OSINT tools and resources organized by data type.",
+      "url": "https://osintframework.com/",
+      "kind": "resource",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "directory",
+        "reference",
+        "methodology"
+      ],
+      "maps_to": [],
+      "category": "osint"
+    },
+    {
+      "name": "OWASP Amass",
+      "description": "In-depth attack-surface mapping and subdomain enumeration via passive and active sources.",
+      "url": "https://github.com/owasp-amass/amass",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "subdomains",
+        "attack-surface",
+        "dns"
+      ],
+      "maps_to": [
+        "disclosure",
+        "network"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "PhoneInfoga",
+      "description": "OSINT framework for scanning international phone numbers and mapping their footprint.",
+      "url": "https://github.com/sundowndev/PhoneInfoga",
+      "kind": "framework",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "phone",
+        "footprint",
+        "recon"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Photon",
+      "description": "Fast web crawler that extracts URLs, emails, secrets, and endpoints for OSINT.",
+      "url": "https://github.com/s0md3v/Photon",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "crawler",
+        "endpoints",
+        "scraping"
+      ],
+      "maps_to": [
+        "disclosure",
+        "secrets"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Recon-ng",
+      "description": "Modular web reconnaissance framework with a Metasploit-style workflow for OSINT.",
+      "url": "https://github.com/lanmaster53/recon-ng",
+      "kind": "framework",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "framework",
+        "recon",
+        "modules"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "SecurityTrails",
+      "description": "Current and historical DNS, WHOIS, and subdomain data for a domain or IP.",
+      "url": "https://securitytrails.com/",
+      "kind": "database",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "dns",
+        "whois",
+        "historical"
+      ],
+      "maps_to": [
+        "disclosure",
+        "network"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Sherlock",
+      "description": "Hunt down a person's accounts by username across 400+ social networks.",
+      "url": "https://github.com/sherlock-project/sherlock",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "username",
+        "social-media",
+        "people"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Social-Analyzer",
+      "description": "Find and analyze a person's profiles across 1000+ social media sites.",
+      "url": "https://github.com/qeeqbox/social-analyzer",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "social-media",
+        "people",
+        "profiles"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "SpiderFoot",
+      "description": "Automated OSINT reconnaissance engine querying 200+ data sources for a target.",
+      "url": "https://github.com/smicallef/spiderfoot",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "automation",
+        "footprinting",
+        "recon"
+      ],
+      "maps_to": [
+        "disclosure",
+        "network"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Sublist3r",
+      "description": "Fast subdomain enumeration using search engines and public sources.",
+      "url": "https://github.com/aboul3la/Sublist3r",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "subdomains",
+        "enumeration",
+        "recon"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "theHarvester",
+      "description": "Gathers emails, subdomains, hosts, and names from public sources for a domain.",
+      "url": "https://github.com/laramies/theHarvester",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "email-harvesting",
+        "subdomains",
+        "recon"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "urlscan.io",
+      "description": "Scan and analyze a website's requests, resources, and screenshots in a sandbox.",
+      "url": "https://urlscan.io/",
+      "kind": "tool",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "website-analysis",
+        "sandbox",
+        "recon"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "VirusTotal",
+      "description": "Analyze files, URLs, domains, and IPs against dozens of AV engines and threat feeds.",
+      "url": "https://www.virustotal.com/",
+      "kind": "database",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "malware",
+        "reputation",
+        "threat-intel"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Wappalyzer",
+      "description": "Fingerprint web technologies, CMSes, and libraries used by a site.",
+      "url": "https://www.wappalyzer.com/",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "web"
+      ],
+      "tags": [
+        "tech-fingerprinting",
+        "cms",
+        "libraries"
+      ],
+      "maps_to": [
+        "disclosure",
+        "dependency"
+      ],
+      "category": "osint"
+    },
+    {
+      "name": "Acunetix",
+      "description": "Commercial automated web application security scanner with crawler and vulnerability detection.",
+      "url": "https://www.acunetix.com",
+      "kind": "tool",
+      "category": "web",
+      "maps_to": [
+        "sqli",
+        "xss",
+        "rce"
+      ],
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "tags": [
+        "web-scanning",
+        "SAST",
+        "compliance"
+      ]
+    },
+    {
+      "name": "BeEF",
+      "description": "Browser Exploitation Framework for command and control of compromised web browsers.",
+      "url": "https://github.com/beefproject/beef",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "browser",
+        "xss",
+        "c2"
+      ],
+      "maps_to": [
+        "xss"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "Burp Suite Community",
+      "description": "Integrated platform for web application security testing with scanning, proxying, and exploitation capabilities.",
+      "url": "https://portswigger.net/burp",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "web scanning",
+        "proxy",
+        "vulnerability assessment",
+        "scanner",
+        "web-testing"
+      ],
+      "maps_to": [
+        "access-control",
+        "auth",
+        "headers",
+        "sqli",
+        "ssrf",
+        "xss"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "Commix",
+      "description": "Automated all-in-one operating system command injection and exploitation tool with shell spawning.",
+      "url": "https://github.com/commixproject/commix",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "injection",
+        "rce",
+        "automation"
+      ],
+      "maps_to": [
+        "rce"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "dirsearch",
+      "description": "Web path scanner for directory and file discovery with support for multiple extensions and status codes.",
+      "url": "https://github.com/maurosoria/dirsearch",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "path-discovery",
+        "enumeration",
+        "reconnaissance"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "DVCS Ripper",
+      "description": "Extracts web-accessible distributed version control repositories (SVN, GIT, HG, BZR).",
+      "url": "https://github.com/kost/dvcs-ripper",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "source-code",
+        "extraction",
+        "vcs"
+      ],
+      "maps_to": [
+        "secrets",
+        "disclosure"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "Fiddler",
+      "description": "Free cross-platform web debugging proxy with session inspection and manipulation tools.",
+      "url": "https://www.telerik.com/fiddler",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "proxy",
+        "debugging",
+        "inspection"
+      ],
+      "maps_to": [
+        "xss",
+        "auth",
+        "headers"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "FuzzDB",
+      "description": "Comprehensive dictionary of attack patterns, primitives, and payloads for application fault injection.",
+      "url": "https://github.com/fuzzdb-project/fuzzdb",
+      "kind": "resource",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "wordlist",
+        "payloads",
+        "fuzzing"
+      ],
+      "maps_to": [],
+      "category": "web"
+    },
+    {
+      "name": "git-dumper",
+      "description": "Tool for extracting and dumping entire git repositories from web-accessible .git directories.",
+      "url": "https://github.com/arthaud/git-dumper",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "source-code",
+        "extraction",
+        "reconnaissance"
+      ],
+      "maps_to": [
+        "secrets",
+        "disclosure"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "GitTools",
+      "description": "Automatically finds and extracts publicly accessible .git repositories from web servers.",
+      "url": "https://github.com/internetwache/GitTools",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "source-code",
+        "enumeration",
+        "secrets"
+      ],
+      "maps_to": [
+        "secrets",
+        "disclosure"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "gobuster",
+      "description": "Brute force tool for web path, DNS, and virtual host discovery and reconnaissance.",
+      "url": "https://github.com/OJ/gobuster",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "brute-force",
+        "enumeration",
+        "reconnaissance"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "httpx",
+      "description": "Fast HTTP/HTTPS probe for probing masscan/nmap output with features extraction.",
+      "url": "https://github.com/projectdiscovery/httpx",
+      "kind": "tool",
+      "category": "web",
+      "maps_to": [
+        "network"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "HTTP-probing",
+        "web-reconnaissance",
+        "SSL-info"
+      ]
+    },
+    {
+      "name": "Merlin",
+      "description": "Cross-platform HTTP/2 command and control server written in Go for post-exploitation.",
+      "url": "https://github.com/Ne0nd0g/merlin",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "c2",
+        "http2",
+        "post-exploitation"
+      ],
+      "maps_to": [
+        "rce"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "mitmproxy",
+      "description": "Interactive TLS-capable HTTP proxy for intercepting, inspecting, and modifying web traffic.",
+      "url": "https://mitmproxy.org/",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "proxy",
+        "https",
+        "debugging"
+      ],
+      "maps_to": [
+        "xss",
+        "auth",
+        "headers"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "Nikto",
+      "description": "Open-source web server scanner detecting dangerous files, outdated software, and known issues.",
+      "url": "https://github.com/sullo/nikto",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "web-app",
+        "scanner",
+        "reconnaissance"
+      ],
+      "maps_to": [
+        "xss",
+        "sqli",
+        "auth",
+        "headers"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "NoSQLmap",
+      "description": "Automatic NoSQL injection vulnerability detection and database takeover tool.",
+      "url": "https://github.com/codingo/NoSQLMap",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "nosql",
+        "injection",
+        "automation"
+      ],
+      "maps_to": [
+        "sqli"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "Nuclei",
+      "description": "Template-based vulnerability scanner for web apps, networks, and cloud infrastructure.",
+      "url": "https://github.com/projectdiscovery/nuclei",
+      "kind": "tool",
+      "category": "web",
+      "maps_to": [
+        "rce",
+        "sqli",
+        "xss",
+        "auth"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "vulnerability-scanning",
+        "templates",
+        "automation"
+      ]
+    },
+    {
+      "name": "OWASP ZAP",
+      "description": "Feature-rich HTTP intercepting proxy and fuzzer for automated web security scanning and penetration testing.",
+      "url": "https://www.zaproxy.org/",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "proxy",
+        "scanner",
+        "fuzz"
+      ],
+      "maps_to": [
+        "xss",
+        "sqli",
+        "ssrf",
+        "auth",
+        "headers"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "Raccoon",
+      "description": "Reconnaissance and vulnerability scanning tool for web applications with enumeration capabilities.",
+      "url": "https://github.com/evyatarmeged/Raccoon",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "reconnaissance",
+        "scanning",
+        "enumeration"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "sqlmap",
+      "description": "Automatic SQL injection vulnerability detection and database takeover tool with extensive payloads.",
+      "url": "http://sqlmap.org/",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "sqli",
+        "injection",
+        "automation"
+      ],
+      "maps_to": [
+        "sqli"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "tplmap",
+      "description": "Automatic server-side template injection detection and exploitation with code execution.",
+      "url": "https://github.com/epinna/tplmap",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "ssti",
+        "injection",
+        "rce"
+      ],
+      "maps_to": [
+        "rce"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "weevely3",
+      "description": "Weaponized PHP-based web shell for post-exploitation command execution with obfuscation.",
+      "url": "https://github.com/epinna/weevely3",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "webshell",
+        "php",
+        "c2"
+      ],
+      "maps_to": [
+        "rce"
+      ],
+      "category": "web"
+    },
+    {
+      "name": "Armitage",
+      "description": "Java-based GUI interface and visualization tool for Metasploit Framework operations.",
+      "url": "http://fastandeasyhacking.com/",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "metasploit-gui",
+        "visualization",
+        "penetration-testing"
+      ],
+      "maps_to": [
+        "rce",
+        "sqli",
+        "xss",
+        "ssrf",
+        "auth",
+        "access-control"
+      ],
+      "category": "exploit-frameworks"
+    },
+    {
+      "name": "AutoSploit",
+      "description": "Automated mass exploitation tool integrating Shodan scanning with Metasploit payload delivery.",
+      "url": "https://github.com/NullArray/AutoSploit",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "automation",
+        "exploitation",
+        "metasploit"
+      ],
+      "maps_to": [
+        "rce",
+        "access-control"
+      ],
+      "category": "exploit-frameworks"
+    },
+    {
+      "name": "Decker",
+      "description": "Penetration testing orchestration framework for automating attack workflows and campaign management.",
+      "url": "https://github.com/stevenaldinger/decker",
+      "kind": "framework",
+      "platforms": [
+        "cross-platform",
+        "linux"
+      ],
+      "tags": [
+        "automation",
+        "orchestration",
+        "pentest-framework"
+      ],
+      "maps_to": [
+        "rce",
+        "sqli",
+        "xss",
+        "ssrf",
+        "auth",
+        "access-control"
+      ],
+      "category": "exploit-frameworks"
+    },
+    {
+      "name": "Exploit Writing Tutorials (Corelan)",
+      "description": "Comprehensive tutorial series covering stack-based overflows, shellcode, and modern exploit mitigations.",
+      "url": "https://www.corelan.be/index.php/2009/07/19/exploit-writing-tutorial-part-1-stack-based-overflows/",
+      "kind": "training",
+      "platforms": [],
+      "tags": [
+        "tutorial",
+        "exploit-development",
+        "education"
+      ],
+      "maps_to": [],
+      "category": "exploit-frameworks"
+    },
+    {
+      "name": "Faraday",
+      "description": "Multiuser integrated penetration testing environment for red team collaboration and reporting.",
+      "url": "https://github.com/infobyte/faraday",
+      "kind": "framework",
+      "platforms": [
+        "cross-platform",
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "pentest-framework",
+        "collaboration",
+        "red-team"
+      ],
+      "maps_to": [
+        "rce",
+        "sqli",
+        "xss",
+        "ssrf",
+        "auth",
+        "access-control",
+        "disclosure"
+      ],
+      "category": "exploit-frameworks"
+    },
+    {
+      "name": "Magic Unicorn",
+      "description": "Shellcode generator for bypassing antivirus via Office macros and PowerShell delivery.",
+      "url": "https://github.com/trustedsec/unicorn",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "windows"
+      ],
+      "tags": [
+        "shellcode-generation",
+        "payload",
+        "evasion"
+      ],
+      "maps_to": [
+        "rce"
+      ],
+      "category": "exploit-frameworks"
+    },
+    {
+      "name": "Metasploit Framework",
+      "description": "Comprehensive penetration testing framework with thousands of exploits, payloads, and post-exploitation modules.",
+      "url": "https://www.metasploit.com/",
+      "kind": "framework",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "exploitation",
+        "payload generation",
+        "post-exploitation"
+      ],
+      "maps_to": [
+        "rce",
+        "sqli",
+        "xss",
+        "auth"
+      ],
+      "category": "exploit-frameworks"
+    },
+    {
+      "name": "Metasploit Pro",
+      "description": "Commercial version of Metasploit Framework with advanced automation and reporting.",
+      "url": "https://www.metasploit.com/pro",
+      "kind": "tool",
+      "category": "exploit-frameworks",
+      "maps_to": [
+        "rce",
+        "sqli",
+        "auth"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "exploitation",
+        "automation",
+        "enterprise"
+      ]
+    },
+    {
+      "name": "PEDA (Python Exploit Development Assistance)",
+      "description": "GDB plugin providing enhanced commands for binary debugging and exploit development.",
+      "url": "https://github.com/longld/peda",
+      "kind": "tool",
+      "platforms": [
+        "linux"
+      ],
+      "tags": [
+        "binary-exploitation",
+        "debugging",
+        "gdb-plugin"
+      ],
+      "maps_to": [
+        "rce"
+      ],
+      "category": "exploit-frameworks"
+    },
+    {
+      "name": "Pupy",
+      "description": "Cross-platform remote administration and post-exploitation tool with in-memory Python execution.",
+      "url": "https://github.com/n1nj4sec/pupy",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "post-exploitation",
+        "remote-access",
+        "rat"
+      ],
+      "maps_to": [
+        "rce",
+        "access-control"
+      ],
+      "category": "exploit-frameworks"
+    },
+    {
+      "name": "Pwntools",
+      "description": "Rapid exploit development framework for CTF competitions and binary exploitation.",
+      "url": "https://github.com/Gallopsled/pwntools",
+      "kind": "framework",
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "tags": [
+        "exploitation",
+        "ctf",
+        "binary-exploitation"
+      ],
+      "maps_to": [
+        "rce"
+      ],
+      "category": "exploit-frameworks"
+    },
+    {
+      "name": "Ronin",
+      "description": "Ruby-based security research toolkit for building custom security tools and workflows.",
+      "url": "https://ronin-rb.dev",
+      "kind": "framework",
+      "platforms": [
+        "cross-platform",
+        "linux",
+        "macos"
+      ],
+      "tags": [
+        "security-toolkit",
+        "automation",
+        "ruby"
+      ],
+      "maps_to": [
+        "rce",
+        "sqli",
+        "xss",
+        "ssrf",
+        "auth",
+        "access-control"
+      ],
+      "category": "exploit-frameworks"
+    },
+    {
+      "name": "The Shellcoder's Handbook",
+      "description": "Technical reference guide for low-level programming, shellcode development, and exploit techniques.",
+      "url": "http://www.wiley.com/WileyCDA/WileyTitle/productCd-047008023X.html",
+      "kind": "book",
+      "platforms": [],
+      "tags": [
+        "reference",
+        "shellcoding",
+        "exploit-development"
+      ],
+      "maps_to": [],
+      "category": "exploit-frameworks"
+    },
+    {
+      "name": "ysoserial",
+      "description": "Tool for generating Java serialized gadget chains for RCE exploitation.",
+      "url": "https://github.com/frohoff/ysoserial",
+      "kind": "tool",
+      "category": "exploit-frameworks",
+      "maps_to": [
+        "rce"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "Java",
+        "deserialization",
+        "gadget-chains"
+      ]
+    },
+    {
+      "name": "BruteForce Wallet",
+      "description": "Specialized tool for recovering passwords of encrypted wallet files including Bitcoin wallet.dat.",
+      "url": "https://github.com/glv2/bruteforce-wallet",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "linux"
+      ],
+      "tags": [
+        "wallet-recovery",
+        "cryptocurrency",
+        "brute-force"
+      ],
+      "maps_to": [
+        "crypto"
+      ],
+      "category": "password-hash"
+    },
+    {
+      "name": "CeWL",
+      "description": "Generates custom wordlists by spidering target websites to collect application-specific dictionary words.",
+      "url": "https://digi.ninja/projects/cewl.php",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "linux",
+        "macos"
+      ],
+      "tags": [
+        "wordlist-generation",
+        "web-scraping",
+        "custom-dictionary"
+      ],
+      "maps_to": [
+        "crypto"
+      ],
+      "category": "password-hash"
+    },
+    {
+      "name": "duplicut",
+      "description": "High-performance utility to remove duplicate entries from wordlists without memory overhead.",
+      "url": "https://github.com/nil0x42/duplicut",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "linux"
+      ],
+      "tags": [
+        "wordlist-optimization",
+        "deduplication",
+        "utility"
+      ],
+      "maps_to": [],
+      "category": "password-hash"
+    },
+    {
+      "name": "GoCrack",
+      "description": "Distributed password cracking frontend for hashcat with web-based management and orchestration.",
+      "url": "https://github.com/fireeye/gocrack",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "distributed-cracking",
+        "password-management",
+        "orchestration"
+      ],
+      "maps_to": [
+        "crypto"
+      ],
+      "category": "password-hash"
+    },
+    {
+      "name": "Hashcat",
+      "description": "GPU-accelerated password cracking suite supporting 350+ hash algorithms and rule-based attacks.",
+      "url": "https://hashcat.net/hashcat/",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "hash-cracking",
+        "gpu-accelerated",
+        "password-recovery"
+      ],
+      "maps_to": [
+        "crypto"
+      ],
+      "category": "password-hash"
+    },
+    {
+      "name": "hashcat Rules Engine",
+      "description": "Rule-based password transformation system for hashcat enabling advanced pattern-based crack strategies.",
+      "url": "https://github.com/hashcat/hashcat",
+      "kind": "framework",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "rules",
+        "password-transformation",
+        "pattern-matching"
+      ],
+      "maps_to": [
+        "crypto"
+      ],
+      "category": "password-hash"
+    },
+    {
+      "name": "hate_crack",
+      "description": "Automated password cracking methodology framework that automates hashcat attack chains and strategies.",
+      "url": "https://github.com/trustedsec/hate_crack",
+      "kind": "tool",
+      "platforms": [
+        "linux"
+      ],
+      "tags": [
+        "automation",
+        "hashcat-automation",
+        "password-cracking"
+      ],
+      "maps_to": [
+        "crypto"
+      ],
+      "category": "password-hash"
+    },
+    {
+      "name": "John the Ripper",
+      "description": "Open-source password cracker supporting multiple hash formats and dictionary/brute-force attacks.",
+      "url": "https://www.openwall.com/john/",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "password-cracking",
+        "hash-recovery",
+        "dictionary-attack"
+      ],
+      "maps_to": [
+        "crypto"
+      ],
+      "category": "password-hash"
+    },
+    {
+      "name": "JWT Cracker",
+      "description": "Brute-force cracker for HS256 JSON Web Tokens to recover weak symmetric signing secrets.",
+      "url": "https://github.com/lmammino/jwt-cracker",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "jwt",
+        "token-cracking",
+        "hs256"
+      ],
+      "maps_to": [
+        "auth",
+        "secrets"
+      ],
+      "category": "password-hash"
+    },
+    {
+      "name": "Keeper Password Manager Security Audit",
+      "description": "Auditing tool for checking weak passwords in corporate password managers.",
+      "url": "https://www.keepersecurity.com",
+      "kind": "tool",
+      "category": "password-hash",
+      "maps_to": [
+        "secrets"
+      ],
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "password-audit",
+        "compliance",
+        "enterprise"
+      ]
+    },
+    {
+      "name": "Ncrack",
+      "description": "High-speed network authentication cracking tool for testing weak passwords across hosts and networking devices.",
+      "url": "https://nmap.org/ncrack/",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "credential testing",
+        "authentication",
+        "brute force"
+      ],
+      "maps_to": [
+        "auth"
+      ],
+      "category": "password-hash"
+    },
+    {
+      "name": "RAR Crack",
+      "description": "Brute-force utility for recovering passwords from encrypted RAR archive files.",
+      "url": "http://rarcrack.sourceforge.net",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "tags": [
+        "archive-cracking",
+        "rar-password",
+        "brute-force"
+      ],
+      "maps_to": [],
+      "category": "password-hash"
+    },
+    {
+      "name": "THC Hydra",
+      "description": "High-speed online password cracking tool supporting HTTP, SMB, FTP, telnet, MySQL, LDAP, IMAP, VNC and more.",
+      "url": "https://github.com/vanhauser-thc/thc-hydra",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "password cracking",
+        "brute force",
+        "authentication"
+      ],
+      "maps_to": [
+        "auth"
+      ],
+      "category": "password-hash"
+    },
+    {
+      "name": "Angr",
+      "description": "Python framework for binary analysis with symbolic execution capabilities.",
+      "url": "https://angr.io",
+      "kind": "framework",
+      "category": "reverse-static",
+      "maps_to": [
+        "rce",
+        "auth"
+      ],
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "tags": [
+        "binary-analysis",
+        "symbolic-execution",
+        "vulnerability-research"
+      ]
+    },
+    {
+      "name": "bandit",
+      "description": "Security-oriented static analyzer identifying common security issues in Python code.",
+      "url": "https://github.com/PyCQA/bandit",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "static-analysis",
+        "python",
+        "security"
+      ],
+      "maps_to": [
+        "secrets",
+        "rce",
+        "sqli"
+      ],
+      "category": "reverse-static"
+    },
+    {
+      "name": "binwalk",
+      "description": "Fast tool for analyzing, reverse engineering, and extracting firmware images and binary data.",
+      "url": "https://github.com/devttys0/binwalk",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "linux",
+        "macos"
+      ],
+      "tags": [
+        "binary-analysis",
+        "firmware",
+        "file-extraction"
+      ],
+      "maps_to": [],
+      "category": "reverse-static"
+    },
+    {
+      "name": "Brakeman",
+      "description": "Static security vulnerability scanner for Ruby on Rails applications.",
+      "url": "https://github.com/presidentbeef/brakeman",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "static-analysis",
+        "ruby",
+        "web-security"
+      ],
+      "maps_to": [
+        "xss",
+        "sqli",
+        "auth",
+        "access-control"
+      ],
+      "category": "reverse-static"
+    },
+    {
+      "name": "Capstone",
+      "description": "Lightweight multi-platform disassembly framework supporting multiple architectures.",
+      "url": "http://www.capstone-engine.org/",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "disassembler",
+        "library",
+        "multi-architecture"
+      ],
+      "maps_to": [],
+      "category": "reverse-static"
+    },
+    {
+      "name": "Certora Formal Verification",
+      "description": "Formal verification platform for smart contracts and cryptographic implementations.",
+      "url": "https://www.certora.com",
+      "kind": "tool",
+      "category": "reverse-static",
+      "maps_to": [
+        "crypto"
+      ],
+      "platforms": [
+        "linux",
+        "web"
+      ],
+      "tags": [
+        "smart-contracts",
+        "formal-verification",
+        "security-analysis"
+      ]
+    },
+    {
+      "name": "cppcheck",
+      "description": "Extensible static analyzer for C/C++ code focused on finding bugs and security issues.",
+      "url": "http://cppcheck.sourceforge.net/",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "static-analysis",
+        "cpp",
+        "bug-detection"
+      ],
+      "maps_to": [],
+      "category": "reverse-static"
+    },
+    {
+      "name": "dnSpy",
+      "description": "Tool for reverse engineering and debugging .NET assemblies and C# applications.",
+      "url": "https://github.com/0xd4d/dnSpy",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "reverse-engineering",
+        "dotnet",
+        "debugger"
+      ],
+      "maps_to": [],
+      "category": "reverse-static"
+    },
+    {
+      "name": "ExifTool",
+      "description": "Platform-independent tool for reading, writing, and manipulating image and file metadata.",
+      "url": "https://www.sno.phy.queensu.ca/~phil/exiftool/",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "metadata",
+        "file-analysis",
+        "forensics"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "reverse-static"
+    },
+    {
+      "name": "Ghidra",
+      "description": "Free suite of reverse engineering tools for analyzing binary code across multiple architectures.",
+      "url": "https://www.ghidra-sre.org/",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "reverse-engineering",
+        "disassembler",
+        "binary-analysis"
+      ],
+      "maps_to": [],
+      "category": "reverse-static"
+    },
+    {
+      "name": "Hachoir",
+      "description": "Python library for viewing and editing binary streams as trees with integrated metadata extraction.",
+      "url": "https://hachoir.readthedocs.io/",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "file-format-analysis",
+        "metadata",
+        "library"
+      ],
+      "maps_to": [],
+      "category": "reverse-static"
+    },
+    {
+      "name": "HexEdit.js",
+      "description": "Browser-based hex editor for viewing and editing binary files with no installation required.",
+      "url": "https://hexed.it",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "web"
+      ],
+      "tags": [
+        "hex-editor",
+        "binary-editing",
+        "online-tool"
+      ],
+      "maps_to": [],
+      "category": "reverse-static"
+    },
+    {
+      "name": "IDA Pro",
+      "description": "Industry-standard proprietary multi-processor disassembler and debugger for binary analysis.",
+      "url": "https://www.hex-rays.com/products/ida/",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "reverse-engineering",
+        "disassembler",
+        "commercial"
+      ],
+      "maps_to": [],
+      "category": "reverse-static"
+    },
+    {
+      "name": "Kaitai Struct",
+      "description": "DSL for declaring binary file formats and network protocols with multi-language parser generation.",
+      "url": "http://kaitai.io/",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "file-format-analysis",
+        "binary-protocol",
+        "parser"
+      ],
+      "maps_to": [],
+      "category": "reverse-static"
+    },
+    {
+      "name": "pwndbg",
+      "description": "GDB plug-in providing exploit development features for low-level binary debugging and analysis.",
+      "url": "https://github.com/pwndbg/pwndbg",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "tags": [
+        "debugger",
+        "exploit-development",
+        "binary-analysis"
+      ],
+      "maps_to": [],
+      "category": "reverse-static"
+    },
+    {
+      "name": "Radare2",
+      "description": "Open-source interactive disassembler and reverse engineering framework with scripting support.",
+      "url": "http://rada.re/r/index.html",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform",
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "reverse-engineering",
+        "disassembler",
+        "debugger"
+      ],
+      "maps_to": [],
+      "category": "reverse-static"
+    },
+    {
+      "name": "Triton",
+      "description": "Dynamic binary analysis framework with instruction-level profiling and taint tracking.",
+      "url": "https://github.com/JonathanSalwan/Triton",
+      "kind": "framework",
+      "category": "reverse-static",
+      "maps_to": [
+        "rce"
+      ],
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "tags": [
+        "binary-analysis",
+        "taint-analysis",
+        "symbolic-execution"
+      ]
+    },
+    {
+      "name": "x64dbg",
+      "description": "Open-source x64/x32 debugger for Windows with a focus on malware analysis and exploit development.",
+      "url": "http://x64dbg.com/",
+      "kind": "tool",
+      "platforms": [
+        "windows"
+      ],
+      "tags": [
+        "reverse-engineering",
+        "debugger",
+        "malware-analysis"
+      ],
+      "maps_to": [],
+      "category": "reverse-static"
+    },
+    {
+      "name": "ADAPE",
+      "description": "Umbrella script automating PowerShell modules to discover and exploit Active Directory misconfigurations.",
+      "url": "https://github.com/hausec/ADAPE-Script",
+      "kind": "tool",
+      "platforms": [
+        "windows"
+      ],
+      "tags": [
+        "active-directory",
+        "privilege-escalation",
+        "automation"
+      ],
+      "maps_to": [
+        "access-control",
+        "auth"
+      ],
+      "category": "post-exploitation"
+    },
+    {
+      "name": "Amber",
+      "description": "Reflective PE packer converting native Windows PE files to position-independent shellcode.",
+      "url": "https://github.com/EgeBalci/amber",
+      "kind": "tool",
+      "platforms": [
+        "windows"
+      ],
+      "tags": [
+        "av-evasion",
+        "packer",
+        "shellcode"
+      ],
+      "maps_to": [
+        "rce"
+      ],
+      "category": "post-exploitation"
+    },
+    {
+      "name": "AVET",
+      "description": "Post-processes exploits targeting Windows to evade antivirus detection.",
+      "url": "https://github.com/govolution/avet",
+      "kind": "tool",
+      "platforms": [
+        "windows"
+      ],
+      "tags": [
+        "av-evasion",
+        "exploit-hardening",
+        "windows"
+      ],
+      "maps_to": [
+        "rce"
+      ],
+      "category": "post-exploitation"
+    },
+    {
+      "name": "dnscat2",
+      "description": "Creates encrypted command and control channel over DNS protocol for data exfiltration.",
+      "url": "https://github.com/iagox86/dnscat2",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "exfiltration",
+        "c2",
+        "dns"
+      ],
+      "maps_to": [
+        "network"
+      ],
+      "category": "post-exploitation"
+    },
+    {
+      "name": "GTFOBins",
+      "description": "Curated list of Unix binaries that can bypass local security restrictions in misconfigured systems.",
+      "url": "https://gtfobins.github.io/",
+      "kind": "resource",
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "tags": [
+        "privilege-escalation",
+        "unix",
+        "reference"
+      ],
+      "maps_to": [
+        "access-control"
+      ],
+      "category": "post-exploitation"
+    },
+    {
+      "name": "Impacket SecretsDump",
+      "description": "Extract secrets from Windows SAM, registry, and DC via volume shadow copies.",
+      "url": "https://github.com/fortra/impacket",
+      "kind": "tool",
+      "category": "post-exploitation",
+      "maps_to": [
+        "secrets",
+        "access-control"
+      ],
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "tags": [
+        "credential-dumping",
+        "Windows",
+        "NTDS"
+      ]
+    },
+    {
+      "name": "Iodine",
+      "description": "Tunnels IPv4 data through DNS servers for exfiltration from firewalled networks.",
+      "url": "https://code.kryo.se/iodine/",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "exfiltration",
+        "dns-tunnel",
+        "firewall-bypass"
+      ],
+      "maps_to": [
+        "network"
+      ],
+      "category": "post-exploitation"
+    },
+    {
+      "name": "LinEnum",
+      "description": "Scripted local Linux enumeration and privilege escalation checker for identifying misconfigurations.",
+      "url": "https://github.com/rebootuser/LinEnum",
+      "kind": "tool",
+      "platforms": [
+        "linux"
+      ],
+      "tags": [
+        "privilege-escalation",
+        "enumeration",
+        "automation"
+      ],
+      "maps_to": [
+        "access-control"
+      ],
+      "category": "post-exploitation"
+    },
+    {
+      "name": "LOLBAS",
+      "description": "Documents binaries, scripts, and libraries for Living Off The Land techniques on Windows.",
+      "url": "https://lolbas-project.github.io/",
+      "kind": "resource",
+      "platforms": [
+        "windows"
+      ],
+      "tags": [
+        "privilege-escalation",
+        "windows",
+        "reference"
+      ],
+      "maps_to": [
+        "access-control"
+      ],
+      "category": "post-exploitation"
+    },
+    {
+      "name": "Netcat",
+      "description": "Utility for reading/writing network connections; foundational for reverse shells.",
+      "url": "https://nc110.sourceforge.io",
+      "kind": "tool",
+      "category": "post-exploitation",
+      "maps_to": [
+        "rce"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "networking",
+        "reverse-shells",
+        "listener"
+      ]
+    },
+    {
+      "name": "Shellter",
+      "description": "Dynamic shellcode injection tool and PE infector for runtime code manipulation.",
+      "url": "https://www.shellterproject.com/",
+      "kind": "tool",
+      "platforms": [
+        "windows"
+      ],
+      "tags": [
+        "av-evasion",
+        "injection",
+        "pe-infector"
+      ],
+      "maps_to": [
+        "rce"
+      ],
+      "category": "post-exploitation"
+    },
+    {
+      "name": "Sliver",
+      "description": "Modern successor to Armitage/Covenant; cross-platform C2 framework with multiplayer support.",
+      "url": "https://github.com/BishopFox/sliver",
+      "kind": "framework",
+      "category": "post-exploitation",
+      "maps_to": [
+        "rce"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "C2",
+        "post-exploitation",
+        "command-control"
+      ]
+    },
+    {
+      "name": "TrevorC2",
+      "description": "Client/server tool masking command and control traffic through a browsable website interface.",
+      "url": "https://github.com/trustedsec/trevorc2",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "c2",
+        "exfiltration",
+        "stealth"
+      ],
+      "maps_to": [
+        "network"
+      ],
+      "category": "post-exploitation"
+    },
+    {
+      "name": "unix-privesc-check",
+      "description": "Shell script checking for common privilege escalation vectors on UNIX systems.",
+      "url": "https://github.com/pentestmonkey/unix-privesc-check",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "tags": [
+        "privilege-escalation",
+        "unix",
+        "scanner"
+      ],
+      "maps_to": [
+        "access-control"
+      ],
+      "category": "post-exploitation"
+    },
+    {
+      "name": "Veil",
+      "description": "Generates Metasploit payloads that bypass common antivirus detection signatures.",
+      "url": "https://www.veil-framework.com/",
+      "kind": "tool",
+      "platforms": [
+        "windows"
+      ],
+      "tags": [
+        "av-evasion",
+        "payload-generation",
+        "obfuscation"
+      ],
+      "maps_to": [
+        "rce"
+      ],
+      "category": "post-exploitation"
+    },
+    {
+      "name": "Bloodhound",
+      "description": "Graphical Active Directory trust relationship explorer for Windows domain reconnaissance.",
+      "url": "https://github.com/adaptivethreat/BloodHound",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "active-directory",
+        "enumeration",
+        "domain"
+      ],
+      "maps_to": [
+        "access-control"
+      ],
+      "category": "cloud-mobile-host"
+    },
+    {
+      "name": "CloudHunter",
+      "description": "Locates AWS, Azure, and Google Cloud storage buckets and enumerates access permissions.",
+      "url": "https://github.com/belane/CloudHunter",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "cloud",
+        "storage",
+        "enumeration"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "cloud-mobile-host"
+    },
+    {
+      "name": "Cloudplaining",
+      "description": "AWS IAM policy analyzer identifying least-privilege violations with HTML report generation.",
+      "url": "https://cloudsplaining.readthedocs.io/",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "aws",
+        "iam",
+        "policy-analysis"
+      ],
+      "maps_to": [
+        "access-control"
+      ],
+      "category": "cloud-mobile-host"
+    },
+    {
+      "name": "Commando VM",
+      "description": "Automated installation environment for 140+ Windows penetration testing tools.",
+      "url": "https://github.com/fireeye/commando-vm",
+      "kind": "distro",
+      "platforms": [
+        "windows"
+      ],
+      "tags": [
+        "penetration-testing",
+        "installation",
+        "automation"
+      ],
+      "maps_to": [],
+      "category": "cloud-mobile-host"
+    },
+    {
+      "name": "Covenant",
+      "description": "ASP.NET Core command and control platform for red team collaborative operations.",
+      "url": "https://github.com/cobbr/Covenant",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "c2",
+        "red-team",
+        "collaborative"
+      ],
+      "maps_to": [
+        "rce"
+      ],
+      "category": "cloud-mobile-host"
+    },
+    {
+      "name": "Empire",
+      "description": "Pure PowerShell post-exploitation agent for Windows command and control.",
+      "url": "https://www.powershellempire.com/",
+      "kind": "tool",
+      "platforms": [
+        "windows"
+      ],
+      "tags": [
+        "post-exploitation",
+        "c2",
+        "powershell"
+      ],
+      "maps_to": [
+        "rce"
+      ],
+      "category": "cloud-mobile-host"
+    },
+    {
+      "name": "Frida-Trace",
+      "description": "Dynamic instrumentation toolkit for injecting code and hooking functions in running processes.",
+      "url": "https://frida.re",
+      "kind": "tool",
+      "category": "cloud-mobile-host",
+      "maps_to": [
+        "auth",
+        "secrets"
+      ],
+      "platforms": [
+        "android",
+        "ios",
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "mobile-testing",
+        "dynamic-analysis",
+        "instrumentation",
+        "reverse-engineering"
+      ]
+    },
+    {
+      "name": "Industrial Exploitation Framework (ISF)",
+      "description": "Metasploit-like framework targeting ICS, SCADA, and PLC firmware vulnerabilities.",
+      "url": "https://github.com/dark-lbp/isf",
+      "kind": "framework",
+      "platforms": [
+        "linux"
+      ],
+      "tags": [
+        "industrial-control",
+        "scada",
+        "ics"
+      ],
+      "maps_to": [
+        "rce"
+      ],
+      "category": "cloud-mobile-host"
+    },
+    {
+      "name": "Inveigh",
+      "description": "Windows PowerShell ADIDNS/LLMNR/mDNS/NBNS spoofer and machine-in-the-middle tool.",
+      "url": "https://github.com/Kevin-Robertson/Inveigh",
+      "kind": "tool",
+      "platforms": [
+        "windows"
+      ],
+      "tags": [
+        "network",
+        "mitm",
+        "dns-spoofing"
+      ],
+      "maps_to": [
+        "auth"
+      ],
+      "category": "cloud-mobile-host"
+    },
+    {
+      "name": "LaZagne",
+      "description": "Credentials recovery project extracting passwords from Windows and Linux systems.",
+      "url": "https://github.com/AlessandroZ/LaZagne",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "tags": [
+        "post-exploitation",
+        "credentials",
+        "recovery"
+      ],
+      "maps_to": [
+        "secrets"
+      ],
+      "category": "cloud-mobile-host"
+    },
+    {
+      "name": "Linux Exploit Suggester",
+      "description": "Heuristic tool reporting potentially viable exploits for GNU/Linux systems.",
+      "url": "https://github.com/PenturaLabs/Linux_Exploit_Suggester",
+      "kind": "tool",
+      "platforms": [
+        "linux"
+      ],
+      "tags": [
+        "privilege-escalation",
+        "enumeration",
+        "cves"
+      ],
+      "maps_to": [
+        "dependency"
+      ],
+      "category": "cloud-mobile-host"
+    },
+    {
+      "name": "Lynis",
+      "description": "Security auditing tool for UNIX/Linux systems focusing on hardening assessment.",
+      "url": "https://cisofy.com/lynis/",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "unix"
+      ],
+      "tags": [
+        "auditing",
+        "hardening",
+        "compliance"
+      ],
+      "maps_to": [],
+      "category": "cloud-mobile-host"
+    },
+    {
+      "name": "mimikatz",
+      "description": "Credentials extraction and manipulation tool for Windows operating systems.",
+      "url": "http://blog.gentilkiwi.com/mimikatz",
+      "kind": "tool",
+      "platforms": [
+        "windows"
+      ],
+      "tags": [
+        "post-exploitation",
+        "credentials",
+        "windows"
+      ],
+      "maps_to": [
+        "secrets"
+      ],
+      "category": "cloud-mobile-host"
+    },
+    {
+      "name": "PowerSploit",
+      "description": "PowerShell post-exploitation framework with reconnaissance and privilege escalation modules.",
+      "url": "https://github.com/PowerShellMafia/PowerSploit",
+      "kind": "tool",
+      "platforms": [
+        "windows"
+      ],
+      "tags": [
+        "post-exploitation",
+        "powershell",
+        "privilege-escalation"
+      ],
+      "maps_to": [
+        "rce"
+      ],
+      "category": "cloud-mobile-host"
+    },
+    {
+      "name": "Prowler",
+      "description": "AWS/Azure security assessment framework with CIS, PCI-DSS, and compliance checks.",
+      "url": "https://github.com/prowler-cloud/prowler",
+      "kind": "tool",
+      "category": "cloud-mobile-host",
+      "maps_to": [
+        "access-control",
+        "secrets"
+      ],
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "tags": [
+        "cloud-security",
+        "compliance",
+        "AWS"
+      ]
+    },
+    {
+      "name": "Responder",
+      "description": "LLMNR, NBT-NS, and mDNS poisoner for capturing Windows credentials on networks.",
+      "url": "https://github.com/SpiderLabs/Responder",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "tags": [
+        "network",
+        "mitm",
+        "credentials"
+      ],
+      "maps_to": [
+        "auth"
+      ],
+      "category": "cloud-mobile-host"
+    },
+    {
+      "name": "Rubeus",
+      "description": "Kerberos raw interaction and abuse toolkit for Windows domain attacks.",
+      "url": "https://github.com/GhostPack/Rubeus",
+      "kind": "tool",
+      "platforms": [
+        "windows"
+      ],
+      "tags": [
+        "kerberos",
+        "post-exploitation",
+        "domain"
+      ],
+      "maps_to": [
+        "auth"
+      ],
+      "category": "cloud-mobile-host"
+    },
+    {
+      "name": "ScoutSuite",
+      "description": "Multi-cloud security auditor for AWS, Azure, GCP, and Alibaba Cloud configuration assessment.",
+      "url": "https://github.com/nccgroup/ScoutSuite",
+      "kind": "tool",
+      "category": "cloud-mobile-host",
+      "maps_to": [
+        "access-control",
+        "secrets"
+      ],
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "cloud-security",
+        "AWS",
+        "Azure",
+        "GCP"
+      ]
+    },
+    {
+      "name": "Sysinternals Suite",
+      "description": "Microsoft's system troubleshooting and security utilities for Windows process and kernel analysis.",
+      "url": "https://docs.microsoft.com/en-us/sysinternals/downloads/sysinternals-suite",
+      "kind": "tool",
+      "platforms": [
+        "windows"
+      ],
+      "tags": [
+        "system-analysis",
+        "kernel",
+        "monitoring"
+      ],
+      "maps_to": [],
+      "category": "cloud-mobile-host"
+    },
+    {
+      "name": "Bash Bunny",
+      "description": "Multi-function USB attack platform with domain-specific language for payload automation.",
+      "url": "https://www.hak5.org/gear/bash-bunny",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "physical-access",
+        "payload-delivery",
+        "usb-attack"
+      ],
+      "maps_to": [
+        "rce",
+        "access-control"
+      ],
+      "category": "social-physical"
+    },
+    {
+      "name": "ChipWhisperer",
+      "description": "Power analysis and fault injection framework for side-channel attack research and hardware assessment.",
+      "url": "http://chipwhisperer.com",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "side-channel",
+        "power-analysis",
+        "hardware-security"
+      ],
+      "maps_to": [
+        "crypto",
+        "secrets"
+      ],
+      "category": "social-physical"
+    },
+    {
+      "name": "Cloakify",
+      "description": "Textual steganography toolkit converting any file type into innocuous-looking text strings.",
+      "url": "https://github.com/TryCatchHCF/Cloakify",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "tags": [
+        "steganography",
+        "exfiltration",
+        "obfuscation"
+      ],
+      "maps_to": [
+        "disclosure"
+      ],
+      "category": "social-physical"
+    },
+    {
+      "name": "Evilginx2",
+      "description": "Machine-in-the-middle reverse proxy framework for advanced phishing and 2FA bypass testing.",
+      "url": "https://github.com/kgretzky/evilginx2",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "tags": [
+        "phishing",
+        "mitm",
+        "authentication",
+        "2fa-bypass"
+      ],
+      "maps_to": [
+        "auth"
+      ],
+      "category": "social-physical"
+    },
+    {
+      "name": "Gophish",
+      "description": "Open-source phishing framework for simulated credential harvesting and campaign management.",
+      "url": "https://getgophish.com",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "phishing",
+        "social-engineering",
+        "credential-harvesting"
+      ],
+      "maps_to": [
+        "auth",
+        "disclosure"
+      ],
+      "category": "social-physical"
+    },
+    {
+      "name": "King Phisher",
+      "description": "Multi-campaign phishing engagement management framework with campaign tracking and reporting.",
+      "url": "https://github.com/securestate/king-phisher",
+      "kind": "tool",
+      "platforms": [
+        "linux"
+      ],
+      "tags": [
+        "phishing",
+        "campaign-management",
+        "social-engineering"
+      ],
+      "maps_to": [
+        "auth",
+        "disclosure"
+      ],
+      "category": "social-physical"
+    },
+    {
+      "name": "Modlishka",
+      "description": "Reverse proxy for credential capture with real-time two-factor authentication interception.",
+      "url": "https://github.com/drk1wi/Modlishka",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "phishing",
+        "mitm",
+        "2fa-bypass"
+      ],
+      "maps_to": [
+        "auth"
+      ],
+      "category": "social-physical"
+    },
+    {
+      "name": "PCILeech",
+      "description": "Direct memory access (DMA) attack framework for reading and writing system memory via PCIe.",
+      "url": "https://github.com/ufrisk/pcileech",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "tags": [
+        "dma-attack",
+        "memory-access",
+        "hardware-hacking"
+      ],
+      "maps_to": [
+        "access-control",
+        "secrets"
+      ],
+      "category": "social-physical"
+    },
+    {
+      "name": "Proxmark3",
+      "description": "RFID/NFC cloning, analysis, and simulation toolkit for contactless card security testing.",
+      "url": "https://proxmark3.com",
+      "kind": "tool",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "tags": [
+        "rfid",
+        "nfc",
+        "physical-access",
+        "wireless"
+      ],
+      "maps_to": [
+        "access-control"
+      ],
+      "category": "social-physical"
+    },
+    {
+      "name": "ReelPhish",
+      "description": "Real-time phishing tool simulating man-in-the-middle attacks to defeat multi-factor authentication.",
+      "url": "https://github.com/fireeye/ReelPhish",
+      "kind": "tool",
+      "platforms": [
+        "linux"
+      ],
+      "tags": [
+        "phishing",
+        "authentication",
+        "2fa-testing"
+      ],
+      "maps_to": [
+        "auth"
+      ],
+      "category": "social-physical"
+    },
+    {
+      "name": "Social Engineer Toolkit (official Python)",
+      "description": "Open-source penetration testing framework specialized in social engineering attack vectors.",
+      "url": "https://github.com/trustedsec/social-engineer-toolkit",
+      "kind": "framework",
+      "category": "social-physical",
+      "maps_to": [
+        "auth",
+        "disclosure",
+        "rce"
+      ],
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "tags": [
+        "phishing",
+        "social-engineering",
+        "payloads",
+        "payload-delivery"
+      ]
+    },
+    {
+      "name": "USB Rubber Ducky",
+      "description": "Keystroke injection attack platform disguised as a USB flash drive for rapid payload delivery.",
+      "url": "http://usbrubberducky.com",
+      "kind": "tool",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "physical-access",
+        "keystroke-injection",
+        "payload-delivery"
+      ],
+      "maps_to": [
+        "rce",
+        "access-control"
+      ],
+      "category": "social-physical"
+    },
+    {
+      "name": "CVE Details - Common Vulnerabilities and Exposures",
+      "description": "Dictionary of publicly known security vulnerabilities and exposures with standardized naming.",
+      "url": "https://cve.mitre.org/",
+      "kind": "database",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "vulnerability",
+        "cve",
+        "reference"
+      ],
+      "maps_to": [],
+      "category": "platforms-training"
+    },
+    {
+      "name": "Damn Vulnerable Web Application (DVWA)",
+      "description": "PHP/MySQL web app designed for security professionals to practice testing techniques.",
+      "url": "https://github.com/digininja/DVWA",
+      "kind": "resource",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "training",
+        "vulnerable-app",
+        "docker"
+      ],
+      "maps_to": [
+        "xss",
+        "sqli",
+        "auth",
+        "access-control"
+      ],
+      "category": "platforms-training"
+    },
+    {
+      "name": "Exploit-DB",
+      "description": "Non-profit repository of known exploits and vulnerability proof-of-concepts.",
+      "url": "https://www.exploit-db.com/",
+      "kind": "database",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "exploit",
+        "poc",
+        "research"
+      ],
+      "maps_to": [
+        "rce",
+        "auth",
+        "access-control"
+      ],
+      "category": "platforms-training"
+    },
+    {
+      "name": "HackTheBox",
+      "description": "Online platform with vulnerable machines and CTF challenges for hands-on pentesting practice.",
+      "url": "https://www.hackthebox.com",
+      "kind": "resource",
+      "category": "platforms-training",
+      "maps_to": [],
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "training",
+        "lab-environment",
+        "CTF"
+      ]
+    },
+    {
+      "name": "Kali Linux",
+      "description": "Rolling Debian-based Linux distribution purpose-built for penetration testing and security research.",
+      "url": "https://www.kali.org/",
+      "kind": "distro",
+      "platforms": [
+        "linux"
+      ],
+      "tags": [
+        "pentest",
+        "security",
+        "tools",
+        "rolling-release"
+      ],
+      "maps_to": [],
+      "category": "platforms-training"
+    },
+    {
+      "name": "MITRE ATT&CK",
+      "description": "Curated knowledge base of cyber adversary tactics, techniques, and procedures for threat modeling.",
+      "url": "https://attack.mitre.org",
+      "kind": "resource",
+      "category": "platforms-training",
+      "maps_to": [],
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "threat-intelligence",
+        "framework",
+        "adversary-tactics",
+        "threat-intel",
+        "tactics",
+        "techniques"
+      ]
+    },
+    {
+      "name": "National Vulnerability Database (NVD)",
+      "description": "U.S. government vulnerability repository with CVSS scoring and comprehensive CVE details.",
+      "url": "https://nvd.nist.gov/",
+      "kind": "database",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "vulnerability",
+        "cvss",
+        "cve"
+      ],
+      "maps_to": [],
+      "category": "platforms-training"
+    },
+    {
+      "name": "Offensive Security Training",
+      "description": "Hands-on security training courses from Kali developers including OSCP certification.",
+      "url": "https://www.offensive-security.com/",
+      "kind": "training",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "education",
+        "certification",
+        "hands-on"
+      ],
+      "maps_to": [],
+      "category": "platforms-training"
+    },
+    {
+      "name": "OWASP Juice Shop",
+      "description": "Deliberately vulnerable modern web application for learning web security exploits.",
+      "url": "https://github.com/bkimminich/juice-shop",
+      "kind": "resource",
+      "platforms": [
+        "cross-platform"
+      ],
+      "tags": [
+        "training",
+        "vulnerable-app",
+        "docker"
+      ],
+      "maps_to": [
+        "xss",
+        "sqli",
+        "auth",
+        "access-control"
+      ],
+      "category": "platforms-training"
+    },
+    {
+      "name": "OWASP Testing Guide",
+      "description": "Comprehensive manual for web application security testing methodologies and techniques.",
+      "url": "https://owasp.org/www-project-web-security-testing-guide/",
+      "kind": "resource",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "methodology",
+        "web-app",
+        "education"
+      ],
+      "maps_to": [],
+      "category": "platforms-training"
+    },
+    {
+      "name": "SANS Security Training",
+      "description": "Comprehensive computer security certification and training programs for professionals.",
+      "url": "https://www.sans.org/",
+      "kind": "training",
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "education",
+        "certification",
+        "methodology"
+      ],
+      "maps_to": [],
+      "category": "platforms-training"
+    },
+    {
+      "name": "TryHackMe",
+      "description": "Interactive cybersecurity training platform with guided labs and certification paths.",
+      "url": "https://www.tryhackme.com",
+      "kind": "training",
+      "category": "platforms-training",
+      "maps_to": [],
+      "platforms": [
+        "web"
+      ],
+      "tags": [
+        "training",
+        "education",
+        "certifications"
+      ]
+    }
+  ]
+}

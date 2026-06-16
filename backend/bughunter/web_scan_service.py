@@ -1,0 +1,444 @@
+"""GreyIQ BugHunter — passive live-site security scan.
+
+Safely fetches a single URL, reusing the hardened SSRF/URL guard from
+``web_ingest`` but keeping the *raw* HTML and response headers (the readable
+extractor strips scripts and headers, which is exactly where web security
+signal lives). It then runs passive checks: missing/weak security headers,
+software-version disclosure, insecure cookies, mixed content, secrets leaked
+in inline scripts, dangerous client-side sinks, and error/stack disclosure.
+
+PASSIVE means: one GET, no auth, no fuzzing, no state-changing requests. Point
+it only at sites you own or are explicitly authorized to test. Private,
+loopback, and reserved hosts are refused unless
+``GREYIQ_SCAN_ALLOW_PRIVATE_URLS=1``.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+from bughunter.code_scanner.rules import SECRET_RULES
+from bughunter.settings import get_settings
+from bughunter.web_ingest import (
+    WebsiteFetchError,
+    _ascii_hostname,
+    _host_is_private,
+    normalize_website_url,
+)
+
+_USER_AGENT = "GreyIQ-BugHunter/0.1 (+authorized-scan)"
+_MAX_FINDINGS_RETURNED = 300
+
+# Security response headers expected on a modern site -> (severity, advice).
+_EXPECTED_HEADERS: dict[str, tuple[str, str]] = {
+    "content-security-policy": (
+        "medium",
+        "Add a Content-Security-Policy to constrain script and resource origins.",
+    ),
+    "x-content-type-options": (
+        "low",
+        "Add 'X-Content-Type-Options: nosniff' to stop MIME sniffing.",
+    ),
+    "x-frame-options": (
+        "low",
+        "Add 'X-Frame-Options: DENY' or a CSP frame-ancestors directive to prevent clickjacking.",
+    ),
+    "referrer-policy": (
+        "low",
+        "Add a Referrer-Policy such as 'strict-origin-when-cross-origin'.",
+    ),
+}
+
+_SINK_PATTERNS: tuple[tuple[str, str, str, str], ...] = (
+    ("web.js-eval", r"\beval\s*\(", "Client-side eval() call", "low"),
+    ("web.js-innerhtml", r"\.innerHTML\s*=", "Direct innerHTML assignment (XSS sink)", "low"),
+    ("web.js-document-write", r"document\.write\s*\(", "document.write() call (XSS sink)", "low"),
+    ("web.js-react-dangerous", r"dangerouslySetInnerHTML", "React dangerouslySetInnerHTML (XSS sink)", "low"),
+)
+
+_ERROR_PATTERNS: tuple[tuple[str, str], ...] = (
+    (r"Traceback \(most recent call last\)", "Python traceback"),
+    (r"(?:Fatal error|Warning|Notice):.{0,80}on line \d+", "PHP error"),
+    (r"java\.lang\.[A-Za-z.]+(?:Exception|Error)", "Java exception"),
+    (r"SQLSTATE\[|ORA-\d{5}|SQL syntax.{0,40}near", "SQL error"),
+)
+
+_SEVERITY_WEIGHT: dict[str, float] = {
+    "critical": 0.5,
+    "high": 0.32,
+    "medium": 0.18,
+    "low": 0.06,
+    "info": 0.02,
+}
+_SEVERITY_RANK: dict[str, int] = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+
+
+def _finding(
+    rule_id: str,
+    title: str,
+    severity: str,
+    confidence: str,
+    category: str,
+    url: str,
+    *,
+    snippet: str = "",
+    remediation: str = "",
+    line_start: int = 1,
+) -> dict[str, Any]:
+    return {
+        "rule_id": rule_id,
+        "title": title,
+        "severity": severity,
+        "confidence": confidence,
+        "category": category,
+        "file_path": url,
+        "line_start": line_start,
+        "line_end": line_start,
+        "snippet": snippet,
+        "remediation": remediation,
+    }
+
+
+def _snippet(body: str, match: re.Match[str], ctx: int = 60) -> str:
+    start = max(0, match.start() - ctx)
+    end = min(len(body), match.end() + ctx)
+    return re.sub(r"\s+", " ", body[start:end]).strip()[:200]
+
+
+def _consume(response: Any, settings: Any) -> dict[str, Any]:
+    """Read status, headers, cookies, and a byte-capped body from a response
+    or an HTTPError (so error pages are still analyzed)."""
+    headers = {key.lower(): value for key, value in response.headers.items()}
+    cookies = response.headers.get_all("Set-Cookie") or []
+    raw = response.read(settings.web_fetch_max_bytes + 1)
+    truncated = len(raw) > settings.web_fetch_max_bytes
+    raw = raw[: settings.web_fetch_max_bytes]
+    charset = response.headers.get_content_charset() or "utf-8"
+    try:
+        body = raw.decode(charset, errors="replace")
+    except LookupError:
+        body = raw.decode("utf-8", errors="replace")
+    status = getattr(response, "status", None) or getattr(response, "code", 0)
+    return {
+        "status": int(status or 0),
+        "headers": headers,
+        "cookies": list(cookies),
+        "body": body,
+        "truncated": truncated,
+    }
+
+
+_MAX_REDIRECTS = 5
+
+
+def _guard_url(url: str, allow_private: bool, allowed_ports: frozenset[int]) -> str:
+    """SSRF/policy guard: enforce scheme, reject embedded credentials, block
+    private/loopback/reserved hosts (unless opted in), and restrict ports for
+    public hosts. Returns the URL with an ASCII (punycoded) host so the actual
+    connection target matches exactly what was validated."""
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise WebsiteFetchError("Only http and https URLs can be scanned.")
+    if not parsed.netloc or not parsed.hostname:
+        raise WebsiteFetchError("URL is missing a host.")
+    if "\\" in parsed.netloc:
+        raise WebsiteFetchError("URL host cannot contain backslashes.")
+    if parsed.username or parsed.password:
+        raise WebsiteFetchError("URLs with embedded credentials are not supported.")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise WebsiteFetchError("URL contains an invalid port.") from exc
+
+    ascii_host = _ascii_hostname(parsed.hostname)
+    if _host_is_private(ascii_host) and not allow_private:
+        raise WebsiteFetchError(
+            "Private, local, and reserved hosts are refused. "
+            "Set GREYIQ_SCAN_ALLOW_PRIVATE_URLS=1 to scan your own local apps."
+        )
+    if port is not None and not allow_private and port not in allowed_ports:
+        allowed = ", ".join(str(p) for p in sorted(allowed_ports))
+        raise WebsiteFetchError(f"Port {port} is not allowed for public hosts. Allowed: {allowed}.")
+
+    netloc = ascii_host if port is None else f"{ascii_host}:{port}"
+    return urlunparse(parsed._replace(netloc=netloc))
+
+
+class _GuardedRedirect(HTTPRedirectHandler):
+    """Re-validate every redirect target through the same guard so a 30x bounce
+    cannot escape the policy (DNS rebinding, cross-protocol, internal hop)."""
+
+    def __init__(self, allow_private: bool, allowed_ports: frozenset[int]) -> None:
+        self.allow_private = allow_private
+        self.allowed_ports = allowed_ports
+        self.count = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, N802
+        self.count += 1
+        if self.count > _MAX_REDIRECTS:
+            raise WebsiteFetchError("Website redirected too many times.")
+        target = _guard_url(urljoin(req.full_url, newurl), self.allow_private, self.allowed_ports)
+        return super().redirect_request(req, fp, code, msg, headers, target)
+
+
+def _fetch_raw(url: str) -> dict[str, Any]:
+    settings = get_settings()
+    normalized = normalize_website_url(url)
+    sanitized = _guard_url(normalized, settings.allow_private_urls, settings.web_allowed_ports)
+    request = Request(
+        sanitized,
+        headers={
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+            "User-Agent": _USER_AGENT,
+        },
+        method="GET",
+    )
+    opener = build_opener(_GuardedRedirect(settings.allow_private_urls, settings.web_allowed_ports))
+    try:
+        with opener.open(request, timeout=settings.web_fetch_timeout_seconds) as response:
+            final_url = response.geturl()
+            _guard_url(final_url, settings.allow_private_urls, settings.web_allowed_ports)
+            consumed = _consume(response, settings)
+    except HTTPError as error:
+        # An error response is still worth analyzing (stack traces, headers).
+        final_url = getattr(error, "url", None) or sanitized
+        consumed = _consume(error, settings)
+    consumed["final_url"] = final_url
+    consumed["requested_url"] = normalized
+    return consumed
+
+
+def _analyze(fetched: dict[str, Any]) -> list[dict[str, Any]]:
+    headers = fetched["headers"]
+    cookies = fetched["cookies"]
+    body = fetched["body"]
+    final_url = fetched["final_url"]
+    is_https = final_url.lower().startswith("https://")
+    findings: list[dict[str, Any]] = []
+
+    # 1. Missing security headers.
+    for header, (severity, advice) in _EXPECTED_HEADERS.items():
+        if header not in headers:
+            findings.append(
+                _finding(
+                    f"web.missing-header.{header}",
+                    f"Missing security header: {header}",
+                    severity,
+                    "high",
+                    "headers",
+                    final_url,
+                    remediation=advice,
+                )
+            )
+    if is_https and "strict-transport-security" not in headers:
+        findings.append(
+            _finding(
+                "web.missing-header.hsts",
+                "Missing Strict-Transport-Security (HSTS)",
+                "low",
+                "high",
+                "headers",
+                final_url,
+                remediation="Add 'Strict-Transport-Security: max-age=63072000; includeSubDomains'.",
+            )
+        )
+
+    # 2. Software/version disclosure headers.
+    for header in ("server", "x-powered-by"):
+        value = headers.get(header, "")
+        if value and re.search(r"\d", value):
+            findings.append(
+                _finding(
+                    f"web.info-header.{header}",
+                    f"{header} header discloses software/version",
+                    "info",
+                    "medium",
+                    "disclosure",
+                    final_url,
+                    snippet=value[:120],
+                    remediation=f"Remove or obscure the {header} response header.",
+                )
+            )
+
+    # 3. Insecure cookies.
+    for cookie in cookies:
+        lowered = cookie.lower()
+        name = cookie.split("=", 1)[0].strip()
+        if is_https and "secure" not in lowered:
+            findings.append(
+                _finding(
+                    "web.cookie-insecure",
+                    f"Cookie '{name}' missing the Secure flag",
+                    "medium",
+                    "high",
+                    "cookies",
+                    final_url,
+                    snippet=cookie[:120],
+                    remediation="Set Secure so the cookie is only sent over HTTPS.",
+                )
+            )
+        if "httponly" not in lowered:
+            findings.append(
+                _finding(
+                    "web.cookie-no-httponly",
+                    f"Cookie '{name}' missing the HttpOnly flag",
+                    "low",
+                    "high",
+                    "cookies",
+                    final_url,
+                    snippet=cookie[:120],
+                    remediation="Set HttpOnly so client-side JavaScript cannot read the cookie.",
+                )
+            )
+
+    # 4. Mixed content on an HTTPS page.
+    if is_https:
+        mixed = re.findall(r"""(?:src|href|action)\s*=\s*["']http://[^"']+""", body, re.IGNORECASE)
+        if mixed:
+            findings.append(
+                _finding(
+                    "web.mixed-content",
+                    f"{len(mixed)} insecure http:// resource reference(s) on an HTTPS page",
+                    "medium",
+                    "high",
+                    "mixed_content",
+                    final_url,
+                    snippet=mixed[0][:160],
+                    remediation="Load every sub-resource over HTTPS.",
+                )
+            )
+
+    # 5. Secrets leaked in the served HTML/JS (reuse the code-scanner rules).
+    for rule in SECRET_RULES:
+        try:
+            for hit in rule.scan(path=final_url, text=body):
+                findings.append(
+                    _finding(
+                        f"web.exposed.{hit.rule_id}",
+                        f"Secret exposed in page source: {hit.title}",
+                        hit.severity.value,
+                        hit.confidence.value,
+                        "secret_exposed",
+                        final_url,
+                        snippet=hit.snippet,
+                        remediation="Never ship secrets to the client; rotate this credential.",
+                        line_start=hit.line_start,
+                    )
+                )
+        except Exception:  # noqa: BLE001 - one bad rule must not abort the scan
+            continue
+
+    # 6. Dangerous client-side sinks.
+    for rule_id, pattern, title, severity in _SINK_PATTERNS:
+        match = re.search(pattern, body)
+        if match:
+            findings.append(
+                _finding(
+                    rule_id,
+                    title,
+                    severity,
+                    "low",
+                    "client_sink",
+                    final_url,
+                    snippet=_snippet(body, match),
+                )
+            )
+
+    # 7. Source map exposure.
+    if "sourcemappingurl=" in body.lower():
+        findings.append(
+            _finding(
+                "web.source-map-exposed",
+                "Source map reference exposed (sourceMappingURL)",
+                "info",
+                "medium",
+                "disclosure",
+                final_url,
+                remediation="Do not ship source maps to production, or restrict access to them.",
+            )
+        )
+
+    # 8. Error / stack disclosure.
+    for pattern, label in _ERROR_PATTERNS:
+        match = re.search(pattern, body)
+        if match:
+            findings.append(
+                _finding(
+                    "web.error-disclosure",
+                    f"Possible error/stack disclosure ({label})",
+                    "low",
+                    "medium",
+                    "disclosure",
+                    final_url,
+                    snippet=_snippet(body, match),
+                )
+            )
+            break
+
+    return findings
+
+
+def _risk(findings: list[dict[str, Any]]) -> tuple[str, float]:
+    score = round(min(1.0, sum(_SEVERITY_WEIGHT.get(f["severity"], 0.0) for f in findings)), 3)
+    severities = {f["severity"] for f in findings}
+    if severities & {"critical", "high"} or score >= 0.5:
+        return "high", score
+    if "medium" in severities or score >= 0.2:
+        return "moderate", score
+    if findings:
+        return "low", score
+    return "clean", score
+
+
+_RISK_ADVICE = {
+    "high": "Serious web exposure detected. Review the high/critical findings before this stays live.",
+    "moderate": "Hardening gaps detected. Address the medium findings to reduce attack surface.",
+    "low": "Minor hardening findings only. Triage as routine.",
+    "clean": "No passive web security issues detected at this depth.",
+}
+
+
+def run_web_scan(url: str, max_findings: int = _MAX_FINDINGS_RETURNED) -> dict[str, Any]:
+    """Passively scan a single URL. Returns a JSON-serializable result, or
+    ``{"ok": False, "error": ...}`` on a fetch failure instead of raising."""
+    target = str(url or "").strip()
+    if not target:
+        return {"ok": False, "scan_type": "web", "error": "No URL provided."}
+
+    try:
+        fetched = _fetch_raw(target)
+    except WebsiteFetchError as exc:
+        return {"ok": False, "scan_type": "web", "target": target, "error": str(exc)}
+    except (URLError, TimeoutError, ValueError) as exc:
+        return {
+            "ok": False,
+            "scan_type": "web",
+            "target": target,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    findings = _analyze(fetched)
+    findings.sort(key=lambda f: _SEVERITY_RANK.get(f["severity"], 0), reverse=True)
+    risk, score = _risk(findings)
+    return {
+        "ok": True,
+        "scan_type": "web",
+        "target": target,
+        "final_url": fetched["final_url"],
+        "status": fetched["status"],
+        "risk": risk,
+        "score": score,
+        "recommendation": _RISK_ADVICE[risk],
+        "finding_count": len(findings),
+        "findings": findings[:max_findings],
+        "findings_truncated": len(findings) > max_findings,
+        "response_truncated": fetched["truncated"],
+        "security_headers_present": sorted(
+            h for h in _EXPECTED_HEADERS if h in fetched["headers"]
+        ),
+    }

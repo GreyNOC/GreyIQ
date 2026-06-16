@@ -139,12 +139,73 @@ const els = {
   repoSourcesInput: document.querySelector("#repoSourcesInput"),
   repoIngestButton: document.querySelector("#repoIngestButton"),
   repoIngestStatus: document.querySelector("#repoIngestStatus"),
+  trainingFolderForm: document.querySelector("#trainingFolderForm"),
+  trainingFolderInput: document.querySelector("#trainingFolderInput"),
+  trainingFolderBrowse: document.querySelector("#trainingFolderBrowse"),
+  trainingFolderSubmit: document.querySelector("#trainingFolderSubmit"),
+  trainingFolderStatus: document.querySelector("#trainingFolderStatus"),
+  brainForm: document.querySelector("#brainForm"),
+  brainProvider: document.querySelector("#brainProvider"),
+  brainModel: document.querySelector("#brainModel"),
+  brainBaseUrl: document.querySelector("#brainBaseUrl"),
+  brainApiKey: document.querySelector("#brainApiKey"),
+  brainTest: document.querySelector("#brainTest"),
+  brainSave: document.querySelector("#brainSave"),
+  brainStatus: document.querySelector("#brainStatus"),
+  brainModelRow: document.querySelector("#brainModelRow"),
+  brainModelStatus: document.querySelector("#brainModelStatus"),
+  brainDownload: document.querySelector("#brainDownload"),
+  agentToggle: document.querySelector("#agentToggle"),
+  agentWorkspace: document.querySelector("#agentWorkspace"),
+  agentWsPath: document.querySelector("#agentWsPath"),
   trainingSourceList: document.querySelector("#trainingSourceList"),
   trainButton: document.querySelector("#trainButton"),
   trainingDataCount: document.querySelector("#trainingDataCount"),
   choiceCount: document.querySelector("#choiceCount"),
   modelState: document.querySelector("#modelState"),
-  memoryList: document.querySelector("#memoryList")
+  memoryList: document.querySelector("#memoryList"),
+  themeToggle: document.querySelector("#themeToggle"),
+  appShell: document.querySelector(".app-shell"),
+  workbench: document.querySelector("#workbench"),
+  workbenchDivider: document.querySelector("#workbenchDivider"),
+  workbenchMaximize: document.querySelector("#workbenchMaximize"),
+  workbenchTablist: document.querySelector(".workbench-tablist"),
+  workspaceRefresh: document.querySelector("#workspaceRefresh"),
+  workspaceSearch: document.querySelector("#workspaceSearch"),
+  workspaceTree: document.querySelector("#workspaceTree"),
+  filePreviewPanel: document.querySelector("#filePreviewPanel"),
+  changesPanel: document.querySelector("#changesPanel"),
+  agentStepsPanel: document.querySelector("#agentStepsPanel"),
+  verifyPanel: document.querySelector("#verifyPanel"),
+  bountyForm: document.querySelector("#bountyForm"),
+  bountyProfile: document.querySelector("#bountyProfile"),
+  bountyProfileHint: document.querySelector("#bountyProfileHint"),
+  bountyClass: document.querySelector("#bountyClass"),
+  bountyTarget: document.querySelector("#bountyTarget"),
+  bountyScope: document.querySelector("#bountyScope"),
+  bountyOutput: document.querySelector("#bountyOutput"),
+  bountyOutputBrowse: document.querySelector("#bountyOutputBrowse"),
+  bountyAuthorized: document.querySelector("#bountyAuthorized"),
+  bountyPerFinding: document.querySelector("#bountyPerFinding"),
+  bountyRun: document.querySelector("#bountyRun"),
+  bountyStatus: document.querySelector("#bountyStatus"),
+  bountyReport: document.querySelector("#bountyReport"),
+  bountyReportActions: document.querySelector("#bountyReportActions"),
+  bountyCopyReport: document.querySelector("#bountyCopyReport"),
+  redteamForm: document.querySelector("#redteamForm"),
+  redteamBehavioral: document.querySelector("#redteamBehavioral"),
+  redteamAuthorized: document.querySelector("#redteamAuthorized"),
+  redteamRun: document.querySelector("#redteamRun"),
+  redteamStatus: document.querySelector("#redteamStatus"),
+  redteamReport: document.querySelector("#redteamReport"),
+  redteamReportActions: document.querySelector("#redteamReportActions"),
+  redteamCopyReport: document.querySelector("#redteamCopyReport"),
+  toolkitForm: document.querySelector("#toolkitForm"),
+  toolkitCategory: document.querySelector("#toolkitCategory"),
+  toolkitClass: document.querySelector("#toolkitClass"),
+  toolkitSearch: document.querySelector("#toolkitSearch"),
+  toolkitStatus: document.querySelector("#toolkitStatus"),
+  toolkitList: document.querySelector("#toolkitList")
 };
 
 class AccelerationBackend {
@@ -311,7 +372,25 @@ function loadState() {
     memories: {},
     backendPreference: "cpu",
     botDefaultRevision: BOT_DEFAULT_REVISION,
-    selectedTrainingSources: [...DEFAULT_SELECTED_TRAINING_SOURCES]
+    selectedTrainingSources: [...DEFAULT_SELECTED_TRAINING_SOURCES],
+    agentMode: false,
+    agentWorkspace: "",
+    theme: "light",
+    workbenchTab: "preview",
+    workbenchActiveFile: "",
+    workbenchSearch: "",
+    workbenchTree: [],
+    workbenchHeight: null,
+    workbenchDocked: false,
+    workbenchWrap: false,
+    lastAgentTranscript: [],
+    lastAgentChanges: [],
+    bountyProfile: "full-sweep",
+    bountyClass: "",
+    bountyScope: "",
+    bountyOutput: "",
+    bountyPerFinding: false,
+    redteamBehavioral: false
   };
 
   try {
@@ -370,7 +449,20 @@ function trainingSourceName(sourceId) {
 }
 
 function saveState() {
-  localStorage.setItem(STORE_KEY, JSON.stringify(state));
+  // Volatile/heavy workbench data (file tree, agent transcript, before/after
+  // diffs) is kept in memory only — persisting it could blow the localStorage
+  // quota and it is cheap to refetch. Theme and workbench UI prefs do persist.
+  const {
+    workbenchTree: _tree,
+    lastAgentTranscript: _transcript,
+    lastAgentChanges: _changes,
+    ...persist
+  } = state;
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify(persist));
+  } catch (_) {
+    // Storage full or unavailable — non-fatal; the app keeps working in memory.
+  }
 }
 
 async function apiFetch(path, options = {}) {
@@ -424,6 +516,32 @@ function normalizeReplyPayload(payload, userText) {
     },
     modelName: payload?.model_name || "GreyIQ",
     device: payload?.device || diagnostics.device || "local"
+  };
+}
+
+function normalizeAnswerForChat(answer, userText, strategy = "local_engine") {
+  if (answer && typeof answer === "object" && "text" in answer) {
+    return answer;
+  }
+  return {
+    text: String(answer || "I am here with you. Give me a little more to work with and I will shape it."),
+    citations: [],
+    diagnostics: {
+      used_fallback: false,
+      captured_for_training: false,
+      intent: inferIntent(userText),
+      mode: strategy === "coding_agent" ? "agent" : "default",
+      strategy,
+      confidence: 0,
+      retrieval_count: 0,
+      memory_count: 0,
+      note_count: 0,
+      citation_count: 0,
+      engine_ready: Boolean(service.available),
+      device: service.status?.device || backend?.mode || "local"
+    },
+    modelName: strategy === "coding_agent" ? "coding-agent" : "GreyIQ",
+    device: service.status?.device || backend?.mode || "local"
   };
 }
 
@@ -923,13 +1041,21 @@ async function replyFor(userText) {
   if (service.available || (await refreshServiceStatus({ silent: true }))) {
     try {
       const bot = activeBot();
+      // Prior turns (excluding the message we're about to send) give the coding
+      // brain conversation context for multi-turn coding.
+      const history = (activeChat() || [])
+        .slice(0, -1)
+        .slice(-12)
+        .map((message) => ({ role: message.role === "bot" ? "assistant" : "user", content: message.text }))
+        .filter((message) => message.content);
       const response = await apiFetch("/api/chat", {
         method: "POST",
-        timeoutMs: 60000,
+        timeoutMs: 120000,
         body: JSON.stringify({
           message: userText,
           bot: serializableBot(bot),
           memories: activeMemories(),
+          history,
           max_new_tokens: 160,
           temperature: Math.max(0.05, Math.min(1.2, bot.temperature / 100)),
           auto_capture: true
@@ -1008,6 +1134,7 @@ function render() {
   renderChat();
   renderTraining();
   renderTrainingSources();
+  renderAgentBar();
   renderBackend();
   saveState();
 }
@@ -1376,7 +1503,12 @@ els.composer.addEventListener("submit", async (event) => {
 
   els.sendButton.disabled = true;
   try {
-    const answer = await replyFor(text);
+    const rawAnswer = state.agentMode && state.agentWorkspace ? await runAgent(text) : await replyFor(text);
+    const answer = normalizeAnswerForChat(
+      rawAnswer,
+      text,
+      state.agentMode && state.agentWorkspace ? "coding_agent" : "local_engine"
+    );
     chat.push({
       id: crypto.randomUUID(),
       role: "bot",
@@ -1440,7 +1572,7 @@ els.trainingDataForm.addEventListener("submit", (event) => {
   addMemory({ kind: "training_data", sourceId, text });
 });
 
-els.repoIngestForm.addEventListener("submit", async (event) => {
+els.repoIngestForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const sources = els.repoSourcesInput.value
     .split(/\r?\n/)
@@ -1489,6 +1621,79 @@ els.repoIngestForm.addEventListener("submit", async (event) => {
   }
 });
 
+const desktopFolderPicker =
+  typeof window !== "undefined" &&
+  window.greyiqDesktop &&
+  typeof window.greyiqDesktop.pickFolder === "function";
+
+if (desktopFolderPicker && els.trainingFolderBrowse) {
+  els.trainingFolderBrowse.hidden = false;
+}
+
+async function chooseTrainingFolder() {
+  if (!desktopFolderPicker) {
+    return null;
+  }
+  try {
+    return await window.greyiqDesktop.pickFolder();
+  } catch (_) {
+    return null;
+  }
+}
+
+els.trainingFolderBrowse?.addEventListener("click", async () => {
+  const picked = await chooseTrainingFolder();
+  if (picked) {
+    els.trainingFolderInput.value = picked;
+  }
+});
+
+els.trainingFolderForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  let folder = els.trainingFolderInput.value.trim();
+  if (!folder) {
+    const picked = await chooseTrainingFolder();
+    if (picked) {
+      folder = picked;
+      els.trainingFolderInput.value = picked;
+    }
+  }
+  if (!folder) {
+    els.trainingFolderStatus.textContent = desktopFolderPicker
+      ? "Choose a folder first."
+      : "Paste a folder path first.";
+    return;
+  }
+
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.trainingFolderStatus.textContent = "Local GreyIQ service is not running.";
+    return;
+  }
+
+  els.trainingFolderSubmit.disabled = true;
+  els.trainingFolderStatus.textContent = "Reading folder and ingesting files... this can take a while for large folders.";
+  try {
+    const result = await apiFetch("/api/train/folder", {
+      method: "POST",
+      timeoutMs: 300000,
+      body: JSON.stringify({ folder })
+    });
+    els.trainingFolderStatus.textContent = result.message || "Folder added to training data.";
+    state.selectedTrainingSources = normalizeSelectedTrainingSources([
+      ...state.selectedTrainingSources,
+      "src_imported_docs"
+    ]);
+    saveState();
+    renderTrainingSources();
+    await refreshServiceStatus({ silent: true });
+  } catch (error) {
+    els.trainingFolderStatus.textContent = error.message || "Could not add that folder.";
+  } finally {
+    els.trainingFolderSubmit.disabled = false;
+  }
+  render();
+});
+
 els.trainButton.addEventListener("click", async () => {
   const bot = activeBot();
   trainBot(bot);
@@ -1518,6 +1723,1018 @@ els.trainButton.addEventListener("click", async () => {
     await refreshServiceStatus({ silent: true });
   }
   render();
+});
+
+// ---- Coding brain (local model / Claude / OpenAI-compatible) ----
+let coderConfig = null;
+const BRAIN_FIELDS = {
+  off: [],
+  local: ["model", "base_url"],
+  anthropic: ["model", "api_key"],
+  openai: ["model", "base_url", "api_key"]
+};
+
+function brainBlockFor(provider) {
+  if (!coderConfig || provider === "off") return {};
+  return coderConfig[provider] || {};
+}
+
+function applyBrainFields(provider, repopulate) {
+  const fields = BRAIN_FIELDS[provider] || [];
+  els.brainForm.querySelectorAll("[data-brain-field]").forEach((row) => {
+    row.hidden = !fields.includes(row.dataset.brainField);
+  });
+  if (els.brainTest) {
+    els.brainTest.hidden = provider === "off";
+  }
+  if (els.brainModelRow) {
+    els.brainModelRow.hidden = provider !== "local";
+    if (provider === "local") {
+      void refreshModelStatus();
+    }
+  }
+  if (repopulate) {
+    const block = brainBlockFor(provider);
+    els.brainModel.value = block.model || "";
+    els.brainBaseUrl.value = block.base_url || "";
+    els.brainApiKey.value = "";
+    els.brainApiKey.placeholder = block.has_api_key ? "saved — leave blank to keep" : "paste API key";
+  }
+}
+
+function renderBrainForm() {
+  if (!els.brainForm) return;
+  const provider = coderConfig && coderConfig.enabled && coderConfig.provider ? coderConfig.provider : "off";
+  els.brainProvider.value = ["off", "local", "anthropic", "openai"].includes(provider) ? provider : "off";
+  applyBrainFields(els.brainProvider.value, true);
+}
+
+function buildBrainBlock(provider) {
+  const block = {};
+  if (BRAIN_FIELDS[provider].includes("model")) block.model = els.brainModel.value.trim();
+  if (BRAIN_FIELDS[provider].includes("base_url")) block.base_url = els.brainBaseUrl.value.trim();
+  if (BRAIN_FIELDS[provider].includes("api_key")) block.api_key = els.brainApiKey.value; // blank = keep saved
+  return block;
+}
+
+async function loadCoderConfig() {
+  if (!els.brainForm) return;
+  try {
+    coderConfig = await apiFetch("/api/coder", { timeoutMs: 4000 });
+    renderBrainForm();
+  } catch (_) {
+    // Local service not up yet; the form keeps its defaults.
+  }
+}
+
+els.brainProvider?.addEventListener("change", () => {
+  applyBrainFields(els.brainProvider.value, true);
+});
+
+els.brainForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.brainStatus.textContent = "Local GreyIQ service is not running.";
+    return;
+  }
+  const provider = els.brainProvider.value;
+  const update = provider === "off"
+    ? { enabled: false }
+    : { enabled: true, provider, [provider]: buildBrainBlock(provider) };
+  els.brainSave.disabled = true;
+  els.brainStatus.textContent = "Saving…";
+  try {
+    coderConfig = await apiFetch("/api/coder", {
+      method: "POST",
+      timeoutMs: 10000,
+      body: JSON.stringify({ config: update })
+    });
+    renderBrainForm();
+    els.brainStatus.textContent = provider === "off"
+      ? "Coding brain off — using the local model."
+      : `Saved. Brain: ${provider}. Use Test to verify.`;
+  } catch (error) {
+    els.brainStatus.textContent = error.message || "Could not save brain settings.";
+  } finally {
+    els.brainSave.disabled = false;
+  }
+});
+
+async function refreshModelStatus() {
+  if (!els.brainModelStatus) return;
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.brainModelStatus.textContent = "Local service not running.";
+    return;
+  }
+  try {
+    const info = await apiFetch("/api/coder/models", { timeoutMs: 6000 });
+    if (info.ok === false) {
+      els.brainModelStatus.textContent = info.error || "Ollama not reachable — is it running?";
+      els.brainDownload.hidden = false;
+      return;
+    }
+    if (info.present) {
+      els.brainModelStatus.textContent = `Model installed: ${info.configured} ✓`;
+      els.brainDownload.hidden = true;
+    } else {
+      els.brainModelStatus.textContent = `${info.configured || "Model"} not installed.`;
+      els.brainDownload.hidden = false;
+    }
+  } catch (error) {
+    els.brainModelStatus.textContent = error.message || "Could not check the model.";
+  }
+}
+
+let modelPullTimer = null;
+
+function pollModelPull() {
+  if (modelPullTimer) {
+    clearInterval(modelPullTimer);
+  }
+  modelPullTimer = setInterval(async () => {
+    let status;
+    try {
+      status = await apiFetch("/api/coder/pull", { timeoutMs: 6000 });
+    } catch (_) {
+      return; // transient — keep polling
+    }
+    if (status.active) {
+      const pct = status.percent ? ` ${status.percent}%` : "";
+      els.brainModelStatus.textContent = `Downloading ${status.model}…${pct} ${status.status || ""}`.trim();
+      return;
+    }
+    clearInterval(modelPullTimer);
+    modelPullTimer = null;
+    els.brainDownload.disabled = false;
+    if (status.error) {
+      els.brainModelStatus.textContent = `Download failed: ${status.error}`;
+    } else {
+      void refreshModelStatus();
+    }
+  }, 2000);
+}
+
+els.brainDownload?.addEventListener("click", async () => {
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.brainModelStatus.textContent = "Local service not running.";
+    return;
+  }
+  els.brainDownload.disabled = true;
+  els.brainModelStatus.textContent = "Starting download… (the 14B model is ~9 GB, downloaded once)";
+  try {
+    const res = await apiFetch("/api/coder/pull", { method: "POST", timeoutMs: 10000, body: JSON.stringify({}) });
+    if (res.ok === false) {
+      els.brainModelStatus.textContent = res.error || "Could not start the download.";
+      els.brainDownload.disabled = false;
+      return;
+    }
+    pollModelPull();
+  } catch (error) {
+    els.brainModelStatus.textContent = error.message || "Download failed to start.";
+    els.brainDownload.disabled = false;
+  }
+});
+
+els.brainTest?.addEventListener("click", async () => {
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.brainStatus.textContent = "Local GreyIQ service is not running.";
+    return;
+  }
+  els.brainTest.disabled = true;
+  els.brainStatus.textContent = "Testing… (save first if you changed settings)";
+  try {
+    const result = await apiFetch("/api/coder/test", { method: "POST", timeoutMs: 60000 });
+    els.brainStatus.textContent = result.ok
+      ? `OK — ${result.provider} (${result.model}) replied.`
+      : `Failed: ${result.error}`;
+  } catch (error) {
+    els.brainStatus.textContent = error.message || "Test failed.";
+  } finally {
+    els.brainTest.disabled = false;
+  }
+});
+
+if (els.brainForm) {
+  // Sensible initial state before the saved config loads from the backend.
+  applyBrainFields(els.brainProvider.value, false);
+}
+
+// ---- Theme (light / dark) ----
+function applyTheme() {
+  const theme = state.theme === "dark" ? "dark" : "light";
+  document.body.dataset.theme = theme;
+  const meta = document.querySelector('meta[name="color-scheme"]');
+  if (meta) {
+    meta.setAttribute("content", theme === "dark" ? "dark" : "light");
+  }
+  if (els.themeToggle) {
+    els.themeToggle.textContent = theme === "dark" ? "Light" : "Dark";
+    els.themeToggle.setAttribute("aria-pressed", String(theme === "dark"));
+    els.themeToggle.title = theme === "dark" ? "Switch to light theme" : "Switch to dark theme";
+  }
+}
+
+function toggleTheme() {
+  state.theme = state.theme === "dark" ? "light" : "dark";
+  applyTheme();
+  saveState();
+}
+
+els.themeToggle?.addEventListener("click", toggleTheme);
+
+// ---- Coding agent mode (reads/edits files + runs commands in a workspace) ----
+function shortAgentArgs(input) {
+  if (!input || typeof input !== "object") return "";
+  return String(input.path || input.command || input.pattern || input.query || "").slice(0, 64);
+}
+
+async function chooseWorkspace() {
+  if (desktopFolderPicker) {
+    return await chooseTrainingFolder();
+  }
+  const typed = window.prompt("Workspace folder path for the agent to work in:", state.agentWorkspace || "");
+  return typed ? typed.trim() : null;
+}
+
+function renderAgentBar() {
+  if (!els.agentToggle) return;
+  els.agentToggle.textContent = state.agentMode ? "Agent: on" : "Agent: off";
+  els.agentToggle.setAttribute("aria-pressed", String(Boolean(state.agentMode)));
+  els.agentToggle.classList.toggle("is-active", Boolean(state.agentMode));
+  if (els.agentWsPath) {
+    els.agentWsPath.textContent = state.agentWorkspace || "no workspace set";
+    els.agentWsPath.title = state.agentWorkspace || "";
+  }
+}
+
+// ---- Workbench (IDE-style layer shown only in Agent mode) ----
+function makeHint(text, isError = false) {
+  const p = document.createElement("p");
+  p.className = `workbench-hint${isError ? " is-error" : ""}`;
+  p.textContent = text;
+  return p;
+}
+
+const WORKBENCH_TABS = ["preview", "changes", "steps", "verify"];
+
+function applyWorkbenchSize() {
+  if (!els.appShell) return;
+  const docked = Boolean(state.workbenchDocked);
+  // Docked = workbench fills the left, chat docks to the right at ~1/3 (CSS).
+  els.appShell.classList.toggle("wb-docked", docked);
+  if (!docked) {
+    const height = (typeof state.workbenchHeight === "number" && state.workbenchHeight > 0)
+      ? state.workbenchHeight
+      : Math.round(window.innerHeight * 0.44);
+    els.appShell.style.setProperty("--workbench-h", `${height}px`);
+    if (els.workbenchDivider) {
+      // Expose the splitter's value/bounds so screen readers announce resizing.
+      els.workbenchDivider.setAttribute("aria-valuemin", String(8 * 16));
+      els.workbenchDivider.setAttribute("aria-valuemax", String(Math.round(window.innerHeight * 0.88)));
+      els.workbenchDivider.setAttribute("aria-valuenow", String(height));
+    }
+  }
+  if (els.workbenchMaximize) {
+    els.workbenchMaximize.setAttribute("aria-pressed", String(docked));
+    els.workbenchMaximize.textContent = docked ? "⤡" : "⤢";
+    const label = docked ? "Restore split (chat below)" : "Dock workbench (chat to the right)";
+    els.workbenchMaximize.title = label;
+    els.workbenchMaximize.setAttribute("aria-label", label);
+  }
+}
+
+function renderWorkbench() {
+  if (!els.workbench) return;
+  const on = Boolean(state.agentMode);
+  els.workbench.hidden = !on;
+  els.appShell?.classList.toggle("is-agent", on);
+  document.body.classList.toggle("agent-active", on);
+  if (!on) return;
+  applyWorkbenchSize();
+  setWorkbenchTab(state.workbenchTab || "preview");
+  renderWorkspaceTree(state.workbenchTree);
+  if (state.workbenchActiveFile && els.filePreviewPanel?.dataset.loadedPath) {
+    // keep the currently previewed file as-is
+  } else {
+    renderFilePreview(null);
+  }
+  renderChangesPanel(state.lastAgentChanges);
+  renderAgentSteps(state.lastAgentTranscript);
+  renderVerifyPanel(state.lastAgentTranscript);
+}
+
+function setWorkbenchTab(tabName, focusTab = false) {
+  const tab = WORKBENCH_TABS.includes(tabName) ? tabName : "preview";
+  state.workbenchTab = tab;
+  document.querySelectorAll("[data-workbench-tab]").forEach((btn) => {
+    const active = btn.dataset.workbenchTab === tab;
+    btn.classList.toggle("is-active", active);
+    btn.setAttribute("aria-selected", String(active));
+    btn.tabIndex = active ? 0 : -1;
+    if (active && focusTab) btn.focus();
+  });
+  const panels = {
+    preview: els.filePreviewPanel,
+    changes: els.changesPanel,
+    steps: els.agentStepsPanel,
+    verify: els.verifyPanel
+  };
+  for (const [name, panel] of Object.entries(panels)) {
+    if (panel) panel.hidden = name !== tab;
+  }
+}
+
+async function refreshWorkspaceTree() {
+  if (!els.workspaceTree) return;
+  if (!state.agentWorkspace) {
+    state.workbenchTree = [];
+    renderWorkspaceTree([]);
+    return;
+  }
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.workspaceTree.replaceChildren(makeHint("Local GreyIQ service is not running.", true));
+    return;
+  }
+  els.workspaceTree.replaceChildren(makeHint("Loading files…"));
+  try {
+    const res = await apiFetch("/api/workspace/tree", {
+      method: "POST",
+      timeoutMs: 15000,
+      body: JSON.stringify({ workspace: state.agentWorkspace })
+    });
+    if (res.ok === false) {
+      state.workbenchTree = [];
+      els.workspaceTree.replaceChildren(makeHint(res.error || "Could not list the workspace.", true));
+      return;
+    }
+    state.workbenchTree = Array.isArray(res.entries) ? res.entries : [];
+    renderWorkspaceTree(state.workbenchTree, Boolean(res.truncated));
+  } catch (error) {
+    els.workspaceTree.replaceChildren(makeHint(error.message || "Could not list the workspace.", true));
+  }
+}
+
+// Folders the user has expanded (collapsed by default so a deep repo stays
+// readable). Persists across re-renders for the session.
+const expandedDirs = new Set();
+
+function makeTreeButton(entry, depth, isDir, fullPath) {
+  const node = document.createElement("button");
+  node.type = "button";
+  const isActive = !isDir && entry.path === state.workbenchActiveFile;
+  node.className = `workspace-tree-item${isDir ? " is-dir" : ""}${isActive ? " is-active" : ""}`;
+  node.style.paddingLeft = `${0.4 + depth * 0.8}rem`;
+  node.title = entry.path;
+  node.setAttribute("role", "treeitem");
+  node.setAttribute("aria-level", String(depth + 1));
+
+  const icon = document.createElement("span");
+  icon.className = "tree-icon";
+  icon.setAttribute("aria-hidden", "true");
+  const label = document.createElement("span");
+  label.className = "tree-label";
+  label.textContent = fullPath ? entry.path : entry.name;
+
+  if (isDir) {
+    const open = expandedDirs.has(entry.path);
+    node.setAttribute("aria-expanded", String(open));
+    icon.textContent = open ? "▾" : "▸";
+    node.addEventListener("click", () => {
+      if (expandedDirs.has(entry.path)) expandedDirs.delete(entry.path);
+      else expandedDirs.add(entry.path);
+      renderWorkspaceTree(state.workbenchTree);
+      [...els.workspaceTree.querySelectorAll(".workspace-tree-item")]
+        .find((el) => el.title === entry.path)
+        ?.focus();
+    });
+  } else {
+    icon.textContent = ""; // spacer keeps file labels aligned under the chevrons
+    if (isActive) node.setAttribute("aria-current", "true");
+    node.addEventListener("click", () => openWorkspaceFile(entry.path));
+  }
+  node.append(icon, label);
+  return node;
+}
+
+function renderWorkspaceTree(entries, truncated = false) {
+  if (!els.workspaceTree) return;
+  const list = Array.isArray(entries) ? entries : [];
+  const search = (state.workbenchSearch || "").trim().toLowerCase();
+  els.workspaceTree.replaceChildren();
+
+  if (!list.length) {
+    els.workspaceTree.append(
+      makeHint(state.agentWorkspace ? "No files to show." : "Set a workspace folder to browse its files.")
+    );
+    return;
+  }
+
+  // Search: flat list of matching files (full path), ignoring the tree structure.
+  if (search) {
+    const matches = list.filter((entry) => entry.type === "file" && entry.path.toLowerCase().includes(search));
+    if (!matches.length) {
+      els.workspaceTree.append(makeHint("No files match your filter."));
+      return;
+    }
+    matches.forEach((entry, index) => {
+      const node = makeTreeButton(entry, 0, false, true);
+      node.tabIndex = index === 0 ? 0 : -1;
+      els.workspaceTree.append(node);
+    });
+    return;
+  }
+
+  // Collapsible tree: group the flat list by parent, render only expanded branches.
+  const byParent = new Map();
+  for (const entry of list) {
+    const slash = entry.path.lastIndexOf("/");
+    const parent = slash >= 0 ? entry.path.slice(0, slash) : "";
+    if (!byParent.has(parent)) byParent.set(parent, []);
+    byParent.get(parent).push(entry);
+  }
+  const rows = [];
+  const walk = (parent, depth) => {
+    for (const entry of byParent.get(parent) || []) {
+      const isDir = entry.type === "dir";
+      rows.push({ entry, depth, isDir });
+      if (isDir && expandedDirs.has(entry.path)) walk(entry.path, depth + 1);
+    }
+  };
+  walk("", 0);
+
+  if (!rows.length) {
+    els.workspaceTree.append(makeHint("No files to show."));
+    return;
+  }
+  const activeIdx = rows.findIndex((row) => row.entry.path === state.workbenchActiveFile);
+  const tabStop = activeIdx >= 0 ? activeIdx : 0;
+  rows.forEach((row, index) => {
+    const node = makeTreeButton(row.entry, row.depth, row.isDir, false);
+    node.tabIndex = index === tabStop ? 0 : -1;
+    els.workspaceTree.append(node);
+  });
+  if (truncated) {
+    els.workspaceTree.append(makeHint("… list truncated (large workspace)."));
+  }
+}
+
+async function openWorkspaceFile(path) {
+  state.workbenchActiveFile = path;
+  setWorkbenchTab("preview");
+  saveState();
+  renderWorkspaceTree(state.workbenchTree);
+  if (!els.filePreviewPanel) return;
+  els.filePreviewPanel.dataset.loadedPath = "";
+  els.filePreviewPanel.replaceChildren(makeHint(`Loading ${path}…`));
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    renderFilePreview({ ok: false, error: "Local GreyIQ service is not running.", path });
+    return;
+  }
+  try {
+    const res = await apiFetch("/api/workspace/file", {
+      method: "POST",
+      timeoutMs: 20000,
+      body: JSON.stringify({ workspace: state.agentWorkspace, path })
+    });
+    renderFilePreview(res);
+  } catch (error) {
+    renderFilePreview({ ok: false, error: error.message || "Could not read that file.", path });
+  }
+}
+
+// ---- Lightweight, safe syntax highlighting (no external library) ----
+const HL_KEYWORDS = {
+  js: new Set(
+    ("const let var function return if else for while do switch case break continue new class extends " +
+      "super this typeof instanceof in of try catch finally throw async await yield import export from " +
+      "default null undefined true false void delete static get set").split(" ")
+  ),
+  py: new Set(
+    ("def return if elif else for while break continue class import from as try except finally raise with " +
+      "lambda yield global nonlocal pass assert del in is not and or None True False async await print self").split(" ")
+  ),
+  shell: new Set("if then else elif fi for while do done case esac function in return export local set echo".split(" ")),
+  config: new Set("true false null yes no on off".split(" "))
+};
+// Languages we colorize; anything else renders as plain (escaped) text.
+const HL_LANGS = new Set(["js", "py", "shell", "config", "json", "css"]);
+
+function langFromPath(path) {
+  const ext = String(path || "").split(".").pop().toLowerCase();
+  if (["js", "mjs", "cjs", "jsx", "ts", "tsx"].includes(ext)) return "js";
+  if (ext === "json") return "json";
+  if (ext === "py") return "py";
+  if (["css", "scss", "less", "sass"].includes(ext)) return "css";
+  if (["sh", "bash", "zsh", "ps1", "bat", "cmd"].includes(ext)) return "shell";
+  if (["yml", "yaml", "toml", "ini", "cfg", "conf", "properties", "env"].includes(ext)) return "config";
+  return "";
+}
+
+function highlightCode(text, lang) {
+  if (!HL_LANGS.has(lang)) return escapeHtml(text);
+  const kw = HL_KEYWORDS[lang];
+  const rules = [];
+  if (lang === "js" || lang === "css") rules.push(["comment", /\/\*[\s\S]*?\*\/|\/\/[^\n]*/y]);
+  else if (lang === "py" || lang === "shell" || lang === "config") rules.push(["comment", /#[^\n]*/y]);
+  rules.push(["string", /"(?:\\.|[^"\\\n])*"?|'(?:\\.|[^'\\\n])*'?|`(?:\\.|[^`\\])*`?/y]);
+  rules.push(["number", /\b\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?\b/y]);
+  rules.push(["ident", /[A-Za-z_$][\w$]*/y]);
+  rules.push(["space", /\s+/y]);
+  rules.push(["other", /[^]/y]);
+
+  let out = "";
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    let consumed = false;
+    for (const [type, re] of rules) {
+      re.lastIndex = i;
+      const m = re.exec(text);
+      if (!m || m.index !== i || m[0].length === 0) continue;
+      const chunk = m[0];
+      let cls = "";
+      if (type === "comment") cls = "tok-comment";
+      else if (type === "string") {
+        cls = "tok-string";
+        if (lang === "json") {
+          let j = i + chunk.length;
+          while (j < n && (text[j] === " " || text[j] === "\t")) j += 1;
+          if (text[j] === ":") cls = "tok-key";
+        }
+      } else if (type === "number") cls = "tok-number";
+      else if (type === "ident") {
+        if (kw && kw.has(chunk)) cls = "tok-keyword";
+        else {
+          let j = i + chunk.length;
+          while (j < n && text[j] === " ") j += 1;
+          if (text[j] === "(") cls = "tok-func";
+        }
+      }
+      const safe = escapeHtml(chunk);
+      out += cls ? `<span class="${cls}">${safe}</span>` : safe;
+      i += chunk.length;
+      consumed = true;
+      break;
+    }
+    if (!consumed) {
+      out += escapeHtml(text[i]);
+      i += 1;
+    }
+  }
+  return out;
+}
+
+function renderFilePreview(file) {
+  if (!els.filePreviewPanel) return;
+  els.filePreviewPanel.replaceChildren();
+  if (!file) {
+    els.filePreviewPanel.dataset.loadedPath = "";
+    els.filePreviewPanel.append(makeHint("Select a file from the workspace to preview it here."));
+    return;
+  }
+
+  const bar = document.createElement("div");
+  bar.className = "code-toolbar";
+  const pathEl = document.createElement("span");
+  pathEl.className = "code-path";
+  pathEl.textContent = file.path || state.workbenchActiveFile || "";
+  bar.append(pathEl);
+
+  if (file.ok === false) {
+    els.filePreviewPanel.dataset.loadedPath = "";
+    els.filePreviewPanel.append(bar, makeHint(file.error || "Could not read this file.", true));
+    return;
+  }
+
+  const wrapBtn = document.createElement("button");
+  wrapBtn.type = "button";
+  wrapBtn.className = "code-wrap-toggle";
+  const setWrapLabel = () => {
+    wrapBtn.textContent = state.workbenchWrap ? "Wrap: on" : "Wrap: off";
+    wrapBtn.setAttribute("aria-pressed", String(Boolean(state.workbenchWrap)));
+  };
+  setWrapLabel();
+  bar.append(wrapBtn);
+  els.filePreviewPanel.append(bar);
+
+  const content = file.content || "";
+  const lines = content.split("\n");
+  const view = document.createElement("div");
+  view.className = `code-view${state.workbenchWrap ? " is-wrap" : ""}`;
+
+  const gutter = document.createElement("pre");
+  gutter.className = "code-gutter";
+  gutter.setAttribute("aria-hidden", "true");
+  gutter.textContent = lines.map((_, index) => index + 1).join("\n");
+
+  const body = document.createElement("pre");
+  body.className = "code-body";
+  const code = document.createElement("code");
+  const lang = langFromPath(file.path || "");
+  // Guard the highlighter against pathological files (keeps the UI responsive).
+  const tooBig = lines.length > 2500 || content.length > 100000;
+  if (tooBig || !lang) {
+    code.textContent = content;
+  } else {
+    code.innerHTML = highlightCode(content, lang);
+  }
+  body.append(code);
+  view.append(gutter, body);
+  els.filePreviewPanel.append(view);
+
+  if (file.truncated) {
+    els.filePreviewPanel.append(makeHint(`Preview truncated — showing the start of ${file.size} bytes.`));
+  }
+
+  wrapBtn.addEventListener("click", () => {
+    state.workbenchWrap = !state.workbenchWrap;
+    saveState();
+    view.classList.toggle("is-wrap", state.workbenchWrap);
+    setWrapLabel();
+  });
+
+  els.filePreviewPanel.dataset.loadedPath = file.path || "";
+}
+
+function renderAgentSteps(transcript) {
+  if (!els.agentStepsPanel) return;
+  const steps = Array.isArray(transcript) ? transcript : [];
+  els.agentStepsPanel.replaceChildren();
+  if (!steps.length) {
+    els.agentStepsPanel.append(makeHint("Run an agent task and each tool step will appear here."));
+    return;
+  }
+  steps.forEach((step) => {
+    const out = typeof step.output === "string" ? step.output : JSON.stringify(step.output, null, 2);
+    const card = document.createElement("div");
+    card.className = `agent-step${step.is_error ? " is-error" : ""}`;
+
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "agent-step-head";
+    head.setAttribute("aria-expanded", "false");
+    head.setAttribute(
+      "aria-label",
+      `${step.tool || "tool"} ${shortAgentArgs(step.input)} — ${step.is_error ? "error" : "ok"}; show output`
+    );
+    head.innerHTML =
+      `<span class="agent-step-status" aria-hidden="true">${step.is_error ? "✕" : "✓"}</span>` +
+      `<span class="agent-step-tool">${escapeHtml(step.tool || "tool")}</span>` +
+      `<span class="agent-step-arg">${escapeHtml(shortAgentArgs(step.input))}</span>`;
+
+    const preview = document.createElement("div");
+    preview.className = "agent-step-preview";
+    preview.textContent = (out || "").split("\n")[0].slice(0, 200) || "(no output)";
+
+    const full = document.createElement("pre");
+    full.className = "agent-step-output";
+    full.textContent = out || "(no output)";
+    full.hidden = true;
+
+    head.addEventListener("click", () => {
+      full.hidden = !full.hidden;
+      preview.hidden = !full.hidden;
+      head.setAttribute("aria-expanded", String(!full.hidden));
+    });
+
+    card.append(head, preview, full);
+    els.agentStepsPanel.append(card);
+  });
+}
+
+function renderVerifyPanel(transcript) {
+  if (!els.verifyPanel) return;
+  const steps = (Array.isArray(transcript) ? transcript : []).filter(
+    (step) => step.tool === "verify" || step.tool === "run_command"
+  );
+  els.verifyPanel.replaceChildren();
+  if (!steps.length) {
+    els.verifyPanel.append(makeHint("Verification and command output from the agent will show here."));
+    return;
+  }
+  steps.forEach((step) => {
+    const out = typeof step.output === "string" ? step.output : JSON.stringify(step.output, null, 2);
+    const failed = Boolean(step.is_error) || /VERIFY FAILED|FAIL\s|exit=[1-9]/.test(out);
+    const block = document.createElement("div");
+    block.className = `verify-output${failed ? " is-error" : ""}`;
+    const label = document.createElement("div");
+    label.className = "verify-label";
+    const status = document.createElement("span");
+    status.className = "verify-status";
+    status.setAttribute("aria-hidden", "true");
+    status.textContent = failed ? "✕" : "✓";
+    // Status word for screen readers (the glyph is decorative + color isn't enough).
+    const srStatus = document.createElement("span");
+    srStatus.className = "visually-hidden";
+    srStatus.textContent = failed ? "failed: " : "passed: ";
+    const labelText = document.createElement("span");
+    labelText.textContent = step.tool === "verify" ? "verify" : `run: ${shortAgentArgs(step.input)}`;
+    label.append(status, srStatus, labelText);
+    const pre = document.createElement("pre");
+    pre.textContent = out || "(no output)";
+    block.append(label, pre);
+    els.verifyPanel.append(block);
+  });
+}
+
+function lineDiff(before, after) {
+  const a = before ? before.split("\n") : [];
+  const b = after ? after.split("\n") : [];
+  const n = a.length;
+  const m = b.length;
+  const dp = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const rows = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      rows.push({ type: "ctx", text: a[i] });
+      i += 1;
+      j += 1;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      rows.push({ type: "del", text: a[i] });
+      i += 1;
+    } else {
+      rows.push({ type: "add", text: b[j] });
+      j += 1;
+    }
+  }
+  while (i < n) {
+    rows.push({ type: "del", text: a[i] });
+    i += 1;
+  }
+  while (j < m) {
+    rows.push({ type: "add", text: b[j] });
+    j += 1;
+  }
+  return rows;
+}
+
+function makeDiffBlock(label, text, cls) {
+  const wrap = document.createElement("div");
+  const head = document.createElement("div");
+  head.className = "diff-block-label";
+  head.textContent = label;
+  const pre = document.createElement("pre");
+  pre.className = `code-preview diff-block diff-${cls}`;
+  pre.textContent = text || "(empty)";
+  wrap.append(head, pre);
+  return wrap;
+}
+
+function buildDiffView(change) {
+  const wrap = document.createElement("div");
+  const before = change.before || "";
+  const after = change.after || "";
+  const a = before ? before.split("\n") : [];
+  const b = after ? after.split("\n") : [];
+  // Guard the O(n*m) diff against pathological file sizes — fall back to plain
+  // before/after blocks for very large or truncated content.
+  const tooBig = a.length > 2000 || b.length > 2000 || a.length * b.length > 2_000_000;
+  if (tooBig || change.before_truncated || change.after_truncated) {
+    if (change.existed) wrap.append(makeDiffBlock("before", before, "del"));
+    wrap.append(makeDiffBlock("after", after, "add"));
+    return wrap;
+  }
+  const rows = change.existed ? lineDiff(before, after) : b.map((text) => ({ type: "add", text }));
+  const pre = document.createElement("pre");
+  pre.className = "diff";
+  for (const row of rows) {
+    const sign = row.type === "add" ? "+" : row.type === "del" ? "-" : " ";
+    const line = document.createElement("span");
+    line.className = `diff-line diff-${row.type}`;
+    line.textContent = `${sign} ${row.text}`;
+    pre.append(line);
+  }
+  wrap.append(pre);
+  return wrap;
+}
+
+function renderChangesPanel(changes) {
+  if (!els.changesPanel) return;
+  const list = Array.isArray(changes) ? changes : [];
+  els.changesPanel.replaceChildren();
+  if (!list.length) {
+    els.changesPanel.append(makeHint("Files the agent creates or edits will be listed here for review."));
+    return;
+  }
+  list.forEach((change) => {
+    const op =
+      change.operation === "write_file" ? (change.existed ? "rewrote" : "created") : "edited";
+    const card = document.createElement("div");
+    card.className = "change-file";
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "change-file-head";
+    head.setAttribute("aria-expanded", "false");
+    head.setAttribute("aria-label", `${op} ${change.path || ""} — show diff`);
+    head.innerHTML =
+      `<span class="change-op">${escapeHtml(op)}</span>` +
+      `<span class="change-path">${escapeHtml(change.path || "")}</span>`;
+    const body = document.createElement("div");
+    body.className = "change-preview";
+    body.hidden = true;
+    body.append(buildDiffView(change));
+    head.addEventListener("click", () => {
+      body.hidden = !body.hidden;
+      head.setAttribute("aria-expanded", String(!body.hidden));
+    });
+    card.append(head, body);
+    els.changesPanel.append(card);
+  });
+}
+
+async function runAgent(userText) {
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    return "The local GreyIQ service is not running.";
+  }
+  const history = (activeChat() || [])
+    .slice(0, -1)
+    .slice(-12)
+    .map((message) => ({ role: message.role === "bot" ? "assistant" : "user", content: message.text }))
+    .filter((message) => message.content);
+  try {
+    const res = await apiFetch("/api/agent", {
+      method: "POST",
+      timeoutMs: 600000,
+      body: JSON.stringify({ message: userText, workspace: state.agentWorkspace, history })
+    });
+    // Feed the Workbench from the structured transcript + change set.
+    state.lastAgentTranscript = Array.isArray(res.transcript) ? res.transcript : [];
+    state.lastAgentChanges = Array.isArray(res.changes) ? res.changes : [];
+    if (state.lastAgentChanges.length) {
+      void refreshWorkspaceTree();
+    }
+    renderWorkbench();
+
+    if (res.ok === false) {
+      return res.message || "The agent could not run.";
+    }
+    let text = res.message || "(done)";
+    if (state.lastAgentTranscript.length) {
+      const steps = state.lastAgentTranscript
+        .map((t) => `${t.is_error ? "⚠ " : ""}${t.tool}(${shortAgentArgs(t.input)})`)
+        .join("  ·  ");
+      text += `\n\n— ${res.model_name || "agent"} ran ${state.lastAgentTranscript.length} step(s): ${steps}`;
+    }
+    if (state.lastAgentChanges.length) {
+      text += `\n\nChanged ${state.lastAgentChanges.length} file(s) — open the Changes tab in the Workbench to review.`;
+    }
+    return text;
+  } catch (error) {
+    return `Agent failed: ${error.message || error}`;
+  }
+}
+
+document.querySelectorAll("[data-workbench-tab]").forEach((btn) => {
+  btn.addEventListener("click", () => setWorkbenchTab(btn.dataset.workbenchTab));
+});
+
+els.workspaceRefresh?.addEventListener("click", () => {
+  void refreshWorkspaceTree();
+});
+
+els.workspaceSearch?.addEventListener("input", (event) => {
+  state.workbenchSearch = event.target.value || "";
+  renderWorkspaceTree(state.workbenchTree);
+});
+
+// Tab keyboard navigation (WAI-ARIA tabs pattern).
+els.workbenchTablist?.addEventListener("keydown", (event) => {
+  const idx = WORKBENCH_TABS.indexOf(state.workbenchTab);
+  let next = -1;
+  if (event.key === "ArrowRight") next = (idx + 1) % WORKBENCH_TABS.length;
+  else if (event.key === "ArrowLeft") next = (idx - 1 + WORKBENCH_TABS.length) % WORKBENCH_TABS.length;
+  else if (event.key === "Home") next = 0;
+  else if (event.key === "End") next = WORKBENCH_TABS.length - 1;
+  else return;
+  event.preventDefault();
+  setWorkbenchTab(WORKBENCH_TABS[next], true);
+});
+
+// File-tree roving focus (arrow keys move the single tab stop).
+els.workspaceTree?.addEventListener("keydown", (event) => {
+  const items = [...els.workspaceTree.querySelectorAll(".workspace-tree-item")];
+  if (!items.length) return;
+  let idx = items.indexOf(document.activeElement);
+  if (idx < 0) idx = 0;
+  if (event.key === "ArrowDown") idx = Math.min(items.length - 1, idx + 1);
+  else if (event.key === "ArrowUp") idx = Math.max(0, idx - 1);
+  else if (event.key === "Home") idx = 0;
+  else if (event.key === "End") idx = items.length - 1;
+  else return;
+  event.preventDefault();
+  items.forEach((item, k) => {
+    item.tabIndex = k === idx ? 0 : -1;
+  });
+  items[idx].focus();
+});
+
+// Resizable chat <-> workbench split (drag the divider, or arrow keys).
+function setWorkbenchHeightPx(px) {
+  const min = 8 * 16;
+  const max = Math.round(window.innerHeight * 0.88);
+  state.workbenchHeight = Math.max(min, Math.min(max, Math.round(px)));
+  state.workbenchDocked = false;
+  applyWorkbenchSize();
+}
+
+if (els.workbenchDivider) {
+  let dragging = false;
+  // Slide the workbench (almost) to the top → snap into docked mode (chat right).
+  const dockThreshold = () => window.innerHeight * 0.9;
+  const stop = (event) => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove("is-resizing");
+    els.workbenchDivider.releasePointerCapture?.(event.pointerId);
+    saveState();
+  };
+  const onMove = (event) => {
+    if (!dragging) return;
+    const height = window.innerHeight - event.clientY;
+    if (height >= dockThreshold()) {
+      state.workbenchDocked = true;
+      applyWorkbenchSize();
+      saveState();
+      stop(event); // end the drag; the divider hides in docked mode
+      els.workbenchMaximize?.focus(); // keep keyboard focus on a visible control
+      return;
+    }
+    setWorkbenchHeightPx(height);
+  };
+  els.workbenchDivider.addEventListener("pointerdown", (event) => {
+    dragging = true;
+    document.body.classList.add("is-resizing");
+    els.workbenchDivider.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+  });
+  els.workbenchDivider.addEventListener("pointermove", onMove);
+  els.workbenchDivider.addEventListener("pointerup", stop);
+  els.workbenchDivider.addEventListener("pointercancel", stop);
+  els.workbenchDivider.addEventListener("keydown", (event) => {
+    const current =
+      (typeof state.workbenchHeight === "number" && state.workbenchHeight) ||
+      Math.round(window.innerHeight * 0.44);
+    if (event.key === "ArrowUp") setWorkbenchHeightPx(current + 24);
+    else if (event.key === "ArrowDown") setWorkbenchHeightPx(current - 24);
+    else if (event.key === "Home") {
+      state.workbenchDocked = true; // slide all the way up → dock chat to the right
+      applyWorkbenchSize();
+      els.workbenchMaximize?.focus(); // divider hides when docked; keep focus visible
+    } else if (event.key === "End") {
+      setWorkbenchHeightPx(8 * 16);
+    } else {
+      return;
+    }
+    event.preventDefault();
+    saveState();
+  });
+}
+
+els.workbenchMaximize?.addEventListener("click", () => {
+  state.workbenchDocked = !state.workbenchDocked;
+  applyWorkbenchSize();
+  saveState();
+});
+
+window.addEventListener("resize", () => {
+  if (state.agentMode) applyWorkbenchSize();
+});
+
+els.agentToggle?.addEventListener("click", async () => {
+  if (!state.agentMode && !state.agentWorkspace) {
+    const picked = await chooseWorkspace();
+    if (!picked) return;
+    state.agentWorkspace = picked;
+  }
+  state.agentMode = !state.agentMode;
+  saveState();
+  renderAgentBar();
+  renderWorkbench();
+  if (state.agentMode) {
+    void refreshWorkspaceTree();
+  }
+});
+
+els.agentWorkspace?.addEventListener("click", async () => {
+  const picked = await chooseWorkspace();
+  if (picked) {
+    state.agentWorkspace = picked;
+    state.workbenchActiveFile = "";
+    if (els.filePreviewPanel) els.filePreviewPanel.dataset.loadedPath = "";
+    saveState();
+    renderAgentBar();
+    if (state.agentMode) {
+      renderWorkbench();
+      void refreshWorkspaceTree();
+    }
+  }
 });
 
 els.cpuButton.addEventListener("click", async () => {
@@ -1584,7 +2801,356 @@ els.newBotButton.addEventListener("click", () => {
   render();
 });
 
+// ---- Bug bounty hunt (scan a target → report with attack plans) ----
+let bountyProfilesData = [];
+
+async function loadBountyProfiles() {
+  if (!els.bountyProfile) return;
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) return;
+  let info;
+  try {
+    info = await apiFetch("/api/bounty/types", { timeoutMs: 6000 });
+  } catch (_) {
+    return;
+  }
+  if (!info || info.ok === false) return;
+  bountyProfilesData = Array.isArray(info.profiles) ? info.profiles : [];
+  els.bountyProfile.replaceChildren();
+  for (const profile of bountyProfilesData) {
+    const option = document.createElement("option");
+    option.value = profile.id;
+    option.textContent = profile.name;
+    els.bountyProfile.append(option);
+  }
+  if (bountyProfilesData.some((p) => p.id === state.bountyProfile)) {
+    els.bountyProfile.value = state.bountyProfile;
+  } else if (bountyProfilesData.length) {
+    state.bountyProfile = bountyProfilesData[0].id;
+  }
+  if (els.bountyClass) {
+    const classes = Array.isArray(info.classes) ? info.classes : [];
+    els.bountyClass.replaceChildren();
+    const any = document.createElement("option");
+    any.value = "";
+    any.textContent = "Any class found";
+    els.bountyClass.append(any);
+    for (const cls of classes) {
+      const option = document.createElement("option");
+      option.value = cls.id;
+      option.textContent = cls.name;
+      els.bountyClass.append(option);
+    }
+    els.bountyClass.value = state.bountyClass || "";
+  }
+  if (els.bountyScope) els.bountyScope.value = state.bountyScope || "";
+  if (els.bountyOutput) els.bountyOutput.value = state.bountyOutput || "";
+  if (els.bountyPerFinding) els.bountyPerFinding.checked = Boolean(state.bountyPerFinding);
+  updateBountyHint();
+}
+
+function updateBountyHint() {
+  if (!els.bountyProfileHint) return;
+  const profile = bountyProfilesData.find((p) => p.id === els.bountyProfile?.value);
+  els.bountyProfileHint.textContent = profile ? profile.description : "";
+}
+
+els.bountyProfile?.addEventListener("change", () => {
+  state.bountyProfile = els.bountyProfile.value;
+  saveState();
+  updateBountyHint();
+});
+
+els.bountyClass?.addEventListener("change", () => {
+  state.bountyClass = els.bountyClass.value;
+  saveState();
+});
+
+if (desktopFolderPicker && els.bountyOutputBrowse) {
+  els.bountyOutputBrowse.hidden = false;
+}
+
+els.bountyOutputBrowse?.addEventListener("click", async () => {
+  const picked = await chooseTrainingFolder();
+  if (picked) {
+    els.bountyOutput.value = picked;
+    state.bountyOutput = picked;
+    saveState();
+  }
+});
+
+els.bountyForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const target = (els.bountyTarget?.value || "").trim();
+  if (!target) {
+    els.bountyStatus.textContent = "Enter a target URL or folder/repo path.";
+    return;
+  }
+  if (!els.bountyAuthorized?.checked) {
+    els.bountyStatus.textContent = "Confirm you're authorized to test this target (tick the box).";
+    return;
+  }
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.bountyStatus.textContent = "Local GreyIQ service is not running.";
+    return;
+  }
+  state.bountyProfile = els.bountyProfile.value;
+  state.bountyClass = els.bountyClass.value;
+  state.bountyScope = (els.bountyScope?.value || "").trim();
+  state.bountyOutput = (els.bountyOutput?.value || "").trim();
+  state.bountyPerFinding = Boolean(els.bountyPerFinding?.checked);
+  saveState();
+  els.bountyRun.disabled = true;
+  els.bountyStatus.textContent = "Hunting… running scanners and writing the report (this can take a minute).";
+  if (els.bountyReport) els.bountyReport.hidden = true;
+  if (els.bountyReportActions) els.bountyReportActions.hidden = true;
+  try {
+    const res = await apiFetch("/api/bounty/scan", {
+      method: "POST",
+      timeoutMs: 600000,
+      body: JSON.stringify({
+        target,
+        profile: state.bountyProfile,
+        vuln_class: state.bountyClass || null,
+        scope: state.bountyScope,
+        output_dir: state.bountyOutput || null,
+        authorized: true,
+        per_finding: state.bountyPerFinding
+      })
+    });
+    if (res.ok === false) {
+      els.bountyStatus.textContent = res.error || "The hunt could not run.";
+    } else {
+      const counts = res.severity_counts || {};
+      const sev = `${counts.critical || 0}C / ${counts.high || 0}H / ${counts.medium || 0}M`;
+      const brain = res.used_brain ? ` · analysis by ${res.brain_model}` : " · deterministic (no brain configured)";
+      const warn = Array.isArray(res.scan_errors) && res.scan_errors.length
+        ? `⚠ ${res.scan_errors.length} scanner(s) failed — results are partial. `
+        : "";
+      const perFiles = Array.isArray(res.per_finding_paths) && res.per_finding_paths.length
+        ? ` + ${res.per_finding_paths.length} per-finding file(s)`
+        : "";
+      els.bountyStatus.textContent =
+        `${warn}Done — risk ${String(res.risk).toUpperCase()}, ${res.finding_count} finding(s) [${sev}]${brain}. Report saved to: ${res.report_path}${perFiles}`;
+      lastBountyReportMarkdown = res.report_markdown || "";
+      if (els.bountyReport && lastBountyReportMarkdown) {
+        els.bountyReport.textContent = lastBountyReportMarkdown;
+        els.bountyReport.hidden = false;
+        if (els.bountyReportActions) els.bountyReportActions.hidden = false;
+      }
+    }
+  } catch (error) {
+    els.bountyStatus.textContent = error.message || "The hunt failed.";
+  } finally {
+    els.bountyRun.disabled = false;
+  }
+});
+
+let lastBountyReportMarkdown = "";
+
+els.bountyCopyReport?.addEventListener("click", async () => {
+  if (!lastBountyReportMarkdown) return;
+  try {
+    await navigator.clipboard.writeText(lastBountyReportMarkdown);
+    els.bountyCopyReport.textContent = "Copied ✓";
+    setTimeout(() => {
+      if (els.bountyCopyReport) els.bountyCopyReport.textContent = "Copy report";
+    }, 1500);
+  } catch (_) {
+    // Clipboard blocked — select the text so the user can copy manually.
+    const range = document.createRange();
+    range.selectNodeContents(els.bountyReport);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+});
+
+// ---- Agent security red-team (test GreyIQ's own agent) ----
+let lastRedteamReportMarkdown = "";
+
+if (els.redteamBehavioral) {
+  els.redteamBehavioral.checked = Boolean(state.redteamBehavioral);
+}
+
+els.redteamForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!els.redteamAuthorized?.checked) {
+    els.redteamStatus.textContent = "Tick the box to red-team your GreyIQ agent.";
+    return;
+  }
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.redteamStatus.textContent = "Local GreyIQ service is not running.";
+    return;
+  }
+  state.redteamBehavioral = Boolean(els.redteamBehavioral?.checked);
+  saveState();
+  els.redteamRun.disabled = true;
+  els.redteamStatus.textContent = state.redteamBehavioral
+    ? "Red-teaming… running sandbox + behavioral probes (the behavioral ones use your brain)."
+    : "Red-teaming… running sandbox + policy probes.";
+  if (els.redteamReport) els.redteamReport.hidden = true;
+  if (els.redteamReportActions) els.redteamReportActions.hidden = true;
+  try {
+    const res = await apiFetch("/api/agent/redteam", {
+      method: "POST",
+      timeoutMs: 600000,
+      body: JSON.stringify({ authorized: true, include_behavioral: state.redteamBehavioral })
+    });
+    if (res.ok === false) {
+      els.redteamStatus.textContent = res.error || "The security test could not run.";
+    } else {
+      const c = res.counts || {};
+      const detail = `${c.secure || 0} secure, ${c.vulnerable || 0} vulnerable, ${c.review || 0} review, ${c.error || 0} error`;
+      els.redteamStatus.textContent =
+        `Posture: ${String(res.posture).toUpperCase()} — ${res.probe_count} probe(s) (${detail}). Report saved to: ${res.report_path}`;
+      lastRedteamReportMarkdown = res.report_markdown || "";
+      if (els.redteamReport && lastRedteamReportMarkdown) {
+        els.redteamReport.textContent = lastRedteamReportMarkdown;
+        els.redteamReport.hidden = false;
+        if (els.redteamReportActions) els.redteamReportActions.hidden = false;
+      }
+    }
+  } catch (error) {
+    els.redteamStatus.textContent = error.message || "The security test failed.";
+  } finally {
+    els.redteamRun.disabled = false;
+  }
+});
+
+els.redteamCopyReport?.addEventListener("click", async () => {
+  if (!lastRedteamReportMarkdown) return;
+  try {
+    await navigator.clipboard.writeText(lastRedteamReportMarkdown);
+    els.redteamCopyReport.textContent = "Copied ✓";
+    setTimeout(() => {
+      if (els.redteamCopyReport) els.redteamCopyReport.textContent = "Copy report";
+    }, 1500);
+  } catch (_) {
+    const range = document.createRange();
+    range.selectNodeContents(els.redteamReport);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+});
+
+// ---- Pentest toolkit (curated catalog from awesome-pentest, mapped to bug classes) ----
+let toolkitData = { tools: [], categories: [], vuln_classes: {} };
+
+function toolkitBadge(text, cls) {
+  const span = document.createElement("span");
+  span.className = cls;
+  span.textContent = text;
+  return span;
+}
+
+function renderToolkit() {
+  if (!els.toolkitList) return;
+  const cat = els.toolkitCategory?.value || "";
+  const cls = els.toolkitClass?.value || "";
+  const q = (els.toolkitSearch?.value || "").trim().toLowerCase();
+  const names = toolkitData.vuln_classes || {};
+  const items = toolkitData.tools.filter((tool) => {
+    if (cat && tool.category !== cat) return false;
+    if (cls && !(tool.maps_to || []).includes(cls)) return false;
+    if (q) {
+      const hay = `${tool.name} ${tool.description} ${(tool.tags || []).join(" ")}`.toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+  if (els.toolkitStatus) {
+    els.toolkitStatus.textContent = `${items.length} of ${toolkitData.tools.length} tools`;
+  }
+  els.toolkitList.replaceChildren();
+  for (const tool of items) {
+    const card = document.createElement("div");
+    card.className = "toolkit-item";
+    const head = document.createElement("div");
+    head.className = "toolkit-item-head";
+    const link = document.createElement("a");
+    link.className = "toolkit-name";
+    link.href = tool.url || "#";
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = tool.name || "(unnamed)";
+    head.append(link);
+    if (tool.kind) head.append(toolkitBadge(tool.kind, "toolkit-kind"));
+    card.append(head);
+    if (tool.description) {
+      const desc = document.createElement("p");
+      desc.className = "toolkit-desc";
+      desc.textContent = tool.description;
+      card.append(desc);
+    }
+    const meta = document.createElement("div");
+    meta.className = "toolkit-tags";
+    for (const m of tool.maps_to || []) meta.append(toolkitBadge(names[m] || m, "toolkit-class"));
+    if (Array.isArray(tool.platforms) && tool.platforms.length) {
+      meta.append(toolkitBadge(tool.platforms.join(" · "), "toolkit-plat"));
+    }
+    if (meta.childNodes.length) card.append(meta);
+    els.toolkitList.append(card);
+  }
+  if (!items.length) {
+    const empty = document.createElement("p");
+    empty.className = "folder-status";
+    empty.textContent = "No tools match these filters.";
+    els.toolkitList.append(empty);
+  }
+}
+
+async function loadToolkit() {
+  if (!els.toolkitForm) return;
+  let data;
+  try {
+    data = await apiFetch("/api/toolkit", { timeoutMs: 6000 });
+  } catch (_) {
+    return; // local service not up yet; the panel stays empty
+  }
+  if (!data || data.ok === false) return;
+  toolkitData = {
+    tools: Array.isArray(data.tools) ? data.tools : [],
+    categories: Array.isArray(data.categories) ? data.categories : [],
+    vuln_classes: data.vuln_classes || {}
+  };
+  if (els.toolkitCategory) {
+    els.toolkitCategory.replaceChildren();
+    const any = document.createElement("option");
+    any.value = "";
+    any.textContent = `All categories (${toolkitData.tools.length})`;
+    els.toolkitCategory.append(any);
+    for (const c of toolkitData.categories) {
+      const option = document.createElement("option");
+      option.value = c.id;
+      option.textContent = c.label;
+      els.toolkitCategory.append(option);
+    }
+  }
+  if (els.toolkitClass) {
+    const present = new Set();
+    for (const tool of toolkitData.tools) for (const m of tool.maps_to || []) present.add(m);
+    els.toolkitClass.replaceChildren();
+    const any = document.createElement("option");
+    any.value = "";
+    any.textContent = "Any bug class";
+    els.toolkitClass.append(any);
+    for (const id of Array.from(present).sort()) {
+      const option = document.createElement("option");
+      option.value = id;
+      option.textContent = toolkitData.vuln_classes[id] || id;
+      els.toolkitClass.append(option);
+    }
+  }
+  renderToolkit();
+}
+
+els.toolkitCategory?.addEventListener("change", renderToolkit);
+els.toolkitClass?.addEventListener("change", renderToolkit);
+els.toolkitSearch?.addEventListener("input", renderToolkit);
+
 async function boot() {
+  applyTheme();
   backend = new AccelerationBackend();
   await backend.setMode(state.backendPreference || "cpu");
 
@@ -1598,7 +3164,14 @@ async function boot() {
   if (service.available) {
     void syncActiveCore();
   }
+  void loadCoderConfig();
+  void loadBountyProfiles();
+  void loadToolkit();
   render();
+  renderWorkbench();
+  if (state.agentMode && state.agentWorkspace) {
+    void refreshWorkspaceTree();
+  }
 }
 
 boot();
