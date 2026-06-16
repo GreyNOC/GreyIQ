@@ -175,10 +175,12 @@ jobs:
 
       - name: Bundle Ollama runtime (zero-setup local brain)
         run: |
-          curl -fsSL -o ollama.tgz "https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64.tgz"
+          # Ollama renamed its Linux release asset from ollama-linux-amd64.tgz
+          # (gzip) to ollama-linux-amd64.tar.zst (zstd) — the old name now 404s.
+          curl -fsSL -o ollama.tar.zst "https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64.tar.zst"
           mkdir -p ollama
-          tar -xzf ollama.tgz -C ollama
-          rm -f ollama.tgz
+          tar --zstd -xf ollama.tar.zst -C ollama
+          rm -f ollama.tar.zst
           if [ ! -x ollama/bin/ollama ]; then
             echo "ollama binary not found at ollama/bin/ollama after extracting the runtime."
             exit 1
