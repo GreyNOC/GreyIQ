@@ -66,7 +66,7 @@ from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E4
 
 
 APP_NAME = "GreyIQ"
-VERSION = "0.9.1"
+VERSION = "0.9.2"
 _CURRENT_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar("greyiq_current_scope", default=None)
 _CSP = (
     "default-src 'self'; "
