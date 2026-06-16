@@ -58,6 +58,13 @@
       "allowToChangeInstallationDirectory": true,
       "include": "build/installer.nsh",
       "artifactName": "GreyIQ-Setup-${version}.exe"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Development",
+      "artifactName": "GreyIQ-${version}-${arch}.${ext}"
     }
   }
 }

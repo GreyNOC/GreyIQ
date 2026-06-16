@@ -21,9 +21,26 @@ const PROJECT_ROOT = app.isPackaged ? path.join(process.resourcesPath, 'app') : 
 // <resources>/backend/greyiq-backend(.exe). Present only in packaged builds.
 const BACKEND_RESOURCE_DIR = app.isPackaged ? path.join(process.resourcesPath, 'backend') : null;
 const RUNTIME_DIR = path.join(app.getPath('userData'), 'runtime');
-// Bundled Ollama runtime (zero-setup local brain). Present only in packaged builds.
-const BUNDLED_OLLAMA = app.isPackaged ? path.join(process.resourcesPath, 'ollama', 'ollama.exe') : null;
+// Bundled Ollama runtime (zero-setup local brain). Present only in packaged
+// builds. The Windows zip puts ollama.exe at the root; the Linux tarball puts
+// the binary under bin/ (with its libs alongside under lib/).
+const BUNDLED_OLLAMA = app.isPackaged
+  ? (process.platform === 'win32'
+      ? path.join(process.resourcesPath, 'ollama', 'ollama.exe')
+      : path.join(process.resourcesPath, 'ollama', 'bin', 'ollama'))
+  : null;
 const OLLAMA_PORT = 11434;
+
+// extraResources can drop the executable bit on non-Windows; restore it
+// best-effort before we spawn a bundled binary.
+function ensureExecutable(filePath) {
+  if (process.platform === 'win32' || !filePath) return;
+  try {
+    fs.chmodSync(filePath, 0o755);
+  } catch (_) {
+    // best-effort; the file may already be executable or owned read-only.
+  }
+}
 
 let mainWindow = null;
 let backendProcess = null;
@@ -171,6 +188,7 @@ function teeBackendOutput(chunk) {
 async function startBackend() {
   backendPort = await findFreePort(DEFAULT_PORT);
   const command = resolveBackendCommand();
+  if (app.isPackaged) ensureExecutable(command.exe);
   const env = {
     ...process.env,
     GREYIQ_HOST: HOST,
@@ -305,6 +323,7 @@ async function startBundledOllama() {
   // Zero-setup local brain: start the bundled Ollama, unless a system Ollama is
   // already serving on the port (then we just use that). No-op in dev (no bundle).
   if (!BUNDLED_OLLAMA || !fs.existsSync(BUNDLED_OLLAMA)) return;
+  ensureExecutable(BUNDLED_OLLAMA);
   if (await ollamaResponding()) return;
   const modelsDir = path.join(app.getPath('userData'), 'ollama-models');
   try {
