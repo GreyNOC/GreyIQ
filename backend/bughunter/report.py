@@ -148,6 +148,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
                        "leads the automated scanners cannot cover.")
         out.append("")
         _append_checklist(out, ctx)
+        _append_tools(out, ctx)
         _append_footer(out, ctx)
         return "\n".join(out)
 
@@ -230,6 +231,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
         out.append("")
 
     _append_checklist(out, ctx)
+    _append_tools(out, ctx)
     _append_footer(out, ctx)
     return "\n".join(out)
 
@@ -245,6 +247,33 @@ def _append_checklist(out: list[str], ctx: dict[str, Any]) -> None:
     for item in checklist:
         out.append(f"- [ ] {str(item).strip()}")
     out.append("")
+
+
+def _append_tools(out: list[str], ctx: dict[str, Any]) -> None:
+    tools = ctx.get("recommended_tools") or []
+    if not tools:
+        return
+    out.append("## Recommended tooling\n")
+    out.append(
+        "Curated tools that fit this target's vuln classes — to confirm the leads above "
+        "within your authorized scope:"
+    )
+    out.append("")
+    out.append("| Tool | What it's for | Classes | Link |")
+    out.append("|---|---|---|---|")
+    for tool in tools:
+        classes = ", ".join(tool.get("maps_to") or []) or "—"
+        out.append(
+            f"| {_md_escape_cell(tool.get('name', ''))} "
+            f"| {_md_escape_cell(tool.get('description', ''))} "
+            f"| {_md_escape_cell(classes)} "
+            f"| {_md_escape_cell(tool.get('url', ''))} |"
+        )
+    out.append("")
+    src = ctx.get("toolkit_source") or {}
+    if src.get("attribution"):
+        out.append(f"_Tooling list: {src['attribution']}_")
+        out.append("")
 
 
 def _append_footer(out: list[str], ctx: dict[str, Any]) -> None:
@@ -294,6 +323,7 @@ def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
         "findings": findings,
         "attack_plans": ctx.get("attack_plans", {}),
         "manual_checklist": ctx.get("manual_checklist", []),
+        "recommended_tools": ctx.get("recommended_tools", []),
         "brain": {
             "used": bool(ctx.get("brain", {}).get("used")),
             "provider": ctx.get("brain", {}).get("provider", ""),

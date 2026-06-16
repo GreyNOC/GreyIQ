@@ -210,6 +210,25 @@
           <pre class="bounty-report" id="redteamReport" hidden></pre>
         </form>
 
+        <form class="choice-form toolkit-form" id="toolkitForm">
+          <div class="source-heading">Pentest toolkit</div>
+          <p class="folder-status">Curated pentest tools mapped to bug classes — pick a class to see what to reach for. Reference index from <a href="https://github.com/enaqx/awesome-pentest" target="_blank" rel="noopener noreferrer">awesome-pentest</a> (CC-BY 4.0).</p>
+          <label>
+            <span>Category</span>
+            <select id="toolkitCategory" name="toolkitCategory"></select>
+          </label>
+          <label>
+            <span>Bug class</span>
+            <select id="toolkitClass" name="toolkitClass"></select>
+          </label>
+          <label>
+            <span>Search</span>
+            <input id="toolkitSearch" name="toolkitSearch" type="search" autocomplete="off" spellcheck="false" placeholder="nmap, burp, xss…">
+          </label>
+          <p class="folder-status" id="toolkitStatus" aria-live="polite"></p>
+          <div class="toolkit-list" id="toolkitList"></div>
+        </form>
+
         <form class="choice-form" id="choiceForm">
           <label>
             <span>Preference</span>

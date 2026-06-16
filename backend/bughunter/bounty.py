@@ -22,6 +22,7 @@ from typing import Any
 
 import coder
 from bughunter import report as report_lib
+from bughunter import toolkit as toolkit_lib
 from bughunter.live_scan_service import run_live_scan
 from bughunter.scan_service import run_code_scan
 from bughunter.web_scan_service import run_web_scan
@@ -123,6 +124,15 @@ _CATEGORY_LABELS: dict[str, dict[str, str]] = {
     "mixed_content": {"name": "Mixed content", "cwe": "CWE-311"},
     "disclosure": {"name": "Information disclosure", "cwe": "CWE-200"},
 }
+
+
+def vuln_class_names() -> dict[str, str]:
+    """{class_id: human name} across the core vuln classes + category labels. Used
+    by the Pentest Toolkit UI to render friendly 'maps to' badges."""
+    names = {cid: meta["name"] for cid, meta in VULN_CLASSES.items()}
+    names.update({cid: meta["name"] for cid, meta in _CATEGORY_LABELS.items()})
+    return names
+
 
 # --- Profiles: a target type + which scanners run + which classes it emphasizes. ---
 BOUNTY_PROFILES: dict[str, dict[str, Any]] = {
@@ -308,7 +318,7 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
     return raw, ran, meta, overall_risk, overall_score
 
 
-def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], vuln_class: dict[str, Any] | None, scope: str, findings: list[dict[str, Any]], playbook: str) -> dict[str, Any]:
+def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], vuln_class: dict[str, Any] | None, scope: str, findings: list[dict[str, Any]], playbook: str, recommended_tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Best-effort LLM enrichment. Returns a brain dict; on any failure the
     caller falls back to the deterministic report."""
     brain: dict[str, Any] = {"used": False, "provider": "", "model": "", "summary": "", "notes": "", "attack_plans": {}, "manual_tests": []}
@@ -327,11 +337,22 @@ def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], 
         }
         for f in findings[:30]
     ]
+    tool_hint = ""
+    if recommended_tools:
+        names = "; ".join(
+            f"{t.get('name')} ({t.get('url')})" for t in recommended_tools[:10] if t.get("name")
+        )
+        if names:
+            tool_hint = (
+                "Relevant tooling you may name in the reproduction steps (reference only — "
+                f"do not output exploit code or payloads): {names}\n\n"
+            )
     prompt = (
         f"AUTHORIZED bug-bounty hunt.\nTarget: {target}\nProfile: {profile.get('name')}\n"
         f"Focus class: {vuln_class.get('name') if vuln_class else 'none (report all)'}\n"
         f"Scope/authorization notes: {scope or '(none provided)'}\n\n"
         f"Playbook guidance:\n{playbook[:2500]}\n\n"
+        f"{tool_hint}"
         f"Automated findings (JSON):\n{json.dumps(compact, default=str)[:8000]}\n\n"
         "Return ONLY a JSON object:\n"
         '{"executive_summary": "2-4 sentences, most important issue first",\n'
@@ -475,7 +496,15 @@ def run_bounty_hunt(
     attack_plans = {f["ref"]: _deterministic_attack_plan(f, f.get("class_id", "")) for f in display}
 
     playbook = _load_playbook(profile_id, seed_dir, runtime_dir)
-    brain = _ask_brain(coder_cfg or {}, clean_target, profile, class_obj, scope, display, playbook)
+    # Curated tools that fit this hunt: the profile's classes + the focus class +
+    # whatever classes the scanners actually surfaced (most-relevant first).
+    rec_class_ids = list(dict.fromkeys(
+        list(profile.get("classes", []))
+        + ([vuln_class_id] if vuln_class_id else [])
+        + [str(f.get("class_id")) for f in display if f.get("class_id")]
+    ))
+    recommended_tools = toolkit_lib.recommended_tools(rec_class_ids, seed_dir, runtime_dir, limit=12)
+    brain = _ask_brain(coder_cfg or {}, clean_target, profile, class_obj, scope, display, playbook, recommended_tools)
     for ref, plan in brain.get("attack_plans", {}).items():
         if ref in attack_plans and (plan.get("steps") or plan.get("poc")):
             attack_plans[ref] = {**attack_plans[ref], **{k: v for k, v in plan.items() if v}}
@@ -513,6 +542,8 @@ def run_bounty_hunt(
         "scan_errors": scan_errors,
         "focus_unmatched": focus_unmatched,
         "other_findings_count": other_findings_count,
+        "recommended_tools": recommended_tools,
+        "toolkit_source": toolkit_lib.load_catalog(seed_dir, runtime_dir).get("source", {}),
         "recommendation": "",
     }
 
