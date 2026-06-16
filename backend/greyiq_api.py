@@ -302,6 +302,13 @@ class GreyIQRuntime:
                 "message": response,
                 "used_fallback": bool(diagnostics.used_fallback),
                 "captured_for_training": bool(diagnostics.captured_for_training),
+                "confidence": diagnostics.confidence,
+                "diagnostics": diagnostics_payload(
+                    diagnostics,
+                    citation_count=len(citations),
+                    engine_ready=bool(engine.ready),
+                    runtime_device=engine.device_info.name,
+                ),
                 "model_name": engine.model_path.name if engine.model_path else "none",
                 "device": engine.device_info.name,
                 "citations": [
@@ -323,6 +330,21 @@ class GreyIQRuntime:
                 "message": fallback_reply(request.message),
                 "used_fallback": True,
                 "captured_for_training": False,
+                "confidence": 0.18,
+                "diagnostics": {
+                    "used_fallback": True,
+                    "captured_for_training": False,
+                    "intent": "unknown",
+                    "mode": "fallback",
+                    "strategy": "api_exception",
+                    "confidence": 0.18,
+                    "retrieval_count": 0,
+                    "memory_count": 0,
+                    "note_count": 0,
+                    "citation_count": 0,
+                    "engine_ready": False,
+                    "device": "browser",
+                },
                 "model_name": "fallback",
                 "device": "browser",
                 "citations": [],
@@ -534,6 +556,29 @@ def fallback_reply(message: str) -> str:
     )
 
 
+def diagnostics_payload(
+    diagnostics: Any,
+    *,
+    citation_count: int,
+    engine_ready: bool,
+    runtime_device: str,
+) -> dict[str, Any]:
+    return {
+        "used_fallback": bool(getattr(diagnostics, "used_fallback", False)),
+        "captured_for_training": bool(getattr(diagnostics, "captured_for_training", False)),
+        "intent": str(getattr(diagnostics, "intent_label", "") or "unknown"),
+        "mode": str(getattr(diagnostics, "mode", "") or "default"),
+        "strategy": str(getattr(diagnostics, "strategy", "") or "unknown"),
+        "confidence": float(getattr(diagnostics, "confidence", 0.0) or 0.0),
+        "retrieval_count": int(getattr(diagnostics, "retrieval_count", 0) or 0),
+        "memory_count": int(getattr(diagnostics, "memory_count", 0) or 0),
+        "note_count": int(getattr(diagnostics, "note_count", 0) or 0),
+        "citation_count": int(citation_count),
+        "engine_ready": bool(engine_ready),
+        "device": runtime_device,
+    }
+
+
 def seed_training_note(request: ChatRequest) -> None:
     bot = request.bot or {}
     memories = request.memories or []
@@ -575,25 +620,55 @@ def health() -> dict[str, Any]:
     return {"status": "ok", "app": APP_NAME, "version": VERSION}
 
 
-def preferences(request: PreferenceRequest) -> dict[str, Any]:
+def normalize_rating(value: str | None) -> str:
+    rating = str(value or "").strip().lower()
+    if rating in {"like", "liked", "prefer", "preferred", "thumbs_up", "up"}:
+        return "like"
+    if rating in {"dislike", "avoid", "rejected", "thumbs_down", "down"}:
+        return "dislike"
+    return rating
+
+
+def preference_training_entry(request: PreferenceRequest) -> tuple[str, str]:
     bot = request.bot or {}
     bot_name = str(bot.get("name") or "GreyIQ").strip()
+    rating = normalize_rating(request.rating)
     chunks: list[str] = []
     target_file = "greyiq_personal_choices.txt"
+
     if request.preference:
-        chunks.append(f"{bot_name} should prefer: {request.preference}")
+        chunks.append(f"{bot_name} should prefer: {request.preference.strip()}")
     if request.user and request.assistant:
-        target_file = "greyiq_preferred_examples.txt"
-        chunks.append(
-            f"<START_CONVO>\n<USER>\n{request.user.strip()}\n<ASSISTANT>\n{request.assistant.strip()}\n<END_CONVO>"
-        )
+        user_text = request.user.strip()
+        assistant_text = request.assistant.strip()
+        if rating == "dislike":
+            chunks.append(
+                "\n".join(
+                    [
+                        f"{bot_name} should avoid this response pattern for similar requests.",
+                        f"User asked: {user_text}",
+                        f"Rejected response: {assistant_text}",
+                    ]
+                )
+            )
+        else:
+            target_file = "greyiq_preferred_examples.txt"
+            chunks.append(
+                f"<START_CONVO>\n<USER>\n{user_text}\n<ASSISTANT>\n{assistant_text}\n<END_CONVO>"
+            )
     if request.training_text:
         target_file = source_training_file(request.source_id)
         source_name = request.source_name or request.source_id or "Training Data"
         chunks.append(f"Source: {source_name}\n{request.training_text.strip()}")
-    if request.rating:
-        chunks.append(f"Feedback rating: {request.rating}")
-    path = append_training_text(target_file, "\n".join(chunks))
+    if rating:
+        chunks.append(f"Feedback rating: {rating}")
+
+    return target_file, "\n".join(chunk for chunk in chunks if chunk.strip())
+
+
+def preferences(request: PreferenceRequest) -> dict[str, Any]:
+    target_file, training_text = preference_training_entry(request)
+    path = append_training_text(target_file, training_text)
     return {"ok": True, "path": str(path), "source_id": request.source_id}
 
 

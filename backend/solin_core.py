@@ -557,6 +557,13 @@ class QueryIntent:
 class ReplyDiagnostics:
     used_fallback: bool
     captured_for_training: bool = False
+    intent_label: str = ""
+    mode: str = ""
+    strategy: str = ""
+    confidence: float = 0.0
+    retrieval_count: int = 0
+    memory_count: int = 0
+    note_count: int = 0
 
 
 @dataclass(slots=True)
@@ -3592,6 +3599,44 @@ class SolinEngine:
             settings["top_k"] = min(int(settings["top_k"]), 24)
         return settings
 
+    def _estimate_reply_confidence(
+        self,
+        response: str,
+        matches: list[SourceMatch],
+        diagnostics: ReplyDiagnostics,
+        *,
+        intent: QueryIntent | None = None,
+        context_summary: str = "",
+        memory_summary: str = "",
+        note_summary: str = "",
+    ) -> float:
+        if not response.strip():
+            return 0.0
+
+        if intent and intent.direct_response:
+            base = 0.92
+        elif diagnostics.used_fallback:
+            base = 0.42 if matches else 0.28
+        elif self.ready:
+            base = 0.68
+        else:
+            base = 0.46
+
+        if matches:
+            base = max(base, min(0.93, 0.42 + matches[0].score * 0.5))
+        if context_summary:
+            base += 0.06
+        if memory_summary or note_summary:
+            base += 0.03
+        if intent and intent.label == QUERY_INTENT_DOCUMENT and not matches:
+            base -= 0.18
+        if self._response_looks_low_quality(response):
+            base -= 0.24
+        if diagnostics.used_fallback and not matches and not context_summary:
+            base = min(base, 0.42)
+
+        return round(max(0.05, min(0.98, base)), 2)
+
     def _register_turn(self, user_input: str, response: str) -> None:
         self._turns.append((user_input, response))
         self._turns = self._turns[-self.max_history_turns :]
@@ -3608,9 +3653,27 @@ class SolinEngine:
         auto_capture: bool,
         remembered_note: str = "",
         store_exchange: bool = True,
+        intent: QueryIntent | None = None,
+        context_summary: str = "",
+        memory_summary: str = "",
+        note_summary: str = "",
+        strategy: str = "",
     ) -> tuple[str, list[SourceMatch], ReplyDiagnostics]:
-        # Output safety gate. We screen even refusals — cheap and keeps the
-        # rule "every assistant utterance went through screening" true.
+        if intent is not None and not diagnostics.intent_label:
+            diagnostics.intent_label = intent.label
+        if strategy:
+            diagnostics.strategy = strategy
+        diagnostics.retrieval_count = len(matches)
+        diagnostics.confidence = self._estimate_reply_confidence(
+            response,
+            matches,
+            diagnostics,
+            intent=intent,
+            context_summary=context_summary,
+            memory_summary=memory_summary,
+            note_summary=note_summary,
+        )
+        # Output safety gate. We screen every assistant utterance before storing it.
         if hasattr(self, "safety"):
             output_screen = self.safety.screen_output(response)
             if not output_screen.allowed:
@@ -3618,6 +3681,16 @@ class SolinEngine:
                 diagnostics.used_fallback = True
                 store_exchange = False
                 auto_capture = False
+                diagnostics.strategy = "output_safety_refusal"
+                diagnostics.confidence = self._estimate_reply_confidence(
+                    response,
+                    matches,
+                    diagnostics,
+                    intent=intent,
+                    context_summary=context_summary,
+                    memory_summary=memory_summary,
+                    note_summary=note_summary,
+                )
         self._register_turn(user_input, response)
         if self.memory_recording_enabled and remembered_note:
             self.chat_memory.add_note(remembered_note, source_user=user_input)
@@ -3653,6 +3726,7 @@ class SolinEngine:
                 return "Please type a message first.", [], diagnostics
             understood_input = normalize_intent_routing_text(cleaned_input) or cleaned_input
             resolved_mode = self._resolve_mode(mode)
+            diagnostics.mode = resolved_mode
 
             # Safety gate: refuse before we ever touch the model if the input
             # falls into a blocked category for the current capability mode.
@@ -3667,6 +3741,7 @@ class SolinEngine:
                     auto_capture=False,
                     remembered_note="",
                     store_exchange=False,
+                    strategy="input_safety_refusal",
                 )
 
             remembered_note = _extract_user_note(cleaned_input) if self.memory_recording_enabled else ""
@@ -3687,9 +3762,11 @@ class SolinEngine:
                     auto_capture=auto_capture,
                     remembered_note=remembered_note,
                     store_exchange=False,
+                    strategy="memory_ack",
                 )
 
             intent = self._classify_intent(understood_input)
+            diagnostics.intent_label = intent.label
             if intent.direct_response:
                 response = intent.direct_response
                 return self._finalize_reply(
@@ -3699,6 +3776,8 @@ class SolinEngine:
                     diagnostics,
                     auto_capture=auto_capture,
                     remembered_note=remembered_note,
+                    intent=intent,
+                    strategy="direct_response",
                 )
 
             if self._is_broad_document_summary_query(understood_input, intent):
@@ -3710,6 +3789,8 @@ class SolinEngine:
                     diagnostics,
                     auto_capture=auto_capture,
                     remembered_note=remembered_note,
+                    intent=intent,
+                    strategy="document_overview",
                 )
             matches = self._retrieve_supporting_context(
                 understood_input,
@@ -3737,6 +3818,9 @@ class SolinEngine:
             context_summary = self._compress_context(understood_input, matches, intent, mode=resolved_mode)
             note_summary = self._compress_note_context(note_matches)
             memory_summary = self._compress_memory_context(understood_input, memory_matches)
+            diagnostics.retrieval_count = len(matches)
+            diagnostics.note_count = len(note_matches)
+            diagnostics.memory_count = len(memory_matches)
 
             # On CPU, retrieval-grounded document/summary answers are much faster and
             # more reliable when we return the compressed context directly instead of
@@ -3764,6 +3848,11 @@ class SolinEngine:
                     diagnostics,
                     auto_capture=auto_capture,
                     remembered_note=remembered_note,
+                    intent=intent,
+                    context_summary=context_summary,
+                    memory_summary=memory_summary,
+                    note_summary=note_summary,
+                    strategy="retrieval_summary",
                 )
 
             web_result = (
@@ -3780,6 +3869,11 @@ class SolinEngine:
                     diagnostics,
                     auto_capture=auto_capture,
                     remembered_note=remembered_note,
+                    intent=intent,
+                    context_summary=context_summary,
+                    memory_summary=memory_summary,
+                    note_summary=note_summary,
+                    strategy="web_lookup",
                 )
 
             if intent.label == QUERY_INTENT_DOCUMENT and not matches and not memory_matches:
@@ -3792,6 +3886,11 @@ class SolinEngine:
                     diagnostics,
                     auto_capture=auto_capture,
                     remembered_note=remembered_note,
+                    intent=intent,
+                    context_summary=context_summary,
+                    memory_summary=memory_summary,
+                    note_summary=note_summary,
+                    strategy="document_no_match",
                 )
 
             if not self.ready:
@@ -3810,6 +3909,11 @@ class SolinEngine:
                     diagnostics,
                     auto_capture=auto_capture,
                     remembered_note=remembered_note,
+                    intent=intent,
+                    context_summary=context_summary,
+                    memory_summary=memory_summary,
+                    note_summary=note_summary,
+                    strategy="engine_not_ready_fallback",
                 )
 
             prompt = self._build_prompt(
@@ -3837,6 +3941,11 @@ class SolinEngine:
                     diagnostics,
                     auto_capture=auto_capture,
                     remembered_note=remembered_note,
+                    intent=intent,
+                    context_summary=context_summary,
+                    memory_summary=memory_summary,
+                    note_summary=note_summary,
+                    strategy="encoding_fallback",
                 )
 
             prompt_ids = input_ids[-self.block_size :]
@@ -3875,6 +3984,7 @@ class SolinEngine:
 
             response = normalize_generated_response(response)
             response = self._tighten_response(response)
+            reply_strategy = "model_generation"
             if (
                 not response
                 or self._response_looks_low_quality(response)
@@ -3885,6 +3995,7 @@ class SolinEngine:
                 )
             ):
                 diagnostics.used_fallback = True
+                reply_strategy = "quality_fallback"
                 response = self._fallback_response(
                     matches,
                     summary=context_summary,
@@ -3900,4 +4011,9 @@ class SolinEngine:
                 diagnostics,
                 auto_capture=auto_capture,
                 remembered_note=remembered_note,
+                intent=intent,
+                context_summary=context_summary,
+                memory_summary=memory_summary,
+                note_summary=note_summary,
+                strategy=reply_strategy,
             )

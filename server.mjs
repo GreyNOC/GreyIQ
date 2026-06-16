@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { extname, join, normalize, resolve } from "node:path";
+import { extname, resolve, sep } from "node:path";
 
 const port = Number.parseInt(process.env.PORT || "4173", 10);
 const root = resolve("public");
@@ -15,11 +15,24 @@ const mimeTypes = new Map([
 ]);
 
 function resolvePublicPath(url) {
-  const requestUrl = new URL(url, `http://localhost:${port}`);
-  const pathname = requestUrl.pathname === "/" ? "/index.html" : requestUrl.pathname;
-  const filePath = normalize(join(root, decodeURIComponent(pathname)));
+  let requestUrl;
+  try {
+    requestUrl = new URL(url, `http://localhost:${port}`);
+  } catch {
+    return null;
+  }
 
-  if (!filePath.startsWith(root)) {
+  const pathname = requestUrl.pathname === "/" ? "/index.html" : requestUrl.pathname;
+  let decodedPathname;
+  try {
+    decodedPathname = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+
+  const filePath = resolve(root, `.${decodedPathname}`);
+
+  if (filePath !== root && !filePath.startsWith(`${root}${sep}`)) {
     return null;
   }
 
