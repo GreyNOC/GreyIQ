@@ -195,7 +195,13 @@ const els = {
   redteamStatus: document.querySelector("#redteamStatus"),
   redteamReport: document.querySelector("#redteamReport"),
   redteamReportActions: document.querySelector("#redteamReportActions"),
-  redteamCopyReport: document.querySelector("#redteamCopyReport")
+  redteamCopyReport: document.querySelector("#redteamCopyReport"),
+  toolkitForm: document.querySelector("#toolkitForm"),
+  toolkitCategory: document.querySelector("#toolkitCategory"),
+  toolkitClass: document.querySelector("#toolkitClass"),
+  toolkitSearch: document.querySelector("#toolkitSearch"),
+  toolkitStatus: document.querySelector("#toolkitStatus"),
+  toolkitList: document.querySelector("#toolkitList")
 };
 
 class AccelerationBackend {
@@ -2795,6 +2801,121 @@ els.redteamCopyReport?.addEventListener("click", async () => {
   }
 });
 
+// ---- Pentest toolkit (curated catalog from awesome-pentest, mapped to bug classes) ----
+let toolkitData = { tools: [], categories: [], vuln_classes: {} };
+
+function toolkitBadge(text, cls) {
+  const span = document.createElement("span");
+  span.className = cls;
+  span.textContent = text;
+  return span;
+}
+
+function renderToolkit() {
+  if (!els.toolkitList) return;
+  const cat = els.toolkitCategory?.value || "";
+  const cls = els.toolkitClass?.value || "";
+  const q = (els.toolkitSearch?.value || "").trim().toLowerCase();
+  const names = toolkitData.vuln_classes || {};
+  const items = toolkitData.tools.filter((tool) => {
+    if (cat && tool.category !== cat) return false;
+    if (cls && !(tool.maps_to || []).includes(cls)) return false;
+    if (q) {
+      const hay = `${tool.name} ${tool.description} ${(tool.tags || []).join(" ")}`.toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+  if (els.toolkitStatus) {
+    els.toolkitStatus.textContent = `${items.length} of ${toolkitData.tools.length} tools`;
+  }
+  els.toolkitList.replaceChildren();
+  for (const tool of items) {
+    const card = document.createElement("div");
+    card.className = "toolkit-item";
+    const head = document.createElement("div");
+    head.className = "toolkit-item-head";
+    const link = document.createElement("a");
+    link.className = "toolkit-name";
+    link.href = tool.url || "#";
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = tool.name || "(unnamed)";
+    head.append(link);
+    if (tool.kind) head.append(toolkitBadge(tool.kind, "toolkit-kind"));
+    card.append(head);
+    if (tool.description) {
+      const desc = document.createElement("p");
+      desc.className = "toolkit-desc";
+      desc.textContent = tool.description;
+      card.append(desc);
+    }
+    const meta = document.createElement("div");
+    meta.className = "toolkit-tags";
+    for (const m of tool.maps_to || []) meta.append(toolkitBadge(names[m] || m, "toolkit-class"));
+    if (Array.isArray(tool.platforms) && tool.platforms.length) {
+      meta.append(toolkitBadge(tool.platforms.join(" · "), "toolkit-plat"));
+    }
+    if (meta.childNodes.length) card.append(meta);
+    els.toolkitList.append(card);
+  }
+  if (!items.length) {
+    const empty = document.createElement("p");
+    empty.className = "folder-status";
+    empty.textContent = "No tools match these filters.";
+    els.toolkitList.append(empty);
+  }
+}
+
+async function loadToolkit() {
+  if (!els.toolkitForm) return;
+  let data;
+  try {
+    data = await apiFetch("/api/toolkit", { timeoutMs: 6000 });
+  } catch (_) {
+    return; // local service not up yet; the panel stays empty
+  }
+  if (!data || data.ok === false) return;
+  toolkitData = {
+    tools: Array.isArray(data.tools) ? data.tools : [],
+    categories: Array.isArray(data.categories) ? data.categories : [],
+    vuln_classes: data.vuln_classes || {}
+  };
+  if (els.toolkitCategory) {
+    els.toolkitCategory.replaceChildren();
+    const any = document.createElement("option");
+    any.value = "";
+    any.textContent = `All categories (${toolkitData.tools.length})`;
+    els.toolkitCategory.append(any);
+    for (const c of toolkitData.categories) {
+      const option = document.createElement("option");
+      option.value = c.id;
+      option.textContent = c.label;
+      els.toolkitCategory.append(option);
+    }
+  }
+  if (els.toolkitClass) {
+    const present = new Set();
+    for (const tool of toolkitData.tools) for (const m of tool.maps_to || []) present.add(m);
+    els.toolkitClass.replaceChildren();
+    const any = document.createElement("option");
+    any.value = "";
+    any.textContent = "Any bug class";
+    els.toolkitClass.append(any);
+    for (const id of Array.from(present).sort()) {
+      const option = document.createElement("option");
+      option.value = id;
+      option.textContent = toolkitData.vuln_classes[id] || id;
+      els.toolkitClass.append(option);
+    }
+  }
+  renderToolkit();
+}
+
+els.toolkitCategory?.addEventListener("change", renderToolkit);
+els.toolkitClass?.addEventListener("change", renderToolkit);
+els.toolkitSearch?.addEventListener("input", renderToolkit);
+
 async function boot() {
   applyTheme();
   backend = new AccelerationBackend();
@@ -2812,6 +2933,7 @@ async function boot() {
   }
   void loadCoderConfig();
   void loadBountyProfiles();
+  void loadToolkit();
   render();
   renderWorkbench();
   if (state.agentMode && state.agentWorkspace) {

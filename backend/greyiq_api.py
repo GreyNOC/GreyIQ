@@ -61,7 +61,8 @@ from bughunter.web_scan_service import run_web_scan  # noqa: E402
 from bughunter.live_scan_service import run_live_scan  # noqa: E402
 from bughunter.triage import triage  # noqa: E402
 from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
-from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt  # noqa: E402
+from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names  # noqa: E402
+from bughunter import toolkit as toolkit_lib  # noqa: E402
 from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E402
 
 
@@ -1024,6 +1025,14 @@ def health() -> dict[str, Any]:
     return {"status": "ok", "app": APP_NAME, "version": VERSION}
 
 
+def toolkit_catalog() -> dict[str, Any]:
+    """Curated Pentest Toolkit catalog (awesome-pentest, CC-BY 4.0) plus friendly
+    vuln-class names so the UI can render 'maps to' badges."""
+    payload = toolkit_lib.catalog_payload(SEED_DIR, RUNTIME_DIR)
+    payload["vuln_classes"] = vuln_class_names()
+    return payload
+
+
 def preferences(request: PreferenceRequest) -> dict[str, Any]:
     bot = request.bot or {}
     bot_name = str(bot.get("name") or "GreyIQ").strip()
@@ -1261,6 +1270,9 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             return
         if method == "GET" and path == "/api/bounty/types":
             await send_json(send, bounty_profiles())
+            return
+        if method == "GET" and path == "/api/toolkit":
+            await send_json(send, toolkit_catalog())
             return
         if method == "POST" and path == "/api/bounty/scan":
             request = validate_payload(BountyScanRequest, await read_json_body(receive))
