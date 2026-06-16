@@ -513,6 +513,68 @@ label {
   word-break: break-word;
 }
 
+.message-evidence {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 0.72rem;
+}
+
+.evidence-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.evidence-chip {
+  padding: 0.22rem 0.42rem;
+  border: 1px solid rgba(105, 114, 125, 0.24);
+  border-radius: 6px;
+  background: rgba(238, 243, 239, 0.78);
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.source-list {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.source-list summary {
+  width: max-content;
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.source-hit {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.25rem 0.6rem;
+  margin-top: 0.45rem;
+  padding-top: 0.45rem;
+  border-top: 1px solid var(--line);
+}
+
+.source-hit strong,
+.source-hit small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-hit small {
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.source-hit p {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--ink);
+  line-height: 1.38;
+}
+
 .rating-bar {
   display: none;
   gap: 0.4rem;
@@ -569,6 +631,15 @@ label {
 .text-button:disabled {
   opacity: 0.6;
   cursor: progress;
+}
+
+.inline-status {
+  min-height: 1rem;
+  margin: -0.25rem 0 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+  line-height: 1.35;
 }
 
 .folder-actions {

@@ -135,6 +135,10 @@ const els = {
   trainingDataForm: document.querySelector("#trainingDataForm"),
   trainingDataSource: document.querySelector("#trainingDataSource"),
   trainingDataInput: document.querySelector("#trainingDataInput"),
+  repoIngestForm: document.querySelector("#repoIngestForm"),
+  repoSourcesInput: document.querySelector("#repoSourcesInput"),
+  repoIngestButton: document.querySelector("#repoIngestButton"),
+  repoIngestStatus: document.querySelector("#repoIngestStatus"),
   trainingFolderForm: document.querySelector("#trainingFolderForm"),
   trainingFolderInput: document.querySelector("#trainingFolderInput"),
   trainingFolderBrowse: document.querySelector("#trainingFolderBrowse"),
@@ -489,6 +493,56 @@ async function apiFetch(path, options = {}) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function normalizeReplyPayload(payload, userText) {
+  const diagnostics = payload?.diagnostics || {};
+  return {
+    text: payload?.message || "I am here with you. Give me a little more to work with and I will shape it.",
+    citations: Array.isArray(payload?.citations) ? payload.citations : [],
+    diagnostics: {
+      used_fallback: Boolean(payload?.used_fallback || diagnostics.used_fallback),
+      captured_for_training: Boolean(payload?.captured_for_training || diagnostics.captured_for_training),
+      intent: diagnostics.intent || inferIntent(userText),
+      mode: diagnostics.mode || "default",
+      strategy: diagnostics.strategy || "local_engine",
+      confidence: Number(payload?.confidence ?? diagnostics.confidence ?? 0),
+      retrieval_count: Number(diagnostics.retrieval_count || 0),
+      memory_count: Number(diagnostics.memory_count || 0),
+      note_count: Number(diagnostics.note_count || 0),
+      citation_count: Number(diagnostics.citation_count || payload?.citations?.length || 0),
+      engine_ready: Boolean(diagnostics.engine_ready),
+      device: diagnostics.device || payload?.device || "local"
+    },
+    modelName: payload?.model_name || "GreyIQ",
+    device: payload?.device || diagnostics.device || "local"
+  };
+}
+
+function normalizeAnswerForChat(answer, userText, strategy = "local_engine") {
+  if (answer && typeof answer === "object" && "text" in answer) {
+    return answer;
+  }
+  return {
+    text: String(answer || "I am here with you. Give me a little more to work with and I will shape it."),
+    citations: [],
+    diagnostics: {
+      used_fallback: false,
+      captured_for_training: false,
+      intent: inferIntent(userText),
+      mode: strategy === "coding_agent" ? "agent" : "default",
+      strategy,
+      confidence: 0,
+      retrieval_count: 0,
+      memory_count: 0,
+      note_count: 0,
+      citation_count: 0,
+      engine_ready: Boolean(service.available),
+      device: service.status?.device || backend?.mode || "local"
+    },
+    modelName: strategy === "coding_agent" ? "coding-agent" : "GreyIQ",
+    device: service.status?.device || backend?.mode || "local"
+  };
 }
 
 async function refreshServiceStatus({ silent = false } = {}) {
@@ -1010,7 +1064,7 @@ async function replyFor(userText) {
       service.available = true;
       service.lastError = "";
       void refreshServiceStatus({ silent: true });
-      return response.message || "I am here with you. Give me a little more to work with and I will shape it.";
+      return normalizeReplyPayload(response, userText);
     } catch (error) {
       service.available = false;
       service.lastError = error.message || "GreyIQ service fell back to browser mode";
@@ -1038,7 +1092,28 @@ async function browserReplyFor(userText) {
     return score + overlapBonus + brevityPenalty + variety;
   });
   const bestIndex = adjusted.indexOf(Math.max(...adjusted));
-  return candidates[bestIndex];
+  const bestScore = adjusted[bestIndex] || 0;
+  const confidence = Math.max(0.18, Math.min(0.74, 0.42 + bestScore * 0.18));
+  return {
+    text: candidates[bestIndex],
+    citations: [],
+    diagnostics: {
+      used_fallback: true,
+      captured_for_training: false,
+      intent: inferIntent(userText),
+      mode: "browser",
+      strategy: "browser_ranker",
+      confidence,
+      retrieval_count: 0,
+      memory_count: memories.length,
+      note_count: 0,
+      citation_count: 0,
+      engine_ready: false,
+      device: backend?.mode || "cpu"
+    },
+    modelName: "browser-ranker",
+    device: backend?.mode || "cpu"
+  };
 }
 
 function overlap(a, b) {
@@ -1083,6 +1158,93 @@ function renderBots() {
   }
 }
 
+function labelFromIdentifier(value) {
+  return String(value || "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase())
+    .trim();
+}
+
+function formatConfidence(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) {
+    return "";
+  }
+  return `${Math.round(Math.max(0, Math.min(1, number)) * 100)}% confidence`;
+}
+
+function appendEvidenceChip(row, text) {
+  if (!text) {
+    return;
+  }
+  const chip = document.createElement("span");
+  chip.className = "evidence-chip";
+  chip.textContent = text;
+  row.append(chip);
+}
+
+function renderMessageEvidence(article, message) {
+  if (message.role !== "bot") {
+    return;
+  }
+
+  const diagnostics = message.diagnostics || {};
+  const citations = Array.isArray(message.citations) ? message.citations : [];
+  const confidence = formatConfidence(diagnostics.confidence);
+  const hasEvidence =
+    confidence ||
+    message.modelName ||
+    diagnostics.strategy ||
+    diagnostics.used_fallback ||
+    citations.length > 0;
+
+  if (!hasEvidence) {
+    return;
+  }
+
+  const evidence = document.createElement("div");
+  evidence.className = "message-evidence";
+  const chips = document.createElement("div");
+  chips.className = "evidence-chips";
+
+  appendEvidenceChip(chips, diagnostics.used_fallback ? "Fallback" : "Local engine");
+  appendEvidenceChip(chips, message.modelName || diagnostics.device);
+  appendEvidenceChip(chips, labelFromIdentifier(diagnostics.strategy));
+  appendEvidenceChip(chips, confidence);
+  if (citations.length > 0) {
+    appendEvidenceChip(chips, `${citations.length} source${citations.length === 1 ? "" : "s"}`);
+  }
+
+  evidence.append(chips);
+
+  if (citations.length > 0) {
+    const details = document.createElement("details");
+    details.className = "source-list";
+    const summary = document.createElement("summary");
+    summary.textContent = "Sources";
+    details.append(summary);
+
+    for (const citation of citations.slice(0, 3)) {
+      const item = document.createElement("article");
+      item.className = "source-hit";
+      const heading = document.createElement("strong");
+      heading.textContent = citation.source || citation.source_id || "Local source";
+      const score = document.createElement("small");
+      const scoreValue = Number(citation.score || 0);
+      score.textContent = Number.isFinite(scoreValue) && scoreValue > 0 ? `${Math.round(scoreValue * 100)}% match` : "";
+      const excerpt = document.createElement("p");
+      excerpt.textContent = citation.excerpt || "";
+      item.append(heading, score, excerpt);
+      details.append(item);
+    }
+
+    evidence.append(details);
+  }
+
+  const ratingBar = article.querySelector(".rating-bar");
+  article.insertBefore(evidence, ratingBar);
+}
+
 function renderEditor() {
   const bot = activeBot();
   els.botName.value = bot.name;
@@ -1123,6 +1285,7 @@ function renderChat() {
     article.classList.add(message.role === "user" ? "is-user" : "is-bot");
     meta.textContent = message.role === "user" ? "You" : activeBot().name;
     body.textContent = message.text;
+    renderMessageEvidence(article, message);
 
     if (message.rating === "like") {
       like.classList.add("is-active");
@@ -1340,13 +1503,35 @@ els.composer.addEventListener("submit", async (event) => {
 
   els.sendButton.disabled = true;
   try {
-    const answer = state.agentMode && state.agentWorkspace ? await runAgent(text) : await replyFor(text);
-    chat.push({ id: crypto.randomUUID(), role: "bot", text: answer, createdAt: Date.now() });
+    const rawAnswer = state.agentMode && state.agentWorkspace ? await runAgent(text) : await replyFor(text);
+    const answer = normalizeAnswerForChat(
+      rawAnswer,
+      text,
+      state.agentMode && state.agentWorkspace ? "coding_agent" : "local_engine"
+    );
+    chat.push({
+      id: crypto.randomUUID(),
+      role: "bot",
+      text: answer.text,
+      citations: answer.citations,
+      diagnostics: answer.diagnostics,
+      modelName: answer.modelName,
+      device: answer.device,
+      createdAt: Date.now()
+    });
   } catch (error) {
     chat.push({
       id: crypto.randomUUID(),
       role: "bot",
       text: `I hit a local runtime snag: ${error.message || "unknown error"}. The browser model is still available.`,
+      citations: [],
+      diagnostics: {
+        used_fallback: true,
+        strategy: "ui_exception",
+        confidence: 0.12,
+        intent: inferIntent(text),
+        mode: "browser"
+      },
       createdAt: Date.now()
     });
   } finally {
@@ -1385,6 +1570,55 @@ els.trainingDataForm.addEventListener("submit", (event) => {
     sourceId
   ]);
   addMemory({ kind: "training_data", sourceId, text });
+});
+
+els.repoIngestForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const sources = els.repoSourcesInput.value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (sources.length === 0) {
+    els.repoIngestStatus.textContent = "Add at least one repo path or URL.";
+    return;
+  }
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.repoIngestStatus.textContent = "Start the GreyIQ backend before ingesting repositories.";
+    return;
+  }
+
+  els.repoIngestButton.disabled = true;
+  els.repoIngestStatus.textContent = "Ingesting repositories...";
+  try {
+    const payload = await apiFetch("/api/repos/ingest", {
+      method: "POST",
+      timeoutMs: 240000,
+      body: JSON.stringify({
+        sources,
+        max_total_chars: 4000000,
+        max_files_per_repo: 900
+      })
+    });
+    const summary = payload.summary || {};
+    state.selectedTrainingSources = normalizeSelectedTrainingSources([
+      ...state.selectedTrainingSources,
+      "src_imported_docs"
+    ]);
+    addMemory({
+      kind: "training_data",
+      sourceId: "src_imported_docs",
+      text: `Repository ingest: ${summary.ingested || 0} repo(s), ${summary.files_added || 0} file(s), ${summary.characters_added || 0} characters.`
+    });
+    els.repoIngestStatus.textContent = `Ingested ${summary.ingested || 0} repo(s), ${summary.files_added || 0} file(s).`;
+    await refreshServiceStatus({ silent: true });
+  } catch (error) {
+    els.repoIngestStatus.textContent = error.message || "Repository ingest failed.";
+  } finally {
+    els.repoIngestButton.disabled = false;
+    renderTrainingSources();
+    renderBackend();
+    saveState();
+  }
 });
 
 const desktopFolderPicker =
@@ -1437,7 +1671,7 @@ els.trainingFolderForm?.addEventListener("submit", async (event) => {
   }
 
   els.trainingFolderSubmit.disabled = true;
-  els.trainingFolderStatus.textContent = "Reading folder and ingesting files… this can take a while for large folders.";
+  els.trainingFolderStatus.textContent = "Reading folder and ingesting files... this can take a while for large folders.";
   try {
     const result = await apiFetch("/api/train/folder", {
       method: "POST",
@@ -1445,7 +1679,6 @@ els.trainingFolderForm?.addEventListener("submit", async (event) => {
       body: JSON.stringify({ folder })
     });
     els.trainingFolderStatus.textContent = result.message || "Folder added to training data.";
-    // Ingested files count as Imported Documents — make sure they're included next train.
     state.selectedTrainingSources = normalizeSelectedTrainingSources([
       ...state.selectedTrainingSources,
       "src_imported_docs"

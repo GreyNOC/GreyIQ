@@ -41,9 +41,22 @@ function isInsideRoot(filePath) {
 }
 
 function resolvePublicPath(url) {
-  const requestUrl = new URL(url, `http://localhost:${port}`);
+  let requestUrl;
+  try {
+    requestUrl = new URL(url, `http://localhost:${port}`);
+  } catch {
+    return null;
+  }
+
   const pathname = requestUrl.pathname === "/" ? "/index.html" : requestUrl.pathname;
-  const filePath = resolve(normalize(join(root, decodeURIComponent(pathname))));
+  let decodedPathname;
+  try {
+    decodedPathname = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+
+  const filePath = resolve(normalize(join(root, decodedPathname)));
 
   if (!isInsideRoot(filePath)) {
     return null;

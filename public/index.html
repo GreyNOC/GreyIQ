@@ -249,6 +249,15 @@
           <button class="text-button" type="submit">Add training data</button>
         </form>
 
+        <form class="choice-form" id="repoIngestForm">
+          <label>
+            <span>Repositories</span>
+            <textarea id="repoSourcesInput" rows="4" placeholder="C:\path\to\repo&#10;https://github.com/org/repo.git"></textarea>
+          </label>
+          <button class="text-button" id="repoIngestButton" type="submit">Ingest repositories</button>
+          <p class="inline-status" id="repoIngestStatus"></p>
+        </form>
+
         <form class="choice-form" id="trainingFolderForm">
           <label>
             <span>Add a local folder</span>
