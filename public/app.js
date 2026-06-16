@@ -1835,50 +1835,103 @@ async function refreshWorkspaceTree() {
   }
 }
 
+// Folders the user has expanded (collapsed by default so a deep repo stays
+// readable). Persists across re-renders for the session.
+const expandedDirs = new Set();
+
+function makeTreeButton(entry, depth, isDir, fullPath) {
+  const node = document.createElement("button");
+  node.type = "button";
+  const isActive = !isDir && entry.path === state.workbenchActiveFile;
+  node.className = `workspace-tree-item${isDir ? " is-dir" : ""}${isActive ? " is-active" : ""}`;
+  node.style.paddingLeft = `${0.4 + depth * 0.8}rem`;
+  node.title = entry.path;
+  node.setAttribute("role", "treeitem");
+  node.setAttribute("aria-level", String(depth + 1));
+
+  const icon = document.createElement("span");
+  icon.className = "tree-icon";
+  icon.setAttribute("aria-hidden", "true");
+  const label = document.createElement("span");
+  label.className = "tree-label";
+  label.textContent = fullPath ? entry.path : entry.name;
+
+  if (isDir) {
+    const open = expandedDirs.has(entry.path);
+    node.setAttribute("aria-expanded", String(open));
+    icon.textContent = open ? "▾" : "▸";
+    node.addEventListener("click", () => {
+      if (expandedDirs.has(entry.path)) expandedDirs.delete(entry.path);
+      else expandedDirs.add(entry.path);
+      renderWorkspaceTree(state.workbenchTree);
+      [...els.workspaceTree.querySelectorAll(".workspace-tree-item")]
+        .find((el) => el.title === entry.path)
+        ?.focus();
+    });
+  } else {
+    icon.textContent = ""; // spacer keeps file labels aligned under the chevrons
+    if (isActive) node.setAttribute("aria-current", "true");
+    node.addEventListener("click", () => openWorkspaceFile(entry.path));
+  }
+  node.append(icon, label);
+  return node;
+}
+
 function renderWorkspaceTree(entries, truncated = false) {
   if (!els.workspaceTree) return;
   const list = Array.isArray(entries) ? entries : [];
   const search = (state.workbenchSearch || "").trim().toLowerCase();
-  const filtered = search
-    ? list.filter((entry) => entry.type === "file" && entry.path.toLowerCase().includes(search))
-    : list;
-
   els.workspaceTree.replaceChildren();
-  if (!filtered.length) {
+
+  if (!list.length) {
     els.workspaceTree.append(
-      makeHint(
-        !state.agentWorkspace
-          ? "Set a workspace folder to browse its files."
-          : search
-            ? "No files match your filter."
-            : "No files to show."
-      )
+      makeHint(state.agentWorkspace ? "No files to show." : "Set a workspace folder to browse its files.")
     );
     return;
   }
 
-  // The item that should hold the single tab stop (roving tabindex): the active
-  // file if it's visible, otherwise the first item.
-  const activeIdx = filtered.findIndex((entry) => entry.path === state.workbenchActiveFile);
-  const tabStop = activeIdx >= 0 ? activeIdx : 0;
-
-  filtered.forEach((entry, index) => {
-    const isFile = entry.type === "file";
-    const node = document.createElement(isFile ? "button" : "div");
-    const depth = search ? 0 : Math.max(0, entry.path.split("/").length - 1);
-    const isActive = entry.path === state.workbenchActiveFile;
-    node.className = `workspace-tree-item${isFile ? "" : " is-dir"}${isActive ? " is-active" : ""}`;
-    node.style.paddingLeft = `${0.4 + depth * 0.85}rem`;
-    node.title = entry.path;
-    node.textContent = search ? entry.path : (isFile ? entry.name : `${entry.name}/`);
-    node.setAttribute("role", "treeitem");
-    node.setAttribute("aria-level", String(depth + 1));
-    node.tabIndex = index === tabStop ? 0 : -1;
-    if (isActive) node.setAttribute("aria-current", "true");
-    if (isFile) {
-      node.type = "button";
-      node.addEventListener("click", () => openWorkspaceFile(entry.path));
+  // Search: flat list of matching files (full path), ignoring the tree structure.
+  if (search) {
+    const matches = list.filter((entry) => entry.type === "file" && entry.path.toLowerCase().includes(search));
+    if (!matches.length) {
+      els.workspaceTree.append(makeHint("No files match your filter."));
+      return;
     }
+    matches.forEach((entry, index) => {
+      const node = makeTreeButton(entry, 0, false, true);
+      node.tabIndex = index === 0 ? 0 : -1;
+      els.workspaceTree.append(node);
+    });
+    return;
+  }
+
+  // Collapsible tree: group the flat list by parent, render only expanded branches.
+  const byParent = new Map();
+  for (const entry of list) {
+    const slash = entry.path.lastIndexOf("/");
+    const parent = slash >= 0 ? entry.path.slice(0, slash) : "";
+    if (!byParent.has(parent)) byParent.set(parent, []);
+    byParent.get(parent).push(entry);
+  }
+  const rows = [];
+  const walk = (parent, depth) => {
+    for (const entry of byParent.get(parent) || []) {
+      const isDir = entry.type === "dir";
+      rows.push({ entry, depth, isDir });
+      if (isDir && expandedDirs.has(entry.path)) walk(entry.path, depth + 1);
+    }
+  };
+  walk("", 0);
+
+  if (!rows.length) {
+    els.workspaceTree.append(makeHint("No files to show."));
+    return;
+  }
+  const activeIdx = rows.findIndex((row) => row.entry.path === state.workbenchActiveFile);
+  const tabStop = activeIdx >= 0 ? activeIdx : 0;
+  rows.forEach((row, index) => {
+    const node = makeTreeButton(row.entry, row.depth, row.isDir, false);
+    node.tabIndex = index === tabStop ? 0 : -1;
     els.workspaceTree.append(node);
   });
   if (truncated) {
