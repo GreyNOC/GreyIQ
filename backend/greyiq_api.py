@@ -62,10 +62,11 @@ from bughunter.live_scan_service import run_live_scan  # noqa: E402
 from bughunter.triage import triage  # noqa: E402
 from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
 from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt  # noqa: E402
+from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E402
 
 
 APP_NAME = "GreyIQ"
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 _CURRENT_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar("greyiq_current_scope", default=None)
 _CSP = (
     "default-src 'self'; "
@@ -252,6 +253,11 @@ class BountyScanRequest(BaseModel):
     run_live: bool = False
     per_finding: bool = False
     max_files: int = Field(default=5000, ge=1, le=100_000)
+
+
+class AgentRedteamRequest(BaseModel):
+    authorized: bool = False
+    include_behavioral: bool = False
 
 
 class TrainFolderRequest(BaseModel):
@@ -583,6 +589,18 @@ class GreyIQRuntime:
             run_live=request.run_live,
             max_files=request.max_files,
             per_finding=request.per_finding,
+        )
+
+    def run_agent_redteam(self, request: "AgentRedteamRequest") -> dict[str, Any]:
+        return run_agent_redteam(
+            None,  # red-team always writes to the runtime reports dir (no caller-chosen path)
+            request.authorized,
+            self._coder_config(),
+            default_reports_dir=RUNTIME_DIR / "reports",
+            runtime_dir=RUNTIME_DIR,
+            seed_dir=SEED_DIR,
+            version=VERSION,
+            include_behavioral=request.include_behavioral,
         )
 
     def _build_coder_messages(self, request: ChatRequest, limit: int) -> list[dict[str, str]]:
@@ -1253,6 +1271,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/scan":
             request = validate_payload(BountyScanRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.run_bounty, request))
+            return
+        if method == "POST" and path == "/api/agent/redteam":
+            request = validate_payload(AgentRedteamRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.run_agent_redteam, request))
             return
         if method == "GET" and path == "/api/cores":
             await send_json(send, await asyncio.to_thread(runtime.store.load))

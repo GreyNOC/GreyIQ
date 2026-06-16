@@ -187,7 +187,15 @@ const els = {
   bountyStatus: document.querySelector("#bountyStatus"),
   bountyReport: document.querySelector("#bountyReport"),
   bountyReportActions: document.querySelector("#bountyReportActions"),
-  bountyCopyReport: document.querySelector("#bountyCopyReport")
+  bountyCopyReport: document.querySelector("#bountyCopyReport"),
+  redteamForm: document.querySelector("#redteamForm"),
+  redteamBehavioral: document.querySelector("#redteamBehavioral"),
+  redteamAuthorized: document.querySelector("#redteamAuthorized"),
+  redteamRun: document.querySelector("#redteamRun"),
+  redteamStatus: document.querySelector("#redteamStatus"),
+  redteamReport: document.querySelector("#redteamReport"),
+  redteamReportActions: document.querySelector("#redteamReportActions"),
+  redteamCopyReport: document.querySelector("#redteamCopyReport")
 };
 
 class AccelerationBackend {
@@ -364,6 +372,7 @@ function loadState() {
     workbenchTree: [],
     workbenchHeight: null,
     workbenchMaximized: false,
+    workbenchDocked: false,
     workbenchWrap: false,
     lastAgentTranscript: [],
     lastAgentChanges: [],
@@ -372,7 +381,8 @@ function loadState() {
     bountyClass: "",
     bountyScope: "",
     bountyOutput: "",
-    bountyPerFinding: false
+    bountyPerFinding: false,
+    redteamBehavioral: false
   };
 
   try {
@@ -1733,26 +1743,25 @@ const WORKBENCH_TABS = ["preview", "changes", "steps", "verify"];
 
 function applyWorkbenchSize() {
   if (!els.appShell) return;
-  let height;
-  if (state.workbenchMaximized) {
-    height = Math.round(window.innerHeight * 0.86);
-  } else if (typeof state.workbenchHeight === "number" && state.workbenchHeight > 0) {
-    height = state.workbenchHeight;
-  } else {
-    height = Math.round(window.innerHeight * 0.44);
-  }
-  els.appShell.style.setProperty("--workbench-h", `${height}px`);
-  if (els.workbenchDivider) {
-    // Expose the splitter's value/bounds so screen readers announce resizing.
-    els.workbenchDivider.setAttribute("aria-valuemin", String(8 * 16));
-    els.workbenchDivider.setAttribute("aria-valuemax", String(Math.round(window.innerHeight * 0.88)));
-    els.workbenchDivider.setAttribute("aria-valuenow", String(height));
+  const docked = Boolean(state.workbenchDocked);
+  // Docked = workbench fills the left, chat docks to the right at ~1/3 (CSS).
+  els.appShell.classList.toggle("wb-docked", docked);
+  if (!docked) {
+    const height = (typeof state.workbenchHeight === "number" && state.workbenchHeight > 0)
+      ? state.workbenchHeight
+      : Math.round(window.innerHeight * 0.44);
+    els.appShell.style.setProperty("--workbench-h", `${height}px`);
+    if (els.workbenchDivider) {
+      // Expose the splitter's value/bounds so screen readers announce resizing.
+      els.workbenchDivider.setAttribute("aria-valuemin", String(8 * 16));
+      els.workbenchDivider.setAttribute("aria-valuemax", String(Math.round(window.innerHeight * 0.88)));
+      els.workbenchDivider.setAttribute("aria-valuenow", String(height));
+    }
   }
   if (els.workbenchMaximize) {
-    const max = Boolean(state.workbenchMaximized);
-    els.workbenchMaximize.setAttribute("aria-pressed", String(max));
-    els.workbenchMaximize.textContent = max ? "⤡" : "⤢";
-    const label = max ? "Restore workbench size" : "Maximize workbench";
+    els.workbenchMaximize.setAttribute("aria-pressed", String(docked));
+    els.workbenchMaximize.textContent = docked ? "⤡" : "⤢";
+    const label = docked ? "Restore split (chat below)" : "Dock workbench (chat to the right)";
     els.workbenchMaximize.title = label;
     els.workbenchMaximize.setAttribute("aria-label", label);
   }
@@ -2346,22 +2355,32 @@ function setWorkbenchHeightPx(px) {
   const min = 8 * 16;
   const max = Math.round(window.innerHeight * 0.88);
   state.workbenchHeight = Math.max(min, Math.min(max, Math.round(px)));
-  state.workbenchMaximized = false;
+  state.workbenchDocked = false;
   applyWorkbenchSize();
 }
 
 if (els.workbenchDivider) {
   let dragging = false;
-  const onMove = (event) => {
-    if (!dragging) return;
-    setWorkbenchHeightPx(window.innerHeight - event.clientY);
-  };
+  // Slide the workbench (almost) to the top → snap into docked mode (chat right).
+  const dockThreshold = () => window.innerHeight * 0.9;
   const stop = (event) => {
     if (!dragging) return;
     dragging = false;
     document.body.classList.remove("is-resizing");
     els.workbenchDivider.releasePointerCapture?.(event.pointerId);
     saveState();
+  };
+  const onMove = (event) => {
+    if (!dragging) return;
+    const height = window.innerHeight - event.clientY;
+    if (height >= dockThreshold()) {
+      state.workbenchDocked = true;
+      applyWorkbenchSize();
+      saveState();
+      stop(event); // end the drag; the divider hides in docked mode
+      return;
+    }
+    setWorkbenchHeightPx(height);
   };
   els.workbenchDivider.addEventListener("pointerdown", (event) => {
     dragging = true;
@@ -2378,16 +2397,21 @@ if (els.workbenchDivider) {
       Math.round(window.innerHeight * 0.44);
     if (event.key === "ArrowUp") setWorkbenchHeightPx(current + 24);
     else if (event.key === "ArrowDown") setWorkbenchHeightPx(current - 24);
-    else if (event.key === "Home") setWorkbenchHeightPx(window.innerHeight * 0.88);
-    else if (event.key === "End") setWorkbenchHeightPx(8 * 16);
-    else return;
+    else if (event.key === "Home") {
+      state.workbenchDocked = true; // slide all the way up → dock chat to the right
+      applyWorkbenchSize();
+    } else if (event.key === "End") {
+      setWorkbenchHeightPx(8 * 16);
+    } else {
+      return;
+    }
     event.preventDefault();
     saveState();
   });
 }
 
 els.workbenchMaximize?.addEventListener("click", () => {
-  state.workbenchMaximized = !state.workbenchMaximized;
+  state.workbenchDocked = !state.workbenchDocked;
   applyWorkbenchSize();
   saveState();
 });
@@ -2648,6 +2672,75 @@ els.bountyCopyReport?.addEventListener("click", async () => {
     // Clipboard blocked — select the text so the user can copy manually.
     const range = document.createRange();
     range.selectNodeContents(els.bountyReport);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+});
+
+// ---- Agent security red-team (test GreyIQ's own agent) ----
+let lastRedteamReportMarkdown = "";
+
+if (els.redteamBehavioral) {
+  els.redteamBehavioral.checked = Boolean(state.redteamBehavioral);
+}
+
+els.redteamForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!els.redteamAuthorized?.checked) {
+    els.redteamStatus.textContent = "Tick the box to red-team your GreyIQ agent.";
+    return;
+  }
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.redteamStatus.textContent = "Local GreyIQ service is not running.";
+    return;
+  }
+  state.redteamBehavioral = Boolean(els.redteamBehavioral?.checked);
+  saveState();
+  els.redteamRun.disabled = true;
+  els.redteamStatus.textContent = state.redteamBehavioral
+    ? "Red-teaming… running sandbox + behavioral probes (the behavioral ones use your brain)."
+    : "Red-teaming… running sandbox + policy probes.";
+  if (els.redteamReport) els.redteamReport.hidden = true;
+  if (els.redteamReportActions) els.redteamReportActions.hidden = true;
+  try {
+    const res = await apiFetch("/api/agent/redteam", {
+      method: "POST",
+      timeoutMs: 600000,
+      body: JSON.stringify({ authorized: true, include_behavioral: state.redteamBehavioral })
+    });
+    if (res.ok === false) {
+      els.redteamStatus.textContent = res.error || "The security test could not run.";
+    } else {
+      const c = res.counts || {};
+      const detail = `${c.secure || 0} secure, ${c.vulnerable || 0} vulnerable, ${c.review || 0} review, ${c.error || 0} error`;
+      els.redteamStatus.textContent =
+        `Posture: ${String(res.posture).toUpperCase()} — ${res.probe_count} probe(s) (${detail}). Report saved to: ${res.report_path}`;
+      lastRedteamReportMarkdown = res.report_markdown || "";
+      if (els.redteamReport && lastRedteamReportMarkdown) {
+        els.redteamReport.textContent = lastRedteamReportMarkdown;
+        els.redteamReport.hidden = false;
+        if (els.redteamReportActions) els.redteamReportActions.hidden = false;
+      }
+    }
+  } catch (error) {
+    els.redteamStatus.textContent = error.message || "The security test failed.";
+  } finally {
+    els.redteamRun.disabled = false;
+  }
+});
+
+els.redteamCopyReport?.addEventListener("click", async () => {
+  if (!lastRedteamReportMarkdown) return;
+  try {
+    await navigator.clipboard.writeText(lastRedteamReportMarkdown);
+    els.redteamCopyReport.textContent = "Copied ✓";
+    setTimeout(() => {
+      if (els.redteamCopyReport) els.redteamCopyReport.textContent = "Copy report";
+    }, 1500);
+  } catch (_) {
+    const range = document.createRange();
+    range.selectNodeContents(els.redteamReport);
     const sel = window.getSelection();
     sel.removeAllRanges();
     sel.addRange(range);
