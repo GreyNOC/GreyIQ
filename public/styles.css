@@ -915,15 +915,6 @@ button.workspace-tree-item:focus-visible {
   font-weight: 700;
 }
 
-.workspace-search-result {
-  display: block;
-  padding: 0.3rem 0.4rem;
-  border-radius: 5px;
-  color: var(--ink);
-  font-family: var(--code-font);
-  font-size: 0.74rem;
-}
-
 .workbench-main {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
@@ -1017,15 +1008,6 @@ button.workspace-tree-item:focus-visible {
 
 .workbench-hint.is-error {
   color: var(--coral);
-}
-
-.code-preview-head {
-  margin-bottom: 0.5rem;
-  color: var(--muted);
-  font-family: var(--code-font);
-  font-size: 0.76rem;
-  font-weight: 700;
-  word-break: break-all;
 }
 
 .code-preview {
