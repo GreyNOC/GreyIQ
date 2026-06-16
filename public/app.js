@@ -371,12 +371,10 @@ function loadState() {
     workbenchSearch: "",
     workbenchTree: [],
     workbenchHeight: null,
-    workbenchMaximized: false,
     workbenchDocked: false,
     workbenchWrap: false,
     lastAgentTranscript: [],
     lastAgentChanges: [],
-    lastAgentOutput: "",
     bountyProfile: "full-sweep",
     bountyClass: "",
     bountyScope: "",
@@ -448,7 +446,6 @@ function saveState() {
     workbenchTree: _tree,
     lastAgentTranscript: _transcript,
     lastAgentChanges: _changes,
-    lastAgentOutput: _output,
     ...persist
   } = state;
   try {
@@ -2278,10 +2275,6 @@ async function runAgent(userText) {
     // Feed the Workbench from the structured transcript + change set.
     state.lastAgentTranscript = Array.isArray(res.transcript) ? res.transcript : [];
     state.lastAgentChanges = Array.isArray(res.changes) ? res.changes : [];
-    state.lastAgentOutput = state.lastAgentTranscript
-      .filter((step) => step.tool === "verify" || step.tool === "run_command")
-      .map((step) => (typeof step.output === "string" ? step.output : ""))
-      .join("\n\n");
     if (state.lastAgentChanges.length) {
       void refreshWorkspaceTree();
     }
@@ -2378,6 +2371,7 @@ if (els.workbenchDivider) {
       applyWorkbenchSize();
       saveState();
       stop(event); // end the drag; the divider hides in docked mode
+      els.workbenchMaximize?.focus(); // keep keyboard focus on a visible control
       return;
     }
     setWorkbenchHeightPx(height);
@@ -2400,6 +2394,7 @@ if (els.workbenchDivider) {
     else if (event.key === "Home") {
       state.workbenchDocked = true; // slide all the way up → dock chat to the right
       applyWorkbenchSize();
+      els.workbenchMaximize?.focus(); // divider hides when docked; keep focus visible
     } else if (event.key === "End") {
       setWorkbenchHeightPx(8 * 16);
     } else {

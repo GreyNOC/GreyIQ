@@ -66,7 +66,7 @@ from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E4
 
 
 APP_NAME = "GreyIQ"
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 _CURRENT_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar("greyiq_current_scope", default=None)
 _CSP = (
     "default-src 'self'; "
@@ -189,12 +189,6 @@ class WorkspaceTreeRequest(BaseModel):
 class WorkspaceFileRequest(BaseModel):
     workspace: str = Field(min_length=1, max_length=4000)
     path: str = Field(min_length=1, max_length=4000)
-
-
-class WorkspaceSearchRequest(BaseModel):
-    workspace: str = Field(min_length=1, max_length=4000)
-    query: str = Field(min_length=1, max_length=400)
-    max_results: int = Field(default=100, ge=1, le=1000)
 
 
 class PreferenceRequest(BaseModel):
@@ -1351,15 +1345,6 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             await send_json(
                 send,
                 await asyncio.to_thread(workspace_fs.read_file, request.workspace, request.path),
-            )
-            return
-        if method == "POST" and path == "/api/workspace/search":
-            request = validate_payload(WorkspaceSearchRequest, await read_json_body(receive))
-            await send_json(
-                send,
-                await asyncio.to_thread(
-                    workspace_fs.search_files, request.workspace, request.query, request.max_results
-                ),
             )
             return
         if path.startswith("/api/"):

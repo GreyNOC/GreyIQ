@@ -34,7 +34,8 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
         "name": "Remote code execution / command injection",
         "cwe": "CWE-78 / CWE-94",
         "owasp": "A03:2021 Injection",
-        "categories": {"cmd_inject", "eval_exec", "backdoor"},
+        # Scanner emits these for shell-out / eval / backdoor / curl|sh / obfuscated code.
+        "categories": {"injection", "supply-chain", "backdoor", "obfuscation"},
         "checklist": [
             "Trace each flagged sink back to a request parameter, header, or filename the attacker controls.",
             "Try a benign marker payload first (e.g. `;echo greyiq123`) and look for the marker in the response or logs.",
@@ -67,7 +68,9 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
         "name": "Server-side request forgery (SSRF)",
         "cwe": "CWE-918",
         "owasp": "A10:2021 SSRF",
-        "categories": {"network"},
+        # The static scanner can't confirm SSRF (it's a request-flow bug) — this is a
+        # manual-hunt class; the checklist below guides it.
+        "categories": set(),
         "checklist": [
             "Find parameters that take a URL/host (webhooks, image/import-by-URL, PDF/render).",
             "Point one at a collaborator host you control and confirm the server connects out.",
@@ -113,8 +116,9 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
 # finding carries a class in the report.
 _CATEGORY_LABELS: dict[str, dict[str, str]] = {
     "crypto": {"name": "Weak cryptography", "cwe": "CWE-327"},
-    "deps": {"name": "Vulnerable dependency", "cwe": "CWE-1104"},
-    "ci": {"name": "Insecure CI/CD workflow", "cwe": "CWE-draft"},
+    "dependency": {"name": "Vulnerable dependency", "cwe": "CWE-1104"},
+    "network": {"name": "Insecure network / transport", "cwe": "CWE-295"},
+    "ci": {"name": "Insecure CI/CD workflow", "cwe": "CWE-1395"},
     "headers": {"name": "Security hardening (headers)", "cwe": "CWE-693"},
     "mixed_content": {"name": "Mixed content", "cwe": "CWE-311"},
     "disclosure": {"name": "Information disclosure", "cwe": "CWE-200"},

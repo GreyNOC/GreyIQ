@@ -1,6 +1,6 @@
 """Safe, read-only workspace introspection for the GreyIQ Workbench.
 
-These helpers power the file explorer, file preview, and file search that appear
+These helpers power the file explorer and read-only file preview that appear
 when Agent mode is on. They are deliberately read-only and strictly confined to
 the workspace folder the user picked: every path is resolved and checked to live
 inside that root before any disk access, so the frontend can never read outside
@@ -11,7 +11,7 @@ message instead of a 500.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 # Folders that are large, generated, or irrelevant to a code workspace view.
 SKIP_DIRS: frozenset[str] = frozenset(
@@ -105,26 +105,6 @@ def _safe_child(base: Path, child: Path) -> bool:
     return resolved == base or base in resolved.parents
 
 
-def _iter_files(base: Path) -> Iterator[Path]:
-    """Yield files under ``base`` depth-first, skipping heavy/generated dirs and
-    anything that resolves outside the workspace (symlinks, junctions)."""
-    try:
-        children = sorted(base.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
-    except OSError:
-        return
-    for child in children:
-        try:
-            if not _safe_child(base, child):
-                continue
-            if child.is_dir():
-                if child.name not in SKIP_DIRS:
-                    yield from _iter_files(child)
-            elif child.is_file():
-                yield child
-        except OSError:
-            continue
-
-
 def list_tree(root: str, max_entries: int = 1000) -> dict[str, Any]:
     """List the workspace as a flat, depth-first (dirs-before-files) entry list.
 
@@ -215,42 +195,3 @@ def read_file(root: str, path: str, max_bytes: int = DEFAULT_MAX_BYTES) -> dict[
     if truncated:
         result["truncated"] = True
     return result
-
-
-def search_files(root: str, query: str, max_results: int = 100) -> dict[str, Any]:
-    """Case-insensitive substring search across text files in the workspace."""
-    try:
-        base = resolve_workspace(root)
-    except WorkspaceError as exc:
-        return {"ok": False, "error": str(exc), "matches": [], "truncated": False}
-
-    needle = str(query or "").strip()
-    if not needle:
-        return {"ok": False, "error": "Enter something to search for.", "matches": [], "truncated": False}
-
-    lowered = needle.lower()
-    cap = max(1, int(max_results or 100))
-    matches: list[dict[str, Any]] = []
-    truncated = False
-
-    for file_path in _iter_files(base):
-        if len(matches) >= cap:
-            truncated = True
-            break
-        if not is_text_file(file_path):
-            continue
-        try:
-            if file_path.stat().st_size > DEFAULT_MAX_BYTES:
-                continue
-            text = file_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        rel = file_path.relative_to(base).as_posix()
-        for lineno, line in enumerate(text.splitlines(), 1):
-            if lowered in line.lower():
-                matches.append({"path": rel, "line": lineno, "text": line.strip()[:240]})
-                if len(matches) >= cap:
-                    truncated = True
-                    break
-
-    return {"ok": True, "matches": matches, "truncated": truncated, "query": needle}

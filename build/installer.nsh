@@ -14,8 +14,11 @@
 !macro customInstall
   CreateDirectory "$INSTDIR\training-data"
   ; The seed corpus is bundled in the backend resources; surface a copy if present.
-  CopyFiles /SILENT "$INSTDIR\resources\backend\_internal\seed\greyiq_manual_pdfs.txt" "$INSTDIR\training-data\greyiq_manual_pdfs.txt"
+  ; PyInstaller 6.x (pinned) puts datas under _internal/, so copy the legacy flat
+  ; path first (fallback for older toolchains) and the _internal path LAST so the
+  ; current layout always wins. /SILENT = a missing source path is non-fatal.
   CopyFiles /SILENT "$INSTDIR\resources\backend\seed\greyiq_manual_pdfs.txt" "$INSTDIR\training-data\greyiq_manual_pdfs.txt"
+  CopyFiles /SILENT "$INSTDIR\resources\backend\_internal\seed\greyiq_manual_pdfs.txt" "$INSTDIR\training-data\greyiq_manual_pdfs.txt"
 !macroend
 
 !macro customUnInstall
