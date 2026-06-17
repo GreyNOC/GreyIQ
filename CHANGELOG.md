@@ -2,6 +2,14 @@
 
 Notable changes to GreyIQ.
 
+## v0.9.6
+
+### Changed
+- **Dark mode is now the default.** New installs and the browser fallback open in
+  dark. An explicit theme choice (via the header toggle) is remembered and always
+  wins; users who never picked — including those with a stale light preference from
+  the old default — now open in dark.
+
 ## v0.9.5
 
 ### Added
