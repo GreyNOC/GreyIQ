@@ -228,6 +228,14 @@ class CoreSaveRequest(BaseModel):
     core: dict[str, Any]
 
 
+class DeleteCoreRequest(BaseModel):
+    core_id: str = Field(min_length=1, max_length=200)
+
+
+class DeleteModelRequest(BaseModel):
+    model: str = Field(min_length=1, max_length=200)
+
+
 class ScanCodeRequest(BaseModel):
     target: str = Field(min_length=1, max_length=4000)
     target_type: str = Field(default="path", max_length=20)
@@ -542,6 +550,27 @@ class GreyIQRuntime:
 
         threading.Thread(target=worker, name="ollama-pull", daemon=True).start()
         return {"ok": True, "active": True, "model": target}
+
+    def delete_model(self, model: str) -> dict[str, Any]:
+        target = (model or "").strip()
+        if not target:
+            return {"ok": False, "error": "No model specified."}
+        with self.lock:
+            if self.model_pull.get("active") and self.model_pull.get("model") == target:
+                return {"ok": False, "error": "That model is still downloading."}
+        host, _ = self._local_brain()
+        try:
+            coder.ollama_delete(host, target)
+        except coder.CoderError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "deleted": target}
+
+    def delete_core(self, core_id: str) -> dict[str, Any]:
+        try:
+            ai_core = self.store.delete_core(core_id, who="greyiq")
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "core_id": core_id, "ai_core": ai_core}
 
     def run_agent(self, request: AgentRequest) -> dict[str, Any]:
         try:
@@ -1419,6 +1448,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             request = validate_payload(CoreSaveRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.store.save_core, request.core, who="greyiq"))
             return
+        if method == "POST" and path == "/api/cores/delete":
+            request = validate_payload(DeleteCoreRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.delete_core, request.core_id))
+            return
         if method == "POST" and path == "/api/preferences":
             request = validate_payload(PreferenceRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(preferences, request))
@@ -1474,6 +1507,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             return
         if method == "GET" and path == "/api/coder/pull":
             await send_json(send, runtime.model_pull_status())
+            return
+        if method == "POST" and path == "/api/coder/delete":
+            request = validate_payload(DeleteModelRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.delete_model, request.model))
             return
         if method == "POST" and path == "/api/agent":
             request = validate_payload(AgentRequest, await read_json_body(receive))

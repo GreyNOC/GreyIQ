@@ -787,6 +787,46 @@ label {
   color: var(--muted);
 }
 
+/* Delete personality + manage local models */
+.text-button.danger {
+  color: var(--danger);
+}
+
+#deleteBotButton {
+  margin-top: 0.25rem;
+}
+
+#deleteBotButton:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.model-list {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.model-list[hidden] {
+  display: none;
+}
+
+.model-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.3rem 0.5rem;
+  background: var(--surface);
+}
+
+.model-name {
+  font-size: 0.74rem;
+  color: var(--ink);
+  word-break: break-all;
+}
+
 /* label rows use display:grid, which overrides the [hidden] attribute */
 .brain-form [data-brain-field][hidden] {
   display: none;
