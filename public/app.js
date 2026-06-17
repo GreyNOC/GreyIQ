@@ -377,7 +377,8 @@ function loadState() {
     selectedTrainingSources: [...DEFAULT_SELECTED_TRAINING_SOURCES],
     agentMode: false,
     agentWorkspace: "",
-    theme: "light",
+    theme: "dark",
+    themeChosen: false,
     workbenchTab: "preview",
     workbenchActiveFile: "",
     workbenchSearch: "",
@@ -1966,7 +1967,9 @@ if (els.brainForm) {
 
 // ---- Theme (light / dark) ----
 function applyTheme() {
-  const theme = state.theme === "dark" ? "dark" : "light";
+  // Default to dark; honor the user's explicit choice once they've toggled.
+  const theme = state.themeChosen ? (state.theme === "dark" ? "dark" : "light") : "dark";
+  state.theme = theme;
   document.body.dataset.theme = theme;
   const meta = document.querySelector('meta[name="color-scheme"]');
   if (meta) {
@@ -1980,6 +1983,7 @@ function applyTheme() {
 }
 
 function toggleTheme() {
+  state.themeChosen = true;
   state.theme = state.theme === "dark" ? "light" : "dark";
   applyTheme();
   saveState();
