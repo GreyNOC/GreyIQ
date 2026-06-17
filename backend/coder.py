@@ -236,6 +236,32 @@ def ollama_list_models(host: str, timeout: float = 10.0) -> list[str]:
     return [str(m.get("name") or m.get("model") or "") for m in (body.get("models") or []) if isinstance(m, dict)]
 
 
+def ollama_delete(host: str, model: str, timeout: float = 20.0) -> None:
+    """Delete a pulled model from the local Ollama store (DELETE /api/delete).
+    Raises CoderError on failure."""
+    endpoint = host.rstrip("/") + "/api/delete"
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps({"name": model}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="DELETE",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "ignore") if hasattr(exc, "read") else ""
+        if exc.code == 404:
+            raise CoderError(f"Model '{model}' is not installed.") from exc
+        raise CoderError(f"Ollama delete HTTP {exc.code}: {detail[:300] or exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise CoderError(
+            f"Could not reach Ollama at {host} ({exc.reason}). Start it with `ollama serve`."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise CoderError(f"Ollama delete failed: {exc}") from exc
+
+
 def model_installed(installed: list[str], model: str) -> bool:
     """Match a configured model name against installed names, tolerating the
     implicit ':latest' tag Ollama adds to untagged names."""

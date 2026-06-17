@@ -125,6 +125,7 @@ const els = {
   gpuButton: document.querySelector("#gpuButton"),
   clearChatButton: document.querySelector("#clearChatButton"),
   newBotButton: document.querySelector("#newBotButton"),
+  deleteBotButton: document.querySelector("#deleteBotButton"),
   messageStream: document.querySelector("#messageStream"),
   messageTemplate: document.querySelector("#messageTemplate"),
   composer: document.querySelector("#composer"),
@@ -155,6 +156,7 @@ const els = {
   brainModelRow: document.querySelector("#brainModelRow"),
   brainModelStatus: document.querySelector("#brainModelStatus"),
   brainDownload: document.querySelector("#brainDownload"),
+  brainModelList: document.querySelector("#brainModelList"),
   agentToggle: document.querySelector("#agentToggle"),
   agentWorkspace: document.querySelector("#agentWorkspace"),
   agentWsPath: document.querySelector("#agentWsPath"),
@@ -1270,6 +1272,7 @@ function renderEditor() {
     });
     els.swatchRow.append(button);
   }
+  if (els.deleteBotButton) els.deleteBotButton.disabled = state.bots.length <= 1;
 }
 
 function renderChat() {
@@ -1747,6 +1750,7 @@ function applyBrainFields(provider, repopulate) {
   if (els.brainTest) {
     els.brainTest.hidden = provider === "off";
   }
+  if (els.brainModelList) els.brainModelList.hidden = provider !== "local";
   if (els.brainModelRow) {
     els.brainModelRow.hidden = provider !== "local";
     if (provider === "local") {
@@ -1831,6 +1835,7 @@ async function refreshModelStatus() {
     if (info.ok === false) {
       els.brainModelStatus.textContent = info.error || "Ollama not reachable — is it running?";
       els.brainDownload.hidden = false;
+      renderModelList([], "");
       return;
     }
     if (info.present) {
@@ -1840,8 +1845,48 @@ async function refreshModelStatus() {
       els.brainModelStatus.textContent = `${info.configured || "Model"} not installed.`;
       els.brainDownload.hidden = false;
     }
+    renderModelList(info.installed, info.configured);
   } catch (error) {
     els.brainModelStatus.textContent = error.message || "Could not check the model.";
+  }
+}
+
+// List the installed local models, each with a Remove button.
+function renderModelList(installed, configured) {
+  if (!els.brainModelList) return;
+  els.brainModelList.replaceChildren();
+  const models = Array.isArray(installed) ? installed : [];
+  for (const name of models) {
+    const row = document.createElement("div");
+    row.className = "model-row";
+    const label = document.createElement("span");
+    label.className = "model-name";
+    const inUse = name === configured || name === `${configured}:latest`;
+    label.textContent = inUse ? `${name} (in use)` : name;
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "text-button danger";
+    del.textContent = "Remove";
+    del.addEventListener("click", () => deleteModel(name, del));
+    row.append(label, del);
+    els.brainModelList.append(row);
+  }
+}
+
+async function deleteModel(name, btn) {
+  if (!window.confirm(`Delete the local model "${name}"? This frees its disk space; you can re-download it later.`)) return;
+  if (btn) { btn.disabled = true; btn.textContent = "Removing…"; }
+  try {
+    const res = await apiFetch("/api/coder/delete", { method: "POST", timeoutMs: 60000, body: JSON.stringify({ model: name }) });
+    if (res.ok === false) {
+      els.brainModelStatus.textContent = res.error || "Could not delete the model.";
+      if (btn) { btn.disabled = false; btn.textContent = "Remove"; }
+      return;
+    }
+    void refreshModelStatus();
+  } catch (error) {
+    els.brainModelStatus.textContent = error.message || "Delete failed.";
+    if (btn) { btn.disabled = false; btn.textContent = "Remove"; }
   }
 }
 
@@ -2798,6 +2843,27 @@ els.newBotButton.addEventListener("click", () => {
   state.activeBotId = id;
   trainBot(bot);
   queueCoreSync();
+  render();
+});
+
+els.deleteBotButton?.addEventListener("click", () => {
+  if (state.bots.length <= 1) return; // always keep at least one personality
+  const bot = activeBot();
+  if (!window.confirm(`Delete "${bot.name}"? This removes its chat history and learned memory on this device.`)) return;
+  const removedId = bot.id;
+  state.bots = state.bots.filter((b) => b.id !== removedId);
+  delete state.chats[removedId];
+  delete state.memories[removedId];
+  state.activeBotId = state.bots[0].id;
+  // Best-effort: drop the matching AI core on the backend too (ignore failures).
+  if (service.available) {
+    void apiFetch("/api/cores/delete", {
+      method: "POST",
+      timeoutMs: 8000,
+      body: JSON.stringify({ core_id: coreIdForBot(bot) })
+    }).catch(() => {});
+  }
+  saveState();
   render();
 });
 
