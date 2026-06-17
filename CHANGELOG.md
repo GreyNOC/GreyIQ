@@ -2,6 +2,14 @@
 
 Notable changes to GreyIQ.
 
+## v0.9.5
+
+### Added
+- **Delete personalities and local models.** A "Delete this bot" button in the bot
+  editor removes a personality along with its chat history, learned memory, and
+  backend AI core (always keeping at least one). The Coding brain panel now lists
+  installed Ollama models with a **Remove** button to free their disk space.
+
 ## v0.9.4
 
 ### Added
