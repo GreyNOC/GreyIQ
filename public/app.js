@@ -38,6 +38,44 @@ const TRAINING_SOURCES = [
   }
 ];
 
+const STARTER_TASKS = [
+  {
+    label: "Review project",
+    prompt: "Review this project. Start by scanning the repo structure, identify the main components, then summarize risks, missing tests, and the safest next improvements.",
+    agent: true
+  },
+  {
+    label: "Explain repo",
+    prompt: "Explain this repo in plain language: what it does, how it is organized, the main entry points, and how to run or test it.",
+    agent: true
+  },
+  {
+    label: "Fix failing tests",
+    prompt: "Find and fix the failing tests. Inspect the test/build commands first, make the smallest safe change, then run verification and explain what changed.",
+    agent: true
+  },
+  {
+    label: "Find security risks",
+    prompt: "Review the project for security risks. Focus on secrets, command execution, file access, network exposure, dependency risk, and unsafe auth or scan behavior.",
+    agent: true
+  },
+  {
+    label: "Create README",
+    prompt: "Create or improve the README for this project with purpose, setup, run commands, test commands, features, and safety notes.",
+    agent: true
+  },
+  {
+    label: "Package for release",
+    prompt: "Prepare a release plan for this project. Check package/build settings, list required verification, and identify any blockers before packaging.",
+    agent: true
+  },
+  {
+    label: "Issue / PR plan",
+    prompt: "Create an issue and PR plan for this work: scope, files likely to change, test plan, risks, and review checklist.",
+    agent: false
+  }
+];
+
 const DEFAULT_BOTS = [
   {
     id: "astra",
@@ -155,6 +193,7 @@ const els = {
   brainModelRow: document.querySelector("#brainModelRow"),
   brainModelStatus: document.querySelector("#brainModelStatus"),
   brainDownload: document.querySelector("#brainDownload"),
+  modelStatusIndicator: document.querySelector("#modelStatusIndicator"),
   agentToggle: document.querySelector("#agentToggle"),
   agentWorkspace: document.querySelector("#agentWorkspace"),
   agentWsPath: document.querySelector("#agentWsPath"),
@@ -164,6 +203,7 @@ const els = {
   choiceCount: document.querySelector("#choiceCount"),
   modelState: document.querySelector("#modelState"),
   memoryList: document.querySelector("#memoryList"),
+  projectBriefList: document.querySelector("#projectBriefList"),
   themeToggle: document.querySelector("#themeToggle"),
   appShell: document.querySelector(".app-shell"),
   workbench: document.querySelector("#workbench"),
@@ -177,6 +217,7 @@ const els = {
   changesPanel: document.querySelector("#changesPanel"),
   agentStepsPanel: document.querySelector("#agentStepsPanel"),
   verifyPanel: document.querySelector("#verifyPanel"),
+  agentRunFlow: document.querySelector("#agentRunFlow"),
   bountyForm: document.querySelector("#bountyForm"),
   bountyProfile: document.querySelector("#bountyProfile"),
   bountyProfileHint: document.querySelector("#bountyProfileHint"),
@@ -187,6 +228,7 @@ const els = {
   bountyOutputBrowse: document.querySelector("#bountyOutputBrowse"),
   bountyAuthorized: document.querySelector("#bountyAuthorized"),
   bountyPerFinding: document.querySelector("#bountyPerFinding"),
+  bountyRunLive: document.querySelector("#bountyRunLive"),
   bountyRun: document.querySelector("#bountyRun"),
   bountyStatus: document.querySelector("#bountyStatus"),
   bountyReport: document.querySelector("#bountyReport"),
@@ -375,14 +417,17 @@ function loadState() {
     selectedTrainingSources: [...DEFAULT_SELECTED_TRAINING_SOURCES],
     agentMode: false,
     agentWorkspace: "",
-    theme: "light",
+    theme: "dark",
     workbenchTab: "preview",
     workbenchActiveFile: "",
     workbenchSearch: "",
     workbenchTree: [],
+    workbenchViewedFiles: [],
     workbenchHeight: null,
     workbenchDocked: false,
     workbenchWrap: false,
+    rollbackStatus: "",
+    lastAgentSummary: "",
     lastAgentTranscript: [],
     lastAgentChanges: [],
     bountyProfile: "full-sweep",
@@ -390,6 +435,7 @@ function loadState() {
     bountyScope: "",
     bountyOutput: "",
     bountyPerFinding: false,
+    bountyRunLive: false,
     redteamBehavioral: false
   };
 
@@ -1272,9 +1318,57 @@ function renderEditor() {
   }
 }
 
+function applyStarterTask(task) {
+  if (!task || !els.promptInput) return;
+  els.promptInput.value = task.prompt;
+  els.promptInput.focus();
+  els.promptInput.setSelectionRange(els.promptInput.value.length, els.promptInput.value.length);
+  if (task.agent && state.agentWorkspace) {
+    state.agentMode = true;
+    state.workbenchDocked = true;
+    renderAgentBar();
+    renderWorkbench();
+    void refreshWorkspaceTree();
+  } else if (task.agent && els.agentWsPath) {
+    els.agentWsPath.textContent = "Choose a workspace to run this with Agent mode";
+  }
+}
+
+function renderStarterHome() {
+  const home = document.createElement("section");
+  home.className = "starter-home";
+  const title = document.createElement("div");
+  title.className = "starter-title";
+  title.innerHTML = `
+    <p class="eyebrow">GreyIQ Workbench</p>
+    <h2>What should we work on?</h2>
+    <p>Start with a prompt, or pick a task card. Repo-aware cards use Agent mode when a workspace is available.</p>
+  `;
+  const grid = document.createElement("div");
+  grid.className = "starter-grid";
+  STARTER_TASKS.forEach((task) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "starter-card";
+    button.innerHTML = `
+      <strong>${escapeHtml(task.label)}</strong>
+      <span>${task.agent ? "Agent workspace" : "Chat plan"}</span>
+    `;
+    button.addEventListener("click", () => applyStarterTask(task));
+    grid.append(button);
+  });
+  home.append(title, grid);
+  els.messageStream.append(home);
+}
+
 function renderChat() {
   els.messageStream.replaceChildren();
-  for (const message of activeChat()) {
+  const chat = activeChat();
+  if (!chat.length) {
+    renderStarterHome();
+    return;
+  }
+  for (const message of chat) {
     const fragment = els.messageTemplate.content.cloneNode(true);
     const article = fragment.querySelector(".message");
     const meta = fragment.querySelector(".message-meta");
@@ -1312,6 +1406,7 @@ function renderTraining() {
     : trainingStatus === "complete" || activeBot().trainedAt
       ? "Trained"
       : "Fresh";
+  renderProjectBrief(memories, trainingStatus);
   els.memoryList.replaceChildren();
 
   for (const memory of memories.slice().reverse().slice(0, 10)) {
@@ -1767,6 +1862,29 @@ function renderBrainForm() {
   const provider = coderConfig && coderConfig.enabled && coderConfig.provider ? coderConfig.provider : "off";
   els.brainProvider.value = ["off", "local", "anthropic", "openai"].includes(provider) ? provider : "off";
   applyBrainFields(els.brainProvider.value, true);
+  updateModelStatusIndicator();
+}
+
+function updateModelStatusIndicator(text, stateName = "ready") {
+  if (!els.modelStatusIndicator) return;
+  const provider = els.brainProvider?.value || "off";
+  let label = text;
+  let tone = stateName;
+  if (!label) {
+    if (provider === "off") {
+      label = "Local only / cloud disabled";
+      tone = "local";
+    } else if (provider === "local") {
+      label = "Local model ready";
+      tone = "ready";
+    } else {
+      label = `${labelFromIdentifier(provider)} model selected`;
+      tone = "cloud";
+    }
+  }
+  els.modelStatusIndicator.dataset.state = tone;
+  const textEl = els.modelStatusIndicator.querySelector("span:last-child");
+  if (textEl) textEl.textContent = label;
 }
 
 function buildBrainBlock(provider) {
@@ -1789,6 +1907,7 @@ async function loadCoderConfig() {
 
 els.brainProvider?.addEventListener("change", () => {
   applyBrainFields(els.brainProvider.value, true);
+  updateModelStatusIndicator();
 });
 
 els.brainForm?.addEventListener("submit", async (event) => {
@@ -1813,6 +1932,7 @@ els.brainForm?.addEventListener("submit", async (event) => {
     els.brainStatus.textContent = provider === "off"
       ? "Coding brain off — using the local model."
       : `Saved. Brain: ${provider}. Use Test to verify.`;
+    updateModelStatusIndicator();
   } catch (error) {
     els.brainStatus.textContent = error.message || "Could not save brain settings.";
   } finally {
@@ -1824,6 +1944,7 @@ async function refreshModelStatus() {
   if (!els.brainModelStatus) return;
   if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
     els.brainModelStatus.textContent = "Local service not running.";
+    updateModelStatusIndicator("Model needs setup", "setup");
     return;
   }
   try {
@@ -1831,17 +1952,21 @@ async function refreshModelStatus() {
     if (info.ok === false) {
       els.brainModelStatus.textContent = info.error || "Ollama not reachable — is it running?";
       els.brainDownload.hidden = false;
+      updateModelStatusIndicator("Model needs setup", "setup");
       return;
     }
     if (info.present) {
       els.brainModelStatus.textContent = `Model installed: ${info.configured} ✓`;
       els.brainDownload.hidden = true;
+      updateModelStatusIndicator("Local model ready", "ready");
     } else {
       els.brainModelStatus.textContent = `${info.configured || "Model"} not installed.`;
       els.brainDownload.hidden = false;
+      updateModelStatusIndicator("Model needs setup", "setup");
     }
   } catch (error) {
     els.brainModelStatus.textContent = error.message || "Could not check the model.";
+    updateModelStatusIndicator("Model needs setup", "setup");
   }
 }
 
@@ -1861,6 +1986,7 @@ function pollModelPull() {
     if (status.active) {
       const pct = status.percent ? ` ${status.percent}%` : "";
       els.brainModelStatus.textContent = `Downloading ${status.model}…${pct} ${status.status || ""}`.trim();
+      updateModelStatusIndicator("Downloading model", "downloading");
       return;
     }
     clearInterval(modelPullTimer);
@@ -1881,6 +2007,7 @@ els.brainDownload?.addEventListener("click", async () => {
   }
   els.brainDownload.disabled = true;
   els.brainModelStatus.textContent = "Starting download… (the 14B model is ~9 GB, downloaded once)";
+  updateModelStatusIndicator("Downloading model", "downloading");
   try {
     const res = await apiFetch("/api/coder/pull", { method: "POST", timeoutMs: 10000, body: JSON.stringify({}) });
     if (res.ok === false) {
@@ -2021,6 +2148,7 @@ function renderWorkbench() {
   renderChangesPanel(state.lastAgentChanges);
   renderAgentSteps(state.lastAgentTranscript);
   renderVerifyPanel(state.lastAgentTranscript);
+  renderAgentRunFlow();
 }
 
 function setWorkbenchTab(tabName, focusTab = false) {
@@ -2078,6 +2206,23 @@ async function refreshWorkspaceTree() {
 // readable). Persists across re-renders for the session.
 const expandedDirs = new Set();
 
+function isSecurityRelatedPath(path) {
+  return /(^|\/)(\.env|secrets?|auth|security|crypto|token|keys?|permissions?|bughunter|trust)(\/|\.|$)/i.test(path || "");
+}
+
+function fileMarker(entry) {
+  const path = entry.path || "";
+  const viewed = Array.isArray(state.workbenchViewedFiles) && state.workbenchViewedFiles.includes(path);
+  const change = (Array.isArray(state.lastAgentChanges) ? state.lastAgentChanges : []).find((item) => item.path === path);
+  if (change) {
+    if (change.operation === "write_file" && !change.existed) return { label: "created", cls: "created" };
+    return { label: "changed", cls: "changed" };
+  }
+  if (isSecurityRelatedPath(path)) return { label: "risky", cls: "risky" };
+  if (viewed) return { label: "viewed", cls: "viewed" };
+  return null;
+}
+
 function makeTreeButton(entry, depth, isDir, fullPath) {
   const node = document.createElement("button");
   node.type = "button";
@@ -2094,6 +2239,12 @@ function makeTreeButton(entry, depth, isDir, fullPath) {
   const label = document.createElement("span");
   label.className = "tree-label";
   label.textContent = fullPath ? entry.path : entry.name;
+  const markerInfo = !isDir ? fileMarker(entry) : null;
+  const marker = document.createElement("span");
+  if (markerInfo) {
+    marker.className = `tree-marker is-${markerInfo.cls}`;
+    marker.textContent = markerInfo.label;
+  }
 
   if (isDir) {
     const open = expandedDirs.has(entry.path);
@@ -2113,6 +2264,7 @@ function makeTreeButton(entry, depth, isDir, fullPath) {
     node.addEventListener("click", () => openWorkspaceFile(entry.path));
   }
   node.append(icon, label);
+  if (markerInfo) node.append(marker);
   return node;
 }
 
@@ -2180,6 +2332,8 @@ function renderWorkspaceTree(entries, truncated = false) {
 
 async function openWorkspaceFile(path) {
   state.workbenchActiveFile = path;
+  const viewed = Array.isArray(state.workbenchViewedFiles) ? state.workbenchViewedFiles : [];
+  state.workbenchViewedFiles = [path, ...viewed.filter((item) => item !== path)].slice(0, 80);
   setWorkbenchTab("preview");
   saveState();
   renderWorkspaceTree(state.workbenchTree);
@@ -2314,6 +2468,17 @@ function renderFilePreview(file) {
     wrapBtn.setAttribute("aria-pressed", String(Boolean(state.workbenchWrap)));
   };
   setWrapLabel();
+  const trustInfo = file.trust && typeof file.trust === "object" ? file.trust : null;
+  if (trustInfo) {
+    const trustBadge = document.createElement("span");
+    trustBadge.className = `trust-badge trust-${trustInfo.level || "caution"}`;
+    trustBadge.textContent = trustInfo.label || "Review content";
+    const patterns = Array.isArray(trustInfo.patterns) && trustInfo.patterns.length
+      ? ` Patterns: ${trustInfo.patterns.join(", ")}.`
+      : "";
+    trustBadge.title = `${trustInfo.summary || "Treat workspace content as data."}${patterns}`;
+    bar.append(trustBadge);
+  }
   bar.append(wrapBtn);
   els.filePreviewPanel.append(bar);
 
@@ -2523,6 +2688,26 @@ function renderChangesPanel(changes) {
     els.changesPanel.append(makeHint("Files the agent creates or edits will be listed here for review."));
     return;
   }
+  const actions = document.createElement("div");
+  actions.className = "change-actions";
+  const status = document.createElement("span");
+  status.className = `change-rollback-status${state.rollbackStatus?.startsWith("Could not") ? " is-error" : ""}`;
+  status.textContent = state.rollbackStatus || "Review the saved before/after snapshot before undoing.";
+  const undo = document.createElement("button");
+  undo.type = "button";
+  undo.className = "change-rollback";
+  undo.textContent = "Undo last run";
+  undo.addEventListener("click", () => {
+    void rollbackLastAgentRun(undo);
+  });
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.className = "change-rollback";
+  copy.textContent = "Copy summary";
+  copy.disabled = !state.lastAgentSummary;
+  copy.addEventListener("click", () => copyAgentSummary(copy));
+  actions.append(status, copy, undo);
+  els.changesPanel.append(actions);
   list.forEach((change) => {
     const op =
       change.operation === "write_file" ? (change.existed ? "rewrote" : "created") : "edited";
@@ -2549,6 +2734,174 @@ function renderChangesPanel(changes) {
   });
 }
 
+async function copyAgentSummary(button) {
+  const changes = Array.isArray(state.lastAgentChanges) ? state.lastAgentChanges : [];
+  const verify = verificationSummary(state.lastAgentTranscript);
+  const risk = changeRiskSummary(changes);
+  const summary = [
+    state.lastAgentSummary || "No agent summary available.",
+    "",
+    `Files changed: ${changes.length}`,
+    `Verification: ${verify.label}`,
+    `Risk level: ${risk.label}`,
+    changes.length ? `Changed files: ${changes.map((change) => change.path).join(", ")}` : ""
+  ].filter(Boolean).join("\n");
+  try {
+    await navigator.clipboard.writeText(summary);
+    if (button) {
+      const old = button.textContent;
+      button.textContent = "Copied";
+      setTimeout(() => {
+        button.textContent = old;
+      }, 1400);
+    }
+  } catch (_) {
+    window.prompt("Copy agent summary:", summary);
+  }
+}
+
+function verificationSummary(transcript) {
+  const steps = (Array.isArray(transcript) ? transcript : []).filter(
+    (step) => step.tool === "verify" || step.tool === "run_command"
+  );
+  if (!steps.length) return { label: "verification not run", failed: false, count: 0 };
+  const failed = steps.some((step) => {
+    const out = typeof step.output === "string" ? step.output : JSON.stringify(step.output || "");
+    return Boolean(step.is_error) || /VERIFY FAILED|FAIL\s|exit=[1-9]/.test(out);
+  });
+  return {
+    label: failed ? `${steps.length} verification step(s), review needed` : `${steps.length} verification step(s) passed`,
+    failed,
+    count: steps.length
+  };
+}
+
+function changeRiskSummary(changes) {
+  const list = Array.isArray(changes) ? changes : [];
+  const risky = list.some((change) => isSecurityRelatedPath(change.path || ""));
+  if (risky) return { label: "Elevated", tone: "warn" };
+  if (list.length > 3) return { label: "Medium", tone: "mid" };
+  return { label: list.length ? "Low" : "None", tone: "ok" };
+}
+
+function runFlowStep(label, detail, stateName) {
+  const item = document.createElement("article");
+  item.className = `run-flow-step is-${stateName}`;
+  item.innerHTML = `<strong>${escapeHtml(label)}</strong><span>${escapeHtml(detail)}</span>`;
+  return item;
+}
+
+function renderAgentRunFlow() {
+  if (!els.agentRunFlow) return;
+  const transcript = Array.isArray(state.lastAgentTranscript) ? state.lastAgentTranscript : [];
+  const changes = Array.isArray(state.lastAgentChanges) ? state.lastAgentChanges : [];
+  const verify = verificationSummary(transcript);
+  const risk = changeRiskSummary(changes);
+  const hasRun = transcript.length || changes.length || state.lastAgentSummary;
+  els.agentRunFlow.replaceChildren();
+  els.agentRunFlow.append(
+    runFlowStep("Plan", hasRun ? `${transcript.length || 1} agent step(s)` : "Waiting for an Agent task", hasRun ? "done" : "idle"),
+    runFlowStep("Change", changes.length ? `${changes.length} file(s) changed` : "No file changes", changes.length ? "done" : "idle"),
+    runFlowStep("Verify", verify.label, verify.failed ? "warn" : verify.count ? "done" : "idle"),
+    runFlowStep("Explain", state.lastAgentSummary ? "Summary available" : "No explanation yet", state.lastAgentSummary ? "done" : "idle")
+  );
+
+  const trust = document.createElement("div");
+  trust.className = `run-flow-trust is-${risk.tone}`;
+  trust.innerHTML = `
+    <span>Risk: ${escapeHtml(risk.label)}</span>
+    <span>Files: ${changes.length}</span>
+    <span>${escapeHtml(verify.label)}</span>
+  `;
+  const actions = document.createElement("div");
+  actions.className = "run-flow-actions";
+  const openDiff = document.createElement("button");
+  openDiff.type = "button";
+  openDiff.textContent = "Open diff";
+  openDiff.disabled = !changes.length;
+  openDiff.addEventListener("click", () => setWorkbenchTab("changes", true));
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.textContent = "Copy summary";
+  copy.disabled = !state.lastAgentSummary;
+  copy.addEventListener("click", () => copyAgentSummary(copy));
+  actions.append(openDiff, copy);
+  els.agentRunFlow.append(trust, actions);
+}
+
+async function rollbackLastAgentRun(button) {
+  const changes = Array.isArray(state.lastAgentChanges) ? state.lastAgentChanges : [];
+  if (!changes.length) return;
+  if (!state.agentWorkspace) {
+    state.rollbackStatus = "Could not undo: no workspace is selected.";
+    renderChangesPanel(changes);
+    return;
+  }
+  const confirmed = window.confirm(
+    "Undo the last agent run in this workspace? Files changed after the run will not be overwritten."
+  );
+  if (!confirmed) return;
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    state.rollbackStatus = "Could not undo: local GreyIQ service is not running.";
+    renderChangesPanel(changes);
+    return;
+  }
+  if (button) button.disabled = true;
+  state.rollbackStatus = "Undoing last run...";
+  renderChangesPanel(changes);
+  try {
+    const res = await apiFetch("/api/workspace/rollback", {
+      method: "POST",
+      timeoutMs: 60000,
+      body: JSON.stringify({ workspace: state.agentWorkspace, changes })
+    });
+    if (res.ok === false) {
+      const detail = Array.isArray(res.errors) && res.errors.length ? ` ${res.errors.join(" ")}` : "";
+      state.rollbackStatus = `Could not undo every file.${detail}`;
+    } else {
+      const restored = Array.isArray(res.restored) ? res.restored.length : 0;
+      const deleted = Array.isArray(res.deleted) ? res.deleted.length : 0;
+      state.rollbackStatus = `Undone: restored ${restored}, deleted ${deleted}.`;
+      state.lastAgentChanges = [];
+      state.lastAgentTranscript = [];
+      state.lastAgentSummary = "";
+      state.workbenchActiveFile = "";
+      if (els.filePreviewPanel) els.filePreviewPanel.dataset.loadedPath = "";
+      void refreshWorkspaceTree();
+    }
+  } catch (error) {
+    state.rollbackStatus = `Could not undo: ${error.message || error}`;
+  } finally {
+    renderWorkbench();
+  }
+}
+
+function briefItem(label, value) {
+  const item = document.createElement("article");
+  item.className = "brief-item";
+  const heading = document.createElement("strong");
+  heading.textContent = label;
+  const body = document.createElement("span");
+  body.textContent = value;
+  item.append(heading, body);
+  return item;
+}
+
+function renderProjectBrief(memories, trainingStatus) {
+  if (!els.projectBriefList) return;
+  const changed = Array.isArray(state.lastAgentChanges) ? state.lastAgentChanges.length : 0;
+  const verified = verificationSummary(state.lastAgentTranscript);
+  const notes = memories.filter((memory) => memory.kind === "preference" || memory.kind === "training_data").length;
+  els.projectBriefList.replaceChildren(
+    briefItem("Purpose", "Local-first GreyIQ chat, coding agent, Workbench, memory, rollback, verification, and BugHunter."),
+    briefItem("Tech stack", "Static browser UI, Node/Electron shell, Python API/runtime, local model support."),
+    briefItem("Run commands", "npm run start, npm run backend, npm run desktop, npm run check."),
+    briefItem("Key files", "public/app.js, public/styles.css, backend/agent.py, backend/workspace.py, backend/greyiq_api.py."),
+    briefItem("User notes", notes ? `${notes} saved preference/source item(s).` : "No project notes saved yet."),
+    briefItem("Last scan", changed ? `${changed} file(s) changed; ${verified.label}.` : (trainingStatus || "No agent run yet."))
+  );
+}
+
 async function runAgent(userText) {
   if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
     return "The local GreyIQ service is not running.";
@@ -2567,6 +2920,8 @@ async function runAgent(userText) {
     // Feed the Workbench from the structured transcript + change set.
     state.lastAgentTranscript = Array.isArray(res.transcript) ? res.transcript : [];
     state.lastAgentChanges = Array.isArray(res.changes) ? res.changes : [];
+    state.lastAgentSummary = res.message || "";
+    state.rollbackStatus = "";
     if (state.lastAgentChanges.length) {
       void refreshWorkspaceTree();
     }
@@ -2845,13 +3200,24 @@ async function loadBountyProfiles() {
   if (els.bountyScope) els.bountyScope.value = state.bountyScope || "";
   if (els.bountyOutput) els.bountyOutput.value = state.bountyOutput || "";
   if (els.bountyPerFinding) els.bountyPerFinding.checked = Boolean(state.bountyPerFinding);
+  if (els.bountyRunLive) els.bountyRunLive.checked = Boolean(state.bountyRunLive);
   updateBountyHint();
 }
 
 function updateBountyHint() {
   if (!els.bountyProfileHint) return;
   const profile = bountyProfilesData.find((p) => p.id === els.bountyProfile?.value);
-  els.bountyProfileHint.textContent = profile ? profile.description : "";
+  if (!profile) {
+    els.bountyProfileHint.textContent = "";
+    return;
+  }
+  const names = new Map(Array.from(els.bountyClass?.options || []).map((option) => [option.value, option.textContent]));
+  const focus = Array.isArray(profile.classes)
+    ? profile.classes.map((id) => names.get(id) || id).filter(Boolean).slice(0, 6)
+    : [];
+  els.bountyProfileHint.textContent = focus.length
+    ? `${profile.description} Focuses: ${focus.join(", ")}.`
+    : profile.description;
 }
 
 els.bountyProfile?.addEventListener("change", () => {
@@ -2898,9 +3264,12 @@ els.bountyForm?.addEventListener("submit", async (event) => {
   state.bountyScope = (els.bountyScope?.value || "").trim();
   state.bountyOutput = (els.bountyOutput?.value || "").trim();
   state.bountyPerFinding = Boolean(els.bountyPerFinding?.checked);
+  state.bountyRunLive = Boolean(els.bountyRunLive?.checked);
   saveState();
   els.bountyRun.disabled = true;
-  els.bountyStatus.textContent = "Hunting… running scanners and writing the report (this can take a minute).";
+  els.bountyStatus.textContent = state.bountyRunLive
+    ? "Hunting... running scanners, live browser pass, and writing the report (this can take a minute)."
+    : "Hunting... running scanners and writing the report (this can take a minute).";
   if (els.bountyReport) els.bountyReport.hidden = true;
   if (els.bountyReportActions) els.bountyReportActions.hidden = true;
   try {
@@ -2914,6 +3283,7 @@ els.bountyForm?.addEventListener("submit", async (event) => {
         scope: state.bountyScope,
         output_dir: state.bountyOutput || null,
         authorized: true,
+        run_live: state.bountyRunLive,
         per_finding: state.bountyPerFinding
       })
     });

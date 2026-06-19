@@ -16,6 +16,14 @@ disclosure issues. The real value is the structured checklist below.
 - **Injection** — parameters reaching queries/commands; a SQL error in a response is a strong SQLi lead.
 - **SSRF** — server-side URL fetchers; rate-limiting and resource exhaustion gaps.
 
+## Evidence that makes API reports stronger
+- **CORS** - credentialed endpoints that trust arbitrary origins or wildcard subdomains.
+- **Business logic** - replay, idempotency, state-machine bypass, quota reset, coupon/credit duplication.
+- Include the exact method, path, query, headers that matter, and JSON body.
+- Name both account roles/tokens used for authorization comparisons.
+- Show the minimal changed field or identifier between allowed and unauthorized requests.
+- Preserve response status, response body excerpt, and resulting object/account state.
+
 ## Writing the report
 Capture the exact request (method, path, headers, body) and the response that
 proves the issue, plus the token/role context. Show the minimal diff between an

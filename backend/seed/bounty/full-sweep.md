@@ -19,6 +19,11 @@ passive web for URLs) and reports every class it finds.
 - **Access control / IDOR** — swap identifiers across accounts.
 - **Auth/session** — cookie flags, token handling, rate-limiting.
 
+## Extra sweep leads
+- **CSRF / CORS / redirects** - browser-trust issues; strongest when they expose authenticated actions or data.
+- **File upload / business logic** - often manual-only; prove state change, storage impact, or workflow bypass.
+- **Supply chain** - dependency, CI, install-hook, and artifact risks; prove reachability to builds or secrets.
+
 ## Writing the report
 One report, severity-ordered. For each issue: where, evidence, reproduction,
 impact, fix. Call out chains explicitly. Submit the most severe, confirmed bug

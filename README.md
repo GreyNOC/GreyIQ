@@ -4,6 +4,7 @@ GreyIQ (GreyNOC-IQ) is a soft, friendly, powerful **local-first AI** desktop/web
 
 It includes:
 
+- **DevOps/server setup playbooks** for PM2 ecosystem files, Ubuntu VPS setup, Nginx reverse proxies, environment variables/secrets, and `DEPLOY.md` runbooks.
 - **Editable bots** with name, color, persona, style, and response variation.
 - A pluggable **coding brain** — answer with a local model (Ollama), Claude, or any OpenAI-compatible endpoint; falls back to the bundled local engine.
 - **Agent mode + the Workbench IDE** — let the brain read, edit, and (optionally) run things in a workspace folder, with a file explorer, code preview, diffs, agent steps, and verification output.
@@ -42,6 +43,14 @@ npm run desktop
 npm run check
 ```
 
+Reusable checks are also available:
+
+```powershell
+npm run check:js
+npm run check:python
+npm run check:devops
+```
+
 ## Coding brain
 
 In the **Coding brain** panel (training column) pick a provider:
@@ -63,6 +72,15 @@ Agent Steps, and a Verify panel. Drag the divider to resize, or slide it to the 
 **dock** the workbench (chat moves to a 1/3 side panel). A light/dark theme toggle is in
 the header.
 
+For deployment work, GreyIQ injects deterministic project setup detection into the
+agent prompt before the repo map, then applies bundled playbooks for PM2, Ubuntu VPS,
+Nginx, env/secrets, and deployment docs. PM2 ecosystem generation prefers localhost
+binding, avoids secrets, and updates `DEPLOY.md` when deployment behavior changes.
+Verification is stronger for scripts and configs: Python, JSON, JavaScript, PM2
+ecosystem files, shell scripts, YAML files, and `.env.example` secret-shaped values are
+checked where the local command settings allow it. Command execution remains off by
+default.
+
 ## BugHunter
 
 - **Scan** from chat: `scan code <path|repo>`, `scan web <url>`, `scan live <url>`.
@@ -72,6 +90,10 @@ the header.
   reproduction steps + attack plans, and a Markdown report (+ JSON sidecar, optional
   per-finding files) is written to a folder you choose. **Authorized testing only** —
   a hunt won't run unless you confirm the target is in scope.
+- Bounty reports now add triage, class mix, chain leads, submission-readiness checks,
+  retest guidance, and platform-friendly one-file-per-finding exports. URL targets can
+  opt into the live browser pass, and focus classes also cover CSRF, CORS, open
+  redirect, unsafe file upload, business logic, and supply-chain/dependency risk.
 - **Agent security test** — red-teams GreyIQ's own agent in a throwaway sandbox
   (sandbox/policy probes always; opt-in prompt-injection + jailbreak behavioral probes)
   and reports a posture verdict.

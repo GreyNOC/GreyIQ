@@ -98,11 +98,11 @@
         </form>
       </section>
 
-      <aside class="training-panel" aria-label="Training">
+      <aside class="training-panel" aria-label="Project brief and training">
         <header class="panel-header">
           <div>
-            <p class="eyebrow">Training</p>
-            <h2>Training Data</h2>
+            <p class="eyebrow">Project Memory</p>
+            <h2>Project Brief</h2>
           </div>
           <button class="icon-button" id="trainButton" type="button" title="Train" aria-label="Train">
             <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -114,28 +114,40 @@
           </button>
         </header>
 
+        <section class="project-brief" aria-label="Project brief">
+          <div class="brief-list" id="projectBriefList"></div>
+          <!-- TODO: Add safe inline project-memory editing only after backend-backed validation and rollback exist for this panel. -->
+        </section>
+
         <form class="choice-form brain-form" id="brainForm">
           <label>
-            <span>Coding brain</span>
+            <span>Model mode</span>
             <select id="brainProvider" name="brainProvider">
-              <option value="off">Off — local TinyGPT only</option>
+              <option value="off">Local only</option>
               <option value="local">Local model (Ollama)</option>
               <option value="anthropic">Claude API</option>
-              <option value="openai">OpenAI / ChatGPT</option>
+              <option value="openai">OpenAI-compatible</option>
             </select>
           </label>
-          <label data-brain-field="model">
-            <span>Model</span>
-            <input id="brainModel" name="brainModel" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. qwen2.5-coder:14b">
-          </label>
-          <label data-brain-field="base_url">
-            <span>Server URL</span>
-            <input id="brainBaseUrl" name="brainBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:11434/v1">
-          </label>
-          <label data-brain-field="api_key">
-            <span>API key</span>
-            <input id="brainApiKey" name="brainApiKey" type="password" autocomplete="off" placeholder="paste API key">
-          </label>
+          <div class="model-state-card" id="modelStatusIndicator" role="status" aria-live="polite">
+            <span class="model-dot"></span>
+            <span>Local model ready</span>
+          </div>
+          <details class="advanced-model">
+            <summary>Advanced model details</summary>
+            <label data-brain-field="model">
+              <span>Model</span>
+              <input id="brainModel" name="brainModel" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. qwen2.5-coder:14b">
+            </label>
+            <label data-brain-field="base_url">
+              <span>Server URL</span>
+              <input id="brainBaseUrl" name="brainBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:11434/v1">
+            </label>
+            <label data-brain-field="api_key">
+              <span>API key</span>
+              <input id="brainApiKey" name="brainApiKey" type="password" autocomplete="off" placeholder="paste API key">
+            </label>
+          </details>
           <div class="folder-actions" id="brainModelRow" hidden>
             <span class="folder-status" id="brainModelStatus">checking model…</span>
             <button class="text-button" type="button" id="brainDownload">Download model</button>
@@ -148,7 +160,15 @@
         </form>
 
         <form class="choice-form bounty-form" id="bountyForm">
-          <div class="source-heading">Bug bounty hunt</div>
+          <div class="source-heading">BugHunter wizard</div>
+          <ol class="bughunter-flow" aria-label="BugHunter steps">
+            <li><strong>1</strong><span>Confirm authorization</span></li>
+            <li><strong>2</strong><span>Choose target / scope</span></li>
+            <li><strong>3</strong><span>Choose hunt type</span></li>
+            <li><strong>4</strong><span>Run scan</span></li>
+            <li><strong>5</strong><span>Review findings</span></li>
+            <li><strong>6</strong><span>Export report</span></li>
+          </ol>
           <label>
             <span>Bounty type</span>
             <select id="bountyProfile" name="bountyProfile"></select>
@@ -178,6 +198,10 @@
           <label class="bounty-auth" for="bountyPerFinding">
             <input id="bountyPerFinding" type="checkbox">
             <span>Also write one file per finding (for submission).</span>
+          </label>
+          <label class="bounty-auth" for="bountyRunLive">
+            <input id="bountyRunLive" type="checkbox">
+            <span>Include live browser pass for URL targets.</span>
           </label>
           <label class="bounty-auth" for="bountyAuthorized">
             <input id="bountyAuthorized" type="checkbox">
@@ -313,6 +337,7 @@
             </div>
             <button type="button" id="workbenchMaximize" class="workbench-maximize" title="Dock workbench (chat to the right)" aria-label="Dock workbench (chat to the right)" aria-pressed="false">⤢</button>
           </div>
+          <div class="agent-run-flow" id="agentRunFlow" aria-label="Agent run status"></div>
 
           <div id="filePreviewPanel" class="workbench-panel" role="tabpanel" aria-labelledby="wbtab-preview" tabindex="0"></div>
           <div id="changesPanel" class="workbench-panel" role="tabpanel" aria-labelledby="wbtab-changes" tabindex="0" hidden></div>

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import urllib.error
 import urllib.request
@@ -22,8 +23,10 @@ from pathlib import Path
 from typing import Any
 
 import coder
+import devops_detect
 import repomap
 import skills as skills_lib
+import trust
 
 AGENT_DEFAULTS: dict[str, Any] = {
     "allow_commands": False,
@@ -58,9 +61,16 @@ AGENT_SYSTEM_PROMPT = (
     "folder. Use the provided tools to read, search, edit, and create files, and "
     "to run commands when that is enabled. Work in small, verifiable steps: look "
     "before you edit, make one focused change, then call the `verify` tool. If "
-    "verify reports FAILED, fix the problem and verify again — never finish with a "
+    "verify reports FAILED, fix the problem and verify again - never finish with a "
     "broken file. All paths are relative to the workspace root. If playbooks are "
-    "given below, follow their steps. When the task is done and verify passes, stop "
+    "given below, follow their steps. For Git work, inspect status/diffs first, use "
+    "standard git syntax, preserve user changes, and avoid destructive commands unless "
+    "the user explicitly asks. For deployment, PM2, server setup, scripts, VPS, "
+    "Nginx, env vars, or process management work: inspect before editing, make a short "
+    "setup plan before writing files, do not invent domains, credentials, or secrets, "
+    "prefer 127.0.0.1 binding unless asked otherwise, create repeatable scripts/configs, "
+    "verify generated configs/scripts, update DEPLOY.md when deployment behavior changes, "
+    "and include rollback notes. When the task is done and verify passes, stop "
     "calling tools and give a short summary of what you changed (file:line) and the "
     "verification result. If something is ambiguous or risky, explain it instead of "
     "guessing."
@@ -148,8 +158,9 @@ _TOOLS: list[dict[str, Any]] = [
     {
         "name": "verify",
         "description": (
-            "Check the files you have changed. Syntax-checks touched .py/.json files and, "
-            "if a verify command is configured, runs it. Returns VERIFY PASSED or FAILED. "
+            "Check the files you have changed. Syntax-checks touched .py/.json/.js/.cjs/.mjs/.sh/.yml/.yaml "
+            "files, scans .env.example for likely real secrets, and runs the configured verify command. "
+            "Command-backed checks run only when commands are enabled. Returns VERIFY PASSED or FAILED. "
             "Call this after edits and before finishing."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
@@ -163,6 +174,86 @@ class AgentError(RuntimeError):
 
 class ToolError(Exception):
     """A tool call failed; surfaced back to the model as an error result."""
+
+
+_JS_SUFFIXES = {".js", ".cjs", ".mjs"}
+_YAML_SUFFIXES = {".yml", ".yaml"}
+_ECOSYSTEM_NAMES = {"ecosystem.config.js", "ecosystem.config.cjs", "ecosystem.config.mjs"}
+_SECRET_KEY_RE = re.compile(
+    r"(?:secret|password|passwd|token|api[_-]?key|private[_-]?key|access[_-]?key|client[_-]?secret)",
+    re.IGNORECASE,
+)
+_SECRET_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("OpenAI-style API key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b")),
+    ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b")),
+    ("Slack token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b")),
+    ("private key block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+)
+_PLACEHOLDER_VALUES = {
+    "",
+    "0",
+    "false",
+    "none",
+    "null",
+    "changeme",
+    "change-me",
+    "change_me",
+    "replace-me",
+    "replace_me",
+    "placeholder",
+    "example",
+    "example-value",
+    "your-value",
+    "your_value",
+    "your-api-key",
+    "your_api_key",
+    "your-secret",
+    "your_secret",
+}
+
+
+def _is_env_example(rel_path: str, path: Path) -> bool:
+    return path.name == ".env.example" or rel_path.endswith(".env.example")
+
+
+def _is_placeholder_secret(value: str) -> bool:
+    cleaned = value.strip().strip("\"'")
+    lowered = cleaned.lower()
+    if lowered in _PLACEHOLDER_VALUES:
+        return True
+    if lowered.startswith("<") and lowered.endswith(">"):
+        return True
+    if lowered.startswith("${") and lowered.endswith("}"):
+        return True
+    if "replace" in lowered or "changeme" in lowered or "your_" in lowered or "your-" in lowered:
+        return True
+    return bool(re.fullmatch(r"[xX*._-]+", cleaned))
+
+
+def _scan_env_example_for_secrets(text: str) -> list[str]:
+    findings: list[str] = []
+    for lineno, raw_line in enumerate(text.splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if _is_placeholder_secret(value):
+            continue
+        for label, pattern in _SECRET_VALUE_PATTERNS:
+            if pattern.search(value):
+                findings.append(f"line {lineno} key {key}: looks like a {label}")
+                break
+        else:
+            if _SECRET_KEY_RE.search(key) and len(value.strip().strip("\"'")) >= 16:
+                findings.append(f"line {lineno} key {key}: secret-like example value is too specific")
+    return findings
 
 
 def agent_settings(coder_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -191,7 +282,8 @@ class ToolBox:
         self.changes: list[dict[str, Any]] = []
 
     def _resolve(self, rel_path: str) -> Path:
-        candidate = (self.root / str(rel_path or ".")).resolve()
+        normalized = str(rel_path or ".").replace("\\", "/")
+        candidate = (self.root / normalized).resolve()
         if candidate != self.root and self.root not in candidate.parents:
             raise ToolError(f"Path '{rel_path}' is outside the workspace.")
         return candidate
@@ -233,7 +325,9 @@ class ToolBox:
             raise ToolError(
                 f"File is {target.stat().st_size} bytes (> {self.max_file_bytes}); read a smaller file or grep it."
             )
-        return target.read_text(encoding="utf-8", errors="replace")
+        rel = target.relative_to(self.root).as_posix()
+        text = target.read_text(encoding="utf-8", errors="replace")
+        return trust.wrap_for_model(text, path=rel)
 
     def _mark_touched(self, target: Path) -> None:
         self.touched.add(target.relative_to(self.root).as_posix())
@@ -321,7 +415,11 @@ class ToolBox:
                     continue
                 for lineno, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
                     if regex.search(line):
-                        hits.append(f"{path.relative_to(self.root).as_posix()}:{lineno}: {line.strip()[:200]}")
+                        rel = path.relative_to(self.root).as_posix()
+                        snippet = line.strip()[:200]
+                        assessment = trust.assess_text(snippet, path=rel)
+                        label = f" [{assessment.label}]" if assessment.patterns else ""
+                        hits.append(f"{rel}:{lineno}{label}: {snippet}")
                         if len(hits) >= 200:
                             return "\n".join(hits) + "\n... [200-match limit]"
             except OSError:
@@ -356,25 +454,139 @@ class ToolBox:
         out = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
         return f"exit={proc.returncode}\n{out.strip()}"
 
+    def _run_verify_process(self, command: list[str]) -> tuple[bool, str]:
+        try:
+            proc = subprocess.run(
+                command,
+                shell=False,
+                cwd=str(self.root),
+                capture_output=True,
+                text=True,
+                timeout=self.command_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"timed out after {self.command_timeout:.0f}s"
+        output = ((proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")).strip()
+        return proc.returncode == 0, self._summarize_process_output(output)
+
+    @staticmethod
+    def _summarize_process_output(output: str) -> str:
+        if not output:
+            return ""
+        lines = output.splitlines()
+        if len(lines) > 8:
+            return "\n".join(lines[-8:])
+        return output
+
+    def _check_node_syntax(self, rel: str, path: Path, lines: list[str]) -> bool:
+        if not self.allow_commands:
+            lines.append(f"SKIP {rel}: node --check requires commands enabled")
+            return False
+        node = shutil.which("node")
+        if not node:
+            lines.append(f"SKIP {rel}: node is not available")
+            return False
+        ok, output = self._run_verify_process([node, "--check", str(path)])
+        if ok:
+            lines.append(f"OK   {rel} (node --check)")
+            return True
+        detail = f": {output}" if output else ""
+        lines.append(f"FAIL {rel}: node --check failed{detail}")
+        return False
+
+    def _check_ecosystem_config_load(self, rel: str, path: Path, lines: list[str]) -> bool:
+        node = shutil.which("node")
+        if not self.allow_commands or not node:
+            return True
+        if path.suffix.lower() == ".cjs":
+            script = "const path=require('node:path'); require(path.resolve(process.argv[1]));"
+            command = [node, "-e", script, str(path)]
+        else:
+            script = "import { pathToFileURL } from 'node:url'; await import(pathToFileURL(process.argv[1]));"
+            command = [node, "--input-type=module", "-e", script, str(path)]
+        ok, output = self._run_verify_process(command)
+        if ok:
+            lines.append(f"OK   {rel} (ecosystem config loads)")
+            return True
+        detail = f": {output}" if output else ""
+        lines.append(f"FAIL {rel}: ecosystem config did not load{detail}")
+        return False
+
+    def _check_shell_syntax(self, rel: str, path: Path, lines: list[str]) -> bool:
+        if not self.allow_commands:
+            lines.append(f"SKIP {rel}: bash -n requires commands enabled")
+            return False
+        bash = shutil.which("bash")
+        if not bash:
+            lines.append(f"SKIP {rel}: bash is not available")
+            return False
+        ok, output = self._run_verify_process([bash, "-n", str(path)])
+        if ok:
+            lines.append(f"OK   {rel} (bash -n)")
+            return True
+        detail = f": {output}" if output else ""
+        lines.append(f"FAIL {rel}: bash syntax check failed{detail}")
+        return False
+
+    @staticmethod
+    def _check_yaml_parse(rel: str, path: Path, lines: list[str]) -> bool:
+        try:
+            import yaml  # type: ignore[import-untyped]
+        except ImportError:
+            lines.append(f"SKIP {rel}: PyYAML is not installed; YAML parse skipped")
+            return False
+        try:
+            yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
+            lines.append(f"OK   {rel} (YAML parse)")
+            return True
+        except Exception as exc:  # noqa: BLE001 - optional parser surfaces several exception types
+            lines.append(f"FAIL {rel}: YAML parse failed: {exc}")
+            return False
+
     def _tool_verify(self, args: dict[str, Any]) -> str:
         lines: list[str] = []
         failed = False
-        examined = 0
-        # In-process syntax checks on touched files (frozen-safe: no python/node needed).
+        considered = 0
+        # In-process checks are frozen-safe and do not require command execution.
         for rel in sorted(self.touched):
             path = self._resolve(rel)
             if not path.is_file():
                 continue
             suffix = path.suffix.lower()
-            if suffix not in (".py", ".json"):
-                continue
-            examined += 1
+            considered += 1
             try:
                 if suffix == ".py":
                     compile(path.read_text(encoding="utf-8", errors="replace"), str(path), "exec")
-                else:
+                    lines.append(f"OK   {rel} (python syntax)")
+                elif suffix == ".json":
                     json.loads(path.read_text(encoding="utf-8", errors="replace"))
-                lines.append(f"OK   {rel}")
+                    lines.append(f"OK   {rel} (JSON parse)")
+                elif _is_env_example(rel, path):
+                    findings = _scan_env_example_for_secrets(
+                        path.read_text(encoding="utf-8", errors="replace")
+                    )
+                    if findings:
+                        failed = True
+                        lines.append(f"FAIL {rel}: likely real secrets in example file: {'; '.join(findings)}")
+                    else:
+                        lines.append(f"OK   {rel} (secret scan)")
+                elif suffix in _YAML_SUFFIXES:
+                    if not self._check_yaml_parse(rel, path, lines):
+                        failed = True if lines[-1].startswith("FAIL") else failed
+                elif suffix in _JS_SUFFIXES:
+                    js_ok = self._check_node_syntax(rel, path, lines)
+                    if lines[-1].startswith("FAIL"):
+                        failed = True
+                    if js_ok and path.name in _ECOSYSTEM_NAMES:
+                        self._check_ecosystem_config_load(rel, path, lines)
+                        if lines[-1].startswith("FAIL"):
+                            failed = True
+                elif suffix == ".sh":
+                    self._check_shell_syntax(rel, path, lines)
+                    if lines[-1].startswith("FAIL"):
+                        failed = True
+                else:
+                    considered -= 1
             except (SyntaxError, ValueError) as exc:
                 failed = True
                 lines.append(f"FAIL {rel}: {exc}")
@@ -400,9 +612,11 @@ class ToolBox:
                     failed = True
                     lines.append(f"verify command timed out after {self.command_timeout:.0f}s")
 
-        if examined == 0 and not self.verify_command:
+        if considered == 0 and not self.verify_command:
             self.verified_ok = True
-            return "Nothing to verify (no .py/.json files changed; set agent.verify_command to run tests)."
+            return (
+                "Nothing to verify (no supported changed files; set agent.verify_command to run project checks)."
+            )
 
         self.verified_ok = not failed
         report = ("VERIFY PASSED\n" if not failed else "VERIFY FAILED\n") + "\n".join(lines)
@@ -485,6 +699,15 @@ def run_agent(
                 system_prompt += "\n\n" + block
         except Exception:  # noqa: BLE001 - skills are best-effort, never block a run
             pass
+
+    # Add deterministic deployment context before the repo map so server setup
+    # tasks start with concrete project facts, not guesses.
+    try:
+        project_setup = devops_detect.build_project_setup_block(root)
+        if project_setup:
+            system_prompt += "\n\n" + project_setup
+    except Exception:  # noqa: BLE001 - best-effort, never block a run
+        pass
 
     # Inject a compact repo map so the model is oriented from step one.
     if settings.get("repo_map", True):

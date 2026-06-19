@@ -26,6 +26,28 @@ _SEVERITY_LABEL = {
     "info": "Info",
 }
 
+_SUBMISSION_CHECKLIST = [
+    "Target, endpoint, account role, and program scope are named.",
+    "Steps reproduce the issue from a clean session with minimal assumptions.",
+    "Evidence proves security impact without exposing unrelated sensitive data.",
+    "Impact is tied to realistic attacker capability and affected data or action.",
+    "Remediation is concrete enough for the owner to verify a fix.",
+]
+
+_RETEST_CHECKLIST = [
+    "Replay the original proof after the fix and confirm the vulnerable behavior is gone.",
+    "Try the closest bypass variants: alternate HTTP verb, content type, role, object id, or encoding.",
+    "Confirm the fix did not only hide the client-side path while leaving the server-side action exposed.",
+]
+
+_CHAIN_RULES = [
+    ({"disclosure", "access-control"}, "Information disclosure plus access-control leads can become stronger IDOR/BOLA reports."),
+    ({"secrets", "auth"}, "Exposed credentials plus weak session/auth controls may support account or environment compromise."),
+    ({"redirect", "auth"}, "Open redirects inside auth flows may increase phishing, OAuth, or token-leak impact."),
+    ({"cors", "auth"}, "CORS trust issues matter most when credentialed browser reads expose authenticated data."),
+    ({"supply-chain", "secrets"}, "Build/dependency issues become higher value when they can reach release secrets or deploy artifacts."),
+]
+
 
 def _sev_rank(finding: dict[str, Any]) -> int:
     return _SEVERITY_ORDER.get(str(finding.get("severity", "info")).lower(), 0)
@@ -69,6 +91,37 @@ def _location(finding: dict[str, Any]) -> str:
     return loc
 
 
+def _class_counts(findings: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for finding in findings:
+        name = str(finding.get("class_name") or finding.get("category") or "Other").strip() or "Other"
+        counts[name] = counts.get(name, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0].lower())))
+
+
+def _chain_leads(findings: list[dict[str, Any]]) -> list[str]:
+    present = {str(f.get("class_id") or f.get("category") or "").lower() for f in findings}
+    present |= {str(f.get("category") or "").lower() for f in findings}
+    return [note for required, note in _CHAIN_RULES if required <= present]
+
+
+def _checkbox(done: bool, text: str) -> str:
+    return f"- [{'x' if done else ' '}] {text}"
+
+
+def _finding_readiness(finding: dict[str, Any], plan: dict[str, Any]) -> list[str]:
+    steps = plan.get("steps") or []
+    impact = plan.get("impact") or finding.get("impact")
+    remediation = finding.get("remediation") or plan.get("remediation")
+    return [
+        _checkbox(bool(_location(finding)), "Precise affected location is captured."),
+        _checkbox(bool(finding.get("snippet") or finding.get("description")), "Evidence is present and safe to share."),
+        _checkbox(len(steps) >= 2, "Reproduction steps are specific enough to replay."),
+        _checkbox(bool(impact), "Impact is stated in bounty-review language."),
+        _checkbox(bool(remediation), "A concrete fix recommendation is included."),
+    ]
+
+
 def build_markdown(ctx: dict[str, Any]) -> str:
     findings: list[dict[str, Any]] = ctx.get("findings", [])
     counts = severity_counts(findings)
@@ -91,6 +144,9 @@ def build_markdown(ctx: dict[str, Any]) -> str:
     out.append(f"| **Overall risk** | {str(ctx.get('risk', 'unknown')).upper()} (score {ctx.get('score', 0)}) |")
     out.append(f"| **Findings** | {len(findings)} ({counts['critical']} critical, {counts['high']} high, {counts['medium']} medium, {counts['low']} low, {counts['info']} info) |")
     out.append(f"| **Scanners** | {', '.join(ctx.get('scanners_run', [])) or 'none'} |")
+    if ctx.get("run_live_requested") or "live" in ctx.get("scanners_run", []):
+        live_state = "ran" if "live" in ctx.get("scanners_run", []) else "requested"
+        out.append(f"| **Live browser pass** | {live_state} |")
     out.append(f"| **Generated** | {ctx.get('generated_at', '')} |")
     out.append(f"| **Tool** | {ctx.get('tool', 'GreyIQ BugHunter')} v{ctx.get('version', '')} |")
     out.append("")
@@ -128,6 +184,8 @@ def build_markdown(ctx: dict[str, Any]) -> str:
         out.append("")
     out.append(ctx.get("recommendation") or _default_summary(counts, len(findings)))
     out.append("")
+
+    _append_bounty_triage(out, ctx, counts)
 
     # --- Methodology ---
     out.append("## Methodology\n")
@@ -220,6 +278,9 @@ def build_markdown(ctx: dict[str, Any]) -> str:
         if remediation:
             out.append(f"**Remediation:** {remediation}")
             out.append("")
+        out.append("**Submission readiness**\n")
+        out.extend(_finding_readiness(finding, plan))
+        out.append("")
         if finding.get("references"):
             out.append("**References:** " + ", ".join(finding["references"]))
             out.append("")
@@ -236,6 +297,46 @@ def build_markdown(ctx: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def _append_bounty_triage(out: list[str], ctx: dict[str, Any], counts: dict[str, int]) -> None:
+    findings = ctx.get("findings") or []
+    out.append("## Bounty triage\n")
+    if findings:
+        top = sorted(findings, key=_sev_rank, reverse=True)[0]
+        top_sev = _SEVERITY_LABEL.get(str(top.get("severity")).lower(), "?")
+        out.append(
+            f"- **Highest priority:** {top.get('ref', '')} - {top.get('title', 'Finding')} "
+            f"({top_sev}, {top.get('class_name') or top.get('category') or 'unclassified'})."
+        )
+        classes = _class_counts(findings)
+        if classes:
+            out.append(
+                "- **Class mix:** "
+                + ", ".join(f"{name}: {count}" for name, count in list(classes.items())[:8])
+                + "."
+            )
+        chain_notes = _chain_leads(findings)
+        if chain_notes:
+            out.append("- **Chain leads:** " + " ".join(chain_notes))
+    else:
+        out.append("- **Highest priority:** no automated finding yet; use the manual checklist for in-scope leads.")
+    high = counts["critical"] + counts["high"]
+    if high:
+        out.append("- **Submission order:** confirm and submit critical/high findings first, one report per root cause.")
+    elif counts["medium"]:
+        out.append("- **Submission order:** validate medium findings for real impact or chainability before filing.")
+    else:
+        out.append("- **Submission order:** treat low/info items as hardening unless a policy-approved chain raises impact.")
+    if ctx.get("scan_errors"):
+        out.append("- **Coverage caution:** scanner errors make this a partial result; rerun after fixing scanner access.")
+    if ctx.get("run_live_requested"):
+        out.append("- **Dynamic coverage:** live browser telemetry was requested; review console/network findings separately from passive HTTP findings.")
+    out.append("")
+    out.append("### Submission preflight\n")
+    for item in _SUBMISSION_CHECKLIST:
+        out.append(f"- [ ] {item}")
+    out.append("")
+
+
 def _append_checklist(out: list[str], ctx: dict[str, Any]) -> None:
     checklist = ctx.get("manual_checklist") or []
     if not checklist:
@@ -246,6 +347,11 @@ def _append_checklist(out: list[str], ctx: dict[str, Any]) -> None:
     out.append("")
     for item in checklist:
         out.append(f"- [ ] {str(item).strip()}")
+    out.append("")
+
+    out.append("### Retest after fix\n")
+    for item in _RETEST_CHECKLIST:
+        out.append(f"- [ ] {item}")
     out.append("")
 
 
@@ -319,11 +425,15 @@ def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
         "risk": ctx.get("risk", "unknown"),
         "score": ctx.get("score", 0),
         "severity_counts": severity_counts(findings),
+        "class_counts": _class_counts(findings),
         "finding_count": len(findings),
         "findings": findings,
         "attack_plans": ctx.get("attack_plans", {}),
         "manual_checklist": ctx.get("manual_checklist", []),
+        "submission_checklist": list(_SUBMISSION_CHECKLIST),
+        "retest_checklist": list(_RETEST_CHECKLIST),
         "recommended_tools": ctx.get("recommended_tools", []),
+        "run_live_requested": bool(ctx.get("run_live_requested")),
         "brain": {
             "used": bool(ctx.get("brain", {}).get("used")),
             "provider": ctx.get("brain", {}).get("provider", ""),
@@ -399,6 +509,13 @@ def build_finding_markdown(ctx: dict[str, Any], finding: dict[str, Any]) -> str:
     remediation = finding.get("remediation") or plan.get("remediation")
     if remediation:
         out.append(f"## Remediation\n\n{remediation}\n")
+    out.append("## Submission readiness\n")
+    out.extend(_finding_readiness(finding, plan))
+    out.append("")
+    out.append("## Retest after fix\n")
+    for item in _RETEST_CHECKLIST:
+        out.append(f"- [ ] {item}")
+    out.append("")
     if finding.get("references"):
         out.append("## References\n\n" + ", ".join(finding["references"]) + "\n")
 

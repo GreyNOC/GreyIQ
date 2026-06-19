@@ -479,6 +479,72 @@ label {
   overflow-y: auto;
 }
 
+.starter-home {
+  display: grid;
+  align-content: center;
+  gap: 1.25rem;
+  width: min(48rem, 100%);
+  min-height: 100%;
+  margin: 0 auto;
+  padding: 2rem 0;
+}
+
+.starter-title {
+  display: grid;
+  gap: 0.35rem;
+  text-align: center;
+}
+
+.starter-title h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: clamp(1.7rem, 3vw, 2.35rem);
+  letter-spacing: 0;
+  line-height: 1.08;
+}
+
+.starter-title p:last-child {
+  max-width: 35rem;
+  margin: 0 auto;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.starter-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.6rem;
+}
+
+.starter-card {
+  display: grid;
+  gap: 0.25rem;
+  min-height: 4.4rem;
+  padding: 0.85rem 0.95rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  text-align: left;
+}
+
+.starter-card:hover,
+.starter-card:focus-visible {
+  border-color: rgba(46, 163, 160, 0.5);
+  background: var(--panel-2);
+}
+
+.starter-card strong {
+  font-size: 0.94rem;
+}
+
+.starter-card span {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
 .message {
   position: relative;
   width: min(48rem, 92%);
@@ -792,6 +858,130 @@ label {
   display: none;
 }
 
+.project-brief,
+.advanced-model {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.project-brief {
+  padding: 0.65rem;
+}
+
+.brief-list {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.brief-item {
+  display: grid;
+  gap: 0.18rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--line), transparent 35%);
+}
+
+.brief-item:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.brief-item strong {
+  color: var(--ink);
+  font-size: 0.75rem;
+}
+
+.brief-item span {
+  color: var(--muted);
+  font-size: 0.76rem;
+  line-height: 1.38;
+}
+
+.model-state-card {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.35rem;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 0.8rem;
+  font-weight: 800;
+}
+
+.model-dot {
+  width: 0.58rem;
+  height: 0.58rem;
+  border-radius: 50%;
+  background: var(--teal);
+  box-shadow: 0 0 0 3px rgba(46, 163, 160, 0.16);
+}
+
+.model-state-card[data-state="setup"] .model-dot {
+  background: var(--sun);
+  box-shadow: 0 0 0 3px rgba(224, 173, 74, 0.16);
+}
+
+.model-state-card[data-state="downloading"] .model-dot {
+  background: var(--violet);
+  box-shadow: 0 0 0 3px rgba(138, 123, 240, 0.16);
+}
+
+.model-state-card[data-state="local"] .model-dot {
+  background: var(--muted);
+  box-shadow: 0 0 0 3px rgba(151, 162, 178, 0.16);
+}
+
+.advanced-model {
+  padding: 0.55rem 0.65rem;
+}
+
+.advanced-model summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.advanced-model[open] {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.bughunter-flow {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.bughunter-flow li {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 800;
+}
+
+.bughunter-flow strong {
+  display: inline-grid;
+  place-items: center;
+  width: 1.35rem;
+  height: 1.35rem;
+  border-radius: 50%;
+  background: var(--teal-2);
+  color: var(--ink);
+  font-size: 0.72rem;
+}
+
 .agent-bar {
   display: flex;
   align-items: center;
@@ -1054,6 +1244,35 @@ label {
   white-space: nowrap;
 }
 
+.tree-marker {
+  flex: 0 0 auto;
+  max-width: 4.8rem;
+  overflow: hidden;
+  padding: 0.12rem 0.34rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.62rem;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tree-marker.is-changed {
+  border-color: rgba(46, 163, 160, 0.45);
+  color: var(--teal);
+}
+
+.tree-marker.is-created {
+  border-color: rgba(126, 231, 135, 0.4);
+  color: var(--diff-add-fg);
+}
+
+.tree-marker.is-risky {
+  border-color: rgba(224, 173, 74, 0.5);
+  color: var(--sun);
+}
+
 button.workspace-tree-item:hover {
   background: var(--surface);
 }
@@ -1126,6 +1345,82 @@ button.workspace-tree-item:focus-visible {
   outline-offset: 1px;
 }
 
+.agent-run-flow {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr)) auto auto;
+  align-items: stretch;
+  gap: 0.45rem;
+  padding: 0.5rem 0.6rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.run-flow-step,
+.run-flow-trust {
+  min-width: 0;
+  padding: 0.52rem 0.58rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+
+.run-flow-step {
+  display: grid;
+  gap: 0.16rem;
+}
+
+.run-flow-step strong {
+  color: var(--ink);
+  font-size: 0.74rem;
+}
+
+.run-flow-step span,
+.run-flow-trust span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-flow-step.is-done {
+  border-color: rgba(46, 163, 160, 0.42);
+}
+
+.run-flow-step.is-warn,
+.run-flow-trust.is-warn {
+  border-color: rgba(224, 173, 74, 0.45);
+}
+
+.run-flow-trust {
+  display: grid;
+  gap: 0.12rem;
+  width: 11rem;
+}
+
+.run-flow-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  width: 6.6rem;
+}
+
+.run-flow-actions button {
+  min-height: 1.85rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.run-flow-actions button:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+
 .workbench-maximize {
   flex: 0 0 auto;
   width: 2rem;
@@ -1189,6 +1484,46 @@ button.workspace-tree-item:focus-visible {
 }
 
 /* ---- Agent step cards ---- */
+.change-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.6rem;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+
+.change-rollback-status {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.change-rollback-status.is-error {
+  color: var(--coral);
+}
+
+.change-rollback {
+  flex: 0 0 auto;
+  width: auto;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.change-rollback:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
 .agent-step {
   margin-bottom: 0.5rem;
   border: 1px solid var(--line);
@@ -1439,6 +1774,8 @@ body.is-resizing {
 }
 
 .code-path {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   color: var(--muted);
   font-family: var(--code-font);
@@ -1446,6 +1783,25 @@ body.is-resizing {
   font-weight: 700;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.trust-badge {
+  flex: 0 1 auto;
+  max-width: 14rem;
+  overflow: hidden;
+  padding: 0.25rem 0.45rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trust-badge.trust-suspicious {
+  border-color: rgba(201, 85, 66, 0.55);
+  color: var(--coral);
 }
 
 .code-wrap-toggle {
@@ -1573,6 +1929,19 @@ body.is-resizing {
     min-height: 30rem;
   }
 
+  .agent-run-flow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .run-flow-trust,
+  .run-flow-actions {
+    width: auto;
+  }
+
+  .run-flow-actions {
+    flex-direction: row;
+  }
+
   /* Stacked/page-scroll layout: drop the fixed split + drag divider. */
   .app-shell.is-agent {
     grid-template-rows: none;
@@ -1645,6 +2014,14 @@ body.is-resizing {
 
   .message {
     width: 100%;
+  }
+
+  .starter-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .agent-run-flow {
+    grid-template-columns: 1fr;
   }
 
   .field-grid {
