@@ -13,6 +13,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import trust
+
 # Folders that are large, generated, or irrelevant to a code workspace view.
 SKIP_DIRS: frozenset[str] = frozenset(
     {
@@ -186,11 +188,13 @@ def read_file(root: str, path: str, max_bytes: int = DEFAULT_MAX_BYTES) -> dict[
     except OSError as exc:
         return {"ok": False, "error": f"Could not read file: {exc}", "path": rel}
 
+    content = data.decode("utf-8", errors="replace")
     result: dict[str, Any] = {
         "ok": True,
         "path": rel,
-        "content": data.decode("utf-8", errors="replace"),
+        "content": content,
         "size": size,
+        "trust": trust.scan_text(content, source=rel),
     }
     if truncated:
         result["truncated"] = True

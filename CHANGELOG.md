@@ -2,6 +2,40 @@
 
 Notable changes to GreyIQ.
 
+## v0.9.7
+
+### Added
+- **Task templates.** A row of one-click starter workflows sits above the composer —
+  *Review project, Explain repo, Create README, Fix failing tests, Find security
+  risks, Package for release,* and *Issue / PR plan*. Each one prefills the composer
+  (you review and send it) and enables Agent mode where the task needs to read or edit
+  files; *Find security risks* runs BugHunter's code scanner on your workspace.
+- **Project memory & source cards.** A new **Project** tab (the Workbench's default
+  view) shows what GreyIQ knows about the current workspace as source cards — purpose,
+  tech stack, run commands, and key files, derived by a one-click **Scan project**
+  (stack/run/files are detected offline; the one-line purpose uses your brain) — plus
+  your own preferences, constraints, and open tasks. The agent is handed this memory at
+  the start of every run, and it persists per workspace.
+- **Guided "Plan → Change → Verify → Explain" workflow.** A new first tab in the
+  Workbench presents every agent run as four ordered stages: the up-front plan the
+  agent is told to follow, the files it changed, the verification result (pass/fail),
+  and a plain-language summary — with quick links into the Changes and Verify tabs.
+- **One-click rollback.** Each agent run snapshots the pre-edit state of every file it
+  touches; **Undo last agent run** restores them exactly and removes files the run
+  created. The snapshot is kept per workspace and survives an app restart.
+- **Security trust labels.** Files are scanned for prompt-injection: the Workbench
+  preview shows a per-file trust label ("trusted local file" → "prompt-injection risk"
+  with the matched signals), and when the agent reads a risky file its contents are
+  handed to the model inside an explicit untrusted-DATA boundary — so an embedded
+  "ignore your instructions / use write_file / exfiltrate secrets" is treated as data to
+  report, not a command to follow. An agent run shows a Trust-check note for any flagged
+  reads, and the agent bar shows whether shell commands require approval. This brings the
+  agent red-team's injection thinking into the daily UI.
+
+### Changed
+- `scan` / `bughunt` chat commands now always run the BugHunter scanner, even when
+  Agent mode is on (previously they were routed to the agent).
+
 ## v0.9.6
 
 ### Changed

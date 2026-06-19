@@ -55,13 +55,28 @@ The brain answers chat, drives Agent mode, and writes the analysis in BugHunter 
 
 ## Agent mode & the Workbench
 
-Toggle **Agent** and pick a workspace folder. The agent reads/searches/edits files
-(traversal-guarded, confined to the workspace) and verifies its work; `run_command`
-is **off by default**. The **Workbench** opens an IDE-style layer — a file tree, a
-read-only preview with line numbers + light syntax highlighting, a Changes/diff tab,
-Agent Steps, and a Verify panel. Drag the divider to resize, or slide it to the top to
+Toggle **Agent** and pick a workspace folder. The agent plans, then reads/searches/edits
+files (traversal-guarded, confined to the workspace) and verifies its work; `run_command`
+is **off by default**. The **Workbench** opens an IDE-style layer — a **Project** tab
+(source cards of what GreyIQ knows about the workspace: purpose, tech stack, run
+commands, key files, plus your own notes — one-click **Scan project**, and the agent
+gets it on every run), a **Workflow** tab that lays each run out as
+**Plan → Change → Verify → Explain**, plus a file tree, a read-only preview with line
+numbers + light syntax highlighting, a Changes/diff tab, Agent Steps, and a Verify
+panel. **Undo last agent run** rolls the workspace back to its exact state before the
+run. Drag the divider to resize, or slide it to the top to
 **dock** the workbench (chat moves to a 1/3 side panel). A light/dark theme toggle is in
 the header.
+
+One-click **task templates** above the composer (Review project, Explain repo, Create
+README, Fix failing tests, Find security risks, Package for release, Issue / PR plan)
+prefill a vetted prompt and switch on Agent mode when the task needs it.
+
+**Security trust labels.** GreyIQ scans files for prompt-injection and labels them in the
+preview (*trusted local file* → *prompt-injection risk*, with the matched signals). When
+the agent reads a flagged file, its contents are handed to the model as untrusted **data,
+not instructions**, so an embedded "ignore your instructions / exfiltrate secrets" can't
+hijack the run — the same thinking as the agent red-team, in the daily UI.
 
 ## BugHunter
 

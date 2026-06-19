@@ -131,6 +131,7 @@ const els = {
   composer: document.querySelector("#composer"),
   promptInput: document.querySelector("#promptInput"),
   sendButton: document.querySelector("#sendButton"),
+  templateBar: document.querySelector("#templateBar"),
   choiceForm: document.querySelector("#choiceForm"),
   choiceInput: document.querySelector("#choiceInput"),
   trainingDataForm: document.querySelector("#trainingDataForm"),
@@ -160,6 +161,7 @@ const els = {
   agentToggle: document.querySelector("#agentToggle"),
   agentWorkspace: document.querySelector("#agentWorkspace"),
   agentWsPath: document.querySelector("#agentWsPath"),
+  agentCmdPolicy: document.querySelector("#agentCmdPolicy"),
   trainingSourceList: document.querySelector("#trainingSourceList"),
   trainButton: document.querySelector("#trainButton"),
   trainingDataCount: document.querySelector("#trainingDataCount"),
@@ -175,6 +177,8 @@ const els = {
   workspaceRefresh: document.querySelector("#workspaceRefresh"),
   workspaceSearch: document.querySelector("#workspaceSearch"),
   workspaceTree: document.querySelector("#workspaceTree"),
+  projectPanel: document.querySelector("#projectPanel"),
+  workflowPanel: document.querySelector("#workflowPanel"),
   filePreviewPanel: document.querySelector("#filePreviewPanel"),
   changesPanel: document.querySelector("#changesPanel"),
   agentStepsPanel: document.querySelector("#agentStepsPanel"),
@@ -379,7 +383,7 @@ function loadState() {
     agentWorkspace: "",
     theme: "dark",
     themeChosen: false,
-    workbenchTab: "preview",
+    workbenchTab: "project",
     workbenchActiveFile: "",
     workbenchSearch: "",
     workbenchTree: [],
@@ -388,6 +392,9 @@ function loadState() {
     workbenchWrap: false,
     lastAgentTranscript: [],
     lastAgentChanges: [],
+    lastAgentPlan: [],
+    lastAgentExplain: "",
+    lastAgentFlaggedReads: [],
     bountyProfile: "full-sweep",
     bountyClass: "",
     bountyScope: "",
@@ -459,6 +466,11 @@ function saveState() {
     workbenchTree: _tree,
     lastAgentTranscript: _transcript,
     lastAgentChanges: _changes,
+    lastAgentPlan: _plan,
+    lastAgentExplain: _explain,
+    lastAgentFlaggedReads: _flagged,
+    agentSnapshot: _snapshot,
+    projectMemory: _projectMemory,
     ...persist
   } = state;
   try {
@@ -1507,11 +1519,15 @@ els.composer.addEventListener("submit", async (event) => {
 
   els.sendButton.disabled = true;
   try {
-    const rawAnswer = state.agentMode && state.agentWorkspace ? await runAgent(text) : await replyFor(text);
+    // scan/bughunt commands always go to the chat endpoint so BugHunter's scanner
+    // runs — even in Agent mode, where the agent endpoint wouldn't detect them.
+    const isScanCommand = /^\s*\/?(?:scan|bughunt)\b[:\s]/i.test(text);
+    const useAgent = Boolean(state.agentMode && state.agentWorkspace) && !isScanCommand;
+    const rawAnswer = useAgent ? await runAgent(text) : await replyFor(text);
     const answer = normalizeAnswerForChat(
       rawAnswer,
       text,
-      state.agentMode && state.agentWorkspace ? "coding_agent" : "local_engine"
+      useAgent ? "coding_agent" : "local_engine"
     );
     chat.push({
       id: crypto.randomUUID(),
@@ -1787,6 +1803,7 @@ async function loadCoderConfig() {
   try {
     coderConfig = await apiFetch("/api/coder", { timeoutMs: 4000 });
     renderBrainForm();
+    renderAgentBar(); // refresh the command-policy trust label now the config is known
   } catch (_) {
     // Local service not up yet; the form keeps its defaults.
   }
@@ -2014,6 +2031,162 @@ function renderAgentBar() {
     els.agentWsPath.textContent = state.agentWorkspace || "no workspace set";
     els.agentWsPath.title = state.agentWorkspace || "";
   }
+  if (els.agentCmdPolicy) {
+    // Trust label for tool actions: is run_command gated behind approval?
+    const allow = Boolean(coderConfig && coderConfig.agent && coderConfig.agent.allow_commands);
+    els.agentCmdPolicy.hidden = !state.agentMode;
+    els.agentCmdPolicy.textContent = allow ? "⚠ commands: enabled" : "commands: approval required";
+    els.agentCmdPolicy.className = `agent-cmd-policy${allow ? " is-on" : ""}`;
+    els.agentCmdPolicy.title = allow
+      ? "run_command is ON — the agent can run shell commands in this workspace."
+      : "run_command is OFF — the agent cannot run shell commands (enable it in the agent config to allow).";
+  }
+}
+
+// ---- Task templates (starter workflows that prefill the composer) ----
+// Each chip drops a vetted prompt into the input — it does NOT auto-send, so the
+// user can tweak it first. `needsAgent` templates flip Agent mode on (the agent
+// can then read/edit files); `scan` ones run BugHunter's code scanner instead.
+const TASK_TEMPLATES = [
+  {
+    id: "review",
+    label: "Review project",
+    hint: "Read the code and report back — no file changes",
+    needsAgent: true,
+    prompt:
+      "Review this project. Read the key files first, then give a concise assessment: " +
+      "what it does, how it's structured, code quality and risks, and the top 3 " +
+      "improvements you'd make. Don't change any files — just report."
+  },
+  {
+    id: "explain",
+    label: "Explain repo",
+    hint: "A beginner-friendly tour of the codebase",
+    needsAgent: true,
+    prompt:
+      "Explain this repo like I'm brand new to it: the big picture, the main parts and " +
+      "how they fit together, the key files to start reading, and how control and data " +
+      "flow. Keep it beginner-friendly and don't change any files."
+  },
+  {
+    id: "readme",
+    label: "Create README",
+    hint: "Generate or update README.md, then verify it",
+    needsAgent: true,
+    prompt:
+      "Read this project and write a clear README.md: what it is, how to install and " +
+      "run it, the main features, and the project layout. Create or update README.md, " +
+      "then verify it."
+  },
+  {
+    id: "tests",
+    label: "Fix failing tests",
+    hint: "Diagnose and fix failing tests, then verify",
+    needsAgent: true,
+    prompt:
+      "Find and fix the failing tests in this project. Run the test suite to see what's " +
+      "failing, fix the root cause (don't change the test unless the test itself is " +
+      "wrong), and verify the tests pass. If running commands isn't enabled, tell me " +
+      "exactly what to run."
+  },
+  {
+    id: "security",
+    label: "Find security risks",
+    hint: "Run BugHunter's code scanner on your workspace",
+    scan: true
+  },
+  {
+    id: "release",
+    label: "Package for release",
+    hint: "Steps to produce a release build",
+    needsAgent: true,
+    prompt:
+      "Help me package this app for release: review the build and release setup, give me " +
+      "the exact step-by-step to produce a release build, and flag anything missing or " +
+      "risky. Don't change files unless I confirm."
+  },
+  {
+    id: "plan",
+    label: "Issue / PR plan",
+    hint: "Draft a GitHub issue + step-by-step PR plan",
+    needsAgent: true,
+    prompt:
+      "Turn my request into a concrete plan: a GitHub issue (title, problem, acceptance " +
+      "criteria) and a step-by-step PR plan (files to change, in order, plus tests). If I " +
+      "haven't told you what the change is yet, ask me first."
+  }
+];
+
+function renderTemplateBar() {
+  if (!els.templateBar) return;
+  els.templateBar.replaceChildren();
+  const label = document.createElement("span");
+  label.className = "template-bar-label";
+  label.textContent = "Templates";
+  els.templateBar.append(label);
+  for (const template of TASK_TEMPLATES) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "template-chip";
+    chip.textContent = template.label;
+    chip.title = template.hint || template.label;
+    chip.addEventListener("click", () => void applyTemplate(template));
+    els.templateBar.append(chip);
+  }
+}
+
+function fillComposer(text) {
+  els.promptInput.value = text;
+  els.promptInput.focus();
+  // If there's a fill-in-the-blank placeholder, select it so the user types over it.
+  const placeholder = "<path to your project>";
+  const at = text.indexOf(placeholder);
+  if (at >= 0) {
+    els.promptInput.setSelectionRange(at, at + placeholder.length);
+  } else {
+    els.promptInput.setSelectionRange(text.length, text.length);
+  }
+  els.promptInput.scrollIntoView({ block: "nearest" });
+}
+
+// Turn Agent mode ON (vs. the toggle, which flips it). Picks a workspace first if
+// none is set. Returns false if the user cancels the workspace picker.
+async function ensureAgentMode() {
+  if (state.agentMode) return true;
+  if (!state.agentWorkspace) {
+    const picked = await chooseWorkspace();
+    if (!picked) return false;
+    state.agentWorkspace = picked;
+  }
+  state.agentMode = true;
+  saveState();
+  renderAgentBar();
+  renderWorkbench();
+  void refreshWorkspaceTree();
+  return true;
+}
+
+async function applyTemplate(template) {
+  if (template.scan) {
+    let workspace = (state.agentWorkspace || "").trim();
+    if (!workspace) {
+      const picked = await chooseWorkspace();
+      if (picked) {
+        workspace = picked.trim();
+        state.agentWorkspace = workspace;
+        saveState();
+        renderAgentBar();
+      }
+    }
+    fillComposer(workspace ? `scan code ${workspace}` : "scan code <path to your project>");
+    return;
+  }
+  if (template.needsAgent) {
+    // Best-effort: if the user cancels the workspace picker we still prefill, so
+    // they can run it as a plain chat or set a workspace and resend.
+    await ensureAgentMode();
+  }
+  fillComposer(template.prompt);
 }
 
 // ---- Workbench (IDE-style layer shown only in Agent mode) ----
@@ -2024,7 +2197,7 @@ function makeHint(text, isError = false) {
   return p;
 }
 
-const WORKBENCH_TABS = ["preview", "changes", "steps", "verify"];
+const WORKBENCH_TABS = ["project", "workflow", "preview", "changes", "steps", "verify"];
 
 function applyWorkbenchSize() {
   if (!els.appShell) return;
@@ -2060,7 +2233,7 @@ function renderWorkbench() {
   document.body.classList.toggle("agent-active", on);
   if (!on) return;
   applyWorkbenchSize();
-  setWorkbenchTab(state.workbenchTab || "preview");
+  setWorkbenchTab(state.workbenchTab || "project");
   renderWorkspaceTree(state.workbenchTree);
   if (state.workbenchActiveFile && els.filePreviewPanel?.dataset.loadedPath) {
     // keep the currently previewed file as-is
@@ -2070,6 +2243,18 @@ function renderWorkbench() {
   renderChangesPanel(state.lastAgentChanges);
   renderAgentSteps(state.lastAgentTranscript);
   renderVerifyPanel(state.lastAgentTranscript);
+  renderWorkflowPanel();
+  renderProjectPanel();
+  // Fetch rollback availability + project memory once per session so they survive a
+  // reload (both live server-side). `undefined` = not yet checked this workspace.
+  if (state.agentWorkspace && state.agentSnapshot === undefined) {
+    state.agentSnapshot = null;
+    void refreshSnapshotState();
+  }
+  if (state.agentWorkspace && state.projectMemory === undefined) {
+    state.projectMemory = null;
+    void refreshProjectMemory();
+  }
 }
 
 function setWorkbenchTab(tabName, focusTab = false) {
@@ -2083,6 +2268,8 @@ function setWorkbenchTab(tabName, focusTab = false) {
     if (active && focusTab) btn.focus();
   });
   const panels = {
+    project: els.projectPanel,
+    workflow: els.workflowPanel,
     preview: els.filePreviewPanel,
     changes: els.changesPanel,
     steps: els.agentStepsPanel,
@@ -2364,7 +2551,41 @@ function renderFilePreview(file) {
   };
   setWrapLabel();
   bar.append(wrapBtn);
+  if (file.trust && file.trust.label) {
+    const badge = document.createElement("span");
+    badge.className = `trust-badge is-${file.trust.level || "clean"}`;
+    badge.textContent = file.trust.label;
+    bar.append(badge);
+  }
   els.filePreviewPanel.append(bar);
+
+  // Trust warning: list the prompt-injection signals when the file isn't clean.
+  if (file.trust && file.trust.level && file.trust.level !== "clean" && (file.trust.signals || []).length) {
+    const warn = document.createElement("details");
+    warn.className = `trust-warning is-${file.trust.level}`;
+    warn.open = file.trust.level === "risk";
+    const summary = document.createElement("summary");
+    summary.textContent =
+      file.trust.level === "risk"
+        ? "⚠ This file contains text that reads like instructions to an AI — the agent treats it as data, not commands."
+        : "This file has content worth reviewing before trusting it.";
+    warn.append(summary);
+    const ul = document.createElement("ul");
+    file.trust.signals.forEach((sig) => {
+      const li = document.createElement("li");
+      const label = document.createElement("strong");
+      label.textContent = sig.label || sig.id || "signal";
+      li.append(label);
+      if (sig.excerpt) {
+        const code = document.createElement("code");
+        code.textContent = sig.excerpt;
+        li.append(document.createTextNode(": "), code);
+      }
+      ul.append(li);
+    });
+    warn.append(ul);
+    els.filePreviewPanel.append(warn);
+  }
 
   const content = file.content || "";
   const lines = content.split("\n");
@@ -2598,6 +2819,414 @@ function renderChangesPanel(changes) {
   });
 }
 
+// ---- Workflow tab: Plan -> Change -> Verify -> Explain (the guided trust loop) ----
+function makeWorkflowStage(title, glyph, statusClass) {
+  const stage = document.createElement("section");
+  stage.className = "workflow-stage";
+  const head = document.createElement("div");
+  head.className = "workflow-stage-head";
+  const badge = document.createElement("span");
+  badge.className = `workflow-stage-num${statusClass ? " " + statusClass : ""}`;
+  badge.textContent = glyph;
+  badge.setAttribute("aria-hidden", "true");
+  const heading = document.createElement("span");
+  heading.className = "workflow-stage-title";
+  heading.textContent = title;
+  head.append(badge, heading);
+  const body = document.createElement("div");
+  body.className = "workflow-stage-body";
+  stage.append(head, body);
+  els.workflowPanel.append(stage);
+  return body;
+}
+
+function renderWorkflowPanel() {
+  if (!els.workflowPanel) return;
+  els.workflowPanel.replaceChildren();
+
+  const transcript = Array.isArray(state.lastAgentTranscript) ? state.lastAgentTranscript : [];
+  const changes = Array.isArray(state.lastAgentChanges) ? state.lastAgentChanges : [];
+  const plan = Array.isArray(state.lastAgentPlan) ? state.lastAgentPlan : [];
+  const explain = state.lastAgentExplain || "";
+
+  const intro = document.createElement("p");
+  intro.className = "workflow-intro";
+  intro.textContent = "Plan → Change → Verify → Explain";
+  els.workflowPanel.append(intro);
+
+  if (!(transcript.length || changes.length || plan.length || explain)) {
+    els.workflowPanel.append(
+      makeHint("Run an agent task and its Plan → Change → Verify → Explain will appear here.")
+    );
+    return;
+  }
+
+  // 1) Plan
+  const planBody = makeWorkflowStage("Plan", "1");
+  if (plan.length) {
+    const ol = document.createElement("ol");
+    ol.className = "workflow-plan";
+    plan.forEach((step) => {
+      const li = document.createElement("li");
+      li.textContent = step;
+      ol.append(li);
+    });
+    planBody.append(ol);
+  } else {
+    planBody.append(makeHint("No plan was captured for this run."));
+  }
+
+  // 2) Change
+  const changeBody = makeWorkflowStage("Change", "2");
+  if (changes.length) {
+    const list = document.createElement("ul");
+    list.className = "workflow-changes";
+    changes.forEach((change) => {
+      const op =
+        change.operation === "write_file" ? (change.existed ? "rewrote" : "created") : "edited";
+      const li = document.createElement("li");
+      li.innerHTML =
+        `<span class="change-op">${escapeHtml(op)}</span> ` +
+        `<span class="change-path">${escapeHtml(change.path || "")}</span>`;
+      list.append(li);
+    });
+    changeBody.append(list);
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "workflow-link";
+    open.textContent = "Open diffs in Changes →";
+    open.addEventListener("click", () => setWorkbenchTab("changes", true));
+    changeBody.append(open);
+  } else {
+    changeBody.append(makeHint("No files were changed."));
+  }
+
+  // 3) Verify
+  const verifySteps = transcript.filter((s) => s.tool === "verify" || s.tool === "run_command");
+  const anyFail = verifySteps.some(
+    (s) => s.is_error || /VERIFY FAILED|FAIL\s|exit=[1-9]/.test(String(s.output || ""))
+  );
+  const verified = verifySteps.length > 0 && !anyFail;
+  const verifyBody = makeWorkflowStage(
+    "Verify",
+    verifySteps.length ? (verified ? "✓" : "✕") : "3",
+    verifySteps.length ? (verified ? "is-ok" : "is-error") : ""
+  );
+  if (!verifySteps.length) {
+    verifyBody.append(makeHint("Nothing was verified this run."));
+  } else {
+    const summary = document.createElement("p");
+    summary.textContent = verified
+      ? `Verification passed (${verifySteps.length} check${verifySteps.length > 1 ? "s" : ""}).`
+      : "Verification reported a problem.";
+    verifyBody.append(summary);
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "workflow-link";
+    open.textContent = "Open Verify output →";
+    open.addEventListener("click", () => setWorkbenchTab("verify", true));
+    verifyBody.append(open);
+  }
+
+  // 4) Explain
+  const explainBody = makeWorkflowStage("Explain", "4");
+  const summary = document.createElement("p");
+  summary.className = "workflow-explain";
+  summary.textContent = explain || "(no summary)";
+  explainBody.append(summary);
+
+  // Trust check: files the agent read this run that looked like prompt injection.
+  const flagged = Array.isArray(state.lastAgentFlaggedReads) ? state.lastAgentFlaggedReads : [];
+  if (flagged.length) {
+    const risky = flagged.filter((f) => f.level === "risk").length;
+    const note = document.createElement("div");
+    note.className = `workflow-security${risky ? " is-risk" : ""}`;
+    const heading = document.createElement("strong");
+    heading.textContent = "⚠ Trust check";
+    const body = document.createElement("p");
+    body.textContent =
+      `The agent read ${flagged.length} flagged file(s)` +
+      (risky ? ` (${risky} prompt-injection risk)` : "") +
+      ` — their contents were treated as untrusted data, not instructions: ` +
+      flagged.map((f) => f.path).join(", ") +
+      ".";
+    note.append(heading, body);
+    els.workflowPanel.append(note);
+  }
+
+  // Rollback footer — one-click undo of the whole run.
+  if (state.agentSnapshot && state.agentSnapshot.available) {
+    const footer = document.createElement("div");
+    footer.className = "workflow-rollback";
+    const count = Number(state.agentSnapshot.count || 0);
+    const undo = document.createElement("button");
+    undo.type = "button";
+    undo.className = "workflow-undo";
+    undo.textContent = `Undo last agent run${count ? ` (${count} file${count > 1 ? "s" : ""})` : ""}`;
+    undo.addEventListener("click", () => void undoLastAgentRun());
+    const note = document.createElement("p");
+    note.className = "workflow-rollback-note";
+    note.textContent = "Restores files to their state before the last run.";
+    footer.append(undo, note);
+    els.workflowPanel.append(footer);
+  }
+}
+
+async function refreshSnapshotState() {
+  if (!state.agentWorkspace) {
+    state.agentSnapshot = { available: false, count: 0 };
+    return;
+  }
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    return;
+  }
+  try {
+    const res = await apiFetch("/api/agent/snapshot", {
+      method: "POST",
+      body: JSON.stringify({ workspace: state.agentWorkspace })
+    });
+    state.agentSnapshot = {
+      available: Boolean(res && res.available),
+      count: Number((res && res.count) || 0)
+    };
+  } catch (_) {
+    state.agentSnapshot = { available: false, count: 0 };
+  }
+  if (state.agentMode) renderWorkflowPanel();
+}
+
+async function undoLastAgentRun() {
+  if (!state.agentWorkspace) return;
+  const count = Number(state.agentSnapshot?.count || 0);
+  const message = count
+    ? `Undo the last agent run? This restores ${count} file${count > 1 ? "s" : ""} to their state before the run, discarding changes since.`
+    : "Undo the last agent run? This restores files to their state before the run.";
+  if (!window.confirm(message)) return;
+  try {
+    const res = await apiFetch("/api/agent/undo", {
+      method: "POST",
+      body: JSON.stringify({ workspace: state.agentWorkspace })
+    });
+    if (!res || res.ok === false) {
+      window.alert((res && res.error) || "Undo failed.");
+      return;
+    }
+    state.agentSnapshot = { available: false, count: 0 };
+    state.lastAgentChanges = [];
+    const restored = (res.restored || []).length;
+    const deleted = (res.deleted || []).length;
+    activeChat().push({
+      id: crypto.randomUUID(),
+      role: "bot",
+      text:
+        `Rolled back the last agent run — restored ${restored} file(s)` +
+        (deleted ? `, deleted ${deleted} created file(s)` : "") +
+        ".",
+      createdAt: Date.now()
+    });
+    renderChat();
+    saveState();
+    void refreshWorkspaceTree();
+    renderChangesPanel(state.lastAgentChanges);
+    renderWorkflowPanel();
+  } catch (error) {
+    window.alert(`Undo failed: ${error.message || error}`);
+  }
+}
+
+// ---- Project tab: source cards of what GreyIQ knows about this workspace ----
+const PROJECT_CATEGORIES = [
+  { key: "purpose", label: "Purpose" },
+  { key: "stack", label: "Tech stack" },
+  { key: "run", label: "Run commands" },
+  { key: "files", label: "Key files" },
+  { key: "preferences", label: "Preferences" },
+  { key: "constraints", label: "Constraints" },
+  { key: "tasks", label: "Open tasks" }
+];
+
+function renderProjectPanel() {
+  if (!els.projectPanel) return;
+  els.projectPanel.replaceChildren();
+  const mem = state.projectMemory || {};
+  const facts = Array.isArray(mem.facts) ? mem.facts : [];
+
+  const head = document.createElement("div");
+  head.className = "project-head";
+  const intro = document.createElement("p");
+  intro.className = "project-intro";
+  intro.textContent = "What GreyIQ knows about this project";
+  const scanBtn = document.createElement("button");
+  scanBtn.type = "button";
+  scanBtn.className = "project-scan";
+  scanBtn.disabled = Boolean(mem.scanning);
+  scanBtn.textContent = mem.scanning ? "Scanning…" : facts.length ? "Re-scan" : "Scan project";
+  scanBtn.addEventListener("click", () => void scanProject());
+  head.append(intro, scanBtn);
+  els.projectPanel.append(head);
+
+  if (!facts.length) {
+    els.projectPanel.append(
+      makeHint(
+        mem.scanning
+          ? "Scanning the workspace…"
+          : "No project memory yet. Click “Scan project” to derive the purpose, tech stack, run commands, and key files — or add your own notes below."
+      )
+    );
+  } else {
+    PROJECT_CATEGORIES.forEach(({ key, label }) => {
+      const items = facts.filter((fact) => fact.category === key);
+      if (!items.length) return;
+      const card = document.createElement("section");
+      card.className = "project-card";
+      const cardHead = document.createElement("div");
+      cardHead.className = "project-card-head";
+      cardHead.textContent = label;
+      card.append(cardHead);
+      const ul = document.createElement("ul");
+      ul.className = "project-facts";
+      items.forEach((fact) => {
+        const li = document.createElement("li");
+        li.className = "project-fact";
+        const text = document.createElement("span");
+        text.className = "project-fact-text";
+        text.textContent = fact.text;
+        const tag = document.createElement("span");
+        tag.className = `project-fact-src is-${fact.source === "auto" ? "auto" : "user"}`;
+        tag.textContent = fact.source === "auto" ? "auto" : "you";
+        const del = document.createElement("button");
+        del.type = "button";
+        del.className = "project-fact-del";
+        del.title = "Remove this fact";
+        del.setAttribute("aria-label", `Remove: ${fact.text}`);
+        del.textContent = "✕";
+        del.addEventListener("click", () => void removeProjectFact(fact.id));
+        li.append(text, tag, del);
+        ul.append(li);
+      });
+      card.append(ul);
+      els.projectPanel.append(card);
+    });
+  }
+
+  const addForm = document.createElement("form");
+  addForm.className = "project-add";
+  const select = document.createElement("select");
+  select.className = "project-add-cat";
+  select.setAttribute("aria-label", "Category");
+  PROJECT_CATEGORIES.forEach(({ key, label }) => {
+    const option = document.createElement("option");
+    option.value = key;
+    option.textContent = label;
+    select.append(option);
+  });
+  select.value = "constraints";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "project-add-text";
+  input.placeholder = "Add a note GreyIQ should remember…";
+  input.setAttribute("aria-label", "New project note");
+  const addBtn = document.createElement("button");
+  addBtn.type = "submit";
+  addBtn.className = "project-add-btn";
+  addBtn.textContent = "Add";
+  addForm.append(select, input, addBtn);
+  addForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    void addProjectFact(select.value, text);
+  });
+  els.projectPanel.append(addForm);
+
+  if (mem.updatedAt) {
+    const when = new Date(mem.updatedAt);
+    if (!Number.isNaN(when.getTime())) {
+      const upd = document.createElement("p");
+      upd.className = "project-updated";
+      upd.textContent = `Updated ${when.toLocaleString()}`;
+      els.projectPanel.append(upd);
+    }
+  }
+}
+
+async function refreshProjectMemory() {
+  if (!state.agentWorkspace) {
+    state.projectMemory = { facts: [] };
+    return;
+  }
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) return;
+  try {
+    const res = await apiFetch("/api/project/memory", {
+      method: "POST",
+      body: JSON.stringify({ workspace: state.agentWorkspace })
+    });
+    state.projectMemory = {
+      facts: Array.isArray(res.facts) ? res.facts : [],
+      updatedAt: res.updated_at || null
+    };
+  } catch (_) {
+    state.projectMemory = { facts: [] };
+  }
+  if (state.agentMode) renderProjectPanel();
+}
+
+async function scanProject() {
+  if (!state.agentWorkspace) return;
+  state.projectMemory = { ...(state.projectMemory || {}), scanning: true };
+  renderProjectPanel();
+  try {
+    const res = await apiFetch("/api/project/scan", {
+      method: "POST",
+      timeoutMs: 120000,
+      body: JSON.stringify({ workspace: state.agentWorkspace })
+    });
+    if (res && res.ok !== false) {
+      state.projectMemory = {
+        facts: Array.isArray(res.facts) ? res.facts : [],
+        updatedAt: res.updated_at || null
+      };
+    } else {
+      state.projectMemory = { ...(state.projectMemory || {}), scanning: false };
+      window.alert((res && res.error) || "Scan failed.");
+    }
+  } catch (error) {
+    state.projectMemory = { ...(state.projectMemory || {}), scanning: false };
+    window.alert(`Scan failed: ${error.message || error}`);
+  }
+  renderProjectPanel();
+}
+
+async function saveProjectMemory(facts) {
+  state.projectMemory = { ...(state.projectMemory || {}), facts, scanning: false };
+  renderProjectPanel();
+  if (!state.agentWorkspace) return;
+  try {
+    const res = await apiFetch("/api/project/memory/save", {
+      method: "POST",
+      body: JSON.stringify({ workspace: state.agentWorkspace, facts })
+    });
+    if (res && Array.isArray(res.facts)) {
+      state.projectMemory = { facts: res.facts, updatedAt: res.updated_at || null };
+      renderProjectPanel();
+    }
+  } catch (_) {
+    // Kept in memory; non-fatal if the save round-trip fails.
+  }
+}
+
+function addProjectFact(category, text) {
+  const facts = [...((state.projectMemory && state.projectMemory.facts) || [])];
+  facts.push({ id: crypto.randomUUID(), category, text, source: "user" });
+  return saveProjectMemory(facts);
+}
+
+function removeProjectFact(id) {
+  const facts = ((state.projectMemory && state.projectMemory.facts) || []).filter((fact) => fact.id !== id);
+  return saveProjectMemory(facts);
+}
+
 async function runAgent(userText) {
   if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
     return "The local GreyIQ service is not running.";
@@ -2616,6 +3245,15 @@ async function runAgent(userText) {
     // Feed the Workbench from the structured transcript + change set.
     state.lastAgentTranscript = Array.isArray(res.transcript) ? res.transcript : [];
     state.lastAgentChanges = Array.isArray(res.changes) ? res.changes : [];
+    state.lastAgentPlan = Array.isArray(res.plan) ? res.plan : [];
+    state.lastAgentExplain = res.message || "";
+    state.lastAgentFlaggedReads = Array.isArray(res.flagged_reads) ? res.flagged_reads : [];
+    state.agentSnapshot = {
+      available: Boolean(res.snapshot_available),
+      count: Number(res.snapshot_count || 0)
+    };
+    // Surface the guided Plan → Change → Verify → Explain view after a run.
+    state.workbenchTab = "workflow";
     if (state.lastAgentChanges.length) {
       void refreshWorkspaceTree();
     }
@@ -2776,6 +3414,8 @@ els.agentWorkspace?.addEventListener("click", async () => {
   if (picked) {
     state.agentWorkspace = picked;
     state.workbenchActiveFile = "";
+    state.agentSnapshot = undefined; // re-check rollback availability for the new workspace
+    state.projectMemory = undefined; // re-load project memory for the new workspace
     if (els.filePreviewPanel) els.filePreviewPanel.dataset.loadedPath = "";
     saveState();
     renderAgentBar();
@@ -3260,6 +3900,7 @@ async function boot() {
   void loadToolkit();
   void renderGpuAccel();
   render();
+  renderTemplateBar();
   renderWorkbench();
   if (state.agentMode && state.agentWorkspace) {
     void refreshWorkspaceTree();

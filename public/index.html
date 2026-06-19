@@ -86,7 +86,10 @@
           <button class="agent-toggle" id="agentToggle" type="button" aria-pressed="false" title="Let the brain read, edit, and run things in a workspace folder">Agent: off</button>
           <button class="agent-ws-button" id="agentWorkspace" type="button" title="Set the folder the agent works in">Workspace</button>
           <span class="agent-ws-path" id="agentWsPath">no workspace set</span>
+          <span class="agent-cmd-policy" id="agentCmdPolicy" hidden></span>
         </div>
+
+        <div class="template-bar" id="templateBar" aria-label="Task templates"></div>
 
         <form class="composer" id="composer">
           <textarea id="promptInput" rows="2" placeholder="Message the bot"></textarea>
@@ -309,7 +312,9 @@
         <section class="workbench-main">
           <div class="workbench-tabs">
             <div class="workbench-tablist" role="tablist" aria-label="Workbench panels">
-              <button type="button" role="tab" id="wbtab-preview" aria-controls="filePreviewPanel" aria-selected="true" data-workbench-tab="preview" class="is-active">Preview</button>
+              <button type="button" role="tab" id="wbtab-project" aria-controls="projectPanel" aria-selected="true" data-workbench-tab="project" class="is-active">Project</button>
+              <button type="button" role="tab" id="wbtab-workflow" aria-controls="workflowPanel" aria-selected="false" tabindex="-1" data-workbench-tab="workflow">Workflow</button>
+              <button type="button" role="tab" id="wbtab-preview" aria-controls="filePreviewPanel" aria-selected="false" tabindex="-1" data-workbench-tab="preview">Preview</button>
               <button type="button" role="tab" id="wbtab-changes" aria-controls="changesPanel" aria-selected="false" tabindex="-1" data-workbench-tab="changes">Changes</button>
               <button type="button" role="tab" id="wbtab-steps" aria-controls="agentStepsPanel" aria-selected="false" tabindex="-1" data-workbench-tab="steps">Agent Steps</button>
               <button type="button" role="tab" id="wbtab-verify" aria-controls="verifyPanel" aria-selected="false" tabindex="-1" data-workbench-tab="verify">Verify</button>
@@ -317,7 +322,9 @@
             <button type="button" id="workbenchMaximize" class="workbench-maximize" title="Dock workbench (chat to the right)" aria-label="Dock workbench (chat to the right)" aria-pressed="false">⤢</button>
           </div>
 
-          <div id="filePreviewPanel" class="workbench-panel" role="tabpanel" aria-labelledby="wbtab-preview" tabindex="0"></div>
+          <div id="projectPanel" class="workbench-panel" role="tabpanel" aria-labelledby="wbtab-project" tabindex="0"></div>
+          <div id="workflowPanel" class="workbench-panel" role="tabpanel" aria-labelledby="wbtab-workflow" tabindex="0" hidden></div>
+          <div id="filePreviewPanel" class="workbench-panel" role="tabpanel" aria-labelledby="wbtab-preview" tabindex="0" hidden></div>
           <div id="changesPanel" class="workbench-panel" role="tabpanel" aria-labelledby="wbtab-changes" tabindex="0" hidden></div>
           <div id="agentStepsPanel" class="workbench-panel" role="tabpanel" aria-labelledby="wbtab-steps" tabindex="0" hidden></div>
           <div id="verifyPanel" class="workbench-panel" role="tabpanel" aria-labelledby="wbtab-verify" tabindex="0" hidden></div>
