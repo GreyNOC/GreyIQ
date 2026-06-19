@@ -12,6 +12,7 @@
     "desktop": "electron .",
     "freeze:backend": "pyinstaller --noconfirm --clean build/greyiq-backend.spec",
     "dist": "electron-builder --win portable nsis",
+    "build:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File build/build-portable.ps1",
     "check": "node --check server.mjs && node --check public/app.js && node --check electron/main.cjs && node --check electron/preload.cjs && python -c \"from pathlib import Path; p=Path('backend/greyiq_api.py'); compile(p.read_text(encoding='utf-8'), str(p), 'exec')\" && python -m unittest backend.test_core_contracts"
   },
   "devDependencies": {
