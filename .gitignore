@@ -17,4 +17,7 @@ build/*
 !build/requirements-build.txt
 !build/build-portable.ps1
 *.log
+.env
+.env.*
+!.env.example
 

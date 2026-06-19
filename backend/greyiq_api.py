@@ -345,6 +345,11 @@ class WorkspaceFileRequest(BaseModel):
     path: str = Field(min_length=1, max_length=4000)
 
 
+class WorkspaceRollbackRequest(BaseModel):
+    workspace: str = Field(min_length=1, max_length=4000)
+    changes: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class PreferenceRequest(BaseModel):
     bot: dict[str, Any] = Field(default_factory=dict)
     preference: str | None = Field(default=None, max_length=8000)
@@ -1905,6 +1910,13 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             await send_json(
                 send,
                 await asyncio.to_thread(workspace_fs.read_file, request.workspace, request.path),
+            )
+            return
+        if method == "POST" and path == "/api/workspace/rollback":
+            request = validate_payload(WorkspaceRollbackRequest, await read_json_body(receive))
+            await send_json(
+                send,
+                await asyncio.to_thread(workspace_fs.rollback_changes, request.workspace, request.changes),
             )
             return
         if path.startswith("/api/"):
