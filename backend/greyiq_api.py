@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import mimetypes
 import os
+import secrets
 import shutil
 import sys
 import threading
@@ -46,6 +48,123 @@ def _snapshot_path(workspace: str) -> Path:
         key = str(workspace or "")
     digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
     return SNAPSHOT_DIR / f"{digest}.json"
+
+
+# --- Local API hardening ---------------------------------------------------
+# Cap request bodies so a local client can't exhaust memory with a huge payload.
+MAX_REQUEST_BYTES = int(os.getenv("GREYIQ_MAX_REQUEST_BYTES", str(16 * 1024 * 1024)))
+
+# Per-process session token. The backend injects it into the HTML it serves (a
+# CSP-safe <meta> tag); the same-origin app echoes it back as X-GreyIQ-Token on
+# every /api/* call. This blocks *other local processes* from driving the API
+# over 127.0.0.1 — the Origin check alone can't, since a non-browser client can
+# omit Origin. Explicitly allowlisted cross-origin frontends are exempt.
+SESSION_TOKEN = secrets.token_urlsafe(32)
+SESSION_TOKEN_PLACEHOLDER = "__GREYIQ_SESSION_TOKEN__"
+SESSION_TOKEN_PATH = RUNTIME_DIR / "session.token"
+
+# API keys live here (owner-only perms), separate from the general plaintext
+# config, instead of inside solin_runtime_config.json.
+SECRETS_PATH = RUNTIME_DIR / "secrets.json"
+_SECRET_PROVIDERS = ("anthropic", "openai", "local")
+
+
+def _restrict_file(path: Path) -> None:
+    """Best-effort owner-only perms (meaningful on POSIX; on Windows the file
+    already sits in the per-user profile)."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _write_session_token() -> None:
+    try:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        SESSION_TOKEN_PATH.write_text(SESSION_TOKEN, encoding="utf-8")
+        _restrict_file(SESSION_TOKEN_PATH)
+    except OSError:
+        pass
+
+
+def _load_secrets() -> dict[str, str]:
+    try:
+        data = json.loads(SECRETS_PATH.read_text(encoding="utf-8"))
+        return {k: str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _store_secret(provider: str, api_key: str) -> None:
+    data = _load_secrets()
+    if api_key:
+        data[provider] = api_key
+    else:
+        data.pop(provider, None)
+    try:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        SECRETS_PATH.write_text(json.dumps(data), encoding="utf-8")
+        _restrict_file(SECRETS_PATH)
+    except OSError:
+        pass
+
+
+def _merge_coder_secrets(config: dict[str, Any]) -> dict[str, Any]:
+    """Overlay stored API keys onto a coder config read from the main file."""
+    stored = _load_secrets()
+    if not stored:
+        return config
+    merged = json.loads(json.dumps(config)) if config else {}
+    for provider in _SECRET_PROVIDERS:
+        key = stored.get(provider)
+        if not key:
+            continue
+        block = merged.get(provider)
+        if isinstance(block, dict):
+            block["api_key"] = key
+        else:
+            merged[provider] = {"api_key": key}
+    return merged
+
+
+def _split_coder_secrets(config: dict[str, Any]) -> dict[str, Any]:
+    """Move any API keys out of a coder config into the secrets store, leaving the
+    main config key-free."""
+    for provider in _SECRET_PROVIDERS:
+        block = config.get(provider)
+        if isinstance(block, dict) and block.get("api_key"):
+            _store_secret(provider, str(block["api_key"]))
+            block["api_key"] = ""
+    return config
+
+
+def _migrate_coder_secrets() -> None:
+    """One-time: pull API keys out of an existing plaintext solin_runtime_config
+    into the perms-restricted secrets store."""
+    runtime_path = RUNTIME_DIR / "solin_runtime_config.json"
+    payload = read_json(runtime_path, {})
+    coder_cfg = payload.get("coder") if isinstance(payload, dict) else None
+    if not isinstance(coder_cfg, dict):
+        return
+    moved = False
+    for provider in _SECRET_PROVIDERS:
+        block = coder_cfg.get(provider)
+        if isinstance(block, dict) and block.get("api_key"):
+            _store_secret(provider, str(block["api_key"]))
+            block["api_key"] = ""
+            moved = True
+    if moved:
+        write_json(runtime_path, payload)
+
+
+def _session_authorized(scope: dict[str, Any] | None) -> bool:
+    """True if a request may call /api/*: an allowlisted cross-origin frontend, or
+    a same-origin/local client presenting the session token."""
+    origin = _normalize_origin(_header(scope, "origin"))
+    if origin and origin in _configured_origins():
+        return True
+    provided = _header(scope, "x-greyiq-token").strip()
+    return bool(provided) and hmac.compare_digest(provided, SESSION_TOKEN)
 
 
 if str(BACKEND_DIR) not in sys.path:
@@ -496,16 +615,19 @@ class GreyIQRuntime:
     def _coder_config(self) -> dict[str, Any]:
         payload = read_json(RUNTIME_DIR / "solin_runtime_config.json", {})
         config = payload.get("coder") if isinstance(payload, dict) else None
-        return config if isinstance(config, dict) else {}
+        config = config if isinstance(config, dict) else {}
+        return _merge_coder_secrets(config)
 
     def save_coder_config(self, update: dict[str, Any]) -> dict[str, Any]:
         runtime_path = RUNTIME_DIR / "solin_runtime_config.json"
         payload = read_json(runtime_path, {})
         if not isinstance(payload, dict):
             payload = {}
-        payload["coder"] = coder.merge_update(payload.get("coder"), update)
+        # Merge the UI update, then split API keys out into the secrets store so the
+        # main config stays key-free.
+        payload["coder"] = _split_coder_secrets(coder.merge_update(payload.get("coder"), update))
         write_json(runtime_path, payload)
-        return coder.public_config(payload["coder"])
+        return coder.public_config(self._coder_config())
 
     def coder_status(self) -> dict[str, Any]:
         return coder.public_config(self._coder_config())
@@ -1081,6 +1203,8 @@ def default_training_text() -> str:
 def ensure_runtime() -> None:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     (RUNTIME_DIR / "data").mkdir(parents=True, exist_ok=True)
+    _write_session_token()
+    _migrate_coder_secrets()
     for name in SEED_FILES:
         src = SEED_DIR / name
         dst = RUNTIME_DIR / name
@@ -1334,10 +1458,15 @@ def validate_payload(model: type[BaseModel], payload: dict[str, Any]) -> BaseMod
 
 async def read_body(receive: Any) -> bytes:
     chunks: list[bytes] = []
+    total = 0
     more_body = True
     while more_body:
         message = await receive()
-        chunks.append(message.get("body", b""))
+        chunk = message.get("body", b"")
+        total += len(chunk)
+        if total > MAX_REQUEST_BYTES:
+            raise HTTPError(413, f"Request body too large (limit {MAX_REQUEST_BYTES} bytes).")
+        chunks.append(chunk)
         more_body = bool(message.get("more_body", False))
     return b"".join(chunks)
 
@@ -1422,7 +1551,7 @@ def _cors_headers(scope: dict[str, Any] | None) -> list[tuple[bytes, bytes]]:
     return [
         (b"access-control-allow-origin", normalized.encode("ascii")),
         (b"access-control-allow-methods", b"GET,POST,OPTIONS"),
-        (b"access-control-allow-headers", b"content-type,accept"),
+        (b"access-control-allow-headers", b"content-type,accept,x-greyiq-token"),
         (b"access-control-max-age", b"600"),
         (b"vary", b"Origin"),
     ]
@@ -1469,6 +1598,25 @@ async def send_file(send: Any, path: Path, status_code: int = 200) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
+async def send_index(send: Any) -> None:
+    """Serve index.html with the per-session token injected into its <meta> tag, so
+    the same-origin app can authenticate its /api/* calls."""
+    try:
+        html = (PUBLIC_DIR / "index.html").read_text(encoding="utf-8")
+    except OSError:
+        await send_json(send, {"error": "not found"}, 404)
+        return
+    body = html.replace(SESSION_TOKEN_PLACEHOLDER, SESSION_TOKEN).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": response_headers("text/html; charset=utf-8", len(body)),
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
+
+
 async def send_empty(send: Any, status_code: int = 204) -> None:
     await send(
         {
@@ -1496,9 +1644,15 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         await send_json(send, {"error": "origin not allowed"}, 403)
         return
 
+    # Session-token gate: /api/* (except liveness) requires the per-session token,
+    # so other local processes can't drive the API over 127.0.0.1.
+    if path.startswith("/api/") and path != "/api/health" and not _session_authorized(scope):
+        await send_json(send, {"error": "missing or invalid session token"}, 403)
+        return
+
     try:
         if method == "GET" and path in {"/", "/app"}:
-            await send_file(send, PUBLIC_DIR / "index.html")
+            await send_index(send)
             return
         if method == "GET" and path == "/api/health":
             await send_json(send, health())
@@ -1672,7 +1826,7 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if file_path.exists() and file_path.is_file():
             await send_file(send, file_path)
             return
-        await send_file(send, PUBLIC_DIR / "index.html")
+        await send_index(send)
     except HTTPError as exc:
         await send_json(send, {"detail": exc.detail}, exc.status_code)
     except Exception as exc:

@@ -56,6 +56,31 @@ def _clip_change(text: str | None) -> str:
         return text[:_MAX_CHANGE_CHARS] + f"\n... [truncated, {len(text)} chars total]"
     return text
 
+
+# Commands that are NEVER run, even when allow_commands is on — destructive or
+# system-altering, the catastrophic-blast-radius cases. A hard floor on top of the
+# allow_commands gate (which already keeps run_command off by default).
+_BLOCKED_COMMAND_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
+    ("recursive force-delete", re.compile(r"\brm\s+-[a-z]*r[a-z]*f|\brm\s+-[a-z]*f[a-z]*r", re.I)),
+    ("recursive dir delete", re.compile(r"\b(rd|rmdir)\s+/s|\bdel\s+/[a-z]*s", re.I)),
+    ("disk format", re.compile(r"\bformat\s+[a-z]:|\bmkfs\b", re.I)),
+    ("raw disk write", re.compile(r"\bdd\s+if=|>\s*/dev/sd[a-z]", re.I)),
+    ("fork bomb", re.compile(r":\(\)\s*\{\s*:\s*\|", re.I)),
+    ("power control", re.compile(r"\b(shutdown|reboot|halt|poweroff)\b", re.I)),
+    ("registry delete", re.compile(r"\breg\s+delete\b", re.I)),
+    ("pipe download to shell", re.compile(r"\b(curl|wget|iwr|invoke-webrequest)\b[^|]*\|\s*(sh|bash|zsh|powershell|python|cmd)\b", re.I)),
+    ("world-writable chmod", re.compile(r"\bchmod\s+-?R?\s*777\b", re.I)),
+    ("privilege escalation", re.compile(r"\bsudo\b|\brunas\b", re.I)),
+]
+
+
+def _blocked_command(command: str) -> str | None:
+    for label, pattern in _BLOCKED_COMMAND_PATTERNS:
+        if pattern.search(command):
+            return label
+    return None
+
+
 AGENT_SYSTEM_PROMPT = (
     "You are GreyIQ, an autonomous coding agent working inside a fixed workspace "
     "folder. Use the provided tools to read, search, edit, and create files, and "
@@ -386,6 +411,13 @@ class ToolBox:
         command = str(args.get("command", "")).strip()
         if not command:
             raise ToolError("command must not be empty.")
+        blocked = _blocked_command(command)
+        if blocked:
+            raise ToolError(
+                f"Refused: this command matches a blocked dangerous pattern ({blocked}). "
+                "Destructive/system-altering commands are never run, even with commands "
+                "enabled — run it yourself if you truly intend to."
+            )
         try:
             proc = subprocess.run(  # noqa: S602 - intentional, workspace-scoped, user-enabled
                 command,

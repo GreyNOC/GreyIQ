@@ -101,6 +101,16 @@ running service. If you intentionally serve a separate trusted frontend, set
 `GREYIQ_ALLOWED_ORIGINS` to a comma-separated list such as
 `http://127.0.0.1:4173`.
 
+Every `/api/*` call (except the health check) requires a **per-session token** the
+backend mints at startup and injects into the page it serves — so another local
+process on `127.0.0.1` can't drive the API (allowlisted cross-origin frontends are
+exempt). Request bodies are capped (`GREYIQ_MAX_REQUEST_BYTES`, default 16 MB).
+**API keys are kept in a permission-restricted `secrets.json`**, separate from the
+main config and migrated out of it on first run, and are never sent back to the UI.
+The agent's `run_command` stays **off by default**, and even when enabled a denylist
+refuses catastrophic commands (`rm -rf`, disk formats, pipe-to-shell, power control,
+privilege escalation, …).
+
 Local code scans can be restricted to one folder with
 `GREYIQ_CODE_SCAN_BASE_PATH`. Remote repository scans require HTTPS URLs from
 the built-in host allowlist. Web/live scans refuse private/loopback hosts unless

@@ -480,12 +480,22 @@ function saveState() {
   }
 }
 
+// Per-session token the backend injected into the page (CSP-safe <meta>); echoed
+// on every /api/* call so the backend knows the request is from its own app and
+// not another local process. Absent in the static browser fallback (no backend).
+const SESSION_TOKEN = (() => {
+  const meta = document.querySelector('meta[name="greyiq-session"]');
+  const value = meta ? meta.content : "";
+  return value && value !== "__GREYIQ_SESSION_TOKEN__" ? value : "";
+})();
+
 async function apiFetch(path, options = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs || API_TIMEOUT_MS);
   const { timeoutMs: _timeoutMs, ...requestOptions } = options;
   const headers = {
     Accept: "application/json",
+    ...(SESSION_TOKEN ? { "X-GreyIQ-Token": SESSION_TOKEN } : {}),
     ...(requestOptions.body ? { "Content-Type": "application/json" } : {}),
     ...(requestOptions.headers || {})
   };

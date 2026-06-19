@@ -8,6 +8,7 @@ node_modules/
 release/
 dist/
 ollama/
+.venv-build/
 .claude/
 # build/ holds electron-builder input resources (committed), not build output.
 build/*
