@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import mimetypes
 import os
@@ -33,12 +34,26 @@ else:
     PUBLIC_DIR = PROJECT_ROOT / "public"
     SEED_DIR = BACKEND_DIR / "seed"
 RUNTIME_DIR = Path(os.getenv("GREYIQ_RUNTIME_DIR", PROJECT_ROOT / "runtime")).resolve()
+# One rollback snapshot per workspace (the last agent run), keyed by a hash of the
+# resolved workspace path. Powers "Undo last agent run".
+SNAPSHOT_DIR = RUNTIME_DIR / "agent_snapshots"
+
+
+def _snapshot_path(workspace: str) -> Path:
+    try:
+        key = str(Path(str(workspace or "")).expanduser().resolve())
+    except (OSError, RuntimeError, ValueError):
+        key = str(workspace or "")
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
+    return SNAPSHOT_DIR / f"{digest}.json"
+
 
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 import agent as coding_agent  # noqa: E402
 import coder  # noqa: E402
+import project_memory  # noqa: E402
 import workspace as workspace_fs  # noqa: E402
 from ai_core.core_store import AICoreStore, DEFAULT_CORE_ID, slugify  # noqa: E402
 from document_ingest import (  # noqa: E402
@@ -68,7 +83,7 @@ from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E4
 
 
 APP_NAME = "GreyIQ"
-VERSION = "0.9.6"
+VERSION = "0.9.7"
 _CURRENT_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar("greyiq_current_scope", default=None)
 _CSP = (
     "default-src 'self'; "
@@ -181,6 +196,19 @@ class AgentRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
     workspace: str = Field(min_length=1, max_length=4000)
     history: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class AgentUndoRequest(BaseModel):
+    workspace: str = Field(min_length=1, max_length=4000)
+
+
+class ProjectMemoryRequest(BaseModel):
+    workspace: str = Field(min_length=1, max_length=4000)
+
+
+class ProjectMemorySaveRequest(BaseModel):
+    workspace: str = Field(min_length=1, max_length=4000)
+    facts: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class WorkspaceTreeRequest(BaseModel):
@@ -582,6 +610,7 @@ class GreyIQRuntime:
                 runtime_dir=RUNTIME_DIR,
                 seed_dir=SEED_DIR,
             )
+            snapshot_meta = self._persist_snapshot(request.workspace, result.get("snapshot") or [])
             return {
                 "ok": True,
                 "request_id": uuid4().hex,
@@ -590,6 +619,10 @@ class GreyIQRuntime:
                 "steps": result["steps"],
                 "changes": result.get("changes", []),
                 "touched_files": result.get("touched_files", []),
+                "plan": result.get("plan", []),
+                "flagged_reads": result.get("flagged_reads", []),
+                "snapshot_available": snapshot_meta["available"],
+                "snapshot_count": snapshot_meta["count"],
                 "model_name": f"{result['provider']}:{result['model']}",
                 "provider": result["provider"],
             }
@@ -602,7 +635,82 @@ class GreyIQRuntime:
                 "steps": 0,
                 "changes": [],
                 "touched_files": [],
+                "plan": [],
+                "flagged_reads": [],
+                "snapshot_available": False,
+                "snapshot_count": 0,
             }
+
+    def _persist_snapshot(self, workspace: str, snapshot: list[dict[str, Any]]) -> dict[str, Any]:
+        """Save the run's pre-edit snapshot (one per workspace, overwriting the
+        prior one) so "Undo last agent run" can restore it later. Best-effort."""
+        if not snapshot:
+            return {"available": False, "count": 0}
+        try:
+            SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "workspace": str(Path(workspace).expanduser().resolve()),
+                "created_at": datetime.now(UTC).isoformat(),
+                "files": snapshot,
+            }
+            _snapshot_path(workspace).write_text(json.dumps(payload), encoding="utf-8")
+            return {"available": True, "count": len(snapshot)}
+        except OSError:
+            return {"available": False, "count": 0}
+
+    def agent_snapshot(self, request: AgentUndoRequest) -> dict[str, Any]:
+        """Report whether an "Undo last agent run" snapshot exists for a workspace."""
+        try:
+            path = _snapshot_path(request.workspace)
+            if not path.is_file():
+                return {"available": False, "count": 0}
+            data = json.loads(path.read_text(encoding="utf-8"))
+            files = data.get("files") or []
+            return {
+                "available": bool(files),
+                "count": len(files),
+                "created_at": data.get("created_at"),
+                "files": [str(entry.get("path") or "") for entry in files][:200],
+            }
+        except (OSError, json.JSONDecodeError):
+            return {"available": False, "count": 0}
+
+    def agent_undo(self, request: AgentUndoRequest) -> dict[str, Any]:
+        """Restore the workspace to its state before the last agent run, then
+        consume the snapshot so the same run can't be undone twice."""
+        try:
+            path = _snapshot_path(request.workspace)
+            if not path.is_file():
+                return {"ok": False, "error": "Nothing to undo — no snapshot from a recent agent run."}
+            data = json.loads(path.read_text(encoding="utf-8"))
+            outcome = coding_agent.restore_snapshot(data.get("files") or [], request.workspace)
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return {"ok": True, "available": False, **outcome}
+        except coding_agent.AgentError as exc:
+            return {"ok": False, "error": str(exc)}
+        except (OSError, json.JSONDecodeError) as exc:
+            return {"ok": False, "error": f"Could not read the snapshot: {exc}"}
+
+    def project_memory_load(self, request: ProjectMemoryRequest) -> dict[str, Any]:
+        try:
+            return {"ok": True, **project_memory.load(RUNTIME_DIR, request.workspace)}
+        except project_memory.ProjectMemoryError as exc:
+            return {"ok": False, "error": str(exc), "facts": [], "updated_at": None}
+
+    def project_memory_save(self, request: ProjectMemorySaveRequest) -> dict[str, Any]:
+        try:
+            return {"ok": True, **project_memory.save(RUNTIME_DIR, request.workspace, request.facts)}
+        except (project_memory.ProjectMemoryError, OSError) as exc:
+            return {"ok": False, "error": str(exc), "facts": [], "updated_at": None}
+
+    def project_scan(self, request: ProjectMemoryRequest) -> dict[str, Any]:
+        try:
+            return {"ok": True, **project_memory.scan(RUNTIME_DIR, request.workspace, self._coder_config())}
+        except (project_memory.ProjectMemoryError, OSError) as exc:
+            return {"ok": False, "error": str(exc), "facts": [], "updated_at": None}
 
     def run_bounty(self, request: "BountyScanRequest") -> dict[str, Any]:
         return run_bounty_hunt(
@@ -1515,6 +1623,26 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/agent":
             request = validate_payload(AgentRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.run_agent, request))
+            return
+        if method == "POST" and path == "/api/agent/snapshot":
+            request = validate_payload(AgentUndoRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.agent_snapshot, request))
+            return
+        if method == "POST" and path == "/api/agent/undo":
+            request = validate_payload(AgentUndoRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.agent_undo, request))
+            return
+        if method == "POST" and path == "/api/project/memory":
+            request = validate_payload(ProjectMemoryRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.project_memory_load, request))
+            return
+        if method == "POST" and path == "/api/project/memory/save":
+            request = validate_payload(ProjectMemorySaveRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.project_memory_save, request))
+            return
+        if method == "POST" and path == "/api/project/scan":
+            request = validate_payload(ProjectMemoryRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.project_scan, request))
             return
         if method == "POST" and path == "/api/workspace/tree":
             request = validate_payload(WorkspaceTreeRequest, await read_json_body(receive))

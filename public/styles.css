@@ -857,6 +857,440 @@ label {
   color: #ffffff;
 }
 
+.template-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0 0.25rem 0.5rem;
+}
+
+.template-bar-label {
+  font-size: 0.66rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.template-chip {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 0.26rem 0.7rem;
+  font-size: 0.74rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.template-chip:hover {
+  border-color: var(--teal);
+  color: var(--teal);
+}
+
+.template-chip:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* ---- Workflow tab: Plan -> Change -> Verify -> Explain ---- */
+.workflow-intro {
+  margin: 0 0 0.85rem;
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+}
+
+.workflow-stage {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0 0 0.9rem 1.95rem;
+}
+
+/* Connector rail down the left of the stepper. */
+.workflow-stage::before {
+  content: "";
+  position: absolute;
+  left: 0.69rem;
+  top: 1.55rem;
+  bottom: -0.1rem;
+  width: 2px;
+  background: var(--line);
+}
+
+.workflow-stage:last-of-type::before {
+  display: none;
+}
+
+.workflow-stage-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.workflow-stage-num {
+  position: absolute;
+  left: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.45rem;
+  height: 1.45rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 0.74rem;
+  font-weight: 800;
+}
+
+.workflow-stage-num.is-ok {
+  background: var(--teal);
+  border-color: var(--teal);
+  color: #ffffff;
+}
+
+.workflow-stage-num.is-error {
+  background: var(--coral);
+  border-color: var(--coral);
+  color: #ffffff;
+}
+
+.workflow-stage-title {
+  font-size: 0.86rem;
+  font-weight: 800;
+  color: var(--ink);
+}
+
+.workflow-stage-body {
+  font-size: 0.82rem;
+  color: var(--ink);
+  line-height: 1.45;
+}
+
+.workflow-stage-body p {
+  margin: 0;
+}
+
+.workflow-plan {
+  margin: 0;
+  padding-left: 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.workflow-changes {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-family: var(--code-font);
+  font-size: 0.78rem;
+}
+
+.workflow-explain {
+  white-space: pre-wrap;
+}
+
+.workflow-link {
+  margin-top: 0.35rem;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--teal);
+  font-size: 0.78rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.workflow-link:hover {
+  text-decoration: underline;
+}
+
+.workflow-rollback {
+  margin-top: 0.3rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--line);
+}
+
+.workflow-undo {
+  border: 1px solid var(--coral);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--coral);
+  padding: 0.5rem 0.9rem;
+  font-size: 0.8rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.workflow-undo:hover {
+  background: var(--coral);
+  color: #ffffff;
+}
+
+.workflow-rollback-note {
+  margin: 0.4rem 0 0;
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+
+/* ---- Project tab: source cards ---- */
+.project-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.7rem;
+}
+
+.project-intro {
+  margin: 0;
+  font-size: 0.78rem;
+  font-weight: 800;
+  color: var(--muted);
+}
+
+.project-scan {
+  border: 1px solid var(--teal);
+  border-radius: 999px;
+  background: var(--teal);
+  color: #ffffff;
+  padding: 0.3rem 0.85rem;
+  font-size: 0.76rem;
+  font-weight: 800;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.project-scan:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.project-card {
+  margin-bottom: 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.project-card-head {
+  padding: 0.4rem 0.7rem;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--line);
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.project-facts {
+  margin: 0;
+  padding: 0.35rem 0.5rem;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.project-fact {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.2rem 0.25rem;
+  font-size: 0.82rem;
+  color: var(--ink);
+}
+
+.project-fact-text {
+  flex: 1;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.project-fact-src {
+  flex-shrink: 0;
+  border-radius: 999px;
+  padding: 0.05rem 0.45rem;
+  font-size: 0.64rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.project-fact-src.is-auto {
+  background: var(--teal-2);
+  color: var(--teal);
+}
+
+.project-fact-src.is-user {
+  background: var(--surface-2);
+  color: var(--muted);
+  border: 1px solid var(--line);
+}
+
+.project-fact-del {
+  flex-shrink: 0;
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0.1rem 0.2rem;
+  border-radius: 4px;
+}
+
+.project-fact-del:hover {
+  color: var(--coral);
+}
+
+.project-add {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 0.4rem;
+  align-items: center;
+  margin-top: 0.5rem;
+  padding-top: 0.7rem;
+  border-top: 1px solid var(--line);
+}
+
+.project-add-cat,
+.project-add-text {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 0.35rem 0.5rem;
+  font-size: 0.78rem;
+}
+
+.project-add-btn {
+  border: 1px solid var(--teal);
+  border-radius: 6px;
+  background: var(--teal);
+  color: #ffffff;
+  padding: 0.36rem 0.8rem;
+  font-size: 0.78rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.project-updated {
+  margin: 0.55rem 0 0;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+/* ---- Trust labels (file preview, command policy, workflow security note) ---- */
+.trust-badge {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  padding: 0.12rem 0.55rem;
+  font-size: 0.64rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.trust-badge.is-clean {
+  background: var(--teal-2);
+  color: var(--teal);
+}
+
+.trust-badge.is-caution {
+  background: rgba(214, 155, 45, 0.18);
+  color: var(--sun);
+}
+
+.trust-badge.is-risk {
+  background: rgba(201, 85, 66, 0.16);
+  color: var(--coral);
+}
+
+.trust-warning {
+  margin: 0 0 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+  font-size: 0.8rem;
+  background: var(--surface);
+}
+
+.trust-warning.is-risk {
+  border-color: var(--coral);
+}
+
+.trust-warning.is-caution {
+  border-color: var(--sun);
+}
+
+.trust-warning summary {
+  cursor: pointer;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.trust-warning ul {
+  margin: 0.5rem 0 0;
+  padding-left: 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.trust-warning code {
+  font-family: var(--code-font);
+  font-size: 0.72rem;
+  color: var(--muted);
+  word-break: break-word;
+}
+
+.workflow-security {
+  margin-top: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--sun);
+  border-radius: 8px;
+  background: rgba(214, 155, 45, 0.1);
+  font-size: 0.8rem;
+}
+
+.workflow-security.is-risk {
+  border-color: var(--coral);
+  background: rgba(201, 85, 66, 0.1);
+}
+
+.workflow-security p {
+  margin: 0.25rem 0 0;
+  line-height: 1.4;
+}
+
+.agent-cmd-policy {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.12rem 0.55rem;
+}
+
+.agent-cmd-policy.is-on {
+  color: var(--coral);
+  border-color: var(--coral);
+}
+
 .agent-ws-path {
   color: var(--muted);
   font-size: 0.74rem;
@@ -1480,6 +1914,8 @@ body.is-resizing {
 
 .code-path {
   overflow: hidden;
+  flex: 1 1 auto;
+  min-width: 0;
   color: var(--muted);
   font-family: var(--code-font);
   font-size: 0.78rem;
