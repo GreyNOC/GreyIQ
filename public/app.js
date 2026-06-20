@@ -211,7 +211,12 @@ const els = {
   toolkitClass: document.querySelector("#toolkitClass"),
   toolkitSearch: document.querySelector("#toolkitSearch"),
   toolkitStatus: document.querySelector("#toolkitStatus"),
-  toolkitList: document.querySelector("#toolkitList")
+  toolkitList: document.querySelector("#toolkitList"),
+  panelModes: document.querySelector(".panel-modes"),
+  panelModeButtons: [...document.querySelectorAll(".panel-mode-btn")],
+  panelModePanels: [...document.querySelectorAll(".panel-mode")],
+  panelModeEyebrow: document.querySelector("#panelModeEyebrow"),
+  panelModeTitle: document.querySelector("#panelModeTitle")
 };
 
 class AccelerationBackend {
@@ -400,7 +405,8 @@ function loadState() {
     bountyScope: "",
     bountyOutput: "",
     bountyPerFinding: false,
-    redteamBehavioral: false
+    redteamBehavioral: false,
+    panelMode: "brain"
   };
 
   try {
@@ -2018,6 +2024,53 @@ function toggleTheme() {
 
 els.themeToggle?.addEventListener("click", toggleTheme);
 
+// ---- Right-panel mode menu (Brain / Train / Security) ----
+// One surface at a time. Each mode owns a slice of the old "everything" panel, so
+// the user picks an intent and only its controls show. Mirrors the WAI-ARIA tabs
+// pattern (the workbench tablist uses the same approach).
+const PANEL_MODES = ["brain", "train", "security"];
+const PANEL_MODE_LABELS = {
+  brain: { eyebrow: "Setup", title: "Coding Brain" },
+  train: { eyebrow: "Local model", title: "Training" },
+  security: { eyebrow: "Offense", title: "Security" }
+};
+
+function setPanelMode(mode, focusTab = false) {
+  if (!PANEL_MODES.includes(mode)) mode = "brain";
+  state.panelMode = mode;
+  for (const button of els.panelModeButtons) {
+    const active = button.dataset.panelMode === mode;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
+    if (active && focusTab) button.focus();
+  }
+  for (const panel of els.panelModePanels) {
+    panel.hidden = panel.dataset.mode !== mode;
+  }
+  const label = PANEL_MODE_LABELS[mode];
+  if (els.panelModeEyebrow) els.panelModeEyebrow.textContent = label.eyebrow;
+  if (els.panelModeTitle) els.panelModeTitle.textContent = label.title;
+  saveState();
+}
+
+for (const button of els.panelModeButtons) {
+  button.addEventListener("click", () => setPanelMode(button.dataset.panelMode));
+}
+
+// Arrow-key navigation across the mode menu (WAI-ARIA tabs pattern).
+els.panelModes?.addEventListener("keydown", (event) => {
+  const idx = PANEL_MODES.indexOf(state.panelMode);
+  let next = -1;
+  if (event.key === "ArrowRight" || event.key === "ArrowDown") next = (idx + 1) % PANEL_MODES.length;
+  else if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = (idx - 1 + PANEL_MODES.length) % PANEL_MODES.length;
+  else if (event.key === "Home") next = 0;
+  else if (event.key === "End") next = PANEL_MODES.length - 1;
+  else return;
+  event.preventDefault();
+  setPanelMode(PANEL_MODES[next], true);
+});
+
 // ---- Coding agent mode (reads/edits files + runs commands in a workspace) ----
 function shortAgentArgs(input) {
   if (!input || typeof input !== "object") return "";
@@ -3237,6 +3290,8 @@ function removeProjectFact(id) {
   return saveProjectMemory(facts);
 }
 
+const agentSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function runAgent(userText) {
   if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
     return "The local GreyIQ service is not running.";
@@ -3246,46 +3301,114 @@ async function runAgent(userText) {
     .slice(-12)
     .map((message) => ({ role: message.role === "bot" ? "assistant" : "user", content: message.text }))
     .filter((message) => message.content);
+
+  // Prefer the streamed run so the Workbench shows tool-by-tool progress live;
+  // fall back to the one-shot endpoint if streaming isn't available (older backend).
+  let started = null;
+  try {
+    started = await apiFetch("/api/agent/stream", {
+      method: "POST",
+      timeoutMs: 20000,
+      body: JSON.stringify({ message: userText, workspace: state.agentWorkspace, history })
+    });
+  } catch (_) {
+    started = null;
+  }
+  if (!started || started.ok === false || !started.request_id) {
+    return runAgentSync(userText, history);
+  }
+
+  // Reset the live view and surface the Agent Steps tab while the run streams in.
+  state.lastAgentTranscript = [];
+  state.lastAgentPlan = [];
+  state.workbenchTab = "steps";
+  renderWorkbench();
+
+  const requestId = started.request_id;
+  let cursor = 0;
+  let failures = 0;
+  const deadline = Date.now() + 600000; // 10-minute ceiling
+  while (Date.now() < deadline) {
+    let ev;
+    try {
+      ev = await apiFetch("/api/agent/events", {
+        method: "POST",
+        timeoutMs: 30000,
+        body: JSON.stringify({ request_id: requestId, cursor })
+      });
+      failures = 0;
+    } catch (error) {
+      // The run continues server-side; tolerate a few transient poll failures.
+      if (++failures > 5) return `Agent failed: ${error.message || error}`;
+      await agentSleep(800);
+      continue;
+    }
+    if (ev.ok === false) {
+      return ev.error ? `Agent failed: ${ev.error}` : "The agent run was lost.";
+    }
+    cursor = typeof ev.cursor === "number" ? ev.cursor : cursor;
+    let changed = false;
+    for (const event of ev.events || []) {
+      if (event.type === "plan") {
+        state.lastAgentPlan = Array.isArray(event.plan) ? event.plan : [];
+      } else if (event.type === "step" && event.entry) {
+        state.lastAgentTranscript.push(event.entry);
+      }
+      changed = true;
+    }
+    if (changed) renderWorkbench();
+    if (ev.done) return applyAgentResult(ev.result || {});
+    await agentSleep(600);
+  }
+  return "The agent run timed out.";
+}
+
+async function runAgentSync(userText, history) {
   try {
     const res = await apiFetch("/api/agent", {
       method: "POST",
       timeoutMs: 600000,
       body: JSON.stringify({ message: userText, workspace: state.agentWorkspace, history })
     });
-    // Feed the Workbench from the structured transcript + change set.
-    state.lastAgentTranscript = Array.isArray(res.transcript) ? res.transcript : [];
-    state.lastAgentChanges = Array.isArray(res.changes) ? res.changes : [];
-    state.lastAgentPlan = Array.isArray(res.plan) ? res.plan : [];
-    state.lastAgentExplain = res.message || "";
-    state.lastAgentFlaggedReads = Array.isArray(res.flagged_reads) ? res.flagged_reads : [];
-    state.agentSnapshot = {
-      available: Boolean(res.snapshot_available),
-      count: Number(res.snapshot_count || 0)
-    };
-    // Surface the guided Plan → Change → Verify → Explain view after a run.
-    state.workbenchTab = "workflow";
-    if (state.lastAgentChanges.length) {
-      void refreshWorkspaceTree();
-    }
-    renderWorkbench();
-
-    if (res.ok === false) {
-      return res.message || "The agent could not run.";
-    }
-    let text = res.message || "(done)";
-    if (state.lastAgentTranscript.length) {
-      const steps = state.lastAgentTranscript
-        .map((t) => `${t.is_error ? "⚠ " : ""}${t.tool}(${shortAgentArgs(t.input)})`)
-        .join("  ·  ");
-      text += `\n\n— ${res.model_name || "agent"} ran ${state.lastAgentTranscript.length} step(s): ${steps}`;
-    }
-    if (state.lastAgentChanges.length) {
-      text += `\n\nChanged ${state.lastAgentChanges.length} file(s) — open the Changes tab in the Workbench to review.`;
-    }
-    return text;
+    return applyAgentResult(res);
   } catch (error) {
     return `Agent failed: ${error.message || error}`;
   }
+}
+
+// Apply a finished agent result to the Workbench and return the chat summary.
+// Shared by the streamed and one-shot paths so a run ends identically either way.
+function applyAgentResult(res) {
+  state.lastAgentTranscript = Array.isArray(res.transcript) ? res.transcript : state.lastAgentTranscript;
+  state.lastAgentChanges = Array.isArray(res.changes) ? res.changes : [];
+  state.lastAgentPlan = Array.isArray(res.plan) ? res.plan : state.lastAgentPlan;
+  state.lastAgentExplain = res.message || "";
+  state.lastAgentFlaggedReads = Array.isArray(res.flagged_reads) ? res.flagged_reads : [];
+  state.agentSnapshot = {
+    available: Boolean(res.snapshot_available),
+    count: Number(res.snapshot_count || 0)
+  };
+  // Surface the guided Plan → Change → Verify → Explain view after a run.
+  state.workbenchTab = "workflow";
+  if (state.lastAgentChanges.length) {
+    void refreshWorkspaceTree();
+  }
+  renderWorkbench();
+
+  if (res.ok === false) {
+    return res.message || "The agent could not run.";
+  }
+  let text = res.message || "(done)";
+  if (state.lastAgentTranscript.length) {
+    const steps = state.lastAgentTranscript
+      .map((t) => `${t.is_error ? "⚠ " : ""}${t.tool}(${shortAgentArgs(t.input)})`)
+      .join("  ·  ");
+    text += `\n\n— ${res.model_name || "agent"} ran ${state.lastAgentTranscript.length} step(s): ${steps}`;
+  }
+  if (state.lastAgentChanges.length) {
+    text += `\n\nChanged ${state.lastAgentChanges.length} file(s) — open the Changes tab in the Workbench to review.`;
+  }
+  return text;
 }
 
 document.querySelectorAll("[data-workbench-tab]").forEach((btn) => {
@@ -3910,6 +4033,7 @@ async function boot() {
   void loadToolkit();
   void renderGpuAccel();
   render();
+  setPanelMode(state.panelMode || "brain");
   renderTemplateBar();
   renderWorkbench();
   if (state.agentMode && state.agentWorkspace) {

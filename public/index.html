@@ -25,37 +25,43 @@
 
         <section class="bot-list" id="botList" aria-label="Bots"></section>
 
-        <form class="bot-editor" id="botEditor">
-          <label>
-            <span>Name</span>
-            <input id="botName" name="name" maxlength="28" autocomplete="off">
-          </label>
-
-          <label>
-            <span>Persona</span>
-            <textarea id="botPersona" name="persona" rows="6"></textarea>
-          </label>
-
-          <div class="field-grid">
+        <details class="bot-editor-fold" id="botEditorFold">
+          <summary>
+            <span>Persona &amp; style</span>
+            <svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg>
+          </summary>
+          <form class="bot-editor" id="botEditor">
             <label>
-              <span>Style</span>
-              <select id="botStyle" name="style">
-                <option value="direct">Direct</option>
-                <option value="warm">Warm</option>
-                <option value="technical">Technical</option>
-                <option value="creative">Creative</option>
-              </select>
+              <span>Name</span>
+              <input id="botName" name="name" maxlength="28" autocomplete="off">
             </label>
 
             <label>
-              <span>Variation</span>
-              <input id="botTemperature" name="temperature" type="range" min="0" max="100" step="1">
+              <span>Persona</span>
+              <textarea id="botPersona" name="persona" rows="6"></textarea>
             </label>
-          </div>
 
-          <div class="swatch-row" id="swatchRow" aria-label="Bot color"></div>
-          <button class="text-button danger" type="button" id="deleteBotButton">Delete this bot</button>
-        </form>
+            <div class="field-grid">
+              <label>
+                <span>Style</span>
+                <select id="botStyle" name="style">
+                  <option value="direct">Direct</option>
+                  <option value="warm">Warm</option>
+                  <option value="technical">Technical</option>
+                  <option value="creative">Creative</option>
+                </select>
+              </label>
+
+              <label>
+                <span>Variation</span>
+                <input id="botTemperature" name="temperature" type="range" min="0" max="100" step="1">
+              </label>
+            </div>
+
+            <div class="swatch-row" id="swatchRow" aria-label="Bot color"></div>
+            <button class="text-button danger" type="button" id="deleteBotButton">Delete this bot</button>
+          </form>
+        </details>
       </aside>
 
       <section class="chat-panel" aria-label="Chat">
@@ -103,199 +109,232 @@
         </form>
       </section>
 
-      <aside class="training-panel" aria-label="Training">
+      <aside class="training-panel" aria-label="Brain, training and security tools">
         <header class="panel-header">
           <div>
-            <p class="eyebrow">Training</p>
-            <h2>Training Data</h2>
+            <p class="eyebrow" id="panelModeEyebrow">Setup</p>
+            <h2 id="panelModeTitle">Coding Brain</h2>
           </div>
-          <button class="icon-button" id="trainButton" type="button" title="Train" aria-label="Train">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 3v18"></path>
-              <path d="M5 8h14"></path>
-              <path d="M7 14h10"></path>
-              <path d="M9 20h6"></path>
-            </svg>
-          </button>
         </header>
 
-        <form class="choice-form brain-form" id="brainForm">
-          <label>
-            <span>Coding brain</span>
-            <select id="brainProvider" name="brainProvider">
-              <option value="off">Off — local TinyGPT only</option>
-              <option value="local">Local model (Ollama)</option>
-              <option value="anthropic">Claude API</option>
-              <option value="openai">OpenAI / ChatGPT</option>
-            </select>
-          </label>
-          <label data-brain-field="model">
-            <span>Model</span>
-            <input id="brainModel" name="brainModel" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. qwen2.5-coder:14b">
-          </label>
-          <label data-brain-field="base_url">
-            <span>Server URL</span>
-            <input id="brainBaseUrl" name="brainBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:11434/v1">
-          </label>
-          <label data-brain-field="api_key">
-            <span>API key</span>
-            <input id="brainApiKey" name="brainApiKey" type="password" autocomplete="off" placeholder="paste API key">
-          </label>
-          <div class="folder-actions" id="brainModelRow" hidden>
-            <span class="folder-status" id="brainModelStatus">checking model…</span>
-            <button class="text-button" type="button" id="brainDownload">Download model</button>
-          </div>
-          <div class="model-list" id="brainModelList" hidden></div>
-          <div class="folder-actions">
-            <button class="text-button" type="button" id="brainTest">Test</button>
-            <button class="text-button" type="submit" id="brainSave">Save brain</button>
-          </div>
-          <p class="folder-status" id="brainStatus" aria-live="polite"></p>
-          <p class="folder-status" id="brainAccel"></p>
-        </form>
+        <div class="panel-modes" role="tablist" aria-label="Tool mode">
+          <button type="button" role="tab" id="pmode-brain" class="panel-mode-btn is-active" data-panel-mode="brain" aria-selected="true" aria-controls="panelBrain">Brain</button>
+          <button type="button" role="tab" id="pmode-train" class="panel-mode-btn" data-panel-mode="train" aria-selected="false" tabindex="-1" aria-controls="panelTrain">Train</button>
+          <button type="button" role="tab" id="pmode-security" class="panel-mode-btn" data-panel-mode="security" aria-selected="false" tabindex="-1" aria-controls="panelSecurity">Security</button>
+        </div>
 
-        <form class="choice-form bounty-form" id="bountyForm">
-          <div class="source-heading">Bug bounty hunt</div>
-          <label>
-            <span>Bounty type</span>
-            <select id="bountyProfile" name="bountyProfile"></select>
-          </label>
-          <p class="folder-status" id="bountyProfileHint"></p>
-          <label>
-            <span>Focus class (optional)</span>
-            <select id="bountyClass" name="bountyClass">
-              <option value="">Any class found</option>
-            </select>
-          </label>
-          <label>
-            <span>Target (URL or folder/repo)</span>
-            <input id="bountyTarget" name="bountyTarget" type="text" autocomplete="off" spellcheck="false" placeholder="https://example.com  or  C:\path\to\repo">
-          </label>
-          <label>
-            <span>Scope / program notes</span>
-            <input id="bountyScope" name="bountyScope" type="text" autocomplete="off" placeholder="e.g. HackerOne acme — *.example.com in scope">
-          </label>
-          <label>
-            <span>Report output folder</span>
-            <input id="bountyOutput" name="bountyOutput" type="text" autocomplete="off" spellcheck="false" placeholder="default: app reports folder">
-          </label>
-          <div class="folder-actions">
-            <button class="text-button" type="button" id="bountyOutputBrowse" hidden>Choose folder…</button>
-          </div>
-          <label class="bounty-auth" for="bountyPerFinding">
-            <input id="bountyPerFinding" type="checkbox">
-            <span>Also write one file per finding (for submission).</span>
-          </label>
-          <label class="bounty-auth" for="bountyAuthorized">
-            <input id="bountyAuthorized" type="checkbox">
-            <span>I'm authorized to test this target (in scope).</span>
-          </label>
-          <button class="text-button" type="submit" id="bountyRun">Run hunt &amp; write report</button>
-          <p class="folder-status" id="bountyStatus" aria-live="polite"></p>
-          <div class="folder-actions bounty-report-actions" id="bountyReportActions" hidden>
-            <button class="text-button" type="button" id="bountyCopyReport">Copy report</button>
-          </div>
-          <pre class="bounty-report" id="bountyReport" hidden></pre>
-        </form>
+        <!-- BRAIN: the model that powers coding + agent work -->
+        <div class="panel-mode" id="panelBrain" data-mode="brain" role="tabpanel" aria-labelledby="pmode-brain" tabindex="0">
+          <p class="mode-intro">Choose the model that powers coding and agent work. Local Ollama runs offline and private; Claude is closest to Claude Code.</p>
+          <form class="choice-form brain-form" id="brainForm">
+            <label>
+              <span>Coding brain</span>
+              <select id="brainProvider" name="brainProvider">
+                <option value="off">Off — local TinyGPT only</option>
+                <option value="local">Local model (Ollama)</option>
+                <option value="anthropic">Claude API</option>
+                <option value="openai">OpenAI / ChatGPT</option>
+              </select>
+            </label>
+            <label data-brain-field="model">
+              <span>Model</span>
+              <input id="brainModel" name="brainModel" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. qwen2.5-coder:14b">
+            </label>
+            <label data-brain-field="base_url">
+              <span>Server URL</span>
+              <input id="brainBaseUrl" name="brainBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:11434/v1">
+            </label>
+            <label data-brain-field="api_key">
+              <span>API key</span>
+              <input id="brainApiKey" name="brainApiKey" type="password" autocomplete="off" placeholder="paste API key">
+            </label>
+            <div class="folder-actions" id="brainModelRow" hidden>
+              <span class="folder-status" id="brainModelStatus">checking model…</span>
+              <button class="text-button" type="button" id="brainDownload">Download model</button>
+            </div>
+            <div class="model-list" id="brainModelList" hidden></div>
+            <div class="folder-actions">
+              <button class="text-button" type="button" id="brainTest">Test</button>
+              <button class="text-button" type="submit" id="brainSave">Save brain</button>
+            </div>
+            <p class="folder-status" id="brainStatus" aria-live="polite"></p>
+            <p class="folder-status" id="brainAccel"></p>
+          </form>
+        </div>
 
-        <form class="choice-form redteam-form" id="redteamForm">
-          <div class="source-heading">Agent security test</div>
-          <p class="folder-status">Red-team GreyIQ's own coding agent — sandbox isolation, tool policy, and prompt injection. Runs in a throwaway sandbox; your files aren't touched.</p>
-          <label class="bounty-auth" for="redteamBehavioral">
-            <input id="redteamBehavioral" type="checkbox">
-            <span>Include behavioral probes (uses your coding brain).</span>
-          </label>
-          <label class="bounty-auth" for="redteamAuthorized">
-            <input id="redteamAuthorized" type="checkbox">
-            <span>Yes, red-team my GreyIQ agent.</span>
-          </label>
-          <button class="text-button" type="submit" id="redteamRun">Run security test</button>
-          <p class="folder-status" id="redteamStatus" aria-live="polite"></p>
-          <div class="folder-actions bounty-report-actions" id="redteamReportActions" hidden>
-            <button class="text-button" type="button" id="redteamCopyReport">Copy report</button>
-          </div>
-          <pre class="bounty-report" id="redteamReport" hidden></pre>
-        </form>
+        <!-- TRAIN: teach the local TinyGPT fallback -->
+        <div class="panel-mode" id="panelTrain" data-mode="train" role="tabpanel" aria-labelledby="pmode-train" tabindex="0" hidden>
+          <p class="mode-intro">Feed the offline local model. Pick which sources it learns from, then train.</p>
 
-        <form class="choice-form toolkit-form" id="toolkitForm">
-          <div class="source-heading">Pentest &amp; OSINT toolkit</div>
-          <p class="folder-status">Curated pentest + OSINT tools mapped to bug classes — pick a class or category to see what to reach for. Reference index from <a href="https://github.com/enaqx/awesome-pentest" target="_blank" rel="noopener noreferrer">awesome-pentest</a> (CC-BY 4.0) and <a href="https://github.com/jivoi/awesome-osint" target="_blank" rel="noopener noreferrer">awesome-osint</a> (MIT).</p>
-          <label>
-            <span>Category</span>
-            <select id="toolkitCategory" name="toolkitCategory"></select>
-          </label>
-          <label>
-            <span>Bug class</span>
-            <select id="toolkitClass" name="toolkitClass"></select>
-          </label>
-          <label>
-            <span>Search</span>
-            <input id="toolkitSearch" name="toolkitSearch" type="search" autocomplete="off" spellcheck="false" placeholder="nmap, burp, xss…">
-          </label>
-          <p class="folder-status" id="toolkitStatus" aria-live="polite"></p>
-          <div class="toolkit-list" id="toolkitList"></div>
-        </form>
+          <section class="meter-wrap" aria-label="Training stats">
+            <div class="meter-row">
+              <span>Data</span>
+              <strong id="trainingDataCount">0</strong>
+            </div>
+            <div class="meter-row">
+              <span>Choices</span>
+              <strong id="choiceCount">0</strong>
+            </div>
+            <div class="meter-row">
+              <span>Model</span>
+              <strong id="modelState">Fresh</strong>
+            </div>
+          </section>
 
-        <form class="choice-form" id="choiceForm">
-          <label>
-            <span>Preference</span>
-            <textarea id="choiceInput" rows="4" placeholder="I prefer short answers with concrete next steps."></textarea>
-          </label>
-          <button class="text-button" type="submit">Add preference</button>
-        </form>
+          <button class="text-button primary-action" id="trainButton" type="button">Train the local model</button>
 
-        <form class="choice-form" id="trainingDataForm">
-          <label>
-            <span>Source</span>
-            <select id="trainingDataSource" name="trainingDataSource"></select>
-          </label>
-          <label>
-            <span>Training data</span>
-            <textarea id="trainingDataInput" rows="5" placeholder="Paste notes, examples, facts, preferred answers, or source text."></textarea>
-          </label>
-          <button class="text-button" type="submit">Add training data</button>
-        </form>
+          <div class="source-heading">Train on</div>
+          <section class="source-picker" id="trainingSourceList" aria-label="Training sources"></section>
 
-        <form class="choice-form" id="repoIngestForm">
-          <label>
-            <span>Repositories</span>
-            <textarea id="repoSourcesInput" rows="4" placeholder="C:\path\to\repo&#10;https://github.com/org/repo.git"></textarea>
-          </label>
-          <button class="text-button" id="repoIngestButton" type="submit">Ingest repositories</button>
-          <p class="inline-status" id="repoIngestStatus"></p>
-        </form>
+          <details class="mode-fold">
+            <summary><span>Add a preference</span><svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></summary>
+            <form class="choice-form" id="choiceForm">
+              <label>
+                <span>Preference</span>
+                <textarea id="choiceInput" rows="4" placeholder="I prefer short answers with concrete next steps."></textarea>
+              </label>
+              <button class="text-button" type="submit">Add preference</button>
+            </form>
+          </details>
 
-        <form class="choice-form" id="trainingFolderForm">
-          <label>
-            <span>Add a local folder</span>
-            <input id="trainingFolderInput" name="trainingFolder" type="text" autocomplete="off" spellcheck="false" placeholder="Choose a folder, or paste its path">
-          </label>
-          <div class="folder-actions">
-            <button class="text-button" type="button" id="trainingFolderBrowse" hidden>Choose folder…</button>
-            <button class="text-button" type="submit" id="trainingFolderSubmit">Add folder</button>
-          </div>
-          <p class="folder-status" id="trainingFolderStatus" aria-live="polite"></p>
-        </form>
+          <details class="mode-fold">
+            <summary><span>Add training data</span><svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></summary>
+            <form class="choice-form" id="trainingDataForm">
+              <label>
+                <span>Source</span>
+                <select id="trainingDataSource" name="trainingDataSource"></select>
+              </label>
+              <label>
+                <span>Training data</span>
+                <textarea id="trainingDataInput" rows="5" placeholder="Paste notes, examples, facts, preferred answers, or source text."></textarea>
+              </label>
+              <button class="text-button" type="submit">Add training data</button>
+            </form>
+          </details>
 
-        <div class="source-heading">Train on</div>
-        <section class="source-picker" id="trainingSourceList" aria-label="Training sources"></section>
+          <details class="mode-fold">
+            <summary><span>Ingest repositories</span><svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></summary>
+            <form class="choice-form" id="repoIngestForm">
+              <label>
+                <span>Repositories</span>
+                <textarea id="repoSourcesInput" rows="4" placeholder="C:\path\to\repo&#10;https://github.com/org/repo.git"></textarea>
+              </label>
+              <button class="text-button" id="repoIngestButton" type="submit">Ingest repositories</button>
+              <p class="inline-status" id="repoIngestStatus"></p>
+            </form>
+          </details>
 
-        <section class="meter-wrap" aria-label="Training stats">
-          <div class="meter-row">
-            <span>Data</span>
-            <strong id="trainingDataCount">0</strong>
-          </div>
-          <div class="meter-row">
-            <span>Choices</span>
-            <strong id="choiceCount">0</strong>
-          </div>
-          <div class="meter-row">
-            <span>Model</span>
-            <strong id="modelState">Fresh</strong>
-          </div>
-        </section>
+          <details class="mode-fold">
+            <summary><span>Add a local folder</span><svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></summary>
+            <form class="choice-form" id="trainingFolderForm">
+              <label>
+                <span>Folder</span>
+                <input id="trainingFolderInput" name="trainingFolder" type="text" autocomplete="off" spellcheck="false" placeholder="Choose a folder, or paste its path">
+              </label>
+              <div class="folder-actions">
+                <button class="text-button" type="button" id="trainingFolderBrowse" hidden>Choose folder…</button>
+                <button class="text-button" type="submit" id="trainingFolderSubmit">Add folder</button>
+              </div>
+              <p class="folder-status" id="trainingFolderStatus" aria-live="polite"></p>
+            </form>
+          </details>
 
-        <section class="memory-list" id="memoryList" aria-label="Training memory"></section>
+          <div class="source-heading">Recent memory</div>
+          <section class="memory-list" id="memoryList" aria-label="Training memory"></section>
+        </div>
+
+        <!-- SECURITY: bug bounty, agent red-team, pentest toolkit -->
+        <div class="panel-mode" id="panelSecurity" data-mode="security" role="tabpanel" aria-labelledby="pmode-security" tabindex="0" hidden>
+          <p class="mode-intro">Find bugs in authorized targets, red-team GreyIQ's own agent, and look up the right tool for a bug class.</p>
+
+          <details class="mode-fold" open>
+            <summary><span>Bug bounty hunt</span><svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></summary>
+            <form class="choice-form bounty-form" id="bountyForm">
+              <label>
+                <span>Bounty type</span>
+                <select id="bountyProfile" name="bountyProfile"></select>
+              </label>
+              <p class="folder-status" id="bountyProfileHint"></p>
+              <label>
+                <span>Focus class (optional)</span>
+                <select id="bountyClass" name="bountyClass">
+                  <option value="">Any class found</option>
+                </select>
+              </label>
+              <label>
+                <span>Target (URL or folder/repo)</span>
+                <input id="bountyTarget" name="bountyTarget" type="text" autocomplete="off" spellcheck="false" placeholder="https://example.com  or  C:\path\to\repo">
+              </label>
+              <label>
+                <span>Scope / program notes</span>
+                <input id="bountyScope" name="bountyScope" type="text" autocomplete="off" placeholder="e.g. HackerOne acme — *.example.com in scope">
+              </label>
+              <label>
+                <span>Report output folder</span>
+                <input id="bountyOutput" name="bountyOutput" type="text" autocomplete="off" spellcheck="false" placeholder="default: app reports folder">
+              </label>
+              <div class="folder-actions">
+                <button class="text-button" type="button" id="bountyOutputBrowse" hidden>Choose folder…</button>
+              </div>
+              <label class="bounty-auth" for="bountyPerFinding">
+                <input id="bountyPerFinding" type="checkbox">
+                <span>Also write one file per finding (for submission).</span>
+              </label>
+              <label class="bounty-auth" for="bountyAuthorized">
+                <input id="bountyAuthorized" type="checkbox">
+                <span>I'm authorized to test this target (in scope).</span>
+              </label>
+              <button class="text-button" type="submit" id="bountyRun">Run hunt &amp; write report</button>
+              <p class="folder-status" id="bountyStatus" aria-live="polite"></p>
+              <div class="folder-actions bounty-report-actions" id="bountyReportActions" hidden>
+                <button class="text-button" type="button" id="bountyCopyReport">Copy report</button>
+              </div>
+              <pre class="bounty-report" id="bountyReport" hidden></pre>
+            </form>
+          </details>
+
+          <details class="mode-fold">
+            <summary><span>Agent security test</span><svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></summary>
+            <form class="choice-form redteam-form" id="redteamForm">
+              <p class="folder-status">Red-team GreyIQ's own coding agent — sandbox isolation, tool policy, and prompt injection. Runs in a throwaway sandbox; your files aren't touched.</p>
+              <label class="bounty-auth" for="redteamBehavioral">
+                <input id="redteamBehavioral" type="checkbox">
+                <span>Include behavioral probes (uses your coding brain).</span>
+              </label>
+              <label class="bounty-auth" for="redteamAuthorized">
+                <input id="redteamAuthorized" type="checkbox">
+                <span>Yes, red-team my GreyIQ agent.</span>
+              </label>
+              <button class="text-button" type="submit" id="redteamRun">Run security test</button>
+              <p class="folder-status" id="redteamStatus" aria-live="polite"></p>
+              <div class="folder-actions bounty-report-actions" id="redteamReportActions" hidden>
+                <button class="text-button" type="button" id="redteamCopyReport">Copy report</button>
+              </div>
+              <pre class="bounty-report" id="redteamReport" hidden></pre>
+            </form>
+          </details>
+
+          <details class="mode-fold">
+            <summary><span>Pentest &amp; OSINT toolkit</span><svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></summary>
+            <form class="choice-form toolkit-form" id="toolkitForm">
+              <p class="folder-status">Curated pentest + OSINT tools mapped to bug classes — pick a class or category to see what to reach for. Reference index from <a href="https://github.com/enaqx/awesome-pentest" target="_blank" rel="noopener noreferrer">awesome-pentest</a> (CC-BY 4.0) and <a href="https://github.com/jivoi/awesome-osint" target="_blank" rel="noopener noreferrer">awesome-osint</a> (MIT).</p>
+              <label>
+                <span>Category</span>
+                <select id="toolkitCategory" name="toolkitCategory"></select>
+              </label>
+              <label>
+                <span>Bug class</span>
+                <select id="toolkitClass" name="toolkitClass"></select>
+              </label>
+              <label>
+                <span>Search</span>
+                <input id="toolkitSearch" name="toolkitSearch" type="search" autocomplete="off" spellcheck="false" placeholder="nmap, burp, xss…">
+              </label>
+              <p class="folder-status" id="toolkitStatus" aria-live="polite"></p>
+              <div class="toolkit-list" id="toolkitList"></div>
+            </form>
+          </details>
+        </div>
       </aside>
 
       <div class="workbench-divider" id="workbenchDivider" role="separator" aria-orientation="horizontal" aria-label="Resize workbench — drag, or focus and use the arrow keys" tabindex="0"></div>
