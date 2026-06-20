@@ -498,7 +498,20 @@ def _openai_tools() -> list[dict[str, Any]]:
     ]
 
 
-def _auto_verify(toolbox: "ToolBox", transcript: list[dict[str, Any]], auto_verifies: int) -> str | None:
+def _emit(on_event: Any, event: dict[str, Any]) -> None:
+    """Deliver a progress event to an optional callback. Best-effort: a delivery
+    error (e.g. the consumer went away) must never disrupt the agent run."""
+    if on_event is None:
+        return
+    try:
+        on_event(event)
+    except Exception:  # noqa: BLE001 - event delivery is non-critical
+        pass
+
+
+def _auto_verify(
+    toolbox: "ToolBox", transcript: list[dict[str, Any]], auto_verifies: int, on_event: Any = None
+) -> str | None:
     """When the model tries to finish with touched-but-unverified files, run verify
     once. Returns continuation feedback if verification failed (so the loop keeps
     going to fix it), or None to allow the run to finish."""
@@ -506,6 +519,7 @@ def _auto_verify(toolbox: "ToolBox", transcript: list[dict[str, Any]], auto_veri
         return None
     output, is_error = toolbox.run("verify", {})
     transcript.append({"tool": "verify", "input": {}, "output": output, "is_error": is_error})
+    _emit(on_event, {"type": "step", "entry": transcript[-1]})
     if is_error:
         return f"Automated check before finishing:\n{output}\nFix these issues, then continue."
     return None
@@ -568,8 +582,14 @@ def run_agent(
     coder_cfg: dict[str, Any],
     runtime_dir: str | Path | None = None,
     seed_dir: str | Path | None = None,
+    on_event: Any = None,
 ) -> dict[str, Any]:
-    """Run the agent loop. Returns {text, transcript, steps, model, provider}."""
+    """Run the agent loop. Returns {text, transcript, steps, model, provider}.
+
+    `on_event`, if given, is called with progress events as they happen
+    ({"type": "plan", ...} once, then {"type": "step", "entry": <transcript row>}
+    per tool call) so a caller can stream the run to the UI. It is best-effort and
+    never affects the result."""
     root = Path(str(workspace or "")).expanduser()
     if not str(workspace or "").strip():
         raise AgentError("Pick a workspace folder for the agent to work in.")
@@ -638,12 +658,13 @@ def run_agent(
         system_prompt += "\n\nYOUR PLAN (follow these steps, adapting as you learn):\n" + "\n".join(
             f"{i}. {step}" for i, step in enumerate(plan, 1)
         )
+        _emit(on_event, {"type": "plan", "plan": plan})
 
     if provider == "anthropic":
-        result = _run_anthropic(messages, system_prompt, cfg, settings, toolbox)
+        result = _run_anthropic(messages, system_prompt, cfg, settings, toolbox, on_event)
     elif provider in ("local", "openai"):
         block = cfg["local"] if provider == "local" else cfg["openai"]
-        result = _run_tool_loop(messages, system_prompt, cfg, block, settings, toolbox, provider)
+        result = _run_tool_loop(messages, system_prompt, cfg, block, settings, toolbox, provider, on_event)
     else:
         raise AgentError(
             "No coding brain is configured. Set up a brain (Local model or Claude) first — the agent needs one to think."
@@ -712,6 +733,7 @@ def _run_anthropic(
     cfg: dict[str, Any],
     settings: dict[str, Any],
     toolbox: ToolBox,
+    on_event: Any = None,
 ) -> dict[str, Any]:
     block = cfg["anthropic"]
     api_key = str(block.get("api_key") or "").strip()
@@ -722,29 +744,55 @@ def _run_anthropic(
     except ImportError as exc:
         raise AgentError("The 'anthropic' package is not installed in this backend.") from exc
 
-    client = anthropic.Anthropic(api_key=api_key, timeout=float(cfg.get("timeout_s") or 120.0))
+    # max_retries lets the SDK back off and retry transient 429/5xx/connection
+    # errors itself — one blip mid-run no longer kills the whole agent loop.
+    client = anthropic.Anthropic(
+        api_key=api_key, timeout=float(cfg.get("timeout_s") or 120.0), max_retries=coder._MAX_RETRIES
+    )
     model = str(block.get("model") or coder.DEFAULT_ANTHROPIC_MODEL)
     tools = _anthropic_tools()
     transcript: list[dict[str, Any]] = []
     max_steps = int(settings["max_steps"])
     auto_verifies = 0
 
+    # Prompt caching: the system prompt (workspace + repo map + skills + project
+    # memory) and tool defs form a large, stable prefix that is re-sent on every
+    # step. Marking the system block as an ephemeral cache breakpoint caches that
+    # whole prefix (tools precede system in the cache order), so each step after
+    # the first only pays to process the growing message tail — a big latency and
+    # cost win on multi-step runs. A model that rejects cache_control falls back
+    # to a plain string system prompt for the rest of the run.
+    system_param: Any = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
+
+    def _create() -> Any:
+        return client.messages.create(
+            model=model,
+            max_tokens=int(cfg.get("max_tokens") or 8192),
+            system=system_param,
+            messages=messages,
+            tools=tools,
+        )
+
     for _ in range(max_steps):
         try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=int(cfg.get("max_tokens") or 8192),
-                system=system_prompt,
-                messages=messages,
-                tools=tools,
-            )
+            response = _create()
+        except anthropic.BadRequestError as exc:
+            detail = str(getattr(exc, "message", exc)).lower()
+            if isinstance(system_param, list) and "cache" in detail:
+                system_param = system_prompt  # disable caching, retry once
+                try:
+                    response = _create()
+                except Exception as retry_exc:  # noqa: BLE001
+                    raise AgentError(f"Claude request failed: {retry_exc}") from retry_exc
+            else:
+                raise AgentError(f"Claude rejected the request: {getattr(exc, 'message', exc)}") from exc
         except Exception as exc:  # noqa: BLE001
             raise AgentError(f"Claude request failed: {exc}") from exc
 
         text = "".join(b.text for b in response.content if getattr(b, "type", "") == "text").strip()
         tool_uses = [b for b in response.content if getattr(b, "type", "") == "tool_use"]
         if response.stop_reason != "tool_use" or not tool_uses:
-            feedback = _auto_verify(toolbox, transcript, auto_verifies)
+            feedback = _auto_verify(toolbox, transcript, auto_verifies, on_event)
             if feedback is not None:
                 auto_verifies += 1
                 messages.append({"role": "assistant", "content": response.content})
@@ -763,6 +811,7 @@ def _run_anthropic(
         for use in tool_uses:
             output, is_error = toolbox.run(use.name, dict(use.input or {}))
             transcript.append({"tool": use.name, "input": dict(use.input or {}), "output": output, "is_error": is_error})
+            _emit(on_event, {"type": "step", "entry": transcript[-1]})
             results.append(
                 {"type": "tool_result", "tool_use_id": use.id, "content": output, "is_error": is_error}
             )
@@ -785,6 +834,7 @@ def _run_tool_loop(
     settings: dict[str, Any],
     toolbox: ToolBox,
     provider: str,
+    on_event: Any = None,
 ) -> dict[str, Any]:
     """Tool-calling loop for local (Ollama native /api/chat) and OpenAI-compatible
     providers. `local` uses the native endpoint specifically so we can set the
@@ -844,9 +894,13 @@ def _run_tool_loop(
         )
         if api_key:
             request.add_header("Authorization", f"Bearer {api_key}")
-        try:
+
+        def _open() -> bytes:
             with urllib.request.urlopen(request, timeout=timeout) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
+                return resp.read()
+
+        try:
+            body = json.loads(coder.with_retries(_open).decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "ignore")[:400] if hasattr(exc, "read") else ""
             raise AgentError(f"{label} HTTP {exc.code}: {detail or exc.reason}") from exc
@@ -869,7 +923,7 @@ def _run_tool_loop(
                 tool_calls, from_text = recovered, True
 
         if not tool_calls:
-            feedback = _auto_verify(toolbox, transcript, auto_verifies)
+            feedback = _auto_verify(toolbox, transcript, auto_verifies, on_event)
             if feedback is not None:
                 auto_verifies += 1
                 convo.append({"role": "assistant", "content": text})
@@ -891,6 +945,7 @@ def _run_tool_loop(
             for tc in tool_calls:
                 output, is_error = toolbox.run(tc["name"], tc["arguments"])
                 transcript.append({"tool": tc["name"], "input": tc["arguments"], "output": output, "is_error": is_error})
+                _emit(on_event, {"type": "step", "entry": transcript[-1]})
                 blobs.append(f"[{tc['name']}] {output}")
             convo.append({"role": "user", "content": "Tool results:\n" + "\n\n".join(blobs)})
         else:
@@ -898,6 +953,7 @@ def _run_tool_loop(
             for tc in tool_calls:
                 output, is_error = toolbox.run(tc["name"], tc["arguments"])
                 transcript.append({"tool": tc["name"], "input": tc["arguments"], "output": output, "is_error": is_error})
+                _emit(on_event, {"type": "step", "entry": transcript[-1]})
                 tool_msg: dict[str, Any] = {"role": "tool", "content": output}
                 if tc.get("id"):
                     tool_msg["tool_call_id"] = tc["id"]

@@ -17,9 +17,40 @@ Secrets (API keys) live in the runtime config and are never echoed back to the U
 from __future__ import annotations
 
 import json
+import socket
+import time
 import urllib.error
 import urllib.request
 from typing import Any
+
+# Transient HTTP statuses worth retrying: rate limiting and server-side errors.
+# 4xx client errors (auth, bad request) are NOT retried — they won't fix themselves.
+_RETRY_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+_MAX_RETRIES = 3
+_BASE_RETRY_DELAY = 1.0  # seconds; doubles each attempt (1s, 2s, 4s)
+
+
+def with_retries(call, *, max_retries: int = _MAX_RETRIES, sleep=time.sleep):
+    """Call a zero-arg function, retrying transient network failures with bounded
+    exponential backoff. Retries on retryable HTTP statuses (429/5xx/…) and read
+    timeouts; everything else (auth errors, connection-refused, bad request)
+    propagates immediately so the caller's specific error message still surfaces."""
+    attempt = 0
+    while True:
+        try:
+            return call()
+        except urllib.error.HTTPError as exc:
+            if exc.code in _RETRY_STATUSES and attempt < max_retries:
+                sleep(_BASE_RETRY_DELAY * (2 ** attempt))
+                attempt += 1
+                continue
+            raise
+        except (TimeoutError, socket.timeout):
+            if attempt < max_retries:
+                sleep(_BASE_RETRY_DELAY * (2 ** attempt))
+                attempt += 1
+                continue
+            raise
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are GreyIQ, a precise and helpful coding assistant. "
@@ -185,9 +216,13 @@ def ollama_chat(
     )
     if api_key:
         request.add_header("Authorization", f"Bearer {api_key}")
-    try:
+
+    def _open() -> bytes:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = json.loads(response.read().decode("utf-8"))
+            return response.read()
+
+    try:
+        body = json.loads(with_retries(_open).decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "ignore") if hasattr(exc, "read") else ""
         low = (detail or "").lower()
@@ -348,7 +383,9 @@ def _generate_anthropic(
     except ImportError as exc:
         raise CoderError("The 'anthropic' package is not installed in this backend.") from exc
 
-    client = anthropic.Anthropic(api_key=api_key, timeout=timeout)
+    # max_retries lets the SDK back off and retry transient 429/5xx/connection
+    # errors itself, so a single blip doesn't kill the request.
+    client = anthropic.Anthropic(api_key=api_key, timeout=timeout, max_retries=_MAX_RETRIES)
     base_kwargs: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
@@ -427,9 +464,12 @@ def _generate_openai_compatible(
     if api_key:
         request.add_header("Authorization", f"Bearer {api_key}")
 
-    try:
+    def _open() -> bytes:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = json.loads(response.read().decode("utf-8"))
+            return response.read()
+
+    try:
+        body = json.loads(with_retries(_open).decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "ignore")[:400] if hasattr(exc, "read") else ""
         raise CoderError(f"{label} HTTP {exc.code}: {detail or exc.reason}") from exc

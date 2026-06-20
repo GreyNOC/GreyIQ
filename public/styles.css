@@ -2127,3 +2127,137 @@ body.is-resizing {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---- Right-panel mode menu (Brain / Train / Security) ----
+   One surface at a time: a segmented menu swaps between three slices of what used
+   to be one long scroll, so the panel only ever shows what the chosen mode needs. */
+.panel-modes {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.25rem;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-2);
+}
+
+.panel-mode-btn {
+  flex: 1;
+  padding: 0.55rem 0.4rem;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.panel-mode-btn:hover {
+  color: var(--ink);
+}
+
+.panel-mode-btn.is-active {
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+}
+
+body[data-theme="dark"] .panel-mode-btn.is-active {
+  background: var(--teal-2);
+}
+
+.panel-mode {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+/* `.panel-mode { display: flex }` outranks the UA `[hidden] { display: none }`,
+   so the hidden modes would still show — restore hiding for inactive modes. */
+.panel-mode[hidden] {
+  display: none;
+}
+
+.mode-intro {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+/* Collapsible secondary controls — keep the surface quiet until the user opens one. */
+.mode-fold,
+.bot-editor-fold {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.mode-fold > summary,
+.bot-editor-fold > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.7rem 0.85rem;
+  color: var(--ink);
+  font-size: 0.82rem;
+  font-weight: 800;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.mode-fold > summary::-webkit-details-marker,
+.bot-editor-fold > summary::-webkit-details-marker {
+  display: none;
+}
+
+.mode-fold > summary:hover,
+.bot-editor-fold > summary:hover {
+  background: var(--surface-2);
+}
+
+.mode-fold > summary:focus-visible,
+.bot-editor-fold > summary:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+.fold-caret {
+  width: 1rem;
+  height: 1rem;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 0.15s ease;
+}
+
+.mode-fold[open] > summary .fold-caret,
+.bot-editor-fold[open] > summary .fold-caret {
+  transform: rotate(90deg);
+}
+
+.mode-fold[open] > summary,
+.bot-editor-fold[open] > summary {
+  border-bottom: 1px solid var(--line);
+}
+
+.mode-fold > form,
+.bot-editor-fold > .bot-editor {
+  padding: 0.85rem;
+}
+
+/* Train mode's add-forms are genuinely secondary — quiet their submit buttons so
+   only the one primary action (Train the local model) reads as the main CTA. */
+#panelTrain .mode-fold .text-button[type="submit"] {
+  background: transparent;
+  color: var(--teal);
+}
+
+#panelTrain .mode-fold .text-button[type="submit"]:hover {
+  background: var(--teal-2);
+}

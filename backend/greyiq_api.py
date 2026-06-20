@@ -321,6 +321,11 @@ class AgentUndoRequest(BaseModel):
     workspace: str = Field(min_length=1, max_length=4000)
 
 
+class AgentEventsRequest(BaseModel):
+    request_id: str = Field(min_length=1, max_length=64)
+    cursor: int = Field(default=0, ge=0)
+
+
 class ProjectMemoryRequest(BaseModel):
     workspace: str = Field(min_length=1, max_length=4000)
 
@@ -498,6 +503,10 @@ class GreyIQRuntime:
             "active": False, "model": "", "status": "", "percent": 0,
             "completed": 0, "total": 0, "done": False, "error": "",
         }
+        # Live agent runs, keyed by request_id: each holds a growing event list the
+        # UI polls (start_agent_run / agent_run_events) so a run streams instead of
+        # blocking on one big response.
+        self.agent_runs: dict[str, dict[str, Any]] = {}
         self.store = AICoreStore(RUNTIME_DIR)
         ensure_runtime()
         self._rewrite_core_defaults()
@@ -762,6 +771,81 @@ class GreyIQRuntime:
                 "snapshot_available": False,
                 "snapshot_count": 0,
             }
+
+    def start_agent_run(self, request: AgentRequest) -> dict[str, Any]:
+        """Kick off an agent run in the background and return its request_id. The
+        UI polls agent_run_events() for live tool-by-tool progress and, when the
+        run finishes, the same result payload /api/agent would have returned."""
+        request_id = uuid4().hex
+        record: dict[str, Any] = {"events": [], "done": False, "result": None}
+        with self.lock:
+            # Bound memory: drop the oldest finished runs once a few have piled up.
+            finished = [rid for rid, rec in self.agent_runs.items() if rec.get("done")]
+            for rid in finished[:-3]:
+                self.agent_runs.pop(rid, None)
+            self.agent_runs[request_id] = record
+
+        def on_event(event: dict[str, Any]) -> None:
+            with self.lock:
+                record["events"].append(event)
+
+        def worker() -> None:
+            try:
+                result = coding_agent.run_agent(
+                    request.message,
+                    request.history,
+                    request.workspace,
+                    self._coder_config(),
+                    runtime_dir=RUNTIME_DIR,
+                    seed_dir=SEED_DIR,
+                    on_event=on_event,
+                )
+                snapshot_meta = self._persist_snapshot(request.workspace, result.get("snapshot") or [])
+                payload = {
+                    "ok": True,
+                    "request_id": request_id,
+                    "message": friendly_branding(result["text"]),
+                    "transcript": result["transcript"],
+                    "steps": result["steps"],
+                    "changes": result.get("changes", []),
+                    "touched_files": result.get("touched_files", []),
+                    "plan": result.get("plan", []),
+                    "flagged_reads": result.get("flagged_reads", []),
+                    "snapshot_available": snapshot_meta["available"],
+                    "snapshot_count": snapshot_meta["count"],
+                    "model_name": f"{result['provider']}:{result['model']}",
+                    "provider": result["provider"],
+                }
+            except coding_agent.AgentError as exc:
+                payload = {"ok": False, "request_id": request_id, "message": str(exc)}
+            except Exception as exc:  # noqa: BLE001 - surfaced to the UI, never crashes the server
+                self.log(f"Agent run failed: {exc}")
+                payload = {"ok": False, "request_id": request_id, "message": f"Agent error: {exc}"}
+            with self.lock:
+                record["result"] = payload
+                record["done"] = True
+
+        threading.Thread(target=worker, name="agent-run", daemon=True).start()
+        return {"ok": True, "request_id": request_id}
+
+    def agent_run_events(self, request_id: str, cursor: int) -> dict[str, Any]:
+        """Return events for a run since `cursor`, plus the final result once done.
+        Polled by the UI; unknown ids report done so a stale poll loop stops."""
+        with self.lock:
+            record = self.agent_runs.get(request_id)
+            if record is None:
+                return {"ok": False, "error": "unknown agent run", "done": True, "events": [], "cursor": cursor}
+            start = max(0, int(cursor or 0))
+            events = record["events"][start:]
+            response: dict[str, Any] = {
+                "ok": True,
+                "events": events,
+                "cursor": start + len(events),
+                "done": bool(record["done"]),
+            }
+            if record["done"]:
+                response["result"] = record["result"]
+            return response
 
     def _persist_snapshot(self, workspace: str, snapshot: list[dict[str, Any]]) -> dict[str, Any]:
         """Save the run's pre-edit snapshot (one per workspace, overwriting the
@@ -1777,6 +1861,17 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/agent":
             request = validate_payload(AgentRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.run_agent, request))
+            return
+        if method == "POST" and path == "/api/agent/stream":
+            request = validate_payload(AgentRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.start_agent_run, request))
+            return
+        if method == "POST" and path == "/api/agent/events":
+            request = validate_payload(AgentEventsRequest, await read_json_body(receive))
+            await send_json(
+                send,
+                await asyncio.to_thread(runtime.agent_run_events, request.request_id, request.cursor),
+            )
             return
         if method == "POST" and path == "/api/agent/snapshot":
             request = validate_payload(AgentUndoRequest, await read_json_body(receive))
