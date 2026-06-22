@@ -25,6 +25,12 @@ untrusted input.
 - **Secrets** (CWE-798) — confirm live, check git history, rotate.
 - **SSRF** (CWE-918) — server-side fetchers taking attacker URLs.
 
+## Extra bounty angles
+- **Supply chain** - package install scripts, unpinned actions, CI secret exposure, unsigned artifact downloads.
+- **File handling** - upload validators, archive extraction, path joins, preview/conversion workers, temp-file reuse.
+- **CSRF** - server routes that mutate state without framework CSRF middleware or SameSite coverage.
+- Tie static findings to reachable routes or deployed build paths; source-only risk is weaker without reachability.
+
 ## Writing the report
 Cite file:line, show the tainted data flow (source → sink), give a PoC input,
 state impact, and recommend the concrete fix (parameterize, sanitize, drop the

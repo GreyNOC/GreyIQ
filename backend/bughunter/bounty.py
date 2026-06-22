@@ -111,6 +111,72 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
             "Confirm with a boolean- or time-based test before any data extraction.",
         ],
     },
+    "csrf": {
+        "name": "Cross-site request forgery (CSRF)",
+        "cwe": "CWE-352",
+        "owasp": "A01:2021 Broken Access Control",
+        "categories": set(),
+        "checklist": [
+            "List state-changing actions (email/password changes, invites, billing, admin updates).",
+            "Confirm whether each request requires an unpredictable anti-CSRF token and a SameSite cookie posture.",
+            "Build a minimal same-site/cross-site form or fetch proof that changes state for the victim account.",
+        ],
+    },
+    "cors": {
+        "name": "CORS / cross-origin trust misconfiguration",
+        "cwe": "CWE-942",
+        "owasp": "A05:2021 Security Misconfiguration",
+        "categories": set(),
+        "checklist": [
+            "Check whether the API reflects arbitrary Origin values or trusts attacker-controlled subdomains.",
+            "If credentials are allowed, prove a browser can read sensitive response data from an untrusted origin.",
+            "Document the exact Origin, response headers, and data class exposed.",
+        ],
+    },
+    "redirect": {
+        "name": "Open redirect / unsafe forwarding",
+        "cwe": "CWE-601",
+        "owasp": "A01:2021 Broken Access Control",
+        "categories": set(),
+        "checklist": [
+            "Find redirect parameters such as next, returnUrl, callback, continue, redirect_uri, or url.",
+            "Confirm whether an absolute external URL is accepted after login, OAuth, password reset, or invite flows.",
+            "Assess chainability with token leakage, phishing, OAuth allow-list bypass, or account takeover paths.",
+        ],
+    },
+    "file-upload": {
+        "name": "Unsafe file upload / file handling",
+        "cwe": "CWE-434",
+        "owasp": "A04:2021 Insecure Design",
+        "categories": set(),
+        "checklist": [
+            "Identify upload, import, avatar, attachment, document-conversion, and archive-extraction flows.",
+            "Test extension/MIME validation, storage location, executable handling, and direct object access.",
+            "For archives, check path traversal and zip-bomb protections without causing resource exhaustion.",
+        ],
+    },
+    "business-logic": {
+        "name": "Business logic / workflow abuse",
+        "cwe": "CWE-840",
+        "owasp": "A04:2021 Insecure Design",
+        "categories": set(),
+        "checklist": [
+            "Model the intended workflow and try skipping, repeating, or reordering each server-side step.",
+            "Test negative quantities, duplicate coupons, race-sensitive actions, quota resets, and role transitions.",
+            "Capture the before/after state that proves unauthorized value, privilege, or data movement.",
+        ],
+    },
+    "supply-chain": {
+        "name": "Supply-chain / dependency risk",
+        "cwe": "CWE-1104 / CWE-1395",
+        "owasp": "A06:2021 Vulnerable & Outdated Components",
+        "categories": {"dependency", "ci"},
+        "checklist": [
+            "Confirm the vulnerable package, workflow, or artifact is reachable in the deployed build path.",
+            "Map exploitability to the program's policy: vulnerable dependency, malicious install script, or CI secret exposure.",
+            "Recommend the smallest upgrade, pin, checksum, or permission reduction that removes the path.",
+        ],
+    },
 }
 
 # Categories that aren't a core bounty class get a readable label so every
@@ -141,10 +207,11 @@ BOUNTY_PROFILES: dict[str, dict[str, Any]] = {
         "description": "Passive scan of a live web page/app: headers, cookies, mixed content, exposed secrets, client-side XSS sinks, disclosure. Optionally a dynamic (Playwright) pass.",
         "kinds": {"url"},
         "scanners": ["web"],
-        "classes": ["xss", "auth", "ssrf", "secrets", "access-control"],
+        "classes": ["xss", "auth", "ssrf", "secrets", "access-control", "csrf", "cors", "redirect", "file-upload", "business-logic"],
         "checklist": [
             "Spider the app for input points (forms, query params, JSON bodies, file uploads).",
             "Review CSP and CORS for gaps that enable XSS or cross-origin data theft.",
+            "Review every state-changing flow for CSRF, IDOR, and workflow bypass potential.",
         ],
     },
     "api": {
@@ -152,11 +219,12 @@ BOUNTY_PROFILES: dict[str, dict[str, Any]] = {
         "description": "Passive review of an HTTP API endpoint: auth headers, disclosure, error leakage, transport hardening. Most API bugs need authenticated manual testing — the checklist guides it.",
         "kinds": {"url"},
         "scanners": ["web"],
-        "classes": ["access-control", "auth", "ssrf", "sqli"],
+        "classes": ["access-control", "auth", "ssrf", "sqli", "cors", "business-logic"],
         "checklist": [
             "Diff responses across roles for the same object id (IDOR / BOLA).",
             "Fuzz content-type and HTTP verbs; check for verb tampering and mass assignment.",
             "Look for missing rate-limits and verbose error bodies.",
+            "Test workflow invariants: idempotency, replay, quota, coupon, and state-machine transitions.",
         ],
     },
     "source-code": {
@@ -164,10 +232,11 @@ BOUNTY_PROFILES: dict[str, dict[str, Any]] = {
         "description": "Static scan of a repo or folder for injection sinks, eval/exec, hardcoded secrets, weak crypto, vulnerable deps, risky CI, and backdoor patterns.",
         "kinds": {"path", "git"},
         "scanners": ["code"],
-        "classes": ["rce", "secrets", "ssrf", "sqli"],
+        "classes": ["rce", "secrets", "ssrf", "sqli", "supply-chain", "file-upload", "csrf"],
         "checklist": [
             "Grep for the framework's raw-query / template-render / deserialization APIs.",
             "Map untrusted input (request, env, file) to each flagged sink to confirm reachability.",
+            "Trace package install hooks, CI permissions, and artifact download paths for build-time compromise.",
         ],
     },
     "secrets": {
@@ -175,7 +244,7 @@ BOUNTY_PROFILES: dict[str, dict[str, Any]] = {
         "description": "Hunt for leaked credentials in source (static) or served pages (passive) — API keys, tokens, private keys.",
         "kinds": {"path", "git", "url"},
         "scanners": ["auto"],
-        "classes": ["secrets"],
+        "classes": ["secrets", "supply-chain"],
         "checklist": [
             "Check JS bundles, source maps, and .env-style files served to the client.",
             "Validate any candidate secret against its service (in scope) before reporting.",
@@ -209,7 +278,13 @@ def list_profiles() -> dict[str, Any]:
     return {
         "ok": True,
         "profiles": [
-            {"id": pid, "name": p["name"], "description": p["description"], "kinds": sorted(p["kinds"])}
+            {
+                "id": pid,
+                "name": p["name"],
+                "description": p["description"],
+                "kinds": sorted(p["kinds"]),
+                "classes": list(p.get("classes", [])),
+            }
             for pid, p in BOUNTY_PROFILES.items()
         ],
         "classes": [{"id": cid, "name": c["name"]} for cid, c in VULN_CLASSES.items()],
@@ -544,6 +619,7 @@ def run_bounty_hunt(
         "other_findings_count": other_findings_count,
         "recommended_tools": recommended_tools,
         "toolkit_source": toolkit_lib.load_catalog(seed_dir, runtime_dir).get("source", {}),
+        "run_live_requested": bool(run_live and kind == "url"),
         "recommendation": "",
     }
 

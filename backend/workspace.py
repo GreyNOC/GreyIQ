@@ -81,10 +81,16 @@ def resolve_inside(root: Path, rel_path: str) -> Path:
     """Resolve ``rel_path`` against ``root`` and guarantee the result stays inside
     the workspace. Raises WorkspaceError on any traversal attempt."""
     base = root.resolve()
-    candidate = (base / str(rel_path or ".")).resolve()
+    normalized = str(rel_path or ".").replace("\\", "/")
+    candidate = (base / normalized).resolve()
     if candidate != base and base not in candidate.parents:
         raise WorkspaceError(f"Path '{rel_path}' is outside the workspace.")
     return candidate
+
+
+def relative_workspace_path(root: Path, rel_path: str) -> str:
+    """Normalize a user/tool path to a POSIX workspace-relative path."""
+    return resolve_inside(root, rel_path).relative_to(root.resolve()).as_posix()
 
 
 def is_text_file(path: Path) -> bool:
@@ -196,6 +202,87 @@ def read_file(root: str, path: str, max_bytes: int = DEFAULT_MAX_BYTES) -> dict[
         "size": size,
         "trust": trust.scan_text(content, source=rel),
     }
+    result["trust"] = trust.assess_text(result["content"], path=rel).as_dict()
     if truncated:
         result["truncated"] = True
     return result
+
+
+def _remove_empty_parents(base: Path, start: Path) -> None:
+    current = start
+    while current != base and base in current.parents:
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
+
+
+def rollback_changes(root: str, changes: list[dict[str, Any]]) -> dict[str, Any]:
+    """Undo a Workbench agent change payload inside ``root``.
+
+    Existing files are restored to their exact pre-run text. Files created by the
+    run are deleted. The rollback refuses truncated change payloads and files
+    whose current content no longer matches the recorded post-run text, so user
+    edits made after the run are not silently overwritten.
+    """
+    try:
+        base = resolve_workspace(root)
+    except WorkspaceError as exc:
+        return {"ok": False, "error": str(exc), "restored": [], "deleted": []}
+
+    restored: list[str] = []
+    deleted: list[str] = []
+    errors: list[str] = []
+    entries = list(reversed(changes or []))
+
+    for index, change in enumerate(entries, 1):
+        raw_path = str((change or {}).get("path") or "").strip()
+        if not raw_path:
+            errors.append(f"Change {index} is missing a file path.")
+            continue
+        try:
+            rel = relative_workspace_path(base, raw_path)
+            target = resolve_inside(base, rel)
+        except WorkspaceError:
+            errors.append(f"{raw_path}: rollback is limited to the selected workspace.")
+            continue
+
+        if change.get("before_truncated") or change.get("after_truncated"):
+            errors.append(f"{rel}: cannot roll back because the saved snapshot was truncated.")
+            continue
+
+        before = str(change.get("before") or "")
+        after = str(change.get("after") or "")
+        existed = bool(change.get("existed"))
+
+        try:
+            current = target.read_text(encoding="utf-8", errors="replace") if target.exists() else None
+        except OSError as exc:
+            errors.append(f"{rel}: could not read the current file ({exc}).")
+            continue
+
+        if current != after and (existed or current is not None):
+            errors.append(f"{rel}: file changed after the agent run; refresh or review it before undoing.")
+            continue
+
+        try:
+            if existed:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(before, encoding="utf-8")
+                restored.append(rel)
+            else:
+                if target.exists():
+                    target.unlink()
+                deleted.append(rel)
+                _remove_empty_parents(base, target.parent)
+        except OSError as exc:
+            errors.append(f"{rel}: could not restore this file ({exc}).")
+
+    return {
+        "ok": not errors,
+        "restored": restored,
+        "deleted": deleted,
+        "errors": errors,
+        "error": "Some files could not be rolled back." if errors else "",
+    }
