@@ -91,8 +91,10 @@ CODER_DEFAULTS: dict[str, Any] = {
     },
     "agent": {
         "allow_commands": False,
+        "allow_network": True,
         "max_steps": 25,
         "command_timeout_s": 60.0,
+        "net_timeout_s": 10.0,
         "verify_command": "",
         "skills_enabled": True,
         "repo_map": True,

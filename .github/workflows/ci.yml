@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, GreyNOC/bug-bounty-release]
   pull_request:
-    branches: [main]
+    branches: [main, GreyNOC/bug-bounty-release]
 
 permissions:
   contents: read

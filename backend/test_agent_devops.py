@@ -64,6 +64,16 @@ Follow the steps.
         self.assertTrue(selected)
         self.assertEqual("git-workflow", selected[0].name)
 
+    def test_ci_requests_select_ci_pipeline_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            loaded = skills_lib.load_skills(Path(tmp), BACKEND_DIR / "seed", None)
+
+        self.assertIn("ci-pipeline", {skill.name for skill in loaded})
+        selected = skills_lib.select_skills("create a github actions ci pipeline for this repo", loaded)
+
+        self.assertTrue(selected)
+        self.assertEqual("ci-pipeline", selected[0].name)
+
 
 class ProjectDetectionTests(unittest.TestCase):
     def test_detects_sample_node_python_project(self) -> None:
@@ -98,9 +108,39 @@ class ProjectDetectionTests(unittest.TestCase):
         self.assertIn("- Python backend: yes", block)
         self.assertIn("- Existing PM2 config: yes", block)
         self.assertIn("- Env example: yes", block)
-        self.assertIn("- GitHub Actions: yes", block)
+        self.assertIn("- CI: GitHub Actions", block)
+        self.assertIn("ci.yml", block)
+        self.assertIn("- Check/test commands: npm run check", block)
         self.assertIn("- Likely frontend port: 5173", block)
         self.assertIn("- Likely backend port: 8766", block)
+
+    def test_detects_non_github_ci_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".gitlab-ci.yml").write_text("stages: [test]\n", encoding="utf-8")
+
+            block = devops_detect.build_project_setup_block(root)
+
+        self.assertIn("- CI: GitLab CI", block)
+
+    def test_reports_none_when_no_ci(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            block = devops_detect.build_project_setup_block(Path(tmp))
+
+        self.assertIn("- CI: none detected", block)
+
+    def test_surfaces_check_commands_from_package_scripts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(
+                json.dumps({"scripts": {"lint": "eslint .", "test": "vitest run"}}), encoding="utf-8"
+            )
+
+            block = devops_detect.build_project_setup_block(root)
+
+        self.assertIn("- Check/test commands:", block)
+        self.assertIn("npm run lint", block)
+        self.assertIn("npm test", block)
 
 
 class VerifyDevOpsTests(unittest.TestCase):

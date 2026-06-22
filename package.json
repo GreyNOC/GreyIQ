@@ -14,9 +14,9 @@
     "dist": "electron-builder --win portable nsis",
     "build:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File build/build-portable.ps1",
     "check:js": "node --check server.mjs && node --check public/app.js && node --check electron/main.cjs && node --check electron/preload.cjs",
-    "check:python": "python -B -c \"from pathlib import Path; p=Path('backend/greyiq_api.py'); compile(p.read_text(encoding='utf-8'), str(p), 'exec')\" && python -B -m unittest backend.test_core_contracts backend.test_agent_devops backend.test_workbench_safety",
+    "check:python": "python -B -c \"from pathlib import Path; p=Path('backend/greyiq_api.py'); compile(p.read_text(encoding='utf-8'), str(p), 'exec')\" && python -B -m unittest discover -s backend -t backend",
     "check:devops": "node scripts/check-devops.cjs",
-    "check": "npm run check:js && npm run check:python"
+    "check": "npm run check:js && npm run check:python && npm run check:devops"
   },
   "devDependencies": {
     "electron": "^42.3.3",
