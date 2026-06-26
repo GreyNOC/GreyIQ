@@ -1034,7 +1034,16 @@
         "headers",
         "sqli",
         "ssrf",
-        "xss"
+        "xss",
+        "ssti",
+        "xxe",
+        "nosqli",
+        "jwt",
+        "graphql",
+        "request-smuggling",
+        "prototype-pollution",
+        "race-condition",
+        "cloud-exposure"
       ],
       "category": "web"
     },
@@ -1282,7 +1291,8 @@
         "automation"
       ],
       "maps_to": [
-        "sqli"
+        "sqli",
+        "nosqli"
       ],
       "category": "web"
     },
@@ -1381,7 +1391,8 @@
         "rce"
       ],
       "maps_to": [
-        "rce"
+        "rce",
+        "ssti"
       ],
       "category": "web"
     },
@@ -1867,7 +1878,8 @@
       ],
       "maps_to": [
         "auth",
-        "secrets"
+        "secrets",
+        "jwt"
       ],
       "category": "password-hash"
     },
@@ -2689,7 +2701,8 @@
       "category": "cloud-mobile-host",
       "maps_to": [
         "auth",
-        "secrets"
+        "secrets",
+        "jwt"
       ],
       "platforms": [
         "android",

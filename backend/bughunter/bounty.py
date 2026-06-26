@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import coder
+from bughunter import next_steps as next_steps_lib
 from bughunter import report as report_lib
 from bughunter import toolkit as toolkit_lib
 from bughunter.live_scan_service import run_live_scan
@@ -177,6 +178,119 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
             "Recommend the smallest upgrade, pin, checksum, or permission reduction that removes the path.",
         ],
     },
+    # --- Modern high-value classes (manual-hunt: the static/passive scanners can't
+    # confirm these, so they carry no scanner category and live in the checklist /
+    # guided-next-steps guidance). ---
+    "ssti": {
+        "name": "Server-side template injection (SSTI)",
+        "cwe": "CWE-1336 / CWE-94",
+        "owasp": "A03:2021 Injection",
+        "categories": set(),
+        "checklist": [
+            "Find input that reaches a server-side template (search, display names, profile fields, email/PDF/report generators).",
+            "Send per-engine probes (`${7*7}`, `{{7*7}}`, `#{7*7}`, `<%= 7*7 %>`) and look for `49` rendered back.",
+            "Once the engine is identified, escalate within scope from expression evaluation toward file read or RCE — stop at proof.",
+        ],
+    },
+    "xxe": {
+        "name": "XML external entity (XXE)",
+        "cwe": "CWE-611",
+        "owasp": "A05:2021 Security Misconfiguration",
+        "categories": set(),
+        "checklist": [
+            "Identify endpoints that parse XML (SOAP, SAML, SVG/DOCX/XLSX uploads, RSS, `application/xml` bodies).",
+            "Submit a benign external entity pointing at a collaborator host and confirm the server fetches it (out-of-band).",
+            "If entities resolve, test in-scope file read and internal SSRF reach; prefer OOB exfiltration when responses are blind.",
+        ],
+    },
+    "nosqli": {
+        "name": "NoSQL injection",
+        "cwe": "CWE-943",
+        "owasp": "A03:2021 Injection",
+        "categories": set(),
+        "checklist": [
+            "Target JSON/query params reaching Mongo/Couch/Elastic-style backends (login, search, filters).",
+            "Swap scalars for operator payloads (`{\"$ne\": null}`, `{\"$gt\": \"\"}`, `[$where]`) and compare to baseline.",
+            "Confirm an auth bypass or changed result set, then prove the minimal real impact.",
+        ],
+    },
+    "jwt": {
+        "name": "JWT / token forgery & weakness",
+        "cwe": "CWE-347 / CWE-345",
+        "owasp": "A07:2021 Identification & Authentication Failures",
+        "categories": set(),
+        "checklist": [
+            "Decode the token; check `alg`/`kid`/`iss`/`exp` and whether the signature is actually verified server-side.",
+            "Test `alg:none`, RS/HS key confusion (sign with the public key as the HMAC secret), `kid` injection, and weak secrets.",
+            "Prove a privilege change (swap `sub`/`role`/`scope`) only with a token the server accepts as valid.",
+        ],
+    },
+    "graphql": {
+        "name": "GraphQL abuse",
+        "cwe": "CWE-639 / CWE-770",
+        "owasp": "A01:2021 Broken Access Control",
+        "categories": set(),
+        "checklist": [
+            "Try introspection; if enabled, map the full schema for hidden queries and mutations.",
+            "Test field-level authorization (BOLA/BFLA) by reaching objects or mutations another role should not.",
+            "Probe batching/aliasing for rate-limit bypass and query depth/complexity for DoS — measure, never exhaust.",
+        ],
+    },
+    "prototype-pollution": {
+        "name": "Prototype pollution",
+        "cwe": "CWE-1321",
+        "owasp": "A03:2021 Injection",
+        "categories": set(),
+        "checklist": [
+            "Find merges of attacker JSON into objects (config merge, query parsing, `Object.assign` / lodash `merge`).",
+            "Inject `__proto__` / `constructor.prototype` keys and confirm a polluted property on a fresh object.",
+            "Chain to a real gadget in scope (XSS, auth bypass, Node RCE) — pollution alone is usually informational.",
+        ],
+    },
+    "race-condition": {
+        "name": "Race condition / TOCTOU",
+        "cwe": "CWE-362 / CWE-367",
+        "owasp": "A04:2021 Insecure Design",
+        "categories": set(),
+        "checklist": [
+            "List single-use or limit-enforcing actions (coupon redeem, withdraw, vote, invite, 2FA verify).",
+            "Fire concurrent requests (single-packet / last-byte sync) and check for double-spend or limit bypass.",
+            "Capture the before/after state proving the invariant broke, and the request count it took.",
+        ],
+    },
+    "request-smuggling": {
+        "name": "HTTP request smuggling / desync",
+        "cwe": "CWE-444",
+        "owasp": "A06:2021 Vulnerable & Outdated Components",
+        "categories": set(),
+        "checklist": [
+            "Identify a front-end/back-end chain (CDN, proxy, LB) and test CL.TE / TE.CL / TE.TE desync with timing probes.",
+            "Use a self-contained desync (capture your own next request) to prove the split without affecting other users.",
+            "Map impact (cache poisoning, request hijack, control bypass) and report the proof, not a weaponized chain.",
+        ],
+    },
+    "subdomain-takeover": {
+        "name": "Subdomain takeover / dangling DNS",
+        "cwe": "CWE-350",
+        "owasp": "A05:2021 Security Misconfiguration",
+        "categories": set(),
+        "checklist": [
+            "Enumerate subdomains and resolve CNAMEs to third-party services (S3, GitHub Pages, Heroku, Azure, Fastly).",
+            "Flag any pointing at an unclaimed/decommissioned resource returning a takeover fingerprint.",
+            "Prove control by claiming the resource and serving a benign marker — never host real content.",
+        ],
+    },
+    "cloud-exposure": {
+        "name": "Exposed cloud storage / metadata",
+        "cwe": "CWE-732 / CWE-668",
+        "owasp": "A05:2021 Security Misconfiguration",
+        "categories": set(),
+        "checklist": [
+            "Find referenced buckets/blobs (S3, GCS, Azure) in HTML/JS/configs and test public list/read/write.",
+            "Where an SSRF exists, check reach to cloud metadata (169.254.169.254) for credentials — in scope only.",
+            "Document the exact object/permission and the sensitive data class exposed.",
+        ],
+    },
 }
 
 # Categories that aren't a core bounty class get a readable label so every
@@ -207,7 +321,7 @@ BOUNTY_PROFILES: dict[str, dict[str, Any]] = {
         "description": "Passive scan of a live web page/app: headers, cookies, mixed content, exposed secrets, client-side XSS sinks, disclosure. Optionally a dynamic (Playwright) pass.",
         "kinds": {"url"},
         "scanners": ["web"],
-        "classes": ["xss", "auth", "ssrf", "secrets", "access-control", "csrf", "cors", "redirect", "file-upload", "business-logic"],
+        "classes": ["xss", "auth", "ssrf", "secrets", "access-control", "csrf", "cors", "redirect", "file-upload", "business-logic", "ssti", "xxe", "nosqli", "jwt", "graphql", "prototype-pollution", "race-condition", "request-smuggling", "subdomain-takeover", "cloud-exposure"],
         "checklist": [
             "Spider the app for input points (forms, query params, JSON bodies, file uploads).",
             "Review CSP and CORS for gaps that enable XSS or cross-origin data theft.",
@@ -219,7 +333,7 @@ BOUNTY_PROFILES: dict[str, dict[str, Any]] = {
         "description": "Passive review of an HTTP API endpoint: auth headers, disclosure, error leakage, transport hardening. Most API bugs need authenticated manual testing — the checklist guides it.",
         "kinds": {"url"},
         "scanners": ["web"],
-        "classes": ["access-control", "auth", "ssrf", "sqli", "cors", "business-logic"],
+        "classes": ["access-control", "auth", "ssrf", "sqli", "cors", "business-logic", "nosqli", "jwt", "graphql", "ssti", "xxe", "race-condition", "request-smuggling", "cloud-exposure"],
         "checklist": [
             "Diff responses across roles for the same object id (IDOR / BOLA).",
             "Fuzz content-type and HTTP verbs; check for verb tampering and mass assignment.",
@@ -232,7 +346,7 @@ BOUNTY_PROFILES: dict[str, dict[str, Any]] = {
         "description": "Static scan of a repo or folder for injection sinks, eval/exec, hardcoded secrets, weak crypto, vulnerable deps, risky CI, and backdoor patterns.",
         "kinds": {"path", "git"},
         "scanners": ["code"],
-        "classes": ["rce", "secrets", "ssrf", "sqli", "supply-chain", "file-upload", "csrf"],
+        "classes": ["rce", "secrets", "ssrf", "sqli", "supply-chain", "file-upload", "csrf", "ssti", "xxe", "nosqli", "jwt", "prototype-pollution"],
         "checklist": [
             "Grep for the framework's raw-query / template-render / deserialization APIs.",
             "Map untrusted input (request, env, file) to each flagged sink to confirm reachability.",
@@ -396,7 +510,7 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
 def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], vuln_class: dict[str, Any] | None, scope: str, findings: list[dict[str, Any]], playbook: str, recommended_tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Best-effort LLM enrichment. Returns a brain dict; on any failure the
     caller falls back to the deterministic report."""
-    brain: dict[str, Any] = {"used": False, "provider": "", "model": "", "summary": "", "notes": "", "attack_plans": {}, "manual_tests": []}
+    brain: dict[str, Any] = {"used": False, "provider": "", "model": "", "summary": "", "notes": "", "attack_plans": {}, "manual_tests": [], "next_steps": []}
     if not coder.coder_enabled(coder_cfg):
         return brain
     cfg = dict(coder.coder_config(coder_cfg))
@@ -433,8 +547,12 @@ def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], 
         '{"executive_summary": "2-4 sentences, most important issue first",\n'
         ' "attack_plans": [{"ref": "F1", "steps": ["..."], "poc": "short PoC outline", "impact": "..."}],\n'
         ' "manual_tests": ["lead the scanner cannot confirm, to try by hand in scope"],\n'
+        ' "next_steps": ["the single most valuable thing to do next, target-specific, imperative — '
+        'ordered most-valuable first"],\n'
         ' "notes": "optional extra analysis"}\n'
-        "If there are no findings, still suggest concrete in-scope manual tests for the focus class."
+        "For next_steps, be specific to THIS target and these findings — name the endpoint/parameter/file and the "
+        "concrete check, not generic advice. If there are no findings, still suggest concrete in-scope manual tests "
+        "and next steps for the focus class."
     )
     try:
         result = coder.generate([{"role": "user", "content": prompt}], cfg)
@@ -450,6 +568,7 @@ def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], 
     brain["summary"] = str(parsed.get("executive_summary") or "").strip()
     brain["notes"] = str(parsed.get("notes") or "").strip()
     brain["manual_tests"] = [str(t).strip() for t in (parsed.get("manual_tests") or []) if str(t).strip()][:12]
+    brain["next_steps"] = [str(t).strip() for t in (parsed.get("next_steps") or []) if str(t).strip()][:8]
     for plan in parsed.get("attack_plans") or []:
         ref = str(plan.get("ref") or "").strip()
         if not ref:
@@ -601,6 +720,7 @@ def run_bounty_hunt(
         "version": version,
         "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
         "target": clean_target,
+        "kind": kind,
         "profile": {"id": profile_id, "name": profile["name"], "description": profile["description"]},
         "vuln_class": class_obj,
         "scope": scope,
@@ -622,6 +742,12 @@ def run_bounty_hunt(
         "run_live_requested": bool(run_live and kind == "url"),
         "recommendation": "",
     }
+
+    # Guided next steps: a deterministic, ordered operator action plan (brain leads
+    # folded in), plus a coverage/gaps summary. Built from the finished context so
+    # it reflects exactly what ran.
+    ctx["next_steps"] = next_steps_lib.build_next_steps(ctx, brain.get("next_steps"))
+    ctx["coverage"] = next_steps_lib.coverage_summary(ctx)
 
     markdown = report_lib.build_markdown(ctx)
     json_doc = report_lib.build_json(ctx)
@@ -670,6 +796,8 @@ def run_bounty_hunt(
         "scan_errors": scan_errors,
         "used_brain": brain.get("used", False),
         "brain_model": f"{brain.get('provider')}:{brain.get('model')}" if brain.get("used") else "",
+        "next_steps": ctx["next_steps"],
+        "coverage": ctx["coverage"],
         "report_markdown": markdown,
     }
 

@@ -780,6 +780,174 @@ label {
   display: none;
 }
 
+/* Guided next steps — the ordered operator action plan a hunt returns. */
+.next-steps {
+  margin: 0.6rem 0 0;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-2);
+}
+
+.next-steps[hidden] {
+  display: none;
+}
+
+.next-steps-title {
+  margin: 0 0 0.15rem;
+  font-size: 0.92rem;
+}
+
+.next-steps-intro {
+  margin: 0 0 0.6rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.next-steps-phase {
+  margin: 0.7rem 0 0.35rem;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.next-steps-items {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.next-step {
+  display: grid;
+  grid-template-columns: 1.6rem 1fr;
+  gap: 0.45rem;
+  padding: 0.5rem 0.55rem;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--muted);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+/* Priority accent on the left rail: critical/high are loud, the rest cool down. */
+.next-step.prio-critical,
+.next-step.prio-high {
+  border-left-color: var(--coral);
+}
+.next-step.prio-medium {
+  border-left-color: #c98a2b;
+}
+.next-step.prio-low,
+.next-step.prio-info {
+  border-left-color: var(--muted);
+}
+.next-step.prio-setup,
+.next-step.prio-hunt,
+.next-step.prio-chain,
+.next-step.prio-expand,
+.next-step.prio-submit,
+.next-step.prio-retest {
+  border-left-color: var(--accent);
+}
+
+.next-step-num {
+  font-family: var(--code-font);
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--muted);
+  text-align: right;
+}
+
+.next-step-body {
+  min-width: 0;
+}
+
+.next-step-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.next-step-tag {
+  flex: none;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.next-step.prio-critical .next-step-tag,
+.next-step.prio-high .next-step-tag {
+  color: var(--coral);
+  border-color: var(--coral);
+}
+
+.next-step-action {
+  font-size: 0.82rem;
+  font-weight: 650;
+  color: var(--ink);
+}
+
+.next-step-detail {
+  margin: 0.25rem 0 0;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.next-step-meta {
+  margin: 0.25rem 0 0;
+  font-family: var(--code-font);
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+
+.next-steps-coverage {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 0.7rem;
+  padding-top: 0.6rem;
+  border-top: 1px dashed var(--line);
+}
+
+@media (min-width: 30rem) {
+  .next-steps-coverage {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.coverage-title {
+  margin-bottom: 0.25rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.coverage-block ul {
+  margin: 0;
+  padding-left: 1.05rem;
+  display: grid;
+  gap: 0.2rem;
+}
+
+.coverage-block li {
+  font-size: 0.76rem;
+  line-height: 1.4;
+  color: var(--text);
+}
+
+.coverage-gaps .coverage-title {
+  color: var(--coral);
+}
+
 /* Pentest toolkit catalog */
 .toolkit-list {
   display: grid;

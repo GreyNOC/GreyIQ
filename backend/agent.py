@@ -1094,6 +1094,67 @@ def _auto_verify(
     return None
 
 
+def _outstanding_work(toolbox: "ToolBox", completed: bool) -> list[str]:
+    """What still needs attention after a run — the basis for an honest completion
+    status. Empty list means a clean finish."""
+    items: list[str] = []
+    if toolbox.touched and not toolbox.verified_ok:
+        files = ", ".join(sorted(toolbox.touched)[:8])
+        more = f" (+{len(toolbox.touched) - 8} more)" if len(toolbox.touched) > 8 else ""
+        items.append(f"Changed files are not verified-clean: {files}{more}. Run verify and fix any failures.")
+    if not completed:
+        items.append("The run hit the step limit before signalling completion — re-run to continue from here.")
+    return items
+
+
+def _finalize(
+    text: str,
+    transcript: list[dict[str, Any]],
+    toolbox: "ToolBox",
+    model: str,
+    provider: str,
+    *,
+    completed: bool,
+) -> dict[str, Any]:
+    """Build the standard agent result with an honest completion status.
+
+    ``completed`` is True only when the model finished on its own (it stopped
+    calling tools), False when the loop hit the step cap. ``verified`` reflects
+    whether the last verify passed (or there was nothing to verify), so a caller
+    never reads "done" when changes are still broken."""
+    outstanding = _outstanding_work(toolbox, completed)
+    clean = completed and not outstanding
+    return {
+        "text": text,
+        "transcript": transcript,
+        "steps": len(transcript),
+        "model": model,
+        "provider": provider,
+        "completed": clean,
+        "verified": bool(toolbox.verified_ok or not toolbox.touched),
+        "outstanding": outstanding,
+    }
+
+
+def _step_limit_text(toolbox: "ToolBox", transcript: list[dict[str, Any]], on_event: Any) -> str:
+    """When the loop hits the step cap, run one best-effort verify so the user
+    learns the true state of their files, then return a continuation message that
+    names what is left rather than a bare 'ran out of steps'."""
+    if toolbox.touched and not toolbox.verified_ok:
+        output, is_error = toolbox.run("verify", {})
+        transcript.append({"tool": "verify", "input": {}, "output": output, "is_error": is_error})
+        _emit(on_event, {"type": "step", "entry": transcript[-1]})
+    lines = ["Reached the step limit before finishing."]
+    outstanding = _outstanding_work(toolbox, completed=False)
+    # Drop the generic step-limit note here; the lead sentence already says it.
+    detail = [item for item in outstanding if "step limit" not in item]
+    if detail:
+        lines.append("Still outstanding:")
+        lines.extend(f"- {item}" for item in detail)
+    lines.append("Re-run with the same request to continue from the current state.")
+    return "\n".join(lines)
+
+
 _PLAN_MAX_STEPS = 8
 
 
@@ -1376,13 +1437,10 @@ def _run_anthropic(
                 messages.append({"role": "assistant", "content": response.content})
                 messages.append({"role": "user", "content": feedback})
                 continue
-            return {
-                "text": text or "(done)",
-                "transcript": transcript,
-                "steps": len(transcript),
-                "model": getattr(response, "model", model),
-                "provider": "anthropic",
-            }
+            return _finalize(
+                text or "(done)", transcript, toolbox,
+                getattr(response, "model", model), "anthropic", completed=True,
+            )
 
         messages.append({"role": "assistant", "content": response.content})
         results = []
@@ -1395,13 +1453,10 @@ def _run_anthropic(
             )
         messages.append({"role": "user", "content": results})
 
-    return {
-        "text": "Reached the step limit before finishing. Re-run to continue.",
-        "transcript": transcript,
-        "steps": len(transcript),
-        "model": model,
-        "provider": "anthropic",
-    }
+    return _finalize(
+        _step_limit_text(toolbox, transcript, on_event), transcript, toolbox,
+        model, "anthropic", completed=False,
+    )
 
 
 def _run_tool_loop(
@@ -1507,13 +1562,9 @@ def _run_tool_loop(
                 convo.append({"role": "assistant", "content": text})
                 convo.append({"role": "user", "content": feedback})
                 continue
-            return {
-                "text": text.strip() or "(done)",
-                "transcript": transcript,
-                "steps": len(transcript),
-                "model": model,
-                "provider": provider,
-            }
+            return _finalize(
+                text.strip() or "(done)", transcript, toolbox, model, provider, completed=True,
+            )
 
         if from_text:
             # Model emitted tool calls as text — thread results back as a plain
@@ -1539,13 +1590,10 @@ def _run_tool_loop(
                     tool_msg["tool_name"] = tc["name"]
                 convo.append(tool_msg)
 
-    return {
-        "text": "Reached the step limit before finishing. Re-run to continue.",
-        "transcript": transcript,
-        "steps": len(transcript),
-        "model": model,
-        "provider": provider,
-    }
+    return _finalize(
+        _step_limit_text(toolbox, transcript, on_event), transcript, toolbox,
+        model, provider, completed=False,
+    )
 
 
 def restore_snapshot(files: list[dict[str, Any]], workspace: str) -> dict[str, Any]:

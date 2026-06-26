@@ -48,6 +48,14 @@ _CHAIN_RULES = [
     ({"supply-chain", "secrets"}, "Build/dependency issues become higher value when they can reach release secrets or deploy artifacts."),
 ]
 
+# Short uppercase tag per next-step priority (severity word or action tier), for
+# the guided-next-steps list. Plain text — frozen-safe, no glyph dependency.
+_NEXT_STEP_TAG = {
+    "critical": "CRITICAL", "high": "HIGH", "medium": "MEDIUM", "low": "LOW", "info": "INFO",
+    "setup": "SETUP", "hunt": "HUNT", "chain": "CHAIN", "expand": "EXPAND",
+    "submit": "SUBMIT", "retest": "RETEST",
+}
+
 
 def _sev_rank(finding: dict[str, Any]) -> int:
     return _SEVERITY_ORDER.get(str(finding.get("severity", "info")).lower(), 0)
@@ -186,6 +194,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
     out.append("")
 
     _append_bounty_triage(out, ctx, counts)
+    _append_next_steps(out, ctx)
 
     # --- Methodology ---
     out.append("## Methodology\n")
@@ -337,6 +346,61 @@ def _append_bounty_triage(out: list[str], ctx: dict[str, Any], counts: dict[str,
     out.append("")
 
 
+def _append_next_steps(out: list[str], ctx: dict[str, Any]) -> None:
+    """The guided, ordered operator action plan — the 'what do I do now' section.
+    Steps arrive pre-ordered and grouped by phase from ``next_steps.build_next_steps``."""
+    steps = ctx.get("next_steps") or []
+    out.append("## Guided next steps\n")
+    out.append(
+        "A prioritized, ordered plan — work it top to bottom. Highest-impact first; each step names the "
+        "opening move and the single tool to reach for."
+    )
+    out.append("")
+    if not steps:
+        out.append("_No next steps were generated for this run._")
+        out.append("")
+        return
+    current_phase: str | None = None
+    for step in steps:
+        phase = str(step.get("phase") or "").strip()
+        if phase and phase != current_phase:
+            out.append(f"### {phase}\n")
+            current_phase = phase
+        tag = _NEXT_STEP_TAG.get(str(step.get("priority")).lower(), "")
+        prefix = f"`{tag}` " if tag else ""
+        action = str(step.get("action") or "").strip() or "Next step"
+        out.append(f"{step.get('order', '')}. {prefix}**{action}**")
+        detail = str(step.get("detail") or "").strip()
+        if detail:
+            out.append(f"   {detail}")
+        meta_bits: list[str] = []
+        if step.get("ref"):
+            meta_bits.append(f"finding {step['ref']}")
+        if step.get("tool"):
+            meta_bits.append(f"tool: {step['tool']}")
+        if meta_bits:
+            out.append(f"   _({' · '.join(meta_bits)})_")
+        out.append("")
+
+    coverage = ctx.get("coverage") or {}
+    covered = coverage.get("covered") or []
+    gaps = coverage.get("gaps") or []
+    if covered or gaps:
+        out.append("### Coverage & gaps\n")
+        if covered:
+            out.append("**Covered by this run:**")
+            out.append("")
+            for item in covered:
+                out.append(f"- {item}")
+            out.append("")
+        if gaps:
+            out.append("**Not covered — where the blind spots are:**")
+            out.append("")
+            for item in gaps:
+                out.append(f"- {item}")
+            out.append("")
+
+
 def _append_checklist(out: list[str], ctx: dict[str, Any]) -> None:
     checklist = ctx.get("manual_checklist") or []
     if not checklist:
@@ -429,6 +493,8 @@ def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
         "finding_count": len(findings),
         "findings": findings,
         "attack_plans": ctx.get("attack_plans", {}),
+        "next_steps": ctx.get("next_steps", []),
+        "coverage": ctx.get("coverage", {}),
         "manual_checklist": ctx.get("manual_checklist", []),
         "submission_checklist": list(_SUBMISSION_CHECKLIST),
         "retest_checklist": list(_RETEST_CHECKLIST),

@@ -2,6 +2,45 @@
 
 Notable changes to GreyIQ.
 
+## v0.9.8
+
+### Added
+- **Guided next steps for the bounty hunt.** Every hunt now ends with an ordered,
+  prioritized operator action plan — "what do I do now?" answered as numbered steps
+  grouped into phases (*stabilize coverage → confirm findings → hunt by hand → chain &
+  escalate → expand coverage → prepare submission → retest*). Each confirmation step is
+  emitted highest-impact first (severity, confidence, **and intrinsic class value**
+  weighted), names the opening reproduction move, and points at the single best tool
+  from the curated toolkit. The plan is deterministic (works fully offline) and, when a
+  brain is configured, folds in target-specific analyst leads. It renders as a clean,
+  color-coded checklist in the UI (the full Markdown report is one click away) and ships
+  in the report's Markdown and JSON, plus a new `next_steps` field on the scan response.
+- **10 modern high-bounty vuln classes.** The focus taxonomy nearly doubles with
+  server-side template injection (SSTI), XXE, NoSQL injection, JWT forgery/weakness,
+  GraphQL abuse, prototype pollution, race conditions / TOCTOU, HTTP request smuggling,
+  subdomain takeover, and exposed cloud storage/metadata — each with CWE/OWASP mapping,
+  a sharp 3-step hunt checklist, curated tool recommendations, and chain leads (e.g.
+  *SSRF + cloud-exposure → metadata credentials*). They flow into the web-app, API, and
+  source-code profiles and the full sweep.
+- **Coverage & gaps summary.** The report and UI now state what the pass actually
+  covered and — more importantly — what it structurally could not (no dynamic pass, no
+  authenticated testing, git history unscanned, partial on scanner error), so the
+  operator knows where the blind spots are before trusting a low finding count.
+
+### Changed
+- **Runs without PyTorch — bug-hunting goes anywhere.** The local TinyGPT brain is the
+  only component that needs PyTorch; its import is now lazily guarded, so the backend
+  boots even where torch is absent or won't load (e.g. an ARM phone running the API
+  under PM2/Termux). The bug-hunting engine and the Claude API brain are entirely
+  torch-free and stay fully functional; local-model train/infer is cleanly gated off
+  with a clear message, and `status` reports `local_model_available`.
+- **Honest agent completion status.** A run now reports an explicit `completed` /
+  `verified` / `outstanding` triple instead of implying success by default: it only
+  claims "done" when the model finished on its own *and* its changed files verified
+  clean. Hitting the step limit runs a final verify, names exactly what is still
+  outstanding (unverified files, remaining work), and tells you a re-run will continue
+  from the current state. The Workbench surfaces a ✓/⚠ completion line accordingly.
+
 ## v0.9.7
 
 ### Added

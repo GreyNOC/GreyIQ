@@ -195,9 +195,11 @@ const els = {
   bountyPerFinding: document.querySelector("#bountyPerFinding"),
   bountyRun: document.querySelector("#bountyRun"),
   bountyStatus: document.querySelector("#bountyStatus"),
+  bountyNextSteps: document.querySelector("#bountyNextSteps"),
   bountyReport: document.querySelector("#bountyReport"),
   bountyReportActions: document.querySelector("#bountyReportActions"),
   bountyCopyReport: document.querySelector("#bountyCopyReport"),
+  bountyToggleReport: document.querySelector("#bountyToggleReport"),
   redteamForm: document.querySelector("#redteamForm"),
   redteamBehavioral: document.querySelector("#redteamBehavioral"),
   redteamAuthorized: document.querySelector("#redteamAuthorized"),
@@ -3384,6 +3386,8 @@ function applyAgentResult(res) {
   state.lastAgentPlan = Array.isArray(res.plan) ? res.plan : state.lastAgentPlan;
   state.lastAgentExplain = res.message || "";
   state.lastAgentFlaggedReads = Array.isArray(res.flagged_reads) ? res.flagged_reads : [];
+  state.lastAgentCompleted = res.ok !== false ? Boolean(res.completed) : null;
+  state.lastAgentOutstanding = Array.isArray(res.outstanding) ? res.outstanding : [];
   state.agentSnapshot = {
     available: Boolean(res.snapshot_available),
     count: Number(res.snapshot_count || 0)
@@ -3407,6 +3411,16 @@ function applyAgentResult(res) {
   }
   if (state.lastAgentChanges.length) {
     text += `\n\nChanged ${state.lastAgentChanges.length} file(s) — open the Changes tab in the Workbench to review.`;
+  }
+  // Honest completion status: only claim "done" when the run finished cleanly and
+  // its changes verified. Otherwise name what's left so a re-run is productive.
+  if (state.lastAgentCompleted === true) {
+    text += `\n\n✓ Completed${res.verified ? " and verified" : ""}.`;
+  } else if (state.lastAgentCompleted === false) {
+    const reasons = state.lastAgentOutstanding.length
+      ? "\n  - " + state.lastAgentOutstanding.join("\n  - ")
+      : "";
+    text += `\n\n⚠ Not fully complete:${reasons}`;
   }
   return text;
 }
@@ -3745,6 +3759,10 @@ els.bountyForm?.addEventListener("submit", async (event) => {
   els.bountyRun.disabled = true;
   els.bountyStatus.textContent = "Hunting… running scanners and writing the report (this can take a minute).";
   if (els.bountyReport) els.bountyReport.hidden = true;
+  if (els.bountyNextSteps) {
+    els.bountyNextSteps.hidden = true;
+    els.bountyNextSteps.replaceChildren();
+  }
   if (els.bountyReportActions) els.bountyReportActions.hidden = true;
   try {
     const res = await apiFetch("/api/bounty/scan", {
@@ -3775,9 +3793,15 @@ els.bountyForm?.addEventListener("submit", async (event) => {
       els.bountyStatus.textContent =
         `${warn}Done — risk ${String(res.risk).toUpperCase()}, ${res.finding_count} finding(s) [${sev}]${brain}. Report saved to: ${res.report_path}${perFiles}`;
       lastBountyReportMarkdown = res.report_markdown || "";
+      renderBountyNextSteps(res.next_steps, res.coverage);
       if (els.bountyReport && lastBountyReportMarkdown) {
         els.bountyReport.textContent = lastBountyReportMarkdown;
-        els.bountyReport.hidden = false;
+        els.bountyReport.hidden = true; // next-steps lead; full report is opt-in
+        if (els.bountyToggleReport) {
+          els.bountyToggleReport.hidden = false;
+          els.bountyToggleReport.textContent = "Show full report";
+          els.bountyToggleReport.setAttribute("aria-expanded", "false");
+        }
         if (els.bountyReportActions) els.bountyReportActions.hidden = false;
       }
     }
@@ -3789,6 +3813,126 @@ els.bountyForm?.addEventListener("submit", async (event) => {
 });
 
 let lastBountyReportMarkdown = "";
+
+// Render the structured, ordered operator action plan returned by a hunt. DOM-built
+// (no innerHTML) so brain-authored step text can never inject markup.
+function renderBountyNextSteps(steps, coverage) {
+  const host = els.bountyNextSteps;
+  if (!host) return;
+  host.replaceChildren();
+  const list = Array.isArray(steps) ? steps : [];
+  if (!list.length) {
+    host.hidden = true;
+    return;
+  }
+
+  const title = document.createElement("h4");
+  title.className = "next-steps-title";
+  title.textContent = "Guided next steps";
+  host.append(title);
+
+  const intro = document.createElement("p");
+  intro.className = "next-steps-intro";
+  intro.textContent =
+    "Work top to bottom — highest-impact first. Each step names the opening move and the tool to reach for.";
+  host.append(intro);
+
+  let currentPhase = null;
+  let phaseItems = null;
+  for (const step of list) {
+    const phase = String(step.phase || "");
+    if (phase !== currentPhase) {
+      const phaseEl = document.createElement("div");
+      phaseEl.className = "next-steps-phase";
+      phaseEl.textContent = phase;
+      host.append(phaseEl);
+      phaseItems = document.createElement("div");
+      phaseItems.className = "next-steps-items";
+      host.append(phaseItems);
+      currentPhase = phase;
+    }
+    const priority = String(step.priority || "").toLowerCase();
+    const row = document.createElement("div");
+    row.className = `next-step prio-${priority}`;
+
+    const num = document.createElement("span");
+    num.className = "next-step-num";
+    num.textContent = String(step.order ?? "");
+    row.append(num);
+
+    const body = document.createElement("div");
+    body.className = "next-step-body";
+    const head = document.createElement("div");
+    head.className = "next-step-head";
+    const tag = String(step.priority || "").toUpperCase();
+    if (tag) {
+      const badge = document.createElement("span");
+      badge.className = "next-step-tag";
+      badge.textContent = tag;
+      head.append(badge);
+    }
+    const action = document.createElement("span");
+    action.className = "next-step-action";
+    action.textContent = String(step.action || "");
+    head.append(action);
+    body.append(head);
+
+    if (step.detail) {
+      const detail = document.createElement("p");
+      detail.className = "next-step-detail";
+      detail.textContent = String(step.detail);
+      body.append(detail);
+    }
+    const meta = [];
+    if (step.ref) meta.push(`finding ${step.ref}`);
+    if (step.tool) meta.push(`tool: ${step.tool}`);
+    if (meta.length) {
+      const metaEl = document.createElement("p");
+      metaEl.className = "next-step-meta";
+      metaEl.textContent = meta.join(" · ");
+      body.append(metaEl);
+    }
+    row.append(body);
+    phaseItems.append(row);
+  }
+
+  const cov = coverage || {};
+  const covered = Array.isArray(cov.covered) ? cov.covered : [];
+  const gaps = Array.isArray(cov.gaps) ? cov.gaps : [];
+  if (covered.length || gaps.length) {
+    const wrap = document.createElement("div");
+    wrap.className = "next-steps-coverage";
+    if (covered.length) wrap.append(coverageBlock("Covered by this run", covered, "covered"));
+    if (gaps.length) wrap.append(coverageBlock("Not covered — blind spots", gaps, "gaps"));
+    host.append(wrap);
+  }
+  host.hidden = false;
+}
+
+function coverageBlock(title, items, kind) {
+  const block = document.createElement("div");
+  block.className = `coverage-block coverage-${kind}`;
+  const heading = document.createElement("div");
+  heading.className = "coverage-title";
+  heading.textContent = title;
+  block.append(heading);
+  const ul = document.createElement("ul");
+  for (const item of items) {
+    const li = document.createElement("li");
+    li.textContent = String(item);
+    ul.append(li);
+  }
+  block.append(ul);
+  return block;
+}
+
+els.bountyToggleReport?.addEventListener("click", () => {
+  if (!els.bountyReport) return;
+  const show = els.bountyReport.hidden;
+  els.bountyReport.hidden = !show;
+  els.bountyToggleReport.textContent = show ? "Hide full report" : "Show full report";
+  els.bountyToggleReport.setAttribute("aria-expanded", show ? "true" : "false");
+});
 
 els.bountyCopyReport?.addEventListener("click", async () => {
   if (!lastBountyReportMarkdown) return;

@@ -182,15 +182,37 @@ from document_ingest import (  # noqa: E402
     supported_extensions,
 )
 from repo_ingest import ingest_repositories  # noqa: E402
-from solin_core import SolinEngine  # noqa: E402
-from training_runtime import (  # noqa: E402
-    DEFAULT_EVAL_INTERVAL,
-    DEFAULT_LEARNING_RATE,
-    DEFAULT_MAX_ITERS,
-    MAX_TRAINING_CHARS,
-    TrainingSettings,
-    run_training_loop,
-)
+
+# The local TinyGPT brain (solin_core / training_runtime) is the only part of the
+# backend that needs PyTorch. Import it lazily-guarded so the whole service still
+# boots where torch is absent or won't load — e.g. an ARM phone running the API
+# under PM2/Termux. The bug-hunting engine and the Claude API brain are entirely
+# torch-free and stay fully functional; only local-model train/infer is gated off
+# with a clear message instead of crashing the process at import time.
+try:
+    from solin_core import SolinEngine  # noqa: E402
+    from training_runtime import (  # noqa: E402
+        DEFAULT_EVAL_INTERVAL,
+        DEFAULT_LEARNING_RATE,
+        DEFAULT_MAX_ITERS,
+        MAX_TRAINING_CHARS,
+        TrainingSettings,
+        run_training_loop,
+    )
+    _ML_RUNTIME_AVAILABLE = True
+    _ML_RUNTIME_ERROR = ""
+except Exception as _ml_exc:  # noqa: BLE001 - torch/numpy may be missing or fail to load (DLL, ABI, ARM wheel)
+    SolinEngine = None  # type: ignore[assignment,misc]
+    TrainingSettings = None  # type: ignore[assignment,misc]
+    run_training_loop = None  # type: ignore[assignment]
+    # Mirror training_runtime's defaults so request models and settings still validate.
+    MAX_TRAINING_CHARS = 8_000_000
+    DEFAULT_MAX_ITERS = 1000
+    DEFAULT_EVAL_INTERVAL = 100
+    DEFAULT_LEARNING_RATE = 3e-4
+    _ML_RUNTIME_AVAILABLE = False
+    _ML_RUNTIME_ERROR = f"Local model runtime unavailable ({type(_ml_exc).__name__}: {_ml_exc}). " \
+        "Bug-hunting and the Claude API brain still work; local TinyGPT train/infer is disabled."
 from bughunter.scan_service import run_code_scan  # noqa: E402
 from bughunter.web_scan_service import run_web_scan  # noqa: E402
 from bughunter.live_scan_service import run_live_scan  # noqa: E402
@@ -202,7 +224,7 @@ from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E4
 
 
 APP_NAME = "GreyIQ"
-VERSION = "0.9.7"
+VERSION = "0.9.8"
 _CURRENT_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar("greyiq_current_scope", default=None)
 _CSP = (
     "default-src 'self'; "
@@ -564,9 +586,10 @@ class GreyIQRuntime:
                 "app": APP_NAME,
                 "version": VERSION,
                 "runtime_dir": str(RUNTIME_DIR),
+                "local_model_available": _ML_RUNTIME_AVAILABLE,
                 "engine_loaded": engine is not None,
                 "engine_ready": bool(engine and engine.ready),
-                "engine_error": self.engine_error,
+                "engine_error": self.engine_error or (_ML_RUNTIME_ERROR if not _ML_RUNTIME_AVAILABLE else ""),
                 "model_name": model_path.name if model_path else "none",
                 "model_path": str(model_path) if model_path else "",
                 "device": getattr(device_info, "name", "unknown") if device_info else "unknown",
@@ -592,6 +615,9 @@ class GreyIQRuntime:
         with self.lock:
             if self.engine is not None:
                 return self.engine
+            if not _ML_RUNTIME_AVAILABLE:
+                self.engine_error = _ML_RUNTIME_ERROR
+                raise RuntimeError(_ML_RUNTIME_ERROR)
             try:
                 self.engine = SolinEngine(RUNTIME_DIR, status_callback=self.log)
                 self.engine.safety = OpenPolicy()
@@ -757,6 +783,9 @@ class GreyIQRuntime:
                 "touched_files": result.get("touched_files", []),
                 "plan": result.get("plan", []),
                 "flagged_reads": result.get("flagged_reads", []),
+                "completed": result.get("completed", False),
+                "verified": result.get("verified", False),
+                "outstanding": result.get("outstanding", []),
                 "snapshot_available": snapshot_meta["available"],
                 "snapshot_count": snapshot_meta["count"],
                 "model_name": f"{result['provider']}:{result['model']}",
@@ -773,6 +802,9 @@ class GreyIQRuntime:
                 "touched_files": [],
                 "plan": [],
                 "flagged_reads": [],
+                "completed": False,
+                "verified": False,
+                "outstanding": [],
                 "snapshot_available": False,
                 "snapshot_count": 0,
             }
@@ -816,6 +848,9 @@ class GreyIQRuntime:
                     "touched_files": result.get("touched_files", []),
                     "plan": result.get("plan", []),
                     "flagged_reads": result.get("flagged_reads", []),
+                    "completed": result.get("completed", False),
+                    "verified": result.get("verified", False),
+                    "outstanding": result.get("outstanding", []),
                     "snapshot_available": snapshot_meta["available"],
                     "snapshot_count": snapshot_meta["count"],
                     "model_name": f"{result['provider']}:{result['model']}",
@@ -1125,6 +1160,8 @@ class GreyIQRuntime:
             }
 
     def start_training(self, request: TrainingRequest) -> dict[str, Any]:
+        if not _ML_RUNTIME_AVAILABLE:
+            raise HTTPError(503, _ML_RUNTIME_ERROR)
         with self.lock:
             if self.training.active:
                 raise HTTPError(409, "Training is already active.")
