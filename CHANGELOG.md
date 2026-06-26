@@ -10,6 +10,7 @@ Notable changes to GreyIQ.
 
 ### Fixed
 - Fix GreyIQ BugHunter JWT exposure triage to suppress OAuth flow-token false positives, gate session-impact reporting on replay confirmation, and use CWE-200 instead of CWE-798.
+- Redact web-scan secret evidence before JSON/Markdown report generation so reports do not duplicate exposed client-side keys.
 
 ## v0.9.9
 
