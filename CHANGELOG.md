@@ -2,6 +2,14 @@
 
 Notable changes to GreyIQ.
 
+## Unreleased
+
+### Added
+- Add BugHunter proof-of-impact report sections and readiness checks so impact claims require concrete evidence.
+
+### Fixed
+- Fix GreyIQ BugHunter JWT exposure triage to suppress OAuth flow-token false positives, gate session-impact reporting on replay confirmation, and use CWE-200 instead of CWE-798.
+
 ## v0.9.9
 
 ### Fixed

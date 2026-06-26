@@ -12,11 +12,64 @@ Ported and extended from the GreyNOC Aegis secret extractor.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
+from dataclasses import dataclass
 
+from bughunter.code_scanner.jwt_exposure import classify_jwt_exposure
 from bughunter.code_scanner.model import Confidence, Severity
-from bughunter.code_scanner.rules.base import RegexRule
+from bughunter.code_scanner.model import Finding
+from bughunter.code_scanner.rules.base import RegexRule, Rule, _line_span, _snippet_around
 
 _PEM_FLAGS = re.MULTILINE | re.DOTALL
+_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{16,}\b")
+
+
+@dataclass(frozen=True)
+class JwtExposureRule(Rule):
+    """Claim-aware JWT rule.
+
+    Static scans cannot prove replay, so identity/session JWTs are held back
+    until a caller supplies replay evidence through the classifier. The rule
+    only emits when decoded claim values contain concrete secret material.
+    """
+
+    def scan(self, *, path: str, text: str) -> Iterable[Finding]:
+        seen: set[tuple[str, str]] = set()
+        for match in _JWT_RE.finditer(text):
+            token = match.group(0)
+            key = (path, token)
+            if key in seen:
+                continue
+            seen.add(key)
+            classification = classify_jwt_exposure(token)
+            if classification is None or classification.finding is not True:
+                continue
+            line_start, line_end = _line_span(text, match)
+            secret_kinds = ", ".join(sorted({hit.kind for hit in classification.secret_hits}))
+            if classification.role == "embedded_secret":
+                title = "Secret value embedded in JWT claim"
+                description = (
+                    "A JWT claim value contains concrete secret material"
+                    f"{f' ({secret_kinds})' if secret_kinds else ''}. OAuth scope names were excluded from scanning."
+                )
+                remediation = "Remove the secret value from the token, rotate the exposed secret, and issue tokens by reference."
+            else:
+                title = "Confirmed replayable JWT"
+                description = classification.impact or "JWT replay was confirmed."
+                remediation = "Revoke the token and ensure public client-side flow tokens cannot authenticate users."
+            yield Finding(
+                rule_id=f"{self.rule_id}.embedded-secret" if classification.role == "embedded_secret" else self.rule_id,
+                title=title,
+                description=description,
+                severity=Severity(classification.severity),
+                confidence=Confidence.HIGH,
+                category=self.category,
+                file_path=path,
+                line_start=line_start,
+                line_end=line_end,
+                snippet=_snippet_around(text, match),
+                remediation=remediation,
+            )
 
 RULES = (
     RegexRule(
@@ -108,16 +161,14 @@ RULES = (
         pattern=r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b",
         unique=True,
     ),
-    RegexRule(
+    JwtExposureRule(
         rule_id="secret.jwt",
         title="JWT in source",
-        description="A literal JWT (three base64url segments separated by dots) is committed.",
-        severity=Severity.MEDIUM,
-        confidence=Confidence.MEDIUM,
+        description="A JWT was parsed and classified from its claims before exposure triage.",
+        severity=Severity.INFO,
+        confidence=Confidence.HIGH,
         category="secret",
-        remediation="Treat any committed JWT as compromised. Revoke it on the auth server.",
-        pattern=r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{16,}\b",
-        unique=True,
+        remediation="Only report JWTs as credentials after replay is confirmed or a real secret value is present.",
     ),
     RegexRule(
         rule_id="secret.private-key-pem",
@@ -154,7 +205,7 @@ RULES = (
         confidence=Confidence.MEDIUM,
         category="secret",
         remediation="Move the file out of the repo, add `.env` to .gitignore, distribute via a secrets channel.",
-        pattern=r"(?im)^[A-Z][A-Z0-9_]{2,}\s*=\s*[A-Za-z0-9_+/=\-]{10,}\s*$",
+        pattern=r"(?im)^[A-Z][A-Z0-9_]{2,}[^\S\n]*=[^\S\n]*[A-Za-z0-9_+/=\-]{10,}[^\S\n]*$",
         path_globs=("*.env", "**/.env", "**/.env.*"),
         unique=True,
         line_must_not_contain=("example", "EXAMPLE", "your-", "<", "FAKE", "fake"),

@@ -48,6 +48,7 @@ class BountyReportTests(unittest.TestCase):
                 "F1": {
                     "steps": ["Log in as account A.", "Replay the request with account B."],
                     "impact": "Cross-tenant order disclosure.",
+                    "proof_of_impact": "The replay as account B returned order 123 owned by account A.",
                 }
             },
             "manual_checklist": ["Replay as a lower-privileged account."],
@@ -59,12 +60,57 @@ class BountyReportTests(unittest.TestCase):
         json_doc = report_lib.build_json(ctx)
 
         self.assertIn("## Bounty triage", markdown)
+        self.assertIn("**Proof of impact:**", markdown)
+        self.assertIn("The replay as account B returned order 123 owned by account A.", markdown)
         self.assertIn("### Submission preflight", markdown)
         self.assertIn("**Submission readiness**", markdown)
+        self.assertIn("[x] Proof of impact is captured as concrete evidence.", markdown)
         self.assertIn("### Retest after fix", markdown)
         self.assertEqual(json_doc["class_counts"]["Broken access control / IDOR"], 1)
+        self.assertEqual(
+            json_doc["attack_plans"]["F1"]["proof_of_impact"],
+            "The replay as account B returned order 123 owned by account A.",
+        )
         self.assertTrue(json_doc["run_live_requested"])
         self.assertIn("submission_checklist", json_doc)
+
+        single = report_lib.build_finding_markdown(ctx, ctx["findings"][0])
+        self.assertIn("## Proof of impact", single)
+        self.assertIn("The replay as account B returned order 123 owned by account A.", single)
+
+    def test_report_marks_missing_proof_of_impact_not_ready(self) -> None:
+        ctx = {
+            "tool": "GreyIQ BugHunter",
+            "target": "https://example.test",
+            "profile": {"id": "web-app", "name": "Web application", "description": ""},
+            "findings": [
+                {
+                    "ref": "F1",
+                    "severity": "medium",
+                    "confidence": "medium",
+                    "category": "secret",
+                    "title": "Candidate issue",
+                    "location": "app.js",
+                    "rule_id": "manual.candidate",
+                    "description": "A candidate issue was detected.",
+                    "snippet": "candidate evidence",
+                }
+            ],
+            "attack_plans": {
+                "F1": {
+                    "steps": ["Open the target.", "Replay the request."],
+                    "impact": "Potential sensitive data exposure.",
+                }
+            },
+            "recommended_tools": [],
+            "brain": {"used": False},
+        }
+
+        markdown = report_lib.build_markdown(ctx)
+
+        self.assertIn("**Proof of impact:**", markdown)
+        self.assertIn("Not captured yet", markdown)
+        self.assertIn("[ ] Proof of impact is captured as concrete evidence.", markdown)
 
     def test_profiles_expose_expanded_focus_classes(self) -> None:
         payload = list_profiles()

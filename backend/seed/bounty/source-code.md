@@ -22,7 +22,7 @@ untrusted input.
 ## Classes to prioritize
 - **RCE / injection** (CWE-78/94) — shell, eval, template, deserialization sinks.
 - **SQLi** (CWE-89) — string-built queries; prefer parameterized queries as the fix.
-- **Secrets** (CWE-798) — confirm live, check git history, rotate.
+- **Secrets** (CWE-200) — confirm live, check git history, rotate.
 - **SSRF** (CWE-918) — server-side fetchers taking attacker URLs.
 
 ## Extra bounty angles

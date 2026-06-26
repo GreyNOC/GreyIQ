@@ -56,9 +56,32 @@ _NEXT_STEP_TAG = {
     "submit": "SUBMIT", "retest": "RETEST",
 }
 
+_JWT_CREDENTIAL_RULE_IDS = {"secret.jwt", "web.exposed.secret.jwt"}
+
 
 def _sev_rank(finding: dict[str, Any]) -> int:
     return _SEVERITY_ORDER.get(str(finding.get("severity", "info")).lower(), 0)
+
+
+def _jwt_replay_value(finding: dict[str, Any]) -> bool | None:
+    if "replay_authenticated" in finding:
+        value = finding.get("replay_authenticated")
+    elif "jwt_replay_authenticated" in finding:
+        value = finding.get("jwt_replay_authenticated")
+    else:
+        value = (finding.get("jwt_exposure") or {}).get("replay_authenticated")
+    return value if isinstance(value, bool) else None
+
+
+def _reportable_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop unconfirmed JWT credential candidates before report rendering."""
+    out: list[dict[str, Any]] = []
+    for finding in findings:
+        rule_id = str(finding.get("rule_id") or "")
+        if rule_id in _JWT_CREDENTIAL_RULE_IDS and _jwt_replay_value(finding) is not True:
+            continue
+        out.append(finding)
+    return out
 
 
 def severity_counts(findings: list[dict[str, Any]]) -> dict[str, int]:
@@ -117,21 +140,32 @@ def _checkbox(done: bool, text: str) -> str:
     return f"- [{'x' if done else ' '}] {text}"
 
 
+def _proof_of_impact(finding: dict[str, Any], plan: dict[str, Any]) -> str:
+    for source in (plan, finding):
+        for key in ("proof_of_impact", "impact_proof", "proof", "impact_evidence"):
+            value = str(source.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
 def _finding_readiness(finding: dict[str, Any], plan: dict[str, Any]) -> list[str]:
     steps = plan.get("steps") or []
     impact = plan.get("impact") or finding.get("impact")
+    proof = _proof_of_impact(finding, plan)
     remediation = finding.get("remediation") or plan.get("remediation")
     return [
         _checkbox(bool(_location(finding)), "Precise affected location is captured."),
         _checkbox(bool(finding.get("snippet") or finding.get("description")), "Evidence is present and safe to share."),
         _checkbox(len(steps) >= 2, "Reproduction steps are specific enough to replay."),
         _checkbox(bool(impact), "Impact is stated in bounty-review language."),
+        _checkbox(bool(proof), "Proof of impact is captured as concrete evidence."),
         _checkbox(bool(remediation), "A concrete fix recommendation is included."),
     ]
 
 
 def build_markdown(ctx: dict[str, Any]) -> str:
-    findings: list[dict[str, Any]] = ctx.get("findings", [])
+    findings: list[dict[str, Any]] = _reportable_findings(ctx.get("findings", []))
     counts = severity_counts(findings)
     profile = ctx.get("profile", {}) or {}
     vuln_class = ctx.get("vuln_class") or None
@@ -283,6 +317,13 @@ def build_markdown(ctx: dict[str, Any]) -> str:
         if plan.get("impact") or finding.get("impact"):
             out.append(f"**Impact:** {plan.get('impact') or finding.get('impact')}")
             out.append("")
+        proof = _proof_of_impact(finding, plan)
+        out.append("**Proof of impact:**")
+        if proof:
+            out.append(proof)
+        else:
+            out.append("_Not captured yet. Do not submit until reproduction evidence proves affected data, privilege, or state change._")
+        out.append("")
         remediation = finding.get("remediation") or plan.get("remediation")
         if remediation:
             out.append(f"**Remediation:** {remediation}")
@@ -307,7 +348,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
 
 
 def _append_bounty_triage(out: list[str], ctx: dict[str, Any], counts: dict[str, int]) -> None:
-    findings = ctx.get("findings") or []
+    findings = _reportable_findings(ctx.get("findings") or [])
     out.append("## Bounty triage\n")
     if findings:
         top = sorted(findings, key=_sev_rank, reverse=True)[0]
@@ -475,7 +516,7 @@ def _default_summary(counts: dict[str, int], total: int) -> str:
 
 def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
     """Machine-readable sidecar mirroring the report."""
-    findings = ctx.get("findings", [])
+    findings = _reportable_findings(ctx.get("findings", []))
     return {
         "tool": ctx.get("tool", "GreyIQ BugHunter"),
         "version": ctx.get("version", ""),
@@ -512,6 +553,8 @@ def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
 def build_finding_markdown(ctx: dict[str, Any], finding: dict[str, Any]) -> str:
     """A self-contained, submission-ready Markdown report for a single finding —
     everything a bounty platform needs in one paste."""
+    if not _reportable_findings([finding]):
+        return ""
     sev = _SEVERITY_LABEL.get(str(finding.get("severity")).lower(), "?")
     plan = (ctx.get("attack_plans") or {}).get(finding.get("ref"), {}) or {}
     out: list[str] = []
@@ -572,6 +615,13 @@ def build_finding_markdown(ctx: dict[str, Any], finding: dict[str, Any]) -> str:
     impact = plan.get("impact") or finding.get("impact")
     if impact:
         out.append(f"## Impact\n\n{impact}\n")
+    proof = _proof_of_impact(finding, plan)
+    out.append("## Proof of impact\n")
+    if proof:
+        out.append(proof)
+    else:
+        out.append("_Not captured yet. Do not submit until reproduction evidence proves affected data, privilege, or state change._")
+    out.append("")
     remediation = finding.get("remediation") or plan.get("remediation")
     if remediation:
         out.append(f"## Remediation\n\n{remediation}\n")

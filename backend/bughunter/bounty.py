@@ -46,7 +46,7 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
     },
     "secrets": {
         "name": "Exposed secret / credential",
-        "cwe": "CWE-798 / CWE-200",
+        "cwe": "CWE-200",
         "owasp": "A07:2021 Identification & Authentication Failures",
         "categories": {"secret", "secret_exposed"},
         "checklist": [
@@ -380,7 +380,7 @@ BOUNTY_SYSTEM_PROMPT = (
     "You are GreyIQ BugHunter, a security analyst preparing an AUTHORIZED bug-bounty report. "
     "You are given automated scan findings for an in-scope target. Your job is to prioritize them, "
     "write clear reproduction / proof-of-concept steps suitable for a bounty submission, assess impact, "
-    "and recommend a fix. Reproduction steps describe how to confirm the bug on the authorized target — "
+    "capture concrete proof of impact, and recommend a fix. Reproduction steps describe how to confirm the bug on the authorized target — "
     "they are for the report. Do NOT provide mass-exploitation tooling, malware, ways to attack systems "
     "you are not authorized to test, or techniques to evade detection. Stay strictly within the named scope. "
     "Respond with a single JSON object and nothing else."
@@ -439,7 +439,7 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
         steps.extend(meta["checklist"])
     else:
         steps.append("Confirm the finding is reachable from untrusted input, then assess impact.")
-    return {"steps": steps, "impact": "", "poc": ""}
+    return {"steps": steps, "impact": "", "proof_of_impact": "", "poc": ""}
 
 
 def _safe_slug(value: str, fallback: str = "target") -> str:
@@ -545,7 +545,8 @@ def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], 
         f"Automated findings (JSON):\n{json.dumps(compact, default=str)[:8000]}\n\n"
         "Return ONLY a JSON object:\n"
         '{"executive_summary": "2-4 sentences, most important issue first",\n'
-        ' "attack_plans": [{"ref": "F1", "steps": ["..."], "poc": "short PoC outline", "impact": "..."}],\n'
+        ' "attack_plans": [{"ref": "F1", "steps": ["..."], "poc": "short PoC outline", "impact": "...", '
+        '"proof_of_impact": "specific response, data, permission, or state-change evidence that proves impact; empty if not proven"}],\n'
         ' "manual_tests": ["lead the scanner cannot confirm, to try by hand in scope"],\n'
         ' "next_steps": ["the single most valuable thing to do next, target-specific, imperative — '
         'ordered most-valuable first"],\n'
@@ -577,6 +578,7 @@ def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], 
             "steps": [str(s).strip() for s in (plan.get("steps") or []) if str(s).strip()],
             "poc": str(plan.get("poc") or "").strip(),
             "impact": str(plan.get("impact") or "").strip(),
+            "proof_of_impact": str(plan.get("proof_of_impact") or plan.get("impact_proof") or "").strip(),
         }
     return brain
 
