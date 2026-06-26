@@ -48,7 +48,16 @@ class BountyReportTests(unittest.TestCase):
                 "F1": {
                     "steps": ["Log in as account A.", "Replay the request with account B."],
                     "impact": "Cross-tenant order disclosure.",
-                    "proof_of_impact": "The replay as account B returned order 123 owned by account A.",
+                    "proof_of_impact": {
+                        "status": "confirmed",
+                        "method": "Replay account A's order request with account B's session.",
+                        "actor": "Account B",
+                        "affected_asset": "Order 123 owned by account A",
+                        "observed_result": "HTTP 200 returned order 123 to account B.",
+                        "control_result": "Account B should receive 403 or an empty result for account A's order.",
+                        "evidence": "The replay as account B returned order 123 owned by account A.",
+                        "limitations": "Only a single order id was tested.",
+                    },
                 }
             },
             "manual_checklist": ["Replay as a lower-privileged account."],
@@ -61,16 +70,21 @@ class BountyReportTests(unittest.TestCase):
 
         self.assertIn("## Bounty triage", markdown)
         self.assertIn("**Proof of impact:**", markdown)
+        self.assertIn("**Status:** Confirmed", markdown)
+        self.assertIn("**Observed result:** HTTP 200 returned order 123 to account B.", markdown)
+        self.assertIn("**Control / expected result:** Account B should receive 403", markdown)
         self.assertIn("The replay as account B returned order 123 owned by account A.", markdown)
         self.assertIn("### Submission preflight", markdown)
         self.assertIn("**Submission readiness**", markdown)
-        self.assertIn("[x] Proof of impact is captured as concrete evidence.", markdown)
+        self.assertIn("[x] Confirmed proof of impact is captured as concrete evidence.", markdown)
         self.assertIn("### Retest after fix", markdown)
         self.assertEqual(json_doc["class_counts"]["Broken access control / IDOR"], 1)
         self.assertEqual(
-            json_doc["attack_plans"]["F1"]["proof_of_impact"],
+            json_doc["attack_plans"]["F1"]["proof_of_impact"]["evidence"],
             "The replay as account B returned order 123 owned by account A.",
         )
+        self.assertEqual(json_doc["proof_of_impact"]["F1"]["status"], "confirmed")
+        self.assertTrue(json_doc["proof_of_impact"]["F1"]["ready"])
         self.assertTrue(json_doc["run_live_requested"])
         self.assertIn("submission_checklist", json_doc)
 
@@ -110,7 +124,45 @@ class BountyReportTests(unittest.TestCase):
 
         self.assertIn("**Proof of impact:**", markdown)
         self.assertIn("Not captured yet", markdown)
-        self.assertIn("[ ] Proof of impact is captured as concrete evidence.", markdown)
+        self.assertIn("[ ] Confirmed proof of impact is captured as concrete evidence.", markdown)
+
+    def test_report_marks_generic_proof_as_candidate_not_ready(self) -> None:
+        ctx = {
+            "tool": "GreyIQ BugHunter",
+            "target": "https://example.test",
+            "profile": {"id": "web-app", "name": "Web application", "description": ""},
+            "findings": [
+                {
+                    "ref": "F1",
+                    "severity": "medium",
+                    "confidence": "medium",
+                    "category": "access-control",
+                    "title": "Candidate issue",
+                    "location": "app.js",
+                    "rule_id": "manual.candidate",
+                    "description": "A candidate issue was detected.",
+                    "snippet": "candidate evidence",
+                }
+            ],
+            "attack_plans": {
+                "F1": {
+                    "steps": ["Open the target.", "Replay the request."],
+                    "impact": "Potential sensitive data exposure.",
+                    "proof_of_impact": "Needs confirmation.",
+                }
+            },
+            "recommended_tools": [],
+            "brain": {"used": False},
+        }
+
+        markdown = report_lib.build_markdown(ctx)
+        json_doc = report_lib.build_json(ctx)
+
+        self.assertIn("**Status:** Candidate / unverified", markdown)
+        self.assertIn("**Gap:** Treat this as a lead", markdown)
+        self.assertIn("[ ] Confirmed proof of impact is captured as concrete evidence.", markdown)
+        self.assertEqual(json_doc["proof_of_impact"]["F1"]["status"], "candidate")
+        self.assertFalse(json_doc["proof_of_impact"]["F1"]["ready"])
 
     def test_profiles_expose_expanded_focus_classes(self) -> None:
         payload = list_profiles()

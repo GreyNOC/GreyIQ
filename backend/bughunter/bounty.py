@@ -546,7 +546,10 @@ def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], 
         "Return ONLY a JSON object:\n"
         '{"executive_summary": "2-4 sentences, most important issue first",\n'
         ' "attack_plans": [{"ref": "F1", "steps": ["..."], "poc": "short PoC outline", "impact": "...", '
-        '"proof_of_impact": "specific response, data, permission, or state-change evidence that proves impact; empty if not proven"}],\n'
+        '"proof_of_impact": {"status": "confirmed|candidate|missing", "method": "authorized test used", '
+        '"actor": "role/account used", "affected_asset": "data/action affected", '
+        '"observed_result": "exact response/state proving impact", "control_result": "expected/negative-control result", '
+        '"evidence": "safe concise proof, redacted", "limitations": "what is not yet proven"}}],\n'
         ' "manual_tests": ["lead the scanner cannot confirm, to try by hand in scope"],\n'
         ' "next_steps": ["the single most valuable thing to do next, target-specific, imperative — '
         'ordered most-valuable first"],\n'
@@ -574,11 +577,25 @@ def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], 
         ref = str(plan.get("ref") or "").strip()
         if not ref:
             continue
+        proof = plan.get("proof_of_impact") or plan.get("impact_proof") or ""
+        if isinstance(proof, dict):
+            proof_value: Any = {
+                "status": str(proof.get("status") or proof.get("proof_status") or "").strip(),
+                "method": str(proof.get("method") or proof.get("test_method") or "").strip(),
+                "actor": str(proof.get("actor") or proof.get("role") or proof.get("account") or "").strip(),
+                "affected_asset": str(proof.get("affected_asset") or proof.get("asset") or proof.get("data") or "").strip(),
+                "observed_result": str(proof.get("observed_result") or proof.get("result") or "").strip(),
+                "control_result": str(proof.get("control_result") or proof.get("negative_control") or "").strip(),
+                "evidence": str(proof.get("evidence") or proof.get("summary") or proof.get("description") or "").strip(),
+                "limitations": str(proof.get("limitations") or proof.get("scope_limitations") or proof.get("notes") or "").strip(),
+            }
+        else:
+            proof_value = str(proof or "").strip()
         brain["attack_plans"][ref] = {
             "steps": [str(s).strip() for s in (plan.get("steps") or []) if str(s).strip()],
             "poc": str(plan.get("poc") or "").strip(),
             "impact": str(plan.get("impact") or "").strip(),
-            "proof_of_impact": str(plan.get("proof_of_impact") or plan.get("impact_proof") or "").strip(),
+            "proof_of_impact": proof_value,
         }
     return brain
 
