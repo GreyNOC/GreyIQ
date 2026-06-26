@@ -2,6 +2,17 @@
 
 Notable changes to GreyIQ.
 
+## v0.9.9
+
+### Fixed
+- **Empty "Bounty type" dropdown when the backend is late.** The Security panel's
+  selectors (bounty type, focus class, toolkit) were populated once at boot and gated
+  on the local API being reachable at that instant — so if the API lagged the UI (the
+  packaged build unpacking on first launch, or the PM2/phone split where the Node UI
+  serves before the Python API), the dropdowns stayed blank with no retry. They now
+  (re)load whenever the Security panel is shown and the moment the service becomes
+  reachable, via an idempotent `ensureSecurityData()`.
+
 ## v0.9.8
 
 ### Added
