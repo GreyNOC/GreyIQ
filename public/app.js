@@ -588,6 +588,9 @@ async function refreshServiceStatus({ silent = false } = {}) {
       lastError: ""
     };
     ensureServicePolling();
+    // If the backend only just became reachable, fill any Security-panel selectors
+    // that bailed empty at boot (the lazy poll is how a late backend gets noticed).
+    if (state.panelMode === "security") ensureSecurityData();
     if (!silent) {
       render();
     } else {
@@ -2054,6 +2057,19 @@ function setPanelMode(mode, focusTab = false) {
   if (els.panelModeEyebrow) els.panelModeEyebrow.textContent = label.eyebrow;
   if (els.panelModeTitle) els.panelModeTitle.textContent = label.title;
   saveState();
+  // The Security panel's selectors (bounty type, focus class, toolkit) load lazily
+  // and self-gate on the local service. (Re)load them whenever the panel is shown
+  // and they're still empty — otherwise a backend that comes up after boot leaves
+  // the dropdowns blank with no retry.
+  if (mode === "security") ensureSecurityData();
+}
+
+// Populate the Security panel's selectors if they haven't loaded yet. Idempotent
+// and cheap: both loaders self-gate on service availability and no-op when already
+// populated, so this is safe to call on every panel show and service-up transition.
+function ensureSecurityData() {
+  if (els.bountyProfile && !bountyProfilesData.length) void loadBountyProfiles();
+  if (els.toolkitForm && !toolkitData.tools.length) void loadToolkit();
 }
 
 for (const button of els.panelModeButtons) {
