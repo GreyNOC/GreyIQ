@@ -21,6 +21,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from bughunter.code_scanner.redaction import redact_text
 from bughunter.code_scanner.rules import SECRET_RULES
 from bughunter.settings import get_settings
 from bughunter.web_ingest import (
@@ -89,6 +90,7 @@ def _finding(
     remediation: str = "",
     line_start: int = 1,
 ) -> dict[str, Any]:
+    safe_snippet, redacted = redact_text(snippet)
     return {
         "rule_id": rule_id,
         "title": title,
@@ -98,8 +100,9 @@ def _finding(
         "file_path": url,
         "line_start": line_start,
         "line_end": line_start,
-        "snippet": snippet,
+        "snippet": safe_snippet,
         "remediation": remediation,
+        "redacted": redacted,
     }
 
 

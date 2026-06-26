@@ -30,7 +30,7 @@ _CONFIDENCE_RANK: dict[str, int] = {"high": 3, "medium": 2, "low": 1}
 _MAX_FINDINGS_RETURNED = 500
 
 
-def _finding_to_dict(finding: Finding) -> dict[str, Any]:
+def _finding_to_dict(finding: Finding, *, redacted: bool = False) -> dict[str, Any]:
     return {
         "rule_id": finding.rule_id,
         "title": finding.title,
@@ -43,6 +43,7 @@ def _finding_to_dict(finding: Finding) -> dict[str, Any]:
         "line_end": finding.line_end,
         "snippet": finding.snippet,
         "remediation": finding.remediation,
+        "redacted": redacted,
     }
 
 
@@ -70,7 +71,13 @@ def _result_to_dict(result: ScanResult) -> dict[str, Any]:
         "finding_count": len(result.findings),
         "suppressed_count": result.suppressed_count,
         "git_metadata": result.git_metadata,
-        "findings": [_finding_to_dict(f) for f in ordered[:_MAX_FINDINGS_RETURNED]],
+        "findings": [
+            _finding_to_dict(
+                f,
+                redacted=f"{f.rule_id}@{f.file_path}:{f.line_start}" in result.redacted_findings,
+            )
+            for f in ordered[:_MAX_FINDINGS_RETURNED]
+        ],
         "findings_truncated": len(result.findings) > _MAX_FINDINGS_RETURNED,
     }
 

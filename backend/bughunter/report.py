@@ -140,26 +140,153 @@ def _checkbox(done: bool, text: str) -> str:
     return f"- [{'x' if done else ' '}] {text}"
 
 
-def _proof_of_impact(finding: dict[str, Any], plan: dict[str, Any]) -> str:
+_CONFIRMED_PROOF_STATUSES = {"confirmed", "verified", "proven", "reproduced"}
+_CANDIDATE_PROOF_STATUSES = {"candidate", "unverified", "partial", "needs_confirmation", "needs-confirmation"}
+_GENERIC_PROOF_RE = re.compile(
+    r"^(?:n/?a|none|unknown|tbd|todo|not captured|needs? confirmation|verify manually|manual verification required)$",
+    re.IGNORECASE,
+)
+_CONCRETE_IMPACT_RE = re.compile(
+    r"\b(?:returned|exposed|disclosed|read|downloaded|listed|created|updated|deleted|changed|"
+    r"bypassed|authenticated|impersonated|forged|admin|cross-tenant|account|user|customer|order|"
+    r"invoice|email|token|secret|session|owned by|as account|before/after|http\s*(?:200|201|204|403))\b",
+    re.IGNORECASE,
+)
+
+
+def _proof_value(finding: dict[str, Any], plan: dict[str, Any]) -> Any:
     for source in (plan, finding):
         for key in ("proof_of_impact", "impact_proof", "proof", "impact_evidence"):
-            value = str(source.get(key) or "").strip()
+            value = source.get(key)
             if value:
                 return value
+    return None
+
+
+def _explicit_proof_status(finding: dict[str, Any], plan: dict[str, Any], proof: Any) -> str:
+    sources: list[Any] = []
+    if isinstance(proof, dict):
+        sources.append(proof)
+    sources.extend([plan, finding])
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in ("proof_status", "impact_status", "proof_of_impact_status", "status"):
+            raw = str(source.get(key) or "").strip().lower()
+            if raw in _CONFIRMED_PROOF_STATUSES:
+                return "confirmed"
+            if raw in _CANDIDATE_PROOF_STATUSES:
+                return "candidate"
+        for key in ("impact_confirmed", "proof_confirmed", "replay_authenticated"):
+            value = source.get(key)
+            if isinstance(value, bool):
+                return "confirmed" if value else "candidate"
+    if _jwt_replay_value(finding) is True:
+        return "confirmed"
     return ""
+
+
+def _proof_text_is_concrete(text: str) -> bool:
+    cleaned = str(text or "").strip()
+    if len(cleaned) < 20 or _GENERIC_PROOF_RE.match(cleaned):
+        return False
+    return bool(_CONCRETE_IMPACT_RE.search(cleaned))
+
+
+def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> dict[str, str | bool]:
+    proof = _proof_value(finding, plan)
+    detail: dict[str, str | bool] = {
+        "status": "missing",
+        "ready": False,
+        "evidence": "",
+        "method": "",
+        "observed_result": "",
+        "affected_asset": "",
+        "actor": "",
+        "control_result": "",
+        "limitations": "",
+    }
+    if proof is None:
+        return detail
+
+    if isinstance(proof, dict):
+        detail["evidence"] = str(
+            proof.get("evidence")
+            or proof.get("summary")
+            or proof.get("description")
+            or proof.get("observed_result")
+            or ""
+        ).strip()
+        detail["method"] = str(proof.get("method") or proof.get("test_method") or "").strip()
+        detail["observed_result"] = str(proof.get("observed_result") or proof.get("result") or "").strip()
+        detail["affected_asset"] = str(proof.get("affected_asset") or proof.get("asset") or proof.get("data") or "").strip()
+        detail["actor"] = str(proof.get("actor") or proof.get("role") or proof.get("account") or "").strip()
+        detail["control_result"] = str(proof.get("control_result") or proof.get("negative_control") or "").strip()
+        detail["limitations"] = str(proof.get("limitations") or proof.get("scope_limitations") or proof.get("notes") or "").strip()
+    else:
+        detail["evidence"] = str(proof or "").strip()
+
+    combined = " ".join(
+        str(detail.get(key) or "")
+        for key in ("evidence", "observed_result", "affected_asset", "actor", "control_result")
+    )
+    explicit_status = _explicit_proof_status(finding, plan, proof)
+    if explicit_status:
+        detail["status"] = explicit_status
+    elif _proof_text_is_concrete(combined):
+        detail["status"] = "confirmed"
+    elif str(detail["evidence"]).strip():
+        detail["status"] = "candidate"
+    detail["ready"] = detail["status"] == "confirmed" and bool(str(detail["evidence"]).strip() or str(detail["observed_result"]).strip())
+    return detail
+
+
+def _proof_status_label(status: str) -> str:
+    return {
+        "confirmed": "Confirmed",
+        "candidate": "Candidate / unverified",
+        "missing": "Missing",
+    }.get(status, status.replace("_", " ").title() or "Missing")
+
+
+def _append_proof_of_impact(out: list[str], finding: dict[str, Any], plan: dict[str, Any], *, heading: str) -> None:
+    detail = _proof_of_impact_detail(finding, plan)
+    status = str(detail["status"])
+    out.append(heading)
+    if status == "missing":
+        out.append("_Not captured yet. Do not submit until reproduction evidence proves affected data, privilege, or state change._")
+        out.append("")
+        return
+    out.append(f"- **Status:** {_proof_status_label(status)}")
+    labels = (
+        ("method", "Method"),
+        ("actor", "Actor / role"),
+        ("affected_asset", "Affected asset or data"),
+        ("observed_result", "Observed result"),
+        ("control_result", "Control / expected result"),
+        ("evidence", "Evidence"),
+        ("limitations", "Limitations"),
+    )
+    for key, label in labels:
+        value = str(detail.get(key) or "").strip()
+        if value:
+            out.append(f"- **{label}:** {value}")
+    if status != "confirmed":
+        out.append("- **Gap:** Treat this as a lead until an authorized replay or dynamic check proves the effect.")
+    out.append("")
 
 
 def _finding_readiness(finding: dict[str, Any], plan: dict[str, Any]) -> list[str]:
     steps = plan.get("steps") or []
     impact = plan.get("impact") or finding.get("impact")
-    proof = _proof_of_impact(finding, plan)
+    proof = _proof_of_impact_detail(finding, plan)
     remediation = finding.get("remediation") or plan.get("remediation")
     return [
         _checkbox(bool(_location(finding)), "Precise affected location is captured."),
         _checkbox(bool(finding.get("snippet") or finding.get("description")), "Evidence is present and safe to share."),
         _checkbox(len(steps) >= 2, "Reproduction steps are specific enough to replay."),
         _checkbox(bool(impact), "Impact is stated in bounty-review language."),
-        _checkbox(bool(proof), "Proof of impact is captured as concrete evidence."),
+        _checkbox(bool(proof["ready"]), "Confirmed proof of impact is captured as concrete evidence."),
         _checkbox(bool(remediation), "A concrete fix recommendation is included."),
     ]
 
@@ -317,13 +444,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
         if plan.get("impact") or finding.get("impact"):
             out.append(f"**Impact:** {plan.get('impact') or finding.get('impact')}")
             out.append("")
-        proof = _proof_of_impact(finding, plan)
-        out.append("**Proof of impact:**")
-        if proof:
-            out.append(proof)
-        else:
-            out.append("_Not captured yet. Do not submit until reproduction evidence proves affected data, privilege, or state change._")
-        out.append("")
+        _append_proof_of_impact(out, finding, plan, heading="**Proof of impact:**")
         remediation = finding.get("remediation") or plan.get("remediation")
         if remediation:
             out.append(f"**Remediation:** {remediation}")
@@ -517,6 +638,7 @@ def _default_summary(counts: dict[str, int], total: int) -> str:
 def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
     """Machine-readable sidecar mirroring the report."""
     findings = _reportable_findings(ctx.get("findings", []))
+    attack_plans = ctx.get("attack_plans", {}) or {}
     return {
         "tool": ctx.get("tool", "GreyIQ BugHunter"),
         "version": ctx.get("version", ""),
@@ -533,7 +655,15 @@ def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
         "class_counts": _class_counts(findings),
         "finding_count": len(findings),
         "findings": findings,
-        "attack_plans": ctx.get("attack_plans", {}),
+        "attack_plans": attack_plans,
+        "proof_of_impact": {
+            str(finding.get("ref") or ""): _proof_of_impact_detail(
+                finding,
+                attack_plans.get(finding.get("ref")) or {},
+            )
+            for finding in findings
+            if finding.get("ref")
+        },
         "next_steps": ctx.get("next_steps", []),
         "coverage": ctx.get("coverage", {}),
         "manual_checklist": ctx.get("manual_checklist", []),
@@ -615,13 +745,7 @@ def build_finding_markdown(ctx: dict[str, Any], finding: dict[str, Any]) -> str:
     impact = plan.get("impact") or finding.get("impact")
     if impact:
         out.append(f"## Impact\n\n{impact}\n")
-    proof = _proof_of_impact(finding, plan)
-    out.append("## Proof of impact\n")
-    if proof:
-        out.append(proof)
-    else:
-        out.append("_Not captured yet. Do not submit until reproduction evidence proves affected data, privilege, or state change._")
-    out.append("")
+    _append_proof_of_impact(out, finding, plan, heading="## Proof of impact\n")
     remediation = finding.get("remediation") or plan.get("remediation")
     if remediation:
         out.append(f"## Remediation\n\n{remediation}\n")
