@@ -413,7 +413,9 @@ function loadState() {
 
   try {
     const saved = JSON.parse(localStorage.getItem(STORE_KEY) || "null");
-    if (!saved || !Array.isArray(saved.bots)) {
+    // An empty bots array is as invalid as a missing one — the app assumes at least
+    // one bot (activeBot()/render paths index into it), so fall back to defaults.
+    if (!saved || !Array.isArray(saved.bots) || saved.bots.length === 0) {
       return fallback;
     }
 
@@ -595,7 +597,11 @@ async function refreshServiceStatus({ silent = false } = {}) {
       render();
     } else {
       renderBackend();
-      renderTraining();
+      // Only rebuild the training/memory panel when something it shows actually
+      // changed — a no-op poll must not wipe the user's focus/scroll there.
+      if (trainingSignature() !== lastTrainingSignature) {
+        renderTraining();
+      }
     }
     return true;
   } catch (error) {
@@ -1181,10 +1187,21 @@ function renderBots() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = `bot-item${bot.id === state.activeBotId ? " is-active" : ""}`;
-    button.innerHTML = `
-      <span class="bot-avatar" style="background:${bot.color}">${initials(bot.name)}</span>
-      <span><strong>${escapeHtml(bot.name)}</strong><span>${escapeHtml(bot.style)}</span></span>
-    `;
+    // Build via DOM, not innerHTML: bot.color comes from localStorage and was
+    // interpolated raw into a style="" attribute — a tampered value could break out
+    // and inject markup. Setting it through the CSSOM (style.background) makes the
+    // browser reject anything that isn't a valid color.
+    const avatar = document.createElement("span");
+    avatar.className = "bot-avatar";
+    avatar.style.background = String(bot.color || "");
+    avatar.textContent = initials(bot.name);
+    const meta = document.createElement("span");
+    const strong = document.createElement("strong");
+    strong.textContent = bot.name;
+    const sub = document.createElement("span");
+    sub.textContent = bot.style;
+    meta.append(strong, sub);
+    button.replaceChildren(avatar, meta);
     button.addEventListener("click", () => {
       state.activeBotId = bot.id;
       queueCoreSync();
@@ -1338,6 +1355,22 @@ function renderChat() {
   els.messageStream.scrollTop = els.messageStream.scrollHeight;
 }
 
+let lastTrainingSignature = "";
+
+// A compact signature of everything renderTraining() actually reflects. The 5s
+// status poll uses it to skip rebuilding the memory list when nothing changed —
+// otherwise replaceChildren() every tick destroys focus/scroll in that panel.
+function trainingSignature() {
+  const t = service.status?.training || {};
+  const memories = activeMemories();
+  return JSON.stringify([
+    Boolean(t.active), Boolean(t.paused),
+    t.status?.status || t.status?.stage || "",
+    t.last_error || "", t.finished_at || "",
+    memories.length, Boolean(activeBot()?.trainedAt), state.activeBotId,
+  ]);
+}
+
 function renderTraining() {
   const memories = activeMemories();
   const training = service.status?.training;
@@ -1374,6 +1407,7 @@ function renderTraining() {
     item.querySelector(".memory-delete").addEventListener("click", () => removeMemory(memory.id));
     els.memoryList.append(item);
   }
+  lastTrainingSignature = trainingSignature();
 }
 
 function renderTrainingSources() {
@@ -3959,7 +3993,16 @@ els.bountyCopyReport?.addEventListener("click", async () => {
       if (els.bountyCopyReport) els.bountyCopyReport.textContent = "Copy report";
     }, 1500);
   } catch (_) {
-    // Clipboard blocked — select the text so the user can copy manually.
+    // Clipboard blocked — select the text so the user can copy manually. The report
+    // is hidden by default now (next-steps lead), and you can't select a hidden
+    // element, so reveal it first and sync the toggle.
+    if (els.bountyReport && els.bountyReport.hidden) {
+      els.bountyReport.hidden = false;
+      if (els.bountyToggleReport) {
+        els.bountyToggleReport.textContent = "Hide full report";
+        els.bountyToggleReport.setAttribute("aria-expanded", "true");
+      }
+    }
     const range = document.createRange();
     range.selectNodeContents(els.bountyReport);
     const sel = window.getSelection();

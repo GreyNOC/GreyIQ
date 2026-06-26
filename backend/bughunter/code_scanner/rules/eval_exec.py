@@ -71,7 +71,10 @@ _RULES_RAW = [
         "Use yaml.safe_load or pass Loader=yaml.SafeLoader explicitly.",
         ("python",),
         (),
-        r"\byaml\s*\.\s*load\s*\([^)]*(?<!SafeLoader)\s*\)",
+        # Flag yaml.load( unless a SafeLoader is named in the args. The old
+        # end-anchored negative-lookbehind missed multi-line/nested-paren calls and
+        # mis-suppressed; this also (correctly) keeps flagging Full/UnsafeLoader.
+        r"\byaml\s*\.\s*load\s*\((?![^)]*SafeLoader)",
     ),
     (
         "py.marshal-loads",

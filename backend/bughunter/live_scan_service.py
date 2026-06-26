@@ -20,9 +20,16 @@ from __future__ import annotations
 
 from typing import Any
 
+from bughunter.code_scanner.redaction import redact_text
 from bughunter.settings import get_settings
 from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
 from bughunter.web_scan_service import _guard_url
+
+# Bound runtime capture so a noisy/hostile page can't grow these lists without
+# limit during the wait window (memory-exhaustion guard), and clip each captured
+# string at capture time.
+_CAPTURE_CAP = 2000
+_STR_CLIP = 1000
 
 _SEVERITY_WEIGHT: dict[str, float] = {
     "critical": 0.5,
@@ -41,6 +48,9 @@ _RISK_ADVICE = {
 
 
 def _finding(rule_id: str, title: str, severity: str, confidence: str, url: str, snippet: str) -> dict[str, Any]:
+    # Runtime evidence (console text, exception messages, request URLs) can carry
+    # tokens/secrets — redact before it reaches the report, like the passive scanner.
+    safe, redacted = redact_text(str(snippet))
     return {
         "rule_id": rule_id,
         "title": title,
@@ -50,8 +60,9 @@ def _finding(rule_id: str, title: str, severity: str, confidence: str, url: str,
         "file_path": url,
         "line_start": 1,
         "line_end": 1,
-        "snippet": snippet[:240],
+        "snippet": safe[:240],
         "remediation": "",
+        "redacted": redacted,
     }
 
 
@@ -104,20 +115,33 @@ def run_live_scan(url: str, wait_seconds: float = 6.0, max_findings: int = 300) 
     page_errors: list[str] = []
     failed_requests: list[tuple[str, str]] = []
     bad_responses: list[tuple[str, int]] = []
+    capture_overflow = {"v": False}
 
     def on_console(message: Any) -> None:
         if message.type in {"error", "warning"}:
-            console_msgs.append((message.type, message.text))
+            if len(console_msgs) >= _CAPTURE_CAP:
+                capture_overflow["v"] = True
+                return
+            console_msgs.append((message.type, str(message.text)[:_STR_CLIP]))
 
     def on_pageerror(error: Any) -> None:
-        page_errors.append(str(error))
+        if len(page_errors) >= _CAPTURE_CAP:
+            capture_overflow["v"] = True
+            return
+        page_errors.append(str(error)[:_STR_CLIP])
 
     def on_requestfailed(request: Any) -> None:
-        failed_requests.append((request.url, request.failure or "failed"))
+        if len(failed_requests) >= _CAPTURE_CAP:
+            capture_overflow["v"] = True
+            return
+        failed_requests.append((str(request.url)[:_STR_CLIP], str(request.failure or "failed")[:200]))
 
     def on_response(response: Any) -> None:
         if response.status >= 400:
-            bad_responses.append((response.url, response.status))
+            if len(bad_responses) >= _CAPTURE_CAP:
+                capture_overflow["v"] = True
+                return
+            bad_responses.append((str(response.url)[:_STR_CLIP], response.status))
 
     wait_ms = int(max(0.0, wait_seconds) * 1000)
     try:
@@ -175,5 +199,6 @@ def run_live_scan(url: str, wait_seconds: float = 6.0, max_findings: int = 300) 
             "console_warnings": sum(1 for k, _ in console_msgs if k == "warning"),
             "failed_requests": len(failed_requests),
             "bad_responses": len(bad_responses),
+            "capture_capped": capture_overflow["v"],
         },
     }

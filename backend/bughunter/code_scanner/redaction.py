@@ -45,9 +45,12 @@ _GENERIC_PASSWORD_RE: Final = re.compile(
     re.IGNORECASE,
 )
 
-# .env style KEY=VALUE, one line. Redact the VALUE.
+# .env style KEY=VALUE. Redact the VALUE. NOT anchored to ^...$ — snippets are
+# often whitespace-collapsed to a single line (the web/live scanners do this), so
+# anchored matching would silently miss every KEY=VALUE on a collapsed line and
+# leak the adjacent credentials. We match each KEY=VALUE at a word boundary.
 _DOTENV_RE: Final = re.compile(
-    r"^([A-Z][A-Z0-9_]{2,}\s*=\s*)([A-Za-z0-9_+/=\-]{10,})\s*$",
+    r"(?:^|(?<=\s))([A-Z][A-Z0-9_]{2,}\s*=\s*)([A-Za-z0-9_+/=\-]{10,})",
     re.MULTILINE,
 )
 
@@ -56,6 +59,13 @@ _DOTENV_RE: Final = re.compile(
 # guarantee it never leaks.
 _PEM_RE: Final = re.compile(
     r"-----BEGIN (?:RSA |EC |OPENSSH |PGP |DSA )?PRIVATE KEY( BLOCK)?-----[\s\S]*?-----END"
+)
+
+# Fallback for a private-key header with NO matching -----END----- (the snippet
+# was truncated mid-key, which is exactly when the body would otherwise leak).
+# Stamp from the header to the end of the text so the key material never escapes.
+_PEM_LONE_RE: Final = re.compile(
+    r"-----BEGIN (?:RSA |EC |OPENSSH |PGP |DSA )?PRIVATE KEY( BLOCK)?-----[\s\S]*"
 )
 
 
@@ -93,6 +103,13 @@ def _redact_text(text: str) -> tuple[str, bool]:
     # PEM blocks: stamp the entire block. Run first so the subsequent
     # patterns don't independently chew on its body.
     new_text, count = _PEM_RE.subn("[REDACTED_PRIVATE_KEY_BLOCK]", text)
+    if count:
+        redacted_any = True
+        text = new_text
+    # Then catch a truncated key whose END marker was clipped off (the lone-BEGIN
+    # case). If the block above already stamped it, the BEGIN header is gone, so
+    # this can't double-match.
+    new_text, count = _PEM_LONE_RE.subn("[REDACTED_PRIVATE_KEY_BLOCK]", text)
     if count:
         redacted_any = True
         text = new_text

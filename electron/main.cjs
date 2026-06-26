@@ -220,6 +220,9 @@ async function startBackend() {
     env,
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
+    // POSIX: make the child a process-group leader so killTree's process.kill(-pid)
+    // actually signals its grandchildren (model runners). Windows uses taskkill /T.
+    detached: process.platform !== 'win32',
   });
 
   backendProcess.on('error', (err) => {
@@ -491,6 +494,8 @@ async function startBundledOllama() {
       env: { ...process.env, OLLAMA_HOST: `127.0.0.1:${OLLAMA_PORT}`, OLLAMA_MODELS: modelsDir },
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
+      // POSIX group leader so killTree reaps Ollama's model-runner grandchildren.
+      detached: process.platform !== 'win32',
     });
     ollamaProcess.stdout.on('data', (chunk) => process.stdout.write(`[Ollama] ${chunk}`));
     ollamaProcess.stderr.on('data', (chunk) => process.stdout.write(`[Ollama] ${chunk}`));
@@ -526,24 +531,44 @@ async function boot() {
   // Warm up the bundled local runtime in the background (don't block the window).
   void startBundledOllama();
   createWindow();
-  await startBackend();
-  showApp();
+  // Always swap to the app (or the error page) even if startup throws — otherwise an
+  // unhandled rejection leaves the window stuck on the loading spinner forever.
+  try {
+    await startBackend();
+  } catch (err) {
+    if (!startupError) startupError = `Startup failed: ${err && err.message ? err.message : err}`;
+  } finally {
+    showApp();
+  }
 }
 
-app.whenReady().then(boot);
+app.whenReady().then(boot).catch((err) => {
+  if (!startupError) startupError = `Startup failed: ${err && err.message ? err.message : err}`;
+  try { showApp(); } catch (_) { /* nothing more we can do */ }
+});
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
+// Kill the whole process tree, not just the direct child — the backend and Ollama
+// spawn their own children (model runners), which would otherwise be orphaned and
+// keep holding ports/memory after the app quits.
+function killTree(proc) {
+  if (!proc || proc.killed || proc.pid == null) return;
+  try {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { windowsHide: true });
+    } else {
+      try { process.kill(-proc.pid); } catch (_) { proc.kill(); }
+    }
+  } catch (_) { /* best-effort during shutdown */ }
+}
+
 app.on('before-quit', () => {
   quitting = true;
-  if (backendProcess && !backendProcess.killed) {
-    backendProcess.kill();
-  }
-  if (ollamaProcess && !ollamaProcess.killed) {
-    ollamaProcess.kill();
-  }
+  killTree(backendProcess);
+  killTree(ollamaProcess);
   if (logStream) {
     try {
       logStream.end();

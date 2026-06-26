@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import coder
+from bughunter import impact_model
 from bughunter import next_steps as next_steps_lib
 from bughunter import report as report_lib
 from bughunter import toolkit as toolkit_lib
@@ -431,7 +432,26 @@ def _classify(finding: dict[str, Any]) -> tuple[str, str, str, str]:
     return category or "other", (category or "Other").replace("_", " ").title(), "", ""
 
 
+# Scanner categories / rule prefixes whose finding ALREADY carries a concrete
+# captured artifact (a real leaked value or error body) — enough for a 'candidate'
+# proof status. Everything else is 'missing' until the operator captures proof. A
+# static/passive scan never produces 'confirmed' deterministically.
+_ARTIFACT_CATEGORIES = {"secret", "secret_exposed", "disclosure"}
+
+
+def _deterministic_proof_status(finding: dict[str, Any]) -> str:
+    category = str(finding.get("category") or "").lower()
+    rule_id = str(finding.get("rule_id") or "").lower()
+    if category in _ARTIFACT_CATEGORIES or rule_id.startswith(("secret.", "web.exposed.")) or "disclosure" in rule_id:
+        return "candidate"
+    return "missing"
+
+
 def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[str, Any]:
+    """Build the offline attack plan: reproduction steps PLUS a real impact
+    narrative, a structured proof-of-impact block whose *proof obligation* names the
+    exact artifact to capture, and a CVSS v3.1 estimate — all from impact_model, so
+    a fully offline report is strong. The brain enriches these when configured."""
     where = finding.get("location") or finding.get("file_path") or "the affected location"
     meta = VULN_CLASSES.get(class_id)
     steps = [f"Locate the issue at `{where}` (rule `{finding.get('rule_id', '')}`)."]
@@ -439,7 +459,31 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
         steps.extend(meta["checklist"])
     else:
         steps.append("Confirm the finding is reachable from untrusted input, then assess impact.")
-    return {"steps": steps, "impact": "", "proof_of_impact": "", "poc": ""}
+
+    model = impact_model.impact_for_class(class_id)
+    impact_text = (
+        f"{model['attacker_capability']} "
+        f"Affected asset: {model['affected_asset']} "
+        f"Realistic impact: {model['business_impact']}"
+    )
+    proof_of_impact = {
+        "status": _deterministic_proof_status(finding),
+        "method": "",
+        "actor": "",
+        "affected_asset": model["affected_asset"],
+        "observed_result": "",
+        "control_result": "",
+        "evidence": "",
+        "limitations": "Static/passive scan cannot confirm exploitation; capture the proof obligation below to prove impact.",
+        "proof_obligation": model["proof_obligation"],
+    }
+    return {
+        "steps": steps,
+        "impact": impact_text,
+        "proof_of_impact": proof_of_impact,
+        "cvss": impact_model.cvss_for_class(class_id),
+        "poc": "",
+    }
 
 
 def _safe_slug(value: str, fallback: str = "target") -> str:
@@ -546,14 +590,20 @@ def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], 
         "Return ONLY a JSON object:\n"
         '{"executive_summary": "2-4 sentences, most important issue first",\n'
         ' "attack_plans": [{"ref": "F1", "steps": ["..."], "poc": "short PoC outline", "impact": "...", '
+        '"cvss_vector": "CVSS:3.1 base vector, e.g. AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N", '
         '"proof_of_impact": {"status": "confirmed|candidate|missing", "method": "authorized test used", '
         '"actor": "role/account used", "affected_asset": "data/action affected", '
         '"observed_result": "exact response/state proving impact", "control_result": "expected/negative-control result", '
-        '"evidence": "safe concise proof, redacted", "limitations": "what is not yet proven"}}],\n'
+        '"evidence": "safe concise proof, redacted", "limitations": "what is not yet proven", '
+        '"proof_obligation": "the exact artifact to capture to PROVE impact for a submission"}}],\n'
         ' "manual_tests": ["lead the scanner cannot confirm, to try by hand in scope"],\n'
         ' "next_steps": ["the single most valuable thing to do next, target-specific, imperative — '
         'ordered most-valuable first"],\n'
         ' "notes": "optional extra analysis"}\n'
+        "Proof rules: set status to 'confirmed' ONLY when observed_result is a REAL captured artifact from an authorized "
+        "test (an actual response/state you were given); never invent response bodies or claim proof you do not have — "
+        "if unproven, use 'candidate' or 'missing' and always give a concrete proof_obligation. Estimate a CVSS v3.1 "
+        "vector per finding.\n"
         "For next_steps, be specific to THIS target and these findings — name the endpoint/parameter/file and the "
         "concrete check, not generic advice. If there are no findings, still suggest concrete in-scope manual tests "
         "and next steps for the focus class."
@@ -588,15 +638,27 @@ def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], 
                 "control_result": str(proof.get("control_result") or proof.get("negative_control") or "").strip(),
                 "evidence": str(proof.get("evidence") or proof.get("summary") or proof.get("description") or "").strip(),
                 "limitations": str(proof.get("limitations") or proof.get("scope_limitations") or proof.get("notes") or "").strip(),
+                "proof_obligation": str(proof.get("proof_obligation") or proof.get("obligation") or "").strip(),
             }
         else:
             proof_value = str(proof or "").strip()
-        brain["attack_plans"][ref] = {
+        new_plan: dict[str, Any] = {
             "steps": [str(s).strip() for s in (plan.get("steps") or []) if str(s).strip()],
             "poc": str(plan.get("poc") or "").strip(),
             "impact": str(plan.get("impact") or "").strip(),
             "proof_of_impact": proof_value,
         }
+        cvss_vector = str(plan.get("cvss_vector") or plan.get("cvss") or "").strip()
+        if cvss_vector:
+            scored = impact_model.cvss_base_score(cvss_vector)
+            new_plan["cvss"] = {
+                "vector": cvss_vector,
+                "base_score": scored["score"],
+                "base_severity": scored["severity"],
+                "estimated": True,
+                "justification": "Analyst-estimated CVSS v3.1 base vector for this finding.",
+            }
+        brain["attack_plans"][ref] = new_plan
     return brain
 
 
@@ -720,7 +782,27 @@ def run_bounty_hunt(
     brain = _ask_brain(coder_cfg or {}, clean_target, profile, class_obj, scope, display, playbook, recommended_tools)
     for ref, plan in brain.get("attack_plans", {}).items():
         if ref in attack_plans and (plan.get("steps") or plan.get("poc")):
-            attack_plans[ref] = {**attack_plans[ref], **{k: v for k, v in plan.items() if v}}
+            base = attack_plans[ref]
+            merged = {**base, **{k: v for k, v in plan.items() if v}}
+            # The deterministic proof obligation + CVSS are the floor: keep them when
+            # the brain didn't supply its own, so the report is never left without
+            # the "capture this to prove impact" guidance or a severity vector.
+            base_proof = base.get("proof_of_impact")
+            new_proof = merged.get("proof_of_impact")
+            if isinstance(base_proof, dict):
+                if isinstance(new_proof, dict):
+                    if not new_proof.get("proof_obligation"):
+                        new_proof["proof_obligation"] = base_proof.get("proof_obligation", "")
+                elif isinstance(new_proof, str) and new_proof.strip():
+                    # The brain returned a free-text proof; fold it into the structured
+                    # base so the deterministic proof obligation (and affected asset /
+                    # limitations) still survive instead of being overwritten by a bare string.
+                    promoted = dict(base_proof)
+                    promoted["evidence"] = new_proof.strip()
+                    merged["proof_of_impact"] = promoted
+            if not merged.get("cvss"):
+                merged["cvss"] = base.get("cvss")
+            attack_plans[ref] = merged
 
     # Manual checklist = profile + selected-class + brain ideas.
     checklist = list(profile.get("checklist", []))
@@ -789,10 +871,16 @@ def run_bounty_hunt(
     per_finding_paths: list[str] = []
     if per_finding:
         for finding in display:
+            # build_finding_markdown returns '' for findings the report drops (e.g.
+            # an unconfirmed JWT credential candidate). Render first and skip empties
+            # so we never write a zero-byte file or list a path to nothing.
+            markdown_finding = report_lib.build_finding_markdown(ctx, finding)
+            if not markdown_finding.strip():
+                continue
             fstem = f"{stem}-{finding.get('ref', 'F')}-{_safe_slug(finding.get('title', ''), 'finding')}"
             fpath = out_dir / f"{fstem}.md"
             try:
-                fpath.write_text(report_lib.build_finding_markdown(ctx, finding), encoding="utf-8")
+                fpath.write_text(markdown_finding, encoding="utf-8")
                 per_finding_paths.append(str(fpath))
             except OSError:
                 continue

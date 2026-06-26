@@ -16,8 +16,10 @@ Safety:
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
+import shlex
 import shutil
 import socket
 import ssl
@@ -86,10 +88,48 @@ _BLOCKED_COMMAND_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
 ]
 
 
+# Shell separators we split on before tokenizing, so `a && rm -r -f b` is checked
+# segment-by-segment.
+_CMD_SEPARATORS = re.compile(r"[;\n]|&&|\|\|?")
+
+
+def _rm_recursive_force(command: str) -> bool:
+    """True if any `rm` invocation combines a recursive flag with a force flag,
+    even when the flags are split across separate tokens (`rm -r -f`, `rm --recursive
+    --force`) — which the single-token regex misses."""
+    for segment in _CMD_SEPARATORS.split(command):
+        try:
+            tokens = shlex.split(segment, posix=True)
+        except ValueError:
+            tokens = segment.split()
+        rm_seen = recursive = force = False
+        for tok in tokens:
+            prog = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+            if prog == "rm":
+                rm_seen, recursive, force = True, False, False
+                continue
+            if not rm_seen or not tok.startswith("-"):
+                continue
+            low = tok.lower()
+            if low == "--recursive":
+                recursive = True
+            elif low == "--force":
+                force = True
+            elif not tok.startswith("--"):
+                body = low[1:]
+                recursive = recursive or "r" in body
+                force = force or "f" in body
+            if rm_seen and recursive and force:
+                return True
+    return False
+
+
 def _blocked_command(command: str) -> str | None:
     for label, pattern in _BLOCKED_COMMAND_PATTERNS:
         if pattern.search(command):
             return label
+    if _rm_recursive_force(command):
+        return "recursive force-delete"
     return None
 
 
@@ -338,6 +378,24 @@ _NET_ACTIONS = {"dns", "tcp", "http", "tls"}
 _NET_HTTP_HEADERS = ("server", "content-type", "content-length", "location", "cache-control")
 
 
+class _MetadataBlocked(Exception):
+    """Raised when a net_probe HTTP redirect points at a blocked metadata host."""
+
+
+class _MetadataGuardRedirect(urllib.request.HTTPRedirectHandler):
+    """Re-validate every redirect hop through the metadata guard, so a 30x bounce
+    to 169.254.169.254 (cloud metadata) can't slip past the initial-host check."""
+
+    def __init__(self, guard: Any) -> None:
+        self._guard = guard
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, N802
+        blocked = self._guard(urlparse(newurl).hostname or "")
+        if blocked:
+            raise _MetadataBlocked(blocked)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _split_host_port(target: str) -> tuple[str, int | None]:
     """Pull a (host, port) pair out of a host, host:port, or URL string.
     Returns port=None when none is present."""
@@ -408,6 +466,9 @@ class ToolBox:
         # (clipped for the UI payload), this keeps the complete bytes so an undo
         # restores files exactly.
         self.snapshot: dict[str, dict[str, Any]] = {}
+        # Directories the run created (that did not exist at first touch), deepest
+        # first — so a rollback can remove them and an undo is actually clean.
+        self.created_dirs: list[str] = []
         # Files read this run that the trust scanner flagged (prompt-injection
         # risk). Surfaced in the UI; risky content is also wrapped as untrusted
         # data before it reaches the model.
@@ -462,24 +523,62 @@ class ToolBox:
         return n
 
     def _read_line_range(self, target: Path, start: int, limit: int | None) -> tuple[str, str]:
-        """Read up to `limit` lines starting at 1-based line `start`, line by line so a
-        huge file never loads whole. Stops early at the output budget. Returns
-        (text, header) where header is trusted metadata to show outside the data wrapper."""
+        """Read up to `limit` lines starting at 1-based line `start`. Streams the file
+        in fixed chunks and splits lines itself, so it can page to ANY offset in a
+        large file (its whole purpose) while never loading a single newline-free
+        "line" wholesale — each line is clipped to a memory bound. Returns
+        (text, header) where header is trusted metadata shown outside the data wrapper."""
+        clip = max(self.max_output, 4096)  # cap any single line so a no-newline file can't OOM
         collected: list[str] = []
         chars = 0
         truncated = False
+        lineno = 0
+        last = start - 1
+
+        def take(text: str) -> bool:
+            """Account for one full line; return True when the budget is reached."""
+            nonlocal lineno, last, chars, truncated
+            lineno += 1
+            if lineno < start:
+                return False
+            if (limit is not None and len(collected) >= limit) or chars >= self.max_output:
+                truncated = True
+                return True
+            collected.append(text)
+            chars += len(text)
+            last = lineno
+            return False
+
         with target.open("r", encoding="utf-8", errors="replace") as handle:
-            for lineno, line in enumerate(handle, 1):
-                if lineno < start:
-                    continue
-                if (limit is not None and len(collected) >= limit) or chars >= self.max_output:
-                    truncated = True
+            cur = ""          # accumulated (clipped) current line
+            buf = ""          # unconsumed chunk tail up to the next newline
+            stop = False
+            while not stop:
+                chunk = handle.read(65536)
+                if not chunk:
                     break
-                collected.append(line)
-                chars += len(line)
+                buf += chunk
+                while True:
+                    nl = buf.find("\n")
+                    if nl < 0:
+                        room = clip - len(cur)
+                        if room > 0:
+                            cur += buf[:room]
+                        buf = ""  # discard the over-clip remainder of an unfinished line
+                        break
+                    segment, buf = buf[:nl], buf[nl + 1:]
+                    room = clip - len(cur)
+                    if room > 0:
+                        cur += segment[:room]
+                    if take(cur + "\n"):
+                        stop = True
+                        break
+                    cur = ""
+            if not stop and cur:
+                take(cur)  # final line with no trailing newline
+
         if not collected:
             return "", f"[offset {start} is past the end of the file]\n"
-        last = start + len(collected) - 1
         more = " — more follows, raise offset to continue" if truncated else ""
         return "".join(collected), f"[lines {start}-{last}{more}]\n"
 
@@ -550,8 +649,22 @@ class ToolBox:
             }
         )
 
+    def _capture_created_dirs(self, target: Path) -> None:
+        """Record ancestor directories that don't yet exist before we create them, so
+        rollback can remove the ones the run introduced (sorted deepest-first at
+        snapshot time for a safe bottom-up rmdir)."""
+        parent = target.parent
+        while parent != self.root and self.root in parent.parents:
+            if parent.exists():
+                break
+            rel = parent.relative_to(self.root).as_posix()
+            if rel not in self.created_dirs:
+                self.created_dirs.append(rel)
+            parent = parent.parent
+
     def _tool_write_file(self, args: dict[str, Any]) -> str:
         target = self._resolve(args["path"])
+        self._capture_created_dirs(target)
         target.parent.mkdir(parents=True, exist_ok=True)
         content = str(args.get("content", ""))
         before = self._safe_read(target)
@@ -595,11 +708,21 @@ class ToolBox:
         self.snapshot[rel] = {"existed": bool(existed), "content": content if existed else ""}
 
     def snapshot_payload(self) -> list[dict[str, Any]]:
-        """Full pre-run state of touched files, for one-click rollback."""
-        return [
+        """Full pre-run state of touched files (and the directories the run created),
+        for one-click rollback. Created-dir entries are deepest-first so restore can
+        rmdir them bottom-up after the files inside are removed."""
+        payload = [
             {"path": rel, "existed": entry["existed"], "content": entry["content"]}
             for rel, entry in self.snapshot.items()
         ]
+        for rel in sorted(self.created_dirs, key=lambda p: p.count("/"), reverse=True):
+            payload.append({"path": rel, "is_dir": True, "existed": False})
+        return payload
+
+    def _note_flagged(self, rel: str, label: str) -> None:
+        """Record a prompt-injection-flagged read so the Workbench can surface it."""
+        if not any(r["path"] == rel for r in self.flagged_reads):
+            self.flagged_reads.append({"path": rel, "level": label or "suspicious", "signals": [label] if label else []})
 
     def _tool_grep(self, args: dict[str, Any]) -> str:
         try:
@@ -609,6 +732,7 @@ class ToolBox:
         base = self._resolve(args.get("path", "."))
         files = [base] if base.is_file() else [p for p in base.rglob("*") if p.is_file()]
         hits: list[str] = []
+        capped = False
         for path in files:
             if any(part in {".git", "node_modules", "__pycache__"} for part in path.parts):
                 continue
@@ -621,18 +745,30 @@ class ToolBox:
                         snippet = line.strip()[:200]
                         assessment = trust.assess_text(snippet, path=rel)
                         label = f" [{assessment.label}]" if assessment.patterns else ""
+                        if assessment.patterns:
+                            self._note_flagged(rel, assessment.label)
                         hits.append(f"{rel}:{lineno}{label}: {snippet}")
                         if len(hits) >= 200:
-                            return "\n".join(hits) + "\n... [200-match limit]"
+                            capped = True
+                            break
+                if capped:
+                    break
             except OSError:
                 continue
-        return "\n".join(hits) if hits else "(no matches)"
+        if not hits:
+            return "(no matches)"
+        body = "\n".join(hits) + ("\n... [200-match limit]" if capped else "")
+        # Search hits are workspace content — hand them to the model behind the same
+        # untrusted-DATA boundary as read_file so an injected directive in a matched
+        # line can't be mistaken for an instruction.
+        return trust.wrap_for_model(body, path="(grep results)")
 
     def _tool_find_code(self, args: dict[str, Any]) -> str:
         query = str(args.get("query", "")).strip()
         if not query:
             raise ToolError("query must not be empty.")
-        return repomap.search_repo(self.root, query, max_bytes=self.max_file_bytes)
+        out = repomap.search_repo(self.root, query, max_bytes=self.max_file_bytes)
+        return trust.wrap_for_model(out, path="(find_code results)")
 
     def _tool_run_command(self, args: dict[str, Any]) -> str:
         if not self.allow_commands:
@@ -716,7 +852,34 @@ class ToolBox:
                 addrs.append(entry)
         return f"DNS {host}: " + (", ".join(addrs) if addrs else "no records")
 
+    def _metadata_guard(self, host: str) -> str | None:
+        """Refuse cloud-metadata / link-local targets — a credential-theft SSRF
+        vector. net_probe is an ops/NOC tool, so loopback and RFC1918 private hosts
+        stay allowed (internal service health is a legitimate use); only link-local
+        (169.254.0.0/16, fe80::/10, which includes cloud metadata) and multicast are
+        blocked. Resolves first so a name pointing at metadata is caught too."""
+        cleaned = (host or "").strip().strip("[]")
+        try:
+            infos = socket.getaddrinfo(cleaned, None)
+        except OSError:
+            return None  # let the action's own resolution path report the error
+        for *_x, sockaddr in infos:
+            raw = str(sockaddr[0]).split("%")[0]
+            try:
+                addr = ipaddress.ip_address(raw)
+            except ValueError:
+                continue
+            if addr.is_link_local or addr.is_multicast or raw in {"169.254.169.254", "fd00:ec2::254"}:
+                return (
+                    f"Refused: {host} resolves to a link-local/metadata address ({raw}); "
+                    "net_probe will not reach cloud metadata or link-local hosts."
+                )
+        return None
+
     def _net_tcp(self, host: str, port: int) -> str:
+        blocked = self._metadata_guard(host)
+        if blocked:
+            return blocked
         start = time.monotonic()
         try:
             with socket.create_connection((host, port), timeout=self.net_timeout):
@@ -735,16 +898,24 @@ class ToolBox:
         parsed = urlparse(target if "://" in target else "http://" + target)
         if parsed.scheme not in ("http", "https"):
             raise ToolError("http action only supports http:// and https:// URLs.")
+        blocked = self._metadata_guard(parsed.hostname or "")
+        if blocked:
+            return blocked
         url = parsed.geturl()
         request = urllib.request.Request(
             url, method="GET", headers={"User-Agent": "GreyIQ-netprobe/1.0", "Accept": "*/*"}
         )
+        # Re-validate every redirect target — otherwise a 30x to a metadata IP would
+        # be auto-followed past the initial-host guard.
+        opener = urllib.request.build_opener(_MetadataGuardRedirect(self._metadata_guard))
         start = time.monotonic()
         try:
-            with urllib.request.urlopen(request, timeout=self.net_timeout) as resp:
+            with opener.open(request, timeout=self.net_timeout) as resp:
                 ms = (time.monotonic() - start) * 1000
                 resp.read(2048)  # touch the body so timing is realistic; content discarded
                 status, reason, final, headers = resp.status, resp.reason, resp.geturl(), resp.headers
+        except _MetadataBlocked as exc:
+            return str(exc)
         except urllib.error.HTTPError as exc:
             # A 4xx/5xx is a valid diagnostic result, not a tool failure.
             ms = (time.monotonic() - start) * 1000
@@ -770,6 +941,9 @@ class ToolBox:
         return "\n".join(lines)
 
     def _net_tls(self, host: str, port: int) -> str:
+        blocked = self._metadata_guard(host)
+        if blocked:
+            return blocked
         context = ssl.create_default_context()
         start = time.monotonic()
         try:
@@ -1606,6 +1780,8 @@ def restore_snapshot(files: list[dict[str, Any]], workspace: str) -> dict[str, A
     restored: list[str] = []
     deleted: list[str] = []
     errors: list[str] = []
+    # Files first; directory entries (is_dir) are deepest-first at the tail, so an
+    # empty created dir is removed only after the files inside it are deleted.
     for entry in files or []:
         rel = str(entry.get("path") or "").strip()
         if not rel:
@@ -1614,6 +1790,12 @@ def restore_snapshot(files: list[dict[str, Any]], workspace: str) -> dict[str, A
             target = (root / rel).resolve()
             if target != root and root not in target.parents:
                 errors.append(f"{rel}: outside workspace")
+                continue
+            if entry.get("is_dir"):
+                # A directory the run created: remove it if it's now empty.
+                if target.is_dir() and not any(target.iterdir()):
+                    target.rmdir()
+                    deleted.append(rel + "/")
                 continue
             if entry.get("existed"):
                 target.parent.mkdir(parents=True, exist_ok=True)

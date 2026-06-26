@@ -204,11 +204,24 @@ def safe_torch_save(obj, path: Path) -> None:
             pass
 
 
+def _safe_mtime(path: Path) -> float:
+    """mtime for sorting, tolerant of a file that vanished between glob and stat
+    (a concurrent prune or external deletion would otherwise crash the sort)."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _sample_text(text: str, max_chars: int) -> str:
     """Return up to max_chars by pulling evenly-spaced windows across the full text."""
     if len(text) <= max_chars:
         return text
     window = 2000
+    # With a budget smaller than one window, the window math yields zero windows and
+    # would silently return "" — discarding the data. Just take a head slice instead.
+    if max_chars <= window:
+        return text[:max_chars]
     n_windows = max_chars // window
     step = max(1, (len(text) - window) // max(n_windows, 1))
     parts = [text[i : i + window] for i in range(0, len(text) - window, step)][:n_windows]
@@ -478,7 +491,7 @@ def save_best_model(
 
     archived_models = sorted(
         today_folder.glob("best_model_*.pt"),
-        key=lambda path: path.stat().st_mtime,
+        key=_safe_mtime,
         reverse=True,
     )
     for stale_path in archived_models[MAX_DAILY_STABLE_MODELS:]:

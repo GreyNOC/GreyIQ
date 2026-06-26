@@ -12,6 +12,7 @@ Pure Python, offline, frozen-safe (no embeddings / no model needed).
 """
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -41,21 +42,23 @@ _WORD = re.compile(r"[A-Za-z0-9_]{2,}")
 
 def _iter_text_files(root: Path, max_files: int, max_bytes: int) -> list[Path]:
     files: list[Path] = []
-    for path in sorted(root.rglob("*")):
-        if len(files) >= max_files:
-            break
-        if not path.is_file():
-            continue
-        if any(part in IGNORE_DIRS for part in path.relative_to(root).parts):
-            continue
-        if path.suffix.lower() not in TEXT_EXTENSIONS:
-            continue
-        try:
-            if path.stat().st_size > max_bytes:
+    # Walk with in-place dir pruning so ignored subtrees (node_modules/.git/.venv)
+    # are never descended into — rglob("*") would enumerate and sort every file in
+    # them first, which is slow and memory-heavy on a large repo.
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in IGNORE_DIRS)
+        for name in sorted(filenames):
+            if len(files) >= max_files:
+                return files
+            path = Path(dirpath) / name
+            if path.suffix.lower() not in TEXT_EXTENSIONS:
                 continue
-        except OSError:
-            continue
-        files.append(path)
+            try:
+                if path.stat().st_size > max_bytes:
+                    continue
+            except OSError:
+                continue
+            files.append(path)
     return files
 
 

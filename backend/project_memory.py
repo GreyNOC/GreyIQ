@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -140,7 +141,15 @@ def save(runtime_dir: str | Path, workspace: str, facts: Any) -> dict[str, Any]:
     path = _path(runtime_dir, workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"workspace": str(workspace), "updated_at": updated_at, "facts": clean}
-    path.write_text(json.dumps(payload), encoding="utf-8")
+    # Atomic write: a crash or concurrent writer must never leave a half-written
+    # file that `load` then discards (losing every saved fact). Write a sibling temp
+    # file and os.replace it into place (atomic on the same filesystem).
+    tmp = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return {"facts": clean, "updated_at": updated_at}
 
 

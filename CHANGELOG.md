@@ -2,15 +2,50 @@
 
 Notable changes to GreyIQ.
 
-## Unreleased
+## v0.10.0
 
 ### Added
-- Add BugHunter proof-of-impact report sections and readiness checks so impact claims require concrete evidence.
-- Normalize BugHunter proof of impact as confirmed/candidate/missing evidence with method, actor, observed result, control result, affected asset, and limitations.
+- **Proof of impact, built in.** Every bug-bounty finding now ships a real impact
+  model — attacker capability → affected asset → business impact — plus a
+  **finding-specific proof obligation** (the exact artifact to capture to *prove* the
+  impact for a submission) and an estimated **CVSS v3.1 vector with a computed base
+  score** (the calculator is verified against NVD reference scores). This is
+  deterministic and works fully offline; the LLM brain enriches it rather than being
+  the only source — previously the proof-of-impact renderer sat empty on every offline
+  run. New `impact_model.py`; `cvss` / `proof_obligation` fields in the report Markdown
+  and JSON.
+- **Captured passive proof for web findings.** Header/cookie/version/mixed-content/
+  error findings now carry the exact request line, response status, and offending
+  header/Set-Cookie value as redacted `proof_evidence`, so the report shows what
+  produced each finding.
+- BugHunter proof-of-impact report sections and readiness checks so impact claims
+  require concrete evidence (confirmed/candidate/missing, with method, actor, observed
+  result, control result, affected asset, and limitations).
 
-### Fixed
-- Fix GreyIQ BugHunter JWT exposure triage to suppress OAuth flow-token false positives, gate session-impact reporting on replay confirmation, and use CWE-200 instead of CWE-798.
-- Redact web-scan secret evidence before JSON/Markdown report generation so reports do not duplicate exposed client-side keys.
+### Fixed (whole-app QA/QC audit)
+- **Stronger honesty on proof status.** A finding is marked "confirmed" only with a
+  real captured artifact (authenticated replay, live secret, or a response carrying an
+  HTTP status) — concrete-sounding LLM prose alone, or passive web evidence ("a GET
+  returned 200"), can no longer flip an unproven lead to submission-ready.
+- **Secret-leak redaction holes closed:** a truncated PEM private key (END marker
+  clipped) and credentials on a whitespace-collapsed `.env`-style line are now
+  redacted; live-scan runtime evidence is redacted before it reaches the report.
+- BugHunter JWT exposure triage suppresses OAuth flow-token false positives, gates
+  session-impact reporting on replay confirmation, and uses CWE-200; web-scan secret
+  evidence is redacted before report generation.
+- **SSRF hardening:** the agent's `net_probe` refuses cloud-metadata / link-local
+  targets (including via HTTP redirect) while still allowing legitimate loopback/
+  private ops diagnostics.
+- **Agent engine:** the destructive-command denylist now catches `rm -r -f` with split
+  flags; ranged file reads are memory-bounded yet can still page through a large file;
+  `grep`/`find_code` output goes through the untrusted-data boundary; rollback removes
+  directories the run created.
+- **Reliability:** atomic writes for the secrets store, runtime config, and project
+  memory (no torn files, no world-readable window); the API no longer reflects raw
+  exception text on a 500; Electron shows the error page instead of a stuck spinner on a
+  boot failure and reaps the backend/Ollama process tree on quit; assorted
+  scanner-accuracy and unbounded-growth fixes (yaml.load detection, minified-file skip,
+  repo-map walk, BPE cache, live-capture caps).
 
 ## v0.9.9
 

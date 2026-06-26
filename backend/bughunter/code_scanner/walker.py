@@ -173,7 +173,11 @@ def walk_collect(
             except ValueError:
                 continue
             suffix = absolute.suffix.lower()
-            if suffix in _SKIP_EXTENSIONS:
+            name = absolute.name.lower()
+            # Path.suffix only returns the LAST component, so compound minified
+            # extensions (.min.js / .min.css) never matched the suffix set and were
+            # scanned anyway — match them by filename instead.
+            if suffix in _SKIP_EXTENSIONS or name.endswith((".min.js", ".min.css", ".min.mjs", ".bundle.js")):
                 _record_skip(relative, "binary extension")
                 continue
             if include_globs and not _matches_any(relative, include_globs):
