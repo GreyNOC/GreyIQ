@@ -89,9 +89,10 @@ def _finding(
     snippet: str = "",
     remediation: str = "",
     line_start: int = 1,
+    proof_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     safe_snippet, redacted = redact_text(snippet)
-    return {
+    finding: dict[str, Any] = {
         "rule_id": rule_id,
         "title": title,
         "severity": severity,
@@ -104,6 +105,18 @@ def _finding(
         "remediation": remediation,
         "redacted": redacted,
     }
+    # Carry the passive proof artifacts (the exact request + offending response
+    # element) so the report can prove the finding without exploitation. Every
+    # value is redacted — a Set-Cookie or header can carry a token.
+    if proof_evidence:
+        cleaned = {
+            key: redact_text(str(value))[0]
+            for key, value in proof_evidence.items()
+            if str(value or "").strip()
+        }
+        if cleaned:
+            finding["proof_evidence"] = cleaned
+    return finding
 
 
 def _snippet(body: str, match: re.Match[str], ctx: int = 60) -> str:
@@ -222,6 +235,11 @@ def _analyze(fetched: dict[str, Any]) -> list[dict[str, Any]]:
     body = fetched["body"]
     final_url = fetched["final_url"]
     is_https = final_url.lower().startswith("https://")
+    # The exact passive request + response status are the proof context every
+    # finding shares — the report shows them so the operator sees what produced it.
+    request_line = f"GET {final_url}"
+    response_status = f"HTTP {fetched.get('status')}" if fetched.get("status") else ""
+    base_proof = {"request_line": request_line, "response_status": response_status}
     findings: list[dict[str, Any]] = []
 
     # 1. Missing security headers.
@@ -236,6 +254,7 @@ def _analyze(fetched: dict[str, Any]) -> list[dict[str, Any]]:
                     "headers",
                     final_url,
                     remediation=advice,
+                    proof_evidence={**base_proof, "matched_value": f"{header} header absent from the response"},
                 )
             )
     if is_https and "strict-transport-security" not in headers:
@@ -265,6 +284,7 @@ def _analyze(fetched: dict[str, Any]) -> list[dict[str, Any]]:
                     final_url,
                     snippet=value[:120],
                     remediation=f"Remove or obscure the {header} response header.",
+                    proof_evidence={**base_proof, "response_header": f"{header}: {value[:120]}"},
                 )
             )
 
@@ -283,6 +303,7 @@ def _analyze(fetched: dict[str, Any]) -> list[dict[str, Any]]:
                     final_url,
                     snippet=cookie[:120],
                     remediation="Set Secure so the cookie is only sent over HTTPS.",
+                    proof_evidence={**base_proof, "set_cookie": cookie[:200]},
                 )
             )
         if "httponly" not in lowered:
@@ -296,6 +317,7 @@ def _analyze(fetched: dict[str, Any]) -> list[dict[str, Any]]:
                     final_url,
                     snippet=cookie[:120],
                     remediation="Set HttpOnly so client-side JavaScript cannot read the cookie.",
+                    proof_evidence={**base_proof, "set_cookie": cookie[:200]},
                 )
             )
 
@@ -313,6 +335,7 @@ def _analyze(fetched: dict[str, Any]) -> list[dict[str, Any]]:
                     final_url,
                     snippet=mixed[0][:160],
                     remediation="Load every sub-resource over HTTPS.",
+                    proof_evidence={**base_proof, "matched_value": mixed[0][:200]},
                 )
             )
 
@@ -331,6 +354,7 @@ def _analyze(fetched: dict[str, Any]) -> list[dict[str, Any]]:
                         snippet=hit.snippet,
                         remediation="Never ship secrets to the client; rotate this credential.",
                         line_start=hit.line_start,
+                        proof_evidence={**base_proof, "matched_value": hit.snippet},
                     )
                 )
         except Exception:  # noqa: BLE001 - one bad rule must not abort the scan
@@ -379,6 +403,7 @@ def _analyze(fetched: dict[str, Any]) -> list[dict[str, Any]]:
                     "disclosure",
                     final_url,
                     snippet=_snippet(body, match),
+                    proof_evidence={**base_proof, "matched_value": _snippet(body, match)},
                 )
             )
             break

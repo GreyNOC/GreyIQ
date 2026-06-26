@@ -17,6 +17,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from bughunter.code_scanner.redaction import redact_text
+
 _SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 _SEVERITY_LABEL = {
     "critical": "Critical",
@@ -193,6 +195,27 @@ def _proof_text_is_concrete(text: str) -> bool:
     return bool(_CONCRETE_IMPACT_RE.search(cleaned))
 
 
+_HTTP_RESULT_RE = re.compile(r"\bHTTP\s*[1-5]\d{2}\b|\b(?:returned|response|status)\b[^.]{0,40}\b[1-5]\d{2}\b", re.IGNORECASE)
+
+
+def _has_captured_artifact(finding: dict[str, Any], proof: Any, observed_result: str) -> bool:
+    """True only when there is a REAL captured artifact proving IMPACT — never from
+    narrative prose alone. NOTE: the passive web ``proof_evidence`` (request line +
+    'header absent' + response status) is deliberately NOT counted here: it proves a
+    GET happened, not security impact, so letting it satisfy this gate would let
+    brain prose flip a hardening finding to 'confirmed'. Only genuinely
+    impact-proving artifacts qualify."""
+    if _jwt_replay_value(finding) is True:
+        return True
+    if finding.get("secret_hits"):
+        return True
+    if isinstance(proof, dict) and proof.get("proof_evidence"):
+        return True
+    if observed_result and _HTTP_RESULT_RE.search(observed_result):
+        return True
+    return False
+
+
 def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> dict[str, str | bool]:
     proof = _proof_value(finding, plan)
     detail: dict[str, str | bool] = {
@@ -205,6 +228,7 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
         "actor": "",
         "control_result": "",
         "limitations": "",
+        "proof_obligation": "",
     }
     if proof is None:
         return detail
@@ -223,19 +247,28 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
         detail["actor"] = str(proof.get("actor") or proof.get("role") or proof.get("account") or "").strip()
         detail["control_result"] = str(proof.get("control_result") or proof.get("negative_control") or "").strip()
         detail["limitations"] = str(proof.get("limitations") or proof.get("scope_limitations") or proof.get("notes") or "").strip()
+        detail["proof_obligation"] = str(proof.get("proof_obligation") or proof.get("obligation") or "").strip()
     else:
         detail["evidence"] = str(proof or "").strip()
 
-    combined = " ".join(
-        str(detail.get(key) or "")
-        for key in ("evidence", "observed_result", "affected_asset", "actor", "control_result")
-    )
+    # Re-redact any evidence/observed_result the brain echoed — a captured response
+    # can contain the very secret/token the finding is about; never double-leak it.
+    if detail["evidence"]:
+        detail["evidence"] = redact_text(str(detail["evidence"]))[0]
+    if detail["observed_result"]:
+        detail["observed_result"] = redact_text(str(detail["observed_result"]))[0]
+
+    # Status: only a REAL captured artifact + concrete text earns 'confirmed';
+    # concrete-looking prose alone caps at 'candidate'. (The descriptive
+    # affected_asset/actor fields never drive promotion — only true proof fields do.)
+    combined = f"{detail['evidence']} {detail['observed_result']}".strip()
     explicit_status = _explicit_proof_status(finding, plan, proof)
+    artifact = _has_captured_artifact(finding, proof, str(detail["observed_result"]))
     if explicit_status:
         detail["status"] = explicit_status
-    elif _proof_text_is_concrete(combined):
+    elif artifact and _proof_text_is_concrete(combined):
         detail["status"] = "confirmed"
-    elif str(detail["evidence"]).strip():
+    elif _proof_text_is_concrete(combined) or str(detail["evidence"]).strip() or str(detail["observed_result"]).strip():
         detail["status"] = "candidate"
     detail["ready"] = detail["status"] == "confirmed" and bool(str(detail["evidence"]).strip() or str(detail["observed_result"]).strip())
     return detail
@@ -252,9 +285,20 @@ def _proof_status_label(status: str) -> str:
 def _append_proof_of_impact(out: list[str], finding: dict[str, Any], plan: dict[str, Any], *, heading: str) -> None:
     detail = _proof_of_impact_detail(finding, plan)
     status = str(detail["status"])
+    obligation = str(detail.get("proof_obligation") or "").strip()
     out.append(heading)
     if status == "missing":
-        out.append("_Not captured yet. Do not submit until reproduction evidence proves affected data, privilege, or state change._")
+        # Even with nothing captured, the deterministic proof obligation tells the
+        # operator the exact artifact to grab — far more useful than a bare warning.
+        if obligation:
+            out.append("- **Status:** Not yet captured — this is a lead, not a proven finding.")
+            affected = str(detail.get("affected_asset") or "").strip()
+            if affected:
+                out.append(f"- **Affected asset or data:** {affected}")
+            out.append(f"- **Proof obligation (capture this to prove impact):** {obligation}")
+            out.append("- _Do not submit until the proof obligation above is captured within your authorized scope._")
+        else:
+            out.append("_Not captured yet. Do not submit until reproduction evidence proves affected data, privilege, or state change._")
         out.append("")
         return
     out.append(f"- **Status:** {_proof_status_label(status)}")
@@ -271,9 +315,55 @@ def _append_proof_of_impact(out: list[str], finding: dict[str, Any], plan: dict[
         value = str(detail.get(key) or "").strip()
         if value:
             out.append(f"- **{label}:** {value}")
+    if obligation:
+        out.append(f"- **Proof obligation (capture this to prove impact):** {obligation}")
     if status != "confirmed":
         out.append("- **Gap:** Treat this as a lead until an authorized replay or dynamic check proves the effect.")
     out.append("")
+
+
+_PROOF_EVIDENCE_LABELS = (
+    ("request_line", "Request"),
+    ("response_status", "Response status"),
+    ("response_header", "Response header"),
+    ("set_cookie", "Set-Cookie"),
+    ("matched_value", "Matched value"),
+)
+
+
+def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
+    """Render the captured passive proof artifacts (request line, response status,
+    offending header/cookie) a web finding carries — the strongest passive proof."""
+    pe = finding.get("proof_evidence")
+    if not isinstance(pe, dict) or not pe:
+        return
+    rows = [(label, str(pe.get(key) or "").strip()) for key, label in _PROOF_EVIDENCE_LABELS]
+    rows = [(label, value) for label, value in rows if value]
+    if not rows:
+        return
+    out.append("**Captured proof (passive — already redacted):**\n")
+    for label, value in rows:
+        out.append(f"- **{label}:** {_code(value)}")
+    out.append("")
+
+
+def _append_cvss(out: list[str], plan: dict[str, Any]) -> None:
+    """Render the CVSS v3.1 estimate (vector + computed base score + 'why')."""
+    cvss = plan.get("cvss") if isinstance(plan, dict) else None
+    if not isinstance(cvss, dict) or not cvss.get("vector"):
+        return
+    est = " (estimated)" if cvss.get("estimated") else ""
+    score = cvss.get("base_score")
+    sev = str(cvss.get("base_severity") or "").strip()
+    tail = ""
+    if score is not None:
+        tail = f" — {score}" + (f" {sev}" if sev else "")
+    elif sev:
+        tail = f" — {sev}"
+    out.append(f"- **CVSS v3.1{est}:** {_code(str(cvss['vector']))}{tail}")
+    justification = str(cvss.get("justification") or "").strip()
+    if justification:
+        out.append(f"- **Why this severity:** {justification}")
 
 
 def _finding_readiness(finding: dict[str, Any], plan: dict[str, Any]) -> list[str]:
@@ -399,6 +489,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
     attack_plans = ctx.get("attack_plans", {}) or {}
     for finding in findings:
         ref = finding.get("ref", "")
+        plan = attack_plans.get(ref) or {}
         sev = _SEVERITY_LABEL.get(str(finding.get("severity")).lower(), "?")
         out.append(f"### {ref} · {finding.get('title', 'Finding')} — {sev}\n")
         out.append(f"- **Severity / confidence:** {sev} / {finding.get('confidence', 'unknown')}")
@@ -408,12 +499,14 @@ def build_markdown(ctx: dict[str, Any]) -> str:
             out.append(f"- **CWE:** {finding['cwe']}")
         if finding.get("owasp"):
             out.append(f"- **OWASP:** {finding['owasp']}")
+        _append_cvss(out, plan)
         out.append(f"- **Location:** {_code(_location(finding))}")
         out.append(f"- **Rule:** {_code(finding.get('rule_id', ''))}")
         out.append("")
         if finding.get("description"):
             out.append(finding["description"].strip())
             out.append("")
+        _append_proof_evidence(out, finding)
         snippet = str(finding.get("snippet") or "").strip()
         if snippet:
             clipped = snippet[:1200]
@@ -424,7 +517,6 @@ def build_markdown(ctx: dict[str, Any]) -> str:
             out.append(fence)
             out.append("")
 
-        plan = attack_plans.get(ref) or {}
         out.append("**Attack plan / steps to reproduce**\n")
         steps = plan.get("steps") or []
         if steps:
@@ -664,6 +756,11 @@ def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
             for finding in findings
             if finding.get("ref")
         },
+        "cvss": {
+            str(finding.get("ref") or ""): (attack_plans.get(finding.get("ref")) or {}).get("cvss")
+            for finding in findings
+            if finding.get("ref") and isinstance((attack_plans.get(finding.get("ref")) or {}).get("cvss"), dict)
+        },
         "next_steps": ctx.get("next_steps", []),
         "coverage": ctx.get("coverage", {}),
         "manual_checklist": ctx.get("manual_checklist", []),
@@ -699,6 +796,12 @@ def build_finding_markdown(ctx: dict[str, Any], finding: dict[str, Any]) -> str:
         out.append(f"| **CWE** | {finding['cwe']} |")
     if finding.get("owasp"):
         out.append(f"| **OWASP** | {finding['owasp']} |")
+    cvss = plan.get("cvss") if isinstance(plan, dict) else None
+    if isinstance(cvss, dict) and cvss.get("vector"):
+        score = cvss.get("base_score")
+        sev_word = str(cvss.get("base_severity") or "").strip()
+        tail = f" — {score} {sev_word}".rstrip() if score is not None else (f" — {sev_word}" if sev_word else "")
+        out.append(f"| **CVSS v3.1 (est.)** | {_code(str(cvss['vector']))}{tail} |")
     out.append(f"| **Location** | {_code(_location(finding))} |")
     out.append(f"| **Generated** | {ctx.get('generated_at', '')} |")
     out.append("")
@@ -713,6 +816,8 @@ def build_finding_markdown(ctx: dict[str, Any], finding: dict[str, Any]) -> str:
         out.append("## Summary\n")
         out.append(finding["description"].strip())
         out.append("")
+
+    _append_proof_evidence(out, finding)
 
     snippet = str(finding.get("snippet") or "").strip()
     if snippet:

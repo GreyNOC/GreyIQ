@@ -43,6 +43,10 @@ from pathlib import Path
 
 END_OF_WORD = "</w>"
 
+# Bounds for the per-word BPE encode cache so it stays flat over a long-lived engine.
+_ENCODE_CACHE_MAX = 50_000
+_ENCODE_CACHE_MAX_WORD = 64
+
 # Pre-tokenize on word characters / individual punctuation. Whitespace is
 # not preserved as a token — END_OF_WORD restores spaces between words on
 # decode. Newlines do survive because we split text into lines upstream.
@@ -158,8 +162,9 @@ class BPETokenizer:
     # ----------------------------------------------------------- encoding
 
     def _encode_word(self, word: str) -> list[str]:
-        if word in self._encode_cache:
-            return self._encode_cache[word]
+        cached = self._encode_cache.get(word)
+        if cached is not None:
+            return cached
         if not word:
             return []
         symbols: list[str] = list(word) + [END_OF_WORD]
@@ -178,7 +183,13 @@ class BPETokenizer:
             merged = symbols[best_idx] + symbols[best_idx + 1]
             symbols[best_idx : best_idx + 2] = [merged]
 
-        self._encode_cache[word] = symbols
+        # Bound the cache so it can't grow without limit over a long-lived engine:
+        # skip pathologically long tokens, and drop the cache when it hits the cap
+        # (a cheap reset — the common words simply repopulate).
+        if len(word) <= _ENCODE_CACHE_MAX_WORD:
+            if len(self._encode_cache) >= _ENCODE_CACHE_MAX:
+                self._encode_cache.clear()
+            self._encode_cache[word] = symbols
         return symbols
 
     def encode(self, text: str) -> list[int]:

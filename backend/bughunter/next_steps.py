@@ -66,7 +66,7 @@ _CHAIN_ACTIONS: list[tuple[set[str], str]] = [
     ({"xxe", "ssrf"}, "Use the XXE as an SSRF primitive — internal service reach or OOB file read is what makes it report-worthy."),
     ({"subdomain-takeover", "auth"}, "A claimable subdomain inside the auth/cookie scope can capture sessions or pass OAuth allow-lists — test that reach."),
     ({"prototype-pollution", "xss"}, "Land the prototype-pollution gadget on a sink (XSS/auth bypass) — pollution without a gadget usually closes as informational."),
-    ({"idor", "graphql"}, "Walk GraphQL field-level authorization for the same object-id weakness — BOLA via a hidden query is a common high."),
+    ({"access-control", "graphql"}, "Walk GraphQL field-level authorization for the same object-id weakness — BOLA via a hidden query is a common high."),
 ]
 
 # Per-profile expansion advice: how to broaden coverage once the first pass is

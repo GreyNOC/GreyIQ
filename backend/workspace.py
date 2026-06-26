@@ -200,9 +200,11 @@ def read_file(root: str, path: str, max_bytes: int = DEFAULT_MAX_BYTES) -> dict[
         "path": rel,
         "content": content,
         "size": size,
+        # scan_text carries the level + per-signal labels the Workbench trust badge
+        # renders. (Previously a second assess_text() call clobbered this with a
+        # thinner payload, dropping the signals — keep the rich one.)
         "trust": trust.scan_text(content, source=rel),
     }
-    result["trust"] = trust.assess_text(result["content"], path=rel).as_dict()
     if truncated:
         result["truncated"] = True
     return result

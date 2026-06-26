@@ -187,8 +187,11 @@ class TrustLabelTests(unittest.TestCase):
             payload = workspace.read_file(str(root), "payload.md")
 
             self.assertTrue(payload["ok"])
-            self.assertEqual(payload["trust"]["level"], "suspicious")
-            self.assertIn("hidden HTML comment", payload["trust"]["patterns"])
+            # The preview trust payload is scan_text's shape (level + per-signal
+            # labels) — the shape the Workbench badge + warning list consume.
+            self.assertEqual(payload["trust"]["level"], "risk")
+            labels = " ".join(s.get("label", "") for s in payload["trust"]["signals"]).lower()
+            self.assertIn("comment", labels)
 
 
 if __name__ == "__main__":

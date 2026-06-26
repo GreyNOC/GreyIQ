@@ -69,20 +69,39 @@ SECRETS_PATH = RUNTIME_DIR / "secrets.json"
 _SECRET_PROVIDERS = ("anthropic", "openai", "local")
 
 
-def _restrict_file(path: Path) -> None:
-    """Best-effort owner-only perms (meaningful on POSIX; on Windows the file
-    already sits in the per-user profile)."""
+# Serializes the read-modify-write of the secrets store so two concurrent provider
+# writes can't drop each other's update.
+_SECRETS_LOCK = threading.Lock()
+
+
+def _atomic_write(path: Path, text: str, *, private: bool = False) -> None:
+    """Write ``text`` to ``path`` atomically (temp file + os.replace), so a reader
+    or a crash never sees a half-written file. When ``private`` the temp file is
+    created with owner-only perms (0o600) BEFORE any data is written, so a secret is
+    never briefly on disk world-readable (the old write-then-chmod left a window)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    replaced = False
     try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+        if private:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+        else:
+            tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+        replaced = True
+    finally:
+        if not replaced:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def _write_session_token() -> None:
     try:
-        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-        SESSION_TOKEN_PATH.write_text(SESSION_TOKEN, encoding="utf-8")
-        _restrict_file(SESSION_TOKEN_PATH)
+        _atomic_write(SESSION_TOKEN_PATH, SESSION_TOKEN, private=True)
     except OSError:
         pass
 
@@ -96,17 +115,16 @@ def _load_secrets() -> dict[str, str]:
 
 
 def _store_secret(provider: str, api_key: str) -> None:
-    data = _load_secrets()
-    if api_key:
-        data[provider] = api_key
-    else:
-        data.pop(provider, None)
-    try:
-        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-        SECRETS_PATH.write_text(json.dumps(data), encoding="utf-8")
-        _restrict_file(SECRETS_PATH)
-    except OSError:
-        pass
+    with _SECRETS_LOCK:
+        data = _load_secrets()
+        if api_key:
+            data[provider] = api_key
+        else:
+            data.pop(provider, None)
+        try:
+            _atomic_write(SECRETS_PATH, json.dumps(data), private=True)
+        except OSError:
+            pass
 
 
 def _merge_coder_secrets(config: dict[str, Any]) -> dict[str, Any]:
@@ -224,7 +242,7 @@ from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E4
 
 
 APP_NAME = "GreyIQ"
-VERSION = "0.9.9"
+VERSION = "0.10.0"
 _CURRENT_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar("greyiq_current_scope", default=None)
 _CSP = (
     "default-src 'self'; "
@@ -637,10 +655,14 @@ class GreyIQRuntime:
     def set_device(self, preference: str) -> dict[str, Any]:
         normalized = normalize_device(preference)
         runtime_path = RUNTIME_DIR / "solin_runtime_config.json"
-        payload = read_json(runtime_path, {})
-        payload["device_preference"] = normalized
-        write_json(runtime_path, payload)
+        # Serialize the read-modify-write so a concurrent save_coder_config/set_device
+        # can't lose this update (self.lock is a reentrant RLock).
         with self.lock:
+            payload = read_json(runtime_path, {})
+            if not isinstance(payload, dict):
+                payload = {}
+            payload["device_preference"] = normalized
+            write_json(runtime_path, payload)
             if self.engine is not None:
                 self.engine.safety = OpenPolicy()
                 self.engine.reload_with_device_preference(normalized)
@@ -660,13 +682,16 @@ class GreyIQRuntime:
 
     def save_coder_config(self, update: dict[str, Any]) -> dict[str, Any]:
         runtime_path = RUNTIME_DIR / "solin_runtime_config.json"
-        payload = read_json(runtime_path, {})
-        if not isinstance(payload, dict):
-            payload = {}
-        # Merge the UI update, then split API keys out into the secrets store so the
-        # main config stays key-free.
-        payload["coder"] = _split_coder_secrets(coder.merge_update(payload.get("coder"), update))
-        write_json(runtime_path, payload)
+        # Serialize the read-modify-write against set_device and concurrent saves so
+        # an interleaved write can't drop the device_preference or another field.
+        with self.lock:
+            payload = read_json(runtime_path, {})
+            if not isinstance(payload, dict):
+                payload = {}
+            # Merge the UI update, then split API keys out into the secrets store so
+            # the main config stays key-free.
+            payload["coder"] = _split_coder_secrets(coder.merge_update(payload.get("coder"), update))
+            write_json(runtime_path, payload)
         return coder.public_config(self._coder_config())
 
     def coder_status(self) -> dict[str, Any]:
@@ -1300,8 +1325,8 @@ def read_json(path: Path, fallback: Any) -> Any:
 
 
 def write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    # Atomic: a crash or concurrent reader must never see a truncated config file.
+    _atomic_write(path, json.dumps(payload, indent=2))
 
 
 def default_training_text() -> str:
@@ -1973,9 +1998,11 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         await send_index(send)
     except HTTPError as exc:
         await send_json(send, {"detail": exc.detail}, exc.status_code)
-    except Exception as exc:
+    except Exception:
+        # Log the full traceback server-side, but never reflect raw exception text
+        # (paths, internals) to the client — deliberate errors use the HTTPError path.
         runtime.log(traceback.format_exc())
-        await send_json(send, {"error": str(exc)}, 500)
+        await send_json(send, {"error": "internal server error"}, 500)
 
 
 async def route_lifespan(receive: Any, send: Any) -> None:
