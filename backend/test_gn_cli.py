@@ -68,8 +68,34 @@ class GnCliTests(unittest.TestCase):
 
     def test_cli_commands_match_dispatch_list(self) -> None:
         # run_frozen dispatches on these verbs; keep them aligned with the parser.
-        for verb in ("hunt", "scan", "profiles", "classes", "tools", "version"):
+        for verb in ("hunt", "campaign", "scan", "learn", "stats", "profiles", "classes", "tools", "version"):
             self.assertIn(verb, gn_cli.CLI_COMMANDS)
+
+    def test_learn_and_stats_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            original = gn_cli.RUNTIME_DIR
+            gn_cli.RUNTIME_DIR = Path(tmp)
+            try:
+                code, out, _ = _run(["learn", "-c", "xss", "--status", "accepted",
+                                     "--target", "https://shop.example.com", "--bounty", "500"])
+                self.assertEqual(code, 0)
+                self.assertIn("Recorded", out)
+                # Unknown status is rejected with a usage error.
+                self.assertEqual(_run(["learn", "-c", "xss", "--status", "banana", "--program", "p"])[0], 2)
+                # Stats for the derived program shows the class breakdown.
+                code, out, _ = _run(["stats", "--target", "https://shop.example.com"])
+                self.assertEqual(code, 0)
+                self.assertIn("xss", out)
+                self.assertIn("500", out)
+                # Stats across all programs.
+                self.assertEqual(_run(["stats"])[0], 0)
+            finally:
+                gn_cli.RUNTIME_DIR = original
+
+    def test_campaign_requires_authorization(self) -> None:
+        code, _, err = _run(["campaign", str(BACKEND_DIR / "bughunter")])
+        self.assertEqual(code, 2)
+        self.assertIn("authorize", err.lower())
 
 
 if __name__ == "__main__":
