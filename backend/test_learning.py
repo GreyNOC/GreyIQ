@@ -62,6 +62,21 @@ class RecordAndPriorsTests(unittest.TestCase):
     def test_priors_absent_without_history(self) -> None:
         self.assertEqual(learning.learned_priors(self.rt, "never-seen"), {})
 
+    def test_unadjudicated_submissions_carry_no_prior(self) -> None:
+        # A class with only "submitted" rows (no accepted/duplicate yet) has no signal.
+        learning.record_outcome(self.rt, program="acme", class_id="xss", status="submitted")
+        learning.record_outcome(self.rt, program="acme", class_id="xss", status="submitted")
+        self.assertNotIn("xss", learning.learned_priors(self.rt, "acme"))
+
+    def test_rescan_does_not_dilute_an_earned_prior(self) -> None:
+        # The bug: re-running a campaign auto-logs the same confirmed finding as
+        # "submitted", which must NOT pull an earned prior back toward neutral.
+        learning.record_outcome(self.rt, program="acme", class_id="ssrf", status="accepted", bounty=300.0)
+        baseline = learning.learned_priors(self.rt, "acme")["ssrf"]
+        for _ in range(5):  # five weekly re-scans auto-log "submitted"
+            learning.record_outcome(self.rt, program="acme", class_id="ssrf", status="submitted")
+        self.assertEqual(learning.learned_priors(self.rt, "acme")["ssrf"], baseline)
+
     def test_intelligence_notes(self) -> None:
         learning.record_outcome(self.rt, program="acme", class_id="ssrf", status="resolved", bounty=1000.0)
         learning.record_outcome(self.rt, program="acme", class_id="clickjacking", status="duplicate")

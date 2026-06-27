@@ -324,6 +324,7 @@ def _append_proof_of_impact(out: list[str], finding: dict[str, Any], plan: dict[
 
 _PROOF_EVIDENCE_LABELS = (
     ("request_line", "Request"),
+    ("request_header", "Request header"),
     ("response_status", "Response status"),
     ("response_header", "Response header"),
     ("set_cookie", "Set-Cookie"),
@@ -332,8 +333,11 @@ _PROOF_EVIDENCE_LABELS = (
 
 
 def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
-    """Render the captured passive proof artifacts (request line, response status,
-    offending header/cookie) a web finding carries — the strongest passive proof."""
+    """Render the captured passive proof artifacts (request line + crafted header,
+    response status, offending header/cookie) a web finding carries — the strongest
+    passive proof. When a crafted request line is present (active probes), also emit
+    a copy-pasteable raw request->response block reconstructed purely from the
+    already-redacted captured fields (no request is synthesized)."""
     pe = finding.get("proof_evidence")
     if not isinstance(pe, dict) or not pe:
         return
@@ -345,6 +349,30 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
     for label, value in rows:
         out.append(f"- **{label}:** {_code(value)}")
     out.append("")
+    # A reconstructed raw request/response is the single most convincing artifact for
+    # a triager. Only render it when a crafted request line was captured (active
+    # probes); passive header-only findings legitimately have no request to show.
+    request_line = str(pe.get("request_line") or "").strip()
+    if request_line:
+        lines = [request_line]
+        request_header = str(pe.get("request_header") or "").strip()
+        if request_header:
+            lines.append(request_header)
+        lines.append("")  # blank line separates request from response
+        status = str(pe.get("response_status") or "").strip()
+        if status:
+            lines.append(status)  # already 'HTTP <code>' — do not double-prefix
+        for key in ("response_header", "set_cookie", "matched_value"):
+            value = str(pe.get(key) or "").strip()
+            if value:
+                lines.append(value)
+        body = "\n".join(lines)
+        fence = _fence(body)
+        out.append("Captured request/response (reconstructed from redacted artifacts — benign GET probe):\n")
+        out.append(f"{fence}http")
+        out.append(body)
+        out.append(fence)
+        out.append("")
 
 
 def _append_cvss(out: list[str], plan: dict[str, Any]) -> None:

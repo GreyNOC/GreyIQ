@@ -164,6 +164,47 @@ class BountyReportTests(unittest.TestCase):
         self.assertEqual(json_doc["proof_of_impact"]["F1"]["status"], "candidate")
         self.assertFalse(json_doc["proof_of_impact"]["F1"]["ready"])
 
+    def test_active_proof_renders_request_header_and_http_block(self) -> None:
+        # A confirmed active finding carries request_line + request_header (the crafted
+        # Origin:/Host:) — both must render, plus a copy-pasteable raw ```http block.
+        ctx = {
+            "tool": "GreyIQ BugHunter", "target": "https://example.test",
+            "profile": {"id": "web-app", "name": "Web application", "description": ""},
+            "findings": [{
+                "ref": "F1", "severity": "high", "confidence": "high", "category": "headers",
+                "class_id": "cors", "class_name": "CORS misconfiguration",
+                "title": "Credentialed CORS reflection", "location": "https://example.test/api",
+                "rule_id": "active.cors", "description": "Origin reflected with credentials.",
+                "proof_evidence": {
+                    "request_line": "GET https://example.test/api",
+                    "request_header": "Origin: https://greyiq-marker.example",
+                    "response_status": "HTTP 200",
+                    "matched_value": "Access-Control-Allow-Origin: https://greyiq-marker.example; Access-Control-Allow-Credentials: true",
+                },
+            }],
+            "attack_plans": {"F1": {"steps": ["Send a cross-origin request."], "impact": "Cross-origin theft."}},
+            "recommended_tools": [], "brain": {"used": False},
+        }
+        single = report_lib.build_finding_markdown(ctx, ctx["findings"][0])
+        self.assertIn("**Request header:**", single)
+        self.assertIn("Origin: https://greyiq-marker.example", single)
+        self.assertIn("```http", single)
+        # The block reconstructs request -> response from the captured fields.
+        self.assertIn("GET https://example.test/api", single)
+        self.assertIn("HTTP 200", single)
+
+    def test_passive_web_finding_gets_curl_repro_step(self) -> None:
+        from bughunter.bounty import _deterministic_attack_plan
+        finding = {
+            "location": "https://example.test/?q=1", "rule_id": "web.missing-header.csp",
+            "proof_evidence": {"request_line": "GET https://example.test/?q=1"},
+        }
+        plan = _deterministic_attack_plan(finding, "headers")
+        self.assertTrue(any("curl -sSiL" in step for step in plan["steps"]))
+        # A source-code finding (no URL) must NOT get a curl step.
+        src_plan = _deterministic_attack_plan({"location": "app.py", "rule_id": "py.os-system"}, "rce")
+        self.assertFalse(any("curl" in step for step in src_plan["steps"]))
+
     def test_profiles_expose_expanded_focus_classes(self) -> None:
         payload = list_profiles()
         classes = {item["id"] for item in payload["classes"]}

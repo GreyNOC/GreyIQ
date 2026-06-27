@@ -125,12 +125,19 @@ def learned_priors(runtime_dir: str | Path, program: str | None, target: str = "
         return {}
     priors: dict[str, float] = {}
     for cls, stats in (prog.get("class_stats") or {}).items():
-        submitted = max(1, int(stats.get("submitted", 0)))
         rewarded = int(stats.get("rewarded", 0))
         noise = int(stats.get("noise", 0))
+        # Drive the reward-rate off ADJUDICATED outcomes only (rewarded + noise),
+        # never the raw "submitted" count. Otherwise a weekly re-scan that auto-logs
+        # the same confirmed finding as "submitted" would keep diluting an already
+        # earned prior toward neutral. A class with only un-adjudicated submissions
+        # carries no signal yet, so it stays absent (callers treat absent as 1.0).
+        adjudicated = rewarded + noise
+        if adjudicated == 0:
+            continue
         paid = float(stats.get("bounty_total", 0.0)) > 0
         # Reward-rate centered at 0 (no info) -> map to a bounded multiplier.
-        score = (rewarded - noise) / submitted
+        score = (rewarded - noise) / adjudicated
         weight = 1.0 + 0.8 * score + (0.2 if paid else 0.0)
         priors[cls] = round(max(0.5, min(2.0, weight)), 3)
     return priors

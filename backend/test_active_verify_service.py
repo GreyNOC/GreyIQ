@@ -83,7 +83,7 @@ class ActiveCheckTests(unittest.TestCase):
 
     def test_only_safe_methods_are_ever_issued(self) -> None:
         stub = _Stub()
-        for check in (av._check_cors, av._check_open_redirect, av._check_reflected_xss, av._check_host_header):
+        for check in (av._check_cors, av._check_open_redirect, av._check_reflected_xss, av._check_host_header, av._check_ssti):
             check(stub, self.URL)
         av._check_clickjacking(stub, self.URL, None)
         self.assertTrue(set(stub.methods) <= {"GET", "HEAD", "OPTIONS"}, stub.methods)
@@ -118,6 +118,35 @@ class ActiveCheckTests(unittest.TestCase):
         f = av._check_error_sqli(SqlStub(), "https://app.example.com/?id=1")
         self.assertIsNotNone(f)
         self.assertEqual(f["_active_proof"]["status"], "confirmed")
+
+    def test_ssti_confirms_when_expression_is_evaluated(self) -> None:
+        class TemplateStub:  # a real template engine evaluates {{7*7}} -> 49
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                val = (parse_qs(urlparse(url).query, keep_blank_values=True).get("q") or [""])[0]
+                rendered = val.replace("{{7*7}}", "49")
+                return {"status": 200, "headers": {"content-type": "text/html"}, "cookies": [],
+                        "body": f"<html>{rendered}</html>", "final_url": url, "location": None}
+        f = av._check_ssti(TemplateStub(), self.URL)
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertEqual(f["_active_class_hint"], "ssti")
+        self.assertEqual(f["rule_id"], "active.ssti")
+
+    def test_ssti_does_not_confirm_on_verbatim_reflection(self) -> None:
+        class LiteralStub:  # no template engine — reflects {{7*7}} verbatim
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                val = (parse_qs(urlparse(url).query, keep_blank_values=True).get("q") or [""])[0]
+                return {"status": 200, "headers": {"content-type": "text/html"}, "cookies": [],
+                        "body": f"<html>{val}</html>", "final_url": url, "location": None}
+        self.assertIsNone(av._check_ssti(LiteralStub(), self.URL))
+
+    def test_ssti_does_not_confirm_on_coincidental_49(self) -> None:
+        class Coincidental49Stub:  # the page contains '49' but never evaluates the marker
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                val = (parse_qs(urlparse(url).query, keep_blank_values=True).get("q") or [""])[0]
+                return {"status": 200, "headers": {"content-type": "text/html"}, "cookies": [],
+                        "body": f"<html>49 results for {val}</html>", "final_url": url, "location": None}
+        self.assertIsNone(av._check_ssti(Coincidental49Stub(), self.URL))
 
 
 class ScopeBindingTests(unittest.TestCase):

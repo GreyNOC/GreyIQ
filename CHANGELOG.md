@@ -2,6 +2,65 @@
 
 Notable changes to GreyIQ.
 
+## v0.13.0
+
+A whole-engine QA/QC pass (multi-agent audit of the find → prove → report
+pipeline, every recommendation adversarially verified against the code) plus the
+API surface the upcoming bug-bounty cockpit needs.
+
+### Find — close real blind spots
+- **Static SQL-injection sink pack.** A new `sqli` rule pack flags queries built by
+  string-formatting (f-string / `%` / `+` / `.format` / template literal) handed to
+  a DB `execute`/`query` across Python, Node, Go, Django, and PHP — HIGH severity,
+  MEDIUM confidence. Parameterized calls and constant SQL do not match. The `sqli`
+  bounty class now maps to real findings instead of an empty manual checklist.
+- **Static SSRF sink pack.** A new `ssrf` rule pack flags server-side fetches of a
+  non-literal URL (`requests`/`httpx`/`urlopen`, `axios`/`fetch`, Go `http.Get`,
+  PHP) — HIGH severity, LOW confidence (the first argument is often a benign
+  constant, so these are honest leads, not confirmed bugs). The `ssrf` class now
+  produces findings.
+- **Sensitive-path probe.** A hunt's web scan now probes a short, **constant**
+  wordlist of well-known exposed paths (`/.git/config`, `/.git/HEAD`, `/.env`,
+  `/.svn/entries`, `/server-status`, `/actuator/health`, swagger/openapi,
+  `/.DS_Store`) and **content-validates** every hit — an SPA that returns its 200
+  HTML shell for unknown paths is never flagged. Same-origin, GET-only through the
+  existing SSRF/redirect guard, governor-throttled, redacted evidence, and **off by
+  default** for the bare passive `/api/scan/web` (a quick scan stays a single GET).
+
+### Prove — one more confirmation, fuller artifacts
+- **Active SSTI check.** A new opt-in active check confirms server-side template
+  injection with a benign `{{7*7}}` → `49` differential against a literal-string
+  negative control (a coincidental "49" can't confirm — the marker must be evaluated
+  adjacent to it). GET-only, inside the existing double-gated, scope-bound,
+  budgeted active envelope.
+- **Captured request header + raw HTTP repro block.** Active proofs now render the
+  crafted `Origin:`/`Host:` request header (previously captured but silently
+  dropped) and a copy-pasteable fenced `http` request→response block reconstructed
+  purely from the already-redacted captured fields — the single most convincing
+  artifact for a triager.
+
+### Report
+- **curl reproduction step.** The deterministic attack plan for a passive web
+  finding now leads with a benign `curl -sSiL <url> | head -n 40` (shell-escaped) so
+  an offline report still hands the operator a one-line repro. Source-code findings
+  are unchanged.
+
+### API — make the engine reachable from the browser
+- **Structured findings on `/api/bounty/scan`.** The scan response now includes the
+  per-finding `findings`, `attack_plans`, `proof_of_impact`, `cvss`, `class_counts`,
+  and submission/retest checklists it already computed (and previously threw away),
+  so a GUI can render a findings board + proof pane without re-parsing the markdown.
+  Additive; redacted/scope-filtered exactly like the on-disk sidecar.
+- **`POST /api/bounty/campaign`, `POST /api/bounty/learn`, `GET /api/bounty/stats`** —
+  the end-to-end campaign and the learning loop are now reachable over the API
+  (previously CLI-only), authorization still fails closed server-side.
+
+### Fixed
+- **Learning priors no longer self-corrupt on re-scan.** `learned_priors` now drives
+  the reward-rate denominator off *adjudicated* outcomes (rewarded + duplicate/N-A)
+  only — a weekly campaign auto-logging the same confirmed finding as "submitted" no
+  longer dilutes an earned prior back toward neutral.
+
 ## v0.12.0
 
 ### Added

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -73,9 +74,9 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
         "name": "Server-side request forgery (SSRF)",
         "cwe": "CWE-918",
         "owasp": "A10:2021 SSRF",
-        # The static scanner can't confirm SSRF (it's a request-flow bug) — this is a
-        # manual-hunt class; the checklist below guides it.
-        "categories": set(),
+        # The static scanner flags server-side-fetch SINKS (ssrf rule pack) as leads;
+        # reachability is still confirmed by the manual checklist below.
+        "categories": {"ssrf"},
         "checklist": [
             "Find parameters that take a URL/host (webhooks, image/import-by-URL, PDF/render).",
             "Point one at a collaborator host you control and confirm the server connects out.",
@@ -108,7 +109,8 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
         "name": "SQL injection",
         "cwe": "CWE-89",
         "owasp": "A03:2021 Injection",
-        "categories": set(),
+        # Static raw-SQL sink leads (sqli rule pack) + the error-based active check.
+        "categories": {"sqli"},
         "checklist": [
             "Identify parameters that reach a query; a SQL error in the response (flagged as disclosure) is a strong lead.",
             "Probe with a single quote and a balanced pair; compare error vs. normal responses.",
@@ -457,6 +459,16 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
     where = finding.get("location") or finding.get("file_path") or "the affected location"
     meta = VULN_CLASSES.get(class_id)
     steps = [f"Locate the issue at `{where}` (rule `{finding.get('rule_id', '')}`)."]
+    # For a web finding, lead with a benign curl that reproduces the observed
+    # condition. shlex.quote so an attacker-influenced path/query in the URL can't
+    # break the copy-pasted shell command. Web-only: a source finding has no URL.
+    location_str = str(finding.get("location") or "")
+    if location_str.startswith(("http://", "https://")) or finding.get("proof_evidence"):
+        curl_target = location_str if location_str.startswith(("http://", "https://")) else str(where)
+        steps.insert(0, (
+            f"Reproduce the observed condition: `curl -sSiL {shlex.quote(curl_target)} | head -n 40` "
+            "(benign GET; inspect the response headers/cookie that triggered this finding)."
+        ))
     if meta:
         steps.extend(meta["checklist"])
     else:
@@ -520,7 +532,7 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
         if scanner == "code":
             result = run_code_scan(target, "git_remote" if kind == "git" else "path", max_files=max_files)
         elif scanner == "web":
-            result = run_web_scan(target)
+            result = run_web_scan(target, probe_paths=True)
         else:
             continue
         ran.append(scanner)
@@ -951,6 +963,19 @@ def run_bounty_hunt(
         "coverage": ctx["coverage"],
         "active_verified_classes": ctx["active_verified_classes"],
         "active_authorization": ctx["active_authorization"],
+        # Structured per-finding data so a GUI can render a findings board + proof
+        # pane without re-parsing the markdown. These mirror the on-disk JSON sidecar
+        # (already scope-filtered + redacted by _reportable_findings) — additive,
+        # no scope/auth/SSRF logic touched. The structured `findings` list can be a
+        # subset of `display` (it drops e.g. unconfirmed JWT credential candidates),
+        # so a GUI should count from `findings`, not the legacy `finding_count`.
+        "findings": json_doc["findings"],
+        "attack_plans": json_doc["attack_plans"],
+        "proof_of_impact": json_doc["proof_of_impact"],
+        "cvss": json_doc["cvss"],
+        "class_counts": json_doc["class_counts"],
+        "submission_checklist": json_doc["submission_checklist"],
+        "retest_checklist": json_doc["retest_checklist"],
         "report_markdown": markdown,
     }
 
