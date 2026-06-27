@@ -97,6 +97,28 @@ class GnCliTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("authorize", err.lower())
 
+    def test_operator_cli_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            original = gn_cli.RUNTIME_DIR
+            gn_cli.RUNTIME_DIR = Path(tmp)
+            try:
+                # Add a program, list it, show the (empty) pipeline.
+                self.assertEqual(_run(["operator", "add", "--name", "Acme", "--scope", "*.acme.com",
+                                       "--targets", "https://acme.com", "--handle", "acme", "--active"])[0], 0)
+                code, out, _ = _run(["operator", "list"])
+                self.assertEqual(code, 0)
+                self.assertIn("acme", out)
+                self.assertEqual(_run(["operator", "pipeline"])[0], 0)
+                # run is gated on -y/--authorize (it fires live campaigns).
+                code, _, err = _run(["operator", "run"])
+                self.assertEqual(code, 2)
+                self.assertIn("authorize", err.lower())
+                # auto-submit without a handle is dropped fail-closed.
+                _run(["operator", "add", "--name", "NoHandle", "--scope", "x.com", "--auto-submit"])
+                self.assertEqual(_run(["operator", "remove", "acme"])[0], 0)
+            finally:
+                gn_cli.RUNTIME_DIR = original
+
 
 if __name__ == "__main__":
     unittest.main()
