@@ -3034,6 +3034,18 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-list .ck-floc { flex: 1; }
 .ck-tag { font-size: 0.7rem; color: var(--muted); padding: 0.12rem 0.45rem; border: 1px solid var(--border); border-radius: 999px; white-space: nowrap; }
 
+/* Operator tab */
+.ck-nav-5 { grid-template-columns: 1fr 1fr 1fr; }
+.ck-op-ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; margin: 0.4rem 0 1.2rem; }
+.ck-op-log { max-height: 14rem; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); padding: 0.5rem 0.7rem; margin-bottom: 1.2rem; }
+.ck-op-event { display: flex; gap: 0.6rem; font-size: 0.78rem; line-height: 1.6; font-family: var(--code-font); color: var(--text); }
+.ck-op-time { color: var(--muted); flex: none; }
+.ck-prog-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 0.6rem; align-items: end; }
+.ck-prog-form label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.76rem; color: var(--muted); }
+.ck-prog-form input { font: inherit; font-size: 0.84rem; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 0.45rem 0.55rem; }
+.ck-prog-form .ck-toggles { grid-column: 1 / -1; }
+.ck-prog-form .ck-status { grid-column: 1 / -1; }
+
 @media (max-width: 1100px) {
   .ck-body, .ck-body.has-detail { grid-template-columns: 18rem minmax(0, 1fr) 0; }
   .ck-body.has-detail .ck-detail { position: fixed; right: 0; top: 0; bottom: 0; width: min(92vw, 30rem); z-index: 40; box-shadow: -12px 0 40px rgba(0,0,0,0.35); }
