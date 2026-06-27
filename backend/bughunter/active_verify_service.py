@@ -20,10 +20,12 @@ SAFETY (this is the one place a bounty tool could become a weapon):
     settings, so SSRF/private-host/metadata/port/IDN guards apply identically.
     Redirects are NEVER followed off-host — the first 30x Location is *captured*.
   - Methods are GET/HEAD/OPTIONS only with benign idempotent markers (a single
-    quote to elicit a SQL error, a `{{7*7}}` arithmetic expression to detect a
-    template engine, a `<svg/onload>` reflection probe — all inspected, never
-    executed by us); never a state-changing verb/parameter, never a file-read/RCE/
-    SLEEP payload, never fuzzing/wordlists.
+    quote to elicit a SQL error, an `AND '1'='1` vs `AND '1'='2` boolean differential
+    that reads ONE bit and extracts no data, a `{{7*7}}` arithmetic expression to
+    detect a template engine, a `<svg/onload>` reflection probe, an encoded-CRLF +
+    custom-header marker to detect header injection — all inspected, never executed by
+    us); never a state-changing verb/parameter, never a file-read/RCE/SLEEP payload,
+    never fuzzing/wordlists.
   - A per-host token-bucket governor + a per-hunt request budget bound the load.
   - Every captured string is redacted before it lands in a proof artifact.
   - Fail-closed proof: 'confirmed' needs a positive observation AND a control
@@ -255,6 +257,50 @@ def _check_cors(http: _Http, url: str) -> dict[str, Any] | None:
                        limitations="Without Allow-Credentials, a credentialed cross-origin read is not proven.")
         ev = {"request_line": f"GET {url}", "request_header": f"Origin: {_MARKER_ORIGIN}", "response_status": f"HTTP {probe['status']}", "matched_value": f"ACAO: {acao}"}
         return _finding("active.cors-reflection", "CORS reflects arbitrary Origin (no credentials)", "low", "cors", "cors", url, proof, ev)
+
+    # Variant 2 — Origin: null trusted with credentials (reachable from a sandboxed
+    # iframe/data-URI). Confirm only when a DIFFERENT benign Origin does NOT also yield
+    # null, so 'null' is genuinely attacker-reachable, not a static value.
+    try:
+        null_probe = http.fetch(url, extra_headers={"Origin": "null"})
+    except _ActiveError:
+        null_probe = None
+    if null_probe is not None:
+        n_acao = (null_probe["headers"].get("access-control-allow-origin") or "").strip()
+        n_acac = (null_probe["headers"].get("access-control-allow-credentials") or "").strip().lower()
+        if n_acao == "null" and n_acac == "true" and ctrl_acao != "null":
+            proof = _proof(
+                "confirmed", method="GET with Origin: null", affected_asset="authenticated API responses (readable from a sandboxed iframe / data: URI)",
+                observed_result="Access-Control-Allow-Origin: null was returned with Allow-Credentials: true",
+                control_result=f"a normal Origin was reflected as {ctrl_acao or '(none)'} — 'null' is specially trusted",
+                evidence=f"ACAO=null; ACAC={n_acac}",
+            )
+            ev = {"request_line": f"GET {url}", "request_header": "Origin: null", "response_status": f"HTTP {null_probe['status']}",
+                  "matched_value": "Access-Control-Allow-Origin: null; Access-Control-Allow-Credentials: true"}
+            return _finding("active.cors-reflection", "CORS trusts Origin: null with credentials", "high", "cors", "cors", url, proof, ev)
+
+    # Variant 3 — attacker-controlled subdomain of the in-scope host reflected with
+    # credentials (a takeover/XSS on any sibling subdomain then reads this API).
+    host = urlparse(url).hostname or ""
+    if host:
+        sub_origin = f"https://{_MARK}.{host}"
+        try:
+            sub_probe = http.fetch(url, extra_headers={"Origin": sub_origin})
+        except _ActiveError:
+            sub_probe = None
+        if sub_probe is not None:
+            s_acao = (sub_probe["headers"].get("access-control-allow-origin") or "").strip()
+            s_acac = (sub_probe["headers"].get("access-control-allow-credentials") or "").strip().lower()
+            if s_acao == sub_origin and s_acac == "true" and ctrl_acao != sub_origin:
+                proof = _proof(
+                    "confirmed", method=f"GET with Origin: {sub_origin}", affected_asset="authenticated API responses readable from any subdomain of the target",
+                    observed_result=f"an arbitrary subdomain Origin ({sub_origin}) was reflected with Allow-Credentials: true",
+                    control_result=f"a different Origin was reflected as {ctrl_acao or '(none)'} — any subdomain is trusted",
+                    evidence=f"ACAO={sub_origin}; ACAC={s_acac}",
+                )
+                ev = {"request_line": f"GET {url}", "request_header": f"Origin: {sub_origin}", "response_status": f"HTTP {sub_probe['status']}",
+                      "matched_value": f"Access-Control-Allow-Origin: {sub_origin}; Access-Control-Allow-Credentials: true"}
+                return _finding("active.cors-reflection", "CORS trusts arbitrary subdomain Origin with credentials", "high", "cors", "cors", url, proof, ev)
     return None
 
 
@@ -432,6 +478,88 @@ def _check_error_sqli(http: _Http, url: str) -> dict[str, Any] | None:
     return None
 
 
+def _norm_len(body: str) -> int:
+    """Length of the body with volatile whitespace collapsed, so a stable page
+    compares stably across reads (CSRF tokens / timestamps still flap — handled by
+    the baseline-stability gate, not here)."""
+    return len(re.sub(r"\s+", " ", body or ""))
+
+
+def _check_bool_sqli(http: _Http, url: str) -> dict[str, Any] | None:
+    """Boolean-based blind SQLi, GET-only, no timing/SLEEP, no data extraction — just
+    one boolean bit. Confirms ONLY when the page is stable across two baselines AND a
+    TRUE tautology tracks the baseline while a FALSE contradiction diverges materially.
+    The two matching baselines ARE the negative control: a page that flaps on its own
+    can't be differentiated, so it degrades to candidate rather than over-claiming."""
+    parsed = urlparse(url)
+    params = [k for k, v in parse_qsl(parsed.query)]
+    if not params:
+        return None  # need a real existing param; never invent injection points
+    for param in params[:2]:
+        original = dict(parse_qsl(parsed.query)).get(param, "1")
+        try:
+            base1 = http.fetch(_with_query(url, {param: original}))
+            base2 = http.fetch(_with_query(url, {param: original}))
+            t_resp = http.fetch(_with_query(url, {param: original + "' AND '1'='1"}))
+            f_resp = http.fetch(_with_query(url, {param: original + "' AND '1'='2"}))
+        except _ActiveError:
+            continue
+        b1, b2 = _norm_len(base1.get("body") or ""), _norm_len(base2.get("body") or "")
+        tl, fl = _norm_len(t_resp.get("body") or ""), _norm_len(f_resp.get("body") or "")
+        ref = max(b1, 1)
+        # Page must be STABLE (two unmodified reads near-identical) to be differentiable.
+        if abs(b1 - b2) > max(8, ref * 0.02):
+            continue  # dynamic page — not safely confirmable here
+        true_tracks = abs(tl - b1) <= max(8, ref * 0.02)
+        false_diverges = abs(fl - b1) > max(24, ref * 0.05)
+        if true_tracks and false_diverges:
+            proof = _proof(
+                "confirmed", method=f"GET with {param}=...' AND '1'='1 vs ...' AND '1'='2",
+                affected_asset="the database reachable by the query's role (boolean-inferable)",
+                observed_result=f"the TRUE condition returned a page matching the stable baseline (~{b1} chars) while the FALSE condition diverged (~{fl} chars)",
+                control_result=f"two unmodified requests returned near-identical pages (~{b1}/{b2} chars), so the page is stable and the TRUE/FALSE difference tracks the injected boolean",
+                evidence=f"normalized lengths baseline={b1}/{b2}, TRUE={tl}, FALSE={fl}",
+            )
+            ev = {"request_line": f"GET {_with_query(url, {param: original + chr(39) + ' AND ' + chr(39) + '1' + chr(39) + '=' + chr(39) + '2'})}",
+                  "response_status": f"HTTP {f_resp['status']}", "matched_value": f"FALSE page diverged by {abs(fl - b1)} chars from a stable baseline"}
+            return _finding("active.sqli-boolean", f"Boolean-based blind SQL injection via '{param}'", "high", "disclosure", "sqli", url, proof, ev)
+    return None
+
+
+def _check_crlf(http: _Http, url: str) -> dict[str, Any] | None:
+    """CRLF / response-header injection, GET-only. Injects an encoded CRLF + a benign
+    custom-header marker into a param; confirms ONLY when the server SPLITS it into a
+    real response header equal to the marker AND a control without the CRLF does not —
+    proving the value crossed into the header block. Benign marker header only; nothing
+    that affects other users' traffic (contrast request smuggling)."""
+    parsed = urlparse(url)
+    existing = {k.lower() for k, _ in parse_qsl(parsed.query)}
+    candidates = [p for p in _REDIRECT_PARAMS if p in existing] or ["next", "redirect", "url", "page"]
+    # RAW CR/LF — _with_query's urlencode encodes it ONCE to %0D%0A (pre-encoding here
+    # would double-encode to %250D%250A and never inject a real newline).
+    marker_value = f"\r\nX-Greyiq-Crlf:{_MARK}"
+    for param in candidates[:3]:
+        try:
+            probe = http.fetch(_with_query(url, {param: marker_value}))
+            control = http.fetch(_with_query(url, {param: f"X-Greyiq-Crlf-{_MARK}"}))
+        except _ActiveError:
+            continue
+        injected = (probe["headers"].get("x-greyiq-crlf") or "").strip()
+        ctrl_injected = (control["headers"].get("x-greyiq-crlf") or "").strip()
+        if injected == _MARK and ctrl_injected != _MARK:
+            proof = _proof(
+                "confirmed", method=f"GET with {param} carrying an encoded CRLF + marker header",
+                affected_asset="response headers (header injection, cache poisoning, cookie setting, XSS via header)",
+                observed_result=f"the server split the '{param}' value into a real 'X-Greyiq-Crlf: {_MARK}' response header — the CRLF was honored",
+                control_result="the same marker WITHOUT a CRLF did not produce the header, proving the newline was the cause",
+                evidence=f"X-Greyiq-Crlf: {_MARK} present in the response headers",
+            )
+            ev = {"request_line": f"GET {_with_query(url, {param: marker_value})}", "response_status": f"HTTP {probe['status']}",
+                  "matched_value": f"injected response header X-Greyiq-Crlf: {_MARK}"}
+            return _finding("active.crlf", f"CRLF / response-header injection via '{param}'", "high", "disclosure", "redirect", url, proof, ev)
+    return None
+
+
 def verify_active(
     target_url: str,
     findings: list[dict[str, Any]],
@@ -494,6 +622,8 @@ def verify_active(
         lambda: _check_reflected_xss(http, sanitized),
         lambda: _check_ssti(http, sanitized),
         lambda: _check_error_sqli(http, sanitized),
+        lambda: _check_bool_sqli(http, sanitized),
+        lambda: _check_crlf(http, sanitized),
     ]
     for check in checks:
         if rate_limited:

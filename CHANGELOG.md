@@ -2,6 +2,26 @@
 
 Notable changes to GreyIQ.
 
+## v0.18.0
+
+### Prove more — three new GET-only active confirmations (more submittable findings)
+More leads become **Confirmed** (the bar for filing), all inside the existing
+double-gated, scope-bound, negative-control, budgeted active envelope:
+- **Boolean-based blind SQLi** — an `AND '1'='1'` vs `AND '1'='2'` differential that
+  reads **one boolean bit** and extracts no data. Confirms only when two unmodified
+  baselines are near-identical (the page is stable enough to differentiate — its own
+  negative control) AND the TRUE branch tracks the baseline while the FALSE branch
+  diverges materially; a flapping/dynamic page or an ignored parameter degrades to
+  no-finding rather than over-claiming. No timing, no `SLEEP`, no `UNION`.
+- **CRLF / response-header injection** — injects an encoded CRLF + a benign custom
+  header marker into a parameter and confirms only when the server **splits it into a
+  real response header** equal to the marker AND a control without the CRLF does not.
+- **Two more CORS confirmations** — `Origin: null` trusted with credentials, and an
+  arbitrary **subdomain** Origin reflected with credentials — each gated by a distinct
+  negative control so the reflection is proven attacker-driven.
+
+All GET-only with benign markers; every "confirmed" is backed by a same-run control.
+
 ## v0.17.0
 
 ### Find more — five declared-but-empty vuln classes now detect
