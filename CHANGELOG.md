@@ -2,6 +2,53 @@
 
 Notable changes to GreyIQ.
 
+## v0.19.0
+
+### The autonomous operator — run the whole bounty loop unattended
+Point GreyIQ at a **portfolio of programs** and it runs the money loop on a schedule
+without hand-holding: recon → hunt → prove → consolidate → **dedup across runs** →
+rank by expected value → submission packages → (only when explicitly armed) **file
+confirmed findings**, then reschedule and move on. A new **Operator** tab in the
+cockpit is the control panel: program management, a live activity log, the kill
+switch, and a money pipeline funnel (discovered → confirmed → reported → submitted →
+paid, with $ per program).
+
+New modules, all pure/frozen-safe (stdlib + the existing stores):
+- **`portfolio.py`** — the program list (`RUNTIME_DIR/portfolio.json`): scope, seed
+  targets, cadence, and **fail-closed** automation flags (active/live/auto_submit all
+  default OFF; an empty scope or missing HackerOne handle forces auto-submit off).
+- **`ledger.py`** — a persistent finding ledger keyed by a stable dedup key
+  (`class|rule|digit-normalized-location`). It powers **cross-run dedup** (a re-run
+  never re-reports — or re-files — a finding it already reported) and the pipeline
+  funnel. `stage='confirmed'` is set *only* when the server-truth `proof_status` is
+  confirmed, so the funnel can't inflate the submit-eligible pool.
+- **`ranking.py`** — expected-value ordering (`severity × learned prior × confirmed
+  weight × program-pay factor`, every factor bounded), with **confirmed as the
+  outermost sort key** so a confirmed finding never sinks below a lead.
+- **`operator.py`** — the unattended loop: a background supervisor that runs due,
+  enabled programs sequentially, a stop-event **kill switch** checked between every
+  program and before every submit, and the run-cycle that hunts each target and
+  (when armed) auto-files.
+
+Campaign consolidation now ranks by EV and records every finding in the ledger,
+skipping a submission package for anything already reported in a prior run.
+
+### Safety (unattended automation, done right)
+Auto-submission is **quadruple-gated** and optimizes for high signal, never volume:
+the loop must be started with **arm auto-submit** *and* the program must opt in *and*
+the finding must be server-recomputed **confirmed** *and* not already
+reported/submitted (ledger dedup) *and* within the program's daily cap. The operator
+adds **zero new network/scanning code** — it calls the same `run_campaign` (recon
+stays same-origin, active probing stays scope-bound and fail-closed) and the same
+**unbypassable** `submit_to_hackerone` gate (confirm + server-recomputed
+`proof_status=='confirmed'` + real creds). Starting it requires an explicit
+authorization confirmation.
+
+New API: `GET/POST /api/operator/programs`, `/programs/delete`, `/start` (authorized +
+arm), `/stop` (kill switch), `/events`, `GET /api/operator/pipeline`. +13 tests
+covering the dedup, throttle, fail-closed scope, and "review-only never submits"
+invariants.
+
 ## v0.18.0
 
 ### Prove more — three new GET-only active confirmations (more submittable findings)

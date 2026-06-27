@@ -4273,11 +4273,15 @@ const ck = {
     findings: document.querySelector("#ckViewFindings"),
     surface: document.querySelector("#ckViewSurface"),
     submissions: document.querySelector("#ckViewSubmissions"),
-    learn: document.querySelector("#ckViewLearn")
+    learn: document.querySelector("#ckViewLearn"),
+    operator: document.querySelector("#ckViewOperator")
   },
   detail: document.querySelector("#ckDetail"),
   body: document.querySelector(".ck-body")
 };
+
+let ckOpPoll = null;        // operator event-poll timer
+let ckOpEventCount = 0;     // events already rendered
 
 const ckState = {
   result: null,          // last hunt/campaign response
@@ -4323,6 +4327,9 @@ function ckSetView(view) {
   if (view === "learn") void ckRenderLearn();
   if (view === "surface") ckRenderSurface();
   if (view === "submissions") ckRenderSubmissions();
+  if (view === "operator") void ckRenderOperator();
+  // Operator events only poll while its tab is open.
+  if (view !== "operator" && ckOpPoll) { clearInterval(ckOpPoll); ckOpPoll = null; }
 }
 
 function ckSetRunType(type) {
@@ -4963,6 +4970,189 @@ async function ckRenderLearn() {
     const inp = cel("input"); inp.id = id; inp.type = type; if (type === "number") inp.min = "0";
     wrap.append(inp); return { wrap, input: inp };
   }
+}
+
+// ---- Operator: the autonomous portfolio control panel + money pipeline ----
+async function ckRenderOperator() {
+  const host = ck.views.operator;
+  host.replaceChildren();
+  host.append(cel("h2", "ck-section-title", "Autonomous operator"));
+  host.append(cel("p", "ck-hint", "Add the programs you're authorized to hunt, then arm the operator. It runs each program on its schedule — recon, hunt, prove, dedup, report — and (only when you explicitly arm auto-submit per program) files confirmed, non-duplicate findings within a daily cap. The kill switch stops it immediately."));
+
+  let data = null;
+  if (service.available || (await refreshServiceStatus({ silent: true }))) {
+    try { data = await apiFetch("/api/operator/pipeline", { timeoutMs: 8000 }); } catch (_) { data = null; }
+  }
+  if (!data || data.ok === false) { host.append(cel("p", "ck-status is-error", "Local engine not running.")); return; }
+
+  // --- Control bar: start / stop / arm auto-submit ---
+  const ctl = cel("div", "ck-op-ctl");
+  const running = Boolean(data.running);
+  const statusPill = cel("span", `ck-pill ${running ? "is-armed" : ""}`);
+  statusPill.append(cel("span", null, "Operator: "), cel("strong", null, running ? "running" : "stopped"));
+  ctl.append(statusPill);
+
+  const armWrap = cel("label", "ck-switch ck-auth");
+  const arm = cel("input"); arm.type = "checkbox"; arm.id = "ckOpArm";
+  armWrap.append(arm, ckArmLabel());
+  ctl.append(armWrap);
+
+  if (!running) {
+    const startBtn = cel("button", "ck-btn primary", "Start operator");
+    startBtn.type = "button";
+    startBtn.addEventListener("click", () => ckOperatorStart(arm.checked));
+    ctl.append(startBtn);
+  } else {
+    const stopBtn = cel("button", "ck-btn", "■ Kill switch — stop");
+    stopBtn.type = "button";
+    stopBtn.style.borderColor = "var(--danger)"; stopBtn.style.color = "var(--danger)";
+    stopBtn.addEventListener("click", ckOperatorStop);
+    ctl.append(stopBtn);
+  }
+  host.append(ctl);
+
+  // --- Money pipeline funnel ---
+  const pf = (data.funnel && data.funnel.portfolio) || { stages: {}, total: 0, bounty_total: 0 };
+  host.append(cel("h3", "ck-section-title", "Money pipeline"));
+  const funnel = cel("div", "ck-stats-grid");
+  const stages = [["discovered", "Discovered"], ["confirmed", "Confirmed"], ["reported", "Reported"], ["submitted", "Submitted"], ["paid", "Paid"]];
+  for (const [k, label] of stages) {
+    const c = cel("div", "ck-stat");
+    c.append(cel("div", "n", String((pf.stages || {})[k] || 0)), cel("div", "l", label));
+    funnel.append(c);
+  }
+  const money = cel("div", "ck-stat");
+  money.append(cel("div", "n", `$${pf.bounty_total || 0}`), cel("div", "l", "Bounty"));
+  funnel.append(money);
+  host.append(funnel);
+
+  // --- Live event log ---
+  host.append(cel("h3", "ck-section-title", "Activity"));
+  const log = cel("div", "ck-op-log"); log.id = "ckOpLog";
+  host.append(log);
+  ckOpEventCount = 0;
+  await ckOperatorPollEvents();
+  if (ckOpPoll) clearInterval(ckOpPoll);
+  ckOpPoll = setInterval(() => { void ckOperatorPollEvents(); }, 4000);
+
+  // --- Programs ---
+  host.append(cel("h3", "ck-section-title", `Programs (${(data.programs || []).length})`));
+  const list = cel("ul", "ck-list");
+  for (const prog of (data.programs || [])) list.append(ckProgramRow(prog, data.funnel));
+  if (!(data.programs || []).length) host.append(cel("p", "ck-hint", "No programs yet — add one below."));
+  else host.append(list);
+
+  // --- Add program form ---
+  host.append(cel("h3", "ck-section-title", "Add / update a program"));
+  host.append(ckProgramForm());
+}
+
+function ckArmLabel() {
+  const span = cel("span");
+  span.append(cel("strong", null, "Arm auto-submit"));
+  span.append(document.createTextNode(" — file confirmed, non-duplicate findings to HackerOne automatically (per-program opt-in + daily cap still apply). Off = review-only."));
+  return span;
+}
+
+async function ckOperatorStart(allowSubmit) {
+  if (allowSubmit && !window.confirm("ARM AUTO-SUBMIT?\n\nThe operator will FILE confirmed findings to your HackerOne programs automatically (only programs you set auto-submit on, only confirmed + non-duplicate findings, within each program's daily cap). Only do this for authorized, in-scope programs.")) return;
+  if (!window.confirm("Start the operator on your portfolio? You confirm you are AUTHORIZED to test every enabled program's scope.")) return;
+  try {
+    await apiFetch("/api/operator/start", { method: "POST", body: JSON.stringify({ authorized: true, allow_submit: Boolean(allowSubmit) }) });
+    void ckRenderOperator();
+  } catch (err) { window.alert(err.message || "Could not start."); }
+}
+
+async function ckOperatorStop() {
+  try { await apiFetch("/api/operator/stop", { method: "POST", body: JSON.stringify({}) }); } catch (_) {}
+  setTimeout(() => void ckRenderOperator(), 400);
+}
+
+async function ckOperatorPollEvents() {
+  const log = document.querySelector("#ckOpLog");
+  if (!log) return;
+  let res = null;
+  try { res = await apiFetch("/api/operator/events", { method: "POST", timeoutMs: 6000, body: JSON.stringify({ after: ckOpEventCount }) }); } catch (_) { return; }
+  for (const ev of (res.events || [])) {
+    const row = cel("div", "ck-op-event");
+    row.append(cel("span", "ck-op-time", (ev.at || "").slice(11, 19)), cel("span", null, ev.message || ""));
+    log.append(row);
+  }
+  if (res.events && res.events.length) { ckOpEventCount = res.count || (ckOpEventCount + res.events.length); log.scrollTop = log.scrollHeight; }
+  if (!log.childNodes.length) log.append(cel("p", "ck-hint", "No activity yet. Start the operator to see live progress."));
+}
+
+function ckProgramRow(prog, funnel) {
+  const li = cel("li"); li.style.flexWrap = "wrap";
+  const left = cel("div"); left.style.flex = "1";
+  left.append(cel("span", "ck-ftitle", prog.name || prog.id));
+  if (prog.auto_submit) left.append(document.createTextNode(" "), cel("span", "ck-tag", "auto-submit"));
+  if (!prog.enabled) left.append(document.createTextNode(" "), cel("span", "ck-tag", "disabled"));
+  const fp = (funnel && funnel.programs && funnel.programs[prog.id]) || null;
+  const meta = `${prog.scope_text || "(no scope)"} · ${(prog.seed_targets || []).length} target(s)` + (fp ? ` · ${fp.stages.submitted || 0} submitted · $${fp.bounty_total || 0}` : "");
+  left.append(cel("div", "ck-floc", meta));
+  li.append(left);
+
+  const acts = cel("div", "ck-actions"); acts.style.margin = "0";
+  const toggle = cel("button", "ck-btn", prog.enabled ? "Disable" : "Enable");
+  toggle.type = "button";
+  toggle.addEventListener("click", async () => {
+    try { await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify({ id: prog.id, name: prog.name, scope_text: prog.scope_text, seed_targets: prog.seed_targets, active: prog.active, live: prog.live, auto_submit: prog.auto_submit, platform: prog.platform, platform_handle: prog.platform_handle, interval_minutes: prog.interval_minutes, max_submits_per_day: prog.max_submits_per_day, max_pages: prog.max_pages, enabled: !prog.enabled }) }); void ckRenderOperator(); } catch (_) {}
+  });
+  acts.append(toggle);
+  const del = cel("button", "ck-btn", "Delete");
+  del.type = "button";
+  del.addEventListener("click", async () => { if (!window.confirm(`Delete program "${prog.name || prog.id}"?`)) return; try { await apiFetch("/api/operator/programs/delete", { method: "POST", body: JSON.stringify({ id: prog.id }) }); void ckRenderOperator(); } catch (_) {} });
+  acts.append(del);
+  li.append(acts);
+  return li;
+}
+
+function ckProgramForm() {
+  const form = cel("form", "ck-prog-form");
+  const name = ckField("Program name", "text", "");
+  const scope = ckField("Scope (hosts/wildcards — the active gate)", "text", "");
+  const targets = ckField("Seed targets (comma/space separated URLs)", "text", "");
+  const handle = ckField("HackerOne team handle (for auto-submit)", "text", "");
+  const interval = ckField("Re-run every (minutes)", "number", "1440");
+  const cap = ckField("Max auto-submits / day", "number", "3");
+  form.append(name.wrap, scope.wrap, targets.wrap, handle.wrap, interval.wrap, cap.wrap);
+
+  const toggles = cel("div", "ck-toggles");
+  const active = ckToggle("Capture proof of impact (active)", true);
+  const live = ckToggle("Dynamic Playwright pass", false);
+  const auto = ckToggle("Auto-submit confirmed findings (per-program opt-in)", false);
+  toggles.append(active.wrap, live.wrap, auto.wrap);
+  form.append(toggles);
+
+  const submit = cel("button", "ck-btn primary", "Save program");
+  submit.type = "submit";
+  form.append(submit);
+  const note = cel("p", "ck-status");
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!name.input.value.trim() || !scope.input.value.trim()) { note.textContent = "Name and scope are required."; note.classList.add("is-error"); return; }
+    const seeds = targets.input.value.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+    try {
+      await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify({
+        name: name.input.value.trim(), scope_text: scope.input.value.trim(), seed_targets: seeds,
+        platform: handle.input.value.trim() ? "hackerone" : "manual", platform_handle: handle.input.value.trim(),
+        active: active.input.checked, live: live.input.checked, auto_submit: auto.input.checked,
+        interval_minutes: Number(interval.input.value) || 1440, max_submits_per_day: Number(cap.input.value) || 3
+      }) });
+      note.classList.remove("is-error"); note.textContent = "Saved.";
+      void ckRenderOperator();
+    } catch (err) { note.textContent = err.message || "Could not save."; note.classList.add("is-error"); }
+  });
+  form.append(note);
+  return form;
+}
+
+function ckToggle(label, checked) {
+  const wrap = cel("label", "ck-switch");
+  const input = cel("input"); input.type = "checkbox"; input.checked = Boolean(checked);
+  wrap.append(input, cel("span", null, label));
+  return { wrap, input };
 }
 
 function ckBadgeCount(view, n) {

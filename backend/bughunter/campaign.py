@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from bughunter import active_verify_service, fsutil, learning, recon, submission
+from bughunter import active_verify_service, fsutil, ledger, learning, ranking, recon, submission
 from bughunter.bounty import _infer_kind, _safe_slug, run_bounty_hunt
 
 _SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
@@ -143,22 +143,24 @@ def run_campaign(
                 "cvss": (doc.get("cvss") or {}).get(ref) or {},
             })
 
-    # --- Rank: severity, then learned program priors, then CVSS, then proof. ---
-    def _rank(item: dict[str, Any]) -> tuple:
-        finding = item["finding"]
-        sev = _SEV_RANK.get(str(finding.get("severity")).lower(), 0)
-        prior = priors.get(str(finding.get("class_id") or ""), 1.0)
-        confirmed = 1 if item["proof_status"] == "confirmed" else 0
-        score = float(item["cvss"].get("base_score") or 0.0)
-        return (confirmed, sev * prior, score, sev)
-
-    consolidated.sort(key=_rank, reverse=True)
+    # --- Rank by EXPECTED VALUE (confirmed outermost, then EV, severity, CVSS) so the
+    # most-likely-to-pay findings sort first. ---
+    program_stats = (learning.program_summary(rt, program, clean_target).get("class_stats") if rt is not None else {}) or {}
+    ranking.rank_by_ev(consolidated, priors, program_stats)
     confirmed = [c for c in consolidated if c["proof_status"] == "confirmed"]
 
-    # --- Submission packages (reportable findings; confirmed first). ---
+    # --- Cross-run dedup: record every finding in the persistent ledger and learn
+    # which were ALREADY reported in a prior run (so a re-run never re-files them). ---
+    if rt is not None:
+        ledger.upsert_findings(rt, program, clean_target, consolidated)
+
+    # --- Submission packages (reportable findings; confirmed first; never re-package a
+    # finding already reported in a prior run). ---
     submission_paths: list[str] = []
     sub_dir = out_root / "submissions"
     for rank_i, item in enumerate(consolidated, 1):
+        if item.get("duplicate_of_prior"):
+            continue  # already reported in a previous run — don't re-emit a package
         doc = _read_json(item["source_json"])
         ctx = _ctx_from_doc(doc)
         finding = item["finding"]
@@ -167,6 +169,8 @@ def run_campaign(
         if package:
             item["submission_path"] = package["markdown_path"]
             submission_paths.append(package["markdown_path"])
+            if rt is not None:
+                ledger.mark_reported(rt, program, clean_target, finding)
             # Log confirmed findings to the learning store so outcomes can be recorded.
             if rt is not None and item["proof_status"] == "confirmed":
                 learning.record_outcome(
@@ -201,6 +205,7 @@ def run_campaign(
         finding["ref"] = ref
         finding["source_url"] = item["source_url"]
         finding["proof_status"] = item["proof_status"]
+        finding["ev"] = item.get("ev")  # expected-value rank score for the dashboard
         findings_out.append(finding)
         proof_out[ref] = {"status": item["proof_status"]}
         if item.get("cvss"):

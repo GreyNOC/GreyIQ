@@ -275,6 +275,9 @@ from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, 
 from bughunter import campaign as bounty_campaign  # noqa: E402
 from bughunter import learning as bounty_learning  # noqa: E402
 from bughunter import submission as bounty_submission  # noqa: E402
+from bughunter import ledger as bounty_ledger  # noqa: E402
+from bughunter import portfolio as bounty_portfolio  # noqa: E402
+from bughunter.operator import OperatorLoop  # noqa: E402
 from bughunter import toolkit as toolkit_lib  # noqa: E402
 from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E402
 
@@ -541,6 +544,37 @@ class HackerOneCredsRequest(BaseModel):
     api_token: str = Field(default="", max_length=400)
 
 
+class ProgramUpsertRequest(BaseModel):
+    id: str | None = Field(default=None, max_length=120)
+    name: str = Field(default="", max_length=200)
+    platform: str = Field(default="manual", max_length=20)
+    platform_handle: str = Field(default="", max_length=200)
+    scope_text: str = Field(default="", max_length=4000)
+    in_scope_hosts: list[str] = Field(default_factory=list)
+    out_of_scope_hosts: list[str] = Field(default_factory=list)
+    seed_targets: list[str] = Field(default_factory=list)
+    active: bool = False
+    live: bool = False
+    auto_submit: bool = False
+    max_pages: int = Field(default=12, ge=1, le=50)
+    interval_minutes: int = Field(default=1440, ge=5, le=20160)
+    max_submits_per_day: int = Field(default=3, ge=0, le=25)
+    enabled: bool = True
+
+
+class ProgramDeleteRequest(BaseModel):
+    id: str = Field(min_length=1, max_length=120)
+
+
+class OperatorStartRequest(BaseModel):
+    authorized: bool = False
+    allow_submit: bool = False  # ARM auto-submit (still per-program opt-in + confirmed-only + dedup'd)
+
+
+class OperatorEventsRequest(BaseModel):
+    after: int = Field(default=0, ge=0)
+
+
 class AgentRedteamRequest(BaseModel):
     authorized: bool = False
     include_behavioral: bool = False
@@ -636,6 +670,9 @@ class GreyIQRuntime:
         # In-memory only (drop-oldest); the on-disk report/JSON sidecar is the durable
         # copy. Lets the cockpit fetch a canonical build_submission package per finding.
         self.bounty_runs: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        # The autonomous operator loop (lazy — created on first start so its callables
+        # bind to this runtime's hard-gated run_campaign + submit_finding).
+        self._operator: "OperatorLoop | None" = None
         self.store = AICoreStore(RUNTIME_DIR)
         ensure_runtime()
         self._rewrite_core_defaults()
@@ -1209,6 +1246,69 @@ class GreyIQRuntime:
     def _hackerone_creds(self) -> tuple[str, str, str]:
         stored = _load_secrets()
         return (stored.get("hackerone.team_handle", ""), stored.get("hackerone.api_username", ""), stored.get("hackerone.api_token", ""))
+
+    # ---- Autonomous operator ------------------------------------------------------
+    def _operator_run_campaign(self, target: str, *, scope: str, program: str, active: bool, live: bool, max_pages: int) -> dict[str, Any]:
+        """The operator's run_campaign_fn — goes through runtime.run_campaign so the
+        run is cached (run_id) and the submit path can resolve it. authorized=True
+        because the operator only runs after the user explicitly armed it (the start
+        endpoint requires authorized); scope stays the fail-closed gate."""
+        return self.run_campaign(CampaignRequest(
+            target=target, scope=scope, authorized=True, program=program,
+            active=active, live=live, max_pages=max_pages,
+        ))
+
+    def _operator_submit(self, run_id: str, ref: str) -> dict[str, Any]:
+        """The operator's submit_fn — the SAME hard-gated runtime.submit_finding (confirm
+        + server-recomputed proof_status=='confirmed' + creds). Unforgeable by the loop."""
+        return self.submit_finding(SubmitRequest(run_id=run_id, ref=ref, confirm=True, platform="hackerone"))
+
+    def _get_operator(self) -> "OperatorLoop":
+        with self.lock:
+            if self._operator is None:
+                self._operator = OperatorLoop(
+                    str(RUNTIME_DIR),
+                    run_campaign_fn=self._operator_run_campaign,
+                    submit_fn=self._operator_submit,
+                )
+            return self._operator
+
+    def list_programs(self) -> dict[str, Any]:
+        return {"ok": True, "programs": bounty_portfolio.list_programs(RUNTIME_DIR)}
+
+    def upsert_program(self, request: "ProgramUpsertRequest") -> dict[str, Any]:
+        record = request.model_dump(exclude_none=True)
+        return {"ok": True, "program": bounty_portfolio.upsert_program(RUNTIME_DIR, record)}
+
+    def remove_program(self, program_id: str) -> dict[str, Any]:
+        return {"ok": bounty_portfolio.remove_program(RUNTIME_DIR, program_id)}
+
+    def operator_start(self, request: "OperatorStartRequest") -> dict[str, Any]:
+        if not request.authorized:
+            return {"ok": False, "error": "Confirm you are authorized to run the portfolio's programs (set authorized)."}
+        started = self._get_operator().start(allow_submit=bool(request.allow_submit))
+        return {"ok": True, "started": started, "allow_submit": bool(request.allow_submit),
+                "note": "auto-submit ARMED — confirmed, non-duplicate findings will be filed within each program's daily cap." if request.allow_submit
+                        else "review-only — findings are hunted and queued; nothing is auto-filed."}
+
+    def operator_stop(self) -> dict[str, Any]:
+        if self._operator is not None:
+            self._operator.stop()
+        return {"ok": True}
+
+    def operator_events(self, after: int = 0) -> dict[str, Any]:
+        if self._operator is None:
+            return {"ok": True, "running": False, "events": [], "count": 0}
+        return {"ok": True, **self._operator.event_tail(after=after)}
+
+    def operator_pipeline(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "funnel": bounty_ledger.funnel(RUNTIME_DIR),
+            "programs": bounty_portfolio.list_programs(RUNTIME_DIR),
+            "learning": bounty_learning.program_summary(RUNTIME_DIR),
+            "running": bool(self._operator and self._operator.running),
+        }
 
     def record_outcome(self, request: "LearnRequest") -> dict[str, Any]:
         try:
@@ -2119,6 +2219,31 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/hackerone/creds":
             request = validate_payload(HackerOneCredsRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.save_hackerone_creds, request))
+            return
+        if method == "GET" and path == "/api/operator/programs":
+            await send_json(send, await asyncio.to_thread(runtime.list_programs))
+            return
+        if method == "POST" and path == "/api/operator/programs":
+            request = validate_payload(ProgramUpsertRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.upsert_program, request))
+            return
+        if method == "POST" and path == "/api/operator/programs/delete":
+            request = validate_payload(ProgramDeleteRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.remove_program, request.id))
+            return
+        if method == "POST" and path == "/api/operator/start":
+            request = validate_payload(OperatorStartRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.operator_start, request))
+            return
+        if method == "POST" and path == "/api/operator/stop":
+            await send_json(send, await asyncio.to_thread(runtime.operator_stop))
+            return
+        if method == "POST" and path == "/api/operator/events":
+            request = validate_payload(OperatorEventsRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.operator_events, request.after))
+            return
+        if method == "GET" and path == "/api/operator/pipeline":
+            await send_json(send, await asyncio.to_thread(runtime.operator_pipeline))
             return
         if method == "POST" and path == "/api/agent/redteam":
             request = validate_payload(AgentRedteamRequest, await read_json_body(receive))
