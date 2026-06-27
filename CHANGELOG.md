@@ -2,6 +2,41 @@
 
 Notable changes to GreyIQ.
 
+## v0.14.0
+
+### Bug-bounty cockpit — the app is now bug-bounty-first
+GreyIQ opens into a dedicated **Hunt cockpit** instead of the AI-studio chat. The
+studio (chat, coding brain, training, Workbench) is preserved behind a single
+**Studio ↗** toggle (a **◀ Hunt** button returns) — nothing was removed, the
+default surface just changed.
+
+The cockpit is a full bug-bounty workflow built directly on the engine:
+- **Launch rail** — one form for a **Single hunt** or a **Full campaign**: target,
+  scope/program, profile + focus class (hunt) or program handle + recon depth
+  (campaign), and prominent safety switches (**Test for proof of impact**, dynamic
+  Playwright pass, and a required **authorized** toggle). Authorization and active
+  scoping stay enforced server-side, fail-closed.
+- **Findings board** — the center stage: a sortable, filterable table (severity ·
+  class/CWE · **proof-status pill** confirmed/candidate/missing · finding · location
+  · CVSS), with a run-summary strip (risk, severity counts, an active-verification
+  armed/disarmed chip) and filter chips (All / Confirmed / by severity).
+- **Finding detail drawer** — click any finding for the full proof pane: numbered
+  reproduction steps, the captured proof-of-impact (observed / control / evidence),
+  the **“To confirm” obligation** for unproven leads, CVSS vector, impact,
+  remediation, and a one-click **Copy submission draft**.
+- **Surface** — the recon map for a campaign (discovered URLs + robots/sitemap/
+  security.txt sources). **Submissions** — a confirmed-first draft queue.
+  **Learn** — the per-program stats dashboard with an inline *record-outcome* form,
+  so the learning loop closes without dropping to the CLI.
+
+Every dynamic node is built DOM-only (`createElement`/`textContent`, never
+`innerHTML`) so scanner- and brain-derived finding text can't inject markup.
+
+### API
+- `run_campaign` now also returns a compact structured payload (campaign-global
+  finding refs + proof/CVSS maps + a `surface` block + severity counts + risk) so
+  the cockpit renders one board for campaigns exactly like single hunts.
+
 ## v0.13.0
 
 A whole-engine QA/QC pass (multi-agent audit of the find → prove → report

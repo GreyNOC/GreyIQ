@@ -38,6 +38,23 @@ def _proof_status(doc: dict[str, Any], ref: str) -> str:
     return str(((doc.get("proof_of_impact") or {}).get(ref) or {}).get("status") or "missing")
 
 
+def _severity_counts(findings: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+    for finding in findings:
+        sev = str(finding.get("severity", "info")).lower()
+        if sev in counts:
+            counts[sev] += 1
+    return counts
+
+
+def _campaign_risk(consolidated: list[dict[str, Any]]) -> str:
+    present = {str(item["finding"].get("severity", "")).lower() for item in consolidated}
+    for sev, label in (("critical", "critical"), ("high", "high"), ("medium", "moderate")):
+        if sev in present:
+            return label
+    return "low" if consolidated else "clean"
+
+
 def run_campaign(
     target: str,
     *,
@@ -171,6 +188,27 @@ def run_campaign(
     fsutil.write_text_safe(json_path, json.dumps(_render_campaign_json(ctx_meta), indent=2, default=str))
     _emit("done")
 
+    # Compact structured findings so a GUI can render one board for campaigns just
+    # like single hunts. Refs are reassigned campaign-globally (C1, C2…) so the
+    # per-target F1/F2 don't collide across targets.
+    findings_out: list[dict[str, Any]] = []
+    proof_out: dict[str, Any] = {}
+    cvss_out: dict[str, Any] = {}
+    plans_out: dict[str, Any] = {}
+    for index, item in enumerate(consolidated, 1):
+        finding = dict(item["finding"])
+        ref = f"C{index}"
+        finding["ref"] = ref
+        finding["source_url"] = item["source_url"]
+        finding["proof_status"] = item["proof_status"]
+        findings_out.append(finding)
+        proof_out[ref] = {"status": item["proof_status"]}
+        if item.get("cvss"):
+            cvss_out[ref] = item["cvss"]
+        plan = (_read_json(item["source_json"]).get("attack_plans") or {}).get(item["finding"].get("ref"))
+        if isinstance(plan, dict):
+            plans_out[ref] = plan
+
     return {
         "ok": True,
         "campaign_path": str(campaign_path),
@@ -184,6 +222,14 @@ def run_campaign(
         "confirmed_count": len(confirmed),
         "submission_paths": submission_paths,
         "report_markdown": md,
+        # Structured payload for the cockpit (mirrors /api/bounty/scan).
+        "findings": findings_out,
+        "proof_of_impact": proof_out,
+        "cvss": cvss_out,
+        "attack_plans": plans_out,
+        "surface": {"urls": urls, "sources": recon_sources, "notes": recon_notes},
+        "severity_counts": _severity_counts([item["finding"] for item in consolidated]),
+        "risk": _campaign_risk(consolidated),
     }
 
 

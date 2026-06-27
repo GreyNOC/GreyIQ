@@ -410,7 +410,14 @@ function loadState() {
     bountyPerFinding: false,
     bountyActive: false,
     redteamBehavioral: false,
-    panelMode: "brain"
+    panelMode: "brain",
+    appMode: "hunt",
+    ckRunType: "hunt",
+    ckTarget: "",
+    ckScope: "",
+    ckProgram: "",
+    ckActive: false,
+    ckLive: false
   };
 
   try {
@@ -592,6 +599,9 @@ async function refreshServiceStatus({ silent = false } = {}) {
       lastError: ""
     };
     ensureServicePolling();
+    if (typeof ckSyncService === "function") ckSyncService();
+    // If the cockpit profiles failed to load at boot (late backend), fill them now.
+    if (ck && ck.profile && !ck.profile.options.length) void ckPopulateProfiles();
     // If the backend only just became reachable, fill any Security-panel selectors
     // that bailed empty at boot (the lazy poll is how a late backend gets noticed).
     if (state.panelMode === "security") ensureSecurityData();
@@ -2054,6 +2064,8 @@ function applyTheme() {
     els.themeToggle.setAttribute("aria-pressed", String(theme === "dark"));
     els.themeToggle.title = theme === "dark" ? "Switch to light theme" : "Switch to dark theme";
   }
+  const ckTheme = document.querySelector("#ckTheme");
+  if (ckTheme) ckTheme.textContent = theme === "dark" ? "Light" : "Dark";
 }
 
 function toggleTheme() {
@@ -4227,6 +4239,650 @@ async function renderGpuAccel() {
   }
 }
 
+// ===================== BUG-BOUNTY COCKPIT =====================
+// A bug-bounty-only surface that is the app's default. It consumes the bounty
+// engine over the API (scan / campaign / learn / stats) and renders a findings
+// board, a per-finding proof pane, a recon surface map, a submission queue, and a
+// learning dashboard. Every dynamic node is built with createElement + textContent
+// (never innerHTML) because finding/proof text is scanner- and brain-derived.
+
+const ck = {
+  root: document.querySelector("#cockpit"),
+  service: document.querySelector("#ckService"),
+  theme: document.querySelector("#ckTheme"),
+  studio: document.querySelector("#ckStudio"),
+  huntReturn: document.querySelector("#huntReturn"),
+  nav: document.querySelector("#ckNav"),
+  navButtons: [...document.querySelectorAll(".ck-nav-btn")],
+  launch: document.querySelector("#ckLaunch"),
+  segHunt: document.querySelector("#ckRunHunt"),
+  segCampaign: document.querySelector("#ckRunCampaign"),
+  target: document.querySelector("#ckTarget"),
+  scope: document.querySelector("#ckScope"),
+  profile: document.querySelector("#ckProfile"),
+  klass: document.querySelector("#ckClass"),
+  program: document.querySelector("#ckProgram"),
+  maxPages: document.querySelector("#ckMaxPages"),
+  profileHint: document.querySelector("#ckProfileHint"),
+  active: document.querySelector("#ckActive"),
+  live: document.querySelector("#ckLive"),
+  authorized: document.querySelector("#ckAuthorized"),
+  run: document.querySelector("#ckRun"),
+  status: document.querySelector("#ckStatus"),
+  views: {
+    findings: document.querySelector("#ckViewFindings"),
+    surface: document.querySelector("#ckViewSurface"),
+    submissions: document.querySelector("#ckViewSubmissions"),
+    learn: document.querySelector("#ckViewLearn")
+  },
+  detail: document.querySelector("#ckDetail"),
+  body: document.querySelector(".ck-body")
+};
+
+const ckState = {
+  result: null,          // last hunt/campaign response
+  findings: [],          // normalized finding rows
+  surface: null,         // recon { urls, sources, notes }
+  selectedRef: "",
+  filter: "all",         // all | confirmed | critical | high | medium | low
+  sort: { key: "rank", dir: 1 },
+  view: "findings"
+};
+
+const CK_SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
+
+function cel(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text != null) node.textContent = String(text);
+  return node;
+}
+
+function setAppMode(mode) {
+  state.appMode = mode === "studio" ? "studio" : "hunt";
+  document.body.dataset.appMode = state.appMode;
+  saveState();
+  if (state.appMode === "hunt") ckSyncService();
+}
+
+function ckSyncService() {
+  if (!ck.service) return;
+  const up = Boolean(service.available);
+  ck.service.textContent = up ? "engine ready" : "engine offline";
+  ck.service.classList.toggle("is-up", up);
+  ck.service.classList.toggle("is-down", !up);
+}
+
+function ckSetView(view) {
+  ckState.view = view;
+  for (const btn of ck.navButtons) btn.classList.toggle("is-active", btn.dataset.ckView === view);
+  for (const [name, node] of Object.entries(ck.views)) node.hidden = name !== view;
+  if (view === "learn") void ckRenderLearn();
+  if (view === "surface") ckRenderSurface();
+  if (view === "submissions") ckRenderSubmissions();
+}
+
+function ckSetRunType(type) {
+  state.ckRunType = type === "campaign" ? "campaign" : "hunt";
+  saveState();
+  ck.segHunt?.classList.toggle("is-active", state.ckRunType === "hunt");
+  ck.segCampaign?.classList.toggle("is-active", state.ckRunType === "campaign");
+  for (const node of document.querySelectorAll("[data-ck-when]")) {
+    node.hidden = node.dataset.ckWhen !== state.ckRunType;
+  }
+  if (ck.run) ck.run.textContent = state.ckRunType === "campaign" ? "Run campaign" : "Run hunt";
+}
+
+async function ckPopulateProfiles() {
+  if (!ck.profile) return;
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) return;
+  let info;
+  try { info = await apiFetch("/api/bounty/types", { timeoutMs: 6000 }); } catch (_) { return; }
+  if (!info || info.ok === false) return;
+  const profiles = Array.isArray(info.profiles) ? info.profiles : [];
+  ck.profile.replaceChildren();
+  for (const p of profiles) {
+    const o = cel("option", null, p.name);
+    o.value = p.id;
+    o.dataset.desc = p.description || "";
+    ck.profile.append(o);
+  }
+  if (profiles.some((p) => p.id === state.bountyProfile)) ck.profile.value = state.bountyProfile;
+  const classes = Array.isArray(info.classes) ? info.classes : [];
+  if (ck.klass) {
+    ck.klass.replaceChildren();
+    const any = cel("option", null, "Any class found"); any.value = "";
+    ck.klass.append(any);
+    for (const c of classes) { const o = cel("option", null, c.name); o.value = c.id; ck.klass.append(o); }
+  }
+  ckUpdateProfileHint();
+}
+
+function ckUpdateProfileHint() {
+  if (!ck.profileHint || !ck.profile) return;
+  const opt = ck.profile.selectedOptions[0];
+  ck.profileHint.textContent = opt ? (opt.dataset.desc || "") : "";
+}
+
+function ckNormalizeFindings(res) {
+  // Build uniform rows from either a /scan response (full structured data) or a
+  // /campaign response (consolidated rows + per-ref proof/cvss maps).
+  const findings = Array.isArray(res.findings) ? res.findings : [];
+  const proofMap = res.proof_of_impact || {};
+  const cvssMap = res.cvss || {};
+  const plans = res.attack_plans || {};
+  return findings.map((f, i) => {
+    const ref = String(f.ref || `F${i + 1}`);
+    const proof = (proofMap[ref] && proofMap[ref].status) || f.proof_status || "missing";
+    const cvss = cvssMap[ref] || f.cvss || null;
+    return {
+      ref,
+      rank: f.rank || i + 1,
+      title: String(f.title || "Finding"),
+      severity: String(f.severity || "info").toLowerCase(),
+      className: String(f.class_name || f.class_id || "—"),
+      cwe: String(f.cwe || ""),
+      location: String(f.location || f.file_path || f.source_url || ""),
+      proof: String(proof).toLowerCase(),
+      cvssScore: cvss && (cvss.base_score ?? cvss.score) != null ? Number(cvss.base_score ?? cvss.score) : null,
+      cvss,
+      plan: plans[ref] || null,
+      proofObj: proofMap[ref] || null,
+      description: String(f.description || ""),
+      remediation: String(f.remediation || ""),
+      snippet: String(f.snippet || ""),
+      sourceUrl: String(f.source_url || "")
+    };
+  });
+}
+
+function ckProofBadge(status) {
+  const s = ["confirmed", "candidate", "missing"].includes(status) ? status : "missing";
+  const label = s === "confirmed" ? "Confirmed" : s === "candidate" ? "Candidate" : "Missing";
+  return cel("span", `ck-proof ${s}`, label);
+}
+
+function ckRenderFindings() {
+  const host = ck.views.findings;
+  host.replaceChildren();
+  const res = ckState.result;
+  if (!res) {
+    const empty = cel("div", "ck-empty");
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    p.setAttribute("d", "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14ZM21 21l-4.3-4.3");
+    svg.append(p);
+    empty.append(svg, cel("h2", null, "Run a hunt to begin"), cel("p", null,
+      "Enter an authorized target and scope on the left, then run a single hunt or a full campaign. Findings land here with a proof-status column; click any row for the captured proof and a submission draft."));
+    host.append(empty);
+    return;
+  }
+
+  // Summary strip.
+  const strip = cel("div", "ck-summary");
+  const risk = String(res.risk || "").toLowerCase();
+  if (risk) strip.append(ckPill(`risk-${risk}`, "Risk", String(res.risk).toUpperCase()));
+  const counts = res.severity_counts || {};
+  const dots = cel("span", "ck-sevdots");
+  for (const [k, cls] of [["critical", "c"], ["high", "h"], ["medium", "m"], ["low", "l"], ["info", "i"]]) {
+    if (counts[k]) dots.append(cel("span", `ck-sevdot ${cls}`, `${counts[k]}${k[0].toUpperCase()}`));
+  }
+  if (dots.childNodes.length) { const wrap = ckPill("", "Findings", String(res.finding_count ?? ckState.findings.length)); wrap.append(dots); strip.append(wrap); }
+  else strip.append(ckPill("", "Findings", String(res.finding_count ?? ckState.findings.length)));
+  const confirmed = ckState.findings.filter((f) => f.proof === "confirmed").length;
+  if (confirmed) strip.append(ckPill("is-armed", "Confirmed", String(confirmed)));
+  // Active-verification authorization chip.
+  const auth = res.active_authorization || null;
+  if (auth) {
+    if (auth.in_scope && (res.active_verified_classes || []).length) {
+      strip.append(ckPill("is-armed", "Active", `armed · ${(res.active_verified_classes || []).join(", ")}`));
+    } else if (auth.in_scope === false && auth.skipped_reason) {
+      strip.append(ckPill("is-disarmed", "Active", "disarmed (passive only)"));
+    }
+  }
+  if (res.scanners_run) strip.append(ckPill("", "Scanners", (res.scanners_run || []).join(", ") || "none"));
+  host.append(strip);
+
+  // Filter chips.
+  const filters = cel("div", "ck-filters");
+  const chipDefs = [["all", "All"], ["confirmed", "Confirmed"], ["critical", "Critical"], ["high", "High"], ["medium", "Medium"], ["low", "Low"]];
+  for (const [key, label] of chipDefs) {
+    const chip = cel("button", "ck-chip", label);
+    chip.type = "button";
+    chip.classList.toggle("is-active", ckState.filter === key);
+    chip.addEventListener("click", () => { ckState.filter = key; ckRenderFindings(); });
+    filters.append(chip);
+  }
+  host.append(filters);
+
+  // Filter + sort rows.
+  let rows = ckState.findings.slice();
+  if (ckState.filter === "confirmed") rows = rows.filter((f) => f.proof === "confirmed");
+  else if (ckState.filter !== "all") rows = rows.filter((f) => f.severity === ckState.filter);
+  const { key, dir } = ckState.sort;
+  rows.sort((a, b) => {
+    let av, bv;
+    if (key === "severity") { av = CK_SEV_RANK[a.severity] || 0; bv = CK_SEV_RANK[b.severity] || 0; }
+    else if (key === "proof") { const r = { confirmed: 3, candidate: 2, missing: 1 }; av = r[a.proof] || 0; bv = r[b.proof] || 0; }
+    else if (key === "cvss") { av = a.cvssScore || 0; bv = b.cvssScore || 0; }
+    else { av = a.rank; bv = b.rank; }
+    return (av < bv ? -1 : av > bv ? 1 : 0) * dir;
+  });
+
+  if (!rows.length) {
+    host.append(cel("p", "ck-hint", ckState.findings.length ? "No findings match this filter." : "No findings surfaced. See the per-target report for the manual checklist."));
+    return;
+  }
+
+  const table = cel("table", "ck-table");
+  const thead = cel("thead");
+  const htr = cel("tr");
+  for (const [label, sortKey] of [["Sev", "severity"], ["Class", null], ["Proof", "proof"], ["Finding", null], ["Where", null], ["CVSS", "cvss"]]) {
+    const th = cel("th", null, label);
+    if (sortKey) {
+      const arrow = cel("span", "ck-sort", ckState.sort.key === sortKey ? (ckState.sort.dir < 0 ? " ▲" : " ▼") : " ⇅");
+      th.append(arrow);
+      th.addEventListener("click", () => {
+        if (ckState.sort.key === sortKey) ckState.sort.dir *= -1;
+        else ckState.sort = { key: sortKey, dir: -1 };
+        ckRenderFindings();
+      });
+    } else { th.style.cursor = "default"; }
+    htr.append(th);
+  }
+  thead.append(htr);
+  table.append(thead);
+
+  const tbody = cel("tbody");
+  for (const f of rows) {
+    const tr = cel("tr", `ck-row sev-${f.severity}`);
+    if (f.ref === ckState.selectedRef) tr.classList.add("is-selected");
+    tr.append(td(cel("span", `ck-sev sev-${f.severity}`, f.severity.toUpperCase())));
+    const cls = cel("span", null, f.className);
+    const clsTd = td(cls);
+    if (f.cwe) clsTd.append(cel("span", "ck-tag", f.cwe));
+    tr.append(clsTd);
+    tr.append(td(ckProofBadge(f.proof)));
+    tr.append(td(cel("span", "ck-ftitle", f.title)));
+    tr.append(td(cel("span", "ck-floc", f.location || "—")));
+    tr.append(td(f.cvssScore != null ? cel("span", "ck-cvss", f.cvssScore.toFixed(1)) : cel("span", "ck-cvss", "—")));
+    tr.addEventListener("click", () => ckSelectFinding(f.ref));
+    tbody.append(tr);
+  }
+  table.append(tbody);
+  host.append(table);
+
+  function td(child) { const cell = cel("td"); cell.append(child); return cell; }
+}
+
+function ckPill(cls, label, value) {
+  const pill = cel("span", `ck-pill ${cls}`.trim());
+  pill.append(cel("span", null, label + ": "));
+  pill.append(cel("strong", null, value));
+  return pill;
+}
+
+function ckSelectFinding(ref) {
+  ckState.selectedRef = ref;
+  const f = ckState.findings.find((x) => x.ref === ref);
+  if (!f) return;
+  for (const row of document.querySelectorAll(".ck-row")) row.classList.remove("is-selected");
+  ckRenderDetail(f);
+  ck.body?.classList.add("has-detail");
+  ck.detail.hidden = false;
+  // Re-mark the selected row (cheap re-render of the board keeps it in sync).
+  ckRenderFindings();
+}
+
+function ckCloseDetail() {
+  ckState.selectedRef = "";
+  ck.detail.hidden = true;
+  ck.body?.classList.remove("has-detail");
+  ckRenderFindings();
+}
+
+function ckRenderDetail(f) {
+  const host = ck.detail;
+  host.replaceChildren();
+  const head = cel("div", "ck-detail-head");
+  head.append(cel("h3", null, f.title));
+  const close = cel("button", "ck-detail-close", "✕");
+  close.type = "button";
+  close.setAttribute("aria-label", "Close finding detail");
+  close.addEventListener("click", ckCloseDetail);
+  head.append(close);
+  host.append(head);
+
+  // Badges row.
+  const badges = cel("div", "ck-summary");
+  badges.append(cel("span", `ck-sev sev-${f.severity}`, f.severity.toUpperCase()));
+  badges.append(ckProofBadge(f.proof));
+  if (f.cwe) badges.append(cel("span", "ck-tag", f.cwe));
+  host.append(badges);
+
+  const meta = cel("dl", "ck-meta-grid");
+  const addMeta = (k, v) => { if (v) { meta.append(cel("dt", null, k)); meta.append(cel("dd", null, v)); } };
+  addMeta("Class", f.className);
+  addMeta("Location", f.location);
+  if (f.cvss && f.cvss.vector) addMeta("CVSS", `${f.cvss.vector}${f.cvssScore != null ? ` (${f.cvssScore.toFixed(1)})` : ""}`);
+  else if (f.cvssScore != null) addMeta("CVSS", f.cvssScore.toFixed(1));
+  host.append(meta);
+
+  if (f.description) { host.append(cel("h4", null, "Description")); host.append(cel("p", null, f.description)); }
+
+  const plan = f.plan || {};
+  const steps = Array.isArray(plan.steps) ? plan.steps : [];
+  if (steps.length) {
+    host.append(cel("h4", null, "Steps to reproduce"));
+    const ol = cel("ol", "ck-steps");
+    for (const s of steps) ol.append(cel("li", null, s));
+    host.append(ol);
+  }
+  if (plan.poc) { host.append(cel("h4", null, "Proof of concept")); host.append(cel("pre", null, plan.poc)); }
+
+  // Proof of impact block.
+  const po = f.proofObj || (plan.proof_of_impact && typeof plan.proof_of_impact === "object" ? plan.proof_of_impact : null);
+  if (po) {
+    host.append(cel("h4", null, "Proof of impact"));
+    const pm = cel("dl", "ck-meta-grid");
+    const add = (k, v) => { if (v) { pm.append(cel("dt", null, k)); pm.append(cel("dd", null, v)); } };
+    add("Status", (po.status || "").replace(/^./, (c) => c.toUpperCase()));
+    add("Observed", po.observed_result);
+    add("Control", po.control_result);
+    add("Evidence", po.evidence);
+    if (pm.childNodes.length) host.append(pm);
+    if (po.status !== "confirmed" && po.proof_obligation) {
+      const ob = cel("div", "ck-obligation");
+      ob.append(cel("strong", null, "To confirm: "));
+      ob.append(document.createTextNode(po.proof_obligation));
+      host.append(ob);
+    }
+  }
+  if (plan.impact) { host.append(cel("h4", null, "Impact")); host.append(cel("p", null, plan.impact)); }
+  if (f.remediation) { host.append(cel("h4", null, "Remediation")); host.append(cel("p", null, f.remediation)); }
+
+  // Actions.
+  const actions = cel("div", "ck-actions");
+  const copyBtn = cel("button", "ck-btn primary", "Copy submission draft");
+  copyBtn.type = "button";
+  copyBtn.addEventListener("click", async () => {
+    const ok = await ckCopy(ckBuildSubmissionDraft(f));
+    copyBtn.textContent = ok ? "Copied ✓" : "Copy failed";
+    setTimeout(() => { copyBtn.textContent = "Copy submission draft"; }, 1600);
+  });
+  actions.append(copyBtn);
+  host.append(actions);
+}
+
+function ckBuildSubmissionDraft(f) {
+  const lines = [];
+  const sev = f.severity.replace(/^./, (c) => c.toUpperCase());
+  lines.push(`# [${sev}] ${f.title}`, "");
+  lines.push(`**Target / location:** ${f.location || "(see report)"}`);
+  lines.push(`**Class:** ${f.className}${f.cwe ? ` (${f.cwe})` : ""}`);
+  if (f.cvss && f.cvss.vector) lines.push(`**CVSS v3.1:** ${f.cvss.vector}${f.cvssScore != null ? ` — ${f.cvssScore.toFixed(1)}` : ""}`);
+  lines.push(`**Proof status:** ${f.proof}`, "");
+  if (f.description) lines.push("## Summary", f.description, "");
+  const plan = f.plan || {};
+  if (Array.isArray(plan.steps) && plan.steps.length) {
+    lines.push("## Steps to reproduce");
+    plan.steps.forEach((s, i) => lines.push(`${i + 1}. ${s}`));
+    lines.push("");
+  }
+  if (plan.poc) lines.push("## Proof of concept", "```", plan.poc, "```", "");
+  const po = f.proofObj || null;
+  if (po) {
+    lines.push("## Proof of impact");
+    if (po.observed_result) lines.push(`- Observed: ${po.observed_result}`);
+    if (po.control_result) lines.push(`- Control: ${po.control_result}`);
+    if (po.evidence) lines.push(`- Evidence: ${po.evidence}`);
+    if (po.status !== "confirmed" && po.proof_obligation) lines.push(`- To confirm: ${po.proof_obligation}`);
+    lines.push("");
+  }
+  if (plan.impact) lines.push("## Impact", plan.impact, "");
+  if (f.remediation) lines.push("## Remediation", f.remediation, "");
+  lines.push("---", "_Drafted by GreyIQ BugHunter. Verify the proof obligation before you submit._");
+  return lines.join("\n");
+}
+
+async function ckCopy(text) {
+  try { await navigator.clipboard.writeText(text); return true; }
+  catch (_) {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.append(ta); ta.select();
+      const ok = document.execCommand("copy"); ta.remove(); return ok;
+    } catch (_e) { return false; }
+  }
+}
+
+function ckRenderSurface() {
+  const host = ck.views.surface;
+  host.replaceChildren();
+  const s = ckState.surface;
+  if (!s || !(s.urls || []).length) {
+    host.append(cel("p", "ck-hint", "Run a full campaign to map the target's surface (discovered URLs, robots/sitemap/security.txt sources)."));
+    return;
+  }
+  host.append(cel("h2", "ck-section-title", `Surface — ${s.urls.length} in-scope URL(s)`));
+  const srcs = s.sources || {};
+  if (Object.keys(srcs).length) {
+    const p = cel("p", "ck-hint", "Sources: " + Object.entries(srcs).map(([k, v]) => `${k} ${v}`).join(" · "));
+    host.append(p);
+  }
+  for (const note of (s.notes || [])) host.append(cel("p", "ck-hint", note));
+  const ul = cel("ul", "ck-list");
+  for (const u of s.urls) { const li = cel("li"); li.append(cel("span", "ck-floc", u)); ul.append(li); }
+  host.append(ul);
+}
+
+function ckRenderSubmissions() {
+  const host = ck.views.submissions;
+  host.replaceChildren();
+  const ready = ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate");
+  if (!ready.length) {
+    host.append(cel("p", "ck-hint", "Confirmed and candidate findings appear here as submission drafts. Run with “Test for proof of impact” to confirm leads first."));
+    return;
+  }
+  host.append(cel("h2", "ck-section-title", `Submission queue — ${ready.length} draft(s)`));
+  ready.sort((a, b) => (a.proof === "confirmed" ? 0 : 1) - (b.proof === "confirmed" ? 0 : 1));
+  const ul = cel("ul", "ck-list");
+  for (const f of ready) {
+    const li = cel("li");
+    const left = cel("div");
+    left.append(cel("span", "ck-ftitle", f.title), document.createTextNode(" "));
+    left.append(ckProofBadge(f.proof));
+    li.append(left);
+    const btn = cel("button", "ck-btn", "Copy draft");
+    btn.type = "button";
+    btn.addEventListener("click", async () => {
+      const ok = await ckCopy(ckBuildSubmissionDraft(f));
+      btn.textContent = ok ? "Copied ✓" : "Failed";
+      setTimeout(() => { btn.textContent = "Copy draft"; }, 1500);
+    });
+    li.append(btn);
+    ul.append(li);
+  }
+  host.append(ul);
+}
+
+async function ckRenderLearn() {
+  const host = ck.views.learn;
+  host.replaceChildren();
+  host.append(cel("h2", "ck-section-title", "What the engine has learned"));
+  let data = null;
+  if (service.available || (await refreshServiceStatus({ silent: true }))) {
+    const program = (ck.program?.value || "").trim();
+    const qs = program ? `?program=${encodeURIComponent(program)}` : (ck.target?.value ? `?target=${encodeURIComponent(ck.target.value.trim())}` : "");
+    try { data = await apiFetch(`/api/bounty/stats${qs}`, { timeoutMs: 8000 }); } catch (_) { data = null; }
+  }
+  const summary = data && data.summary ? data.summary : null;
+  if (summary && summary.programs) {
+    const progs = summary.programs;
+    const keys = Object.keys(progs);
+    if (!keys.length) host.append(cel("p", "ck-hint", "No bounty outcomes recorded yet. After you submit, record the outcome below to teach the engine."));
+    else {
+      const grid = cel("div", "ck-stats-grid");
+      for (const k of keys.sort((a, b) => (progs[b].bounty_total || 0) - (progs[a].bounty_total || 0))) {
+        const card = cel("div", "ck-stat");
+        card.append(cel("div", "n", `$${progs[k].bounty_total || 0}`));
+        card.append(cel("div", "l", `${k} · ${progs[k].rewarded || 0}/${progs[k].submitted || 0} rewarded`));
+        grid.append(card);
+      }
+      host.append(grid);
+    }
+  } else if (summary) {
+    const grid = cel("div", "ck-stats-grid");
+    grid.append(statCard(summary.submitted || 0, "Submitted"));
+    grid.append(statCard(summary.rewarded || 0, "Rewarded"));
+    grid.append(statCard(`$${summary.bounty_total || 0}`, "Bounty"));
+    host.append(grid);
+    const intel = (data && Array.isArray(data.intelligence)) ? data.intelligence : [];
+    if (intel.length) {
+      host.append(cel("h3", "ck-section-title", "What pays here"));
+      const ul = cel("ul", "ck-intel");
+      for (const note of intel) ul.append(cel("li", null, note.replace(/`/g, "")));
+      host.append(ul);
+    }
+  }
+
+  // Record-outcome form.
+  host.append(cel("h3", "ck-section-title", "Record a finding outcome"));
+  const form = cel("form", "ck-learn-form");
+  const classField = labeledSelect("Class", "ckLearnClass", [...ck.klass?.options || []].filter((o) => o.value).map((o) => [o.value, o.textContent]));
+  const statusField = labeledSelect("Status", "ckLearnStatus", [["accepted", "accepted"], ["resolved", "resolved"], ["triaged", "triaged"], ["duplicate", "duplicate"], ["informative", "informative"], ["not-applicable", "not-applicable"], ["submitted", "submitted"], ["spam", "spam"]]);
+  const bountyField = labeledInput("Bounty $", "ckLearnBounty", "number");
+  const sevField = labeledInput("Severity", "ckLearnSev", "text");
+  form.append(classField.wrap, statusField.wrap, bountyField.wrap, sevField.wrap);
+  const submit = cel("button", "ck-btn primary", "Record");
+  submit.type = "submit";
+  form.append(submit);
+  const note = cel("p", "ck-status");
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const program = (ck.program?.value || "").trim();
+    const target = (ck.target?.value || "").trim();
+    if (!program && !target) { note.textContent = "Set a target or program handle first."; note.classList.add("is-error"); return; }
+    try {
+      const res = await apiFetch("/api/bounty/learn", {
+        method: "POST",
+        body: JSON.stringify({
+          class_id: classField.input.value, status: statusField.input.value,
+          program: program || null, target, bounty: Number(bountyField.input.value) || 0, severity: sevField.input.value
+        })
+      });
+      if (res.ok === false) { note.textContent = res.error || "Could not record."; note.classList.add("is-error"); }
+      else { note.classList.remove("is-error"); note.textContent = `Recorded ${classField.input.value} → ${statusField.input.value}.`; void ckRenderLearn(); }
+    } catch (err) { note.textContent = err.message || "Could not record."; note.classList.add("is-error"); }
+  });
+  host.append(form, note);
+
+  function statCard(n, l) { const c = cel("div", "ck-stat"); c.append(cel("div", "n", n), cel("div", "l", l)); return c; }
+  function labeledSelect(label, id, opts) {
+    const wrap = cel("label", null); wrap.append(cel("span", null, label));
+    const sel = cel("select"); sel.id = id;
+    for (const [v, t] of opts) { const o = cel("option", null, t); o.value = v; sel.append(o); }
+    wrap.append(sel); return { wrap, input: sel };
+  }
+  function labeledInput(label, id, type) {
+    const wrap = cel("label", null); wrap.append(cel("span", null, label));
+    const inp = cel("input"); inp.id = id; inp.type = type; if (type === "number") inp.min = "0";
+    wrap.append(inp); return { wrap, input: inp };
+  }
+}
+
+function ckBadgeCount(view, n) {
+  const btn = ck.navButtons.find((b) => b.dataset.ckView === view);
+  if (!btn) return;
+  btn.replaceChildren(document.createTextNode(view[0].toUpperCase() + view.slice(1)));
+  if (n) btn.append(cel("span", "ck-badge", String(n)));
+}
+
+async function ckRun() {
+  const target = (ck.target?.value || "").trim();
+  if (!target) { ckStatus("Enter a target URL or folder/repo path.", true); return; }
+  if (!ck.authorized?.checked) { ckStatus("Confirm you are authorized to test this target (tick the box).", true); return; }
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) { ckStatus("Local GreyIQ engine is not running.", true); return; }
+  state.ckTarget = target;
+  state.ckScope = (ck.scope?.value || "").trim();
+  state.ckProgram = (ck.program?.value || "").trim();
+  state.ckActive = Boolean(ck.active?.checked);
+  state.ckLive = Boolean(ck.live?.checked);
+  state.bountyProfile = ck.profile?.value || state.bountyProfile;
+  saveState();
+  ck.run.disabled = true;
+  const isCampaign = state.ckRunType === "campaign";
+  ckStatus(isCampaign ? "Campaign running — mapping the surface, hunting each URL (this can take a few minutes)…" : "Hunting — running scanners and proving findings…");
+  try {
+    let res;
+    if (isCampaign) {
+      res = await apiFetch("/api/bounty/campaign", {
+        method: "POST", timeoutMs: 900000,
+        body: JSON.stringify({
+          target, scope: state.ckScope, authorized: true, program: state.ckProgram || null,
+          active: state.ckActive, live: state.ckLive, max_pages: Number(ck.maxPages?.value) || 12
+        })
+      });
+    } else {
+      res = await apiFetch("/api/bounty/scan", {
+        method: "POST", timeoutMs: 600000,
+        body: JSON.stringify({
+          target, profile: state.bountyProfile, vuln_class: (ck.klass?.value || null) || null,
+          scope: state.ckScope, authorized: true, active: state.ckActive, run_live: state.ckLive
+        })
+      });
+    }
+    if (res.ok === false) { ckStatus(res.error || "The run could not complete.", true); return; }
+    ckState.result = res;
+    ckState.findings = ckNormalizeFindings(res);
+    ckState.surface = res.surface || (res.urls ? { urls: res.urls, sources: res.recon_sources, notes: res.recon_notes } : null);
+    ckState.selectedRef = "";
+    ckCloseDetail();
+    ckBadgeCount("findings", ckState.findings.length);
+    ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);
+    const confirmed = ckState.findings.filter((f) => f.proof === "confirmed").length;
+    const where = res.report_path || res.campaign_path || "the reports folder";
+    ckStatus(`Done — ${isCampaign ? `${res.urls_scanned ?? "?"}/${res.urls_discovered ?? "?"} target(s), ` : ""}${ckState.findings.length} finding(s), ${confirmed} confirmed. Report: ${where}`);
+    ckSetView("findings");
+    ckRenderFindings();
+  } catch (err) {
+    ckStatus(err.message || "The run failed.", true);
+  } finally {
+    ck.run.disabled = false;
+  }
+}
+
+function ckStatus(text, isError) {
+  if (!ck.status) return;
+  ck.status.textContent = text;
+  ck.status.classList.toggle("is-error", Boolean(isError));
+}
+
+function bootCockpit() {
+  if (!ck.root) return;
+  document.body.dataset.appMode = state.appMode || "hunt";
+  ck.studio?.addEventListener("click", () => setAppMode("studio"));
+  ck.huntReturn?.addEventListener("click", () => setAppMode("hunt"));
+  ck.theme?.addEventListener("click", () => toggleTheme());
+  for (const btn of ck.navButtons) btn.addEventListener("click", () => ckSetView(btn.dataset.ckView));
+  ck.segHunt?.addEventListener("click", () => ckSetRunType("hunt"));
+  ck.segCampaign?.addEventListener("click", () => ckSetRunType("campaign"));
+  ck.profile?.addEventListener("change", () => { state.bountyProfile = ck.profile.value; saveState(); ckUpdateProfileHint(); });
+  ck.launch?.addEventListener("submit", (e) => { e.preventDefault(); void ckRun(); });
+  // Restore persisted form values.
+  if (ck.target) ck.target.value = state.ckTarget || "";
+  if (ck.scope) ck.scope.value = state.ckScope || "";
+  if (ck.program) ck.program.value = state.ckProgram || "";
+  if (ck.active) ck.active.checked = Boolean(state.ckActive);
+  if (ck.live) ck.live.checked = Boolean(state.ckLive);
+  ckSetRunType(state.ckRunType || "hunt");
+  ckSyncService();
+  void ckPopulateProfiles();
+  ckRenderFindings();
+}
+
 async function boot() {
   applyTheme();
   backend = new AccelerationBackend();
@@ -4248,6 +4904,7 @@ async function boot() {
   void renderGpuAccel();
   render();
   setPanelMode(state.panelMode || "brain");
+  bootCockpit();
   renderTemplateBar();
   renderWorkbench();
   if (state.agentMode && state.agentWorkspace) {
