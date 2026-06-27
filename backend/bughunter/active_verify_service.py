@@ -19,8 +19,11 @@ SAFETY (this is the one place a bounty tool could become a weapon):
   - No new egress path: every request reuses web_scan_service._guard_url + the same
     settings, so SSRF/private-host/metadata/port/IDN guards apply identically.
     Redirects are NEVER followed off-host — the first 30x Location is *captured*.
-  - Methods are GET/HEAD/OPTIONS only with benign idempotent markers; never a
-    state-changing verb/parameter, never a real payload, never fuzzing/wordlists.
+  - Methods are GET/HEAD/OPTIONS only with benign idempotent markers (a single
+    quote to elicit a SQL error, a `{{7*7}}` arithmetic expression to detect a
+    template engine, a `<svg/onload>` reflection probe — all inspected, never
+    executed by us); never a state-changing verb/parameter, never a file-read/RCE/
+    SLEEP payload, never fuzzing/wordlists.
   - A per-host token-bucket governor + a per-hunt request budget bound the load.
   - Every captured string is redacted before it lands in a proof artifact.
   - Fail-closed proof: 'confirmed' needs a positive observation AND a control
@@ -368,6 +371,38 @@ def _check_reflected_xss(http: _Http, url: str) -> dict[str, Any] | None:
     return None
 
 
+def _check_ssti(http: _Http, url: str) -> dict[str, Any] | None:
+    parsed = urlparse(url)
+    params = [k for k, _ in parse_qsl(parsed.query)] or ["q"]
+    probe_payload = f"{_MARK}{{{{7*7}}}}"  # marker + {{7*7}} (a benign arithmetic expression)
+    control_payload = f"{_MARK}7*7"        # marker + the literal string '7*7'
+    evaluated = f"{_MARK}49"               # what an engine that EVALUATES {{7*7}} emits
+    for param in params[:2]:
+        try:
+            probe = http.fetch(_with_query(url, {param: probe_payload}))
+            control = http.fetch(_with_query(url, {param: control_payload}))
+        except _ActiveError:
+            continue
+        body, ctrl_body = probe.get("body") or "", control.get("body") or ""
+        # Confirmed: the template expression {{7*7}} was EVALUATED to 49 immediately
+        # after our unique marker (server-side engine execution), and the literal-
+        # arithmetic control did NOT yield marker+49 (rules out a coincidental '49').
+        # We only INSPECT strings; the arithmetic is evaluated by the target's own
+        # engine — no file read, no code, no RCE payload.
+        if evaluated in body and evaluated not in ctrl_body:
+            proof = _proof(
+                "confirmed", method=f"GET with {param}={probe_payload}",
+                affected_asset="the server-side template/rendering context (a path to RCE on many engines)",
+                observed_result=f"the '{param}' parameter's {{{{7*7}}}} expression was evaluated to 49 by the server-side template engine",
+                control_result="a literal '7*7' control did NOT produce 49 — proving the engine evaluated the expression rather than echoing it",
+                evidence=f"the marker immediately followed by the evaluated result ({evaluated}) appears in the response body",
+            )
+            ev = {"request_line": f"GET {_with_query(url, {param: probe_payload})}", "response_status": f"HTTP {probe['status']}",
+                  "matched_value": f"{{{{7*7}}}} evaluated to 49 ({evaluated})"}
+            return _finding("active.ssti", f"Server-side template injection via '{param}' parameter", "high", "injection", "ssti", url, proof, ev)
+    return None
+
+
 def _check_error_sqli(http: _Http, url: str) -> dict[str, Any] | None:
     parsed = urlparse(url)
     params = [k for k, v in parse_qsl(parsed.query)]
@@ -457,6 +492,7 @@ def verify_active(
         lambda: _check_open_redirect(http, sanitized),
         lambda: _check_host_header(http, sanitized),
         lambda: _check_reflected_xss(http, sanitized),
+        lambda: _check_ssti(http, sanitized),
         lambda: _check_error_sqli(http, sanitized),
     ]
     for check in checks:

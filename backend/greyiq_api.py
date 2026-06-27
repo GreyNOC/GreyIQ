@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from uuid import uuid4
 
 import uvicorn
@@ -237,6 +237,8 @@ from bughunter.live_scan_service import run_live_scan  # noqa: E402
 from bughunter.triage import triage  # noqa: E402
 from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
 from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names  # noqa: E402
+from bughunter import campaign as bounty_campaign  # noqa: E402
+from bughunter import learning as bounty_learning  # noqa: E402
 from bughunter import toolkit as toolkit_lib  # noqa: E402
 from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E402
 
@@ -461,6 +463,27 @@ class BountyScanRequest(BaseModel):
     active: bool = False
     per_finding: bool = False
     max_files: int = Field(default=5000, ge=1, le=100_000)
+
+
+class CampaignRequest(BaseModel):
+    target: str = Field(min_length=1, max_length=4000)
+    scope: str = Field(default="", max_length=2000)
+    authorized: bool = False
+    program: str | None = Field(default=None, max_length=200)
+    active: bool = False
+    live: bool = False
+    max_pages: int = Field(default=12, ge=1, le=50)
+
+
+class LearnRequest(BaseModel):
+    class_id: str = Field(min_length=1, max_length=60)
+    status: str = Field(min_length=1, max_length=40)
+    program: str | None = Field(default=None, max_length=200)
+    target: str = Field(default="", max_length=4000)
+    bounty: float = Field(default=0.0, ge=0)
+    severity: str = Field(default="", max_length=20)
+    title: str = Field(default="", max_length=200)
+    notes: str = Field(default="", max_length=500)
 
 
 class AgentRedteamRequest(BaseModel):
@@ -1002,6 +1025,48 @@ class GreyIQRuntime:
             max_files=request.max_files,
             per_finding=request.per_finding,
         )
+
+    def run_campaign(self, request: "CampaignRequest") -> dict[str, Any]:
+        # authorized passes straight through — campaign.run_campaign fails closed when
+        # it is False, exactly like the CLI. No default-True anywhere.
+        return bounty_campaign.run_campaign(
+            request.target,
+            scope=request.scope,
+            authorized=request.authorized,
+            coder_cfg=self._coder_config(),
+            default_reports_dir=RUNTIME_DIR / "reports",
+            seed_dir=SEED_DIR,
+            runtime_dir=RUNTIME_DIR,
+            version=VERSION,
+            active=request.active,
+            live=request.live,
+            program=request.program,
+            max_pages=request.max_pages,
+        )
+
+    def record_outcome(self, request: "LearnRequest") -> dict[str, Any]:
+        try:
+            prog = bounty_learning.record_outcome(
+                RUNTIME_DIR,
+                program=request.program,
+                target=request.target,
+                class_id=request.class_id,
+                title=request.title,
+                status=request.status,
+                bounty=request.bounty,
+                severity=request.severity,
+                notes=request.notes,
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "program": bounty_learning.program_key(request.program, request.target), "stats": prog}
+
+    def bounty_stats(self, program: str | None, target: str) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "summary": bounty_learning.program_summary(RUNTIME_DIR, program, target or ""),
+            "intelligence": bounty_learning.program_intelligence(RUNTIME_DIR, program, target or ""),
+        }
 
     def run_agent_redteam(self, request: "AgentRedteamRequest") -> dict[str, Any]:
         return run_agent_redteam(
@@ -1851,6 +1916,20 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/scan":
             request = validate_payload(BountyScanRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.run_bounty, request))
+            return
+        if method == "POST" and path == "/api/bounty/campaign":
+            request = validate_payload(CampaignRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.run_campaign, request))
+            return
+        if method == "POST" and path == "/api/bounty/learn":
+            request = validate_payload(LearnRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.record_outcome, request))
+            return
+        if method == "GET" and path == "/api/bounty/stats":
+            params = parse_qs(scope.get("query_string", b"").decode("utf-8", "replace"))
+            program = (params.get("program") or [None])[0]
+            target = (params.get("target") or [""])[0]
+            await send_json(send, await asyncio.to_thread(runtime.bounty_stats, program, target))
             return
         if method == "POST" and path == "/api/agent/redteam":
             request = validate_payload(AgentRedteamRequest, await read_json_body(receive))

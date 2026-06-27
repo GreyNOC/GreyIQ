@@ -16,6 +16,8 @@ from bughunter.code_scanner.rules.deps import RULES as DEP_RULES
 from bughunter.code_scanner.rules.eval_exec import RULES as EVAL_RULES
 from bughunter.code_scanner.rules.network import RULES as NETWORK_RULES
 from bughunter.code_scanner.rules.secrets import RULES as SECRET_RULES
+from bughunter.code_scanner.rules.sqli import RULES as SQLI_RULES
+from bughunter.code_scanner.rules.ssrf import RULES as SSRF_RULES
 
 ALL_RULES: tuple[Rule, ...] = (
     *SECRET_RULES,
@@ -26,6 +28,8 @@ ALL_RULES: tuple[Rule, ...] = (
     *CI_RULES,
     *BACKDOOR_RULES,
     *DEP_RULES,
+    *SQLI_RULES,
+    *SSRF_RULES,
 )
 
 

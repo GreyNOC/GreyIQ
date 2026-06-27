@@ -15,6 +15,7 @@ loopback, and reserved hosts are refused unless
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -23,6 +24,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.code_scanner.rules import SECRET_RULES
+from bughunter.rate_limit import HostRateGovernor
 from bughunter.settings import get_settings
 from bughunter.web_ingest import (
     WebsiteFetchError,
@@ -431,9 +433,109 @@ _RISK_ADVICE = {
 }
 
 
-def run_web_scan(url: str, max_findings: int = _MAX_FINDINGS_RETURNED) -> dict[str, Any]:
+# A short, CONSTANT wordlist of well-known sensitive paths — never recursion or
+# fuzzing, so this stays passive recon, not a scanner-evasion tool. Each entry is
+# (path, severity, validator-kind); the validator content-checks the body so an SPA
+# that 200s every path with its HTML shell never produces a false finding.
+_SENSITIVE_PATHS = (
+    ("/.git/config", "high", "git_config"),
+    ("/.git/HEAD", "high", "git_head"),
+    ("/.env", "high", "dotenv"),
+    ("/.svn/entries", "high", "svn"),
+    ("/server-status", "medium", "apache_status"),
+    ("/actuator/health", "medium", "actuator"),
+    ("/swagger.json", "low", "openapi"),
+    ("/openapi.json", "low", "openapi"),
+    ("/api-docs", "low", "openapi"),
+    ("/.DS_Store", "low", "dsstore"),
+)
+
+
+def _sensitive_path_matches(kind: str, body: str, headers: dict[str, Any], status: int) -> bool:
+    """Content-validate a candidate exposed path. NEVER flag on a 200 alone — SPAs
+    return their HTML shell (200) for unknown paths, which would be all false
+    positives. Each kind checks for the file's real signature."""
+    head = (body or "")[:4096]
+    low = head.lower()
+    if "<html" in low or "<!doctype html" in low:
+        return False  # an HTML shell is the SPA fallback, not the real artifact
+    if kind == "git_config":
+        return "[core]" in head
+    if kind == "git_head":
+        return head.lstrip().startswith("ref:")
+    if kind == "dotenv":
+        return bool(re.search(r"(?m)^[A-Z][A-Z0-9_]{2,}\s*=", head))
+    if kind == "svn":
+        return bool(re.match(r"^\d+\s", (body or "").lstrip())) or "svn:" in head
+    if kind == "apache_status":
+        return "Apache Server Status" in head
+    if kind == "actuator":
+        try:
+            data = json.loads(body or "")
+        except (ValueError, TypeError):
+            return False
+        return isinstance(data, dict) and "status" in data
+    if kind == "openapi":
+        try:
+            data = json.loads(body or "")
+        except (ValueError, TypeError):
+            return False
+        return isinstance(data, dict) and any(k in data for k in ("swagger", "openapi", "paths"))
+    if kind == "dsstore":
+        return "Bud1" in head
+    return False
+
+
+def _probe_sensitive_paths(base_url: str, governor: HostRateGovernor) -> list[dict[str, Any]]:
+    """Probe the small constant wordlist on the target's own origin, content-validate
+    each 200, and emit a redacted disclosure finding for real hits. Same-origin,
+    GET-only via _fetch_raw (so the SSRF/redirect/port guards apply identically),
+    governor-throttled, and bounded — best-effort, never raises."""
+    parsed = urlparse(base_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    host = parsed.hostname or ""
+    out: list[dict[str, Any]] = []
+    for path, severity, kind in _SENSITIVE_PATHS:
+        if not governor.throttle(host):
+            break  # per-host budget exhausted -> stop (fail closed, no bursting)
+        url = base + path
+        try:
+            fetched = _fetch_raw(url)
+        except (WebsiteFetchError, URLError, TimeoutError, ValueError, OSError):
+            continue
+        if int(fetched.get("status") or 0) != 200:
+            continue
+        if not _sensitive_path_matches(kind, fetched.get("body") or "", fetched.get("headers") or {}, 200):
+            continue
+        name = re.sub(r"[^a-z0-9]+", "-", path.lower()).strip("-")
+        out.append(
+            _finding(
+                f"web.exposed-path.{name}",
+                f"Sensitive path exposed: {path}",
+                severity,
+                "high",
+                "disclosure",
+                url,
+                remediation=f"Block public access to {path} at the web server / reverse proxy; it should never be served.",
+                proof_evidence={
+                    "request_line": f"GET {url}",
+                    "response_status": "HTTP 200",
+                    "matched_value": (fetched.get("body") or "")[:200],
+                },
+            )
+        )
+    return out
+
+
+def run_web_scan(
+    url: str, max_findings: int = _MAX_FINDINGS_RETURNED, *, probe_paths: bool = False
+) -> dict[str, Any]:
     """Passively scan a single URL. Returns a JSON-serializable result, or
-    ``{"ok": False, "error": ...}`` on a fetch failure instead of raising."""
+    ``{"ok": False, "error": ...}`` on a fetch failure instead of raising.
+
+    ``probe_paths`` adds the bounded, content-validated sensitive-path probe (used by
+    the bounty engine for hunts + campaigns); the bare passive scan leaves it off so
+    a quick scan stays a single GET."""
     target = str(url or "").strip()
     if not target:
         return {"ok": False, "scan_type": "web", "error": "No URL provided."}
@@ -451,6 +553,17 @@ def run_web_scan(url: str, max_findings: int = _MAX_FINDINGS_RETURNED) -> dict[s
         }
 
     findings = _analyze(fetched)
+    if probe_paths:
+        # Best-effort: a probe failure must never sink the whole scan.
+        try:
+            settings = get_settings()
+            governor = HostRateGovernor(
+                capacity=len(_SENSITIVE_PATHS) + 2,
+                min_interval_s=settings.active_min_interval_ms / 1000.0,
+            )
+            findings.extend(_probe_sensitive_paths(fetched["final_url"], governor))
+        except Exception:  # noqa: BLE001 - probing is additive, never fatal
+            pass
     findings.sort(key=lambda f: _SEVERITY_RANK.get(f["severity"], 0), reverse=True)
     risk, score = _risk(findings)
     return {
