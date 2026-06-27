@@ -1,11 +1,18 @@
 """GreyIQ BugHunter — bounded recon / discovery.
 
-A campaign starts by mapping the surface: a small, same-origin, depth- and
-page-capped crawl plus passive recon (robots.txt, sitemap.xml,
-/.well-known/security.txt) to find more input points than the single landing
-page. Every fetch goes through the passive scanner's SSRF/private-host/port guard
-(reused verbatim), is GET-only, rate-limited by the shared per-host governor, and
-NEVER leaves the seed origin. Pure / frozen-safe.
+A campaign starts by mapping the surface: a depth- and page-capped crawl, passive
+recon (robots.txt, sitemap.xml, /.well-known/security.txt), served-JS endpoint/secret
+mining, and tech fingerprinting — to find far more input points than the single
+landing page. Every fetch goes through the passive scanner's SSRF/private-host/port
+guard (reused verbatim), is GET-only, and is bounded three ways: the per-host token
+governor, a global per-campaign request budget (the kill switch for host fan-out under
+a wildcard scope), and the page cap.
+
+SCOPE: by default discovery never leaves the seed origin. When the caller passes a
+``scope_in(host) -> bool`` gate (the campaign binds it to the SAME fail-closed
+host_in_active_scope used for active probing), discovery may follow in-scope hosts —
+and ONLY those; every new host is checked BEFORE it is fetched, and out-of-scope hosts
+are counted, never fetched. Pure / frozen-safe.
 """
 
 from __future__ import annotations
@@ -14,17 +21,19 @@ import re
 from typing import Any
 from urllib.parse import urldefrag, urljoin, urlparse
 
+from bughunter.fingerprint import fingerprint
 from bughunter.rate_limit import HostRateGovernor
+from bughunter.recon_js import mine_js
 from bughunter.settings import get_settings
 from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
 from bughunter.web_scan_service import _fetch_raw, _guard_url
 
-# Pull hrefs / form actions / script srcs out of HTML (cheap, no parser dep).
 _LINK_RE = re.compile(r"""(?:href|src|action)\s*=\s*["']([^"'#\s]+)["']""", re.IGNORECASE)
+_SCRIPT_SRC_RE = re.compile(r"""<script[^>]+src\s*=\s*["']([^"']+\.m?js[^"']*)["']""", re.IGNORECASE)
 _SITEMAP_LOC_RE = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>", re.IGNORECASE)
-# Non-page assets we don't bother queuing as crawl targets.
 _SKIP_EXT = (".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".woff", ".woff2",
              ".ttf", ".eot", ".pdf", ".zip", ".mp4", ".webm", ".mp3", ".map")
+_MAX_JS = 8  # served-JS bundles mined per campaign (bounded)
 
 
 def _same_origin(url: str, host: str) -> bool:
@@ -35,7 +44,9 @@ def _clean(url: str) -> str:
     return urldefrag(url)[0]
 
 
-def _extract_links(body: str, base_url: str, host: str) -> list[str]:
+def _extract_links(body: str, base_url: str) -> list[str]:
+    """All in-page http(s) links (NOT scope-filtered — the caller applies the scope
+    gate so out-of-scope hosts can be counted)."""
     out: list[str] = []
     for raw in _LINK_RE.findall(body or "")[:600]:
         if raw.lower().startswith(("javascript:", "mailto:", "tel:", "data:")):
@@ -46,7 +57,19 @@ def _extract_links(body: str, base_url: str, host: str) -> list[str]:
             continue
         if absolute.lower().endswith(_SKIP_EXT):
             continue
-        if absolute.startswith(("http://", "https://")) and _same_origin(absolute, host):
+        if absolute.startswith(("http://", "https://")):
+            out.append(absolute)
+    return out
+
+
+def _extract_scripts(body: str, base_url: str) -> list[str]:
+    out: list[str] = []
+    for raw in _SCRIPT_SRC_RE.findall(body or "")[:60]:
+        try:
+            absolute = _clean(urljoin(base_url, raw))
+        except ValueError:
+            continue
+        if absolute.startswith(("http://", "https://")):
             out.append(absolute)
     return out
 
@@ -67,38 +90,58 @@ def discover(
     scope_in: Any = None,
     max_pages: int = 15,
     max_depth: int = 2,
+    max_requests: int = 40,
     settings: Any = None,
     governor: HostRateGovernor | None = None,
 ) -> dict[str, Any]:
-    """Crawl the seed origin (bounded) + passive recon. Returns
-    {urls, host, sources, notes} where urls is a deduped, in-origin, capped list
-    (seed first). ``scope_in(host) -> bool`` optionally gates which hosts may be
-    fetched (defaults to same-origin only)."""
+    """Map the seed's surface (bounded). Returns {urls, host, sources, notes,
+    endpoints, params, js_secrets, tech, hints, dropped_out_of_scope, requests_used}.
+    ``scope_in(host) -> bool`` gates which hosts may be fetched (default: same-origin)."""
     settings = settings or get_settings()
     try:
         sanitized = _guard_url(normalize_website_url(seed_url), settings.allow_private_urls, settings.web_allowed_ports)
     except WebsiteFetchError as exc:
-        return {"urls": [seed_url], "host": "", "sources": {}, "notes": [f"recon skipped: {exc}"]}
+        return {"urls": [seed_url], "host": "", "sources": {}, "notes": [f"recon skipped: {exc}"],
+                "endpoints": [], "params": [], "js_secrets": [], "tech": [], "hints": {}, "dropped_out_of_scope": 0, "requests_used": 0}
     host = (urlparse(sanitized).hostname or "").lower()
     governor = governor or HostRateGovernor(
         capacity=max(settings.active_max_requests_per_host, max_pages + 6),
         min_interval_s=settings.active_min_interval_ms / 1000.0,
     )
+    used = {"n": 0}
+
+    def budgeted_fetch(url: str) -> dict[str, Any] | None:
+        if used["n"] >= max_requests:
+            return None  # global per-campaign budget — the host-fan-out kill switch
+        used["n"] += 1
+        return _safe_fetch(url, settings, governor)
+
+    def host_ok(h: str) -> bool:
+        h = (h or "").lower()
+        if not h:
+            return False
+        if h == host:
+            return True
+        return bool(scope_in(h)) if callable(scope_in) else False
 
     def in_scope(u: str) -> bool:
-        if not _same_origin(u, host):
-            return False
-        return bool(scope_in(urlparse(u).hostname or "")) if callable(scope_in) else True
+        return host_ok(urlparse(u).hostname or "")
 
     discovered: list[str] = [sanitized]
     seen = {sanitized}
     sources: dict[str, int] = {}
     notes: list[str] = []
+    params: set[str] = set()
+    js_secrets: list[dict[str, Any]] = []
+    tech: list[str] = []
+    hints: dict[str, str] = {}
+    dropped_oos = 0
+    js_done: set[str] = set()
 
     # --- Passive recon: robots, sitemap, security.txt seed extra paths. ---
     base = f"{urlparse(sanitized).scheme}://{urlparse(sanitized).netloc}"
     for path, kind in (("/robots.txt", "robots"), ("/sitemap.xml", "sitemap"), ("/.well-known/security.txt", "security.txt")):
-        fetched = _safe_fetch(base + path, settings, governor)
+        fetched = budgeted_fetch(base + path)
         if not fetched or fetched.get("status", 0) >= 400:
             continue
         body = fetched.get("body") or ""
@@ -113,24 +156,34 @@ def discover(
                 url = _clean(loc.strip())
                 if url.startswith(("http://", "https://")) and in_scope(url) and url not in seen:
                     seen.add(url); discovered.append(url); found += 1
-        else:  # security.txt presence is itself a (good) signal
+        else:
             notes.append("security.txt present (program contact / policy).")
         if found:
             sources[kind] = found
 
-    # --- Bounded BFS crawl from the seed. ---
+    # --- Bounded BFS crawl + served-JS mine + fingerprint. ---
     queue: list[tuple[str, int]] = [(sanitized, 0)]
     crawled = 0
-    while queue and len(discovered) < max_pages and crawled < max_pages:
+    while queue and len(discovered) < max_pages and used["n"] < max_requests and crawled < max_pages:
         url, depth = queue.pop(0)
         if depth > max_depth:
             continue
-        fetched = _safe_fetch(url, settings, governor)
+        fetched = budgeted_fetch(url)
         crawled += 1
         if not fetched:
             continue
-        for link in _extract_links(fetched.get("body") or "", fetched.get("final_url") or url, host):
-            if link in seen or not in_scope(link):
+        body = fetched.get("body") or ""
+        final = fetched.get("final_url") or url
+
+        if not tech:  # fingerprint once, from the first reachable page
+            fp = fingerprint(fetched.get("headers"), body, fetched.get("cookies"))
+            tech, hints = fp.get("tech") or [], fp.get("hints") or {}
+
+        for link in _extract_links(body, final):
+            if link in seen:
+                continue
+            if not in_scope(link):
+                dropped_oos += 1
                 continue
             seen.add(link)
             discovered.append(link)
@@ -140,6 +193,37 @@ def discover(
             if len(discovered) >= max_pages:
                 break
 
+        # Mine served JS for endpoints / params / secrets.
+        for js_url in _extract_scripts(body, final):
+            if js_url in js_done or len(js_done) >= _MAX_JS or used["n"] >= max_requests:
+                continue
+            if not in_scope(js_url):
+                dropped_oos += 1
+                continue
+            js_done.add(js_url)
+            jf = budgeted_fetch(js_url)
+            if not jf:
+                continue
+            mined = mine_js(jf.get("body") or "", jf.get("final_url") or js_url, host_filter=host_ok)
+            params.update(mined.get("params") or [])
+            js_secrets.extend(mined.get("secret_findings") or [])
+            for ep in (mined.get("endpoints") or []):
+                if ep not in seen and in_scope(ep) and len(discovered) < max_pages:
+                    seen.add(ep); discovered.append(ep)
+                    sources["js-endpoint"] = sources.get("js-endpoint", 0) + 1
+
     if len(discovered) >= max_pages:
         notes.append(f"discovery capped at {max_pages} URLs.")
-    return {"urls": discovered[:max_pages], "host": host, "sources": sources, "notes": notes}
+    if used["n"] >= max_requests:
+        notes.append(f"recon request budget ({max_requests}) reached — surface may be partial.")
+    if dropped_oos:
+        notes.append(f"{dropped_oos} discovered link(s) skipped as out-of-scope.")
+    if js_secrets:
+        notes.append(f"{len(js_secrets)} secret(s) found in served JS (redacted).")
+
+    return {
+        "urls": discovered[:max_pages], "host": host, "sources": sources, "notes": notes,
+        "endpoints": [u for u in discovered if u != sanitized][:max_pages],
+        "params": sorted(params)[:60], "js_secrets": js_secrets, "tech": tech, "hints": hints,
+        "dropped_out_of_scope": dropped_oos, "requests_used": used["n"],
+    }

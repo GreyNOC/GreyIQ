@@ -22,7 +22,8 @@ from pathlib import Path
 from typing import Any
 
 from bughunter import active_verify_service, fsutil, ledger, learning, ranking, recon, submission
-from bughunter.bounty import _infer_kind, _safe_slug, run_bounty_hunt
+from bughunter.bounty import _classify, _infer_kind, _safe_slug, run_bounty_hunt
+from bughunter.settings import get_settings
 
 _SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 
@@ -99,12 +100,21 @@ def run_campaign(
     out_root.mkdir(parents=True, exist_ok=True)
 
     # --- Surface mapping (URL targets) → the list of targets to hunt. ---
+    rec_js_secrets: list[dict[str, Any]] = []
+    recon_tech: list[str] = []
     if kind == "url":
         _emit("recon: mapping the surface…")
-        rec = recon.discover(clean_target, max_pages=max_pages)
+        # Bind discovery to the SAME fail-closed scope gate the active prover uses, so
+        # in-scope cross-host expansion (a wildcard program) is followed and ONLY
+        # in-scope hosts are ever fetched.
+        settings = get_settings()
+        scope_gate = (lambda h: active_verify_service.host_in_active_scope(h, scope, settings)) if str(scope or "").strip() else None
+        rec = recon.discover(clean_target, max_pages=max_pages, scope_in=scope_gate)
         urls = rec.get("urls") or [clean_target]
         recon_notes = rec.get("notes") or []
         recon_sources = rec.get("sources") or {}
+        rec_js_secrets = rec.get("js_secrets") or []
+        recon_tech = rec.get("tech") or []
     else:
         urls = [clean_target]
         recon_notes, recon_sources = [], {}
@@ -142,6 +152,19 @@ def run_campaign(
                 "proof_status": _proof_status(doc, ref),
                 "cvss": (doc.get("cvss") or {}).get(ref) or {},
             })
+
+    # --- Secrets mined from served JS (recon-sourced) — classify + dedup + add. ---
+    for index, secret in enumerate(rec_js_secrets, 1):
+        cid, cname, cwe, owasp = _classify(secret)
+        finding = {**secret, "ref": f"JS{index}", "class_id": cid, "class_name": cname, "cwe": cwe, "owasp": owasp,
+                   "location": secret.get("file_path") or clean_target}
+        norm_loc = re.sub(r"\d+", "N", str(finding.get("location") or ""))
+        key = f"{cid}|{finding.get('rule_id')}|{norm_loc}"
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        consolidated.append({"finding": finding, "source_url": finding["location"], "source_report": "",
+                             "source_json": "", "proof_status": "candidate", "cvss": {}})
 
     # --- Rank by EXPECTED VALUE (confirmed outermost, then EV, severity, CVSS) so the
     # most-likely-to-pay findings sort first. ---
@@ -232,7 +255,7 @@ def run_campaign(
         "proof_of_impact": proof_out,
         "cvss": cvss_out,
         "attack_plans": plans_out,
-        "surface": {"urls": urls, "sources": recon_sources, "notes": recon_notes},
+        "surface": {"urls": urls, "sources": recon_sources, "notes": recon_notes, "tech": recon_tech},
         "severity_counts": _severity_counts([item["finding"] for item in consolidated]),
         "risk": _campaign_risk(consolidated),
     }

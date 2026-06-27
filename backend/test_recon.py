@@ -25,22 +25,28 @@ class ReconHelperTests(unittest.TestCase):
     def test_clean_strips_fragment(self) -> None:
         self.assertEqual(recon._clean("https://x/y#frag"), "https://x/y")
 
-    def test_extract_links_same_origin_only(self) -> None:
+    def test_extract_links_returns_all_candidates(self) -> None:
+        # _extract_links returns ALL http(s) links (scope filtering is the caller's job
+        # now, via in_scope, so out-of-scope hosts can be counted). Assets + non-http
+        # schemes are still skipped.
         body = (
             '<a href="/page1">1</a>'
             '<a href="https://example.com/page2">2</a>'
             '<a href="https://other.com/page3">3</a>'
             '<a href="mailto:x@example.com">m</a>'
-            '<script src="/app.js"></script>'
             '<link href="/styles.css">'
             '<img src="/logo.png">'
         )
-        links = recon._extract_links(body, "https://example.com/", "example.com")
+        links = recon._extract_links(body, "https://example.com/")
         self.assertIn("https://example.com/page1", links)
         self.assertIn("https://example.com/page2", links)
-        self.assertNotIn("https://other.com/page3", links)  # cross-origin dropped
+        self.assertIn("https://other.com/page3", links)  # candidate — caller applies scope
         self.assertFalse(any(link.endswith((".css", ".png")) for link in links))  # assets skipped
         self.assertFalse(any("mailto" in link for link in links))
+
+    def test_script_extraction(self) -> None:
+        scripts = recon._extract_scripts('<script src="/static/main.abc.js"></script><script>x()</script>', "https://example.com/")
+        self.assertEqual(scripts, ["https://example.com/static/main.abc.js"])
 
 
 class ReconGuardTests(unittest.TestCase):
