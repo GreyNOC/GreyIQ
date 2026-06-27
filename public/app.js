@@ -1902,6 +1902,16 @@ els.brainForm?.addEventListener("submit", async (event) => {
     els.brainStatus.textContent = provider === "off"
       ? "Coding brain off — using the local model."
       : `Saved. Brain: ${provider}. Use Test to verify.`;
+    // The local (Ollama) runtime is downloaded on first use to keep the app small —
+    // provision + start it now that the user picked the local model.
+    if (provider === "local" && window.greyiqDesktop && typeof window.greyiqDesktop.ensureOllama === "function") {
+      els.brainStatus.textContent = "Saved. Preparing the local model runtime (first time downloads ~1 GB)…";
+      window.greyiqDesktop.ensureOllama().then((res) => {
+        els.brainStatus.textContent = res && res.ok
+          ? "Local model runtime ready. Use Test to verify."
+          : "Saved, but the local runtime could not start — install Ollama, or use the Claude/OpenAI brain.";
+      }).catch(() => {});
+    }
   } catch (error) {
     els.brainStatus.textContent = error.message || "Could not save brain settings.";
   } finally {

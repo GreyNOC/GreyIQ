@@ -81,17 +81,9 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      - name: Bundle Ollama runtime (zero-setup local brain)
-        shell: pwsh
-        run: |
-          $url = "https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64.zip"
-          New-Item -ItemType Directory -Force -Path ollama | Out-Null
-          Invoke-WebRequest -Uri $url -OutFile ollama.zip
-          Expand-Archive -Path ollama.zip -DestinationPath ollama -Force
-          Remove-Item ollama.zip
-          if (-not (Test-Path "ollama/ollama.exe")) { throw "ollama.exe not found after extracting the runtime." }
-          $mb = [math]::Round((Get-ChildItem ollama -Recurse | Measure-Object Length -Sum).Sum / 1MB)
-          Write-Output "Bundled Ollama runtime: $mb MB"
+      # Ollama is NO LONGER bundled (it was ~1.4 GB / 86% of the old portable). The
+      # app downloads it on demand to userData the first time the local model is
+      # selected — see electron/main.cjs ensureBaseOllama.
 
       - name: Build portable + installer (electron-builder)
         run: npx electron-builder --win portable nsis --publish never
@@ -194,22 +186,9 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      - name: Bundle Ollama runtime (zero-setup local brain)
-        run: |
-          # Ollama renamed its Linux release asset from ollama-linux-amd64.tgz
-          # (gzip) to ollama-linux-amd64.tar.zst (zstd) — the old name now 404s.
-          curl -fsSL -o ollama.tar.zst "https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64.tar.zst"
-          mkdir -p ollama
-          tar --zstd -xf ollama.tar.zst -C ollama
-          rm -f ollama.tar.zst
-          # Keep the bundled CUDA runner so NVIDIA GPUs work out of the box — the
-          # CPU-only torch wheel already keeps assets under GitHub's 2 GiB cap, so
-          # no Ollama pruning is needed. (AMD/ROCm is fetched at first run by the app.)
-          if [ ! -x ollama/bin/ollama ]; then
-            echo "ollama binary not found at ollama/bin/ollama after extracting the runtime."
-            exit 1
-          fi
-          echo "Bundled Ollama runtime: $(du -sh ollama | cut -f1)"
+      # Ollama is NO LONGER bundled — downloaded on demand at first local-model use
+      # (electron/main.cjs ensureBaseOllama). This also frees the ~1.4 GB that
+      # previously contributed to the runner's "No space left on device" pressure.
 
       - name: Build Linux GUI (electron-builder AppImage)
         run: npx electron-builder --linux AppImage --publish never

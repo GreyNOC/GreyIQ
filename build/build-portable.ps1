@@ -145,27 +145,10 @@ if ($LASTEXITCODE -ne 0) {
     & npm install; Assert-LastExit "npm install"
 }
 
-# --- Bundle the Ollama runtime ---
-$OllamaDir = Join-Path $RepoRoot "ollama"
-$OllamaExe = Join-Path $OllamaDir "ollama.exe"
-if ($SkipOllama) {
-    Write-Step "Skipping Ollama bundle (-SkipOllama)"
-    Write-Warning "The portable build will NOT include the zero-setup local model runtime."
-    New-Item -ItemType Directory -Force -Path $OllamaDir | Out-Null  # keep extraResources copy happy
-} elseif (Test-Path $OllamaExe) {
-    Write-Step "Ollama runtime already present, skipping download ($OllamaDir)"
-} else {
-    Write-Step "Downloading + extracting the Ollama runtime (~0.6-1 GB)"
-    $url = "https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64.zip"
-    $zip = Join-Path $RepoRoot "ollama.zip"
-    New-Item -ItemType Directory -Force -Path $OllamaDir | Out-Null
-    Invoke-WebRequest -Uri $url -OutFile $zip
-    Expand-Archive -Path $zip -DestinationPath $OllamaDir -Force
-    Remove-Item $zip -Force
-    if (-not (Test-Path $OllamaExe)) { throw "ollama.exe not found after extracting the runtime." }
-    $mb = [math]::Round((Get-ChildItem $OllamaDir -Recurse | Measure-Object Length -Sum).Sum / 1MB)
-    Write-Host "    Bundled Ollama runtime: $mb MB"
-}
+# --- Ollama is no longer bundled (downloaded on demand at first local-model use;
+# see electron/main.cjs ensureBaseOllama). Nothing to do here. The -SkipOllama flag
+# is retained for backward compatibility and is a no-op.
+Write-Step "Ollama: on-demand (not bundled) - keeping the portable lean"
 
 # --- Build the portable (+ optional installer) ---
 $targets = @("portable")
