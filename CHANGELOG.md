@@ -2,6 +2,30 @@
 
 Notable changes to GreyIQ.
 
+## v0.21.0
+
+### Surface expansion — find far more, still in scope
+Recon now mines the real attack surface, not just the landing page:
+- **Served-JS mining** (`recon_js.py`) — pulls in-scope API **endpoints**, query-param
+  **names**, same-apex **hosts**, and (already-**redacted**) leaked **secrets** out of
+  bundled JavaScript. Discovered endpoints become hunt targets (so the active prover's
+  XSS/SQLi/redirect/CRLF checks get real parameters to bite on), and JS secrets are
+  folded into the campaign findings.
+- **In-scope cross-host discovery** — recon now follows hosts the program scope allows
+  (a wildcard like `*.acme.com`), gated by the **same fail-closed
+  `host_in_active_scope`** the active prover uses. Every new host is checked **before**
+  it's fetched; out-of-scope hosts are counted, never fetched.
+- **Tech fingerprinting** (`fingerprint.py`) — names the stack from already-fetched
+  headers/cookies/body and emits advisory hints (e.g. Django → emphasize SSTI/SQLi).
+  Advisory only: it reorders which already-gated checks run, never enables one.
+
+### Safety
+A new **global per-campaign request budget** (default 40) bounds total fetches — the
+kill switch for host fan-out under a wildcard scope, on top of the per-host governor.
+Served-JS mining is bounded (≤8 bundles), secrets are redacted inside `recon_js`
+before they leave it, and the SSRF/private-host/port guard runs on every fetch. No new
+deps; pure stdlib.
+
 ## v0.20.0
 
 ### Report polish — land more reports
