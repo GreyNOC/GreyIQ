@@ -24,8 +24,15 @@ SAFETY (this is the one place a bounty tool could become a weapon):
     that reads ONE bit and extracts no data, a `{{7*7}}` arithmetic expression to
     detect a template engine, a `<svg/onload>` reflection probe, an encoded-CRLF +
     custom-header marker to detect header injection — all inspected, never executed by
-    us); never a state-changing verb/parameter, never a file-read/RCE/SLEEP payload,
-    never fuzzing/wordlists.
+    us); never a state-changing verb/parameter, never a file-read/RCE payload, never
+    fuzzing/wordlists.
+  - OPT-IN time-based blind SQLi (``time_based=True``) is the one exception to the
+    "never executed" rule: it injects a single FIXED, bounded ``SLEEP(4)`` (well under
+    the fetch timeout, no amplification), reads ZERO data (one timing bit), excludes the
+    governor throttle from its measurement, and confirms only on a stable multi-trial
+    differential against a fast ``SLEEP(0)`` negative control. Off by default.
+  - Open-bucket exposure only GET-probes a cloud bucket whose HOST is itself in the
+    hunt scope; a referenced third-party bucket is reported as a candidate, never probed.
   - A per-host token-bucket governor + a per-hunt request budget bound the load.
   - Every captured string is redacted before it lands in a proof artifact.
   - Fail-closed proof: 'confirmed' needs a positive observation AND a control
@@ -35,6 +42,7 @@ SAFETY (this is the one place a bounty tool could become a weapon):
 from __future__ import annotations
 
 import re
+import time
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -179,17 +187,22 @@ class _Http:
         if extra_headers:
             headers.update(extra_headers)
         request = Request(sanitized, headers=headers, method=method)
+        # Time ONLY the request (not the governor throttle above), so a time-based
+        # check measures the server, not our own rate-limit sleep.
+        started = time.monotonic()
         try:
             with self.opener.open(request, timeout=self.settings.web_fetch_timeout_seconds) as resp:
                 consumed = _consume(resp, self.settings)
                 consumed["final_url"] = resp.geturl()
                 consumed["location"] = resp.headers.get("Location") if resp.headers else None
+                consumed["elapsed"] = time.monotonic() - started
                 return consumed
         except HTTPError as exc:
             # A 3xx (captured, not followed) or 4xx/5xx is a valid observation.
             consumed = _consume(exc, self.settings)
             consumed["final_url"] = sanitized
             consumed["location"] = exc.headers.get("Location") if exc.headers else None
+            consumed["elapsed"] = time.monotonic() - started
             return consumed
         except (URLError, TimeoutError, OSError) as exc:
             raise _ActiveError(str(exc)) from exc
@@ -560,6 +573,117 @@ def _check_crlf(http: _Http, url: str) -> dict[str, Any] | None:
     return None
 
 
+# Time-based blind SQLi sends a small, FIXED, bounded SLEEP — the one check that emits
+# an executing payload, so it is OPT-IN (off by default) and held to a strict envelope:
+# a constant delay we control (no amplification), well under the fetch timeout, request-
+# only timing (excludes the governor throttle), and a multi-trial differential with a
+# fast SLEEP(0) negative control. No data is ever read or extracted — one timing bit.
+_TIME_DELAY_S = 4          # the injected sleep (fixed; < web_fetch_timeout_seconds, default 8)
+_TIME_MARGIN_S = 3.0       # a confirmed probe must be at least this much slower than the fast controls
+
+
+def _check_time_sqli(http: _Http, url: str) -> dict[str, Any] | None:
+    parsed = urlparse(url)
+    params = [k for k, v in parse_qsl(parsed.query)]
+    if not params:
+        return None  # need a real existing param; never invent injection points
+    d = _TIME_DELAY_S
+    # MySQL/MariaDB SLEEP is the most common; a single fixed payload keeps requests bounded.
+    slow = f"' AND SLEEP({d})-- -"
+    fast = "' AND SLEEP(0)-- -"
+    for param in params[:1]:  # one param — the timing pass is request-heavy
+        original = dict(parse_qsl(parsed.query)).get(param, "1")
+        try:
+            base = http.fetch(_with_query(url, {param: original}))
+            ctrl = http.fetch(_with_query(url, {param: original + fast}))   # injected, but SLEEP(0) -> fast (negative control)
+            p1 = http.fetch(_with_query(url, {param: original + slow}))
+            p2 = http.fetch(_with_query(url, {param: original + slow}))     # second trial to rule out jitter
+        except _ActiveError:
+            continue
+        fast_max = max(float(base.get("elapsed") or 0.0), float(ctrl.get("elapsed") or 0.0))
+        e1, e2 = float(p1.get("elapsed") or 0.0), float(p2.get("elapsed") or 0.0)
+        # Confirm ONLY when both SLEEP(D) probes are >= D-margin slower than BOTH fast
+        # controls (the unmodified baseline AND the injected-but-SLEEP(0) request). The
+        # SLEEP(0) control proves the delay tracks the injected value, not a slow page.
+        if e1 - fast_max >= _TIME_MARGIN_S and e2 - fast_max >= _TIME_MARGIN_S:
+            proof = _proof(
+                "confirmed", method=f"GET with {param}=...' AND SLEEP({d}) (bounded, no data read)",
+                affected_asset="the database reachable by the query's role (time-inferable blind SQLi)",
+                observed_result=f"injecting SLEEP({d}) delayed the response to ~{e1:.1f}s/{e2:.1f}s across two trials",
+                control_result=f"the unmodified request and a SLEEP(0) injection both returned in ~{fast_max:.1f}s — the delay tracks the injected sleep",
+                evidence=f"request-only timing: baseline/SLEEP(0)≈{fast_max:.1f}s, SLEEP({d})≈{e1:.1f}s and {e2:.1f}s",
+            )
+            ev = {"request_line": f"GET {_with_query(url, {param: original + slow})}", "response_status": f"HTTP {p1['status']}",
+                  "matched_value": f"SLEEP({d}) caused a ~{e1:.1f}s delay vs ~{fast_max:.1f}s control"}
+            return _finding("active.sqli-time", f"Time-based blind SQL injection via '{param}'", "high", "disclosure", "sqli", url, proof, ev)
+    return None
+
+
+_BUCKET_RE = re.compile(
+    r"https?://(?:"
+    r"([a-z0-9][a-z0-9.\-]{1,200}\.s3[.\-][a-z0-9.\-]*amazonaws\.com)"          # S3 virtual-hosted
+    r"|(storage\.googleapis\.com/[a-z0-9._\-]{3,200})"                            # GCS
+    r"|([a-z0-9][a-z0-9.\-]{1,200}\.blob\.core\.windows\.net/[a-z0-9._\-]{1,200})"  # Azure
+    r")", re.IGNORECASE)
+
+
+def _check_open_bucket(http: _Http, landing: dict[str, Any] | None, scope: str, settings: Any) -> dict[str, Any] | None:
+    """Open cloud-bucket exposure for buckets the PAGE references. Strictly scope-gated:
+    a bucket host MUST pass host_in_active_scope (a third-party bucket is not auto-in-
+    scope — those degrade to a candidate note). GET-only list endpoint; confirms only on
+    an anonymous directory listing; 403/AccessDenied is the negative control -> candidate."""
+    body = (landing or {}).get("body") or ""
+    if not body:
+        return None
+    candidates: list[str] = []
+    for m in _BUCKET_RE.finditer(body):
+        u = m.group(0).rstrip("/\"'")
+        if u not in candidates:
+            candidates.append(u)
+        if len(candidates) >= 8:
+            break
+    referenced_out_of_scope = 0
+    for bucket_url in candidates[:6]:
+        host = urlparse(bucket_url).hostname or ""
+        if not host_in_active_scope(host, scope, settings):
+            referenced_out_of_scope += 1
+            continue  # never probe a bucket host the operator didn't put in scope
+        list_url = bucket_url + ("?list-type=2" if "amazonaws.com" in host else "")
+        try:
+            resp = http.fetch(list_url)
+        except _ActiveError:
+            continue
+        rbody = (resp.get("body") or "")[:4000]
+        status = int(resp.get("status") or 0)
+        # Anonymous listing (body may be truncated by the fetch cap — match the opening).
+        is_listing = status == 200 and ("<ListBucketResult" in rbody and ("<Key>" in rbody or "<Contents>" in rbody))
+        denied = "AccessDenied" in rbody or status in (401, 403)
+        if is_listing:
+            proof = _proof(
+                "confirmed", method=f"GET {list_url}", affected_asset="every object in the referenced cloud bucket",
+                observed_result="the bucket returned an anonymous directory listing (public read)",
+                control_result="a locked bucket returns 403/AccessDenied — this one listed its contents to an unauthenticated request",
+                evidence="anonymous ListBucketResult with object keys",
+            )
+            ev = {"request_line": f"GET {list_url}", "response_status": f"HTTP {status}", "matched_value": "public ListBucketResult (object keys redacted)"}
+            return _finding("active.open-bucket", "Public cloud bucket (anonymous listing)", "high", "disclosure", "cloud-exposure", bucket_url, proof, ev)
+        if denied:
+            proof = _proof("candidate", method=f"GET {list_url}",
+                           observed_result="the referenced bucket exists but denied anonymous listing (403/AccessDenied)",
+                           limitations="The bucket is not publicly listable; individual objects or write access may still be testable.",
+                           proof_obligation="Probe specific object keys / test write access within scope to assess impact.")
+            ev = {"request_line": f"GET {list_url}", "response_status": f"HTTP {status}", "matched_value": "AccessDenied (bucket exists, not public)"}
+            return _finding("active.open-bucket", "Cloud bucket referenced (access denied — candidate)", "low", "disclosure", "cloud-exposure", bucket_url, proof, ev)
+    if referenced_out_of_scope:
+        proof = _proof("candidate", method="page reference (not probed)",
+                       observed_result=f"the page references {referenced_out_of_scope} cloud bucket(s) whose host is not in your scope",
+                       limitations="Bucket hosts outside the program scope are never probed.",
+                       proof_obligation="If the bucket is in scope, add its host to Scope and re-run to verify public access.")
+        ev = {"request_line": "(page reference)", "matched_value": f"{referenced_out_of_scope} referenced bucket(s) out of scope"}
+        return _finding("active.open-bucket", "Cloud bucket referenced (out of scope — add to verify)", "info", "disclosure", "cloud-exposure", "", proof, ev)
+    return None
+
+
 def verify_active(
     target_url: str,
     findings: list[dict[str, Any]],
@@ -569,6 +693,7 @@ def verify_active(
     settings: Any = None,
     governor: HostRateGovernor | None = None,
     http: _Http | None = None,
+    time_based: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run the active checks against an in-scope target. Returns
     ``(active_findings, meta)``. ``active_findings`` are confirmed/candidate finding
@@ -624,7 +749,13 @@ def verify_active(
         lambda: _check_error_sqli(http, sanitized),
         lambda: _check_bool_sqli(http, sanitized),
         lambda: _check_crlf(http, sanitized),
+        # Open-bucket is GET-only and scope-gated; safe in the default pass.
+        lambda: _check_open_bucket(http, landing, scope, settings),
     ]
+    # Time-based blind SQLi is the only check that emits an executing payload (a bounded
+    # SLEEP), so it is OPT-IN — appended only when the operator explicitly enables it.
+    if time_based:
+        checks.append(lambda: _check_time_sqli(http, sanitized))
     for check in checks:
         if rate_limited:
             break

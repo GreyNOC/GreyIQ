@@ -417,6 +417,7 @@ function loadState() {
     ckScope: "",
     ckProgram: "",
     ckActive: false,
+    ckTimeBased: false,
     ckLive: false
   };
 
@@ -4275,6 +4276,7 @@ const ck = {
   maxPages: document.querySelector("#ckMaxPages"),
   profileHint: document.querySelector("#ckProfileHint"),
   active: document.querySelector("#ckActive"),
+  timeBased: document.querySelector("#ckTimeBased"),
   live: document.querySelector("#ckLive"),
   authorized: document.querySelector("#ckAuthorized"),
   run: document.querySelector("#ckRun"),
@@ -5181,6 +5183,7 @@ async function ckRun() {
   state.ckScope = (ck.scope?.value || "").trim();
   state.ckProgram = (ck.program?.value || "").trim();
   state.ckActive = Boolean(ck.active?.checked);
+  state.ckTimeBased = Boolean(ck.timeBased?.checked);
   state.ckLive = Boolean(ck.live?.checked);
   state.bountyProfile = ck.profile?.value || state.bountyProfile;
   saveState();
@@ -5194,7 +5197,7 @@ async function ckRun() {
         method: "POST", timeoutMs: 900000,
         body: JSON.stringify({
           target, scope: state.ckScope, authorized: true, program: state.ckProgram || null,
-          active: state.ckActive, live: state.ckLive, max_pages: Number(ck.maxPages?.value) || 12
+          active: state.ckActive, time_based: state.ckTimeBased, live: state.ckLive, max_pages: Number(ck.maxPages?.value) || 12
         })
       });
     } else {
@@ -5202,7 +5205,7 @@ async function ckRun() {
         method: "POST", timeoutMs: 600000,
         body: JSON.stringify({
           target, profile: state.bountyProfile, vuln_class: (ck.klass?.value || null) || null,
-          scope: state.ckScope, authorized: true, active: state.ckActive, run_live: state.ckLive
+          scope: state.ckScope, authorized: true, active: state.ckActive, time_based: state.ckTimeBased, run_live: state.ckLive
         })
       });
     }
@@ -5250,6 +5253,7 @@ function bootCockpit() {
   if (ck.scope) ck.scope.value = state.ckScope || "";
   if (ck.program) ck.program.value = state.ckProgram || "";
   if (ck.active) ck.active.checked = Boolean(state.ckActive);
+  if (ck.timeBased) ck.timeBased.checked = Boolean(state.ckTimeBased);
   if (ck.live) ck.live.checked = Boolean(state.ckLive);
   ckSetRunType(state.ckRunType || "hunt");
   ckSyncService();

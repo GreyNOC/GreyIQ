@@ -221,6 +221,98 @@ class ActiveCheckTests(unittest.TestCase):
                         "body": f"<html>49 results for {val}</html>", "final_url": url, "location": None}
         self.assertIsNone(av._check_ssti(Coincidental49Stub(), self.URL))
 
+    # ---- time-based blind SQLi (opt-in; the one executing payload) -----------------
+    def test_time_sqli_confirms_on_stable_delay_differential(self) -> None:
+        class TimeStub:  # only SLEEP(4) is slow; baseline and SLEEP(0) are fast
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                val = (parse_qs(urlparse(url).query, keep_blank_values=True).get("id") or [""])[0]
+                elapsed = 4.4 if "SLEEP(4)" in val else 0.05
+                return {"status": 200, "headers": {}, "cookies": [], "body": "ok",
+                        "final_url": url, "location": None, "elapsed": elapsed}
+        f = av._check_time_sqli(TimeStub(), "https://app.example.com/?id=1")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertEqual(f["rule_id"], "active.sqli-time")
+        self.assertEqual(f["_active_class_hint"], "sqli")
+
+    def test_time_sqli_does_not_confirm_on_uniformly_slow_page(self) -> None:
+        class SlowStub:  # the page is slow for EVERY request — no differential
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                return {"status": 200, "headers": {}, "cookies": [], "body": "ok",
+                        "final_url": url, "location": None, "elapsed": 4.5}
+        self.assertIsNone(av._check_time_sqli(SlowStub(), "https://app.example.com/?id=1"))
+
+    def test_time_sqli_requires_both_trials_slow(self) -> None:
+        # base, SLEEP(0) control, then the two SLEEP(4) trials — only the FIRST is slow.
+        seq = iter([0.05, 0.05, 4.4, 0.05])
+        class JitterStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                return {"status": 200, "headers": {}, "cookies": [], "body": "ok",
+                        "final_url": url, "location": None, "elapsed": next(seq)}
+        self.assertIsNone(av._check_time_sqli(JitterStub(), "https://app.example.com/?id=1"))
+
+    def test_time_sqli_skips_when_no_param(self) -> None:
+        self.assertIsNone(av._check_time_sqli(_Stub(), "https://app.example.com/"))
+
+    def test_time_sqli_off_by_default_in_verify_active_checks(self) -> None:
+        # The opt-in probe must NOT be in the default check set (only added when time_based=True).
+        import inspect
+        src = inspect.getsource(av.verify_active)
+        self.assertIn("if time_based:", src)
+        self.assertIn("_check_time_sqli", src)
+
+    # ---- open cloud-bucket exposure (GET-only, scope-gated) ------------------------
+    def test_open_bucket_confirms_on_public_listing(self) -> None:
+        s = get_settings()
+        bucket = "https://acme-uploads.s3.amazonaws.com/"
+        landing = {"body": f'<img src="{bucket}logo.png">', "status": 200, "headers": {}}
+        class ListingStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                self_url = url
+                return {"status": 200, "headers": {}, "cookies": [], "final_url": self_url, "location": None,
+                        "body": '<?xml version="1.0"?><ListBucketResult><Contents><Key>db-backup.sql</Key></Contents></ListBucketResult>'}
+        f = av._check_open_bucket(ListingStub(), landing, "acme-uploads.s3.amazonaws.com", s)
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertEqual(f["rule_id"], "active.open-bucket")
+        self.assertEqual(f["_active_class_hint"], "cloud-exposure")
+        self.assertNotIn("db-backup.sql", str(f))  # object keys are never echoed
+
+    def test_open_bucket_access_denied_is_candidate(self) -> None:
+        s = get_settings()
+        bucket = "https://acme-locked.s3.amazonaws.com/"
+        landing = {"body": f'config: {bucket}private', "status": 200, "headers": {}}
+        class DeniedStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                return {"status": 403, "headers": {}, "cookies": [], "final_url": url, "location": None,
+                        "body": '<Error><Code>AccessDenied</Code></Error>'}
+        f = av._check_open_bucket(DeniedStub(), landing, "acme-locked.s3.amazonaws.com", s)
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "candidate")
+        self.assertEqual(f["rule_id"], "active.open-bucket")
+
+    def test_open_bucket_out_of_scope_host_is_never_probed(self) -> None:
+        s = get_settings()
+        bucket = "https://thirdparty.s3.amazonaws.com/"
+        landing = {"body": f'cdn {bucket}asset.js', "status": 200, "headers": {}}
+        class NeverStub:
+            def __init__(self): self.called = False
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                self.called = True
+                return {"status": 200, "headers": {}, "cookies": [], "body": "", "final_url": url, "location": None}
+        stub = NeverStub()
+        # Scope names the app host, NOT the bucket host → the bucket must never be fetched.
+        f = av._check_open_bucket(stub, landing, "app.example.com", s)
+        self.assertFalse(stub.called)
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "candidate")
+        self.assertEqual(f["severity"], "info")
+
+    def test_open_bucket_returns_none_when_no_buckets_referenced(self) -> None:
+        s = get_settings()
+        f = av._check_open_bucket(_Stub(), {"body": "<html>nothing to see</html>"}, "app.example.com", s)
+        self.assertIsNone(f)
+
 
 class ScopeBindingTests(unittest.TestCase):
     def test_named_host_in_scope(self) -> None:
