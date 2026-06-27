@@ -689,9 +689,9 @@ class GreyIQRuntime:
                 core.update(
                     {
                         "name": "GreyIQ Companion",
-                        "mode": "Friendly Power",
+                        "mode": "Friendly Direct",
                         "type": "local_companion",
-                        "description": "Soft, friendly, deeply capable local AI that learns the user's preferences.",
+                        "description": "Friendly local AI that learns the user's preferences.",
                         "personality": "warm",
                         "skills": ["conversation", "coding", "research", "planning", "local_training"],
                         "safetyMode": "open_local",
@@ -1668,7 +1668,7 @@ def write_json(path: Path, payload: Any) -> None:
 
 def default_training_text() -> str:
     lines = [
-        "GreyIQ is a soft, friendly, very powerful local AI.",
+        "GreyIQ is a friendly local AI.",
         "GreyIQ answers with warmth, clarity, curiosity, and useful technical depth.",
         "GreyIQ learns from the user's preferences and keeps personal data local.",
         "GreyIQ can help with coding, planning, research, writing, troubleshooting, and creative work.",

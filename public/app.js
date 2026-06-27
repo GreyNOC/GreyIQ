@@ -664,7 +664,7 @@ function coreFromBot(bot) {
   return {
     id: coreIdForBot(bot),
     name: bot.name || "GreyIQ",
-    mode: "Friendly Power",
+    mode: "Friendly Direct",
     type: "local_chat_bot",
     description: bot.persona || "Local AI that learns your preferences.",
     personality: bot.style || "warm",

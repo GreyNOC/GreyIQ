@@ -1,6 +1,6 @@
 # GreyIQ
 
-GreyIQ (GreyNOC-IQ) is a soft, friendly, powerful **local-first AI** desktop/web app. It's a GreyNOC product that runs as its own experience, separate from the GreyNOC SOC interface — your data stays on your machine.
+GreyIQ (GreyNOC-IQ) is a **local-first AI** desktop/web app. It's a GreyNOC product that runs as its own experience, separate from the GreyNOC SOC interface — your data stays on your machine.
 
 It includes:
 
