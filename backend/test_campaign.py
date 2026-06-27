@@ -60,6 +60,19 @@ class CampaignTests(unittest.TestCase):
         for path in result["submission_paths"]:
             self.assertTrue(Path(path).is_file())
 
+    def test_campaign_returns_structured_findings_for_the_cockpit(self) -> None:
+        result = self._run()
+        self.assertTrue(result["ok"])
+        # The cockpit drives one board off these — campaign-global refs, proof + cvss
+        # maps, and a surface block, mirroring /api/bounty/scan.
+        self.assertEqual(len(result["findings"]), result["finding_count"])
+        self.assertTrue(all(f["ref"].startswith("C") for f in result["findings"]))
+        for f in result["findings"]:
+            self.assertIn(f["ref"], result["proof_of_impact"])
+        self.assertIn("surface", result)
+        self.assertIn("urls", result["surface"])
+        self.assertIn(result["risk"], {"critical", "high", "moderate", "low", "clean"})
+
     def test_static_findings_are_not_auto_recorded_as_submitted(self) -> None:
         # Source-code findings are candidates (no active proof) -> nothing logged
         # to the learning store, so we never pollute program memory with leads.

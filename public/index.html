@@ -8,7 +8,7 @@
     <title>GreyIQ</title>
     <link rel="stylesheet" href="./styles.css">
   </head>
-  <body data-theme="dark">
+  <body data-theme="dark" data-app-mode="hunt">
     <main class="app-shell">
       <aside class="bot-panel" aria-label="Bot roster and persona">
         <header class="brand-row">
@@ -72,6 +72,7 @@
             <h2 id="activeBotName">GreyIQ</h2>
           </div>
           <div class="header-actions">
+            <button class="theme-toggle" id="huntReturn" type="button" title="Back to the bug-bounty cockpit">◀ Hunt</button>
             <button class="theme-toggle" id="themeToggle" type="button" aria-pressed="false" title="Switch theme">Dark</button>
             <div class="segmented" role="group" aria-label="Acceleration">
               <button id="cpuButton" class="segment is-active" type="button">CPU</button>
@@ -376,6 +377,84 @@
           <div id="verifyPanel" class="workbench-panel" role="tabpanel" aria-labelledby="wbtab-verify" tabindex="0" hidden></div>
         </section>
       </section>
+    </main>
+
+    <!-- ===================== BUG-BOUNTY COCKPIT ===================== -->
+    <!-- The default surface. The AI studio above is demoted behind "Studio".
+         All dynamic content is built DOM-only in app.js (no innerHTML). -->
+    <main class="cockpit" id="cockpit" aria-label="Bug bounty cockpit">
+      <header class="ck-topbar">
+        <div class="ck-brand">
+          <span class="ck-logo" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M12 2 3 6v6c0 5 3.8 8.4 9 10 5.2-1.6 9-5 9-10V6l-9-4Z"></path><path d="m9 12 2 2 4-4"></path></svg>
+          </span>
+          <div>
+            <p class="ck-eyebrow">GreyNOC-IQ · Bug Bounty</p>
+            <h1>Hunt</h1>
+          </div>
+        </div>
+        <div class="ck-topbar-actions">
+          <span class="ck-service" id="ckService" title="Local engine status">connecting…</span>
+          <button class="ck-ghost" id="ckTheme" type="button" title="Switch theme">Dark</button>
+          <button class="ck-ghost" id="ckStudio" type="button" title="Open the AI studio (chat, coding brain, training)">Studio ↗</button>
+        </div>
+      </header>
+
+      <div class="ck-body">
+        <aside class="ck-rail" aria-label="Hunt controls">
+          <nav class="ck-nav" id="ckNav" aria-label="Cockpit views">
+            <button class="ck-nav-btn is-active" data-ck-view="findings" type="button">Findings</button>
+            <button class="ck-nav-btn" data-ck-view="surface" type="button">Surface</button>
+            <button class="ck-nav-btn" data-ck-view="submissions" type="button">Submissions</button>
+            <button class="ck-nav-btn" data-ck-view="learn" type="button">Learn</button>
+          </nav>
+
+          <form class="ck-launch" id="ckLaunch">
+            <div class="ck-seg-group" role="group" aria-label="Run type">
+              <button type="button" class="ck-seg is-active" id="ckRunHunt" data-ck-runtype="hunt">Single hunt</button>
+              <button type="button" class="ck-seg" id="ckRunCampaign" data-ck-runtype="campaign">Full campaign</button>
+            </div>
+
+            <label><span>Target</span>
+              <input id="ckTarget" type="text" autocomplete="off" spellcheck="false" placeholder="https://example.com  ·  C:\path\to\repo"></label>
+            <label><span>Scope / program notes</span>
+              <input id="ckScope" type="text" autocomplete="off" placeholder="acme — *.example.com in scope"></label>
+
+            <div class="ck-grid2">
+              <label data-ck-when="hunt"><span>Profile</span><select id="ckProfile"></select></label>
+              <label data-ck-when="hunt"><span>Focus class</span><select id="ckClass"></select></label>
+              <label data-ck-when="campaign" hidden><span>Program handle</span>
+                <input id="ckProgram" type="text" autocomplete="off" placeholder="default: target domain"></label>
+              <label data-ck-when="campaign" hidden><span>Recon depth (pages)</span>
+                <input id="ckMaxPages" type="number" min="1" max="50" value="12"></label>
+            </div>
+            <p class="ck-hint" id="ckProfileHint" data-ck-when="hunt"></p>
+
+            <div class="ck-toggles">
+              <label class="ck-switch"><input id="ckActive" type="checkbox">
+                <span>Test for <strong>proof of impact</strong> <em>— benign in-scope probes that mark findings Confirmed</em></span></label>
+              <label class="ck-switch"><input id="ckLive" type="checkbox">
+                <span>Dynamic browser pass <em>(Playwright)</em></span></label>
+              <label class="ck-switch ck-auth"><input id="ckAuthorized" type="checkbox">
+                <span><strong>I'm authorized to test this target (in scope).</strong></span></label>
+            </div>
+
+            <button class="ck-run" id="ckRun" type="submit">Run hunt</button>
+            <p class="ck-status" id="ckStatus" aria-live="polite"></p>
+          </form>
+
+          <p class="ck-disclaimer">Authorized testing only. Active probes fire only against a host you name in Scope, after you tick the authorization box. The server enforces both — fail-closed.</p>
+        </aside>
+
+        <section class="ck-main">
+          <div class="ck-view" id="ckViewFindings"></div>
+          <div class="ck-view" id="ckViewSurface" hidden></div>
+          <div class="ck-view" id="ckViewSubmissions" hidden></div>
+          <div class="ck-view" id="ckViewLearn" hidden></div>
+        </section>
+
+        <aside class="ck-detail" id="ckDetail" hidden aria-label="Finding detail"></aside>
+      </div>
     </main>
 
     <template id="messageTemplate">
