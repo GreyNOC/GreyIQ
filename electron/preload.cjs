@@ -8,4 +8,7 @@ contextBridge.exposeInMainWorld('greyiqDesktop', {
   pickFolder: () => ipcRenderer.invoke('greyiq:pick-folder'),
   // Local-model GPU acceleration status: { vendor, runtime, accelerated }.
   gpuInfo: () => ipcRenderer.invoke('greyiq:gpu-info'),
+  // Provision (download on first use) + start the on-demand Ollama runtime when the
+  // user selects the local model. Resolves { ok, runtime } or { ok: false, error }.
+  ensureOllama: () => ipcRenderer.invoke('greyiq:ensure-ollama'),
 });

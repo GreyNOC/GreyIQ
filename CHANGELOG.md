@@ -2,6 +2,23 @@
 
 Notable changes to GreyIQ.
 
+## v0.23.0
+
+### Much smaller download + faster first launch — Ollama is now on-demand
+Ollama (the local-model runtime) was **~1.4 GB — about 86% of the portable** — and
+the bug-hunting engine and the Claude/OpenAI brains never use it. It is **no longer
+bundled**: the portable/installer drop to roughly **~250 MB**, and the first-launch
+unpack shrinks accordingly (on top of the v0.15.0 boot-time fix).
+
+Ollama is now **downloaded on demand** to a writable `userData` dir the first time the
+operator actually selects the **local** model in the Brain settings — reusing the same
+proven download/extract path the AMD/ROCm runtime already used. The renderer triggers
+it via a new `greyiq:ensure-ollama` IPC; nothing downloads at boot, and a system-
+installed Ollama (already serving on the port) is used directly. NVIDIA GPUs still work
+on the downloaded base runner; AMD/ROCm is still fetched on first run. Removed the now-
+redundant Ollama bundling step from the Windows + Linux release CI (also relieving the
+Linux runner's disk pressure).
+
 ## v0.22.0
 
 ### Headless operator — run the loop with no GUI (`gn operator`)

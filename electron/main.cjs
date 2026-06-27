@@ -23,20 +23,20 @@ const PROJECT_ROOT = app.isPackaged ? path.join(process.resourcesPath, 'app') : 
 // <resources>/backend/greyiq-backend(.exe). Present only in packaged builds.
 const BACKEND_RESOURCE_DIR = app.isPackaged ? path.join(process.resourcesPath, 'backend') : null;
 const RUNTIME_DIR = path.join(app.getPath('userData'), 'runtime');
-// Bundled Ollama runtime (zero-setup local brain). Present only in packaged
-// builds. The Windows zip puts ollama.exe at the root; the Linux tarball puts
-// the binary under bin/ (with its libs alongside under lib/).
-const OLLAMA_RES_DIR = app.isPackaged ? path.join(process.resourcesPath, 'ollama') : null;
-const BUNDLED_OLLAMA = OLLAMA_RES_DIR
-  ? (process.platform === 'win32'
-      ? path.join(OLLAMA_RES_DIR, 'ollama.exe')
-      : path.join(OLLAMA_RES_DIR, 'bin', 'ollama'))
-  : null;
+// Ollama runtime (zero-setup LOCAL brain). It is NO LONGER bundled — it was ~1.4 GB
+// (86% of the old portable) and the bug-hunting engine + the Claude/OpenAI brains
+// never use it. It is downloaded ON DEMAND to a writable userData dir the first time
+// the operator actually selects the local model, so the default app stays small/fast.
+const OLLAMA_BASE_DIR = path.join(app.getPath('userData'), 'ollama');
+const OLLAMA_BIN = process.platform === 'win32'
+  ? path.join(OLLAMA_BASE_DIR, 'ollama.exe')
+  : path.join(OLLAMA_BASE_DIR, 'bin', 'ollama');
 const OLLAMA_PORT = 11434;
-// NVIDIA (CUDA) is included in the bundled Ollama runtime. AMD GPUs need Ollama's
-// ROCm runner, which ships as a separate ~1 GB package — too big to bundle under
-// GitHub's 2 GiB asset cap — so we fetch it once on first run when an AMD GPU is
-// detected and overlay it onto a writable copy of the bundled runtime.
+const OLLAMA_BASE_URL = process.platform === 'win32'
+  ? 'https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64.zip'
+  : 'https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64.tar.zst';
+// AMD GPUs need Ollama's ROCm runner (a separate ~1 GB package); fetched once on
+// first run when an AMD GPU is detected, overlaid onto the base runtime.
 const OLLAMA_ROCM_URL = process.platform === 'win32'
   ? 'https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64-rocm.zip'
   : 'https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64-rocm.tar.zst';
@@ -421,9 +421,35 @@ function extractArchive(archivePath, destDir) {
   });
 }
 
+async function ensureBaseOllama() {
+  // Provision (once) the base Ollama runtime to a writable userData dir, downloading
+  // it on demand (it is no longer bundled). Returns the binary path, or null if the
+  // download/extract fails. Only ever called when the user actually wants the local
+  // model — never at boot — so the default app never pays for it.
+  if (!app.isPackaged) return null;  // dev: use a system-installed ollama if present
+  if (fs.existsSync(OLLAMA_BIN)) return OLLAMA_BIN;
+  logGpu('Local model selected — downloading the Ollama runtime (one-time ~1 GB)…');
+  const archive = path.join(app.getPath('userData'), process.platform === 'win32' ? 'ollama-base.zip' : 'ollama-base.tar.zst');
+  try {
+    fs.mkdirSync(OLLAMA_BASE_DIR, { recursive: true });
+    await downloadFile(OLLAMA_BASE_URL, archive);
+    await extractArchive(archive, OLLAMA_BASE_DIR);
+    fs.rmSync(archive, { force: true });
+    if (!fs.existsSync(OLLAMA_BIN)) throw new Error('Ollama binary missing after extraction');
+    ensureExecutable(OLLAMA_BIN);
+    logGpu('Ollama runtime ready.');
+    return OLLAMA_BIN;
+  } catch (err) {
+    logGpu(`Ollama provisioning failed (${err.message}).`);
+    try { fs.rmSync(archive, { force: true }); } catch (_) { /* ignore */ }
+    return null;
+  }
+}
+
 async function ensureRocmRuntime() {
   // Provision (once) and return the path to a ROCm-capable ollama binary, or null.
-  if (!OLLAMA_RES_DIR) return null;
+  // Needs the base runtime first (it's overlaid onto a copy of it).
+  if (!fs.existsSync(OLLAMA_BIN)) return null;
   const rocmDir = path.join(app.getPath('userData'), 'ollama-rocm');
   const rocmBin = process.platform === 'win32'
     ? path.join(rocmDir, 'ollama.exe')
@@ -436,9 +462,9 @@ async function ensureRocmRuntime() {
   try {
     fs.rmSync(rocmDir, { recursive: true, force: true });
     fs.mkdirSync(rocmDir, { recursive: true });
-    // Writable copy of the bundled runtime (binary + CPU runner), minus the CUDA
+    // Writable copy of the base runtime (binary + CPU runner), minus the CUDA
     // libs an AMD box won't use; the ROCm overlay is extracted on top next.
-    fs.cpSync(OLLAMA_RES_DIR, rocmDir, {
+    fs.cpSync(OLLAMA_BASE_DIR, rocmDir, {
       recursive: true,
       filter: (src) => !/[\\/]lib[\\/]ollama[\\/]cuda/i.test(src),
     });
@@ -469,20 +495,22 @@ async function resolveOllamaRuntime() {
       }
     }
   } catch (err) {
-    logGpu(`GPU runtime resolution failed (${err.message}); using bundled runtime.`);
+    logGpu(`GPU runtime resolution failed (${err.message}); using base runtime.`);
   }
   activeOllamaRuntime = 'bundled';
-  return BUNDLED_OLLAMA;
+  return OLLAMA_BIN;
 }
 
-async function startBundledOllama() {
-  // Zero-setup local brain: start the bundled Ollama, unless a system Ollama is
-  // already serving on the port (then we just use that). No-op in dev (no bundle).
-  if (!BUNDLED_OLLAMA || !fs.existsSync(BUNDLED_OLLAMA)) return;
-  if (await ollamaResponding()) return;
-  // Pick a GPU-capable runtime (NVIDIA is bundled; AMD is fetched once), always
-  // falling back to the bundled binary.
-  const ollamaBin = (await resolveOllamaRuntime()) || BUNDLED_OLLAMA;
+async function startOllama() {
+  // On-demand local brain: provision the Ollama runtime (downloaded on first use),
+  // then start it — unless a system Ollama is already serving on the port. Triggered
+  // by the renderer when the user selects the local model, NEVER at boot.
+  if (await ollamaResponding()) return true;
+  const baseBin = await ensureBaseOllama();
+  if (!baseBin || !fs.existsSync(baseBin)) return false;
+  // Pick a GPU-capable runtime (NVIDIA works on the base runner; AMD ROCm is fetched
+  // once), always falling back to the base binary.
+  const ollamaBin = (await resolveOllamaRuntime()) || OLLAMA_BIN;
   ensureExecutable(ollamaBin);
   const modelsDir = path.join(app.getPath('userData'), 'ollama-models');
   try {
@@ -501,12 +529,25 @@ async function startBundledOllama() {
     ollamaProcess.stdout.on('data', (chunk) => process.stdout.write(`[Ollama] ${chunk}`));
     ollamaProcess.stderr.on('data', (chunk) => process.stdout.write(`[Ollama] ${chunk}`));
     ollamaProcess.on('error', (err) => process.stderr.write(`[Ollama] failed to start: ${err.message}\n`));
+    return true;
   } catch (err) {
     process.stderr.write(`[Ollama] spawn error: ${err.message}\n`);
+    return false;
   }
 }
 
 function registerIpcHandlers() {
+  // Provision + start the on-demand Ollama runtime (the renderer calls this when the
+  // user selects the local model). Downloads ~1 GB on first use; later launches reuse it.
+  ipcMain.handle('greyiq:ensure-ollama', async () => {
+    try {
+      const ok = await startOllama();
+      return { ok: Boolean(ok), runtime: activeOllamaRuntime };
+    } catch (err) {
+      return { ok: false, error: String(err && err.message || err) };
+    }
+  });
+
   // Native folder picker for "Add a local folder" in the training panel.
   ipcMain.handle('greyiq:pick-folder', async () => {
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -529,8 +570,10 @@ function registerIpcHandlers() {
 
 async function boot() {
   registerIpcHandlers();
-  // Warm up the bundled local runtime in the background (don't block the window).
-  void startBundledOllama();
+  // Ollama is NOT started at boot — it's downloaded + started on demand (greyiq:
+  // ensure-ollama) only when the operator selects the local model, so the default
+  // app stays small and fast. If a system Ollama is already serving, the backend
+  // uses it directly.
   createWindow();
   // Always swap to the app (or the error page) even if startup throws — otherwise an
   // unhandled rejection leaves the window stuck on the loading spinner forever.
