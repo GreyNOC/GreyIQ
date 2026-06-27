@@ -103,12 +103,16 @@ jobs:
       # redundant cost. Re-add a `continue-on-error` upload only if you ever
       # need the binaries on the run page for debugging.
 
-      - name: Publish GitHub Release
+      # Upload to a DRAFT release. GitHub releases become immutable once published,
+      # which blocks the linux job from appending its assets afterward. So both
+      # platform jobs upload while the release is still a draft, and a final
+      # `publish` job flips it to published once every asset is attached.
+      - name: Upload Windows assets to the draft release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
           name: GreyIQ ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
-          draft: false
+          draft: true
           prerelease: false
           fail_on_unmatched_files: true
           files: |
@@ -117,8 +121,8 @@ jobs:
 
   linux:
     name: Build Linux GUI (AppImage) + headless CLI
-    # Runs after windows so the GitHub Release already exists; this job just
-    # appends the Linux assets to the same tag.
+    # Runs after windows so the DRAFT release already exists; this job appends the
+    # Linux assets to that draft (the `publish` job publishes it once both finish).
     needs: windows
     runs-on: ubuntu-latest
     steps:
@@ -204,14 +208,31 @@ jobs:
       - name: List build artifacts
         run: ls -lh release || true
 
-      - name: Publish GitHub Release (Linux assets)
+      - name: Append Linux assets to the draft release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
           name: GreyIQ ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
-          draft: false
+          draft: true
           prerelease: false
           fail_on_unmatched_files: true
           files: |
             release/GreyIQ-*.AppImage
             release/GreyIQ-*-linux-cli.tar.gz
+
+  publish:
+    name: Publish the release (flip draft -> published)
+    # Runs only after BOTH platform builds have uploaded their assets to the draft,
+    # so the single publish event freezes an immutable release carrying every asset.
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Flip the draft release to published
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+        run: |
+          gh release edit "$TAG" \
+            --repo "${{ github.repository }}" \
+            --draft=false \
+            --latest
