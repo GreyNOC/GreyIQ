@@ -63,11 +63,11 @@ def default_templates() -> list[dict[str, Any]]:
         {
             "id": "tpl_greyiq_companion",
             "name": "GreyIQ Companion",
-            "mode": "Friendly Power",
+            "mode": "Friendly Direct",
             "type": "local_companion",
             "description": (
-                "Soft, friendly, very powerful local AI that learns personal choices, "
-                "remembers useful preferences, and helps with serious work without becoming cold."
+                "Warm, direct local AI that learns personal choices, "
+                "remembers useful preferences, and helps with serious work without sounding robotic."
             ),
             "personality": "warm",
             "skills": [
