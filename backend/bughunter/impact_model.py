@@ -253,6 +253,92 @@ _GENERIC_MODEL: dict[str, str] = {
     "cvss_vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N",
 }
 
+# --- Per-class REMEDIATION (one concrete, verifiable fix) + REFERENCES (authoritative
+# links a triager trusts). These are the report's "fix" + "references" floor: present
+# on EVERY finding even with no brain and no per-rule remediation. Constant text, no
+# network. A unit test asserts both are present for every class id.
+_CS = "https://cheatsheetseries.owasp.org/cheatsheets"
+_CWE = "https://cwe.mitre.org/data/definitions"
+
+_REMEDIATION: dict[str, str] = {
+    "rce": "Never pass untrusted input to a shell/eval/deserializer. Use argv arrays (shell=False), safe parsers, and an allowlist; drop privileges on the worker.",
+    "secrets": "Revoke and rotate the exposed credential immediately, remove it from the served asset/source, and load secrets from a secret manager / env at runtime — never commit or ship them.",
+    "xss": "Context-encode all output (HTML/attr/JS/URL), prefer a framework's auto-escaping, set a strict Content-Security-Policy, and validate input on the server.",
+    "ssrf": "Allowlist the destination host + scheme before fetching, resolve and reject private/link-local/metadata IPs, and disable following redirects to internal addresses.",
+    "access-control": "Enforce a server-side authorization check that the authenticated principal owns/may access the requested object on every request; never rely on client-supplied ids or UI hiding.",
+    "auth": "Set Secure/HttpOnly/SameSite on session cookies, use high-entropy tokens with server-side expiry/rotation, rate-limit auth endpoints, and invalidate sessions on logout/reset.",
+    "sqli": "Use parameterized queries / prepared statements for every query; never build SQL by string formatting. Apply least-privilege DB roles.",
+    "csrf": "Require an unpredictable per-session anti-CSRF token (or SameSite=strict cookies) on every state-changing request and verify it server-side.",
+    "cors": "Reflect Origin only from an explicit allowlist, never combine `Access-Control-Allow-Origin: *`/reflected with `Allow-Credentials: true`, and never trust `null`.",
+    "redirect": "Allowlist redirect targets (relative paths or a fixed host set); validate with a host/scheme check (e.g. url_has_allowed_host_and_scheme) and reject off-host URLs.",
+    "file-upload": "Validate type by content (not extension), store outside the web root with non-executable permissions and random names, and serve via a controlled handler.",
+    "business-logic": "Enforce the intended workflow and invariants server-side (ownership, quantity/price, state transitions); never trust client-asserted steps or amounts.",
+    "supply-chain": "Pin and integrity-verify dependencies (lockfile + hashes), build from a clean source, and never pipe a remote download straight into a shell.",
+    "ssti": "Render fixed template files and pass user input as context variables; never build the template string from input. Sandbox the engine where supported.",
+    "xxe": "Disable DTDs and external-entity resolution on the XML parser (or use defusedxml); reject documents containing a DOCTYPE for untrusted input.",
+    "nosqli": "Use typed query builders / parameterized operators, validate that user input is the expected scalar type, and reject query-operator objects (`$ne`, `$where`).",
+    "jwt": "Pin a single strong algorithm (reject `none`), always verify the signature with a long random key, and validate iss/aud/exp; never accept HS/RS key confusion.",
+    "graphql": "Disable introspection in production, enforce per-field authorization, and add query depth/complexity limits and rate limiting.",
+    "prototype-pollution": "Reject `__proto__`/`constructor`/`prototype` keys when merging/cloning untrusted objects; use Map or a null-prototype object and a vetted merge utility.",
+    "race-condition": "Make the critical section atomic (DB transaction + row lock, unique constraint, or idempotency key) so concurrent requests can't double-spend the operation.",
+    "request-smuggling": "Normalize and reject ambiguous Content-Length/Transfer-Encoding combinations at the front-end proxy; use HTTP/2 to the backend and a single conformant parser.",
+    "subdomain-takeover": "Remove dangling DNS records that point at unclaimed third-party services; verify ownership before pointing a record and monitor for unresolved targets.",
+    "cloud-exposure": "Make the bucket/resource private, enforce block-public-access, scope IAM to least privilege, and require auth on every object.",
+    "crypto": "Use a vetted library with a modern algorithm (AES-GCM, SHA-256+, Argon2/bcrypt for passwords), random IVs/salts, and never a hardcoded key.",
+    "dependency": "Upgrade the vulnerable package to a fixed version (or backport the patch), and add automated dependency scanning to CI.",
+    "network": "Use TLS for all transport, validate certificates, and bind services to least-exposed interfaces with authentication.",
+    "ci": "Pin actions/images by digest, scope tokens to least privilege, never echo secrets, and require review for workflow changes from forks.",
+    "headers": "Add the missing security response headers (HSTS, CSP, X-Content-Type-Options, X-Frame-Options/frame-ancestors, Referrer-Policy) at the app or edge.",
+    "mixed_content": "Serve every sub-resource over HTTPS and add `upgrade-insecure-requests` to the CSP so no asset loads over http on a secure page.",
+    "disclosure": "Remove the verbose error/stack/version disclosure from responses, return generic errors to clients, and log details server-side only.",
+}
+
+_REFERENCES: dict[str, list[str]] = {
+    "rce": [f"{_CS}/OS_Command_Injection_Defense_Cheat_Sheet.html", f"{_CWE}/78.html"],
+    "secrets": [f"{_CS}/Secrets_Management_Cheat_Sheet.html", f"{_CWE}/798.html"],
+    "xss": [f"{_CS}/Cross_Site_Scripting_Prevention_Cheat_Sheet.html", f"{_CWE}/79.html", "https://portswigger.net/web-security/cross-site-scripting"],
+    "ssrf": [f"{_CS}/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html", f"{_CWE}/918.html", "https://portswigger.net/web-security/ssrf"],
+    "access-control": [f"{_CS}/Access_Control_Cheat_Sheet.html", f"{_CWE}/639.html", "https://portswigger.net/web-security/access-control/idor"],
+    "auth": [f"{_CS}/Session_Management_Cheat_Sheet.html", f"{_CWE}/384.html"],
+    "sqli": [f"{_CS}/SQL_Injection_Prevention_Cheat_Sheet.html", f"{_CWE}/89.html", "https://portswigger.net/web-security/sql-injection"],
+    "csrf": [f"{_CS}/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html", f"{_CWE}/352.html"],
+    "cors": [f"{_CS}/HTML5_Security_Cheat_Sheet.html", f"{_CWE}/942.html", "https://portswigger.net/web-security/cors"],
+    "redirect": [f"{_CS}/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html", f"{_CWE}/601.html"],
+    "file-upload": [f"{_CS}/File_Upload_Cheat_Sheet.html", f"{_CWE}/434.html"],
+    "business-logic": ["https://owasp.org/www-community/vulnerabilities/Business_logic_vulnerability", f"{_CWE}/840.html"],
+    "supply-chain": [f"{_CS}/Vulnerable_Dependency_Management_Cheat_Sheet.html", f"{_CWE}/1357.html"],
+    "ssti": ["https://portswigger.net/web-security/server-side-template-injection", f"{_CWE}/1336.html"],
+    "xxe": [f"{_CS}/XML_External_Entity_Prevention_Cheat_Sheet.html", f"{_CWE}/611.html", "https://portswigger.net/web-security/xxe"],
+    "nosqli": [f"{_CS}/Injection_Prevention_Cheat_Sheet.html", f"{_CWE}/943.html", "https://portswigger.net/web-security/nosql-injection"],
+    "jwt": [f"{_CS}/JSON_Web_Token_for_Java_Cheat_Sheet.html", f"{_CWE}/347.html", "https://portswigger.net/web-security/jwt"],
+    "graphql": [f"{_CS}/GraphQL_Cheat_Sheet.html", f"{_CWE}/200.html"],
+    "prototype-pollution": ["https://portswigger.net/web-security/prototype-pollution", f"{_CWE}/1321.html"],
+    "race-condition": ["https://portswigger.net/web-security/race-conditions", f"{_CWE}/362.html"],
+    "request-smuggling": ["https://portswigger.net/web-security/request-smuggling", f"{_CWE}/444.html"],
+    "subdomain-takeover": ["https://owasp.org/www-community/Subdomain_Takeover", f"{_CWE}/350.html"],
+    "cloud-exposure": [f"{_CS}/Secrets_Management_Cheat_Sheet.html", f"{_CWE}/200.html"],
+    "crypto": [f"{_CS}/Cryptographic_Storage_Cheat_Sheet.html", f"{_CWE}/327.html"],
+    "dependency": [f"{_CS}/Vulnerable_Dependency_Management_Cheat_Sheet.html", f"{_CWE}/1395.html"],
+    "network": [f"{_CS}/Transport_Layer_Security_Cheat_Sheet.html", f"{_CWE}/319.html"],
+    "ci": ["https://docs.github.com/actions/security-guides/security-hardening-for-github-actions", f"{_CWE}/1395.html"],
+    "headers": [f"{_CS}/HTTP_Security_Response_Headers_Cheat_Sheet.html", f"{_CWE}/693.html"],
+    "mixed_content": [f"{_CS}/HTTP_Security_Response_Headers_Cheat_Sheet.html", f"{_CWE}/319.html"],
+    "disclosure": [f"{_CS}/Error_Handling_Cheat_Sheet.html", f"{_CWE}/200.html"],
+}
+
+_GENERIC_REMEDIATION = "Validate and sanitize untrusted input at the trust boundary, enforce the relevant control server-side, and confirm the fix with the captured proof artifact."
+_GENERIC_REFERENCES = ["https://owasp.org/www-project-top-ten/", f"{_CWE}/710.html"]
+
+
+def remediation_for_class(class_id: str) -> str:
+    """A concrete, verifiable fix sentence for the class (always non-empty)."""
+    return _REMEDIATION.get(str(class_id or ""), _GENERIC_REMEDIATION)
+
+
+def references_for_class(class_id: str) -> list[str]:
+    """2-3 authoritative https:// references for the class (always non-empty)."""
+    return list(_REFERENCES.get(str(class_id or ""), _GENERIC_REFERENCES))
+
 # --- CVSS v3.1 base-score metric weights (spec section 7.4). ---
 _AV = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}
 _AC = {"L": 0.77, "H": 0.44}

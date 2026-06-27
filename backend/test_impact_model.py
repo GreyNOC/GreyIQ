@@ -27,6 +27,36 @@ class ImpactModelTests(unittest.TestCase):
             for field in ("attacker_capability", "affected_asset", "business_impact", "proof_obligation", "cvss_vector"):
                 self.assertTrue(str(entry[field]).strip(), f"{cid}.{field} empty")
 
+    def test_every_class_has_remediation_and_references(self) -> None:
+        # The report's "fix" + "references" floor: present on every class so an
+        # offline report is submission-grade.
+        for cid in list(VULN_CLASSES) + list(_CATEGORY_LABELS):
+            self.assertTrue(impact_model.remediation_for_class(cid).strip(), f"{cid} remediation empty")
+            refs = impact_model.references_for_class(cid)
+            self.assertTrue(refs, f"{cid} references empty")
+            for url in refs:
+                self.assertTrue(url.startswith("https://"), f"{cid} reference not https: {url}")
+
+    def test_offline_report_renders_remediation_and_references(self) -> None:
+        # An impact_model-class finding with no scanner remediation still gets a
+        # Remediation and a References section in the rendered report.
+        ctx = {
+            "tool": "GreyIQ BugHunter", "target": "https://example.test",
+            "profile": {"id": "web-app", "name": "Web application", "description": ""},
+            "findings": [{
+                "ref": "F1", "severity": "high", "confidence": "high", "category": "ssrf",
+                "class_id": "ssrf", "class_name": "Server-side request forgery (SSRF)", "cwe": "CWE-918",
+                "title": "SSRF sink", "location": "app.py", "rule_id": "py.requests-variable-url",
+                "references": impact_model.references_for_class("ssrf"),
+            }],
+            "attack_plans": {"F1": _deterministic_attack_plan({"location": "app.py", "rule_id": "x"}, "ssrf")},
+            "recommended_tools": [], "brain": {"used": False},
+        }
+        md = report_lib.build_finding_markdown(ctx, ctx["findings"][0])
+        self.assertIn("## Remediation", md)
+        self.assertIn("## References", md)
+        self.assertIn("https://", md)
+
     def test_cvss_base_scores_match_nvd_reference(self) -> None:
         refs = {
             "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H": 9.8,

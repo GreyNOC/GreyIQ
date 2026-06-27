@@ -40,8 +40,9 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
         "name": "Remote code execution / command injection",
         "cwe": "CWE-78 / CWE-94",
         "owasp": "A03:2021 Injection",
-        # Scanner emits these for shell-out / eval / backdoor / curl|sh / obfuscated code.
-        "categories": {"injection", "supply-chain", "backdoor", "obfuscation"},
+        # Scanner emits these for shell-out / eval / backdoor / curl|sh / obfuscated code,
+        # plus insecure-deserialization sinks (a path to RCE).
+        "categories": {"injection", "supply-chain", "backdoor", "obfuscation", "deserialization"},
         "checklist": [
             "Trace each flagged sink back to a request parameter, header, or filename the attacker controls.",
             "Try a benign marker payload first (e.g. `;echo greyiq123`) and look for the marker in the response or logs.",
@@ -143,7 +144,8 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
         "name": "Open redirect / unsafe forwarding",
         "cwe": "CWE-601",
         "owasp": "A01:2021 Broken Access Control",
-        "categories": set(),
+        # Static open-redirect sinks + the active CRLF/redirect check map here.
+        "categories": {"open_redirect"},
         "checklist": [
             "Find redirect parameters such as next, returnUrl, callback, continue, redirect_uri, or url.",
             "Confirm whether an absolute external URL is accepted after login, OAuth, password reset, or invite flows.",
@@ -190,7 +192,8 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
         "name": "Server-side template injection (SSTI)",
         "cwe": "CWE-1336 / CWE-94",
         "owasp": "A03:2021 Injection",
-        "categories": set(),
+        # Static ssti-source sinks (the active {{7*7}} check carries class_hint='ssti').
+        "categories": {"ssti"},
         "checklist": [
             "Find input that reaches a server-side template (search, display names, profile fields, email/PDF/report generators).",
             "Send per-engine probes (`${7*7}`, `{{7*7}}`, `#{7*7}`, `<%= 7*7 %>`) and look for `49` rendered back.",
@@ -201,7 +204,7 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
         "name": "XML external entity (XXE)",
         "cwe": "CWE-611",
         "owasp": "A05:2021 Security Misconfiguration",
-        "categories": set(),
+        "categories": {"xxe"},
         "checklist": [
             "Identify endpoints that parse XML (SOAP, SAML, SVG/DOCX/XLSX uploads, RSS, `application/xml` bodies).",
             "Submit a benign external entity pointing at a collaborator host and confirm the server fetches it (out-of-band).",
@@ -223,7 +226,8 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
         "name": "JWT / token forgery & weakness",
         "cwe": "CWE-347 / CWE-345",
         "owasp": "A07:2021 Identification & Authentication Failures",
-        "categories": set(),
+        # Static weak-JWT sinks: alg:none, verify disabled, short HMAC secret.
+        "categories": {"jwt"},
         "checklist": [
             "Decode the token; check `alg`/`kid`/`iss`/`exp` and whether the signature is actually verified server-side.",
             "Test `alg:none`, RS/HS key confusion (sign with the public key as the HMAC secret), `kid` injection, and weak secrets.",
@@ -496,6 +500,9 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
         "impact": impact_text,
         "proof_of_impact": proof_of_impact,
         "cvss": impact_model.cvss_for_class(class_id),
+        # Deterministic remediation floor — a per-rule remediation still wins in the
+        # report via `finding.get('remediation') or plan.get('remediation')`.
+        "remediation": impact_model.remediation_for_class(class_id),
         "poc": "",
     }
 
@@ -786,6 +793,9 @@ def run_bounty_hunt(
                 "class_name": cname,
                 "cwe": cwe,
                 "owasp": owasp,
+                # Authoritative references floor — only when the scanner rule didn't
+                # supply its own (no rule sets references today, so this always fills).
+                "references": finding.get("references") or impact_model.references_for_class(cid),
             }
         )
     rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
