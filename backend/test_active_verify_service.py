@@ -10,8 +10,11 @@ differential.
 from __future__ import annotations
 
 import os
+import re
+import socket
 import sys
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -438,6 +441,207 @@ class ActiveE2ETests(unittest.TestCase):
             )
             self.assertTrue(res["ok"])
             self.assertNotIn("active.", Path(res["report_path"]).read_text(encoding="utf-8"))
+
+
+# ============================================================================
+# END-TO-END: drive the real engine (real sockets, real _Http.fetch + governor +
+# timing) against local servers I control. These prove the two advanced checks
+# actually FIRE against a vulnerable backend AND stay silent against a clean one —
+# the timing path in particular cannot be validated by the no-network stubs above.
+# All run on 127.0.0.1 with GREYIQ_SCAN_ALLOW_PRIVATE_URLS=1 (authorized own-infra).
+# ============================================================================
+class _BaseTimeHandler(BaseHTTPRequestHandler):
+    """A backend whose query is time-injectable: when 'vulnerable', it actually
+    runs the injected SLEEP(n) (sleeps n seconds) — exactly what a real blind-SQLi
+    backend does. The clean subclass ignores the payload."""
+    vulnerable = True
+    seen_methods: list[str] = []
+
+    def do_GET(self) -> None:  # noqa: N802
+        type(self).seen_methods.append(self.command)
+        q = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+        injected = " ".join(v for vals in q.values() for v in vals)
+        m = re.search(r"sleep\((\d+(?:\.\d+)?)\)", injected, re.IGNORECASE)
+        if type(self).vulnerable and m:
+            time.sleep(float(m.group(1)))  # the DB executes the injected delay
+        body = b"<html>ok</html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    do_HEAD = do_GET
+
+    def log_message(self, *args: object) -> None:
+        return
+
+
+class _VulnTimeHandler(_BaseTimeHandler):
+    vulnerable = True
+
+
+class _CleanTimeHandler(_BaseTimeHandler):
+    vulnerable = False
+
+
+class TimeSqliE2ETests(unittest.TestCase):
+    # Small, REAL delay so the differential is genuine but the test stays fast + robust:
+    # the injected SLEEP dominates (>= 0.6s); the fast controls are sub-ms localhost hops.
+    ENV = {
+        "GREYIQ_SCAN_ALLOW_PRIVATE_URLS": "1",
+        "GREYIQ_ACTIVE_MIN_INTERVAL_MS": "0",
+        "GREYIQ_ACTIVE_MAX_REQUESTS_PER_HOST": "60",
+        "GREYIQ_ACTIVE_TIME_SQLI_DELAY_S": "0.8",
+        "GREYIQ_ACTIVE_TIME_SQLI_MARGIN_S": "0.3",  # 0.5s headroom — robust under CI scheduler jitter
+    }
+
+    def setUp(self) -> None:
+        self._saved = {k: os.environ.get(k) for k in self.ENV}
+        os.environ.update(self.ENV)
+        self.server = None
+
+    def tearDown(self) -> None:
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        if self.server is not None:
+            self.server.shutdown()
+
+    def _serve(self, handler_cls: type) -> int:
+        handler_cls.seen_methods = []
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        return self.server.server_port
+
+    def _http(self):
+        return av._Http(get_settings(), HostRateGovernor(capacity=60, min_interval_s=0.0), max_requests=30)
+
+    def test_confirms_against_time_vulnerable_backend(self) -> None:
+        port = self._serve(_VulnTimeHandler)
+        url = f"http://127.0.0.1:{port}/?id=1"
+        f = av._check_time_sqli(self._http(), url, get_settings())
+        self.assertIsNotNone(f, "time-based SQLi must confirm when the backend runs the injected SLEEP")
+        self.assertEqual(f["rule_id"], "active.sqli-time")
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertEqual(f["_active_class_hint"], "sqli")
+
+    def test_no_false_positive_against_clean_backend(self) -> None:
+        port = self._serve(_CleanTimeHandler)
+        url = f"http://127.0.0.1:{port}/?id=1"
+        f = av._check_time_sqli(self._http(), url, get_settings())
+        self.assertIsNone(f, "a backend that ignores the SLEEP payload must NOT be reported")
+        # Prove the None is a real negative (server WAS probed, just never delayed) —
+        # not a silent connection failure: exactly the four timing requests reached the
+        # server (baseline + SLEEP(0) control + two SLEEP(D) trials), and no more.
+        self.assertEqual(len(_CleanTimeHandler.seen_methods), 4)
+
+    def test_full_verify_active_fires_time_check_only_when_opted_in(self) -> None:
+        port = self._serve(_VulnTimeHandler)
+        url = f"http://127.0.0.1:{port}/?id=1"
+        # Opt-in ON: the executing SLEEP probe runs and confirms.
+        findings, meta = av.verify_active(url, [], scope="127.0.0.1", time_based=True, requests_budget=40)
+        self.assertTrue(meta["in_scope"])
+        self.assertIn("active.sqli-time", {f["rule_id"] for f in findings})
+        # Opt-in OFF (default): no executing SLEEP probe, even against the vulnerable backend.
+        findings_off, _ = av.verify_active(url, [], scope="127.0.0.1", requests_budget=40)
+        self.assertNotIn("active.sqli-time", {f["rule_id"] for f in findings_off})
+        # And we only ever issued idempotent methods.
+        self.assertTrue(set(_VulnTimeHandler.seen_methods) <= {"GET", "HEAD", "OPTIONS"})
+
+
+class _BucketHandler(BaseHTTPRequestHandler):
+    """Stands in for an S3 bucket endpoint over a real socket. Class attrs set per
+    test: a public bucket returns an anonymous ListBucketResult; a locked one 403s."""
+    status = 200
+    body = b""
+    hits = 0
+
+    def do_GET(self) -> None:  # noqa: N802
+        type(self).hits += 1
+        body = type(self).body
+        self.send_response(type(self).status)
+        self.send_header("Content-Type", "application/xml")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_HEAD = do_GET
+
+    def log_message(self, *args: object) -> None:
+        return
+
+
+class OpenBucketE2ETests(unittest.TestCase):
+    """Real _Http.fetch over a socket. A getaddrinfo shim points the (regex-matched)
+    S3 hostname at the local server, so the FULL path runs — regex, scope gate,
+    _guard_url, real fetch, listing detection — without external egress."""
+
+    def setUp(self) -> None:
+        self._prev = os.environ.get("GREYIQ_SCAN_ALLOW_PRIVATE_URLS")
+        os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
+        self._orig_gai = socket.getaddrinfo
+        self.server = None
+
+    def tearDown(self) -> None:
+        socket.getaddrinfo = self._orig_gai
+        if self.server is not None:
+            self.server.shutdown()
+        if self._prev is None:
+            os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+        else:
+            os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = self._prev
+
+    def _serve(self, status: int, body: bytes) -> None:
+        _BucketHandler.status = status
+        _BucketHandler.body = body
+        _BucketHandler.hits = 0
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _BucketHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        port = self.server.server_port
+        orig = self._orig_gai
+        # Any host now resolves to the local listener (controls IP AND port via sockaddr).
+        socket.getaddrinfo = lambda host, p, *a, **k: orig("127.0.0.1", port, *a, **k)
+
+    def _http(self):
+        return av._Http(get_settings(), HostRateGovernor(capacity=20, min_interval_s=0.0), max_requests=12)
+
+    def test_confirms_public_listing_over_real_socket(self) -> None:
+        self._serve(200, (b'<?xml version="1.0" encoding="UTF-8"?>'
+                          b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+                          b'<Name>testbucket</Name><Contents><Key>secret/db-backup.sql</Key></Contents>'
+                          b'</ListBucketResult>'))
+        bucket = "http://testbucket.s3.amazonaws.com/"
+        landing = {"body": f'<a href="{bucket}logo.png">x</a>', "status": 200, "headers": {}}
+        f = av._check_open_bucket(self._http(), landing, "testbucket.s3.amazonaws.com", get_settings())
+        self.assertIsNotNone(f, "an anonymous public listing must confirm over a real fetch")
+        self.assertEqual(f["rule_id"], "active.open-bucket")
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertNotIn("db-backup.sql", str(f))  # object keys are never echoed
+
+    def test_locked_bucket_is_candidate_not_confirmed(self) -> None:
+        self._serve(403, b'<?xml version="1.0"?><Error><Code>AccessDenied</Code></Error>')
+        bucket = "http://locked-bucket.s3.amazonaws.com/"
+        landing = {"body": f'cfg {bucket}private', "status": 200, "headers": {}}
+        f = av._check_open_bucket(self._http(), landing, "locked-bucket.s3.amazonaws.com", get_settings())
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "candidate")  # no false "public" positive
+
+    def test_private_resolving_bucket_is_refused_when_private_urls_off(self) -> None:
+        # SSRF / DNS-rebind defense: with private URLs DISABLED, a public-looking S3 host
+        # that resolves (here, via the shim) to a private/loopback IP must be REFUSED by
+        # the guard — never fetched, never reported — even though it is named in scope.
+        os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "0"
+        self._serve(200, (b'<?xml version="1.0"?><ListBucketResult>'
+                          b'<Contents><Key>x</Key></Contents></ListBucketResult>'))
+        bucket = "http://evil-rebind.s3.amazonaws.com/"
+        landing = {"body": f'<img src="{bucket}p.png">', "status": 200, "headers": {}}
+        f = av._check_open_bucket(self._http(), landing, "evil-rebind.s3.amazonaws.com", get_settings())
+        self.assertIsNone(f, "a bucket host resolving to a private IP must be refused, not reported")
+        self.assertEqual(_BucketHandler.hits, 0, "the guard must block before any socket reaches the listener")
 
 
 if __name__ == "__main__":
