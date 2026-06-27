@@ -242,7 +242,7 @@ from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E4
 
 
 APP_NAME = "GreyIQ"
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 _CURRENT_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar("greyiq_current_scope", default=None)
 _CSP = (
     "default-src 'self'; "
@@ -458,6 +458,7 @@ class BountyScanRequest(BaseModel):
     scope: str = Field(default="", max_length=2000)
     authorized: bool = False
     run_live: bool = False
+    active: bool = False
     per_finding: bool = False
     max_files: int = Field(default=5000, ge=1, le=100_000)
 
@@ -997,6 +998,7 @@ class GreyIQRuntime:
             runtime_dir=RUNTIME_DIR,
             version=VERSION,
             run_live=request.run_live,
+            active=request.active,
             max_files=request.max_files,
             per_finding=request.per_finding,
         )

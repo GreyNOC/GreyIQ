@@ -16,6 +16,12 @@ Env vars:
   (default "80,443"). Ignored when private URLs are allowed.
 - GREYIQ_WEB_FETCH_TIMEOUT : per-request fetch timeout in seconds (default 8).
 - GREYIQ_WEB_FETCH_MAX_BYTES : max bytes read per fetch (default 3_000_000).
+- GREYIQ_ACTIVE_MAX_REQUESTS_PER_HOST : hard ceiling of active-verification requests
+  the per-host governor allows (default 20).
+- GREYIQ_ACTIVE_MIN_INTERVAL_MS : minimum delay between active requests to one host
+  (default 500 ms).
+- GREYIQ_ACTIVE_SCAN_ALLOWLIST : comma-separated host suffixes that count as in-scope
+  for ACTIVE verification even if not named in the hunt's scope text (default empty).
 """
 
 from __future__ import annotations
@@ -55,6 +61,11 @@ def _ports_env(name: str, default: frozenset[int]) -> frozenset[int]:
     return frozenset(ports) or default
 
 
+def _suffixes_env(name: str) -> tuple[str, ...]:
+    raw = os.getenv(name) or ""
+    return tuple(part.strip().lower().lstrip(".") for part in raw.split(",") if part.strip())
+
+
 @dataclass(frozen=True)
 class ScannerSettings:
     code_scan_base_path: str = ""
@@ -62,6 +73,9 @@ class ScannerSettings:
     web_allowed_ports: frozenset[int] = field(default_factory=lambda: _DEFAULT_PORTS)
     web_fetch_timeout_seconds: float = 8.0
     web_fetch_max_bytes: int = 3_000_000
+    active_max_requests_per_host: int = 20
+    active_min_interval_ms: int = 500
+    active_scan_allowlist: tuple[str, ...] = ()
 
 
 def get_settings() -> ScannerSettings:
@@ -71,4 +85,7 @@ def get_settings() -> ScannerSettings:
         web_allowed_ports=_ports_env("GREYIQ_WEB_ALLOWED_PORTS", _DEFAULT_PORTS),
         web_fetch_timeout_seconds=_float_env("GREYIQ_WEB_FETCH_TIMEOUT", 8.0),
         web_fetch_max_bytes=_int_env("GREYIQ_WEB_FETCH_MAX_BYTES", 3_000_000),
+        active_max_requests_per_host=_int_env("GREYIQ_ACTIVE_MAX_REQUESTS_PER_HOST", 20),
+        active_min_interval_ms=_int_env("GREYIQ_ACTIVE_MIN_INTERVAL_MS", 500),
+        active_scan_allowlist=_suffixes_env("GREYIQ_ACTIVE_SCAN_ALLOWLIST"),
     )

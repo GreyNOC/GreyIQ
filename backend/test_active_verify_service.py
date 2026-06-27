@@ -1,0 +1,250 @@
+"""Tests for the opt-in ACTIVE proof-capture verifier.
+
+Unit tests drive the per-check logic through a recording stub (no network);
+end-to-end tests run the real verifier (and a full bounty hunt) against a local
+HTTP server with GREYIQ_SCAN_ALLOW_PRIVATE_URLS=1 so 127.0.0.1 is reachable.
+Safety is asserted directly: only GET/HEAD/OPTIONS are ever issued, an
+out-of-scope host triggers zero requests, and 'confirmed' requires a control
+differential.
+"""
+from __future__ import annotations
+
+import os
+import sys
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+
+BACKEND_DIR = Path(__file__).resolve().parent
+REPO_ROOT = BACKEND_DIR.parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from bughunter import active_verify_service as av  # noqa: E402
+from bughunter.rate_limit import HostRateGovernor  # noqa: E402
+from bughunter.settings import get_settings  # noqa: E402
+
+
+class _Stub:
+    """Records methods and returns canned responses keyed off the crafted request."""
+
+    def __init__(self, *, cors_credentialed: bool = True, reflect_control_origin: bool = True) -> None:
+        self.methods: list[str] = []
+        self.cors_credentialed = cors_credentialed
+        self.reflect_control_origin = reflect_control_origin
+
+    def fetch(self, url: str, *, method: str = "GET", extra_headers=None) -> dict:
+        self.methods.append(method)
+        h = {k.lower(): v for k, v in (extra_headers or {}).items()}
+        headers: dict[str, str] = {}
+        status, location, body = 200, None, ""
+        origin = h.get("origin")
+        if origin == av._MARKER_ORIGIN:
+            headers["access-control-allow-origin"] = origin
+            if self.cors_credentialed:
+                headers["access-control-allow-credentials"] = "true"
+        elif origin and self.reflect_control_origin:
+            headers["access-control-allow-origin"] = origin
+        q = parse_qs(urlparse(url).query, keep_blank_values=True)
+        nxt = (q.get("next") or [""])[0]
+        if av._MARKER_HOST in nxt:
+            status, location = 302, av._MARKER_ORIGIN + "/"
+        reflected = " ".join(v for vals in q.values() for v in vals)
+        body = f"<html>echo {reflected}</html>"
+        if h.get("host") == av._MARKER_HOST:
+            location = f"http://{av._MARKER_HOST}/x"
+        return {"status": status, "headers": headers, "cookies": [], "body": body, "truncated": False, "final_url": url, "location": location}
+
+
+class ActiveCheckTests(unittest.TestCase):
+    URL = "https://app.example.com/?q=x&next=/home"
+
+    def test_cors_credentialed_reflection_confirms(self) -> None:
+        f = av._check_cors(_Stub(), self.URL)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertIn("Access-Control-Allow-Origin", f["proof_evidence"]["matched_value"])
+
+    def test_cors_without_credentials_is_candidate_not_confirmed(self) -> None:
+        f = av._check_cors(_Stub(cors_credentialed=False), self.URL)
+        self.assertEqual(f["_active_proof"]["status"], "candidate")
+
+    def test_reflected_xss_unescaped_confirms_with_control(self) -> None:
+        f = av._check_reflected_xss(_Stub(), self.URL)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertEqual(f["_active_class_hint"], "xss")
+
+    def test_open_redirect_confirms_and_is_not_followed(self) -> None:
+        f = av._check_open_redirect(_Stub(), self.URL)
+        self.assertEqual(f["rule_id"], "active.open-redirect")
+        self.assertIn(av._MARKER_HOST, f["proof_evidence"]["matched_value"])
+
+    def test_only_safe_methods_are_ever_issued(self) -> None:
+        stub = _Stub()
+        for check in (av._check_cors, av._check_open_redirect, av._check_reflected_xss, av._check_host_header):
+            check(stub, self.URL)
+        av._check_clickjacking(stub, self.URL, None)
+        self.assertTrue(set(stub.methods) <= {"GET", "HEAD", "OPTIONS"}, stub.methods)
+
+    def test_clickjacking_is_candidate_not_confirmed(self) -> None:
+        resp = {"status": 200, "headers": {}, "body": "", "cookies": [], "location": None}
+        f = av._check_clickjacking(_Stub(), self.URL, resp)
+        self.assertEqual(f["_active_proof"]["status"], "candidate")
+        self.assertTrue(f["_active_proof"]["proof_obligation"])  # tells the operator how to prove it
+
+    def test_xss_non_html_content_type_is_not_confirmed(self) -> None:
+        class JsonStub(_Stub):
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                r = super().fetch(url, method=method, extra_headers=extra_headers)
+                r["headers"]["content-type"] = "application/json"
+                return r
+        # A verbatim reflection into application/json is not browser-executable XSS.
+        self.assertIsNone(av._check_reflected_xss(JsonStub(), self.URL))
+
+    def test_sqli_does_not_confirm_on_non_sql_error(self) -> None:
+        class TracebackStub:  # the injected quote (%27) breaks a NON-SQL path
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                body = "Traceback (most recent call last): KeyError" if "%27" in url else "ok"
+                return {"status": 500, "headers": {}, "body": body, "cookies": [], "location": None}
+        self.assertIsNone(av._check_error_sqli(TracebackStub(), "https://app.example.com/?id=1"))
+
+    def test_sqli_confirms_on_real_sql_error(self) -> None:
+        class SqlStub:  # the injected quote (%27) produces a real DB error banner
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                body = "You have an error in your SQL syntax near" if "%27" in url else "ok"
+                return {"status": 500, "headers": {}, "body": body, "cookies": [], "location": None}
+        f = av._check_error_sqli(SqlStub(), "https://app.example.com/?id=1")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+
+
+class ScopeBindingTests(unittest.TestCase):
+    def test_named_host_in_scope(self) -> None:
+        s = get_settings()
+        self.assertTrue(av.host_in_active_scope("app.example.com", "program: *.example.com in scope", s))
+        self.assertTrue(av.host_in_active_scope("example.com", "example.com", s))
+
+    def test_unnamed_host_out_of_scope(self) -> None:
+        s = get_settings()
+        self.assertFalse(av.host_in_active_scope("evil.test", "example.com only", s))
+        self.assertFalse(av.host_in_active_scope("evil.test", "", s))
+
+    def test_substring_does_not_widen_scope(self) -> None:
+        s = get_settings()
+        # 'example.com' must NOT match a scope that only names 'notexample.com'.
+        self.assertFalse(av.host_in_active_scope("example.com", "in scope: notexample.com", s))
+        self.assertFalse(av.host_in_active_scope("evilexample.com", "example.com", s))
+        # Proper subdomain / wildcard matching still works.
+        self.assertTrue(av.host_in_active_scope("app.example.com", "*.example.com", s))
+        self.assertTrue(av.host_in_active_scope("example.com", "https://example.com/login in scope", s))
+
+    def test_out_of_scope_target_makes_zero_requests(self) -> None:
+        # No DNS, no network: scope is checked before the URL guard.
+        findings, meta = av.verify_active("https://evil.test/", [], scope="example.com")
+        self.assertEqual(findings, [])
+        self.assertFalse(meta["in_scope"])
+        self.assertIn("not named", meta["skipped_reason"])
+
+
+class _SiteHandler(BaseHTTPRequestHandler):
+    seen_methods: list[str] = []
+
+    def _respond(self, status: int, headers: dict, body: bytes) -> None:
+        self.send_response(status)
+        for key, value in headers.items():
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        _SiteHandler.seen_methods.append(self.command)
+        q = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+        headers = {"Content-Type": "text/html"}  # intentionally NO X-Frame-Options (clickjacking)
+        origin = self.headers.get("Origin")
+        if origin:
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Access-Control-Allow-Credentials"] = "true"
+        nxt = (q.get("next") or [""])[0]
+        if "greyiq-marker.example" in nxt:
+            self._respond(302, {"Location": nxt}, b"")
+            return
+        reflected = " ".join(v for vals in q.values() for v in vals)  # raw reflection (XSS)
+        self._respond(200, headers, f"<html>echo {reflected}</html>".encode())
+
+    do_HEAD = do_GET
+
+    def log_message(self, *args: object) -> None:
+        return
+
+
+class ActiveE2ETests(unittest.TestCase):
+    def setUp(self) -> None:
+        _SiteHandler.seen_methods = []
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _SiteHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.port = self.server.server_port
+        self._prev = os.environ.get("GREYIQ_SCAN_ALLOW_PRIVATE_URLS")
+        os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        if self._prev is None:
+            os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+        else:
+            os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = self._prev
+
+    def test_verify_active_confirms_classes_against_local_site(self) -> None:
+        url = f"http://127.0.0.1:{self.port}/?q=x&next=/home"
+        findings, meta = av.verify_active(url, [], scope="127.0.0.1")
+        self.assertTrue(meta["in_scope"])
+        status = {f["_active_class_hint"]: f["_active_proof"]["status"] for f in findings}
+        # CORS / reflected-XSS (html) / open-redirect have real control differentials -> confirmed.
+        self.assertEqual(status.get("cors"), "confirmed")
+        self.assertEqual(status.get("xss"), "confirmed")
+        self.assertEqual(status.get("redirect"), "confirmed")
+        # Clickjacking is header-only (no differential) -> honestly a candidate, not confirmed.
+        self.assertEqual(status.get("headers"), "candidate")
+        self.assertTrue(set(_SiteHandler.seen_methods) <= {"GET", "HEAD", "OPTIONS"})
+
+    def test_governor_exhaustion_returns_partial_not_raise(self) -> None:
+        url = f"http://127.0.0.1:{self.port}/?q=x&next=/home"
+        gov = HostRateGovernor(capacity=1, min_interval_s=0.0)
+        findings, meta = av.verify_active(url, [], scope="127.0.0.1", governor=gov)
+        self.assertTrue(meta["rate_limited"])
+
+    def test_bounty_hunt_active_renders_confirmed(self) -> None:
+        from bughunter.bounty import run_bounty_hunt
+        import tempfile
+        url = f"http://127.0.0.1:{self.port}/?q=x&next=/home"
+        with tempfile.TemporaryDirectory() as tmp:
+            res = run_bounty_hunt(
+                url, "web-app", None, tmp, "127.0.0.1", True, {},
+                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed", runtime_dir=None,
+                version="t", active=True,
+            )
+            self.assertTrue(res["ok"])
+            markdown = Path(res["report_path"]).read_text(encoding="utf-8")
+            self.assertIn("active.", markdown)            # an active finding is present
+            self.assertIn("Status:** Confirmed", markdown)  # rendered as confirmed proof
+            self.assertIn("Active verification", markdown)   # authorization note
+
+    def test_bounty_hunt_without_active_has_no_active_findings(self) -> None:
+        from bughunter.bounty import run_bounty_hunt
+        import tempfile
+        url = f"http://127.0.0.1:{self.port}/?q=x"
+        with tempfile.TemporaryDirectory() as tmp:
+            res = run_bounty_hunt(
+                url, "web-app", None, tmp, "127.0.0.1", True, {},
+                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed", runtime_dir=None,
+                version="t", active=False,
+            )
+            self.assertTrue(res["ok"])
+            self.assertNotIn("active.", Path(res["report_path"]).read_text(encoding="utf-8"))
+
+
+if __name__ == "__main__":
+    unittest.main()
