@@ -4281,12 +4281,15 @@ const ck = {
 
 const ckState = {
   result: null,          // last hunt/campaign response
+  runId: "",             // server run id — keys canonical submission packages
   findings: [],          // normalized finding rows
   surface: null,         // recon { urls, sources, notes }
   selectedRef: "",
   filter: "all",         // all | confirmed | critical | high | medium | low
   sort: { key: "rank", dir: 1 },
-  view: "findings"
+  view: "findings",
+  h1: null,              // { team_handle, api_username, has_token } — never the token
+  triage: {}             // ref -> "submitted" | "drafted" (client-side worklist marks)
 };
 
 const CK_SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
@@ -4604,14 +4607,22 @@ function ckRenderDetail(f) {
 
   // Actions.
   const actions = cel("div", "ck-actions");
-  const copyBtn = cel("button", "ck-btn primary", "Copy submission draft");
+  const copyBtn = cel("button", "ck-btn primary", "Copy submission report");
   copyBtn.type = "button";
   copyBtn.addEventListener("click", async () => {
-    const ok = await ckCopy(ckBuildSubmissionDraft(f));
-    copyBtn.textContent = ok ? "Copied ✓" : "Copy failed";
-    setTimeout(() => { copyBtn.textContent = "Copy submission draft"; }, 1600);
+    const pkg = await ckSubmissionMarkdown(f);
+    const ok = await ckCopy(pkg.text);
+    copyBtn.textContent = ok ? (pkg.canonical ? "Copied ✓" : "Copied (offline)") : "Copy failed";
+    setTimeout(() => { copyBtn.textContent = "Copy submission report"; }, 1600);
   });
   actions.append(copyBtn);
+  const dlBtn = cel("button", "ck-btn", "Download .md");
+  dlBtn.type = "button";
+  dlBtn.addEventListener("click", async () => {
+    const pkg = await ckSubmissionMarkdown(f);
+    ckDownloadText(`${f.ref}-${ckSlug(f.title)}.md`, pkg.text);
+  });
+  actions.append(dlBtn);
   host.append(actions);
 }
 
@@ -4658,6 +4669,78 @@ async function ckCopy(text) {
   }
 }
 
+// Fetch the CANONICAL server-built submission package (build_submission) for a
+// finding. Falls back to the client draft only when the server package is
+// unavailable (e.g. the run was evicted) so offline still works.
+async function ckSubmissionMarkdown(f) {
+  if (ckState.runId) {
+    try {
+      const res = await apiFetch("/api/bounty/submission", {
+        method: "POST", timeoutMs: 20000,
+        body: JSON.stringify({ run_id: ckState.runId, ref: f.ref, platform: "hackerone" })
+      });
+      if (res.ok && res.package && res.package.vulnerability_information) {
+        return { text: res.package.vulnerability_information, canonical: true, package: res.package };
+      }
+    } catch (_) { /* fall through to the offline draft */ }
+  }
+  return { text: ckBuildSubmissionDraft(f), canonical: false, package: null };
+}
+
+function ckSlug(s) { return String(s || "finding").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "finding"; }
+
+function ckDownloadText(filename, text) {
+  const blob = new Blob([text], { type: "text/markdown" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function ckFetchCreds() {
+  try {
+    const res = await apiFetch("/api/bounty/hackerone/creds", { timeoutMs: 6000 });
+    ckState.h1 = res && res.ok ? res : null;
+  } catch (_) { ckState.h1 = null; }
+  return ckState.h1;
+}
+
+function ckCanSubmit(f) {
+  return f.proof === "confirmed" && ckState.h1 && ckState.h1.has_token && ckState.h1.team_handle;
+}
+
+async function ckSubmitFinding(f, btn, statusEl) {
+  if (!ckCanSubmit(f)) return;
+  const handle = ckState.h1.team_handle;
+  if (!window.confirm(`File "${f.title}" to the HackerOne team "${handle}"?\n\nThis sends a real report to the live program. Only do this for an in-scope, authorized, CONFIRMED finding.`)) return;
+  btn.disabled = true;
+  btn.textContent = "Submitting…";
+  try {
+    const res = await apiFetch("/api/bounty/submit", {
+      method: "POST", timeoutMs: 60000,
+      body: JSON.stringify({ run_id: ckState.runId, ref: f.ref, confirm: true, platform: "hackerone" })
+    });
+    if (res.ok) {
+      ckState.triage[f.ref] = "submitted";
+      btn.replaceWith(ckReportLink(res.url, res.report_id));
+      if (statusEl) statusEl.textContent = "";
+    } else {
+      btn.disabled = false; btn.textContent = "Submit to HackerOne";
+      if (statusEl) { statusEl.textContent = res.error || "Submit refused."; statusEl.classList.add("is-error"); }
+    }
+  } catch (err) {
+    btn.disabled = false; btn.textContent = "Submit to HackerOne";
+    if (statusEl) { statusEl.textContent = err.message || "Submit failed."; statusEl.classList.add("is-error"); }
+  }
+}
+
+function ckReportLink(url, reportId) {
+  const link = cel("a", "ck-btn", url ? `Submitted ✓ (#${reportId || ""})` : "Submitted ✓");
+  if (url) { link.href = url; link.target = "_blank"; link.rel = "noopener noreferrer"; }
+  return link;
+}
+
 function ckRenderSurface() {
   const host = ck.views.surface;
   host.replaceChildren();
@@ -4681,31 +4764,120 @@ function ckRenderSurface() {
 function ckRenderSubmissions() {
   const host = ck.views.submissions;
   host.replaceChildren();
+  host.append(ckCredsBar());
+
   const ready = ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate");
+  host.append(cel("h2", "ck-section-title", `Submission queue — ${ready.length} reportable`));
   if (!ready.length) {
-    host.append(cel("p", "ck-hint", "Confirmed and candidate findings appear here as submission drafts. Run with “Test for proof of impact” to confirm leads first."));
+    host.append(cel("p", "ck-hint", "Confirmed and candidate findings land here as submission-ready packages. Run with “Test for proof of impact” to confirm leads — only a Confirmed finding can be filed to HackerOne."));
     return;
   }
-  host.append(cel("h2", "ck-section-title", `Submission queue — ${ready.length} draft(s)`));
+  // Confirmed-first, then candidate.
   ready.sort((a, b) => (a.proof === "confirmed" ? 0 : 1) - (b.proof === "confirmed" ? 0 : 1));
+
   const ul = cel("ul", "ck-list");
   for (const f of ready) {
     const li = cel("li");
+    li.style.flexWrap = "wrap";
+
     const left = cel("div");
+    left.style.flex = "1";
     left.append(cel("span", "ck-ftitle", f.title), document.createTextNode(" "));
     left.append(ckProofBadge(f.proof));
+    if (ckState.triage[f.ref] === "submitted") left.append(document.createTextNode(" "), cel("span", "ck-tag", "submitted"));
     li.append(left);
-    const btn = cel("button", "ck-btn", "Copy draft");
-    btn.type = "button";
-    btn.addEventListener("click", async () => {
-      const ok = await ckCopy(ckBuildSubmissionDraft(f));
-      btn.textContent = ok ? "Copied ✓" : "Failed";
-      setTimeout(() => { btn.textContent = "Copy draft"; }, 1500);
+
+    const acts = cel("div", "ck-actions");
+    acts.style.margin = "0";
+
+    const copyBtn = cel("button", "ck-btn", "Copy report");
+    copyBtn.type = "button";
+    copyBtn.addEventListener("click", async () => {
+      const pkg = await ckSubmissionMarkdown(f);
+      const ok = await ckCopy(pkg.text);
+      copyBtn.textContent = ok ? (pkg.canonical ? "Copied ✓" : "Copied (offline)") : "Failed";
+      setTimeout(() => { copyBtn.textContent = "Copy report"; }, 1600);
     });
-    li.append(btn);
+    acts.append(copyBtn);
+
+    const dlBtn = cel("button", "ck-btn", "Download .md");
+    dlBtn.type = "button";
+    dlBtn.addEventListener("click", async () => {
+      const pkg = await ckSubmissionMarkdown(f);
+      ckDownloadText(`${f.ref}-${ckSlug(f.title)}.md`, pkg.text);
+    });
+    acts.append(dlBtn);
+
+    const statusEl = cel("p", "ck-status");
+    statusEl.style.flexBasis = "100%";
+
+    if (ckState.triage[f.ref] === "submitted") {
+      acts.append(ckReportLink("", ""));
+    } else {
+      const submitBtn = cel("button", "ck-btn primary", "Submit to HackerOne");
+      submitBtn.type = "button";
+      const can = ckCanSubmit(f);
+      submitBtn.disabled = !can;
+      submitBtn.title = can ? "File this confirmed finding to your HackerOne program"
+        : (f.proof !== "confirmed" ? "Capture proof of impact first — only a Confirmed finding can be filed."
+          : "Add your HackerOne team handle + API token below.");
+      submitBtn.addEventListener("click", () => ckSubmitFinding(f, submitBtn, statusEl));
+      acts.append(submitBtn);
+    }
+
+    li.append(acts, statusEl);
     ul.append(li);
   }
   host.append(ul);
+}
+
+// HackerOne credentials bar — shows configured state and a save form. The token is
+// a password field, never read back from the server (only has_token is returned).
+function ckCredsBar() {
+  const wrap = cel("div", "ck-creds");
+  const h1 = ckState.h1;
+  const head = cel("div", "ck-creds-head");
+  head.append(cel("strong", null, "HackerOne API"));
+  const state = cel("span", "ck-tag", h1 && h1.has_token && h1.team_handle ? `connected · ${h1.team_handle}` : "not configured");
+  head.append(state);
+  wrap.append(head);
+
+  const form = cel("form", "ck-learn-form");
+  const handle = ckField("Team handle", "text", (h1 && h1.team_handle) || "");
+  const user = ckField("API username", "text", (h1 && h1.api_username) || "");
+  const token = ckField("API token", "password", "");
+  token.input.placeholder = h1 && h1.has_token ? "•••••• (saved — leave blank to keep)" : "paste API token";
+  form.append(handle.wrap, user.wrap, token.wrap);
+  const save = cel("button", "ck-btn primary", "Save");
+  save.type = "submit";
+  form.append(save);
+  const note = cel("p", "ck-status");
+  note.style.flexBasis = "100%";
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      const res = await apiFetch("/api/bounty/hackerone/creds", {
+        method: "POST",
+        body: JSON.stringify({ team_handle: handle.input.value.trim(), api_username: user.input.value.trim(), api_token: token.input.value })
+      });
+      ckState.h1 = res && res.ok ? res : ckState.h1;
+      note.classList.remove("is-error");
+      note.textContent = "Saved.";
+      ckRenderSubmissions();
+    } catch (err) { note.textContent = err.message || "Could not save."; note.classList.add("is-error"); }
+  });
+  form.append(note);
+  wrap.append(form);
+  return wrap;
+}
+
+function ckField(label, type, value) {
+  const w = cel("label");
+  w.append(cel("span", null, label));
+  const input = cel("input");
+  input.type = type; input.value = value || ""; input.autocomplete = "off";
+  w.append(input);
+  return { wrap: w, input };
 }
 
 async function ckRenderLearn() {
@@ -4836,6 +5008,8 @@ async function ckRun() {
     }
     if (res.ok === false) { ckStatus(res.error || "The run could not complete.", true); return; }
     ckState.result = res;
+    ckState.runId = res.run_id || "";
+    ckState.triage = {};
     ckState.findings = ckNormalizeFindings(res);
     ckState.surface = res.surface || (res.urls ? { urls: res.urls, sources: res.recon_sources, notes: res.recon_notes } : null);
     ckState.selectedRef = "";
@@ -4880,6 +5054,7 @@ function bootCockpit() {
   ckSetRunType(state.ckRunType || "hunt");
   ckSyncService();
   void ckPopulateProfiles();
+  void ckFetchCreds();
   ckRenderFindings();
 }
 

@@ -2,6 +2,38 @@
 
 Notable changes to GreyIQ.
 
+## v0.16.0
+
+### After-testing workflow — submit a report straight from the app
+The cockpit's Submissions tab is now a real worklist: after a run you can get the
+**canonical** server-built report per finding, export it, and file a confirmed
+finding to HackerOne — without leaving the app.
+
+- **Canonical packages, not client drafts.** A new `POST /api/bounty/submission`
+  rebuilds the exact `build_finding_markdown`/`build_submission` package the CLI and
+  campaign use (title, severity rating, CWE, CVSS, steps, proof, remediation), keyed
+  by a `run_id` the scan/campaign response now returns (bounded in-memory run cache —
+  no re-scan). The detail drawer and Submissions queue **Copy report** / **Download
+  .md** now use this canonical output, falling back to the offline draft only if the
+  run was evicted.
+- **File to HackerOne, hard-gated.** A new `POST /api/bounty/submit` calls the
+  existing `submit_to_hackerone`, which **refuses unless** an explicit confirm, a
+  **server-recomputed `proof_status == "confirmed"`**, and real credentials are all
+  present — a forged client request can't push a non-confirmed finding. The cockpit's
+  **Submit to HackerOne** button is disabled until a finding is Confirmed *and* creds
+  are configured (a UI mirror of the gate, never a replacement), and asks for an
+  explicit confirmation naming the team + finding before it fires.
+- **Credentials in the perms-restricted secrets store.** `GET/POST
+  /api/bounty/hackerone/creds` store the team handle + API username/token alongside
+  the provider keys (atomic, private file); the status endpoint returns only
+  `has_token` — the token is **never echoed** back to the browser.
+- A successful submit records the outcome to the learning store (`status: submitted`)
+  and marks the finding submitted in the queue, closing the run → submit → learn loop.
+
+New tests: canonical package build, the server-authoritative submit gate (refuses
+non-confirmed even with creds + confirm), creds round-trip (token never leaked), and
+the bounded run cache.
+
 ## v0.15.0
 
 ### Much faster startup — the portable opens in a fraction of the time
