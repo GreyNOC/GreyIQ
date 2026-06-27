@@ -205,6 +205,36 @@ class BountyReportTests(unittest.TestCase):
         src_plan = _deterministic_attack_plan({"location": "app.py", "rule_id": "py.os-system"}, "rce")
         self.assertFalse(any("curl" in step for step in src_plan["steps"]))
 
+    def test_report_polish_links_vrt_and_completeness(self) -> None:
+        from bughunter import impact_model
+        ctx = {
+            "tool": "GreyIQ BugHunter", "target": "https://example.test",
+            "profile": {"id": "web-app", "name": "Web application", "description": ""},
+            "findings": [{
+                "ref": "F1", "severity": "high", "confidence": "high", "category": "ssrf",
+                "class_id": "ssrf", "class_name": "Server-side request forgery (SSRF)",
+                "cwe": "CWE-918", "owasp": "A10:2021 SSRF", "vrt": impact_model.bugcrowd_vrt("ssrf"),
+                "title": "SSRF", "location": "https://example.test/fetch?url=", "rule_id": "active.ssrf",
+                "description": "The url parameter is fetched server-side.",
+                "proof_evidence": {"request_line": "GET https://example.test/fetch?url=...", "response_status": "HTTP 200"},
+                "references": impact_model.references_for_class("ssrf"),
+            }],
+            "attack_plans": {"F1": {"steps": ["a", "b"], "impact": "internal recon",
+                                    "proof_of_impact": {"status": "confirmed", "observed_result": "o", "control_result": "c", "evidence": "e"},
+                                    "remediation": "allowlist hosts"}},
+            "recommended_tools": [], "brain": {"used": False},
+        }
+        single = report_lib.build_finding_markdown(ctx, ctx["findings"][0])
+        self.assertIn("cwe.mitre.org/data/definitions/918.html", single)  # CWE deep link
+        self.assertIn("owasp.org/Top10/", single)                          # OWASP deep link
+        self.assertIn("Bugcrowd VRT", single)
+        self.assertIn("server_side_request_forgery_ssrf", single)
+        # build_json carries the per-finding completeness score (advisory).
+        json_doc = report_lib.build_json(ctx)
+        comp = json_doc["completeness"]["F1"]
+        self.assertEqual(comp["score"], comp["max"])  # fully documented
+        self.assertEqual(comp["missing"], [])
+
     def test_profiles_expose_expanded_focus_classes(self) -> None:
         payload = list_profiles()
         classes = {item["id"] for item in payload["classes"]}

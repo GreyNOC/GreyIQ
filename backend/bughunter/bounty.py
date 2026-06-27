@@ -796,6 +796,7 @@ def run_bounty_hunt(
                 # Authoritative references floor — only when the scanner rule didn't
                 # supply its own (no rule sets references today, so this always fills).
                 "references": finding.get("references") or impact_model.references_for_class(cid),
+                "vrt": impact_model.bugcrowd_vrt(cid),  # Bugcrowd VRT alongside the H1 rating
             }
         )
     rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}

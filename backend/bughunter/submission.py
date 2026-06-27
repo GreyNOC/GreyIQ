@@ -58,6 +58,7 @@ def build_submission(ctx: dict[str, Any], finding: dict[str, Any]) -> dict[str, 
         "severity_rating": severity_rating(finding, plan),
         "cwe": str(finding.get("cwe") or ""),
         "weakness": _cwe_number(finding),
+        "vrt": str(finding.get("vrt") or ""),  # Bugcrowd VRT category (est.), '' if unmapped
         "proof_status": str(proof.get("status") or "missing"),
         "vulnerability_information": body,
         "impact": impact,

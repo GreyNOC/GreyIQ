@@ -413,19 +413,74 @@ def _append_active_authorization(out: list[str], ctx: dict[str, Any]) -> None:
         out.append(f"- **Active verification:** skipped (passive only) — {reason}")
 
 
-def _finding_readiness(finding: dict[str, Any], plan: dict[str, Any]) -> list[str]:
+def _finding_check_results(finding: dict[str, Any], plan: dict[str, Any]) -> list[tuple[bool, str]]:
+    """The single source of truth for both the rendered submission-readiness checklist
+    and the machine-readable completeness score, so the two can never drift. This is a
+    DOCUMENTATION-completeness signal only — the request-line point below is evidence
+    bookkeeping and must NEVER feed proof['ready']/status (proof confirmation has its
+    own gate in _has_captured_artifact)."""
     steps = plan.get("steps") or []
     impact = plan.get("impact") or finding.get("impact")
     proof = _proof_of_impact_detail(finding, plan)
     remediation = finding.get("remediation") or plan.get("remediation")
+    pe = finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {}
     return [
-        _checkbox(bool(_location(finding)), "Precise affected location is captured."),
-        _checkbox(bool(finding.get("snippet") or finding.get("description")), "Evidence is present and safe to share."),
-        _checkbox(len(steps) >= 2, "Reproduction steps are specific enough to replay."),
-        _checkbox(bool(impact), "Impact is stated in bounty-review language."),
-        _checkbox(bool(proof["ready"]), "Confirmed proof of impact is captured as concrete evidence."),
-        _checkbox(bool(remediation), "A concrete fix recommendation is included."),
+        (bool(_location(finding)), "Precise affected location is captured."),
+        (bool(finding.get("snippet") or finding.get("description")), "Evidence is present and safe to share."),
+        (len(steps) >= 2, "Reproduction steps are specific enough to replay."),
+        (bool(impact), "Impact is stated in bounty-review language."),
+        (bool(proof["ready"]), "Confirmed proof of impact is captured as concrete evidence."),
+        (bool(remediation), "A concrete fix recommendation is included."),
+        (bool(pe.get("request_line")), "A captured request/PoC artifact is attached."),
+        (bool(str(proof.get("control_result") or "").strip()), "A negative control distinguishes it from baseline."),
     ]
+
+
+def _finding_readiness(finding: dict[str, Any], plan: dict[str, Any]) -> list[str]:
+    return [_checkbox(done, label) for done, label in _finding_check_results(finding, plan)]
+
+
+def finding_completeness(finding: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    """Evidence-completeness score for a finding — advisory only (never a submit
+    precondition). {score, max, missing[]} computed from the SAME predicate list as the
+    rendered readiness checklist."""
+    results = _finding_check_results(finding, plan)
+    return {
+        "score": sum(1 for done, _ in results if done),
+        "max": len(results),
+        "missing": [label for done, label in results if not done],
+    }
+
+
+_OWASP_TOP10_URLS = {
+    "A01:2021": "https://owasp.org/Top10/A01_2021-Broken_Access_Control/",
+    "A02:2021": "https://owasp.org/Top10/A02_2021-Cryptographic_Failures/",
+    "A03:2021": "https://owasp.org/Top10/A03_2021-Injection/",
+    "A04:2021": "https://owasp.org/Top10/A04_2021-Insecure_Design/",
+    "A05:2021": "https://owasp.org/Top10/A05_2021-Security_Misconfiguration/",
+    "A06:2021": "https://owasp.org/Top10/A06_2021-Vulnerable_and_Outdated_Components/",
+    "A07:2021": "https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures/",
+    "A08:2021": "https://owasp.org/Top10/A08_2021-Software_and_Data_Integrity_Failures/",
+    "A09:2021": "https://owasp.org/Top10/A09_2021-Security_Logging_and_Monitoring_Failures/",
+    "A10:2021": "https://owasp.org/Top10/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/",
+}
+
+
+def _linkify_cwe(text: str) -> str:
+    """Turn each 'CWE-<n>' token into a Markdown link to its MITRE page (handles the
+    compound 'CWE-639 / CWE-284' form). No-op if no token matches."""
+    return re.sub(r"CWE-(\d+)", lambda m: f"[CWE-{m.group(1)}](https://cwe.mitre.org/data/definitions/{m.group(1)}.html)", str(text or ""))
+
+
+def _linkify_owasp(text: str) -> str:
+    """Link an 'Axx:2021 ...' OWASP Top-10 token to its category page (or the Top-10
+    index for an unknown prefix). No-op if no token matches."""
+    s = str(text or "")
+    m = re.match(r"\s*(A\d\d:2021)", s)
+    if not m:
+        return s
+    url = _OWASP_TOP10_URLS.get(m.group(1), "https://owasp.org/Top10/")
+    return f"[{s.strip()}]({url})"
 
 
 def build_markdown(ctx: dict[str, Any]) -> str:
@@ -544,9 +599,11 @@ def build_markdown(ctx: dict[str, Any]) -> str:
         if finding.get("class_name"):
             out.append(f"- **Class:** {finding['class_name']}")
         if finding.get("cwe"):
-            out.append(f"- **CWE:** {finding['cwe']}")
+            out.append(f"- **CWE:** {_linkify_cwe(finding['cwe'])}")
         if finding.get("owasp"):
-            out.append(f"- **OWASP:** {finding['owasp']}")
+            out.append(f"- **OWASP:** {_linkify_owasp(finding['owasp'])}")
+        if finding.get("vrt"):
+            out.append(f"- **Bugcrowd VRT (est.):** {_code(str(finding['vrt']))}")
         _append_cvss(out, plan)
         out.append(f"- **Location:** {_code(_location(finding))}")
         out.append(f"- **Rule:** {_code(finding.get('rule_id', ''))}")
@@ -809,6 +866,13 @@ def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
             for finding in findings
             if finding.get("ref") and isinstance((attack_plans.get(finding.get("ref")) or {}).get("cvss"), dict)
         },
+        # Advisory evidence-completeness per finding (documentation signal only — never
+        # a submit precondition; the submit gate stays confirm + confirmed proof + creds).
+        "completeness": {
+            str(finding.get("ref") or ""): finding_completeness(finding, attack_plans.get(finding.get("ref")) or {})
+            for finding in findings
+            if finding.get("ref")
+        },
         "next_steps": ctx.get("next_steps", []),
         "coverage": ctx.get("coverage", {}),
         "manual_checklist": ctx.get("manual_checklist", []),
@@ -841,9 +905,11 @@ def build_finding_markdown(ctx: dict[str, Any], finding: dict[str, Any]) -> str:
     if finding.get("class_name"):
         out.append(f"| **Class** | {finding['class_name']} |")
     if finding.get("cwe"):
-        out.append(f"| **CWE** | {finding['cwe']} |")
+        out.append(f"| **CWE** | {_linkify_cwe(finding['cwe'])} |")
     if finding.get("owasp"):
-        out.append(f"| **OWASP** | {finding['owasp']} |")
+        out.append(f"| **OWASP** | {_linkify_owasp(finding['owasp'])} |")
+    if finding.get("vrt"):
+        out.append(f"| **Bugcrowd VRT (est.)** | {_code(str(finding['vrt']))} |")
     cvss = plan.get("cvss") if isinstance(plan, dict) else None
     if isinstance(cvss, dict) and cvss.get("vector"):
         score = cvss.get("base_score")
