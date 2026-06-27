@@ -22,6 +22,7 @@ from typing import Any
 
 import coder
 from bughunter import active_verify_service
+from bughunter import fsutil
 from bughunter import impact_model
 from bughunter import next_steps as next_steps_lib
 from bughunter import report as report_lib
@@ -905,8 +906,8 @@ def run_bounty_hunt(
     md_path = out_dir / f"{stem}.md"
     json_path = out_dir / f"{stem}.json"
     try:
-        md_path.write_text(markdown, encoding="utf-8")
-        json_path.write_text(json.dumps(json_doc, indent=2, default=str), encoding="utf-8")
+        fsutil.write_text_safe(md_path, markdown)
+        fsutil.write_text_safe(json_path, json.dumps(json_doc, indent=2, default=str))
     except OSError as exc:
         return {"ok": False, "error": f"Could not write the report: {exc}"}
 
@@ -923,7 +924,7 @@ def run_bounty_hunt(
             fstem = f"{stem}-{finding.get('ref', 'F')}-{_safe_slug(finding.get('title', ''), 'finding')}"
             fpath = out_dir / f"{fstem}.md"
             try:
-                fpath.write_text(markdown_finding, encoding="utf-8")
+                fsutil.write_text_safe(fpath, markdown_finding)
                 per_finding_paths.append(str(fpath))
             except OSError:
                 continue

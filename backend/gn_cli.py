@@ -36,8 +36,16 @@ if str(BACKEND_DIR) not in sys.path:
 
 from _version import VERSION  # noqa: E402
 
+# Windows consoles default to cp1252; degrade gracefully instead of crashing on
+# any non-encodable char in output or argparse help (e.g. an em-dash).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, ValueError, OSError):
+        pass
+
 # These are the CLI verbs run_frozen.py recognizes to dispatch here.
-CLI_COMMANDS = ("hunt", "scan", "profiles", "classes", "tools", "version", "gn")
+CLI_COMMANDS = ("hunt", "campaign", "scan", "learn", "stats", "profiles", "classes", "tools", "version", "gn")
 
 _SEV_COLOR = {"critical": "1;31", "high": "31", "medium": "33", "low": "36", "info": "2"}
 
@@ -137,6 +145,91 @@ def _print_hunt_summary(result: dict) -> None:
     print(f"Next: {_c('open the report', '2')} for guided next steps, proof obligations, and CVSS per finding.\n")
 
 
+def _cmd_campaign(args: argparse.Namespace) -> int:
+    from bughunter.campaign import run_campaign
+
+    if not args.authorize:
+        return _err("a campaign tests a live/owned target end-to-end — pass -y/--authorize to confirm scope.")
+    result = run_campaign(
+        args.target,
+        scope=args.scope or "",
+        authorized=True,
+        coder_cfg=_load_coder_config(args.brain),
+        default_reports_dir=RUNTIME_DIR / "reports",
+        seed_dir=SEED_DIR,
+        runtime_dir=RUNTIME_DIR,
+        version=VERSION,
+        active=args.active,
+        live=args.live,
+        program=args.program,
+        max_pages=args.max_pages,
+        on_progress=(lambda m: print(_c(f"  - {m}", "2"))) if not args.json else None,
+    )
+    if not result.get("ok"):
+        return _err(result.get("error", "the campaign could not run."))
+    if args.json:
+        result.pop("report_markdown", None)
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+    print(f"\n{_c('GreyIQ campaign', '1')} — {result.get('program', '')}")
+    print(f"Surface: {result.get('urls_scanned', 0)}/{result.get('urls_discovered', 0)} target(s)   "
+          f"Findings: {result.get('finding_count', 0)}   {_c(str(result.get('confirmed_count', 0)) + ' confirmed', '32')}")
+    subs = result.get("submission_paths") or []
+    print(f"Submission packages: {len(subs)}   Report: {result.get('campaign_path', '')}")
+    if result.get("confirmed_count"):
+        print(_c("Confirmed findings are submission-ready under submissions/. Record outcomes with `gn learn`.", "32"))
+    return 0
+
+
+def _cmd_learn(args: argparse.Namespace) -> int:
+    from bughunter import learning
+
+    try:
+        prog = learning.record_outcome(
+            RUNTIME_DIR, program=args.program, target=args.target or "", class_id=args.vuln_class,
+            title=args.title or "", status=args.status, bounty=args.bounty, severity=args.severity or "", notes=args.notes or "",
+        )
+    except ValueError as exc:
+        return _err(str(exc))
+    key = learning.program_key(args.program, args.target or "")
+    print(_c(f"Recorded: {args.vuln_class} -> {args.status}" + (f" (${args.bounty:g})" if args.bounty else "") + f"  [program: {key}]", "32"))
+    print(f"Program totals — submitted: {sum(s['submitted'] for s in prog['class_stats'].values())}, "
+          f"rewarded: {sum(s['rewarded'] for s in prog['class_stats'].values())}, "
+          f"bounty: ${sum(s['bounty_total'] for s in prog['class_stats'].values()):g}")
+    return 0
+
+
+def _cmd_stats(args: argparse.Namespace) -> int:
+    from bughunter import learning
+
+    data = learning.program_summary(RUNTIME_DIR, args.program, args.target or "")
+    if args.json:
+        print(json.dumps(data, indent=2, default=str))
+        return 0
+    if "programs" in data:  # all programs
+        progs = data["programs"]
+        if not progs:
+            print("No bounty outcomes recorded yet. After you submit, run `gn learn` to teach the engine.")
+            return 0
+        print(_c("Bounty learning — by program:", "1"))
+        for key, summary in sorted(progs.items(), key=lambda kv: -kv[1]["bounty_total"]):
+            print(f"  {_c(key, '36'):<28} submitted {summary['submitted']}, rewarded {summary['rewarded']}, ${summary['bounty_total']:g}")
+        print("\nRun `gn stats --program <key>` for the class breakdown.")
+        return 0
+    print(_c(f"Program: {data['program']}", "1"))
+    print(f"  submitted {data['submitted']}, rewarded {data['rewarded']}, bounty ${data['bounty_total']:g}")
+    if data.get("class_stats"):
+        print("  class breakdown (by bounty):")
+        for cls, s in data["class_stats"].items():
+            print(f"    {_c(cls, '36'):<26} sub {s['submitted']}, rewarded {s['rewarded']}, noise {s['noise']}, ${s['bounty_total']:g}")
+    intel = learning.program_intelligence(RUNTIME_DIR, args.program, args.target or "")
+    if intel:
+        print(_c("  what pays here:", "32"))
+        for note in intel:
+            print(f"    - {note}")
+    return 0
+
+
 def _cmd_scan(args: argparse.Namespace) -> int:
     from bughunter.chat_commands import _code_target_type, _looks_like_path, _looks_like_url
     from bughunter.scan_service import run_code_scan
@@ -231,6 +324,35 @@ def build_parser() -> argparse.ArgumentParser:
     hunt.add_argument("-y", "--authorize", action="store_true", help="confirm you are AUTHORIZED to test the target (required)")
     hunt.add_argument("--json", action="store_true", help="print the machine-readable result")
     hunt.set_defaults(func=_cmd_hunt)
+
+    camp = sub.add_parser("campaign", help="end-to-end: recon -> hunt every URL -> prove -> submission packages -> learn")
+    camp.add_argument("target", help="https:// URL (recon-crawled) or repo/folder path")
+    camp.add_argument("-s", "--scope", default="", help="program/scope notes (name the host to allow active checks)")
+    camp.add_argument("--program", default=None, help="program handle for the learning store (default: target domain)")
+    camp.add_argument("--active", action="store_true", help="capture proof of impact on each URL (recommended)")
+    camp.add_argument("--live", action="store_true", help="dynamic Playwright pass per URL")
+    camp.add_argument("--brain", action="store_true", help="use the configured LLM brain to enrich")
+    camp.add_argument("--max-pages", type=int, default=12, help="recon discovery cap (default 12)")
+    camp.add_argument("-y", "--authorize", action="store_true", help="confirm you are AUTHORIZED + in scope (required)")
+    camp.add_argument("--json", action="store_true")
+    camp.set_defaults(func=_cmd_campaign)
+
+    learn = sub.add_parser("learn", help="record a finding's bounty outcome (teaches the engine)")
+    learn.add_argument("-c", "--class", dest="vuln_class", required=True, help="vuln class id (see `gn classes`)")
+    learn.add_argument("--status", required=True, help="accepted | resolved | duplicate | informative | not-applicable | triaged | submitted | spam")
+    learn.add_argument("--program", default=None, help="program handle (default: derived from --target)")
+    learn.add_argument("--target", default="", help="target URL/host (used to derive the program if no handle)")
+    learn.add_argument("--bounty", type=float, default=0.0, help="bounty amount, if any")
+    learn.add_argument("--severity", default="", help="severity, e.g. high")
+    learn.add_argument("--title", default="", help="short finding title")
+    learn.add_argument("--notes", default="", help="free-text notes")
+    learn.set_defaults(func=_cmd_learn)
+
+    stats = sub.add_parser("stats", help="show what the engine has learned per program")
+    stats.add_argument("--program", default=None, help="a program handle (omit for all programs)")
+    stats.add_argument("--target", default="", help="a target URL/host (derives the program)")
+    stats.add_argument("--json", action="store_true")
+    stats.set_defaults(func=_cmd_stats)
 
     scan = sub.add_parser("scan", help="quick code/web scan with a triage summary")
     scan.add_argument("target", help="https:// URL or local path")

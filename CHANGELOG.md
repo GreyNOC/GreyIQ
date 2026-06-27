@@ -2,6 +2,49 @@
 
 Notable changes to GreyIQ.
 
+## v0.12.0
+
+### Added
+- **`gn campaign` — run the whole bounty end-to-end.** One command takes a target
+  through the full bounty: **recon** maps the surface (a bounded, same-origin,
+  depth/page-capped crawl plus passive recon of `robots.txt`, `sitemap.xml`, and
+  `/.well-known/security.txt`), then the engine **hunts every discovered URL**
+  (scan + optional `--active` proof of impact), **consolidates and ranks** the
+  findings (deduped across the surface; ranked by severity × learned program priors
+  × CVSS × confirmed-proof), and emits a **`CAMPAIGN.md` index plus a
+  submission-ready package per reportable finding** under `submissions/`. Gated on
+  `-y/--authorize`; `--active` captures proof, `--live` adds the dynamic Playwright
+  pass, `--max-pages` caps discovery. Works on both URL targets (recon-crawled) and
+  local repo/folder targets (single source-code hunt). Recon reuses the passive
+  scanner's SSRF/private-host/port guard on **every** fetch (input URL, each redirect
+  hop, and the final URL), is GET-only, same-origin-only, and rate-limited by the
+  shared per-host governor.
+- **Learn from the bounty.** A local, deterministic feedback loop: `gn learn -c
+  <class> --status <accepted|resolved|duplicate|informative|not-applicable|triaged|
+  submitted|spam> [--bounty N] [--program H | --target URL]` records a finding's
+  outcome, and `gn stats [--program H | --target URL]` shows what the engine has
+  learned per program. Outcomes build a per-program, per-class memory that sharpens
+  the **next** campaign — classes a program has paid out for get a priority boost,
+  classes that are consistently duplicate/N-A get a penalty — and the campaign report
+  surfaces this "program intelligence" so the operator focuses where the program
+  actually rewards. Pure JSON store under the runtime dir; no network, no ML.
+- **Submission packaging.** Every reportable finding is exported as a HackerOne-shaped
+  package (title, severity rating, CWE, impact, and the self-contained
+  `vulnerability_information` body). Pushing to the HackerOne API is a separate,
+  **hard-gated** action — it refuses unless given an explicit confirmation, a
+  **confirmed** proof status, and real credentials, and is the only path that touches
+  the network.
+
+### Fixed
+- **Windows long-path safety (`MAX_PATH`).** A deep install dir plus the campaign's
+  nested `campaign-…/targets/` layout could push a report path past Windows' 260-char
+  limit, surfacing as a misleading "file not found" on write (and a silently empty
+  read). All report/submission/campaign reads and writes now route through a
+  long-path-safe helper that transparently retries over the `\\?\` extended-length
+  prefix on Windows. New `bughunter/fsutil.py`.
+- The `gn` CLI now forces UTF-8 (with graceful fallback) on stdout/stderr so help text
+  and output never crash on a `cp1252` Windows console.
+
 ## v0.11.1
 
 _(The v0.11.0 release tag was consumed by GitHub's immutable-releases feature and
