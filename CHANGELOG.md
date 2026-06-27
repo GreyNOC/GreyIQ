@@ -2,6 +2,21 @@
 
 Notable changes to GreyIQ.
 
+## v0.20.0
+
+### Report polish — land more reports
+- **Clickable CWE / OWASP references.** Every `CWE-<n>` becomes a link to its MITRE
+  page (compound `CWE-639 / CWE-284` handled) and each `Axx:2021` OWASP token links to
+  its Top-10 category page, in both the per-finding report and the main report.
+- **Bugcrowd VRT alongside the HackerOne rating.** Each finding carries an estimated
+  Bugcrowd VRT category (`impact_model.bugcrowd_vrt`), rendered in the report header
+  and included in the submission package — so a report speaks both platforms' language.
+- **Evidence-completeness score.** The submission-readiness checklist and a new
+  machine-readable `completeness` map ({score, max, missing}) now share one predicate
+  list (they can't drift), with two added evidence-grade checks (a captured request/PoC
+  artifact, a negative control). It's **advisory only** — never a submit precondition;
+  the submit gate stays confirm + confirmed proof + creds.
+
 ## v0.19.0
 
 ### The autonomous operator — run the whole bounty loop unattended

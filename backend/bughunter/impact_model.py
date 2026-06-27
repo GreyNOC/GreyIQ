@@ -339,6 +339,37 @@ def references_for_class(class_id: str) -> list[str]:
     """2-3 authoritative https:// references for the class (always non-empty)."""
     return list(_REFERENCES.get(str(class_id or ""), _GENERIC_REFERENCES))
 
+
+# --- Bugcrowd VRT (Vulnerability Rating Taxonomy) category, alongside the HackerOne
+# severity rating, so a report carries both platforms' language. Estimated — '' for a
+# class with no clean VRT mapping (the report only renders the row when non-empty).
+_BUGCROWD_VRT: dict[str, str] = {
+    "rce": "server_security_misconfiguration.remote_code_execution_rce",
+    "xss": "cross_site_scripting_xss.stored",
+    "sqli": "server_side_injection.sql_injection",
+    "ssrf": "server_side_injection.server_side_request_forgery_ssrf",
+    "ssti": "server_side_injection.server_side_template_injection_ssti",
+    "xxe": "server_side_injection.xml_external_entity_injection_xxe",
+    "access-control": "broken_access_control_bac.insecure_direct_object_reference_idor",
+    "auth": "broken_authentication_and_session_management",
+    "csrf": "broken_authentication_and_session_management.cross_site_request_forgery_csrf",
+    "redirect": "unvalidated_redirects_and_forwards.open_redirect",
+    "cors": "server_security_misconfiguration.cors_misconfiguration",
+    "secrets": "sensitive_data_exposure.disclosure_of_secrets",
+    "jwt": "broken_authentication_and_session_management.authentication_bypass",
+    "file-upload": "unrestricted_file_upload",
+    "graphql": "server_security_misconfiguration.misconfigured_dns",
+    "deserialization": "server_side_injection.remote_code_execution_rce",
+    "nosqli": "server_side_injection.nosql_injection",
+    "headers": "server_security_misconfiguration.security_headers",
+    "disclosure": "sensitive_data_exposure.disclosure_of_known_vulnerabilities",
+}
+
+
+def bugcrowd_vrt(class_id: str) -> str:
+    """The Bugcrowd VRT category for a class, or '' if there is no clean mapping."""
+    return _BUGCROWD_VRT.get(str(class_id or ""), "")
+
 # --- CVSS v3.1 base-score metric weights (spec section 7.4). ---
 _AV = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}
 _AC = {"L": 0.77, "H": 0.44}
