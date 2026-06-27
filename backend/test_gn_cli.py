@@ -1,0 +1,76 @@
+"""Tests for the `gn` bug-bounty CLI."""
+from __future__ import annotations
+
+import contextlib
+import io
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+BACKEND_DIR = Path(__file__).resolve().parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+import gn_cli  # noqa: E402
+
+
+def _run(argv: list[str]) -> tuple[int, str, str]:
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = gn_cli.main(argv)
+    return code, out.getvalue(), err.getvalue()
+
+
+class GnCliTests(unittest.TestCase):
+    def test_version_and_help(self) -> None:
+        code, out, _ = _run(["version"])
+        self.assertEqual(code, 0)
+        self.assertIn(gn_cli.VERSION, out)
+        # No args prints help, exit 0.
+        self.assertEqual(_run([])[0], 0)
+
+    def test_profiles_classes_tools(self) -> None:
+        self.assertEqual(_run(["profiles"])[0], 0)
+        code, out, _ = _run(["classes"])
+        self.assertEqual(code, 0)
+        self.assertIn("ssti", out)
+        code, out, _ = _run(["tools", "xss"])
+        self.assertEqual(code, 0)
+        self.assertEqual(_run(["tools", "no-such-class"])[0], 2)  # nothing mapped -> error
+
+    def test_hunt_requires_authorization(self) -> None:
+        code, _, err = _run(["hunt", str(BACKEND_DIR / "bughunter"), "-p", "source-code"])
+        self.assertEqual(code, 2)
+        self.assertIn("authorize", err.lower())
+
+    def test_hunt_runs_deterministically_and_writes_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "src"
+            target.mkdir()
+            (target / "leak.py").write_text("AWS_KEY = 'AKIA" + "A" * 16 + "'\n", encoding="utf-8")
+            out_dir = Path(tmp) / "reports"
+            code, out, _ = _run(["hunt", str(target), "-p", "source-code", "-y", "-o", str(out_dir)])
+            self.assertEqual(code, 0)
+            self.assertIn("GreyIQ hunt", out)
+            self.assertTrue(list(out_dir.glob("*.md")), "a markdown report should be written")
+
+    def test_hunt_json_output(self) -> None:
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, _ = _run(["hunt", str(BACKEND_DIR / "bughunter" / "settings.py"), "-p", "source-code", "-y", "-o", tmp, "--json"])
+            # settings.py is a file; the code profile accepts a path. Result is JSON.
+            self.assertEqual(code, 0)
+            doc = json.loads(out)
+            self.assertIn("risk", doc)
+            self.assertNotIn("report_markdown", doc)  # trimmed from JSON (it's in the file)
+
+    def test_cli_commands_match_dispatch_list(self) -> None:
+        # run_frozen dispatches on these verbs; keep them aligned with the parser.
+        for verb in ("hunt", "scan", "profiles", "classes", "tools", "version"):
+            self.assertIn(verb, gn_cli.CLI_COMMANDS)
+
+
+if __name__ == "__main__":
+    unittest.main()
