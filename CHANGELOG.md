@@ -2,7 +2,10 @@
 
 Notable changes to GreyIQ.
 
-## v0.11.0
+## v0.11.1
+
+_(Re-tag of the v0.11.0 work — the v0.11.0 release tag was consumed by GitHub's
+immutable-releases feature and could not carry the binaries; no code difference.)_
 
 ### Added
 - **Active verification — prove findings, don't just flag them.** A new opt-in layer
