@@ -2,6 +2,22 @@
 
 Notable changes to GreyIQ.
 
+## v0.22.0
+
+### Headless operator — run the loop with no GUI (`gn operator`)
+The autonomous operator is now drivable from the terminal, so it can run on a server,
+a VPS, or a phone:
+- `gn operator add --name acme --scope "*.acme.com" --targets https://acme.com [--active] [--auto-submit --handle <team>]`
+- `gn operator list` / `remove <id>` / `pipeline` (the money funnel)
+- `gn operator run -y [--once] [--allow-submit]` — runs the unattended loop (continuous
+  with a live event stream + Ctrl-C kill switch, or `--once` for a single pass).
+
+It builds the loop's callables directly over the torch-free engine, so the submit path
+goes through the **same** hard-gated `submit_to_hackerone` (confirm + server-recomputed
+`proof_status=='confirmed'` + the creds the desktop app stored). `run` requires an
+explicit `-y/--authorize`; auto-submission stays off unless `--allow-submit` is passed
+**and** the program opted in **and** has a HackerOne handle.
+
 ## v0.21.0
 
 ### Surface expansion — find far more, still in scope

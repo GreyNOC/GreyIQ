@@ -45,7 +45,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 # These are the CLI verbs run_frozen.py recognizes to dispatch here.
-CLI_COMMANDS = ("hunt", "campaign", "scan", "learn", "stats", "profiles", "classes", "tools", "version", "gn")
+CLI_COMMANDS = ("hunt", "campaign", "scan", "learn", "stats", "operator", "profiles", "classes", "tools", "version", "gn")
 
 _SEV_COLOR = {"critical": "1;31", "high": "31", "medium": "33", "low": "36", "info": "2"}
 
@@ -230,6 +230,144 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _operator_callables(coder_cfg: dict):
+    """Build the operator's run_campaign_fn + submit_fn directly over the torch-free
+    bughunter engine (no API). The submit path goes through the SAME hard-gated
+    submission.submit_to_hackerone (confirm + proof_status=='confirmed' + creds)."""
+    from datetime import UTC, datetime
+
+    from bughunter import campaign as campaign_mod
+    from bughunter import submission as submission_mod
+
+    last: dict = {}
+
+    def run_campaign_fn(target, *, scope, program, active, live, max_pages):
+        result = campaign_mod.run_campaign(
+            target, scope=scope, authorized=True, coder_cfg=coder_cfg,
+            default_reports_dir=RUNTIME_DIR / "reports", seed_dir=SEED_DIR, runtime_dir=RUNTIME_DIR,
+            version=VERSION, active=active, live=live, program=program, max_pages=max_pages,
+        )
+        last["result"], last["target"], last["scope"] = result, target, scope
+        return result
+
+    def submit_fn(_run_id, ref):
+        result = last.get("result") or {}
+        finding = next((f for f in (result.get("findings") or []) if f.get("ref") == ref), None)
+        if finding is None:
+            return {"ok": False, "error": "finding not found in the last run"}
+        ctx = {
+            "tool": "GreyIQ BugHunter", "version": VERSION,
+            "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
+            "target": last.get("target", ""), "scope": last.get("scope", ""),
+            "attack_plans": result.get("attack_plans") or {},
+        }
+        package = submission_mod.build_submission(ctx, finding)
+        if package is None:
+            return {"ok": False, "error": "finding is not reportable"}
+        handle, username, token = _hackerone_creds()
+        try:
+            return {"ok": True, **submission_mod.submit_to_hackerone(
+                package, team_handle=handle, api_username=username, api_token=token, confirm=True)}
+        except submission_mod.SubmissionError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    return run_campaign_fn, submit_fn
+
+
+def _hackerone_creds() -> tuple[str, str, str]:
+    """Read the HackerOne creds the desktop app stored in the shared secrets file."""
+    try:
+        secrets = json.loads((RUNTIME_DIR / "secrets.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        secrets = {}
+    if not isinstance(secrets, dict):
+        secrets = {}
+    return (str(secrets.get("hackerone.team_handle", "")), str(secrets.get("hackerone.api_username", "")),
+            str(secrets.get("hackerone.api_token", "")))
+
+
+def _cmd_operator(args: argparse.Namespace) -> int:
+    from bughunter import operator as operator_mod
+    from bughunter import portfolio
+
+    rt = str(RUNTIME_DIR)
+    action = getattr(args, "op_action", None)
+
+    if action == "list" or action is None:
+        progs = portfolio.list_programs(rt)
+        if not progs:
+            print("No programs yet. Add one: gn operator add --name acme --scope '*.acme.com' --targets https://acme.com")
+            return 0
+        print(_c(f"Portfolio ({len(progs)} program(s)):", "1"))
+        for p in progs:
+            flags = " ".join(f for f, on in (("active", p["active"]), ("live", p["live"]), ("auto-submit", p["auto_submit"]),
+                                             ("enabled", p["enabled"])) if on) or "disabled"
+            print(f"  {_c(p['id'], '36'):<24} {p['name']}  [{flags}]  scope: {p['scope_text'] or '(none)'}  "
+                  f"targets: {len(p['seed_targets'])}  every {p['interval_minutes']}m")
+        return 0
+
+    if action == "add":
+        prog = portfolio.upsert_program(rt, {
+            "name": args.name, "scope_text": args.scope, "seed_targets": args.targets or [],
+            "platform": "hackerone" if args.handle else "manual", "platform_handle": args.handle or "",
+            "active": args.active, "live": args.live, "auto_submit": args.auto_submit,
+            "interval_minutes": args.interval, "max_submits_per_day": args.max_submits, "max_pages": args.max_pages,
+        })
+        warn = "" if (not args.auto_submit or prog["auto_submit"]) else _c("  (auto-submit ignored — needs a HackerOne handle + non-empty scope)", "33")
+        print(_c(f"Saved program: {prog['id']}", "32") + warn)
+        return 0
+
+    if action == "remove":
+        ok = portfolio.remove_program(rt, args.id)
+        return 0 if ok else _err(f"no such program: {args.id}")
+
+    if action == "pipeline":
+        from bughunter import ledger
+        f = ledger.funnel(rt).get("portfolio", {})
+        st = f.get("stages", {})
+        print(_c("Money pipeline (portfolio):", "1"))
+        print(f"  discovered {st.get('discovered',0)}  confirmed {st.get('confirmed',0)}  reported {st.get('reported',0)}  "
+              f"submitted {st.get('submitted',0)}  paid {st.get('paid',0)}   {_c('$'+str(f.get('bounty_total',0)),'32')}")
+        return 0
+
+    if action == "run":
+        if not args.authorize:
+            return _err("the operator runs live campaigns — pass -y/--authorize to confirm you're authorized on every enabled program.")
+        run_campaign_fn, submit_fn = _operator_callables(_load_coder_config(args.brain))
+        loop = operator_mod.OperatorLoop(rt, run_campaign_fn=run_campaign_fn, submit_fn=submit_fn)
+        if args.allow_submit:
+            print(_c("AUTO-SUBMIT ARMED — confirmed, non-duplicate findings will be filed (per-program opt-in + daily cap apply).", "1;31"))
+        if args.once:
+            progs = [p for p in portfolio.list_programs(rt) if p.get("enabled")]
+            if not progs:
+                return _err("no enabled programs to run.")
+            for p in progs:
+                print(_c(f"· cycle: {p['id']}", "2"))
+                submit = submit_fn if (args.allow_submit and p.get("auto_submit")) else None
+                summary = operator_mod.run_program_cycle(rt, p, run_campaign_fn=run_campaign_fn, submit_fn=submit,
+                                                         on_event=lambda m: print(_c(f"    {m}", "2")))
+                print(f"  {p['id']}: {summary['findings']} findings, {summary['confirmed']} confirmed, {summary['submitted']} submitted")
+            return 0
+        # Continuous: run the loop, stream events, Ctrl+C to stop.
+        loop.start(allow_submit=args.allow_submit)
+        print(_c("Operator running — Ctrl+C to stop.", "1"))
+        seen = 0
+        try:
+            import time
+            while loop.running:
+                tail = loop.event_tail(after=seen)
+                for ev in tail["events"]:
+                    print(f"  {_c(ev['at'][11:19], '2')}  {ev['message']}")
+                seen = tail["count"]
+                time.sleep(2)
+        except KeyboardInterrupt:
+            loop.stop()
+            print(_c("\nKill switch — stopping…", "33"))
+        return 0
+
+    return _err(f"unknown operator action: {action}")
+
+
 def _cmd_scan(args: argparse.Namespace) -> int:
     from bughunter.chat_commands import _code_target_type, _looks_like_path, _looks_like_url
     from bughunter.scan_service import run_code_scan
@@ -353,6 +491,34 @@ def build_parser() -> argparse.ArgumentParser:
     stats.add_argument("--target", default="", help="a target URL/host (derives the program)")
     stats.add_argument("--json", action="store_true")
     stats.set_defaults(func=_cmd_stats)
+
+    op = sub.add_parser("operator", help="autonomous operator — run a portfolio of programs unattended")
+    op.set_defaults(func=_cmd_operator, op_action=None)
+    opsub = op.add_subparsers(dest="op_action", metavar="<action>")
+    opsub.add_parser("list", help="list portfolio programs").set_defaults(func=_cmd_operator)
+    opa = opsub.add_parser("add", help="add or update a program")
+    opa.add_argument("--name", required=True)
+    opa.add_argument("--scope", required=True, help="scope hosts/wildcards (the fail-closed active gate)")
+    opa.add_argument("--targets", nargs="+", default=[], help="seed target URLs (each in scope)")
+    opa.add_argument("--handle", default="", help="HackerOne team handle (required to auto-submit)")
+    opa.add_argument("--interval", type=int, default=1440, help="re-run cadence in minutes (default 1440)")
+    opa.add_argument("--max-submits", dest="max_submits", type=int, default=3, help="max auto-submits/day (default 3)")
+    opa.add_argument("--max-pages", dest="max_pages", type=int, default=12)
+    opa.add_argument("--active", action="store_true", help="capture proof of impact")
+    opa.add_argument("--live", action="store_true", help="dynamic Playwright pass")
+    opa.add_argument("--auto-submit", dest="auto_submit", action="store_true", help="opt this program into auto-submission")
+    opa.set_defaults(func=_cmd_operator)
+    opr = opsub.add_parser("remove", help="remove a program")
+    opr.add_argument("id")
+    opr.set_defaults(func=_cmd_operator)
+    oprun = opsub.add_parser("run", help="run the operator loop")
+    oprun.add_argument("--once", action="store_true", help="run each due program one cycle, then exit")
+    oprun.add_argument("--allow-submit", dest="allow_submit", action="store_true", help="ARM auto-submission (per-program opt-in still applies)")
+    oprun.add_argument("--brain", action="store_true", help="use the configured LLM brain to enrich")
+    oprun.add_argument("-y", "--authorize", action="store_true", help="confirm you're AUTHORIZED on every enabled program (required)")
+    oprun.set_defaults(func=_cmd_operator)
+    opp = opsub.add_parser("pipeline", help="show the money pipeline funnel")
+    opp.set_defaults(func=_cmd_operator)
 
     scan = sub.add_parser("scan", help="quick code/web scan with a triage summary")
     scan.add_argument("target", help="https:// URL or local path")
