@@ -2,6 +2,39 @@
 
 Notable changes to GreyIQ.
 
+## v0.17.0
+
+### Find more — five declared-but-empty vuln classes now detect
+Static sink rule packs take five bounty classes that previously found *nothing*
+(only a manual checklist) to real findings, each classified accurately with CWE/OWASP:
+- **Open redirect** (`open_redirect` → `redirect`): Flask/Django/Express redirect to a
+  request value, and DOM-based `location` from a URL param.
+- **SSTI source** (`ssti`): Jinja2 `render_template_string` built from input,
+  `Template(var)`, Handlebars/EJS/Pug compiled from a variable — complements the
+  active `{{7*7}}` confirmation.
+- **XXE** (`xxe`): lxml/stdlib/PHP/Java XML parsers without entity/DTD hardening
+  (suppressed when a hardened-parser token is on the line).
+- **Weak JWT** (`jwt`): `alg:none`, signature verification disabled, short hardcoded
+  HMAC secret.
+- **Insecure deserialization** (`deserialization` → `rce`): PHP `unserialize($_GET)`,
+  Ruby `Marshal.load`, Java `ObjectInputStream.readObject` (Python pickle/yaml/marshal
+  were already covered by the eval/exec pack).
+
+All sink-only, HIGH severity with honest LOW/MEDIUM confidence, pure-regex and
+frozen-safe; safe forms (parameterized, hardened-parser, constant target) don't match.
+
+### Report — every finding is submission-grade
+- **Remediation + references floor.** Every vuln class now carries a concrete,
+  verifiable fix sentence and 2–3 authoritative links (OWASP cheat sheet + CWE +
+  PortSwigger). A fully offline run now renders a **Remediation** and a **References**
+  section on every finding (previously present only on some scanner rules / when the
+  brain was configured), and the submission-readiness "concrete fix" checkbox now
+  passes. New `impact_model.remediation_for_class` / `references_for_class`.
+
+New tests: the five sink packs (positive + negative-control per pack, no rule_id
+collisions, accurate classification) and the remediation/references coverage +
+offline-report rendering.
+
 ## v0.16.0
 
 ### After-testing workflow — submit a report straight from the app

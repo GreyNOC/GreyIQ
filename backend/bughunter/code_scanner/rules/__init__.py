@@ -18,6 +18,11 @@ from bughunter.code_scanner.rules.network import RULES as NETWORK_RULES
 from bughunter.code_scanner.rules.secrets import RULES as SECRET_RULES
 from bughunter.code_scanner.rules.sqli import RULES as SQLI_RULES
 from bughunter.code_scanner.rules.ssrf import RULES as SSRF_RULES
+from bughunter.code_scanner.rules.deserialize import RULES as DESERIALIZE_RULES
+from bughunter.code_scanner.rules.open_redirect import RULES as REDIRECT_RULES
+from bughunter.code_scanner.rules.ssti_source import RULES as SSTI_SOURCE_RULES
+from bughunter.code_scanner.rules.xxe import RULES as XXE_RULES
+from bughunter.code_scanner.rules.jwt_weak import RULES as JWT_WEAK_RULES
 
 ALL_RULES: tuple[Rule, ...] = (
     *SECRET_RULES,
@@ -30,6 +35,11 @@ ALL_RULES: tuple[Rule, ...] = (
     *DEP_RULES,
     *SQLI_RULES,
     *SSRF_RULES,
+    *DESERIALIZE_RULES,
+    *REDIRECT_RULES,
+    *SSTI_SOURCE_RULES,
+    *XXE_RULES,
+    *JWT_WEAK_RULES,
 )
 
 
