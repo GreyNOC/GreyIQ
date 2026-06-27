@@ -193,6 +193,7 @@ const els = {
   bountyOutputBrowse: document.querySelector("#bountyOutputBrowse"),
   bountyAuthorized: document.querySelector("#bountyAuthorized"),
   bountyPerFinding: document.querySelector("#bountyPerFinding"),
+  bountyActive: document.querySelector("#bountyActive"),
   bountyRun: document.querySelector("#bountyRun"),
   bountyStatus: document.querySelector("#bountyStatus"),
   bountyNextSteps: document.querySelector("#bountyNextSteps"),
@@ -407,6 +408,7 @@ function loadState() {
     bountyScope: "",
     bountyOutput: "",
     bountyPerFinding: false,
+    bountyActive: false,
     redteamBehavioral: false,
     panelMode: "brain"
   };
@@ -3752,6 +3754,7 @@ async function loadBountyProfiles() {
   if (els.bountyScope) els.bountyScope.value = state.bountyScope || "";
   if (els.bountyOutput) els.bountyOutput.value = state.bountyOutput || "";
   if (els.bountyPerFinding) els.bountyPerFinding.checked = Boolean(state.bountyPerFinding);
+  if (els.bountyActive) els.bountyActive.checked = Boolean(state.bountyActive);
   updateBountyHint();
 }
 
@@ -3805,6 +3808,7 @@ els.bountyForm?.addEventListener("submit", async (event) => {
   state.bountyScope = (els.bountyScope?.value || "").trim();
   state.bountyOutput = (els.bountyOutput?.value || "").trim();
   state.bountyPerFinding = Boolean(els.bountyPerFinding?.checked);
+  state.bountyActive = Boolean(els.bountyActive?.checked);
   saveState();
   els.bountyRun.disabled = true;
   els.bountyStatus.textContent = "Hunting… running scanners and writing the report (this can take a minute).";
@@ -3825,7 +3829,8 @@ els.bountyForm?.addEventListener("submit", async (event) => {
         scope: state.bountyScope,
         output_dir: state.bountyOutput || null,
         authorized: true,
-        per_finding: state.bountyPerFinding
+        per_finding: state.bountyPerFinding,
+        active: state.bountyActive
       })
     });
     if (res.ok === false) {
@@ -3840,8 +3845,14 @@ els.bountyForm?.addEventListener("submit", async (event) => {
       const perFiles = Array.isArray(res.per_finding_paths) && res.per_finding_paths.length
         ? ` + ${res.per_finding_paths.length} per-finding file(s)`
         : "";
+      const verified = Array.isArray(res.active_verified_classes) ? res.active_verified_classes : [];
+      const activeNote = verified.length
+        ? ` · ✓ actively confirmed: ${verified.join(", ")}`
+        : (state.bountyActive && res.active_authorization && res.active_authorization.in_scope === false
+          ? " · active verification skipped (host not in scope)"
+          : "");
       els.bountyStatus.textContent =
-        `${warn}Done — risk ${String(res.risk).toUpperCase()}, ${res.finding_count} finding(s) [${sev}]${brain}. Report saved to: ${res.report_path}${perFiles}`;
+        `${warn}Done — risk ${String(res.risk).toUpperCase()}, ${res.finding_count} finding(s) [${sev}]${brain}${activeNote}. Report saved to: ${res.report_path}${perFiles}`;
       lastBountyReportMarkdown = res.report_markdown || "";
       renderBountyNextSteps(res.next_steps, res.coverage);
       if (els.bountyReport && lastBountyReportMarkdown) {

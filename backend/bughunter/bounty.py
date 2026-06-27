@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import coder
+from bughunter import active_verify_service
 from bughunter import impact_model
 from bughunter import next_steps as next_steps_lib
 from bughunter import report as report_lib
@@ -690,6 +691,7 @@ def run_bounty_hunt(
     runtime_dir: Path | None = None,
     version: str = "",
     run_live: bool = False,
+    active: bool = False,
     max_files: int = 5000,
     per_finding: bool = False,
 ) -> dict[str, Any]:
@@ -734,14 +736,38 @@ def run_bounty_hunt(
     if scan_errors and not scan_succeeded:
         return {"ok": False, "error": "Scan could not run — " + "; ".join(scan_errors), "scan_errors": scan_errors}
 
+    # Opt-in ACTIVE verification: double-gated (active + authorized + url), scope-bound,
+    # rate-limited. It DISCOVERS and PROVES a provable subset (XSS/CORS/redirect/
+    # clickjacking/host-header/SQLi-error) with one benign request each, emitting
+    # confirmed findings that flow through the normal annotate/rank/report pipeline.
+    active_meta: dict[str, Any] = {}
+    if active and authorized and kind == "url":
+        try:
+            active_findings, active_meta = active_verify_service.verify_active(clean_target, raw_findings, scope=scope)
+            if active_findings:
+                raw_findings = list(raw_findings) + active_findings
+                if "active" not in scanners_run:
+                    scanners_run = list(scanners_run) + ["active"]
+            elif active_meta.get("in_scope"):
+                scanners_run = list(scanners_run) + ["active"]
+        except Exception as exc:  # noqa: BLE001 - active layer is best-effort; never break a hunt
+            active_meta = {"in_scope": False, "skipped_reason": f"active verification error: {exc}"}
+
     # Annotate + rank.
     annotated: list[dict[str, Any]] = []
     for finding in raw_findings:
-        cid, cname, cwe, owasp = _classify(finding)
+        hint = finding.get("_active_class_hint")
+        if hint and hint in VULN_CLASSES:
+            # An active finding already knows its exact class — use it directly so
+            # manual-hunt classes (cors/redirect/sqli) get proper CWE/OWASP names.
+            meta = VULN_CLASSES[hint]
+            cid, cname, cwe, owasp = hint, meta["name"], meta["cwe"], meta.get("owasp", "")
+        else:
+            cid, cname, cwe, owasp = _classify(finding)
         annotated.append(
             {
                 **finding,
-                "location": str(finding.get("file_path") or ""),
+                "location": str(finding.get("file_path") or finding.get("location") or ""),
                 "line": finding.get("line_start"),
                 "class_id": cid,
                 "class_name": cname,
@@ -804,6 +830,20 @@ def run_bounty_hunt(
                 merged["cvss"] = base.get("cvss")
             attack_plans[ref] = merged
 
+    # Active proof wins last: a REAL captured request/response outranks the brain's
+    # prose and the deterministic candidate. Fold it into the finding's attack plan
+    # (preserving the deterministic proof obligation) and strip the private carriers.
+    for finding in display:
+        active_proof = finding.pop("_active_proof", None)
+        finding.pop("_active_cvss", None)
+        finding.pop("_active_class_hint", None)
+        ref = finding.get("ref")
+        if isinstance(active_proof, dict) and ref in attack_plans:
+            base_proof = attack_plans[ref].get("proof_of_impact")
+            if isinstance(base_proof, dict) and not active_proof.get("proof_obligation"):
+                active_proof = {**active_proof, "proof_obligation": base_proof.get("proof_obligation", "")}
+            attack_plans[ref]["proof_of_impact"] = active_proof
+
     # Manual checklist = profile + selected-class + brain ideas.
     checklist = list(profile.get("checklist", []))
     if class_meta:
@@ -841,6 +881,9 @@ def run_bounty_hunt(
         "recommended_tools": recommended_tools,
         "toolkit_source": toolkit_lib.load_catalog(seed_dir, runtime_dir).get("source", {}),
         "run_live_requested": bool(run_live and kind == "url"),
+        "active_requested": bool(active and kind == "url"),
+        "active_authorization": active_meta,
+        "active_verified_classes": active_meta.get("verified_classes", []),
         "recommendation": "",
     }
 
@@ -905,6 +948,8 @@ def run_bounty_hunt(
         "brain_model": f"{brain.get('provider')}:{brain.get('model')}" if brain.get("used") else "",
         "next_steps": ctx["next_steps"],
         "coverage": ctx["coverage"],
+        "active_verified_classes": ctx["active_verified_classes"],
+        "active_authorization": ctx["active_authorization"],
         "report_markdown": markdown,
     }
 

@@ -366,6 +366,25 @@ def _append_cvss(out: list[str], plan: dict[str, Any]) -> None:
         out.append(f"- **Why this severity:** {justification}")
 
 
+def _append_active_authorization(out: list[str], ctx: dict[str, Any]) -> None:
+    """Record what the opt-in active verification layer did (or why it was skipped)."""
+    if not ctx.get("active_requested"):
+        return
+    meta = ctx.get("active_authorization") or {}
+    if meta.get("in_scope"):
+        classes = ", ".join(meta.get("verified_classes") or []) or "none confirmed"
+        note = (
+            f"- **Active verification:** ran against `{meta.get('host', '')}` (in scope) — "
+            f"benign GET/HEAD/OPTIONS only, rate-limited; classes confirmed by a captured artifact: {classes}."
+        )
+        if meta.get("rate_limited"):
+            note += " (request budget reached — some checks were skipped.)"
+        out.append(note)
+    else:
+        reason = str(meta.get("skipped_reason") or "host not in asserted scope").strip()
+        out.append(f"- **Active verification:** skipped (passive only) — {reason}")
+
+
 def _finding_readiness(finding: dict[str, Any], plan: dict[str, Any]) -> list[str]:
     steps = plan.get("steps") or []
     impact = plan.get("impact") or finding.get("impact")
@@ -434,6 +453,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
     out.append(f"- **In-scope authorization confirmed:** {'yes' if ctx.get('authorized') else 'NOT confirmed'}")
     if scope:
         out.append(f"- **Program / scope notes:** {scope}")
+    _append_active_authorization(out, ctx)
     out.append("")
 
     # --- Executive summary ---

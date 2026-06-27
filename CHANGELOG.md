@@ -2,6 +2,28 @@
 
 Notable changes to GreyIQ.
 
+## v0.11.0
+
+### Added
+- **Active verification — prove findings, don't just flag them.** A new opt-in layer
+  turns provable leads into *confirmed* findings with a captured request/response. For
+  a URL target, ticking **Active verification** fires at most one benign
+  GET/HEAD/OPTIONS per check to prove: reflected XSS (unescaped, HTML-context, with a
+  no-marker control), CORS Origin reflection with credentials, open redirect
+  (off-origin `Location` captured, never followed), host-header reflection, error-based
+  SQL injection (a single quote eliciting a real **SQL** error banner), and clickjacking
+  framability (a candidate with a PoC obligation). Each confirmed check writes a
+  `status: confirmed` proof — backed by a same-run **negative control** — into the
+  proof-of-impact slot, so the report renders "Confirmed" with the artifact in hand.
+  Safety: strictly double-gated (active + authorized + URL), **scope-bound and
+  fail-closed** (a host you didn't name in Scope is never probed — exact/suffix host
+  matching, not substring), reuses the passive scanner's SSRF/private-host/port guard
+  on every request, never follows redirects off-host, GET/HEAD/OPTIONS-only with benign
+  markers, a per-host token-bucket plus a per-hunt request budget, and every artifact
+  redacted. Default OFF. New `active_verify_service.py` + `rate_limit.py`; env knobs
+  `GREYIQ_ACTIVE_MAX_REQUESTS_PER_HOST`, `GREYIQ_ACTIVE_MIN_INTERVAL_MS`,
+  `GREYIQ_ACTIVE_SCAN_ALLOWLIST`.
+
 ## v0.10.0
 
 ### Added

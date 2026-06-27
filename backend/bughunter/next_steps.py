@@ -144,6 +144,9 @@ def coverage_summary(ctx: dict[str, Any]) -> dict[str, Any]:
         covered.append("Passive web review (headers, cookies, mixed content, client sinks, disclosure).")
     if "live" in scanners:
         covered.append("Dynamic browser pass (runtime console/network telemetry).")
+    verified = ctx.get("active_verified_classes") or []
+    if verified:
+        covered.append(f"Active verification (authorized, rate-limited) confirmed by captured artifact: {', '.join(verified)}.")
     if not covered:
         covered.append("No scanner completed — coverage is effectively nil.")
 
