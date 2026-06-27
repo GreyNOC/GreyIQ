@@ -2,6 +2,30 @@
 
 Notable changes to GreyIQ.
 
+## v0.15.0
+
+### Much faster startup — the portable opens in a fraction of the time
+Profiling the double-click → window path found two avoidable costs, both fixed:
+
+- **PyTorch dropped from the packaged binary (~1.2 GB → gone).** Torch was 86% of the
+  1.4 GB payload and the bug-hunting engine never uses it — it only powered the
+  offline TinyGPT chat brain and the Train tab (both now in the demoted Studio). The
+  portable download and the **one-time first-launch unpack shrink ~6×** (the old
+  fresh-run unpack was measured at ~200 s). The Ollama/Claude coding brain and every
+  bug-bounty feature are unaffected; the offline local model degrades to a clear
+  "local model unavailable" message in the packaged app (still available from source,
+  and re-bundlable via the build spec).
+- **Torch + pandas are no longer imported at boot.** The backend imported the
+  torch-backed local-model runtime (`solin_core`, ~3.9 s) and document ingestion
+  (`pytesseract`→`pandas`, ~1.4 s) at module load, before it could answer
+  `/api/health` — the gate the desktop window blocks on. Both are now imported
+  **lazily on first actual use**, cutting the API's import time from **~6.0 s to
+  ~0.65 s on every launch**. `/api/status` still reports local-model availability via
+  a cheap `find_spec` probe (no torch import).
+
+New regression tests pin both invariants (no torch/pandas on the boot path; the
+service boots and degrades gracefully when torch is absent — the frozen condition).
+
 ## v0.14.0
 
 ### Bug-bounty cockpit — the app is now bug-bounty-first

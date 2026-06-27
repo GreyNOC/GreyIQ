@@ -20,12 +20,16 @@ datas = [
     (os.path.join(ROOT, "public"), "public"),
 ]
 binaries = []
+# NOTE: the offline TinyGPT brain (solin_core / solin_typo / solin_bpe /
+# training_runtime) is intentionally NOT bundled. It depends on PyTorch (~1.2 GB),
+# which dominated the portable download + the ~200 s first-launch unpack while the
+# bug-hunting engine and the Ollama/Claude brain never touch it. The backend imports
+# that runtime lazily (greyiq_api._ensure_ml_runtime) and degrades to a clear
+# "local model unavailable" message when it is absent — so the shipped app is a lean
+# bug-bounty tool. Re-add the modules here + torch to the collect_all list below to
+# restore the in-binary local model.
 hiddenimports = [
-    "solin_core",
-    "solin_typo",
-    "solin_bpe",
     "document_ingest",
-    "training_runtime",
     "ai_core.core_store",
     "coder",
     "agent",
@@ -36,10 +40,9 @@ hiddenimports = [
     "gn_cli",  # run_frozen imports it at function level (CLI dispatch) — force-include
 ]
 
-# torch and the ASGI stack load a lot dynamically; pull everything in. numpy is
-# included so torch initializes it (otherwise torch logs a NumPy import warning).
-# anthropic is the Claude coding-brain client.
-for package in ("torch", "numpy", "anthropic", "uvicorn", "pydantic", "pydantic_core", "pypdf"):
+# The ASGI stack + clients load a lot dynamically; pull everything in. numpy stays
+# (document_ingest's pandas path uses it). anthropic is the Claude coding-brain client.
+for package in ("numpy", "anthropic", "uvicorn", "pydantic", "pydantic_core", "pypdf"):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(package)
     datas += pkg_datas
     binaries += pkg_binaries
@@ -65,7 +68,10 @@ a = Analysis(  # noqa: F821
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter", "matplotlib", "pytest", "PyQt5", "PySide2"],
+    # Hard-exclude the PyTorch family so nothing drags it back in transitively — it is
+    # the offline-model dependency we deliberately drop to keep the app lean/fast.
+    excludes=["tkinter", "matplotlib", "pytest", "PyQt5", "PySide2",
+              "torch", "torchvision", "torchaudio", "torchgen", "functorch"],
     noarchive=False,
     cipher=block_cipher,
 )

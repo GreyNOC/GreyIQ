@@ -193,44 +193,78 @@ import coder  # noqa: E402
 import project_memory  # noqa: E402
 import workspace as workspace_fs  # noqa: E402
 from ai_core.core_store import AICoreStore, DEFAULT_CORE_ID, slugify  # noqa: E402
-from document_ingest import (  # noqa: E402
-    collect_supported_files,
-    ingest_source_files,
-    summarize_ingest,
-    supported_extensions,
-)
+# document_ingest pulls pytesseract -> pandas (~1.4s) and is only used by the
+# folder-ingest/training endpoints, so it is imported lazily (see _document_ingest)
+# to keep it off the boot path the packaged app blocks on.
 from repo_ingest import ingest_repositories  # noqa: E402
 
 # The local TinyGPT brain (solin_core / training_runtime) is the only part of the
-# backend that needs PyTorch. Import it lazily-guarded so the whole service still
-# boots where torch is absent or won't load — e.g. an ARM phone running the API
-# under PM2/Termux. The bug-hunting engine and the Claude API brain are entirely
-# torch-free and stay fully functional; only local-model train/infer is gated off
-# with a clear message instead of crashing the process at import time.
-try:
-    from solin_core import SolinEngine  # noqa: E402
-    from training_runtime import (  # noqa: E402
-        DEFAULT_EVAL_INTERVAL,
-        DEFAULT_LEARNING_RATE,
-        DEFAULT_MAX_ITERS,
-        MAX_TRAINING_CHARS,
-        TrainingSettings,
-        run_training_loop,
-    )
+# backend that needs PyTorch, and `import torch` alone costs ~4s. It is NOT on the
+# bug-hunting or Claude-brain path, so it is imported LAZILY on first actual use
+# instead of at module load — the API server answers /api/health (the gate Electron
+# blocks on before showing the window) in ~1s instead of ~6s, so the packaged app
+# feels far snappier. Torch absence (e.g. an ARM phone under Termux) still degrades
+# to a clear message rather than crashing. See _ensure_ml_runtime / _ml_runtime_status.
+SolinEngine = None  # type: ignore[assignment,misc]
+TrainingSettings = None  # type: ignore[assignment,misc]
+run_training_loop = None  # type: ignore[assignment]
+# Mirror training_runtime's defaults so request models and settings validate without
+# importing it (and thus without paying the torch import cost) at boot.
+MAX_TRAINING_CHARS = 8_000_000
+DEFAULT_MAX_ITERS = 1000
+DEFAULT_EVAL_INTERVAL = 100
+DEFAULT_LEARNING_RATE = 3e-4
+_ML_RUNTIME_AVAILABLE: bool | None = None  # tri-state: None = not yet probed
+_ML_RUNTIME_ERROR = ""
+_ML_UNAVAILABLE_MSG = (
+    "Local model runtime unavailable (PyTorch not loaded). Bug-hunting and the "
+    "Claude API brain still work; local TinyGPT train/infer is disabled."
+)
+
+
+def _ensure_ml_runtime() -> bool:
+    """Import the torch-backed TinyGPT runtime on first actual use (heavy: ~4s for
+    torch), deferred out of the boot path. Returns True if available and binds the
+    module-level symbols; otherwise caches a clear error. Bug-hunting and the Claude
+    brain never call this."""
+    global _ML_RUNTIME_AVAILABLE, _ML_RUNTIME_ERROR, SolinEngine, TrainingSettings, run_training_loop
+    global MAX_TRAINING_CHARS, DEFAULT_MAX_ITERS, DEFAULT_EVAL_INTERVAL, DEFAULT_LEARNING_RATE
+    if _ML_RUNTIME_AVAILABLE is not None:
+        return _ML_RUNTIME_AVAILABLE
+    try:
+        from solin_core import SolinEngine as _Engine
+        from training_runtime import (
+            DEFAULT_EVAL_INTERVAL as _EI,
+            DEFAULT_LEARNING_RATE as _LR,
+            DEFAULT_MAX_ITERS as _MI,
+            MAX_TRAINING_CHARS as _MC,
+            TrainingSettings as _TS,
+            run_training_loop as _RL,
+        )
+    except Exception as exc:  # noqa: BLE001 - torch/numpy may be missing or fail to load (DLL, ABI, ARM wheel)
+        _ML_RUNTIME_AVAILABLE = False
+        _ML_RUNTIME_ERROR = f"Local model runtime unavailable ({type(exc).__name__}: {exc}). " \
+            "Bug-hunting and the Claude API brain still work; local TinyGPT train/infer is disabled."
+        return False
+    SolinEngine, TrainingSettings, run_training_loop = _Engine, _TS, _RL
+    MAX_TRAINING_CHARS, DEFAULT_MAX_ITERS, DEFAULT_EVAL_INTERVAL, DEFAULT_LEARNING_RATE = _MC, _MI, _EI, _LR
     _ML_RUNTIME_AVAILABLE = True
     _ML_RUNTIME_ERROR = ""
-except Exception as _ml_exc:  # noqa: BLE001 - torch/numpy may be missing or fail to load (DLL, ABI, ARM wheel)
-    SolinEngine = None  # type: ignore[assignment,misc]
-    TrainingSettings = None  # type: ignore[assignment,misc]
-    run_training_loop = None  # type: ignore[assignment]
-    # Mirror training_runtime's defaults so request models and settings still validate.
-    MAX_TRAINING_CHARS = 8_000_000
-    DEFAULT_MAX_ITERS = 1000
-    DEFAULT_EVAL_INTERVAL = 100
-    DEFAULT_LEARNING_RATE = 3e-4
-    _ML_RUNTIME_AVAILABLE = False
-    _ML_RUNTIME_ERROR = f"Local model runtime unavailable ({type(_ml_exc).__name__}: {_ml_exc}). " \
-        "Bug-hunting and the Claude API brain still work; local TinyGPT train/infer is disabled."
+    return True
+
+
+def _ml_runtime_status() -> tuple[bool, str]:
+    """Cheap availability for /api/status WITHOUT importing torch — a find_spec probe
+    only, so the front-end status poll never drags torch onto a hot path. Once the
+    runtime has actually been loaded, the cached result wins."""
+    if _ML_RUNTIME_AVAILABLE is not None:
+        return _ML_RUNTIME_AVAILABLE, _ML_RUNTIME_ERROR
+    import importlib.util
+    try:
+        present = importlib.util.find_spec("torch") is not None
+    except (ImportError, ValueError):
+        present = False
+    return (True, "") if present else (False, _ML_UNAVAILABLE_MSG)
 from bughunter.scan_service import run_code_scan  # noqa: E402
 from bughunter.web_scan_service import run_web_scan  # noqa: E402
 from bughunter.live_scan_service import run_live_scan  # noqa: E402
@@ -624,14 +658,15 @@ class GreyIQRuntime:
             engine = self.engine
             model_path = getattr(engine, "model_path", None) if engine else None
             device_info = getattr(engine, "device_info", None) if engine else None
+            _ml_available, _ml_error = _ml_runtime_status()  # cheap probe; no torch import
             return {
                 "app": APP_NAME,
                 "version": VERSION,
                 "runtime_dir": str(RUNTIME_DIR),
-                "local_model_available": _ML_RUNTIME_AVAILABLE,
+                "local_model_available": _ml_available,
                 "engine_loaded": engine is not None,
                 "engine_ready": bool(engine and engine.ready),
-                "engine_error": self.engine_error or (_ML_RUNTIME_ERROR if not _ML_RUNTIME_AVAILABLE else ""),
+                "engine_error": self.engine_error or (_ml_error if not _ml_available else ""),
                 "model_name": model_path.name if model_path else "none",
                 "model_path": str(model_path) if model_path else "",
                 "device": getattr(device_info, "name", "unknown") if device_info else "unknown",
@@ -653,11 +688,11 @@ class GreyIQRuntime:
             "recent_logs": self.training.logs[:20],
         }
 
-    def get_engine(self) -> SolinEngine:
+    def get_engine(self) -> "SolinEngine":
         with self.lock:
             if self.engine is not None:
                 return self.engine
-            if not _ML_RUNTIME_AVAILABLE:
+            if not _ensure_ml_runtime():  # imports torch on first use only
                 self.engine_error = _ML_RUNTIME_ERROR
                 raise RuntimeError(_ML_RUNTIME_ERROR)
             try:
@@ -1252,7 +1287,7 @@ class GreyIQRuntime:
             }
 
     def start_training(self, request: TrainingRequest) -> dict[str, Any]:
-        if not _ML_RUNTIME_AVAILABLE:
+        if not _ensure_ml_runtime():  # imports torch on first use only
             raise HTTPError(503, _ML_RUNTIME_ERROR)
         with self.lock:
             if self.training.active:
@@ -1536,6 +1571,14 @@ def ingest_training_folder(request: TrainFolderRequest) -> dict[str, Any]:
     cheap: the manifest skips files whose contents have not changed. The ingested
     text counts as "Imported Documents" (src_imported_docs) for training.
     """
+    # Lazy: pulls pytesseract -> pandas (~1.4s). Kept off the boot path.
+    from document_ingest import (
+        collect_supported_files,
+        ingest_source_files,
+        summarize_ingest,
+        supported_extensions,
+    )
+
     folder = Path(request.folder).expanduser()
     if not folder.exists() or not folder.is_dir():
         raise HTTPError(400, f"Not a folder: {request.folder}")
