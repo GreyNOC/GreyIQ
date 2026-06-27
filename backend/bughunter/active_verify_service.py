@@ -578,18 +578,25 @@ def _check_crlf(http: _Http, url: str) -> dict[str, Any] | None:
 # a constant delay we control (no amplification), well under the fetch timeout, request-
 # only timing (excludes the governor throttle), and a multi-trial differential with a
 # fast SLEEP(0) negative control. No data is ever read or extracted — one timing bit.
+# The delay/margin default to 4s/3s and are tunable via settings (jittery targets).
 _TIME_DELAY_S = 4          # the injected sleep (fixed; < web_fetch_timeout_seconds, default 8)
 _TIME_MARGIN_S = 3.0       # a confirmed probe must be at least this much slower than the fast controls
 
 
-def _check_time_sqli(http: _Http, url: str) -> dict[str, Any] | None:
+def _check_time_sqli(http: _Http, url: str, settings: Any = None) -> dict[str, Any] | None:
+    settings = settings or get_settings()
     parsed = urlparse(url)
     params = [k for k, v in parse_qsl(parsed.query)]
     if not params:
         return None  # need a real existing param; never invent injection points
-    d = _TIME_DELAY_S
+    d = getattr(settings, "active_time_sqli_delay_seconds", _TIME_DELAY_S) or _TIME_DELAY_S
+    margin = getattr(settings, "active_time_sqli_margin_seconds", _TIME_MARGIN_S) or _TIME_MARGIN_S
+    # Keep the injected delay strictly under the fetch timeout so a confirmed probe never
+    # trips the timeout (which would read as an error, not a delay).
+    d = min(float(d), max(1.0, float(settings.web_fetch_timeout_seconds) - 1.0))
     # MySQL/MariaDB SLEEP is the most common; a single fixed payload keeps requests bounded.
-    slow = f"' AND SLEEP({d})-- -"
+    d_str = str(int(d)) if float(d).is_integer() else f"{d:.1f}"  # SLEEP(4), not SLEEP(4.0)
+    slow = f"' AND SLEEP({d_str})-- -"
     fast = "' AND SLEEP(0)-- -"
     for param in params[:1]:  # one param — the timing pass is request-heavy
         original = dict(parse_qsl(parsed.query)).get(param, "1")
@@ -605,16 +612,16 @@ def _check_time_sqli(http: _Http, url: str) -> dict[str, Any] | None:
         # Confirm ONLY when both SLEEP(D) probes are >= D-margin slower than BOTH fast
         # controls (the unmodified baseline AND the injected-but-SLEEP(0) request). The
         # SLEEP(0) control proves the delay tracks the injected value, not a slow page.
-        if e1 - fast_max >= _TIME_MARGIN_S and e2 - fast_max >= _TIME_MARGIN_S:
+        if e1 - fast_max >= margin and e2 - fast_max >= margin:
             proof = _proof(
-                "confirmed", method=f"GET with {param}=...' AND SLEEP({d}) (bounded, no data read)",
+                "confirmed", method=f"GET with {param}=...' AND SLEEP({d_str}) (bounded, no data read)",
                 affected_asset="the database reachable by the query's role (time-inferable blind SQLi)",
-                observed_result=f"injecting SLEEP({d}) delayed the response to ~{e1:.1f}s/{e2:.1f}s across two trials",
+                observed_result=f"injecting SLEEP({d_str}) delayed the response to ~{e1:.1f}s/{e2:.1f}s across two trials",
                 control_result=f"the unmodified request and a SLEEP(0) injection both returned in ~{fast_max:.1f}s — the delay tracks the injected sleep",
-                evidence=f"request-only timing: baseline/SLEEP(0)≈{fast_max:.1f}s, SLEEP({d})≈{e1:.1f}s and {e2:.1f}s",
+                evidence=f"request-only timing: baseline/SLEEP(0)≈{fast_max:.1f}s, SLEEP({d_str})≈{e1:.1f}s and {e2:.1f}s",
             )
             ev = {"request_line": f"GET {_with_query(url, {param: original + slow})}", "response_status": f"HTTP {p1['status']}",
-                  "matched_value": f"SLEEP({d}) caused a ~{e1:.1f}s delay vs ~{fast_max:.1f}s control"}
+                  "matched_value": f"SLEEP({d_str}) caused a ~{e1:.1f}s delay vs ~{fast_max:.1f}s control"}
             return _finding("active.sqli-time", f"Time-based blind SQL injection via '{param}'", "high", "disclosure", "sqli", url, proof, ev)
     return None
 
@@ -651,7 +658,10 @@ def _check_open_bucket(http: _Http, landing: dict[str, Any] | None, scope: str, 
         list_url = bucket_url + ("?list-type=2" if "amazonaws.com" in host else "")
         try:
             resp = http.fetch(list_url)
-        except _ActiveError:
+        except (_ActiveError, WebsiteFetchError):
+            # This check fetches a FOREIGN host (the bucket), so unlike the other
+            # checks it can hit the SSRF/port guard (e.g. a bucket whose host resolves
+            # to a private IP when private URLs are off). Skip it — never abort the pass.
             continue
         rbody = (resp.get("body") or "")[:4000]
         status = int(resp.get("status") or 0)
@@ -755,7 +765,7 @@ def verify_active(
     # Time-based blind SQLi is the only check that emits an executing payload (a bounded
     # SLEEP), so it is OPT-IN — appended only when the operator explicitly enables it.
     if time_based:
-        checks.append(lambda: _check_time_sqli(http, sanitized))
+        checks.append(lambda: _check_time_sqli(http, sanitized, settings))
     for check in checks:
         if rate_limited:
             break

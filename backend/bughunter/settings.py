@@ -22,6 +22,11 @@ Env vars:
   (default 500 ms).
 - GREYIQ_ACTIVE_SCAN_ALLOWLIST : comma-separated host suffixes that count as in-scope
   for ACTIVE verification even if not named in the hunt's scope text (default empty).
+- GREYIQ_ACTIVE_TIME_SQLI_DELAY_S : the bounded SLEEP() the opt-in time-based blind-SQLi
+  probe injects, in seconds (default 4; must stay < GREYIQ_WEB_FETCH_TIMEOUT). Raise it for
+  jittery targets.
+- GREYIQ_ACTIVE_TIME_SQLI_MARGIN_S : how much slower (seconds) BOTH trial probes must be vs
+  the fast controls before the probe is confirmed (default 3; keep well under the delay).
 """
 
 from __future__ import annotations
@@ -76,6 +81,8 @@ class ScannerSettings:
     active_max_requests_per_host: int = 20
     active_min_interval_ms: int = 500
     active_scan_allowlist: tuple[str, ...] = ()
+    active_time_sqli_delay_seconds: float = 4.0
+    active_time_sqli_margin_seconds: float = 3.0
 
 
 def get_settings() -> ScannerSettings:
@@ -88,4 +95,6 @@ def get_settings() -> ScannerSettings:
         active_max_requests_per_host=_int_env("GREYIQ_ACTIVE_MAX_REQUESTS_PER_HOST", 20),
         active_min_interval_ms=_int_env("GREYIQ_ACTIVE_MIN_INTERVAL_MS", 500),
         active_scan_allowlist=_suffixes_env("GREYIQ_ACTIVE_SCAN_ALLOWLIST"),
+        active_time_sqli_delay_seconds=_float_env("GREYIQ_ACTIVE_TIME_SQLI_DELAY_S", 4.0),
+        active_time_sqli_margin_seconds=_float_env("GREYIQ_ACTIVE_TIME_SQLI_MARGIN_S", 3.0),
     )
