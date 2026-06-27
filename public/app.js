@@ -46,7 +46,7 @@ const DEFAULT_BOTS = [
     style: "direct",
     temperature: 46,
     persona:
-      "Astra is a smart, trustworthy generalist. It gives the direct answer first, separates facts from assumptions, and turns broad requests into practical next moves.",
+      "Astra is a generalist. It gives the direct answer first, separates facts from assumptions, and turns broad requests into practical next moves.",
     corpus: [
       "Start with the strongest signal, name the assumption, then choose the smallest useful action.",
       "A trustworthy answer says what is known, what is inferred, and what should be checked.",
@@ -63,7 +63,7 @@ const DEFAULT_BOTS = [
     style: "warm",
     temperature: 54,
     persona:
-      "Mira is warm, steady, and deeply useful. It helps the user feel oriented, keeps uncertainty honest, and makes complex work feel manageable.",
+      "Mira is warm and steady. It helps the user feel oriented, keeps uncertainty honest, and makes complex work feel manageable.",
     corpus: [
       "Hold the feeling and the practical step at the same time.",
       "A steady answer can be kind without becoming vague.",
@@ -543,7 +543,7 @@ async function apiFetch(path, options = {}) {
 function normalizeReplyPayload(payload, userText) {
   const diagnostics = payload?.diagnostics || {};
   return {
-    text: payload?.message || "I am here with you. Give me a little more to work with and I will shape it.",
+    text: payload?.message || "Give me a little more to work with and I will respond.",
     citations: Array.isArray(payload?.citations) ? payload.citations : [],
     diagnostics: {
       used_fallback: Boolean(payload?.used_fallback || diagnostics.used_fallback),
@@ -569,7 +569,7 @@ function normalizeAnswerForChat(answer, userText, strategy = "local_engine") {
     return answer;
   }
   return {
-    text: String(answer || "I am here with you. Give me a little more to work with and I will shape it."),
+    text: String(answer || "Give me a little more to work with and I will respond."),
     citations: [],
     diagnostics: {
       used_fallback: false,
@@ -666,7 +666,7 @@ function coreFromBot(bot) {
     name: bot.name || "GreyIQ",
     mode: "Friendly Power",
     type: "local_chat_bot",
-    description: bot.persona || "Soft, friendly, powerful local AI.",
+    description: bot.persona || "Local AI that learns your preferences.",
     personality: bot.style || "warm",
     skills: [
       "conversation",
@@ -768,7 +768,7 @@ function activeChat() {
     {
       id: crypto.randomUUID(),
       role: "bot",
-      text: `${activeBot().name} is local, loaded, and ready.`,
+      text: `${activeBot().name} is loaded and running locally.`,
       createdAt: Date.now()
     }
   ];
@@ -1611,7 +1611,7 @@ els.composer.addEventListener("submit", async (event) => {
     chat.push({
       id: crypto.randomUUID(),
       role: "bot",
-      text: `I hit a local runtime snag: ${error.message || "unknown error"}. The browser model is still available.`,
+      text: `Local runtime error: ${error.message || "unknown error"}. The browser model is still available.`,
       citations: [],
       diagnostics: {
         used_fallback: true,
@@ -3912,13 +3912,13 @@ function renderBountyNextSteps(steps, coverage) {
 
   const title = document.createElement("h4");
   title.className = "next-steps-title";
-  title.textContent = "Guided next steps";
+  title.textContent = "Next steps";
   host.append(title);
 
   const intro = document.createElement("p");
   intro.className = "next-steps-intro";
   intro.textContent =
-    "Work top to bottom — highest-impact first. Each step names the opening move and the tool to reach for.";
+    "Ordered by impact, highest first. Each step lists the action and the tool to use.";
   host.append(intro);
 
   let currentPhase = null;
