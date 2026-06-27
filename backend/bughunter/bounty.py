@@ -712,6 +712,7 @@ def run_bounty_hunt(
     version: str = "",
     run_live: bool = False,
     active: bool = False,
+    time_based: bool = False,
     max_files: int = 5000,
     per_finding: bool = False,
 ) -> dict[str, Any]:
@@ -758,12 +759,15 @@ def run_bounty_hunt(
 
     # Opt-in ACTIVE verification: double-gated (active + authorized + url), scope-bound,
     # rate-limited. It DISCOVERS and PROVES a provable subset (XSS/CORS/redirect/
-    # clickjacking/host-header/SQLi-error) with one benign request each, emitting
-    # confirmed findings that flow through the normal annotate/rank/report pipeline.
+    # clickjacking/host-header/SQLi-error/CRLF/open-bucket) with one benign request each,
+    # emitting confirmed findings that flow through the normal annotate/rank/report
+    # pipeline. time_based adds the opt-in bounded-SLEEP blind-SQLi probe.
     active_meta: dict[str, Any] = {}
-    if active and authorized and kind == "url":
+    # time_based implies active: enabling the opt-in SLEEP probe can never silently
+    # skip the rest of the (already-gated, scope-bound) active pass.
+    if (active or time_based) and authorized and kind == "url":
         try:
-            active_findings, active_meta = active_verify_service.verify_active(clean_target, raw_findings, scope=scope)
+            active_findings, active_meta = active_verify_service.verify_active(clean_target, raw_findings, scope=scope, time_based=time_based)
             if active_findings:
                 raw_findings = list(raw_findings) + active_findings
                 if "active" not in scanners_run:
