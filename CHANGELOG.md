@@ -4,10 +4,19 @@ Notable changes to GreyIQ.
 
 ## v0.11.1
 
-_(Re-tag of the v0.11.0 work — the v0.11.0 release tag was consumed by GitHub's
-immutable-releases feature and could not carry the binaries; no code difference.)_
+_(The v0.11.0 release tag was consumed by GitHub's immutable-releases feature and
+could not carry the binaries, so this re-tag also folds in the `gn` CLI.)_
 
 ### Added
+- **`gn` — a short bug-bounty CLI.** Drive the same engine from the terminal:
+  `gn hunt <url|repo> -y [-p profile] [-c class] [-s "scope"] [--active] [--live]`,
+  plus `gn scan`, `gn profiles`, `gn classes`, and `gn tools <class…>`. A hunt is
+  gated on `-y/--authorize`; `--active` runs the proof-of-impact testing. Torch-free
+  and frozen-safe — the shipped backend binary doubles as the CLI
+  (`greyiq-backend hunt …`), and `gn`/`gn.cmd` wrap it for source checkouts
+  (`npm run gn -- …`).
+- The Security tab's active option is now labelled **"Test for proof of impact"** to
+  make the capture-the-proof workflow discoverable.
 - **Active verification — prove findings, don't just flag them.** A new opt-in layer
   turns provable leads into *confirmed* findings with a captured request/response. For
   a URL target, ticking **Active verification** fires at most one benign

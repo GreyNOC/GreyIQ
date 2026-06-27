@@ -18,12 +18,21 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-import uvicorn  # noqa: E402
-
-from greyiq_api import app  # noqa: E402
-
-
 def main() -> None:
+    # Dual-purpose binary: with a CLI verb as the first argument, dispatch to the
+    # `gn` CLI (importing ONLY the torch-free bughunter engine — no uvicorn/API);
+    # with no arguments, run the API server. So the shipped backend exe is also the
+    # `gn` command (the gn.cmd / gn shims call `greyiq-backend(.exe) <verb> ...`).
+    import gn_cli
+
+    argv = sys.argv[1:]
+    if argv and (argv[0] in gn_cli.CLI_COMMANDS or argv[0] in ("-V", "--version", "-h", "--help")):
+        raise SystemExit(gn_cli.main(argv))
+
+    import uvicorn  # noqa: E402 - server-only deps, imported lazily so CLI mode stays light
+
+    from greyiq_api import app  # noqa: E402
+
     host = os.getenv("GREYIQ_HOST", "127.0.0.1")
     port = int(os.getenv("GREYIQ_PORT", os.getenv("PORT", "8766")))
     # Pass the app instance (not an import string) so this works inside a frozen

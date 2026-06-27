@@ -1,0 +1,5 @@
+# The POSIX `gn` launcher and shell scripts must stay LF — a CRLF shebang
+# (`#!/usr/bin/env bash\r`) fails to execute on Linux/macOS.
+gn text eol=lf
+*.sh text eol=lf
+build/build-portable.ps1 text eol=crlf

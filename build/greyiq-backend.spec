@@ -32,6 +32,8 @@ hiddenimports = [
     "skills",
     "repomap",
     "workspace",
+    "_version",
+    "gn_cli",  # run_frozen imports it at function level (CLI dispatch) — force-include
 ]
 
 # torch and the ASGI stack load a lot dynamically; pull everything in. numpy is
