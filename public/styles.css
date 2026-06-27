@@ -3025,6 +3025,10 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-learn-form label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.76rem; color: var(--muted); }
 .ck-learn-form input, .ck-learn-form select { font: inherit; font-size: 0.84rem; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 0.45rem 0.55rem; }
 
+.ck-creds { border: 1px solid var(--border); border-radius: 11px; padding: 0.85rem; margin-bottom: 1.1rem; background: var(--surface); }
+.ck-creds-head { display: flex; align-items: center; gap: 0.55rem; margin-bottom: 0.7rem; }
+.ck-creds-head strong { font-size: 0.9rem; }
+
 .ck-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
 .ck-list li { padding: 0.6rem 0.8rem; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); font-size: 0.84rem; display: flex; justify-content: space-between; align-items: center; gap: 0.6rem; }
 .ck-list .ck-floc { flex: 1; }

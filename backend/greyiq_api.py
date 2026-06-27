@@ -11,6 +11,7 @@ import shutil
 import sys
 import threading
 import traceback
+from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -273,6 +274,7 @@ from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
 from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names  # noqa: E402
 from bughunter import campaign as bounty_campaign  # noqa: E402
 from bughunter import learning as bounty_learning  # noqa: E402
+from bughunter import submission as bounty_submission  # noqa: E402
 from bughunter import toolkit as toolkit_lib  # noqa: E402
 from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E402
 
@@ -520,6 +522,25 @@ class LearnRequest(BaseModel):
     notes: str = Field(default="", max_length=500)
 
 
+class SubmissionPackageRequest(BaseModel):
+    run_id: str = Field(min_length=1, max_length=64)
+    ref: str = Field(min_length=1, max_length=40)
+    platform: str = Field(default="hackerone", max_length=20)
+
+
+class SubmitRequest(BaseModel):
+    run_id: str = Field(min_length=1, max_length=64)
+    ref: str = Field(min_length=1, max_length=40)
+    confirm: bool = False
+    platform: str = Field(default="hackerone", max_length=20)
+
+
+class HackerOneCredsRequest(BaseModel):
+    team_handle: str = Field(default="", max_length=200)
+    api_username: str = Field(default="", max_length=200)
+    api_token: str = Field(default="", max_length=400)
+
+
 class AgentRedteamRequest(BaseModel):
     authorized: bool = False
     include_behavioral: bool = False
@@ -610,6 +631,11 @@ class GreyIQRuntime:
         # UI polls (start_agent_run / agent_run_events) so a run streams instead of
         # blocking on one big response.
         self.agent_runs: dict[str, dict[str, Any]] = {}
+        # Bounded index of recent bounty runs, keyed by run_id: holds the minimal ctx +
+        # per-ref findings a submission package needs to rebuild WITHOUT re-scanning.
+        # In-memory only (drop-oldest); the on-disk report/JSON sidecar is the durable
+        # copy. Lets the cockpit fetch a canonical build_submission package per finding.
+        self.bounty_runs: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
         self.store = AICoreStore(RUNTIME_DIR)
         ensure_runtime()
         self._rewrite_core_defaults()
@@ -1043,7 +1069,7 @@ class GreyIQRuntime:
             return {"ok": False, "error": str(exc), "facts": [], "updated_at": None}
 
     def run_bounty(self, request: "BountyScanRequest") -> dict[str, Any]:
-        return run_bounty_hunt(
+        result = run_bounty_hunt(
             request.target,
             request.profile,
             request.vuln_class,
@@ -1060,11 +1086,13 @@ class GreyIQRuntime:
             max_files=request.max_files,
             per_finding=request.per_finding,
         )
+        self._cache_bounty_run(result, target=request.target, scope=request.scope, program=None)
+        return result
 
     def run_campaign(self, request: "CampaignRequest") -> dict[str, Any]:
         # authorized passes straight through — campaign.run_campaign fails closed when
         # it is False, exactly like the CLI. No default-True anywhere.
-        return bounty_campaign.run_campaign(
+        result = bounty_campaign.run_campaign(
             request.target,
             scope=request.scope,
             authorized=request.authorized,
@@ -1078,6 +1106,109 @@ class GreyIQRuntime:
             program=request.program,
             max_pages=request.max_pages,
         )
+        self._cache_bounty_run(result, target=request.target, scope=request.scope, program=request.program)
+        return result
+
+    # ---- After-testing / submission workflow -------------------------------------
+    def _cache_bounty_run(self, result: dict[str, Any], *, target: str, scope: str, program: str | None) -> None:
+        """Index a finished run by a fresh run_id so a canonical per-finding submission
+        package can be rebuilt without re-scanning. Stores only the minimal ctx + the
+        per-ref findings (already redacted/scope-filtered by the report layer); bounded
+        drop-oldest, in-memory. Mutates ``result`` to add ``run_id``."""
+        if not result.get("ok") or not result.get("findings"):
+            return
+        run_id = uuid4().hex
+        ctx = {
+            "tool": "GreyIQ BugHunter", "version": VERSION,
+            "generated_at": result.get("generated_at", ""),
+            "target": target, "scope": scope,
+            "attack_plans": result.get("attack_plans") or {},
+        }
+        findings_by_ref = {str(f.get("ref")): f for f in (result.get("findings") or []) if f.get("ref")}
+        with self.lock:
+            self.bounty_runs[run_id] = {
+                "ctx": ctx, "findings": findings_by_ref, "program": program, "target": target,
+            }
+            while len(self.bounty_runs) > 16:
+                self.bounty_runs.popitem(last=False)  # evict oldest
+        result["run_id"] = run_id
+
+    def _resolve_run_finding(self, run_id: str, ref: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+        with self.lock:
+            run = self.bounty_runs.get(run_id)
+        if not run:
+            return None, None, None
+        return run["ctx"], run["findings"].get(ref), run
+
+    def build_submission_package(self, request: "SubmissionPackageRequest") -> dict[str, Any]:
+        """Return the CANONICAL server-built submission package for one finding (the
+        same build_submission used by the CLI/campaign) — never a client approximation.
+        Pure/no-network."""
+        ctx, finding, _ = self._resolve_run_finding(request.run_id, request.ref)
+        if ctx is None:
+            return {"ok": False, "error": "This run is no longer cached — re-run the hunt to rebuild submission packages."}
+        if finding is None:
+            return {"ok": False, "error": "Unknown finding for this run."}
+        package = bounty_submission.build_submission(ctx, finding)
+        if package is None:
+            return {"ok": False, "error": "This finding is not reportable (the report rules drop it, e.g. an unconfirmed credential lead)."}
+        return {"ok": True, "package": package, "platform": request.platform}
+
+    def submit_finding(self, request: "SubmitRequest") -> dict[str, Any]:
+        """File one CONFIRMED finding to HackerOne via the hard-gated submit. The gate
+        lives in submission.submit_to_hackerone and is unbypassable: proof_status is
+        recomputed server-side from the cached ctx, so a forged confirm can't push a
+        non-confirmed finding. Creds come from the perms-restricted secrets store, never
+        the request body. The ONLY path here that touches the network."""
+        if request.platform != "hackerone":
+            return {"ok": False, "error": "Only the HackerOne API submit is wired. Export the package and file it on other platforms."}
+        pkg_result = self.build_submission_package(SubmissionPackageRequest(run_id=request.run_id, ref=request.ref, platform="hackerone"))
+        if not pkg_result.get("ok"):
+            return pkg_result
+        package = pkg_result["package"]
+        handle, username, token = self._hackerone_creds()
+        try:
+            outcome = bounty_submission.submit_to_hackerone(
+                package, team_handle=handle, api_username=username, api_token=token, confirm=request.confirm,
+            )
+        except bounty_submission.SubmissionError as exc:
+            return {"ok": False, "error": str(exc)}
+        # Record the submission to the learning store + triage so the loop closes.
+        _, finding, run = self._resolve_run_finding(request.run_id, request.ref)
+        if finding is not None:
+            try:
+                bounty_learning.record_outcome(
+                    RUNTIME_DIR, program=(run or {}).get("program"), target=(run or {}).get("target", ""),
+                    class_id=str(finding.get("class_id") or "other"), title=str(finding.get("title") or ""),
+                    status="submitted", severity=str(finding.get("severity") or ""),
+                    notes=f"HackerOne report {outcome.get('report_id', '')}",
+                )
+            except ValueError:
+                pass
+        return {"ok": True, **outcome}
+
+    def hackerone_creds_status(self) -> dict[str, Any]:
+        """Creds presence for the UI — NEVER returns the API token."""
+        stored = _load_secrets()
+        return {
+            "ok": True,
+            "team_handle": stored.get("hackerone.team_handle", ""),
+            "api_username": stored.get("hackerone.api_username", ""),
+            "has_token": bool(stored.get("hackerone.api_token")),
+        }
+
+    def save_hackerone_creds(self, request: "HackerOneCredsRequest") -> dict[str, Any]:
+        # Empty string clears that field (matches _store_secret's pop). Stored in the
+        # same perms-restricted, atomically-written secrets file as the provider keys.
+        _store_secret("hackerone.team_handle", request.team_handle.strip())
+        _store_secret("hackerone.api_username", request.api_username.strip())
+        if request.api_token:  # never clear the token on an empty submit of the form
+            _store_secret("hackerone.api_token", request.api_token.strip())
+        return self.hackerone_creds_status()
+
+    def _hackerone_creds(self) -> tuple[str, str, str]:
+        stored = _load_secrets()
+        return (stored.get("hackerone.team_handle", ""), stored.get("hackerone.api_username", ""), stored.get("hackerone.api_token", ""))
 
     def record_outcome(self, request: "LearnRequest") -> dict[str, Any]:
         try:
@@ -1973,6 +2104,21 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             program = (params.get("program") or [None])[0]
             target = (params.get("target") or [""])[0]
             await send_json(send, await asyncio.to_thread(runtime.bounty_stats, program, target))
+            return
+        if method == "POST" and path == "/api/bounty/submission":
+            request = validate_payload(SubmissionPackageRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.build_submission_package, request))
+            return
+        if method == "POST" and path == "/api/bounty/submit":
+            request = validate_payload(SubmitRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.submit_finding, request))
+            return
+        if method == "GET" and path == "/api/bounty/hackerone/creds":
+            await send_json(send, await asyncio.to_thread(runtime.hackerone_creds_status))
+            return
+        if method == "POST" and path == "/api/bounty/hackerone/creds":
+            request = validate_payload(HackerOneCredsRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.save_hackerone_creds, request))
             return
         if method == "POST" and path == "/api/agent/redteam":
             request = validate_payload(AgentRedteamRequest, await read_json_body(receive))
