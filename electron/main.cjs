@@ -11,11 +11,12 @@ const { spawn } = require('node:child_process');
 const APP_NAME = 'GreyIQ';
 const HOST = '127.0.0.1';
 const DEFAULT_PORT = parseInt(process.env.GREYIQ_PORT || '8766', 10);
-// The frozen backend's first launch is slow: the portable build unpacks ~1 GB to
-// a temp dir and torch/model import is cold (measured ~200 s on a fresh run, less
-// on later launches once the unpack is cached). Wait well past that before giving
-// up so a working backend is never killed by an impatient timeout.
-const STARTUP_TIMEOUT_MS = parseInt(process.env.GREYIQ_STARTUP_TIMEOUT_MS || '360000', 10);
+// The frozen backend's first launch pays a one-time unpack of the portable archive
+// to a temp dir (~250 MB since PyTorch was dropped from the bundle); later launches
+// reuse the cached unpack and the API now answers /api/health in ~1 s (torch + pandas
+// are no longer on the boot path). The timeout stays generous so a slow first unpack
+// on a cold disk is never killed by an impatient timeout.
+const STARTUP_TIMEOUT_MS = parseInt(process.env.GREYIQ_STARTUP_TIMEOUT_MS || '180000', 10);
 const HEALTH_POLL_MS = 500;
 const PROJECT_ROOT = app.isPackaged ? path.join(process.resourcesPath, 'app') : path.resolve(__dirname, '..');
 // The PyInstaller-frozen backend is shipped as an extraResource at
@@ -250,7 +251,7 @@ function loadingHtml() {
       <div style="text-align:center;max-width:440px;padding:24px">
         <div style="width:42px;height:42px;border:4px solid #d6dad0;border-top-color:#3b7a57;border-radius:50%;margin:0 auto 22px;animation:spin 1s linear infinite"></div>
         <h1 style="font-size:20px;font-weight:500;margin:0 0 10px">Starting GreyIQ…</h1>
-        <p style="color:#5f6b5a;font-size:14px;line-height:1.65;margin:0">The local AI engine is warming up. The first launch can take a few minutes while it unpacks and loads the model — later launches are much faster. This window will open automatically when it's ready.</p>
+        <p style="color:#5f6b5a;font-size:14px;line-height:1.65;margin:0">The bug-bounty engine is starting. The first launch unpacks the app once (later launches are much faster). This window opens automatically when it's ready.</p>
       </div>
       <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
     </body>`)}`;
