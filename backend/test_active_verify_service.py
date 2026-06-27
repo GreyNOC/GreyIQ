@@ -83,7 +83,8 @@ class ActiveCheckTests(unittest.TestCase):
 
     def test_only_safe_methods_are_ever_issued(self) -> None:
         stub = _Stub()
-        for check in (av._check_cors, av._check_open_redirect, av._check_reflected_xss, av._check_host_header, av._check_ssti):
+        for check in (av._check_cors, av._check_open_redirect, av._check_reflected_xss, av._check_host_header,
+                      av._check_ssti, av._check_error_sqli, av._check_bool_sqli, av._check_crlf):
             check(stub, self.URL)
         av._check_clickjacking(stub, self.URL, None)
         self.assertTrue(set(stub.methods) <= {"GET", "HEAD", "OPTIONS"}, stub.methods)
@@ -139,6 +140,78 @@ class ActiveCheckTests(unittest.TestCase):
                 return {"status": 200, "headers": {"content-type": "text/html"}, "cookies": [],
                         "body": f"<html>{val}</html>", "final_url": url, "location": None}
         self.assertIsNone(av._check_ssti(LiteralStub(), self.URL))
+
+    def test_bool_sqli_confirms_on_stable_differential(self) -> None:
+        class BoolStub:  # stable page; FALSE condition returns a much shorter page
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                body = "x" * 800
+                if "1'='2" in url or "1%27%3D%272" in url:
+                    body = "x" * 200  # FALSE branch diverges materially
+                return {"status": 200, "headers": {}, "body": body, "cookies": [], "final_url": url, "location": None}
+        f = av._check_bool_sqli(BoolStub(), "https://app.example.com/?id=1")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertEqual(f["rule_id"], "active.sqli-boolean")
+
+    def test_bool_sqli_does_not_confirm_on_dynamic_page(self) -> None:
+        import itertools
+        class FlapStub:  # the page flaps on its own — not safely differentiable
+            def __init__(self): self._n = itertools.count()
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                body = "x" * (300 + (next(self._n) % 2) * 500)  # alternates 300/800
+                return {"status": 200, "headers": {}, "body": body, "cookies": [], "final_url": url, "location": None}
+        self.assertIsNone(av._check_bool_sqli(FlapStub(), "https://app.example.com/?id=1"))
+
+    def test_bool_sqli_does_not_confirm_when_param_ignored(self) -> None:
+        class IgnoreStub:  # every response identical — the param has no effect
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                return {"status": 200, "headers": {}, "body": "x" * 500, "cookies": [], "final_url": url, "location": None}
+        self.assertIsNone(av._check_bool_sqli(IgnoreStub(), "https://app.example.com/?id=1"))
+
+    def test_crlf_confirms_when_header_is_split_out(self) -> None:
+        class CrlfStub:  # server reflects the CRLF-injected value as a real header
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                headers = {}
+                if "%0d%0a" in url.lower():
+                    headers["x-greyiq-crlf"] = av._MARK
+                return {"status": 200, "headers": headers, "body": "", "cookies": [], "final_url": url, "location": None}
+        f = av._check_crlf(CrlfStub(), "https://app.example.com/?next=/home")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertEqual(f["rule_id"], "active.crlf")
+
+    def test_crlf_does_not_confirm_without_split(self) -> None:
+        class NoSplitStub:  # value reflected in body but NOT split into a header
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                return {"status": 200, "headers": {}, "body": "echo", "cookies": [], "final_url": url, "location": None}
+        self.assertIsNone(av._check_crlf(NoSplitStub(), "https://app.example.com/?next=/home"))
+
+    def test_cors_null_origin_confirms(self) -> None:
+        class NullCorsStub:  # trusts ONLY Origin: null (so variant 1 fails, variant 2 confirms)
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                origin = {k.lower(): v for k, v in (extra_headers or {}).items()}.get("origin")
+                headers = {}
+                if origin == "null":
+                    headers["access-control-allow-origin"] = "null"
+                    headers["access-control-allow-credentials"] = "true"
+                return {"status": 200, "headers": headers, "cookies": [], "body": "", "final_url": url, "location": None}
+        f = av._check_cors(NullCorsStub(), "https://app.example.com/?q=x")
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertIn("null", f["proof_evidence"]["matched_value"])
+
+    def test_cors_subdomain_origin_confirms(self) -> None:
+        class SubCorsStub:  # reflects any subdomain of the host with credentials
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                origin = {k.lower(): v for k, v in (extra_headers or {}).items()}.get("origin") or ""
+                headers = {}
+                host = urlparse(url).hostname or ""
+                if origin.endswith("." + host) and origin != f"https://{host}":
+                    headers["access-control-allow-origin"] = origin
+                    headers["access-control-allow-credentials"] = "true"
+                return {"status": 200, "headers": headers, "cookies": [], "body": "", "final_url": url, "location": None}
+        f = av._check_cors(SubCorsStub(), "https://app.example.com/?q=x")
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertIn(av._MARK, f["proof_evidence"]["matched_value"])
 
     def test_ssti_does_not_confirm_on_coincidental_49(self) -> None:
         class Coincidental49Stub:  # the page contains '49' but never evaluates the marker

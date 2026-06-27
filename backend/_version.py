@@ -1,3 +1,3 @@
 """Single source of the backend version string (imported by greyiq_api and gn_cli)."""
 
-VERSION = "0.17.0"
+VERSION = "0.18.0"
