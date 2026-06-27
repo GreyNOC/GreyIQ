@@ -5,6 +5,7 @@ only localhost; the happy-path TLS/HTTP behaviour is covered by parsing/guard te
 rather than reaching the internet (which would be flaky in CI)."""
 from __future__ import annotations
 
+import importlib.util
 import sys
 import tempfile
 import unittest
@@ -17,6 +18,12 @@ if str(BACKEND_DIR) not in sys.path:
 
 import agent  # noqa: E402
 import skills as skills_lib  # noqa: E402
+
+# verify's pytest path is only exercised when pytest is importable — the same check
+# agent._detect_test_command() makes. Skip (don't fail) the pytest-dependent cases when
+# it is absent, e.g. on the CI runner, which installs requirements.txt without pytest.
+_PYTEST_AVAILABLE = importlib.util.find_spec("pytest") is not None
+_NEEDS_PYTEST = unittest.skipUnless(_PYTEST_AVAILABLE, "pytest is not installed")
 
 
 def _settings(**overrides: object) -> dict[str, object]:
@@ -142,6 +149,7 @@ class ReadFileRangeTests(unittest.TestCase):
 
 
 class VerifyTestDetectionTests(unittest.TestCase):
+    @_NEEDS_PYTEST
     def test_pytest_detected_and_reported_when_commands_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
@@ -152,6 +160,7 @@ class VerifyTestDetectionTests(unittest.TestCase):
             self.assertIn("tests detected", out)
             self.assertIn("pytest", out)
 
+    @_NEEDS_PYTEST
     def test_pytest_runs_and_passes_when_commands_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "test_pass.py").write_text("def test_ok():\n    assert 1 + 1 == 2\n", encoding="utf-8")
@@ -161,6 +170,7 @@ class VerifyTestDetectionTests(unittest.TestCase):
             self.assertIn("VERIFY PASSED", out)
             self.assertIn("tests passed", out)
 
+    @_NEEDS_PYTEST
     def test_pytest_runs_and_fails_when_commands_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "test_fail.py").write_text("def test_bad():\n    assert False\n", encoding="utf-8")
