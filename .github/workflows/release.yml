@@ -89,10 +89,33 @@ jobs:
         run: npx electron-builder --win portable nsis --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Authenticode signing is OPT-IN via repo secrets. When WINDOWS_CSC_LINK is
+          # set (a base64-encoded .pfx) electron-builder auto-signs the portable, the
+          # installer, and the inner app exe; when the secret is absent these render as
+          # empty strings and electron-builder skips signing — the unsigned build is
+          # unchanged. See docs/CODE_SIGNING.md.
+          CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
 
       - name: List build artifacts
         shell: pwsh
         run: Get-ChildItem release -Filter *.exe | Select-Object Name, Length
+
+      - name: Report Authenticode signing status
+        shell: pwsh
+        env:
+          CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CSC_LINK)) {
+            Write-Output "::warning::No WINDOWS_CSC_LINK secret set — release binaries are UNSIGNED (SmartScreen will warn). See docs/CODE_SIGNING.md."
+          } else {
+            Write-Output "Signing cert provided; verifying signatures on the built .exe files:"
+            Get-ChildItem release -Filter *.exe | ForEach-Object {
+              $sig = Get-AuthenticodeSignature $_.FullName
+              Write-Output ("  {0}: {1} ({2})" -f $_.Name, $sig.Status, $sig.SignerCertificate.Subject)
+              if ($sig.Status -ne 'Valid') { throw "Signature on $($_.Name) is $($sig.Status) — signing was requested but failed." }
+            }
+          }
 
       # NOTE: we intentionally do NOT upload the .exe files as Actions artifacts.
       # Each build is ~2.8 GB and Actions artifact storage is a small, quota-
