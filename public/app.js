@@ -418,7 +418,9 @@ function loadState() {
     ckProgram: "",
     ckActive: false,
     ckTimeBased: false,
-    ckLive: false
+    ckLive: false,
+    ckAuthCookie: "",
+    ckAuthHeaders: ""
   };
 
   try {
@@ -4278,6 +4280,9 @@ const ck = {
   active: document.querySelector("#ckActive"),
   timeBased: document.querySelector("#ckTimeBased"),
   live: document.querySelector("#ckLive"),
+  authFold: document.querySelector("#ckAuthFold"),
+  authCookie: document.querySelector("#ckAuthCookie"),
+  authHeaders: document.querySelector("#ckAuthHeaders"),
   authorized: document.querySelector("#ckAuthorized"),
   run: document.querySelector("#ckRun"),
   status: document.querySelector("#ckStatus"),
@@ -5185,8 +5190,11 @@ async function ckRun() {
   state.ckActive = Boolean(ck.active?.checked);
   state.ckTimeBased = Boolean(ck.timeBased?.checked);
   state.ckLive = Boolean(ck.live?.checked);
+  state.ckAuthCookie = (ck.authCookie?.value || "").trim();
+  state.ckAuthHeaders = (ck.authHeaders?.value || "");
   state.bountyProfile = ck.profile?.value || state.bountyProfile;
   saveState();
+  const authHeaderLines = state.ckAuthHeaders.split("\n").map((s) => s.trim()).filter(Boolean);
   ck.run.disabled = true;
   const isCampaign = state.ckRunType === "campaign";
   ckStatus(isCampaign ? "Campaign running — mapping the surface, hunting each URL (this can take a few minutes)…" : "Hunting — running scanners and proving findings…");
@@ -5197,7 +5205,8 @@ async function ckRun() {
         method: "POST", timeoutMs: 900000,
         body: JSON.stringify({
           target, scope: state.ckScope, authorized: true, program: state.ckProgram || null,
-          active: state.ckActive, time_based: state.ckTimeBased, live: state.ckLive, max_pages: Number(ck.maxPages?.value) || 12
+          active: state.ckActive, time_based: state.ckTimeBased, live: state.ckLive, max_pages: Number(ck.maxPages?.value) || 12,
+          auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines
         })
       });
     } else {
@@ -5205,7 +5214,8 @@ async function ckRun() {
         method: "POST", timeoutMs: 600000,
         body: JSON.stringify({
           target, profile: state.bountyProfile, vuln_class: (ck.klass?.value || null) || null,
-          scope: state.ckScope, authorized: true, active: state.ckActive, time_based: state.ckTimeBased, run_live: state.ckLive
+          scope: state.ckScope, authorized: true, active: state.ckActive, time_based: state.ckTimeBased, run_live: state.ckLive,
+          auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines
         })
       });
     }
@@ -5255,6 +5265,9 @@ function bootCockpit() {
   if (ck.active) ck.active.checked = Boolean(state.ckActive);
   if (ck.timeBased) ck.timeBased.checked = Boolean(state.ckTimeBased);
   if (ck.live) ck.live.checked = Boolean(state.ckLive);
+  if (ck.authCookie) ck.authCookie.value = state.ckAuthCookie || "";
+  if (ck.authHeaders) ck.authHeaders.value = state.ckAuthHeaders || "";
+  if (ck.authFold && (state.ckAuthCookie || state.ckAuthHeaders)) ck.authFold.open = true;
   ckSetRunType(state.ckRunType || "hunt");
   ckSyncService();
   void ckPopulateProfiles();

@@ -30,6 +30,7 @@ from bughunter import report as report_lib
 from bughunter import toolkit as toolkit_lib
 from bughunter.live_scan_service import run_live_scan
 from bughunter.scan_service import run_code_scan
+from bughunter.scan_auth import AuthContext, build_auth
 from bughunter.web_scan_service import run_web_scan
 
 # --- Vuln classes: how a finding category maps to a bounty bug class, plus the
@@ -522,7 +523,7 @@ def _resolve_output_dir(output_dir: str | None, default_reports_dir: Path) -> Pa
     return target.resolve()
 
 
-def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: int, run_live: bool) -> tuple[list[dict[str, Any]], list[str], dict[str, Any], str, float]:
+def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: int, run_live: bool, auth: AuthContext | None = None) -> tuple[list[dict[str, Any]], list[str], dict[str, Any], str, float]:
     """Run the profile's scanners for the inferred target kind. Returns
     (raw_findings, scanners_run, scan_meta, risk, score)."""
     scanners = profile["scanners"]
@@ -539,7 +540,7 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
         if scanner == "code":
             result = run_code_scan(target, "git_remote" if kind == "git" else "path", max_files=max_files)
         elif scanner == "web":
-            result = run_web_scan(target, probe_paths=True)
+            result = run_web_scan(target, probe_paths=True, auth=auth)
         else:
             continue
         ran.append(scanner)
@@ -713,6 +714,7 @@ def run_bounty_hunt(
     run_live: bool = False,
     active: bool = False,
     time_based: bool = False,
+    auth: dict[str, Any] | None = None,
     max_files: int = 5000,
     per_finding: bool = False,
 ) -> dict[str, Any]:
@@ -748,7 +750,14 @@ def run_bounty_hunt(
     if kind == "git" and not clean_target.lower().startswith("https://"):
         return {"ok": False, "error": "Point git hunts at a full https:// URL (e.g. https://github.com/org/repo). SSH/SCP git URLs aren't supported."}
 
-    raw_findings, scanners_run, scan_meta, risk, score = _run_scanners(profile, kind, clean_target, max_files, run_live)
+    # Optional authenticated scanning: bind the operator's cookie/headers to the
+    # target host. Attached SAME-SITE only (see scan_auth) so the session reaches
+    # the target + its subdomains and nothing else — for URL targets only.
+    auth_ctx: AuthContext | None = None
+    if kind == "url" and isinstance(auth, dict):
+        auth_ctx = build_auth(clean_target, cookie=auth.get("cookie", ""), headers=auth.get("headers") or [])
+
+    raw_findings, scanners_run, scan_meta, risk, score = _run_scanners(profile, kind, clean_target, max_files, run_live, auth_ctx)
     # Surface scanner failures instead of letting a failed scan read as a clean
     # target (the worst failure mode for a bug-finding tool). If every scanner
     # failed, that's an error, not a clean result.
@@ -767,7 +776,7 @@ def run_bounty_hunt(
     # skip the rest of the (already-gated, scope-bound) active pass.
     if (active or time_based) and authorized and kind == "url":
         try:
-            active_findings, active_meta = active_verify_service.verify_active(clean_target, raw_findings, scope=scope, time_based=time_based)
+            active_findings, active_meta = active_verify_service.verify_active(clean_target, raw_findings, scope=scope, time_based=time_based, auth=auth_ctx)
             if active_findings:
                 raw_findings = list(raw_findings) + active_findings
                 if "active" not in scanners_run:

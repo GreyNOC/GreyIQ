@@ -68,6 +68,7 @@ def run_campaign(
     version: str = "",
     active: bool = False,
     time_based: bool = False,
+    auth: dict[str, Any] | None = None,
     live: bool = False,
     program: str | None = None,
     max_pages: int = 12,
@@ -130,7 +131,7 @@ def run_campaign(
         result = run_bounty_hunt(
             url, profile, None, str(out_root / "targets"), scope, True, coder_cfg,
             default_reports_dir=out_root / "targets", seed_dir=seed_dir, runtime_dir=runtime_dir,
-            version=version, run_live=live, active=active, time_based=time_based, per_finding=False,
+            version=version, run_live=live, active=active, time_based=time_based, auth=auth, per_finding=False,
         )
         per_target.append({"target": url, "ok": result.get("ok", False),
                            "report_path": result.get("report_path", ""), "error": result.get("error", "")})

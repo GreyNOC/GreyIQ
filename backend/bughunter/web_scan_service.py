@@ -25,6 +25,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.code_scanner.rules import SECRET_RULES
 from bughunter.rate_limit import HostRateGovernor
+from bughunter.scan_auth import AuthContext, auth_headers_for, same_site
 from bughunter.settings import get_settings
 from bughunter.web_ingest import (
     WebsiteFetchError,
@@ -188,11 +189,16 @@ def _guard_url(url: str, allow_private: bool, allowed_ports: frozenset[int]) -> 
 
 class _GuardedRedirect(HTTPRedirectHandler):
     """Re-validate every redirect target through the same guard so a 30x bounce
-    cannot escape the policy (DNS rebinding, cross-protocol, internal hop)."""
+    cannot escape the policy (DNS rebinding, cross-protocol, internal hop). When an
+    operator session is attached, it is ALSO stripped from the redirected request
+    if the bounce leaves the same-site boundary — so a redirect to a login/SSO host
+    can never carry the session off-target."""
 
-    def __init__(self, allow_private: bool, allowed_ports: frozenset[int]) -> None:
+    def __init__(self, allow_private: bool, allowed_ports: frozenset[int],
+                 auth: AuthContext | None = None) -> None:
         self.allow_private = allow_private
         self.allowed_ports = allowed_ports
+        self.auth = auth
         self.count = 0
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, N802
@@ -200,23 +206,34 @@ class _GuardedRedirect(HTTPRedirectHandler):
         if self.count > _MAX_REDIRECTS:
             raise WebsiteFetchError("Website redirected too many times.")
         target = _guard_url(urljoin(req.full_url, newurl), self.allow_private, self.allowed_ports)
-        return super().redirect_request(req, fp, code, msg, headers, target)
+        new = super().redirect_request(req, fp, code, msg, headers, target)
+        if new is not None and self.auth is not None:
+            target_host = urlparse(target).hostname or ""
+            if not same_site(target_host, self.auth.host):
+                # Drop the session on a cross-site bounce. Match by LOWERCASED name:
+                # urllib stores header keys capitalized ("X-Api-Key" -> "X-api-key"),
+                # so remove_header(original_name) would silently miss multi-word headers
+                # and leak them to the redirect target.
+                drop = {name.lower() for name in self.auth.headers}
+                new.headers = {k: v for k, v in new.headers.items() if k.lower() not in drop}
+                new.unredirected_hdrs = {k: v for k, v in new.unredirected_hdrs.items() if k.lower() not in drop}
+        return new
 
 
-def _fetch_raw(url: str) -> dict[str, Any]:
+def _fetch_raw(url: str, *, auth: AuthContext | None = None) -> dict[str, Any]:
     settings = get_settings()
     normalized = normalize_website_url(url)
     sanitized = _guard_url(normalized, settings.allow_private_urls, settings.web_allowed_ports)
-    request = Request(
-        sanitized,
-        headers={
-            "Accept": "*/*",
-            "Accept-Encoding": "identity",
-            "User-Agent": _USER_AGENT,
-        },
-        method="GET",
-    )
-    opener = build_opener(_GuardedRedirect(settings.allow_private_urls, settings.web_allowed_ports))
+    headers = {
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+        "User-Agent": _USER_AGENT,
+    }
+    # Operator session attached SAME-SITE only; a cross-site redirect strips it again
+    # (see _GuardedRedirect), so it never leaves the target's host.
+    headers.update(auth_headers_for(urlparse(sanitized).hostname or "", auth))
+    request = Request(sanitized, headers=headers, method="GET")
+    opener = build_opener(_GuardedRedirect(settings.allow_private_urls, settings.web_allowed_ports, auth=auth))
     try:
         with opener.open(request, timeout=settings.web_fetch_timeout_seconds) as response:
             final_url = response.geturl()
@@ -486,7 +503,7 @@ def _sensitive_path_matches(kind: str, body: str, headers: dict[str, Any], statu
     return False
 
 
-def _probe_sensitive_paths(base_url: str, governor: HostRateGovernor) -> list[dict[str, Any]]:
+def _probe_sensitive_paths(base_url: str, governor: HostRateGovernor, *, auth: AuthContext | None = None) -> list[dict[str, Any]]:
     """Probe the small constant wordlist on the target's own origin, content-validate
     each 200, and emit a redacted disclosure finding for real hits. Same-origin,
     GET-only via _fetch_raw (so the SSRF/redirect/port guards apply identically),
@@ -500,7 +517,7 @@ def _probe_sensitive_paths(base_url: str, governor: HostRateGovernor) -> list[di
             break  # per-host budget exhausted -> stop (fail closed, no bursting)
         url = base + path
         try:
-            fetched = _fetch_raw(url)
+            fetched = _fetch_raw(url, auth=auth)
         except (WebsiteFetchError, URLError, TimeoutError, ValueError, OSError):
             continue
         if int(fetched.get("status") or 0) != 200:
@@ -528,7 +545,8 @@ def _probe_sensitive_paths(base_url: str, governor: HostRateGovernor) -> list[di
 
 
 def run_web_scan(
-    url: str, max_findings: int = _MAX_FINDINGS_RETURNED, *, probe_paths: bool = False
+    url: str, max_findings: int = _MAX_FINDINGS_RETURNED, *, probe_paths: bool = False,
+    auth: AuthContext | None = None,
 ) -> dict[str, Any]:
     """Passively scan a single URL. Returns a JSON-serializable result, or
     ``{"ok": False, "error": ...}`` on a fetch failure instead of raising.
@@ -541,7 +559,7 @@ def run_web_scan(
         return {"ok": False, "scan_type": "web", "error": "No URL provided."}
 
     try:
-        fetched = _fetch_raw(target)
+        fetched = _fetch_raw(target, auth=auth)
     except WebsiteFetchError as exc:
         return {"ok": False, "scan_type": "web", "target": target, "error": str(exc)}
     except (URLError, TimeoutError, ValueError) as exc:
@@ -561,7 +579,7 @@ def run_web_scan(
                 capacity=len(_SENSITIVE_PATHS) + 2,
                 min_interval_s=settings.active_min_interval_ms / 1000.0,
             )
-            findings.extend(_probe_sensitive_paths(fetched["final_url"], governor))
+            findings.extend(_probe_sensitive_paths(fetched["final_url"], governor, auth=auth))
         except Exception:  # noqa: BLE001 - probing is additive, never fatal
             pass
     findings.sort(key=lambda f: _SEVERITY_RANK.get(f["severity"], 0), reverse=True)

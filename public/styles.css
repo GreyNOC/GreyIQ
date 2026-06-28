@@ -2910,6 +2910,13 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-switch input { margin-top: 0.15rem; accent-color: var(--accent); width: 1rem; height: 1rem; flex: none; }
 .ck-switch em { color: var(--muted); font-style: normal; }
 .ck-auth { padding: 0.5rem 0.6rem; border: 1px solid color-mix(in srgb, var(--sun) 40%, var(--border)); border-radius: 9px; background: color-mix(in srgb, var(--sun) 8%, transparent); }
+.ck-auth-fold { border: 1px solid var(--border); border-radius: 9px; padding: 0 0.6rem; }
+.ck-auth-fold > summary { cursor: pointer; padding: 0.5rem 0; font-size: 0.78rem; font-weight: 500; color: var(--text); list-style: none; display: flex; align-items: center; gap: 0.4rem; }
+.ck-auth-fold > summary::-webkit-details-marker { display: none; }
+.ck-auth-fold[open] > summary { border-bottom: 1px solid var(--border); margin-bottom: 0.5rem; }
+.ck-auth-fold .ck-auth-hint { font-size: 0.68rem; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 0.02rem 0.4rem; }
+.ck-auth-fold label { margin-bottom: 0.5rem; }
+.ck-auth-fold textarea { font: inherit; font-size: 0.78rem; resize: vertical; }
 .ck-run {
   font: inherit; font-weight: 600; font-size: 0.9rem; cursor: pointer;
   padding: 0.62rem; border: 0; border-radius: 10px; margin-top: 0.2rem;

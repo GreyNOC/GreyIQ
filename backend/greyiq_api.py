@@ -501,6 +501,8 @@ class BountyScanRequest(BaseModel):
     run_live: bool = False
     active: bool = False
     time_based: bool = False
+    auth_cookie: str = Field(default="", max_length=8000)
+    auth_headers: list[str] = Field(default_factory=list, max_length=20)
     per_finding: bool = False
     max_files: int = Field(default=5000, ge=1, le=100_000)
 
@@ -512,6 +514,8 @@ class CampaignRequest(BaseModel):
     program: str | None = Field(default=None, max_length=200)
     active: bool = False
     time_based: bool = False
+    auth_cookie: str = Field(default="", max_length=8000)
+    auth_headers: list[str] = Field(default_factory=list, max_length=20)
     live: bool = False
     max_pages: int = Field(default=12, ge=1, le=50)
 
@@ -1123,6 +1127,7 @@ class GreyIQRuntime:
             run_live=request.run_live,
             active=request.active,
             time_based=request.time_based,
+            auth={"cookie": request.auth_cookie, "headers": request.auth_headers},
             max_files=request.max_files,
             per_finding=request.per_finding,
         )
@@ -1143,6 +1148,7 @@ class GreyIQRuntime:
             version=VERSION,
             active=request.active,
             time_based=request.time_based,
+            auth={"cookie": request.auth_cookie, "headers": request.auth_headers},
             live=request.live,
             program=request.program,
             max_pages=request.max_pages,
