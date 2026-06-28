@@ -559,9 +559,11 @@ class _BucketHandler(BaseHTTPRequestHandler):
     status = 200
     body = b""
     hits = 0
+    last_headers: dict = {}
 
     def do_GET(self) -> None:  # noqa: N802
         type(self).hits += 1
+        type(self).last_headers = {k.lower(): v for k, v in self.headers.items()}
         body = type(self).body
         self.send_response(type(self).status)
         self.send_header("Content-Type", "application/xml")
@@ -606,8 +608,8 @@ class OpenBucketE2ETests(unittest.TestCase):
         # Any host now resolves to the local listener (controls IP AND port via sockaddr).
         socket.getaddrinfo = lambda host, p, *a, **k: orig("127.0.0.1", port, *a, **k)
 
-    def _http(self):
-        return av._Http(get_settings(), HostRateGovernor(capacity=20, min_interval_s=0.0), max_requests=12)
+    def _http(self, auth=None):
+        return av._Http(get_settings(), HostRateGovernor(capacity=20, min_interval_s=0.0), max_requests=12, auth=auth)
 
     def test_confirms_public_listing_over_real_socket(self) -> None:
         self._serve(200, (b'<?xml version="1.0" encoding="UTF-8"?>'
@@ -642,6 +644,81 @@ class OpenBucketE2ETests(unittest.TestCase):
         f = av._check_open_bucket(self._http(), landing, "evil-rebind.s3.amazonaws.com", get_settings())
         self.assertIsNone(f, "a bucket host resolving to a private IP must be refused, not reported")
         self.assertEqual(_BucketHandler.hits, 0, "the guard must block before any socket reaches the listener")
+
+    def test_operator_session_never_leaks_to_a_foreign_bucket(self) -> None:
+        # The CRITICAL invariant: an authenticated scan binds the operator's cookie to
+        # the TARGET host. The open-bucket check fetches a FOREIGN host (the bucket), so
+        # that fetch must carry NO Cookie even though auth is active for the hunt.
+        from bughunter.scan_auth import build_auth
+        self._serve(200, (b'<?xml version="1.0"?><ListBucketResult>'
+                          b'<Contents><Key>k</Key></Contents></ListBucketResult>'))
+        auth = build_auth("https://app.example.com/", cookie="session=TOP-SECRET")  # bound to the TARGET
+        bucket = "http://assets.s3.amazonaws.com/"
+        landing = {"body": f'<img src="{bucket}p.png">', "status": 200, "headers": {}}
+        f = av._check_open_bucket(self._http(auth=auth), landing, "assets.s3.amazonaws.com", get_settings())
+        self.assertIsNotNone(f)  # the bucket is still probed + confirmed
+        self.assertNotIn("cookie", _BucketHandler.last_headers, "the session must NEVER reach a foreign bucket host")
+        self.assertNotIn("TOP-SECRET", str(_BucketHandler.last_headers))
+
+
+class _CookieGatedHandler(BaseHTTPRequestHandler):
+    """A behind-login app: it reflects the `q` param UNESCAPED (a real XSS) only when a
+    valid session cookie is present; unauthenticated requests get a benign login page.
+    So the bug is reachable ONLY by an authenticated scan."""
+
+    def do_GET(self) -> None:  # noqa: N802
+        cookie = self.headers.get("Cookie") or ""
+        q = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+        reflected = " ".join(v for vals in q.values() for v in vals)
+        if "session=" in cookie:
+            body = f"<html>echo {reflected}</html>".encode()          # authed -> vulnerable reflection
+        else:
+            body = b"<html>Please log in to continue.</html>"          # anon -> nothing to find
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    do_HEAD = do_GET
+
+    def log_message(self, *args: object) -> None:
+        return
+
+
+class AuthScanE2ETests(unittest.TestCase):
+    """End-to-end: a reflected-XSS that only exists behind login is found WITH a
+    session and missed WITHOUT one — over real sockets."""
+
+    def setUp(self) -> None:
+        self._prev = os.environ.get("GREYIQ_SCAN_ALLOW_PRIVATE_URLS")
+        os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _CookieGatedHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.port = self.server.server_port
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        if self._prev is None:
+            os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+        else:
+            os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = self._prev
+
+    def _xss(self, findings) -> bool:
+        return any(f.get("_active_class_hint") == "xss" and f["_active_proof"]["status"] == "confirmed" for f in findings)
+
+    def test_behind_login_xss_found_only_with_session(self) -> None:
+        from bughunter.scan_auth import build_auth
+        url = f"http://127.0.0.1:{self.port}/?q=x"
+        auth = build_auth(f"http://127.0.0.1:{self.port}/", cookie="session=abc123")
+        # WITH the session -> the authed reflection is reachable -> XSS confirmed.
+        findings, meta = av.verify_active(url, [], scope="127.0.0.1", auth=auth)
+        self.assertTrue(meta["in_scope"])
+        self.assertTrue(self._xss(findings), "authenticated scan must reach the behind-login XSS")
+        # WITHOUT it -> only the login page is seen -> nothing to confirm.
+        findings_anon, _ = av.verify_active(url, [], scope="127.0.0.1")
+        self.assertFalse(self._xss(findings_anon), "without a session the bug is not reachable")
 
 
 if __name__ == "__main__":

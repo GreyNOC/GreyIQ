@@ -442,6 +442,15 @@
                 <span><strong>I'm authorized to test this target (in scope).</strong></span></label>
             </div>
 
+            <details class="ck-auth-fold" id="ckAuthFold">
+              <summary>Scan behind a login <span class="ck-auth-hint">optional</span></summary>
+              <label><span>Session cookie</span>
+                <input id="ckAuthCookie" type="text" autocomplete="off" spellcheck="false" placeholder="session=…; csrf=…"></label>
+              <label><span>Extra headers <em>(one per line, Name: value)</em></span>
+                <textarea id="ckAuthHeaders" rows="2" autocomplete="off" spellcheck="false" placeholder="Authorization: Bearer …"></textarea></label>
+              <p class="ck-hint">Sent only to the target host and its subdomains — never to a third-party host, even on a redirect.</p>
+            </details>
+
             <button class="ck-run" id="ckRun" type="submit">Run hunt</button>
             <p class="ck-status" id="ckStatus" aria-live="polite"></p>
           </form>

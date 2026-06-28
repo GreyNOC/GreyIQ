@@ -50,6 +50,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.rate_limit import HostRateGovernor
+from bughunter.scan_auth import AuthContext, auth_headers_for
 from bughunter.settings import get_settings
 from bughunter.web_ingest import (
     WebsiteFetchError,
@@ -165,10 +166,12 @@ class _Http:
     independent ceilings: a per-hunt request budget (``max_requests``, counted here)
     and a process-wide per-host token bucket (the governor)."""
 
-    def __init__(self, settings: Any, governor: HostRateGovernor, max_requests: int = 12) -> None:
+    def __init__(self, settings: Any, governor: HostRateGovernor, max_requests: int = 12,
+                 auth: AuthContext | None = None) -> None:
         self.settings = settings
         self.governor = governor
         self.max_requests = max(1, int(max_requests))
+        self.auth = auth  # operator session, attached SAME-SITE only (never to a foreign bucket)
         self.sent = 0
         self.opener = build_opener(_NoRedirect())
 
@@ -184,6 +187,10 @@ class _Http:
             raise _RateLimited()
         self.sent += 1
         headers = {"User-Agent": _USER_AGENT, "Accept": "*/*", "Accept-Encoding": "identity"}
+        # Operator auth is attached ONLY when this request's host is same-site as the
+        # bound host — so the open-bucket check's foreign-host fetch (and any other
+        # off-target host) never receives the session.
+        headers.update(auth_headers_for(host, self.auth))
         if extra_headers:
             headers.update(extra_headers)
         request = Request(sanitized, headers=headers, method=method)
@@ -704,6 +711,7 @@ def verify_active(
     governor: HostRateGovernor | None = None,
     http: _Http | None = None,
     time_based: bool = False,
+    auth: AuthContext | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run the active checks against an in-scope target. Returns
     ``(active_findings, meta)``. ``active_findings`` are confirmed/candidate finding
@@ -734,7 +742,7 @@ def verify_active(
         capacity=settings.active_max_requests_per_host,
         min_interval_s=settings.active_min_interval_ms / 1000.0,
     )
-    http = http or _Http(settings, governor, max_requests=requests_budget)
+    http = http or _Http(settings, governor, max_requests=requests_budget, auth=auth)
 
     # Fetch the landing page once so header-only checks (clickjacking) reuse it.
     landing: dict[str, Any] | None = None

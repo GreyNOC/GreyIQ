@@ -112,6 +112,7 @@ def _cmd_hunt(args: argparse.Namespace) -> int:
         run_live=args.live,
         active=args.active or getattr(args, "time_based", False),  # --time-based implies --active
         time_based=getattr(args, "time_based", False),
+        auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
         per_finding=args.per_finding,
     )
     if not result.get("ok"):
@@ -162,6 +163,7 @@ def _cmd_campaign(args: argparse.Namespace) -> int:
         version=VERSION,
         active=args.active or getattr(args, "time_based", False),  # --time-based implies --active
         time_based=getattr(args, "time_based", False),
+        auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
         live=args.live,
         program=args.program,
         max_pages=args.max_pages,
@@ -459,6 +461,9 @@ def build_parser() -> argparse.ArgumentParser:
     hunt.add_argument("--active", action="store_true", help="active verification: send benign probes to PROVE findings (URL targets)")
     hunt.add_argument("--time-based", dest="time_based", action="store_true",
                       help="opt-in: add the bounded-SLEEP blind-SQLi probe (implies --active; off by default — it executes a fixed SLEEP)")
+    hunt.add_argument("--cookie", default="", help="scan behind a login: a Cookie header value, sent to the target host + subdomains ONLY")
+    hunt.add_argument("--header", action="append", metavar="'Name: value'",
+                      help="extra auth header (repeatable), e.g. --header 'Authorization: Bearer ...'; sent same-site only")
     hunt.add_argument("--live", action="store_true", help="dynamic Playwright browser pass (URL targets)")
     hunt.add_argument("--brain", action="store_true", help="use the configured LLM brain to enrich (default: deterministic)")
     hunt.add_argument("-o", "--out", default=None, help="report output folder (default: runtime/reports)")
@@ -474,6 +479,9 @@ def build_parser() -> argparse.ArgumentParser:
     camp.add_argument("--active", action="store_true", help="capture proof of impact on each URL (recommended)")
     camp.add_argument("--time-based", dest="time_based", action="store_true",
                       help="opt-in: add the bounded-SLEEP blind-SQLi probe per URL (implies --active; off by default)")
+    camp.add_argument("--cookie", default="", help="scan behind a login: a Cookie header value, sent to in-scope hosts + subdomains ONLY")
+    camp.add_argument("--header", action="append", metavar="'Name: value'",
+                      help="extra auth header (repeatable), e.g. --header 'Authorization: Bearer ...'; sent same-site only")
     camp.add_argument("--live", action="store_true", help="dynamic Playwright pass per URL")
     camp.add_argument("--brain", action="store_true", help="use the configured LLM brain to enrich")
     camp.add_argument("--max-pages", type=int, default=12, help="recon discovery cap (default 12)")
