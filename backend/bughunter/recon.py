@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from urllib.parse import urldefrag, urljoin, urlparse
+from urllib.parse import parse_qsl, urldefrag, urljoin, urlparse
 
 from bughunter.fingerprint import fingerprint
 from bughunter.rate_limit import HostRateGovernor
@@ -31,6 +31,13 @@ from bughunter.web_scan_service import _fetch_raw, _guard_url
 _LINK_RE = re.compile(r"""(?:href|src|action)\s*=\s*["']([^"'#\s]+)["']""", re.IGNORECASE)
 _SCRIPT_SRC_RE = re.compile(r"""<script[^>]+src\s*=\s*["']([^"']+\.m?js[^"']*)["']""", re.IGNORECASE)
 _SITEMAP_LOC_RE = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>", re.IGNORECASE)
+# Form-field names — the param names a page's own inputs submit. These are exactly the
+# parameters the active prover should bite on, even when no link carries them in a query
+# string. ``name=`` may appear before or after other attributes on the tag.
+_FORM_NAME_RE = re.compile(
+    r"""<(?:input|textarea|select|button)\b[^>]*?\bname\s*=\s*["']([A-Za-z_][A-Za-z0-9_\-\[\]\.]{0,39})["']""",
+    re.IGNORECASE,
+)
 _SKIP_EXT = (".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".woff", ".woff2",
              ".ttf", ".eot", ".pdf", ".zip", ".mp4", ".webm", ".mp3", ".map")
 _MAX_JS = 8  # served-JS bundles mined per campaign (bounded)
@@ -72,6 +79,20 @@ def _extract_scripts(body: str, base_url: str) -> list[str]:
         if absolute.startswith(("http://", "https://")):
             out.append(absolute)
     return out
+
+
+def _html_param_names(body: str) -> set[str]:
+    """Parameter names from a page's own form fields (input/select/textarea/button)."""
+    return set(_FORM_NAME_RE.findall(body or "")[:200])
+
+
+def _qs_param_names(url: str) -> set[str]:
+    """Query-string parameter names embedded in a URL — so a param seen on one endpoint
+    can be tried against a param-less sibling."""
+    try:
+        return {k for k, _ in parse_qsl(urlparse(url).query) if k}
+    except ValueError:
+        return set()
 
 
 def _safe_fetch(url: str, settings: Any, governor: HostRateGovernor) -> dict[str, Any] | None:
@@ -174,6 +195,7 @@ def discover(
             continue
         body = fetched.get("body") or ""
         final = fetched.get("final_url") or url
+        params.update(_html_param_names(body))  # the page's own form-field names
 
         if not tech:  # fingerprint once, from the first reachable page
             fp = fingerprint(fetched.get("headers"), body, fetched.get("cookies"))
@@ -212,6 +234,11 @@ def discover(
                     seen.add(ep); discovered.append(ep)
                     sources["js-endpoint"] = sources.get("js-endpoint", 0) + 1
 
+    # Query-string param names from every discovered URL — a param seen on one endpoint
+    # becomes a candidate for a param-less sibling (the active prover dedupes per-URL).
+    for disc_url in discovered:
+        params.update(_qs_param_names(disc_url))
+
     if len(discovered) >= max_pages:
         notes.append(f"discovery capped at {max_pages} URLs.")
     if used["n"] >= max_requests:
@@ -220,6 +247,8 @@ def discover(
         notes.append(f"{dropped_oos} discovered link(s) skipped as out-of-scope.")
     if js_secrets:
         notes.append(f"{len(js_secrets)} secret(s) found in served JS (redacted).")
+    if params:
+        notes.append(f"{len(params)} input parameter name(s) discovered (forms/JS/links) — probed by the active checks.")
 
     return {
         "urls": discovered[:max_pages], "host": host, "sources": sources, "notes": notes,

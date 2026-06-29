@@ -717,6 +717,7 @@ def run_bounty_hunt(
     auth: dict[str, Any] | None = None,
     max_files: int = 5000,
     per_finding: bool = False,
+    extra_params: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run a bounty hunt end to end and write a Markdown + JSON report.
 
@@ -776,7 +777,7 @@ def run_bounty_hunt(
     # skip the rest of the (already-gated, scope-bound) active pass.
     if (active or time_based) and authorized and kind == "url":
         try:
-            active_findings, active_meta = active_verify_service.verify_active(clean_target, raw_findings, scope=scope, time_based=time_based, auth=auth_ctx)
+            active_findings, active_meta = active_verify_service.verify_active(clean_target, raw_findings, scope=scope, time_based=time_based, auth=auth_ctx, extra_params=extra_params)
             if active_findings:
                 raw_findings = list(raw_findings) + active_findings
                 if "active" not in scanners_run:

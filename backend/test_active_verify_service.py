@@ -317,6 +317,77 @@ class ActiveCheckTests(unittest.TestCase):
         self.assertIsNone(f)
 
 
+class ParamDiscoveryTests(unittest.TestCase):
+    """Recon-discovered parameter names let the param-keyed checks bite on endpoints
+    that carry no query string of their own — the surface recon found but the prover
+    previously ignored. The per-check request budget is unchanged: URL params come
+    first, discovered names only fill the slots the URL didn't."""
+
+    def test_candidate_params_url_first_then_discovered_deduped(self) -> None:
+        # URL param first, then discovered (case-insensitive dedupe drops the dup 'A').
+        out = av._candidate_params("https://h/x?a=1", ["A", "b", "c"], ("z",), 3)
+        self.assertEqual(out, ["a", "b", "c"])
+
+    def test_candidate_params_default_only_when_no_url_or_discovered(self) -> None:
+        self.assertEqual(av._candidate_params("https://h/x", [], ("q",), 2), ["q"])
+        self.assertEqual(av._candidate_params("https://h/x", ["p"], ("q",), 2), ["p"])  # discovered beats default
+
+    def test_candidate_params_empty_default_bails(self) -> None:
+        # SQLi checks pass default=() so a param-less URL with no discovered name yields
+        # nothing — they never invent an injection point.
+        self.assertEqual(av._candidate_params("https://h/x", [], (), 2), [])
+
+    def test_clean_param_names_drops_malformed_dedupes_and_caps(self) -> None:
+        cleaned = av._clean_param_names(["good", "al_so-ok", "user[id]", "bad name", "x" * 60, "9lead", "", "GOOD"])
+        self.assertIn("good", cleaned)
+        self.assertIn("user[id]", cleaned)            # PHP/Rails-style names are valid
+        self.assertNotIn("bad name", cleaned)          # space → dropped
+        self.assertNotIn("9lead", cleaned)             # must start with a letter/underscore
+        self.assertEqual(sum(1 for n in cleaned if n.lower() == "good"), 1)  # case-insensitive dedupe
+        capped = av._clean_param_names([f"p{i}" for i in range(100)])
+        self.assertLessEqual(len(capped), av._MAX_DISCOVERED_PARAMS)
+
+    def test_reflected_xss_fires_on_discovered_param_for_paramless_url(self) -> None:
+        class OnlyKwStub:  # reflects ONLY the 'kw' param, unescaped, as HTML
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                kw = (parse_qs(urlparse(url).query, keep_blank_values=True).get("kw") or [""])[0]
+                return {"status": 200, "headers": {"content-type": "text/html"}, "cookies": [],
+                        "body": f"<html>{kw}</html>", "final_url": url, "location": None}
+        url = "https://app.example.com/profile"  # no query string of its own
+        # Without the discovered name, the check guesses 'q'; the server ignores it → miss.
+        self.assertIsNone(av._check_reflected_xss(OnlyKwStub(), url))
+        # Recon found 'kw' (a form field / JS param) → the check now bites and confirms.
+        f = av._check_reflected_xss(OnlyKwStub(), url, ["kw"])
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertIn("kw", f["title"])
+
+    def test_error_sqli_fires_on_discovered_param_for_paramless_url(self) -> None:
+        class KwSqlStub:  # a quote in 'kw' yields a DB error banner; no 'kw' → clean
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                kw = (parse_qs(urlparse(url).query, keep_blank_values=True).get("kw") or [""])[0]
+                body = "You have an error in your SQL syntax near" if "'" in kw else "ok"
+                return {"status": 200, "headers": {}, "body": body, "cookies": [], "final_url": url, "location": None}
+        url = "https://app.example.com/list"
+        self.assertIsNone(av._check_error_sqli(KwSqlStub(), url))      # no param → never invents one
+        f = av._check_error_sqli(KwSqlStub(), url, ["kw"])             # discovered 'kw' → confirmed
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+
+    def test_redirect_candidates_pick_up_discovered_redirectish_param_only(self) -> None:
+        cands = av._redirect_candidates("https://h/login", ["returnTo", "q", "csrf"], ("next",), 3)
+        self.assertIn("returnTo", cands)     # redirect-ish discovered name is tried
+        self.assertNotIn("q", cands)         # unrelated discovered names are not fuzzed
+        self.assertNotIn("csrf", cands)
+
+    def test_verify_active_sanitizes_extra_params_before_use(self) -> None:
+        # An out-of-scope host returns before any probe, but the call must accept the
+        # extra_params kwarg and not raise on malformed names.
+        _, meta = av.verify_active("https://not-in-scope.example/", [], scope="other.example",
+                                   extra_params=["ok_name", "bad name", "user[id]"])
+        self.assertFalse(meta["in_scope"])
+
+
 class ScopeBindingTests(unittest.TestCase):
     def test_named_host_in_scope(self) -> None:
         s = get_settings()

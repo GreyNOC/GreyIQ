@@ -161,6 +161,93 @@ def _with_query(url: str, params: dict[str, str]) -> str:
     return urlunparse(parsed._replace(query=urlencode(existing)))
 
 
+# A valid query-parameter token (incl. PHP/Rails-style `user[id]` / `filter.name`).
+# Operator- and recon-supplied param names are validated against this before they ever
+# become a probe key — a malformed token is dropped rather than injected.
+_PARAM_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_\-\[\]\.]{0,39}$")
+_MAX_DISCOVERED_PARAMS = 40
+# Param NAMES that signal a redirect/forward target (used to pick which discovered
+# params the redirect/CRLF checks bite on, without fuzzing every unrelated param).
+_REDIRECT_HINTS = ("redirect", "return", "next", "dest", "continue", "callback", "forward", "goto", "url")
+
+
+def _clean_param_names(names: Any) -> list[str]:
+    """Sanitize + bound caller-supplied (recon/operator) param names before they become
+    probe keys: keep only well-formed tokens, dedupe case-insensitively, cap the count.
+    These are names DISCOVERED from the target's own JS/HTML (evidence the param exists),
+    not a blind wordlist."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in names or []:
+        name = str(raw or "").strip()
+        if not _PARAM_NAME_RE.match(name):
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+        if len(out) >= _MAX_DISCOVERED_PARAMS:
+            break
+    return out
+
+
+def _candidate_params(url: str, extra: list[str] | None, default: tuple[str, ...], limit: int) -> list[str]:
+    """Ordered, deduped parameter names a param-keyed check should probe: params already
+    present in the URL FIRST (most likely live), then recon-discovered names, then a small
+    built-in default — capped at ``limit`` (the SAME small per-check cap as before, so an
+    already-parametered URL costs the same number of requests; only param-poor endpoints,
+    which previously tested nothing, gain coverage). Pass ``default=()`` for the SQLi checks
+    so a param-less endpoint with no discovered name still bails — they never invent an
+    injection point."""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(name: str) -> None:
+        clean = (name or "").strip()
+        key = clean.lower()
+        if clean and key not in seen:
+            seen.add(key)
+            out.append(clean)
+
+    for key, _ in parse_qsl(urlparse(url).query):
+        _add(key)
+    for name in extra or []:
+        _add(name)
+    if not out:
+        for name in default:
+            _add(name)
+    return out[:limit]
+
+
+def _redirect_candidates(url: str, extra: list[str] | None, default: tuple[str, ...], limit: int) -> list[str]:
+    """Redirect/CRLF candidates: redirect-NAMED params already in the URL first, then
+    recon-discovered params whose NAME looks like a redirect/forward target, then the
+    built-in defaults — so a custom-named redirect param the app actually uses gets tested
+    without firing at every unrelated param."""
+    existing = {k.lower() for k, _ in parse_qsl(urlparse(url).query)}
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(name: str) -> None:
+        clean = (name or "").strip()
+        key = clean.lower()
+        if clean and key not in seen:
+            seen.add(key)
+            out.append(clean)
+
+    for param in _REDIRECT_PARAMS:
+        if param in existing:
+            _add(param)
+    for name in extra or []:
+        if any(hint in (name or "").lower() for hint in _REDIRECT_HINTS):
+            _add(name)
+    if not out:
+        for name in default:
+            _add(name)
+    return out[:limit]
+
+
 class _Http:
     """Bounded, SSRF-guarded, non-redirect-following HTTP for active checks. Two
     independent ceilings: a per-hunt request budget (``max_requests``, counted here)
@@ -324,11 +411,9 @@ def _check_cors(http: _Http, url: str) -> dict[str, Any] | None:
     return None
 
 
-def _check_open_redirect(http: _Http, url: str) -> dict[str, Any] | None:
-    parsed = urlparse(url)
-    existing = {k.lower() for k, _ in parse_qsl(parsed.query)}
-    candidates = [p for p in _REDIRECT_PARAMS if p in existing] or ["next", "redirect", "url"]
-    for param in candidates[:3]:
+def _check_open_redirect(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
+    candidates = _redirect_candidates(url, extra_params, ("next", "redirect", "url"), 3)
+    for param in candidates:
         try:
             probe = http.fetch(_with_query(url, {param: _MARKER_ORIGIN + "/"}))
         except _ActiveError:
@@ -407,11 +492,10 @@ def _check_host_header(http: _Http, url: str) -> dict[str, Any] | None:
     return _finding("active.host-header-injection", "Host header reflected (host-header injection)", "medium", "redirect", "redirect", url, proof, ev)
 
 
-def _check_reflected_xss(http: _Http, url: str) -> dict[str, Any] | None:
-    parsed = urlparse(url)
-    params = [k for k, _ in parse_qsl(parsed.query)] or ["q"]
+def _check_reflected_xss(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
+    params = _candidate_params(url, extra_params, ("q",), 2)
     marker_payload = f"{_MARK}<svg/onload=1>"
-    for param in params[:2]:
+    for param in params:
         try:
             probe = http.fetch(_with_query(url, {param: marker_payload}))
             control = http.fetch(_with_query(url, {param: _MARK}))
@@ -437,13 +521,12 @@ def _check_reflected_xss(http: _Http, url: str) -> dict[str, Any] | None:
     return None
 
 
-def _check_ssti(http: _Http, url: str) -> dict[str, Any] | None:
-    parsed = urlparse(url)
-    params = [k for k, _ in parse_qsl(parsed.query)] or ["q"]
+def _check_ssti(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
+    params = _candidate_params(url, extra_params, ("q",), 2)
     probe_payload = f"{_MARK}{{{{7*7}}}}"  # marker + {{7*7}} (a benign arithmetic expression)
     control_payload = f"{_MARK}7*7"        # marker + the literal string '7*7'
     evaluated = f"{_MARK}49"               # what an engine that EVALUATES {{7*7}} emits
-    for param in params[:2]:
+    for param in params:
         try:
             probe = http.fetch(_with_query(url, {param: probe_payload}))
             control = http.fetch(_with_query(url, {param: control_payload}))
@@ -469,12 +552,12 @@ def _check_ssti(http: _Http, url: str) -> dict[str, Any] | None:
     return None
 
 
-def _check_error_sqli(http: _Http, url: str) -> dict[str, Any] | None:
+def _check_error_sqli(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
     parsed = urlparse(url)
-    params = [k for k, v in parse_qsl(parsed.query)]
+    params = _candidate_params(url, extra_params, (), 2)
     if not params:
-        return None  # need an existing param to perturb; never invent injection points blindly
-    for param in params[:2]:
+        return None  # need a URL or recon-discovered param to perturb; never invent one blindly
+    for param in params:
         original = dict(parse_qsl(parsed.query)).get(param, "1")
         try:
             probe = http.fetch(_with_query(url, {param: original + "'"}))
@@ -505,17 +588,17 @@ def _norm_len(body: str) -> int:
     return len(re.sub(r"\s+", " ", body or ""))
 
 
-def _check_bool_sqli(http: _Http, url: str) -> dict[str, Any] | None:
+def _check_bool_sqli(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
     """Boolean-based blind SQLi, GET-only, no timing/SLEEP, no data extraction — just
     one boolean bit. Confirms ONLY when the page is stable across two baselines AND a
     TRUE tautology tracks the baseline while a FALSE contradiction diverges materially.
     The two matching baselines ARE the negative control: a page that flaps on its own
     can't be differentiated, so it degrades to candidate rather than over-claiming."""
     parsed = urlparse(url)
-    params = [k for k, v in parse_qsl(parsed.query)]
+    params = _candidate_params(url, extra_params, (), 2)
     if not params:
-        return None  # need a real existing param; never invent injection points
-    for param in params[:2]:
+        return None  # need a URL or recon-discovered param; never invent injection points
+    for param in params:
         original = dict(parse_qsl(parsed.query)).get(param, "1")
         try:
             base1 = http.fetch(_with_query(url, {param: original}))
@@ -546,19 +629,17 @@ def _check_bool_sqli(http: _Http, url: str) -> dict[str, Any] | None:
     return None
 
 
-def _check_crlf(http: _Http, url: str) -> dict[str, Any] | None:
+def _check_crlf(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
     """CRLF / response-header injection, GET-only. Injects an encoded CRLF + a benign
     custom-header marker into a param; confirms ONLY when the server SPLITS it into a
     real response header equal to the marker AND a control without the CRLF does not —
     proving the value crossed into the header block. Benign marker header only; nothing
     that affects other users' traffic (contrast request smuggling)."""
-    parsed = urlparse(url)
-    existing = {k.lower() for k, _ in parse_qsl(parsed.query)}
-    candidates = [p for p in _REDIRECT_PARAMS if p in existing] or ["next", "redirect", "url", "page"]
+    candidates = _redirect_candidates(url, extra_params, ("next", "redirect", "url", "page"), 3)
     # RAW CR/LF — _with_query's urlencode encodes it ONCE to %0D%0A (pre-encoding here
     # would double-encode to %250D%250A and never inject a real newline).
     marker_value = f"\r\nX-Greyiq-Crlf:{_MARK}"
-    for param in candidates[:3]:
+    for param in candidates:
         try:
             probe = http.fetch(_with_query(url, {param: marker_value}))
             control = http.fetch(_with_query(url, {param: f"X-Greyiq-Crlf-{_MARK}"}))
@@ -590,12 +671,12 @@ _TIME_DELAY_S = 4          # the injected sleep (fixed; < web_fetch_timeout_seco
 _TIME_MARGIN_S = 3.0       # a confirmed probe must be at least this much slower than the fast controls
 
 
-def _check_time_sqli(http: _Http, url: str, settings: Any = None) -> dict[str, Any] | None:
+def _check_time_sqli(http: _Http, url: str, settings: Any = None, extra_params: list[str] | None = None) -> dict[str, Any] | None:
     settings = settings or get_settings()
     parsed = urlparse(url)
-    params = [k for k, v in parse_qsl(parsed.query)]
+    params = _candidate_params(url, extra_params, (), 1)
     if not params:
-        return None  # need a real existing param; never invent injection points
+        return None  # need a URL or recon-discovered param; never invent injection points
     d = getattr(settings, "active_time_sqli_delay_seconds", _TIME_DELAY_S) or _TIME_DELAY_S
     margin = getattr(settings, "active_time_sqli_margin_seconds", _TIME_MARGIN_S) or _TIME_MARGIN_S
     # Keep the injected delay strictly under the fetch timeout so a confirmed probe never
@@ -605,7 +686,7 @@ def _check_time_sqli(http: _Http, url: str, settings: Any = None) -> dict[str, A
     d_str = str(int(d)) if float(d).is_integer() else f"{d:.1f}"  # SLEEP(4), not SLEEP(4.0)
     slow = f"' AND SLEEP({d_str})-- -"
     fast = "' AND SLEEP(0)-- -"
-    for param in params[:1]:  # one param — the timing pass is request-heavy
+    for param in params:  # one param — the timing pass is request-heavy
         original = dict(parse_qsl(parsed.query)).get(param, "1")
         try:
             base = http.fetch(_with_query(url, {param: original}))
@@ -712,12 +793,19 @@ def verify_active(
     http: _Http | None = None,
     time_based: bool = False,
     auth: AuthContext | None = None,
+    extra_params: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run the active checks against an in-scope target. Returns
     ``(active_findings, meta)``. ``active_findings`` are confirmed/candidate finding
     dicts carrying a ``_active_proof`` for the orchestrator to merge; ``meta`` records
-    the authorization/scope/budget outcome for the report."""
+    the authorization/scope/budget outcome for the report.
+
+    ``extra_params`` are parameter NAMES recon discovered for this host (mined from the
+    target's own JS/HTML). The param-keyed checks probe URL params UNION these, so an
+    endpoint that carries no query string itself still gets its real parameters tested —
+    the surface recon found but the prover previously ignored."""
     settings = settings or get_settings()
+    discovered_params = _clean_param_names(extra_params)
     try:
         normalized = normalize_website_url(target_url)
     except WebsiteFetchError as exc:
@@ -760,20 +848,20 @@ def verify_active(
     checks: list[Callable[[], dict[str, Any] | None]] = [
         lambda: _check_clickjacking(http, sanitized, landing),
         lambda: _check_cors(http, sanitized),
-        lambda: _check_open_redirect(http, sanitized),
+        lambda: _check_open_redirect(http, sanitized, discovered_params),
         lambda: _check_host_header(http, sanitized),
-        lambda: _check_reflected_xss(http, sanitized),
-        lambda: _check_ssti(http, sanitized),
-        lambda: _check_error_sqli(http, sanitized),
-        lambda: _check_bool_sqli(http, sanitized),
-        lambda: _check_crlf(http, sanitized),
+        lambda: _check_reflected_xss(http, sanitized, discovered_params),
+        lambda: _check_ssti(http, sanitized, discovered_params),
+        lambda: _check_error_sqli(http, sanitized, discovered_params),
+        lambda: _check_bool_sqli(http, sanitized, discovered_params),
+        lambda: _check_crlf(http, sanitized, discovered_params),
         # Open-bucket is GET-only and scope-gated; safe in the default pass.
         lambda: _check_open_bucket(http, landing, scope, settings),
     ]
     # Time-based blind SQLi is the only check that emits an executing payload (a bounded
     # SLEEP), so it is OPT-IN — appended only when the operator explicitly enables it.
     if time_based:
-        checks.append(lambda: _check_time_sqli(http, sanitized, settings))
+        checks.append(lambda: _check_time_sqli(http, sanitized, settings, discovered_params))
     for check in checks:
         if rate_limited:
             break
@@ -791,6 +879,7 @@ def verify_active(
     meta = {
         "in_scope": True, "host": host, "requests_used": getattr(http, "sent", 0),
         "rate_limited": rate_limited, "verified_classes": verified,
+        "discovered_params_used": len(discovered_params),
         "skipped_reason": "",
     }
     return results, meta

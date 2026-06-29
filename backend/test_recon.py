@@ -48,6 +48,26 @@ class ReconHelperTests(unittest.TestCase):
         scripts = recon._extract_scripts('<script src="/static/main.abc.js"></script><script>x()</script>', "https://example.com/")
         self.assertEqual(scripts, ["https://example.com/static/main.abc.js"])
 
+    def test_html_param_names_from_form_fields(self) -> None:
+        # The param names a page's own inputs submit are exactly what the active prover
+        # should bite on — even when no link carries them in a query string.
+        body = (
+            '<form action="/search">'
+            '<input type="text" name="kw">'
+            "<input name='page' value='1'>"
+            '<select name="sort"><option>a</option></select>'
+            '<textarea name="comment"></textarea>'
+            '<button name="action" value="go">Go</button>'
+            '<input type="submit">'  # no name → ignored
+            '</form>'
+        )
+        names = recon._html_param_names(body)
+        self.assertEqual(names, {"kw", "page", "sort", "comment", "action"})
+
+    def test_qs_param_names_from_url(self) -> None:
+        self.assertEqual(recon._qs_param_names("https://x/a?id=1&ref=home&id=2"), {"id", "ref"})
+        self.assertEqual(recon._qs_param_names("https://x/a"), set())
+
 
 class ReconGuardTests(unittest.TestCase):
     def test_private_seed_short_circuits_without_network(self) -> None:

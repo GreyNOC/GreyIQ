@@ -104,6 +104,7 @@ def run_campaign(
     # --- Surface mapping (URL targets) → the list of targets to hunt. ---
     rec_js_secrets: list[dict[str, Any]] = []
     recon_tech: list[str] = []
+    recon_params: list[str] = []
     if kind == "url":
         _emit("recon: mapping the surface…")
         # Bind discovery to the SAME fail-closed scope gate the active prover uses, so
@@ -117,6 +118,10 @@ def run_campaign(
         recon_sources = rec.get("sources") or {}
         rec_js_secrets = rec.get("js_secrets") or []
         recon_tech = rec.get("tech") or []
+        # Parameter names recon mined from the target's own JS/HTML. Fed to every
+        # per-URL active pass so a discovered endpoint that carries no query string of
+        # its own still gets its real parameters probed (XSS/SQLi/redirect/SSTI/CRLF).
+        recon_params = rec.get("params") or []
     else:
         urls = [clean_target]
         recon_notes, recon_sources = [], {}
@@ -132,6 +137,7 @@ def run_campaign(
             url, profile, None, str(out_root / "targets"), scope, True, coder_cfg,
             default_reports_dir=out_root / "targets", seed_dir=seed_dir, runtime_dir=runtime_dir,
             version=version, run_live=live, active=active, time_based=time_based, auth=auth, per_finding=False,
+            extra_params=recon_params,
         )
         per_target.append({"target": url, "ok": result.get("ok", False),
                            "report_path": result.get("report_path", ""), "error": result.get("error", "")})
