@@ -2,6 +2,31 @@
 
 Notable changes to GreyIQ.
 
+## v0.27.0
+
+### Find more — discovered parameters now feed the active prover
+The active verification checks (reflected XSS, SSTI, error/boolean/time-based SQL
+injection, open redirect, CRLF) used to inject only into parameters that were already
+present in a URL's query string. Recon mined parameter names from the target's own
+JavaScript — but the campaign discarded them, so an endpoint discovered without a query
+string (for example `/search` with no `?q=`) was never probed for the parameters it
+actually takes.
+
+Now the parameter names recon discovers are threaded into every parameter-keyed active
+check. Coverage is strictly wider with **no extra requests on already-parametered URLs**:
+the URL's own parameters are tried first and the discovered names only fill the slots a
+URL leaves empty (capped per check), so a param-less endpoint that previously tested
+nothing now probes its real parameters. The SQL-injection checks still refuse to invent
+an injection point — they act only on a parameter the URL carries or that recon actually
+found.
+
+Recon also mines more parameter sources: HTML form fields (`input`/`select`/`textarea`/
+`button` names) on every crawled page, plus the query-string parameter names of every
+discovered URL (so a parameter seen on one endpoint is tried against a param-less
+sibling). The safety envelope is unchanged — GET-only, scope-bound and fail-closed,
+marker-plus-negative-control confirmation, and a per-host/per-hunt request budget; every
+discovered name is validated and capped before it is ever used as a probe key.
+
 ## v0.23.0
 
 ### Much smaller download + faster first launch — Ollama is now on-demand
