@@ -5091,7 +5091,67 @@ function ckRenderIdor() {
   host.append(out);
   host.append(ckIdorProbeForm());
   host.append(ckBflaForm());
+  host.append(ckStoredXssForm());
   host.append(ckOobPanel());
+}
+
+function ckStoredXssForm() {
+  const wrap = cel("div");
+  wrap.append(cel("h3", "ck-section-title", "Stored XSS — persistence confirm"));
+  wrap.append(cel("p", "ck-hint",
+    "Confirm stored XSS: GreyIQ mints a unique marker payload — submit it into the target field yourself (default, GET-only), then give the view URL to check if it rendered unescaped. Tick “Send automatically” to have GreyIQ POST the payload into the field (its only non-GET egress)."));
+  const form = cel("form", "ck-learn-form");
+  const viewUrl = ckField("View URL (where the content renders)", "text", "");
+  const injectUrl = ckField("Inject URL (form endpoint — auto-send only)", "text", "");
+  const field = ckField("Field name (auto-send only)", "text", "");
+  const cookie = ckField("Session Cookie (optional)", "text", "");
+  const marker = ckField("Marker (to re-check after a manual submit — optional)", "text", "");
+  const scope = ckField("Scope (name the host)", "text", state.ckScope || "");
+  form.append(viewUrl.wrap, injectUrl.wrap, field.wrap, cookie.wrap, marker.wrap, scope.wrap);
+  const sendWrap = cel("label", "ck-hint"); sendWrap.style.flexBasis = "100%";
+  const sendBox = cel("input"); sendBox.type = "checkbox"; sendBox.style.marginRight = "6px";
+  sendWrap.append(sendBox, document.createTextNode("Send the payload automatically (POST into the field — the only non-GET egress)"));
+  form.append(sendWrap);
+  const run = cel("button", "ck-btn", "Confirm stored XSS"); run.type = "submit"; form.append(run);
+  const note = cel("p", "ck-status"); note.style.flexBasis = "100%";
+  const out = cel("div", "ck-research");
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!viewUrl.input.value.trim()) { note.classList.add("is-error"); note.textContent = "The view URL is required."; return; }
+    const label = run.textContent; run.disabled = true; run.textContent = sendBox.checked ? "Sending…" : "Checking…";
+    note.classList.remove("is-error"); note.textContent = ""; out.replaceChildren();
+    try {
+      const res = await apiFetch("/api/bounty/stored-xss", {
+        method: "POST", timeoutMs: 60000, body: JSON.stringify({
+          view_url: viewUrl.input.value.trim(), inject_url: injectUrl.input.value.trim(), field: field.input.value.trim(),
+          cookie: cookie.input.value.trim(), marker: marker.input.value.trim(), send: sendBox.checked,
+          scope: scope.input.value.trim(), platform: ckState.platform || "hackerone"
+        })
+      });
+      if (!res || res.ok === false) {
+        note.classList.add("is-error"); note.textContent = (res && res.error) || "Check failed.";
+      } else if (res.status === "confirmed") {
+        out.append(cel("p", "ck-ftitle", "✅ Stored XSS CONFIRMED"));
+        ckState.runId = res.run_id || ckState.runId;
+        const row = { ref: res.ref || "F1", title: res.title || "Stored XSS", severity: res.severity || "high",
+                      proof: "confirmed", className: "Stored / persistent XSS", cwe: "CWE-79",
+                      plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" };
+        ckState.findings = (ckState.findings || []).filter((f) => !(f.ref === row.ref && f.className === row.className)).concat(row);
+        ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);
+        const pre = cel("pre", "ck-research-md"); pre.textContent = res.report || ""; pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "300px"; pre.style.overflow = "auto"; out.append(pre);
+      } else if (res.status === "ready") {
+        if (res.marker) marker.input.value = res.marker;
+        out.append(cel("p", "ck-hint", `Submit one of these into the target field, then click Confirm again (marker ${res.marker}):`));
+        const pl = res.payloads || {};
+        for (const k of Object.keys(pl)) { out.append(cel("p", "ck-ftitle", k)); const pre = cel("pre", "ck-research-md"); pre.textContent = pl[k]; pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "120px"; pre.style.overflow = "auto"; out.append(pre); }
+      } else {
+        note.textContent = `Not confirmed (${res.status}). ${res.reason || res.error || ""}`;
+      }
+    } catch (err) { note.classList.add("is-error"); note.textContent = err.message || "Check failed."; }
+    finally { run.disabled = false; run.textContent = label; }
+  });
+  form.append(note); wrap.append(form); wrap.append(out);
+  return wrap;
 }
 
 function ckIdorProbeForm() {
