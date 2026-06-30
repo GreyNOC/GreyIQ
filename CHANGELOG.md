@@ -2,6 +2,30 @@
 
 Notable changes to GreyIQ.
 
+## v0.40.0
+
+### Blind XXE over OOB (assisted + opt-in auto-send)
+Confirms blind XML External Entity (XXE) injection out of band — the XML parser resolving an
+attacker-supplied external entity makes a request to your collaborator, proving the bug
+**without exfiltrating any file** (the entity only fetches the callback).
+
+- **Assisted (default, GET-only):** GreyIQ mints a token and hands you ready payload variants
+  (classic, parameter-entity, SVG, SOAP) with the callback embedded; deliver one to an XML
+  endpoint, then re-poll the token to confirm.
+- **Auto (opt-in `send`):** GreyIQ POSTs the benign payload itself — its first and only
+  non-GET egress, gated, scope-bound, SSRF-guarded, no-redirect. Same negative-control +
+  crawler-UA hardening as the SSRF path.
+- Wired: `POST /api/bounty/oob-xxe` and a "blind XXE" panel in the cockpit OOB section.
+  Confirmed/candidate hits cache as runs (report / bundle / submit); the hard submit gate
+  still only auto-files confirmed findings.
+- **DNS OOB channel — deferred.** A DNS channel needs an authoritative DNS server logging
+  queries, which the phone-behind-an-HTTP-Cloudflare-tunnel collaborator can't host (tunnels
+  carry HTTP, not UDP:53). Revisit with a small VPS or a delegated domain running a logging
+  resolver.
+
+378 tests green (+8), plus a no-network end-to-end smoke (auto-send confirms + caches a run;
+assisted returns the payload kit without sending).
+
 ## v0.39.0
 
 ### Wider known-CVE coverage — more libraries + CMS detection
