@@ -2,6 +2,25 @@
 
 Notable changes to GreyIQ.
 
+## v0.33.0
+
+### Confirm blind bugs out-of-band (OOB collaborator)
+GreyIQ can now **confirm blind, out-of-band vulnerabilities** — blind SSRF above all —
+using your own OOB collaborator (e.g. the greynoc-chat `/oob` receiver running on your
+phone). It mints a unique callback URL, injects it into the target's server-side-fetch
+parameters, sends a benign GET probe, then polls your collaborator for an inbound hit: a
+recorded callback **proves** the target reached out of band, where nothing reflects in its
+own response.
+
+- New **Out-of-band** panel in the cockpit's Access-control tab: configure your collaborator
+  (URL + secret, write-only), auto-confirm blind SSRF against a target, or **mint a callback
+  URL** to paste into a manual XXE / blind-XSS payload.
+- `POST /api/bounty/oob-ssrf` (a confirmed hit is cached as a run, so the per-platform
+  report / screenshot / research / bundle / submit all work on it), plus `/api/oob/config`,
+  `/api/oob/mint`, `/api/oob/poll`.
+- Scope-bound + SSRF-guarded target probes; the collaborator secret lives in GreyIQ's
+  secrets store and is never embedded. Pairs with the new greynoc-chat OOB receiver.
+
 ## v0.32.0
 
 ### Subdomain enumeration + takeover — more surface, a high-value easy win
