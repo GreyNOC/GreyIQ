@@ -5168,6 +5168,53 @@ function ckOobPanel() {
     finally { run.disabled = false; run.textContent = label; }
   });
   wrap.append(sform); wrap.append(snote); wrap.append(sout);
+
+  // --- Blind XXE over OOB ---
+  wrap.append(cel("h2", "ck-section-title", "Out-of-band (OOB) — blind XXE"));
+  wrap.append(cel("p", "ck-hint", "Confirm blind XXE. By default GreyIQ hands you ready payload variants to deliver to an XML endpoint yourself (GET-only stays intact), then re-poll the token to confirm. Tick “Send automatically” to have GreyIQ POST the benign payload itself — its only non-GET request."));
+  const xform = cel("form", "ck-learn-form");
+  const xurl = ckField("XML endpoint URL", "text", "");
+  const xscope = ckField("Scope (name the host)", "text", state.ckScope || "");
+  const xtoken = ckField("Token (to re-poll after manual delivery — optional)", "text", "");
+  xform.append(xurl.wrap, xscope.wrap, xtoken.wrap);
+  const sendWrap = cel("label", "ck-hint"); sendWrap.style.flexBasis = "100%";
+  const sendBox = cel("input"); sendBox.type = "checkbox"; sendBox.style.marginRight = "6px";
+  sendWrap.append(sendBox, document.createTextNode("Send the payload automatically (POST — the only non-GET egress)"));
+  xform.append(sendWrap);
+  const xrun = cel("button", "ck-btn primary", "Confirm blind XXE"); xrun.type = "submit"; xform.append(xrun);
+  const xnote = cel("p", "ck-status"); xnote.style.flexBasis = "100%";
+  const xout = cel("div", "ck-research");
+  xform.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!xurl.input.value.trim()) { xnote.classList.add("is-error"); xnote.textContent = "Enter the XML endpoint URL."; return; }
+    const label = xrun.textContent; xrun.disabled = true; xrun.textContent = sendBox.checked ? "Sending…" : "Polling…";
+    xnote.classList.remove("is-error"); xnote.textContent = ""; xout.replaceChildren();
+    try {
+      const res = await apiFetch("/api/bounty/oob-xxe", { method: "POST", timeoutMs: 90000, body: JSON.stringify({ url: xurl.input.value.trim(), scope: xscope.input.value.trim(), platform: ckState.platform || "hackerone", send: sendBox.checked, token: xtoken.input.value.trim() }) });
+      if (!res || res.ok === false) {
+        xnote.classList.add("is-error"); xnote.textContent = (res && res.error) || "Probe failed.";
+      } else if (res.status === "confirmed" || res.status === "candidate") {
+        xout.append(cel("p", "ck-ftitle", res.status === "confirmed" ? "✅ Blind XXE CONFIRMED" : "⚠ Blind XXE candidate (verify the callback source)"));
+        ckState.runId = res.run_id || ckState.runId;
+        ckState.findings = [{ ref: "F1", title: res.title || "Blind XXE", severity: res.severity || "high", proof: res.status, className: "XML External Entity (XXE)", cwe: "CWE-611", plan: {}, cvss: {}, proofObj: { status: res.status }, description: "" }];
+        ckBadgeCount("submissions", 1);
+        if (res.report) { const pre = cel("pre", "ck-research-md"); pre.textContent = res.report; pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "320px"; pre.style.overflow = "auto"; xout.append(pre); }
+        xout.append(cel("p", "ck-hint", "Added to Submissions."));
+      } else if (res.status === "ready") {
+        if (res.token) xtoken.input.value = res.token;
+        xout.append(cel("p", "ck-hint", `Deliver one of these payloads to the XML endpoint, then click Confirm again to poll token ${res.token}:`));
+        const pl = res.payloads || {};
+        for (const k of Object.keys(pl)) {
+          xout.append(cel("p", "ck-ftitle", k));
+          const pre = cel("pre", "ck-research-md"); pre.textContent = pl[k]; pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "180px"; pre.style.overflow = "auto"; xout.append(pre);
+        }
+      } else {
+        xnote.textContent = `No out-of-band callback (${res.status}). ${res.reason || res.error || ""}`;
+      }
+    } catch (err) { xnote.classList.add("is-error"); xnote.textContent = err.message || "Probe failed."; }
+    finally { xrun.disabled = false; xrun.textContent = label; }
+  });
+  wrap.append(xform); wrap.append(xnote); wrap.append(xout);
   return wrap;
 }
 

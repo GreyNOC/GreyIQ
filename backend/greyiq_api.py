@@ -597,6 +597,14 @@ class OobSsrfRequest(BaseModel):
     platform: str = Field(default="hackerone", max_length=20)
 
 
+class OobXxeRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=4000)
+    scope: str = Field(default="", max_length=2000)
+    platform: str = Field(default="hackerone", max_length=20)
+    send: bool = Field(default=False)               # opt-in: POST the payload (only non-GET egress)
+    token: str = Field(default="", max_length=64)   # re-poll an assisted token after delivering manually
+
+
 class IdorRequest(BaseModel):
     url_a: str = Field(min_length=1, max_length=4000)   # account A's object URL
     url_b: str = Field(min_length=1, max_length=4000)   # account B's object URL (B owns this)
@@ -1657,6 +1665,36 @@ class GreyIQRuntime:
                 "param": res.get("param"), "token": res.get("token"),
                 "title": finding["title"], "severity": finding["severity"]}
 
+    @_confirm_route
+    def check_oob_xxe(self, request: "OobXxeRequest") -> dict[str, Any]:
+        """Confirm blind XXE out-of-band. Assisted by default (mint + hand back payload
+        variants to deliver, then re-poll the token); ``send=True`` opts in to GreyIQ POSTing
+        the benign payload itself (the only non-GET egress). A confirmed/candidate hit is
+        cached as a run finding; a 'ready'/'no-callback' result returns the payloads + token."""
+        base, secret = self._oob_config()
+        res = bounty_oob.confirm_blind_xxe(
+            request.url, base=base, secret=secret, scope=request.scope,
+            send=bool(request.send), token=(request.token or None))
+        if not res.get("ok"):
+            return res
+        status = res.get("status")
+        if status not in {"confirmed", "candidate"}:
+            # ready / no-callback / send-failed: hand back the kit (payloads + token) so the
+            # operator can deliver out-of-band and re-poll. Nothing is cached as a run.
+            return {"ok": True, "status": status, "token": res.get("token"),
+                    "payloads": res.get("payloads"), "callback_url": res.get("callback_url"),
+                    "reason": res.get("reason", ""), "error": res.get("error", "")}
+
+        finding = dict(res["finding"]); finding["ref"] = "F1"
+        plan = res["attack_plan"]
+        host = urlparse(request.url).hostname or "target"
+        persisted = self._persist_finding_run(
+            findings=[finding], plans={"F1": plan}, target=request.url, scope=request.scope,
+            platform=request.platform, slug="oob-xxe", host=host)
+        return {"ok": True, "status": status, "run_id": persisted["run_id"], "ref": "F1",
+                "platform": persisted["platform"], "report": persisted["report"], "token": res.get("token"),
+                "title": finding["title"], "severity": finding["severity"]}
+
     # ---- Autonomous operator ------------------------------------------------------
     def _operator_run_campaign(self, target: str, *, scope: str, program: str, active: bool, live: bool,
                                deep: bool = False, max_pages: int = 12) -> dict[str, Any]:
@@ -2666,6 +2704,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/oob-ssrf":
             request = validate_payload(OobSsrfRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.check_oob_ssrf, request))
+            return
+        if method == "POST" and path == "/api/bounty/oob-xxe":
+            request = validate_payload(OobXxeRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.check_oob_xxe, request))
             return
         if method == "POST" and path == "/api/bounty/submit":
             request = validate_payload(SubmitRequest, await read_json_body(receive))

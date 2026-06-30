@@ -123,5 +123,96 @@ class ConfirmTests(unittest.TestCase):
         self.assertIn("collaborator", res["error"].lower())
 
 
+class XxeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._guard = oob._guard_url
+        self._poll = oob.poll_collaborator
+        self._post = oob._post_xml
+        oob._guard_url = lambda u, *a, **k: u
+        self.cfg = {"base": "https://collab.example", "secret": "s" * 16,
+                    "scope": "app.example.com", "settings": get_settings()}
+
+    def tearDown(self) -> None:
+        oob._guard_url = self._guard
+        oob.poll_collaborator = self._poll
+        oob._post_xml = self._post
+
+    def test_payloads_embed_the_callback_as_an_external_entity(self) -> None:
+        p = oob.build_xxe_payloads("https://collab.example", "deadbeef")
+        cb = "https://collab.example/oob/deadbeef"
+        self.assertIn(cb, p["classic"])
+        self.assertIn("<!ENTITY xxe SYSTEM", p["classic"])
+        for variant in ("classic", "parameter_entity", "svg", "soap"):
+            self.assertIn("deadbeef", p[variant])
+
+    def test_assisted_mode_returns_ready_kit_without_sending(self) -> None:
+        # Fresh assisted call: hand back payloads + token, send NOTHING (GET-only preserved).
+        posted = []
+        oob._post_xml = lambda url, xml, **k: posted.append(url) or {"ok": True, "status": 200}
+        res = oob.confirm_blind_xxe("https://app.example.com/import", **self.cfg)
+        self.assertEqual(res["status"], "ready")
+        self.assertIn("classic", res["payloads"])
+        self.assertTrue(res["token"])
+        self.assertEqual(posted, [])  # nothing was POSTed in assisted mode
+
+    def test_assisted_repoll_confirms_on_a_hit(self) -> None:
+        hit = {"method": "GET", "ip": "9.9.9.9", "headers": {"user-agent": "Java/1.8.0"}}
+        oob.poll_collaborator = lambda base, secret, token, **k: {"ok": True, "count": 1, "hits": [{**hit, "path": f"/oob/{token}"}]}
+        res = oob.confirm_blind_xxe("https://app.example.com/import", token="abc123token", **self.cfg)
+        self.assertEqual(res["status"], "confirmed")
+        self.assertEqual(res["finding"]["class_id"], "xxe")
+        self.assertEqual(res["finding"]["rule_id"], "active.blind-xxe-oob")
+        self.assertEqual(res["finding"]["snippet"], "")  # no file exfiltrated
+        self.assertEqual(res["attack_plan"]["proof_of_impact"]["status"], "confirmed")
+
+    def test_auto_send_posts_then_confirms(self) -> None:
+        sent = []
+        oob._post_xml = lambda url, xml, **k: sent.append((url, xml)) or {"ok": True, "status": 200}
+        # staged poll: empty first (negative control), hit after.
+        calls = {}
+        def staged(base, secret, token, **k):
+            calls[token] = calls.get(token, 0) + 1
+            if calls[token] == 1:
+                return {"ok": True, "count": 0, "hits": []}
+            return {"ok": True, "count": 1, "hits": [{"method": "GET", "ip": "9.9.9.9", "headers": {"user-agent": "Go-http-client/1.1"}, "path": f"/oob/{token}"}]}
+        oob.poll_collaborator = staged
+        res = oob.confirm_blind_xxe("https://app.example.com/import", send=True, poll_attempts=1, poll_delay_s=0.0, **self.cfg)
+        self.assertEqual(res["status"], "confirmed")
+        self.assertEqual(len(sent), 1)              # exactly one POST
+        self.assertIn("<!ENTITY xxe SYSTEM", sent[0][1])  # the classic XXE payload body
+
+    def test_auto_send_crawler_hit_is_candidate(self) -> None:
+        oob._post_xml = lambda url, xml, **k: {"ok": True, "status": 200}
+        calls = {}
+        def staged(base, secret, token, **k):
+            calls[token] = calls.get(token, 0) + 1
+            if calls[token] == 1:
+                return {"ok": True, "count": 0, "hits": []}
+            return {"ok": True, "count": 1, "hits": [{"method": "GET", "ip": "1.1.1.1", "headers": {"user-agent": "Twitterbot/1.0"}, "path": f"/oob/{token}"}]}
+        oob.poll_collaborator = staged
+        res = oob.confirm_blind_xxe("https://app.example.com/import", send=True, poll_attempts=1, poll_delay_s=0.0, **self.cfg)
+        self.assertEqual(res["status"], "candidate")
+
+    def test_auto_send_negative_control_blocks_a_dirty_token(self) -> None:
+        # Token already has hits before the POST -> can't attribute -> refuse.
+        oob._post_xml = lambda url, xml, **k: {"ok": True, "status": 200}
+        oob.poll_collaborator = lambda base, secret, token, **k: {"ok": True, "count": 3, "hits": [{}]}
+        res = oob.confirm_blind_xxe("https://app.example.com/import", send=True, poll_delay_s=0.0, **self.cfg)
+        self.assertFalse(res["ok"])
+        self.assertIn("already has hits", res["error"])
+
+    def test_auto_send_post_failure_is_reported(self) -> None:
+        oob._post_xml = lambda url, xml, **k: {"ok": False, "error": "connection refused"}
+        oob.poll_collaborator = lambda base, secret, token, **k: {"ok": True, "count": 0, "hits": []}
+        res = oob.confirm_blind_xxe("https://app.example.com/import", send=True, poll_delay_s=0.0, **self.cfg)
+        self.assertEqual(res["status"], "send-failed")
+
+    def test_out_of_scope_target_refused(self) -> None:
+        res = oob.confirm_blind_xxe("https://evil.example/import", base="https://collab.example",
+                                    secret="s" * 16, scope="other.example", settings=get_settings())
+        self.assertFalse(res["ok"])
+        self.assertIn("scope", res["error"].lower())
+
+
 if __name__ == "__main__":
     unittest.main()
