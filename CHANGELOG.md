@@ -2,6 +2,28 @@
 
 Notable changes to GreyIQ.
 
+## v0.37.0
+
+### New earner — known-CVE / outdated-component detection (Phase B)
+A new passive check that finds a class programs pay for: outdated front-end libraries with
+published CVEs.
+
+- Fingerprints the **versions** of jQuery, Lodash, Bootstrap, Moment, AngularJS, Handlebars,
+  and DOMPurify from script `src` filenames and the libraries' own version banners (with a
+  guard so `jquery-ui` / `jquery-migrate` don't masquerade as jQuery core), then maps each
+  detected version to a curated, offline table of real CVEs whose fix is in a higher version
+  — each with its CVSS, CWE, an estimated EPSS-style exploit-likelihood, and a KEV flag for
+  prioritisation.
+- **Honest tiering:** results are version-fingerprint *candidates*, not claimed exploits.
+  They cache as runs so you can export the outdated-component report / bundle, but the hard
+  submit gate refuses to auto-file a candidate — it recomputes proof status server-side and
+  only CONFIRMED findings can be auto-submitted.
+- Wired everywhere: `POST /api/bounty/cve`, `gn cve <url> -y`, and a "Known-CVE components"
+  panel on the cockpit's Surface view. GET-only, scope-bound (fail-closed), SSRF-guarded.
+
+364 tests green (+15), plus a no-network end-to-end smoke proving the candidate path caches a
+run and the submit gate refuses it.
+
 ## v0.36.0
 
 ### QA hardening round 3 — confirm-route robustness + one severity source of truth
