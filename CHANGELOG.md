@@ -2,6 +2,31 @@
 
 Notable changes to GreyIQ.
 
+## v0.31.0
+
+### Confirm IDOR / broken access control — the #1 paying class
+GreyIQ can now **prove** IDOR/BOLA (broken access control), the highest-value bug class
+and the one a single-session scanner can't touch because it needs two accounts. You supply
+**two of your own authorized test accounts** and one object URL each; the engine runs a
+GET-only, scope-bound, three-request differential:
+
+- account A reads A's object (ground truth),
+- account B reads B's own object (control — proves B's session is valid),
+- account B reads **A's** object (the attack).
+
+It confirms a cross-tenant read only when B's response to A's object is ~identical to A's
+own **and** matches A clearly more than it matches B's own object — so a real IDOR is told
+apart from a properly-scoped endpoint or a shared/static page (no false "confirmed").
+
+Crucially, the captured proof is the **differential only** (statuses + similarity ratios) —
+the other user's data is **never shown, stored, or written into the report**. Each session
+is attached same-site only, so neither credential ever leaves the target host.
+
+A confirmed IDOR becomes a first-class finding: a new **Access control** cockpit tab,
+`gn idor <A-url> <B-url> --a-cookie ... --b-cookie ... -y`, and `POST /api/bounty/idor` —
+all flowing into the per-platform report, screenshot, research dossier, downloadable
+bundle, and the hard-gated HackerOne submit.
+
 ## v0.30.0
 
 ### Deep mode runs unattended — the operator works leads aggressively on a schedule
