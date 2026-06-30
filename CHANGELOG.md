@@ -2,6 +2,22 @@
 
 Notable changes to GreyIQ.
 
+## v0.45.0
+
+### Phase C — CSRF (missing anti-CSRF token, candidate-grade)
+A new passive check in the active suite: a **state-changing POST form served with no
+anti-CSRF token**.
+
+- Honest tiering — modern browsers default cookies to `SameSite=Lax`, which already blocks
+  cross-site POST, so a missing token alone is rarely exploitable. A tokenless POST form whose
+  session cookie is explicitly `SameSite=None` is a **medium** candidate; if a Lax/Strict
+  cookie is observed it's **skipped** (protected); otherwise a **low** candidate the operator
+  verifies (the limitation is stated in the finding).
+- Skips forms that carry a token field (csrf/xsrf/authenticity_token/…) or a page-wide
+  `<meta name="csrf-token">`. GET-only, passive form inspection. Maps to the CSRF class.
+
+409 tests green (+6).
+
 ## v0.44.0
 
 ### Phase C — certificate-transparency subdomain seeding (takeover)
