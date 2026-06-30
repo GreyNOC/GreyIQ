@@ -220,6 +220,86 @@ class BflaDifferentialTests(unittest.TestCase):
         self.assertIn("page chrome", res["reason"])
 
 
+import re as _re
+
+_CHROME = ("<html><head><title>App</title></head><body><nav>Home Orders Account Settings Logout</nav>"
+           "<h1>Order detail</h1><div class='card'>")
+_OBJECTS = {
+    "1001": "Alice ordered 3 widgets, total $42.00, ship to 1 Apple Street, card ending 1111",
+    "1002": "Bob ordered 99 sprockets, total $9999.00, ship to 9 Banana Avenue, card ending 2222",
+}
+
+
+def _fake_probe_http(by_url):
+    class FakeHttp:
+        def __init__(self, settings, governor, max_requests=4, auth=None):
+            self.auth = auth
+        def fetch(self, url, *, method="GET", extra_headers=None):
+            status, body = by_url(url)
+            return {"status": status, "headers": {}, "body": body, "cookies": [], "final_url": url, "location": None}
+    return FakeHttp
+
+
+def _run_probe(by_url, url):
+    orig = ac._Http
+    ac._Http = _fake_probe_http(by_url)
+    try:
+        return ac.run_idor_probe(url, account={"cookie": "sess=ME"}, scope="127.0.0.1", settings=_settings())
+    finally:
+        ac._Http = orig
+
+
+def _by_id_object(url):
+    m = _re.search(r"/order/(\d+)", url) or _re.search(r"[?&]id=(\d+)", url)
+    if not m:
+        return (404, "nope")
+    oid = m.group(1)
+    detail = _OBJECTS.get(oid, f"object {oid} placeholder content for testing the differential band")
+    return (200, _CHROME + f"<p>{detail}</p></div></body></html>")
+
+
+class IdorProbeTests(unittest.TestCase):
+    def test_path_id_mutation_flags_a_candidate(self) -> None:
+        res = _run_probe(_by_id_object, "http://127.0.0.1/api/order/1001")
+        self.assertEqual(res["status"], "candidate")
+        self.assertEqual(res["finding"]["rule_id"], "active.idor-probe")
+        self.assertEqual(res["finding"]["snippet"], "")          # neighbour body withheld
+        self.assertNotIn("Bob", res["finding"]["proof_evidence"]["matched_value"])
+        self.assertEqual(res["attack_plan"]["proof_of_impact"]["status"], "candidate")
+
+    def test_query_id_mutation_flags_a_candidate(self) -> None:
+        res = _run_probe(_by_id_object, "http://127.0.0.1/view?id=1001")
+        self.assertEqual(res["status"], "candidate")
+
+    def test_identical_neighbour_is_enforced(self) -> None:
+        # Every id returns the SAME static page -> not object-specific -> no signal.
+        res = _run_probe(lambda url: (200, _CHROME + "<p>generic dashboard for everyone</p></div></body></html>"),
+                         "http://127.0.0.1/api/order/1001")
+        self.assertEqual(res["status"], "enforced")
+
+    def test_denied_neighbour_is_enforced(self) -> None:
+        def by_url(url):
+            if "/order/1001" in url:
+                return (200, _CHROME + "<p>" + _OBJECTS["1001"] + "</p></div></body></html>")
+            return (403, "<html>Forbidden</html>")
+        res = _run_probe(by_url, "http://127.0.0.1/api/order/1001")
+        self.assertEqual(res["status"], "enforced")
+
+    def test_no_numeric_id_is_reported(self) -> None:
+        res = _run_probe(lambda url: (200, _CHROME + "<p>x</p>"), "http://127.0.0.1/account/profile")
+        self.assertEqual(res["status"], "no-id")
+
+    def test_requires_a_session(self) -> None:
+        r = ac.run_idor_probe("http://127.0.0.1/api/order/1001", account={}, scope="127.0.0.1", settings=_settings())
+        self.assertFalse(r["ok"])
+        self.assertIn("session", r["error"].lower())
+
+    def test_out_of_scope_refused(self) -> None:
+        r = ac.run_idor_probe("http://1.2.3.4/api/order/1", account={"cookie": "a"}, scope="example.com")
+        self.assertFalse(r["ok"])
+        self.assertIn("scope", r["error"].lower())
+
+
 class BflaGatingTests(unittest.TestCase):
     def test_requires_two_sessions(self) -> None:
         r = ac.run_bfla_check(PRIV_URL, admin_account={"cookie": "sess=ADM"}, user_account={},

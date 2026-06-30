@@ -482,6 +482,27 @@ def _cmd_bfla(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_idor_probe(args: argparse.Namespace) -> int:
+    from bughunter import access_control_service as ac
+
+    if not args.authorize:
+        return _err("the probe reads YOUR object with your session against an in-scope host — pass -y/--authorize.")
+    res = ac.run_idor_probe(
+        args.url, account={"cookie": args.cookie or "", "headers": args.header or []}, scope=args.scope or "")
+    if not res.get("ok"):
+        return _err(res["error"])
+    status = res["status"]
+    if status != "candidate" or "finding" not in res:
+        print(_c(f"No IDOR signal ({status}).", "33"))
+        print(f"  {res.get('reason', '')}")
+        return 0
+    print(_c("Possible IDOR (single-session id mutation) — CANDIDATE", "33") + f": {res['finding']['title']}")
+    print(f"  {res['detail'].get('original')}  ->  {res['detail'].get('mutated')}")
+    print(f"  a neighbouring id returned a distinct object (similarity {res['detail'].get('ratio_neighbour_vs_original')}).")
+    print("  Confirm cross-tenant with: gn idor <A's object> <B's object> --a-cookie ... --b-cookie ... -y")
+    return 0
+
+
 def _cmd_idor(args: argparse.Namespace) -> int:
     from datetime import UTC, datetime
     from pathlib import Path
@@ -761,6 +782,14 @@ def build_parser() -> argparse.ArgumentParser:
     bfla.add_argument("-o", "--out", default=None, help="report output path")
     bfla.add_argument("-y", "--authorize", action="store_true", help="confirm you OWN both test accounts and are in scope (required)")
     bfla.set_defaults(func=_cmd_bfla)
+
+    iprobe = sub.add_parser("idor-probe", help="single-session IDOR discovery: mutate a URL's numeric ids and flag neighbouring objects")
+    iprobe.add_argument("url", help="one authenticated object URL with a numeric id (path or query)")
+    iprobe.add_argument("--cookie", default="", help="your session Cookie header value")
+    iprobe.add_argument("--header", action="append", metavar="'Name: value'", help="auth header (repeatable)")
+    iprobe.add_argument("-s", "--scope", default="", help="scope (name the host to allow active testing)")
+    iprobe.add_argument("-y", "--authorize", action="store_true", help="confirm you own the account and are in scope (required)")
+    iprobe.set_defaults(func=_cmd_idor_probe)
 
     classes = sub.add_parser("classes", help="list vuln classes")
     classes.add_argument("--json", action="store_true")

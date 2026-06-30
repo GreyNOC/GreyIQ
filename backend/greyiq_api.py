@@ -626,6 +626,14 @@ class BflaRequest(BaseModel):
     platform: str = Field(default="hackerone", max_length=20)
 
 
+class IdorProbeRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=4000)   # one authenticated object URL with a numeric id
+    cookie: str = Field(default="", max_length=8000)
+    headers: list[str] = Field(default_factory=list, max_length=20)
+    scope: str = Field(default="", max_length=2000)
+    platform: str = Field(default="hackerone", max_length=20)
+
+
 class HackerOneCredsRequest(BaseModel):
     team_handle: str = Field(default="", max_length=200)
     api_username: str = Field(default="", max_length=200)
@@ -1551,6 +1559,30 @@ class GreyIQRuntime:
             json_extra={"detail": res.get("detail")})
         return {
             "ok": True, "status": "confirmed", "run_id": persisted["run_id"], "ref": "F1",
+            "platform": persisted["platform"], "report": persisted["report"], "detail": res.get("detail"),
+            "title": finding["title"], "severity": finding["severity"],
+        }
+
+    @_confirm_route
+    def check_idor_probe(self, request: "IdorProbeRequest") -> dict[str, Any]:
+        """Single-session IDOR DISCOVERY: mutate the URL's numeric ids and flag a neighbouring
+        distinct object as a CANDIDATE. Caches a candidate run (report/bundle work; the submit
+        gate refuses a candidate). Confirm cross-tenant with the dual-session check_idor."""
+        res = bounty_access.run_idor_probe(
+            request.url, account={"cookie": request.cookie, "headers": request.headers}, scope=request.scope)
+        if not res.get("ok"):
+            return res
+        if res.get("status") != "candidate" or "finding" not in res:
+            return {"ok": True, "status": res.get("status"), "reason": res.get("reason", ""), "detail": res.get("detail")}
+
+        finding = dict(res["finding"]); finding["ref"] = "F1"
+        plan = res["attack_plan"]
+        host = urlparse(request.url).hostname or "target"
+        persisted = self._persist_finding_run(
+            findings=[finding], plans={"F1": plan}, target=request.url, scope=request.scope,
+            platform=request.platform, slug="idor-probe", host=host, json_extra={"detail": res.get("detail")})
+        return {
+            "ok": True, "status": "candidate", "run_id": persisted["run_id"], "ref": "F1",
             "platform": persisted["platform"], "report": persisted["report"], "detail": res.get("detail"),
             "title": finding["title"], "severity": finding["severity"],
         }
@@ -2723,6 +2755,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/bfla":
             request = validate_payload(BflaRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.check_bfla, request))
+            return
+        if method == "POST" and path == "/api/bounty/idor-probe":
+            request = validate_payload(IdorProbeRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.check_idor_probe, request))
             return
         if method == "POST" and path == "/api/bounty/takeover":
             request = validate_payload(TakeoverRequest, await read_json_body(receive))

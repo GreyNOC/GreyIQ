@@ -23,13 +23,15 @@ report NEVER includes the raw cross-tenant body; the proof is the DIFFERENTIAL o
 from __future__ import annotations
 
 import difflib
+import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse, urlunparse
 
 from bughunter import impact_model
 from bughunter.active_verify_service import (
     _ActiveError,
     _Http,
+    _with_query,
     host_in_active_scope,
 )
 from bughunter.rate_limit import HostRateGovernor
@@ -176,6 +178,171 @@ def run_idor_check(
 
 _ANON_DENIED = 0.80   # an anonymous request must look clearly UNLIKE the admin response
                       # (denied / login / different) for the endpoint to count as protected
+
+# IDOR id-mutation probe bands. A neighbouring id that returns a 200 whose body is the SAME
+# TEMPLATE but DIFFERENT DATA (similarity in [floor, same)) is a distinct valid object — a
+# likely missing per-object check. Identical (>= same) is the same/static object; below floor
+# is a different page / error, not an enumerable object.
+_PROBE_SAME = 0.98
+_PROBE_FLOOR = 0.45
+_ID_PATH_RE = re.compile(r"(?<=/)(\d{1,12})(?=/|$)")
+
+
+def _id_positions(url: str) -> list[tuple[str, Any, str]]:
+    """Numeric ids to mutate: ``("path", (start, end), value)`` for path segments and
+    ``("query", key, value)`` for digit-valued query params."""
+    parsed = urlparse(url)
+    out: list[tuple[str, Any, str]] = []
+    for m in _ID_PATH_RE.finditer(parsed.path):
+        out.append(("path", (m.start(), m.end()), m.group(1)))
+    for k, v in parse_qsl(parsed.query, keep_blank_values=True):
+        if v.isdigit():
+            out.append(("query", k, v))
+    return out
+
+
+def _mutate_id(url: str, kind: str, key: Any, new_value: str) -> str:
+    if kind == "query":
+        return _with_query(url, {key: new_value})
+    parsed = urlparse(url)
+    start, end = key
+    return urlunparse(parsed._replace(path=parsed.path[:start] + new_value + parsed.path[end:]))
+
+
+def run_idor_probe(
+    url: str,
+    *,
+    account: dict[str, Any],
+    scope: str = "",
+    settings: Any = None,
+    governor: HostRateGovernor | None = None,
+    max_ids: int = 2,
+) -> dict[str, Any]:
+    """Single-session IDOR DISCOVERY (GET-only): mutate the numeric ids in the URL — path
+    segments and query values, including a URL carrying two ids — and flag when a neighbouring
+    id returns a DISTINCT valid object (same template, different data) without re-auth, i.e. a
+    likely missing per-object authorization. CANDIDATE-grade: one session can't prove the
+    neighbour belongs to ANOTHER tenant, so it points the operator at the dual-session IDOR
+    confirm. Returns ``{ok, status, finding?, attack_plan?, detail}``."""
+    settings = settings or get_settings()
+    u = str(url or "").strip()
+    if not u:
+        return _err("Provide an authenticated object URL containing a numeric id (path or query).")
+    try:
+        nu = normalize_website_url(u)
+    except WebsiteFetchError as exc:
+        return _err(str(exc))
+    host = urlparse(nu).hostname or ""
+    if not host_in_active_scope(host, scope, settings):
+        return _err(f"'{host}' is not named in your scope — access-control testing is fail-closed. Add it to Scope.")
+    try:
+        su = _guard_url(nu, settings.allow_private_urls, settings.web_allowed_ports)
+    except WebsiteFetchError as exc:
+        return _err(f"target refused by the URL guard: {exc}")
+    auth = build_auth(su, cookie=account.get("cookie", ""), headers=account.get("headers") or [])
+    if auth is None:
+        return _err("Provide your authenticated session (a cookie and/or auth headers) so the probe reads YOUR object.")
+
+    positions = _id_positions(su)
+    if not positions:
+        return {"ok": True, "status": "no-id", "reason": "no numeric id found in the URL path or query to mutate."}
+
+    governor = governor or HostRateGovernor(
+        capacity=settings.active_max_requests_per_host, min_interval_s=settings.active_min_interval_ms / 1000.0)
+    http = _Http(settings, governor, max_requests=2 + max_ids * 2, auth=auth)
+    try:
+        r0 = http.fetch(su)
+    except _ActiveError as exc:
+        return _err(f"request failed: {exc}")
+    if int(r0.get("status") or 0) != 200 or len(_norm(r0.get("body") or "")) < _MIN_BODY:
+        return {"ok": True, "status": "candidate",
+                "reason": f"the original object did not return a readable 200 (HTTP {r0.get('status')}) — check the URL and session."}
+
+    body0 = r0.get("body") or ""
+    tried: list[str] = []
+    for kind, key, value in positions[:max_ids]:
+        for delta in (1, -1):
+            neighbour = int(value) + delta
+            if neighbour < 0:
+                continue
+            mutated = _mutate_id(su, kind, key, str(neighbour))
+            if mutated == su:
+                continue
+            try:
+                rn = http.fetch(mutated)
+            except _ActiveError:
+                continue
+            tried.append(mutated)
+            st = int(rn.get("status") or 0)
+            ratio = _ratio(rn.get("body") or "", body0)
+            if st == 200 and len(_norm(rn.get("body") or "")) >= _MIN_BODY and _PROBE_FLOOR <= ratio < _PROBE_SAME:
+                detail = {"original": su, "mutated": mutated, "old_id": value, "new_id": str(neighbour),
+                          "ratio_neighbour_vs_original": round(ratio, 3), "status": st}
+                finding, plan = _build_probe_finding(su, mutated, value, str(neighbour), detail)
+                return {"ok": True, "status": "candidate", "finding": finding, "attack_plan": plan, "detail": detail}
+
+    return {"ok": True, "status": "enforced",
+            "reason": ("mutating the id returned no distinct valid object (denied, identical, or a different page). "
+                       "No IDOR signal from a single session here."),
+            "detail": {"tried": tried}}
+
+
+def _build_probe_finding(original: str, mutated: str, old_id: str, new_id: str,
+                         detail: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """A candidate IDOR finding from the single-session id-mutation probe. The neighbour body
+    is NEVER embedded (it may be another user's data) — the proof is the differential."""
+    path = urlparse(original).path or "/"
+    model = impact_model.impact_for_class("access-control")
+    matched = (f"changing the id {old_id} -> {new_id} returned a DISTINCT valid object (HTTP 200; body similarity to the "
+               f"original {detail['ratio_neighbour_vs_original']} — same template, different data) with the same session")
+    finding = {
+        "rule_id": "active.idor-probe",
+        "title": f"Possible IDOR: object id is mutable at {path} (single-session probe)",
+        "severity": "medium",
+        "confidence": "medium",  # single session can't prove cross-tenant ownership
+        "category": "access-control",
+        "location": original,
+        "file_path": original,
+        "line_start": 1, "line_end": 1,
+        "class_id": _AC_META["class_id"], "class_name": _AC_META["class_name"],
+        "cwe": _AC_META["cwe"], "owasp": _AC_META["owasp"],
+        "references": impact_model.references_for_class("access-control"),
+        "vrt": impact_model.bugcrowd_vrt("access-control"),
+        "remediation": impact_model.remediation_for_class("access-control"),
+        "snippet": "",  # neighbour body withheld (possible another user's data)
+        "proof_evidence": {
+            "request_line": f"GET {mutated}",
+            "request_header": "Cookie: <your own session>",
+            "response_status": "HTTP 200",
+            "matched_value": matched,
+        },
+    }
+    plan = {
+        "steps": [
+            f"With your session, request the object: GET {original}",
+            f"Change the id {old_id} -> {new_id} and request: GET {mutated}",
+            "Observe a DISTINCT valid object returned (same template, different data) — the endpoint serves objects by id without a per-object ownership check.",
+            "CONFIRM cross-tenant access with the dual-session IDOR check (your two accounts): prove account B reads account A's object.",
+        ],
+        "poc": (f"# Same session, neighbouring id:\n"
+                f"curl -s -i '{original}' -H 'Cookie: <session>'   # your object\n"
+                f"curl -s -i '{mutated}' -H 'Cookie: <session>'   # a DIFFERENT valid object via id {new_id}"),
+        "impact": model.get("business_impact", ""),
+        "cvss": impact_model.cvss_for_class("access-control"),
+        "remediation": impact_model.remediation_for_class("access-control"),
+        "proof_of_impact": {
+            "status": "candidate",
+            "method": "single-session id-mutation probe (GET-only, no data exfiltrated into the report)",
+            "actor": "the authenticated test account (one session)",
+            "affected_asset": "objects addressable by a guessable/sequential id at this endpoint",
+            "observed_result": matched,
+            "control_result": "the original id returned your object; a neighbouring id returned a different valid object of the same shape",
+            "evidence": "neighbour-id response is a distinct same-template 200 (ratios captured; body withheld)",
+            "proof_obligation": ("Confirm CROSS-TENANT access with the dual-session IDOR check (two accounts) — a single "
+                                 "session can't prove the neighbouring object belongs to another user."),
+        },
+    }
+    return finding, plan
 
 
 def run_bfla_check(

@@ -5089,8 +5089,56 @@ function ckRenderIdor() {
   form.append(note);
   host.append(form);
   host.append(out);
+  host.append(ckIdorProbeForm());
   host.append(ckBflaForm());
   host.append(ckOobPanel());
+}
+
+function ckIdorProbeForm() {
+  const wrap = cel("div");
+  wrap.append(cel("h3", "ck-section-title", "IDOR discovery — single-session id probe"));
+  wrap.append(cel("p", "ck-hint",
+    "Give ONE authenticated object URL with a numeric id (path or query) + your session. The probe mutates the id and flags a neighbouring DISTINCT object as a candidate — then confirm cross-tenant with the dual-session check above. GET-only, scope-bound."));
+  const form = cel("form", "ck-learn-form");
+  const url = ckField("Object URL with a numeric id (e.g. https://app/api/order/1001)", "text", "");
+  const cookie = ckField("Your session — Cookie", "text", "");
+  const scope = ckField("Scope (name the host)", "text", state.ckScope || "");
+  form.append(url.wrap, cookie.wrap, scope.wrap);
+  const run = cel("button", "ck-btn", "Probe ids"); run.type = "submit"; form.append(run);
+  const note = cel("p", "ck-status"); note.style.flexBasis = "100%";
+  const out = cel("div", "ck-research");
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!url.input.value.trim()) { note.classList.add("is-error"); note.textContent = "Enter an object URL with a numeric id."; return; }
+    const label = run.textContent; run.disabled = true; run.textContent = "Probing…";
+    note.classList.remove("is-error"); note.textContent = ""; out.replaceChildren();
+    try {
+      const res = await apiFetch("/api/bounty/idor-probe", {
+        method: "POST", timeoutMs: 60000, body: JSON.stringify({
+          url: url.input.value.trim(), cookie: cookie.input.value.trim(),
+          scope: scope.input.value.trim(), platform: ckState.platform || "hackerone"
+        })
+      });
+      if (!res || res.ok === false) {
+        note.classList.add("is-error"); note.textContent = (res && res.error) || "Probe failed.";
+      } else if (res.status === "candidate" && res.run_id) {
+        out.append(cel("p", "ck-ftitle", "⚠ Possible IDOR (candidate) — confirm cross-tenant with two accounts above"));
+        ckState.runId = res.run_id || ckState.runId;
+        const row = { ref: res.ref || "F1", title: res.title || "Possible IDOR (single-session probe)",
+                      severity: res.severity || "medium", proof: "candidate",
+                      className: "Broken access control (IDOR/BOLA)", cwe: "CWE-639 / CWE-284",
+                      plan: {}, cvss: {}, proofObj: { status: "candidate" }, description: "" };
+        ckState.findings = (ckState.findings || []).filter((f) => !(f.ref === row.ref && f.className === row.className)).concat(row);
+        ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);
+        const pre = cel("pre", "ck-research-md"); pre.textContent = res.report || ""; pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "300px"; pre.style.overflow = "auto"; out.append(pre);
+      } else {
+        note.textContent = `No IDOR signal (${res.status}). ${res.reason || ""}`;
+      }
+    } catch (err) { note.classList.add("is-error"); note.textContent = err.message || "Probe failed."; }
+    finally { run.disabled = false; run.textContent = label; }
+  });
+  form.append(note); wrap.append(form); wrap.append(out);
+  return wrap;
 }
 
 function ckBflaForm() {
