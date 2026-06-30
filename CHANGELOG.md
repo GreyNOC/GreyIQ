@@ -2,6 +2,28 @@
 
 Notable changes to GreyIQ.
 
+## v0.36.0
+
+### QA hardening round 3 — confirm-route robustness + one severity source of truth
+The audit's architecture items, landed:
+
+- **No more opaque 500s on the confirm routes.** The IDOR / takeover / OOB-SSRF routes now
+  share one `_persist_finding_run` tail (build ctx → render → write `.md` **+ `.json`** →
+  cache the run) instead of three drifting ~30-line copies, and each is wrapped so an
+  unexpected service/render exception returns a structured `{ok: false, error}` the cockpit
+  can show (the full traceback is logged server-side). The OOB route — which silently
+  skipped its JSON evidence sidecar — now writes one like the others.
+- **A finding's severity can no longer disagree across outputs.** A single
+  `resolve_severity()` (CVSS-preferred, then the raw scanner label) is the source of truth,
+  resolved once at confirm time and written back onto the finding — so the cockpit toast,
+  the default report's table/detail/triage, the per-platform report, and the HackerOne
+  `severity_rating` always show the same word.
+- **PoC screenshots embed on every report surface**, not just the per-platform package —
+  the default report (`build_markdown` + `build_finding_markdown`) now renders the captured
+  screenshot too (by basename, with the not-auto-redacted caveat).
+
+349 tests green (+10), plus a live end-to-end smoke of the refactored confirm path.
+
 ## v0.35.0
 
 ### QA hardening round 2 — boolean-SQLi precision + the safety-critical tests
