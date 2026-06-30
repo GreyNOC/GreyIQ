@@ -172,7 +172,10 @@ if ($artifacts) {
     foreach ($a in $artifacts) {
         Write-Host ("    {0}  ({1:N0} MB)" -f $a.Name, ($a.Length / 1MB)) -ForegroundColor Green
     }
-    $portable = $artifacts | Where-Object { $_.Name -like "*portable*" } | Select-Object -First 1
+    # Name the portable THIS run produced (match the current version), not whatever sorts
+    # first in a release\ folder that may hold older builds.
+    $portable = $artifacts | Where-Object { $_.Name -like "*$version-portable*" } | Select-Object -First 1
+    if (-not $portable) { $portable = $artifacts | Where-Object { $_.Name -like "*portable*" } | Select-Object -First 1 }
     if ($portable) { Write-Host ""; Write-Host "Portable exe: $($portable.FullName)" -ForegroundColor Green }
 } else {
     Write-Warning "No .exe found in release\ - check the electron-builder output above."
