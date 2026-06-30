@@ -81,7 +81,7 @@ class ScanTests(unittest.TestCase):
         res = ts.scan_subdomain_takeover(
             "https://example.com/", scope="example.com", settings=get_settings(),
             extra_hosts=["dangling.example.com", "evil.other.com"],
-            resolver=lambda h: h in resolve, include_ct=False,
+            resolver=lambda h: h in resolve, include_ct=False, cname_resolver=lambda h: [],
         )
         self.assertTrue(res["ok"])
         self.assertEqual(res["apex"], "example.com")
@@ -99,7 +99,7 @@ class ScanTests(unittest.TestCase):
         ts._guard_url, ts._fetch_raw = guard, fetch
         res = ts.scan_subdomain_takeover(
             "example.com", scope="example.com", settings=get_settings(),
-            extra_hosts=["evil.other.com"], resolver=lambda h: True, include_ct=False,
+            extra_hosts=["evil.other.com"], resolver=lambda h: True, include_ct=False, cname_resolver=lambda h: [],
         )
         self.assertNotIn("evil.other.com", touched)
         self.assertTrue(all(h.endswith("example.com") for h in touched))
@@ -109,7 +109,7 @@ class ScanTests(unittest.TestCase):
         # would hit the same catch-all); rely on apex + recon-discovered hosts only.
         ts._guard_url, ts._fetch_raw = _stub_fetch({})  # no host matches a fingerprint
         res = ts.scan_subdomain_takeover("example.com", scope="example.com", settings=get_settings(),
-                                         extra_hosts=["api.example.com"], resolver=lambda h: True, include_ct=False)
+                                         extra_hosts=["api.example.com"], resolver=lambda h: True, include_ct=False, cname_resolver=lambda h: [])
         self.assertTrue(res["ok"])
         self.assertNotIn("www.example.com", res["resolved"])  # wordlist NOT expanded under wildcard
         self.assertIn("example.com", res["resolved"])
@@ -160,12 +160,61 @@ class CertTransparencyTests(unittest.TestCase):
                 "example.com", scope="example.com", settings=get_settings(),
                 resolver=lambda h: h == "legacy-cdn.example.com",
                 ct_fetch_json=lambda url, **k: [{"name_value": "legacy-cdn.example.com"}],
+                cname_resolver=lambda h: [],
             )
         finally:
             ts._guard_url, ts._fetch_raw = self._g, self._f
         self.assertGreaterEqual(res["ct_count"], 1)
         self.assertIn("legacy-cdn.example.com", res["resolved"])
         self.assertEqual(len(res["findings"]), 1)
+
+
+class CnameCorrelationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._g, self._f = ts._guard_url, ts._fetch_raw
+
+    def tearDown(self) -> None:
+        ts._guard_url, ts._fetch_raw = self._g, self._f
+
+    def test_match_cname_service(self) -> None:
+        self.assertEqual(ts._match_cname_service(["a.s3.amazonaws.com"]), ("AWS S3", "a.s3.amazonaws.com"))
+        self.assertEqual(ts._match_cname_service(["x.github.io"]), ("GitHub Pages", "x.github.io"))
+        self.assertIsNone(ts._match_cname_service(["a.example.com", "b.internal"]))
+        self.assertIsNone(ts._match_cname_service([]))
+
+    def test_cname_enriches_a_confirmed_finding(self) -> None:
+        ts._guard_url, ts._fetch_raw = _stub_fetch({
+            "dangling.example.com": (404, "<html>Fastly error: unknown domain</html>")})
+        res = ts.scan_subdomain_takeover(
+            "example.com", scope="example.com", settings=get_settings(),
+            extra_hosts=["dangling.example.com"], resolver=lambda h: h == "dangling.example.com",
+            include_ct=False, cname_resolver=lambda h: ["edge.fastly.net"] if "dangling" in h else [])
+        f = res["findings"][0]
+        self.assertEqual(f["rule_id"], "active.subdomain-takeover")   # still a confirmed takeover
+        self.assertEqual(f.get("_takeover_cname"), "edge.fastly.net")
+        self.assertIn("CNAMEs to edge.fastly.net", f["proof_evidence"]["matched_value"])
+
+    def test_dangling_cname_with_no_fingerprint_is_a_candidate(self) -> None:
+        ts._guard_url, ts._fetch_raw = _stub_fetch({})  # no host serves a fingerprint
+        res = ts.scan_subdomain_takeover(
+            "example.com", scope="example.com", settings=get_settings(),
+            extra_hosts=["pages.example.com"], resolver=lambda h: h == "pages.example.com",
+            include_ct=False, cname_resolver=lambda h: ["org.github.io"] if "pages" in h else [])
+        cands = [f for f in res["findings"] if f["rule_id"] == "active.subdomain-takeover-cname"]
+        self.assertEqual(len(cands), 1)
+        self.assertTrue(cands[0]["_candidate"])
+        self.assertEqual(cands[0]["severity"], "medium")
+        self.assertEqual(cands[0]["snippet"], "")  # no third-party body embedded
+        self.assertEqual(ts.build_plan(cands[0])["proof_of_impact"]["status"], "candidate")
+        self.assertEqual(ts.build_plan(cands[0])["cvss"]["base_severity"], "medium")
+
+    def test_no_cname_match_yields_no_candidate(self) -> None:
+        ts._guard_url, ts._fetch_raw = _stub_fetch({})
+        res = ts.scan_subdomain_takeover(
+            "example.com", scope="example.com", settings=get_settings(),
+            extra_hosts=["www.example.com"], resolver=lambda h: h == "www.example.com",
+            include_ct=False, cname_resolver=lambda h: ["lb.internal.example.com"])
+        self.assertEqual(res["findings"], [])
 
 
 if __name__ == "__main__":

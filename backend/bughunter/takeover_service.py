@@ -23,6 +23,7 @@ import urllib.request
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from bughunter import dns_mini
 from bughunter.active_verify_service import host_in_active_scope
 from bughunter.settings import get_settings
 from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
@@ -59,6 +60,45 @@ _FINGERPRINTS: tuple[dict[str, str], ...] = (
     {"service": "Cargo", "signature": "If you're moving your domain away from Cargo", "points_to": "subdomain.cargocollective.com"},
     {"service": "Wordpress", "signature": "Do you want to register *.wordpress.com?", "points_to": "*.wordpress.com"},
 )
+
+
+# CNAME targets that indicate a third-party hosting service which can be claimed if the
+# resource is gone (dangling CNAME). Correlating a subdomain's CNAME with one of these catches
+# takeovers the page-body fingerprint misses (e.g. the service returns nothing fetchable).
+_CNAME_SERVICES: tuple[tuple[str, str], ...] = (
+    (".github.io", "GitHub Pages"),
+    (".s3.amazonaws.com", "AWS S3"),
+    (".s3-website", "AWS S3"),
+    (".herokudns.com", "Heroku"),
+    (".herokuapp.com", "Heroku"),
+    (".fastly.net", "Fastly"),
+    (".myshopify.com", "Shopify"),
+    (".pantheonsite.io", "Pantheon"),
+    (".ghost.io", "Ghost"),
+    (".surge.sh", "Surge.sh"),
+    (".bitbucket.io", "Bitbucket"),
+    (".helpscoutdocs.com", "Help Scout"),
+    (".cargocollective.com", "Cargo"),
+    (".wordpress.com", "Wordpress"),
+    (".azurewebsites.net", "Azure App Service"),
+    (".trafficmanager.net", "Azure Traffic Manager"),
+    (".cloudapp.net", "Azure"),
+    (".readthedocs.io", "Read the Docs"),
+    (".netlify.app", "Netlify"),
+    (".wpengine.com", "WP Engine"),
+    (".zendesk.com", "Zendesk"),
+    (".tumblr.com", "Tumblr"),
+)
+
+
+def _match_cname_service(cnames: list[str] | None) -> tuple[str, str] | None:
+    """Return (service, cname_target) if any CNAME target points at a takeoverable service."""
+    for target in cnames or []:
+        t = str(target or "").lower()
+        for suffix, service in _CNAME_SERVICES:
+            if suffix in t:
+                return service, t
+    return None
 
 
 def _target_host(target: str) -> str:
@@ -174,23 +214,71 @@ def _build_finding(host: str, fp: dict[str, str], url: str, status: int) -> dict
     }
 
 
+def _cname_candidate(host: str, service: str, target: str) -> dict[str, Any]:
+    """A CANDIDATE takeover from CNAME correlation alone: the subdomain CNAMEs to a
+    takeoverable service but serves no body fingerprint (the resource may simply be gone).
+    The operator verifies the resource is claimable."""
+    url = f"https://{host}/"
+    return {
+        "rule_id": "active.subdomain-takeover-cname",
+        "title": f"Dangling CNAME: {host} → {service} (takeover candidate)",
+        "severity": "medium",
+        "confidence": "medium",
+        "category": "subdomain-takeover",
+        "location": url, "file_path": url,
+        "line_start": 1, "line_end": 1,
+        "class_id": "subdomain-takeover",
+        "class_name": "Subdomain takeover",
+        "cwe": "CWE-350 / CWE-284",
+        "owasp": "A05:2021 Security Misconfiguration",
+        "references": [
+            "https://owasp.org/www-community/attacks/Subdomain_Takeover",
+            "https://github.com/EdOverflow/can-i-take-over-xyz",
+        ],
+        "vrt": "",
+        "remediation": f"Remove the dangling CNAME for {host}, or reclaim the {service} resource it points to.",
+        "snippet": "",
+        "proof_evidence": {
+            "request_line": f"DNS CNAME {host} → {target}",
+            "matched_value": (f"{host} CNAMEs to {target} ({service}) but serves no live takeover fingerprint — verify whether "
+                              f"the {service} resource is unclaimed/claimable."),
+        },
+        "_takeover_service": service, "_takeover_points_to": target, "_takeover_cname": target,
+        "_candidate": True,
+    }
+
+
 def build_plan(finding: dict[str, Any]) -> dict[str, Any]:
-    """A confirmed-proof attack plan for a takeover finding, for the report pipeline."""
+    """An attack plan for a takeover finding, for the report pipeline. Confirmed (body
+    fingerprint) and CNAME-only candidates (``_candidate``) get the right proof tier + CVSS."""
     host = _target_host(finding.get("location", "")) or finding.get("location", "")
     service = finding.get("_takeover_service", "the third-party service")
     points_to = finding.get("_takeover_points_to", "")
-    return {
-        "steps": [
+    candidate = bool(finding.get("_candidate"))
+    if candidate:
+        steps = [
+            f"Confirm {host} CNAMEs to {points_to or service} (a dangling CNAME).",
+            f"Check whether the {service} resource is unclaimed — the page returns no live content / an error.",
+            f"If claimable, register the matching {service} resource, serve a benign marker to prove control, then release it.",
+        ]
+        cvss = {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", "base_score": 6.5, "base_severity": "medium", "estimated": True}
+        poi = {
+            "status": "candidate",
+            "method": "DNS CNAME correlation to a takeoverable service (no resource was claimed)",
+            "affected_asset": f"the subdomain {host} and any cookie/trust scoped to its parent domain",
+            "observed_result": f"{host} CNAMEs to {points_to} ({service}) but serves no live content — the resource may be claimable",
+            "control_result": f"a live, claimed {service} resource would serve content, not a missing/error response",
+            "evidence": finding.get("proof_evidence", {}).get("matched_value", ""),
+            "proof_obligation": f"Confirm the {service} resource is unclaimed, then claim it + serve a benign marker (then release) to prove control.",
+        }
+    else:
+        steps = [
             f"Confirm {host} still resolves to {points_to or service} (a dangling CNAME to a deleted resource).",
             f"Fetch https://{host}/ and observe the {service} 'unclaimed' page (fingerprint: \"{finding.get('snippet', '')}\").",
             f"Claim the {service} resource (register the matching bucket/app/page), serve a benign marker file to prove control, then release it.",
-        ],
-        "poc": f"curl -s https://{host}/    # returns the {service} 'unclaimed' page — the resource is claimable",
-        "impact": (f"An attacker can claim {host} and serve arbitrary content on the target's own subdomain — phishing under a "
-                   f"trusted name, OAuth/redirect abuse, and theft of any cookie scoped to the parent domain."),
-        "cvss": {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:H/A:N", "base_score": 7.6, "base_severity": "high", "estimated": True},
-        "remediation": finding.get("remediation", ""),
-        "proof_of_impact": {
+        ]
+        cvss = {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:H/A:N", "base_score": 7.6, "base_severity": "high", "estimated": True}
+        poi = {
             "status": "confirmed",
             "method": "GET fetch + dangling-service fingerprint match (no resource was claimed)",
             "affected_asset": f"the subdomain {host} and any cookie/trust scoped to its parent domain",
@@ -198,7 +286,15 @@ def build_plan(finding: dict[str, Any]) -> dict[str, Any]:
             "control_result": f"a live, claimed site would not return {service}'s 'no such site/bucket/app' response",
             "evidence": finding.get("proof_evidence", {}).get("matched_value", ""),
             "proof_obligation": f"Claim the {service} resource and serve a benign marker (then release it) to demonstrate full control of the subdomain.",
-        },
+        }
+    return {
+        "steps": steps,
+        "poc": f"curl -s https://{host}/    # the {service} resource the subdomain points to",
+        "impact": (f"An attacker can claim {host} and serve arbitrary content on the target's own subdomain — phishing under a "
+                   f"trusted name, OAuth/redirect abuse, and theft of any cookie scoped to the parent domain."),
+        "cvss": cvss,
+        "remediation": finding.get("remediation", ""),
+        "proof_of_impact": poi,
     }
 
 
@@ -212,6 +308,8 @@ def scan_subdomain_takeover(
     resolver: Callable[[str], bool] | None = None,
     include_ct: bool = True,
     ct_fetch_json: Callable[..., Any] | None = None,
+    cname_resolver: Callable[[str], list[str]] | None = None,
+    max_cname: int = 40,
 ) -> dict[str, Any]:
     """Enumerate subdomains of ``target``'s apex (wordlist + recon-discovered hosts),
     resolve them, and confirm takeovers on the in-scope, resolving ones. Returns
@@ -239,10 +337,23 @@ def scan_subdomain_takeover(
     # Only ever touch hosts the operator put in scope (fail-closed), then resolve, then check.
     in_scope = [h for h in sorted(candidates) if host_in_active_scope(h, scope, settings)]
     resolved = [h for h in in_scope if resolver(h)][:max_check]
+    cname_resolver = cname_resolver or (lambda h: dns_mini.resolve_cname(h, timeout=2.5))
     findings: list[dict[str, Any]] = []
+    cname_lookups = 0
     for host in resolved:
         finding = check_host_takeover(host, settings)
+        # CNAME correlation (bounded): enrich a confirmed finding, or surface a dangling-CNAME
+        # candidate the body fingerprint missed.
+        svc = None
+        if cname_lookups < max_cname:
+            cname_lookups += 1
+            svc = _match_cname_service(cname_resolver(host))
         if finding:
+            if svc:
+                finding["_takeover_cname"] = svc[1]
+                finding["proof_evidence"]["matched_value"] += f"; the subdomain also CNAMEs to {svc[1]} ({svc[0]})"
             findings.append(finding)
+        elif svc:
+            findings.append(_cname_candidate(host, svc[0], svc[1]))
     return {"ok": True, "apex": apex, "candidates": len(candidates), "in_scope": len(in_scope),
-            "ct_count": len(ct_hosts), "resolved": resolved, "findings": findings}
+            "ct_count": len(ct_hosts), "cname_lookups": cname_lookups, "resolved": resolved, "findings": findings}
