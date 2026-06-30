@@ -280,6 +280,7 @@ from bughunter import screenshot_service as bounty_screenshot  # noqa: E402
 from bughunter import bundle as bounty_bundle  # noqa: E402
 from bughunter import research as bounty_research  # noqa: E402
 from bughunter import access_control_service as bounty_access  # noqa: E402
+from bughunter import takeover_service as bounty_takeover  # noqa: E402
 from bughunter import ledger as bounty_ledger  # noqa: E402
 from bughunter import portfolio as bounty_portfolio  # noqa: E402
 from bughunter.operator import OperatorLoop  # noqa: E402
@@ -563,6 +564,12 @@ class BundleRequest(BaseModel):
 class ResearchRequest(BaseModel):
     run_id: str = Field(min_length=1, max_length=64)
     ref: str = Field(min_length=1, max_length=40)
+
+
+class TakeoverRequest(BaseModel):
+    target: str = Field(min_length=1, max_length=4000)   # apex/host to enumerate
+    scope: str = Field(default="", max_length=2000)
+    platform: str = Field(default="hackerone", max_length=20)
 
 
 class IdorRequest(BaseModel):
@@ -1315,6 +1322,54 @@ class GreyIQRuntime:
             "ok": True, "markdown": dossier["markdown"], "used_brain": dossier["used_brain"],
             "model": dossier["model"], "path": written,
         }
+
+    def scan_takeover(self, request: "TakeoverRequest") -> dict[str, Any]:
+        """Enumerate subdomains of the target's apex and confirm dangling takeovers. Each
+        confirmed takeover is cached as a run finding (report/screenshot/research/bundle/
+        submit all work). GET-only, scope-bound, SSRF-guarded — no resource is ever claimed."""
+        from datetime import UTC, datetime
+
+        res = bounty_takeover.scan_subdomain_takeover(request.target, scope=request.scope)
+        if not res.get("ok"):
+            return res
+        findings = res.get("findings") or []
+        summary = {"ok": True, "apex": res.get("apex"), "resolved": res.get("resolved") or [],
+                   "resolved_count": len(res.get("resolved") or []), "count": len(findings), "run_id": None,
+                   "findings": [{"title": f["title"], "severity": f["severity"], "service": f.get("_takeover_service"),
+                                 "location": f["location"]} for f in findings]}
+        if not findings:
+            return summary
+
+        gen = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+        plans: dict[str, Any] = {}
+        for i, f in enumerate(findings, 1):
+            f["ref"] = f"F{i}"
+            plans[f["ref"]] = bounty_takeover.build_plan(f)
+        ctx = {"tool": "GreyIQ BugHunter", "version": VERSION, "generated_at": gen,
+               "target": request.target, "scope": request.scope, "attack_plans": plans}
+        platform = bounty_formats.normalize_platform(request.platform)
+        report_md = "\n\n---\n\n".join(bounty_formats.render_finding(ctx, f, platform) for f in findings)
+
+        safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        out_dir = RUNTIME_DIR / "reports"
+        md_path = out_dir / f"takeover-{safe(res.get('apex'))}-{stamp}.md"
+        json_path = out_dir / f"takeover-{safe(res.get('apex'))}-{stamp}.json"
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            md_path.write_text(report_md, encoding="utf-8")
+            json_path.write_text(json.dumps({"findings": findings, "attack_plans": plans}, indent=2, default=str), encoding="utf-8")
+            report_path, json_out = str(md_path), str(json_path)
+        except OSError:
+            report_path, json_out = "", ""
+
+        result = {"ok": True, "generated_at": gen, "findings": findings, "attack_plans": plans,
+                  "proof_of_impact": {ref: {"status": "confirmed"} for ref in plans},
+                  "report_path": report_path, "json_path": json_out, "output_dir": str(out_dir)}
+        self._cache_bounty_run(result, target=request.target, scope=request.scope, program=None)
+        summary["run_id"] = result.get("run_id")
+        summary["report"] = report_md
+        return summary
 
     def check_idor(self, request: "IdorRequest") -> dict[str, Any]:
         """Confirm IDOR/BOLA via a dual-session differential (the operator's two test
@@ -2453,6 +2508,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/idor":
             request = validate_payload(IdorRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.check_idor, request))
+            return
+        if method == "POST" and path == "/api/bounty/takeover":
+            request = validate_payload(TakeoverRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.scan_takeover, request))
             return
         if method == "POST" and path == "/api/bounty/submit":
             request = validate_payload(SubmitRequest, await read_json_body(receive))

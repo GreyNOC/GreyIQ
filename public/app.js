@@ -4869,9 +4869,68 @@ function ckReportLink(url, reportId) {
   return link;
 }
 
+function ckTakeoverForm() {
+  const wrap = cel("div", "ck-creds");
+  const head = cel("div", "ck-creds-head");
+  head.append(cel("strong", null, "Subdomain takeover"));
+  wrap.append(head);
+  wrap.append(cel("p", "ck-hint", "Enumerate subdomains of an in-scope apex and confirm dangling-service takeovers (GitHub Pages, S3, Heroku, Fastly, Shopify, …). GET-only, scope-bound — no resource is ever claimed."));
+  const form = cel("form", "ck-learn-form");
+  const target = ckField("Apex / host (e.g. example.com)", "text", "");
+  const scope = ckField("Scope (apex / wildcard)", "text", state.ckScope || "");
+  form.append(target.wrap, scope.wrap);
+  const run = cel("button", "ck-btn primary", "Scan for takeovers");
+  run.type = "submit";
+  form.append(run);
+  const note = cel("p", "ck-status"); note.style.flexBasis = "100%";
+  const out = cel("div", "ck-research");
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!target.input.value.trim()) { note.classList.add("is-error"); note.textContent = "Enter an apex/host to enumerate."; return; }
+    const label = run.textContent;
+    run.disabled = true; run.textContent = "Scanning…";
+    note.classList.remove("is-error"); note.textContent = ""; out.replaceChildren();
+    try {
+      const res = await apiFetch("/api/bounty/takeover", {
+        method: "POST", timeoutMs: 120000,
+        body: JSON.stringify({ target: target.input.value.trim(), scope: scope.input.value.trim(), platform: ckState.platform || "hackerone" })
+      });
+      if (!res || res.ok === false) {
+        note.classList.add("is-error"); note.textContent = (res && res.error) || "Scan failed.";
+      } else {
+        note.textContent = `Resolved ${res.resolved_count} in-scope host(s) · ${res.count} takeover(s) confirmed.`;
+        if (res.count > 0) {
+          ckState.runId = res.run_id || ckState.runId;
+          for (const f of (res.findings || [])) out.append(cel("p", "ck-ftitle", "✅ " + f.title));
+          ckState.findings = (res.findings || []).map((f, i) => ({
+            ref: `F${i + 1}`, title: f.title, severity: f.severity || "high", proof: "confirmed",
+            className: "Subdomain takeover", cwe: "CWE-350 / CWE-284", plan: {}, cvss: {},
+            proofObj: { status: "confirmed" }, description: ""
+          }));
+          ckBadgeCount("submissions", ckState.findings.length);
+          if (res.report) {
+            const pre = cel("pre", "ck-research-md");
+            pre.textContent = res.report;
+            pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "320px"; pre.style.overflow = "auto";
+            out.append(pre);
+          }
+          out.append(cel("p", "ck-hint", "Added to Submissions — Copy report / Download / Submit there."));
+        }
+      }
+    } catch (err) {
+      note.classList.add("is-error"); note.textContent = err.message || "Scan failed.";
+    } finally {
+      run.disabled = false; run.textContent = label;
+    }
+  });
+  form.append(note); wrap.append(form); wrap.append(out);
+  return wrap;
+}
+
 function ckRenderSurface() {
   const host = ck.views.surface;
   host.replaceChildren();
+  host.append(ckTakeoverForm());
   const s = ckState.surface;
   if (!s || !(s.urls || []).length) {
     host.append(cel("p", "ck-hint", "Run a full campaign to map the target's surface (discovered URLs, robots/sitemap/security.txt sources)."));

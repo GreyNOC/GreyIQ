@@ -394,6 +394,27 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def _cmd_takeover(args: argparse.Namespace) -> int:
+    from bughunter import takeover_service as tk
+
+    if not args.authorize:
+        return _err("subdomain enumeration touches in-scope hosts only — pass -y/--authorize to confirm scope.")
+    res = tk.scan_subdomain_takeover(args.target, scope=args.scope or "")
+    if not res.get("ok"):
+        return _err(res.get("error", "could not run the scan."))
+    print(f"{_c('Subdomain scan', '1')} — apex {res.get('apex')}: {len(res.get('resolved') or [])} resolving in-scope host(s)")
+    findings = res.get("findings") or []
+    if not findings:
+        print("  no dangling-service takeovers found.")
+        return 0
+    for f in findings:
+        print(_c(f"  TAKEOVER: {f['title']}", "32"))
+        print(f"    {f['proof_evidence']['matched_value']}")
+    if args.json:
+        print(json.dumps(res, indent=2, default=str))
+    return 0
+
+
 def _cmd_idor(args: argparse.Namespace) -> int:
     from datetime import UTC, datetime
     from pathlib import Path
@@ -634,6 +655,13 @@ def build_parser() -> argparse.ArgumentParser:
     bundle.add_argument("path", help="the engagement/campaign output folder to zip")
     bundle.add_argument("-o", "--out", default=None, help="output .zip path (default: <folder>.zip)")
     bundle.set_defaults(func=_cmd_bundle)
+
+    takeover = sub.add_parser("takeover", help="enumerate subdomains of an apex and confirm dangling subdomain takeovers")
+    takeover.add_argument("target", help="apex/host to enumerate (e.g. example.com)")
+    takeover.add_argument("-s", "--scope", default="", help="scope (name the apex/wildcard to allow testing)")
+    takeover.add_argument("--json", action="store_true")
+    takeover.add_argument("-y", "--authorize", action="store_true", help="confirm the apex is in scope (required)")
+    takeover.set_defaults(func=_cmd_takeover)
 
     idor = sub.add_parser("idor", help="confirm IDOR / broken access control with TWO of your authorized test accounts")
     idor.add_argument("url_a", help="account A's object URL (e.g. https://app/api/order/1001)")
