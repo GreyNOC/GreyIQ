@@ -118,6 +118,7 @@ def run_campaign(
     rec_js_secrets: list[dict[str, Any]] = []
     recon_tech: list[str] = []
     recon_params: list[str] = []
+    recon_api_findings: list[dict[str, Any]] = []
     if kind == "url":
         _emit("recon: mapping the surface…")
         # Bind discovery to the SAME fail-closed scope gate the active prover uses, so
@@ -135,6 +136,8 @@ def run_campaign(
         # per-URL active pass so a discovered endpoint that carries no query string of
         # its own still gets its real parameters probed (XSS/SQLi/redirect/SSTI/CRLF).
         recon_params = rec.get("params") or []
+        # GraphQL-introspection (and future API-discovery) candidates, each with an inline plan.
+        recon_api_findings = rec.get("api_findings") or []
     else:
         urls = [clean_target]
         recon_notes, recon_sources = [], {}
@@ -186,6 +189,20 @@ def run_campaign(
         seen_keys.add(key)
         consolidated.append({"finding": finding, "source_url": finding["location"], "source_report": "",
                              "source_json": "", "proof_status": "candidate", "cvss": {}})
+
+    # --- API-discovery candidates (GraphQL introspection): each carries its own inline plan. ---
+    for finding in recon_api_findings:
+        norm_loc = re.sub(r"\d+", "N", str(finding.get("location") or ""))
+        key = f"{finding.get('class_id')}|{finding.get('rule_id')}|{norm_loc}"
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        plan = finding.pop("_plan", None) or {}
+        consolidated.append({
+            "finding": finding, "source_url": finding.get("location") or clean_target,
+            "source_report": "", "source_json": "", "proof_status": "candidate",
+            "cvss": plan.get("cvss") or {}, "plan": plan,
+        })
 
     # --- Known-CVE / outdated-component pass (passive, candidate-grade). One scope-bound,
     # SSRF-guarded GET of the target fingerprints its front-end libraries and folds each

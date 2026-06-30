@@ -21,6 +21,7 @@ import re
 from typing import Any
 from urllib.parse import parse_qsl, urldefrag, urljoin, urlparse
 
+from bughunter import api_discovery_service
 from bughunter.fingerprint import fingerprint
 from bughunter.rate_limit import HostRateGovernor
 from bughunter.recon_js import mine_js
@@ -234,6 +235,19 @@ def discover(
                     seen.add(ep); discovered.append(ep)
                     sources["js-endpoint"] = sources.get("js-endpoint", 0) + 1
 
+    # --- API surface discovery: OpenAPI/Swagger spec + GraphQL introspection (GET-only,
+    # scope-gated, budget-shared). Expands the prover's surface with the spec's endpoints +
+    # params, and flags GraphQL introspection if it's enabled. ---
+    api_findings: list[dict[str, Any]] = []
+    api_surface = api_discovery_service.discover_api_surface(sanitized, fetch=budgeted_fetch, in_scope=in_scope)
+    for ep in api_surface.get("endpoints") or []:
+        if ep not in seen and in_scope(ep) and len(discovered) < max_pages:
+            seen.add(ep); discovered.append(ep)
+            sources["api-spec"] = sources.get("api-spec", 0) + 1
+    params.update(api_surface.get("params") or [])
+    api_findings = api_surface.get("findings") or []
+    notes.extend(api_surface.get("notes") or [])
+
     # Query-string param names from every discovered URL — a param seen on one endpoint
     # becomes a candidate for a param-less sibling (the active prover dedupes per-URL).
     for disc_url in discovered:
@@ -254,5 +268,6 @@ def discover(
         "urls": discovered[:max_pages], "host": host, "sources": sources, "notes": notes,
         "endpoints": [u for u in discovered if u != sanitized][:max_pages],
         "params": sorted(params)[:60], "js_secrets": js_secrets, "tech": tech, "hints": hints,
+        "api_findings": api_findings,
         "dropped_out_of_scope": dropped_oos, "requests_used": used["n"],
     }

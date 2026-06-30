@@ -105,6 +105,36 @@ class CampaignTests(unittest.TestCase):
         self.assertIn(ref, result["cvss"])              # CVSS surfaced for ranking/severity
         self.assertGreaterEqual(len(result["submission_paths"]), 1)  # a report package was written
 
+    def test_url_campaign_folds_in_api_discovery_findings(self) -> None:
+        # recon's api_findings (e.g. GraphQL introspection) — each carrying an inline plan —
+        # must land on the campaign board as candidates with their plan/CVSS.
+        from bughunter import api_discovery_service as apidisc
+
+        target = "https://api.example.com/"
+        gql_finding = apidisc._graphql_finding(
+            "https://api.example.com/graphql",
+            {"query_type": "Query", "mutation_type": "Mutation", "type_count": 12, "types": ["User"]})
+
+        orig = (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves)
+        campaign.recon.discover = lambda t, **k: {
+            "urls": [t], "notes": [], "sources": {}, "js_secrets": [], "tech": [], "params": [],
+            "api_findings": [dict(gql_finding, _plan=dict(gql_finding["_plan"]))]}
+        campaign.run_bounty_hunt = lambda *a, **k: {"ok": True, "json_path": "", "report_path": ""}
+        campaign.cve_service.scan_known_cves = lambda t, **k: {"ok": True, "host": "api.example.com", "target": t, "components": [], "count": 0, "findings": []}
+        try:
+            result = campaign.run_campaign(
+                target, scope="api.example.com", authorized=True, coder_cfg={},
+                default_reports_dir=self.reports, runtime_dir=self.runtime, version="9.9.9", program="demo")
+        finally:
+            campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves = orig
+
+        self.assertTrue(result["ok"], result.get("error"))
+        refs = [f["ref"] for f in result["findings"] if "introspection" in f["title"].lower()]
+        self.assertEqual(len(refs), 1, [f["title"] for f in result["findings"]])
+        ref = refs[0]
+        self.assertEqual(result["proof_of_impact"][ref]["status"], "candidate")
+        self.assertIn(ref, result["attack_plans"])  # inline plan threaded through
+
     def test_static_findings_are_not_auto_recorded_as_submitted(self) -> None:
         # Source-code findings are candidates (no active proof) -> nothing logged
         # to the learning store, so we never pollute program memory with leads.
