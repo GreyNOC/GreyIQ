@@ -33,6 +33,15 @@ class PortfolioTests(unittest.TestCase):
         self.assertFalse(p["active"])
         self.assertFalse(p["auto_submit"])
 
+    def test_deep_implies_active_and_requires_scope(self) -> None:
+        # Deep on with scope -> deep stays on AND active is forced on (deep implies proof).
+        p = portfolio.upsert_program(self.rt, {"name": "D", "scope_text": "d.com", "deep": True, "active": False})
+        self.assertTrue(p["deep"])
+        self.assertTrue(p["active"])
+        # Deep with no scope -> forced off (fail-closed, like active/live).
+        p2 = portfolio.upsert_program(self.rt, {"name": "NoScopeDeep", "deep": True})
+        self.assertFalse(p2["deep"])
+
     def test_auto_submit_requires_handle(self) -> None:
         p = portfolio.upsert_program(self.rt, {"name": "X", "scope_text": "x.com", "auto_submit": True, "platform": "manual"})
         self.assertFalse(p["auto_submit"])  # no hackerone handle -> can't auto-submit
@@ -123,7 +132,8 @@ class OperatorCycleTests(unittest.TestCase):
         base.update(kw)
         return base
 
-    def _run_campaign_fn(self, target, *, scope, program, active, live, max_pages):
+    def _run_campaign_fn(self, target, *, scope, program, active, live, deep=False, max_pages=12):
+        self.last_deep = deep  # record so a test can assert deep was threaded through
         # One confirmed finding per run.
         f = _finding("C1", "xss", "active.reflected-xss", f"{target}/?q=", proof="confirmed")
         # ledger.upsert_findings normally runs inside run_campaign — simulate it here.
@@ -141,6 +151,14 @@ class OperatorCycleTests(unittest.TestCase):
         self.assertEqual(self.submits, [])
         self.assertEqual(s["confirmed"], 1)
 
+    def test_deep_flag_is_threaded_to_the_campaign(self) -> None:
+        self.last_deep = None
+        operator.run_program_cycle(self.rt, self._program(deep=True), run_campaign_fn=self._run_campaign_fn, submit_fn=None)
+        self.assertTrue(self.last_deep)   # the program's deep flag reached run_campaign_fn
+        self.last_deep = None
+        operator.run_program_cycle(self.rt, self._program(deep=False), run_campaign_fn=self._run_campaign_fn, submit_fn=None)
+        self.assertFalse(self.last_deep)
+
     def test_armed_auto_submit_files_confirmed(self) -> None:
         s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=self._run_campaign_fn, submit_fn=self._submit_fn)
         self.assertEqual(len(self.submits), 1)
@@ -155,7 +173,7 @@ class OperatorCycleTests(unittest.TestCase):
     def test_throttle_caps_per_day(self) -> None:
         # Five distinct confirmed findings, cap of 2/day -> only 2 filed.
         calls = {"n": 0}
-        def many_fn(target, *, scope, program, active, live, max_pages):
+        def many_fn(target, *, scope, program, active, live, deep=False, max_pages=12):
             calls["n"] += 1
             f = _finding(f"C{calls['n']}", "xss", "active.reflected-xss", f"{target}/p{calls['n']}", proof="confirmed")
             ledger.upsert_findings(self.rt, program, target, [{"finding": f, "source_url": f["location"], "proof_status": "confirmed", "cvss": {"base_score": 6.1}}])

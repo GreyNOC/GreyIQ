@@ -581,6 +581,7 @@ class ProgramUpsertRequest(BaseModel):
     seed_targets: list[str] = Field(default_factory=list)
     active: bool = False
     live: bool = False
+    deep: bool = False
     auto_submit: bool = False
     max_pages: int = Field(default=12, ge=1, le=50)
     interval_minutes: int = Field(default=1440, ge=5, le=20160)
@@ -1405,14 +1406,17 @@ class GreyIQRuntime:
         return (stored.get("hackerone.team_handle", ""), stored.get("hackerone.api_username", ""), stored.get("hackerone.api_token", ""))
 
     # ---- Autonomous operator ------------------------------------------------------
-    def _operator_run_campaign(self, target: str, *, scope: str, program: str, active: bool, live: bool, max_pages: int) -> dict[str, Any]:
+    def _operator_run_campaign(self, target: str, *, scope: str, program: str, active: bool, live: bool,
+                               deep: bool = False, max_pages: int = 12) -> dict[str, Any]:
         """The operator's run_campaign_fn — goes through runtime.run_campaign so the
         run is cached (run_id) and the submit path can resolve it. authorized=True
         because the operator only runs after the user explicitly armed it (the start
-        endpoint requires authorized); scope stays the fail-closed gate."""
+        endpoint requires authorized); scope stays the fail-closed gate. ``deep`` carries
+        the program's deep-mode flag (time-based SQLi + screenshot/research per confirmed
+        lead) through unchanged."""
         return self.run_campaign(CampaignRequest(
             target=target, scope=scope, authorized=True, program=program,
-            active=active, live=live, max_pages=max_pages,
+            active=active, live=live, deep=deep, max_pages=max_pages,
         ))
 
     def _operator_submit(self, run_id: str, ref: str) -> dict[str, Any]:

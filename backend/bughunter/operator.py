@@ -56,8 +56,8 @@ def run_program_cycle(
     """Hunt every seed target of one program and (if submit_fn is provided AND the
     program opts in) auto-file confirmed, non-duplicate findings within budget.
 
-    ``run_campaign_fn(target, *, scope, program, active, live, max_pages)`` must return
-    the runtime.run_campaign result (with run_id + findings + proof_of_impact).
+    ``run_campaign_fn(target, *, scope, program, active, live, deep, max_pages)`` must
+    return the runtime.run_campaign result (with run_id + findings + proof_of_impact).
     ``submit_fn(run_id, ref) -> {ok, report_id, url} | {ok: False, error}`` is the
     runtime's hard-gated submit; None => review-only (never submits)."""
     pid = program["id"]
@@ -74,7 +74,7 @@ def run_program_cycle(
             result = run_campaign_fn(
                 target, scope=program.get("scope_text", ""), program=pid,
                 active=bool(program.get("active")), live=bool(program.get("live")),
-                max_pages=int(program.get("max_pages") or 12),
+                deep=bool(program.get("deep")), max_pages=int(program.get("max_pages") or 12),
             )
         except Exception as exc:  # noqa: BLE001 - one bad target never kills the loop
             summary["errors"].append(f"{target}: {type(exc).__name__}: {exc}")

@@ -247,11 +247,11 @@ def _operator_callables(coder_cfg: dict):
 
     last: dict = {}
 
-    def run_campaign_fn(target, *, scope, program, active, live, max_pages):
+    def run_campaign_fn(target, *, scope, program, active, live, deep=False, max_pages=12):
         result = campaign_mod.run_campaign(
             target, scope=scope, authorized=True, coder_cfg=coder_cfg,
             default_reports_dir=RUNTIME_DIR / "reports", seed_dir=SEED_DIR, runtime_dir=RUNTIME_DIR,
-            version=VERSION, active=active, live=live, program=program, max_pages=max_pages,
+            version=VERSION, active=active, live=live, deep=deep, program=program, max_pages=max_pages,
         )
         last["result"], last["target"], last["scope"] = result, target, scope
         return result
@@ -306,8 +306,8 @@ def _cmd_operator(args: argparse.Namespace) -> int:
             return 0
         print(_c(f"Portfolio ({len(progs)} program(s)):", "1"))
         for p in progs:
-            flags = " ".join(f for f, on in (("active", p["active"]), ("live", p["live"]), ("auto-submit", p["auto_submit"]),
-                                             ("enabled", p["enabled"])) if on) or "disabled"
+            flags = " ".join(f for f, on in (("active", p["active"]), ("live", p["live"]), ("deep", p.get("deep")),
+                                             ("auto-submit", p["auto_submit"]), ("enabled", p["enabled"])) if on) or "disabled"
             print(f"  {_c(p['id'], '36'):<24} {p['name']}  [{flags}]  scope: {p['scope_text'] or '(none)'}  "
                   f"targets: {len(p['seed_targets'])}  every {p['interval_minutes']}m")
         return 0
@@ -316,7 +316,7 @@ def _cmd_operator(args: argparse.Namespace) -> int:
         prog = portfolio.upsert_program(rt, {
             "name": args.name, "scope_text": args.scope, "seed_targets": args.targets or [],
             "platform": "hackerone" if args.handle else "manual", "platform_handle": args.handle or "",
-            "active": args.active, "live": args.live, "auto_submit": args.auto_submit,
+            "active": args.active, "live": args.live, "deep": getattr(args, "deep", False), "auto_submit": args.auto_submit,
             "interval_minutes": args.interval, "max_submits_per_day": args.max_submits, "max_pages": args.max_pages,
         })
         warn = "" if (not args.auto_submit or prog["auto_submit"]) else _c("  (auto-submit ignored — needs a HackerOne handle + non-empty scope)", "33")
@@ -559,6 +559,8 @@ def build_parser() -> argparse.ArgumentParser:
     opa.add_argument("--max-pages", dest="max_pages", type=int, default=12)
     opa.add_argument("--active", action="store_true", help="capture proof of impact")
     opa.add_argument("--live", action="store_true", help="dynamic Playwright pass")
+    opa.add_argument("--deep", action="store_true",
+                     help="aggressive auto-work (implies --active): time-based SQLi + a screenshot + a researched dossier per confirmed lead")
     opa.add_argument("--auto-submit", dest="auto_submit", action="store_true", help="opt this program into auto-submission")
     opa.set_defaults(func=_cmd_operator)
     opr = opsub.add_parser("remove", help="remove a program")

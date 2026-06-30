@@ -42,6 +42,7 @@ _DEFAULTS: dict[str, Any] = {
     "seed_targets": [],            # URLs/hosts to hunt (each within scope)
     "active": False,               # capture proof-of-impact (active verification)
     "live": False,                 # dynamic Playwright pass
+    "deep": False,                 # aggressive: time-based SQLi + auto screenshot + research per confirmed lead
     "auto_submit": False,          # FILE confirmed findings automatically — DANGER, default off
     "max_pages": 12,
     "interval_minutes": 1440,      # how often the operator re-runs this program
@@ -85,11 +86,16 @@ def _now() -> str:
 
 def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     out = {**_DEFAULTS, **{k: v for k, v in record.items() if k in _DEFAULTS or k == "id"}}
-    # Fail-closed coupling: active/live/auto_submit require a non-empty scope.
+    # Fail-closed coupling: active/live/deep/auto_submit require a non-empty scope.
     if not str(out.get("scope_text") or "").strip():
         out["active"] = False
         out["live"] = False
+        out["deep"] = False
         out["auto_submit"] = False
+    # Deep implies proof-of-impact (it adds time-based SQLi + screenshot/research per
+    # confirmed lead), so a deep program is always active.
+    if out.get("deep"):
+        out["active"] = True
     # Auto-submit additionally requires a platform handle to even attempt a file.
     if out["auto_submit"] and not (out["platform"] == "hackerone" and str(out.get("platform_handle") or "").strip()):
         out["auto_submit"] = False

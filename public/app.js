@@ -5331,8 +5331,9 @@ function ckProgramForm() {
   const toggles = cel("div", "ck-toggles");
   const active = ckToggle("Capture proof of impact (active)", true);
   const live = ckToggle("Dynamic Playwright pass", false);
+  const deep = ckToggle("Deep auto-work (time-based SQLi + screenshot + research per confirmed lead)", false);
   const auto = ckToggle("Auto-submit confirmed findings (per-program opt-in)", false);
-  toggles.append(active.wrap, live.wrap, auto.wrap);
+  toggles.append(active.wrap, live.wrap, deep.wrap, auto.wrap);
   form.append(toggles);
 
   const submit = cel("button", "ck-btn primary", "Save program");
@@ -5347,7 +5348,7 @@ function ckProgramForm() {
       await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify({
         name: name.input.value.trim(), scope_text: scope.input.value.trim(), seed_targets: seeds,
         platform: handle.input.value.trim() ? "hackerone" : "manual", platform_handle: handle.input.value.trim(),
-        active: active.input.checked, live: live.input.checked, auto_submit: auto.input.checked,
+        active: active.input.checked, live: live.input.checked, deep: deep.input.checked, auto_submit: auto.input.checked,
         interval_minutes: Number(interval.input.value) || 1440, max_submits_per_day: Number(cap.input.value) || 3
       }) });
       note.classList.remove("is-error"); note.textContent = "Saved.";
