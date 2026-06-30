@@ -2,6 +2,23 @@
 
 Notable changes to GreyIQ.
 
+## v0.35.0
+
+### QA hardening round 2 — boolean-SQLi precision + the safety-critical tests
+Continuing the audit-driven hardening:
+
+- **Boolean-blind SQLi** now rejects an *infrastructure* differential: the TRUE/FALSE
+  divergence must be two clean **200s with no SQL-error banner** (a WAF/error block page of
+  a different length no longer confirms), and must **reproduce on a second pass** before it
+  confirms.
+- Added targeted tests for the two **most safety-critical functions, previously untested**:
+  the SSRF/URL policy (`web_ingest._enforce_url_policy` — refuses non-http schemes, embedded
+  credentials, non-standard ports, and private/loopback/link-local/cloud-metadata IPs) and
+  the archive **zip-slip / tar-slip** guard (rejects traversal, absolute, and null-byte
+  member names).
+
+339 tests green (+14).
+
 ## v0.34.0
 
 ### QA hardening — fewer false positives, accurate severity (engine-wide audit)
