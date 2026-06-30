@@ -2,6 +2,28 @@
 
 Notable changes to GreyIQ.
 
+## v0.28.0
+
+### Choose your reporting format — HackerOne, YesWeHack, Bugcrowd, Intigriti
+Submission reports can now be shaped for the destination platform. The **same finding —
+and the same gathered evidence —** is reframed with each platform's own conventions:
+
+- **HackerOne** — Weakness (CWE) + severity rating; Summary / Steps / Supporting material / Impact.
+- **YesWeHack** — Bug type (CWE) + CVSS vector; Description / Steps / PoC / Impact / Remediation.
+- **Bugcrowd** — VRT-led with a P1–P5 priority; Description / Steps / PoC / Impact / Remediation.
+- **Intigriti** — Type (OWASP/CWE) + CVSS; Description / Endpoint / PoC / Impact / Recommended fix.
+
+Pick the format in the Hunt cockpit's **Submissions** tab (a new selector). **Copy report**
+and **Download .md** produce the chosen platform's layout, and the gathered evidence — the
+captured request/response, matched values, `Set-Cookie`, and code/response excerpt — is
+always included when the finding carries it. The one-click API submit still files to
+HackerOne (the only wired platform API); use Copy/Download to file on the others.
+
+On the CLI, `gn platforms` lists the formats and `gn campaign --platform <id>` writes the
+submission packages in that format. New `GET /api/bounty/platforms`. The report framing is
+done by a new `report_formats` module that re-shapes `report.py`'s output per platform
+without changing what the HackerOne API submit sends.
+
 ## v0.27.0
 
 ### Find more — discovered parameters now feed the active prover
