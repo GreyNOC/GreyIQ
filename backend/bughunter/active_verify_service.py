@@ -479,6 +479,56 @@ def _check_clickjacking(http: _Http, url: str, fetched: dict[str, Any] | None) -
     return _finding("active.clickjacking", "Page is framable (clickjacking candidate)", "low", "headers", "headers", url, proof, ev)
 
 
+_FORM_RE = re.compile(r"<form\b[^>]*>.*?</form>", re.IGNORECASE | re.DOTALL)
+_METHOD_POST_RE = re.compile(r"method\s*=\s*[\"']?\s*post", re.IGNORECASE)
+# Anti-CSRF token field names (hidden input) or a page-wide meta token.
+_CSRF_TOKEN_RE = re.compile(
+    r"name\s*=\s*[\"']?(?:[a-z0-9_\-]*x?csrf[a-z0-9_\-]*|authenticity_token|"
+    r"__requestverificationtoken|_token|anti[\-_]?forgery[a-z]*|nonce)",
+    re.IGNORECASE,
+)
+_META_CSRF_RE = re.compile(r"<meta[^>]+name\s*=\s*[\"']csrf-token[\"']", re.IGNORECASE)
+
+
+def _check_csrf(landing: dict[str, Any] | None, url: str) -> dict[str, Any] | None:
+    """Candidate-grade CSRF: a state-changing POST form served with NO anti-CSRF token.
+    Passive (GET, form inspection). Honest tiering — modern browsers default cookies to
+    SameSite=Lax, which already blocks cross-site POST, so a missing token alone is rarely
+    exploitable. A tokenless POST form whose session cookie is explicitly ``SameSite=None``
+    is a MEDIUM candidate; if a Lax/Strict cookie is observed it's skipped (protected);
+    otherwise a LOW candidate the operator must verify."""
+    if not landing:
+        return None
+    body = landing.get("body") or ""
+    if _META_CSRF_RE.search(body):
+        return None  # a page-wide CSRF meta token (AJAX frameworks attach it to POSTs)
+    tokenless = any(
+        _METHOD_POST_RE.search(m.group(0)) and not _CSRF_TOKEN_RE.search(m.group(0))
+        for m in _FORM_RE.finditer(body)
+    )
+    if not tokenless:
+        return None
+    cookies = " ".join(str(c) for c in (landing.get("cookies") or [])).lower()
+    samesite_none = "samesite=none" in cookies
+    samesite_lax_strict = ("samesite=lax" in cookies) or ("samesite=strict" in cookies)
+    if samesite_lax_strict and not samesite_none:
+        return None  # the session cookie is SameSite Lax/Strict -> cross-site POST blocked
+    sev = "medium" if samesite_none else "low"
+    proof = _proof(
+        "candidate", method="GET (passive form inspection)",
+        affected_asset="authenticated users tricked into submitting this form cross-site",
+        observed_result="a state-changing POST form is served with no anti-CSRF token field",
+        limitations=("Browsers default cookies to SameSite=Lax, which blocks cross-site POST; a missing token is only "
+                     "exploitable if the session cookie is SameSite=None or the action is otherwise reachable cross-site. "
+                     + ("A response cookie is set SameSite=None (cross-site cookies allowed)."
+                        if samesite_none else "The session cookie's SameSite policy was not observed here — verify it.")),
+        proof_obligation="Host a page that auto-submits a forged cross-site POST with the victim's cookies and confirm the state change.",
+        evidence="<form method=post> with no csrf/xsrf/authenticity_token field" + ("; Set-Cookie SameSite=None" if samesite_none else ""),
+    )
+    ev = {"request_line": f"GET {url}", "matched_value": "POST form with no anti-CSRF token" + ("; a cookie is SameSite=None" if samesite_none else "")}
+    return _finding("active.csrf-missing-token", "State-changing form without anti-CSRF token", sev, "csrf", "csrf", url, proof, ev)
+
+
 def _check_host_header(http: _Http, url: str) -> dict[str, Any] | None:
     try:
         probe = http.fetch(url, extra_headers={"Host": _MARKER_HOST})
@@ -940,6 +990,7 @@ def verify_active(
     # is wrapped so a budget exhaustion stops cleanly without raising.
     checks: list[Callable[[], dict[str, Any] | None]] = [
         lambda: _check_clickjacking(http, sanitized, landing),
+        lambda: _check_csrf(landing, sanitized),
         lambda: _check_cors(http, sanitized),
         lambda: _check_open_redirect(http, sanitized, discovered_params),
         lambda: _check_host_header(http, sanitized),

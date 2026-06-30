@@ -123,6 +123,41 @@ class ActiveCheckTests(unittest.TestCase):
         self.assertIsNotNone(f)
         self.assertEqual(f["_active_proof"]["status"], "confirmed")
 
+    def test_csrf_candidate_on_tokenless_post_form(self) -> None:
+        landing = {"body": '<form method="POST" action="/transfer"><input name="amount"></form>',
+                   "cookies": [], "final_url": "https://app.example.com/pay"}
+        f = av._check_csrf(landing, "https://app.example.com/pay")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "candidate")
+        self.assertEqual(f["_active_class_hint"], "csrf")
+        self.assertEqual(f["severity"], "low")
+
+    def test_csrf_skips_form_with_token(self) -> None:
+        landing = {"body": '<form method="post"><input type="hidden" name="csrf_token" value="x"><input name="amount"></form>',
+                   "cookies": [], "final_url": "u"}
+        self.assertIsNone(av._check_csrf(landing, "https://app.example.com/pay"))
+
+    def test_csrf_skips_when_meta_csrf_token_present(self) -> None:
+        landing = {"body": '<head><meta name="csrf-token" content="abc"></head><form method="post"><input name="x"></form>',
+                   "cookies": [], "final_url": "u"}
+        self.assertIsNone(av._check_csrf(landing, "https://app.example.com/pay"))
+
+    def test_csrf_skips_when_cookie_is_samesite_lax(self) -> None:
+        landing = {"body": '<form method="post"><input name="amount"></form>',
+                   "cookies": ["sid=abc; Path=/; HttpOnly; SameSite=Lax"], "final_url": "u"}
+        self.assertIsNone(av._check_csrf(landing, "https://app.example.com/pay"))
+
+    def test_csrf_medium_when_cookie_is_samesite_none(self) -> None:
+        landing = {"body": '<form method="post"><input name="amount"></form>',
+                   "cookies": ["sid=abc; Path=/; Secure; SameSite=None"], "final_url": "u"}
+        f = av._check_csrf(landing, "https://app.example.com/pay")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["severity"], "medium")
+
+    def test_csrf_ignores_get_forms(self) -> None:
+        landing = {"body": '<form method="get" action="/search"><input name="q"></form>', "cookies": [], "final_url": "u"}
+        self.assertIsNone(av._check_csrf(landing, "https://app.example.com/"))
+
     def test_nosqli_confirms_on_operator_object_error(self) -> None:
         # The param sent as {$ne: ...} (encoded %24ne) breaks a typed Mongoose field -> CastError.
         class MongoStub:
