@@ -123,6 +123,39 @@ class ActiveCheckTests(unittest.TestCase):
         self.assertIsNotNone(f)
         self.assertEqual(f["_active_proof"]["status"], "confirmed")
 
+    def test_nosqli_confirms_on_operator_object_error(self) -> None:
+        # The param sent as {$ne: ...} (encoded %24ne) breaks a typed Mongoose field -> CastError.
+        class MongoStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                body = "CastError: Cast to ObjectId failed for value" if "%24ne" in url else "ok"
+                return {"status": 500 if "%24ne" in url else 200, "headers": {}, "body": body, "cookies": [], "location": None}
+        f = av._check_nosqli(MongoStub(), "https://app.example.com/?id=1")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertEqual(f["_active_class_hint"], "nosqli")
+        self.assertEqual(f["rule_id"], "active.nosqli-error")
+
+    def test_nosqli_does_not_confirm_on_generic_error(self) -> None:
+        # A generic stack trace from the operator object is NOT a NoSQL backend error.
+        class TracebackStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                body = "Traceback (most recent call last): TypeError" if "%24ne" in url else "ok"
+                return {"status": 500, "headers": {}, "body": body, "cookies": [], "location": None}
+        self.assertIsNone(av._check_nosqli(TracebackStub(), "https://app.example.com/?id=1"))
+
+    def test_nosqli_does_not_confirm_when_banner_is_always_present(self) -> None:
+        # A page that always shows a Mongo banner (e.g. a debug console) fails the control.
+        class AlwaysStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                return {"status": 200, "headers": {}, "body": "MongoServerError: something", "cookies": [], "location": None}
+        self.assertIsNone(av._check_nosqli(AlwaysStub(), "https://app.example.com/?id=1"))
+
+    def test_nosqli_needs_a_param(self) -> None:
+        class Stub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                return {"status": 200, "headers": {}, "body": "MongoError", "cookies": [], "location": None}
+        self.assertIsNone(av._check_nosqli(Stub(), "https://app.example.com/"))  # no param to perturb
+
     def test_ssti_confirms_when_expression_is_evaluated(self) -> None:
         class TemplateStub:  # a real template engine evaluates {{7*7}} -> 49
             def fetch(self, url, *, method="GET", extra_headers=None):

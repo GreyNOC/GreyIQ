@@ -79,6 +79,20 @@ _SQL_ERROR_RE = re.compile(
     r"You have an error in your SQL syntax|SQLite3?::|sqlite3.OperationalError",
     re.IGNORECASE,
 )
+# High-signal NoSQL backend error banners ONLY — unambiguous Mongo/Mongoose/BSON/PyMongo/
+# Couchbase errors. Generic JS/stack traces are deliberately excluded (they'd false-positive
+# against the engine's confirm-grade promise). Matched only with a negative control.
+_NOSQL_ERROR_RE = re.compile(
+    r"Mongo(?:Server|Network|Parse)?Error"
+    r"|MongooseError"
+    r"|BSON(?:Type)?Error"
+    r"|Cast(?:Error)?\s+to\s+(?:ObjectId|Number|Boolean|Date|Buffer|String)\s+failed"
+    r"|E11000\s+duplicate\s+key"
+    r"|pymongo(?:\.errors)?\b"
+    r"|OperationFailure"
+    r"|N1QL(?:Error)?|CouchbaseError",
+    re.IGNORECASE,
+)
 # A stable marker token (no Math.random needed): unique enough across one host's
 # response surface, deterministic for tests.
 _MARK = "gq7x4q2v"
@@ -596,6 +610,50 @@ def _check_error_sqli(http: _Http, url: str, extra_params: list[str] | None = No
     return None
 
 
+def _with_operator(url: str, param: str, value: str) -> str:
+    """Replace a scalar query param with a NoSQL OPERATOR-OBJECT key (``param`` -> ``param[$ne]``)
+    so an Express/qs-style parser materialises ``{param: {$ne: value}}`` server-side. The plain
+    param is dropped so the server sees a single, unambiguous operator object."""
+    parsed = urlparse(url)
+    existing = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    existing.pop(param, None)
+    existing[f"{param}[$ne]"] = value
+    return urlunparse(parsed._replace(query=urlencode(existing)))
+
+
+def _check_nosqli(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
+    """Error-based NoSQL injection: send a param as an operator object ({$ne: ...}); a NoSQL
+    backend error banner that appears ONLY for the operator (not the scalar control) confirms
+    a NoSQL injection point (e.g. Mongoose casting {$ne:...} to a typed field). High precision,
+    mirroring the SQL-error check; a generic stack trace never confirms."""
+    parsed = urlparse(url)
+    params = _candidate_params(url, extra_params, (), 2)
+    if not params:
+        return None  # need a URL or recon-discovered param; never invent an injection point
+    base_q = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    for param in params:
+        original = base_q.get(param, "1")
+        try:
+            probe = http.fetch(_with_operator(url, param, original))   # param -> {$ne: original}
+            control = http.fetch(_with_query(url, {param: original}))  # plain scalar baseline
+        except _ActiveError:
+            continue
+        body, ctrl_body = probe.get("body") or "", control.get("body") or ""
+        matched = bool(_NOSQL_ERROR_RE.search(body))
+        ctrl_matched = bool(_NOSQL_ERROR_RE.search(ctrl_body))
+        if matched and not ctrl_matched:
+            proof = _proof(
+                "confirmed", method=f"GET with {param}[$ne]={original} (operator-object injection)",
+                affected_asset="the NoSQL datastore reachable by this query's role",
+                observed_result=f"sending '{param}' as an operator object ({{$ne: ...}}) produced a NoSQL backend error",
+                control_result="the same parameter as a plain scalar returned no NoSQL error — the operator object broke the query",
+                evidence="a NoSQL backend error banner (MongoError / Mongoose CastError / BSONError) surfaced after the operator injection",
+            )
+            ev = {"request_line": f"GET {_with_operator(url, param, original)}", "response_status": f"HTTP {probe['status']}", "matched_value": "NoSQL error banner"}
+            return _finding("active.nosqli-error", f"NoSQL injection via '{param}' (operator object elicited a NoSQL error)", "high", "injection", "nosqli", url, proof, ev)
+    return None
+
+
 def _norm_len(body: str) -> int:
     """Length of the body with volatile whitespace collapsed, so a stable page
     compares stably across reads (CSRF tokens / timestamps still flap — handled by
@@ -889,6 +947,7 @@ def verify_active(
         lambda: _check_ssti(http, sanitized, discovered_params),
         lambda: _check_error_sqli(http, sanitized, discovered_params),
         lambda: _check_bool_sqli(http, sanitized, discovered_params),
+        lambda: _check_nosqli(http, sanitized, discovered_params),
         lambda: _check_crlf(http, sanitized, discovered_params),
         # Open-bucket is GET-only and scope-gated; safe in the default pass.
         lambda: _check_open_bucket(http, landing, scope, settings),
