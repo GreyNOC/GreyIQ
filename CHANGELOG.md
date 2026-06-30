@@ -2,6 +2,23 @@
 
 Notable changes to GreyIQ.
 
+## v0.42.0
+
+### Phase C — BFLA (broken function-level authorization)
+Confirms a privilege-escalation class with the same proven dual-session machinery as IDOR,
+GET-only:
+
+- A **three-session differential** (admin / low-privilege user / anonymous): confirms only
+  when the low-privilege user's response ~matches the **admin** response **and** an anonymous
+  request is denied/different — so the endpoint is genuinely access-controlled, not a public
+  page. Otherwise reported honestly as `enforced` or a `candidate`.
+- The privileged body is **never embedded** — the proof is the differential only (statuses +
+  similarity ratios), exactly like IDOR.
+- Wired everywhere: `POST /api/bounty/bfla`, `gn bfla <url> -y` (high-/low-priv sessions), and
+  a BFLA panel in the cockpit access-control view. A confirmed bypass caches as a run.
+
+395 tests green (+7).
+
 ## v0.41.0
 
 ### Phase C — API surface discovery (OpenAPI/Swagger + GraphQL)
