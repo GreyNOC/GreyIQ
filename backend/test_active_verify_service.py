@@ -171,6 +171,27 @@ class ActiveCheckTests(unittest.TestCase):
                 return {"status": 200, "headers": {}, "body": "x" * 500, "cookies": [], "final_url": url, "location": None}
         self.assertIsNone(av._check_bool_sqli(IgnoreStub(), "https://app.example.com/?id=1"))
 
+    def test_bool_sqli_does_not_confirm_on_waf_block_page(self) -> None:
+        # The FALSE payload is blocked by a WAF (403, different length). That length
+        # differential is infrastructure, not a DB boolean — must NOT confirm.
+        class WafStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                if "1'='2" in url or "1%27%3D%272" in url:
+                    return {"status": 403, "headers": {}, "body": "Request blocked by WAF. " + "z" * 300, "cookies": [], "final_url": url, "location": None}
+                return {"status": 200, "headers": {}, "body": "x" * 800, "cookies": [], "final_url": url, "location": None}
+        self.assertIsNone(av._check_bool_sqli(WafStub(), "https://app.example.com/?id=1"))
+
+    def test_host_header_body_only_reflection_is_candidate(self) -> None:
+        # Host reflected only into the BODY (common, usually harmless) -> candidate, not confirmed.
+        class BodyEchoStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                h = {k.lower(): v for k, v in (extra_headers or {}).items()}
+                body = f"<html>host={h.get('host', '')}</html>" if "host" in h else "<html>host=real</html>"
+                return {"status": 200, "headers": {}, "cookies": [], "body": body, "final_url": url, "location": None}
+        f = av._check_host_header(BodyEchoStub(), "https://app.example.com/")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "candidate")
+
     def test_crlf_confirms_when_header_is_split_out(self) -> None:
         class CrlfStub:  # server reflects the CRLF-injected value as a real header
             def fetch(self, url, *, method="GET", extra_headers=None):

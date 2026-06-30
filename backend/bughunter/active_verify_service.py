@@ -630,17 +630,37 @@ def _check_bool_sqli(http: _Http, url: str, extra_params: list[str] | None = Non
             continue  # dynamic page — not safely confirmable here
         true_tracks = abs(tl - b1) <= max(8, ref * 0.02)
         false_diverges = abs(fl - b1) > max(24, ref * 0.05)
-        if true_tracks and false_diverges:
-            proof = _proof(
-                "confirmed", method=f"GET with {param}=...' AND '1'='1 vs ...' AND '1'='2",
-                affected_asset="the database reachable by the query's role (boolean-inferable)",
-                observed_result=f"the TRUE condition returned a page matching the stable baseline (~{b1} chars) while the FALSE condition diverged (~{fl} chars)",
-                control_result=f"two unmodified requests returned near-identical pages (~{b1}/{b2} chars), so the page is stable and the TRUE/FALSE difference tracks the injected boolean",
-                evidence=f"normalized lengths baseline={b1}/{b2}, TRUE={tl}, FALSE={fl}",
-            )
-            ev = {"request_line": f"GET {_with_query(url, {param: original + chr(39) + ' AND ' + chr(39) + '1' + chr(39) + '=' + chr(39) + '2'})}",
-                  "response_status": f"HTTP {f_resp['status']}", "matched_value": f"FALSE page diverged by {abs(fl - b1)} chars from a stable baseline"}
-            return _finding("active.sqli-boolean", f"Boolean-based blind SQL injection via '{param}'", "high", "disclosure", "sqli", url, proof, ev)
+        if not (true_tracks and false_diverges):
+            continue
+        # Reject an INFRASTRUCTURE differential masquerading as a DB boolean: a WAF/error
+        # page of a different length satisfies the length test without any DB involvement.
+        # Both responses must be a normal 200, and neither may carry a SQL-error banner
+        # (that would be error-based, not boolean).
+        if int(t_resp.get("status") or 0) != 200 or int(f_resp.get("status") or 0) != 200:
+            continue
+        if _SQL_ERROR_RE.search(f_resp.get("body") or "") or _SQL_ERROR_RE.search(t_resp.get("body") or ""):
+            continue
+        # Second confirmation pass: the TRUE/FALSE divergence must REPRODUCE in the same
+        # direction, ruling out a coincidental one-off length flap (cache, rotating ad,
+        # per-request token) that happened to look like a boolean.
+        try:
+            t2 = http.fetch(_with_query(url, {param: original + "' AND '1'='1"}))
+            f2 = http.fetch(_with_query(url, {param: original + "' AND '1'='2"}))
+        except _ActiveError:
+            continue
+        tl2, fl2 = _norm_len(t2.get("body") or ""), _norm_len(f2.get("body") or "")
+        if not (abs(tl2 - b1) <= max(8, ref * 0.02) and abs(fl2 - b1) > max(24, ref * 0.05)):
+            continue  # divergence did not reproduce — not safely confirmable
+        proof = _proof(
+            "confirmed", method=f"GET with {param}=...' AND '1'='1 vs ...' AND '1'='2 (reproduced twice)",
+            affected_asset="the database reachable by the query's role (boolean-inferable)",
+            observed_result=f"the TRUE condition returned a page matching the stable baseline (~{b1} chars) while the FALSE condition diverged (~{fl} chars), reproduced on a second pass",
+            control_result=f"two unmodified requests returned near-identical pages (~{b1}/{b2} chars), both TRUE/FALSE were 200 with no SQL-error banner, so the difference tracks the injected boolean — not a WAF/error page",
+            evidence=f"normalized lengths baseline={b1}/{b2}, TRUE={tl}/{tl2}, FALSE={fl}/{fl2}",
+        )
+        ev = {"request_line": f"GET {_with_query(url, {param: original + chr(39) + ' AND ' + chr(39) + '1' + chr(39) + '=' + chr(39) + '2'})}",
+              "response_status": f"HTTP {f_resp['status']}", "matched_value": f"FALSE page diverged by {abs(fl - b1)} chars from a stable baseline"}
+        return _finding("active.sqli-boolean", f"Boolean-based blind SQL injection via '{param}'", "high", "disclosure", "sqli", url, proof, ev)
     return None
 
 
