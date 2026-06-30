@@ -2,6 +2,25 @@
 
 Notable changes to GreyIQ.
 
+## v0.32.0
+
+### Subdomain enumeration + takeover — more surface, a high-value easy win
+GreyIQ now maps more of the attack surface and confirms **dangling subdomain takeovers** —
+a DNS record still pointing at a deleted third-party resource (GitHub Pages, S3, Heroku,
+Fastly, Shopify, …) that an attacker can claim to serve content on the target's own
+subdomain.
+
+Give it an in-scope apex; it enumerates subdomains from a bounded label wordlist (resolved
+via DNS — no external API) plus any hosts recon already found, fetches each resolving,
+in-scope host **GET-only through the same SSRF/private-host guard**, and confirms a takeover
+only on a **strong, service-specific "unclaimed" fingerprint** (curated to unique signatures
+so a normal page or a plain 404 never matches). No resource is ever claimed.
+
+A confirmed takeover is a first-class finding: a **Subdomain takeover** form in the cockpit's
+Surface tab, `gn takeover example.com -s example.com -y`, and `POST /api/bounty/takeover` —
+all flowing into the per-platform report, screenshot, research, downloadable bundle, and the
+hard-gated submit.
+
 ## v0.31.0
 
 ### Confirm IDOR / broken access control — the #1 paying class
