@@ -4301,6 +4301,7 @@ const ck = {
 
 let ckOpPoll = null;        // operator event-poll timer
 let ckOpEventCount = 0;     // events already rendered
+let ckOpEdit = null;        // the program being edited in the form (null = adding a new one)
 
 const ckState = {
   result: null,          // last hunt/campaign response
@@ -5747,8 +5748,8 @@ async function ckRenderOperator() {
   if (!(data.programs || []).length) host.append(cel("p", "ck-hint", "No programs yet — add one below."));
   else host.append(list);
 
-  // --- Add program form ---
-  host.append(cel("h3", "ck-section-title", "Add / update a program"));
+  // --- Add / edit program form ---
+  host.append(cel("h3", "ck-section-title", ckOpEdit ? `Edit program — ${ckOpEdit.name || ckOpEdit.id}` : "Add / update a program"));
   host.append(ckProgramForm());
 }
 
@@ -5799,6 +5800,17 @@ function ckProgramRow(prog, funnel) {
   li.append(left);
 
   const acts = cel("div", "ck-actions"); acts.style.margin = "0";
+  const edit = cel("button", "ck-btn", "Edit");
+  edit.type = "button";
+  edit.addEventListener("click", () => {
+    ckOpEdit = prog;
+    void ckRenderOperator();
+    setTimeout(() => {
+      const f = document.querySelector(".ck-prog-form");
+      if (f) { f.scrollIntoView({ behavior: "smooth", block: "center" }); const n = f.querySelector("input"); if (n) n.focus(); }
+    }, 60);
+  });
+  acts.append(edit);
   const toggle = cel("button", "ck-btn", prog.enabled ? "Disable" : "Enable");
   toggle.type = "button";
   toggle.addEventListener("click", async () => {
@@ -5814,38 +5826,54 @@ function ckProgramRow(prog, funnel) {
 }
 
 function ckProgramForm() {
+  const editing = ckOpEdit;  // a program object when editing, else null (adding new)
   const form = cel("form", "ck-prog-form");
-  const name = ckField("Program name", "text", "");
-  const scope = ckField("Scope (hosts/wildcards — the active gate)", "text", "");
-  const targets = ckField("Seed targets (comma/space separated URLs)", "text", "");
-  const handle = ckField("HackerOne team handle (for auto-submit)", "text", "");
-  const interval = ckField("Re-run every (minutes)", "number", "1440");
-  const cap = ckField("Max auto-submits / day", "number", "3");
+  const name = ckField("Program name", "text", editing ? (editing.name || "") : "");
+  const scope = ckField("Scope (hosts/wildcards — the active gate)", "text", editing ? (editing.scope_text || "") : "");
+  const targets = ckField("Seed targets (comma/space separated URLs)", "text", editing ? (editing.seed_targets || []).join(", ") : "");
+  const handle = ckField("HackerOne team handle (for auto-submit)", "text", editing ? (editing.platform_handle || "") : "");
+  const interval = ckField("Re-run every (minutes)", "number", editing ? String(editing.interval_minutes || 1440) : "1440");
+  const cap = ckField("Max auto-submits / day", "number", editing ? String(editing.max_submits_per_day ?? 3) : "3");
   form.append(name.wrap, scope.wrap, targets.wrap, handle.wrap, interval.wrap, cap.wrap);
 
   const toggles = cel("div", "ck-toggles");
-  const active = ckToggle("Capture proof of impact (active)", true);
-  const live = ckToggle("Dynamic Playwright pass", false);
-  const deep = ckToggle("Deep auto-work (time-based SQLi + screenshot + research per confirmed lead)", false);
-  const auto = ckToggle("Auto-submit confirmed findings (per-program opt-in)", false);
+  const active = ckToggle("Capture proof of impact (active)", editing ? !!editing.active : true);
+  const live = ckToggle("Dynamic Playwright pass", editing ? !!editing.live : false);
+  const deep = ckToggle("Deep auto-work (time-based SQLi + screenshot + research per confirmed lead)", editing ? !!editing.deep : false);
+  const auto = ckToggle("Auto-submit confirmed findings (per-program opt-in)", editing ? !!editing.auto_submit : false);
   toggles.append(active.wrap, live.wrap, deep.wrap, auto.wrap);
   form.append(toggles);
 
-  const submit = cel("button", "ck-btn primary", "Save program");
+  const submit = cel("button", "ck-btn primary", editing ? "Update program" : "Save program");
   submit.type = "submit";
   form.append(submit);
+  if (editing) {
+    const cancel = cel("button", "ck-btn", "Cancel");
+    cancel.type = "button";
+    cancel.addEventListener("click", () => { ckOpEdit = null; void ckRenderOperator(); });
+    form.append(cancel);
+  }
   const note = cel("p", "ck-status");
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     if (!name.input.value.trim() || !scope.input.value.trim()) { note.textContent = "Name and scope are required."; note.classList.add("is-error"); return; }
     const seeds = targets.input.value.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+    const payload = {
+      name: name.input.value.trim(), scope_text: scope.input.value.trim(), seed_targets: seeds,
+      platform: handle.input.value.trim() ? "hackerone" : "manual", platform_handle: handle.input.value.trim(),
+      active: active.input.checked, live: live.input.checked, deep: deep.input.checked, auto_submit: auto.input.checked,
+      interval_minutes: Number(interval.input.value) || 1440, max_submits_per_day: Number(cap.input.value) || 3
+    };
+    if (editing) {
+      // Update the existing record: carry its id + the fields the form doesn't expose so
+      // they're preserved (enabled state, recon depth) rather than reset to defaults.
+      payload.id = editing.id;
+      payload.enabled = editing.enabled;
+      if (editing.max_pages != null) payload.max_pages = editing.max_pages;
+    }
     try {
-      await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify({
-        name: name.input.value.trim(), scope_text: scope.input.value.trim(), seed_targets: seeds,
-        platform: handle.input.value.trim() ? "hackerone" : "manual", platform_handle: handle.input.value.trim(),
-        active: active.input.checked, live: live.input.checked, deep: deep.input.checked, auto_submit: auto.input.checked,
-        interval_minutes: Number(interval.input.value) || 1440, max_submits_per_day: Number(cap.input.value) || 3
-      }) });
+      await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify(payload) });
+      ckOpEdit = null;
       note.classList.remove("is-error"); note.textContent = "Saved.";
       void ckRenderOperator();
     } catch (err) { note.textContent = err.message || "Could not save."; note.classList.add("is-error"); }
