@@ -26,7 +26,15 @@ def _encode_qname(host: str) -> bytes:
             raw = label.encode("idna") if any(ord(c) > 127 for c in label) else label.encode("ascii")
         except (UnicodeError, ValueError):
             raw = label.encode("ascii", "ignore")
-        out += bytes([len(raw) & 0x3F]) + raw[:63]
+        # Truncate FIRST, then derive the length prefix from what's actually appended —
+        # `bytes([len(raw) & 0x3F])` masked the length to 6 bits (max 63) while `raw[:63]`
+        # always appended a full 63 bytes regardless, so for any label > 63 bytes (a
+        # malformed host, or an IDNA expansion that grows past 63) the declared length and
+        # the appended byte count disagreed, corrupting every label that follows it in
+        # the packet. A label this long is invalid DNS either way; truncating to the
+        # legal 63-byte max and matching the length to it keeps the query well-formed.
+        raw = raw[:63]
+        out += bytes([len(raw)]) + raw
     return out + b"\x00"
 
 

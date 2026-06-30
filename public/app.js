@@ -534,7 +534,12 @@ async function apiFetch(path, options = {}) {
     }
     const payload = await response.json();
     if (!response.ok) {
-      throw new Error(payload.detail || payload.error || response.statusText);
+      // A non-ok response can carry a JSON body that ISN'T an object (literal null, an
+      // array, a bare string from a proxy/error page) -- dereferencing .detail on that
+      // throws an opaque "Cannot read properties of null" that hides the real HTTP
+      // status behind a confusing client-side error instead of surfacing it.
+      const safe = payload && typeof payload === "object" ? payload : {};
+      throw new Error(safe.detail || safe.error || response.statusText);
     }
     return payload;
   } finally {
@@ -4353,6 +4358,7 @@ function ckSetView(view) {
   ckState.view = view;
   for (const btn of ck.navButtons) btn.classList.toggle("is-active", btn.dataset.ckView === view);
   for (const [name, node] of Object.entries(ck.views)) node.hidden = name !== view;
+  if (view === "findings") ckRenderFindings();
   if (view === "learn") void ckRenderLearn();
   if (view === "surface") ckRenderSurface();
   if (view === "submissions") ckRenderSubmissions();
@@ -4443,11 +4449,24 @@ function ckProofBadge(status) {
   return cel("span", `ck-proof ${s}`, label);
 }
 
+// Worst severity present, in the SAME risk-word scheme campaign._campaign_risk uses
+// (critical/high/moderate/low/clean), so a fresh client-side badge means the same thing
+// the server-computed one does.
+const _RISK_FROM_SEVERITY = [["critical", "critical"], ["high", "high"], ["medium", "moderate"]];
+function ckDeriveRisk(findings) {
+  const present = new Set(findings.map((f) => String(f.severity || "").toLowerCase()));
+  for (const [sev, label] of _RISK_FROM_SEVERITY) if (present.has(sev)) return label;
+  return findings.length ? "low" : "clean";
+}
+
 function ckRenderFindings() {
   const host = ck.views.findings;
   host.replaceChildren();
   const res = ckState.result;
-  if (!res) {
+  // A standalone confirm tool (IDOR/BFLA/takeover/CVE/…) can populate ckState.findings
+  // WITHOUT ever running a hunt (res stays null) — show the board whenever there's
+  // anything to show, not only after a hunt specifically.
+  if (!res && !ckState.findings.length) {
     const empty = cel("div", "ck-empty");
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("viewBox", "0 0 24 24");
@@ -4460,21 +4479,27 @@ function ckRenderFindings() {
     return;
   }
 
-  // Summary strip.
+  // Summary strip. The headline numbers (risk/severity-counts/finding-count) are derived
+  // FRESH from ckState.findings — not the (possibly stale) hunt result: a standalone
+  // confirm tool run AFTER a hunt replaces/extends ckState.findings without touching
+  // ckState.result, so trusting res's cached counts here would show a strip that
+  // describes a different set of findings than the rows below it.
   const strip = cel("div", "ck-summary");
-  const risk = String(res.risk || "").toLowerCase();
-  if (risk) strip.append(ckPill(`risk-${risk}`, "Risk", String(res.risk).toUpperCase()));
-  const counts = res.severity_counts || {};
+  const risk = ckDeriveRisk(ckState.findings);
+  if (risk) strip.append(ckPill(`risk-${risk}`, "Risk", risk.toUpperCase()));
+  const counts = {};
+  for (const f of ckState.findings) { const s = String(f.severity || "").toLowerCase(); counts[s] = (counts[s] || 0) + 1; }
   const dots = cel("span", "ck-sevdots");
   for (const [k, cls] of [["critical", "c"], ["high", "h"], ["medium", "m"], ["low", "l"], ["info", "i"]]) {
     if (counts[k]) dots.append(cel("span", `ck-sevdot ${cls}`, `${counts[k]}${k[0].toUpperCase()}`));
   }
-  if (dots.childNodes.length) { const wrap = ckPill("", "Findings", String(res.finding_count ?? ckState.findings.length)); wrap.append(dots); strip.append(wrap); }
-  else strip.append(ckPill("", "Findings", String(res.finding_count ?? ckState.findings.length)));
+  if (dots.childNodes.length) { const wrap = ckPill("", "Findings", String(ckState.findings.length)); wrap.append(dots); strip.append(wrap); }
+  else strip.append(ckPill("", "Findings", String(ckState.findings.length)));
   const confirmed = ckState.findings.filter((f) => f.proof === "confirmed").length;
   if (confirmed) strip.append(ckPill("is-armed", "Confirmed", String(confirmed)));
-  // Active-verification authorization chip.
-  const auth = res.active_authorization || null;
+  // Active-verification authorization chip — genuinely hunt-specific (no standalone tool
+  // produces it), so it's fine to source from res and simply absent without one.
+  const auth = res ? res.active_authorization : null;
   if (auth) {
     if (auth.in_scope && (res.active_verified_classes || []).length) {
       strip.append(ckPill("is-armed", "Active", `armed · ${(res.active_verified_classes || []).join(", ")}`));
@@ -4482,7 +4507,7 @@ function ckRenderFindings() {
       strip.append(ckPill("is-disarmed", "Active", "disarmed (passive only)"));
     }
   }
-  if (res.scanners_run) strip.append(ckPill("", "Scanners", (res.scanners_run || []).join(", ") || "none"));
+  if (res && res.scanners_run) strip.append(ckPill("", "Scanners", (res.scanners_run || []).join(", ") || "none"));
   host.append(strip);
 
   // Filter chips.
@@ -4522,7 +4547,9 @@ function ckRenderFindings() {
   for (const [label, sortKey] of [["Sev", "severity"], ["Class", null], ["Proof", "proof"], ["Finding", null], ["Where", null], ["CVSS", "cvss"]]) {
     const th = cel("th", null, label);
     if (sortKey) {
-      const arrow = cel("span", "ck-sort", ckState.sort.key === sortKey ? (ckState.sort.dir < 0 ? " ▲" : " ▼") : " ⇅");
+      // dir=-1 sorts DESCENDING (the default on first click — critical/high first); the
+      // glyph must match the conventional meaning (▼ descending, ▲ ascending), not invert it.
+      const arrow = cel("span", "ck-sort", ckState.sort.key === sortKey ? (ckState.sort.dir < 0 ? " ▼" : " ▲") : " ⇅");
       th.append(arrow);
       th.addEventListener("click", () => {
         if (ckState.sort.key === sortKey) ckState.sort.dir *= -1;

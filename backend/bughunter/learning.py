@@ -35,6 +35,24 @@ _REWARDING = {"accepted", "resolved"}          # the program valued it
 _NOISE = {"duplicate", "informative", "not-applicable", "spam"}  # don't keep filing these
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Tolerant int() for values read back from the persisted learning store: a
+    hand-edited or corrupted JSON file (e.g. {'rewarded': 'lots'}) must degrade to the
+    default instead of raising and aborting whatever read it (learned_priors feeds
+    ranking.rank_by_ev, which is called unguarded mid-campaign)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _store_path(runtime_dir: str | Path) -> Path:
     return Path(runtime_dir) / _STORE_NAME
 
@@ -126,8 +144,8 @@ def learned_priors(runtime_dir: str | Path, program: str | None, target: str = "
         return {}
     priors: dict[str, float] = {}
     for cls, stats in (prog.get("class_stats") or {}).items():
-        rewarded = int(stats.get("rewarded", 0))
-        noise = int(stats.get("noise", 0))
+        rewarded = _safe_int(stats.get("rewarded", 0))
+        noise = _safe_int(stats.get("noise", 0))
         # Drive the reward-rate off ADJUDICATED outcomes only (rewarded + noise),
         # never the raw "submitted" count. Otherwise a weekly re-scan that auto-logs
         # the same confirmed finding as "submitted" would keep diluting an already
@@ -136,7 +154,7 @@ def learned_priors(runtime_dir: str | Path, program: str | None, target: str = "
         adjudicated = rewarded + noise
         if adjudicated == 0:
             continue
-        paid = float(stats.get("bounty_total", 0.0)) > 0
+        paid = _safe_float(stats.get("bounty_total", 0.0)) > 0
         # Reward-rate centered at 0 (no info) -> map to a bounded multiplier.
         score = (rewarded - noise) / adjudicated
         weight = 1.0 + 0.8 * score + (0.2 if paid else 0.0)
@@ -159,10 +177,10 @@ def program_summary(runtime_dir: str | Path, program: str | None = None, target:
 
 def _summarize(prog: dict[str, Any]) -> dict[str, Any]:
     stats = prog.get("class_stats") or {}
-    total_submitted = sum(int(s.get("submitted", 0)) for s in stats.values())
-    total_rewarded = sum(int(s.get("rewarded", 0)) for s in stats.values())
-    total_bounty = round(sum(float(s.get("bounty_total", 0.0)) for s in stats.values()), 2)
-    top = sorted(stats.items(), key=lambda kv: (-float(kv[1].get("bounty_total", 0.0)), -int(kv[1].get("rewarded", 0))))
+    total_submitted = sum(_safe_int(s.get("submitted", 0)) for s in stats.values())
+    total_rewarded = sum(_safe_int(s.get("rewarded", 0)) for s in stats.values())
+    total_bounty = round(sum(_safe_float(s.get("bounty_total", 0.0)) for s in stats.values()), 2)
+    top = sorted(stats.items(), key=lambda kv: (-_safe_float(kv[1].get("bounty_total", 0.0)), -_safe_int(kv[1].get("rewarded", 0))))
     return {
         "submitted": total_submitted, "rewarded": total_rewarded, "bounty_total": total_bounty,
         "class_stats": dict(top), "findings": len(prog.get("findings") or []), "updated_at": prog.get("updated_at"),
@@ -175,9 +193,9 @@ def program_intelligence(runtime_dir: str | Path, program: str | None, target: s
     if not prog or not prog.get("class_stats"):
         return []
     notes: list[str] = []
-    for cls, stats in sorted((prog["class_stats"]).items(), key=lambda kv: -float(kv[1].get("bounty_total", 0.0))):
-        sub, rew, noise = int(stats.get("submitted", 0)), int(stats.get("rewarded", 0)), int(stats.get("noise", 0))
-        bounty = float(stats.get("bounty_total", 0.0))
+    for cls, stats in sorted((prog["class_stats"]).items(), key=lambda kv: -_safe_float(kv[1].get("bounty_total", 0.0))):
+        sub, rew, noise = _safe_int(stats.get("submitted", 0)), _safe_int(stats.get("rewarded", 0)), _safe_int(stats.get("noise", 0))
+        bounty = _safe_float(stats.get("bounty_total", 0.0))
         if rew and bounty:
             notes.append(f"`{cls}` has paid out (${bounty:.0f} across {rew}/{sub}) — prioritize it here.")
         elif noise >= 2 and noise >= sub - 1:

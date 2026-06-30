@@ -196,6 +196,16 @@ def discover(
             continue
         body = fetched.get("body") or ""
         final = fetched.get("final_url") or url
+        # The QUEUED url was scope-checked before being crawled, but _fetch_raw's redirect
+        # guard only validates SSRF safety per-hop, never SCOPE -- an in-scope page can
+        # still 302 to a public out-of-scope host. Mining params/fingerprinting/links from
+        # that OOS body would leak it into the active prover's surface and the report's
+        # tech fingerprint, so skip ALL body processing for this fetch once it has landed
+        # somewhere out of scope (each extracted link is still independently scope-checked
+        # before being queued, but we must never even look at an OOS page's content).
+        if not in_scope(final):
+            dropped_oos += 1
+            continue
         params.update(_html_param_names(body))  # the page's own form-field names
 
         if not tech:  # fingerprint once, from the first reachable page

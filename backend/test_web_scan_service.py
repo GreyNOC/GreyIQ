@@ -17,6 +17,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from bughunter.bounty import run_bounty_hunt  # noqa: E402
+from bughunter.web_ingest import WebsiteFetchError  # noqa: E402
 from bughunter.web_scan_service import _analyze, run_web_scan  # noqa: E402
 
 
@@ -243,6 +244,76 @@ class TruncatedResponseTests(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("scan_type", res)
         self.assertEqual(res["scan_type"], "web")
+
+
+class HttpErrorPathTests(unittest.TestCase):
+    """_fetch_raw's HTTPError branch (a 4xx/5xx final response) must mirror the success
+    path: close the response (it leaks a socket/fd otherwise) and re-guard the final URL
+    (defence-in-depth against a redirect chain ending somewhere it shouldn't)."""
+
+    def setUp(self) -> None:
+        # Explicit + self-contained regardless of sibling test class execution order:
+        # the re-guard test needs private/link-local hosts REFUSED (the default).
+        self._prev = os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+
+    def tearDown(self) -> None:
+        if self._prev is not None:
+            os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = self._prev
+
+    def _fake_http_error(self, url: str, code: int = 404, body: bytes = b"not found"):
+        import io
+        from email.message import Message
+        from urllib.error import HTTPError
+
+        hdrs = Message()
+        hdrs["Content-Type"] = "text/plain"
+        return HTTPError(url, code, "Not Found", hdrs, io.BytesIO(body))
+
+    def test_http_error_response_is_closed_not_leaked(self) -> None:
+        from bughunter import web_scan_service as wss
+
+        error = self._fake_http_error("http://8.8.8.8/missing")
+        closed = {"v": False}
+        orig_close = error.close
+
+        def tracking_close():
+            closed["v"] = True
+            orig_close()
+        error.close = tracking_close
+
+        class FakeOpener:
+            def open(self, request, timeout=None):
+                raise error
+
+        orig_opener = wss.build_opener
+        wss.build_opener = lambda *a, **k: FakeOpener()
+        try:
+            result = wss._fetch_raw("http://8.8.8.8/x")
+        finally:
+            wss.build_opener = orig_opener
+        self.assertEqual(result["status"], 404)
+        self.assertTrue(closed["v"], "the HTTPError response was never closed -- socket/fd leak")
+
+    def test_http_error_final_url_is_reguarded(self) -> None:
+        from bughunter import web_scan_service as wss
+
+        # error.url claims the chain ended at a link-local/metadata-endpoint host -- the
+        # classic cloud-SSRF target. Even though _GuardedRedirect validates each hop, the
+        # final error response itself must still be re-validated, mirroring the success path.
+        error = self._fake_http_error("http://169.254.169.254/latest/meta-data/")
+
+        class FakeOpener:
+            def open(self, request, timeout=None):
+                raise error
+
+        orig_opener = wss.build_opener
+        wss.build_opener = lambda *a, **k: FakeOpener()
+        try:
+            with self.assertRaises(WebsiteFetchError):
+                wss._fetch_raw("http://8.8.8.8/x")
+        finally:
+            wss.build_opener = orig_opener
+            error.close()
 
 
 if __name__ == "__main__":

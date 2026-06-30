@@ -427,17 +427,29 @@ def _render_campaign_markdown(ctx: dict[str, Any]) -> str:
             out.append(f"\n_(+{len(consolidated) - 40} more — see campaign.json)_")
     out.append("")
 
-    if confirmed:
+    # A confirmed finding the ledger already marked duplicate_of_prior was DELIBERATELY
+    # suppressed from this run's submission packages (campaign.py's submission loop skips
+    # it) -- it must never be listed as "Ready to submit" with no package, or the operator
+    # is told to file something the engine intentionally did not re-package.
+    ready = [item for item in confirmed if not item.get("duplicate_of_prior")]
+    already_reported = [item for item in confirmed if item.get("duplicate_of_prior")]
+    if ready:
         out.append("## Ready to submit (confirmed)\n")
         out.append("These carry a captured proof artifact and a submission package under `submissions/`:")
         out.append("")
-        for item in confirmed:
+        for item in ready:
             f = item["finding"]
             path = item.get("submission_path", "")
             out.append(f"- **{f.get('title', '')}** ({str(f.get('severity', '')).title()}) — `{item['source_url']}`" + (f"  → `{Path(path).name}`" if path else ""))
         out.append("")
         out.append("Submit each from its package (paste the `.md`), or `gn submit` to export/file. After the program "
                    "responds, record the outcome with `gn learn` so the next campaign prioritizes what pays.")
+        if already_reported:
+            out.append("")
+            out.append(f"_{len(already_reported)} other confirmed finding(s) were already reported in a prior run and are not re-listed here._")
+    elif already_reported:
+        out.append("## Already reported\n")
+        out.append(f"All {len(already_reported)} confirmed finding(s) this run were already reported in a prior run (no new package built).")
     else:
         out.append("## Next\n")
         out.append("No findings are auto-confirmed yet. Re-run with active proof on (`--active`, in scope), then submit the "

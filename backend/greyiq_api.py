@@ -1389,9 +1389,13 @@ class GreyIQRuntime:
         if not result.get("ok"):
             return result
         # Record on the cached finding so build_submission/report embed it by basename.
-        finding["screenshot_path"] = result["path"]
-        if run is not None:
-            run.setdefault("screenshots", {})[request.ref] = result["path"]
+        # Each /api/* call runs in its own asyncio.to_thread worker, so two concurrent
+        # requests against the same run_id+ref (e.g. a screenshot + a research call) must
+        # not race on this read-modify-write of the shared cached dicts.
+        with self.lock:
+            finding["screenshot_path"] = result["path"]
+            if run is not None:
+                run.setdefault("screenshots", {})[request.ref] = result["path"]
         data_url = ""
         try:
             raw = Path(result["path"]).read_bytes()
@@ -1421,9 +1425,12 @@ class GreyIQRuntime:
         try:
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(dossier["markdown"], encoding="utf-8")
-            finding["research_path"] = str(out_path)
-            if run is not None:
-                run.setdefault("research_paths", {})[request.ref] = str(out_path)
+            # See capture_screenshot: concurrent /api/* calls against the same run_id+ref
+            # mutate these shared cached dicts from different worker threads.
+            with self.lock:
+                finding["research_path"] = str(out_path)
+                if run is not None:
+                    run.setdefault("research_paths", {})[request.ref] = str(out_path)
             written = str(out_path)
         except OSError:
             written = ""
@@ -2531,6 +2538,31 @@ def repo_ingest(request: RepoIngestRequest) -> dict[str, Any]:
     )
 
 
+def _safe_validation_summary(exc: Exception, max_errors: int = 10) -> str:
+    """A 422 detail message naming WHICH fields failed and why, without ever reflecting
+    the submitted values: pydantic's str(exc) embeds 'input_value=<the actual payload>',
+    which would echo arbitrary client-submitted content (and pydantic's own internal
+    error-code URLs) straight back to the caller — exactly what the deliberate
+    'never reflect raw exception text to the client' design (see route_http's generic
+    Exception handler) exists to prevent. err['msg']/err['loc'] are pydantic's own static,
+    value-free descriptions ("Field required", "Input should be a valid integer")."""
+    errors = getattr(exc, "errors", None)
+    if not callable(errors):
+        return "invalid request payload"
+    try:
+        parsed = errors()
+    except Exception:  # noqa: BLE001 - errors() itself is best-effort here
+        return "invalid request payload"
+    parts = []
+    for err in parsed[:max_errors]:
+        loc = ".".join(str(p) for p in (err.get("loc") or ())) or "(body)"
+        parts.append(f"{loc}: {err.get('msg') or 'invalid value'}")
+    if not parts:
+        return "invalid request payload"
+    suffix = f" (+{len(parsed) - max_errors} more)" if len(parsed) > max_errors else ""
+    return "invalid request payload — " + "; ".join(parts) + suffix
+
+
 def validate_payload(model: type[BaseModel], payload: dict[str, Any]) -> BaseModel:
     try:
         validator = getattr(model, "model_validate", None)
@@ -2538,7 +2570,7 @@ def validate_payload(model: type[BaseModel], payload: dict[str, Any]) -> BaseMod
             return validator(payload)
         return model.parse_obj(payload)
     except Exception as exc:
-        raise HTTPError(422, str(exc)) from exc
+        raise HTTPError(422, _safe_validation_summary(exc)) from exc
 
 
 async def read_body(receive: Any) -> bytes:
@@ -2562,7 +2594,11 @@ async def read_json_body(receive: Any) -> dict[str, Any]:
         return {}
     try:
         payload = json.loads(body.decode("utf-8"))
-    except json.JSONDecodeError as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        # A body containing invalid UTF-8 bytes raises UnicodeDecodeError here, which is
+        # a ValueError but NOT a json.JSONDecodeError -- it must be caught too, or it
+        # escapes as an unhandled exception and the client sees a generic 500 instead of
+        # the intended 400 "bad request".
         raise HTTPError(400, f"Invalid JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise HTTPError(422, "JSON body must be an object.")

@@ -43,6 +43,18 @@ class PortfolioTests(unittest.TestCase):
         p2 = portfolio.upsert_program(self.rt, {"name": "NoScopeDeep", "deep": True})
         self.assertFalse(p2["deep"])
 
+    def test_non_numeric_fields_do_not_crash_the_write(self) -> None:
+        # The CLI / a hand-edited portfolio.json / any direct upsert_program caller is
+        # not Pydantic-validated like the HTTP API -- a bad value (e.g. max_pages='abc')
+        # must degrade to the safe default instead of raising and aborting the write.
+        p = portfolio.upsert_program(self.rt, {
+            "name": "Bad", "scope_text": "bad.com",
+            "max_pages": "abc", "interval_minutes": "soon", "max_submits_per_day": None,
+        })
+        self.assertEqual(p["max_pages"], 12)
+        self.assertEqual(p["interval_minutes"], 1440)
+        self.assertEqual(p["max_submits_per_day"], 3)
+
     def test_auto_submit_requires_handle(self) -> None:
         p = portfolio.upsert_program(self.rt, {"name": "X", "scope_text": "x.com", "auto_submit": True, "platform": "manual"})
         self.assertFalse(p["auto_submit"])  # no hackerone handle -> can't auto-submit
@@ -148,6 +160,17 @@ class RankingTests(unittest.TestCase):
         ev = ranking.expected_value(item, {"xss": 99.0}, {"xss": {"rewarded": 99, "noise": 0, "bounty_total": 1e9, "submitted": 99}})
         self.assertLessEqual(ev["breakdown"]["prior"], 2.0)
         self.assertLessEqual(ev["breakdown"]["program_pay_factor"], 2.0)
+
+    def test_corrupted_class_stats_does_not_crash_the_campaign(self) -> None:
+        # A hand-edited/corrupted runtime learning JSON (non-numeric rewarded/noise/
+        # bounty_total) must degrade gracefully -- rank_by_ev is called unguarded
+        # mid-campaign, so a ValueError here would abort the whole run.
+        item = _item("A", "xss", "r", "x", proof="confirmed", cvss=8.0)
+        corrupted_stats = {"xss": {"rewarded": "lots", "noise": None, "bounty_total": "lots-of-cash", "submitted": "many"}}
+        ev = ranking.expected_value(item, {"xss": "not-a-number"}, corrupted_stats)
+        self.assertIsInstance(ev["ev"], float)
+        ranked = ranking.rank_by_ev([dict(item)], {"xss": "not-a-number"}, corrupted_stats)
+        self.assertEqual(len(ranked), 1)  # completes without raising
 
 
 class OperatorCycleTests(unittest.TestCase):

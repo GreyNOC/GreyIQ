@@ -2,6 +2,64 @@
 
 Notable changes to GreyIQ.
 
+## v0.55.0
+
+### QAQC pass, part 3 — all 16 low-severity + 4 plausible faults fixed
+Completes the QAQC hardening pass started in v0.53.0/v0.54.0: every remaining confirmed
+and plausible finding from the original 50-agent audit is now fixed, with regression
+tests (most verified to actually catch the original bug by reverting the fix and
+confirming the test fails).
+
+**Active verification / cloud / redirect:**
+- GCS and Azure cloud buckets can now confirm as publicly listable (previously only
+  S3 ever did) — each provider gets its correct listing query and response-shape check.
+- A protocol-relative open-redirect (`Location: //evil/`) is now detected — it was
+  silently mis-parsed and missed entirely.
+- A redirect chain ending in an error response now re-validates the final URL and
+  closes the response (was leaking a socket/fd on every 404/500).
+- An IDN (internationalized) target's session now binds in punycode, matching the form
+  every actual request is compared against — before, the session silently never attached.
+
+**Resilience to corrupted/hand-edited state:**
+- A corrupted learning store (non-numeric `rewarded`/`noise`/`bounty_total`) no longer
+  aborts a campaign mid-run.
+- A non-numeric `max_pages`/`interval_minutes`/`max_submits_per_day` no longer crashes
+  `upsert_program` (the CLI / a hand-edited `portfolio.json` aren't Pydantic-shielded
+  like the HTTP API).
+- The operator supervisor thread no longer dies on a timezone-naive `next_run_at`.
+- An invalid-UTF-8 request body now returns a clean 400 instead of a 500.
+
+**Correctness / consistency:**
+- The campaign report no longer lists an already-reported (duplicate) confirmed finding
+  under "Ready to submit" with no package — it's now excluded or annotated.
+- `next_steps`' ranking and submission-phase counts now agree with the report/H1 rating
+  on the same finding (both resolve severity through the CVSS-aware single source of
+  truth) instead of mis-tiering it.
+- `recon` no longer mines params/fingerprints from a page a redirect landed on OUT of
+  scope.
+- A 422 validation error no longer reflects the submitted payload values (or pydantic's
+  internal error-doc URLs) back to the client — only the failing field names + a
+  generic reason.
+- Concurrent `/api/*` calls against the same cached run (e.g. screenshot + research)
+  no longer race on an unlocked read-modify-write of the shared run state.
+- The vendored DNS resolver's query encoder no longer corrupts the packet for a label
+  over 63 bytes (a malformed host or an IDNA expansion) — the declared length now
+  always matches what's actually appended.
+
+**Cockpit:**
+- The Findings tab now re-renders when you switch to it (findings added by a standalone
+  tool like IDOR/CVE/takeover used to sit invisible until an unrelated action).
+- The Findings board now shows standalone-tool findings even when no hunt has run yet,
+  and its summary strip (risk/severity counts) is now derived fresh from the current
+  findings instead of a stale cached hunt result.
+- The column sort-direction arrow now points the right way (was inverted).
+- A non-JSON-object error body no longer crashes `apiFetch` with an opaque
+  "Cannot read properties of null" instead of the real HTTP status.
+
+525 tests green (+36), including new dedicated coverage for `scan_service.py`,
+`next_steps.py`, the API's request/validation/concurrency handling, and the recon
+scope-bleed regression — all previously untested.
+
 ## v0.54.0
 
 ### QAQC pass, part 2 — the 8 medium-severity faults

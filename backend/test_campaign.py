@@ -150,5 +150,69 @@ class CampaignTests(unittest.TestCase):
         self.assertFalse(result["ok"])
 
 
+def _ctx_item(ref: str, *, duplicate: bool, package: bool) -> dict:
+    item = {
+        "finding": {"ref": ref, "title": f"Finding {ref}", "severity": "high"},
+        "source_url": f"https://x/{ref}", "proof_status": "confirmed",
+        "duplicate_of_prior": duplicate,
+    }
+    if package:
+        item["submission_path"] = f"/out/{ref}.md"
+    return item
+
+
+def _minimal_ctx(confirmed: list[dict]) -> dict:
+    return {
+        "program": "acme", "target": "https://x", "kind": "url", "per_target": [],
+        "consolidated": confirmed, "confirmed": confirmed, "active": True,
+        "submission_count": sum(1 for c in confirmed if c.get("submission_path")),
+        "generated_at": "now", "version": "9.9.9", "scope": "x", "intel": [],
+        "urls": [], "recon_sources": {}, "recon_notes": [],
+    }
+
+
+def _section(md: str, heading: str) -> str:
+    """The text of one '## heading' section, up to the next '## '."""
+    start = md.index(heading) + len(heading)
+    rest = md[start:]
+    end = rest.find("\n## ")
+    return rest if end == -1 else rest[:end]
+
+
+class ReadyToSubmitRenderingTests(unittest.TestCase):
+    """A confirmed finding the ledger marked duplicate_of_prior was DELIBERATELY skipped
+    by the submission-package loop (campaign.py's `if item.get('duplicate_of_prior'):
+    continue`) -- the report must never list it under 'Ready to submit' (it has no
+    package), which would mislead the operator into trying to re-submit a finding the
+    engine intentionally suppressed. (Note: the 'Findings (ranked)' table above always
+    lists every consolidated finding incl. duplicates -- that table is intentionally
+    complete; only the 'Ready to submit' section must exclude them.)"""
+
+    def test_duplicate_of_prior_excluded_from_ready_to_submit(self) -> None:
+        fresh = _ctx_item("F1", duplicate=False, package=True)
+        stale = _ctx_item("F2", duplicate=True, package=False)
+        md = campaign._render_campaign_markdown(_minimal_ctx([fresh, stale]))
+        self.assertIn("## Ready to submit (confirmed)", md)
+        ready_section = _section(md, "## Ready to submit (confirmed)")
+        self.assertIn("Finding F1", ready_section)
+        self.assertNotIn("Finding F2", ready_section)  # the duplicate must not appear as "ready"
+        self.assertIn("1 other confirmed finding(s) were already reported", ready_section)
+
+    def test_all_duplicates_renders_already_reported_section(self) -> None:
+        stale = _ctx_item("F1", duplicate=True, package=False)
+        md = campaign._render_campaign_markdown(_minimal_ctx([stale]))
+        self.assertNotIn("## Ready to submit", md)
+        self.assertIn("## Already reported", md)
+        self.assertNotIn("Finding F1", _section(md, "## Already reported"))
+
+    def test_no_duplicates_renders_exactly_as_before(self) -> None:
+        fresh = _ctx_item("F1", duplicate=False, package=True)
+        md = campaign._render_campaign_markdown(_minimal_ctx([fresh]))
+        self.assertIn("## Ready to submit (confirmed)", md)
+        ready_section = _section(md, "## Ready to submit (confirmed)")
+        self.assertIn("Finding F1", ready_section)
+        self.assertNotIn("already reported", ready_section)
+
+
 if __name__ == "__main__":
     unittest.main()

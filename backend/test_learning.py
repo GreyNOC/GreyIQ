@@ -107,5 +107,43 @@ class RecordAndPriorsTests(unittest.TestCase):
         self.assertEqual(summary["programs"]["b"]["bounty_total"], 2000.0)
 
 
+class CorruptedStoreTests(unittest.TestCase):
+    """A hand-edited or corrupted bughunter_learning.json (non-numeric rewarded/noise/
+    bounty_total) must degrade gracefully -- learned_priors feeds ranking.rank_by_ev,
+    which campaign.py calls UNGUARDED mid-campaign, so any crash here aborts the run."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.rt = Path(self._tmp.name)
+        corrupted = {
+            "programs": {
+                "acme": {
+                    "class_stats": {
+                        "xss": {"submitted": "many", "rewarded": "lots", "noise": None, "bounty_total": "lots-of-cash"},
+                    },
+                    "findings": [],
+                    "updated_at": "now",
+                }
+            }
+        }
+        import json
+        (self.rt / "bughunter_learning.json").write_text(json.dumps(corrupted), encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_learned_priors_does_not_crash(self) -> None:
+        priors = learning.learned_priors(self.rt, "acme")
+        self.assertIsInstance(priors, dict)
+
+    def test_program_summary_does_not_crash(self) -> None:
+        summary = learning.program_summary(self.rt, "acme")
+        self.assertIsInstance(summary["bounty_total"], float)
+
+    def test_program_intelligence_does_not_crash(self) -> None:
+        notes = learning.program_intelligence(self.rt, "acme")
+        self.assertIsInstance(notes, list)
+
+
 if __name__ == "__main__":
     unittest.main()

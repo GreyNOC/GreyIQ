@@ -84,6 +84,17 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _safe_int(value: Any, default: int) -> int:
+    """Tolerant int() for a field that may arrive as a non-numeric string (a hand-edited
+    portfolio.json, the CLI, or any direct upsert_program caller -- only the HTTP API is
+    shielded by Pydantic's int fields). A bad value degrades to ``default`` instead of
+    raising and aborting the whole write."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     out = {**_DEFAULTS, **{k: v for k, v in record.items() if k in _DEFAULTS or k == "id"}}
     # Fail-closed coupling: active/live/deep/auto_submit require a non-empty scope.
@@ -99,9 +110,9 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     # Auto-submit additionally requires a platform handle to even attempt a file.
     if out["auto_submit"] and not (out["platform"] == "hackerone" and str(out.get("platform_handle") or "").strip()):
         out["auto_submit"] = False
-    out["max_pages"] = max(1, min(int(out.get("max_pages") or 12), 50))
-    out["interval_minutes"] = max(5, int(out.get("interval_minutes") or 1440))
-    out["max_submits_per_day"] = max(0, min(int(out.get("max_submits_per_day") or 3), 25))
+    out["max_pages"] = max(1, min(_safe_int(out.get("max_pages") or 12, 12), 50))
+    out["interval_minutes"] = max(5, _safe_int(out.get("interval_minutes") or 1440, 1440))
+    out["max_submits_per_day"] = max(0, min(_safe_int(out.get("max_submits_per_day") or 3, 3), 25))
     out["in_scope_hosts"] = [str(h).strip() for h in (out.get("in_scope_hosts") or []) if str(h).strip()]
     out["out_of_scope_hosts"] = [str(h).strip() for h in (out.get("out_of_scope_hosts") or []) if str(h).strip()]
     out["seed_targets"] = [str(t).strip() for t in (out.get("seed_targets") or []) if str(t).strip()]

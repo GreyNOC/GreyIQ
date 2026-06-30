@@ -84,6 +84,22 @@ class ActiveCheckTests(unittest.TestCase):
         self.assertEqual(f["rule_id"], "active.open-redirect")
         self.assertIn(av._MARKER_HOST, f["proof_evidence"]["matched_value"])
 
+    def test_open_redirect_confirms_on_protocol_relative_location(self) -> None:
+        # 'Location: //evil/' (no scheme) is one of the most common, fully browser-
+        # exploitable open-redirect shapes -- a naive 'http://x' + location parse mis-reads
+        # its host as 'x' instead of the real target. Must still confirm.
+        class ProtocolRelativeStub(_Stub):
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                r = super().fetch(url, method=method, extra_headers=extra_headers)
+                if r.get("location") == av._MARKER_ORIGIN + "/":
+                    r["location"] = "//" + av._MARKER_HOST + "/"  # strip the scheme
+                    r["status"] = 302
+                return r
+        f = av._check_open_redirect(ProtocolRelativeStub(), self.URL)
+        self.assertIsNotNone(f)
+        self.assertEqual(f["rule_id"], "active.open-redirect")
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+
     def test_only_safe_methods_are_ever_issued(self) -> None:
         stub = _Stub()
         for check in (av._check_cors, av._check_open_redirect, av._check_reflected_xss, av._check_host_header,
@@ -403,6 +419,57 @@ class ActiveCheckTests(unittest.TestCase):
     def test_open_bucket_returns_none_when_no_buckets_referenced(self) -> None:
         s = get_settings()
         f = av._check_open_bucket(_Stub(), {"body": "<html>nothing to see</html>"}, "app.example.com", s)
+        self.assertIsNone(f)
+
+    def test_gcs_bucket_confirms_on_public_listing(self) -> None:
+        # GCS's XML API returns the SAME ListBucketResult shape as S3 -- a bare GET to the
+        # bucket root (no special query needed) already lists when public-read is granted.
+        s = get_settings()
+        bucket = "https://storage.googleapis.com/acme-public-bucket/logo.png"
+        landing = {"body": f'<img src="{bucket}">', "status": 200, "headers": {}}
+        seen = {}
+        class GcsListingStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                seen["url"] = url
+                return {"status": 200, "headers": {}, "cookies": [], "final_url": url, "location": None,
+                        "body": '<?xml version="1.0"?><ListBucketResult><Contents><Key>data.csv</Key></Contents></ListBucketResult>'}
+        f = av._check_open_bucket(GcsListingStub(), landing, "storage.googleapis.com", s)
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        # Listed against the BUCKET ROOT (acme-public-bucket), not the deep object path.
+        self.assertEqual(seen["url"], "https://storage.googleapis.com/acme-public-bucket")
+
+    def test_azure_container_confirms_on_public_listing(self) -> None:
+        # Azure's listing endpoint needs an explicit restype=container&comp=list on the
+        # CONTAINER root -- a bare GET (even to the root) does not return a listing.
+        s = get_settings()
+        bucket = "https://acmestorage.blob.core.windows.net/public-container/file.txt"
+        landing = {"body": f'<script src="{bucket}"></script>', "status": 200, "headers": {}}
+        seen = {}
+        class AzureListingStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                seen["url"] = url
+                return {"status": 200, "headers": {}, "cookies": [], "final_url": url, "location": None,
+                        "body": '<?xml version="1.0"?><EnumerationResults><Blobs><Blob><Name>secrets.json</Name></Blob></Blobs></EnumerationResults>'}
+        f = av._check_open_bucket(AzureListingStub(), landing, "acmestorage.blob.core.windows.net", s)
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertEqual(seen["url"], "https://acmestorage.blob.core.windows.net/public-container?restype=container&comp=list")
+
+    def test_azure_does_not_confirm_on_an_s3_gcs_shaped_body(self) -> None:
+        # Cross-provider negative: an Azure container must NOT confirm on the S3/GCS body
+        # shape (it never legitimately appears from Azure) -- providers are matched
+        # against their OWN real response format, not a shared heuristic. A 200 response
+        # that matches NEITHER the listing shape NOR an access-denied shape is genuinely
+        # ambiguous, so no finding (confirmed or candidate) is emitted for it at all.
+        s = get_settings()
+        bucket = "https://acmestorage.blob.core.windows.net/container/file.txt"
+        landing = {"body": f'<script src="{bucket}"></script>', "status": 200, "headers": {}}
+        class WrongShapeStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                return {"status": 200, "headers": {}, "cookies": [], "final_url": url, "location": None,
+                        "body": '<?xml version="1.0"?><ListBucketResult><Contents><Key>x</Key></Contents></ListBucketResult>'}
+        f = av._check_open_bucket(WrongShapeStub(), landing, "acmestorage.blob.core.windows.net", s)
         self.assertIsNone(f)
 
 

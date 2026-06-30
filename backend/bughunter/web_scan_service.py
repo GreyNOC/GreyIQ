@@ -260,9 +260,18 @@ def _fetch_raw(url: str, *, auth: AuthContext | None = None) -> dict[str, Any]:
             _guard_url(final_url, settings.allow_private_urls, settings.web_allowed_ports)
             consumed = _consume(response, settings)
     except HTTPError as error:
-        # An error response is still worth analyzing (stack traces, headers).
-        final_url = getattr(error, "url", None) or sanitized
-        consumed = _consume(error, settings)
+        # An error response is still worth analyzing (stack traces, headers). Unlike the
+        # success path (a `with` block), HTTPError isn't auto-closed -- close it in
+        # finally or every 404/500 leaks the underlying socket/file descriptor.
+        try:
+            final_url = getattr(error, "url", None) or sanitized
+            # Re-validate the FINAL url too (defence-in-depth, mirrors the success path):
+            # a redirect chain ending in an error response could still terminate at a
+            # malformed/private host even though each hop was guarded along the way.
+            _guard_url(final_url, settings.allow_private_urls, settings.web_allowed_ports)
+            consumed = _consume(error, settings)
+        finally:
+            error.close()
     except http.client.HTTPException as exc:
         # A truncated/short-closed body (e.g. Content-Length lies, or the connection drops
         # mid-read -> http.client.IncompleteRead) is neither a URLError nor an HTTPError.

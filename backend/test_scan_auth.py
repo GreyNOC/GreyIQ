@@ -107,6 +107,18 @@ class BuildAuthTests(unittest.TestCase):
         self.assertNotIn("\n", auth.headers["Cookie"])
         self.assertEqual(auth.headers["Cookie"], "a=1; b=2")
 
+    def test_idn_host_is_bound_in_punycode_not_unicode(self) -> None:
+        # web_scan_service sanitizes every request/redirect host through _guard_url ->
+        # _ascii_hostname BEFORE comparing it with same_site(). If build_auth bound the
+        # UNICODE form here, every request to the legitimate target -- which arrives
+        # punycoded -- would mismatch and silently never receive the session.
+        auth = sa.build_auth("https://münchen.de/dash", cookie="session=abc")
+        self.assertIsNotNone(auth)
+        self.assertEqual(auth.host, "xn--mnchen-3ya.de")
+        # And the request host (as web_scan_service would present it) now matches.
+        self.assertTrue(sa.same_site("xn--mnchen-3ya.de", auth.host))
+        self.assertTrue(sa.same_site("api.xn--mnchen-3ya.de", auth.host))
+
 
 class GuardedRedirectAuthTests(unittest.TestCase):
     """The passive scanner FOLLOWS redirects, so a 30x bounce off the target host
