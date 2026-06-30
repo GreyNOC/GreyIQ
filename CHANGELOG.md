@@ -2,6 +2,18 @@
 
 Notable changes to GreyIQ.
 
+## v0.49.0
+
+### Operator — edit existing programs
+You can now **edit** a program in the operator, not just enable/disable or delete it.
+
+- Each program row gets an **Edit** button that loads it into the form (name, scope, seed
+  targets, HackerOne handle, interval, daily cap, and all toggles pre-filled). Saving **updates
+  that program in place** (it carries the id) instead of creating a duplicate, and preserves the
+  fields the form doesn't expose (enabled state, recon depth). A **Cancel** backs out of editing.
+
+435 tests green.
+
 ## v0.48.0
 
 ### Phase C complete — DNS CNAME correlation for takeover (vendored mini-resolver)
