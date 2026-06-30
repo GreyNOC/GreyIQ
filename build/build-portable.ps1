@@ -119,8 +119,14 @@ Write-Host "    Frozen backend: $BackendExe"
 # --- Smoke-test the frozen backend ---
 if (-not $SkipSmokeTest) {
     Write-Step "Smoke-testing the frozen backend (/api/health)"
+    # Bind to a FREE loopback port chosen by the OS, so a leftover smoke process or the
+    # running app can never make this bind-fail and get mislabeled as a 'broken bundle'.
+    $portFinder = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $portFinder.Start()
+    $smokePort = ([System.Net.IPEndPoint]$portFinder.LocalEndpoint).Port
+    $portFinder.Stop()
     $env:GREYIQ_HOST = "127.0.0.1"
-    $env:GREYIQ_PORT = "8799"
+    $env:GREYIQ_PORT = "$smokePort"
     $env:GREYIQ_RUNTIME_DIR = Join-Path $env:TEMP "greyiq-build-smoke"
     $proc = Start-Process -FilePath $BackendExe -PassThru -NoNewWindow
     $ok = $false
@@ -128,13 +134,13 @@ if (-not $SkipSmokeTest) {
         Start-Sleep -Seconds 3
         if ($proc.HasExited) { throw "Frozen backend exited early (exit code $($proc.ExitCode)) - the bundle is broken." }
         try {
-            $h = Invoke-WebRequest "http://127.0.0.1:8799/api/health" -UseBasicParsing -TimeoutSec 3
+            $h = Invoke-WebRequest "http://127.0.0.1:$smokePort/api/health" -UseBasicParsing -TimeoutSec 3
             if ($h.StatusCode -eq 200) { $ok = $true; break }
         } catch { }
     }
     if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
     if (-not $ok) { throw "Frozen backend did not answer /api/health within 180s." }
-    Write-Host "    Backend answered /api/health."
+    Write-Host "    Backend answered /api/health on port $smokePort."
 }
 
 # --- Node dependencies ---
