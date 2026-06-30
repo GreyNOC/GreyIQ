@@ -616,6 +616,16 @@ class IdorRequest(BaseModel):
     platform: str = Field(default="hackerone", max_length=20)
 
 
+class BflaRequest(BaseModel):
+    priv_url: str = Field(min_length=1, max_length=4000)   # the privileged/admin endpoint to test
+    admin_cookie: str = Field(default="", max_length=8000)
+    admin_headers: list[str] = Field(default_factory=list, max_length=20)
+    user_cookie: str = Field(default="", max_length=8000)
+    user_headers: list[str] = Field(default_factory=list, max_length=20)
+    scope: str = Field(default="", max_length=2000)
+    platform: str = Field(default="hackerone", max_length=20)
+
+
 class HackerOneCredsRequest(BaseModel):
     team_handle: str = Field(default="", max_length=200)
     api_username: str = Field(default="", max_length=200)
@@ -1507,6 +1517,37 @@ class GreyIQRuntime:
         persisted = self._persist_finding_run(
             findings=[finding], plans={"F1": plan}, target=request.url_a, scope=request.scope,
             platform=request.platform, slug="idor", host=host,
+            json_extra={"detail": res.get("detail")})
+        return {
+            "ok": True, "status": "confirmed", "run_id": persisted["run_id"], "ref": "F1",
+            "platform": persisted["platform"], "report": persisted["report"], "detail": res.get("detail"),
+            "title": finding["title"], "severity": finding["severity"],
+        }
+
+    @_confirm_route
+    def check_bfla(self, request: "BflaRequest") -> dict[str, Any]:
+        """Confirm BFLA (broken function-level authorization) via a three-session differential
+        (admin / low-priv user / anon). On a CONFIRMED bypass, cache it as a run so every
+        per-finding action works on it. The proof is the differential only — never the
+        privileged body."""
+        res = bounty_access.run_bfla_check(
+            request.priv_url,
+            admin_account={"cookie": request.admin_cookie, "headers": request.admin_headers},
+            user_account={"cookie": request.user_cookie, "headers": request.user_headers},
+            scope=request.scope,
+        )
+        if not res.get("ok"):
+            return res
+        status = res["status"]
+        if status != "confirmed":
+            return {"ok": True, "status": status, "reason": res.get("reason", ""), "detail": res.get("detail")}
+
+        finding = dict(res["finding"]); finding["ref"] = "F1"
+        plan = res["attack_plan"]
+        host = urlparse(request.priv_url).hostname or "target"
+        persisted = self._persist_finding_run(
+            findings=[finding], plans={"F1": plan}, target=request.priv_url, scope=request.scope,
+            platform=request.platform, slug="bfla", host=host,
             json_extra={"detail": res.get("detail")})
         return {
             "ok": True, "status": "confirmed", "run_id": persisted["run_id"], "ref": "F1",
@@ -2678,6 +2719,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/idor":
             request = validate_payload(IdorRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.check_idor, request))
+            return
+        if method == "POST" and path == "/api/bounty/bfla":
+            request = validate_payload(BflaRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.check_bfla, request))
             return
         if method == "POST" and path == "/api/bounty/takeover":
             request = validate_payload(TakeoverRequest, await read_json_body(receive))

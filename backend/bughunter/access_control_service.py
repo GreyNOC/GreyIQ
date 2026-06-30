@@ -174,6 +174,167 @@ def run_idor_check(
             "detail": detail}
 
 
+_ANON_DENIED = 0.80   # an anonymous request must look clearly UNLIKE the admin response
+                      # (denied / login / different) for the endpoint to count as protected
+
+
+def run_bfla_check(
+    priv_url: str,
+    *,
+    admin_account: dict[str, Any],
+    user_account: dict[str, Any],
+    scope: str = "",
+    settings: Any = None,
+    governor: HostRateGovernor | None = None,
+) -> dict[str, Any]:
+    """Confirm BFLA (broken function-level authorization) on a PRIVILEGED endpoint via a
+    three-session differential, GET-only and scope-bound:
+
+        r_admin = high-privilege session GET priv_url   (ground truth: the authorized response)
+        r_user  = low-privilege session  GET priv_url    (the attack: does the user get it too?)
+        r_anon  = NO session             GET priv_url    (control: is the endpoint protected at all?)
+
+    Confirms only when the low-privilege user's response is ~identical to the ADMIN response
+    AND an anonymous request is denied/different (so the function is genuinely access-controlled,
+    not a public page). As with IDOR, the proof is the DIFFERENTIAL only — the privileged body
+    (which may be another user's / sensitive data) is never embedded."""
+    settings = settings or get_settings()
+    u = str(priv_url or "").strip()
+    if not u:
+        return _err("Provide the privileged endpoint URL to test (e.g. the admin/API function).")
+    try:
+        nu = normalize_website_url(u)
+    except WebsiteFetchError as exc:
+        return _err(str(exc))
+    host = urlparse(nu).hostname or ""
+    if not host_in_active_scope(host, scope, settings):
+        return _err(f"'{host}' is not named in your scope — access-control testing is fail-closed. Add it to Scope.")
+    try:
+        su = _guard_url(nu, settings.allow_private_urls, settings.web_allowed_ports)
+    except WebsiteFetchError as exc:
+        return _err(f"target refused by the URL guard: {exc}")
+
+    auth_admin = build_auth(su, cookie=admin_account.get("cookie", ""), headers=admin_account.get("headers") or [])
+    auth_user = build_auth(su, cookie=user_account.get("cookie", ""), headers=user_account.get("headers") or [])
+    if auth_admin is None or auth_user is None:
+        return _err("BFLA testing needs TWO sessions — supply a cookie and/or auth headers for BOTH the high-privilege and the low-privilege account.")
+
+    governor = governor or HostRateGovernor(
+        capacity=settings.active_max_requests_per_host, min_interval_s=settings.active_min_interval_ms / 1000.0)
+    http_admin = _Http(settings, governor, max_requests=3, auth=auth_admin)
+    http_user = _Http(settings, governor, max_requests=3, auth=auth_user)
+    http_anon = _Http(settings, governor, max_requests=3, auth=None)   # unauthenticated control
+    try:
+        r_admin = http_admin.fetch(su)
+        r_user = http_user.fetch(su)
+        r_anon = http_anon.fetch(su)
+    except _ActiveError as exc:
+        return _err(f"request failed: {exc}")
+
+    body_admin, body_user, body_anon = (r_admin.get("body") or ""), (r_user.get("body") or ""), (r_anon.get("body") or "")
+    st_admin, st_user, st_anon = int(r_admin.get("status") or 0), int(r_user.get("status") or 0), int(r_anon.get("status") or 0)
+
+    # Control 1: the admin session must actually obtain the privileged page.
+    if st_admin != 200 or len(_norm(body_admin)) < _MIN_BODY:
+        return {"ok": True, "status": "candidate",
+                "reason": f"the high-privilege session did not return a readable 200 for {urlparse(su).path or '/'} (HTTP {st_admin}) — check the admin session / URL.",
+                "detail": {"status_admin": st_admin, "status_user": st_user, "status_anon": st_anon}}
+
+    r_user_admin = _ratio(body_user, body_admin)
+    r_anon_admin = _ratio(body_anon, body_admin)
+    detail = {"status_admin": st_admin, "status_user": st_user, "status_anon": st_anon,
+              "ratio_user_vs_admin": round(r_user_admin, 3), "ratio_anon_vs_admin": round(r_anon_admin, 3)}
+
+    # Control 2: the endpoint must be access-CONTROLLED — an anonymous request must be denied
+    # or clearly different. If anon sees the same thing as admin, the page is just PUBLIC.
+    anon_denied = st_anon != 200 or r_anon_admin < _ANON_DENIED
+    if not anon_denied:
+        return {"ok": True, "status": "candidate",
+                "reason": ("an anonymous (no-session) request returned ~the same content as the admin session, so this "
+                           "endpoint appears PUBLIC, not privilege-gated — BFLA does not apply. Pick a genuinely "
+                           "admin-only function and re-test."),
+                "detail": detail}
+
+    # The attack: the low-privilege user's response ~matches the ADMIN response -> the user
+    # invoked a function they shouldn't reach (a properly-gated endpoint would 403/redirect).
+    if st_user == 200 and r_user_admin >= _SAME:
+        finding, plan = _build_bfla_finding(su, detail)
+        return {"ok": True, "status": "confirmed", "finding": finding, "attack_plan": plan, "detail": detail}
+
+    if st_user == 200 and r_user_admin >= _CANDIDATE:
+        return {"ok": True, "status": "candidate",
+                "reason": (f"the low-privilege user's response was {r_user_admin:.0%} similar to the admin response "
+                           f"(below the {_SAME:.0%} auto-confirm bar) while anonymous access was denied — possible BFLA "
+                           f"behind page chrome/SPA shell. Inspect within scope."),
+                "detail": detail}
+
+    return {"ok": True, "status": "enforced",
+            "reason": (f"the low-privilege user did NOT obtain the privileged response (HTTP {st_user}; similarity to admin "
+                       f"{r_user_admin:.2f}). Function-level access control appears enforced here."),
+            "detail": detail}
+
+
+def _build_bfla_finding(url: str, detail: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build a BFLA finding + attack plan from a confirmed three-session differential. The
+    proof is the DIFFERENTIAL ONLY — never the privileged body."""
+    path = urlparse(url).path or "/"
+    model = impact_model.impact_for_class("access-control")
+    matched = (f"the low-privilege session received the privileged response (HTTP {detail['status_user']}); body matched "
+               f"the admin response (similarity {detail['ratio_user_vs_admin']}) while an anonymous request was denied/"
+               f"different (similarity {detail['ratio_anon_vs_admin']})")
+    finding = {
+        "rule_id": "active.bfla",
+        "title": f"Broken function-level authorization at {path}",
+        "severity": "high",
+        "confidence": "high",
+        "category": "access-control",
+        "location": url,
+        "file_path": url,
+        "line_start": 1, "line_end": 1,
+        "class_id": _AC_META["class_id"], "class_name": "Broken function-level authorization (BFLA)",
+        "cwe": "CWE-862 / CWE-285",
+        "owasp": _AC_META["owasp"],
+        "references": impact_model.references_for_class("access-control"),
+        "vrt": impact_model.bugcrowd_vrt("access-control"),
+        "remediation": impact_model.remediation_for_class("access-control"),
+        "snippet": "",  # privileged body withheld (may be sensitive / another user's data)
+        "proof_evidence": {
+            "request_line": f"GET {url}",
+            "request_header": "Cookie: <low-privilege account session>",
+            "response_status": f"HTTP {detail['status_user']}",
+            "matched_value": matched,
+        },
+    }
+    plan = {
+        "steps": [
+            "Authenticate as the low-privilege account (your second test account).",
+            f"With that session, request the privileged function: GET {url}",
+            f"Observe HTTP {detail['status_user']} returning the admin-only response (body matched the admin session).",
+            f"Control: the same request with NO session is denied/different (similarity to admin {detail['ratio_anon_vs_admin']}), "
+            f"proving the endpoint is access-controlled — yet the low-privilege user reached it.",
+            "Map the blast radius: which other privileged functions (admin actions, other users' management) the low-privilege role can invoke.",
+        ],
+        "poc": (f"# As the low-privilege account, request the admin-only function:\n"
+                f"curl -s -i '{url}' -H 'Cookie: <low-priv session>'\n"
+                f"# -> HTTP {detail['status_user']} with the privileged (admin) response"),
+        "impact": model.get("business_impact", ""),
+        "cvss": impact_model.cvss_for_class("access-control"),
+        "remediation": impact_model.remediation_for_class("access-control"),
+        "proof_of_impact": {
+            "status": "confirmed",
+            "method": "three-session function-level differential (GET-only, no data exfiltrated into the report)",
+            "actor": "authenticated low-privilege account (no admin role)",
+            "affected_asset": "privileged functions reachable by an under-privileged role",
+            "observed_result": matched,
+            "control_result": ("an anonymous request to the same endpoint was denied/different, so the function is genuinely "
+                               "access-controlled — the low-privilege user bypassed the function-level check"),
+            "evidence": "user response ≈ admin response, and anon response ≠ admin response (ratios captured; privileged body withheld)",
+            "proof_obligation": model.get("proof_obligation", ""),
+        },
+    }
+    return finding, plan
+
+
 def _build_finding(url_a: str, url_b: str, detail: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build a fully-annotated access-control finding + its attack plan from a confirmed
     differential. The proof is the DIFFERENTIAL ONLY — never the cross-tenant body."""

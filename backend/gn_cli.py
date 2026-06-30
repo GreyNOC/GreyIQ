@@ -440,6 +440,48 @@ def _cmd_cve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bfla(args: argparse.Namespace) -> int:
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    from bughunter import access_control_service as ac
+    from bughunter import report_formats
+
+    if not args.authorize:
+        return _err("BFLA testing uses your high- and low-privilege test sessions against an in-scope host — pass -y/--authorize.")
+    res = ac.run_bfla_check(
+        args.priv_url,
+        admin_account={"cookie": args.admin_cookie or "", "headers": args.admin_header or []},
+        user_account={"cookie": args.user_cookie or "", "headers": args.user_header or []},
+        scope=args.scope or "",
+    )
+    if not res.get("ok"):
+        return _err(res["error"])
+    status = res["status"]
+    if status != "confirmed":
+        print(_c(f"BFLA not confirmed ({status}).", "33"))
+        print(f"  {res.get('reason', '')}")
+        if res.get("detail"):
+            print(f"  detail: {res['detail']}")
+        return 0
+    finding = res["finding"]; finding.setdefault("ref", "F1"); plan = res["attack_plan"]
+    ctx = {"tool": "GreyIQ BugHunter", "version": VERSION,
+           "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
+           "target": args.priv_url, "scope": args.scope or "", "attack_plans": {"F1": plan}}
+    md = report_formats.render_finding(ctx, finding, report_formats.normalize_platform(args.platform))
+    print(_c("BFLA / broken function-level authorization CONFIRMED", "32") + f" at {finding['title']}")
+    print(f"  differential: {res.get('detail')}")
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    out = args.out or str(RUNTIME_DIR / "reports" / f"bfla-{stamp}.md")
+    try:
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        Path(out).write_text(md, encoding="utf-8")
+        print(f"  report: {out}")
+    except OSError as exc:
+        print(_c(f"  (could not write report: {exc})", "33"))
+    return 0
+
+
 def _cmd_idor(args: argparse.Namespace) -> int:
     from datetime import UTC, datetime
     from pathlib import Path
@@ -707,6 +749,18 @@ def build_parser() -> argparse.ArgumentParser:
     idor.add_argument("-o", "--out", default=None, help="report output path")
     idor.add_argument("-y", "--authorize", action="store_true", help="confirm you OWN both test accounts and are in scope (required)")
     idor.set_defaults(func=_cmd_idor)
+
+    bfla = sub.add_parser("bfla", help="confirm broken function-level authz with your high- and low-privilege test accounts")
+    bfla.add_argument("priv_url", help="the privileged/admin endpoint to test (e.g. https://app/admin/users)")
+    bfla.add_argument("--admin-cookie", dest="admin_cookie", default="", help="high-privilege account's Cookie header value")
+    bfla.add_argument("--admin-header", dest="admin_header", action="append", metavar="'Name: value'", help="high-priv auth header (repeatable)")
+    bfla.add_argument("--user-cookie", dest="user_cookie", default="", help="low-privilege account's Cookie header value")
+    bfla.add_argument("--user-header", dest="user_header", action="append", metavar="'Name: value'", help="low-priv auth header (repeatable)")
+    bfla.add_argument("-s", "--scope", default="", help="scope (name the host to allow active testing)")
+    bfla.add_argument("--platform", default="hackerone", help="report format (see `gn platforms`)")
+    bfla.add_argument("-o", "--out", default=None, help="report output path")
+    bfla.add_argument("-y", "--authorize", action="store_true", help="confirm you OWN both test accounts and are in scope (required)")
+    bfla.set_defaults(func=_cmd_bfla)
 
     classes = sub.add_parser("classes", help="list vuln classes")
     classes.add_argument("--json", action="store_true")

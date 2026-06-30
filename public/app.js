@@ -5089,7 +5089,63 @@ function ckRenderIdor() {
   form.append(note);
   host.append(form);
   host.append(out);
+  host.append(ckBflaForm());
   host.append(ckOobPanel());
+}
+
+function ckBflaForm() {
+  const wrap = cel("div");
+  wrap.append(cel("h2", "ck-section-title", "Access control — BFLA (function-level)"));
+  wrap.append(cel("p", "ck-hint",
+    "Confirm broken function-level authorization: an admin-only endpoint reachable by a LOW-privilege account. Give the privileged URL + your high-privilege session and your low-privilege session. GET-only, scope-bound — an anonymous control proves the endpoint is gated; the privileged body is never shown."));
+  const form = cel("form", "ck-learn-form");
+  const url = ckField("Privileged endpoint URL (e.g. https://app/admin/users)", "text", "");
+  const adminCookie = ckField("High-privilege account — Cookie", "text", "");
+  const adminHdr = ckTextareaField("High-privilege — extra headers (optional)", "Authorization: Bearer ...");
+  const userCookie = ckField("Low-privilege account — Cookie", "text", "");
+  const userHdr = ckTextareaField("Low-privilege — extra headers (optional)", "");
+  const scope = ckField("Scope (name the host to allow testing)", "text", state.ckScope || "");
+  form.append(url.wrap, adminCookie.wrap, adminHdr.wrap, userCookie.wrap, userHdr.wrap, scope.wrap);
+  const run = cel("button", "ck-btn primary", "Confirm BFLA"); run.type = "submit"; form.append(run);
+  const note = cel("p", "ck-status"); note.style.flexBasis = "100%";
+  const out = cel("div", "ck-research");
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!url.input.value.trim()) { note.classList.add("is-error"); note.textContent = "The privileged endpoint URL is required."; return; }
+    const label = run.textContent; run.disabled = true; run.textContent = "Testing…";
+    note.classList.remove("is-error"); note.textContent = ""; out.replaceChildren();
+    const lines = (v) => v.split("\n").map((s) => s.trim()).filter(Boolean);
+    try {
+      const res = await apiFetch("/api/bounty/bfla", {
+        method: "POST", timeoutMs: 60000, body: JSON.stringify({
+          priv_url: url.input.value.trim(),
+          admin_cookie: adminCookie.input.value.trim(), admin_headers: lines(adminHdr.input.value),
+          user_cookie: userCookie.input.value.trim(), user_headers: lines(userHdr.input.value),
+          scope: scope.input.value.trim(), platform: ckState.platform || "hackerone"
+        })
+      });
+      if (!res || res.ok === false) {
+        note.classList.add("is-error"); note.textContent = (res && res.error) || "Could not run the check.";
+      } else if (res.status === "confirmed") {
+        out.append(cel("p", "ck-ftitle", "✅ BFLA / broken function-level authorization CONFIRMED"));
+        out.append(cel("p", "ck-hint", "Added to Submissions — Copy report / Download / Submit it there."));
+        ckState.runId = res.run_id || ckState.runId;
+        const row = { ref: res.ref || "F1", title: res.title || "Broken function-level authorization",
+                      severity: res.severity || "high", proof: "confirmed",
+                      className: "Broken function-level authorization (BFLA)", cwe: "CWE-862 / CWE-285",
+                      plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" };
+        ckState.findings = (ckState.findings || []).filter((f) => !(f.ref === row.ref && f.className === row.className)).concat(row);
+        ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);
+        const pre = cel("pre", "ck-research-md"); pre.textContent = res.report || ""; pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "360px"; pre.style.overflow = "auto"; out.append(pre);
+      } else {
+        note.textContent = `Not confirmed (${res.status}). ${res.reason || ""}`;
+        if (res.detail) out.append(cel("p", "ck-hint", "Differential: " + JSON.stringify(res.detail)));
+      }
+    } catch (err) { note.classList.add("is-error"); note.textContent = err.message || "Check failed."; }
+    finally { run.disabled = false; run.textContent = label; }
+  });
+  form.append(note); wrap.append(form); wrap.append(out);
+  return wrap;
 }
 
 // Out-of-band (OOB) collaborator — config + mint + blind-SSRF confirm. Uses your own

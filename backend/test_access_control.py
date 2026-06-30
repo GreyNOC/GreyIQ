@@ -134,6 +134,106 @@ class IdorDifferentialTests(unittest.TestCase):
         self.assertEqual(res["status"], "candidate")
 
 
+PRIV_URL = "http://127.0.0.1/admin/users"
+ADMIN_DATA = "<html>Admin panel — users alice, bob, carol with role + delete controls</html>"
+DENIED = "<html>403 Forbidden — you do not have permission to view this page</html>"
+
+
+def _fake_bfla_http(by_role):
+    """by_role: dict role -> (status, body). role is 'admin'/'user' by cookie, 'anon' when auth is None."""
+    class FakeHttp:
+        def __init__(self, settings, governor, max_requests=4, auth=None):
+            self.auth = auth
+        def fetch(self, url, *, method="GET", extra_headers=None):
+            if not self.auth:
+                role = "anon"
+            else:
+                cookie = self.auth.headers.get("Cookie", "")
+                role = "admin" if "ADM" in cookie else "user"
+            status, body = by_role[role]
+            return {"status": status, "headers": {}, "body": body, "cookies": [], "final_url": url, "location": None}
+    return FakeHttp
+
+
+def _run_bfla(by_role):
+    orig = ac._Http
+    ac._Http = _fake_bfla_http(by_role)
+    try:
+        return ac.run_bfla_check(
+            PRIV_URL, admin_account={"cookie": "sess=ADM"}, user_account={"cookie": "sess=USR"},
+            scope="127.0.0.1", settings=_settings())
+    finally:
+        ac._Http = orig
+
+
+class BflaDifferentialTests(unittest.TestCase):
+    def test_confirms_when_low_priv_user_gets_admin_content(self) -> None:
+        res = _run_bfla({
+            "admin": (200, ADMIN_DATA),   # admin sees the privileged page
+            "user": (200, ADMIN_DATA),    # low-priv user ALSO sees it (the bug)
+            "anon": (403, DENIED),        # anonymous is denied -> endpoint is protected
+        })
+        self.assertEqual(res["status"], "confirmed")
+        f = res["finding"]
+        self.assertEqual(f["rule_id"], "active.bfla")
+        self.assertEqual(f["class_id"], "access-control")
+        self.assertEqual(f["snippet"], "")  # privileged body never embedded
+        self.assertNotIn("alice", f["proof_evidence"]["matched_value"])
+        self.assertEqual(res["attack_plan"]["proof_of_impact"]["status"], "confirmed")
+
+    def test_enforced_when_user_is_denied(self) -> None:
+        res = _run_bfla({
+            "admin": (200, ADMIN_DATA),
+            "user": (403, DENIED),
+            "anon": (403, DENIED),
+        })
+        self.assertEqual(res["status"], "enforced")
+        self.assertNotIn("finding", res)
+
+    def test_public_endpoint_is_candidate_not_confirmed(self) -> None:
+        # Anonymous sees the same content as admin -> the page is PUBLIC, not privilege-gated.
+        res = _run_bfla({
+            "admin": (200, ADMIN_DATA),
+            "user": (200, ADMIN_DATA),
+            "anon": (200, ADMIN_DATA),
+        })
+        self.assertEqual(res["status"], "candidate")
+        self.assertIn("public", res["reason"].lower())
+
+    def test_admin_session_not_authorized_is_candidate(self) -> None:
+        res = _run_bfla({
+            "admin": (302, ""),           # admin session can't read the page either
+            "user": (200, ADMIN_DATA),
+            "anon": (403, DENIED),
+        })
+        self.assertEqual(res["status"], "candidate")
+        self.assertIn("high-privilege", res["reason"].lower())
+
+    def test_page_chrome_dilution_is_candidate(self) -> None:
+        admin_body = "A" * 120
+        res = _run_bfla({
+            "admin": (200, admin_body),
+            "user": (200, admin_body + "C" * 40),   # admin content in the user's chrome (~0.86)
+            "anon": (403, "no"),
+        })
+        self.assertEqual(res["status"], "candidate")
+        self.assertIn("page chrome", res["reason"])
+
+
+class BflaGatingTests(unittest.TestCase):
+    def test_requires_two_sessions(self) -> None:
+        r = ac.run_bfla_check(PRIV_URL, admin_account={"cookie": "sess=ADM"}, user_account={},
+                              scope="127.0.0.1", settings=_settings())
+        self.assertFalse(r["ok"])
+        self.assertIn("TWO sessions", r["error"])
+
+    def test_out_of_scope_refused(self) -> None:
+        r = ac.run_bfla_check("http://1.2.3.4/admin", admin_account={"cookie": "a"}, user_account={"cookie": "b"},
+                              scope="example.com")
+        self.assertFalse(r["ok"])
+        self.assertIn("scope", r["error"].lower())
+
+
 class IdorGatingTests(unittest.TestCase):
     def test_requires_two_distinct_same_host_urls(self) -> None:
         self.assertFalse(ac.run_idor_check("", "", account_a={}, account_b={}, scope="x")["ok"])
