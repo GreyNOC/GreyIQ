@@ -2,6 +2,22 @@
 
 Notable changes to GreyIQ.
 
+## v0.43.0
+
+### Phase C — NoSQL injection (error-based, confirm-grade)
+A new active check that finds NoSQL injection, added to the active suite (so it runs in every
+active hunt/campaign):
+
+- Sends a parameter as a NoSQL **operator object** (`param` → `{$ne: ...}`); a NoSQL backend
+  error banner that appears **only** for the operator (not the scalar control) confirms the
+  injection point — e.g. Mongoose casting `{$ne:...}` to a typed field (CastError). High
+  precision, mirroring the trusted SQL-error check.
+- Only **unambiguous** Mongo / Mongoose / BSON / PyMongo / Couchbase banners count; a generic
+  stack trace never confirms, and a page that always shows the banner fails the negative
+  control. Maps to the existing NoSQLi class (CWE-943, A03:2021 Injection).
+
+399 tests green (+4).
+
 ## v0.42.0
 
 ### Phase C — BFLA (broken function-level authorization)
