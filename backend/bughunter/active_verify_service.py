@@ -50,6 +50,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.rate_limit import HostRateGovernor
+from bughunter.registrable_domain import is_bare_public_suffix, registrable_domain
 from bughunter.scan_auth import AuthContext, auth_headers_for
 from bughunter.settings import get_settings
 from bughunter.web_ingest import (
@@ -117,10 +118,10 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 def _registrable(host: str) -> str:
-    """Best-effort eTLD+1 (last two labels). Good enough for a scope-naming check;
-    the operator names example.com or the full host."""
-    labels = (host or "").strip(".").split(".")
-    return ".".join(labels[-2:]) if len(labels) >= 2 else (host or "")
+    """Best-effort, public-suffix-AWARE eTLD+1. Good enough for a scope-naming check;
+    the operator names example.com or the full host. See registrable_domain.py: this is
+    NOT last-two-labels for known multi-label suffixes (foo.co.uk, myapp.herokuapp.com)."""
+    return registrable_domain(host)
 
 
 def _scope_hosts(scope: str) -> set[str]:
@@ -152,6 +153,13 @@ def host_in_active_scope(host: str, scope: str, settings: Any) -> bool:
     # 'example.com' match scope 'notexample.com' and probe an out-of-scope host).
     reg = _registrable(cleaned)
     for token in _scope_hosts(scope):
+        if is_bare_public_suffix(token):
+            # The token IS itself a known multi-label public suffix (e.g.
+            # 'herokuapp.com', 'co.uk') -- never someone's own apex, so naming it bare
+            # in free-text scope can NEVER legitimately authorize the whole shared
+            # platform (every unrelated tenant's subdomain would otherwise match the
+            # dotted-suffix wildcard below). Skip it entirely for this token.
+            continue
         if cleaned == token or cleaned.endswith("." + token) or reg == token:
             return True
     for suffix in getattr(settings, "active_scan_allowlist", ()):  # host-suffix allowlist
@@ -224,7 +232,7 @@ def _candidate_params(url: str, extra: list[str] | None, default: tuple[str, ...
             seen.add(key)
             out.append(clean)
 
-    for key, _ in parse_qsl(urlparse(url).query):
+    for key, _ in parse_qsl(urlparse(url).query, keep_blank_values=True):
         _add(key)
     for name in extra or []:
         _add(name)
@@ -239,7 +247,7 @@ def _redirect_candidates(url: str, extra: list[str] | None, default: tuple[str, 
     recon-discovered params whose NAME looks like a redirect/forward target, then the
     built-in defaults — so a custom-named redirect param the app actually uses gets tested
     without firing at every unrelated param."""
-    existing = {k.lower() for k, _ in parse_qsl(urlparse(url).query)}
+    existing = {k.lower() for k, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)}
     out: list[str] = []
     seen: set[str] = set()
 
@@ -637,7 +645,7 @@ def _check_error_sqli(http: _Http, url: str, extra_params: list[str] | None = No
     if not params:
         return None  # need a URL or recon-discovered param to perturb; never invent one blindly
     for param in params:
-        original = dict(parse_qsl(parsed.query)).get(param, "1")
+        original = dict(parse_qsl(parsed.query, keep_blank_values=True)).get(param, "1")
         try:
             probe = http.fetch(_with_query(url, {param: original + "'"}))
             control = http.fetch(_with_query(url, {param: original}))
@@ -722,7 +730,7 @@ def _check_bool_sqli(http: _Http, url: str, extra_params: list[str] | None = Non
     if not params:
         return None  # need a URL or recon-discovered param; never invent injection points
     for param in params:
-        original = dict(parse_qsl(parsed.query)).get(param, "1")
+        original = dict(parse_qsl(parsed.query, keep_blank_values=True)).get(param, "1")
         try:
             base1 = http.fetch(_with_query(url, {param: original}))
             base2 = http.fetch(_with_query(url, {param: original}))
@@ -830,7 +838,7 @@ def _check_time_sqli(http: _Http, url: str, settings: Any = None, extra_params: 
     slow = f"' AND SLEEP({d_str})-- -"
     fast = "' AND SLEEP(0)-- -"
     for param in params:  # one param — the timing pass is request-heavy
-        original = dict(parse_qsl(parsed.query)).get(param, "1")
+        original = dict(parse_qsl(parsed.query, keep_blank_values=True)).get(param, "1")
         try:
             base = http.fetch(_with_query(url, {param: original}))
             ctrl = http.fetch(_with_query(url, {param: original + fast}))   # injected, but SLEEP(0) -> fast (negative control)

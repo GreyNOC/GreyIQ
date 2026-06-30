@@ -214,5 +214,58 @@ class XxeTests(unittest.TestCase):
         self.assertIn("scope", res["error"].lower())
 
 
+class PollCollaboratorRealResponseTests(unittest.TestCase):
+    """The REAL poll_collaborator (not stubbed) against a local server: a misconfigured
+    tunnel/proxy, a load-balancer error page rendered as JSON, or a buggy collaborator can
+    return a non-object JSON body (array/string/number) -- the poll must degrade cleanly,
+    never raise."""
+
+    def _serve(self, body: bytes) -> int:
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return server.server_port
+
+    def test_normal_object_body_parses(self) -> None:
+        port = self._serve(b'{"count": 2, "hits": [{"ip": "1.1.1.1"}]}')
+        res = oob.poll_collaborator(f"http://127.0.0.1:{port}", "secret", "tok")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["count"], 2)
+        self.assertEqual(len(res["hits"]), 1)
+
+    def test_json_array_body_does_not_crash(self) -> None:
+        port = self._serve(b'[{"ip": "1.1.1.1"}]')
+        res = oob.poll_collaborator(f"http://127.0.0.1:{port}", "secret", "tok")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["count"], 0)
+        self.assertEqual(res["hits"], [])
+
+    def test_json_string_body_does_not_crash(self) -> None:
+        port = self._serve(b'"ok"')
+        res = oob.poll_collaborator(f"http://127.0.0.1:{port}", "secret", "tok")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["count"], 0)
+
+    def test_json_number_body_does_not_crash(self) -> None:
+        port = self._serve(b"5")
+        res = oob.poll_collaborator(f"http://127.0.0.1:{port}", "secret", "tok")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

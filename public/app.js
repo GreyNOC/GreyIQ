@@ -5446,8 +5446,11 @@ function ckOobPanel() {
       } else if (res.status === "confirmed") {
         sout.append(cel("p", "ck-ftitle", `✅ Blind SSRF CONFIRMED via '${res.param}'`));
         ckState.runId = res.run_id || ckState.runId;
-        ckState.findings = [{ runId: res.run_id || ckState.runId, ref: "F1", title: res.title || "Blind SSRF", severity: res.severity || "high", proof: "confirmed", className: "Server-side request forgery (SSRF)", cwe: "CWE-918", plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" }];
-        ckBadgeCount("submissions", 1);
+        const row = { runId: res.run_id || ckState.runId, ref: res.ref || "F1", title: res.title || "Blind SSRF",
+                      severity: res.severity || "high", proof: "confirmed", className: "Server-side request forgery (SSRF)",
+                      cwe: "CWE-918", plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" };
+        ckState.findings = (ckState.findings || []).filter((f) => !(f.ref === row.ref && f.className === row.className)).concat(row);
+        ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);
         if (res.report) { const pre = cel("pre", "ck-research-md"); pre.textContent = res.report; pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "320px"; pre.style.overflow = "auto"; sout.append(pre); }
         sout.append(cel("p", "ck-hint", "Added to Submissions."));
       } else {
@@ -5485,8 +5488,11 @@ function ckOobPanel() {
       } else if (res.status === "confirmed" || res.status === "candidate") {
         xout.append(cel("p", "ck-ftitle", res.status === "confirmed" ? "✅ Blind XXE CONFIRMED" : "⚠ Blind XXE candidate (verify the callback source)"));
         ckState.runId = res.run_id || ckState.runId;
-        ckState.findings = [{ runId: res.run_id || ckState.runId, ref: "F1", title: res.title || "Blind XXE", severity: res.severity || "high", proof: res.status, className: "XML External Entity (XXE)", cwe: "CWE-611", plan: {}, cvss: {}, proofObj: { status: res.status }, description: "" }];
-        ckBadgeCount("submissions", 1);
+        const row = { runId: res.run_id || ckState.runId, ref: res.ref || "F1", title: res.title || "Blind XXE",
+                      severity: res.severity || "high", proof: res.status, className: "XML External Entity (XXE)",
+                      cwe: "CWE-611", plan: {}, cvss: {}, proofObj: { status: res.status }, description: "" };
+        ckState.findings = (ckState.findings || []).filter((f) => !(f.ref === row.ref && f.className === row.className)).concat(row);
+        ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);
         if (res.report) { const pre = cel("pre", "ck-research-md"); pre.textContent = res.report; pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "320px"; pre.style.overflow = "auto"; xout.append(pre); }
         xout.append(cel("p", "ck-hint", "Added to Submissions."));
       } else if (res.status === "ready") {

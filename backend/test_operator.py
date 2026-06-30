@@ -12,6 +12,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from bughunter import ledger, operator, portfolio, ranking  # noqa: E402
+from bughunter.operator import OperatorLoop  # noqa: E402
 
 
 class PortfolioTests(unittest.TestCase):
@@ -106,6 +107,31 @@ class LedgerTests(unittest.TestCase):
         ledger.upsert_findings(self.rt, "acme", "https://x", [item])
         ledger.record_submission(self.rt, "acme", "https://x", item["dedup_key"], "R1", "u")
         self.assertEqual(ledger.count_recent_submissions(self.rt, "acme"), 1)
+
+
+class IsDueTests(unittest.TestCase):
+    """_is_due must never raise -- an exception here escapes the list comprehension in
+    _supervise() and kills the WHOLE operator supervisor thread (every program stops being
+    scheduled), not just the one malformed program."""
+
+    def setUp(self) -> None:
+        self.loop = OperatorLoop("unused", run_campaign_fn=lambda *a, **k: {}, submit_fn=lambda *a, **k: {})
+
+    def test_naive_timestamp_does_not_raise_and_counts_as_due(self) -> None:
+        # No timezone offset -> comparing to datetime.now(UTC) raises TypeError, not
+        # ValueError -- must be caught and treated as due (fail toward scheduling it).
+        self.assertTrue(self.loop._is_due({"next_run_at": "2026-07-01T10:00:00"}))
+
+    def test_garbage_string_does_not_raise_and_counts_as_due(self) -> None:
+        self.assertTrue(self.loop._is_due({"next_run_at": "not-a-date"}))
+
+    def test_missing_next_run_at_is_due(self) -> None:
+        self.assertTrue(self.loop._is_due({}))
+
+    def test_future_aware_timestamp_is_not_due(self) -> None:
+        from datetime import UTC, datetime, timedelta
+        future = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+        self.assertFalse(self.loop._is_due({"next_run_at": future}))
 
 
 class RankingTests(unittest.TestCase):

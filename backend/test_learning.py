@@ -19,7 +19,18 @@ class ProgramKeyTests(unittest.TestCase):
 
     def test_falls_back_to_registrable_domain(self) -> None:
         self.assertEqual(learning.program_key(None, "https://shop.example.com/x"), "example.com")
-        self.assertEqual(learning.program_key("", "api.staging.example.co.uk"), "co.uk")
+        # A multi-label public suffix (co.uk) must NOT collapse a real eTLD+1 down to the
+        # bare suffix -- that would merge two unrelated programs' memory into one bucket.
+        self.assertEqual(learning.program_key("", "api.staging.example.co.uk"), "example.co.uk")
+
+    def test_different_co_uk_apexes_get_different_keys(self) -> None:
+        # Regression: before the public-suffix-aware fix, BOTH of these collapsed to the
+        # single bucket 'co.uk', contaminating cross-program learning/dedup state.
+        a = learning.program_key(None, "https://shop.example.co.uk/x")
+        b = learning.program_key(None, "https://foo.bar.co.uk/y")
+        self.assertNotEqual(a, b)
+        self.assertEqual(a, "example.co.uk")
+        self.assertEqual(b, "bar.co.uk")
 
     def test_empty_is_default(self) -> None:
         self.assertEqual(learning.program_key(None, ""), "default")

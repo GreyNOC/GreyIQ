@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -189,6 +190,59 @@ class SensitivePathProbeTests(unittest.TestCase):
         url = f"http://127.0.0.1:{server.server_port}/"
         run_web_scan(url)  # probe_paths defaults to False -> a single GET
         self.assertEqual(seen, ["/"])
+
+
+class TruncatedResponseTests(unittest.TestCase):
+    """A server that claims a Content-Length larger than what it actually sends (or any
+    mid-body connection drop) makes response.read() raise http.client.IncompleteRead --
+    NOT a URLError/HTTPError/ValueError. run_web_scan's 'never raises' contract must hold."""
+
+    def setUp(self) -> None:
+        self._prev = os.environ.get("GREYIQ_SCAN_ALLOW_PRIVATE_URLS")
+        os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
+        self._stop = threading.Event()
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(5)
+        self.port = self.listener.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve_one_truncated, daemon=True)
+        self._thread.start()
+
+    def tearDown(self) -> None:
+        self._stop.set()
+        self.listener.close()
+        if self._prev is None:
+            os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+        else:
+            os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = self._prev
+
+    def _serve_one_truncated(self) -> None:
+        self.listener.settimeout(5.0)
+        try:
+            conn, _ = self.listener.accept()
+        except OSError:
+            return
+        with conn:
+            conn.settimeout(5.0)
+            try:
+                conn.recv(4096)  # drain the request
+                # Chunked encoding: announce a 0x3e8 (1000)-byte chunk, send a partial
+                # chunk, then close mid-chunk -> http.client.IncompleteRead on read().
+                # (A plain Content-Length mismatch does NOT reliably raise -- http.client
+                # just returns the short read -- chunked framing is what actually triggers it.)
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    b"3e8\r\nshort-chunk-body-tru"
+                )
+            except OSError:
+                pass
+
+    def test_run_web_scan_does_not_raise_on_truncated_body(self) -> None:
+        url = f"http://127.0.0.1:{self.port}/"
+        res = run_web_scan(url)  # must return, never raise IncompleteRead/HTTPException
+        self.assertFalse(res["ok"])
+        self.assertIn("scan_type", res)
+        self.assertEqual(res["scan_type"], "web")
 
 
 if __name__ == "__main__":

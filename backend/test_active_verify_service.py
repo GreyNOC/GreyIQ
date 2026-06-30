@@ -497,6 +497,25 @@ class ScopeBindingTests(unittest.TestCase):
         self.assertTrue(av.host_in_active_scope("app.example.com", "*.example.com", s))
         self.assertTrue(av.host_in_active_scope("example.com", "https://example.com/login in scope", s))
 
+    def test_bare_public_suffix_in_scope_text_does_not_authorize_the_whole_platform(self) -> None:
+        # A scope token that is ITSELF a known multi-label public suffix (a shared PaaS
+        # host) must never be treated as someone's own apex -- naming 'herokuapp.com' in
+        # scope text (e.g. copied from a program description mentioning the platform, not
+        # a specific app) must NOT authorize every unrelated tenant's *.herokuapp.com.
+        s = get_settings()
+        self.assertFalse(av.host_in_active_scope("victim-unrelated.herokuapp.com", "herokuapp.com", s))
+        self.assertFalse(av.host_in_active_scope("herokuapp.com", "herokuapp.com", s))
+        self.assertFalse(av.host_in_active_scope("someone-elses-blog.github.io", "scope: github.io", s))
+        # A REAL owned app under that platform still works when the operator names the
+        # FULL host they actually own (not the bare platform suffix).
+        self.assertTrue(av.host_in_active_scope("myapp.herokuapp.com", "myapp.herokuapp.com", s))
+        self.assertTrue(av.host_in_active_scope("api.myapp.herokuapp.com", "myapp.herokuapp.com", s))
+        self.assertFalse(av.host_in_active_scope("other-app.herokuapp.com", "myapp.herokuapp.com", s))
+        # Same protection for multi-label ccSLDs (co.uk): the bare suffix can't authorize
+        # an unrelated co.uk site, but a real owned co.uk apex still works normally.
+        self.assertFalse(av.host_in_active_scope("victim.co.uk", "co.uk", s))
+        self.assertTrue(av.host_in_active_scope("shop.example.co.uk", "example.co.uk", s))
+
     def test_out_of_scope_target_makes_zero_requests(self) -> None:
         # No DNS, no network: scope is checked before the URL guard.
         findings, meta = av.verify_active("https://evil.test/", [], scope="example.com")

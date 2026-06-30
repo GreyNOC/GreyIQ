@@ -15,6 +15,7 @@ loopback, and reserved hosts are refused unless
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 from typing import Any
@@ -262,6 +263,12 @@ def _fetch_raw(url: str, *, auth: AuthContext | None = None) -> dict[str, Any]:
         # An error response is still worth analyzing (stack traces, headers).
         final_url = getattr(error, "url", None) or sanitized
         consumed = _consume(error, settings)
+    except http.client.HTTPException as exc:
+        # A truncated/short-closed body (e.g. Content-Length lies, or the connection drops
+        # mid-read -> http.client.IncompleteRead) is neither a URLError nor an HTTPError.
+        # Re-raise as the ONE error type every caller of _fetch_raw already catches, instead
+        # of letting it escape as a raw http.client exception none of them expect.
+        raise WebsiteFetchError(f"the response body was truncated or malformed: {exc}") from exc
     consumed["final_url"] = final_url
     consumed["requested_url"] = normalized
     return consumed
@@ -581,7 +588,11 @@ def run_web_scan(
         fetched = _fetch_raw(target, auth=auth)
     except WebsiteFetchError as exc:
         return {"ok": False, "scan_type": "web", "target": target, "error": str(exc)}
-    except (URLError, TimeoutError, ValueError) as exc:
+    # http.client.HTTPException (incl. IncompleteRead -> a truncated/short-closed response
+    # body) and OSError (incl. ConnectionError / RemoteDisconnected -> the server dropping
+    # the connection mid-read) are neither URLError nor ValueError, so they must be caught
+    # explicitly here too or this "never raises" contract breaks on a truncating server.
+    except (URLError, TimeoutError, ValueError, http.client.HTTPException, OSError) as exc:
         return {
             "ok": False,
             "scan_type": "web",

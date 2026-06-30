@@ -2,6 +2,41 @@
 
 Notable changes to GreyIQ.
 
+## v0.54.0
+
+### QAQC pass, part 2 — the 8 medium-severity faults
+Continues the v0.53.0 safety-hardening pass: the medium-severity faults the 50-agent QAQC
+audit confirmed (one, the screenshot SSRF-via-redirect, was already closed by v0.53.0's
+redirect re-guard — same root cause, two audit groups).
+
+- **New shared `registrable_domain` helper** (public-suffix-aware, no external data — a
+  small built-in set of common ccSLDs like `co.uk` and multi-tenant PaaS hosts like
+  `herokuapp.com`/`github.io`). Fixes two real bugs at once:
+  - **Scope authorization**: a bare platform suffix typed into free-text scope (e.g.
+    `herokuapp.com`, copied from a program description) no longer authorizes every
+    unrelated tenant under that shared host — only a real, owned apex
+    (`myapp.herokuapp.com`) does. The same protection now covers multi-label ccSLDs.
+  - **Cross-program memory contamination**: `learning.program_key` no longer collapses
+    `foo.co.uk` and `bar.co.uk` into one shared `co.uk` learning/ledger bucket.
+  - Also applied to `recon_js`'s same-apex host filtering.
+- **Blank-valued query parameters are no longer dropped** from the active prover's probe
+  candidate list (`?id=&q=x` now tests `id` too, not just `q`).
+- **`run_web_scan`'s "never raises" contract now actually holds**: a truncated/short-closed
+  response body (`http.client.IncompleteRead`, e.g. a server that drops the connection
+  mid-chunk) is caught and returned as a clean `{"ok": false, ...}` instead of crashing
+  the scan.
+- **OOB collaborator polling no longer crashes** on a non-object JSON response (a
+  misconfigured tunnel/proxy or load-balancer error page rendered as JSON).
+- **The operator supervisor thread no longer dies** on a timezone-naive `next_run_at`
+  (e.g. a hand-edited `portfolio.json`) — one malformed program no longer stops every
+  program from being scheduled.
+- **Blind-SSRF/XXE confirm no longer wipes the Submissions queue**: they now merge into
+  the existing findings list (matching the IDOR/BFLA/stored-XSS panels) instead of
+  replacing it wholesale, so a prior confirmed finding survives running a follow-up OOB
+  check.
+
+489 tests green (+18).
+
 ## v0.53.0
 
 ### Safety hardening — 7 fail-open faults fixed (QAQC pass)

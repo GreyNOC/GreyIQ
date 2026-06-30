@@ -167,6 +167,12 @@ class OperatorLoop:
             return datetime.fromisoformat(str(nxt)) <= datetime.now(UTC)
         except ValueError:
             return True
+        except TypeError:
+            # A timezone-NAIVE stamp (e.g. a hand-edited portfolio.json, or any external
+            # writer that stamps next_run_at without an offset) makes the comparison raise
+            # TypeError, not ValueError -- it must be caught here too, or it escapes the
+            # list comprehension in _supervise() and kills the whole supervisor thread.
+            return True
 
     def _supervise(self) -> None:
         self._emit("operator started" + (" — AUTO-SUBMIT ARMED" if self.allow_submit else " — review-only (no auto-submit)"))

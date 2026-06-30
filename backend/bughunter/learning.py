@@ -25,6 +25,8 @@ from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
+from bughunter.registrable_domain import registrable_domain
+
 _STORE_NAME = "bughunter_learning.json"
 
 # Outcome a submitted finding can have. Weighted toward "did this earn / matter?".
@@ -46,8 +48,7 @@ def program_key(program: str | None, target: str | None = None) -> str:
     raw = str(target or "").strip()
     if raw:
         host = (urlparse(raw if "://" in raw else "http://" + raw).hostname or "").lower()
-    labels = host.strip(".").split(".")
-    return ".".join(labels[-2:]) if len(labels) >= 2 else (host or "default")
+    return registrable_domain(host) or "default"
 
 
 def _load(runtime_dir: str | Path) -> dict[str, Any]:
