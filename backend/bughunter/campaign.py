@@ -23,6 +23,7 @@ from typing import Any
 
 from bughunter import (
     active_verify_service,
+    cve_service,
     fsutil,
     ledger,
     learning,
@@ -186,6 +187,33 @@ def run_campaign(
         consolidated.append({"finding": finding, "source_url": finding["location"], "source_report": "",
                              "source_json": "", "proof_status": "candidate", "cvss": {}})
 
+    # --- Known-CVE / outdated-component pass (passive, candidate-grade). One scope-bound,
+    # SSRF-guarded GET of the target fingerprints its front-end libraries and folds each
+    # outdated component with known CVEs in as a CANDIDATE (never confirmed — exploitability
+    # is unproven), carrying its own attack plan. Best-effort: never breaks the campaign. The
+    # scope defaults to the target's own host when the campaign was run without an explicit
+    # scope, matching recon's "fetch the thing you pointed at" behaviour. ---
+    if kind == "url":
+        cve_scope = str(scope or "").strip() or cve_service._target_host(clean_target)
+        try:
+            _emit("cve: fingerprinting front-end components…")
+            cve_res = cve_service.scan_known_cves(clean_target, scope=cve_scope)
+            for c_index, finding in enumerate(cve_res.get("findings") or [], 1):
+                # Dedup by product (one finding per outdated library, whichever page served it).
+                key = f"cve|{finding.get('_cve_product')}"
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                finding["ref"] = f"CVE{c_index}"
+                plan = cve_service.build_plan(finding)
+                consolidated.append({
+                    "finding": finding, "source_url": finding.get("location") or clean_target,
+                    "source_report": "", "source_json": "", "proof_status": "candidate",
+                    "cvss": plan.get("cvss") or {}, "plan": plan,
+                })
+        except Exception:  # noqa: BLE001 - the CVE pass is enrichment; never break the campaign
+            pass
+
     # --- Rank by EXPECTED VALUE (confirmed outermost, then EV, severity, CVSS) so the
     # most-likely-to-pay findings sort first. ---
     program_stats = (learning.program_summary(rt, program, clean_target).get("class_stats") if rt is not None else {}) or {}
@@ -230,9 +258,16 @@ def run_campaign(
     for rank_i, item in enumerate(consolidated, 1):
         if item.get("duplicate_of_prior"):
             continue  # already reported in a previous run — don't re-emit a package
-        doc = _read_json(item["source_json"])
-        ctx = _ctx_from_doc(doc)
         finding = item["finding"]
+        if item.get("plan") is not None:
+            # Synthetic finding (e.g. known-CVE) carries its plan inline — build the minimal
+            # ctx its submission needs instead of reading a per-target JSON sidecar it has none.
+            ctx = {"tool": "GreyIQ BugHunter", "version": version,
+                   "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
+                   "target": item.get("source_url") or clean_target, "scope": scope,
+                   "attack_plans": {str(finding.get("ref") or ""): item["plan"]}}
+        else:
+            ctx = _ctx_from_doc(_read_json(item["source_json"]))
         stem = f"sub-{rank_i:02d}-{_safe_slug(finding.get('class_id', 'finding'))}-{_safe_slug(finding.get('title', ''), 'finding')}"
         package = submission.write_submission_package(ctx, finding, sub_dir, stem, platform)
         if package:
@@ -279,7 +314,11 @@ def run_campaign(
         proof_out[ref] = {"status": item["proof_status"]}
         if item.get("cvss"):
             cvss_out[ref] = item["cvss"]
-        plan = (_read_json(item["source_json"]).get("attack_plans") or {}).get(item["finding"].get("ref"))
+        # Synthetic findings (known-CVE) carry their plan inline; per-target findings have it
+        # in their JSON sidecar.
+        plan = item.get("plan")
+        if not isinstance(plan, dict):
+            plan = (_read_json(item["source_json"]).get("attack_plans") or {}).get(item["finding"].get("ref"))
         if isinstance(plan, dict):
             plans_out[ref] = plan
 

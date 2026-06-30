@@ -73,6 +73,38 @@ class CampaignTests(unittest.TestCase):
         self.assertIn("urls", result["surface"])
         self.assertIn(result["risk"], {"critical", "high", "moderate", "low", "clean"})
 
+    def test_url_campaign_folds_in_known_cve_candidates(self) -> None:
+        # A URL campaign auto-runs the passive known-CVE pass and folds each outdated
+        # component in as a candidate finding with its own plan + CVSS. recon / the per-URL
+        # hunt / the CVE fetch are all stubbed so the test stays offline.
+        from bughunter import cve_service as cve
+
+        target = "https://app.example.com/"
+        comp = {"product": "jquery", "version": "1.8.0", "evidence": "/static/jquery-1.8.0.min.js"}
+        cve_finding = cve._build_finding(comp, cve.match_cves("jquery", "1.8.0"), target)
+
+        orig = (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves)
+        campaign.recon.discover = lambda t, **k: {"urls": [t], "notes": [], "sources": {}, "js_secrets": [], "tech": [], "params": []}
+        campaign.run_bounty_hunt = lambda *a, **k: {"ok": True, "json_path": "", "report_path": ""}
+        campaign.cve_service.scan_known_cves = lambda t, **k: {
+            "ok": True, "host": "app.example.com", "target": target,
+            "components": [comp], "count": 1, "findings": [dict(cve_finding)]}
+        try:
+            result = campaign.run_campaign(
+                target, scope="app.example.com", authorized=True, coder_cfg={},
+                default_reports_dir=self.reports, runtime_dir=self.runtime, version="9.9.9", program="demo")
+        finally:
+            campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves = orig
+
+        self.assertTrue(result["ok"], result.get("error"))
+        cve_refs = [f["ref"] for f in result["findings"] if "Outdated jQuery" in f["title"]]
+        self.assertEqual(len(cve_refs), 1, [f["title"] for f in result["findings"]])
+        ref = cve_refs[0]
+        self.assertEqual(result["proof_of_impact"][ref]["status"], "candidate")  # never confirmed
+        self.assertIn(ref, result["attack_plans"])      # inline plan threaded onto the board
+        self.assertIn(ref, result["cvss"])              # CVSS surfaced for ranking/severity
+        self.assertGreaterEqual(len(result["submission_paths"]), 1)  # a report package was written
+
     def test_static_findings_are_not_auto_recorded_as_submitted(self) -> None:
         # Source-code findings are candidates (no active proof) -> nothing logged
         # to the learning store, so we never pollute program memory with leads.
