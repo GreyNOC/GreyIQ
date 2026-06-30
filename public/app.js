@@ -4279,6 +4279,7 @@ const ck = {
   profileHint: document.querySelector("#ckProfileHint"),
   active: document.querySelector("#ckActive"),
   timeBased: document.querySelector("#ckTimeBased"),
+  deep: document.querySelector("#ckDeep"),
   live: document.querySelector("#ckLive"),
   authFold: document.querySelector("#ckAuthFold"),
   authCookie: document.querySelector("#ckAuthCookie"),
@@ -4656,7 +4657,99 @@ function ckRenderDetail(f) {
     ckDownloadText(`${f.ref}-${ckSlug(f.title)}.md`, pkg.text);
   });
   actions.append(dlBtn);
+
+  // Capture a proof screenshot of this finding's PoC URL (opt-in, Playwright-backed,
+  // scope-gated). The image is NOT auto-redacted — review before submitting.
+  const shotBtn = cel("button", "ck-btn", "Capture screenshot");
+  shotBtn.type = "button";
+  const shotWrap = cel("div", "ck-shot");
+  shotBtn.addEventListener("click", () => ckCaptureScreenshot(f, shotBtn, shotWrap));
+  actions.append(shotBtn);
+
+  // Research this lead with the configured brain (or a deterministic dossier).
+  const researchBtn = cel("button", "ck-btn", "Research this lead");
+  researchBtn.type = "button";
+  const researchWrap = cel("div", "ck-research");
+  researchBtn.addEventListener("click", () => ckResearchLead(f, researchBtn, researchWrap));
+  actions.append(researchBtn);
+
   host.append(actions);
+  host.append(shotWrap);
+  host.append(researchWrap);
+}
+
+async function ckResearchLead(f, btn, wrap) {
+  if (!ckState.runId) {
+    wrap.replaceChildren(cel("p", "ck-status is-error", "Run a hunt first — research attaches to a cached finding."));
+    return;
+  }
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Researching…";
+  wrap.replaceChildren();
+  try {
+    const res = await apiFetch("/api/bounty/research", {
+      method: "POST", timeoutMs: 120000, body: JSON.stringify({ run_id: ckState.runId, ref: f.ref })
+    });
+    if (res && res.ok) {
+      btn.textContent = "Re-research lead";
+      const src = res.used_brain ? `Researched by ${res.model || "your model"}` : "Deterministic dossier — plug in Claude/ChatGPT/local for deeper research";
+      wrap.append(cel("p", "ck-hint", src + (res.path ? " · saved + included in the bundle" : "")));
+      const pre = cel("pre", "ck-research-md");
+      pre.textContent = res.markdown || "";   // textContent — safe, no markup injection
+      pre.style.whiteSpace = "pre-wrap";
+      pre.style.maxHeight = "340px";
+      pre.style.overflow = "auto";
+      wrap.append(pre);
+    } else {
+      btn.textContent = label;
+      wrap.append(cel("p", "ck-status is-error", (res && res.error) || "Research failed."));
+    }
+  } catch (err) {
+    btn.textContent = label;
+    wrap.append(cel("p", "ck-status is-error", err.message || "Research failed."));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function ckCaptureScreenshot(f, btn, wrap) {
+  if (!ckState.runId) {
+    wrap.replaceChildren(cel("p", "ck-status is-error", "Run a hunt first — screenshots attach to a cached finding."));
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = "Capturing…";
+  wrap.replaceChildren();
+  try {
+    const res = await apiFetch("/api/bounty/screenshot", {
+      method: "POST", timeoutMs: 60000,
+      body: JSON.stringify({ run_id: ckState.runId, ref: f.ref })
+    });
+    if (res && res.ok) {
+      btn.textContent = "Re-capture screenshot";
+      if (res.warning) wrap.append(cel("p", "ck-status is-error", res.warning));
+      if (res.data_url) {
+        const img = cel("img", "ck-shot-img");
+        img.src = res.data_url;              // data: URI, not markup — safe
+        img.alt = "Proof-of-concept screenshot";
+        img.style.maxWidth = "100%";
+        img.style.borderRadius = "6px";
+        img.style.border = "1px solid var(--line, #d0d0d0)";
+        wrap.append(img);
+      }
+      wrap.append(cel("p", "ck-hint", `Saved locally${res.path ? ": " + res.path : ""}. Now embedded in this finding's Copy report / Download .md.`));
+    } else {
+      btn.textContent = "Capture screenshot";
+      wrap.append(cel("p", "ck-status is-error", (res && res.error) || "Capture failed."));
+      if (res && res.install) wrap.append(cel("p", "ck-hint", res.install));
+    }
+  } catch (err) {
+    btn.textContent = "Capture screenshot";
+    wrap.append(cel("p", "ck-status is-error", err.message || "Capture failed."));
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function ckBuildSubmissionDraft(f) {
@@ -4799,6 +4892,7 @@ function ckRenderSubmissions() {
   host.replaceChildren();
   host.append(ckCredsBar());
   host.append(ckFormatBar());
+  host.append(ckBundleBar());
 
   const ready = ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate");
   host.append(cel("h2", "ck-section-title", `Submission queue — ${ready.length} reportable`));
@@ -4898,6 +4992,60 @@ function ckFormatBar() {
     `Copy report / Download .md produce a ${cur.name}-shaped report with the gathered evidence included. `
     + "The one-click API submit files to HackerOne only."));
   return wrap;
+}
+
+// Engagement bundle — one click to download the whole run (reports, per-platform
+// packages, evidence, screenshots, research dossiers, JSON) as a .zip.
+function ckBundleBar() {
+  const wrap = cel("div", "ck-creds");
+  const head = cel("div", "ck-creds-head");
+  head.append(cel("strong", null, "Engagement bundle"));
+  wrap.append(head);
+  const btn = cel("button", "ck-btn primary", "Download everything (.zip)");
+  btn.type = "button";
+  const note = cel("p", "ck-hint", "Reports, per-platform submission packages, captured evidence, screenshots, and research — zipped to submit from.");
+  btn.addEventListener("click", () => ckDownloadBundle(btn, note));
+  wrap.append(btn);
+  wrap.append(note);
+  return wrap;
+}
+
+async function ckDownloadBundle(btn, note) {
+  if (!ckState.runId) { note.textContent = "Run a hunt or campaign first — the bundle packages a finished run."; return; }
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "Bundling…";
+  try {
+    const res = await apiFetch("/api/bounty/bundle", {
+      method: "POST", timeoutMs: 120000, body: JSON.stringify({ run_id: ckState.runId })
+    });
+    if (res && res.ok) {
+      const skipped = (res.skipped || []).length ? ` (${res.skipped.length} skipped)` : "";
+      if (res.inline && res.download_b64) {
+        ckDownloadBase64(res.filename || "greyiq-engagement.zip", res.download_b64, "application/zip");
+        note.textContent = `Downloaded ${res.file_count} file(s)${skipped}.`;
+      } else {
+        note.textContent = `Bundle written to ${res.path} (${Math.round((res.zip_bytes || 0) / 1024)} KB)${skipped} — too large to download inline; open it from that path.`;
+      }
+    } else {
+      note.textContent = (res && res.error) || "Could not build the bundle.";
+    }
+  } catch (err) {
+    note.textContent = err.message || "Bundle failed.";
+  } finally {
+    btn.disabled = false; btn.textContent = label;
+  }
+}
+
+function ckDownloadBase64(filename, b64, mime) {
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  const blob = new Blob([arr], { type: mime || "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // HackerOne credentials bar — shows configured state and a save form. The token is
@@ -5234,6 +5382,7 @@ async function ckRun() {
   state.ckProgram = (ck.program?.value || "").trim();
   state.ckActive = Boolean(ck.active?.checked);
   state.ckTimeBased = Boolean(ck.timeBased?.checked);
+  state.ckDeep = Boolean(ck.deep?.checked);
   state.ckLive = Boolean(ck.live?.checked);
   state.ckAuthCookie = (ck.authCookie?.value || "").trim();
   state.ckAuthHeaders = (ck.authHeaders?.value || "");
@@ -5250,7 +5399,8 @@ async function ckRun() {
         method: "POST", timeoutMs: 900000,
         body: JSON.stringify({
           target, scope: state.ckScope, authorized: true, program: state.ckProgram || null,
-          active: state.ckActive, time_based: state.ckTimeBased, live: state.ckLive, max_pages: Number(ck.maxPages?.value) || 12,
+          active: state.ckActive, time_based: state.ckTimeBased, live: state.ckLive, deep: state.ckDeep,
+          max_pages: Number(ck.maxPages?.value) || 12,
           auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines
         })
       });
@@ -5309,6 +5459,7 @@ function bootCockpit() {
   if (ck.program) ck.program.value = state.ckProgram || "";
   if (ck.active) ck.active.checked = Boolean(state.ckActive);
   if (ck.timeBased) ck.timeBased.checked = Boolean(state.ckTimeBased);
+  if (ck.deep) ck.deep.checked = Boolean(state.ckDeep);
   if (ck.live) ck.live.checked = Boolean(state.ckLive);
   if (ck.authCookie) ck.authCookie.value = state.ckAuthCookie || "";
   if (ck.authHeaders) ck.authHeaders.value = state.ckAuthHeaders || "";

@@ -276,6 +276,9 @@ from bughunter import campaign as bounty_campaign  # noqa: E402
 from bughunter import learning as bounty_learning  # noqa: E402
 from bughunter import submission as bounty_submission  # noqa: E402
 from bughunter import report_formats as bounty_formats  # noqa: E402
+from bughunter import screenshot_service as bounty_screenshot  # noqa: E402
+from bughunter import bundle as bounty_bundle  # noqa: E402
+from bughunter import research as bounty_research  # noqa: E402
 from bughunter import ledger as bounty_ledger  # noqa: E402
 from bughunter import portfolio as bounty_portfolio  # noqa: E402
 from bughunter.operator import OperatorLoop  # noqa: E402
@@ -519,6 +522,7 @@ class CampaignRequest(BaseModel):
     auth_headers: list[str] = Field(default_factory=list, max_length=20)
     live: bool = False
     max_pages: int = Field(default=12, ge=1, le=50)
+    deep: bool = False  # aggressive: time-based SQLi + auto screenshot + research per confirmed lead
 
 
 class LearnRequest(BaseModel):
@@ -543,6 +547,21 @@ class SubmitRequest(BaseModel):
     ref: str = Field(min_length=1, max_length=40)
     confirm: bool = False
     platform: str = Field(default="hackerone", max_length=20)
+
+
+class ScreenshotRequest(BaseModel):
+    run_id: str = Field(min_length=1, max_length=64)
+    ref: str = Field(min_length=1, max_length=40)
+    full_page: bool = False
+
+
+class BundleRequest(BaseModel):
+    run_id: str = Field(min_length=1, max_length=64)
+
+
+class ResearchRequest(BaseModel):
+    run_id: str = Field(min_length=1, max_length=64)
+    ref: str = Field(min_length=1, max_length=40)
 
 
 class HackerOneCredsRequest(BaseModel):
@@ -1153,6 +1172,7 @@ class GreyIQRuntime:
             live=request.live,
             program=request.program,
             max_pages=request.max_pages,
+            deep=request.deep,
         )
         self._cache_bounty_run(result, target=request.target, scope=request.scope, program=request.program)
         return result
@@ -1173,9 +1193,22 @@ class GreyIQRuntime:
             "attack_plans": result.get("attack_plans") or {},
         }
         findings_by_ref = {str(f.get("ref")): f for f in (result.get("findings") or []) if f.get("ref")}
+        # Remember where this run wrote its artifacts so the whole engagement can be
+        # bundled into a downloadable .zip later (a campaign writes a self-contained
+        # folder; a single hunt is gathered by explicit file list).
+        artifacts = {
+            "is_campaign": bool(result.get("campaign_path")),
+            "output_dir": result.get("output_dir", ""),
+            "report_path": result.get("report_path", ""),
+            "json_path": result.get("json_path", ""),
+            "campaign_path": result.get("campaign_path", ""),
+            "per_finding_paths": list(result.get("per_finding_paths") or []),
+            "submission_paths": list(result.get("submission_paths") or []),
+        }
         with self.lock:
             self.bounty_runs[run_id] = {
                 "ctx": ctx, "findings": findings_by_ref, "program": program, "target": target,
+                "artifacts": artifacts,
             }
             while len(self.bounty_runs) > 16:
                 self.bounty_runs.popitem(last=False)  # evict oldest
@@ -1202,6 +1235,118 @@ class GreyIQRuntime:
         if package is None:
             return {"ok": False, "error": "This finding is not reportable (the report rules drop it, e.g. an unconfirmed credential lead)."}
         return {"ok": True, "package": package, "platform": platform}
+
+    def capture_screenshot(self, request: "ScreenshotRequest") -> dict[str, Any]:
+        """Capture a proof screenshot of a finding's PoC URL in a headless browser and
+        record it on the cached run so the report/submission embed it. OPT-IN, scope-bound
+        and SSRF-guarded (in screenshot_service); Playwright-lazy (degrades cleanly). The
+        image is NOT auto-redacted — the response carries a warning and the screenshot is
+        NEVER auto-attached to the HackerOne API submit."""
+        import base64
+
+        ctx, finding, run = self._resolve_run_finding(request.run_id, request.ref)
+        if ctx is None:
+            return {"ok": False, "error": "This run is no longer cached — re-run the hunt to capture a screenshot."}
+        if finding is None:
+            return {"ok": False, "error": "Unknown finding for this run."}
+        url = bounty_screenshot.poc_url_for_finding(finding, ctx)
+        if not url:
+            return {"ok": False, "error": "No proof-of-concept URL to screenshot for this finding (it has no captured request or URL location)."}
+        safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
+        out_path = RUNTIME_DIR / "screenshots" / f"{safe(request.run_id)}-{safe(request.ref)}.png"
+        result = bounty_screenshot.capture_screenshot(
+            url, out_path, scope=str(ctx.get("scope") or ""), authorized=True, full_page=request.full_page,
+        )
+        if not result.get("ok"):
+            return result
+        # Record on the cached finding so build_submission/report embed it by basename.
+        finding["screenshot_path"] = result["path"]
+        if run is not None:
+            run.setdefault("screenshots", {})[request.ref] = result["path"]
+        data_url = ""
+        try:
+            raw = Path(result["path"]).read_bytes()
+            if len(raw) <= 4_000_000:  # inline preview for the cockpit; skip if huge
+                data_url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+        except OSError:
+            pass
+        return {
+            "ok": True, "path": result["path"], "url": result.get("url"), "final_url": result.get("final_url"),
+            "title": result.get("title"), "bytes": result.get("bytes"), "warning": result.get("warning"),
+            "data_url": data_url,
+        }
+
+    def research_finding(self, request: "ResearchRequest") -> dict[str, Any]:
+        """Research one lead with the CONFIGURED brain (Claude/ChatGPT/local) — or a
+        deterministic offline dossier when no brain is on. Writes the dossier into the
+        run's research folder so it's included in the downloadable bundle. Brain-only:
+        no external/internet calls."""
+        ctx, finding, run = self._resolve_run_finding(request.run_id, request.ref)
+        if ctx is None:
+            return {"ok": False, "error": "This run is no longer cached — re-run the hunt to research it."}
+        if finding is None:
+            return {"ok": False, "error": "Unknown finding for this run."}
+        dossier = bounty_research.build_dossier(finding, ctx, self._coder_config())
+        safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
+        out_path = RUNTIME_DIR / "research" / f"{safe(request.run_id)}-{safe(request.ref)}.md"
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(dossier["markdown"], encoding="utf-8")
+            finding["research_path"] = str(out_path)
+            if run is not None:
+                run.setdefault("research_paths", {})[request.ref] = str(out_path)
+            written = str(out_path)
+        except OSError:
+            written = ""
+        return {
+            "ok": True, "markdown": dossier["markdown"], "used_brain": dossier["used_brain"],
+            "model": dossier["model"], "path": written,
+        }
+
+    def export_bundle(self, request: "BundleRequest") -> dict[str, Any]:
+        """Zip the whole engagement (reports, per-platform packages, evidence,
+        screenshots, research dossiers, JSON) for download. A campaign's self-contained
+        folder is zipped whole; a single hunt's artifacts are gathered by file list. The
+        .zip is returned inline (base64) under a size cap, else by path. Local only."""
+        import base64
+
+        with self.lock:
+            run = self.bounty_runs.get(request.run_id)
+        if not run:
+            return {"ok": False, "error": "This run is no longer cached — re-run the hunt to rebuild the bundle."}
+        art = run.get("artifacts") or {}
+        safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
+        out_zip = RUNTIME_DIR / "bundles" / f"engagement-{safe(request.run_id)}.zip"
+        if art.get("is_campaign") and art.get("output_dir") and Path(art["output_dir"]).is_dir():
+            res = bounty_bundle.bundle_directory(art["output_dir"], out_zip)
+        else:
+            specs: list[tuple[str, str]] = []
+            for key in ("report_path", "json_path"):
+                if art.get(key):
+                    specs.append((Path(art[key]).name, art[key]))
+            for p in art.get("per_finding_paths") or []:
+                specs.append((f"findings/{Path(p).name}", p))
+            for p in art.get("submission_paths") or []:
+                specs.append((f"submissions/{Path(p).name}", p))
+            for p in (run.get("screenshots") or {}).values():
+                specs.append((f"screenshots/{Path(p).name}", p))
+            for p in (run.get("research_paths") or {}).values():
+                specs.append((f"research/{Path(p).name}", p))
+            res = bounty_bundle.bundle_files(specs, out_zip)
+        if not res.get("ok"):
+            return res
+        download_b64 = ""
+        zip_bytes = int(res.get("zip_bytes") or 0)
+        if 0 < zip_bytes <= 20 * 1024 * 1024:  # inline for the browser; larger -> path only
+            try:
+                download_b64 = base64.b64encode(Path(res["path"]).read_bytes()).decode("ascii")
+            except OSError:
+                download_b64 = ""
+        return {
+            "ok": True, "path": res["path"], "filename": f"greyiq-engagement-{safe(request.run_id)[:12]}.zip",
+            "zip_bytes": zip_bytes, "file_count": res.get("file_count"), "skipped": res.get("skipped") or [],
+            "download_b64": download_b64, "inline": bool(download_b64),
+        }
 
     def submit_finding(self, request: "SubmitRequest") -> dict[str, Any]:
         """File one CONFIRMED finding to HackerOne via the hard-gated submit. The gate
@@ -2223,6 +2368,18 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/submission":
             request = validate_payload(SubmissionPackageRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.build_submission_package, request))
+            return
+        if method == "POST" and path == "/api/bounty/screenshot":
+            request = validate_payload(ScreenshotRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.capture_screenshot, request))
+            return
+        if method == "POST" and path == "/api/bounty/bundle":
+            request = validate_payload(BundleRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.export_bundle, request))
+            return
+        if method == "POST" and path == "/api/bounty/research":
+            request = validate_payload(ResearchRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.research_finding, request))
             return
         if method == "POST" and path == "/api/bounty/submit":
             request = validate_payload(SubmitRequest, await read_json_body(receive))

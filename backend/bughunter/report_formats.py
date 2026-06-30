@@ -16,9 +16,15 @@ the finding carries it. Pure / frozen-safe.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from bughunter import report as R
+
+# A captured screenshot is an image and cannot be auto-redacted — every report that
+# embeds one carries this caveat so it is never presented as scrubbed.
+_SCREENSHOT_WARNING = ("Screenshot is NOT auto-redacted — review it for secrets, session "
+                       "tokens, or other users' data before sharing this report.")
 
 # Ordered so the UI lists HackerOne first, then YesWeHack, then the next two most
 # popular crowdsourced platforms.
@@ -187,6 +193,19 @@ def _section_evidence(out: list[str], finding: dict[str, Any], *, heading: str) 
         out.append("")
 
 
+def _section_screenshot(out: list[str], finding: dict[str, Any]) -> None:
+    """Embed a captured proof screenshot (referenced by basename so it resolves when the
+    .md and .png are written to the same folder) plus the not-redacted caveat."""
+    path = str(finding.get("screenshot_path") or "").strip()
+    if not path:
+        return
+    out.append("## Screenshot evidence\n")
+    out.append(f"![Proof-of-concept screenshot]({Path(path).name})")
+    out.append("")
+    out.append(f"> {_SCREENSHOT_WARNING}")
+    out.append("")
+
+
 def _section_impact(out: list[str], finding: dict[str, Any], plan: dict[str, Any]) -> None:
     impact = plan.get("impact") or finding.get("impact")
     if impact:
@@ -237,6 +256,7 @@ def render_finding(ctx: dict[str, Any], finding: dict[str, Any], platform: str =
     _section_steps(out, plan)
     _section_poc(out, plan)
     _section_evidence(out, finding, heading=profile["evidence"])
+    _section_screenshot(out, finding)
     _section_impact(out, finding, plan)
     _section_remediation(out, finding, plan, heading=profile["remediation"])
     _section_references(out, finding)

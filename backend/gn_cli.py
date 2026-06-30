@@ -110,7 +110,7 @@ def _cmd_hunt(args: argparse.Namespace) -> int:
         runtime_dir=RUNTIME_DIR,
         version=VERSION,
         run_live=args.live,
-        active=args.active or getattr(args, "time_based", False),  # --time-based implies --active
+        active=args.active or getattr(args, "time_based", False) or getattr(args, "deep", False),  # --time-based/--deep imply --active
         time_based=getattr(args, "time_based", False),
         auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
         per_finding=args.per_finding,
@@ -161,13 +161,14 @@ def _cmd_campaign(args: argparse.Namespace) -> int:
         seed_dir=SEED_DIR,
         runtime_dir=RUNTIME_DIR,
         version=VERSION,
-        active=args.active or getattr(args, "time_based", False),  # --time-based implies --active
+        active=args.active or getattr(args, "time_based", False) or getattr(args, "deep", False),  # --time-based/--deep imply --active
         time_based=getattr(args, "time_based", False),
         auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
         live=args.live,
         program=args.program,
         max_pages=args.max_pages,
         platform=getattr(args, "platform", "hackerone") or "hackerone",
+        deep=getattr(args, "deep", False),
         on_progress=(lambda m: print(_c(f"  - {m}", "2"))) if not args.json else None,
     )
     if not result.get("ok"):
@@ -393,6 +394,24 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def _cmd_bundle(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from bughunter import bundle
+
+    src = str(args.path or "").strip()
+    if not src or not Path(src).is_dir():
+        return _err(f"not a folder: {src or '(none)'} — point this at an engagement/campaign output directory.")
+    out = args.out or (src.rstrip("/\\") + ".zip")
+    res = bundle.bundle_directory(src, out)
+    if not res.get("ok"):
+        return _err(res.get("error", "could not build the bundle."))
+    print(f"{_c('Bundle written', '1')}: {res['path']}")
+    print(f"  {res['file_count']} file(s), {res.get('zip_bytes', 0)} bytes"
+          + (f", {len(res['skipped'])} skipped" if res.get("skipped") else ""))
+    return 0
+
+
 def _cmd_platforms(args: argparse.Namespace) -> int:
     from bughunter import report_formats
 
@@ -503,6 +522,8 @@ def build_parser() -> argparse.ArgumentParser:
     camp.add_argument("--max-pages", type=int, default=12, help="recon discovery cap (default 12)")
     camp.add_argument("--platform", default="hackerone",
                       help="report format for the submission packages: hackerone | yeswehack | bugcrowd | intigriti (see `gn platforms`)")
+    camp.add_argument("--deep", action="store_true",
+                      help="aggressive: implies --active + time-based blind SQLi, and auto-captures a screenshot + writes a brain-researched dossier for each confirmed lead")
     camp.add_argument("-y", "--authorize", action="store_true", help="confirm you are AUTHORIZED + in scope (required)")
     camp.add_argument("--json", action="store_true")
     camp.set_defaults(func=_cmd_campaign)
@@ -564,6 +585,11 @@ def build_parser() -> argparse.ArgumentParser:
     platforms = sub.add_parser("platforms", help="list report formats (HackerOne, YesWeHack, Bugcrowd, Intigriti)")
     platforms.add_argument("--json", action="store_true")
     platforms.set_defaults(func=_cmd_platforms)
+
+    bundle = sub.add_parser("bundle", help="zip an engagement folder (reports + evidence + screenshots) for download")
+    bundle.add_argument("path", help="the engagement/campaign output folder to zip")
+    bundle.add_argument("-o", "--out", default=None, help="output .zip path (default: <folder>.zip)")
+    bundle.set_defaults(func=_cmd_bundle)
 
     classes = sub.add_parser("classes", help="list vuln classes")
     classes.add_argument("--json", action="store_true")

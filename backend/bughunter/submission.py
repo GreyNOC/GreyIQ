@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import shutil
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -89,6 +90,18 @@ def write_submission_package(ctx: dict[str, Any], finding: dict[str, Any], out_d
         fsutil.write_text_safe(json_path, json.dumps(package, indent=2, default=str))
     except OSError:
         return None
+    # Co-locate the proof screenshot (if any) with the .md so its embedded
+    # ![](basename) reference resolves wherever the package folder is opened. The
+    # report embeds by basename, so keep the same name. Best-effort: a copy failure
+    # must not drop the package.
+    shot = str(finding.get("screenshot_path") or "").strip()
+    if shot:
+        src = Path(shot)
+        try:
+            if src.is_file() and src.resolve() != (out_dir / src.name).resolve():
+                shutil.copyfile(src, out_dir / src.name)
+        except OSError:
+            pass
     return {**package, "markdown_path": str(md_path), "json_path": str(json_path)}
 
 

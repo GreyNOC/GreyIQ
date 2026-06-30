@@ -21,7 +21,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from bughunter import active_verify_service, fsutil, ledger, learning, ranking, recon, submission
+from bughunter import (
+    active_verify_service,
+    fsutil,
+    ledger,
+    learning,
+    ranking,
+    recon,
+    research,
+    screenshot_service,
+    submission,
+)
 from bughunter.bounty import _classify, _infer_kind, _safe_slug, run_bounty_hunt
 from bughunter.settings import get_settings
 
@@ -73,6 +83,7 @@ def run_campaign(
     program: str | None = None,
     max_pages: int = 12,
     platform: str = "hackerone",
+    deep: bool = False,
     on_progress: Any = None,
 ) -> dict[str, Any]:
     """Run a full campaign. Returns {ok, campaign_path, json_path, urls_scanned,
@@ -137,7 +148,7 @@ def run_campaign(
         result = run_bounty_hunt(
             url, profile, None, str(out_root / "targets"), scope, True, coder_cfg,
             default_reports_dir=out_root / "targets", seed_dir=seed_dir, runtime_dir=runtime_dir,
-            version=version, run_live=live, active=active, time_based=time_based, auth=auth, per_finding=False,
+            version=version, run_live=live, active=active, time_based=(time_based or deep), auth=auth, per_finding=False,
             extra_params=recon_params,
         )
         per_target.append({"target": url, "ok": result.get("ok", False),
@@ -180,6 +191,32 @@ def run_campaign(
     program_stats = (learning.program_summary(rt, program, clean_target).get("class_stats") if rt is not None else {}) or {}
     ranking.rank_by_ev(consolidated, priors, program_stats)
     confirmed = [c for c in consolidated if c["proof_status"] == "confirmed"]
+
+    # --- DEEP mode: autonomously WORK each confirmed lead — capture a proof screenshot
+    # (scope-gated; degrades cleanly without Playwright) and write a brain-researched
+    # dossier (deterministic offline fallback). Both land in the campaign folder (so the
+    # downloadable bundle carries them) and the screenshot is embedded in the finding's
+    # submission package. Bounded so a big campaign can't launch unbounded browsers/calls.
+    if deep and confirmed:
+        _emit(f"deep: researching + capturing {min(len(confirmed), 8)} confirmed lead(s)…")
+        shot_dir = out_root / "screenshots"
+        research_dir = out_root / "research"
+        for index, item in enumerate(confirmed[:8], 1):
+            finding = item["finding"]
+            stem = f"{index:02d}-{_safe_slug(str(finding.get('ref') or 'finding'))}"
+            ictx = {"target": item.get("source_url") or clean_target, "scope": scope, "attack_plans": {}}
+            poc = screenshot_service.poc_url_for_finding(finding, ictx)
+            if poc:
+                shot = screenshot_service.capture_screenshot(poc, shot_dir / f"{stem}.png", scope=scope, authorized=True)
+                if shot.get("ok"):
+                    finding["screenshot_path"] = shot["path"]
+            try:
+                dossier = research.build_dossier(finding, ictx, coder_cfg)
+                rpath = research_dir / f"{stem}.md"
+                fsutil.write_text_safe(rpath, dossier["markdown"])
+                finding["research_path"] = str(rpath)
+            except Exception:  # noqa: BLE001 - enrichment is best-effort; never break the campaign
+                pass
 
     # --- Cross-run dedup: record every finding in the persistent ledger and learn
     # which were ALREADY reported in a prior run (so a re-run never re-files them). ---
