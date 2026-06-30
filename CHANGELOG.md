@@ -2,6 +2,24 @@
 
 Notable changes to GreyIQ.
 
+## v0.46.0
+
+### Phase C — IDOR discovery probe (single-session id mutation)
+Auto-discovers IDOR candidates so the dual-session confirm has something to point at:
+
+- `run_idor_probe` mutates the numeric ids in a URL — **path segments and query values,
+  including a URL carrying two ids** — and flags when a neighbouring id returns a DISTINCT
+  valid object (same template, different data) with the same session: a likely missing
+  per-object authorization.
+- **Candidate-grade and honest:** one session can't prove the neighbour belongs to another
+  tenant, so it explicitly points to the dual-session IDOR confirm. The neighbour body is
+  never embedded (proof is the differential). Identical/denied/different-page neighbours are
+  reported as enforced.
+- Wired: `POST /api/bounty/idor-probe`, `gn idor-probe <url> -y`, and a probe form in the
+  cockpit access-control view. A candidate caches as a run (the submit gate still refuses it).
+
+416 tests green (+7).
+
 ## v0.45.0
 
 ### Phase C — CSRF (missing anti-CSRF token, candidate-grade)
