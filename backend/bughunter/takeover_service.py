@@ -15,8 +15,11 @@ false positives near zero). Pure / frozen-safe (stdlib socket + the existing gua
 
 from __future__ import annotations
 
+import json
 import secrets
 import socket
+import urllib.error
+import urllib.request
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -63,6 +66,46 @@ def _target_host(target: str) -> str:
     if "://" in raw:
         return (urlparse(raw).hostname or "").lower()
     return raw.split("/", 1)[0].strip().lower()
+
+
+_CT_UA = "GreyIQ-BugHunter/ct"
+
+
+def _ct_fetch_json(url: str, *, timeout: float) -> Any:
+    req = urllib.request.Request(url, headers={"User-Agent": _CT_UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - fixed https crt.sh host
+        return json.loads(resp.read(4_000_000).decode("utf-8", "replace"))
+
+
+def cert_transparency_subdomains(apex: str, *, fetch_json: Callable[..., Any] | None = None,
+                                 timeout: float = 10.0, max_names: int = 200) -> list[str]:
+    """Seed subdomain enumeration from certificate-transparency logs (crt.sh). This is an
+    OSINT lookup the operator explicitly opted into — it queries the public CT logs for the
+    apex's issued certs, never the target itself. Returns a bounded, de-duplicated list of
+    hostnames under ``apex`` (wildcards stripped). Best-effort: any failure returns ``[]`` so
+    enumeration falls back to the wordlist + recon-discovered hosts."""
+    apex = str(apex or "").strip().lower().strip(".")
+    if not apex or "." not in apex:
+        return []
+    fetch_json = fetch_json or _ct_fetch_json
+    url = f"https://crt.sh/?q=%25.{apex}&output=json"
+    try:
+        data = fetch_json(url, timeout=timeout)
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return []
+    if not isinstance(data, list):
+        return []
+    names: set[str] = set()
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        for raw in str(row.get("name_value") or "").split("\n"):
+            h = raw.strip().lower().lstrip("*.").strip(".")
+            if h and (h == apex or h.endswith("." + apex)) and " " not in h and "@" not in h:
+                names.add(h)
+        if len(names) >= max_names:
+            break
+    return sorted(names)[:max_names]
 
 
 def _resolves(host: str) -> bool:
@@ -167,6 +210,8 @@ def scan_subdomain_takeover(
     extra_hosts: list[str] | None = None,
     max_check: int = 80,
     resolver: Callable[[str], bool] | None = None,
+    include_ct: bool = True,
+    ct_fetch_json: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Enumerate subdomains of ``target``'s apex (wordlist + recon-discovered hosts),
     resolve them, and confirm takeovers on the in-scope, resolving ones. Returns
@@ -186,6 +231,10 @@ def scan_subdomain_takeover(
     if not wildcard:
         candidates.update(f"{label}.{apex}" for label in _LABELS)
     candidates.update((h or "").strip().lower() for h in (extra_hosts or []) if (h or "").strip())
+    # Certificate-transparency seeding (crt.sh) — OSINT the operator opted into. Surfaces real
+    # subdomains the wordlist would miss (the highest-yield takeover source). Best-effort.
+    ct_hosts = cert_transparency_subdomains(apex, fetch_json=ct_fetch_json) if include_ct else []
+    candidates.update(ct_hosts)
 
     # Only ever touch hosts the operator put in scope (fail-closed), then resolve, then check.
     in_scope = [h for h in sorted(candidates) if host_in_active_scope(h, scope, settings)]
@@ -196,4 +245,4 @@ def scan_subdomain_takeover(
         if finding:
             findings.append(finding)
     return {"ok": True, "apex": apex, "candidates": len(candidates), "in_scope": len(in_scope),
-            "resolved": resolved, "findings": findings}
+            "ct_count": len(ct_hosts), "resolved": resolved, "findings": findings}
