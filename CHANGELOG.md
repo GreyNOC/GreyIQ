@@ -2,6 +2,22 @@
 
 Notable changes to GreyIQ.
 
+## v0.48.0
+
+### Phase C complete — DNS CNAME correlation for takeover (vendored mini-resolver)
+The last Phase C item: a minimal DNS-over-UDP CNAME resolver (stdlib `socket` only,
+frozen-safe — no dnspython), wired into the subdomain-takeover scan.
+
+- For each in-scope resolved subdomain, GreyIQ resolves its CNAME chain and correlates it with
+  known-takeoverable services (GitHub Pages, S3, Heroku, Fastly, Azure, Netlify, …). A CNAME to
+  such a service **enriches** a confirmed takeover (stronger proof), and a **dangling CNAME with
+  no body fingerprint** is surfaced as a medium **candidate** (the resource may be claimable)
+  for the operator to verify.
+- Bounded (max 40 lookups, short timeout); the lookup goes to a public resolver (the external
+  DNS the OS already uses), never the target. Best-effort — any failure falls back cleanly.
+
+435 tests green (+10). This completes the Phase C plan.
+
 ## v0.47.0
 
 ### Phase C — stored (persistent) XSS confirmation (assisted + opt-in send)
