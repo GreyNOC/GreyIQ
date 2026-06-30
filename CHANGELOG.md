@@ -2,6 +2,22 @@
 
 Notable changes to GreyIQ.
 
+## v0.51.0
+
+### Cockpit — in-app walkthroughs on the dense panels
+Every dense cockpit panel now carries a collapsible **walkthrough** that explains its
+prerequisites and the recommended order of operations — grounded in exactly what each tool
+does, and fail-closed safety notes included.
+
+- **Access control** (IDOR/BOLA · discovery probe · BFLA), the **Operator**, the **Surface**
+  tab (subdomain takeover + CVE fingerprinting), and the main **hunt** form each get a
+  "How this works — walkthrough" panel with prerequisites, a numbered flow, and a safety line.
+- One reusable, declarative component (`ckWalkthrough` + a per-panel spec) drives them, so the
+  pattern is trivial to drop onto future panels. Each remembers its own open/closed state; the
+  hunt form's starts collapsed (it's the primary, frequently-used form), the rest start open.
+
+443 tests green (UI-only change).
+
 ## v0.50.0
 
 ### BugHunter — screenshots resolve scope at capture time (edit-and-recapture)

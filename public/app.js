@@ -4992,6 +4992,7 @@ function ckCveForm() {
 function ckRenderSurface() {
   const host = ck.views.surface;
   host.replaceChildren();
+  host.append(ckWalkthrough("surface"));
   host.append(ckTakeoverForm());
   host.append(ckCveForm());
   const s = ckState.surface;
@@ -5021,6 +5022,123 @@ function ckTextareaField(label, placeholder) {
   return { wrap: w, input: ta };
 }
 
+// --- Reusable collapsible "walkthrough" for the cockpit's dense panels ------------
+// One declarative spec per panel (keyed below). Each renders a <details> the user can
+// fold; the open/closed choice persists per key so a panel a user closes stays closed.
+// Pure copy grounded in what each panel actually does — it never changes behaviour.
+//   spec = { summary, intro?, defaultOpen?, sections: [{ h4?, ordered?, list }], safety? }
+//   a list item is a string, or a ["Bold lead. ", "rest of the sentence"] tuple.
+const CK_WALKTHROUGHS = {
+  "access-control": {
+    summary: "How access-control testing works — walkthrough",
+    intro: "These checks prove broken access control with a real differential — never by showing another user's data. Each is GET-only and scope-bound (fail-closed): a host you don't name in Scope is skipped. Work them in this order.",
+    sections: [
+      { h4: "Before you start", list: [
+        "Two authorized test accounts you control on the SAME host (e.g. a high- and a low-privilege login).",
+        "Each account's session: its Cookie, plus any Authorization / extra header it needs.",
+        "The target host named in the Scope box of each panel — and written authorization to test it.",
+      ] },
+      { h4: "The flow", ordered: true, list: [
+        ["Scope. ", "Put the target host in the Scope box on each panel — it is the fail-closed gate; an unnamed host is refused."],
+        ["Discover — “IDOR discovery — single-session id probe”. ", "Paste one authenticated object URL with a numeric id + that account's session. GreyIQ mutates the id and flags a neighbouring DISTINCT object as a candidate."],
+        ["Confirm cross-tenant — “Access control — IDOR / BOLA”. ", "Give account A's object URL + session and account B's OWN object URL + session. Confirmed means B's session read A's object — the proof is the differential, not the data."],
+        ["Function-level — “Access control — BFLA”. ", "Give an admin-only endpoint + your high-privilege session and your low-privilege session. Confirmed when the low-privilege session reaches it; an anonymous control proves the endpoint is actually gated."],
+        ["Submit. ", "Confirmed findings (and the discovery probe's candidate) land in the Submissions tab — copy, download, or file them there. A borderline dual-session IDOR / BFLA result is reported inline with its differential, not added to Submissions."],
+      ] },
+    ],
+    safety: "Safety: only your own test accounts, only an in-scope host you are authorized to test. GreyIQ never displays or stores another user's data — a confirmed result is an identity/length differential.",
+  },
+  "hunt": {
+    summary: "How a hunt works — walkthrough",
+    defaultOpen: false,  // the primary, frequently-used form — start collapsed
+    intro: "GreyIQ hunts an authorized target, proves what it can with benign checks, and drafts a submission. A single hunt scans one target; a full campaign also maps the surface and works each confirmed lead. Default runs are passive — active probing only fires when you opt in AND name the host in Scope.",
+    sections: [
+      { h4: "Set the target", list: [
+        "Target — the authorized URL (or local repo path) to hunt.",
+        "Scope — name the host(s) you're allowed to probe; this is the fail-closed gate for every active check (an unnamed host stays passive-only).",
+        "Profile / Focus class — bias the hunt toward a program's payouts or a single bug class (single hunt only).",
+      ] },
+      { h4: "Choose how hard it probes", list: [
+        ["Test for proof of impact (active). ", "Fires one benign crafted request per check to turn a lead into a Confirmed proof. Off = passive only."],
+        ["Deep SQLi probe. ", "Adds a single bounded, time-based SLEEP check — opt-in, in-scope only."],
+        ["Dynamic browser pass (Playwright). ", "Renders the page in a real browser to catch client-side surface."],
+        ["Deep auto-work. ", "On a campaign, implies proof of impact + the time-based SQLi probe, then auto-captures a proof screenshot and writes a research dossier for each confirmed lead (needs the host in Scope)."],
+      ] },
+      { h4: "Run it", ordered: true, list: [
+        ["Authorize. ", "Tick “I'm authorized to test this target (in scope)” — no hunt runs until you do, and active checks need it too."],
+        ["Behind a login? ", "Open “Scan behind a login” and paste a session Cookie / headers so the hunt sees authenticated pages."],
+        ["Run. ", "Findings land in the Findings board with a proof-status column; click any row for the captured proof and a submission draft."],
+      ] },
+    ],
+    safety: "Authorized testing only. Active probes are benign and idempotent, and fire only at a host you named in Scope after you tick the authorization box.",
+  },
+  "operator": {
+    summary: "How the autonomous operator works — walkthrough",
+    intro: "The operator works a PORTFOLIO of programs unattended: for each enabled program it runs the full loop on a schedule — recon → hunt → prove → dedup → report. It only files findings when you've armed auto-submit, and the kill switch stops it instantly.",
+    sections: [
+      { h4: "Add a program", list: [
+        "Name + Scope — the hosts/wildcards you're authorized to test (the fail-closed gate; active and deep modes need a non-empty scope).",
+        "Seed targets — the URLs/hosts to hunt each cycle (each within scope).",
+        "Cadence + daily cap — how often it re-runs, and the most it may auto-submit per day.",
+        "HackerOne handle — required only if you want auto-submit.",
+      ] },
+      { h4: "Pick how hard it works each program", list: [
+        ["Active. ", "Capture proof of impact with benign crafted probes."],
+        ["Deep auto-work. ", "Adds time-based SQLi plus an auto proof-screenshot + research dossier per confirmed lead — needs the host in Scope."],
+        ["Auto-submit. ", "FILE confirmed, non-duplicate findings automatically — per-program opt-in, needs a handle, capped per day. Default off (review-only)."],
+      ] },
+      { h4: "Run it", ordered: true, list: [
+        ["Arm (optional). ", "Tick “Arm auto-submit” only if you want hands-off filing — every other gate still applies."],
+        ["Start. ", "It runs due programs sequentially; watch the Activity log and the Money pipeline funnel fill in."],
+        ["Kill switch. ", "Stop immediately at any time — it halts after the current step."],
+      ] },
+    ],
+    safety: "Auto-submit is triple-gated (armed + per-program opt-in + confirmed & non-duplicate + daily cap) and defaults to review-only. Starting confirms you're authorized to test every enabled program's scope.",
+  },
+  "surface": {
+    summary: "What the Surface tab does — walkthrough",
+    intro: "Map and pick apart a target's external surface. Two opt-in tools sit on top of the discovered-URL map; both are GET-only and scope-bound.",
+    sections: [
+      { h4: "Tools", list: [
+        ["Subdomain takeover. ", "Enumerate subdomains of an in-scope apex and confirm dangling-service takeovers (GitHub Pages, S3, Heroku, Fastly, …). No resource is ever claimed."],
+        ["Outdated components (CVE). ", "Fingerprint a page's front-end libraries and flag versions with known CVEs — confirm exploitability before submitting."],
+      ] },
+      { h4: "Surface map", list: [
+        "Run a full campaign to populate the discovered-URL list (with its robots / sitemap / security.txt sources).",
+        "Use those URLs as seed targets for a focused hunt or the access-control checks.",
+      ] },
+    ],
+    safety: "Both tools are GET-only and only ever act on a host you name in Scope.",
+  },
+};
+
+function ckWalkthrough(key) {
+  const spec = CK_WALKTHROUGHS[key];
+  if (!spec) return cel("span");  // unknown key — render nothing (defensive)
+  const storeKey = "greyiq.walkthrough." + key;
+  const box = cel("details", "ck-walkthrough");
+  const stored = localStorage.getItem(storeKey);
+  box.open = stored === null ? (spec.defaultOpen !== false) : stored !== "0";  // honour the user's choice once set
+  box.addEventListener("toggle", () => {
+    try { localStorage.setItem(storeKey, box.open ? "1" : "0"); } catch (_) {}
+  });
+  box.append(cel("summary", null, spec.summary));
+  if (spec.intro) box.append(cel("p", "ck-hint", spec.intro));
+  for (const sec of spec.sections || []) {
+    if (sec.h4) box.append(cel("h4", null, sec.h4));
+    const listEl = cel(sec.ordered ? "ol" : "ul", "ck-steps");
+    for (const item of sec.list || []) {
+      const li = cel("li");
+      if (Array.isArray(item)) { li.append(cel("strong", null, item[0])); li.append(document.createTextNode(item[1])); }
+      else li.append(document.createTextNode(item));
+      listEl.append(li);
+    }
+    box.append(listEl);
+  }
+  if (spec.safety) box.append(cel("p", "ck-hint", spec.safety));
+  return box;
+}
+
 // Access control (IDOR/BOLA) — dual-session cross-tenant read confirm. The operator
 // supplies their two authorized test accounts; the server proves B can read A's object.
 function ckRenderIdor() {
@@ -5029,6 +5147,7 @@ function ckRenderIdor() {
   host.append(cel("h2", "ck-section-title", "Access control — IDOR / BOLA"));
   host.append(cel("p", "ck-hint",
     "Confirm a cross-tenant read with your TWO authorized test accounts. Give account A's object URL + session and account B's OWN object URL + session on the same host. GET-only, scope-bound — another user's data is never shown or stored; the proof is the differential."));
+  host.append(ckWalkthrough("access-control"));
 
   const form = cel("form", "ck-learn-form");
   const urlA = ckField("Account A — object URL", "text", "");
@@ -5687,6 +5806,7 @@ async function ckRenderOperator() {
   host.replaceChildren();
   host.append(cel("h2", "ck-section-title", "Autonomous operator"));
   host.append(cel("p", "ck-hint", "Add the programs you're authorized to hunt, then arm the operator. It runs each program on its schedule — recon, hunt, prove, dedup, report — and (only when you explicitly arm auto-submit per program) files confirmed, non-duplicate findings within a daily cap. The kill switch stops it immediately."));
+  host.append(ckWalkthrough("operator"));
 
   let data = null;
   if (service.available || (await refreshServiceStatus({ silent: true }))) {
@@ -5980,6 +6100,8 @@ function bootCockpit() {
   ck.segCampaign?.addEventListener("click", () => ckSetRunType("campaign"));
   ck.profile?.addEventListener("change", () => { state.bountyProfile = ck.profile.value; saveState(); ckUpdateProfileHint(); });
   ck.launch?.addEventListener("submit", (e) => { e.preventDefault(); void ckRun(); });
+  // Drop the (collapsed-by-default) hunt walkthrough at the top of the launch form.
+  if (ck.launch) ck.launch.prepend(ckWalkthrough("hunt"));
   // Restore persisted form values.
   if (ck.target) ck.target.value = state.ckTarget || "";
   if (ck.scope) ck.scope.value = state.ckScope || "";

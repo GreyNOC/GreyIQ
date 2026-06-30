@@ -3015,6 +3015,14 @@ body[data-app-mode="hunt"] .cockpit {
 }
 .ck-steps { margin: 0 0 0.5rem; padding-left: 1.1rem; font-size: 0.82rem; line-height: 1.55; }
 .ck-steps li { margin-bottom: 0.25rem; }
+.ck-walkthrough { margin: 0.4rem 0 1rem; border: 1px solid var(--border); border-radius: 11px; background: var(--surface); padding: 0.2rem 0.85rem 0.65rem; }
+.ck-walkthrough > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 0.45rem; padding: 0.6rem 0; font-size: 0.82rem; font-weight: 600; color: var(--text); }
+.ck-walkthrough > summary::-webkit-details-marker { display: none; }
+.ck-walkthrough > summary::before { content: "\25B8"; font-size: 0.7rem; color: var(--accent); transition: transform 0.15s ease; }
+.ck-walkthrough[open] > summary::before { transform: rotate(90deg); }
+.ck-walkthrough[open] > summary { border-bottom: 1px solid var(--border); margin-bottom: 0.5rem; }
+.ck-walkthrough h4 { margin: 0.75rem 0 0.3rem; font-size: 0.78rem; color: var(--text); }
+.ck-walkthrough .ck-steps strong { color: var(--text); font-weight: 600; }
 .ck-obligation { border-left: 3px solid var(--sun); background: color-mix(in srgb, var(--sun) 8%, transparent); padding: 0.5rem 0.7rem; border-radius: 0 8px 8px 0; font-size: 0.82rem; }
 .ck-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.8rem; }
 .ck-btn { font: inherit; font-size: 0.8rem; cursor: pointer; padding: 0.45rem 0.8rem; border-radius: 9px; border: 1px solid var(--border); background: var(--surface); color: var(--text); }
