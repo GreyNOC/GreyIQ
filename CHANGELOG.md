@@ -2,6 +2,30 @@
 
 Notable changes to GreyIQ.
 
+## v0.34.0
+
+### QA hardening — fewer false positives, accurate severity (engine-wide audit)
+A multi-agent QA/QC audit of the whole engine drove a round of precision fixes so a
+"confirmed" finding stays trustworthy:
+
+- **Subdomain takeover:** removed two generic-404-grade fingerprints (Webflow, Heroku
+  "There's nothing here, yet.") that fire on normal sites, and now require an **error
+  (4xx/5xx) response** — a normal 200 page that merely *quotes* an "unclaimed" phrase no
+  longer confirms. Added **wildcard-DNS detection** (a catch-all record no longer makes
+  every label "resolve"), and reconciled the finding severity with its CVSS (high).
+- **OOB blind SSRF:** added a **pre-probe negative control** (the fresh, unguessable token
+  must be empty), confirm only on the token going 0→1 after the probe, **downgrade
+  callbacks from social unfurlers / search crawlers to a candidate** (generic HTTP-library
+  UAs, which a real SSRF backend uses, stay confirmed), and make a transient collaborator-
+  poll error non-fatal across params.
+- **Host-header injection:** a Host reflected only into the **response body** (common and
+  usually harmless) is now a low **candidate** with a proof obligation; only a Host
+  reflected into the **Location header** stays confirmed.
+- **Report taxonomy:** corrected the GraphQL Bugcrowd VRT (was a DNS-misconfig category)
+  and the XSS VRT (over-asserted "stored" → "reflected").
+
+325 tests green (4 new regression tests).
+
 ## v0.33.0
 
 ### Confirm blind bugs out-of-band (OOB collaborator)
