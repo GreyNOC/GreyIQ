@@ -281,6 +281,7 @@ from bughunter import bundle as bounty_bundle  # noqa: E402
 from bughunter import research as bounty_research  # noqa: E402
 from bughunter import access_control_service as bounty_access  # noqa: E402
 from bughunter import takeover_service as bounty_takeover  # noqa: E402
+from bughunter import oob_service as bounty_oob  # noqa: E402
 from bughunter import ledger as bounty_ledger  # noqa: E402
 from bughunter import portfolio as bounty_portfolio  # noqa: E402
 from bughunter.operator import OperatorLoop  # noqa: E402
@@ -568,6 +569,21 @@ class ResearchRequest(BaseModel):
 
 class TakeoverRequest(BaseModel):
     target: str = Field(min_length=1, max_length=4000)   # apex/host to enumerate
+    scope: str = Field(default="", max_length=2000)
+    platform: str = Field(default="hackerone", max_length=20)
+
+
+class OobConfigRequest(BaseModel):
+    collaborator_url: str = Field(default="", max_length=2000)
+    secret: str = Field(default="", max_length=400)
+
+
+class OobPollRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=64)
+
+
+class OobSsrfRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=4000)
     scope: str = Field(default="", max_length=2000)
     platform: str = Field(default="hackerone", max_length=20)
 
@@ -1524,6 +1540,72 @@ class GreyIQRuntime:
     def _hackerone_creds(self) -> tuple[str, str, str]:
         stored = _load_secrets()
         return (stored.get("hackerone.team_handle", ""), stored.get("hackerone.api_username", ""), stored.get("hackerone.api_token", ""))
+
+    # ---- OOB collaborator (out-of-band blind-bug confirmation) --------------------
+    def _oob_config(self) -> tuple[str, str]:
+        stored = _load_secrets()
+        return (stored.get("oob.collaborator_url", ""), stored.get("oob.secret", ""))
+
+    def oob_config_status(self) -> dict[str, Any]:
+        """Collaborator config for the UI — NEVER returns the secret, only its presence."""
+        url, secret = self._oob_config()
+        return {"ok": True, "collaborator_url": url, "has_secret": bool(secret)}
+
+    def save_oob_config(self, request: "OobConfigRequest") -> dict[str, Any]:
+        _store_secret("oob.collaborator_url", request.collaborator_url.strip())
+        if request.secret:  # don't clear the secret on an empty submit of the form
+            _store_secret("oob.secret", request.secret.strip())
+        return self.oob_config_status()
+
+    def oob_mint(self) -> dict[str, Any]:
+        """Mint a token + its callback URL to paste into a manual blind payload (XXE/XSS)."""
+        base, secret = self._oob_config()
+        if not base or not secret:
+            return {"ok": False, "error": "Configure the OOB collaborator URL + secret first."}
+        token = bounty_oob.mint_token()
+        return {"ok": True, "token": token, "callback_url": bounty_oob.callback_url(base, token)}
+
+    def oob_poll(self, request: "OobPollRequest") -> dict[str, Any]:
+        base, secret = self._oob_config()
+        return bounty_oob.poll_collaborator(base, secret, request.token)
+
+    def check_oob_ssrf(self, request: "OobSsrfRequest") -> dict[str, Any]:
+        """Confirm blind SSRF out-of-band: inject the collaborator callback into the
+        target's params, probe, and poll. A confirmed hit is cached as a run finding."""
+        from datetime import UTC, datetime
+
+        base, secret = self._oob_config()
+        res = bounty_oob.confirm_blind_ssrf(request.url, base=base, secret=secret, scope=request.scope)
+        if not res.get("ok"):
+            return res
+        if res.get("status") != "confirmed":
+            return {"ok": True, "status": res.get("status"), "reason": res.get("reason", ""), "params_tried": res.get("params_tried", [])}
+
+        finding = dict(res["finding"]); finding["ref"] = "F1"
+        plan = res["attack_plan"]
+        gen = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+        ctx = {"tool": "GreyIQ BugHunter", "version": VERSION, "generated_at": gen,
+               "target": request.url, "scope": request.scope, "attack_plans": {"F1": plan}}
+        platform = bounty_formats.normalize_platform(request.platform)
+        report_md = bounty_formats.render_finding(ctx, finding, platform)
+        safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
+        host = urlparse(request.url).hostname or "target"
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        out_dir = RUNTIME_DIR / "reports"
+        md_path = out_dir / f"oob-ssrf-{safe(host)}-{stamp}.md"
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            md_path.write_text(report_md, encoding="utf-8")
+            report_path = str(md_path)
+        except OSError:
+            report_path = ""
+        result = {"ok": True, "generated_at": gen, "findings": [finding], "attack_plans": {"F1": plan},
+                  "proof_of_impact": {"F1": {"status": "confirmed"}}, "report_path": report_path,
+                  "json_path": "", "output_dir": str(out_dir)}
+        self._cache_bounty_run(result, target=request.url, scope=request.scope, program=None)
+        return {"ok": True, "status": "confirmed", "run_id": result.get("run_id"), "ref": "F1",
+                "platform": platform, "report": report_md, "param": res.get("param"), "token": res.get("token"),
+                "title": finding["title"], "severity": finding["severity"]}
 
     # ---- Autonomous operator ------------------------------------------------------
     def _operator_run_campaign(self, target: str, *, scope: str, program: str, active: bool, live: bool,
@@ -2512,6 +2594,24 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/takeover":
             request = validate_payload(TakeoverRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.scan_takeover, request))
+            return
+        if method == "GET" and path == "/api/oob/config":
+            await send_json(send, await asyncio.to_thread(runtime.oob_config_status))
+            return
+        if method == "POST" and path == "/api/oob/config":
+            request = validate_payload(OobConfigRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.save_oob_config, request))
+            return
+        if method == "POST" and path == "/api/oob/mint":
+            await send_json(send, await asyncio.to_thread(runtime.oob_mint))
+            return
+        if method == "POST" and path == "/api/oob/poll":
+            request = validate_payload(OobPollRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.oob_poll, request))
+            return
+        if method == "POST" and path == "/api/bounty/oob-ssrf":
+            request = validate_payload(OobSsrfRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.check_oob_ssrf, request))
             return
         if method == "POST" and path == "/api/bounty/submit":
             request = validate_payload(SubmitRequest, await read_json_body(receive))

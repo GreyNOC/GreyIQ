@@ -5030,6 +5030,86 @@ function ckRenderIdor() {
   form.append(note);
   host.append(form);
   host.append(out);
+  host.append(ckOobPanel());
+}
+
+// Out-of-band (OOB) collaborator — config + mint + blind-SSRF confirm. Uses your own
+// collaborator (e.g. the greynoc-chat /oob endpoint on your phone). The secret is
+// write-only (only its presence is returned).
+function ckOobPanel() {
+  const wrap = cel("div");
+  wrap.append(cel("h2", "ck-section-title", "Out-of-band (OOB) — blind SSRF"));
+  wrap.append(cel("p", "ck-hint", "Confirm blind bugs with your own collaborator: the probe injects a unique callback URL and polls the collaborator for a hit. Configure your collaborator (e.g. your phone's tunnel), then auto-confirm blind SSRF, or mint a URL to paste into a manual XXE / blind-XSS payload."));
+
+  const cfg = cel("div", "ck-creds");
+  const head = cel("div", "ck-creds-head"); head.append(cel("strong", null, "Collaborator"));
+  const tag = cel("span", "ck-tag", "…"); head.append(tag); cfg.append(head);
+  const form = cel("form", "ck-learn-form");
+  const url = ckField("Collaborator base URL (e.g. https://chat.example)", "text", "");
+  const secret = ckField("OOB secret", "password", "");
+  secret.input.placeholder = "paste secret";
+  form.append(url.wrap, secret.wrap);
+  const save = cel("button", "ck-btn primary", "Save"); save.type = "submit"; form.append(save);
+  const note = cel("p", "ck-status"); note.style.flexBasis = "100%";
+  apiFetch("/api/oob/config", { timeoutMs: 6000 }).then((s) => {
+    if (s && s.ok) {
+      url.input.value = s.collaborator_url || "";
+      tag.textContent = (s.has_secret && s.collaborator_url) ? "configured" : "not configured";
+      secret.input.placeholder = s.has_secret ? "•••••• (saved — blank keeps it)" : "paste secret";
+    }
+  }).catch(() => {});
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      const s = await apiFetch("/api/oob/config", { method: "POST", body: JSON.stringify({ collaborator_url: url.input.value.trim(), secret: secret.input.value }) });
+      tag.textContent = (s && s.has_secret && s.collaborator_url) ? "configured" : "not configured";
+      note.classList.remove("is-error"); note.textContent = "Saved."; secret.input.value = "";
+    } catch (err) { note.classList.add("is-error"); note.textContent = err.message || "Could not save."; }
+  });
+  form.append(note); cfg.append(form); wrap.append(cfg);
+
+  const mintBar = cel("div", "ck-actions");
+  const mintBtn = cel("button", "ck-btn", "Mint callback URL"); mintBtn.type = "button";
+  const mintOut = cel("p", "ck-hint"); mintOut.style.flexBasis = "100%";
+  mintBtn.addEventListener("click", async () => {
+    try {
+      const m = await apiFetch("/api/oob/mint", { method: "POST", body: "{}" });
+      mintOut.textContent = (m && m.ok) ? `Paste into a payload: ${m.callback_url}  (token ${m.token})` : ((m && m.error) || "Configure the collaborator first.");
+    } catch (err) { mintOut.textContent = err.message || "Mint failed."; }
+  });
+  mintBar.append(mintBtn); wrap.append(mintBar); wrap.append(mintOut);
+
+  const sform = cel("form", "ck-learn-form");
+  const turl = ckField("Target URL (with a server-side-fetch parameter)", "text", "");
+  const tscope = ckField("Scope (name the host)", "text", state.ckScope || "");
+  sform.append(turl.wrap, tscope.wrap);
+  const run = cel("button", "ck-btn primary", "Confirm blind SSRF"); run.type = "submit"; sform.append(run);
+  const snote = cel("p", "ck-status"); snote.style.flexBasis = "100%";
+  const sout = cel("div", "ck-research");
+  sform.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!turl.input.value.trim()) { snote.classList.add("is-error"); snote.textContent = "Enter a target URL."; return; }
+    const label = run.textContent; run.disabled = true; run.textContent = "Probing…";
+    snote.classList.remove("is-error"); snote.textContent = ""; sout.replaceChildren();
+    try {
+      const res = await apiFetch("/api/bounty/oob-ssrf", { method: "POST", timeoutMs: 90000, body: JSON.stringify({ url: turl.input.value.trim(), scope: tscope.input.value.trim(), platform: ckState.platform || "hackerone" }) });
+      if (!res || res.ok === false) {
+        snote.classList.add("is-error"); snote.textContent = (res && res.error) || "Probe failed.";
+      } else if (res.status === "confirmed") {
+        sout.append(cel("p", "ck-ftitle", `✅ Blind SSRF CONFIRMED via '${res.param}'`));
+        ckState.runId = res.run_id || ckState.runId;
+        ckState.findings = [{ ref: "F1", title: res.title || "Blind SSRF", severity: res.severity || "high", proof: "confirmed", className: "Server-side request forgery (SSRF)", cwe: "CWE-918", plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" }];
+        ckBadgeCount("submissions", 1);
+        if (res.report) { const pre = cel("pre", "ck-research-md"); pre.textContent = res.report; pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "320px"; pre.style.overflow = "auto"; sout.append(pre); }
+        sout.append(cel("p", "ck-hint", "Added to Submissions."));
+      } else {
+        snote.textContent = `No out-of-band callback observed (${res.status}). ${res.reason || ""}`;
+      }
+    } catch (err) { snote.classList.add("is-error"); snote.textContent = err.message || "Probe failed."; }
+    finally { run.disabled = false; run.textContent = label; }
+  });
+  wrap.append(sform); wrap.append(snote); wrap.append(sout);
+  return wrap;
 }
 
 function ckRenderSubmissions() {
