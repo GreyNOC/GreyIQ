@@ -415,6 +415,31 @@ def _cmd_takeover(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_cve(args: argparse.Namespace) -> int:
+    from bughunter import cve_service as cv
+
+    if not args.authorize:
+        return _err("fetching the target to fingerprint its components touches an in-scope host — pass -y/--authorize.")
+    res = cv.scan_known_cves(args.target, scope=args.scope or "")
+    if not res.get("ok"):
+        return _err(res.get("error", "could not run the scan."))
+    comps = res.get("components") or []
+    print(f"{_c('Known-CVE scan', '1')} — {res.get('host')}: {len(comps)} fingerprinted component(s)")
+    findings = res.get("findings") or []
+    if not findings:
+        print("  no outdated components with known CVEs found.")
+        if args.json:
+            print(json.dumps(res, indent=2, default=str))
+        return 0
+    for f in findings:
+        print(_c(f"  OUTDATED: {f['title']}", "33"))
+        for ln in f.get("_cve_summary_lines", []):
+            print(f"    - {ln}")
+    if args.json:
+        print(json.dumps(res, indent=2, default=str))
+    return 0
+
+
 def _cmd_idor(args: argparse.Namespace) -> int:
     from datetime import UTC, datetime
     from pathlib import Path
@@ -662,6 +687,13 @@ def build_parser() -> argparse.ArgumentParser:
     takeover.add_argument("--json", action="store_true")
     takeover.add_argument("-y", "--authorize", action="store_true", help="confirm the apex is in scope (required)")
     takeover.set_defaults(func=_cmd_takeover)
+
+    cvescan = sub.add_parser("cve", help="fingerprint a page's front-end libraries and flag outdated components with known CVEs")
+    cvescan.add_argument("target", help="URL/host to fetch and fingerprint (e.g. https://app.example.com)")
+    cvescan.add_argument("-s", "--scope", default="", help="scope (name the host/wildcard to allow testing)")
+    cvescan.add_argument("--json", action="store_true")
+    cvescan.add_argument("-y", "--authorize", action="store_true", help="confirm the host is in scope (required)")
+    cvescan.set_defaults(func=_cmd_cve)
 
     idor = sub.add_parser("idor", help="confirm IDOR / broken access control with TWO of your authorized test accounts")
     idor.add_argument("url_a", help="account A's object URL (e.g. https://app/api/order/1001)")

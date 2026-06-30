@@ -283,6 +283,7 @@ from bughunter import bundle as bounty_bundle  # noqa: E402
 from bughunter import research as bounty_research  # noqa: E402
 from bughunter import access_control_service as bounty_access  # noqa: E402
 from bughunter import takeover_service as bounty_takeover  # noqa: E402
+from bughunter import cve_service as bounty_cve  # noqa: E402
 from bughunter import oob_service as bounty_oob  # noqa: E402
 from bughunter import ledger as bounty_ledger  # noqa: E402
 from bughunter import portfolio as bounty_portfolio  # noqa: E402
@@ -571,6 +572,12 @@ class ResearchRequest(BaseModel):
 
 class TakeoverRequest(BaseModel):
     target: str = Field(min_length=1, max_length=4000)   # apex/host to enumerate
+    scope: str = Field(default="", max_length=2000)
+    platform: str = Field(default="hackerone", max_length=20)
+
+
+class CveScanRequest(BaseModel):
+    target: str = Field(min_length=1, max_length=4000)   # URL/host whose components to fingerprint
     scope: str = Field(default="", max_length=2000)
     platform: str = Field(default="hackerone", max_length=20)
 
@@ -1394,8 +1401,13 @@ class GreyIQRuntime:
         except OSError:
             report_path, json_out = "", ""
 
+        # Per-ref proof status mirrors each plan's own proof_of_impact.status (defaults to
+        # confirmed for the active confirm routes; "candidate" for version-fingerprint runs
+        # like known-CVE) so the cached run never overstates a candidate as confirmed. The
+        # submit gate independently recomputes this from the finding/plan, so this is
+        # informational — but it must still be accurate.
         result = {"ok": True, "generated_at": gen, "findings": findings, "attack_plans": plans,
-                  "proof_of_impact": {ref: {"status": "confirmed"} for ref in plans},
+                  "proof_of_impact": {ref: {"status": str(((plans.get(ref) or {}).get("proof_of_impact") or {}).get("status", "confirmed"))} for ref in plans},
                   "report_path": report_path, "json_path": json_out, "output_dir": str(out_dir)}
         self._cache_bounty_run(result, target=target, scope=scope, program=None)
         return {"run_id": result.get("run_id"), "platform": platform, "report": report_md,
@@ -1430,6 +1442,37 @@ class GreyIQRuntime:
         # (CVSS-preferred) value written back onto each finding, not the raw scanner label.
         summary["findings"] = [{"title": f["title"], "severity": f["severity"],
                                 "service": f.get("_takeover_service"), "location": f["location"]} for f in findings]
+        return summary
+
+    @_confirm_route
+    def scan_cve(self, request: "CveScanRequest") -> dict[str, Any]:
+        """Fingerprint the target's front-end library versions and flag outdated components
+        with known CVEs. These are version-fingerprint CANDIDATES (not confirmed exploits):
+        each is cached as a run so the operator can export the outdated-component report /
+        bundle, but the hard submit gate (which recomputes proof_status) will refuse to
+        auto-file a candidate. GET-only, in-scope, SSRF-guarded."""
+        res = bounty_cve.scan_known_cves(request.target, scope=request.scope)
+        if not res.get("ok"):
+            return res
+        findings = res.get("findings") or []
+        summary = {"ok": True, "host": res.get("host"), "target": res.get("target"),
+                   "components": res.get("components") or [], "count": len(findings), "run_id": None,
+                   "findings": [{"title": f["title"], "severity": f["severity"],
+                                 "product": f.get("_cve_product"), "location": f["location"]} for f in findings]}
+        if not findings:
+            return summary
+
+        plans: dict[str, Any] = {}
+        for i, f in enumerate(findings, 1):
+            f["ref"] = f"F{i}"
+            plans[f["ref"]] = bounty_cve.build_plan(f)
+        persisted = self._persist_finding_run(
+            findings=findings, plans=plans, target=request.target, scope=request.scope,
+            platform=request.platform, slug="cve", host=res.get("host"))
+        summary["run_id"] = persisted["run_id"]
+        summary["report"] = persisted["report"]
+        summary["findings"] = [{"title": f["title"], "severity": f["severity"],
+                                "product": f.get("_cve_product"), "location": f["location"]} for f in findings]
         return summary
 
     @_confirm_route
@@ -2601,6 +2644,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/takeover":
             request = validate_payload(TakeoverRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.scan_takeover, request))
+            return
+        if method == "POST" and path == "/api/bounty/cve":
+            request = validate_payload(CveScanRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.scan_cve, request))
             return
         if method == "GET" and path == "/api/oob/config":
             await send_json(send, await asyncio.to_thread(runtime.oob_config_status))

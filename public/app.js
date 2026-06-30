@@ -4927,10 +4927,69 @@ function ckTakeoverForm() {
   return wrap;
 }
 
+function ckCveForm() {
+  const wrap = cel("div", "ck-creds");
+  const head = cel("div", "ck-creds-head");
+  head.append(cel("strong", null, "Known-CVE components"));
+  wrap.append(head);
+  wrap.append(cel("p", "ck-hint", "Fingerprint a page's front-end libraries (jQuery, Lodash, Bootstrap, Moment, AngularJS, Handlebars, DOMPurify) and flag outdated versions with known CVEs. These are version-fingerprint candidates — confirm exploitability before submitting. GET-only, scope-bound."));
+  const form = cel("form", "ck-learn-form");
+  const target = ckField("URL / host (e.g. https://app.example.com)", "text", "");
+  const scope = ckField("Scope (host / wildcard)", "text", state.ckScope || "");
+  form.append(target.wrap, scope.wrap);
+  const run = cel("button", "ck-btn primary", "Scan components");
+  run.type = "submit";
+  form.append(run);
+  const note = cel("p", "ck-status"); note.style.flexBasis = "100%";
+  const out = cel("div", "ck-research");
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!target.input.value.trim()) { note.classList.add("is-error"); note.textContent = "Enter a URL/host to scan."; return; }
+    const label = run.textContent;
+    run.disabled = true; run.textContent = "Scanning…";
+    note.classList.remove("is-error"); note.textContent = ""; out.replaceChildren();
+    try {
+      const res = await apiFetch("/api/bounty/cve", {
+        method: "POST", timeoutMs: 120000,
+        body: JSON.stringify({ target: target.input.value.trim(), scope: scope.input.value.trim(), platform: ckState.platform || "hackerone" })
+      });
+      if (!res || res.ok === false) {
+        note.classList.add("is-error"); note.textContent = (res && res.error) || "Scan failed.";
+      } else {
+        note.textContent = `${(res.components || []).length} component(s) fingerprinted · ${res.count} outdated with known CVEs.`;
+        if (res.count > 0) {
+          ckState.runId = res.run_id || ckState.runId;
+          for (const f of (res.findings || [])) out.append(cel("p", "ck-ftitle", "⚠ " + f.title));
+          ckState.findings = (res.findings || []).map((f, i) => ({
+            ref: `F${i + 1}`, title: f.title, severity: f.severity || "medium", proof: "candidate",
+            className: "Vulnerable / outdated component", cwe: "", plan: {}, cvss: {},
+            proofObj: { status: "candidate" }, description: ""
+          }));
+          ckBadgeCount("submissions", ckState.findings.length);
+          if (res.report) {
+            const pre = cel("pre", "ck-research-md");
+            pre.textContent = res.report;
+            pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "320px"; pre.style.overflow = "auto";
+            out.append(pre);
+          }
+          out.append(cel("p", "ck-hint", "Added to Submissions as candidates — Copy report / Download work; Submit stays gated until you confirm exploitability."));
+        }
+      }
+    } catch (err) {
+      note.classList.add("is-error"); note.textContent = err.message || "Scan failed.";
+    } finally {
+      run.disabled = false; run.textContent = label;
+    }
+  });
+  form.append(note); wrap.append(form); wrap.append(out);
+  return wrap;
+}
+
 function ckRenderSurface() {
   const host = ck.views.surface;
   host.replaceChildren();
   host.append(ckTakeoverForm());
+  host.append(ckCveForm());
   const s = ckState.surface;
   if (!s || !(s.urls || []).length) {
     host.append(cel("p", "ck-hint", "Run a full campaign to map the target's surface (discovered URLs, robots/sitemap/security.txt sources)."));
