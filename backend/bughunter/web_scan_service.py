@@ -187,6 +187,25 @@ def _guard_url(url: str, allow_private: bool, allowed_ports: frozenset[int]) -> 
     return urlunparse(parsed._replace(netloc=netloc))
 
 
+def playwright_request_allowed(url: str, allow_private: bool, allowed_ports: frozenset[int]) -> bool:
+    """True if a Playwright page's request to ``url`` should be allowed through. Shared by
+    every module that drives a real browser (screenshot_service, live_scan_service): bind
+    this as a ``context.route("**/*", ...)`` handler so the SSRF/private-host/port guard is
+    re-applied to EVERY request the page makes — the document navigation (including
+    redirects) and every sub-resource — not just the initial URL. Without this, a redirect
+    or an embedded resource could drive the browser to a private/internal host the initial
+    guard already blocked (the guard would otherwise only ever see the URL passed to
+    ``page.goto``). Non-http(s) schemes (data:/blob:/about:) are not network egress and are
+    always allowed through; this function never raises."""
+    if not url.startswith(("http://", "https://")):
+        return True
+    try:
+        _guard_url(url, allow_private, allowed_ports)
+        return True
+    except WebsiteFetchError:
+        return False
+
+
 class _GuardedRedirect(HTTPRedirectHandler):
     """Re-validate every redirect target through the same guard so a 30x bounce
     cannot escape the policy (DNS rebinding, cross-protocol, internal hop). When an

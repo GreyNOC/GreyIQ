@@ -216,16 +216,24 @@ _HTTP_RESULT_RE = re.compile(r"\bHTTP\s*[1-5]\d{2}\b|\b(?:returned|response|stat
 
 def _has_captured_artifact(finding: dict[str, Any], proof: Any, observed_result: str) -> bool:
     """True only when there is a REAL captured artifact proving IMPACT — never from
-    narrative prose alone. NOTE: the passive web ``proof_evidence`` (request line +
-    'header absent' + response status) is deliberately NOT counted here: it proves a
-    GET happened, not security impact, so letting it satisfy this gate would let
-    brain prose flip a hardening finding to 'confirmed'. Only genuinely
-    impact-proving artifacts qualify."""
+    narrative prose alone, and never from a bare explicit status. NOTE: the passive web
+    ``proof_evidence`` (request line + 'header absent' + response status) is deliberately
+    NOT counted here: it proves a GET happened, not security impact, so letting it satisfy
+    this gate would let brain prose flip a hardening finding to 'confirmed'. Only
+    genuinely impact-proving artifacts qualify.
+
+    A populated ``observed_result`` AND ``control_result`` pair is the actual
+    distinguishing signal: every active-prover confirmed check (active_verify_service.py)
+    sets BOTH — a captured response plus its negative-control differential — whereas a
+    brain (possibly hallucinating, or echoing scanned-page prompt-injection) writing a bare
+    ``status: confirmed`` with vague prose essentially never supplies a real differential.
+    This keeps an explicit status from single-handedly flipping proof_status (and the
+    auto-submit gate behind it) without backing evidence."""
     if _jwt_replay_value(finding) is True:
         return True
     if finding.get("secret_hits"):
         return True
-    if isinstance(proof, dict) and proof.get("proof_evidence"):
+    if isinstance(proof, dict) and str(proof.get("observed_result") or "").strip() and str(proof.get("control_result") or "").strip():
         return True
     if observed_result and _HTTP_RESULT_RE.search(observed_result):
         return True
@@ -280,7 +288,13 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
     combined = f"{detail['evidence']} {detail['observed_result']}".strip()
     explicit_status = _explicit_proof_status(finding, plan, proof)
     artifact = _has_captured_artifact(finding, proof, str(detail["observed_result"]))
-    if explicit_status:
+    if explicit_status == "confirmed":
+        # An explicit 'confirmed' — from the active prover, an attack plan, or the brain —
+        # is honored ONLY when a real captured artifact backs it. Brain/plan prose alone
+        # caps at 'candidate', so a narrative status can never flip a finding to confirmed
+        # (and through the auto-submit gate) without proof.
+        detail["status"] = "confirmed" if artifact else "candidate"
+    elif explicit_status:
         detail["status"] = explicit_status
     elif artifact and _proof_text_is_concrete(combined):
         detail["status"] = "confirmed"

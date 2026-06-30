@@ -90,6 +90,17 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(f["stages"]["confirmed"], 0)
         self.assertEqual(f["stages"]["discovered"], 1)
 
+    def test_is_submitted_requires_a_real_submission_not_just_reported(self) -> None:
+        item = _item("C1", "xss", "r", "https://x/a")
+        ledger.upsert_findings(self.rt, "acme", "https://x", [item])
+        ledger.mark_reported(self.rt, "acme", "https://x", item["finding"])
+        # 'reported' (a local package was built) is NOT a submission — must stay False so
+        # the operator's auto-submit gate can still file it.
+        self.assertFalse(ledger.is_submitted(self.rt, "acme", "https://x", item["finding"]))
+        self.assertTrue(ledger.is_duplicate(self.rt, "acme", "https://x", item["finding"]))  # is_duplicate is the broader check
+        ledger.record_submission(self.rt, "acme", "https://x", item["dedup_key"], "R1", "u")
+        self.assertTrue(ledger.is_submitted(self.rt, "acme", "https://x", item["finding"]))
+
     def test_recent_submission_throttle_count(self) -> None:
         item = _item("C1", "xss", "r", "https://x/a")
         ledger.upsert_findings(self.rt, "acme", "https://x", [item])
@@ -161,6 +172,22 @@ class OperatorCycleTests(unittest.TestCase):
 
     def test_armed_auto_submit_files_confirmed(self) -> None:
         s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=self._run_campaign_fn, submit_fn=self._submit_fn)
+        self.assertEqual(len(self.submits), 1)
+        self.assertEqual(s["submitted"], 1)
+
+    def test_armed_auto_submit_files_even_after_campaign_marks_reported(self) -> None:
+        # The REAL campaign.py marks a confirmed finding 'reported' (ledger.mark_reported)
+        # the SAME cycle it builds a local submission package — before run_program_cycle
+        # ever gets to check the ledger. The auto-submit gate must key off is_submitted
+        # (stage >= submitted), not is_duplicate (stage >= reported, which mark_reported
+        # alone already satisfies) — otherwise auto-submit could never file anything.
+        def run_fn(target, *, scope, program, active, live, deep=False, max_pages=12):
+            f = _finding("C1", "xss", "active.reflected-xss", f"{target}/?q=", proof="confirmed")
+            ledger.upsert_findings(self.rt, program, target, [{"finding": f, "source_url": f["location"],
+                                                               "proof_status": "confirmed", "cvss": {"base_score": 6.1}}])
+            ledger.mark_reported(self.rt, program, target, f)  # simulates building the submission package
+            return {"ok": True, "run_id": "run-1", "findings": [f], "proof_of_impact": {"C1": {"status": "confirmed"}}}
+        s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=run_fn, submit_fn=self._submit_fn)
         self.assertEqual(len(self.submits), 1)
         self.assertEqual(s["submitted"], 1)
 

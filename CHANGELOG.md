@@ -2,6 +2,45 @@
 
 Notable changes to GreyIQ.
 
+## v0.53.0
+
+### Safety hardening — 7 fail-open faults fixed (QAQC pass)
+A 50-agent fault-hunt + adversarial-verification pass over the whole codebase confirmed 31
+real faults; the 7 high-severity ones are fixed here. Several share one root cause:
+**redirects and sub-resources weren't re-checked against the scope/SSRF gate** — only the
+initial URL was.
+
+- **Deep mode now reports honestly.** `deep=True` already silently enabled the active pass
+  (incl. the opt-in time-based SQLi SLEEP probe) via `time_based`, but the campaign report
+  recorded `active: off`. It now derives one honest `effective_active = active or
+  time_based or deep` for both the probe and the report.
+- **Stored-XSS auto-send no longer leaks the session off-host.** The view-host session is
+  now attached to the inject-URL POST only when it's same-site (`scan_auth.auth_headers_for`)
+  — the inject URL can legitimately be a different in-scope host than the view URL.
+- **Operator auto-submit no longer dead-locks itself.** It gated on `ledger.is_duplicate`
+  (stage ≥ reported), but building a local submission package marks a finding "reported"
+  in the same cycle — so armed auto-submit could never actually file anything. It now uses
+  a new `ledger.is_submitted` (stage ≥ submitted); only a real prior submission blocks a
+  re-file.
+- **Screenshot capture re-guards every redirect/sub-resource** (not just the initial URL)
+  against the SSRF/private-host/port guard, and discards the capture if the final page
+  left scope.
+- **The "confirmed" proof gate no longer trusts a bare explicit status.** A
+  `proof_of_impact.status: "confirmed"` from a brain (possibly hallucinating, or echoing a
+  scanned page's prompt injection) now requires a real captured artifact — concretely, the
+  `observed_result` + `control_result` differential pair every active-prover check actually
+  produces — before it can flip a finding to confirmed (and through the auto-submit gate).
+- **The live (Playwright) scanner re-guards every redirect/sub-resource** the same way.
+- **Submissions/research/screenshot now key off the finding's OWN run**, not whatever ran
+  most recently — fixes submitting/copying the wrong report after running a follow-up tool
+  (IDOR/BFLA/stored-XSS/takeover/CVE) on top of an earlier hunt's findings.
+
+A new `web_scan_service.playwright_request_allowed` helper centralizes the redirect/
+sub-resource re-guard so screenshot capture and the live scanner share one tested
+implementation.
+
+471 tests green (+12).
+
 ## v0.52.0
 
 ### Operator — import targets from CSV, Burp Suite XML, or HAR

@@ -117,8 +117,21 @@ class DeterministicProofTests(unittest.TestCase):
         self.assertEqual(report_lib._proof_of_impact_detail(f, prose)["status"], "candidate")
         artifact = {"proof_of_impact": {"observed_result": "HTTP 200 returned the order owned by account A"}}
         self.assertEqual(report_lib._proof_of_impact_detail(f, artifact)["status"], "confirmed")
-        explicit = {"proof_of_impact": {"status": "confirmed", "evidence": "captured response attached"}}
-        self.assertEqual(report_lib._proof_of_impact_detail(f, explicit)["status"], "confirmed")
+        # An explicit 'confirmed' status WITH a real observed_result/control_result
+        # differential (what every active-prover check actually produces) stays confirmed.
+        explicit_with_artifact = {"proof_of_impact": {
+            "status": "confirmed", "evidence": "captured response attached",
+            "observed_result": "the payload reflected unescaped", "control_result": "a plain marker reflected too",
+        }}
+        self.assertEqual(report_lib._proof_of_impact_detail(f, explicit_with_artifact)["status"], "confirmed")
+
+    def test_explicit_confirmed_status_without_artifact_downgrades_to_candidate(self) -> None:
+        # A bare explicit 'confirmed' status with no real captured differential (exactly
+        # what a hallucinating or prompt-injected brain could emit) must NOT single-
+        # handedly flip proof_status — that would bypass the auto-submit confirm gate.
+        f = {"ref": "F1", "class_id": "access-control", "rule_id": "x"}
+        explicit_no_artifact = {"proof_of_impact": {"status": "confirmed", "evidence": "captured response attached"}}
+        self.assertEqual(report_lib._proof_of_impact_detail(f, explicit_no_artifact)["status"], "candidate")
 
     def test_passive_web_proof_evidence_does_not_satisfy_confirm_gate(self) -> None:
         # A hardening finding carrying only PASSIVE proof_evidence (request line +

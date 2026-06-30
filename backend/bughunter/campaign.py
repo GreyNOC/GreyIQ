@@ -143,6 +143,12 @@ def run_campaign(
         recon_notes, recon_sources = [], {}
 
     # --- Hunt each target with the full engine. ---
+    # `deep` and `time_based` BOTH trigger the (already-gated, scope-bound) active pass in
+    # run_bounty_hunt (it runs on `active or time_based`, and deep forces time_based on), so
+    # the honest "did active probing run" flag is their union. Use it for the per-target run
+    # AND the campaign report so the report can never claim "active: off" while an executing
+    # probe (e.g. the deep-mode time-based SLEEP) actually fired.
+    effective_active = bool(active or time_based or deep)
     per_target: list[dict[str, Any]] = []
     consolidated: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
@@ -152,7 +158,7 @@ def run_campaign(
         result = run_bounty_hunt(
             url, profile, None, str(out_root / "targets"), scope, True, coder_cfg,
             default_reports_dir=out_root / "targets", seed_dir=seed_dir, runtime_dir=runtime_dir,
-            version=version, run_live=live, active=active, time_based=(time_based or deep), auth=auth, per_finding=False,
+            version=version, run_live=live, active=effective_active, time_based=(time_based or deep), auth=auth, per_finding=False,
             extra_params=recon_params,
         )
         per_target.append({"target": url, "ok": result.get("ok", False),
@@ -302,7 +308,7 @@ def run_campaign(
     # --- Campaign index report + JSON. ---
     ctx_meta = {
         "target": clean_target, "program": prog_key, "kind": kind, "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
-        "version": version, "active": active, "scope": scope, "urls": urls, "recon_notes": recon_notes,
+        "version": version, "active": effective_active, "scope": scope, "urls": urls, "recon_notes": recon_notes,
         "recon_sources": recon_sources, "intel": intel, "consolidated": consolidated, "confirmed": confirmed,
         "per_target": per_target, "submission_count": len(submission_paths),
     }

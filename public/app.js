@@ -4417,6 +4417,7 @@ function ckNormalizeFindings(res) {
     const cvss = cvssMap[ref] || f.cvss || null;
     return {
       ref,
+      runId: String(res.run_id || ""),   // the run this finding belongs to (submit/copy/screenshot use THIS, not the latest)
       rank: f.rank || i + 1,
       title: String(f.title || "Finding"),
       severity: String(f.severity || "info").toLowerCase(),
@@ -4682,7 +4683,7 @@ function ckRenderDetail(f) {
 }
 
 async function ckResearchLead(f, btn, wrap) {
-  if (!ckState.runId) {
+  if (!(f.runId || ckState.runId)) {
     wrap.replaceChildren(cel("p", "ck-status is-error", "Run a hunt first — research attaches to a cached finding."));
     return;
   }
@@ -4692,7 +4693,7 @@ async function ckResearchLead(f, btn, wrap) {
   wrap.replaceChildren();
   try {
     const res = await apiFetch("/api/bounty/research", {
-      method: "POST", timeoutMs: 120000, body: JSON.stringify({ run_id: ckState.runId, ref: f.ref })
+      method: "POST", timeoutMs: 120000, body: JSON.stringify({ run_id: f.runId || ckState.runId, ref: f.ref })
     });
     if (res && res.ok) {
       btn.textContent = "Re-research lead";
@@ -4717,7 +4718,7 @@ async function ckResearchLead(f, btn, wrap) {
 }
 
 async function ckCaptureScreenshot(f, btn, wrap) {
-  if (!ckState.runId) {
+  if (!(f.runId || ckState.runId)) {
     wrap.replaceChildren(cel("p", "ck-status is-error", "Run a hunt first — screenshots attach to a cached finding."));
     return;
   }
@@ -4730,7 +4731,7 @@ async function ckCaptureScreenshot(f, btn, wrap) {
       // Send the cockpit's CURRENT Scope box too, so adding the host and re-capturing
       // works without re-running the whole hunt (the server unions it with the run +
       // live program scope and still fails closed via host_in_active_scope).
-      body: JSON.stringify({ run_id: ckState.runId, ref: f.ref, scope: (ck.scope?.value || "").trim() })
+      body: JSON.stringify({ run_id: f.runId || ckState.runId, ref: f.ref, scope: (ck.scope?.value || "").trim() })
     });
     if (res && res.ok) {
       btn.textContent = "Re-capture screenshot";
@@ -4805,11 +4806,12 @@ async function ckCopy(text) {
 // finding. Falls back to the client draft only when the server package is
 // unavailable (e.g. the run was evicted) so offline still works.
 async function ckSubmissionMarkdown(f) {
-  if (ckState.runId) {
+  const rid = f.runId || ckState.runId;   // the finding's OWN run, not whatever ran last
+  if (rid) {
     try {
       const res = await apiFetch("/api/bounty/submission", {
         method: "POST", timeoutMs: 20000,
-        body: JSON.stringify({ run_id: ckState.runId, ref: f.ref, platform: ckState.platform || "hackerone" })
+        body: JSON.stringify({ run_id: rid, ref: f.ref, platform: ckState.platform || "hackerone" })
       });
       if (res.ok && res.package && res.package.vulnerability_information) {
         return { text: res.package.vulnerability_information, canonical: true, package: res.package };
@@ -4851,7 +4853,7 @@ async function ckSubmitFinding(f, btn, statusEl) {
   try {
     const res = await apiFetch("/api/bounty/submit", {
       method: "POST", timeoutMs: 60000,
-      body: JSON.stringify({ run_id: ckState.runId, ref: f.ref, confirm: true, platform: "hackerone" })
+      body: JSON.stringify({ run_id: f.runId || ckState.runId, ref: f.ref, confirm: true, platform: "hackerone" })
     });
     if (res.ok) {
       ckState.triage[f.ref] = "submitted";
@@ -4908,7 +4910,7 @@ function ckTakeoverForm() {
           for (const f of (res.findings || [])) out.append(cel("p", "ck-ftitle", "✅ " + f.title));
           ckState.findings = (res.findings || []).map((f, i) => ({
             ref: `F${i + 1}`, title: f.title, severity: f.severity || "high", proof: "confirmed",
-            className: "Subdomain takeover", cwe: "CWE-350 / CWE-284", plan: {}, cvss: {},
+            className: "Subdomain takeover", cwe: "CWE-350 / CWE-284", runId: res.run_id || ckState.runId, plan: {}, cvss: {},
             proofObj: { status: "confirmed" }, description: ""
           }));
           ckBadgeCount("submissions", ckState.findings.length);
@@ -4966,7 +4968,7 @@ function ckCveForm() {
           for (const f of (res.findings || [])) out.append(cel("p", "ck-ftitle", "⚠ " + f.title));
           ckState.findings = (res.findings || []).map((f, i) => ({
             ref: `F${i + 1}`, title: f.title, severity: f.severity || "medium", proof: "candidate",
-            className: "Vulnerable / outdated component", cwe: "", plan: {}, cvss: {},
+            className: "Vulnerable / outdated component", cwe: "", runId: res.run_id || ckState.runId, plan: {}, cvss: {},
             proofObj: { status: "candidate" }, description: ""
           }));
           ckBadgeCount("submissions", ckState.findings.length);
@@ -5189,7 +5191,7 @@ function ckRenderIdor() {
         out.append(cel("p", "ck-ftitle", "✅ IDOR / broken access control CONFIRMED"));
         out.append(cel("p", "ck-hint", "Added to Submissions — Copy report / Download / Submit it there."));
         ckState.runId = res.run_id || ckState.runId;
-        const row = { ref: res.ref || "F1", title: res.title || "IDOR / broken access control",
+        const row = { runId: res.run_id || ckState.runId, ref: res.ref || "F1", title: res.title || "IDOR / broken access control",
                       severity: res.severity || "high", proof: "confirmed",
                       className: "Broken access control (IDOR/BOLA)", cwe: "CWE-639 / CWE-284",
                       plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" };
@@ -5256,7 +5258,7 @@ function ckStoredXssForm() {
       } else if (res.status === "confirmed") {
         out.append(cel("p", "ck-ftitle", "✅ Stored XSS CONFIRMED"));
         ckState.runId = res.run_id || ckState.runId;
-        const row = { ref: res.ref || "F1", title: res.title || "Stored XSS", severity: res.severity || "high",
+        const row = { runId: res.run_id || ckState.runId, ref: res.ref || "F1", title: res.title || "Stored XSS", severity: res.severity || "high",
                       proof: "confirmed", className: "Stored / persistent XSS", cwe: "CWE-79",
                       plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" };
         ckState.findings = (ckState.findings || []).filter((f) => !(f.ref === row.ref && f.className === row.className)).concat(row);
@@ -5307,7 +5309,7 @@ function ckIdorProbeForm() {
       } else if (res.status === "candidate" && res.run_id) {
         out.append(cel("p", "ck-ftitle", "⚠ Possible IDOR (candidate) — confirm cross-tenant with two accounts above"));
         ckState.runId = res.run_id || ckState.runId;
-        const row = { ref: res.ref || "F1", title: res.title || "Possible IDOR (single-session probe)",
+        const row = { runId: res.run_id || ckState.runId, ref: res.ref || "F1", title: res.title || "Possible IDOR (single-session probe)",
                       severity: res.severity || "medium", proof: "candidate",
                       className: "Broken access control (IDOR/BOLA)", cwe: "CWE-639 / CWE-284",
                       plan: {}, cvss: {}, proofObj: { status: "candidate" }, description: "" };
@@ -5361,7 +5363,7 @@ function ckBflaForm() {
         out.append(cel("p", "ck-ftitle", "✅ BFLA / broken function-level authorization CONFIRMED"));
         out.append(cel("p", "ck-hint", "Added to Submissions — Copy report / Download / Submit it there."));
         ckState.runId = res.run_id || ckState.runId;
-        const row = { ref: res.ref || "F1", title: res.title || "Broken function-level authorization",
+        const row = { runId: res.run_id || ckState.runId, ref: res.ref || "F1", title: res.title || "Broken function-level authorization",
                       severity: res.severity || "high", proof: "confirmed",
                       className: "Broken function-level authorization (BFLA)", cwe: "CWE-862 / CWE-285",
                       plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" };
@@ -5444,7 +5446,7 @@ function ckOobPanel() {
       } else if (res.status === "confirmed") {
         sout.append(cel("p", "ck-ftitle", `✅ Blind SSRF CONFIRMED via '${res.param}'`));
         ckState.runId = res.run_id || ckState.runId;
-        ckState.findings = [{ ref: "F1", title: res.title || "Blind SSRF", severity: res.severity || "high", proof: "confirmed", className: "Server-side request forgery (SSRF)", cwe: "CWE-918", plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" }];
+        ckState.findings = [{ runId: res.run_id || ckState.runId, ref: "F1", title: res.title || "Blind SSRF", severity: res.severity || "high", proof: "confirmed", className: "Server-side request forgery (SSRF)", cwe: "CWE-918", plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" }];
         ckBadgeCount("submissions", 1);
         if (res.report) { const pre = cel("pre", "ck-research-md"); pre.textContent = res.report; pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "320px"; pre.style.overflow = "auto"; sout.append(pre); }
         sout.append(cel("p", "ck-hint", "Added to Submissions."));
@@ -5483,7 +5485,7 @@ function ckOobPanel() {
       } else if (res.status === "confirmed" || res.status === "candidate") {
         xout.append(cel("p", "ck-ftitle", res.status === "confirmed" ? "✅ Blind XXE CONFIRMED" : "⚠ Blind XXE candidate (verify the callback source)"));
         ckState.runId = res.run_id || ckState.runId;
-        ckState.findings = [{ ref: "F1", title: res.title || "Blind XXE", severity: res.severity || "high", proof: res.status, className: "XML External Entity (XXE)", cwe: "CWE-611", plan: {}, cvss: {}, proofObj: { status: res.status }, description: "" }];
+        ckState.findings = [{ runId: res.run_id || ckState.runId, ref: "F1", title: res.title || "Blind XXE", severity: res.severity || "high", proof: res.status, className: "XML External Entity (XXE)", cwe: "CWE-611", plan: {}, cvss: {}, proofObj: { status: res.status }, description: "" }];
         ckBadgeCount("submissions", 1);
         if (res.report) { const pre = cel("pre", "ck-research-md"); pre.textContent = res.report; pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "320px"; pre.style.overflow = "auto"; xout.append(pre); }
         xout.append(cel("p", "ck-hint", "Added to Submissions."));

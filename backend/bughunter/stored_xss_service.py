@@ -27,7 +27,7 @@ from urllib.parse import urlencode, urlparse
 
 from bughunter.active_verify_service import _ActiveError, _Http, _NoRedirect, host_in_active_scope
 from bughunter.rate_limit import HostRateGovernor
-from bughunter.scan_auth import build_auth
+from bughunter.scan_auth import auth_headers_for, build_auth
 from bughunter.settings import get_settings
 from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
 from bughunter.web_scan_service import _USER_AGENT, _guard_url
@@ -59,8 +59,11 @@ def _post_form(url: str, data: dict[str, str], *, auth: Any, timeout: float) -> 
     """POST a form body to an ALREADY scope-checked + SSRF-guarded URL, no redirect followed.
     The operator's session is attached if present. Reached only via the opt-in ``send``."""
     headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": _USER_AGENT, "Accept": "*/*"}
-    if auth is not None:
-        headers.update(getattr(auth, "headers", {}) or {})
+    # Attach the operator session ONLY when the POST host is same-site as the host the
+    # credentials were bound to — same invariant the GET path (_Http.fetch) enforces. The
+    # inject URL is scope-checked independently and may be a DIFFERENT in-scope host, so a
+    # raw header copy would leak the session off-target on the strictest (non-GET) egress.
+    headers.update(auth_headers_for(urlparse(url).hostname or "", auth))
     request = urllib.request.Request(url, data=urlencode(data).encode("utf-8"), method="POST", headers=headers)
     opener = urllib.request.build_opener(_NoRedirect())
     try:

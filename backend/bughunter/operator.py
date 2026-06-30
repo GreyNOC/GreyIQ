@@ -95,8 +95,9 @@ def run_program_cycle(
         for finding in confirmed:
             if budget <= 0 or (stop is not None and stop.is_set()):
                 break
-            if ledger.is_duplicate(runtime_dir, pid, target, finding):
-                continue  # already reported/submitted in a prior run — NEVER re-file
+            if ledger.is_submitted(runtime_dir, pid, target, finding):
+                continue  # already FILED in a prior run — never re-file (a 'reported' finding,
+                          # i.e. one this run just built a package for, must still be fileable)
             res = submit_fn(run_id, finding["ref"])  # hard-gated server-side
             if res.get("ok"):
                 ledger.record_submission(runtime_dir, pid, target, ledger.dedup_key(finding),

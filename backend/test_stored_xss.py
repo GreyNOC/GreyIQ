@@ -109,5 +109,56 @@ class StoredXssTests(unittest.TestCase):
         self.assertIn("scope", res["error"].lower())
 
 
+class PostFormSameSiteTests(unittest.TestCase):
+    """The REAL _post_form (not stubbed) against a local server: the operator's session
+    must attach only when the POST host is same-site as the auth's bound host — the same
+    invariant scan_auth.same_site enforces on the GET path."""
+
+    def setUp(self) -> None:
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        captured = self.captured = []
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(length)
+                captured.append({k: v for k, v in self.headers.items()})
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *a: object) -> None:
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.port = self.server.server_port
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+
+    def test_session_attached_when_post_host_is_same_site_as_auth(self) -> None:
+        from bughunter.scan_auth import build_auth
+        url = f"http://127.0.0.1:{self.port}/submit"
+        auth = build_auth(url, cookie="session=secret123")  # bound to 127.0.0.1
+        res = sx._post_form(url, {"f": "x"}, auth=auth, timeout=5.0)
+        self.assertTrue(res["ok"])
+        self.assertIn("Cookie", self.captured[0])
+        self.assertIn("secret123", self.captured[0]["Cookie"])
+
+    def test_session_withheld_when_post_host_differs_from_auth(self) -> None:
+        from bughunter.scan_auth import build_auth
+        url = f"http://127.0.0.1:{self.port}/submit"
+        # Bound to a DIFFERENT host than the one we're about to POST to — the inject URL
+        # can legitimately be a different in-scope host than the view URL the session was
+        # built against (confirm_stored_xss builds auth from the VIEW url).
+        auth = build_auth("https://app.example.com/", cookie="session=secret123")
+        res = sx._post_form(url, {"f": "x"}, auth=auth, timeout=5.0)
+        self.assertTrue(res["ok"])
+        self.assertNotIn("Cookie", self.captured[0])  # session must NOT leak to a different host
+
+
 if __name__ == "__main__":
     unittest.main()

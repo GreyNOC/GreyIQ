@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 from bughunter.active_verify_service import host_in_active_scope
 from bughunter.settings import get_settings
 from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
-from bughunter.web_scan_service import _guard_url
+from bughunter.web_scan_service import _guard_url, playwright_request_allowed
 
 _VIEWPORT = {"width": 1280, "height": 900}
 _URL_IN_TEXT = re.compile(r"https?://\S+")
@@ -113,15 +113,28 @@ def capture_screenshot(
     except OSError as exc:
         return {"ok": False, "error": f"could not create the output directory: {exc}", "url": target}
 
+    def _guard_route(route: Any) -> None:
+        if playwright_request_allowed(route.request.url, settings.allow_private_urls, settings.web_allowed_ports):
+            route.continue_()
+        else:
+            route.abort()
+
     wait_ms = int(max(0.0, wait_seconds) * 1000)
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
             context = browser.new_context(ignore_https_errors=True, viewport=_VIEWPORT)
+            context.route("**/*", _guard_route)
             page = context.new_page()
             page.goto(sanitized, wait_until="load", timeout=wait_ms + 15000)
             page.wait_for_timeout(wait_ms)
             final_url = page.url
+            # A redirect may have left the named host; capturing an out-of-scope / private
+            # page is exactly what the scope gate exists to prevent — fail closed, no file.
+            final_host = urlparse(final_url).hostname or ""
+            if not host_in_active_scope(final_host, scope, settings):
+                browser.close()
+                return {"ok": False, "error": f"navigation left scope (ended at '{final_host}') — screenshot discarded.", "url": target}
             title = page.title()
             page.screenshot(path=str(out), full_page=full_page)
             browser.close()
