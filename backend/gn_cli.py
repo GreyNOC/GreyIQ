@@ -394,6 +394,48 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def _cmd_idor(args: argparse.Namespace) -> int:
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    from bughunter import access_control_service as ac
+    from bughunter import report_formats
+
+    if not args.authorize:
+        return _err("IDOR testing uses your two authorized test sessions against an in-scope host — pass -y/--authorize.")
+    res = ac.run_idor_check(
+        args.url_a, args.url_b,
+        account_a={"cookie": args.a_cookie or "", "headers": args.a_header or []},
+        account_b={"cookie": args.b_cookie or "", "headers": args.b_header or []},
+        scope=args.scope or "",
+    )
+    if not res.get("ok"):
+        return _err(res["error"])
+    status = res["status"]
+    if status != "confirmed":
+        print(_c(f"IDOR not confirmed ({status}).", "33"))
+        print(f"  {res.get('reason', '')}")
+        if res.get("detail"):
+            print(f"  detail: {res['detail']}")
+        return 0
+    finding = res["finding"]; finding.setdefault("ref", "F1"); plan = res["attack_plan"]
+    ctx = {"tool": "GreyIQ BugHunter", "version": VERSION,
+           "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
+           "target": args.url_a, "scope": args.scope or "", "attack_plans": {"F1": plan}}
+    md = report_formats.render_finding(ctx, finding, report_formats.normalize_platform(args.platform))
+    print(_c("IDOR / broken access control CONFIRMED", "32") + f" at {finding['title']}")
+    print(f"  differential: {res.get('detail')}")
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    out = args.out or str(RUNTIME_DIR / "reports" / f"idor-{stamp}.md")
+    try:
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        Path(out).write_text(md, encoding="utf-8")
+        print(f"  report: {out}")
+    except OSError as exc:
+        print(_c(f"  (could not write report: {exc})", "33"))
+    return 0
+
+
 def _cmd_bundle(args: argparse.Namespace) -> int:
     from pathlib import Path
 
@@ -592,6 +634,19 @@ def build_parser() -> argparse.ArgumentParser:
     bundle.add_argument("path", help="the engagement/campaign output folder to zip")
     bundle.add_argument("-o", "--out", default=None, help="output .zip path (default: <folder>.zip)")
     bundle.set_defaults(func=_cmd_bundle)
+
+    idor = sub.add_parser("idor", help="confirm IDOR / broken access control with TWO of your authorized test accounts")
+    idor.add_argument("url_a", help="account A's object URL (e.g. https://app/api/order/1001)")
+    idor.add_argument("url_b", help="account B's OWN object URL on the same host (a DIFFERENT object B owns)")
+    idor.add_argument("--a-cookie", dest="a_cookie", default="", help="account A's Cookie header value")
+    idor.add_argument("--a-header", dest="a_header", action="append", metavar="'Name: value'", help="account A auth header (repeatable)")
+    idor.add_argument("--b-cookie", dest="b_cookie", default="", help="account B's Cookie header value")
+    idor.add_argument("--b-header", dest="b_header", action="append", metavar="'Name: value'", help="account B auth header (repeatable)")
+    idor.add_argument("-s", "--scope", default="", help="scope (name the host to allow active testing)")
+    idor.add_argument("--platform", default="hackerone", help="report format (see `gn platforms`)")
+    idor.add_argument("-o", "--out", default=None, help="report output path")
+    idor.add_argument("-y", "--authorize", action="store_true", help="confirm you OWN both test accounts and are in scope (required)")
+    idor.set_defaults(func=_cmd_idor)
 
     classes = sub.add_parser("classes", help="list vuln classes")
     classes.add_argument("--json", action="store_true")

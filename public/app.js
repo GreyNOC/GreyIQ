@@ -4291,6 +4291,7 @@ const ck = {
     findings: document.querySelector("#ckViewFindings"),
     surface: document.querySelector("#ckViewSurface"),
     submissions: document.querySelector("#ckViewSubmissions"),
+    idor: document.querySelector("#ckViewIdor"),
     learn: document.querySelector("#ckViewLearn"),
     operator: document.querySelector("#ckViewOperator")
   },
@@ -4354,6 +4355,7 @@ function ckSetView(view) {
   if (view === "learn") void ckRenderLearn();
   if (view === "surface") ckRenderSurface();
   if (view === "submissions") ckRenderSubmissions();
+  if (view === "idor") ckRenderIdor();
   if (view === "operator") void ckRenderOperator();
   // Operator events only poll while its tab is open.
   if (view !== "operator" && ckOpPoll) { clearInterval(ckOpPoll); ckOpPoll = null; }
@@ -4885,6 +4887,90 @@ function ckRenderSurface() {
   const ul = cel("ul", "ck-list");
   for (const u of s.urls) { const li = cel("li"); li.append(cel("span", "ck-floc", u)); ul.append(li); }
   host.append(ul);
+}
+
+function ckTextareaField(label, placeholder) {
+  const w = cel("label");
+  w.append(cel("span", null, label));
+  const ta = cel("textarea");
+  ta.rows = 2; ta.autocomplete = "off";
+  if (placeholder) ta.placeholder = placeholder;
+  w.append(ta);
+  return { wrap: w, input: ta };
+}
+
+// Access control (IDOR/BOLA) — dual-session cross-tenant read confirm. The operator
+// supplies their two authorized test accounts; the server proves B can read A's object.
+function ckRenderIdor() {
+  const host = ck.views.idor;
+  host.replaceChildren();
+  host.append(cel("h2", "ck-section-title", "Access control — IDOR / BOLA"));
+  host.append(cel("p", "ck-hint",
+    "Confirm a cross-tenant read with your TWO authorized test accounts. Give account A's object URL + session and account B's OWN object URL + session on the same host. GET-only, scope-bound — another user's data is never shown or stored; the proof is the differential."));
+
+  const form = cel("form", "ck-learn-form");
+  const urlA = ckField("Account A — object URL", "text", "");
+  const urlB = ckField("Account B — its OWN object URL (same host, a DIFFERENT object)", "text", "");
+  const aCookie = ckField("Account A — Cookie", "text", "");
+  const aHdr = ckTextareaField("Account A — extra headers (one 'Name: value' per line, optional)", "Authorization: Bearer ...");
+  const bCookie = ckField("Account B — Cookie", "text", "");
+  const bHdr = ckTextareaField("Account B — extra headers (optional)", "");
+  const scope = ckField("Scope (name the host to allow testing)", "text", state.ckScope || "");
+  form.append(urlA.wrap, urlB.wrap, aCookie.wrap, aHdr.wrap, bCookie.wrap, bHdr.wrap, scope.wrap);
+
+  const run = cel("button", "ck-btn primary", "Confirm IDOR");
+  run.type = "submit";
+  form.append(run);
+  const note = cel("p", "ck-status"); note.style.flexBasis = "100%";
+  const out = cel("div", "ck-research");
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!urlA.input.value.trim() || !urlB.input.value.trim()) {
+      note.classList.add("is-error"); note.textContent = "Both object URLs are required."; return;
+    }
+    const label = run.textContent;
+    run.disabled = true; run.textContent = "Testing…";
+    note.classList.remove("is-error"); note.textContent = ""; out.replaceChildren();
+    const lines = (v) => v.split("\n").map((s) => s.trim()).filter(Boolean);
+    try {
+      const res = await apiFetch("/api/bounty/idor", {
+        method: "POST", timeoutMs: 60000, body: JSON.stringify({
+          url_a: urlA.input.value.trim(), url_b: urlB.input.value.trim(),
+          a_cookie: aCookie.input.value.trim(), a_headers: lines(aHdr.input.value),
+          b_cookie: bCookie.input.value.trim(), b_headers: lines(bHdr.input.value),
+          scope: scope.input.value.trim(), platform: ckState.platform || "hackerone"
+        })
+      });
+      if (!res || res.ok === false) {
+        note.classList.add("is-error"); note.textContent = (res && res.error) || "Could not run the check.";
+      } else if (res.status === "confirmed") {
+        out.append(cel("p", "ck-ftitle", "✅ IDOR / broken access control CONFIRMED"));
+        out.append(cel("p", "ck-hint", "Added to Submissions — Copy report / Download / Submit it there."));
+        ckState.runId = res.run_id || ckState.runId;
+        const row = { ref: res.ref || "F1", title: res.title || "IDOR / broken access control",
+                      severity: res.severity || "high", proof: "confirmed",
+                      className: "Broken access control (IDOR/BOLA)", cwe: "CWE-639 / CWE-284",
+                      plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" };
+        ckState.findings = (ckState.findings || []).filter((f) => !(f.ref === row.ref && f.className === row.className)).concat(row);
+        ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);
+        const pre = cel("pre", "ck-research-md");
+        pre.textContent = res.report || "";
+        pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "360px"; pre.style.overflow = "auto";
+        out.append(pre);
+      } else {
+        note.textContent = `Not confirmed (${res.status}). ${res.reason || ""}`;
+        if (res.detail) out.append(cel("p", "ck-hint", "Differential: " + JSON.stringify(res.detail)));
+      }
+    } catch (err) {
+      note.classList.add("is-error"); note.textContent = err.message || "Check failed.";
+    } finally {
+      run.disabled = false; run.textContent = label;
+    }
+  });
+  form.append(note);
+  host.append(form);
+  host.append(out);
 }
 
 function ckRenderSubmissions() {

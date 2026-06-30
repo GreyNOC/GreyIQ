@@ -279,6 +279,7 @@ from bughunter import report_formats as bounty_formats  # noqa: E402
 from bughunter import screenshot_service as bounty_screenshot  # noqa: E402
 from bughunter import bundle as bounty_bundle  # noqa: E402
 from bughunter import research as bounty_research  # noqa: E402
+from bughunter import access_control_service as bounty_access  # noqa: E402
 from bughunter import ledger as bounty_ledger  # noqa: E402
 from bughunter import portfolio as bounty_portfolio  # noqa: E402
 from bughunter.operator import OperatorLoop  # noqa: E402
@@ -562,6 +563,17 @@ class BundleRequest(BaseModel):
 class ResearchRequest(BaseModel):
     run_id: str = Field(min_length=1, max_length=64)
     ref: str = Field(min_length=1, max_length=40)
+
+
+class IdorRequest(BaseModel):
+    url_a: str = Field(min_length=1, max_length=4000)   # account A's object URL
+    url_b: str = Field(min_length=1, max_length=4000)   # account B's object URL (B owns this)
+    a_cookie: str = Field(default="", max_length=8000)
+    a_headers: list[str] = Field(default_factory=list, max_length=20)
+    b_cookie: str = Field(default="", max_length=8000)
+    b_headers: list[str] = Field(default_factory=list, max_length=20)
+    scope: str = Field(default="", max_length=2000)
+    platform: str = Field(default="hackerone", max_length=20)
 
 
 class HackerOneCredsRequest(BaseModel):
@@ -1302,6 +1314,59 @@ class GreyIQRuntime:
         return {
             "ok": True, "markdown": dossier["markdown"], "used_brain": dossier["used_brain"],
             "model": dossier["model"], "path": written,
+        }
+
+    def check_idor(self, request: "IdorRequest") -> dict[str, Any]:
+        """Confirm IDOR/BOLA via a dual-session differential (the operator's two test
+        accounts). On a CONFIRMED cross-tenant read, cache it as a run so every per-finding
+        action (per-platform report, screenshot, research, bundle, the hard-gated submit)
+        works on it. The proof is the differential only — never another user's raw data."""
+        from datetime import UTC, datetime
+
+        res = bounty_access.run_idor_check(
+            request.url_a, request.url_b,
+            account_a={"cookie": request.a_cookie, "headers": request.a_headers},
+            account_b={"cookie": request.b_cookie, "headers": request.b_headers},
+            scope=request.scope,
+        )
+        if not res.get("ok"):
+            return res
+        status = res["status"]
+        if status != "confirmed":
+            return {"ok": True, "status": status, "reason": res.get("reason", ""), "detail": res.get("detail")}
+
+        finding = dict(res["finding"]); finding["ref"] = "F1"
+        plan = res["attack_plan"]
+        gen = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+        ctx = {"tool": "GreyIQ BugHunter", "version": VERSION, "generated_at": gen,
+               "target": request.url_a, "scope": request.scope, "attack_plans": {"F1": plan}}
+        platform = bounty_formats.normalize_platform(request.platform)
+        report_md = bounty_formats.render_finding(ctx, finding, platform)
+
+        safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
+        host = urlparse(request.url_a).hostname or "target"
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        out_dir = RUNTIME_DIR / "reports"
+        md_path = out_dir / f"idor-{safe(host)}-{stamp}.md"
+        json_path = out_dir / f"idor-{safe(host)}-{stamp}.json"
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            md_path.write_text(report_md, encoding="utf-8")
+            json_path.write_text(json.dumps({"finding": finding, "attack_plan": plan, "detail": res.get("detail")}, indent=2, default=str), encoding="utf-8")
+            report_path, json_out = str(md_path), str(json_path)
+        except OSError:
+            report_path, json_out = "", ""
+
+        result = {
+            "ok": True, "generated_at": gen, "findings": [finding],
+            "attack_plans": {"F1": plan}, "proof_of_impact": {"F1": {"status": "confirmed"}},
+            "report_path": report_path, "json_path": json_out, "output_dir": str(out_dir),
+        }
+        self._cache_bounty_run(result, target=request.url_a, scope=request.scope, program=None)
+        return {
+            "ok": True, "status": "confirmed", "run_id": result.get("run_id"), "ref": "F1",
+            "platform": platform, "report": report_md, "detail": res.get("detail"),
+            "title": finding["title"], "severity": finding["severity"],
         }
 
     def export_bundle(self, request: "BundleRequest") -> dict[str, Any]:
@@ -2384,6 +2449,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/research":
             request = validate_payload(ResearchRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.research_finding, request))
+            return
+        if method == "POST" and path == "/api/bounty/idor":
+            request = validate_payload(IdorRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.check_idor, request))
             return
         if method == "POST" and path == "/api/bounty/submit":
             request = validate_payload(SubmitRequest, await read_json_body(receive))
