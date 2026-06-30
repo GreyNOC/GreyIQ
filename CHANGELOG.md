@@ -2,6 +2,25 @@
 
 Notable changes to GreyIQ.
 
+## v0.47.0
+
+### Phase C — stored (persistent) XSS confirmation (assisted + opt-in send)
+Confirms a marker payload SUBMITTED on one request and RENDERED UNESCAPED on a DIFFERENT
+view page — true stored XSS, distinct from the reflected check.
+
+- **Assisted (default, GET-only):** GreyIQ mints a unique marker payload; submit it via your
+  own tooling, then GreyIQ GETs the view URL and confirms whether the raw executable tag
+  rendered.
+- **Auto (opt-in `send`):** GreyIQ POSTs the payload into the field at the inject URL — a
+  guarded, scope-bound, no-redirect form POST (the engine's second non-GET egress, like the
+  XXE `send`) — after checking a fresh marker is absent first (negative control).
+- Confirmed **only** when our unique marker payload appears RAW in the view page (escaped ->
+  not confirmed; absent -> not stored), so the proof embeds only our marker. Wired:
+  `POST /api/bounty/stored-xss` + a cockpit "Stored XSS" panel; a confirmed render caches a run.
+
+425 tests green (+9). With this, the active Phase C list is complete (only takeover CNAME
+correlation remains — it needs a DNS library not in the frozen build).
+
 ## v0.46.0
 
 ### Phase C — IDOR discovery probe (single-session id mutation)
