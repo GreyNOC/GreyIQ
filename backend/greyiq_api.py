@@ -279,6 +279,7 @@ from bughunter import submission as bounty_submission  # noqa: E402
 from bughunter import report as bounty_report  # noqa: E402
 from bughunter import report_formats as bounty_formats  # noqa: E402
 from bughunter import screenshot_service as bounty_screenshot  # noqa: E402
+from bughunter import target_ingest as bounty_ingest  # noqa: E402
 from bughunter import bundle as bounty_bundle  # noqa: E402
 from bughunter import research as bounty_research  # noqa: E402
 from bughunter import access_control_service as bounty_access  # noqa: E402
@@ -561,6 +562,11 @@ class ScreenshotRequest(BaseModel):
     ref: str = Field(min_length=1, max_length=40)
     full_page: bool = False
     scope: str = Field(default="", max_length=4000)   # optional extra scope (the cockpit's current Scope box), unioned with the run + live program scope at capture time
+
+
+class IngestTargetsRequest(BaseModel):
+    content: str = Field(default="", max_length=5_000_000)   # pasted/loaded CSV / Burp XML / HAR (module also byte-caps)
+    kind: str = Field(default="auto", max_length=12)          # auto | csv | burp | har
 
 
 class BundleRequest(BaseModel):
@@ -1320,6 +1326,13 @@ class GreyIQRuntime:
         if not run:
             return None, None, None
         return run["ctx"], run["findings"].get(ref), run
+
+    def ingest_targets(self, request: "IngestTargetsRequest") -> dict[str, Any]:
+        """Parse an operator-supplied CSV / Burp XML / HAR export into a normalized list of
+        targets + hosts. Pure / no-network. It NEVER probes and NEVER adds a host to scope —
+        the operator reviews the result and chooses to apply it; the fail-closed
+        host_in_active_scope gate still governs every probe."""
+        return bounty_ingest.ingest(request.content, request.kind)
 
     def build_submission_package(self, request: "SubmissionPackageRequest") -> dict[str, Any]:
         """Return the CANONICAL server-built submission package for one finding (the
@@ -2795,6 +2808,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/screenshot":
             request = validate_payload(ScreenshotRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.capture_screenshot, request))
+            return
+        if method == "POST" and path == "/api/bounty/ingest-targets":
+            request = validate_payload(IngestTargetsRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.ingest_targets, request))
             return
         if method == "POST" and path == "/api/bounty/bundle":
             request = validate_payload(BundleRequest, await read_json_body(receive))

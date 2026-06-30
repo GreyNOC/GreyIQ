@@ -5958,6 +5958,7 @@ function ckProgramForm() {
   const interval = ckField("Re-run every (minutes)", "number", editing ? String(editing.interval_minutes || 1440) : "1440");
   const cap = ckField("Max auto-submits / day", "number", editing ? String(editing.max_submits_per_day ?? 3) : "3");
   form.append(name.wrap, scope.wrap, targets.wrap, handle.wrap, interval.wrap, cap.wrap);
+  form.append(ckTargetImport(targets, scope));
 
   const toggles = cel("div", "ck-toggles");
   const active = ckToggle("Capture proof of impact (active)", editing ? !!editing.active : true);
@@ -6010,6 +6011,94 @@ function ckToggle(label, checked) {
   const input = cel("input"); input.type = "checkbox"; input.checked = Boolean(checked);
   wrap.append(input, cel("span", null, label));
   return { wrap, input };
+}
+
+// Merge `additions` into a current "a, b c" free-text field value, de-duplicating
+// case-sensitively and joining with `sep`. Used to fold imported targets/hosts into the
+// seed-targets (comma) and scope (space) inputs without clobbering what's already typed.
+function mergeList(current, additions, sep) {
+  const out = (current || "").split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+  const have = new Set(out);
+  for (const a of (additions || [])) {
+    const v = String(a || "").trim();
+    if (v && !have.has(v)) { have.add(v); out.push(v); }
+  }
+  return out.join(sep);
+}
+
+// Import targets/scope from a CSV / Burp Suite XML / HAR export. Parsing is server-side
+// and PURE (no network, never touches scope); the operator reviews the result and clicks
+// to fold it into the seed-targets and scope fields. Wired into the Operator program form;
+// reusable anywhere a (targetsField, scopeField) pair exists.
+function ckTargetImport(targetsField, scopeField) {
+  const box = cel("details", "ck-import");
+  box.append(cel("summary", null, "Import targets — CSV / Burp XML / HAR"));
+  box.append(cel("p", "ck-hint", "Paste, or load a file: a CSV of hosts/URLs, a Burp Suite items/sitemap XML export, or a HAR capture. Parsing is local and never adds anything to scope by itself — review the result, then add it."));
+
+  const row = cel("div", "ck-import-row");
+  const kind = cel("select");
+  for (const [v, l] of [["auto", "Auto-detect"], ["csv", "CSV"], ["burp", "Burp XML"], ["har", "HAR"]]) {
+    const o = cel("option", null, l); o.value = v; kind.append(o);
+  }
+  const file = cel("input"); file.type = "file"; file.accept = ".csv,.tsv,.xml,.har,.json,.txt";
+  row.append(kind, file);
+  box.append(row);
+
+  const ta = cel("textarea", "ck-import-ta");
+  ta.rows = 4; ta.spellcheck = false; ta.placeholder = "Paste CSV / Burp XML / HAR here, or choose a file above…";
+  box.append(ta);
+
+  const parse = cel("button", "ck-btn", "Parse"); parse.type = "button";
+  const note = cel("p", "ck-status");
+  const result = cel("div");
+  box.append(parse, note, result);
+
+  file.addEventListener("change", () => {
+    const f = file.files && file.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => { ta.value = String(reader.result || ""); note.className = "ck-status"; note.textContent = `Loaded ${f.name} — click Parse.`; };
+    reader.onerror = () => { note.className = "ck-status is-error"; note.textContent = "Could not read that file."; };
+    reader.readAsText(f);
+  });
+
+  parse.addEventListener("click", async () => {
+    const content = ta.value.trim();
+    if (!content) { note.className = "ck-status is-error"; note.textContent = "Paste or load something first."; return; }
+    const label = parse.textContent; parse.disabled = true; parse.textContent = "Parsing…";
+    note.className = "ck-status"; note.textContent = ""; result.replaceChildren();
+    try {
+      const res = await apiFetch("/api/bounty/ingest-targets", {
+        method: "POST", timeoutMs: 30000, body: JSON.stringify({ content, kind: kind.value })
+      });
+      if (!res || res.ok === false) {
+        note.className = "ck-status is-error";
+        note.textContent = ((res && res.error) || "Nothing parsed.") + (res && (res.notes || []).length ? " " + res.notes.join(" ") : "");
+        return;
+      }
+      note.className = "ck-status";
+      note.textContent = `Parsed ${res.count} target(s) · ${res.host_count} host(s)`
+        + (res.param_names && res.param_names.length ? ` · ${res.param_names.length} param name(s)` : "")
+        + (res.kind ? ` (${res.kind})` : "");
+      const preview = cel("pre", "ck-import-preview");
+      const shown = (res.targets || []).slice(0, 12);
+      preview.textContent = shown.join("\n") + ((res.targets || []).length > 12 ? `\n… +${res.targets.length - 12} more` : "");
+      result.append(preview);
+      const acts = cel("div", "ck-import-acts");
+      const addTargets = cel("button", "ck-btn", `Add ${res.count} to seed targets`); addTargets.type = "button";
+      addTargets.addEventListener("click", () => { targetsField.input.value = mergeList(targetsField.input.value, res.targets, ", "); note.className = "ck-status"; note.textContent = `Added ${res.count} target(s) to seed targets.`; });
+      const addScope = cel("button", "ck-btn", `Add ${res.host_count} host(s) to scope`); addScope.type = "button";
+      addScope.addEventListener("click", () => { scopeField.input.value = mergeList(scopeField.input.value, res.hosts, " "); note.className = "ck-status"; note.textContent = `Added ${res.host_count} host(s) to scope.`; });
+      acts.append(addTargets, addScope);
+      result.append(acts);
+    } catch (err) {
+      note.className = "ck-status is-error"; note.textContent = err.message || "Parse failed.";
+    } finally {
+      parse.disabled = false; parse.textContent = label;
+    }
+  });
+
+  return box;
 }
 
 function ckBadgeCount(view, n) {

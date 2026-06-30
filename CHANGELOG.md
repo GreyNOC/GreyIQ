@@ -2,6 +2,25 @@
 
 Notable changes to GreyIQ.
 
+## v0.52.0
+
+### Operator — import targets from CSV, Burp Suite XML, or HAR
+The "Add / update a program" form gains an **Import targets** panel: paste or load a CSV of
+hosts/URLs, a Burp Suite items/sitemap **XML** export, or a **HAR** capture, and fold the
+result into the program's seed targets and scope.
+
+- One parser ([target_ingest.py](backend/bughunter/target_ingest.py), pure / no-network /
+  stdlib-only) normalizes all three into deduped **targets** (full URLs — query params
+  preserved so the active prover mines them) and **hosts** (for scope), and surfaces the
+  discovered param names.
+- **Fail-closed**: parsing never probes and never auto-adds a host to scope — you review the
+  result and click "Add to seed targets" / "Add hosts to scope". XML carrying a
+  DOCTYPE/ENTITY declaration is refused (entity-expansion / XXE guard); input is byte- and
+  count-capped.
+- Wired: `POST /api/bounty/ingest-targets`.
+
+458 tests green (+15).
+
 ## v0.51.0
 
 ### Cockpit — in-app walkthroughs on the dense panels
