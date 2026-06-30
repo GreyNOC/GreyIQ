@@ -4727,7 +4727,10 @@ async function ckCaptureScreenshot(f, btn, wrap) {
   try {
     const res = await apiFetch("/api/bounty/screenshot", {
       method: "POST", timeoutMs: 60000,
-      body: JSON.stringify({ run_id: ckState.runId, ref: f.ref })
+      // Send the cockpit's CURRENT Scope box too, so adding the host and re-capturing
+      // works without re-running the whole hunt (the server unions it with the run +
+      // live program scope and still fails closed via host_in_active_scope).
+      body: JSON.stringify({ run_id: ckState.runId, ref: f.ref, scope: (ck.scope?.value || "").trim() })
     });
     if (res && res.ok) {
       btn.textContent = "Re-capture screenshot";

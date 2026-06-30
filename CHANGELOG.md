@@ -2,6 +2,25 @@
 
 Notable changes to GreyIQ.
 
+## v0.50.0
+
+### BugHunter — screenshots resolve scope at capture time (edit-and-recapture)
+The **Capture screenshot** button was checking the scope FROZEN into a finding's cached run,
+so adding a host to scope *afterward* never took effect — the capture kept failing the
+fail-closed gate until you re-ran the whole hunt.
+
+- The screenshot endpoint now resolves scope at **capture time** by unioning three
+  operator-supplied sources: the cached run's own scope, the **live program's current
+  `scope_text`** (so editing + saving an Operator program's scope takes effect WITHOUT
+  re-running the hunt), and an optional **scope override from the request** — the cockpit's
+  current Scope box, now sent by the Capture button. Add the host, click capture again; no
+  re-run needed.
+- The union only ever **widens** to hosts you explicitly named: `host_in_active_scope` (plus
+  the SSRF / URL guard) still runs against the union and still fails closed, so an unnamed
+  host is refused exactly as before.
+
+443 tests green (+8), including ALLOW-direction tests that drive the real scope gate end-to-end.
+
 ## v0.49.0
 
 ### Operator — edit existing programs

@@ -560,6 +560,7 @@ class ScreenshotRequest(BaseModel):
     run_id: str = Field(min_length=1, max_length=64)
     ref: str = Field(min_length=1, max_length=40)
     full_page: bool = False
+    scope: str = Field(default="", max_length=4000)   # optional extra scope (the cockpit's current Scope box), unioned with the run + live program scope at capture time
 
 
 class BundleRequest(BaseModel):
@@ -1353,8 +1354,24 @@ class GreyIQRuntime:
             return {"ok": False, "error": "No proof-of-concept URL to screenshot for this finding (it has no captured request or URL location)."}
         safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
         out_path = RUNTIME_DIR / "screenshots" / f"{safe(request.run_id)}-{safe(request.ref)}.png"
+        # Resolve the FRESHEST scope at capture time, not just the scope frozen into the
+        # cached run: union (1) the run's own scope, (2) the live program's current
+        # scope_text — so editing a saved program's scope takes effect WITHOUT re-running
+        # the hunt — and (3) an optional scope the caller passes (the cockpit's current
+        # Scope box). All three are operator-supplied authorizations; the fail-closed
+        # host_in_active_scope gate still runs against the union, so this only ever WIDENS
+        # to hosts the operator has explicitly named.
+        scope_sources = [str(ctx.get("scope") or "")]
+        program_id = str((run or {}).get("program") or "")
+        if program_id:
+            prog = bounty_portfolio.get_program(RUNTIME_DIR, program_id)
+            if prog:
+                scope_sources.append(str(prog.get("scope_text") or ""))
+        if request.scope.strip():
+            scope_sources.append(request.scope)
+        scope = " ".join(s for s in scope_sources if s.strip())
         result = bounty_screenshot.capture_screenshot(
-            url, out_path, scope=str(ctx.get("scope") or ""), authorized=True, full_page=request.full_page,
+            url, out_path, scope=scope, authorized=True, full_page=request.full_page,
         )
         if not result.get("ok"):
             return result
