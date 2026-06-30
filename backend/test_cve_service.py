@@ -57,6 +57,38 @@ class DetectComponentsTests(unittest.TestCase):
         self.assertEqual(comps.get("lodash"), "4.17.4")
         self.assertEqual(comps.get("bootstrap"), "3.3.7")
 
+    def test_jquery_ui_detected_distinctly_from_core(self) -> None:
+        body = ('<script src="/js/jquery-3.6.0.min.js"></script>'
+                '<script src="/js/jquery-ui-1.12.1.min.js"></script>')
+        comps = {c["product"]: c["version"] for c in cve.detect_components(body)}
+        self.assertEqual(comps.get("jquery"), "3.6.0")        # core
+        self.assertEqual(comps.get("jquery-ui"), "1.12.1")    # separate product
+
+    def test_new_libraries_detected(self) -> None:
+        body = ('<script src="/v/axios-0.20.0.min.js"></script>'
+                '<script src="/v/underscore-1.10.2.min.js"></script>'
+                '<script src="/v/mustache-2.1.0.min.js"></script>')
+        comps = {c["product"]: c["version"] for c in cve.detect_components(body)}
+        self.assertEqual(comps.get("axios"), "0.20.0")
+        self.assertEqual(comps.get("underscore"), "1.10.2")
+        self.assertEqual(comps.get("mustache"), "2.1.0")
+
+    def test_wordpress_from_meta_generator(self) -> None:
+        body = '<head><meta name="generator" content="WordPress 5.8.1" /></head>'
+        comps = {c["product"]: c["version"] for c in cve.detect_components(body)}
+        self.assertEqual(comps.get("wordpress"), "5.8.1")
+        self.assertTrue(cve.match_cves("wordpress", "5.8.1"))   # < 5.8.3 -> CVEs apply
+
+    def test_wordpress_from_x_powered_by_header(self) -> None:
+        comps = {c["product"]: c["version"]
+                 for c in cve.detect_components("", {"X-Powered-By": "WordPress/5.7"})}
+        self.assertEqual(comps.get("wordpress"), "5.7")
+
+    def test_server_header_versions_are_not_mapped_to_cves(self) -> None:
+        # nginx/Apache/PHP banner versions must NOT produce findings (low-signal, FP risk).
+        comps = cve.detect_components("", {"Server": "nginx/1.14.0", "X-Powered-By": "PHP/7.2.1"})
+        self.assertEqual([c for c in comps if c["product"] in {"nginx", "apache", "php"}], [])
+
 
 class MatchCvesTests(unittest.TestCase):
     def test_boundary_excludes_fixed_version(self) -> None:

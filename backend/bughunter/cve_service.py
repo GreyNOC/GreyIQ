@@ -94,14 +94,61 @@ _KNOWN_CVES: dict[str, list[dict[str, Any]]] = {
          "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", "epss": 0.25, "kev": False,
          "summary": "Mutation-XSS (mXSS) sanitizer bypass via crafted markup."},
     ],
+    "jquery-ui": [
+        {"cve": "CVE-2021-41182", "fixed_in": "1.13.0", "cwe": "CWE-79", "severity": "medium", "base_score": 6.1,
+         "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", "epss": 0.20, "kev": False,
+         "summary": "XSS via the altField option of the Datepicker widget."},
+        {"cve": "CVE-2021-41184", "fixed_in": "1.13.0", "cwe": "CWE-79", "severity": "medium", "base_score": 6.1,
+         "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", "epss": 0.18, "kev": False,
+         "summary": "XSS via the of option of the .position() util."},
+        {"cve": "CVE-2022-31160", "fixed_in": "1.13.2", "cwe": "CWE-79", "severity": "medium", "base_score": 6.1,
+         "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", "epss": 0.20, "kev": False,
+         "summary": "XSS via crafted values rendered by the checkboxradio widget label."},
+    ],
+    "axios": [
+        {"cve": "CVE-2020-28168", "fixed_in": "0.21.1", "cwe": "CWE-918", "severity": "medium", "base_score": 5.9,
+         "vector": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", "epss": 0.30, "kev": False,
+         "summary": "Proxy bypass / SSRF — a 3xx to an internal host follows despite no_proxy."},
+        {"cve": "CVE-2021-3749", "fixed_in": "0.21.2", "cwe": "CWE-1333", "severity": "high", "base_score": 7.5,
+         "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H", "epss": 0.30, "kev": False,
+         "summary": "ReDoS via a crafted trim-able header value."},
+        {"cve": "CVE-2023-45857", "fixed_in": "1.6.0", "cwe": "CWE-200", "severity": "medium", "base_score": 6.5,
+         "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N", "epss": 0.35, "kev": False,
+         "summary": "XSRF-TOKEN leaked to a third-party host via the absolute-URL request path."},
+    ],
+    "underscore": [
+        {"cve": "CVE-2021-23358", "fixed_in": "1.12.1", "cwe": "CWE-94", "severity": "high", "base_score": 7.2,
+         "vector": "CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H", "epss": 0.40, "kev": False,
+         "summary": "Arbitrary code execution via the template function with a crafted variable option."},
+    ],
+    "mustache": [
+        {"cve": "CVE-2015-8862", "fixed_in": "2.2.1", "cwe": "CWE-79", "severity": "medium", "base_score": 6.1,
+         "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", "epss": 0.15, "kev": False,
+         "summary": "XSS — unescaped output when a view value is a function returning HTML."},
+    ],
+    "wordpress": [
+        {"cve": "CVE-2022-21661", "fixed_in": "5.8.3", "cwe": "CWE-89", "severity": "high", "base_score": 8.1,
+         "vector": "CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:H", "epss": 0.40, "kev": False,
+         "summary": "SQL injection via WP_Query (authenticated, affecting plugins/themes that pass crafted input)."},
+        {"cve": "CVE-2022-21663", "fixed_in": "5.8.3", "cwe": "CWE-94", "severity": "medium", "base_score": 6.6,
+         "vector": "CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H", "epss": 0.20, "kev": False,
+         "summary": "Object-injection mitigations bypass for high-privilege users (multisite)."},
+        {"cve": "CVE-2023-2745", "fixed_in": "6.2.1", "cwe": "CWE-200", "severity": "medium", "base_score": 5.3,
+         "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N", "epss": 0.25, "kev": False,
+         "summary": "Directory-traversal / information disclosure via the block editor in some configs."},
+    ],
 }
 
 _LABELS = {"jquery": "jQuery", "bootstrap": "Bootstrap", "lodash": "Lodash", "moment": "Moment.js",
-           "angularjs": "AngularJS", "handlebars": "Handlebars", "dompurify": "DOMPurify"}
+           "angularjs": "AngularJS", "handlebars": "Handlebars", "dompurify": "DOMPurify",
+           "jquery-ui": "jQuery UI", "axios": "Axios", "underscore": "Underscore.js",
+           "mustache": "Mustache.js", "wordpress": "WordPress (core)"}
 
 # Version pulled from a script `src`/`href` filename. Anchored on a separator so `jquery-ui`
 # / `jquery-migrate` / `jquery.validate` do NOT register as jQuery core (their CVEs differ).
+# jquery-ui is matched BEFORE jquery so it wins on a shared path.
 _SRC_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("jquery-ui", re.compile(r"(?:^|[/\\])jquery[-.]ui[-.](\d+\.\d+(?:\.\d+)?)(?:\.min|\.custom)?\.js", re.I)),
     ("jquery", re.compile(r"(?:^|[/\\])jquery[-.](\d+\.\d+(?:\.\d+)?)(?:\.slim)?(?:\.min)?\.js", re.I)),
     ("bootstrap", re.compile(r"(?:^|[/\\])bootstrap(?:\.bundle)?[-.](\d+\.\d+(?:\.\d+)?)(?:\.min)?\.js", re.I)),
     ("lodash", re.compile(r"(?:^|[/\\])lodash(?:\.core)?[-.]?(\d+\.\d+\.\d+)(?:\.min)?\.js", re.I)),
@@ -109,10 +156,14 @@ _SRC_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("angularjs", re.compile(r"(?:^|[/\\])angular[-.](\d+\.\d+\.\d+)(?:\.min)?\.js", re.I)),
     ("handlebars", re.compile(r"(?:^|[/\\])handlebars(?:\.runtime)?[-.](\d+\.\d+\.\d+)(?:\.min)?\.js", re.I)),
     ("dompurify", re.compile(r"(?:^|[/\\])(?:purify|dompurify)[-.](\d+\.\d+\.\d+)(?:\.min)?\.js", re.I)),
+    ("axios", re.compile(r"(?:^|[/\\])axios[-.](\d+\.\d+\.\d+)(?:\.min)?\.js", re.I)),
+    ("underscore", re.compile(r"(?:^|[/\\])underscore[-.](\d+\.\d+\.\d+)(?:\.min)?\.js", re.I)),
+    ("mustache", re.compile(r"(?:^|[/\\])mustache[-.](\d+\.\d+\.\d+)(?:\.min)?\.js", re.I)),
 )
 
 # Version pulled from the library's own banner/comment in inline or fetched script bodies.
 _BANNER_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("jquery-ui", re.compile(r"jQuery\s+UI[\s\S]{0,40}?(\d+\.\d+\.\d+)", re.I)),
     ("jquery", re.compile(r"jQuery(?:\s+JavaScript\s+Library)?\s+v(\d+\.\d+\.\d+)", re.I)),
     ("bootstrap", re.compile(r"Bootstrap\s+v(\d+\.\d+\.\d+)", re.I)),
     ("lodash", re.compile(r"\blodash(?:\.js)?\s+(?:<[^>]*>\s+)?(\d+\.\d+\.\d+)", re.I)),
@@ -120,6 +171,21 @@ _BANNER_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("angularjs", re.compile(r"AngularJS\s+v(\d+\.\d+\.\d+)", re.I)),
     ("handlebars", re.compile(r"Handlebars(?:\.js)?\s+v?(\d+\.\d+\.\d+)", re.I)),
     ("dompurify", re.compile(r"DOMPurify[\s\S]{0,40}?VERSION\s*[:=]\s*['\"](\d+\.\d+\.\d+)", re.I)),
+    ("underscore", re.compile(r"Underscore\.js\s+(\d+\.\d+\.\d+)", re.I)),
+)
+
+# Version pulled from an HTML <meta name="generator"> tag (CMS / framework fingerprint).
+_META_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("wordpress", re.compile(r"<meta[^>]+name=[\"']generator[\"'][^>]+content=[\"']WordPress\s+(\d+\.\d+(?:\.\d+)?)", re.I)),
+)
+
+# Version pulled from a response HEADER. Server-software versions (Server:, X-Powered-By:
+# nginx/Apache/PHP) are DELIBERATELY not mapped to CVEs — banner version alone is low-signal,
+# rarely remotely exploitable, and routinely rejected by programs, which would be a false
+# positive against this engine's confirm-grade promise. Only products with a clean version +
+# a real, accepted CVE go here; today that is WordPress when it advertises itself in a header.
+_HEADER_RES: tuple[tuple[str, str, re.Pattern[str]], ...] = (
+    ("wordpress", "x-powered-by", re.compile(r"WordPress[/ ](\d+\.\d+(?:\.\d+)?)", re.I)),
 )
 
 
@@ -144,10 +210,11 @@ def _target_host(target: str) -> str:
     return raw.split("/", 1)[0].strip().lower()
 
 
-def detect_components(body: str) -> list[dict[str, str]]:
+def detect_components(body: str, headers: dict[str, Any] | None = None) -> list[dict[str, str]]:
     """Extract (product, version, evidence) tuples from a page/script body — src filenames
-    first (most reliable), then version banners. De-duplicated to the LOWEST version seen per
-    product (the most-vulnerable instance is what we report on)."""
+    first (most reliable), then version banners, then the <meta generator> tag — plus a few
+    response headers (e.g. an X-Powered-By that advertises WordPress). De-duplicated to the
+    LOWEST version seen per product (the most-vulnerable instance is what we report on)."""
     found: dict[str, dict[str, str]] = {}
     text = body or ""
 
@@ -165,6 +232,17 @@ def detect_components(body: str) -> list[dict[str, str]]:
         m = rex.search(text)
         if m:
             _offer(product, m.group(1), m.group(0).strip())
+    for product, rex in _META_RES:
+        m = rex.search(text)
+        if m:
+            _offer(product, m.group(1), m.group(0).strip())
+
+    # Headers (case-insensitive). Only the curated, high-signal header products are matched.
+    hmap = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+    for product, header_name, rex in _HEADER_RES:
+        m = rex.search(hmap.get(header_name, ""))
+        if m:
+            _offer(product, m.group(1), f"{header_name}: {m.group(0).strip()}")
     return list(found.values())
 
 
@@ -272,6 +350,7 @@ def scan_known_cves(target: str, *, scope: str = "", settings: Any = None) -> di
         return {"ok": False, "error": f"{host} is not in the active scope — refusing to fetch (fail-closed)."}
 
     body = ""
+    resp_headers: dict[str, Any] = {}
     fetched_url = ""
     for scheme in ("https", "http"):
         try:
@@ -282,11 +361,12 @@ def scan_known_cves(target: str, *, scope: str = "", settings: Any = None) -> di
             continue
         fetched_url = resp.get("final_url") or sanitized
         body = resp.get("body") or ""
+        resp_headers = resp.get("headers") or {}
         break
     if not fetched_url:
         return {"ok": False, "error": f"Could not fetch {host} over https/http within scope."}
 
-    components = detect_components(body)
+    components = detect_components(body, resp_headers)
     findings: list[dict[str, Any]] = []
     for comp in components:
         cves = match_cves(comp["product"], comp["version"])
