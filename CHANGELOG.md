@@ -2,6 +2,21 @@
 
 Notable changes to GreyIQ.
 
+## v0.30.0
+
+### Deep mode runs unattended — the operator works leads aggressively on a schedule
+The autonomous operator can now run programs in **deep mode**. Add a program with **Deep
+auto-work** on (a new toggle in the operator program form, `gn operator add --deep`, or
+`deep: true` on `POST /api/operator/programs`) and each scheduled cycle runs the campaign
+aggressively: proof-of-impact + time-based blind SQLi, then a screenshot and a researched
+dossier for every confirmed lead — all written into the engagement folder, hands-off.
+
+Same safety model: deep is **fail-closed** (a program with no scope can't be deep, exactly
+like active/live), deep **implies proof-of-impact** (a deep program is always active), and
+it adds **no new egress** — it reuses the operator's existing scope-bound campaign and the
+unchanged, hard-gated auto-submit path (armed + per-program opt-in + server-confirmed +
+ledger-dedup + per-day throttle).
+
 ## v0.29.0
 
 ### Work the lead end to end — research, prove, and download the whole engagement
