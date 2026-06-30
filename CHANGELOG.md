@@ -2,6 +2,22 @@
 
 Notable changes to GreyIQ.
 
+## v0.41.0
+
+### Phase C — API surface discovery (OpenAPI/Swagger + GraphQL)
+Recon now maps the machine-readable API surface, multiplying what every active check reaches:
+
+- Fetches the common **OpenAPI/Swagger** spec locations (`/openapi.json`, `/swagger.json`,
+  `/v3/api-docs`, …), parses OpenAPI 3.x **and** Swagger 2.0, and feeds the concrete GET
+  endpoints + declared parameter names into the prover's surface. A public spec is treated as
+  surface expansion, **not** a finding (it's often intentional).
+- Probes the common **GraphQL** routes with a GET introspection query; if the schema comes
+  back, introspection-enabled is added as a **candidate** finding (type/field evidence + an
+  inline plan). It runs inside the campaign, so the operator surfaces it automatically.
+- GET-only, scope-gated (fail-closed), SSRF-guarded, and budget-shared with recon.
+
+388 tests green (+10).
+
 ## v0.40.0
 
 ### Blind XXE over OOB (assisted + opt-in auto-send)
