@@ -2,6 +2,23 @@
 
 Notable changes to GreyIQ.
 
+## v0.38.0
+
+### Known-CVE detection now runs inside every campaign (passive earnings)
+The outdated-component check (v0.37.0) is now part of the campaign pipeline — so the
+autonomous operator surfaces it automatically on every program it runs, with no separate step.
+
+- After recon, a single scope-bound, SSRF-guarded GET of the target fingerprints its
+  front-end libraries; each outdated component with known CVEs is folded into the campaign as
+  a **candidate** finding (one per library), carrying its own attack plan, CVSS, EPSS-style
+  score, and KEV flag. It shows on the cockpit's findings board, in `CAMPAIGN.md`, and in the
+  downloadable bundle.
+- Honest as ever: candidates, never "confirmed" — the hard submit gate still refuses to
+  auto-file them. Scope defaults to the target's own host when a campaign is run without an
+  explicit scope (matching recon), and the pass is best-effort (never breaks a campaign).
+
+365 tests green (+1).
+
 ## v0.37.0
 
 ### New earner — known-CVE / outdated-component detection (Phase B)
