@@ -4310,8 +4310,17 @@ const ckState = {
   sort: { key: "rank", dir: 1 },
   view: "findings",
   h1: null,              // { team_handle, api_username, has_token } — never the token
+  platform: "hackerone", // report format for Copy/Download (server re-shapes per platform)
   triage: {}             // ref -> "submitted" | "drafted" (client-side worklist marks)
 };
+
+// Report formats — mirrors backend report_formats.PLATFORMS (HackerOne first).
+const CK_PLATFORMS = [
+  { id: "hackerone", name: "HackerOne" },
+  { id: "yeswehack", name: "YesWeHack" },
+  { id: "bugcrowd", name: "Bugcrowd" },
+  { id: "intigriti", name: "Intigriti" }
+];
 
 const CK_SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
 
@@ -4701,7 +4710,7 @@ async function ckSubmissionMarkdown(f) {
     try {
       const res = await apiFetch("/api/bounty/submission", {
         method: "POST", timeoutMs: 20000,
-        body: JSON.stringify({ run_id: ckState.runId, ref: f.ref, platform: "hackerone" })
+        body: JSON.stringify({ run_id: ckState.runId, ref: f.ref, platform: ckState.platform || "hackerone" })
       });
       if (res.ok && res.package && res.package.vulnerability_information) {
         return { text: res.package.vulnerability_information, canonical: true, package: res.package };
@@ -4789,6 +4798,7 @@ function ckRenderSubmissions() {
   const host = ck.views.submissions;
   host.replaceChildren();
   host.append(ckCredsBar());
+  host.append(ckFormatBar());
 
   const ready = ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate");
   host.append(cel("h2", "ck-section-title", `Submission queue — ${ready.length} reportable`));
@@ -4853,6 +4863,41 @@ function ckRenderSubmissions() {
     ul.append(li);
   }
   host.append(ul);
+}
+
+// Report-format selector — the platform the Copy report / Download .md output is shaped
+// for. The server (report_formats) re-frames the SAME finding + the SAME gathered
+// evidence per platform; this only picks which framing to export.
+function ckFormatBar() {
+  const wrap = cel("div", "ck-creds");
+  const head = cel("div", "ck-creds-head");
+  head.append(cel("strong", null, "Report format"));
+  const cur = CK_PLATFORMS.find((p) => p.id === ckState.platform) || CK_PLATFORMS[0];
+  head.append(cel("span", "ck-tag", cur.name));
+  wrap.append(head);
+
+  const form = cel("div", "ck-learn-form");
+  const lab = cel("label");
+  lab.append(cel("span", null, "Platform"));
+  const sel = cel("select");
+  for (const p of CK_PLATFORMS) {
+    const opt = cel("option", null, p.name);
+    opt.value = p.id;
+    if (p.id === ckState.platform) opt.selected = true;
+    sel.append(opt);
+  }
+  sel.addEventListener("change", () => {
+    ckState.platform = sel.value || "hackerone";
+    ckRenderSubmissions();
+  });
+  lab.append(sel);
+  form.append(lab);
+  wrap.append(form);
+
+  wrap.append(cel("p", "ck-hint",
+    `Copy report / Download .md produce a ${cur.name}-shaped report with the gathered evidence included. `
+    + "The one-click API submit files to HackerOne only."));
+  return wrap;
 }
 
 // HackerOne credentials bar — shows configured state and a save form. The token is

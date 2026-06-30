@@ -72,6 +72,7 @@ def run_campaign(
     live: bool = False,
     program: str | None = None,
     max_pages: int = 12,
+    platform: str = "hackerone",
     on_progress: Any = None,
 ) -> dict[str, Any]:
     """Run a full campaign. Returns {ok, campaign_path, json_path, urls_scanned,
@@ -196,7 +197,7 @@ def run_campaign(
         ctx = _ctx_from_doc(doc)
         finding = item["finding"]
         stem = f"sub-{rank_i:02d}-{_safe_slug(finding.get('class_id', 'finding'))}-{_safe_slug(finding.get('title', ''), 'finding')}"
-        package = submission.write_submission_package(ctx, finding, sub_dir, stem)
+        package = submission.write_submission_package(ctx, finding, sub_dir, stem, platform)
         if package:
             item["submission_path"] = package["markdown_path"]
             submission_paths.append(package["markdown_path"])

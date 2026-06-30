@@ -167,6 +167,7 @@ def _cmd_campaign(args: argparse.Namespace) -> int:
         live=args.live,
         program=args.program,
         max_pages=args.max_pages,
+        platform=getattr(args, "platform", "hackerone") or "hackerone",
         on_progress=(lambda m: print(_c(f"  - {m}", "2"))) if not args.json else None,
     )
     if not result.get("ok"):
@@ -392,6 +393,21 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def _cmd_platforms(args: argparse.Namespace) -> int:
+    from bughunter import report_formats
+
+    platforms = report_formats.list_platforms()
+    if args.json:
+        print(json.dumps({"platforms": platforms, "default": report_formats.DEFAULT_PLATFORM}, indent=2))
+        return 0
+    print(_c("Report formats (use --platform <id> on a campaign):", "1"))
+    for p in platforms:
+        default = "  (default)" if p["id"] == report_formats.DEFAULT_PLATFORM else ""
+        print(f"  {_c(p['id'], '36'):<28} {p['name']}{default}")
+        print(f"      {p['blurb']}")
+    return 0
+
+
 def _cmd_profiles(args: argparse.Namespace) -> int:
     from bughunter.bounty import list_profiles
 
@@ -485,6 +501,8 @@ def build_parser() -> argparse.ArgumentParser:
     camp.add_argument("--live", action="store_true", help="dynamic Playwright pass per URL")
     camp.add_argument("--brain", action="store_true", help="use the configured LLM brain to enrich")
     camp.add_argument("--max-pages", type=int, default=12, help="recon discovery cap (default 12)")
+    camp.add_argument("--platform", default="hackerone",
+                      help="report format for the submission packages: hackerone | yeswehack | bugcrowd | intigriti (see `gn platforms`)")
     camp.add_argument("-y", "--authorize", action="store_true", help="confirm you are AUTHORIZED + in scope (required)")
     camp.add_argument("--json", action="store_true")
     camp.set_defaults(func=_cmd_campaign)
@@ -542,6 +560,10 @@ def build_parser() -> argparse.ArgumentParser:
     profiles = sub.add_parser("profiles", help="list hunt profiles")
     profiles.add_argument("--json", action="store_true")
     profiles.set_defaults(func=_cmd_profiles)
+
+    platforms = sub.add_parser("platforms", help="list report formats (HackerOne, YesWeHack, Bugcrowd, Intigriti)")
+    platforms.add_argument("--json", action="store_true")
+    platforms.set_defaults(func=_cmd_platforms)
 
     classes = sub.add_parser("classes", help="list vuln classes")
     classes.add_argument("--json", action="store_true")

@@ -23,6 +23,7 @@ from typing import Any
 
 from bughunter import fsutil
 from bughunter import report as report_lib
+from bughunter import report_formats
 
 # H1 severity_rating vocabulary.
 _H1_SEVERITY = {"critical": "critical", "high": "high", "medium": "medium", "low": "low", "info": "none", "none": "none"}
@@ -41,10 +42,13 @@ def _cwe_number(finding: dict[str, Any]) -> str:
     return match.group(1) if match else ""
 
 
-def build_submission(ctx: dict[str, Any], finding: dict[str, Any]) -> dict[str, Any] | None:
-    """The structured submission package for one finding, or None if the report
-    drops it (e.g. an unconfirmed JWT credential)."""
-    body = report_lib.build_finding_markdown(ctx, finding)
+def build_submission(ctx: dict[str, Any], finding: dict[str, Any], platform: str = "hackerone") -> dict[str, Any] | None:
+    """The structured submission package for one finding, framed for ``platform``
+    (hackerone | yeswehack | bugcrowd | intigriti), or None if the report drops it
+    (e.g. an unconfirmed JWT credential). ``vulnerability_information`` is the platform-
+    shaped Markdown; the gathered evidence is always included when present."""
+    platform = report_formats.normalize_platform(platform)
+    body = report_formats.render_finding(ctx, finding, platform)
     if not body.strip():
         return None
     plan = (ctx.get("attack_plans") or {}).get(finding.get("ref"), {}) or {}
@@ -55,7 +59,12 @@ def build_submission(ctx: dict[str, Any], finding: dict[str, Any]) -> dict[str, 
     return {
         "ref": finding.get("ref", ""),
         "title": title[:255],
+        "platform": platform,
+        "platform_name": report_formats.platform_name(platform),
+        # severity_rating stays the HackerOne API vocabulary (used by submit_to_hackerone);
+        # platform_severity is the chosen platform's own label for display.
         "severity_rating": severity_rating(finding, plan),
+        "platform_severity": report_formats.platform_severity(platform, finding, plan),
         "cwe": str(finding.get("cwe") or ""),
         "weakness": _cwe_number(finding),
         "vrt": str(finding.get("vrt") or ""),  # Bugcrowd VRT category (est.), '' if unmapped
@@ -66,10 +75,11 @@ def build_submission(ctx: dict[str, Any], finding: dict[str, Any]) -> dict[str, 
     }
 
 
-def write_submission_package(ctx: dict[str, Any], finding: dict[str, Any], out_dir: Path, stem: str) -> dict[str, Any] | None:
+def write_submission_package(ctx: dict[str, Any], finding: dict[str, Any], out_dir: Path, stem: str,
+                             platform: str = "hackerone") -> dict[str, Any] | None:
     """Write a finding's submission .md + .json to out_dir. Returns the package
     (with paths) or None if the finding isn't reportable / write failed."""
-    package = build_submission(ctx, finding)
+    package = build_submission(ctx, finding, platform)
     if package is None:
         return None
     md_path = out_dir / f"{stem}.md"

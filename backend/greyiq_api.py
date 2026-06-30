@@ -275,6 +275,7 @@ from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, 
 from bughunter import campaign as bounty_campaign  # noqa: E402
 from bughunter import learning as bounty_learning  # noqa: E402
 from bughunter import submission as bounty_submission  # noqa: E402
+from bughunter import report_formats as bounty_formats  # noqa: E402
 from bughunter import ledger as bounty_ledger  # noqa: E402
 from bughunter import portfolio as bounty_portfolio  # noqa: E402
 from bughunter.operator import OperatorLoop  # noqa: E402
@@ -1196,10 +1197,11 @@ class GreyIQRuntime:
             return {"ok": False, "error": "This run is no longer cached — re-run the hunt to rebuild submission packages."}
         if finding is None:
             return {"ok": False, "error": "Unknown finding for this run."}
-        package = bounty_submission.build_submission(ctx, finding)
+        platform = bounty_formats.normalize_platform(request.platform)
+        package = bounty_submission.build_submission(ctx, finding, platform)
         if package is None:
             return {"ok": False, "error": "This finding is not reportable (the report rules drop it, e.g. an unconfirmed credential lead)."}
-        return {"ok": True, "package": package, "platform": request.platform}
+        return {"ok": True, "package": package, "platform": platform}
 
     def submit_finding(self, request: "SubmitRequest") -> dict[str, Any]:
         """File one CONFIRMED finding to HackerOne via the hard-gated submit. The gate
@@ -1207,8 +1209,8 @@ class GreyIQRuntime:
         recomputed server-side from the cached ctx, so a forged confirm can't push a
         non-confirmed finding. Creds come from the perms-restricted secrets store, never
         the request body. The ONLY path here that touches the network."""
-        if request.platform != "hackerone":
-            return {"ok": False, "error": "Only the HackerOne API submit is wired. Export the package and file it on other platforms."}
+        if bounty_formats.normalize_platform(request.platform) != "hackerone":
+            return {"ok": False, "error": "Only the HackerOne API submit is wired. Export the package (Copy report / Download .md) and file it on the other platforms."}
         pkg_result = self.build_submission_package(SubmissionPackageRequest(run_id=request.run_id, ref=request.ref, platform="hackerone"))
         if not pkg_result.get("ok"):
             return pkg_result
@@ -2193,6 +2195,9 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             return
         if method == "GET" and path == "/api/bounty/types":
             await send_json(send, bounty_profiles())
+            return
+        if method == "GET" and path == "/api/bounty/platforms":
+            await send_json(send, {"ok": True, "platforms": bounty_formats.list_platforms(), "default": bounty_formats.DEFAULT_PLATFORM})
             return
         if method == "GET" and path == "/api/toolkit":
             await send_json(send, toolkit_catalog())
