@@ -481,15 +481,30 @@ def _check_host_header(http: _Http, url: str) -> dict[str, Any] | None:
         control = {"location": "", "body": ""}
     if _MARKER_HOST in (control.get("location") or "") or _MARKER_HOST in (control.get("body") or ""):
         return None  # marker present without our header → not host-driven
-    where = "Location header" if _MARKER_HOST in location else "response body"
-    proof = _proof(
-        "confirmed", method=f"GET with Host: {_MARKER_HOST}", affected_asset="absolute links / redirects (password-reset poisoning, cache poisoning)",
-        observed_result=f"the attacker-supplied Host header was reflected into the {where}",
-        control_result="the real Host did not produce the marker — the value is attacker-controlled",
-        evidence=f"marker host echoed in {where}",
-    )
+    in_location = _MARKER_HOST in location
+    where = "Location header" if in_location else "response body"
+    if in_location:
+        # Host reflected into a redirect Location is genuinely actionable (password-reset
+        # poisoning, cache poisoning) — confirmed.
+        proof = _proof(
+            "confirmed", method=f"GET with Host: {_MARKER_HOST}", affected_asset="absolute links / redirects (password-reset poisoning, cache poisoning)",
+            observed_result="the attacker-supplied Host header was reflected into the Location header",
+            control_result="the real Host did not produce the marker — the value is attacker-controlled",
+            evidence="marker host echoed in the Location header",
+        )
+        sev = "medium"
+    else:
+        # Body-only Host reflection is extremely common and usually harmless — candidate.
+        proof = _proof(
+            "candidate", method=f"GET with Host: {_MARKER_HOST}",
+            observed_result="the attacker-supplied Host header was reflected into the response body",
+            control_result="the real Host did not produce the marker — the value is attacker-controlled",
+            limitations="Body-only Host reflection is common and usually harmless; it is actionable only where that value builds a security-relevant absolute URL (e.g. a password-reset link) or a cacheable response.",
+            proof_obligation="Show the reflected Host lands in a password-reset/confirmation link or a cacheable response — not just printed in the page.",
+        )
+        sev = "low"
     ev = {"request_line": f"GET {url}", "request_header": f"Host: {_MARKER_HOST}", "response_status": f"HTTP {probe['status']}", "matched_value": f"{_MARKER_HOST} in {where}"}
-    return _finding("active.host-header-injection", "Host header reflected (host-header injection)", "medium", "redirect", "redirect", url, proof, ev)
+    return _finding("active.host-header-injection", "Host header reflected (host-header injection)", sev, "redirect", "redirect", url, proof, ev)
 
 
 def _check_reflected_xss(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:

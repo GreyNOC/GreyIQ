@@ -53,11 +53,22 @@ class ConfirmTests(unittest.TestCase):
         oob._guard_url = self._guard
         oob.poll_collaborator = self._poll
 
+    def _staged_poll(self, hit):
+        """A fake poll: empty on the first call per token (the pre-probe control), then the hit."""
+        calls = {}
+        def fake_poll(base, secret, token, **k):
+            calls[token] = calls.get(token, 0) + 1
+            if calls[token] == 1:
+                return {"ok": True, "count": 0, "hits": []}
+            return {"ok": True, "count": 1, "hits": [{**hit, "path": f"/oob/{token}"}]}
+        return fake_poll
+
     def test_confirms_blind_ssrf_on_a_callback_hit(self) -> None:
         seen = {}
+        base_fake = self._staged_poll({"method": "GET", "ip": "9.9.9.9", "headers": {"user-agent": "Go-http-client/1.1"}})
         def fake_poll(base, secret, token, **k):
             seen["token"] = token
-            return {"ok": True, "count": 1, "hits": [{"method": "GET", "path": f"/oob/{token}", "ip": "9.9.9.9"}]}
+            return base_fake(base, secret, token, **k)
         oob.poll_collaborator = fake_poll
         http = FakeHttp()
         res = oob.confirm_blind_ssrf(
@@ -73,6 +84,15 @@ class ConfirmTests(unittest.TestCase):
         # no target data is embedded — the proof is the OOB callback
         self.assertEqual(res["finding"]["snippet"], "")
 
+    def test_crawler_callback_is_candidate_not_confirmed(self) -> None:
+        # A hit from a social unfurler / search crawler is NOT the target's own SSRF fetch.
+        oob.poll_collaborator = self._staged_poll({"method": "GET", "ip": "1.1.1.1", "headers": {"user-agent": "Slackbot-LinkExpanding 1.0"}})
+        res = oob.confirm_blind_ssrf(
+            "https://app.example.com/?url=x", base="https://collab.example", secret="s" * 16,
+            scope="app.example.com", settings=get_settings(), http=FakeHttp(), poll_attempts=1, poll_delay_s=0.0)
+        self.assertEqual(res["status"], "candidate")
+        self.assertEqual(res["attack_plan"]["proof_of_impact"]["status"], "candidate")
+
     def test_no_callback_does_not_confirm(self) -> None:
         oob.poll_collaborator = lambda base, secret, token, **k: {"ok": True, "count": 0, "hits": []}
         res = oob.confirm_blind_ssrf(
@@ -80,6 +100,14 @@ class ConfirmTests(unittest.TestCase):
             scope="app.example.com", settings=get_settings(), http=FakeHttp(), poll_attempts=1, poll_delay_s=0.0)
         self.assertEqual(res["status"], "no-callback")
         self.assertNotIn("finding", res)
+
+    def test_stale_token_with_preexisting_hits_is_skipped(self) -> None:
+        # If the fresh token already has hits (the negative control fails), don't confirm.
+        oob.poll_collaborator = lambda base, secret, token, **k: {"ok": True, "count": 5, "hits": [{"method": "GET", "ip": "2.2.2.2", "headers": {}}]}
+        res = oob.confirm_blind_ssrf(
+            "https://app.example.com/?url=x", base="https://collab.example", secret="s" * 16,
+            scope="app.example.com", settings=get_settings(), http=FakeHttp(), poll_attempts=1, poll_delay_s=0.0)
+        self.assertEqual(res["status"], "no-callback")
 
     def test_out_of_scope_target_refused(self) -> None:
         res = oob.confirm_blind_ssrf(

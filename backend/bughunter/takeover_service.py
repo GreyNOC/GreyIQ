@@ -15,6 +15,7 @@ false positives near zero). Pure / frozen-safe (stdlib socket + the existing gua
 
 from __future__ import annotations
 
+import secrets
 import socket
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -34,14 +35,17 @@ _LABELS = (
     "analytics", "grafana", "kibana", "ci", "build", "deploy", "preview",
 )
 
-# Dangling-service fingerprints — STRONG, service-specific "unclaimed" signatures only, so a
-# normal 404 never matches. (service, signature substring, the CNAME host it dangles to.)
+# Dangling-service fingerprints — STRONG, service-specific "unclaimed" signatures ONLY, and
+# matched only on an ERROR response (see check_host_takeover), so a normal page that merely
+# quotes one of these phrases never confirms. Generic-404-grade phrases (e.g. Webflow's
+# "The page you are looking for doesn't exist", Heroku's "There's nothing here, yet.") are
+# DELIBERATELY excluded — they false-positive on countless normal sites. (service, signature
+# substring, the service host the dangling record points to.)
 _FINGERPRINTS: tuple[dict[str, str], ...] = (
     {"service": "GitHub Pages", "signature": "There isn't a GitHub Pages site here.", "points_to": "*.github.io"},
     {"service": "AWS S3", "signature": "The specified bucket does not exist", "points_to": "*.s3.amazonaws.com"},
     {"service": "AWS S3", "signature": "NoSuchBucket", "points_to": "*.s3.amazonaws.com"},
     {"service": "Heroku", "signature": "herokucdn.com/error-pages/no-such-app.html", "points_to": "*.herokuapp.com"},
-    {"service": "Heroku", "signature": "There's nothing here, yet.", "points_to": "*.herokuapp.com"},
     {"service": "Fastly", "signature": "Fastly error: unknown domain", "points_to": "*.fastly.net"},
     {"service": "Shopify", "signature": "Sorry, this shop is currently unavailable", "points_to": "*.myshopify.com"},
     {"service": "Pantheon", "signature": "The gods are wise, but do not know of the site which you seek", "points_to": "*.pantheonsite.io"},
@@ -50,7 +54,6 @@ _FINGERPRINTS: tuple[dict[str, str], ...] = (
     {"service": "Surge.sh", "signature": "project not found", "points_to": "*.surge.sh"},
     {"service": "Help Scout", "signature": "No settings were found for this company", "points_to": "*.helpscoutdocs.com"},
     {"service": "Cargo", "signature": "If you're moving your domain away from Cargo", "points_to": "subdomain.cargocollective.com"},
-    {"service": "Webflow", "signature": "The page you are looking for doesn't exist or has been moved.", "points_to": "proxy.webflow.com"},
     {"service": "Wordpress", "signature": "Do you want to register *.wordpress.com?", "points_to": "*.wordpress.com"},
 )
 
@@ -81,10 +84,17 @@ def check_host_takeover(host: str, settings: Any = None) -> dict[str, Any] | Non
             resp = _fetch_raw(sanitized)
         except (WebsiteFetchError, OSError, ValueError):
             continue
+        status = int(resp.get("status") or 0)
+        # A genuinely dangling service serves its 'unclaimed' page as an ERROR (4xx/5xx).
+        # Requiring a non-2xx status kills the false positive where a normal 200 page (a
+        # status dashboard, a security blog, an aggregator) merely QUOTES one of these
+        # phrases, and the case where a 30x redirects to such a page.
+        if status < 400:
+            continue
         body_low = (resp.get("body") or "").lower()
         for fp in _FINGERPRINTS:
             if fp["signature"].lower() in body_low:
-                return _build_finding(host, fp, sanitized, int(resp.get("status") or 0))
+                return _build_finding(host, fp, sanitized, status)
     return None
 
 
@@ -135,7 +145,7 @@ def build_plan(finding: dict[str, Any]) -> dict[str, Any]:
         "poc": f"curl -s https://{host}/    # returns the {service} 'unclaimed' page — the resource is claimable",
         "impact": (f"An attacker can claim {host} and serve arbitrary content on the target's own subdomain — phishing under a "
                    f"trusted name, OAuth/redirect abuse, and theft of any cookie scoped to the parent domain."),
-        "cvss": {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:L/I:L/A:N", "base_score": 6.1, "base_severity": "medium", "estimated": True},
+        "cvss": {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:H/A:N", "base_score": 7.6, "base_severity": "high", "estimated": True},
         "remediation": finding.get("remediation", ""),
         "proof_of_impact": {
             "status": "confirmed",
@@ -167,8 +177,14 @@ def scan_subdomain_takeover(
     if not apex or "." not in apex:
         return {"ok": False, "error": "Provide a domain/host (e.g. example.com) to enumerate."}
 
+    # Wildcard-DNS guard: if a random nonexistent label resolves, the apex has a catch-all
+    # record so EVERY wordlist label would "resolve" to the same page and every fetch would
+    # hit one catch-all — useless and noisy. Detect it and skip the pure-wordlist expansion,
+    # relying on recon-discovered hosts (real CNAMEs) instead.
+    wildcard = bool(resolver(f"greyiq-nx-{secrets.token_hex(6)}.{apex}"))
     candidates: set[str] = {apex}
-    candidates.update(f"{label}.{apex}" for label in _LABELS)
+    if not wildcard:
+        candidates.update(f"{label}.{apex}" for label in _LABELS)
     candidates.update((h or "").strip().lower() for h in (extra_hosts or []) if (h or "").strip())
 
     # Only ever touch hosts the operator put in scope (fail-closed), then resolve, then check.

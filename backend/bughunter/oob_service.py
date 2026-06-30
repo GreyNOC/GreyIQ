@@ -20,12 +20,27 @@ GET-only target probes, marker-token correlation, bounded polling. Pure/frozen-s
 from __future__ import annotations
 
 import json
+import re
 import secrets as _secrets
 import time
 import urllib.error
 import urllib.request
 from typing import Any
 from urllib.parse import urlparse
+
+# A callback from a SOCIAL UNFURLER or SEARCH CRAWLER is NOT the target's own server-side
+# fetch — downgrade such an OOB hit to a candidate. NOTE: generic HTTP-library UAs
+# (curl/wget/python-requests/Go-http-client/Java/okhttp) are deliberately NOT here — those
+# ARE what a vulnerable server's SSRF fetch typically sends, so they must stay 'confirmed'.
+_CRAWLER_UA_RE = re.compile(
+    r"\bbot\b|googlebot|bingbot|crawl|spider|slurp|facebookexternalhit|slackbot|"
+    r"twitterbot|whatsapp|telegrambot|discordbot|link.?preview|unfurl",
+    re.IGNORECASE,
+)
+
+
+def _is_crawler_ua(ua: str) -> bool:
+    return bool(_CRAWLER_UA_RE.search(str(ua or "")))
 
 from bughunter.active_verify_service import (
     _ActiveError,
@@ -74,12 +89,13 @@ def poll_collaborator(base: str, secret: str, token: str, *, timeout: float = 8.
     return {"ok": True, "count": int((data or {}).get("count") or 0), "hits": hits or []}
 
 
-def _build_ssrf_finding(target_url: str, param: str, token: str, base: str, hit: dict[str, Any]) -> dict[str, Any]:
+def _build_ssrf_finding(target_url: str, param: str, token: str, base: str, hit: dict[str, Any], confirmed: bool = True) -> dict[str, Any]:
+    word = "confirmed" if confirmed else "callback from a non-server source — candidate"
     return {
         "rule_id": "active.blind-ssrf-oob",
-        "title": f"Blind SSRF via '{param}' (out-of-band confirmed)",
+        "title": f"Blind SSRF via '{param}' (out-of-band {word})",
         "severity": "high",
-        "confidence": "high",
+        "confidence": "high" if confirmed else "medium",
         "category": "ssrf",
         "location": target_url,
         "file_path": target_url,
@@ -98,14 +114,16 @@ def _build_ssrf_finding(target_url: str, param: str, token: str, base: str, hit:
         "proof_evidence": {
             "request_line": f"GET {_with_query(target_url, {param: callback_url(base, token)})}",
             "response_status": f"collaborator hit: {hit.get('method', 'GET')} {hit.get('path', '/oob/' + token)}",
-            "matched_value": (f"the target server made an out-of-band {hit.get('method', 'GET')} request to the "
-                              f"collaborator token {token} (source {hit.get('ip', '?')}) after '{param}' was set to "
-                              f"the callback URL — blind SSRF confirmed"),
+            "matched_value": (f"an out-of-band {hit.get('method', 'GET')} request reached the collaborator token "
+                              f"{token} (source {hit.get('ip', '?')}, UA {(hit.get('headers') or {}).get('user-agent', '?')}) "
+                              f"after '{param}' was set to the callback URL — "
+                              + ("blind SSRF confirmed (the fresh token was empty before the probe)"
+                                 if confirmed else "but the source looks like a crawler/preview bot, not the target's own fetch; verify the source before submitting")),
         },
     }
 
 
-def _ssrf_plan(target_url: str, param: str, token: str, base: str, hit: dict[str, Any]) -> dict[str, Any]:
+def _ssrf_plan(target_url: str, param: str, token: str, base: str, hit: dict[str, Any], confirmed: bool = True) -> dict[str, Any]:
     cb = callback_url(base, token)
     return {
         "steps": [
@@ -121,7 +139,7 @@ def _ssrf_plan(target_url: str, param: str, token: str, base: str, hit: dict[str
         "cvss": {"vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N", "base_score": 8.5, "base_severity": "high", "estimated": True},
         "remediation": "Allow-list outbound destinations; block internal/metadata ranges; pin the resolved IP.",
         "proof_of_impact": {
-            "status": "confirmed",
+            "status": "confirmed" if confirmed else "candidate",
             "method": "out-of-band callback (collaborator) — GET-only probe, no data exfiltrated into the report",
             "affected_asset": "internal services and cloud metadata reachable from the server",
             "observed_result": (f"setting '{param}' to the collaborator URL caused the target to make an out-of-band "
@@ -166,11 +184,21 @@ def confirm_blind_ssrf(
 
     governor = governor or HostRateGovernor(
         capacity=settings.active_max_requests_per_host, min_interval_s=settings.active_min_interval_ms / 1000.0)
-    http = http or _Http(settings, governor, max_requests=8)
+    http = http or _Http(settings, governor, max_requests=10)
     params = _candidate_params(sanitized, extra_params, ("url", "next", "dest", "uri", "callback", "u"), 3)
     tried: list[str] = []
+    poll_errors: list[str] = []
     for param in params:
         token = mint_token()
+        # Pre-probe NEGATIVE CONTROL: the fresh, unguessable token must be empty. If it
+        # already carries hits (collision / a shared collaborator), skip it — we can't
+        # attribute a later hit to our probe.
+        pre = poll_collaborator(base, secret, token, timeout=settings.web_fetch_timeout_seconds)
+        if not pre.get("ok"):
+            poll_errors.append(pre.get("error", "poll failed"))
+            continue
+        if pre.get("count"):
+            continue
         probe_url = _with_query(sanitized, {param: callback_url(base, token)})
         try:
             http.fetch(probe_url)  # the target makes the OOB call if vulnerable
@@ -180,14 +208,24 @@ def confirm_blind_ssrf(
         for _ in range(max(1, poll_attempts)):
             time.sleep(max(0.0, poll_delay_s))
             res = poll_collaborator(base, secret, token, timeout=settings.web_fetch_timeout_seconds)
-            if res.get("ok") and res.get("count"):
-                hit = (res.get("hits") or [{}])[0]
-                finding = _build_ssrf_finding(sanitized, param, token, base, hit)
-                finding["ref"] = "F1"
-                return {"ok": True, "status": "confirmed", "param": param, "token": token,
-                        "finding": finding, "attack_plan": _ssrf_plan(sanitized, param, token, base, hit),
-                        "detail": {"hit": hit}}
             if not res.get("ok"):
-                return {"ok": False, "error": res.get("error", "collaborator poll failed")}
-    return {"ok": True, "status": "no-callback", "params_tried": tried,
+                poll_errors.append(res.get("error", "poll failed"))
+                break  # transient poll failure for THIS param — move on, don't abort the sweep
+            if res.get("count"):
+                # The token went 0 -> N only AFTER our probe, and it is unguessable, so the
+                # callback resulted from this probe. A known crawler/bot/link-preview UA is
+                # downgraded to a CANDIDATE (it may be a log-scanner / unfurler, not the
+                # target's own server-side fetch).
+                hit = (res.get("hits") or [{}])[0]
+                ua = (hit.get("headers") or {}).get("user-agent", "")
+                confirmed = not _is_crawler_ua(ua)
+                finding = _build_ssrf_finding(sanitized, param, token, base, hit, confirmed)
+                finding["ref"] = "F1"
+                return {"ok": True, "status": "confirmed" if confirmed else "candidate",
+                        "param": param, "token": token, "finding": finding,
+                        "attack_plan": _ssrf_plan(sanitized, param, token, base, hit, confirmed),
+                        "detail": {"hit": hit, "negative_control": "the fresh token was empty before the probe"}}
+    if not tried and poll_errors:
+        return {"ok": False, "error": poll_errors[0]}
+    return {"ok": True, "status": "no-callback", "params_tried": tried, "poll_errors": poll_errors,
             "reason": "no out-of-band callback was observed for these parameters (no blind SSRF proven here)."}

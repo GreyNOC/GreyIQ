@@ -345,7 +345,7 @@ def references_for_class(class_id: str) -> list[str]:
 # class with no clean VRT mapping (the report only renders the row when non-empty).
 _BUGCROWD_VRT: dict[str, str] = {
     "rce": "server_security_misconfiguration.remote_code_execution_rce",
-    "xss": "cross_site_scripting_xss.stored",
+    "xss": "cross_site_scripting_xss.reflected",
     "sqli": "server_side_injection.sql_injection",
     "ssrf": "server_side_injection.server_side_request_forgery_ssrf",
     "ssti": "server_side_injection.server_side_template_injection_ssti",
@@ -358,7 +358,7 @@ _BUGCROWD_VRT: dict[str, str] = {
     "secrets": "sensitive_data_exposure.disclosure_of_secrets",
     "jwt": "broken_authentication_and_session_management.authentication_bypass",
     "file-upload": "unrestricted_file_upload",
-    "graphql": "server_security_misconfiguration.misconfigured_dns",
+    "graphql": "",  # no clean Bugcrowd VRT leaf for GraphQL — report renders the honest placeholder
     "deserialization": "server_side_injection.remote_code_execution_rce",
     "nosqli": "server_side_injection.nosql_injection",
     "headers": "server_security_misconfiguration.security_headers",

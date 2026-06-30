@@ -57,6 +57,13 @@ class FingerprintTests(unittest.TestCase):
             "x.example.com": (404, "<html><h1>404 Not Found</h1>The page was not found.</html>")})
         self.assertIsNone(ts.check_host_takeover("x.example.com"))
 
+    def test_200_page_quoting_a_fingerprint_is_not_a_takeover(self) -> None:
+        # A normal 200 page (status dashboard / blog / aggregator) that merely QUOTES the
+        # unclaimed-service text must NOT confirm — a dangling service serves a 4xx/5xx.
+        ts._guard_url, ts._fetch_raw = _stub_fetch({
+            "status.example.com": (200, "<html>Past incident: 'Fastly error: unknown domain' on our CDN. Resolved.</html>")})
+        self.assertIsNone(ts.check_host_takeover("status.example.com"))
+
 
 class ScanTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -96,6 +103,16 @@ class ScanTests(unittest.TestCase):
         )
         self.assertNotIn("evil.other.com", touched)
         self.assertTrue(all(h.endswith("example.com") for h in touched))
+
+    def test_wildcard_dns_skips_wordlist_expansion(self) -> None:
+        # Everything resolves (a wildcard A/CNAME) -> don't expand the wordlist (every label
+        # would hit the same catch-all); rely on apex + recon-discovered hosts only.
+        ts._guard_url, ts._fetch_raw = _stub_fetch({})  # no host matches a fingerprint
+        res = ts.scan_subdomain_takeover("example.com", scope="example.com", settings=get_settings(),
+                                         extra_hosts=["api.example.com"], resolver=lambda h: True)
+        self.assertTrue(res["ok"])
+        self.assertNotIn("www.example.com", res["resolved"])  # wordlist NOT expanded under wildcard
+        self.assertIn("example.com", res["resolved"])
 
     def test_bad_target_errors(self) -> None:
         self.assertFalse(ts.scan_subdomain_takeover("not-a-domain", scope="x")["ok"])
