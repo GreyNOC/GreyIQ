@@ -2,6 +2,21 @@
 
 Notable changes to GreyIQ.
 
+## v0.44.0
+
+### Phase C — certificate-transparency subdomain seeding (takeover)
+Subdomain-takeover enumeration now seeds from certificate-transparency logs (crt.sh) — the
+highest-yield source of real subdomains the wordlist misses.
+
+- Queries crt.sh for the apex's issued certs (OSINT — it queries the public CT logs, **never
+  the target**), parses + de-duplicates the hostnames under the apex (wildcards stripped), and
+  folds them into the candidate set alongside the wordlist + recon-discovered hosts.
+  Best-effort: any failure or out-of-apex name is dropped and enumeration falls back cleanly.
+- This is the engine's first **external (non-target) egress**, by explicit operator opt-in.
+  The per-host fetch + takeover confirmation stay scope-bound, GET-only, and SSRF-guarded.
+
+403 tests green (+4).
+
 ## v0.43.0
 
 ### Phase C — NoSQL injection (error-based, confirm-grade)
