@@ -193,6 +193,32 @@ class BountyReportTests(unittest.TestCase):
         self.assertIn("GET https://example.test/api", single)
         self.assertIn("HTTP 200", single)
 
+    def test_captured_screenshot_embeds_on_both_default_report_paths(self) -> None:
+        # A captured PoC screenshot must embed on the DEFAULT report (build_markdown +
+        # build_finding_markdown), not only the per-platform package. It's referenced by
+        # basename (the .png is bundled alongside the .md) and carries the not-redacted caveat.
+        ctx = {
+            "tool": "GreyIQ BugHunter", "target": "https://example.test",
+            "profile": {"id": "web-app", "name": "Web application", "description": ""},
+            "findings": [{
+                "ref": "F1", "severity": "high", "confidence": "high", "category": "xss",
+                "class_id": "xss", "class_name": "Reflected XSS", "title": "Reflected XSS",
+                "location": "https://example.test/?q=", "rule_id": "active.xss",
+                "description": "Reflected script executes.",
+                "proof_of_impact": {"status": "confirmed"},
+                "screenshot_path": "C:\\\\runtime\\\\screenshots\\\\poc-example-20260629.png",
+            }],
+            "attack_plans": {"F1": {"steps": ["Open the URL."], "impact": "Account takeover."}},
+            "recommended_tools": [], "brain": {"used": False},
+        }
+        single = report_lib.build_finding_markdown(ctx, ctx["findings"][0])
+        multi = report_lib.build_markdown(ctx)
+        for md in (single, multi):
+            self.assertIn("## Screenshot evidence", md)
+            self.assertIn("![Proof-of-concept screenshot](poc-example-20260629.png)", md)  # basename only
+            self.assertNotIn("C:\\\\runtime", md)  # never leak the absolute capture path
+            self.assertIn("NOT auto-redacted", md)
+
     def test_passive_web_finding_gets_curl_repro_step(self) -> None:
         from bughunter.bounty import _deterministic_attack_plan
         finding = {

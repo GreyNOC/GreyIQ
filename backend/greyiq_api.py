@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import hmac
 import json
@@ -275,6 +276,7 @@ from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, 
 from bughunter import campaign as bounty_campaign  # noqa: E402
 from bughunter import learning as bounty_learning  # noqa: E402
 from bughunter import submission as bounty_submission  # noqa: E402
+from bughunter import report as bounty_report  # noqa: E402
 from bughunter import report_formats as bounty_formats  # noqa: E402
 from bughunter import screenshot_service as bounty_screenshot  # noqa: E402
 from bughunter import bundle as bounty_bundle  # noqa: E402
@@ -711,6 +713,21 @@ class TrainingState:
     last_error: str = ""
     logs: list[str] = field(default_factory=list)
     runtime: dict[str, Any] = field(default_factory=lambda: {"status": "idle", "stage": "idle", "detail": ""})
+
+
+def _confirm_route(fn):
+    """Wrap a confirm route (IDOR / takeover / OOB-SSRF) so an unexpected service or
+    report-render exception returns a structured ``{ok: False, error}`` the cockpit can
+    display, instead of bubbling to the generic 500 handler and failing the whole request
+    opaquely. The full traceback is logged server-side; the operator sees a short reason."""
+    @functools.wraps(fn)
+    def wrapper(self, request):
+        try:
+            return fn(self, request)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the operator UI, never crashes the route
+            self.log(traceback.format_exc())
+            return {"ok": False, "error": f"{fn.__name__} failed: {exc.__class__.__name__}: {exc}"}
+    return wrapper
 
 
 class GreyIQRuntime:
@@ -1339,12 +1356,56 @@ class GreyIQRuntime:
             "model": dossier["model"], "path": written,
         }
 
+    def _persist_finding_run(self, *, findings: list[dict[str, Any]], plans: dict[str, Any],
+                             target: str, scope: str, platform: str, slug: str, host: Any,
+                             json_extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Shared tail for the confirm routes (IDOR / takeover / OOB-SSRF): build the report
+        ctx, render every finding for the chosen platform, write the ``.md`` + ``.json``
+        sidecar, and cache the result as a run so every per-finding action (per-platform
+        report, screenshot, research, bundle, the hard-gated submit) resolves later.
+
+        Centralises three near-identical ~30-line tails so they can't drift, and guarantees
+        the JSON evidence sidecar on every path (the OOB route previously skipped it).
+        Returns the bits the caller folds into its own response shape."""
+        # Resolve each finding's severity ONCE (CVSS-preferred) and write it back, so the
+        # toast the cockpit shows, the cached run, the report, and the H1 rating can't
+        # disagree — every later reader sees the same severity word.
+        for f in findings:
+            f["severity"] = bounty_report.resolve_severity(f, plans.get(f.get("ref")))
+        gen = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+        platform = bounty_formats.normalize_platform(platform)
+        ctx = {"tool": "GreyIQ BugHunter", "version": VERSION, "generated_at": gen,
+               "target": target, "scope": scope, "attack_plans": plans}
+        report_md = "\n\n---\n\n".join(bounty_formats.render_finding(ctx, f, platform) for f in findings)
+
+        safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        out_dir = RUNTIME_DIR / "reports"
+        md_path = out_dir / f"{slug}-{safe(host)}-{stamp}.md"
+        json_path = out_dir / f"{slug}-{safe(host)}-{stamp}.json"
+        payload: dict[str, Any] = {"findings": findings, "attack_plans": plans}
+        if json_extra:
+            payload.update(json_extra)
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            md_path.write_text(report_md, encoding="utf-8")
+            json_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+            report_path, json_out = str(md_path), str(json_path)
+        except OSError:
+            report_path, json_out = "", ""
+
+        result = {"ok": True, "generated_at": gen, "findings": findings, "attack_plans": plans,
+                  "proof_of_impact": {ref: {"status": "confirmed"} for ref in plans},
+                  "report_path": report_path, "json_path": json_out, "output_dir": str(out_dir)}
+        self._cache_bounty_run(result, target=target, scope=scope, program=None)
+        return {"run_id": result.get("run_id"), "platform": platform, "report": report_md,
+                "report_path": report_path, "json_path": json_out, "generated_at": gen}
+
+    @_confirm_route
     def scan_takeover(self, request: "TakeoverRequest") -> dict[str, Any]:
         """Enumerate subdomains of the target's apex and confirm dangling takeovers. Each
         confirmed takeover is cached as a run finding (report/screenshot/research/bundle/
         submit all work). GET-only, scope-bound, SSRF-guarded — no resource is ever claimed."""
-        from datetime import UTC, datetime
-
         res = bounty_takeover.scan_subdomain_takeover(request.target, scope=request.scope)
         if not res.get("ok"):
             return res
@@ -1356,44 +1417,27 @@ class GreyIQRuntime:
         if not findings:
             return summary
 
-        gen = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
         plans: dict[str, Any] = {}
         for i, f in enumerate(findings, 1):
             f["ref"] = f"F{i}"
             plans[f["ref"]] = bounty_takeover.build_plan(f)
-        ctx = {"tool": "GreyIQ BugHunter", "version": VERSION, "generated_at": gen,
-               "target": request.target, "scope": request.scope, "attack_plans": plans}
-        platform = bounty_formats.normalize_platform(request.platform)
-        report_md = "\n\n---\n\n".join(bounty_formats.render_finding(ctx, f, platform) for f in findings)
-
-        safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
-        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-        out_dir = RUNTIME_DIR / "reports"
-        md_path = out_dir / f"takeover-{safe(res.get('apex'))}-{stamp}.md"
-        json_path = out_dir / f"takeover-{safe(res.get('apex'))}-{stamp}.json"
-        try:
-            out_dir.mkdir(parents=True, exist_ok=True)
-            md_path.write_text(report_md, encoding="utf-8")
-            json_path.write_text(json.dumps({"findings": findings, "attack_plans": plans}, indent=2, default=str), encoding="utf-8")
-            report_path, json_out = str(md_path), str(json_path)
-        except OSError:
-            report_path, json_out = "", ""
-
-        result = {"ok": True, "generated_at": gen, "findings": findings, "attack_plans": plans,
-                  "proof_of_impact": {ref: {"status": "confirmed"} for ref in plans},
-                  "report_path": report_path, "json_path": json_out, "output_dir": str(out_dir)}
-        self._cache_bounty_run(result, target=request.target, scope=request.scope, program=None)
-        summary["run_id"] = result.get("run_id")
-        summary["report"] = report_md
+        persisted = self._persist_finding_run(
+            findings=findings, plans=plans, target=request.target, scope=request.scope,
+            platform=request.platform, slug="takeover", host=res.get("apex"))
+        summary["run_id"] = persisted["run_id"]
+        summary["report"] = persisted["report"]
+        # Rebuild the summary list AFTER persist so its severities reflect the resolved
+        # (CVSS-preferred) value written back onto each finding, not the raw scanner label.
+        summary["findings"] = [{"title": f["title"], "severity": f["severity"],
+                                "service": f.get("_takeover_service"), "location": f["location"]} for f in findings]
         return summary
 
+    @_confirm_route
     def check_idor(self, request: "IdorRequest") -> dict[str, Any]:
         """Confirm IDOR/BOLA via a dual-session differential (the operator's two test
         accounts). On a CONFIRMED cross-tenant read, cache it as a run so every per-finding
         action (per-platform report, screenshot, research, bundle, the hard-gated submit)
         works on it. The proof is the differential only — never another user's raw data."""
-        from datetime import UTC, datetime
-
         res = bounty_access.run_idor_check(
             request.url_a, request.url_b,
             account_a={"cookie": request.a_cookie, "headers": request.a_headers},
@@ -1408,35 +1452,14 @@ class GreyIQRuntime:
 
         finding = dict(res["finding"]); finding["ref"] = "F1"
         plan = res["attack_plan"]
-        gen = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-        ctx = {"tool": "GreyIQ BugHunter", "version": VERSION, "generated_at": gen,
-               "target": request.url_a, "scope": request.scope, "attack_plans": {"F1": plan}}
-        platform = bounty_formats.normalize_platform(request.platform)
-        report_md = bounty_formats.render_finding(ctx, finding, platform)
-
-        safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
         host = urlparse(request.url_a).hostname or "target"
-        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-        out_dir = RUNTIME_DIR / "reports"
-        md_path = out_dir / f"idor-{safe(host)}-{stamp}.md"
-        json_path = out_dir / f"idor-{safe(host)}-{stamp}.json"
-        try:
-            out_dir.mkdir(parents=True, exist_ok=True)
-            md_path.write_text(report_md, encoding="utf-8")
-            json_path.write_text(json.dumps({"finding": finding, "attack_plan": plan, "detail": res.get("detail")}, indent=2, default=str), encoding="utf-8")
-            report_path, json_out = str(md_path), str(json_path)
-        except OSError:
-            report_path, json_out = "", ""
-
-        result = {
-            "ok": True, "generated_at": gen, "findings": [finding],
-            "attack_plans": {"F1": plan}, "proof_of_impact": {"F1": {"status": "confirmed"}},
-            "report_path": report_path, "json_path": json_out, "output_dir": str(out_dir),
-        }
-        self._cache_bounty_run(result, target=request.url_a, scope=request.scope, program=None)
+        persisted = self._persist_finding_run(
+            findings=[finding], plans={"F1": plan}, target=request.url_a, scope=request.scope,
+            platform=request.platform, slug="idor", host=host,
+            json_extra={"detail": res.get("detail")})
         return {
-            "ok": True, "status": "confirmed", "run_id": result.get("run_id"), "ref": "F1",
-            "platform": platform, "report": report_md, "detail": res.get("detail"),
+            "ok": True, "status": "confirmed", "run_id": persisted["run_id"], "ref": "F1",
+            "platform": persisted["platform"], "report": persisted["report"], "detail": res.get("detail"),
             "title": finding["title"], "severity": finding["severity"],
         }
 
@@ -1569,11 +1592,10 @@ class GreyIQRuntime:
         base, secret = self._oob_config()
         return bounty_oob.poll_collaborator(base, secret, request.token)
 
+    @_confirm_route
     def check_oob_ssrf(self, request: "OobSsrfRequest") -> dict[str, Any]:
         """Confirm blind SSRF out-of-band: inject the collaborator callback into the
         target's params, probe, and poll. A confirmed hit is cached as a run finding."""
-        from datetime import UTC, datetime
-
         base, secret = self._oob_config()
         res = bounty_oob.confirm_blind_ssrf(request.url, base=base, secret=secret, scope=request.scope)
         if not res.get("ok"):
@@ -1583,28 +1605,13 @@ class GreyIQRuntime:
 
         finding = dict(res["finding"]); finding["ref"] = "F1"
         plan = res["attack_plan"]
-        gen = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-        ctx = {"tool": "GreyIQ BugHunter", "version": VERSION, "generated_at": gen,
-               "target": request.url, "scope": request.scope, "attack_plans": {"F1": plan}}
-        platform = bounty_formats.normalize_platform(request.platform)
-        report_md = bounty_formats.render_finding(ctx, finding, platform)
-        safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
         host = urlparse(request.url).hostname or "target"
-        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-        out_dir = RUNTIME_DIR / "reports"
-        md_path = out_dir / f"oob-ssrf-{safe(host)}-{stamp}.md"
-        try:
-            out_dir.mkdir(parents=True, exist_ok=True)
-            md_path.write_text(report_md, encoding="utf-8")
-            report_path = str(md_path)
-        except OSError:
-            report_path = ""
-        result = {"ok": True, "generated_at": gen, "findings": [finding], "attack_plans": {"F1": plan},
-                  "proof_of_impact": {"F1": {"status": "confirmed"}}, "report_path": report_path,
-                  "json_path": "", "output_dir": str(out_dir)}
-        self._cache_bounty_run(result, target=request.url, scope=request.scope, program=None)
-        return {"ok": True, "status": "confirmed", "run_id": result.get("run_id"), "ref": "F1",
-                "platform": platform, "report": report_md, "param": res.get("param"), "token": res.get("token"),
+        persisted = self._persist_finding_run(
+            findings=[finding], plans={"F1": plan}, target=request.url, scope=request.scope,
+            platform=request.platform, slug="oob-ssrf", host=host)
+        return {"ok": True, "status": "confirmed", "run_id": persisted["run_id"], "ref": "F1",
+                "platform": persisted["platform"], "report": persisted["report"],
+                "param": res.get("param"), "token": res.get("token"),
                 "title": finding["title"], "severity": finding["severity"]}
 
     # ---- Autonomous operator ------------------------------------------------------

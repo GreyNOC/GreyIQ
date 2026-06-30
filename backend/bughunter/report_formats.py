@@ -16,15 +16,9 @@ the finding carries it. Pure / frozen-safe.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from bughunter import report as R
-
-# A captured screenshot is an image and cannot be auto-redacted — every report that
-# embeds one carries this caveat so it is never presented as scrubbed.
-_SCREENSHOT_WARNING = ("Screenshot is NOT auto-redacted — review it for secrets, session "
-                       "tokens, or other users' data before sharing this report.")
 
 # Ordered so the UI lists HackerOne first, then YesWeHack, then the next two most
 # popular crowdsourced platforms.
@@ -77,11 +71,9 @@ _PROFILES: dict[str, dict[str, str]] = {
 
 
 def _base_severity(finding: dict[str, Any], plan: dict[str, Any]) -> str:
-    """The severity bucket (prefers the estimated CVSS base severity, else the finding)."""
-    cvss = plan.get("cvss") if isinstance(plan, dict) else None
-    if isinstance(cvss, dict) and cvss.get("base_severity"):
-        return str(cvss["base_severity"]).strip().lower()
-    return str(finding.get("severity") or "low").strip().lower()
+    """The severity bucket — delegates to the single source of truth (``report.resolve_severity``)
+    so the per-platform label can never disagree with the default report or the H1 rating."""
+    return R.resolve_severity(finding, plan)
 
 
 def platform_severity(platform: str, finding: dict[str, Any], plan: dict[str, Any]) -> str:
@@ -194,16 +186,9 @@ def _section_evidence(out: list[str], finding: dict[str, Any], *, heading: str) 
 
 
 def _section_screenshot(out: list[str], finding: dict[str, Any]) -> None:
-    """Embed a captured proof screenshot (referenced by basename so it resolves when the
-    .md and .png are written to the same folder) plus the not-redacted caveat."""
-    path = str(finding.get("screenshot_path") or "").strip()
-    if not path:
-        return
-    out.append("## Screenshot evidence\n")
-    out.append(f"![Proof-of-concept screenshot]({Path(path).name})")
-    out.append("")
-    out.append(f"> {_SCREENSHOT_WARNING}")
-    out.append("")
+    """Embed a captured proof screenshot — delegates to the shared ``report._append_screenshot``
+    so the default report and every per-platform report render screenshot evidence identically."""
+    R._append_screenshot(out, finding)
 
 
 def _section_impact(out: list[str], finding: dict[str, Any], plan: dict[str, Any]) -> None:

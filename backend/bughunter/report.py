@@ -61,8 +61,23 @@ _NEXT_STEP_TAG = {
 _JWT_CREDENTIAL_RULE_IDS = {"secret.jwt", "web.exposed.secret.jwt"}
 
 
-def _sev_rank(finding: dict[str, Any]) -> int:
-    return _SEVERITY_ORDER.get(str(finding.get("severity", "info")).lower(), 0)
+def resolve_severity(finding: dict[str, Any], plan: dict[str, Any] | None = None) -> str:
+    """The single source of truth for a finding's severity word (lowercased).
+
+    The CVSS base severity modelled for the attack plan (impact_model) is authoritative
+    when present — it reflects the analysed impact — and wins over the raw scanner label
+    carried on the finding. Falls back to the finding's own ``severity``, then ``"low"``.
+    Every render path (the default report's table/detail/triage, the per-platform report,
+    and the HackerOne ``severity_rating``) routes through here, so the severity shown for a
+    finding can never disagree across the different outputs the operator submits."""
+    cvss = plan.get("cvss") if isinstance(plan, dict) else None
+    if isinstance(cvss, dict) and cvss.get("base_severity"):
+        return str(cvss["base_severity"]).strip().lower()
+    return str(finding.get("severity") or "low").strip().lower()
+
+
+def _sev_rank(finding: dict[str, Any], plan: dict[str, Any] | None = None) -> int:
+    return _SEVERITY_ORDER.get(resolve_severity(finding, plan), 0)
 
 
 def _jwt_replay_value(finding: dict[str, Any]) -> bool | None:
@@ -86,10 +101,11 @@ def _reportable_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]
     return out
 
 
-def severity_counts(findings: list[dict[str, Any]]) -> dict[str, int]:
+def severity_counts(findings: list[dict[str, Any]], attack_plans: dict[str, Any] | None = None) -> dict[str, int]:
+    plans = attack_plans or {}
     counts = {key: 0 for key in _SEVERITY_ORDER}
     for finding in findings:
-        sev = str(finding.get("severity", "info")).lower()
+        sev = resolve_severity(finding, plans.get(finding.get("ref")))
         if sev in counts:
             counts[sev] += 1
     return counts
@@ -332,6 +348,26 @@ _PROOF_EVIDENCE_LABELS = (
 )
 
 
+_SCREENSHOT_WARNING = ("Screenshot is NOT auto-redacted — review it for secrets, session "
+                       "tokens, and other users' data before attaching it to a report.")
+
+
+def _append_screenshot(out: list[str], finding: dict[str, Any]) -> None:
+    """Embed a captured proof screenshot by basename (so the .md and the .png resolve from
+    the same folder) plus the not-auto-redacted caveat. Shared by the default report and
+    the per-platform report so a captured screenshot lands on *every* report surface, not
+    only the platform package."""
+    path = str(finding.get("screenshot_path") or "").strip()
+    if not path:
+        return
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    out.append("## Screenshot evidence\n")
+    out.append(f"![Proof-of-concept screenshot]({name})")
+    out.append("")
+    out.append(f"> {_SCREENSHOT_WARNING}")
+    out.append("")
+
+
 def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
     """Render the captured passive proof artifacts (request line + crafted header,
     response status, offending header/cookie) a web finding carries — the strongest
@@ -485,7 +521,7 @@ def _linkify_owasp(text: str) -> str:
 
 def build_markdown(ctx: dict[str, Any]) -> str:
     findings: list[dict[str, Any]] = _reportable_findings(ctx.get("findings", []))
-    counts = severity_counts(findings)
+    counts = severity_counts(findings, ctx.get("attack_plans"))
     profile = ctx.get("profile", {}) or {}
     vuln_class = ctx.get("vuln_class") or None
     brain = ctx.get("brain") or {}
@@ -574,13 +610,15 @@ def build_markdown(ctx: dict[str, Any]) -> str:
         return "\n".join(out)
 
     # --- Findings table ---
+    attack_plans = ctx.get("attack_plans", {}) or {}
     out.append("## Findings\n")
     out.append("| # | Severity | Class | Title | Location |")
     out.append("|---|---|---|---|---|")
     for finding in findings:
+        sev = _SEVERITY_LABEL.get(resolve_severity(finding, attack_plans.get(finding.get("ref"))), "?")
         out.append(
             f"| {finding.get('ref', '')} "
-            f"| {_SEVERITY_LABEL.get(str(finding.get('severity')).lower(), '?')} "
+            f"| {sev} "
             f"| {_md_escape_cell(finding.get('class_name') or finding.get('category') or '')} "
             f"| {_md_escape_cell(finding.get('title', ''))} "
             f"| {_code(_location(finding))} |"
@@ -589,11 +627,10 @@ def build_markdown(ctx: dict[str, Any]) -> str:
 
     # --- Per-finding detail ---
     out.append("## Finding details\n")
-    attack_plans = ctx.get("attack_plans", {}) or {}
     for finding in findings:
         ref = finding.get("ref", "")
         plan = attack_plans.get(ref) or {}
-        sev = _SEVERITY_LABEL.get(str(finding.get("severity")).lower(), "?")
+        sev = _SEVERITY_LABEL.get(resolve_severity(finding, plan), "?")
         out.append(f"### {ref} · {finding.get('title', 'Finding')} — {sev}\n")
         out.append(f"- **Severity / confidence:** {sev} / {finding.get('confidence', 'unknown')}")
         if finding.get("class_name"):
@@ -642,6 +679,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
             out.append(f"**Impact:** {plan.get('impact') or finding.get('impact')}")
             out.append("")
         _append_proof_of_impact(out, finding, plan, heading="**Proof of impact:**")
+        _append_screenshot(out, finding)
         remediation = finding.get("remediation") or plan.get("remediation")
         if remediation:
             out.append(f"**Remediation:** {remediation}")
@@ -667,10 +705,11 @@ def build_markdown(ctx: dict[str, Any]) -> str:
 
 def _append_bounty_triage(out: list[str], ctx: dict[str, Any], counts: dict[str, int]) -> None:
     findings = _reportable_findings(ctx.get("findings") or [])
+    plans = ctx.get("attack_plans", {}) or {}
     out.append("## Bounty triage\n")
     if findings:
-        top = sorted(findings, key=_sev_rank, reverse=True)[0]
-        top_sev = _SEVERITY_LABEL.get(str(top.get("severity")).lower(), "?")
+        top = sorted(findings, key=lambda f: _sev_rank(f, plans.get(f.get("ref"))), reverse=True)[0]
+        top_sev = _SEVERITY_LABEL.get(resolve_severity(top, plans.get(top.get("ref"))), "?")
         out.append(
             f"- **Highest priority:** {top.get('ref', '')} - {top.get('title', 'Finding')} "
             f"({top_sev}, {top.get('class_name') or top.get('category') or 'unclassified'})."
@@ -848,7 +887,7 @@ def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
         "scanners_run": ctx.get("scanners_run", []),
         "risk": ctx.get("risk", "unknown"),
         "score": ctx.get("score", 0),
-        "severity_counts": severity_counts(findings),
+        "severity_counts": severity_counts(findings, ctx.get("attack_plans")),
         "class_counts": _class_counts(findings),
         "finding_count": len(findings),
         "findings": findings,
@@ -894,8 +933,8 @@ def build_finding_markdown(ctx: dict[str, Any], finding: dict[str, Any]) -> str:
     everything a bounty platform needs in one paste."""
     if not _reportable_findings([finding]):
         return ""
-    sev = _SEVERITY_LABEL.get(str(finding.get("severity")).lower(), "?")
     plan = (ctx.get("attack_plans") or {}).get(finding.get("ref"), {}) or {}
+    sev = _SEVERITY_LABEL.get(resolve_severity(finding, plan), "?")
     out: list[str] = []
     out.append(f"# {finding.get('title', 'Finding')} — {sev}\n")
     out.append("| | |")
@@ -965,6 +1004,7 @@ def build_finding_markdown(ctx: dict[str, Any], finding: dict[str, Any]) -> str:
     if impact:
         out.append(f"## Impact\n\n{impact}\n")
     _append_proof_of_impact(out, finding, plan, heading="## Proof of impact\n")
+    _append_screenshot(out, finding)
     remediation = finding.get("remediation") or plan.get("remediation")
     if remediation:
         out.append(f"## Remediation\n\n{remediation}\n")

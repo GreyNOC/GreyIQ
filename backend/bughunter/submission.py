@@ -31,11 +31,10 @@ _H1_SEVERITY = {"critical": "critical", "high": "high", "medium": "medium", "low
 
 
 def severity_rating(finding: dict[str, Any], plan: dict[str, Any]) -> str:
-    """Map the finding/CVSS severity onto HackerOne's rating vocabulary."""
-    cvss = plan.get("cvss") if isinstance(plan, dict) else None
-    if isinstance(cvss, dict) and cvss.get("base_severity"):
-        return _H1_SEVERITY.get(str(cvss["base_severity"]).strip().lower(), "low")
-    return _H1_SEVERITY.get(str(finding.get("severity") or "low").strip().lower(), "low")
+    """Map the finding's resolved severity onto HackerOne's rating vocabulary. Uses the
+    single source of truth (``report.resolve_severity``) so the API rating can't disagree
+    with the severity shown in the report the operator pastes alongside it."""
+    return _H1_SEVERITY.get(report_lib.resolve_severity(finding, plan), "low")
 
 
 def _cwe_number(finding: dict[str, Any]) -> str:
@@ -55,7 +54,7 @@ def build_submission(ctx: dict[str, Any], finding: dict[str, Any], platform: str
     plan = (ctx.get("attack_plans") or {}).get(finding.get("ref"), {}) or {}
     proof = report_lib._proof_of_impact_detail(finding, plan)
     impact = str(plan.get("impact") or finding.get("impact") or proof.get("affected_asset") or "").strip()
-    sev = str(finding.get("severity") or "").title()
+    sev = report_lib.resolve_severity(finding, plan).title()
     title = f"[{sev}] {finding.get('title', 'Security finding')} at {finding.get('location') or ctx.get('target', '')}"
     return {
         "ref": finding.get("ref", ""),
