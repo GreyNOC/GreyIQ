@@ -2,6 +2,23 @@
 
 Notable changes to GreyIQ.
 
+## v0.39.0
+
+### Wider known-CVE coverage — more libraries + CMS detection
+The outdated-component check now fingerprints more of the front-end stack:
+
+- Added **jQuery UI** (with a guard so it's never confused with jQuery core), **Axios**,
+  **Underscore.js**, and **Mustache.js** to the curated CVE table, plus **WordPress core**
+  via the `<meta generator>` tag and an `X-Powered-By` header.
+- `detect_components` is now header- and meta-aware (it reads response headers and the
+  generator tag, not just the body).
+- Server-software banner versions (`Server:`, `X-Powered-By:` nginx/Apache/PHP) are
+  **deliberately not** mapped to CVEs — version-alone is low-signal and routinely rejected,
+  which would be a false positive against the engine's confirm-grade promise. Only products
+  with a clean version and a real, accepted CVE are matched.
+
+370 tests green (+5).
+
 ## v0.38.0
 
 ### Known-CVE detection now runs inside every campaign (passive earnings)
