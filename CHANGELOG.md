@@ -2,6 +2,37 @@
 
 Notable changes to GreyIQ.
 
+## v0.29.0
+
+### Work the lead end to end — research, prove, and download the whole engagement
+GreyIQ can now take a lead all the way to a submittable result and hand you the entire
+engagement as one download.
+
+- **Research each lead (your brain, your choice).** A new **Research this lead** action
+  writes a research dossier per finding — what the bug is here, why it matters, an ordered
+  plan to confirm it, exploitation notes, variants to try, and references. It uses the
+  **brain you plug in** (Claude / ChatGPT / local Ollama) and makes **no internet calls**;
+  with no brain configured it still produces a complete deterministic dossier. (`POST
+  /api/bounty/research`.)
+
+- **Screenshot the exploit.** A new **Capture screenshot** action drives a headless
+  browser to a finding's proof-of-concept URL and saves a PNG that's embedded in the
+  report and the submission package. Opt-in, scope-bound and SSRF-guarded, and clearly
+  flagged as **not auto-redacted — review before you submit** (an image can't be scrubbed
+  the way text evidence is). Needs Playwright (`pip install playwright && python -m
+  playwright install chromium`); degrades cleanly when absent. (`POST
+  /api/bounty/screenshot`.)
+
+- **Deep mode — commit to the plan automatically.** A new **Deep auto-work** toggle (and
+  `gn campaign --deep`) implies proof-of-impact + time-based blind SQLi, then for each
+  *confirmed* lead auto-captures a screenshot and writes a researched dossier into the
+  engagement folder. Still GET-only, scope-bound, and bounded.
+
+- **Download everything (.zip).** A new **Download everything** button (and `gn bundle
+  <folder>`, `POST /api/bounty/bundle`) packages the whole engagement — reports,
+  per-platform submission packages, captured evidence, screenshots, research dossiers,
+  and JSON — into a single .zip you can submit from.
+
 ## v0.28.0
 
 ### Choose your reporting format — HackerOne, YesWeHack, Bugcrowd, Intigriti
