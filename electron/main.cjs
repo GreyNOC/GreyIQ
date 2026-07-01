@@ -297,8 +297,14 @@ function createWindow() {
     }
   });
 
-  mainWindow.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => {
-    callback(false);
+  // Deny every permission EXCEPT 'notifications' -- the completion/submission alerts
+  // (public/app.js's ckNotify) call the standard Web Notification API, which Electron
+  // maps straight to a native OS notification with no custom bridge needed. Without
+  // this allow-list entry, Notification.requestPermission() silently resolves to
+  // 'denied' in the packaged app even though the same code works fine in a plain
+  // browser tab during dev.
+  mainWindow.webContents.session.setPermissionRequestHandler((_webContents, permission, callback) => {
+    callback(permission === 'notifications');
   });
 
   // Show a loading screen immediately so the user sees the app is alive while the

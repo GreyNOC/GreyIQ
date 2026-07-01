@@ -282,3 +282,43 @@ def funnel(runtime_dir: str | Path, program: str | None = None, target: str = ""
         "portfolio": _count(keys),
         "programs": {pid: _count([pid]) for pid in keys},
     }
+
+
+# Column order for to_csv_rows() -- every field a bounty hunter would want in a
+# spreadsheet for manual tracking or income reporting. Fixed and explicit (not
+# `rec.keys()`) so the CSV shape never silently changes if a record gains an
+# internal-only field later.
+CSV_COLUMNS: tuple[str, ...] = (
+    "program", "dedup_key", "class_id", "rule_id", "title", "severity", "stage",
+    "proof_status", "cvss_base", "source_url", "bounty", "outcome", "h1_report_id",
+    "h1_state", "first_seen", "last_seen", "submitted_at", "updated_at",
+)
+
+# Leading characters Excel/Sheets/LibreOffice treat as the start of a formula when a
+# cell is opened. `title`/`source_url`/`program` can carry text influenced by a
+# scanned target (a URL path, a page title) -- a hostile program could otherwise land
+# a formula (data exfiltration via HYPERLINK/WEBSERVICE, or DDE) in a hunter's own
+# spreadsheet export.
+_CSV_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _defang_csv_cell(value: Any) -> Any:
+    """A leading apostrophe is rendered as literal text (never evaluated) by every
+    mainstream spreadsheet app -- the standard CSV-formula-injection mitigation."""
+    text = value if isinstance(value, str) else str(value if value is not None else "")
+    return "'" + text if text.startswith(_CSV_FORMULA_TRIGGERS) else value
+
+
+def to_csv_rows(runtime_dir: str | Path, program: str | None = None, target: str = "") -> list[dict[str, Any]]:
+    """Flatten every finding record (one program, or the whole portfolio) into
+    spreadsheet-friendly rows with a fixed, stable column set (CSV_COLUMNS). Read-
+    only -- never mutates the store."""
+    data = _load(runtime_dir).get("programs", {})
+    pids = [program_key(program, target)] if (program or target) else list(data)
+    rows: list[dict[str, Any]] = []
+    for pid in pids:
+        for rec in (data.get(pid, {}).get("findings", {}) or {}).values():
+            row = {col: _defang_csv_cell(rec.get(col, "")) for col in CSV_COLUMNS}
+            row["program"] = _defang_csv_cell(pid)  # authoritative -- rec["program"] may be stale/absent on an old record
+            rows.append(row)
+    return rows

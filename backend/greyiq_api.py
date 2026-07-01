@@ -2245,7 +2245,27 @@ class GreyIQRuntime:
             "ok": True,
             "summary": bounty_learning.program_summary(RUNTIME_DIR, program, target or ""),
             "intelligence": bounty_learning.program_intelligence(RUNTIME_DIR, program, target or ""),
+            # The pipeline funnel (discovered -> confirmed -> reported -> submitted ->
+            # paid) is already computed for the Operator tab (operator_pipeline above) --
+            # surface it here too so the Learn tab (literally "what the engine has
+            # learned") can show where findings are actually getting stuck, not just the
+            # flat submitted/rewarded/$ aggregate.
+            "funnel": bounty_ledger.funnel(RUNTIME_DIR, program, target or ""),
         }
+
+    def export_ledger_csv(self, program: str | None, target: str) -> dict[str, Any]:
+        """Flatten the persistent finding ledger (one program, or the whole
+        portfolio) into a CSV for spreadsheet tracking / income reporting. Pure
+        reshaping of already-computed data — read-only, no network."""
+        import csv
+        import io
+
+        rows = bounty_ledger.to_csv_rows(RUNTIME_DIR, program, target or "")
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=list(bounty_ledger.CSV_COLUMNS))
+        writer.writeheader()
+        writer.writerows(rows)
+        return {"ok": True, "csv": buf.getvalue(), "row_count": len(rows)}
 
     def run_agent_redteam(self, request: "AgentRedteamRequest") -> dict[str, Any]:
         return run_agent_redteam(
@@ -3176,6 +3196,12 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             program = (params.get("program") or [None])[0]
             target = (params.get("target") or [""])[0]
             await send_json(send, await asyncio.to_thread(runtime.bounty_stats, program, target))
+            return
+        if method == "GET" and path == "/api/bounty/ledger-csv":
+            params = parse_qs(scope.get("query_string", b"").decode("utf-8", "replace"))
+            program = (params.get("program") or [None])[0]
+            target = (params.get("target") or [""])[0]
+            await send_json(send, await asyncio.to_thread(runtime.export_ledger_csv, program, target))
             return
         if method == "POST" and path == "/api/bounty/submission":
             request = validate_payload(SubmissionPackageRequest, await read_json_body(receive))

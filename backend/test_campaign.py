@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -408,6 +410,66 @@ class RunCampaignOverTargetsTests(unittest.TestCase):
     def test_dedupes_identical_targets(self) -> None:
         result = self._run([str(self.src_a), str(self.src_a)])
         self.assertEqual(result["targets_total"], 1)
+
+    def test_targets_run_concurrently_not_sequentially(self) -> None:
+        # run_campaign_over_targets() used to loop over targets one at a time -- a
+        # bounded thread pool now overlaps them, since each target's own hunt is
+        # almost entirely network-I/O-bound. Prove genuine overlap by timing N fake
+        # targets that each "work" for a fixed duration: sequential execution would
+        # take N x duration; concurrent execution (up to _SPAN_MAX_WORKERS at once)
+        # should take close to ONE duration.
+        original = campaign.run_campaign
+        duration = 0.3
+        n_targets = 4
+
+        def fake_run_campaign(target, **kw):
+            time.sleep(duration)
+            return {"ok": True, "campaign_path": "", "json_path": "", "urls_scanned": 1, "urls_discovered": 1,
+                    "finding_count": 0, "confirmed_count": 0, "submission_paths": [], "findings": [],
+                    "proof_of_impact": {}, "cvss": {}, "attack_plans": {}, "surface": {}, "risk": "clean"}
+
+        campaign.run_campaign = fake_run_campaign
+        try:
+            targets = [f"{self.src_a}-{i}" for i in range(n_targets)]
+            # These aren't real paths, but fake_run_campaign never looks at them.
+            start = time.monotonic()
+            result = self._run(targets)
+            elapsed = time.monotonic() - start
+        finally:
+            campaign.run_campaign = original
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["targets_hunted"], n_targets)
+        # Sequential would take n_targets * duration (1.2s here); concurrent (up to
+        # 4 workers) should take close to one duration. Generous margin for CI jitter.
+        self.assertLess(elapsed, duration * n_targets * 0.75)
+
+    def test_findings_are_assigned_refs_in_target_order_not_completion_order(self) -> None:
+        # Aggregation must stay deterministic: target A's findings always get lower
+        # ref numbers than target B's, regardless of which target's worker thread
+        # happens to finish first.
+        original = campaign.run_campaign
+        # Target "slow" finishes AFTER target "fast" despite being submitted first
+        # (it's index 1) -- if aggregation used completion order instead of target
+        # order, "fast"'s finding would get C1 instead of C2.
+        order = {"slow": 0.25, "fast": 0.0}
+
+        def fake_run_campaign(target, **kw):
+            time.sleep(order.get(target, 0.0))
+            return {"ok": True, "campaign_path": "", "json_path": "", "urls_scanned": 1, "urls_discovered": 1,
+                    "finding_count": 1, "confirmed_count": 0, "submission_paths": [],
+                    "findings": [{"ref": "F1", "title": f"finding for {target}"}],
+                    "proof_of_impact": {"F1": {"status": "missing"}}, "cvss": {}, "attack_plans": {},
+                    "surface": {}, "risk": "low"}
+
+        campaign.run_campaign = fake_run_campaign
+        try:
+            result = self._run(["slow", "fast"])
+        finally:
+            campaign.run_campaign = original
+        self.assertTrue(result["ok"], result.get("error"))
+        titles_by_ref = {f["ref"]: f["title"] for f in result["findings"]}
+        self.assertEqual(titles_by_ref["C1"], "finding for slow")
+        self.assertEqual(titles_by_ref["C2"], "finding for fast")
 
     def test_writes_a_span_index_and_a_bundleable_output_dir(self) -> None:
         result = self._run([str(self.src_a), str(self.src_b)])

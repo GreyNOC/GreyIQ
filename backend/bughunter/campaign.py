@@ -15,6 +15,7 @@ on top. Frozen-safe; the only network is the engine's own guarded scanners.
 
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
 import hashlib
 import json
@@ -43,6 +44,13 @@ from bughunter.target_ingest import _normalize_one
 
 _SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 _MAX_PROGRAM_TARGETS = 25  # a "span the whole program" campaign is N full campaigns -- bound it
+# Each target's own run_campaign() call is almost entirely network-I/O-bound (rate-
+# governor sleeps, real HTTP round trips) -- a bounded pool of concurrent targets cuts
+# real wall-clock time for a multi-target span without changing run_campaign()'s own
+# internals at all. Kept modest (not e.g. 25 == every target at once) so a program
+# with several targets sharing one apex/host doesn't multiply the effective request
+# rate that host sees beyond what its own HostRateGovernor was tuned for.
+_SPAN_MAX_WORKERS = 4
 
 
 def _read_json(path: str) -> dict[str, Any]:
@@ -521,17 +529,39 @@ def run_campaign_over_targets(
     ref_counter = 0
     ok_count = 0
 
-    for index, target in enumerate(capped, 1):
-        _emit(f"campaign {index}/{len(capped)}: {target}")
+    def _hunt_one(index: int, target: str) -> tuple[str, dict[str, Any] | None, Exception | None]:
+        # Each target's on_progress lines are prefixed with its own [i/N host] tag --
+        # otherwise interleaved lines from concurrently-running targets would be
+        # unreadable in the shared live-progress log.
+        def _target_emit(msg: str) -> None:
+            _emit(f"[{index}/{len(capped)} {target}] {msg}")
+
+        _target_emit("starting…")
         try:
             result = run_campaign(
                 target, scope=scope, authorized=authorized, coder_cfg=coder_cfg,
                 default_reports_dir=span_root, seed_dir=seed_dir, runtime_dir=runtime_dir,
                 version=version, active=active, time_based=time_based, auth=auth, live=live,
                 program=program, max_pages=max_pages, platform=platform, deep=deep,
-                disclose_automation=disclose_automation, on_progress=_emit, excluded_hosts=excluded_hosts,
+                disclose_automation=disclose_automation, on_progress=_target_emit, excluded_hosts=excluded_hosts,
             )
+            return (target, result, None)
         except Exception as exc:  # noqa: BLE001 - one bad target must never abort the span
+            return (target, None, exc)
+
+    # Bounded concurrency: targets run in parallel (each on its own OS thread, exactly
+    # like the ASGI layer already runs each API request), but results are aggregated
+    # back in ORIGINAL target order (not completion order) so the C1/C2/... ref
+    # numbering and per_target ordering stay fully deterministic regardless of which
+    # target happens to finish first -- concurrency changes only the WALL-CLOCK time,
+    # never the shape of the combined result.
+    _emit(f"campaign span: hunting {len(capped)} target(s), up to {min(_SPAN_MAX_WORKERS, len(capped))} at a time…")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_SPAN_MAX_WORKERS, len(capped))) as executor:
+        futures = [executor.submit(_hunt_one, i, t) for i, t in enumerate(capped, 1)]
+        outcomes = [f.result() for f in futures]
+
+    for target, result, exc in outcomes:
+        if exc is not None:
             errors.append(f"{target}: {type(exc).__name__}: {exc}")
             per_target.append({"target": target, "ok": False, "campaign_path": "", "error": str(exc)})
             continue

@@ -41,6 +41,9 @@ SAFETY (this is the one place a bounty tool could become a weapon):
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import re
 import time
 from typing import Any, Callable
@@ -98,6 +101,9 @@ _NOSQL_ERROR_RE = re.compile(
 # A stable marker token (no Math.random needed): unique enough across one host's
 # response surface, deterministic for tests.
 _MARK = "gq7x4q2v"
+# A JWT-shaped value: three base64url segments (the third may be empty for an
+# already-unsigned token).
+_JWT_RE = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$")
 
 
 class _ActiveError(Exception):
@@ -280,6 +286,15 @@ def _redirect_candidates(url: str, extra: list[str] | None, default: tuple[str, 
     return out[:limit]
 
 
+# A bounded retry for CONNECTION-LEVEL transient failures only (reset TCP, a DNS
+# hiccup, a timeout) -- never for an HTTPError (any status code, including 502/503),
+# which is a real answer from the server that the differential checks (bool-SQLi,
+# error-SQLi, CORS reflection) need to see as-is. One retry, short fixed backoff --
+# a bug-bounty target shouldn't get hammered even by a benign probe.
+_MAX_FETCH_ATTEMPTS = 2
+_FETCH_RETRY_BACKOFF_S = 0.4
+
+
 class _Http:
     """Bounded, SSRF-guarded, non-redirect-following HTTP for active checks. Two
     independent ceilings: a per-hunt request budget (``max_requests``, counted here)
@@ -319,25 +334,33 @@ class _Http:
             if extra_headers:
                 headers.update(extra_headers)
             request = Request(sanitized, headers=headers, method=method)
-            # Time ONLY the request (not the governor throttle above), so a time-based
-            # check measures the server, not our own rate-limit sleep.
-            started = time.monotonic()
-            try:
-                with self.opener.open(request, timeout=self.settings.web_fetch_timeout_seconds) as resp:
-                    consumed = _consume(resp, self.settings)
-                    consumed["final_url"] = resp.geturl()
-                    consumed["location"] = resp.headers.get("Location") if resp.headers else None
+            # This retry loop is still ONE logical probe -- self.sent and the governor
+            # token were already spent once above, and are never spent again here, no
+            # matter how many attempts a single fetch() call takes.
+            for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
+                # Time ONLY the request (not the governor throttle, and not a prior
+                # attempt's backoff sleep), so a time-based check measures the server,
+                # not our own rate-limit/retry delay.
+                started = time.monotonic()
+                try:
+                    with self.opener.open(request, timeout=self.settings.web_fetch_timeout_seconds) as resp:
+                        consumed = _consume(resp, self.settings)
+                        consumed["final_url"] = resp.geturl()
+                        consumed["location"] = resp.headers.get("Location") if resp.headers else None
+                        consumed["elapsed"] = time.monotonic() - started
+                        return consumed
+                except HTTPError as exc:
+                    # A 3xx (captured, not followed) or 4xx/5xx is a valid observation
+                    # from the server -- never retried.
+                    consumed = _consume(exc, self.settings)
+                    consumed["final_url"] = sanitized
+                    consumed["location"] = exc.headers.get("Location") if exc.headers else None
                     consumed["elapsed"] = time.monotonic() - started
                     return consumed
-            except HTTPError as exc:
-                # A 3xx (captured, not followed) or 4xx/5xx is a valid observation.
-                consumed = _consume(exc, self.settings)
-                consumed["final_url"] = sanitized
-                consumed["location"] = exc.headers.get("Location") if exc.headers else None
-                consumed["elapsed"] = time.monotonic() - started
-                return consumed
-            except (URLError, TimeoutError, OSError) as exc:
-                raise _ActiveError(str(exc)) from exc
+                except (URLError, TimeoutError, OSError) as exc:
+                    if attempt >= _MAX_FETCH_ATTEMPTS:
+                        raise _ActiveError(str(exc)) from exc
+                    time.sleep(_FETCH_RETRY_BACKOFF_S * attempt)
 
 
 def _redact(value: str) -> str:
@@ -987,6 +1010,126 @@ def _check_open_bucket(http: _Http, landing: dict[str, Any] | None, scope: str, 
     return None
 
 
+def _b64url_decode(segment: str) -> bytes:
+    padded = segment + "=" * (-len(segment) % 4)
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _find_jwt_credential(auth: AuthContext | None) -> tuple[str, str, Callable[[str], str]] | None:
+    """The first JWT-shaped credential in the operator's supplied auth (an
+    Authorization: Bearer header, or a Cookie crumb), as (header_name, current_token,
+    rebuild(new_token) -> new_full_header_value). None if no JWT-shaped value is
+    present — this check is opt-in-by-having-auth, never invents a session."""
+    if auth is None:
+        return None
+    for name, value in auth.headers.items():
+        if name.lower() != "authorization":
+            continue
+        parts = value.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer" and _JWT_RE.match(parts[1].strip()):
+            prefix, token = parts[0] + " ", parts[1].strip()
+            return ("Authorization", token, lambda new: prefix + new)
+    for name, value in auth.headers.items():
+        if name.lower() != "cookie":
+            continue
+        crumbs = [c.strip() for c in value.split(";") if c.strip()]
+        for i, crumb in enumerate(crumbs):
+            cname, sep, cvalue = crumb.partition("=")
+            if sep and _JWT_RE.match(cvalue.strip()):
+                def rebuild(new_token: str, i: int = i, crumbs: list[str] = crumbs, cname: str = cname) -> str:
+                    out = list(crumbs)
+                    out[i] = f"{cname}={new_token}"
+                    return "; ".join(out)
+                return ("Cookie", cvalue.strip(), rebuild)
+    return None
+
+
+def _forge_alg_none_variants(token: str) -> list[str]:
+    """The alg:none-forged variants of `token` (same header keys except alg, SAME
+    payload bytes, empty signature) -- both the RFC-correct 'header.payload.' form
+    and the bare 'header.payload' form some JWT libraries also accept. Returns []
+    when the token is malformed, already alg:none (nothing to forge), or otherwise
+    unusable — the caller treats that as "skip this check", never a crash."""
+    parts = token.split(".")
+    if len(parts) != 3 or not parts[0] or not parts[1]:
+        return []
+    try:
+        header_obj = json.loads(_b64url_decode(parts[0]))
+    except (ValueError, binascii.Error, UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    if not isinstance(header_obj, dict) or str(header_obj.get("alg", "")).strip().lower() == "none":
+        return []
+    header_obj["alg"] = "none"
+    try:
+        forged_header = _b64url_encode(json.dumps(header_obj, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError):
+        return []
+    return [f"{forged_header}.{parts[1]}.", f"{forged_header}.{parts[1]}"]
+
+
+def _check_jwt_alg_none(http: _Http, url: str) -> dict[str, Any] | None:
+    """Confirm the server accepts an UNSIGNED (alg:none) copy of the operator's own
+    session token as authenticated — one of the highest-signal, lowest-effort JWT
+    bugs in real programs. Only runs when the operator supplied a real JWT-shaped
+    credential (never invents one); the forged/control requests reuse that SAME
+    authenticated GET endpoint, so this proves nothing beyond what the operator
+    already authorized scanning."""
+    found = _find_jwt_credential(http.auth)
+    if found is None:
+        return None
+    header_name, real_token, rebuild = found
+    forged_variants = _forge_alg_none_variants(real_token)
+    if not forged_variants:
+        return None
+    try:
+        baseline = http.fetch(url)  # the operator's own real, valid token (auto-attached)
+    except _ActiveError:
+        return None
+    if not (200 <= int(baseline.get("status") or 0) < 300):
+        return None  # can't establish what an "authenticated" response even looks like here
+    parts = real_token.split(".")
+    sig = parts[2]
+    corrupted_sig = (sig[:-1] + ("A" if sig[-1:] != "A" else "B")) if sig else "AAAA"
+    try:
+        # Negative control FIRST: a token with a CORRUPTED signature but the real alg.
+        # If the server accepts that too, it isn't verifying signatures at all -- a
+        # much bigger (and different) problem than alg:none specifically, and this
+        # check can't attribute the bypass to alg:none on its own, so it stays quiet.
+        control = http.fetch(url, extra_headers={header_name: rebuild(f"{parts[0]}.{parts[1]}.{corrupted_sig}")})
+    except _ActiveError:
+        return None
+    if 200 <= int(control.get("status") or 0) < 300:
+        return None
+    for forged in forged_variants:
+        try:
+            probe = http.fetch(url, extra_headers={header_name: rebuild(forged)})
+        except _ActiveError:
+            continue
+        if 200 <= int(probe.get("status") or 0) < 300:
+            proof = _proof(
+                "confirmed", method=f"GET with a forged alg:none {header_name}",
+                affected_asset="every endpoint behind this authentication check",
+                observed_result=f"the unsigned (alg:none) token was accepted (HTTP {probe['status']}), matching the real-token baseline (HTTP {baseline['status']})",
+                control_result=f"a token with a corrupted signature (same algorithm) was rejected (HTTP {control['status']}) — the server does verify signatures normally",
+                evidence="alg:none acceptance confirmed via a real-token baseline plus a corrupted-signature negative control",
+            )
+            ev = {
+                "request_line": f"GET {url}",
+                "request_header": f"{header_name}: <forged alg:none token>",
+                "response_status": f"HTTP {probe['status']}",
+                "matched_value": "unsigned token accepted as authenticated",
+            }
+            return _finding(
+                "active.jwt-alg-none", "JWT alg:none accepted (signature verification bypass)",
+                "critical", "jwt", "jwt", url, proof, ev,
+            )
+    return None
+
+
 def verify_active(
     target_url: str,
     findings: list[dict[str, Any]],
@@ -1064,6 +1207,9 @@ def verify_active(
         lambda: _check_crlf(http, sanitized, discovered_params),
         # Open-bucket is GET-only and scope-gated; safe in the default pass.
         lambda: _check_open_bucket(http, landing, scope, settings),
+        # GET-only and self-gating: a no-op unless the operator supplied a real
+        # JWT-shaped credential to forge from, so it's safe in the default pass too.
+        lambda: _check_jwt_alg_none(http, sanitized),
     ]
     # Time-based blind SQLi is the only check that emits an executing payload (a bounded
     # SLEEP), so it is OPT-IN — appended only when the operator explicitly enables it.

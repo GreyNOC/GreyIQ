@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,6 +33,15 @@ _API_BASE = f"https://{_API_HOST}/v1/hackers"
 _UA = "GreyIQ-BugHunter/hackerone-import"
 _MAX_ENTRIES = 500
 _MAX_PAGES = 10  # 500 entries / 10 pages = 50/page, matches H1's default page size
+# A bounded retry for connection-level failures AND transient/rate-limit HTTP
+# statuses (429/5xx) -- but NEVER 401/403/404, which are deterministic auth/
+# permission/not-found outcomes this module's own docstring already treats as
+# expected, not errors. Honors a 429's Retry-After header, capped so a large
+# value can't stall an operator-triggered UI action for long.
+_MAX_FETCH_ATTEMPTS = 3
+_RETRY_BACKOFF_S = 0.5
+_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
+_MAX_RETRY_AFTER_S = 5.0
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -62,8 +72,30 @@ def _fetch_json(url: str, *, api_username: str, api_token: str, timeout: float) 
     req = urllib.request.Request(
         url, headers={"Authorization": f"Basic {auth}", "Accept": "application/json", "User-Agent": _UA}
     )
-    with _OPENER.open(req, timeout=timeout) as resp:  # noqa: S310 - _is_hackerone_url pins the host; _NoRedirect blocks off-host hops
-        return json.loads(resp.read(8_000_000).decode("utf-8", "replace"))
+    # Every retry reuses this SAME already-validated request/URL -- _is_hackerone_url
+    # was already checked above and _NoRedirect never follows a hop, so a retry can
+    # never end up sending credentials anywhere but the pinned API host.
+    for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
+        try:
+            with _OPENER.open(req, timeout=timeout) as resp:  # noqa: S310 - _is_hackerone_url pins the host; _NoRedirect blocks off-host hops
+                return json.loads(resp.read(8_000_000).decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            if exc.code not in _RETRYABLE_HTTP_CODES or attempt >= _MAX_FETCH_ATTEMPTS:
+                raise
+            wait = _RETRY_BACKOFF_S * attempt
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            if retry_after:
+                try:
+                    # max(0.0, ...) -- a malformed/hostile negative Retry-After must never
+                    # reach time.sleep(), which raises ValueError on a negative duration.
+                    wait = max(0.0, min(float(retry_after), _MAX_RETRY_AFTER_S))
+                except ValueError:
+                    pass
+            time.sleep(wait)
+        except (urllib.error.URLError, OSError, TimeoutError):
+            if attempt >= _MAX_FETCH_ATTEMPTS:
+                raise
+            time.sleep(_RETRY_BACKOFF_S * attempt)
 
 
 def _clean_entry(attrs: dict[str, Any]) -> dict[str, Any] | None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -97,6 +98,24 @@ class RecordAndPriorsTests(unittest.TestCase):
         self.assertIn("ssrf", joined)
         self.assertIn("prioritize", joined)
         self.assertIn("clickjacking", joined)
+
+    def test_concurrent_record_outcome_never_loses_an_update(self) -> None:
+        # Regression: record_outcome() did a bare _load -> mutate -> _save with no
+        # lock (unlike ledger.py/portfolio.py, which both wrap their read-modify-
+        # write cycle in a threading.Lock()) -- two threads recording an outcome for
+        # the SAME program at nearly the same time could both read the same stale
+        # "submitted" count and each write back count+1, silently losing one of the
+        # two updates (a classic lost-update race). This matters once campaign
+        # targets can run concurrently (record_outcome is called once per
+        # confirmed+submitted finding per target).
+        threads = [threading.Thread(target=lambda: learning.record_outcome(
+            self.rt, program="acme", class_id="xss", status="submitted")) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+        stats = learning.program_summary(self.rt, "acme")["class_stats"]["xss"]
+        self.assertEqual(stats["submitted"], 20, "no concurrent update may be silently lost")
 
     def test_summary_all_programs(self) -> None:
         learning.record_outcome(self.rt, program="a", class_id="xss", status="accepted", bounty=100.0)
