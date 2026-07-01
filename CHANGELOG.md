@@ -2,6 +2,56 @@
 
 Notable changes to GreyIQ.
 
+## v0.58.0
+
+### Server security hardening, a live hunt progress log, and engine reliability/UX
+A security-focused release. The server was hardened against the active scanning it now
+attracts, a live progress log makes long hunts observable, and a batch of reliability,
+UX, and active-security improvements landed on top — every one adversarially QA'd before
+shipping.
+
+**Security hardening**
+- **Authenticated API gate**: API routes now require a session token and enforce an
+  origin check, failing closed — closing the window where an unauthenticated request
+  could read config or private files.
+- **DNS-rebinding fix**: the SSRF guard now pins the exact DNS resolution for the
+  lifetime of a request (through the real connect), closing the check-then-connect
+  (TOCTOU) gap where a host could resolve to a public address at guard time and a
+  private one at connect time.
+- **Path containment**: an output directory can no longer be steered to write outside
+  its intended root.
+- Assorted lower-severity fixes: health-endpoint version leak, a blocking file send, and
+  a code-router secret exposure.
+
+**Live hunt progress log**
+- Hunts and campaigns now stream a live activity log (backend `progress` module +
+  polling frontend panel), so a multi-minute run is observable instead of opaque.
+
+**Engine reliability, UX, and active-security enhancements**
+- Bounded retry-with-backoff for transient network failures across active-verify,
+  page-fetch, and HackerOne API calls — a real server response (HTTPError / non-retryable
+  status) still fails on the first attempt, and the per-hunt request budget and per-host
+  rate governor are spent exactly once per logical fetch no matter how many low-level
+  attempts it takes.
+- Completion alerts: a tab-title badge and a native OS notification when a hunt finishes
+  or a finding auto-submits while the tab is hidden.
+- A pipeline funnel visualization and a one-click CSV ledger export on the Learn tab, for
+  spreadsheet tracking / income reporting.
+- Bounded concurrency for multi-target campaign spans (several targets hunted at once),
+  with results aggregated back in original target order so report numbering stays
+  deterministic.
+- A new active check that confirms whether a target accepts a forged, unsigned
+  (`alg:none`) copy of the operator's own JWT as authenticated — strictly opt-in (only
+  when the operator supplied a real JWT-shaped credential) and gated on a
+  negative-signature control so a finding is only raised when it's specifically
+  attributable to `alg:none`.
+- A missing lock around the learning store's read-modify-write was fixed (it was the odd
+  one out versus the ledger and portfolio stores).
+
+Both the security hardening and the enhancement batch were put through a multi-agent
+adversarial QA/QC pass with independent refutation voting; every confirmed finding was
+fixed, tested, and re-verified before merge.
+
 ## v0.57.5
 
 ### Expanded HackerOne integration: program enrichment, hacktivity recon, own activity, status sync
