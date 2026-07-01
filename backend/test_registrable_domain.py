@@ -55,6 +55,20 @@ class RegistrableDomainTests(unittest.TestCase):
         self.assertFalse(is_bare_public_suffix("example.co.uk"))
         self.assertFalse(is_bare_public_suffix(""))
 
+    def test_bare_parent_of_a_multi_label_shared_host_is_also_refused(self) -> None:
+        # Regression: only the full "s3.amazonaws.com" / "blob.core.windows.net" were
+        # ever refused as bare scope tokens -- their OWN bare parent ("amazonaws.com",
+        # "core.windows.net", "windows.net") was not, so naming just the parent in
+        # free-text scope fell through to the dotted-suffix match in
+        # active_verify_service.host_in_active_scope() and authorized probing ANY
+        # unrelated tenant's S3 bucket / Azure Storage container.
+        self.assertTrue(is_bare_public_suffix("amazonaws.com"))
+        self.assertTrue(is_bare_public_suffix("core.windows.net"))
+        self.assertTrue(is_bare_public_suffix("windows.net"))
+        # A real owned host under these must still resolve to itself, not the suffix.
+        self.assertFalse(is_bare_public_suffix("victim-secret-bucket.s3.amazonaws.com"))
+        self.assertFalse(is_bare_public_suffix("myaccount.blob.core.windows.net"))
+
 
 if __name__ == "__main__":
     unittest.main()

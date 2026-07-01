@@ -118,7 +118,12 @@ def fetch_structured_scope(
     program_stats: dict[str, Any] = {}
     try:
         program = fetch(f"{_API_BASE}/programs/{safe_handle}", api_username=api_username, api_token=api_token, timeout=timeout)
-        attrs = (program.get("data") or {}).get("attributes") or {} if isinstance(program, dict) else {}
+        # Guard BOTH levels: an unexpected response shape (a proxy/WAF error page
+        # shaped like JSON:API, an API version change) could make "data" itself a
+        # non-dict truthy value (e.g. a list) -- .get("attributes") on that raises
+        # AttributeError, breaking this function's documented never-raises contract.
+        program_data = program.get("data") if isinstance(program, dict) else None
+        attrs = program_data.get("attributes") or {} if isinstance(program_data, dict) else {}
         program_name = str(attrs.get("name") or handle)
         policy_excerpt = str(attrs.get("policy") or "")[:4000]
         offers_bounty = bool(attrs.get("offers_bounties"))

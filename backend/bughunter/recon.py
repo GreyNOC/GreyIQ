@@ -170,7 +170,15 @@ def discover(
         found = 0
         if kind == "robots":
             for m in re.findall(r"(?:Disallow|Allow|Sitemap)\s*:\s*(\S+)", body, re.IGNORECASE)[:100]:
-                url = _clean(urljoin(base + "/", m))
+                # robots.txt is served BY the target -- a malformed directive value
+                # (e.g. an incomplete IPv6-bracket URL) makes urljoin() raise
+                # ValueError, same hazard _extract_links/_extract_scripts already
+                # guard against; unguarded here it escaped discover() (and its only
+                # caller, run_campaign, which has no try/except of its own either).
+                try:
+                    url = _clean(urljoin(base + "/", m))
+                except ValueError:
+                    continue
                 if url.startswith(("http://", "https://")) and in_scope(url) and url not in seen:
                     seen.add(url); discovered.append(url); found += 1
         elif kind == "sitemap":

@@ -150,6 +150,23 @@ class DegradeTests(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("csv", r["error"].lower())
 
+    def test_malformed_program_data_shape_degrades_instead_of_crashing(self) -> None:
+        # Regression: fetch_structured_scope() did `(program.get("data") or {}).get(
+        # "attributes")` with no isinstance check on "data" itself -- an unexpected
+        # response shape (a proxy/WAF error page shaped like JSON:API, an API version
+        # change) where "data" is a non-dict truthy value (e.g. a list) raised
+        # AttributeError, breaking this module's documented never-raises contract and
+        # surfacing as an opaque "internal server error" instead of a graceful message.
+        def fake_fetch(url, **kw):
+            if url.endswith("/programs/acme"):
+                return {"data": [{"unexpected": "shape"}]}
+            return {"data": [{"attributes": {"asset_identifier": "a.acme.com"}}], "links": {}}
+
+        r = h1.fetch_structured_scope("acme", "user", "token", fetch=fake_fetch)
+        self.assertTrue(r["ok"])  # degrades gracefully -- program_name falls back to the handle
+        self.assertEqual(r["program_name"], "acme")
+        self.assertFalse(r["program_stats"]["offers_bounties"])  # attrs treated as empty, not crashed
+
     def test_scope_fetch_403_after_program_ok_keeps_program_info_as_warning(self) -> None:
         def fake_fetch(url, **kw):
             if url.endswith("/programs/acme"):

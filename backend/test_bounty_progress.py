@@ -1,0 +1,229 @@
+"""Tests for the live progress log (bughunter.progress) and its wiring into
+run_bounty_hunt / run_campaign's on_progress callback — the UI's only way to see
+technical progress while a scan/campaign blocks on asyncio.to_thread."""
+
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+BACKEND_DIR = Path(__file__).resolve().parent
+REPO_ROOT = BACKEND_DIR.parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from bughunter import progress  # noqa: E402
+from bughunter.bounty import run_bounty_hunt  # noqa: E402
+from bughunter.campaign import run_campaign  # noqa: E402
+
+
+class ProgressBufferTests(unittest.TestCase):
+    def test_log_before_start_run_is_a_no_op(self) -> None:
+        progress.log("never-started-run", "hello")
+        self.assertEqual(progress.tail("never-started-run"), {"events": [], "count": 0})
+
+    def test_start_run_then_log_then_tail(self) -> None:
+        progress.start_run("run-a")
+        progress.log("run-a", "first")
+        progress.log("run-a", "second")
+        result = progress.tail("run-a")
+        self.assertEqual(result["count"], 2)
+        self.assertEqual([e["message"] for e in result["events"]], ["first", "second"])
+        self.assertTrue(all("at" in e for e in result["events"]))
+
+    def test_tail_after_cursor_only_returns_new_events(self) -> None:
+        progress.start_run("run-b")
+        progress.log("run-b", "one")
+        first = progress.tail("run-b")
+        progress.log("run-b", "two")
+        second = progress.tail("run-b", after=first["count"])
+        self.assertEqual([e["message"] for e in second["events"]], ["two"])
+
+    def test_start_run_resets_a_prior_buffer(self) -> None:
+        progress.start_run("run-c")
+        progress.log("run-c", "stale")
+        progress.start_run("run-c")
+        self.assertEqual(progress.tail("run-c"), {"events": [], "count": 0})
+
+    def test_empty_run_id_is_always_a_no_op(self) -> None:
+        progress.start_run("")
+        progress.log("", "ignored")
+        self.assertEqual(progress.tail(""), {"events": [], "count": 0})
+
+    def test_trimming_keeps_the_cursor_correct_via_base_seq(self) -> None:
+        # A client's "after" cursor is an ABSOLUTE count returned by tail(), not a raw
+        # index into the (bounded) buffer -- so once old events get trimmed off the
+        # front, a cursor from before the trim must still land on the right event.
+        progress.start_run("run-d")
+        original_max = progress._MAX_LINES_PER_RUN
+        progress._MAX_LINES_PER_RUN = 5
+        try:
+            for i in range(8):
+                progress.log("run-d", f"event-{i}")
+            result = progress.tail("run-d")
+            self.assertEqual(result["count"], 8)
+            self.assertEqual(len(result["events"]), 5, "the buffer itself is bounded")
+            self.assertEqual(result["events"][0]["message"], "event-3")
+            # A cursor from BEFORE the trim (e.g. after=2) must still resolve sanely --
+            # clamped to the oldest retained event, never a negative slice or a crash.
+            resumed = progress.tail("run-d", after=2)
+            self.assertEqual(resumed["events"][0]["message"], "event-3")
+        finally:
+            progress._MAX_LINES_PER_RUN = original_max
+
+    def test_sink_returns_a_callable_bound_to_the_run_id(self) -> None:
+        progress.start_run("run-e")
+        emit = progress.sink("run-e")
+        emit("via sink")
+        self.assertEqual([e["message"] for e in progress.tail("run-e")["events"]], ["via sink"])
+
+    def test_run_eviction_caps_total_tracked_runs(self) -> None:
+        original_max_runs = progress._MAX_RUNS
+        progress._MAX_RUNS = 2
+        try:
+            progress.start_run("evict-1")
+            progress.start_run("evict-2")
+            progress.start_run("evict-3")
+            self.assertEqual(progress.tail("evict-1"), {"events": [], "count": 0}, "oldest run must be evicted")
+            progress.log("evict-2", "x")
+            self.assertEqual(progress.tail("evict-2")["count"], 1)
+        finally:
+            progress._MAX_RUNS = original_max_runs
+
+
+class _EchoHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        body = b"<html>hello</html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args: object) -> None:
+        return
+
+
+class RunBountyHuntProgressTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._prev = os.environ.get("GREYIQ_SCAN_ALLOW_PRIVATE_URLS")
+        os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _EchoHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        if self._prev is None:
+            os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+        else:
+            os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = self._prev
+
+    def test_on_progress_receives_the_hunt_lifecycle_checkpoints(self) -> None:
+        url = f"http://127.0.0.1:{self.server.server_port}/"
+        lines: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            report = run_bounty_hunt(
+                url, "web-app", None, tmp, "local QA fixture", True, {},
+                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
+                runtime_dir=REPO_ROOT / "runtime", on_progress=lines.append,
+            )
+        self.assertTrue(report["ok"])
+        joined = " | ".join(lines)
+        self.assertIn("running scanner(s)", joined)
+        self.assertIn("scan complete", joined)
+        self.assertIn("writing report", joined)
+        self.assertTrue(any(line.startswith("done —") for line in lines))
+
+    def test_a_raising_on_progress_callback_never_breaks_the_hunt(self) -> None:
+        url = f"http://127.0.0.1:{self.server.server_port}/"
+
+        def boom(_msg: str) -> None:
+            raise RuntimeError("a broken progress sink must not break the hunt")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            report = run_bounty_hunt(
+                url, "web-app", None, tmp, "local QA fixture", True, {},
+                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
+                runtime_dir=REPO_ROOT / "runtime", on_progress=boom,
+            )
+        self.assertTrue(report["ok"])
+
+    def test_run_id_bound_sink_lands_in_the_shared_progress_buffer(self) -> None:
+        url = f"http://127.0.0.1:{self.server.server_port}/"
+        progress.start_run("hunt-run-1")
+        with tempfile.TemporaryDirectory() as tmp:
+            report = run_bounty_hunt(
+                url, "web-app", None, tmp, "local QA fixture", True, {},
+                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
+                runtime_dir=REPO_ROOT / "runtime", on_progress=progress.sink("hunt-run-1"),
+            )
+        self.assertTrue(report["ok"])
+        events = progress.tail("hunt-run-1")
+        self.assertGreater(events["count"], 0)
+
+    def test_two_back_to_back_hunts_on_the_same_target_never_collide_on_disk(self) -> None:
+        # Regression: the report filename stem was built from only profile_id + target
+        # slug + second-granularity timestamp -- two hunts on the same target/profile
+        # started within the same wall-clock second (a double-click on "Run Hunt", or a
+        # manual hunt racing a campaign's per-URL run_bounty_hunt call for the same URL)
+        # produced an IDENTICAL stem, so the second call's write silently clobbered the
+        # first's report on disk even though the first's API response had already
+        # returned ok:True pointing at that same (now-overwritten) path.
+        url = f"http://127.0.0.1:{self.server.server_port}/"
+        with tempfile.TemporaryDirectory() as tmp:
+            first = run_bounty_hunt(
+                url, "web-app", None, tmp, "local QA fixture", True, {},
+                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed", runtime_dir=REPO_ROOT / "runtime",
+            )
+            second = run_bounty_hunt(
+                url, "web-app", None, tmp, "local QA fixture", True, {},
+                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed", runtime_dir=REPO_ROOT / "runtime",
+            )
+            self.assertTrue(first["ok"])
+            self.assertTrue(second["ok"])
+            self.assertNotEqual(first["report_path"], second["report_path"])
+            self.assertNotEqual(first["json_path"], second["json_path"])
+            # Both files must actually exist on disk (neither call's write clobbered the other's).
+            self.assertTrue(Path(first["report_path"]).is_file())
+            self.assertTrue(Path(second["report_path"]).is_file())
+
+
+class RunCampaignProgressChainTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._prev = os.environ.get("GREYIQ_SCAN_ALLOW_PRIVATE_URLS")
+        os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _EchoHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        if self._prev is None:
+            os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+        else:
+            os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = self._prev
+
+    def test_campaign_progress_includes_the_nested_hunts_own_checkpoints(self) -> None:
+        # run_campaign's own "hunt N/M: url" line, AND the per-target run_bounty_hunt's
+        # checkpoints (now that campaign.py passes on_progress=_emit through) must both
+        # reach the same sink -- proving the whole chain, not just the outer layer.
+        url = f"http://127.0.0.1:{self.server.server_port}/"
+        lines: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_campaign(
+                url, scope="local QA fixture", authorized=True, coder_cfg={},
+                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
+                runtime_dir=REPO_ROOT / "runtime", max_pages=1, on_progress=lines.append,
+            )
+        self.assertTrue(result["ok"])
+        joined = " | ".join(lines)
+        self.assertIn("hunt 1/", joined)
+        self.assertIn("running scanner(s)", joined, "the nested run_bounty_hunt's own checkpoints must surface too")
+
+
+if __name__ == "__main__":
+    unittest.main()

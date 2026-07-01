@@ -136,6 +136,20 @@ class ReportStatusTests(unittest.TestCase):
         self.assertIn("report", r["error"].lower())
         self.assertIn("404", r["error"])
 
+    def test_malformed_data_shape_degrades_instead_of_crashing(self) -> None:
+        # Regression: fetch_report_status() did `(data or {}).get("attributes")` with
+        # no isinstance check on "data" itself -- an unexpected response shape for
+        # this single-resource endpoint (data as a non-dict truthy value, e.g. a
+        # list) raised AttributeError, breaking this module's documented
+        # never-raises contract.
+        def fake_fetch(url, **kw):
+            return {"data": [{"unexpected": "shape"}]}
+
+        r = h1a.fetch_report_status("129329", "user", "token", fetch=fake_fetch)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["state"], "")
+        self.assertEqual(r["title"], "")
+
 
 class EarningsAndBalanceTests(unittest.TestCase):
     def test_earnings_reads_type_from_attributes(self) -> None:

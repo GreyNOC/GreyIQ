@@ -304,6 +304,14 @@ def _enforce_url_policy(url: str, allow_private_urls: bool) -> str:
     # exactly what we validated. This blocks IDN-homograph payloads from
     # silently re-resolving to a different host during the actual fetch.
     netloc = ascii_hostname
+    if ":" in ascii_hostname:
+        # An IPv6 literal -- urlparse().hostname strips the [brackets], so
+        # ascii_hostname is bracket-less here. Without re-adding them, the
+        # rebuilt URL (e.g. "http://2606:4700:4700::1111/") is malformed:
+        # http.client splits host:port on the LAST colon, misreading it as
+        # host="2606:4700:4700:" port=1111 -- an entirely different, invalid
+        # host than the one just validated as public/safe.
+        netloc = f"[{ascii_hostname}]"
     if port is not None:
         netloc = f"{netloc}:{port}"
     sanitized = parsed._replace(netloc=netloc)
@@ -347,12 +355,36 @@ _dns_pin_lock = threading.Lock()
 _dns_pins: dict[int, tuple[str, list[tuple]]] = {}
 
 
+def _rewrite_sockaddr_port(sockaddr: tuple, port) -> tuple | None:
+    """A pin caches resolved IPs, not a specific port — _host_is_private() pins with
+    port=None (it only needs the address to classify), but the real connect a moment
+    later asks for the real port. Returns sockaddr with `port` substituted in, or None
+    if `port` can't be coerced to an int (caller should fall back to a real lookup)."""
+    try:
+        new_port = int(port) if port is not None else 0
+    except (TypeError, ValueError):
+        return None
+    if len(sockaddr) == 2:  # AF_INET: (host, port)
+        return (sockaddr[0], new_port)
+    if len(sockaddr) == 4:  # AF_INET6: (host, port, flowinfo, scopeid)
+        return (sockaddr[0], new_port, sockaddr[2], sockaddr[3])
+    return None
+
+
 def _pinned_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):  # noqa: A002 - matches socket.getaddrinfo's own signature
     if isinstance(host, str):
         with _dns_pin_lock:
             pin = _dns_pins.get(threading.get_ident())
         if pin is not None and host.strip().lower() == pin[0]:
-            return pin[1]
+            rewritten = []
+            for entry_family, entry_type, entry_proto, canonname, sockaddr in pin[1]:
+                new_sockaddr = _rewrite_sockaddr_port(sockaddr, port)
+                if new_sockaddr is None:
+                    rewritten = None
+                    break
+                rewritten.append((entry_family, entry_type, entry_proto, canonname, new_sockaddr))
+            if rewritten is not None:
+                return rewritten
     return _real_getaddrinfo(host, port, family, type, proto, flags)
 
 

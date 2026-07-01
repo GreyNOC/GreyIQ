@@ -145,14 +145,23 @@ def host_in_active_scope(host: str, scope: str, settings: Any) -> bool:
     """Fail-closed scope binding: a host is eligible for ACTIVE probing only if the
     operator named it (its registrable domain or full host appears in the scope
     text), or it matches the env allowlist, or it's your own private/loopback infra
-    with private URLs explicitly allowed."""
+    with private URLs explicitly allowed. settings.excluded_hosts (a saved program's
+    out_of_scope_hosts, when the caller resolved one) is checked FIRST and always wins
+    over every positive match below — an exclusion the operator set can never be
+    silently overridden by a broader scope_text wildcard."""
     cleaned = (host or "").strip().lower().strip("[]")
     if not cleaned:
         return False
+    reg = _registrable(cleaned)
+    for excluded in getattr(settings, "excluded_hosts", ()) or ():
+        token = str(excluded or "").strip().lower().strip("[]").lstrip("*").lstrip(".")
+        if not token:
+            continue
+        if cleaned == token or cleaned.endswith("." + token) or reg == token:
+            return False
     # No-DNS checks first: the operator named the host. Match host TOKENS exactly or
     # by proper dotted suffix — not a substring of the free text (which would let
     # 'example.com' match scope 'notexample.com' and probe an out-of-scope host).
-    reg = _registrable(cleaned)
     for token in _scope_hosts(scope):
         if is_bare_public_suffix(token):
             # The token IS itself a known multi-label public suffix (e.g.
@@ -1068,7 +1077,15 @@ def verify_active(
         except _RateLimited:
             rate_limited = True
             break
-        except _ActiveError:
+        except (_ActiveError, WebsiteFetchError):
+            # _Http.fetch() funnels every request through normalize_website_url() /
+            # _guard_url() inside guarded_dns_scope() -- a URL that grew past
+            # MAX_URL_LENGTH once THIS check appended its injected marker, or a host
+            # whose DNS answer changed to something private/reserved between the
+            # initial guard and this later request, raises WebsiteFetchError (a
+            # ValueError subclass), not _ActiveError. Skip just this one check, same
+            # as any other per-request failure -- it must never abort every check
+            # ordered after it.
             result = None
         if result:
             results.append(result)

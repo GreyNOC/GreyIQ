@@ -73,6 +73,11 @@ class DnsRebindingPinTests(unittest.TestCase):
             result = socket.getaddrinfo("evil-rebind.example", 443, proto=socket.IPPROTO_TCP)
             self.assertEqual(result[0][4][0], _PUBLIC_IP)
             self.assertEqual(calls["n"], 1, "the pin must prevent a second real DNS lookup")
+            # The pin was installed by _host_is_private(), which resolves with port=None
+            # (it only needs the address) -- the REAL connect a moment later asks for the
+            # real port (443 here), and a pinned sockaddr carrying the WRONG port (0, from
+            # the pinning call) would make the real connect fail outright.
+            self.assertEqual(result[0][4][1], 443, "a pinned sockaddr must carry the port actually requested, not the pinning call's port=None")
 
         # Outside the scope the pin is cleared -- a fresh lookup now genuinely
         # reaches the rebinding resolver again and (this time) sees the attack.
@@ -132,6 +137,45 @@ class DnsRebindingPinTests(unittest.TestCase):
         t2.join()
         self.assertTrue(results["t1"])
         self.assertTrue(results["t2"])
+
+    def test_pinned_ipv6_sockaddr_also_gets_the_requested_port(self) -> None:
+        # An AF_INET6 sockaddr is a 4-tuple (host, port, flowinfo, scopeid) -- the port
+        # rewrite must preserve flowinfo/scopeid, not just truncate to a 2-tuple.
+        ipv6_entry = [(socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("2001:4860:4860::8888", 0, 0, 0))]
+        web_ingest._real_getaddrinfo = lambda host, port, *a, **k: ipv6_entry
+        with web_ingest.guarded_dns_scope():
+            web_ingest._host_is_private("v6.example")
+            result = socket.getaddrinfo("v6.example", 443)
+            self.assertEqual(result[0][4], ("2001:4860:4860::8888", 443, 0, 0))
+
+    def test_pinned_result_rewrites_port_for_every_returned_address(self) -> None:
+        # A hostname resolving to multiple IPs (common for CDNs) must have EVERY
+        # returned sockaddr carry the real port, not just the first one.
+        multi = [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (_PUBLIC_IP, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("1.1.1.1", 0)),
+        ]
+        web_ingest._real_getaddrinfo = lambda host, port, *a, **k: multi
+        with web_ingest.guarded_dns_scope():
+            web_ingest._host_is_private("multi.example")
+            result = socket.getaddrinfo("multi.example", 8443)
+            self.assertEqual([r[4][1] for r in result], [8443, 8443])
+
+    def test_uncoercible_port_falls_back_to_the_real_resolver_instead_of_a_bad_pin(self) -> None:
+        calls = {"n": 0}
+
+        def resolver(host, port, *a, **k):
+            calls["n"] += 1
+            return _addrinfo(_PUBLIC_IP, port)
+
+        web_ingest._real_getaddrinfo = resolver
+        with web_ingest.guarded_dns_scope():
+            web_ingest._host_is_private("odd-port.example")
+            self.assertEqual(calls["n"], 1)
+            # A port that can't be coerced to int must not silently produce a malformed
+            # sockaddr -- fall back to a real lookup instead.
+            socket.getaddrinfo("odd-port.example", "not-a-port")
+            self.assertEqual(calls["n"], 2, "an uncoercible port must bypass the pin, not return a broken sockaddr")
 
     def test_non_string_host_falls_through_to_the_real_resolver(self) -> None:
         # socket.getaddrinfo can be called with host=None or other non-str values by

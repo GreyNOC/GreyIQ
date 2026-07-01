@@ -9,6 +9,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -18,7 +19,26 @@ if str(BACKEND_DIR) not in sys.path:
 
 from bughunter.bounty import run_bounty_hunt  # noqa: E402
 from bughunter.web_ingest import WebsiteFetchError  # noqa: E402
-from bughunter.web_scan_service import _analyze, run_web_scan  # noqa: E402
+from bughunter.web_scan_service import _analyze, _guard_url, run_web_scan  # noqa: E402
+
+
+class GuardUrlIpv6Tests(unittest.TestCase):
+    """_guard_url is reused by _fetch_raw, _GuardedRedirect, playwright_request_allowed,
+    and recon.discover() -- a malformed sanitized URL here breaks all of them at once."""
+
+    def test_public_ipv6_literal_keeps_its_brackets_after_sanitizing(self) -> None:
+        # Regression: the netloc rebuild used the bracket-less ascii_host (urlparse().
+        # hostname strips [brackets] for IPv6) directly, producing a malformed URL like
+        # "http://2001:4860:4860::8888/". Re-parsing that string reads a WRONG host
+        # than the one just validated as public -- every public IPv6-literal target
+        # was unscannable across web_scan_service, recon, and campaign flows built on it.
+        out = _guard_url("http://[2001:4860:4860::8888]/path", False, frozenset({80, 443}))
+        self.assertEqual(urlparse(out).hostname, "2001:4860:4860::8888")
+
+    def test_public_ipv6_literal_with_explicit_port_stays_well_formed(self) -> None:
+        out = _guard_url("http://[2001:4860:4860::8888]:443/path", False, frozenset({80, 443}))
+        self.assertEqual(urlparse(out).hostname, "2001:4860:4860::8888")
+        self.assertEqual(urlparse(out).port, 443)
 
 
 class WebProofEvidenceTests(unittest.TestCase):

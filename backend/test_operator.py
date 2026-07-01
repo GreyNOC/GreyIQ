@@ -130,20 +130,58 @@ class LedgerTests(unittest.TestCase):
         # Force the stamp far outside the 24h window the throttle checks by default.
         data = ledger._load(self.rt)
         rec = data["programs"][ledger.program_key("acme", "https://x")]["findings"][item["dedup_key"]]
+        rec["submitted_at"] = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
         rec["updated_at"] = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
         ledger._save(self.rt, data)
         self.assertEqual(ledger.count_recent_submissions(self.rt, "acme", within_hours=24), 0)
         self.assertEqual(ledger.count_recent_submissions(self.rt, "acme", within_hours=72), 1)
 
     def test_count_recent_submissions_unparseable_stamp_fails_toward_the_throttle(self) -> None:
-        # An unparseable updated_at must COUNT (fail toward throttling, never silently
-        # under-count and let the operator over-submit past its daily cap).
+        # An unparseable submitted_at must COUNT (fail toward throttling, never
+        # silently under-count and let the operator over-submit past its daily cap).
         item = _item("C1", "xss", "r", "https://x/a")
         ledger.upsert_findings(self.rt, "acme", "https://x", [item])
         ledger.record_submission(self.rt, "acme", "https://x", item["dedup_key"], "R1", "u")
         data = ledger._load(self.rt)
         rec = data["programs"][ledger.program_key("acme", "https://x")]["findings"][item["dedup_key"]]
-        rec["updated_at"] = "not-a-real-timestamp"
+        rec["submitted_at"] = "not-a-real-timestamp"
+        ledger._save(self.rt, data)
+        self.assertEqual(ledger.count_recent_submissions(self.rt, "acme"), 1)
+
+    def test_a_routine_h1_sync_does_not_make_an_old_submission_look_recent(self) -> None:
+        # Regression: count_recent_submissions used to filter on updated_at, which
+        # advance_stage()/record_h1_sync() bump on EVERY stage transition -- not just
+        # the moment of actual filing. A finding submitted long ago, later marked
+        # 'paid' by a routine HackerOne status-sync poll (which happens today), was
+        # wrongly counted as a submission made in the last 24h, eating into the
+        # program's max_submits_per_day throttle for no real new submission.
+        from datetime import UTC, datetime, timedelta
+
+        item = _item("C1", "xss", "r", "https://x/a")
+        ledger.upsert_findings(self.rt, "acme", "https://x", [item])
+        ledger.record_submission(self.rt, "acme", "https://x", item["dedup_key"], "R1", "u")
+        # Back-date the ORIGINAL submission to 10 days ago.
+        data = ledger._load(self.rt)
+        rec = data["programs"][ledger.program_key("acme", "https://x")]["findings"][item["dedup_key"]]
+        rec["submitted_at"] = (datetime.now(UTC) - timedelta(days=10)).isoformat()
+        rec["updated_at"] = (datetime.now(UTC) - timedelta(days=10)).isoformat()
+        ledger._save(self.rt, data)
+        self.assertEqual(ledger.count_recent_submissions(self.rt, "acme", within_hours=24), 0)
+        # A sync happening TODAY bumps updated_at to now (via record_h1_sync), but must
+        # NOT resurrect this 10-day-old submission as "recent".
+        [rec] = ledger.submitted_records(self.rt)
+        ledger.record_h1_sync(self.rt, rec["pid"], rec["key"], state="resolved", resolved_with_reward=True)
+        self.assertEqual(ledger.count_recent_submissions(self.rt, "acme", within_hours=24), 0)
+
+    def test_legacy_record_with_no_submitted_at_falls_back_to_updated_at(self) -> None:
+        # A record written before this field existed has no submitted_at at all --
+        # must still be counted via its updated_at, not silently dropped.
+        item = _item("C1", "xss", "r", "https://x/a")
+        ledger.upsert_findings(self.rt, "acme", "https://x", [item])
+        ledger.record_submission(self.rt, "acme", "https://x", item["dedup_key"], "R1", "u")
+        data = ledger._load(self.rt)
+        rec = data["programs"][ledger.program_key("acme", "https://x")]["findings"][item["dedup_key"]]
+        rec["submitted_at"] = ""  # simulate a pre-fix record
         ledger._save(self.rt, data)
         self.assertEqual(ledger.count_recent_submissions(self.rt, "acme"), 1)
 
@@ -530,6 +568,35 @@ class SupervisorLoopTests(unittest.TestCase):
         thread.join(timeout=5)
         self.assertFalse(thread.is_alive())
         self.assertEqual(calls, ["p1"])  # p2 never ran
+
+    def test_concurrent_start_calls_spawn_only_one_supervisor(self) -> None:
+        # Regression: start()'s check-then-act on self.running was not atomic (each
+        # API request runs on its own asyncio.to_thread worker), so two concurrent
+        # /api/operator/start calls -- a UI double-click, a client retry, two tabs --
+        # could both observe running=False before either set it True, spawning TWO
+        # independent supervisor loops that hunt the same programs and can
+        # double-submit the same confirmed finding to HackerOne.
+        loop = OperatorLoop(self.rt, run_campaign_fn=lambda *a, **k: {}, submit_fn=lambda *a, **k: {})
+        results: list[bool] = []
+        results_lock = threading.Lock()
+        barrier = threading.Barrier(8)
+
+        def race() -> None:
+            barrier.wait(timeout=5)
+            won = loop.start()
+            with results_lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=race) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+        self.assertEqual(results.count(True), 1, "exactly one concurrent start() call must win the race")
+        self.assertEqual(results.count(False), 7)
+        loop.stop()
+        loop._thread.join(timeout=5)
+        self.assertFalse(loop.running)
 
 
 if __name__ == "__main__":

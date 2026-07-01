@@ -185,7 +185,12 @@ def _guard_url(url: str, allow_private: bool, allowed_ports: frozenset[int]) -> 
         allowed = ", ".join(str(p) for p in sorted(allowed_ports))
         raise WebsiteFetchError(f"Port {port} is not allowed for public hosts. Allowed: {allowed}.")
 
-    netloc = ascii_host if port is None else f"{ascii_host}:{port}"
+    # An IPv6 literal -- urlparse().hostname strips the [brackets], so ascii_host is
+    # bracket-less here. Without re-adding them, the rebuilt URL is malformed:
+    # http.client splits host:port on the LAST colon, misreading it as an entirely
+    # different, invalid host than the one just validated as public/safe.
+    host_for_netloc = f"[{ascii_host}]" if ":" in ascii_host else ascii_host
+    netloc = host_for_netloc if port is None else f"{host_for_netloc}:{port}"
     return urlunparse(parsed._replace(netloc=netloc))
 
 

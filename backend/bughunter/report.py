@@ -65,14 +65,21 @@ def resolve_severity(finding: dict[str, Any], plan: dict[str, Any] | None = None
     """The single source of truth for a finding's severity word (lowercased).
 
     The CVSS base severity modelled for the attack plan (impact_model) is authoritative
-    when present — it reflects the analysed impact — and wins over the raw scanner label
-    carried on the finding. Falls back to the finding's own ``severity``, then ``"low"``.
-    Every render path (the default report's table/detail/triage, the per-platform report,
-    and the HackerOne ``severity_rating``) routes through here, so the severity shown for a
-    finding can never disagree across the different outputs the operator submits."""
+    when present AND a real recognized tier — it reflects the analysed impact — and wins
+    over the raw scanner label carried on the finding. impact_model.cvss_severity() can
+    return the literal string "None" for a base score of 0.0 (e.g. a brain-supplied
+    vector with C:N/I:N/A:N) — that is a valid CVSS OUTCOME, not a valid SEVERITY TIER,
+    so it is never trusted as authoritative here; it falls through to the finding's own
+    severity instead, exactly like a missing/absent CVSS block would. Falls back to the
+    finding's own ``severity``, then ``"low"``. Every render path (the default report's
+    table/detail/triage, the per-platform report, and the HackerOne ``severity_rating``)
+    routes through here, so the severity shown for a finding can never disagree across
+    the different outputs the operator submits."""
     cvss = plan.get("cvss") if isinstance(plan, dict) else None
-    if isinstance(cvss, dict) and cvss.get("base_severity"):
-        return str(cvss["base_severity"]).strip().lower()
+    if isinstance(cvss, dict):
+        cvss_severity = str(cvss.get("base_severity") or "").strip().lower()
+        if cvss_severity in _SEVERITY_ORDER:
+            return cvss_severity
     return str(finding.get("severity") or "low").strip().lower()
 
 

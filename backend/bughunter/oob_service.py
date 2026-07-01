@@ -215,7 +215,12 @@ def confirm_blind_ssrf(
         probe_url = _with_query(sanitized, {param: callback_url(base, token)})
         try:
             http.fetch(probe_url)  # the target makes the OOB call if vulnerable
-        except _ActiveError:
+        except (_ActiveError, WebsiteFetchError):
+            # WebsiteFetchError (a ValueError subclass) is raised by _Http.fetch's own
+            # normalize_website_url()/_guard_url() -- e.g. this param's probe_url grew
+            # past MAX_URL_LENGTH, or the host's DNS answer changed to something
+            # private between the initial guard and now. Skip just this param, same
+            # as _ActiveError -- it must never abort the whole sweep.
             continue
         tried.append(param)
         for _ in range(max(1, poll_attempts)):

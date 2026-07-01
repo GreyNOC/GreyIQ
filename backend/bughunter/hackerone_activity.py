@@ -164,8 +164,11 @@ def fetch_report_status(
                        timeout=timeout, fetch=fetch, noun="report")
     if err:
         return err
-    data = result.get("data") or {}
-    attrs = (data or {}).get("attributes") or {}
+    data = result.get("data")
+    # Guard data's type before .get(): an unexpected response shape for this
+    # single-resource endpoint (data as a non-dict truthy value) would otherwise
+    # raise AttributeError, breaking this module's documented never-raises contract.
+    attrs = data.get("attributes") or {} if isinstance(data, dict) else {}
     return {
         "ok": True,
         "id": clean_id,

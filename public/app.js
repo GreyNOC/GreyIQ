@@ -4312,6 +4312,8 @@ const ck = {
 let ckOpPoll = null;        // operator event-poll timer
 let ckOpEventCount = 0;     // events already rendered
 let ckOpEdit = null;        // the program being edited in the form (null = adding a new one)
+let ckLivePoll = null;      // scan/campaign live-progress poll timer
+let ckLiveEventCount = 0;   // live-progress lines already rendered
 
 const ckState = {
   result: null,          // last hunt/campaign response
@@ -6866,6 +6868,8 @@ async function ckRun() {
       : isCampaign ? "Campaign running — mapping the surface, hunting each URL (this can take a few minutes)…"
       : "Hunting — running scanners and proving findings…"
   );
+  const progressRunId = crypto.randomUUID();
+  ckStartLiveLog(progressRunId);
   try {
     let res;
     if (isCampaign) {
@@ -6876,7 +6880,7 @@ async function ckRun() {
           program_id: spanning ? state.ckActiveProgramId : null,
           active: state.ckActive, time_based: state.ckTimeBased, live: state.ckLive, deep: state.ckDeep,
           max_pages: Number(ck.maxPages?.value) || 12,
-          auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines
+          auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines, run_id: progressRunId
         })
       });
     } else {
@@ -6885,7 +6889,7 @@ async function ckRun() {
         body: JSON.stringify({
           target, profile: state.bountyProfile, vuln_class: (ck.klass?.value || null) || null,
           scope: state.ckScope, authorized: true, active: state.ckActive, time_based: state.ckTimeBased, run_live: state.ckLive,
-          auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines
+          auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines, run_id: progressRunId
         })
       });
     }
@@ -6911,7 +6915,40 @@ async function ckRun() {
     ckStatus(err.message || "The run failed.", true);
   } finally {
     ck.run.disabled = false;
+    ckStopLiveLog();
+    void ckPollLiveLog(progressRunId); // catch any trailing line(s) emitted right before the response returned
   }
+}
+
+function ckStartLiveLog(runId) {
+  const log = document.querySelector("#ckLiveLog");
+  if (!log) return;
+  ckStopLiveLog();
+  ckLiveEventCount = 0;
+  log.hidden = false;
+  log.replaceChildren(cel("p", "ck-hint", "Starting…"));
+  ckLivePoll = setInterval(() => { void ckPollLiveLog(runId); }, 1200);
+}
+
+function ckStopLiveLog() {
+  if (ckLivePoll) { clearInterval(ckLivePoll); ckLivePoll = null; }
+}
+
+async function ckPollLiveLog(runId) {
+  const log = document.querySelector("#ckLiveLog");
+  if (!log) return;
+  let res = null;
+  try { res = await apiFetch("/api/bounty/progress", { method: "POST", timeoutMs: 6000, body: JSON.stringify({ run_id: runId, after: ckLiveEventCount }) }); } catch (_) { return; }
+  if (!res || res.ok === false) return;
+  if (!(res.events || []).length) return;
+  if (log.firstElementChild && log.firstElementChild.textContent === "Starting…") log.replaceChildren();
+  for (const ev of res.events) {
+    const row = cel("div", "ck-op-event");
+    row.append(cel("span", "ck-op-time", (ev.at || "").slice(11, 19)), cel("span", null, ev.message || ""));
+    log.append(row);
+  }
+  ckLiveEventCount = res.count || (ckLiveEventCount + res.events.length);
+  log.scrollTop = log.scrollHeight;
 }
 
 function ckStatus(text, isError) {

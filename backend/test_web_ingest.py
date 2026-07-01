@@ -48,6 +48,28 @@ class UrlPolicyTests(unittest.TestCase):
         out = _enforce_url_policy("http://8.8.8.8/path", False)
         self.assertTrue(out.startswith("http://8.8.8.8"))
 
+    def test_public_ipv6_literal_keeps_its_brackets_after_sanitizing(self) -> None:
+        # Regression: the netloc rebuild used the bracket-less ascii_hostname
+        # (urlparse().hostname strips [brackets] for IPv6) directly, producing a
+        # malformed URL like "http://2606:4700:4700::1111/path". Re-parsing that
+        # string reads a WRONG host ("2606:4700:4700:" per http.client's own
+        # last-colon host:port split) than the one just validated as public --
+        # every public IPv6-literal target was unscannable as a result.
+        from urllib.parse import urlparse as _urlparse
+
+        out = _enforce_url_policy("http://[2606:4700:4700::1111]/path", False)
+        self.assertEqual(out, "http://[2606:4700:4700::1111]/path")
+        # The sanitized URL must re-parse back to the SAME hostname that was
+        # actually validated -- the whole point of returning a sanitized URL.
+        self.assertEqual(_urlparse(out).hostname, "2606:4700:4700::1111")
+
+    def test_public_ipv6_literal_with_explicit_port_stays_well_formed(self) -> None:
+        from urllib.parse import urlparse as _urlparse
+
+        out = _enforce_url_policy("http://[2606:4700:4700::1111]:80/path", False)
+        self.assertEqual(_urlparse(out).hostname, "2606:4700:4700::1111")
+        self.assertEqual(_urlparse(out).port, 80)
+
     def test_allow_private_lets_loopback_through(self) -> None:
         self.assertTrue(_enforce_url_policy("http://127.0.0.1/", True).startswith("http://127.0.0.1"))
 

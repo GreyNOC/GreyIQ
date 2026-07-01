@@ -148,11 +148,18 @@ class OperatorLoop:
                 "events": evs[after:], "count": len(evs)}
 
     def start(self, *, allow_submit: bool = False) -> bool:
-        if self.running:
-            return False
+        # The check-then-act on self.running must be atomic: each API request runs on
+        # its own asyncio.to_thread worker, so two concurrent /api/operator/start calls
+        # (a UI double-click, a client retry, two tabs) could otherwise both observe
+        # running=False before either sets it True, spawning two supervisor threads
+        # that independently hunt the same programs and can double-submit the same
+        # confirmed finding to HackerOne.
+        with self._lock:
+            if self.running:
+                return False
+            self.running = True
         self.stop_event.clear()
         self.allow_submit = bool(allow_submit)
-        self.running = True
         self.started_at = datetime.now(UTC).isoformat()
         self._thread = threading.Thread(target=self._supervise, daemon=True, name="greyiq-operator")
         self._thread.start()
