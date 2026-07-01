@@ -95,8 +95,9 @@ def run_program_cycle(
         for finding in confirmed:
             if budget <= 0 or (stop is not None and stop.is_set()):
                 break
-            if ledger.is_duplicate(runtime_dir, pid, target, finding):
-                continue  # already reported/submitted in a prior run — NEVER re-file
+            if ledger.is_submitted(runtime_dir, pid, target, finding):
+                continue  # already FILED in a prior run — never re-file (a 'reported' finding,
+                          # i.e. one this run just built a package for, must still be fileable)
             res = submit_fn(run_id, finding["ref"])  # hard-gated server-side
             if res.get("ok"):
                 ledger.record_submission(runtime_dir, pid, target, ledger.dedup_key(finding),
@@ -165,6 +166,12 @@ class OperatorLoop:
         try:
             return datetime.fromisoformat(str(nxt)) <= datetime.now(UTC)
         except ValueError:
+            return True
+        except TypeError:
+            # A timezone-NAIVE stamp (e.g. a hand-edited portfolio.json, or any external
+            # writer that stamps next_run_at without an offset) makes the comparison raise
+            # TypeError, not ValueError -- it must be caught here too, or it escapes the
+            # list comprehension in _supervise() and kills the whole supervisor thread.
             return True
 
     def _supervise(self) -> None:

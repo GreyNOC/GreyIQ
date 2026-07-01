@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -16,6 +17,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from bughunter.bounty import run_bounty_hunt  # noqa: E402
+from bughunter.web_ingest import WebsiteFetchError  # noqa: E402
 from bughunter.web_scan_service import _analyze, run_web_scan  # noqa: E402
 
 
@@ -189,6 +191,129 @@ class SensitivePathProbeTests(unittest.TestCase):
         url = f"http://127.0.0.1:{server.server_port}/"
         run_web_scan(url)  # probe_paths defaults to False -> a single GET
         self.assertEqual(seen, ["/"])
+
+
+class TruncatedResponseTests(unittest.TestCase):
+    """A server that claims a Content-Length larger than what it actually sends (or any
+    mid-body connection drop) makes response.read() raise http.client.IncompleteRead --
+    NOT a URLError/HTTPError/ValueError. run_web_scan's 'never raises' contract must hold."""
+
+    def setUp(self) -> None:
+        self._prev = os.environ.get("GREYIQ_SCAN_ALLOW_PRIVATE_URLS")
+        os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
+        self._stop = threading.Event()
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(5)
+        self.port = self.listener.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve_one_truncated, daemon=True)
+        self._thread.start()
+
+    def tearDown(self) -> None:
+        self._stop.set()
+        self.listener.close()
+        if self._prev is None:
+            os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+        else:
+            os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = self._prev
+
+    def _serve_one_truncated(self) -> None:
+        self.listener.settimeout(5.0)
+        try:
+            conn, _ = self.listener.accept()
+        except OSError:
+            return
+        with conn:
+            conn.settimeout(5.0)
+            try:
+                conn.recv(4096)  # drain the request
+                # Chunked encoding: announce a 0x3e8 (1000)-byte chunk, send a partial
+                # chunk, then close mid-chunk -> http.client.IncompleteRead on read().
+                # (A plain Content-Length mismatch does NOT reliably raise -- http.client
+                # just returns the short read -- chunked framing is what actually triggers it.)
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    b"3e8\r\nshort-chunk-body-tru"
+                )
+            except OSError:
+                pass
+
+    def test_run_web_scan_does_not_raise_on_truncated_body(self) -> None:
+        url = f"http://127.0.0.1:{self.port}/"
+        res = run_web_scan(url)  # must return, never raise IncompleteRead/HTTPException
+        self.assertFalse(res["ok"])
+        self.assertIn("scan_type", res)
+        self.assertEqual(res["scan_type"], "web")
+
+
+class HttpErrorPathTests(unittest.TestCase):
+    """_fetch_raw's HTTPError branch (a 4xx/5xx final response) must mirror the success
+    path: close the response (it leaks a socket/fd otherwise) and re-guard the final URL
+    (defence-in-depth against a redirect chain ending somewhere it shouldn't)."""
+
+    def setUp(self) -> None:
+        # Explicit + self-contained regardless of sibling test class execution order:
+        # the re-guard test needs private/link-local hosts REFUSED (the default).
+        self._prev = os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+
+    def tearDown(self) -> None:
+        if self._prev is not None:
+            os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = self._prev
+
+    def _fake_http_error(self, url: str, code: int = 404, body: bytes = b"not found"):
+        import io
+        from email.message import Message
+        from urllib.error import HTTPError
+
+        hdrs = Message()
+        hdrs["Content-Type"] = "text/plain"
+        return HTTPError(url, code, "Not Found", hdrs, io.BytesIO(body))
+
+    def test_http_error_response_is_closed_not_leaked(self) -> None:
+        from bughunter import web_scan_service as wss
+
+        error = self._fake_http_error("http://8.8.8.8/missing")
+        closed = {"v": False}
+        orig_close = error.close
+
+        def tracking_close():
+            closed["v"] = True
+            orig_close()
+        error.close = tracking_close
+
+        class FakeOpener:
+            def open(self, request, timeout=None):
+                raise error
+
+        orig_opener = wss.build_opener
+        wss.build_opener = lambda *a, **k: FakeOpener()
+        try:
+            result = wss._fetch_raw("http://8.8.8.8/x")
+        finally:
+            wss.build_opener = orig_opener
+        self.assertEqual(result["status"], 404)
+        self.assertTrue(closed["v"], "the HTTPError response was never closed -- socket/fd leak")
+
+    def test_http_error_final_url_is_reguarded(self) -> None:
+        from bughunter import web_scan_service as wss
+
+        # error.url claims the chain ended at a link-local/metadata-endpoint host -- the
+        # classic cloud-SSRF target. Even though _GuardedRedirect validates each hop, the
+        # final error response itself must still be re-validated, mirroring the success path.
+        error = self._fake_http_error("http://169.254.169.254/latest/meta-data/")
+
+        class FakeOpener:
+            def open(self, request, timeout=None):
+                raise error
+
+        orig_opener = wss.build_opener
+        wss.build_opener = lambda *a, **k: FakeOpener()
+        try:
+            with self.assertRaises(WebsiteFetchError):
+                wss._fetch_raw("http://8.8.8.8/x")
+        finally:
+            wss.build_opener = orig_opener
+            error.close()
 
 
 if __name__ == "__main__":

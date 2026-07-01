@@ -86,8 +86,11 @@ def poll_collaborator(base: str, secret: str, token: str, *, timeout: float = 8.
         return {"ok": False, "error": f"collaborator poll HTTP {exc.code}"}
     except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError) as exc:
         return {"ok": False, "error": f"collaborator poll failed: {exc}"}
-    hits = data.get("hits") if isinstance(data, dict) else None
-    return {"ok": True, "count": int((data or {}).get("count") or 0), "hits": hits or []}
+    # The collaborator's response may not be a JSON object (a misconfigured tunnel/proxy,
+    # a load-balancer error page rendered as JSON, or a buggy collaborator could return an
+    # array/string/number) — normalize to {} so a non-dict body never crashes the poll.
+    data = data if isinstance(data, dict) else {}
+    return {"ok": True, "count": int(data.get("count") or 0), "hits": data.get("hits") or []}
 
 
 def _build_ssrf_finding(target_url: str, param: str, token: str, base: str, hit: dict[str, Any], confirmed: bool = True) -> dict[str, Any]:

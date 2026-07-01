@@ -143,6 +143,12 @@ def run_campaign(
         recon_notes, recon_sources = [], {}
 
     # --- Hunt each target with the full engine. ---
+    # `deep` and `time_based` BOTH trigger the (already-gated, scope-bound) active pass in
+    # run_bounty_hunt (it runs on `active or time_based`, and deep forces time_based on), so
+    # the honest "did active probing run" flag is their union. Use it for the per-target run
+    # AND the campaign report so the report can never claim "active: off" while an executing
+    # probe (e.g. the deep-mode time-based SLEEP) actually fired.
+    effective_active = bool(active or time_based or deep)
     per_target: list[dict[str, Any]] = []
     consolidated: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
@@ -152,7 +158,7 @@ def run_campaign(
         result = run_bounty_hunt(
             url, profile, None, str(out_root / "targets"), scope, True, coder_cfg,
             default_reports_dir=out_root / "targets", seed_dir=seed_dir, runtime_dir=runtime_dir,
-            version=version, run_live=live, active=active, time_based=(time_based or deep), auth=auth, per_finding=False,
+            version=version, run_live=live, active=effective_active, time_based=(time_based or deep), auth=auth, per_finding=False,
             extra_params=recon_params,
         )
         per_target.append({"target": url, "ok": result.get("ok", False),
@@ -302,7 +308,7 @@ def run_campaign(
     # --- Campaign index report + JSON. ---
     ctx_meta = {
         "target": clean_target, "program": prog_key, "kind": kind, "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
-        "version": version, "active": active, "scope": scope, "urls": urls, "recon_notes": recon_notes,
+        "version": version, "active": effective_active, "scope": scope, "urls": urls, "recon_notes": recon_notes,
         "recon_sources": recon_sources, "intel": intel, "consolidated": consolidated, "confirmed": confirmed,
         "per_target": per_target, "submission_count": len(submission_paths),
     }
@@ -421,17 +427,29 @@ def _render_campaign_markdown(ctx: dict[str, Any]) -> str:
             out.append(f"\n_(+{len(consolidated) - 40} more — see campaign.json)_")
     out.append("")
 
-    if confirmed:
+    # A confirmed finding the ledger already marked duplicate_of_prior was DELIBERATELY
+    # suppressed from this run's submission packages (campaign.py's submission loop skips
+    # it) -- it must never be listed as "Ready to submit" with no package, or the operator
+    # is told to file something the engine intentionally did not re-package.
+    ready = [item for item in confirmed if not item.get("duplicate_of_prior")]
+    already_reported = [item for item in confirmed if item.get("duplicate_of_prior")]
+    if ready:
         out.append("## Ready to submit (confirmed)\n")
         out.append("These carry a captured proof artifact and a submission package under `submissions/`:")
         out.append("")
-        for item in confirmed:
+        for item in ready:
             f = item["finding"]
             path = item.get("submission_path", "")
             out.append(f"- **{f.get('title', '')}** ({str(f.get('severity', '')).title()}) — `{item['source_url']}`" + (f"  → `{Path(path).name}`" if path else ""))
         out.append("")
         out.append("Submit each from its package (paste the `.md`), or `gn submit` to export/file. After the program "
                    "responds, record the outcome with `gn learn` so the next campaign prioritizes what pays.")
+        if already_reported:
+            out.append("")
+            out.append(f"_{len(already_reported)} other confirmed finding(s) were already reported in a prior run and are not re-listed here._")
+    elif already_reported:
+        out.append("## Already reported\n")
+        out.append(f"All {len(already_reported)} confirmed finding(s) this run were already reported in a prior run (no new package built).")
     else:
         out.append("## Next\n")
         out.append("No findings are auto-confirmed yet. Re-run with active proof on (`--active`, in scope), then submit the "

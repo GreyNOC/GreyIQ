@@ -279,6 +279,7 @@ from bughunter import submission as bounty_submission  # noqa: E402
 from bughunter import report as bounty_report  # noqa: E402
 from bughunter import report_formats as bounty_formats  # noqa: E402
 from bughunter import screenshot_service as bounty_screenshot  # noqa: E402
+from bughunter import target_ingest as bounty_ingest  # noqa: E402
 from bughunter import bundle as bounty_bundle  # noqa: E402
 from bughunter import research as bounty_research  # noqa: E402
 from bughunter import access_control_service as bounty_access  # noqa: E402
@@ -288,6 +289,7 @@ from bughunter import oob_service as bounty_oob  # noqa: E402
 from bughunter import stored_xss_service as bounty_stored_xss  # noqa: E402
 from bughunter import ledger as bounty_ledger  # noqa: E402
 from bughunter import portfolio as bounty_portfolio  # noqa: E402
+from bughunter import hackerone_import as bounty_h1_import  # noqa: E402
 from bughunter.operator import OperatorLoop  # noqa: E402
 from bughunter import toolkit as toolkit_lib  # noqa: E402
 from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E402
@@ -560,6 +562,12 @@ class ScreenshotRequest(BaseModel):
     run_id: str = Field(min_length=1, max_length=64)
     ref: str = Field(min_length=1, max_length=40)
     full_page: bool = False
+    scope: str = Field(default="", max_length=4000)   # optional extra scope (the cockpit's current Scope box), unioned with the run + live program scope at capture time
+
+
+class IngestTargetsRequest(BaseModel):
+    content: str = Field(default="", max_length=5_000_000)   # pasted/loaded CSV / Burp XML / HAR (module also byte-caps)
+    kind: str = Field(default="auto", max_length=20)          # auto | csv | burp | har | hackerone_scope
 
 
 class BundleRequest(BaseModel):
@@ -662,6 +670,10 @@ class ProgramUpsertRequest(BaseModel):
     in_scope_hosts: list[str] = Field(default_factory=list)
     out_of_scope_hosts: list[str] = Field(default_factory=list)
     seed_targets: list[str] = Field(default_factory=list)
+    structured_scope: list[dict[str, Any]] = Field(default_factory=list, max_length=500)
+    oob_allowed: bool = False
+    notes: str = Field(default="", max_length=4000)
+    resync_scope: bool = False  # re-derive scope_text/hosts from structured_scope even if scope_text is already set (see portfolio.upsert_program)
     active: bool = False
     live: bool = False
     deep: bool = False
@@ -674,6 +686,10 @@ class ProgramUpsertRequest(BaseModel):
 
 class ProgramDeleteRequest(BaseModel):
     id: str = Field(min_length=1, max_length=120)
+
+
+class HackerOneImportRequest(BaseModel):
+    handle: str = Field(min_length=1, max_length=200)
 
 
 class OperatorStartRequest(BaseModel):
@@ -1320,6 +1336,13 @@ class GreyIQRuntime:
             return None, None, None
         return run["ctx"], run["findings"].get(ref), run
 
+    def ingest_targets(self, request: "IngestTargetsRequest") -> dict[str, Any]:
+        """Parse an operator-supplied CSV / Burp XML / HAR export into a normalized list of
+        targets + hosts. Pure / no-network. It NEVER probes and NEVER adds a host to scope —
+        the operator reviews the result and chooses to apply it; the fail-closed
+        host_in_active_scope gate still governs every probe."""
+        return bounty_ingest.ingest(request.content, request.kind)
+
     def build_submission_package(self, request: "SubmissionPackageRequest") -> dict[str, Any]:
         """Return the CANONICAL server-built submission package for one finding (the
         same build_submission used by the CLI/campaign) — never a client approximation.
@@ -1353,15 +1376,35 @@ class GreyIQRuntime:
             return {"ok": False, "error": "No proof-of-concept URL to screenshot for this finding (it has no captured request or URL location)."}
         safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
         out_path = RUNTIME_DIR / "screenshots" / f"{safe(request.run_id)}-{safe(request.ref)}.png"
+        # Resolve the FRESHEST scope at capture time, not just the scope frozen into the
+        # cached run: union (1) the run's own scope, (2) the live program's current
+        # scope_text — so editing a saved program's scope takes effect WITHOUT re-running
+        # the hunt — and (3) an optional scope the caller passes (the cockpit's current
+        # Scope box). All three are operator-supplied authorizations; the fail-closed
+        # host_in_active_scope gate still runs against the union, so this only ever WIDENS
+        # to hosts the operator has explicitly named.
+        scope_sources = [str(ctx.get("scope") or "")]
+        program_id = str((run or {}).get("program") or "")
+        if program_id:
+            prog = bounty_portfolio.get_program(RUNTIME_DIR, program_id)
+            if prog:
+                scope_sources.append(str(prog.get("scope_text") or ""))
+        if request.scope.strip():
+            scope_sources.append(request.scope)
+        scope = " ".join(s for s in scope_sources if s.strip())
         result = bounty_screenshot.capture_screenshot(
-            url, out_path, scope=str(ctx.get("scope") or ""), authorized=True, full_page=request.full_page,
+            url, out_path, scope=scope, authorized=True, full_page=request.full_page,
         )
         if not result.get("ok"):
             return result
         # Record on the cached finding so build_submission/report embed it by basename.
-        finding["screenshot_path"] = result["path"]
-        if run is not None:
-            run.setdefault("screenshots", {})[request.ref] = result["path"]
+        # Each /api/* call runs in its own asyncio.to_thread worker, so two concurrent
+        # requests against the same run_id+ref (e.g. a screenshot + a research call) must
+        # not race on this read-modify-write of the shared cached dicts.
+        with self.lock:
+            finding["screenshot_path"] = result["path"]
+            if run is not None:
+                run.setdefault("screenshots", {})[request.ref] = result["path"]
         data_url = ""
         try:
             raw = Path(result["path"]).read_bytes()
@@ -1391,9 +1434,12 @@ class GreyIQRuntime:
         try:
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(dossier["markdown"], encoding="utf-8")
-            finding["research_path"] = str(out_path)
-            if run is not None:
-                run.setdefault("research_paths", {})[request.ref] = str(out_path)
+            # See capture_screenshot: concurrent /api/* calls against the same run_id+ref
+            # mutate these shared cached dicts from different worker threads.
+            with self.lock:
+                finding["research_path"] = str(out_path)
+                if run is not None:
+                    run.setdefault("research_paths", {})[request.ref] = str(out_path)
             written = str(out_path)
         except OSError:
             written = ""
@@ -1840,8 +1886,23 @@ class GreyIQRuntime:
         return {"ok": True, "programs": bounty_portfolio.list_programs(RUNTIME_DIR)}
 
     def upsert_program(self, request: "ProgramUpsertRequest") -> dict[str, Any]:
-        record = request.model_dump(exclude_none=True)
+        # exclude_unset: a caller that doesn't know about a field (e.g. the Operator tab's
+        # compact edit form predates structured_scope/oob_allowed/notes) must never reset
+        # it to that field's bare default just by omitting it from the request body -- the
+        # existing stored value is preserved instead. A caller that DOES send a field
+        # (even a falsy one, like active=false) still gets it applied, since Pydantic marks
+        # any key present in the request JSON as "set" regardless of its value.
+        record = request.model_dump(exclude_unset=True, exclude_none=True)
         return {"ok": True, "program": bounty_portfolio.upsert_program(RUNTIME_DIR, record)}
+
+    def import_hackerone_scope(self, request: "HackerOneImportRequest") -> dict[str, Any]:
+        """Preview a program's scope pulled from the HackerOne API — the ONLY read here
+        that reaches a non-target host, and only on this explicit, operator-clicked call
+        (never automatic/background). Returns a PREVIEW; nothing is saved until the
+        operator submits the Program form. Reuses the same creds already stored for
+        submission — no new secret."""
+        _, username, token = self._hackerone_creds()
+        return bounty_h1_import.fetch_structured_scope(request.handle, username, token)
 
     def remove_program(self, program_id: str) -> dict[str, Any]:
         return {"ok": bounty_portfolio.remove_program(RUNTIME_DIR, program_id)}
@@ -2501,6 +2562,31 @@ def repo_ingest(request: RepoIngestRequest) -> dict[str, Any]:
     )
 
 
+def _safe_validation_summary(exc: Exception, max_errors: int = 10) -> str:
+    """A 422 detail message naming WHICH fields failed and why, without ever reflecting
+    the submitted values: pydantic's str(exc) embeds 'input_value=<the actual payload>',
+    which would echo arbitrary client-submitted content (and pydantic's own internal
+    error-code URLs) straight back to the caller — exactly what the deliberate
+    'never reflect raw exception text to the client' design (see route_http's generic
+    Exception handler) exists to prevent. err['msg']/err['loc'] are pydantic's own static,
+    value-free descriptions ("Field required", "Input should be a valid integer")."""
+    errors = getattr(exc, "errors", None)
+    if not callable(errors):
+        return "invalid request payload"
+    try:
+        parsed = errors()
+    except Exception:  # noqa: BLE001 - errors() itself is best-effort here
+        return "invalid request payload"
+    parts = []
+    for err in parsed[:max_errors]:
+        loc = ".".join(str(p) for p in (err.get("loc") or ())) or "(body)"
+        parts.append(f"{loc}: {err.get('msg') or 'invalid value'}")
+    if not parts:
+        return "invalid request payload"
+    suffix = f" (+{len(parsed) - max_errors} more)" if len(parsed) > max_errors else ""
+    return "invalid request payload — " + "; ".join(parts) + suffix
+
+
 def validate_payload(model: type[BaseModel], payload: dict[str, Any]) -> BaseModel:
     try:
         validator = getattr(model, "model_validate", None)
@@ -2508,7 +2594,7 @@ def validate_payload(model: type[BaseModel], payload: dict[str, Any]) -> BaseMod
             return validator(payload)
         return model.parse_obj(payload)
     except Exception as exc:
-        raise HTTPError(422, str(exc)) from exc
+        raise HTTPError(422, _safe_validation_summary(exc)) from exc
 
 
 async def read_body(receive: Any) -> bytes:
@@ -2532,7 +2618,11 @@ async def read_json_body(receive: Any) -> dict[str, Any]:
         return {}
     try:
         payload = json.loads(body.decode("utf-8"))
-    except json.JSONDecodeError as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        # A body containing invalid UTF-8 bytes raises UnicodeDecodeError here, which is
+        # a ValueError but NOT a json.JSONDecodeError -- it must be caught too, or it
+        # escapes as an unhandled exception and the client sees a generic 500 instead of
+        # the intended 400 "bad request".
         raise HTTPError(400, f"Invalid JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise HTTPError(422, "JSON body must be an object.")
@@ -2779,6 +2869,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             request = validate_payload(ScreenshotRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.capture_screenshot, request))
             return
+        if method == "POST" and path == "/api/bounty/ingest-targets":
+            request = validate_payload(IngestTargetsRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.ingest_targets, request))
+            return
         if method == "POST" and path == "/api/bounty/bundle":
             request = validate_payload(BundleRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.export_bundle, request))
@@ -2854,6 +2948,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/operator/programs/delete":
             request = validate_payload(ProgramDeleteRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.remove_program, request.id))
+            return
+        if method == "POST" and path == "/api/hackerone/import-scope":
+            request = validate_payload(HackerOneImportRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.import_hackerone_scope, request))
             return
         if method == "POST" and path == "/api/operator/start":
             request = validate_payload(OperatorStartRequest, await read_json_body(receive))

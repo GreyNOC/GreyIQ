@@ -122,6 +122,41 @@ class ConfirmTests(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("collaborator", res["error"].lower())
 
+    def test_all_pre_probe_polls_failing_returns_an_error_not_no_callback(self) -> None:
+        # Every param's PRE-PROBE poll (the negative-control check) fails -- no param is
+        # ever actually tried, so this must surface as a real error (ok=False), not the
+        # misleadingly-clean 'no-callback' status (which would imply the probe RAN and
+        # genuinely saw nothing).
+        oob.poll_collaborator = lambda base, secret, token, **k: {"ok": False, "error": "collaborator unreachable"}
+        res = oob.confirm_blind_ssrf(
+            "https://app.example.com/?url=x", base="https://collab.example", secret="s" * 16,
+            scope="app.example.com", settings=get_settings(), http=FakeHttp(), poll_attempts=1, poll_delay_s=0.0)
+        self.assertFalse(res["ok"])
+        self.assertIn("collaborator unreachable", res["error"])
+
+    def test_transient_poll_failure_on_one_param_does_not_abort_the_sweep(self) -> None:
+        # A transient poll failure for ONE param's in-loop attempt must `break` to the
+        # NEXT param (continuing the sweep), not abort the whole probe -- the next
+        # candidate param still gets a fair shot and can still confirm.
+        calls = {"n": 0}
+
+        def fake_poll(base, secret, token, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"ok": True, "count": 0, "hits": []}      # param 1 pre-probe: clean
+            if calls["n"] == 2:
+                return {"ok": False, "error": "transient timeout"}  # param 1 poll-attempt: fails -> break
+            if calls["n"] == 3:
+                return {"ok": True, "count": 0, "hits": []}      # param 2 pre-probe: clean
+            return {"ok": True, "count": 1, "hits": [{"method": "GET", "ip": "9.9.9.9",
+                    "headers": {"user-agent": "Go-http-client/1.1"}}]}  # param 2 poll-attempt: HIT
+        oob.poll_collaborator = fake_poll
+        res = oob.confirm_blind_ssrf(
+            "https://app.example.com/?url=x&next=y", base="https://collab.example", secret="s" * 16,
+            scope="app.example.com", settings=get_settings(), http=FakeHttp(), poll_attempts=1, poll_delay_s=0.0)
+        self.assertEqual(res["status"], "confirmed")
+        self.assertEqual(res["param"], "next")  # confirmed via the SECOND param, after param 1's transient failure
+
 
 class XxeTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -212,6 +247,59 @@ class XxeTests(unittest.TestCase):
                                     secret="s" * 16, scope="other.example", settings=get_settings())
         self.assertFalse(res["ok"])
         self.assertIn("scope", res["error"].lower())
+
+
+class PollCollaboratorRealResponseTests(unittest.TestCase):
+    """The REAL poll_collaborator (not stubbed) against a local server: a misconfigured
+    tunnel/proxy, a load-balancer error page rendered as JSON, or a buggy collaborator can
+    return a non-object JSON body (array/string/number) -- the poll must degrade cleanly,
+    never raise."""
+
+    def _serve(self, body: bytes) -> int:
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return server.server_port
+
+    def test_normal_object_body_parses(self) -> None:
+        port = self._serve(b'{"count": 2, "hits": [{"ip": "1.1.1.1"}]}')
+        res = oob.poll_collaborator(f"http://127.0.0.1:{port}", "secret", "tok")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["count"], 2)
+        self.assertEqual(len(res["hits"]), 1)
+
+    def test_json_array_body_does_not_crash(self) -> None:
+        port = self._serve(b'[{"ip": "1.1.1.1"}]')
+        res = oob.poll_collaborator(f"http://127.0.0.1:{port}", "secret", "tok")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["count"], 0)
+        self.assertEqual(res["hits"], [])
+
+    def test_json_string_body_does_not_crash(self) -> None:
+        port = self._serve(b'"ok"')
+        res = oob.poll_collaborator(f"http://127.0.0.1:{port}", "secret", "tok")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["count"], 0)
+
+    def test_json_number_body_does_not_crash(self) -> None:
+        port = self._serve(b"5")
+        res = oob.poll_collaborator(f"http://127.0.0.1:{port}", "secret", "tok")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["count"], 0)
 
 
 if __name__ == "__main__":

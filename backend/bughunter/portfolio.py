@@ -30,6 +30,7 @@ from bughunter.learning import program_key
 
 _STORE_NAME = "portfolio.json"
 _LOCK = threading.Lock()  # serialize read-modify-write (os.replace is atomic but not RMW-safe)
+_MAX_SCOPE_ENTRIES = 500  # bound a program's structured scope (an imported program is a convenience, never an unbounded loader)
 
 # Field defaults — every automation flag defaults to the SAFE/off value.
 _DEFAULTS: dict[str, Any] = {
@@ -40,6 +41,9 @@ _DEFAULTS: dict[str, Any] = {
     "in_scope_hosts": [],
     "out_of_scope_hosts": [],
     "seed_targets": [],            # URLs/hosts to hunt (each within scope)
+    "structured_scope": [],        # [{identifier, asset_type, eligible_for_submission, eligible_for_bounty, instruction, max_severity}], from HackerOne API/CSV import or hand entry
+    "oob_allowed": False,          # operator-confirmed: this program's policy permits out-of-band/collaborator testing
+    "notes": "",                   # free text — policy excerpt, reward table, anything pasted in
     "active": False,               # capture proof-of-impact (active verification)
     "live": False,                 # dynamic Playwright pass
     "deep": False,                 # aggressive: time-based SQLi + auto screenshot + research per confirmed lead
@@ -84,8 +88,53 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _safe_int(value: Any, default: int) -> int:
+    """Tolerant int() for a field that may arrive as a non-numeric string (a hand-edited
+    portfolio.json, the CLI, or any direct upsert_program caller -- only the HTTP API is
+    shielded by Pydantic's int fields). A bad value degrades to ``default`` instead of
+    raising and aborting the whole write."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clean_scope_entry(entry: Any) -> dict[str, Any] | None:
+    """Validate one structured-scope row (from HackerOne API/CSV import or hand entry).
+    Returns None for a row with no identifier — never invents a scope entry."""
+    if not isinstance(entry, dict):
+        return None
+    identifier = str(entry.get("identifier") or entry.get("asset_identifier") or "").strip()
+    if not identifier:
+        return None
+    return {
+        "identifier": identifier[:500],
+        "asset_type": str(entry.get("asset_type") or "").strip()[:60],
+        "eligible_for_submission": bool(entry.get("eligible_for_submission", True)),
+        "eligible_for_bounty": bool(entry.get("eligible_for_bounty", False)),
+        "instruction": str(entry.get("instruction") or "")[:2000],
+        "max_severity": str(entry.get("max_severity") or "").strip()[:20],
+    }
+
+
 def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     out = {**_DEFAULTS, **{k: v for k, v in record.items() if k in _DEFAULTS or k == "id"}}
+    out["structured_scope"] = [
+        e for e in (_clean_scope_entry(x) for x in (out.get("structured_scope") or [])) if e
+    ][:_MAX_SCOPE_ENTRIES]
+    out["oob_allowed"] = bool(out.get("oob_allowed"))
+    out["notes"] = str(out.get("notes") or "")[:4000]
+    # Convenience default ONLY: derive scope_text/in_scope_hosts/out_of_scope_hosts from
+    # structured_scope when the caller hasn't already typed a scope. Never overrides a
+    # hand-edited scope_text -- structured_scope is a source to pull FROM, not a mirror.
+    if out["structured_scope"] and not str(out.get("scope_text") or "").strip():
+        in_ids = [e["identifier"] for e in out["structured_scope"] if e["eligible_for_submission"]]
+        out_ids = [e["identifier"] for e in out["structured_scope"] if not e["eligible_for_submission"]]
+        out["scope_text"] = " ".join(in_ids)
+        if not out.get("in_scope_hosts"):
+            out["in_scope_hosts"] = in_ids
+        if not out.get("out_of_scope_hosts"):
+            out["out_of_scope_hosts"] = out_ids
     # Fail-closed coupling: active/live/deep/auto_submit require a non-empty scope.
     if not str(out.get("scope_text") or "").strip():
         out["active"] = False
@@ -99,9 +148,9 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     # Auto-submit additionally requires a platform handle to even attempt a file.
     if out["auto_submit"] and not (out["platform"] == "hackerone" and str(out.get("platform_handle") or "").strip()):
         out["auto_submit"] = False
-    out["max_pages"] = max(1, min(int(out.get("max_pages") or 12), 50))
-    out["interval_minutes"] = max(5, int(out.get("interval_minutes") or 1440))
-    out["max_submits_per_day"] = max(0, min(int(out.get("max_submits_per_day") or 3), 25))
+    out["max_pages"] = max(1, min(_safe_int(out.get("max_pages") or 12, 12), 50))
+    out["interval_minutes"] = max(5, _safe_int(out.get("interval_minutes") or 1440, 1440))
+    out["max_submits_per_day"] = max(0, min(_safe_int(out.get("max_submits_per_day") or 3, 3), 25))
     out["in_scope_hosts"] = [str(h).strip() for h in (out.get("in_scope_hosts") or []) if str(h).strip()]
     out["out_of_scope_hosts"] = [str(h).strip() for h in (out.get("out_of_scope_hosts") or []) if str(h).strip()]
     out["seed_targets"] = [str(t).strip() for t in (out.get("seed_targets") or []) if str(t).strip()]
@@ -109,18 +158,34 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def list_programs(runtime_dir: str | Path) -> list[dict[str, Any]]:
+    """Every record is re-normalized on read (idempotent for anything already written via
+    ``upsert_program``) so a record from BEFORE a field existed (e.g. one hand-written or
+    saved by an older GreyIQ version) always carries every current field's safe default,
+    instead of a caller needing to know which fields might be missing."""
     progs = _load(runtime_dir).get("programs", {})
-    return [progs[k] for k in sorted(progs)]
+    return [_normalize({**progs[k], "id": k}) for k in sorted(progs) if isinstance(progs[k], dict)]
 
 
 def get_program(runtime_dir: str | Path, program_id: str) -> dict[str, Any] | None:
-    return _load(runtime_dir).get("programs", {}).get(str(program_id))
+    prog = _load(runtime_dir).get("programs", {}).get(str(program_id))
+    return _normalize({**prog, "id": str(program_id)}) if isinstance(prog, dict) else None
 
 
 def upsert_program(runtime_dir: str | Path, record: dict[str, Any]) -> dict[str, Any]:
     """Create or update a program. The id is derived from the program name/handle via
     the shared program_key, so the portfolio, ledger, and learning store all key on
-    the SAME id (one program = one memory)."""
+    the SAME id (one program = one memory).
+
+    ``record["resync_scope"]`` (not a stored field — read here, never persisted) is an
+    explicit signal from a caller that owns the structured-scope table (the Program-setup
+    UI) that scope_text/in_scope_hosts/out_of_scope_hosts should be RE-derived from
+    whatever structured_scope this call carries, even if a scope_text already exists from
+    a prior save. Without it, ``_normalize``'s derivation only ever fires once (when
+    scope_text starts out empty) -- a later edit that changes structured_scope would
+    otherwise leave the stale, previously-derived scope_text in place forever, since a
+    caller that doesn't expose a scope_text field of its own has no other way to ask for
+    a refresh without risking clobbering a scope some OTHER caller (e.g. the Operator
+    tab's plain-text scope field) hand-typed on purpose."""
     name = str(record.get("name") or "").strip()
     handle = str(record.get("platform_handle") or "").strip()
     seed = str((record.get("seed_targets") or [""])[0] if record.get("seed_targets") else "")
@@ -129,7 +194,12 @@ def upsert_program(runtime_dir: str | Path, record: dict[str, Any]) -> dict[str,
         data = _load(runtime_dir)
         programs = data.setdefault("programs", {})
         existing = programs.get(pid, {})
-        merged = _normalize({**existing, **record, "id": pid})
+        merge_source = {**existing, **record, "id": pid}
+        if record.get("resync_scope") and merge_source.get("structured_scope"):
+            merge_source["scope_text"] = ""
+            merge_source["in_scope_hosts"] = []
+            merge_source["out_of_scope_hosts"] = []
+        merged = _normalize(merge_source)
         merged["name"] = name or existing.get("name") or pid
         merged["created_at"] = existing.get("created_at") or _now()
         programs[pid] = merged

@@ -98,6 +98,11 @@ default.
 
 ## BugHunter
 
+See [docs/USER_GUIDE.md](docs/USER_GUIDE.md) for the full Hunt-cockpit walkthrough —
+Program setup (including pulling real scope from HackerOne's API or a CSV/paste import),
+per-program SSRF/OOB setup, running a hunt, and reports & submission. The cockpit also opens
+a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the top bar).
+
 - **Scan** from chat: `scan code <path|repo>`, `scan web <url>`, `scan live <url>`.
 - **Bug-bounty hunt** (training panel): pick a profile (Web app / API / Source-code /
   Secrets / Full sweep) and an optional vuln-class focus (XSS, SQLi, SSRF, IDOR/access

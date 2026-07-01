@@ -23,7 +23,7 @@ from typing import Any
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.settings import get_settings
 from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
-from bughunter.web_scan_service import _guard_url
+from bughunter.web_scan_service import _guard_url, playwright_request_allowed
 
 # Bound runtime capture so a noisy/hostile page can't grow these lists without
 # limit during the wait window (memory-exhaustion guard), and clip each captured
@@ -145,9 +145,16 @@ def run_live_scan(url: str, wait_seconds: float = 6.0, max_findings: int = 300) 
 
     wait_ms = int(max(0.0, wait_seconds) * 1000)
     try:
+        def _guard_route(route: Any) -> None:
+            if playwright_request_allowed(route.request.url, settings.allow_private_urls, settings.web_allowed_ports):
+                route.continue_()
+            else:
+                route.abort()
+
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
             context = browser.new_context(ignore_https_errors=True)
+            context.route("**/*", _guard_route)
             page = context.new_page()
             page.on("console", on_console)
             page.on("pageerror", on_pageerror)

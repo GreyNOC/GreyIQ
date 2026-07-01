@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -12,6 +14,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from bughunter import ledger, operator, portfolio, ranking  # noqa: E402
+from bughunter.operator import OperatorLoop  # noqa: E402
 
 
 class PortfolioTests(unittest.TestCase):
@@ -41,6 +44,18 @@ class PortfolioTests(unittest.TestCase):
         # Deep with no scope -> forced off (fail-closed, like active/live).
         p2 = portfolio.upsert_program(self.rt, {"name": "NoScopeDeep", "deep": True})
         self.assertFalse(p2["deep"])
+
+    def test_non_numeric_fields_do_not_crash_the_write(self) -> None:
+        # The CLI / a hand-edited portfolio.json / any direct upsert_program caller is
+        # not Pydantic-validated like the HTTP API -- a bad value (e.g. max_pages='abc')
+        # must degrade to the safe default instead of raising and aborting the write.
+        p = portfolio.upsert_program(self.rt, {
+            "name": "Bad", "scope_text": "bad.com",
+            "max_pages": "abc", "interval_minutes": "soon", "max_submits_per_day": None,
+        })
+        self.assertEqual(p["max_pages"], 12)
+        self.assertEqual(p["interval_minutes"], 1440)
+        self.assertEqual(p["max_submits_per_day"], 3)
 
     def test_auto_submit_requires_handle(self) -> None:
         p = portfolio.upsert_program(self.rt, {"name": "X", "scope_text": "x.com", "auto_submit": True, "platform": "manual"})
@@ -90,11 +105,138 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(f["stages"]["confirmed"], 0)
         self.assertEqual(f["stages"]["discovered"], 1)
 
+    def test_is_submitted_requires_a_real_submission_not_just_reported(self) -> None:
+        item = _item("C1", "xss", "r", "https://x/a")
+        ledger.upsert_findings(self.rt, "acme", "https://x", [item])
+        ledger.mark_reported(self.rt, "acme", "https://x", item["finding"])
+        # 'reported' (a local package was built) is NOT a submission — must stay False so
+        # the operator's auto-submit gate can still file it.
+        self.assertFalse(ledger.is_submitted(self.rt, "acme", "https://x", item["finding"]))
+        self.assertTrue(ledger.is_duplicate(self.rt, "acme", "https://x", item["finding"]))  # is_duplicate is the broader check
+        ledger.record_submission(self.rt, "acme", "https://x", item["dedup_key"], "R1", "u")
+        self.assertTrue(ledger.is_submitted(self.rt, "acme", "https://x", item["finding"]))
+
     def test_recent_submission_throttle_count(self) -> None:
         item = _item("C1", "xss", "r", "https://x/a")
         ledger.upsert_findings(self.rt, "acme", "https://x", [item])
         ledger.record_submission(self.rt, "acme", "https://x", item["dedup_key"], "R1", "u")
         self.assertEqual(ledger.count_recent_submissions(self.rt, "acme"), 1)
+
+    def test_count_recent_submissions_excludes_stamps_outside_the_window(self) -> None:
+        from datetime import UTC, datetime, timedelta
+        item = _item("C1", "xss", "r", "https://x/a")
+        ledger.upsert_findings(self.rt, "acme", "https://x", [item])
+        ledger.record_submission(self.rt, "acme", "https://x", item["dedup_key"], "R1", "u")
+        # Force the stamp far outside the 24h window the throttle checks by default.
+        data = ledger._load(self.rt)
+        rec = data["programs"][ledger.program_key("acme", "https://x")]["findings"][item["dedup_key"]]
+        rec["updated_at"] = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
+        ledger._save(self.rt, data)
+        self.assertEqual(ledger.count_recent_submissions(self.rt, "acme", within_hours=24), 0)
+        self.assertEqual(ledger.count_recent_submissions(self.rt, "acme", within_hours=72), 1)
+
+    def test_count_recent_submissions_unparseable_stamp_fails_toward_the_throttle(self) -> None:
+        # An unparseable updated_at must COUNT (fail toward throttling, never silently
+        # under-count and let the operator over-submit past its daily cap).
+        item = _item("C1", "xss", "r", "https://x/a")
+        ledger.upsert_findings(self.rt, "acme", "https://x", [item])
+        ledger.record_submission(self.rt, "acme", "https://x", item["dedup_key"], "R1", "u")
+        data = ledger._load(self.rt)
+        rec = data["programs"][ledger.program_key("acme", "https://x")]["findings"][item["dedup_key"]]
+        rec["updated_at"] = "not-a-real-timestamp"
+        ledger._save(self.rt, data)
+        self.assertEqual(ledger.count_recent_submissions(self.rt, "acme"), 1)
+
+    def test_advance_stage_never_regresses(self) -> None:
+        item = _item("C1", "xss", "r", "https://x/a")
+        ledger.upsert_findings(self.rt, "acme", "https://x", [item])
+        ledger.record_submission(self.rt, "acme", "https://x", item["dedup_key"], "R1", "u")  # -> 'submitted'
+        ledger.advance_stage(self.rt, "acme", "https://x", item["dedup_key"], "confirmed")  # attempted regress
+        data = ledger._load(self.rt)
+        rec = data["programs"][ledger.program_key("acme", "https://x")]["findings"][item["dedup_key"]]
+        self.assertEqual(rec["stage"], "submitted")  # unchanged -- never moved backward
+
+    def test_advance_stage_unknown_stage_name_is_ignored(self) -> None:
+        item = _item("C1", "xss", "r", "https://x/a", proof="missing")  # starts at 'discovered'
+        ledger.upsert_findings(self.rt, "acme", "https://x", [item])
+        ledger.advance_stage(self.rt, "acme", "https://x", item["dedup_key"], "not-a-real-stage")
+        data = ledger._load(self.rt)
+        rec = data["programs"][ledger.program_key("acme", "https://x")]["findings"][item["dedup_key"]]
+        self.assertEqual(rec["stage"], "discovered")  # untouched
+
+    def test_funnel_whole_portfolio_aggregates_across_programs(self) -> None:
+        ledger.upsert_findings(self.rt, "acme", "https://a", [_item("C1", "xss", "r", "https://a/1", proof="confirmed")])
+        ledger.upsert_findings(self.rt, "beta", "https://b", [_item("C2", "ssrf", "r", "https://b/1", proof="confirmed")])
+        whole = ledger.funnel(self.rt)
+        self.assertEqual(whole["portfolio"]["stages"]["confirmed"], 2)
+        self.assertEqual(len(whole["programs"]), 2)
+        acme_key = ledger.program_key("acme", "https://a")
+        self.assertEqual(whole["programs"][acme_key]["stages"]["confirmed"], 1)
+
+
+class PortfolioLifecycleTests(unittest.TestCase):
+    """portfolio.remove_program / set_enabled / touch_run had no test coverage at all."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.rt = self._tmp.name
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_remove_program_deletes_and_reports_success(self) -> None:
+        p = portfolio.upsert_program(self.rt, {"name": "Acme", "scope_text": "acme.com"})
+        self.assertTrue(portfolio.remove_program(self.rt, p["id"]))
+        self.assertIsNone(portfolio.get_program(self.rt, p["id"]))
+
+    def test_remove_program_unknown_id_returns_false(self) -> None:
+        self.assertFalse(portfolio.remove_program(self.rt, "does-not-exist"))
+
+    def test_set_enabled_toggles_and_persists(self) -> None:
+        p = portfolio.upsert_program(self.rt, {"name": "Acme", "scope_text": "acme.com"})
+        self.assertTrue(p["enabled"])
+        updated = portfolio.set_enabled(self.rt, p["id"], False)
+        self.assertFalse(updated["enabled"])
+        self.assertFalse(portfolio.get_program(self.rt, p["id"])["enabled"])
+
+    def test_set_enabled_unknown_id_returns_none(self) -> None:
+        self.assertIsNone(portfolio.set_enabled(self.rt, "does-not-exist", True))
+
+    def test_touch_run_stamps_last_and_next_run(self) -> None:
+        p = portfolio.upsert_program(self.rt, {"name": "Acme", "scope_text": "acme.com"})
+        self.assertIsNone(p["last_run_at"])
+        portfolio.touch_run(self.rt, p["id"], next_run_at="2099-01-01T00:00:00+00:00")
+        updated = portfolio.get_program(self.rt, p["id"])
+        self.assertIsNotNone(updated["last_run_at"])
+        self.assertEqual(updated["next_run_at"], "2099-01-01T00:00:00+00:00")
+
+    def test_touch_run_unknown_id_does_not_raise(self) -> None:
+        portfolio.touch_run(self.rt, "does-not-exist", next_run_at="2099-01-01T00:00:00+00:00")  # must not raise
+
+
+class IsDueTests(unittest.TestCase):
+    """_is_due must never raise -- an exception here escapes the list comprehension in
+    _supervise() and kills the WHOLE operator supervisor thread (every program stops being
+    scheduled), not just the one malformed program."""
+
+    def setUp(self) -> None:
+        self.loop = OperatorLoop("unused", run_campaign_fn=lambda *a, **k: {}, submit_fn=lambda *a, **k: {})
+
+    def test_naive_timestamp_does_not_raise_and_counts_as_due(self) -> None:
+        # No timezone offset -> comparing to datetime.now(UTC) raises TypeError, not
+        # ValueError -- must be caught and treated as due (fail toward scheduling it).
+        self.assertTrue(self.loop._is_due({"next_run_at": "2026-07-01T10:00:00"}))
+
+    def test_garbage_string_does_not_raise_and_counts_as_due(self) -> None:
+        self.assertTrue(self.loop._is_due({"next_run_at": "not-a-date"}))
+
+    def test_missing_next_run_at_is_due(self) -> None:
+        self.assertTrue(self.loop._is_due({}))
+
+    def test_future_aware_timestamp_is_not_due(self) -> None:
+        from datetime import UTC, datetime, timedelta
+        future = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+        self.assertFalse(self.loop._is_due({"next_run_at": future}))
 
 
 class RankingTests(unittest.TestCase):
@@ -111,6 +253,41 @@ class RankingTests(unittest.TestCase):
         ev = ranking.expected_value(item, {"xss": 99.0}, {"xss": {"rewarded": 99, "noise": 0, "bounty_total": 1e9, "submitted": 99}})
         self.assertLessEqual(ev["breakdown"]["prior"], 2.0)
         self.assertLessEqual(ev["breakdown"]["program_pay_factor"], 2.0)
+
+    def test_pay_factor_unadjudicated_with_a_paid_bounty_gets_the_small_bonus(self) -> None:
+        # adjudicated (rewarded+noise) == 0 but bounty_total > 0 is a real, if odd, state
+        # (e.g. a bounty recorded before the outcome was adjudicated) -- it should get the
+        # SMALL "paid" bonus (1.2), not the full reward-rate-driven multiplier.
+        stats = {"xss": {"rewarded": 0, "noise": 0, "bounty_total": 500.0}}
+        self.assertAlmostEqual(ranking._program_pay_factor("xss", stats), 1.2)
+
+    def test_pay_factor_unadjudicated_no_bounty_is_neutral(self) -> None:
+        stats = {"xss": {"rewarded": 0, "noise": 0, "bounty_total": 0.0}}
+        self.assertAlmostEqual(ranking._program_pay_factor("xss", stats), 1.0)
+
+    def test_pay_factor_all_noise_clamps_to_the_floor(self) -> None:
+        # rewarded=0, noise=10 -> score=-1.0 -> 1.0 + 0.8*(-1.0) = 0.2, clamped to the 0.5 floor.
+        stats = {"xss": {"rewarded": 0, "noise": 10, "bounty_total": 0.0}}
+        self.assertAlmostEqual(ranking._program_pay_factor("xss", stats), 0.5)
+
+    def test_pay_factor_all_rewarded_clamps_to_the_ceiling(self) -> None:
+        stats = {"xss": {"rewarded": 10, "noise": 0, "bounty_total": 1000.0}}
+        self.assertAlmostEqual(ranking._program_pay_factor("xss", stats), 2.0)
+
+    def test_pay_factor_no_stats_for_class_is_neutral(self) -> None:
+        self.assertEqual(ranking._program_pay_factor("xss", {}), 1.0)
+        self.assertEqual(ranking._program_pay_factor("xss", None), 1.0)
+
+    def test_corrupted_class_stats_does_not_crash_the_campaign(self) -> None:
+        # A hand-edited/corrupted runtime learning JSON (non-numeric rewarded/noise/
+        # bounty_total) must degrade gracefully -- rank_by_ev is called unguarded
+        # mid-campaign, so a ValueError here would abort the whole run.
+        item = _item("A", "xss", "r", "x", proof="confirmed", cvss=8.0)
+        corrupted_stats = {"xss": {"rewarded": "lots", "noise": None, "bounty_total": "lots-of-cash", "submitted": "many"}}
+        ev = ranking.expected_value(item, {"xss": "not-a-number"}, corrupted_stats)
+        self.assertIsInstance(ev["ev"], float)
+        ranked = ranking.rank_by_ev([dict(item)], {"xss": "not-a-number"}, corrupted_stats)
+        self.assertEqual(len(ranked), 1)  # completes without raising
 
 
 class OperatorCycleTests(unittest.TestCase):
@@ -164,6 +341,22 @@ class OperatorCycleTests(unittest.TestCase):
         self.assertEqual(len(self.submits), 1)
         self.assertEqual(s["submitted"], 1)
 
+    def test_armed_auto_submit_files_even_after_campaign_marks_reported(self) -> None:
+        # The REAL campaign.py marks a confirmed finding 'reported' (ledger.mark_reported)
+        # the SAME cycle it builds a local submission package — before run_program_cycle
+        # ever gets to check the ledger. The auto-submit gate must key off is_submitted
+        # (stage >= submitted), not is_duplicate (stage >= reported, which mark_reported
+        # alone already satisfies) — otherwise auto-submit could never file anything.
+        def run_fn(target, *, scope, program, active, live, deep=False, max_pages=12):
+            f = _finding("C1", "xss", "active.reflected-xss", f"{target}/?q=", proof="confirmed")
+            ledger.upsert_findings(self.rt, program, target, [{"finding": f, "source_url": f["location"],
+                                                               "proof_status": "confirmed", "cvss": {"base_score": 6.1}}])
+            ledger.mark_reported(self.rt, program, target, f)  # simulates building the submission package
+            return {"ok": True, "run_id": "run-1", "findings": [f], "proof_of_impact": {"C1": {"status": "confirmed"}}}
+        s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=run_fn, submit_fn=self._submit_fn)
+        self.assertEqual(len(self.submits), 1)
+        self.assertEqual(s["submitted"], 1)
+
     def test_dedup_blocks_refile_on_second_cycle(self) -> None:
         op = dict(self._program())
         operator.run_program_cycle(self.rt, op, run_campaign_fn=self._run_campaign_fn, submit_fn=self._submit_fn)
@@ -181,6 +374,108 @@ class OperatorCycleTests(unittest.TestCase):
         prog = self._program(max_submits_per_day=2, seed_targets=["https://a", "https://b", "https://c", "https://d", "https://e"])
         operator.run_program_cycle(self.rt, prog, run_campaign_fn=many_fn, submit_fn=self._submit_fn)
         self.assertEqual(len(self.submits), 2)
+
+    def test_run_campaign_fn_raising_is_recorded_and_does_not_kill_the_cycle(self) -> None:
+        def boom(target, *, scope, program, active, live, deep=False, max_pages=12):
+            raise RuntimeError("simulated campaign crash")
+        prog = self._program(seed_targets=["https://a", "https://b"])
+        s = operator.run_program_cycle(self.rt, prog, run_campaign_fn=boom, submit_fn=self._submit_fn)
+        self.assertEqual(s["targets_run"], 0)
+        self.assertEqual(len(s["errors"]), 2)  # one error per target, both recorded
+        self.assertIn("RuntimeError", s["errors"][0])
+        self.assertEqual(self.submits, [])
+
+    def test_campaign_ok_false_is_recorded_as_an_error_not_raised(self) -> None:
+        def failing(target, *, scope, program, active, live, deep=False, max_pages=12):
+            return {"ok": False, "error": "not authorized"}
+        s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=failing, submit_fn=self._submit_fn)
+        self.assertEqual(s["targets_run"], 0)
+        self.assertEqual(len(s["errors"]), 1)
+        self.assertIn("not authorized", s["errors"][0])
+
+    def test_finding_missing_ref_is_tolerated(self) -> None:
+        def run_fn(target, *, scope, program, active, live, deep=False, max_pages=12):
+            f = {"class_id": "xss", "rule_id": "r", "location": target, "severity": "high", "title": "x"}  # no 'ref'
+            return {"ok": True, "run_id": "run-1", "findings": [f], "proof_of_impact": {}}
+        s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=run_fn, submit_fn=self._submit_fn)
+        self.assertEqual(s["targets_run"], 1)
+        self.assertEqual(s["findings"], 1)
+        self.assertEqual(s["confirmed"], 0)  # proof_of_impact.get(None) -> not confirmed, no crash
+        self.assertEqual(self.submits, [])
+
+    def test_empty_seed_targets_is_a_clean_no_op(self) -> None:
+        prog = self._program(seed_targets=[])
+        s = operator.run_program_cycle(self.rt, prog, run_campaign_fn=self._run_campaign_fn, submit_fn=self._submit_fn)
+        self.assertEqual(s["targets_run"], 0)
+        self.assertEqual(s["findings"], 0)
+        self.assertEqual(s["errors"], [])
+        self.assertEqual(self.submits, [])
+
+    def test_submit_fn_failure_is_recorded_without_advancing_the_ledger(self) -> None:
+        def failing_submit(run_id, ref):
+            return {"ok": False, "error": "HackerOne rejected the report"}
+        s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=self._run_campaign_fn, submit_fn=failing_submit)
+        self.assertEqual(s["submitted"], 0)
+        self.assertEqual(len(s["errors"]), 1)
+        self.assertIn("HackerOne rejected", s["errors"][0])
+        # A failed submit must NOT mark the finding submitted -- it must still be
+        # eligible to retry on the next cycle.
+        self.assertFalse(ledger.is_submitted(self.rt, "acme", "https://acme.com",
+                          _finding("C1", "xss", "active.reflected-xss", "https://acme.com/?q=", proof="confirmed")))
+
+
+class SupervisorLoopTests(unittest.TestCase):
+    """OperatorLoop._supervise's idle-tick (no due programs) and kill-switch-between-
+    programs paths had no test coverage -- both exercised here via the REAL loop running
+    in a background thread against a real (temp-dir) portfolio store."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.rt = self._tmp.name
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_idle_tick_wait_responds_to_the_stop_event_not_the_full_timeout(self) -> None:
+        # Zero programs -> due=[] every pass -> _supervise calls
+        # self.stop_event.wait(timeout=15). Setting the event from another thread must
+        # wake it well before the 15s timeout, proving the idle tick is responsive.
+        loop = OperatorLoop(self.rt, run_campaign_fn=lambda *a, **k: {}, submit_fn=lambda *a, **k: {})
+        thread = threading.Thread(target=loop._supervise, daemon=True)
+        start = time.monotonic()
+        thread.start()
+        time.sleep(0.05)  # let it enter the idle wait
+        loop.stop_event.set()
+        thread.join(timeout=5)
+        elapsed = time.monotonic() - start
+        self.assertFalse(thread.is_alive())
+        self.assertLess(elapsed, 5.0)  # nowhere near the 15s idle-wait timeout
+        self.assertFalse(loop.running)
+
+    def test_kill_switch_stops_before_a_second_due_program(self) -> None:
+        portfolio.upsert_program(self.rt, {"id": "p1", "name": "P1", "scope_text": "a.com",
+                                            "seed_targets": ["https://a.com"], "auto_submit": False})
+        portfolio.upsert_program(self.rt, {"id": "p2", "name": "P2", "scope_text": "b.com",
+                                            "seed_targets": ["https://b.com"], "auto_submit": False})
+        calls: list[str] = []
+        started = threading.Event()
+
+        def run_campaign_fn(target, *, scope, program, active, live, deep=False, max_pages=12):
+            calls.append(program)
+            started.set()
+            return {"ok": True, "run_id": "r", "findings": [], "proof_of_impact": {}}
+
+        loop = OperatorLoop(self.rt, run_campaign_fn=run_campaign_fn, submit_fn=lambda *a, **k: {})
+        thread = threading.Thread(target=loop._supervise, daemon=True)
+        thread.start()
+        # The moment the FIRST program's campaign fires, engage the kill switch — the
+        # per-program loop's `if self.stop_event.is_set(): break` must stop it before
+        # ever reaching the second due program.
+        self.assertTrue(started.wait(timeout=5))
+        loop.stop_event.set()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(calls, ["p1"])  # p2 never ran
 
 
 if __name__ == "__main__":

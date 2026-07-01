@@ -22,16 +22,33 @@ def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Tolerant int() for values read from the persisted learning store: a hand-edited
+    or corrupted JSON file (e.g. {'rewarded': 'lots'}) must degrade to the default
+    instead of aborting the whole campaign with an unhandled ValueError/TypeError."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _program_pay_factor(class_id: str, program_stats: dict[str, Any] | None) -> float:
     """A class that has PAID for this program is worth more; one that's been pure
     noise (duplicate/N-A) is worth less. Bounded [0.5, 2.0]; neutral 1.0 with no data."""
     stats = (program_stats or {}).get(str(class_id or "")) if program_stats else None
     if not stats:
         return 1.0
-    rewarded = int(stats.get("rewarded", 0))
-    noise = int(stats.get("noise", 0))
+    rewarded = _safe_int(stats.get("rewarded", 0))
+    noise = _safe_int(stats.get("noise", 0))
     adjudicated = rewarded + noise
-    paid = float(stats.get("bounty_total", 0.0)) > 0
+    paid = _safe_float(stats.get("bounty_total", 0.0)) > 0
     if adjudicated == 0:
         return 1.0 + (0.2 if paid else 0.0)
     score = (rewarded - noise) / adjudicated
@@ -43,9 +60,9 @@ def expected_value(item: dict[str, Any], priors: dict[str, float] | None, progra
     finding = item.get("finding") or item
     class_id = str(finding.get("class_id") or "")
     sev = _SEV_VALUE.get(str(finding.get("severity") or "info").lower(), 0.05)
-    cvss = float((item.get("cvss") or {}).get("base_score") or 0.0)
+    cvss = _safe_float((item.get("cvss") or {}).get("base_score") or 0.0)
     sev_value = max(sev, cvss / 10.0)  # prefer the computed CVSS when present
-    prior = _clamp(float((priors or {}).get(class_id, 1.0)), 0.5, 2.0)
+    prior = _clamp(_safe_float((priors or {}).get(class_id, 1.0), 1.0), 0.5, 2.0)
     proof = str(item.get("proof_status") or finding.get("proof_status") or "missing")
     confirmed_weight = _CONFIRMED_WEIGHT.get(proof, 0.4)
     pay = _program_pay_factor(class_id, program_stats)
@@ -69,7 +86,7 @@ def rank_by_ev(consolidated: list[dict[str, Any]], priors: dict[str, float] | No
         finding = item.get("finding") or item
         confirmed = 1 if str(item.get("proof_status")) == "confirmed" else 0
         sev = _SEV_RANK.get(str(finding.get("severity") or "").lower(), 0)
-        cvss = float((item.get("cvss") or {}).get("base_score") or 0.0)
+        cvss = _safe_float((item.get("cvss") or {}).get("base_score") or 0.0)
         return (confirmed, item.get("ev", 0.0), sev, cvss)
 
     consolidated.sort(key=_key, reverse=True)

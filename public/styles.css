@@ -3015,6 +3015,27 @@ body[data-app-mode="hunt"] .cockpit {
 }
 .ck-steps { margin: 0 0 0.5rem; padding-left: 1.1rem; font-size: 0.82rem; line-height: 1.55; }
 .ck-steps li { margin-bottom: 0.25rem; }
+.ck-walkthrough { margin: 0.4rem 0 1rem; border: 1px solid var(--border); border-radius: 11px; background: var(--surface); padding: 0.2rem 0.85rem 0.65rem; }
+.ck-walkthrough > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 0.45rem; padding: 0.6rem 0; font-size: 0.82rem; font-weight: 600; color: var(--text); }
+.ck-walkthrough > summary::-webkit-details-marker { display: none; }
+.ck-walkthrough > summary::before { content: "\25B8"; font-size: 0.7rem; color: var(--accent); transition: transform 0.15s ease; }
+.ck-walkthrough[open] > summary::before { transform: rotate(90deg); }
+.ck-walkthrough[open] > summary { border-bottom: 1px solid var(--border); margin-bottom: 0.5rem; }
+.ck-walkthrough h4 { margin: 0.75rem 0 0.3rem; font-size: 0.78rem; color: var(--text); }
+.ck-walkthrough .ck-steps strong { color: var(--text); font-weight: 600; }
+.ck-prog-form .ck-import { grid-column: 1 / -1; }
+.ck-import { margin: 0.2rem 0; border: 1px solid var(--border); border-radius: 11px; background: var(--surface); padding: 0.2rem 0.85rem 0.7rem; }
+.ck-import > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 0.45rem; padding: 0.6rem 0; font-size: 0.82rem; font-weight: 600; color: var(--text); }
+.ck-import > summary::-webkit-details-marker { display: none; }
+.ck-import > summary::before { content: "\25B8"; font-size: 0.7rem; color: var(--accent); transition: transform 0.15s ease; }
+.ck-import[open] > summary::before { transform: rotate(90deg); }
+.ck-import[open] > summary { border-bottom: 1px solid var(--border); margin-bottom: 0.5rem; }
+.ck-import-row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; margin: 0.3rem 0 0.5rem; }
+.ck-import-row select { font: inherit; font-size: 0.8rem; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 0.3rem 0.4rem; }
+.ck-import-row input[type="file"] { font: inherit; font-size: 0.76rem; color: var(--muted); max-width: 100%; }
+.ck-import-ta { width: 100%; box-sizing: border-box; font-family: ui-monospace, "Cascadia Code", monospace; font-size: 0.78rem; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 0.45rem 0.55rem; resize: vertical; }
+.ck-import-preview { margin: 0.5rem 0; max-height: 180px; overflow: auto; font-size: 0.74rem; white-space: pre-wrap; word-break: break-all; background: var(--surface-2, var(--surface)); border: 1px solid var(--border); border-radius: 8px; padding: 0.4rem 0.55rem; color: var(--muted); }
+.ck-import-acts { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.3rem; }
 .ck-obligation { border-left: 3px solid var(--sun); background: color-mix(in srgb, var(--sun) 8%, transparent); padding: 0.5rem 0.7rem; border-radius: 0 8px 8px 0; font-size: 0.82rem; }
 .ck-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.8rem; }
 .ck-btn { font: inherit; font-size: 0.8rem; cursor: pointer; padding: 0.45rem 0.8rem; border-radius: 9px; border: 1px solid var(--border); background: var(--surface); color: var(--text); }
@@ -3052,6 +3073,43 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-prog-form input { font: inherit; font-size: 0.84rem; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 0.45rem 0.55rem; }
 .ck-prog-form .ck-toggles { grid-column: 1 / -1; }
 .ck-prog-form .ck-status { grid-column: 1 / -1; }
+
+/* Program setup tab */
+.ck-prog-setup-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 0.6rem; align-items: end; margin-top: 0.6rem; }
+.ck-prog-setup-form label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.76rem; color: var(--muted); }
+.ck-prog-setup-form input, .ck-prog-setup-form textarea { font: inherit; font-size: 0.84rem; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 0.45rem 0.55rem; }
+.ck-prog-setup-form textarea { resize: vertical; }
+.ck-prog-setup-form .ck-import,
+.ck-prog-setup-form .ck-toggles,
+.ck-prog-setup-form .ck-status,
+.ck-prog-setup-form .ck-scope-table,
+.ck-prog-setup-form h4 { grid-column: 1 / -1; margin: 0; }
+.ck-scope-table { display: flex; flex-direction: column; gap: 0.4rem; }
+.ck-scope-body { display: flex; flex-direction: column; gap: 0.35rem; }
+.ck-scope-row {
+  display: grid; grid-template-columns: 1.3fr 0.8fr auto auto 0.7fr 1.3fr auto;
+  gap: 0.4rem; align-items: center;
+}
+.ck-scope-row input[type="text"] {
+  font: inherit; font-size: 0.78rem; color: var(--text); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 7px; padding: 0.35rem 0.5rem; width: 100%; box-sizing: border-box;
+}
+.ck-scope-head span { font-size: 0.68rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
+.ck-scope-check { display: flex; align-items: center; gap: 0.3rem; font-size: 0.74rem; color: var(--muted); cursor: pointer; white-space: nowrap; }
+.ck-scope-rm { padding: 0.3rem 0.55rem; color: var(--muted); }
+
+/* Guided first-run wizard */
+.ck-wizard {
+  position: fixed; inset: 0; z-index: 80; display: flex; align-items: flex-end; justify-content: flex-end;
+  padding: 1.4rem; pointer-events: none;
+}
+.ck-wizard-card {
+  pointer-events: auto; width: min(22rem, 100%); background: var(--surface); border: 1px solid var(--border);
+  border-radius: 14px; padding: 1rem 1.1rem; box-shadow: 0 20px 50px rgba(0,0,0,0.35);
+}
+.ck-wizard-step { margin: 0 0 0.2rem; font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.ck-wizard-card h3 { margin: 0 0 0.4rem; font-size: 1rem; }
+.ck-wizard-acts { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.8rem; justify-content: flex-end; }
 
 @media (max-width: 1100px) {
   .ck-body, .ck-body.has-detail { grid-template-columns: 18rem minmax(0, 1fr) 0; }

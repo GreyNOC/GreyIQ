@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
+from bughunter.web_ingest import WebsiteFetchError, _ascii_hostname
+
 # Header names an operator may not inject — hop-by-hop / framing headers whose
 # value the transport must control. Auth headers (Cookie, Authorization, X-*) are fine.
 _FORBIDDEN_HEADER_NAMES = frozenset(
@@ -93,6 +95,17 @@ def build_auth(target_url: str, *, cookie: str = "", headers: Any = None) -> Aut
     host = urlparse(str(target_url or "")).hostname or ""
     if not host:
         return None
+    try:
+        # Normalize to the SAME punycoded, lowercased form same_site() compares the
+        # request/redirect host against (web_scan_service sanitizes via _guard_url before
+        # every fetch). Without this, an IDN target binds auth to its unicode hostname
+        # ('münchen.de'), the actual requests go out to the punycoded form
+        # ('xn--mnchen-3ya.de'), same_site() does an exact/suffix STRING compare between
+        # the two forms, and the session is silently never attached -- even to the
+        # legitimate same-site target.
+        host = _ascii_hostname(host)
+    except WebsiteFetchError:
+        pass  # an unencodable host falls back to the raw (lowercased) form below
     built: dict[str, str] = {}
     cookie = str(cookie or "").strip()
     if cookie:

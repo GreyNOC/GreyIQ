@@ -43,6 +43,17 @@ class SameSiteTests(unittest.TestCase):
         self.assertFalse(sa.same_site("", "example.com"))
         self.assertFalse(sa.same_site("example.com", ""))
 
+    def test_trailing_dot_fqdn_is_unrecognized_fails_closed(self) -> None:
+        # PINS the current behavior (a coverage gap, not a security bug): same_site does
+        # a raw string compare with no trailing-dot normalization, so the root-zone FQDN
+        # form ('example.com.' -- semantically identical to 'example.com') does NOT match
+        # unless BOTH sides carry the dot. This only ever causes a session to be withheld
+        # (fail-closed), never attached somewhere it shouldn't be -- a correctness/
+        # usability gap, not an exploitable widening.
+        self.assertFalse(sa.same_site("app.example.com.", "example.com"))
+        self.assertFalse(sa.same_site("app.example.com", "example.com."))
+        self.assertTrue(sa.same_site("app.example.com.", "example.com."))  # both dotted -> matches
+
     def test_ip_hosts_require_exact_match(self) -> None:
         # An IP has no subdomains; the dotted-suffix test must not treat an IP whose
         # label-suffix coincides as same-site.
@@ -106,6 +117,18 @@ class BuildAuthTests(unittest.TestCase):
         auth = sa.build_auth("https://example.com/", cookie="a=1;\n  b=2")
         self.assertNotIn("\n", auth.headers["Cookie"])
         self.assertEqual(auth.headers["Cookie"], "a=1; b=2")
+
+    def test_idn_host_is_bound_in_punycode_not_unicode(self) -> None:
+        # web_scan_service sanitizes every request/redirect host through _guard_url ->
+        # _ascii_hostname BEFORE comparing it with same_site(). If build_auth bound the
+        # UNICODE form here, every request to the legitimate target -- which arrives
+        # punycoded -- would mismatch and silently never receive the session.
+        auth = sa.build_auth("https://münchen.de/dash", cookie="session=abc")
+        self.assertIsNotNone(auth)
+        self.assertEqual(auth.host, "xn--mnchen-3ya.de")
+        # And the request host (as web_scan_service would present it) now matches.
+        self.assertTrue(sa.same_site("xn--mnchen-3ya.de", auth.host))
+        self.assertTrue(sa.same_site("api.xn--mnchen-3ya.de", auth.host))
 
 
 class GuardedRedirectAuthTests(unittest.TestCase):

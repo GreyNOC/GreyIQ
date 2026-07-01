@@ -2,6 +2,243 @@
 
 Notable changes to GreyIQ.
 
+## v0.56.0
+
+### QAQC pass, part 4 — closing the test-coverage backlog
+The 50-agent QAQC audit that drove v0.53.0–v0.55.0 also produced a list of ~60
+test-coverage gaps (code paths with no dedicated test) alongside the confirmed faults.
+This release closes that backlog, plus one real bug it surfaced along the way.
+
+**Fixed:**
+- `report.py`'s JWT-replay check crashed (`AttributeError`) whenever a `jwt_exposure`
+  field arrived as something other than a dict (a corrupted run cache or an unexpected
+  upstream shape) — it now degrades to "unconfirmed" instead of taking down the whole
+  report render for every JWT-credential finding.
+
+**New dedicated coverage (previously untested or thinly tested):**
+- The full SSRF/egress-guard surface (`_guard_url`, redirect re-guarding, settings env
+  parsing, same-site session binding) and the API's auth/CORS/path-traversal boundary,
+  driven through a real in-process ASGI harness.
+- Response-consumption isolation (byte cap, cookies, charset) and the sensitive-path
+  validators (`git config`, `.env`, actuator, etc.), including governor-exhaustion
+  fail-closed behavior.
+- `operator`/`ledger`/`portfolio`/`rate_limit`: lifecycle methods, the supervisor loop's
+  kill-switch and idle-wait (run against a real background thread), and EV pay-factor
+  edge cases that previously had zero coverage.
+- `triage.py` (zero coverage before this) and the remaining `ranking`/`campaign` gaps,
+  including severity roll-ups and "Ready to submit" rendering.
+- `access_control`, `api_discovery`, and `oob_service`: cross-origin OpenAPI scope
+  filtering, two-ID IDOR probing, and OOB sweep resilience to a transient poll failure.
+- `submission.py`'s HackerOne submit (success path, HTTP/URL-error decoding, screenshot
+  co-location and basename-collision behavior) and `report.py`'s Markdown-escaping /
+  `build_json` dropped-finding handling — previously only the refusal gates were tested.
+- `bundle.py`'s archive-size-cap and per-file-size-skip branches.
+- `live_scan_service.py` (the Playwright dynamic-scan engine) had **no test file at
+  all** — now covered end-to-end via a fake `playwright.sync_api` injected into
+  `sys.modules`, driving the real event-handling, per-request SSRF route guard, and
+  capture-cap-overflow code, plus the risk-scoring bands.
+- `recon.discover`'s three kill switches (page cap, per-campaign request budget, BFS
+  depth) against a real local multi-page server, and the per-host governor throttle
+  `_safe_fetch` defers to.
+- `recon_js.mine_js`'s `fetch`/`axios`/`.open` call-target regex, every extraction cap,
+  and redirected-`base_url` scoping.
+- The vendored DNS resolver's compressed-name reader against hostile input (pointer
+  cycles, pointer-to-self, out-of-range/forward pointers, unterminated names) — none of
+  it can hang or crash, only degrade to a partial/empty name.
+- `active_verify_service`'s Host-header confirmed (Location-reflection) branch, the
+  per-hunt request budget's `_RateLimited` propagation (independent of the per-host
+  governor), and direct tests of `_with_operator`/`_norm_len`.
+
+803 tests green (+278), including two previously-zero-coverage modules
+(`live_scan_service.py`, `triage.py`) and one previously-zero-coverage security
+boundary (`greyiq_api.py`'s auth/CORS/traversal handling via a real ASGI harness).
+
+## v0.55.0
+
+### QAQC pass, part 3 — all 16 low-severity + 4 plausible faults fixed
+Completes the QAQC hardening pass started in v0.53.0/v0.54.0: every remaining confirmed
+and plausible finding from the original 50-agent audit is now fixed, with regression
+tests (most verified to actually catch the original bug by reverting the fix and
+confirming the test fails).
+
+**Active verification / cloud / redirect:**
+- GCS and Azure cloud buckets can now confirm as publicly listable (previously only
+  S3 ever did) — each provider gets its correct listing query and response-shape check.
+- A protocol-relative open-redirect (`Location: //evil/`) is now detected — it was
+  silently mis-parsed and missed entirely.
+- A redirect chain ending in an error response now re-validates the final URL and
+  closes the response (was leaking a socket/fd on every 404/500).
+- An IDN (internationalized) target's session now binds in punycode, matching the form
+  every actual request is compared against — before, the session silently never attached.
+
+**Resilience to corrupted/hand-edited state:**
+- A corrupted learning store (non-numeric `rewarded`/`noise`/`bounty_total`) no longer
+  aborts a campaign mid-run.
+- A non-numeric `max_pages`/`interval_minutes`/`max_submits_per_day` no longer crashes
+  `upsert_program` (the CLI / a hand-edited `portfolio.json` aren't Pydantic-shielded
+  like the HTTP API).
+- The operator supervisor thread no longer dies on a timezone-naive `next_run_at`.
+- An invalid-UTF-8 request body now returns a clean 400 instead of a 500.
+
+**Correctness / consistency:**
+- The campaign report no longer lists an already-reported (duplicate) confirmed finding
+  under "Ready to submit" with no package — it's now excluded or annotated.
+- `next_steps`' ranking and submission-phase counts now agree with the report/H1 rating
+  on the same finding (both resolve severity through the CVSS-aware single source of
+  truth) instead of mis-tiering it.
+- `recon` no longer mines params/fingerprints from a page a redirect landed on OUT of
+  scope.
+- A 422 validation error no longer reflects the submitted payload values (or pydantic's
+  internal error-doc URLs) back to the client — only the failing field names + a
+  generic reason.
+- Concurrent `/api/*` calls against the same cached run (e.g. screenshot + research)
+  no longer race on an unlocked read-modify-write of the shared run state.
+- The vendored DNS resolver's query encoder no longer corrupts the packet for a label
+  over 63 bytes (a malformed host or an IDNA expansion) — the declared length now
+  always matches what's actually appended.
+
+**Cockpit:**
+- The Findings tab now re-renders when you switch to it (findings added by a standalone
+  tool like IDOR/CVE/takeover used to sit invisible until an unrelated action).
+- The Findings board now shows standalone-tool findings even when no hunt has run yet,
+  and its summary strip (risk/severity counts) is now derived fresh from the current
+  findings instead of a stale cached hunt result.
+- The column sort-direction arrow now points the right way (was inverted).
+- A non-JSON-object error body no longer crashes `apiFetch` with an opaque
+  "Cannot read properties of null" instead of the real HTTP status.
+
+525 tests green (+36), including new dedicated coverage for `scan_service.py`,
+`next_steps.py`, the API's request/validation/concurrency handling, and the recon
+scope-bleed regression — all previously untested.
+
+## v0.54.0
+
+### QAQC pass, part 2 — the 8 medium-severity faults
+Continues the v0.53.0 safety-hardening pass: the medium-severity faults the 50-agent QAQC
+audit confirmed (one, the screenshot SSRF-via-redirect, was already closed by v0.53.0's
+redirect re-guard — same root cause, two audit groups).
+
+- **New shared `registrable_domain` helper** (public-suffix-aware, no external data — a
+  small built-in set of common ccSLDs like `co.uk` and multi-tenant PaaS hosts like
+  `herokuapp.com`/`github.io`). Fixes two real bugs at once:
+  - **Scope authorization**: a bare platform suffix typed into free-text scope (e.g.
+    `herokuapp.com`, copied from a program description) no longer authorizes every
+    unrelated tenant under that shared host — only a real, owned apex
+    (`myapp.herokuapp.com`) does. The same protection now covers multi-label ccSLDs.
+  - **Cross-program memory contamination**: `learning.program_key` no longer collapses
+    `foo.co.uk` and `bar.co.uk` into one shared `co.uk` learning/ledger bucket.
+  - Also applied to `recon_js`'s same-apex host filtering.
+- **Blank-valued query parameters are no longer dropped** from the active prover's probe
+  candidate list (`?id=&q=x` now tests `id` too, not just `q`).
+- **`run_web_scan`'s "never raises" contract now actually holds**: a truncated/short-closed
+  response body (`http.client.IncompleteRead`, e.g. a server that drops the connection
+  mid-chunk) is caught and returned as a clean `{"ok": false, ...}` instead of crashing
+  the scan.
+- **OOB collaborator polling no longer crashes** on a non-object JSON response (a
+  misconfigured tunnel/proxy or load-balancer error page rendered as JSON).
+- **The operator supervisor thread no longer dies** on a timezone-naive `next_run_at`
+  (e.g. a hand-edited `portfolio.json`) — one malformed program no longer stops every
+  program from being scheduled.
+- **Blind-SSRF/XXE confirm no longer wipes the Submissions queue**: they now merge into
+  the existing findings list (matching the IDOR/BFLA/stored-XSS panels) instead of
+  replacing it wholesale, so a prior confirmed finding survives running a follow-up OOB
+  check.
+
+489 tests green (+18).
+
+## v0.53.0
+
+### Safety hardening — 7 fail-open faults fixed (QAQC pass)
+A 50-agent fault-hunt + adversarial-verification pass over the whole codebase confirmed 31
+real faults; the 7 high-severity ones are fixed here. Several share one root cause:
+**redirects and sub-resources weren't re-checked against the scope/SSRF gate** — only the
+initial URL was.
+
+- **Deep mode now reports honestly.** `deep=True` already silently enabled the active pass
+  (incl. the opt-in time-based SQLi SLEEP probe) via `time_based`, but the campaign report
+  recorded `active: off`. It now derives one honest `effective_active = active or
+  time_based or deep` for both the probe and the report.
+- **Stored-XSS auto-send no longer leaks the session off-host.** The view-host session is
+  now attached to the inject-URL POST only when it's same-site (`scan_auth.auth_headers_for`)
+  — the inject URL can legitimately be a different in-scope host than the view URL.
+- **Operator auto-submit no longer dead-locks itself.** It gated on `ledger.is_duplicate`
+  (stage ≥ reported), but building a local submission package marks a finding "reported"
+  in the same cycle — so armed auto-submit could never actually file anything. It now uses
+  a new `ledger.is_submitted` (stage ≥ submitted); only a real prior submission blocks a
+  re-file.
+- **Screenshot capture re-guards every redirect/sub-resource** (not just the initial URL)
+  against the SSRF/private-host/port guard, and discards the capture if the final page
+  left scope.
+- **The "confirmed" proof gate no longer trusts a bare explicit status.** A
+  `proof_of_impact.status: "confirmed"` from a brain (possibly hallucinating, or echoing a
+  scanned page's prompt injection) now requires a real captured artifact — concretely, the
+  `observed_result` + `control_result` differential pair every active-prover check actually
+  produces — before it can flip a finding to confirmed (and through the auto-submit gate).
+- **The live (Playwright) scanner re-guards every redirect/sub-resource** the same way.
+- **Submissions/research/screenshot now key off the finding's OWN run**, not whatever ran
+  most recently — fixes submitting/copying the wrong report after running a follow-up tool
+  (IDOR/BFLA/stored-XSS/takeover/CVE) on top of an earlier hunt's findings.
+
+A new `web_scan_service.playwright_request_allowed` helper centralizes the redirect/
+sub-resource re-guard so screenshot capture and the live scanner share one tested
+implementation.
+
+471 tests green (+12).
+
+## v0.52.0
+
+### Operator — import targets from CSV, Burp Suite XML, or HAR
+The "Add / update a program" form gains an **Import targets** panel: paste or load a CSV of
+hosts/URLs, a Burp Suite items/sitemap **XML** export, or a **HAR** capture, and fold the
+result into the program's seed targets and scope.
+
+- One parser ([target_ingest.py](backend/bughunter/target_ingest.py), pure / no-network /
+  stdlib-only) normalizes all three into deduped **targets** (full URLs — query params
+  preserved so the active prover mines them) and **hosts** (for scope), and surfaces the
+  discovered param names.
+- **Fail-closed**: parsing never probes and never auto-adds a host to scope — you review the
+  result and click "Add to seed targets" / "Add hosts to scope". XML carrying a
+  DOCTYPE/ENTITY declaration is refused (entity-expansion / XXE guard); input is byte- and
+  count-capped.
+- Wired: `POST /api/bounty/ingest-targets`.
+
+458 tests green (+15).
+
+## v0.51.0
+
+### Cockpit — in-app walkthroughs on the dense panels
+Every dense cockpit panel now carries a collapsible **walkthrough** that explains its
+prerequisites and the recommended order of operations — grounded in exactly what each tool
+does, and fail-closed safety notes included.
+
+- **Access control** (IDOR/BOLA · discovery probe · BFLA), the **Operator**, the **Surface**
+  tab (subdomain takeover + CVE fingerprinting), and the main **hunt** form each get a
+  "How this works — walkthrough" panel with prerequisites, a numbered flow, and a safety line.
+- One reusable, declarative component (`ckWalkthrough` + a per-panel spec) drives them, so the
+  pattern is trivial to drop onto future panels. Each remembers its own open/closed state; the
+  hunt form's starts collapsed (it's the primary, frequently-used form), the rest start open.
+
+443 tests green (UI-only change).
+
+## v0.50.0
+
+### BugHunter — screenshots resolve scope at capture time (edit-and-recapture)
+The **Capture screenshot** button was checking the scope FROZEN into a finding's cached run,
+so adding a host to scope *afterward* never took effect — the capture kept failing the
+fail-closed gate until you re-ran the whole hunt.
+
+- The screenshot endpoint now resolves scope at **capture time** by unioning three
+  operator-supplied sources: the cached run's own scope, the **live program's current
+  `scope_text`** (so editing + saving an Operator program's scope takes effect WITHOUT
+  re-running the hunt), and an optional **scope override from the request** — the cockpit's
+  current Scope box, now sent by the Capture button. Add the host, click capture again; no
+  re-run needed.
+- The union only ever **widens** to hosts you explicitly named: `host_in_active_scope` (plus
+  the SSRF / URL guard) still runs against the union and still fails closed, so an unnamed
+  host is refused exactly as before.
+
+443 tests green (+8), including ALLOW-direction tests that drive the real scope gate end-to-end.
+
 ## v0.49.0
 
 ### Operator — edit existing programs

@@ -534,7 +534,12 @@ async function apiFetch(path, options = {}) {
     }
     const payload = await response.json();
     if (!response.ok) {
-      throw new Error(payload.detail || payload.error || response.statusText);
+      // A non-ok response can carry a JSON body that ISN'T an object (literal null, an
+      // array, a bare string from a proxy/error page) -- dereferencing .detail on that
+      // throws an opaque "Cannot read properties of null" that hides the real HTTP
+      // status behind a confusing client-side error instead of surfacing it.
+      const safe = payload && typeof payload === "object" ? payload : {};
+      throw new Error(safe.detail || safe.error || response.statusText);
     }
     return payload;
   } finally {
@@ -4270,6 +4275,7 @@ const ck = {
   launch: document.querySelector("#ckLaunch"),
   segHunt: document.querySelector("#ckRunHunt"),
   segCampaign: document.querySelector("#ckRunCampaign"),
+  activeProgram: document.querySelector("#ckActiveProgram"),
   target: document.querySelector("#ckTarget"),
   scope: document.querySelector("#ckScope"),
   profile: document.querySelector("#ckProfile"),
@@ -4288,6 +4294,7 @@ const ck = {
   run: document.querySelector("#ckRun"),
   status: document.querySelector("#ckStatus"),
   views: {
+    program: document.querySelector("#ckViewProgram"),
     findings: document.querySelector("#ckViewFindings"),
     surface: document.querySelector("#ckViewSurface"),
     submissions: document.querySelector("#ckViewSubmissions"),
@@ -4311,7 +4318,7 @@ const ckState = {
   selectedRef: "",
   filter: "all",         // all | confirmed | critical | high | medium | low
   sort: { key: "rank", dir: 1 },
-  view: "findings",
+  view: "program",
   h1: null,              // { team_handle, api_username, has_token } — never the token
   platform: "hackerone", // report format for Copy/Download (server re-shapes per platform)
   triage: {}             // ref -> "submitted" | "drafted" (client-side worklist marks)
@@ -4353,6 +4360,8 @@ function ckSetView(view) {
   ckState.view = view;
   for (const btn of ck.navButtons) btn.classList.toggle("is-active", btn.dataset.ckView === view);
   for (const [name, node] of Object.entries(ck.views)) node.hidden = name !== view;
+  if (view === "program") void ckRenderProgram();
+  if (view === "findings") ckRenderFindings();
   if (view === "learn") void ckRenderLearn();
   if (view === "surface") ckRenderSurface();
   if (view === "submissions") ckRenderSubmissions();
@@ -4417,6 +4426,7 @@ function ckNormalizeFindings(res) {
     const cvss = cvssMap[ref] || f.cvss || null;
     return {
       ref,
+      runId: String(res.run_id || ""),   // the run this finding belongs to (submit/copy/screenshot use THIS, not the latest)
       rank: f.rank || i + 1,
       title: String(f.title || "Finding"),
       severity: String(f.severity || "info").toLowerCase(),
@@ -4442,11 +4452,24 @@ function ckProofBadge(status) {
   return cel("span", `ck-proof ${s}`, label);
 }
 
+// Worst severity present, in the SAME risk-word scheme campaign._campaign_risk uses
+// (critical/high/moderate/low/clean), so a fresh client-side badge means the same thing
+// the server-computed one does.
+const _RISK_FROM_SEVERITY = [["critical", "critical"], ["high", "high"], ["medium", "moderate"]];
+function ckDeriveRisk(findings) {
+  const present = new Set(findings.map((f) => String(f.severity || "").toLowerCase()));
+  for (const [sev, label] of _RISK_FROM_SEVERITY) if (present.has(sev)) return label;
+  return findings.length ? "low" : "clean";
+}
+
 function ckRenderFindings() {
   const host = ck.views.findings;
   host.replaceChildren();
   const res = ckState.result;
-  if (!res) {
+  // A standalone confirm tool (IDOR/BFLA/takeover/CVE/…) can populate ckState.findings
+  // WITHOUT ever running a hunt (res stays null) — show the board whenever there's
+  // anything to show, not only after a hunt specifically.
+  if (!res && !ckState.findings.length) {
     const empty = cel("div", "ck-empty");
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("viewBox", "0 0 24 24");
@@ -4459,21 +4482,27 @@ function ckRenderFindings() {
     return;
   }
 
-  // Summary strip.
+  // Summary strip. The headline numbers (risk/severity-counts/finding-count) are derived
+  // FRESH from ckState.findings — not the (possibly stale) hunt result: a standalone
+  // confirm tool run AFTER a hunt replaces/extends ckState.findings without touching
+  // ckState.result, so trusting res's cached counts here would show a strip that
+  // describes a different set of findings than the rows below it.
   const strip = cel("div", "ck-summary");
-  const risk = String(res.risk || "").toLowerCase();
-  if (risk) strip.append(ckPill(`risk-${risk}`, "Risk", String(res.risk).toUpperCase()));
-  const counts = res.severity_counts || {};
+  const risk = ckDeriveRisk(ckState.findings);
+  if (risk) strip.append(ckPill(`risk-${risk}`, "Risk", risk.toUpperCase()));
+  const counts = {};
+  for (const f of ckState.findings) { const s = String(f.severity || "").toLowerCase(); counts[s] = (counts[s] || 0) + 1; }
   const dots = cel("span", "ck-sevdots");
   for (const [k, cls] of [["critical", "c"], ["high", "h"], ["medium", "m"], ["low", "l"], ["info", "i"]]) {
     if (counts[k]) dots.append(cel("span", `ck-sevdot ${cls}`, `${counts[k]}${k[0].toUpperCase()}`));
   }
-  if (dots.childNodes.length) { const wrap = ckPill("", "Findings", String(res.finding_count ?? ckState.findings.length)); wrap.append(dots); strip.append(wrap); }
-  else strip.append(ckPill("", "Findings", String(res.finding_count ?? ckState.findings.length)));
+  if (dots.childNodes.length) { const wrap = ckPill("", "Findings", String(ckState.findings.length)); wrap.append(dots); strip.append(wrap); }
+  else strip.append(ckPill("", "Findings", String(ckState.findings.length)));
   const confirmed = ckState.findings.filter((f) => f.proof === "confirmed").length;
   if (confirmed) strip.append(ckPill("is-armed", "Confirmed", String(confirmed)));
-  // Active-verification authorization chip.
-  const auth = res.active_authorization || null;
+  // Active-verification authorization chip — genuinely hunt-specific (no standalone tool
+  // produces it), so it's fine to source from res and simply absent without one.
+  const auth = res ? res.active_authorization : null;
   if (auth) {
     if (auth.in_scope && (res.active_verified_classes || []).length) {
       strip.append(ckPill("is-armed", "Active", `armed · ${(res.active_verified_classes || []).join(", ")}`));
@@ -4481,7 +4510,7 @@ function ckRenderFindings() {
       strip.append(ckPill("is-disarmed", "Active", "disarmed (passive only)"));
     }
   }
-  if (res.scanners_run) strip.append(ckPill("", "Scanners", (res.scanners_run || []).join(", ") || "none"));
+  if (res && res.scanners_run) strip.append(ckPill("", "Scanners", (res.scanners_run || []).join(", ") || "none"));
   host.append(strip);
 
   // Filter chips.
@@ -4521,7 +4550,9 @@ function ckRenderFindings() {
   for (const [label, sortKey] of [["Sev", "severity"], ["Class", null], ["Proof", "proof"], ["Finding", null], ["Where", null], ["CVSS", "cvss"]]) {
     const th = cel("th", null, label);
     if (sortKey) {
-      const arrow = cel("span", "ck-sort", ckState.sort.key === sortKey ? (ckState.sort.dir < 0 ? " ▲" : " ▼") : " ⇅");
+      // dir=-1 sorts DESCENDING (the default on first click — critical/high first); the
+      // glyph must match the conventional meaning (▼ descending, ▲ ascending), not invert it.
+      const arrow = cel("span", "ck-sort", ckState.sort.key === sortKey ? (ckState.sort.dir < 0 ? " ▼" : " ▲") : " ⇅");
       th.append(arrow);
       th.addEventListener("click", () => {
         if (ckState.sort.key === sortKey) ckState.sort.dir *= -1;
@@ -4682,7 +4713,7 @@ function ckRenderDetail(f) {
 }
 
 async function ckResearchLead(f, btn, wrap) {
-  if (!ckState.runId) {
+  if (!(f.runId || ckState.runId)) {
     wrap.replaceChildren(cel("p", "ck-status is-error", "Run a hunt first — research attaches to a cached finding."));
     return;
   }
@@ -4692,7 +4723,7 @@ async function ckResearchLead(f, btn, wrap) {
   wrap.replaceChildren();
   try {
     const res = await apiFetch("/api/bounty/research", {
-      method: "POST", timeoutMs: 120000, body: JSON.stringify({ run_id: ckState.runId, ref: f.ref })
+      method: "POST", timeoutMs: 120000, body: JSON.stringify({ run_id: f.runId || ckState.runId, ref: f.ref })
     });
     if (res && res.ok) {
       btn.textContent = "Re-research lead";
@@ -4717,7 +4748,7 @@ async function ckResearchLead(f, btn, wrap) {
 }
 
 async function ckCaptureScreenshot(f, btn, wrap) {
-  if (!ckState.runId) {
+  if (!(f.runId || ckState.runId)) {
     wrap.replaceChildren(cel("p", "ck-status is-error", "Run a hunt first — screenshots attach to a cached finding."));
     return;
   }
@@ -4727,7 +4758,10 @@ async function ckCaptureScreenshot(f, btn, wrap) {
   try {
     const res = await apiFetch("/api/bounty/screenshot", {
       method: "POST", timeoutMs: 60000,
-      body: JSON.stringify({ run_id: ckState.runId, ref: f.ref })
+      // Send the cockpit's CURRENT Scope box too, so adding the host and re-capturing
+      // works without re-running the whole hunt (the server unions it with the run +
+      // live program scope and still fails closed via host_in_active_scope).
+      body: JSON.stringify({ run_id: f.runId || ckState.runId, ref: f.ref, scope: (ck.scope?.value || "").trim() })
     });
     if (res && res.ok) {
       btn.textContent = "Re-capture screenshot";
@@ -4802,11 +4836,12 @@ async function ckCopy(text) {
 // finding. Falls back to the client draft only when the server package is
 // unavailable (e.g. the run was evicted) so offline still works.
 async function ckSubmissionMarkdown(f) {
-  if (ckState.runId) {
+  const rid = f.runId || ckState.runId;   // the finding's OWN run, not whatever ran last
+  if (rid) {
     try {
       const res = await apiFetch("/api/bounty/submission", {
         method: "POST", timeoutMs: 20000,
-        body: JSON.stringify({ run_id: ckState.runId, ref: f.ref, platform: ckState.platform || "hackerone" })
+        body: JSON.stringify({ run_id: rid, ref: f.ref, platform: ckState.platform || "hackerone" })
       });
       if (res.ok && res.package && res.package.vulnerability_information) {
         return { text: res.package.vulnerability_information, canonical: true, package: res.package };
@@ -4848,7 +4883,7 @@ async function ckSubmitFinding(f, btn, statusEl) {
   try {
     const res = await apiFetch("/api/bounty/submit", {
       method: "POST", timeoutMs: 60000,
-      body: JSON.stringify({ run_id: ckState.runId, ref: f.ref, confirm: true, platform: "hackerone" })
+      body: JSON.stringify({ run_id: f.runId || ckState.runId, ref: f.ref, confirm: true, platform: "hackerone" })
     });
     if (res.ok) {
       ckState.triage[f.ref] = "submitted";
@@ -4905,7 +4940,7 @@ function ckTakeoverForm() {
           for (const f of (res.findings || [])) out.append(cel("p", "ck-ftitle", "✅ " + f.title));
           ckState.findings = (res.findings || []).map((f, i) => ({
             ref: `F${i + 1}`, title: f.title, severity: f.severity || "high", proof: "confirmed",
-            className: "Subdomain takeover", cwe: "CWE-350 / CWE-284", plan: {}, cvss: {},
+            className: "Subdomain takeover", cwe: "CWE-350 / CWE-284", runId: res.run_id || ckState.runId, plan: {}, cvss: {},
             proofObj: { status: "confirmed" }, description: ""
           }));
           ckBadgeCount("submissions", ckState.findings.length);
@@ -4963,7 +4998,7 @@ function ckCveForm() {
           for (const f of (res.findings || [])) out.append(cel("p", "ck-ftitle", "⚠ " + f.title));
           ckState.findings = (res.findings || []).map((f, i) => ({
             ref: `F${i + 1}`, title: f.title, severity: f.severity || "medium", proof: "candidate",
-            className: "Vulnerable / outdated component", cwe: "", plan: {}, cvss: {},
+            className: "Vulnerable / outdated component", cwe: "", runId: res.run_id || ckState.runId, plan: {}, cvss: {},
             proofObj: { status: "candidate" }, description: ""
           }));
           ckBadgeCount("submissions", ckState.findings.length);
@@ -4989,6 +5024,7 @@ function ckCveForm() {
 function ckRenderSurface() {
   const host = ck.views.surface;
   host.replaceChildren();
+  host.append(ckWalkthrough("surface"));
   host.append(ckTakeoverForm());
   host.append(ckCveForm());
   const s = ckState.surface;
@@ -5018,6 +5054,543 @@ function ckTextareaField(label, placeholder) {
   return { wrap: w, input: ta };
 }
 
+// --- Reusable collapsible "walkthrough" for the cockpit's dense panels ------------
+// One declarative spec per panel (keyed below). Each renders a <details> the user can
+// fold; the open/closed choice persists per key so a panel a user closes stays closed.
+// Pure copy grounded in what each panel actually does — it never changes behaviour.
+//   spec = { summary, intro?, defaultOpen?, sections: [{ h4?, ordered?, list }], safety? }
+//   a list item is a string, or a ["Bold lead. ", "rest of the sentence"] tuple.
+const CK_WALKTHROUGHS = {
+  "program": {
+    summary: "Program setup — walkthrough",
+    intro: "Set up the program you're authorized to test ONCE here, then reuse it everywhere: the launch rail's Program picker fills in Target/Scope, and the same list backs the Operator's autonomous scheduling. This is step one of Program → Hunt → Reports.",
+    sections: [
+      { h4: "Get the scope in", list: [
+        ["Fetch from HackerOne. ", "Enter the program's HackerOne team handle and click Fetch — pulls the program's structured scope via HackerOne's own API, using the API username/token you already saved in Submissions. Many programs restrict this to invited researchers, so a 403/404 here is common, not a bug."],
+        ["Import a CSV or paste. ", "No API access? Export or copy the program's scope table from its HackerOne page and paste/upload it — GreyIQ recognizes the real column names (identifier, asset type, eligible for submission/bounty, instruction, max severity) and keeps every column."],
+        ["Or just type it. ", "Add scope rows by hand with “+ Add scope row” — an identifier is the only required field."],
+      ] },
+      { h4: "Review before you hunt", list: [
+        "Untick “In scope” on any row you don't want probed — it becomes an exclusion, never an expansion.",
+        "A program with no in-scope rows (and no hand-typed Scope) can never go active — the same fail-closed gate the launch rail and Operator use.",
+      ] },
+      { h4: "Then", ordered: true, list: [
+        ["Save the program. ", "It appears in the launch rail's Program picker and the Operator tab."],
+        ["Pick it before you hunt. ", "Selecting it in the launch rail fills in Target/Scope — still hand-editable after."],
+        ["Set up SSRF/OOB testing (optional). ", "Confirm the program's policy allows out-of-band testing, then jump straight to the Access-control tab's collaborator panel with scope pre-filled."],
+      ] },
+    ],
+    safety: "Only the HackerOne API fetch reaches a non-target host (api.hackerone.com, read-only, only on this explicit click). CSV/paste import is local parsing — nothing is added to scope, and nothing is probed, until you click Save.",
+  },
+  "ssrf-setup": {
+    summary: "Program-specific SSRF/OOB setup — walkthrough",
+    defaultOpen: false,
+    intro: "Blind SSRF (and blind XXE) are confirmed with an out-of-band collaborator: GreyIQ injects a callback URL into a candidate parameter and watches for the target calling home. The detection itself lives in the Access-control tab's OOB panel — this is the checklist for setting it up per program.",
+    sections: [
+      { h4: "Before you start", list: [
+        ["Confirm the policy allows it. ", "Some programs explicitly forbid interacting with third-party/out-of-network services during testing. Check the program's policy, then tick “This program's policy allows out-of-band / collaborator testing” in its Program-setup form."],
+        ["Set up a collaborator once. ", "The Access-control tab's OOB panel needs a collaborator base URL + secret (one-time, global setup) — see its own walkthrough there."],
+      ] },
+      { h4: "Where to look for SSRF sinks", list: [
+        "Webhook / callback URL fields (integrations, notifications).",
+        "“Import from URL” / “fetch a file from a link” features (avatars, attachments, feed importers).",
+        "Image or link proxies / thumbnail generators.",
+        "PDF or screenshot export / “render this URL” tools.",
+        "Any parameter that already looks like a URL (redirect, next, return_to, source).",
+      ] },
+      { h4: "Run it", ordered: true, list: [
+        ["Jump over with scope filled in. ", "Use “Set up SSRF/OOB →” on a saved program's row — it carries the program's scope into the Access-control tab's Scope box."],
+        ["Mint + probe. ", "In the OOB panel, mint a callback URL, then run the blind-SSRF probe against a candidate endpoint — GreyIQ injects the callback into likely params and polls for a hit."],
+      ] },
+    ],
+    safety: "GET-only against in-scope hosts, with a same-run negative control before anything is marked confirmed. The proof is the out-of-band interaction, never target data.",
+  },
+  "access-control": {
+    summary: "How access-control testing works — walkthrough",
+    intro: "These checks prove broken access control with a real differential — never by showing another user's data. Each is GET-only and scope-bound (fail-closed): a host you don't name in Scope is skipped. Work them in this order. (Looking for the blind-SSRF/OOB collaborator panel? Open the “Program-specific SSRF/OOB setup” walkthrough below, or use “Set up SSRF/OOB →” on a program row in the Program tab.)",
+    sections: [
+      { h4: "Before you start", list: [
+        "Two authorized test accounts you control on the SAME host (e.g. a high- and a low-privilege login).",
+        "Each account's session: its Cookie, plus any Authorization / extra header it needs.",
+        "The target host named in the Scope box of each panel — and written authorization to test it.",
+      ] },
+      { h4: "The flow", ordered: true, list: [
+        ["Scope. ", "Put the target host in the Scope box on each panel — it is the fail-closed gate; an unnamed host is refused."],
+        ["Discover — “IDOR discovery — single-session id probe”. ", "Paste one authenticated object URL with a numeric id + that account's session. GreyIQ mutates the id and flags a neighbouring DISTINCT object as a candidate."],
+        ["Confirm cross-tenant — “Access control — IDOR / BOLA”. ", "Give account A's object URL + session and account B's OWN object URL + session. Confirmed means B's session read A's object — the proof is the differential, not the data."],
+        ["Function-level — “Access control — BFLA”. ", "Give an admin-only endpoint + your high-privilege session and your low-privilege session. Confirmed when the low-privilege session reaches it; an anonymous control proves the endpoint is actually gated."],
+        ["Submit. ", "Confirmed findings (and the discovery probe's candidate) land in the Submissions tab — copy, download, or file them there. A borderline dual-session IDOR / BFLA result is reported inline with its differential, not added to Submissions."],
+      ] },
+    ],
+    safety: "Safety: only your own test accounts, only an in-scope host you are authorized to test. GreyIQ never displays or stores another user's data — a confirmed result is an identity/length differential.",
+  },
+  "hunt": {
+    summary: "How a hunt works — walkthrough",
+    defaultOpen: false,  // the primary, frequently-used form — start collapsed
+    intro: "GreyIQ hunts an authorized target, proves what it can with benign checks, and drafts a submission. A single hunt scans one target; a full campaign also maps the surface and works each confirmed lead. Default runs are passive — active probing only fires when you opt in AND name the host in Scope.",
+    sections: [
+      { h4: "Set the target", list: [
+        "Program (optional) — pick a program you set up in the Program tab and it fills in Target/Scope below; still hand-editable after.",
+        "Target — the authorized URL (or local repo path) to hunt.",
+        "Scope — name the host(s) you're allowed to probe; this is the fail-closed gate for every active check (an unnamed host stays passive-only).",
+        "Profile / Focus class — bias the hunt toward a program's payouts or a single bug class (single hunt only).",
+      ] },
+      { h4: "Choose how hard it probes", list: [
+        ["Test for proof of impact (active). ", "Fires one benign crafted request per check to turn a lead into a Confirmed proof. Off = passive only."],
+        ["Deep SQLi probe. ", "Adds a single bounded, time-based SLEEP check — opt-in, in-scope only."],
+        ["Dynamic browser pass (Playwright). ", "Renders the page in a real browser to catch client-side surface."],
+        ["Deep auto-work. ", "On a campaign, implies proof of impact + the time-based SQLi probe, then auto-captures a proof screenshot and writes a research dossier for each confirmed lead (needs the host in Scope)."],
+      ] },
+      { h4: "Run it", ordered: true, list: [
+        ["Authorize. ", "Tick “I'm authorized to test this target (in scope)” — no hunt runs until you do, and active checks need it too."],
+        ["Behind a login? ", "Open “Scan behind a login” and paste a session Cookie / headers so the hunt sees authenticated pages."],
+        ["Run. ", "Findings land in the Findings board with a proof-status column; click any row for the captured proof and a submission draft."],
+      ] },
+    ],
+    safety: "Authorized testing only. Active probes are benign and idempotent, and fire only at a host you named in Scope after you tick the authorization box.",
+  },
+  "operator": {
+    summary: "How the autonomous operator works — walkthrough",
+    intro: "The operator works a PORTFOLIO of programs unattended: for each enabled program it runs the full loop on a schedule — recon → hunt → prove → dedup → report. It only files findings when you've armed auto-submit, and the kill switch stops it instantly. (Programs are shared with the Program tab — add/import scope there, tune automation here; both edit the same record.)",
+    sections: [
+      { h4: "Add a program", list: [
+        "Name + Scope — the hosts/wildcards you're authorized to test (the fail-closed gate; active and deep modes need a non-empty scope).",
+        "Seed targets — the URLs/hosts to hunt each cycle (each within scope).",
+        "Cadence + daily cap — how often it re-runs, and the most it may auto-submit per day.",
+        "HackerOne handle — required only if you want auto-submit.",
+      ] },
+      { h4: "Pick how hard it works each program", list: [
+        ["Active. ", "Capture proof of impact with benign crafted probes."],
+        ["Deep auto-work. ", "Adds time-based SQLi plus an auto proof-screenshot + research dossier per confirmed lead — needs the host in Scope."],
+        ["Auto-submit. ", "FILE confirmed, non-duplicate findings automatically — per-program opt-in, needs a handle, capped per day. Default off (review-only)."],
+      ] },
+      { h4: "Run it", ordered: true, list: [
+        ["Arm (optional). ", "Tick “Arm auto-submit” only if you want hands-off filing — every other gate still applies."],
+        ["Start. ", "It runs due programs sequentially; watch the Activity log and the Money pipeline funnel fill in."],
+        ["Kill switch. ", "Stop immediately at any time — it halts after the current step."],
+      ] },
+    ],
+    safety: "Auto-submit is triple-gated (armed + per-program opt-in + confirmed & non-duplicate + daily cap) and defaults to review-only. Starting confirms you're authorized to test every enabled program's scope.",
+  },
+  "surface": {
+    summary: "What the Surface tab does — walkthrough",
+    intro: "Map and pick apart a target's external surface. Two opt-in tools sit on top of the discovered-URL map; both are GET-only and scope-bound.",
+    sections: [
+      { h4: "Tools", list: [
+        ["Subdomain takeover. ", "Enumerate subdomains of an in-scope apex and confirm dangling-service takeovers (GitHub Pages, S3, Heroku, Fastly, …). No resource is ever claimed."],
+        ["Outdated components (CVE). ", "Fingerprint a page's front-end libraries and flag versions with known CVEs — confirm exploitability before submitting."],
+      ] },
+      { h4: "Surface map", list: [
+        "Run a full campaign to populate the discovered-URL list (with its robots / sitemap / security.txt sources).",
+        "Use those URLs as seed targets for a focused hunt or the access-control checks.",
+      ] },
+    ],
+    safety: "Both tools are GET-only and only ever act on a host you name in Scope.",
+  },
+};
+
+function ckWalkthrough(key) {
+  const spec = CK_WALKTHROUGHS[key];
+  if (!spec) return cel("span");  // unknown key — render nothing (defensive)
+  const storeKey = "greyiq.walkthrough." + key;
+  const box = cel("details", "ck-walkthrough");
+  const stored = localStorage.getItem(storeKey);
+  box.open = stored === null ? (spec.defaultOpen !== false) : stored !== "0";  // honour the user's choice once set
+  box.addEventListener("toggle", () => {
+    try { localStorage.setItem(storeKey, box.open ? "1" : "0"); } catch (_) {}
+  });
+  box.append(cel("summary", null, spec.summary));
+  if (spec.intro) box.append(cel("p", "ck-hint", spec.intro));
+  for (const sec of spec.sections || []) {
+    if (sec.h4) box.append(cel("h4", null, sec.h4));
+    const listEl = cel(sec.ordered ? "ol" : "ul", "ck-steps");
+    for (const item of sec.list || []) {
+      const li = cel("li");
+      if (Array.isArray(item)) { li.append(cel("strong", null, item[0])); li.append(document.createTextNode(item[1])); }
+      else li.append(document.createTextNode(item));
+      listEl.append(li);
+    }
+    box.append(listEl);
+  }
+  if (spec.safety) box.append(cel("p", "ck-hint", spec.safety));
+  return box;
+}
+
+// --- Program setup — the front door. One program record (name, HackerOne handle,
+// structured scope, SSRF/OOB notes) feeds the launch rail's Program picker AND the
+// Operator tab's autonomous scheduling — both read/write the same /api/operator/programs
+// list, so a program created in either tab shows up in both. -----------------------------
+let ckProgEdit = null;   // the program being edited here (null = adding a new one)
+let ckProgramsCache = []; // last-fetched program list, shared with the launch-rail picker
+
+async function ckFetchProgramsList() {
+  try {
+    const data = await apiFetch("/api/operator/programs");
+    ckProgramsCache = data.programs || [];
+  } catch (_) { ckProgramsCache = []; }
+  return ckProgramsCache;
+}
+
+function ckPopulateActiveProgramSelect() {
+  if (!ck.activeProgram) return;
+  const current = ck.activeProgram.value;
+  ck.activeProgram.replaceChildren();
+  const none = cel("option", null, "— pick a saved program —"); none.value = "";
+  ck.activeProgram.append(none);
+  for (const p of ckProgramsCache) {
+    const o = cel("option", null, p.name || p.id); o.value = p.id;
+    ck.activeProgram.append(o);
+  }
+  const restore = state.ckActiveProgramId || current;
+  if (restore && [...ck.activeProgram.options].some((o) => o.value === restore)) ck.activeProgram.value = restore;
+}
+
+// Fills Target/Scope from a saved program — still hand-editable after. Only runs on an
+// explicit picker change, never silently on boot (that would clobber a hand-edited
+// Target/Scope with stale program data on every reload).
+function ckApplyActiveProgram(id) {
+  state.ckActiveProgramId = id;
+  saveState();
+  const prog = ckProgramsCache.find((p) => p.id === id);
+  if (!prog) return;
+  if (ck.target && prog.seed_targets && prog.seed_targets.length) ck.target.value = prog.seed_targets[0];
+  if (ck.scope && prog.scope_text) ck.scope.value = prog.scope_text;
+  if (ck.program) ck.program.value = prog.platform_handle || "";
+  state.ckTarget = ck.target ? ck.target.value : state.ckTarget;
+  state.ckScope = ck.scope ? ck.scope.value : state.ckScope;
+  state.ckProgram = ck.program ? ck.program.value : state.ckProgram;
+  saveState();
+}
+
+function ckScopeRowEl(entry) {
+  const row = cel("div", "ck-scope-row");
+  const id = cel("input"); id.type = "text"; id.placeholder = "*.example.com"; id.value = entry.identifier || "";
+  const type = cel("input"); type.type = "text"; type.placeholder = "URL"; type.value = entry.asset_type || "";
+  const sub = cel("label", "ck-scope-check");
+  const subInput = cel("input"); subInput.type = "checkbox"; subInput.checked = entry.eligible_for_submission !== false;
+  sub.append(subInput, cel("span", null, "In scope"));
+  const bounty = cel("label", "ck-scope-check");
+  const bountyInput = cel("input"); bountyInput.type = "checkbox"; bountyInput.checked = Boolean(entry.eligible_for_bounty);
+  bounty.append(bountyInput, cel("span", null, "Bounty"));
+  const sev = cel("input"); sev.type = "text"; sev.placeholder = "max severity"; sev.value = entry.max_severity || "";
+  const note = cel("input"); note.type = "text"; note.placeholder = "instruction (optional)"; note.value = entry.instruction || "";
+  const rm = cel("button", "ck-btn ck-scope-rm", "✕"); rm.type = "button"; rm.title = "Remove row";
+  rm.addEventListener("click", () => row.remove());
+  row.append(id, type, sub, bounty, sev, note, rm);
+  row._ckGet = () => ({
+    identifier: id.value.trim(), asset_type: type.value.trim(),
+    eligible_for_submission: subInput.checked, eligible_for_bounty: bountyInput.checked,
+    max_severity: sev.value.trim(), instruction: note.value.trim(),
+  });
+  return row;
+}
+
+// Mirrors the backend's cap (greyiq_api.ProgramUpsertRequest.structured_scope max_length,
+// portfolio._MAX_SCOPE_ENTRIES) so the client truncates gracefully with a visible note
+// instead of the whole "Save program" request hard-failing with a generic 422.
+const CK_MAX_SCOPE_ENTRIES = 500;
+
+// Dedupe-by-identifier merge of `incoming` rows into `existing`, capped at
+// CK_MAX_SCOPE_ENTRIES. Returns { rows, truncated } — used by both the CSV/paste importer
+// and the HackerOne fetch button so neither can silently grow the table past what a save
+// can actually accept.
+function ckMergeScopeRows(existing, incoming) {
+  const seen = new Set(existing.map((e) => e.identifier.toLowerCase()));
+  const merged = existing.slice();
+  let truncated = false;
+  for (const r of incoming) {
+    if (merged.length >= CK_MAX_SCOPE_ENTRIES) { truncated = true; break; }
+    const key = r.identifier.toLowerCase();
+    if (!seen.has(key)) { seen.add(key); merged.push(r); }
+  }
+  return { rows: merged, truncated };
+}
+
+function ckScopeTable(initialRows) {
+  const wrap = cel("div", "ck-scope-table");
+  const header = cel("div", "ck-scope-row ck-scope-head");
+  for (const label of ["Identifier", "Asset type", "", "", "Max severity", "Instruction", ""]) header.append(cel("span", null, label));
+  wrap.append(header);
+  const body = cel("div", "ck-scope-body");
+  for (const entry of (initialRows || [])) body.append(ckScopeRowEl(entry));
+  wrap.append(body);
+  const addRow = cel("button", "ck-btn", "+ Add scope row"); addRow.type = "button";
+  addRow.addEventListener("click", () => body.append(ckScopeRowEl({})));
+  wrap.append(addRow);
+  wrap.ckCollect = () => [...body.querySelectorAll(".ck-scope-row")].map((r) => r._ckGet()).filter((e) => e.identifier);
+  wrap.ckReplace = (rows) => { body.replaceChildren(); for (const e of rows) body.append(ckScopeRowEl(e)); };
+  return wrap;
+}
+
+function ckProgramSetupRow(p) {
+  const li = cel("li"); li.style.flexWrap = "wrap";
+  const left = cel("div"); left.style.flex = "1";
+  left.append(cel("span", "ck-ftitle", p.name || p.id));
+  if (p.platform_handle) left.append(document.createTextNode(" "), cel("span", "ck-tag", `HackerOne: ${p.platform_handle}`));
+  if (p.oob_allowed) left.append(document.createTextNode(" "), cel("span", "ck-tag", "OOB allowed"));
+  const n = (p.structured_scope || []).length;
+  left.append(cel("div", "ck-floc", `${p.scope_text || "(no scope)"} · ${n} structured scope entr${n === 1 ? "y" : "ies"}`));
+  li.append(left);
+
+  const acts = cel("div", "ck-actions"); acts.style.margin = "0";
+  const edit = cel("button", "ck-btn", "Edit"); edit.type = "button";
+  edit.addEventListener("click", () => {
+    ckProgEdit = p;
+    void ckRenderProgram();
+    setTimeout(() => {
+      const f = document.querySelector(".ck-prog-setup-form");
+      if (f) { f.scrollIntoView({ behavior: "smooth", block: "center" }); const inp = f.querySelector("input"); if (inp) inp.focus(); }
+    }, 60);
+  });
+  const ssrf = cel("button", "ck-btn", "Set up SSRF/OOB →"); ssrf.type = "button";
+  ssrf.title = "Jump to the Access-control tab's OOB panel with this program's scope pre-filled";
+  ssrf.addEventListener("click", () => {
+    if (!p.oob_allowed && !window.confirm(
+      `"${p.name || p.id}" isn't marked as allowing out-of-band/collaborator testing (edit the program and tick that if its policy allows it). Continue to SSRF/OOB setup anyway?`
+    )) return;
+    // Route through the same apply/select-sync path the picker itself uses, so the
+    // always-visible launch-rail Program picker never disagrees with what this shortcut
+    // just set Target/Scope to.
+    ckApplyActiveProgram(p.id);
+    if (ck.activeProgram) ck.activeProgram.value = p.id;
+    ckSetView("idor");
+  });
+  const del = cel("button", "ck-btn", "Delete"); del.type = "button";
+  del.addEventListener("click", async () => {
+    if (!window.confirm(`Delete program "${p.name || p.id}"? This does not affect anything already hunted or reported.`)) return;
+    try {
+      await apiFetch("/api/operator/programs/delete", { method: "POST", body: JSON.stringify({ id: p.id }) });
+      if (state.ckActiveProgramId === p.id) { state.ckActiveProgramId = ""; saveState(); }
+      void ckRenderProgram();
+    } catch (_) {}
+  });
+  acts.append(edit, ssrf, del);
+  li.append(acts);
+  return li;
+}
+
+function ckProgramSetupForm() {
+  const editing = ckProgEdit;
+  const form = cel("form", "ck-prog-setup-form");
+  const name = ckField("Program name", "text", editing ? (editing.name || "") : "");
+  const handle = ckField("HackerOne team handle", "text", editing ? (editing.platform_handle || "") : "");
+  form.append(name.wrap, handle.wrap);
+
+  const fetchBar = cel("div", "ck-import-row");
+  const fetchBtn = cel("button", "ck-btn", "Fetch scope from HackerOne"); fetchBtn.type = "button";
+  fetchBar.append(fetchBtn);
+  const fetchNote = cel("p", "ck-status");
+  form.append(fetchBar, fetchNote);
+
+  form.append(cel("h4", null, "Structured scope"));
+  const scopeTable = ckScopeTable(editing ? (editing.structured_scope || []) : []);
+  form.append(scopeTable);
+
+  fetchBtn.addEventListener("click", async () => {
+    const h = handle.input.value.trim();
+    if (!h) { fetchNote.className = "ck-status is-error"; fetchNote.textContent = "Enter a HackerOne team handle first."; return; }
+    const label = fetchBtn.textContent; fetchBtn.disabled = true; fetchBtn.textContent = "Fetching…";
+    fetchNote.className = "ck-status"; fetchNote.textContent = "";
+    try {
+      const res = await apiFetch("/api/hackerone/import-scope", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ handle: h }) });
+      if (!res || res.ok === false) {
+        fetchNote.className = "ck-status is-error";
+        fetchNote.textContent = (res && res.error) || "Could not fetch scope.";
+        return;
+      }
+      const entries = res.structured_scope || [];
+      let mergeNote = "";
+      if (entries.length) {
+        // Merge (dedupe by identifier, fetched rows win on a match) rather than replace —
+        // a fetch must never silently discard hand-typed or CSV-merged rows already in
+        // the table.
+        const { rows: merged, truncated } = ckMergeScopeRows(
+          scopeTable.ckCollect().filter((e) => !entries.some((f) => f.identifier.toLowerCase() === e.identifier.toLowerCase())),
+          entries
+        );
+        scopeTable.ckReplace(merged);
+        if (truncated) mergeNote = ` Capped at ${CK_MAX_SCOPE_ENTRIES} scope entries — some existing rows were dropped.`;
+      }
+      fetchNote.className = "ck-status";
+      fetchNote.textContent = `Fetched ${entries.length} scope entr${entries.length === 1 ? "y" : "ies"} for "${res.program_name}".`
+        + ((res.warnings || []).length ? " " + res.warnings.join(" ") : "") + mergeNote;
+    } catch (err) {
+      fetchNote.className = "ck-status is-error"; fetchNote.textContent = err.message || "Fetch failed.";
+    } finally {
+      fetchBtn.disabled = false; fetchBtn.textContent = label;
+    }
+  });
+
+  // CSV/paste import merges into the same table (dedupes by identifier) rather than
+  // replacing it, so it composes with a HackerOne fetch or hand-typed rows.
+  const importNote = cel("p", "ck-status");
+  form.append(ckTargetImport(null, null, (rows) => {
+    const { rows: merged, truncated } = ckMergeScopeRows(scopeTable.ckCollect(), rows);
+    scopeTable.ckReplace(merged);
+    importNote.textContent = truncated ? `Capped at ${CK_MAX_SCOPE_ENTRIES} scope entries — some imported rows were dropped.` : "";
+  }));
+  form.append(importNote);
+
+  const toggles = cel("div", "ck-toggles");
+  const oobAllowed = ckToggle("This program's policy allows out-of-band / collaborator testing (SSRF, blind XXE)", editing ? Boolean(editing.oob_allowed) : false);
+  toggles.append(oobAllowed.wrap);
+  form.append(toggles);
+
+  const notes = ckTextareaField("Notes (policy excerpt, reward table, anything worth remembering)", "");
+  notes.input.value = editing ? (editing.notes || "") : "";
+  notes.input.rows = 3;
+  form.append(notes.wrap);
+
+  const submit = cel("button", "ck-btn primary", editing ? "Update program" : "Save program");
+  submit.type = "submit";
+  form.append(submit);
+  if (editing) {
+    const cancel = cel("button", "ck-btn", "Cancel"); cancel.type = "button";
+    cancel.addEventListener("click", () => { ckProgEdit = null; void ckRenderProgram(); });
+    form.append(cancel);
+  }
+  const saveNote = cel("p", "ck-status");
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const structuredScope = scopeTable.ckCollect();
+    if (!name.input.value.trim()) { saveNote.className = "ck-status is-error"; saveNote.textContent = "Program name is required."; return; }
+    const payload = {
+      name: name.input.value.trim(),
+      platform: handle.input.value.trim() ? "hackerone" : "manual",
+      platform_handle: handle.input.value.trim(),
+      structured_scope: structuredScope,
+      oob_allowed: oobAllowed.input.checked,
+      notes: notes.input.value,
+      // This form owns the structured-scope table, so a save here should always re-derive
+      // scope_text/in_scope_hosts/out_of_scope_hosts from whatever the table currently
+      // holds — never echo back a stale value from before this edit. The server no-ops
+      // this when structured_scope is empty, so it can't blank out a scope set some other
+      // way (e.g. hand-typed via the Operator tab).
+      resync_scope: true,
+    };
+    if (editing) {
+      payload.id = editing.id;
+      // Fields this form doesn't expose (seed targets, automation toggles) are simply
+      // omitted — the server preserves the existing stored value for anything not present
+      // in the request instead of resetting it to that field's bare default.
+      payload.enabled = editing.enabled;
+    }
+    try {
+      await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify(payload) });
+      ckProgEdit = null;
+      saveNote.classList.remove("is-error"); saveNote.textContent = "Saved.";
+      await ckFetchProgramsList();
+      ckPopulateActiveProgramSelect();
+      void ckRenderProgram();
+    } catch (err) { saveNote.textContent = err.message || "Could not save."; saveNote.classList.add("is-error"); }
+  });
+  form.append(saveNote);
+  return form;
+}
+
+let ckProgramRenderGen = 0;  // guards against overlapping renders (Edit + Delete fired in quick succession) clobbering each other out of order
+
+async function ckRenderProgram() {
+  const myGen = ++ckProgramRenderGen;
+  const host = ck.views.program;
+  const programs = await ckFetchProgramsList();
+  if (myGen !== ckProgramRenderGen) return;   // a newer call started while this one awaited — it owns the render now, not us
+  ckPopulateActiveProgramSelect();
+
+  host.replaceChildren();
+  host.append(cel("h2", "ck-section-title", "Program setup"));
+  host.append(cel("p", "ck-hint",
+    "Set up the program you're authorized to test: its scope, and (optionally) its HackerOne handle. This feeds the Program picker on the launch rail and the Operator's autonomous scheduling — one program, everywhere."));
+  host.append(ckWalkthrough("program"));
+
+  host.append(cel("h3", "ck-section-title", `Programs (${programs.length})`));
+  if (!programs.length) {
+    host.append(cel("p", "ck-hint", "No programs yet — add one below, or fetch/import a scope to get started."));
+  } else {
+    const list = cel("ul", "ck-list");
+    for (const p of programs) list.append(ckProgramSetupRow(p));
+    host.append(list);
+  }
+
+  host.append(cel("h3", "ck-section-title", ckProgEdit ? `Edit program — ${ckProgEdit.name || ckProgEdit.id}` : "Add a program"));
+  host.append(ckProgramSetupForm());
+}
+
+// --- Guided first-run wizard — drives the REAL cockpit (real ckSetView navigation, real
+// controls), it doesn't simulate a separate flow. Auto-shown once on a clean install (no
+// saved programs, no HackerOne creds); always reachable again via the topbar "Guide me"
+// button. Persisted dismissal is local-only (localStorage), not a server call. ------------
+const CK_WIZARD_STEPS = [
+  { title: "Welcome to GreyIQ", body: "Authorized testing only — your own assets, an authorized engagement, or a bug-bounty program you're enrolled in. Every active probe is scope-bound and fails closed: a host you don't name in Scope is never touched. This tour walks Program → Hunt → Reports." },
+  { title: "1. Add your first program", body: "Give it a name (and its HackerOne handle if it has one). Then pull in real scope: “Fetch scope from HackerOne” (uses the API creds you save in Submissions), or import/paste a CSV, or add rows by hand.", view: "program" },
+  { title: "2. Review the scope", body: "Check the structured-scope table — untick “In scope” on anything you don't want probed (that's an exclusion, never an expansion). Click Save program when it looks right.", view: "program" },
+  { title: "3. SSRF/OOB setup (optional)", body: "If the program's policy allows out-of-band/collaborator testing, tick that on its form, then use “Set up SSRF/OOB →” on the program row to land here with scope pre-filled. Skip this step if you don't need it.", view: "idor" },
+  { title: "4. Run your first hunt", body: "Back in the launch rail: pick your program (fills in Target/Scope), tick “I'm authorized to test this target”, and click Run hunt. Start with a Single hunt before a full campaign.", view: "program", focusSelector: "#ckActiveProgram" },
+  { title: "5. Read the results", body: "Findings land here with a proof-status column — Confirmed means GreyIQ actually proved it with a benign probe, not just flagged a pattern. Click any row for the evidence.", view: "findings" },
+  { title: "6. Generate a report", body: "Confirmed findings show up in Submissions — copy the Markdown, download it, or (once you've saved HackerOne API creds) submit it directly. Nothing is ever auto-filed without you arming it.", view: "submissions" },
+];
+
+function ckDismissWizard() {
+  document.querySelector(".ck-wizard")?.remove();
+  try { localStorage.setItem("greyiq.wizard.dismissed", "1"); } catch (_) {}
+  ckRenderGuideButton();
+}
+
+function ckShowWizard(stepIndex) {
+  document.querySelector(".ck-wizard")?.remove();
+  const i = Math.max(0, Math.min(stepIndex || 0, CK_WIZARD_STEPS.length - 1));
+  const step = CK_WIZARD_STEPS[i];
+  if (step.view) ckSetView(step.view);
+  if (step.focusSelector) {
+    setTimeout(() => {
+      const el = document.querySelector(step.focusSelector);
+      if (el) { el.scrollIntoView({ behavior: "smooth", block: "center" }); el.focus?.(); }
+    }, 80);
+  }
+
+  const overlay = cel("div", "ck-wizard");
+  const card = cel("div", "ck-wizard-card");
+  card.append(cel("p", "ck-wizard-step", `Step ${i + 1} of ${CK_WIZARD_STEPS.length}`));
+  card.append(cel("h3", null, step.title));
+  card.append(cel("p", "ck-hint", step.body));
+  const acts = cel("div", "ck-wizard-acts");
+  const skip = cel("button", "ck-btn", "Skip tour"); skip.type = "button";
+  skip.addEventListener("click", () => ckDismissWizard());
+  acts.append(skip);
+  if (i > 0) {
+    const back = cel("button", "ck-btn", "Back"); back.type = "button";
+    back.addEventListener("click", () => ckShowWizard(i - 1));
+    acts.append(back);
+  }
+  const isLast = i === CK_WIZARD_STEPS.length - 1;
+  const next = cel("button", "ck-btn primary", isLast ? "Done" : "Next"); next.type = "button";
+  next.addEventListener("click", () => { if (isLast) ckDismissWizard(); else ckShowWizard(i + 1); });
+  acts.append(next);
+  card.append(acts);
+  overlay.append(card);
+  document.body.append(overlay);
+}
+
+function ckRenderGuideButton() {
+  if (document.querySelector("#ckGuideBtn")) return;
+  const actions = document.querySelector(".ck-topbar-actions");
+  if (!actions) return;
+  const btn = cel("button", "ck-ghost", "🧭 Guide me"); btn.type = "button"; btn.id = "ckGuideBtn";
+  btn.title = "Replay the guided setup tour";
+  btn.addEventListener("click", () => ckShowWizard(0));
+  actions.prepend(btn);
+}
+
+function ckMaybeShowWizard() {
+  ckRenderGuideButton();
+  let dismissed = false;
+  try { dismissed = localStorage.getItem("greyiq.wizard.dismissed") === "1"; } catch (_) {}
+  const hasProgram = ckProgramsCache.length > 0;
+  const hasCreds = Boolean(ckState.h1 && (ckState.h1.has_token || ckState.h1.api_username));
+  if (dismissed || hasProgram || hasCreds) return;
+  ckShowWizard(0);
+}
+
 // Access control (IDOR/BOLA) — dual-session cross-tenant read confirm. The operator
 // supplies their two authorized test accounts; the server proves B can read A's object.
 function ckRenderIdor() {
@@ -5026,6 +5599,7 @@ function ckRenderIdor() {
   host.append(cel("h2", "ck-section-title", "Access control — IDOR / BOLA"));
   host.append(cel("p", "ck-hint",
     "Confirm a cross-tenant read with your TWO authorized test accounts. Give account A's object URL + session and account B's OWN object URL + session on the same host. GET-only, scope-bound — another user's data is never shown or stored; the proof is the differential."));
+  host.append(ckWalkthrough("access-control"));
 
   const form = cel("form", "ck-learn-form");
   const urlA = ckField("Account A — object URL", "text", "");
@@ -5067,7 +5641,7 @@ function ckRenderIdor() {
         out.append(cel("p", "ck-ftitle", "✅ IDOR / broken access control CONFIRMED"));
         out.append(cel("p", "ck-hint", "Added to Submissions — Copy report / Download / Submit it there."));
         ckState.runId = res.run_id || ckState.runId;
-        const row = { ref: res.ref || "F1", title: res.title || "IDOR / broken access control",
+        const row = { runId: res.run_id || ckState.runId, ref: res.ref || "F1", title: res.title || "IDOR / broken access control",
                       severity: res.severity || "high", proof: "confirmed",
                       className: "Broken access control (IDOR/BOLA)", cwe: "CWE-639 / CWE-284",
                       plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" };
@@ -5093,6 +5667,7 @@ function ckRenderIdor() {
   host.append(ckIdorProbeForm());
   host.append(ckBflaForm());
   host.append(ckStoredXssForm());
+  host.append(ckWalkthrough("ssrf-setup"));
   host.append(ckOobPanel());
 }
 
@@ -5134,7 +5709,7 @@ function ckStoredXssForm() {
       } else if (res.status === "confirmed") {
         out.append(cel("p", "ck-ftitle", "✅ Stored XSS CONFIRMED"));
         ckState.runId = res.run_id || ckState.runId;
-        const row = { ref: res.ref || "F1", title: res.title || "Stored XSS", severity: res.severity || "high",
+        const row = { runId: res.run_id || ckState.runId, ref: res.ref || "F1", title: res.title || "Stored XSS", severity: res.severity || "high",
                       proof: "confirmed", className: "Stored / persistent XSS", cwe: "CWE-79",
                       plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" };
         ckState.findings = (ckState.findings || []).filter((f) => !(f.ref === row.ref && f.className === row.className)).concat(row);
@@ -5185,7 +5760,7 @@ function ckIdorProbeForm() {
       } else if (res.status === "candidate" && res.run_id) {
         out.append(cel("p", "ck-ftitle", "⚠ Possible IDOR (candidate) — confirm cross-tenant with two accounts above"));
         ckState.runId = res.run_id || ckState.runId;
-        const row = { ref: res.ref || "F1", title: res.title || "Possible IDOR (single-session probe)",
+        const row = { runId: res.run_id || ckState.runId, ref: res.ref || "F1", title: res.title || "Possible IDOR (single-session probe)",
                       severity: res.severity || "medium", proof: "candidate",
                       className: "Broken access control (IDOR/BOLA)", cwe: "CWE-639 / CWE-284",
                       plan: {}, cvss: {}, proofObj: { status: "candidate" }, description: "" };
@@ -5239,7 +5814,7 @@ function ckBflaForm() {
         out.append(cel("p", "ck-ftitle", "✅ BFLA / broken function-level authorization CONFIRMED"));
         out.append(cel("p", "ck-hint", "Added to Submissions — Copy report / Download / Submit it there."));
         ckState.runId = res.run_id || ckState.runId;
-        const row = { ref: res.ref || "F1", title: res.title || "Broken function-level authorization",
+        const row = { runId: res.run_id || ckState.runId, ref: res.ref || "F1", title: res.title || "Broken function-level authorization",
                       severity: res.severity || "high", proof: "confirmed",
                       className: "Broken function-level authorization (BFLA)", cwe: "CWE-862 / CWE-285",
                       plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" };
@@ -5322,8 +5897,11 @@ function ckOobPanel() {
       } else if (res.status === "confirmed") {
         sout.append(cel("p", "ck-ftitle", `✅ Blind SSRF CONFIRMED via '${res.param}'`));
         ckState.runId = res.run_id || ckState.runId;
-        ckState.findings = [{ ref: "F1", title: res.title || "Blind SSRF", severity: res.severity || "high", proof: "confirmed", className: "Server-side request forgery (SSRF)", cwe: "CWE-918", plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" }];
-        ckBadgeCount("submissions", 1);
+        const row = { runId: res.run_id || ckState.runId, ref: res.ref || "F1", title: res.title || "Blind SSRF",
+                      severity: res.severity || "high", proof: "confirmed", className: "Server-side request forgery (SSRF)",
+                      cwe: "CWE-918", plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" };
+        ckState.findings = (ckState.findings || []).filter((f) => !(f.ref === row.ref && f.className === row.className)).concat(row);
+        ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);
         if (res.report) { const pre = cel("pre", "ck-research-md"); pre.textContent = res.report; pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "320px"; pre.style.overflow = "auto"; sout.append(pre); }
         sout.append(cel("p", "ck-hint", "Added to Submissions."));
       } else {
@@ -5361,8 +5939,11 @@ function ckOobPanel() {
       } else if (res.status === "confirmed" || res.status === "candidate") {
         xout.append(cel("p", "ck-ftitle", res.status === "confirmed" ? "✅ Blind XXE CONFIRMED" : "⚠ Blind XXE candidate (verify the callback source)"));
         ckState.runId = res.run_id || ckState.runId;
-        ckState.findings = [{ ref: "F1", title: res.title || "Blind XXE", severity: res.severity || "high", proof: res.status, className: "XML External Entity (XXE)", cwe: "CWE-611", plan: {}, cvss: {}, proofObj: { status: res.status }, description: "" }];
-        ckBadgeCount("submissions", 1);
+        const row = { runId: res.run_id || ckState.runId, ref: res.ref || "F1", title: res.title || "Blind XXE",
+                      severity: res.severity || "high", proof: res.status, className: "XML External Entity (XXE)",
+                      cwe: "CWE-611", plan: {}, cvss: {}, proofObj: { status: res.status }, description: "" };
+        ckState.findings = (ckState.findings || []).filter((f) => !(f.ref === row.ref && f.className === row.className)).concat(row);
+        ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);
         if (res.report) { const pre = cel("pre", "ck-research-md"); pre.textContent = res.report; pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "320px"; pre.style.overflow = "auto"; xout.append(pre); }
         xout.append(cel("p", "ck-hint", "Added to Submissions."));
       } else if (res.status === "ready") {
@@ -5684,6 +6265,7 @@ async function ckRenderOperator() {
   host.replaceChildren();
   host.append(cel("h2", "ck-section-title", "Autonomous operator"));
   host.append(cel("p", "ck-hint", "Add the programs you're authorized to hunt, then arm the operator. It runs each program on its schedule — recon, hunt, prove, dedup, report — and (only when you explicitly arm auto-submit per program) files confirmed, non-duplicate findings within a daily cap. The kill switch stops it immediately."));
+  host.append(ckWalkthrough("operator"));
 
   let data = null;
   if (service.available || (await refreshServiceStatus({ silent: true }))) {
@@ -5835,6 +6417,7 @@ function ckProgramForm() {
   const interval = ckField("Re-run every (minutes)", "number", editing ? String(editing.interval_minutes || 1440) : "1440");
   const cap = ckField("Max auto-submits / day", "number", editing ? String(editing.max_submits_per_day ?? 3) : "3");
   form.append(name.wrap, scope.wrap, targets.wrap, handle.wrap, interval.wrap, cap.wrap);
+  form.append(ckTargetImport(targets, scope));
 
   const toggles = cel("div", "ck-toggles");
   const active = ckToggle("Capture proof of impact (active)", editing ? !!editing.active : true);
@@ -5887,6 +6470,113 @@ function ckToggle(label, checked) {
   const input = cel("input"); input.type = "checkbox"; input.checked = Boolean(checked);
   wrap.append(input, cel("span", null, label));
   return { wrap, input };
+}
+
+// Merge `additions` into a current "a, b c" free-text field value, de-duplicating
+// case-sensitively and joining with `sep`. Used to fold imported targets/hosts into the
+// seed-targets (comma) and scope (space) inputs without clobbering what's already typed.
+function mergeList(current, additions, sep) {
+  const out = (current || "").split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+  const have = new Set(out);
+  for (const a of (additions || [])) {
+    const v = String(a || "").trim();
+    if (v && !have.has(v)) { have.add(v); out.push(v); }
+  }
+  return out.join(sep);
+}
+
+// Import targets/scope from a CSV / Burp Suite XML / HAR export, or a HackerOne-style
+// structured-scope CSV. Parsing is server-side and PURE (no network, never touches scope);
+// the operator reviews the result and clicks to fold it in. Wired into the Operator program
+// form (targetsField/scopeField) and the Program-setup form (onStructuredRows) — pass null
+// for whichever pair isn't relevant at a given call site.
+function ckTargetImport(targetsField, scopeField, onStructuredRows) {
+  const box = cel("details", "ck-import");
+  box.append(cel("summary", null, "Import targets — CSV / Burp XML / HAR / HackerOne scope"));
+  box.append(cel("p", "ck-hint", "Paste, or load a file: a CSV of hosts/URLs (or a HackerOne scope export/paste — identifier, asset type, eligible for submission/bounty, instruction, max severity), a Burp Suite items/sitemap XML export, or a HAR capture. Parsing is local and never adds anything to scope by itself — review the result, then add it."));
+
+  const row = cel("div", "ck-import-row");
+  const kind = cel("select");
+  const kindOptions = [["auto", "Auto-detect"], ["csv", "CSV"], ["burp", "Burp XML"], ["har", "HAR"]];
+  if (onStructuredRows) kindOptions.splice(2, 0, ["hackerone_scope", "HackerOne scope CSV/paste"]);
+  for (const [v, l] of kindOptions) {
+    const o = cel("option", null, l); o.value = v; kind.append(o);
+  }
+  const file = cel("input"); file.type = "file"; file.accept = ".csv,.tsv,.xml,.har,.json,.txt";
+  row.append(kind, file);
+  box.append(row);
+
+  const ta = cel("textarea", "ck-import-ta");
+  ta.rows = 4; ta.spellcheck = false; ta.placeholder = "Paste CSV / Burp XML / HAR here, or choose a file above…";
+  box.append(ta);
+
+  const parse = cel("button", "ck-btn", "Parse"); parse.type = "button";
+  const note = cel("p", "ck-status");
+  const result = cel("div");
+  box.append(parse, note, result);
+
+  file.addEventListener("change", () => {
+    const f = file.files && file.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => { ta.value = String(reader.result || ""); note.className = "ck-status"; note.textContent = `Loaded ${f.name} — click Parse.`; };
+    reader.onerror = () => { note.className = "ck-status is-error"; note.textContent = "Could not read that file."; };
+    reader.readAsText(f);
+  });
+
+  parse.addEventListener("click", async () => {
+    const content = ta.value.trim();
+    if (!content) { note.className = "ck-status is-error"; note.textContent = "Paste or load something first."; return; }
+    const label = parse.textContent; parse.disabled = true; parse.textContent = "Parsing…";
+    note.className = "ck-status"; note.textContent = ""; result.replaceChildren();
+    try {
+      const res = await apiFetch("/api/bounty/ingest-targets", {
+        method: "POST", timeoutMs: 30000, body: JSON.stringify({ content, kind: kind.value })
+      });
+      if (!res || res.ok === false) {
+        note.className = "ck-status is-error";
+        note.textContent = ((res && res.error) || "Nothing parsed.") + (res && (res.notes || []).length ? " " + res.notes.join(" ") : "");
+        return;
+      }
+      note.className = "ck-status";
+      note.textContent = `Parsed ${res.count} target(s) · ${res.host_count} host(s)`
+        + (res.param_names && res.param_names.length ? ` · ${res.param_names.length} param name(s)` : "")
+        + (res.kind ? ` (${res.kind})` : "");
+      const preview = cel("pre", "ck-import-preview");
+      const previewLines = res.structured_scope && res.structured_scope.length
+        ? res.structured_scope.map((e) => e.identifier)
+        : (res.targets || []);
+      const shown = previewLines.slice(0, 12);
+      preview.textContent = shown.join("\n") + (previewLines.length > 12 ? `\n… +${previewLines.length - 12} more` : "");
+      result.append(preview);
+      const acts = cel("div", "ck-import-acts");
+      if (targetsField) {
+        const addTargets = cel("button", "ck-btn", `Add ${res.count} to seed targets`); addTargets.type = "button";
+        addTargets.addEventListener("click", () => { targetsField.input.value = mergeList(targetsField.input.value, res.targets, ", "); note.className = "ck-status"; note.textContent = `Added ${res.count} target(s) to seed targets.`; });
+        acts.append(addTargets);
+      }
+      if (scopeField) {
+        const addScope = cel("button", "ck-btn", `Add ${res.host_count} host(s) to scope`); addScope.type = "button";
+        addScope.addEventListener("click", () => { scopeField.input.value = mergeList(scopeField.input.value, res.hosts, " "); note.className = "ck-status"; note.textContent = `Added ${res.host_count} host(s) to scope.`; });
+        acts.append(addScope);
+      }
+      if (onStructuredRows && res.structured_scope && res.structured_scope.length) {
+        const addRows = cel("button", "ck-btn", `Add ${res.structured_scope.length} scope entries`); addRows.type = "button";
+        addRows.addEventListener("click", () => {
+          onStructuredRows(res.structured_scope);
+          note.className = "ck-status"; note.textContent = `Added ${res.structured_scope.length} scope entries.`;
+        });
+        acts.append(addRows);
+      }
+      result.append(acts);
+    } catch (err) {
+      note.className = "ck-status is-error"; note.textContent = err.message || "Parse failed.";
+    } finally {
+      parse.disabled = false; parse.textContent = label;
+    }
+  });
+
+  return box;
 }
 
 function ckBadgeCount(view, n) {
@@ -5975,8 +6665,11 @@ function bootCockpit() {
   for (const btn of ck.navButtons) btn.addEventListener("click", () => ckSetView(btn.dataset.ckView));
   ck.segHunt?.addEventListener("click", () => ckSetRunType("hunt"));
   ck.segCampaign?.addEventListener("click", () => ckSetRunType("campaign"));
+  ck.activeProgram?.addEventListener("change", () => ckApplyActiveProgram(ck.activeProgram.value));
   ck.profile?.addEventListener("change", () => { state.bountyProfile = ck.profile.value; saveState(); ckUpdateProfileHint(); });
   ck.launch?.addEventListener("submit", (e) => { e.preventDefault(); void ckRun(); });
+  // Drop the (collapsed-by-default) hunt walkthrough at the top of the launch form.
+  if (ck.launch) ck.launch.prepend(ckWalkthrough("hunt"));
   // Restore persisted form values.
   if (ck.target) ck.target.value = state.ckTarget || "";
   if (ck.scope) ck.scope.value = state.ckScope || "";
@@ -5991,8 +6684,11 @@ function bootCockpit() {
   ckSetRunType(state.ckRunType || "hunt");
   ckSyncService();
   void ckPopulateProfiles();
-  void ckFetchCreds();
-  ckRenderFindings();
+  void (async () => {
+    await ckFetchCreds();
+    await ckRenderProgram();   // also fetches + populates the launch rail's Program picker
+    ckMaybeShowWizard();
+  })();
 }
 
 async function boot() {

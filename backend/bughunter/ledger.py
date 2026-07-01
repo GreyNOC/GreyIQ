@@ -162,6 +162,17 @@ def is_duplicate(runtime_dir: str | Path, program: str | None, target: str, find
     return bool(rec and _STAGE_RANK.get(rec.get("stage"), 0) >= _STAGE_RANK["reported"])
 
 
+def is_submitted(runtime_dir: str | Path, program: str | None, target: str, finding: dict[str, Any]) -> bool:
+    """True only once a finding was actually FILED (stage >= submitted). The operator's
+    auto-submit gates on THIS, not is_duplicate: building a local submission package marks a
+    finding 'reported' in the SAME cycle, so an is_duplicate (>= reported) check would skip
+    every confirmed finding before it could ever be filed. Only a real prior submission
+    blocks a re-file."""
+    pid = program_key(program, target)
+    rec = _load(runtime_dir).get("programs", {}).get(pid, {}).get("findings", {}).get(dedup_key(finding))
+    return bool(rec and _STAGE_RANK.get(rec.get("stage"), 0) >= _STAGE_RANK["submitted"])
+
+
 def mark_reported(runtime_dir: str | Path, program: str | None, target: str, finding: dict[str, Any]) -> None:
     """Move a finding to 'reported' once a submission package has been produced for it."""
     advance_stage(runtime_dir, program, target, dedup_key(finding), "reported")

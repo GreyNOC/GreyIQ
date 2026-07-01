@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from bughunter.report import resolve_severity
+
 # Severity / confidence → numeric weight. A finding's "act on this next" score is
 # severity-dominant but confidence-aware, so we don't send the operator chasing a
 # low-confidence lead before a solid one.
@@ -80,18 +82,22 @@ _EXPANSION_BY_PROFILE: dict[str, str] = {
 }
 
 
-def _sev(finding: dict[str, Any]) -> str:
-    return str(finding.get("severity") or "info").lower()
+def _sev(finding: dict[str, Any], plan: dict[str, Any] | None = None) -> str:
+    """Severity word for ranking/grouping. Routes through report.resolve_severity (the
+    single source of truth — it prefers the plan's CVSS base_severity over the raw
+    scanner label) so next_steps agrees with the report/H1 rating on the SAME finding,
+    instead of mis-tiering it against every other surface."""
+    return resolve_severity(finding, plan)
 
 
 def _conf(finding: dict[str, Any]) -> str:
     return str(finding.get("confidence") or "unknown").lower()
 
 
-def _priority_score(finding: dict[str, Any]) -> int:
+def _priority_score(finding: dict[str, Any], plan: dict[str, Any] | None = None) -> int:
     class_id = str(finding.get("class_id") or "")
     return (
-        _SEVERITY_WEIGHT.get(_sev(finding), 5)
+        _SEVERITY_WEIGHT.get(_sev(finding, plan), 5)
         + _CONFIDENCE_WEIGHT.get(_conf(finding), 3)
         + _CLASS_VALUE.get(class_id, 2)
     )
@@ -204,12 +210,12 @@ def build_next_steps(ctx: dict[str, Any], brain_next_steps: list[str] | None = N
         )
 
     # --- Phase 2 · Confirm findings (highest impact first) ---
-    ranked = sorted(findings, key=_priority_score, reverse=True)
+    ranked = sorted(findings, key=lambda f: _priority_score(f, attack_plans.get(str(f.get("ref") or ""))), reverse=True)
     individual = ranked[:_MAX_INDIVIDUAL_CONFIRMS]
     remainder = ranked[_MAX_INDIVIDUAL_CONFIRMS:]
     for finding in individual:
         ref = str(finding.get("ref") or "")
-        sev = _sev(finding)
+        sev = _sev(finding, attack_plans.get(ref))
         class_id = str(finding.get("class_id") or "")
         class_name = str(finding.get("class_name") or finding.get("category") or "issue")
         title = str(finding.get("title") or "Finding")
@@ -275,11 +281,11 @@ def build_next_steps(ctx: dict[str, Any], brain_next_steps: list[str] | None = N
     # --- Phase 6 · Prepare submission (severity-aware) ---
     counts = {sev: 0 for sev in _SEVERITY_WEIGHT}
     for finding in findings:
-        s = _sev(finding)
+        s = _sev(finding, attack_plans.get(str(finding.get("ref") or "")))
         if s in counts:
             counts[s] += 1
     high_impact = counts["critical"] + counts["high"]
-    top_ref = next((str(f.get("ref") or "") for f in ranked if _sev(f) in _HIGH_IMPACT), "")
+    top_ref = next((str(f.get("ref") or "") for f in ranked if _sev(f, attack_plans.get(str(f.get("ref") or ""))) in _HIGH_IMPACT), "")
     if high_impact:
         lead = f"Lead with {top_ref}. " if top_ref else ""
         add(

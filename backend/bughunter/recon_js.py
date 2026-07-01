@@ -21,6 +21,7 @@ from urllib.parse import urljoin, urlparse
 
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.code_scanner.rules import SECRET_RULES
+from bughunter.registrable_domain import registrable_domain
 
 # Leading-slash endpoint paths in string literals (api/graphql/rest/version-y looking).
 _ENDPOINT_RE = re.compile(r"""["'`](/[A-Za-z0-9_][A-Za-z0-9_./{}\-]{1,120})["'`]""")
@@ -36,8 +37,7 @@ _CAP_ENDPOINTS, _CAP_PARAMS, _CAP_HOSTS, _CAP_SECRETS = 80, 60, 40, 20
 
 
 def _registrable_apex(host: str) -> str:
-    labels = (host or "").strip(".").lower().split(".")
-    return ".".join(labels[-2:]) if len(labels) >= 2 else (host or "")
+    return registrable_domain(host)
 
 
 def mine_js(js_text: str, base_url: str, *, host_filter: Callable[[str], bool] | None = None) -> dict[str, Any]:

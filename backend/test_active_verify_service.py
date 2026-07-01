@@ -84,6 +84,22 @@ class ActiveCheckTests(unittest.TestCase):
         self.assertEqual(f["rule_id"], "active.open-redirect")
         self.assertIn(av._MARKER_HOST, f["proof_evidence"]["matched_value"])
 
+    def test_open_redirect_confirms_on_protocol_relative_location(self) -> None:
+        # 'Location: //evil/' (no scheme) is one of the most common, fully browser-
+        # exploitable open-redirect shapes -- a naive 'http://x' + location parse mis-reads
+        # its host as 'x' instead of the real target. Must still confirm.
+        class ProtocolRelativeStub(_Stub):
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                r = super().fetch(url, method=method, extra_headers=extra_headers)
+                if r.get("location") == av._MARKER_ORIGIN + "/":
+                    r["location"] = "//" + av._MARKER_HOST + "/"  # strip the scheme
+                    r["status"] = 302
+                return r
+        f = av._check_open_redirect(ProtocolRelativeStub(), self.URL)
+        self.assertIsNotNone(f)
+        self.assertEqual(f["rule_id"], "active.open-redirect")
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+
     def test_only_safe_methods_are_ever_issued(self) -> None:
         stub = _Stub()
         for check in (av._check_cors, av._check_open_redirect, av._check_reflected_xss, av._check_host_header,
@@ -260,6 +276,35 @@ class ActiveCheckTests(unittest.TestCase):
         self.assertIsNotNone(f)
         self.assertEqual(f["_active_proof"]["status"], "candidate")
 
+    def test_host_header_location_reflection_is_confirmed(self) -> None:
+        # Host reflected into a redirect Location (password-reset/cache poisoning) is
+        # genuinely actionable -> CONFIRMED, medium severity, distinct from the
+        # body-only candidate case above. No coverage of this branch before this.
+        class LocationEchoStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                h = {k.lower(): v for k, v in (extra_headers or {}).items()}
+                if h.get("host") == av._MARKER_HOST:
+                    return {"status": 302, "headers": {}, "cookies": [], "body": "",
+                            "final_url": url, "location": f"https://{av._MARKER_HOST}/reset?token=abc"}
+                return {"status": 200, "headers": {}, "cookies": [], "body": "<html>ok</html>",
+                        "final_url": url, "location": None}
+        f = av._check_host_header(LocationEchoStub(), "https://app.example.com/")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertEqual(f["severity"], "medium")
+        self.assertEqual(f["rule_id"], "active.host-header-injection")
+        self.assertIn("Location header", f["proof_evidence"]["matched_value"])
+
+    def test_host_header_marker_present_in_unmodified_control_is_not_host_driven(self) -> None:
+        # The marker host shows up EVEN WITHOUT our injected Host header (e.g. it's
+        # coincidentally part of the real site's own content) -> not attacker-controlled,
+        # must not report anything at all.
+        class AlwaysPresentStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                return {"status": 302, "headers": {}, "cookies": [], "body": "",
+                        "final_url": url, "location": f"https://{av._MARKER_HOST}/always"}
+        self.assertIsNone(av._check_host_header(AlwaysPresentStub(), "https://app.example.com/"))
+
     def test_crlf_confirms_when_header_is_split_out(self) -> None:
         class CrlfStub:  # server reflects the CRLF-injected value as a real header
             def fetch(self, url, *, method="GET", extra_headers=None):
@@ -405,6 +450,144 @@ class ActiveCheckTests(unittest.TestCase):
         f = av._check_open_bucket(_Stub(), {"body": "<html>nothing to see</html>"}, "app.example.com", s)
         self.assertIsNone(f)
 
+    def test_gcs_bucket_confirms_on_public_listing(self) -> None:
+        # GCS's XML API returns the SAME ListBucketResult shape as S3 -- a bare GET to the
+        # bucket root (no special query needed) already lists when public-read is granted.
+        s = get_settings()
+        bucket = "https://storage.googleapis.com/acme-public-bucket/logo.png"
+        landing = {"body": f'<img src="{bucket}">', "status": 200, "headers": {}}
+        seen = {}
+        class GcsListingStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                seen["url"] = url
+                return {"status": 200, "headers": {}, "cookies": [], "final_url": url, "location": None,
+                        "body": '<?xml version="1.0"?><ListBucketResult><Contents><Key>data.csv</Key></Contents></ListBucketResult>'}
+        f = av._check_open_bucket(GcsListingStub(), landing, "storage.googleapis.com", s)
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        # Listed against the BUCKET ROOT (acme-public-bucket), not the deep object path.
+        self.assertEqual(seen["url"], "https://storage.googleapis.com/acme-public-bucket")
+
+    def test_azure_container_confirms_on_public_listing(self) -> None:
+        # Azure's listing endpoint needs an explicit restype=container&comp=list on the
+        # CONTAINER root -- a bare GET (even to the root) does not return a listing.
+        s = get_settings()
+        bucket = "https://acmestorage.blob.core.windows.net/public-container/file.txt"
+        landing = {"body": f'<script src="{bucket}"></script>', "status": 200, "headers": {}}
+        seen = {}
+        class AzureListingStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                seen["url"] = url
+                return {"status": 200, "headers": {}, "cookies": [], "final_url": url, "location": None,
+                        "body": '<?xml version="1.0"?><EnumerationResults><Blobs><Blob><Name>secrets.json</Name></Blob></Blobs></EnumerationResults>'}
+        f = av._check_open_bucket(AzureListingStub(), landing, "acmestorage.blob.core.windows.net", s)
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertEqual(seen["url"], "https://acmestorage.blob.core.windows.net/public-container?restype=container&comp=list")
+
+    def test_azure_does_not_confirm_on_an_s3_gcs_shaped_body(self) -> None:
+        # Cross-provider negative: an Azure container must NOT confirm on the S3/GCS body
+        # shape (it never legitimately appears from Azure) -- providers are matched
+        # against their OWN real response format, not a shared heuristic. A 200 response
+        # that matches NEITHER the listing shape NOR an access-denied shape is genuinely
+        # ambiguous, so no finding (confirmed or candidate) is emitted for it at all.
+        s = get_settings()
+        bucket = "https://acmestorage.blob.core.windows.net/container/file.txt"
+        landing = {"body": f'<script src="{bucket}"></script>', "status": 200, "headers": {}}
+        class WrongShapeStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                return {"status": 200, "headers": {}, "cookies": [], "final_url": url, "location": None,
+                        "body": '<?xml version="1.0"?><ListBucketResult><Contents><Key>x</Key></Contents></ListBucketResult>'}
+        f = av._check_open_bucket(WrongShapeStub(), landing, "acmestorage.blob.core.windows.net", s)
+        self.assertIsNone(f)
+
+
+class WithOperatorTests(unittest.TestCase):
+    """_with_operator's URL transformation (param -> param[$ne]=value, plain param
+    dropped) -- only ever exercised indirectly through _check_nosqli before this."""
+
+    def test_replaces_scalar_param_with_operator_object_key(self) -> None:
+        out = av._with_operator("https://x/y?id=1&other=2", "id", "1")
+        parsed = urlparse(out)
+        q = dict(parse_qs(parsed.query))
+        self.assertNotIn("id", q)                 # plain scalar param removed
+        self.assertIn("id[$ne]", q)
+        self.assertEqual(q["id[$ne]"], ["1"])
+        self.assertEqual(q["other"], ["2"])        # unrelated params preserved
+
+    def test_param_not_present_still_adds_operator_key(self) -> None:
+        out = av._with_operator("https://x/y", "id", "1")
+        self.assertIn("id%5B%24ne%5D=1", out)  # URL-encoded param[$ne]=1
+
+    def test_path_and_host_are_untouched(self) -> None:
+        out = av._with_operator("https://app.example.com/search?id=1", "id", "1")
+        parsed = urlparse(out)
+        self.assertEqual(parsed.scheme, "https")
+        self.assertEqual(parsed.hostname, "app.example.com")
+        self.assertEqual(parsed.path, "/search")
+
+
+class NormLenTests(unittest.TestCase):
+    """_norm_len collapses volatile whitespace so a stable page compares stably --
+    only ever exercised indirectly through _check_bool_sqli before this."""
+
+    def test_collapses_runs_of_whitespace_to_a_single_space(self) -> None:
+        self.assertEqual(av._norm_len("a\n\n  b\t\tc"), len("a b c"))
+
+    def test_identical_content_different_whitespace_normalizes_equal(self) -> None:
+        self.assertEqual(av._norm_len("a\nb\nc"), av._norm_len("a   b   c"))
+
+    def test_empty_and_none_are_zero(self) -> None:
+        self.assertEqual(av._norm_len(""), 0)
+        self.assertEqual(av._norm_len(None), 0)
+
+    def test_leading_and_trailing_whitespace_still_counts_as_one_space(self) -> None:
+        # re.sub collapses the run but does not strip() -- pinning current behavior.
+        self.assertEqual(av._norm_len("  x  "), len(" x "))
+
+
+class HttpPerHuntBudgetTests(unittest.TestCase):
+    """_Http's per-hunt request budget (max_requests) is a SEPARATE ceiling from the
+    per-host governor -- exhausting it must raise _RateLimited without ever touching
+    the governor or the network for the request that trips it."""
+
+    def setUp(self) -> None:
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _SiteHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}/"
+        self._prev = os.environ.get("GREYIQ_SCAN_ALLOW_PRIVATE_URLS")
+        os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        if self._prev is None:
+            os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+        else:
+            os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = self._prev
+
+    def test_budget_exhaustion_raises_rate_limited_after_the_nth_request(self) -> None:
+        # Governor capacity is generous (20) so the GOVERNOR never trips here -- only
+        # the per-hunt budget (max_requests=2) should.
+        http = av._Http(get_settings(), HostRateGovernor(capacity=20, min_interval_s=0.0), max_requests=2)
+        http.fetch(self.url)
+        http.fetch(self.url)
+        self.assertEqual(http.sent, 2)
+        with self.assertRaises(av._RateLimited):
+            http.fetch(self.url)
+        self.assertEqual(http.sent, 2)  # the trip itself does not consume a slot
+
+    def test_rate_limited_is_not_an_active_error_and_is_not_swallowed_by_per_check_handling(self) -> None:
+        # _RateLimited is deliberately NOT an _ActiveError subclass so a per-check
+        # `except _ActiveError` can't accidentally eat it and keep the pass going.
+        self.assertFalse(issubclass(av._RateLimited, av._ActiveError))
+        http = av._Http(get_settings(), HostRateGovernor(capacity=20, min_interval_s=0.0), max_requests=1)
+        http.fetch(self.url)
+        with self.assertRaises(av._RateLimited):
+            try:
+                http.fetch(self.url)
+            except av._ActiveError:
+                self.fail("_RateLimited must not be caught by an `except _ActiveError` handler")
+
 
 class ParamDiscoveryTests(unittest.TestCase):
     """Recon-discovered parameter names let the param-keyed checks bite on endpoints
@@ -497,6 +680,25 @@ class ScopeBindingTests(unittest.TestCase):
         self.assertTrue(av.host_in_active_scope("app.example.com", "*.example.com", s))
         self.assertTrue(av.host_in_active_scope("example.com", "https://example.com/login in scope", s))
 
+    def test_bare_public_suffix_in_scope_text_does_not_authorize_the_whole_platform(self) -> None:
+        # A scope token that is ITSELF a known multi-label public suffix (a shared PaaS
+        # host) must never be treated as someone's own apex -- naming 'herokuapp.com' in
+        # scope text (e.g. copied from a program description mentioning the platform, not
+        # a specific app) must NOT authorize every unrelated tenant's *.herokuapp.com.
+        s = get_settings()
+        self.assertFalse(av.host_in_active_scope("victim-unrelated.herokuapp.com", "herokuapp.com", s))
+        self.assertFalse(av.host_in_active_scope("herokuapp.com", "herokuapp.com", s))
+        self.assertFalse(av.host_in_active_scope("someone-elses-blog.github.io", "scope: github.io", s))
+        # A REAL owned app under that platform still works when the operator names the
+        # FULL host they actually own (not the bare platform suffix).
+        self.assertTrue(av.host_in_active_scope("myapp.herokuapp.com", "myapp.herokuapp.com", s))
+        self.assertTrue(av.host_in_active_scope("api.myapp.herokuapp.com", "myapp.herokuapp.com", s))
+        self.assertFalse(av.host_in_active_scope("other-app.herokuapp.com", "myapp.herokuapp.com", s))
+        # Same protection for multi-label ccSLDs (co.uk): the bare suffix can't authorize
+        # an unrelated co.uk site, but a real owned co.uk apex still works normally.
+        self.assertFalse(av.host_in_active_scope("victim.co.uk", "co.uk", s))
+        self.assertTrue(av.host_in_active_scope("shop.example.co.uk", "example.co.uk", s))
+
     def test_out_of_scope_target_makes_zero_requests(self) -> None:
         # No DNS, no network: scope is checked before the URL guard.
         findings, meta = av.verify_active("https://evil.test/", [], scope="example.com")
@@ -572,6 +774,20 @@ class ActiveE2ETests(unittest.TestCase):
         gov = HostRateGovernor(capacity=1, min_interval_s=0.0)
         findings, meta = av.verify_active(url, [], scope="127.0.0.1", governor=gov)
         self.assertTrue(meta["rate_limited"])
+
+    def test_per_hunt_budget_exhaustion_stops_the_pass_independent_of_the_governor(self) -> None:
+        # A GENEROUS governor (won't trip) but a tight per-hunt requests_budget --
+        # proves the _Http.max_requests ceiling (independent of the host governor)
+        # also cleanly ends the pass via _RateLimited propagation, not a raise.
+        url = f"http://127.0.0.1:{self.port}/?q=x&next=/home"
+        gov = HostRateGovernor(capacity=100, min_interval_s=0.0)
+        findings, meta = av.verify_active(url, [], scope="127.0.0.1", governor=gov, requests_budget=1)
+        self.assertTrue(meta["rate_limited"])
+        self.assertEqual(meta["requests_used"], 1)
+        # No finding needing a SECOND fetch (cors/xss/redirect/etc.) could possibly
+        # have run once the sole request slot was spent on the landing page.
+        classes = {f["_active_class_hint"] for f in findings}
+        self.assertFalse(classes & {"cors", "xss", "redirect", "sqli", "nosqli"})
 
     def test_bounty_hunt_active_renders_confirmed(self) -> None:
         from bughunter.bounty import run_bounty_hunt

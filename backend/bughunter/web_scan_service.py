@@ -15,6 +15,7 @@ loopback, and reserved hosts are refused unless
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 from typing import Any
@@ -187,6 +188,25 @@ def _guard_url(url: str, allow_private: bool, allowed_ports: frozenset[int]) -> 
     return urlunparse(parsed._replace(netloc=netloc))
 
 
+def playwright_request_allowed(url: str, allow_private: bool, allowed_ports: frozenset[int]) -> bool:
+    """True if a Playwright page's request to ``url`` should be allowed through. Shared by
+    every module that drives a real browser (screenshot_service, live_scan_service): bind
+    this as a ``context.route("**/*", ...)`` handler so the SSRF/private-host/port guard is
+    re-applied to EVERY request the page makes — the document navigation (including
+    redirects) and every sub-resource — not just the initial URL. Without this, a redirect
+    or an embedded resource could drive the browser to a private/internal host the initial
+    guard already blocked (the guard would otherwise only ever see the URL passed to
+    ``page.goto``). Non-http(s) schemes (data:/blob:/about:) are not network egress and are
+    always allowed through; this function never raises."""
+    if not url.startswith(("http://", "https://")):
+        return True
+    try:
+        _guard_url(url, allow_private, allowed_ports)
+        return True
+    except WebsiteFetchError:
+        return False
+
+
 class _GuardedRedirect(HTTPRedirectHandler):
     """Re-validate every redirect target through the same guard so a 30x bounce
     cannot escape the policy (DNS rebinding, cross-protocol, internal hop). When an
@@ -240,9 +260,24 @@ def _fetch_raw(url: str, *, auth: AuthContext | None = None) -> dict[str, Any]:
             _guard_url(final_url, settings.allow_private_urls, settings.web_allowed_ports)
             consumed = _consume(response, settings)
     except HTTPError as error:
-        # An error response is still worth analyzing (stack traces, headers).
-        final_url = getattr(error, "url", None) or sanitized
-        consumed = _consume(error, settings)
+        # An error response is still worth analyzing (stack traces, headers). Unlike the
+        # success path (a `with` block), HTTPError isn't auto-closed -- close it in
+        # finally or every 404/500 leaks the underlying socket/file descriptor.
+        try:
+            final_url = getattr(error, "url", None) or sanitized
+            # Re-validate the FINAL url too (defence-in-depth, mirrors the success path):
+            # a redirect chain ending in an error response could still terminate at a
+            # malformed/private host even though each hop was guarded along the way.
+            _guard_url(final_url, settings.allow_private_urls, settings.web_allowed_ports)
+            consumed = _consume(error, settings)
+        finally:
+            error.close()
+    except http.client.HTTPException as exc:
+        # A truncated/short-closed body (e.g. Content-Length lies, or the connection drops
+        # mid-read -> http.client.IncompleteRead) is neither a URLError nor an HTTPError.
+        # Re-raise as the ONE error type every caller of _fetch_raw already catches, instead
+        # of letting it escape as a raw http.client exception none of them expect.
+        raise WebsiteFetchError(f"the response body was truncated or malformed: {exc}") from exc
     consumed["final_url"] = final_url
     consumed["requested_url"] = normalized
     return consumed
@@ -562,7 +597,11 @@ def run_web_scan(
         fetched = _fetch_raw(target, auth=auth)
     except WebsiteFetchError as exc:
         return {"ok": False, "scan_type": "web", "target": target, "error": str(exc)}
-    except (URLError, TimeoutError, ValueError) as exc:
+    # http.client.HTTPException (incl. IncompleteRead -> a truncated/short-closed response
+    # body) and OSError (incl. ConnectionError / RemoteDisconnected -> the server dropping
+    # the connection mid-read) are neither URLError nor ValueError, so they must be caught
+    # explicitly here too or this "never raises" contract breaks on a truncating server.
+    except (URLError, TimeoutError, ValueError, http.client.HTTPException, OSError) as exc:
         return {
             "ok": False,
             "scan_type": "web",

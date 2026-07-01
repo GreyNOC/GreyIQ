@@ -50,6 +50,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.rate_limit import HostRateGovernor
+from bughunter.registrable_domain import is_bare_public_suffix, registrable_domain
 from bughunter.scan_auth import AuthContext, auth_headers_for
 from bughunter.settings import get_settings
 from bughunter.web_ingest import (
@@ -117,10 +118,10 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 def _registrable(host: str) -> str:
-    """Best-effort eTLD+1 (last two labels). Good enough for a scope-naming check;
-    the operator names example.com or the full host."""
-    labels = (host or "").strip(".").split(".")
-    return ".".join(labels[-2:]) if len(labels) >= 2 else (host or "")
+    """Best-effort, public-suffix-AWARE eTLD+1. Good enough for a scope-naming check;
+    the operator names example.com or the full host. See registrable_domain.py: this is
+    NOT last-two-labels for known multi-label suffixes (foo.co.uk, myapp.herokuapp.com)."""
+    return registrable_domain(host)
 
 
 def _scope_hosts(scope: str) -> set[str]:
@@ -152,6 +153,13 @@ def host_in_active_scope(host: str, scope: str, settings: Any) -> bool:
     # 'example.com' match scope 'notexample.com' and probe an out-of-scope host).
     reg = _registrable(cleaned)
     for token in _scope_hosts(scope):
+        if is_bare_public_suffix(token):
+            # The token IS itself a known multi-label public suffix (e.g.
+            # 'herokuapp.com', 'co.uk') -- never someone's own apex, so naming it bare
+            # in free-text scope can NEVER legitimately authorize the whole shared
+            # platform (every unrelated tenant's subdomain would otherwise match the
+            # dotted-suffix wildcard below). Skip it entirely for this token.
+            continue
         if cleaned == token or cleaned.endswith("." + token) or reg == token:
             return True
     for suffix in getattr(settings, "active_scan_allowlist", ()):  # host-suffix allowlist
@@ -224,7 +232,7 @@ def _candidate_params(url: str, extra: list[str] | None, default: tuple[str, ...
             seen.add(key)
             out.append(clean)
 
-    for key, _ in parse_qsl(urlparse(url).query):
+    for key, _ in parse_qsl(urlparse(url).query, keep_blank_values=True):
         _add(key)
     for name in extra or []:
         _add(name)
@@ -239,7 +247,7 @@ def _redirect_candidates(url: str, extra: list[str] | None, default: tuple[str, 
     recon-discovered params whose NAME looks like a redirect/forward target, then the
     built-in defaults — so a custom-named redirect param the app actually uses gets tested
     without firing at every unrelated param."""
-    existing = {k.lower() for k, _ in parse_qsl(urlparse(url).query)}
+    existing = {k.lower() for k, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)}
     out: list[str] = []
     seen: set[str] = set()
 
@@ -435,8 +443,18 @@ def _check_open_redirect(http: _Http, url: str, extra_params: list[str] | None =
         location = (probe.get("location") or "").strip()
         if not location:
             continue
-        loc_host = urlparse(location if "://" in location else "http://x" + location).hostname or ""
-        if loc_host == _MARKER_HOST or location.startswith(_MARKER_ORIGIN):
+        # A protocol-relative Location ('//evil/') is a fully browser-exploitable open
+        # redirect — one of the most common shapes — but carries no '://', so it must be
+        # normalized (leading '//' -> 'https://') BEFORE host extraction, or urlparse
+        # mis-parses 'http://x' + location into host='x' and never sees the real target.
+        if location.startswith("//"):
+            parse_target = "https:" + location
+        elif "://" in location:
+            parse_target = location
+        else:
+            parse_target = "http://x" + location
+        loc_host = urlparse(parse_target).hostname or ""
+        if loc_host == _MARKER_HOST or location.startswith(_MARKER_ORIGIN) or location.startswith("//" + _MARKER_HOST):
             try:
                 control = http.fetch(_with_query(url, {param: "/greyiq-control"}))
             except _ActiveError:
@@ -637,7 +655,7 @@ def _check_error_sqli(http: _Http, url: str, extra_params: list[str] | None = No
     if not params:
         return None  # need a URL or recon-discovered param to perturb; never invent one blindly
     for param in params:
-        original = dict(parse_qsl(parsed.query)).get(param, "1")
+        original = dict(parse_qsl(parsed.query, keep_blank_values=True)).get(param, "1")
         try:
             probe = http.fetch(_with_query(url, {param: original + "'"}))
             control = http.fetch(_with_query(url, {param: original}))
@@ -722,7 +740,7 @@ def _check_bool_sqli(http: _Http, url: str, extra_params: list[str] | None = Non
     if not params:
         return None  # need a URL or recon-discovered param; never invent injection points
     for param in params:
-        original = dict(parse_qsl(parsed.query)).get(param, "1")
+        original = dict(parse_qsl(parsed.query, keep_blank_values=True)).get(param, "1")
         try:
             base1 = http.fetch(_with_query(url, {param: original}))
             base2 = http.fetch(_with_query(url, {param: original}))
@@ -830,7 +848,7 @@ def _check_time_sqli(http: _Http, url: str, settings: Any = None, extra_params: 
     slow = f"' AND SLEEP({d_str})-- -"
     fast = "' AND SLEEP(0)-- -"
     for param in params:  # one param — the timing pass is request-heavy
-        original = dict(parse_qsl(parsed.query)).get(param, "1")
+        original = dict(parse_qsl(parsed.query, keep_blank_values=True)).get(param, "1")
         try:
             base = http.fetch(_with_query(url, {param: original}))
             ctrl = http.fetch(_with_query(url, {param: original + fast}))   # injected, but SLEEP(0) -> fast (negative control)
@@ -865,6 +883,28 @@ _BUCKET_RE = re.compile(
     r")", re.IGNORECASE)
 
 
+def _bucket_listing_request(bucket_url: str, host: str) -> tuple[str, str]:
+    """Return (list_url, provider) for the bucket-listing GET. The regex match may
+    capture a deep object path (e.g. a referenced asset under the bucket), not just the
+    bucket/container root, so this also truncates to the root first — only the root
+    accepts a listing query for any of the three providers."""
+    parsed = urlparse(bucket_url)
+    if "amazonaws.com" in host:
+        # S3 virtual-hosted: the bucket IS the host: https://<bucket>.s3...amazonaws.com/
+        # — no object-path segment to strip; list-type=2 on the root lists it.
+        return f"{parsed.scheme}://{parsed.netloc}/?list-type=2", "s3"
+    # GCS / Azure: the bucket/container name is the FIRST path segment after the host.
+    segments = [s for s in parsed.path.split("/") if s]
+    root_path = segments[0] if segments else ""
+    if "blob.core.windows.net" in host:
+        # Azure container listing needs an explicit restype=container&comp=list on the
+        # CONTAINER root — a bare GET (even to the root) does not list.
+        return f"{parsed.scheme}://{parsed.netloc}/{root_path}?restype=container&comp=list", "azure"
+    # GCS XML API: a bare GET to the bucket root already returns an anonymous listing
+    # when public-read is granted — no extra query needed.
+    return f"{parsed.scheme}://{parsed.netloc}/{root_path}", "gcs"
+
+
 def _check_open_bucket(http: _Http, landing: dict[str, Any] | None, scope: str, settings: Any) -> dict[str, Any] | None:
     """Open cloud-bucket exposure for buckets the PAGE references. Strictly scope-gated:
     a bucket host MUST pass host_in_active_scope (a third-party bucket is not auto-in-
@@ -886,7 +926,7 @@ def _check_open_bucket(http: _Http, landing: dict[str, Any] | None, scope: str, 
         if not host_in_active_scope(host, scope, settings):
             referenced_out_of_scope += 1
             continue  # never probe a bucket host the operator didn't put in scope
-        list_url = bucket_url + ("?list-type=2" if "amazonaws.com" in host else "")
+        list_url, provider = _bucket_listing_request(bucket_url, host)
         try:
             resp = http.fetch(list_url)
         except (_ActiveError, WebsiteFetchError):
@@ -897,8 +937,14 @@ def _check_open_bucket(http: _Http, landing: dict[str, Any] | None, scope: str, 
         rbody = (resp.get("body") or "")[:4000]
         status = int(resp.get("status") or 0)
         # Anonymous listing (body may be truncated by the fetch cap — match the opening).
-        is_listing = status == 200 and ("<ListBucketResult" in rbody and ("<Key>" in rbody or "<Contents>" in rbody))
-        denied = "AccessDenied" in rbody or status in (401, 403)
+        # S3 (list-type=2) and GCS's XML API share the <ListBucketResult>/<Contents>
+        # shape; Azure's container listing uses a distinct <EnumerationResults>/<Blobs>
+        # shape — each provider is matched by its own real response format.
+        if provider == "azure":
+            is_listing = status == 200 and "<EnumerationResults" in rbody and "<Blobs>" in rbody
+        else:
+            is_listing = status == 200 and ("<ListBucketResult" in rbody and ("<Key>" in rbody or "<Contents>" in rbody))
+        denied = "AccessDenied" in rbody or status in (401, 403, 404)
         if is_listing:
             proof = _proof(
                 "confirmed", method=f"GET {list_url}", affected_asset="every object in the referenced cloud bucket",
