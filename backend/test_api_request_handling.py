@@ -20,6 +20,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 import greyiq_api as g  # noqa: E402
+from bughunter import ledger as bounty_ledger  # noqa: E402
 
 
 def _receive_once(body: bytes):
@@ -321,6 +322,29 @@ class HackerOneActivityRouteTests(unittest.TestCase):
         data = json.loads(cap.body)
         self.assertTrue(data["ok"])
         self.assertEqual(data["checked"], 0)  # no submitted findings in this empty ledger -- still a clean 200
+
+    def test_sync_advances_to_paid_on_a_reward_even_when_state_is_unchanged(self) -> None:
+        # Regression: a report can pick up bounty_awarded_at/swag_awarded_at before (or
+        # without) its state changing -- e.g. still 'triaged'. The sync must not skip a
+        # record just because state matches the last-seen h1_state; the reward signal
+        # alone is new information and must still advance the ledger to 'paid'.
+        finding = {"ref": "F1", "class_id": "xss", "rule_id": "active.reflected-xss", "location": "https://x/a"}
+        bounty_ledger.upsert_findings(g.RUNTIME_DIR, "acme", "https://x", [{"finding": finding, "proof_status": "confirmed"}])
+        key = bounty_ledger.dedup_key(finding)
+        pid = bounty_ledger.program_key("acme", "https://x")
+        bounty_ledger.record_submission(g.RUNTIME_DIR, "acme", "https://x", key, "555", "u")
+        bounty_ledger.record_h1_sync(g.RUNTIME_DIR, pid, key, state="triaged", resolved_with_reward=False)
+
+        g.bounty_h1_activity.fetch_report_status = lambda rid, u, t, **kw: {
+            "ok": True, "state": "triaged", "bounty_awarded_at": "2026-02-01T00:00:00Z",
+        }
+        cap = _run_post_route("/api/hackerone/sync-submitted", {})
+        self.assertEqual(cap.status, 200)
+        data = json.loads(cap.body)
+        self.assertEqual(data["updated"], 1)
+        stored = bounty_ledger._load(g.RUNTIME_DIR)["programs"][pid]["findings"][key]
+        self.assertEqual(stored["stage"], "paid")
+        self.assertEqual(stored["h1_state"], "triaged")
 
     def test_token_never_echoed_by_any_new_route(self) -> None:
         g._store_secret("hackerone.api_token", "TOP-SECRET-TOKEN-XYZ")

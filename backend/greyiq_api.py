@@ -2047,9 +2047,14 @@ class GreyIQRuntime:
                 errors.append(f"#{rec.get('h1_report_id')}: {status.get('error', 'unknown error')}")
                 continue
             state = str(status.get("state") or "")
-            if state == str(rec.get("h1_state") or ""):
-                continue  # no change since the last sync
             resolved_with_reward = bool(status.get("bounty_awarded_at") or status.get("swag_awarded_at"))
+            # A reward can appear on the live report before (or without) a state change —
+            # e.g. still 'triaged' but bounty_awarded_at just got set — so skip only when
+            # NEITHER signal moved. submitted_records() only ever returns stage=='submitted'
+            # records (never already 'paid'), so resolved_with_reward alone is always new
+            # information worth recording here, regardless of the state comparison.
+            if state == str(rec.get("h1_state") or "") and not resolved_with_reward:
+                continue  # nothing new to reflect since the last sync
             bounty_ledger.record_h1_sync(RUNTIME_DIR, rec["pid"], rec["key"], state=state, resolved_with_reward=resolved_with_reward)
             updated += 1
             learning_status = _H1_STATE_TO_LEARNING_OUTCOME.get(state)
