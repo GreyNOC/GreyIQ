@@ -118,7 +118,14 @@ def _build_finding(view_url: str, inject_url: str, field: str, kind: str, marker
         "poc": f"# After submitting the payload, the view page returns it raw:\n# GET {view_url}\n# -> ...{build_payloads(marker)[kind]}...",
         "impact": ("Stored XSS executes attacker JavaScript in the browser of everyone who views the content — session "
                    "theft, account takeover, and actions performed as the victim, with no per-victim interaction needed."),
-        "cvss": {"vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:C/C:H/I:H/A:N", "base_score": 8.0, "base_severity": "high", "estimated": True},
+        "cvss": {
+            "vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:C/C:H/I:H/A:N", "base_score": 8.0, "base_severity": "high",
+            "estimated": False,
+            "justification": (
+                f"Actively confirmed: a unique marker payload ({marker}) was submitted and observed rendering "
+                "UNESCAPED on a separate view — not a template estimate."
+            ),
+        },
         "remediation": finding["remediation"],
         "proof_of_impact": {
             "status": "confirmed",

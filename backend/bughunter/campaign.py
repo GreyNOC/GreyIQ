@@ -89,6 +89,7 @@ def run_campaign(
     platform: str = "hackerone",
     deep: bool = False,
     on_progress: Any = None,
+    disclose_automation: bool = False,
 ) -> dict[str, Any]:
     """Run a full campaign. Returns {ok, campaign_path, json_path, urls_scanned,
     finding_count, confirmed_count, submission_paths, ...} or {ok: False, error}."""
@@ -297,9 +298,11 @@ def run_campaign(
             ctx = {"tool": "GreyIQ BugHunter", "version": version,
                    "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
                    "target": item.get("source_url") or clean_target, "scope": scope,
-                   "attack_plans": {str(finding.get("ref") or ""): item["plan"]}}
+                   "attack_plans": {str(finding.get("ref") or ""): item["plan"]},
+                   "disclose_automation": disclose_automation}
         else:
             ctx = _ctx_from_doc(_read_json(item["source_json"]))
+            ctx["disclose_automation"] = disclose_automation
         stem = f"sub-{rank_i:02d}-{_safe_slug(finding.get('class_id', 'finding'))}-{_safe_slug(finding.get('title', ''), 'finding')}"
         package = submission.write_submission_package(ctx, finding, sub_dir, stem, platform)
         if package:
@@ -434,6 +437,7 @@ def run_campaign_over_targets(
     deep: bool = False,
     on_progress: Any = None,
     max_targets: int = _MAX_PROGRAM_TARGETS,
+    disclose_automation: bool = False,
 ) -> dict[str, Any]:
     """Run one full ``run_campaign`` per target (bounded, deduped, best-effort — one
     bad target never aborts the rest) and merge the results into a single combined
@@ -490,6 +494,7 @@ def run_campaign_over_targets(
                 default_reports_dir=span_root, seed_dir=seed_dir, runtime_dir=runtime_dir,
                 version=version, active=active, time_based=time_based, auth=auth, live=live,
                 program=program, max_pages=max_pages, platform=platform, deep=deep,
+                disclose_automation=disclose_automation,
             )
         except Exception as exc:  # noqa: BLE001 - one bad target must never abort the span
             errors.append(f"{target}: {type(exc).__name__}: {exc}")

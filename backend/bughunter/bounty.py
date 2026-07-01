@@ -881,6 +881,14 @@ def run_bounty_hunt(
             if isinstance(base_proof, dict) and not active_proof.get("proof_obligation"):
                 active_proof = {**active_proof, "proof_obligation": base_proof.get("proof_obligation", "")}
             attack_plans[ref]["proof_of_impact"] = active_proof
+            # The CVSS vector was already right for a static/passive lead (chosen from
+            # finding['class_id'], which the _active_class_hint pass above may have already
+            # sharpened) — what changes on confirmation is confidence, not the vector. Reuse
+            # report.py's own evidence gate so "estimated: False" can never disagree with the
+            # proof-of-impact status shown right next to it in the same report.
+            detail = report_lib._proof_of_impact_detail(finding, attack_plans[ref])
+            if detail["status"] == "confirmed":
+                attack_plans[ref]["cvss"] = impact_model.cvss_for_class(finding.get("class_id", ""), confirmed=True)
 
     # Manual checklist = profile + selected-class + brain ideas.
     checklist = list(profile.get("checklist", []))

@@ -277,7 +277,14 @@ def build_plan(finding: dict[str, Any]) -> dict[str, Any]:
             f"Fetch https://{host}/ and observe the {service} 'unclaimed' page (fingerprint: \"{finding.get('snippet', '')}\").",
             f"Claim the {service} resource (register the matching bucket/app/page), serve a benign marker file to prove control, then release it.",
         ]
-        cvss = {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:H/A:N", "base_score": 7.6, "base_severity": "high", "estimated": True}
+        cvss = {
+            "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:H/A:N", "base_score": 7.6, "base_severity": "high",
+            "estimated": False,
+            "justification": (
+                f"Actively confirmed: {host} serves the {service} 'unclaimed resource' fingerprint page, which "
+                "only appears when the DNS record dangles to a claimable resource — not a template estimate."
+            ),
+        }
         poi = {
             "status": "confirmed",
             "method": "GET fetch + dangling-service fingerprint match (no resource was claimed)",

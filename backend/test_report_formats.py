@@ -122,6 +122,31 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("Supporting material / evidence", md)  # no evidence -> no empty section
         self.assertIn("Steps to reproduce", md)                 # the rest still renders
 
+    def test_no_bot_self_identification_by_default(self) -> None:
+        # Submitted content must never name the tool/bot unless the operator has
+        # explicitly opted in for this program (H1-terms disclosure requirement).
+        ctx, finding = _ctx_finding()
+        for p in ("hackerone", "yeswehack", "bugcrowd", "intigriti"):
+            md = rf.render_finding(ctx, finding, p)
+            self.assertNotIn("GreyIQ", md, f"{p} still self-identifies the tool")
+            self.assertNotIn("BugHunter", md, f"{p} still self-identifies the tool")
+            self.assertNotIn("Formatted for", md, f"{p} still carries the old branded footer")
+
+    def test_disclosure_line_added_when_opted_in(self) -> None:
+        ctx, finding = _ctx_finding()
+        ctx["disclose_automation"] = True
+        md = rf.render_finding(ctx, finding, "hackerone")
+        self.assertIn("Disclosure:", md)
+        self.assertIn("GreyIQ BugHunter", md)  # ctx['tool'] is named here on purpose
+        self.assertIn(ctx["version"], md)
+
+    def test_disclosure_omitted_when_flag_false(self) -> None:
+        ctx, finding = _ctx_finding()
+        ctx["disclose_automation"] = False
+        md = rf.render_finding(ctx, finding, "hackerone")
+        self.assertNotIn("Disclosure:", md)
+        self.assertNotIn("GreyIQ", md)
+
 
 class BuildSubmissionPlatformTests(unittest.TestCase):
     def test_package_carries_platform_fields(self) -> None:

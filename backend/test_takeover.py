@@ -193,6 +193,10 @@ class CnameCorrelationTests(unittest.TestCase):
         self.assertEqual(f["rule_id"], "active.subdomain-takeover")   # still a confirmed takeover
         self.assertEqual(f.get("_takeover_cname"), "edge.fastly.net")
         self.assertIn("CNAMEs to edge.fastly.net", f["proof_evidence"]["matched_value"])
+        plan = ts.build_plan(f)
+        self.assertEqual(plan["proof_of_impact"]["status"], "confirmed")
+        self.assertFalse(plan["cvss"]["estimated"])
+        self.assertIn("confirmed", plan["cvss"]["justification"].lower())
 
     def test_dangling_cname_with_no_fingerprint_is_a_candidate(self) -> None:
         ts._guard_url, ts._fetch_raw = _stub_fetch({})  # no host serves a fingerprint
@@ -207,6 +211,7 @@ class CnameCorrelationTests(unittest.TestCase):
         self.assertEqual(cands[0]["snippet"], "")  # no third-party body embedded
         self.assertEqual(ts.build_plan(cands[0])["proof_of_impact"]["status"], "candidate")
         self.assertEqual(ts.build_plan(cands[0])["cvss"]["base_severity"], "medium")
+        self.assertTrue(ts.build_plan(cands[0])["cvss"]["estimated"])  # candidate stays a template estimate
 
     def test_no_cname_match_yields_no_candidate(self) -> None:
         ts._guard_url, ts._fetch_raw = _stub_fetch({})

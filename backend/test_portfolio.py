@@ -39,6 +39,7 @@ class BackwardCompatTests(TempRuntimeMixin, unittest.TestCase):
         self.assertEqual(len(programs), 1)
         self.assertEqual(programs[0]["structured_scope"], [])
         self.assertFalse(programs[0]["oob_allowed"])
+        self.assertFalse(programs[0]["disclose_automation"])
         self.assertEqual(programs[0]["notes"], "")
         self.assertTrue(programs[0]["active"])   # untouched by the new derivation path
 
@@ -144,13 +145,15 @@ class EditPathDerivationTests(TempRuntimeMixin, unittest.TestCase):
         # that field to its bare default. (Here we call upsert_program directly with a
         # record dict that simply omits the keys, same effect as exclude_unset producing one.)
         first = pf.upsert_program(self.runtime_dir, {
-            "name": "Acme", "oob_allowed": True, "notes": "policy allows OOB",
+            "name": "Acme", "oob_allowed": True, "disclose_automation": True, "notes": "policy allows OOB",
             "structured_scope": [{"identifier": "a.acme.com"}],
         })
         # Simulate an edit from a caller that only knows about a subset of fields (like the
-        # Operator tab's compact form) -- it never mentions structured_scope/oob_allowed/notes.
+        # Operator tab's compact form) -- it never mentions structured_scope/oob_allowed/
+        # disclose_automation/notes.
         second = pf.upsert_program(self.runtime_dir, {"id": first["id"], "name": "Acme", "interval_minutes": 60})
         self.assertTrue(second["oob_allowed"])
+        self.assertTrue(second["disclose_automation"])
         self.assertEqual(second["notes"], "policy allows OOB")
         self.assertEqual(len(second["structured_scope"]), 1)
         self.assertEqual(second["interval_minutes"], 60)
@@ -170,12 +173,15 @@ class FailClosedCouplingStillHoldsTests(TempRuntimeMixin, unittest.TestCase):
 
     def test_oob_allowed_and_notes_round_trip(self) -> None:
         prog = pf.upsert_program(self.runtime_dir, {
-            "name": "Acme", "scope_text": "acme.com", "oob_allowed": True, "notes": "Policy allows OOB.",
+            "name": "Acme", "scope_text": "acme.com", "oob_allowed": True,
+            "disclose_automation": True, "notes": "Policy allows OOB.",
         })
         self.assertTrue(prog["oob_allowed"])
+        self.assertTrue(prog["disclose_automation"])
         self.assertEqual(prog["notes"], "Policy allows OOB.")
         reloaded = pf.get_program(self.runtime_dir, prog["id"])
         self.assertTrue(reloaded["oob_allowed"])
+        self.assertTrue(reloaded["disclose_automation"])
 
     def test_oob_allowed_is_not_coupled_to_the_scope_fail_closed_gate(self) -> None:
         # oob_allowed is a policy-confirmation flag surfaced in the UI (a confirm-dialog

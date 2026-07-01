@@ -140,7 +140,16 @@ def _ssrf_plan(target_url: str, param: str, token: str, base: str, hit: dict[str
         "poc": f"GET {_with_query(target_url, {param: cb})}\n# -> out-of-band callback recorded at {base}/oob/{token}",
         "impact": ("The server can be made to issue requests to attacker-chosen hosts — internal services, cloud "
                    "metadata (credential theft), and otherwise-unreachable infrastructure behind the firewall."),
-        "cvss": {"vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N", "base_score": 8.5, "base_severity": "high", "estimated": True},
+        "cvss": {
+            "vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N", "base_score": 8.5, "base_severity": "high",
+            "estimated": not confirmed,
+            "justification": (
+                "Actively confirmed with a real out-of-band collaborator hit correlated to a fresh, unguessable "
+                "token — not a template estimate." if confirmed else
+                "The callback source doesn't look like the target's own server-side fetch (crawler/preview-bot "
+                "UA); confirm the source before treating this as proven."
+            ),
+        },
         "remediation": "Allow-list outbound destinations; block internal/metadata ranges; pin the resolved IP.",
         "proof_of_impact": {
             "status": "confirmed" if confirmed else "candidate",
@@ -327,7 +336,16 @@ def _xxe_plan(target_url: str, token: str, base: str, hit: dict[str, Any], confi
         "impact": ("XML external-entity processing lets an attacker make the server fetch attacker-chosen URLs "
                    "(internal services, cloud metadata) and, depending on the parser, read local files — SSRF and "
                    "file disclosure from a single XML submission."),
-        "cvss": {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N", "base_score": 8.6, "base_severity": "high", "estimated": True},
+        "cvss": {
+            "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N", "base_score": 8.6, "base_severity": "high",
+            "estimated": not confirmed,
+            "justification": (
+                "Actively confirmed with a real out-of-band collaborator hit correlated to a fresh, unguessable "
+                "token — not a template estimate." if confirmed else
+                "The callback source doesn't look like the target's own server-side fetch (crawler/preview-bot "
+                "UA); confirm the source before treating this as proven."
+            ),
+        },
         "remediation": "Disable DTDs / external-entity resolution in the XML parser; use a hardened, secure-processing config.",
         "proof_of_impact": {
             "status": "confirmed" if confirmed else "candidate",

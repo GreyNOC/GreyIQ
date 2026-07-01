@@ -77,6 +77,19 @@ class ImpactModelTests(unittest.TestCase):
         for cid in impact_model.IMPACT_MODEL:
             self.assertGreater(impact_model.cvss_for_class(cid)["base_score"], 0.0, cid)
 
+    def test_cvss_for_class_confirmed_flag(self) -> None:
+        # Default (no confirmed=) stays a template estimate — the vector/score don't
+        # change on confirmation, only the confidence and its justification.
+        estimated = impact_model.cvss_for_class("ssrf")
+        self.assertTrue(estimated["estimated"])
+        self.assertIn("estimate", estimated["justification"].lower())
+        confirmed = impact_model.cvss_for_class("ssrf", confirmed=True)
+        self.assertFalse(confirmed["estimated"])
+        self.assertIn("confirmed", confirmed["justification"].lower())
+        self.assertNotIn("vector is an estimate", confirmed["justification"].lower())
+        self.assertEqual(confirmed["vector"], estimated["vector"])
+        self.assertEqual(confirmed["base_score"], estimated["base_score"])
+
 
 class DeterministicProofTests(unittest.TestCase):
     def test_deterministic_plan_carries_impact_proof_and_cvss(self) -> None:

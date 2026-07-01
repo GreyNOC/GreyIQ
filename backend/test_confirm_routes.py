@@ -74,7 +74,7 @@ class PersistFindingRunTests(unittest.TestCase):
         calls: list[tuple] = []
 
         class R:
-            def _cache_bounty_run(self, result, *, target, scope, program):
+            def _cache_bounty_run(self, result, *, target, scope, program, disclose_automation=False):
                 result["run_id"] = "run_xyz"
                 calls.append((target, scope, program))
 

@@ -43,6 +43,7 @@ _DEFAULTS: dict[str, Any] = {
     "seed_targets": [],            # URLs/hosts to hunt (each within scope)
     "structured_scope": [],        # [{identifier, asset_type, eligible_for_submission, eligible_for_bounty, instruction, max_severity}], from HackerOne API/CSV import or hand entry
     "oob_allowed": False,          # operator-confirmed: this program's policy permits out-of-band/collaborator testing
+    "disclose_automation": False,  # operator-confirmed: this program's terms require disclosing automated-tool assistance in submitted reports
     "notes": "",                   # free text — policy excerpt, reward table, anything pasted in
     "active": False,               # capture proof-of-impact (active verification)
     "live": False,                 # dynamic Playwright pass
@@ -123,6 +124,7 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
         e for e in (_clean_scope_entry(x) for x in (out.get("structured_scope") or [])) if e
     ][:_MAX_SCOPE_ENTRIES]
     out["oob_allowed"] = bool(out.get("oob_allowed"))
+    out["disclose_automation"] = bool(out.get("disclose_automation"))
     out["notes"] = str(out.get("notes") or "")[:4000]
     # Convenience default ONLY: derive scope_text/in_scope_hosts/out_of_scope_hosts from
     # structured_scope when the caller hasn't already typed a scope. Never overrides a
