@@ -403,7 +403,8 @@
       <div class="ck-body">
         <aside class="ck-rail" aria-label="Hunt controls">
           <nav class="ck-nav ck-nav-5" id="ckNav" aria-label="Cockpit views">
-            <button class="ck-nav-btn is-active" data-ck-view="findings" type="button">Findings</button>
+            <button class="ck-nav-btn is-active" data-ck-view="program" type="button">Program</button>
+            <button class="ck-nav-btn" data-ck-view="findings" type="button">Findings</button>
             <button class="ck-nav-btn" data-ck-view="surface" type="button">Surface</button>
             <button class="ck-nav-btn" data-ck-view="submissions" type="button">Submissions</button>
             <button class="ck-nav-btn" data-ck-view="idor" type="button">Access control</button>
@@ -417,6 +418,8 @@
               <button type="button" class="ck-seg" id="ckRunCampaign" data-ck-runtype="campaign">Full campaign</button>
             </div>
 
+            <label><span>Program <em>(optional — fills in Target/Scope below)</em></span>
+              <select id="ckActiveProgram"><option value="">— pick a saved program —</option></select></label>
             <label><span>Target</span>
               <input id="ckTarget" type="text" autocomplete="off" spellcheck="false" placeholder="https://example.com  ·  C:\path\to\repo"></label>
             <label><span>Scope / program notes</span>
@@ -462,7 +465,8 @@
         </aside>
 
         <section class="ck-main">
-          <div class="ck-view" id="ckViewFindings"></div>
+          <div class="ck-view" id="ckViewProgram"></div>
+          <div class="ck-view" id="ckViewFindings" hidden></div>
           <div class="ck-view" id="ckViewSurface" hidden></div>
           <div class="ck-view" id="ckViewSubmissions" hidden></div>
           <div class="ck-view" id="ckViewIdor" hidden></div>

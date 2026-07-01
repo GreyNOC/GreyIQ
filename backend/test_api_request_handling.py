@@ -8,6 +8,7 @@ validation error must never reflect the submitted values back to the client.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import tempfile
 import threading
@@ -30,6 +31,35 @@ def _receive_once(body: bytes):
         sent["v"] = True
         return {"type": "http.request", "body": body, "more_body": False}
     return receive
+
+
+class _Capture:
+    """Minimal in-process ASGI response sink (mirrors test_api_auth_cors.py's harness)."""
+
+    def __init__(self) -> None:
+        self.status: int | None = None
+        self.body = b""
+
+    async def send(self, message: dict) -> None:
+        if message["type"] == "http.response.start":
+            self.status = message["status"]
+        elif message["type"] == "http.response.body":
+            self.body += message.get("body", b"")
+
+
+def _run_post_route(path: str, payload: dict) -> _Capture:
+    """POST `payload` as a JSON body through the real ASGI entry point (g.route_http) --
+    unlike test_api_auth_cors.py's GET-only `_run_route`, this actually carries a body."""
+    cap = _Capture()
+    body = json.dumps(payload).encode("utf-8")
+    headers = [
+        (b"host", b"127.0.0.1:8791"),
+        (b"x-greyiq-token", g.SESSION_TOKEN.encode("ascii")),
+        (b"content-type", b"application/json"),
+    ]
+    scope = {"method": "POST", "path": path, "headers": headers, "scheme": "http", "query_string": b""}
+    asyncio.run(g.route_http(scope, _receive_once(body), cap.send))
+    return cap
 
 
 class ReadJsonBodyTests(unittest.TestCase):
@@ -92,6 +122,122 @@ class ValidatePayloadTests(unittest.TestCase):
         detail = str(ctx.exception.detail)
         self.assertIn("run_id", detail)
         self.assertIn("ref", detail)
+
+    def test_ingest_targets_kind_accepts_hackerone_scope(self) -> None:
+        # Regression: kind's max_length must fit "hackerone_scope" (15 chars) — a live
+        # browser check caught this rejecting with a 422 before the field was widened.
+        req = g.validate_payload(g.IngestTargetsRequest, {"content": "x", "kind": "hackerone_scope"})
+        self.assertEqual(req.kind, "hackerone_scope")
+
+
+class ProgramUpsertExcludeUnsetTests(unittest.TestCase):
+    """The Operator tab's compact edit form doesn't know about structured_scope/oob_allowed/
+    notes -- it simply never puts those keys in the request body. Regression: RuntimeApi.
+    upsert_program used to model_dump every ProgramUpsertRequest field (Pydantic fills
+    omitted fields with their bare default), so an edit via that form silently wiped a
+    program's structured scope table back to empty. Verified end-to-end through the real
+    HTTP-layer path (Pydantic validation -> RuntimeApi.upsert_program -> portfolio merge),
+    not just portfolio.py's already-correct dict-merge in isolation."""
+
+    def setUp(self) -> None:
+        self.rt = g.runtime
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_runtime_dir = g.RUNTIME_DIR
+        g.RUNTIME_DIR = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        g.RUNTIME_DIR = self._orig_runtime_dir
+        self._tmp.cleanup()
+
+    def test_edit_omitting_new_fields_preserves_them(self) -> None:
+        created = g.validate_payload(g.ProgramUpsertRequest, {
+            "name": "Acme", "oob_allowed": True, "notes": "policy allows OOB",
+            "structured_scope": [{"identifier": "a.acme.com"}],
+        })
+        first = self.rt.upsert_program(created)["program"]
+
+        # Simulate the Operator tab's compact form: a real request body that never
+        # mentions structured_scope/oob_allowed/notes at all (not even as null/false).
+        edit = g.validate_payload(g.ProgramUpsertRequest, {"id": first["id"], "name": "Acme", "interval_minutes": 60})
+        second = self.rt.upsert_program(edit)["program"]
+
+        self.assertTrue(second["oob_allowed"])
+        self.assertEqual(second["notes"], "policy allows OOB")
+        self.assertEqual(len(second["structured_scope"]), 1)
+        self.assertEqual(second["interval_minutes"], 60)
+
+    def test_explicit_false_still_applies(self) -> None:
+        # exclude_unset must only skip OMITTED fields -- a field explicitly sent as false
+        # (present in the JSON body) still has to take effect.
+        created = g.validate_payload(g.ProgramUpsertRequest, {"name": "Acme", "oob_allowed": True})
+        first = self.rt.upsert_program(created)["program"]
+        edit = g.validate_payload(g.ProgramUpsertRequest, {"id": first["id"], "name": "Acme", "oob_allowed": False})
+        second = self.rt.upsert_program(edit)["program"]
+        self.assertFalse(second["oob_allowed"])
+
+
+class ImportScopeRouteTests(unittest.TestCase):
+    """POST /api/hackerone/import-scope had zero coverage through the real ASGI dispatch
+    (route match, session-token gate, JSON parsing, credential lookup) -- only the
+    underlying hackerone_import.fetch_structured_scope function was tested directly.
+    Drives the real g.route_http entry point, same as test_api_auth_cors.py's harness,
+    but with an actual JSON body (that harness is GET-only)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_secrets = g.SECRETS_PATH
+        g.SECRETS_PATH = Path(self._tmp.name) / "secrets.json"
+        self._orig_fetch = g.bounty_h1_import.fetch_structured_scope
+
+    def tearDown(self) -> None:
+        g.SECRETS_PATH = self._orig_secrets
+        g.bounty_h1_import.fetch_structured_scope = self._orig_fetch
+        self._tmp.cleanup()
+
+    def test_no_creds_saved_degrades_gracefully_not_500(self) -> None:
+        cap = _run_post_route("/api/hackerone/import-scope", {"handle": "acme"})
+        self.assertEqual(cap.status, 200)   # the handler itself never raises -- {"ok": false, "error": ...}
+        data = json.loads(cap.body)
+        self.assertFalse(data["ok"])
+        self.assertIn("api username", data["error"].lower())
+
+    def test_missing_handle_is_a_clean_422_not_500(self) -> None:
+        cap = _run_post_route("/api/hackerone/import-scope", {})
+        self.assertEqual(cap.status, 422)
+
+    def test_success_path_reaches_the_real_fetch_function_and_returns_its_result(self) -> None:
+        g._store_secret("hackerone.api_username", "me")
+        g._store_secret("hackerone.api_token", "tok")
+        calls = []
+
+        def fake_fetch(handle, api_username, api_token, **kw):
+            calls.append((handle, api_username, api_token))
+            return {"ok": True, "handle": handle, "program_name": "Acme Corp", "policy_excerpt": "",
+                    "offers_bounty": True, "structured_scope": [{"identifier": "a.acme.com"}], "warnings": []}
+
+        g.bounty_h1_import.fetch_structured_scope = fake_fetch
+        cap = _run_post_route("/api/hackerone/import-scope", {"handle": "acme"})
+        self.assertEqual(cap.status, 200)
+        data = json.loads(cap.body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["program_name"], "Acme Corp")
+        self.assertEqual(calls, [("acme", "me", "tok")])   # the saved creds actually reached the fetch call
+
+    def test_token_is_never_echoed_in_the_response(self) -> None:
+        g._store_secret("hackerone.api_username", "me")
+        g._store_secret("hackerone.api_token", "TOP-SECRET-TOKEN-XYZ")
+        g.bounty_h1_import.fetch_structured_scope = lambda *a, **k: {"ok": True, "handle": "acme", "program_name": "Acme",
+                                                                        "policy_excerpt": "", "offers_bounty": False,
+                                                                        "structured_scope": [], "warnings": []}
+        cap = _run_post_route("/api/hackerone/import-scope", {"handle": "acme"})
+        self.assertNotIn(b"TOP-SECRET-TOKEN-XYZ", cap.body)
+
+    def test_wrong_method_falls_through_to_404_not_matched(self) -> None:
+        cap = _Capture()
+        headers = [(b"host", b"127.0.0.1:8791"), (b"x-greyiq-token", g.SESSION_TOKEN.encode("ascii"))]
+        scope = {"method": "GET", "path": "/api/hackerone/import-scope", "headers": headers, "scheme": "http", "query_string": b""}
+        asyncio.run(g.route_http(scope, _receive_once(b""), cap.send))
+        self.assertEqual(cap.status, 404)
 
 
 class ConcurrentRunMutationTests(unittest.TestCase):

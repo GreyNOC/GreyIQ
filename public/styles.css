@@ -3074,6 +3074,43 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-prog-form .ck-toggles { grid-column: 1 / -1; }
 .ck-prog-form .ck-status { grid-column: 1 / -1; }
 
+/* Program setup tab */
+.ck-prog-setup-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 0.6rem; align-items: end; margin-top: 0.6rem; }
+.ck-prog-setup-form label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.76rem; color: var(--muted); }
+.ck-prog-setup-form input, .ck-prog-setup-form textarea { font: inherit; font-size: 0.84rem; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 0.45rem 0.55rem; }
+.ck-prog-setup-form textarea { resize: vertical; }
+.ck-prog-setup-form .ck-import,
+.ck-prog-setup-form .ck-toggles,
+.ck-prog-setup-form .ck-status,
+.ck-prog-setup-form .ck-scope-table,
+.ck-prog-setup-form h4 { grid-column: 1 / -1; margin: 0; }
+.ck-scope-table { display: flex; flex-direction: column; gap: 0.4rem; }
+.ck-scope-body { display: flex; flex-direction: column; gap: 0.35rem; }
+.ck-scope-row {
+  display: grid; grid-template-columns: 1.3fr 0.8fr auto auto 0.7fr 1.3fr auto;
+  gap: 0.4rem; align-items: center;
+}
+.ck-scope-row input[type="text"] {
+  font: inherit; font-size: 0.78rem; color: var(--text); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 7px; padding: 0.35rem 0.5rem; width: 100%; box-sizing: border-box;
+}
+.ck-scope-head span { font-size: 0.68rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
+.ck-scope-check { display: flex; align-items: center; gap: 0.3rem; font-size: 0.74rem; color: var(--muted); cursor: pointer; white-space: nowrap; }
+.ck-scope-rm { padding: 0.3rem 0.55rem; color: var(--muted); }
+
+/* Guided first-run wizard */
+.ck-wizard {
+  position: fixed; inset: 0; z-index: 80; display: flex; align-items: flex-end; justify-content: flex-end;
+  padding: 1.4rem; pointer-events: none;
+}
+.ck-wizard-card {
+  pointer-events: auto; width: min(22rem, 100%); background: var(--surface); border: 1px solid var(--border);
+  border-radius: 14px; padding: 1rem 1.1rem; box-shadow: 0 20px 50px rgba(0,0,0,0.35);
+}
+.ck-wizard-step { margin: 0 0 0.2rem; font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.ck-wizard-card h3 { margin: 0 0 0.4rem; font-size: 1rem; }
+.ck-wizard-acts { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.8rem; justify-content: flex-end; }
+
 @media (max-width: 1100px) {
   .ck-body, .ck-body.has-detail { grid-template-columns: 18rem minmax(0, 1fr) 0; }
   .ck-body.has-detail .ck-detail { position: fixed; right: 0; top: 0; bottom: 0; width: min(92vw, 30rem); z-index: 40; box-shadow: -12px 0 40px rgba(0,0,0,0.35); }

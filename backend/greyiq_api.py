@@ -289,6 +289,7 @@ from bughunter import oob_service as bounty_oob  # noqa: E402
 from bughunter import stored_xss_service as bounty_stored_xss  # noqa: E402
 from bughunter import ledger as bounty_ledger  # noqa: E402
 from bughunter import portfolio as bounty_portfolio  # noqa: E402
+from bughunter import hackerone_import as bounty_h1_import  # noqa: E402
 from bughunter.operator import OperatorLoop  # noqa: E402
 from bughunter import toolkit as toolkit_lib  # noqa: E402
 from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E402
@@ -566,7 +567,7 @@ class ScreenshotRequest(BaseModel):
 
 class IngestTargetsRequest(BaseModel):
     content: str = Field(default="", max_length=5_000_000)   # pasted/loaded CSV / Burp XML / HAR (module also byte-caps)
-    kind: str = Field(default="auto", max_length=12)          # auto | csv | burp | har
+    kind: str = Field(default="auto", max_length=20)          # auto | csv | burp | har | hackerone_scope
 
 
 class BundleRequest(BaseModel):
@@ -669,6 +670,10 @@ class ProgramUpsertRequest(BaseModel):
     in_scope_hosts: list[str] = Field(default_factory=list)
     out_of_scope_hosts: list[str] = Field(default_factory=list)
     seed_targets: list[str] = Field(default_factory=list)
+    structured_scope: list[dict[str, Any]] = Field(default_factory=list, max_length=500)
+    oob_allowed: bool = False
+    notes: str = Field(default="", max_length=4000)
+    resync_scope: bool = False  # re-derive scope_text/hosts from structured_scope even if scope_text is already set (see portfolio.upsert_program)
     active: bool = False
     live: bool = False
     deep: bool = False
@@ -681,6 +686,10 @@ class ProgramUpsertRequest(BaseModel):
 
 class ProgramDeleteRequest(BaseModel):
     id: str = Field(min_length=1, max_length=120)
+
+
+class HackerOneImportRequest(BaseModel):
+    handle: str = Field(min_length=1, max_length=200)
 
 
 class OperatorStartRequest(BaseModel):
@@ -1877,8 +1886,23 @@ class GreyIQRuntime:
         return {"ok": True, "programs": bounty_portfolio.list_programs(RUNTIME_DIR)}
 
     def upsert_program(self, request: "ProgramUpsertRequest") -> dict[str, Any]:
-        record = request.model_dump(exclude_none=True)
+        # exclude_unset: a caller that doesn't know about a field (e.g. the Operator tab's
+        # compact edit form predates structured_scope/oob_allowed/notes) must never reset
+        # it to that field's bare default just by omitting it from the request body -- the
+        # existing stored value is preserved instead. A caller that DOES send a field
+        # (even a falsy one, like active=false) still gets it applied, since Pydantic marks
+        # any key present in the request JSON as "set" regardless of its value.
+        record = request.model_dump(exclude_unset=True, exclude_none=True)
         return {"ok": True, "program": bounty_portfolio.upsert_program(RUNTIME_DIR, record)}
+
+    def import_hackerone_scope(self, request: "HackerOneImportRequest") -> dict[str, Any]:
+        """Preview a program's scope pulled from the HackerOne API — the ONLY read here
+        that reaches a non-target host, and only on this explicit, operator-clicked call
+        (never automatic/background). Returns a PREVIEW; nothing is saved until the
+        operator submits the Program form. Reuses the same creds already stored for
+        submission — no new secret."""
+        _, username, token = self._hackerone_creds()
+        return bounty_h1_import.fetch_structured_scope(request.handle, username, token)
 
     def remove_program(self, program_id: str) -> dict[str, Any]:
         return {"ok": bounty_portfolio.remove_program(RUNTIME_DIR, program_id)}
@@ -2924,6 +2948,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/operator/programs/delete":
             request = validate_payload(ProgramDeleteRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.remove_program, request.id))
+            return
+        if method == "POST" and path == "/api/hackerone/import-scope":
+            request = validate_payload(HackerOneImportRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.import_hackerone_scope, request))
             return
         if method == "POST" and path == "/api/operator/start":
             request = validate_payload(OperatorStartRequest, await read_json_body(receive))

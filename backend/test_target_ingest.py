@@ -112,5 +112,108 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(r["count"], 0)
 
 
+class HackerOneScopeCsvTests(unittest.TestCase):
+    def test_real_header_synonyms_full_row_kept(self) -> None:
+        csv = (
+            "asset_identifier,asset_type,eligible_for_submission,eligible_for_bounty,instruction,max_severity\n"
+            "*.acme.com,URL,true,true,Web app,critical\n"
+            "legacy.acme.com,URL,false,false,Out of scope,none\n"
+        )
+        r = ti.ingest(csv, "hackerone_scope")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["kind"], "hackerone_scope")
+        self.assertEqual(r["scope_count"], 2)
+        rows = {e["identifier"]: e for e in r["structured_scope"]}
+        self.assertTrue(rows["*.acme.com"]["eligible_for_submission"])
+        self.assertTrue(rows["*.acme.com"]["eligible_for_bounty"])
+        self.assertEqual(rows["*.acme.com"]["max_severity"], "critical")
+        self.assertFalse(rows["legacy.acme.com"]["eligible_for_submission"])
+
+    def test_asset_type_column_before_asset_identifier_does_not_shadow_it(self) -> None:
+        # Regression: bare "asset" in _H1_ID_HINTS is a substring of "asset_type", so a
+        # naive first-substring-match would pick asset_type as the identifier column when
+        # it's listed first — silently discarding the real hostnames. _match_column must
+        # prefer an EXACT header match ("asset_identifier") over that substring collision.
+        csv = "asset_type,asset_identifier,eligible_for_submission\nWEB,example.com,true\nMOBILE,otherapp.com,true\n"
+        r = ti.ingest(csv, "hackerone_scope")
+        self.assertTrue(r["ok"])
+        identifiers = {e["identifier"] for e in r["structured_scope"]}
+        self.assertEqual(identifiers, {"example.com", "otherapp.com"})
+        types = {e["identifier"]: e["asset_type"] for e in r["structured_scope"]}
+        self.assertEqual(types["example.com"], "WEB")
+        self.assertEqual(r["targets"], ["https://example.com", "https://otherapp.com"])
+
+    def test_human_header_variants_recognized(self) -> None:
+        # "Identifier" / "Eligible for submission" / "Eligible for bounty" — the human-readable
+        # labels a hand-exported spreadsheet is more likely to carry than raw API attribute names.
+        csv = "Identifier,Eligible for submission,Eligible for bounty\napi.acme.com,Yes,No\n"
+        r = ti.ingest(csv, "hackerone_scope")
+        self.assertTrue(r["ok"])
+        entry = r["structured_scope"][0]
+        self.assertEqual(entry["identifier"], "api.acme.com")
+        self.assertTrue(entry["eligible_for_submission"])
+        self.assertFalse(entry["eligible_for_bounty"])
+
+    def test_missing_columns_defaults_eligible_true(self) -> None:
+        csv = "asset_identifier\n*.acme.com\n"
+        r = ti.ingest(csv, "hackerone_scope")
+        self.assertTrue(r["structured_scope"][0]["eligible_for_submission"])
+        self.assertFalse(r["structured_scope"][0]["eligible_for_bounty"])
+
+    def test_no_recognizable_header_falls_back_to_bare_identifiers(self) -> None:
+        r = ti.ingest("*.acme.com\napi.acme.com\n", "hackerone_scope")
+        self.assertTrue(r["ok"])
+        identifiers = {e["identifier"] for e in r["structured_scope"]}
+        self.assertEqual(identifiers, {"*.acme.com", "api.acme.com"})
+        self.assertTrue(any("no recognizable header" in n.lower() for n in r["notes"]))
+
+    def test_empty_input_not_ok(self) -> None:
+        r = ti.ingest("", "hackerone_scope")
+        self.assertFalse(r["ok"])
+
+    def test_bom_prefixed_header_still_matches(self) -> None:
+        csv = "﻿asset_identifier,eligible_for_submission\n*.acme.com,true\n"
+        r = ti.ingest(csv, "hackerone_scope")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["structured_scope"][0]["identifier"], "*.acme.com")   # no leading BOM artifact
+
+    def test_quoted_field_with_embedded_comma_stays_one_column(self) -> None:
+        csv = 'asset_identifier,instruction\n*.acme.com,"Report bugs, then wait for triage"\n'
+        r = ti.ingest(csv, "hackerone_scope")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["structured_scope"][0]["identifier"], "*.acme.com")
+        self.assertEqual(r["structured_scope"][0]["instruction"], "Report bugs, then wait for triage")
+
+    def test_tab_delimited_is_sniffed(self) -> None:
+        csv = "asset_identifier\teligible_for_submission\n*.acme.com\ttrue\nlegacy.acme.com\tfalse\n"
+        r = ti.ingest(csv, "hackerone_scope")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["scope_count"], 2)
+        rows = {e["identifier"]: e for e in r["structured_scope"]}
+        self.assertTrue(rows["*.acme.com"]["eligible_for_submission"])
+        self.assertFalse(rows["legacy.acme.com"]["eligible_for_submission"])
+
+    def test_crlf_line_endings(self) -> None:
+        csv = "asset_identifier,eligible_for_submission\r\n*.acme.com,true\r\napi.acme.com,true\r\n"
+        r = ti.ingest(csv, "hackerone_scope")
+        self.assertTrue(r["ok"])
+        identifiers = {e["identifier"] for e in r["structured_scope"]}
+        self.assertEqual(identifiers, {"*.acme.com", "api.acme.com"})
+
+    def test_non_host_identifiers_excluded_from_targets(self) -> None:
+        csv = "asset_identifier,eligible_for_submission\napi.acme.com,true\nAcmeMobileApp,true\n"
+        r = ti.ingest(csv, "hackerone_scope")
+        # api.acme.com normalizes to a URL; the dot-less app-name identifier does not -- both
+        # stay in structured_scope, but only the URL-shaped one shows up in targets/hosts.
+        self.assertEqual(r["scope_count"], 2)
+        self.assertEqual(r["targets"], ["https://api.acme.com"])
+        self.assertEqual(r["hosts"], ["api.acme.com"])
+
+    def test_dedupes_by_identifier(self) -> None:
+        csv = "asset_identifier\napi.acme.com\napi.acme.com\n"
+        r = ti.ingest(csv, "hackerone_scope")
+        self.assertEqual(r["scope_count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

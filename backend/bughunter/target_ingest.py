@@ -32,12 +32,23 @@ from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
 MAX_INPUT_BYTES = 4_000_000   # ~4 MB of pasted/loaded text
 MAX_TARGETS = 2000            # cap the produced target list
 MAX_PARAM_NAMES = 200
+MAX_SCOPE_ENTRIES = 500       # cap a HackerOne-style structured-scope import (mirrors portfolio._MAX_SCOPE_ENTRIES)
 
 # CSV column-name hints (substring match, case-insensitive). URL columns win over host
 # columns when both are present (a full URL carries more — path + params).
 _URL_HINTS = ("url", "uri", "endpoint", "request", "link", "address", "location")
 _HOST_HINTS = ("host", "domain", "asset", "hostname", "fqdn", "site", "scope", "target")
 _DOCTYPE_RE = re.compile(r"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
+
+# HackerOne structured-scope CSV column hints (substring match, case-insensitive).
+_H1_ID_HINTS = ("asset_identifier", "identifier", "asset")
+_H1_TYPE_HINTS = ("asset_type", "type")
+_H1_SUBMIT_HINTS = ("eligible_for_submission", "eligible for submission", "in_scope", "in scope", "submission")
+_H1_BOUNTY_HINTS = ("eligible_for_bounty", "eligible for bounty", "bounty")
+_H1_INSTRUCTION_HINTS = ("instruction", "notes")
+_H1_SEVERITY_HINTS = ("max_severity", "max severity", "severity")
+_TRUE_WORDS = {"true", "yes", "y", "1", "eligible", "in scope", "in_scope"}
+_FALSE_WORDS = {"false", "no", "n", "0", "not eligible", "out of scope", "out_of_scope", "ineligible"}
 # A query-param name worth surfacing (mirrors the active prover's accepted token shape).
 _PARAM_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_\-\[\]\.]{0,39}$")
 
@@ -149,6 +160,128 @@ def parse_csv(text: str) -> dict[str, Any]:
     return _finalize("csv", [n for n in (_normalize_one(c) for c in collected) if n], [])
 
 
+def _match_column(cells: list[str], hints: tuple[str, ...]) -> int | None:
+    """Prefer an EXACT header match over a substring one, so a generic hint (e.g. bare
+    "asset" in _H1_ID_HINTS) can't shadow a more specific column ("asset_type" coming
+    before "asset_identifier") just because of column order. Falls back to substring
+    matching (first hint, first matching column) when nothing matches exactly."""
+    for index, cell in enumerate(cells):
+        if cell and cell in hints:
+            return index
+    for index, cell in enumerate(cells):
+        if cell and any(h in cell for h in hints):
+            return index
+    return None
+
+
+def _parse_bool_cell(raw: str, default: bool) -> bool:
+    v = (raw or "").strip().lower()
+    if not v:
+        return default
+    if v in _TRUE_WORDS:
+        return True
+    if v in _FALSE_WORDS:
+        return False
+    return default
+
+
+def _finalize_scope(entries: list[dict[str, Any]], notes: list[str]) -> dict[str, Any]:
+    """Same shape contract as ``_finalize`` (ok/kind/targets/hosts/count/host_count/notes,
+    so the existing generic import widget keeps working unmodified) PLUS the full
+    ``structured_scope`` rows a HackerOne-aware importer needs."""
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        key = entry["identifier"].lower()
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(entry)
+    out_notes = list(notes)
+    if len(deduped) > MAX_SCOPE_ENTRIES:
+        deduped = deduped[:MAX_SCOPE_ENTRIES]
+        out_notes.append(f"Capped to the first {MAX_SCOPE_ENTRIES} scope entries.")
+    # Best-effort URL view for the "seed targets" / "scope" quick-add buttons — many
+    # structured-scope identifiers aren't URLs at all (mobile bundle IDs, CIDRs, repo
+    # names), so this list is a subset of structured_scope, never a replacement for it.
+    targets = _dedupe(
+        n for n in (_normalize_one(e["identifier"]) for e in deduped if e["eligible_for_submission"]) if n
+    )
+    hosts = _dedupe(_host_of(t) for t in targets)
+    if not deduped:
+        out_notes.append("No scope entries found (need an identifier column, or at least one non-empty cell).")
+    return {
+        "ok": bool(deduped), "kind": "hackerone_scope", "structured_scope": deduped, "scope_count": len(deduped),
+        "targets": targets, "hosts": hosts, "param_names": [], "count": len(targets),
+        "host_count": len(hosts), "notes": out_notes,
+    }
+
+
+def parse_hackerone_scope_csv(text: str) -> dict[str, Any]:
+    """A HackerOne-style scope export (or any CSV with asset/type/eligibility columns).
+    Unlike ``parse_csv`` (which collapses a row to a single URL/host cell), this keeps the
+    WHOLE row as a structured scope entry — identifier, asset_type, eligible_for_submission,
+    eligible_for_bounty, instruction, max_severity — matching the same shape the HackerOne
+    API import returns (``hackerone_import.fetch_structured_scope``), so both paths feed the
+    same table. Falls back to treating every cell as a bare in-scope identifier when no
+    recognizable header is present (still useful for a plain one-column asset list)."""
+    body = text.lstrip("﻿")
+    try:
+        try:
+            dialect: Any = csv.Sniffer().sniff(body[:4096], delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        rows = list(csv.reader(io.StringIO(body), dialect))
+    except csv.Error as exc:
+        return _err("hackerone_scope", f"Could not parse CSV: {exc}")
+    if not rows:
+        return _finalize_scope([], [])
+
+    header_cells = [str(c or "").strip().lower() for c in rows[0]]
+    id_col = _match_column(header_cells, _H1_ID_HINTS)
+    columns: dict[str, int | None] | None = None
+    data_rows = rows
+    if id_col is not None:
+        columns = {
+            "identifier": id_col,
+            "asset_type": _match_column(header_cells, _H1_TYPE_HINTS),
+            "eligible_for_submission": _match_column(header_cells, _H1_SUBMIT_HINTS),
+            "eligible_for_bounty": _match_column(header_cells, _H1_BOUNTY_HINTS),
+            "instruction": _match_column(header_cells, _H1_INSTRUCTION_HINTS),
+            "max_severity": _match_column(header_cells, _H1_SEVERITY_HINTS),
+        }
+        data_rows = rows[1:]
+
+    entries: list[dict[str, Any]] = []
+    notes: list[str] = []
+    for row in data_rows:
+        if columns is not None:
+            def cell(key: str, row: list[str] = row, columns: dict[str, int | None] = columns) -> str:
+                idx = columns.get(key)
+                return str(row[idx]).strip() if idx is not None and idx < len(row) else ""
+            identifier = cell("identifier")
+            if not identifier:
+                continue
+            entries.append({
+                "identifier": identifier,
+                "asset_type": cell("asset_type"),
+                "eligible_for_submission": _parse_bool_cell(cell("eligible_for_submission"), True),
+                "eligible_for_bounty": _parse_bool_cell(cell("eligible_for_bounty"), False),
+                "instruction": cell("instruction"),
+                "max_severity": cell("max_severity"),
+            })
+        else:
+            for raw_cell in row:
+                identifier = str(raw_cell or "").strip()
+                if identifier:
+                    entries.append({
+                        "identifier": identifier, "asset_type": "", "eligible_for_submission": True,
+                        "eligible_for_bounty": False, "instruction": "", "max_severity": "",
+                    })
+    if columns is None and entries:
+        notes.append("No recognizable header (identifier/asset type/eligibility) — treated every cell as a bare in-scope identifier.")
+    return _finalize_scope(entries, notes)
+
+
 def parse_burp_xml(text: str) -> dict[str, Any]:
     """A Burp Suite items / sitemap XML export. Reads each <item>'s <url> (falling back to
     protocol+host+path). DOCTYPE/ENTITY-bearing XML is refused before parsing."""
@@ -217,4 +350,6 @@ def ingest(content: str, kind: str = "auto") -> dict[str, Any]:
         return parse_burp_xml(raw)
     if chosen == "har":
         return parse_har(raw)
-    return _err(chosen, f"Unknown ingest kind '{kind}' (use auto, csv, burp, or har).")
+    if chosen == "hackerone_scope":
+        return parse_hackerone_scope_csv(raw)
+    return _err(chosen, f"Unknown ingest kind '{kind}' (use auto, csv, burp, har, or hackerone_scope).")
