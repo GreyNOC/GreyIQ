@@ -2,6 +2,34 @@
 
 Notable changes to GreyIQ.
 
+## v0.57.5
+
+### Expanded HackerOne integration: program enrichment, hacktivity recon, own activity, status sync
+GreyIQ's HackerOne integration previously only fetched a program's scope and submitted
+reports. Every endpoint below was verified against HackerOne's real, official Hacker API
+docs before building against it.
+
+- **Program enrichment**: fetching a program's scope now also captures real program
+  signals — offers bounties, fast payments, Gold Standard Safe Harbor, open scope, and
+  your own track record on that program — shown as badges on the Program tab. There is
+  no structured bounty-table endpoint anywhere in HackerOne's API (confirmed, not
+  guessed), so this surfaces the real flags instead of a guessed reward table.
+- **Hacktivity reconnaissance**: a "Recent hacktivity" panel per program showing what
+  vulnerability classes are actually getting disclosed/paid there.
+- **My HackerOne activity**: an on-demand panel (Submissions tab) for your own report
+  statuses and earnings/balance.
+- **Report-status sync**: a bounded, manually-triggered action (Operator tab) that polls
+  every locally "submitted" finding's real HackerOne status, advances the pipeline to
+  "paid" on a real reward, and records the outcome to the learning store — closing a
+  loop that previously required manually running `gn learn`.
+- Fixed a real gap found along the way: manually submitting a finding never registered
+  it in the local ledger (only the autonomous operator's auto-submit path did), so its
+  HackerOne report id was never tracked for status sync. Now registered at submit time
+  regardless of how the finding was discovered.
+
+Every new call is manually triggered (button click), never automatic/background, using
+the same stored API credentials — no new secret, no new trust boundary.
+
 ## v0.57.4
 
 ### Proof-of-impact CVSS confidence, and no more self-identifying in submitted reports
