@@ -6,12 +6,10 @@ gating (same host, in-scope, two sessions required) is asserted too.
 """
 from __future__ import annotations
 
-import os
 import sys
 import unittest
 from pathlib import Path
 
-os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"  # 127.0.0.1 reachable for the gate
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
