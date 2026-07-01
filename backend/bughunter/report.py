@@ -86,7 +86,11 @@ def _jwt_replay_value(finding: dict[str, Any]) -> bool | None:
     elif "jwt_replay_authenticated" in finding:
         value = finding.get("jwt_replay_authenticated")
     else:
-        value = (finding.get("jwt_exposure") or {}).get("replay_authenticated")
+        jwt_exposure = finding.get("jwt_exposure")
+        # jwt_exposure can arrive malformed (a non-dict) from a corrupted run cache or an
+        # unexpected upstream shape -- guard before .get(), or this crashes the whole
+        # report render (_reportable_findings calls this for every secret.jwt finding).
+        value = jwt_exposure.get("replay_authenticated") if isinstance(jwt_exposure, dict) else None
     return value if isinstance(value, bool) else None
 
 

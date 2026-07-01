@@ -150,6 +150,42 @@ class CampaignTests(unittest.TestCase):
         self.assertFalse(result["ok"])
 
 
+class SeverityRollupTests(unittest.TestCase):
+    """campaign._campaign_risk / _severity_counts -- the roll-up the cockpit's risk badge
+    and severity dots surface -- had no direct test."""
+
+    def _consolidated(self, *severities: str) -> list[dict]:
+        return [{"finding": {"severity": s}} for s in severities]
+
+    def test_severity_counts_tallies_each_band(self) -> None:
+        findings = [{"severity": "critical"}, {"severity": "high"}, {"severity": "high"}, {"severity": "low"}]
+        counts = campaign._severity_counts(findings)
+        self.assertEqual(counts, {"critical": 1, "high": 2, "medium": 0, "low": 1, "info": 0})
+
+    def test_severity_counts_missing_severity_defaults_to_info(self) -> None:
+        counts = campaign._severity_counts([{}])
+        self.assertEqual(counts["info"], 1)
+
+    def test_severity_counts_unknown_label_is_silently_dropped(self) -> None:
+        counts = campaign._severity_counts([{"severity": "made-up"}])
+        self.assertEqual(sum(counts.values()), 0)
+
+    def test_risk_empty_consolidated_is_clean(self) -> None:
+        self.assertEqual(campaign._campaign_risk([]), "clean")
+
+    def test_risk_info_only_is_low(self) -> None:
+        self.assertEqual(campaign._campaign_risk(self._consolidated("info", "low")), "low")
+
+    def test_risk_critical_present_outranks_everything(self) -> None:
+        self.assertEqual(campaign._campaign_risk(self._consolidated("low", "medium", "critical")), "critical")
+
+    def test_risk_high_without_critical_is_high(self) -> None:
+        self.assertEqual(campaign._campaign_risk(self._consolidated("low", "high")), "high")
+
+    def test_risk_medium_without_high_or_critical_is_moderate(self) -> None:
+        self.assertEqual(campaign._campaign_risk(self._consolidated("info", "medium")), "moderate")
+
+
 def _ctx_item(ref: str, *, duplicate: bool, package: bool) -> dict:
     item = {
         "finding": {"ref": ref, "title": f"Finding {ref}", "severity": "high"},

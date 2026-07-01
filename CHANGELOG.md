@@ -2,6 +2,57 @@
 
 Notable changes to GreyIQ.
 
+## v0.56.0
+
+### QAQC pass, part 4 — closing the test-coverage backlog
+The 50-agent QAQC audit that drove v0.53.0–v0.55.0 also produced a list of ~60
+test-coverage gaps (code paths with no dedicated test) alongside the confirmed faults.
+This release closes that backlog, plus one real bug it surfaced along the way.
+
+**Fixed:**
+- `report.py`'s JWT-replay check crashed (`AttributeError`) whenever a `jwt_exposure`
+  field arrived as something other than a dict (a corrupted run cache or an unexpected
+  upstream shape) — it now degrades to "unconfirmed" instead of taking down the whole
+  report render for every JWT-credential finding.
+
+**New dedicated coverage (previously untested or thinly tested):**
+- The full SSRF/egress-guard surface (`_guard_url`, redirect re-guarding, settings env
+  parsing, same-site session binding) and the API's auth/CORS/path-traversal boundary,
+  driven through a real in-process ASGI harness.
+- Response-consumption isolation (byte cap, cookies, charset) and the sensitive-path
+  validators (`git config`, `.env`, actuator, etc.), including governor-exhaustion
+  fail-closed behavior.
+- `operator`/`ledger`/`portfolio`/`rate_limit`: lifecycle methods, the supervisor loop's
+  kill-switch and idle-wait (run against a real background thread), and EV pay-factor
+  edge cases that previously had zero coverage.
+- `triage.py` (zero coverage before this) and the remaining `ranking`/`campaign` gaps,
+  including severity roll-ups and "Ready to submit" rendering.
+- `access_control`, `api_discovery`, and `oob_service`: cross-origin OpenAPI scope
+  filtering, two-ID IDOR probing, and OOB sweep resilience to a transient poll failure.
+- `submission.py`'s HackerOne submit (success path, HTTP/URL-error decoding, screenshot
+  co-location and basename-collision behavior) and `report.py`'s Markdown-escaping /
+  `build_json` dropped-finding handling — previously only the refusal gates were tested.
+- `bundle.py`'s archive-size-cap and per-file-size-skip branches.
+- `live_scan_service.py` (the Playwright dynamic-scan engine) had **no test file at
+  all** — now covered end-to-end via a fake `playwright.sync_api` injected into
+  `sys.modules`, driving the real event-handling, per-request SSRF route guard, and
+  capture-cap-overflow code, plus the risk-scoring bands.
+- `recon.discover`'s three kill switches (page cap, per-campaign request budget, BFS
+  depth) against a real local multi-page server, and the per-host governor throttle
+  `_safe_fetch` defers to.
+- `recon_js.mine_js`'s `fetch`/`axios`/`.open` call-target regex, every extraction cap,
+  and redirected-`base_url` scoping.
+- The vendored DNS resolver's compressed-name reader against hostile input (pointer
+  cycles, pointer-to-self, out-of-range/forward pointers, unterminated names) — none of
+  it can hang or crash, only degrade to a partial/empty name.
+- `active_verify_service`'s Host-header confirmed (Location-reflection) branch, the
+  per-hunt request budget's `_RateLimited` propagation (independent of the per-host
+  governor), and direct tests of `_with_operator`/`_norm_len`.
+
+803 tests green (+278), including two previously-zero-coverage modules
+(`live_scan_service.py`, `triage.py`) and one previously-zero-coverage security
+boundary (`greyiq_api.py`'s auth/CORS/traversal handling via a real ASGI harness).
+
 ## v0.55.0
 
 ### QAQC pass, part 3 — all 16 low-severity + 4 plausible faults fixed

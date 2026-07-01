@@ -122,6 +122,41 @@ class ConfirmTests(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("collaborator", res["error"].lower())
 
+    def test_all_pre_probe_polls_failing_returns_an_error_not_no_callback(self) -> None:
+        # Every param's PRE-PROBE poll (the negative-control check) fails -- no param is
+        # ever actually tried, so this must surface as a real error (ok=False), not the
+        # misleadingly-clean 'no-callback' status (which would imply the probe RAN and
+        # genuinely saw nothing).
+        oob.poll_collaborator = lambda base, secret, token, **k: {"ok": False, "error": "collaborator unreachable"}
+        res = oob.confirm_blind_ssrf(
+            "https://app.example.com/?url=x", base="https://collab.example", secret="s" * 16,
+            scope="app.example.com", settings=get_settings(), http=FakeHttp(), poll_attempts=1, poll_delay_s=0.0)
+        self.assertFalse(res["ok"])
+        self.assertIn("collaborator unreachable", res["error"])
+
+    def test_transient_poll_failure_on_one_param_does_not_abort_the_sweep(self) -> None:
+        # A transient poll failure for ONE param's in-loop attempt must `break` to the
+        # NEXT param (continuing the sweep), not abort the whole probe -- the next
+        # candidate param still gets a fair shot and can still confirm.
+        calls = {"n": 0}
+
+        def fake_poll(base, secret, token, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"ok": True, "count": 0, "hits": []}      # param 1 pre-probe: clean
+            if calls["n"] == 2:
+                return {"ok": False, "error": "transient timeout"}  # param 1 poll-attempt: fails -> break
+            if calls["n"] == 3:
+                return {"ok": True, "count": 0, "hits": []}      # param 2 pre-probe: clean
+            return {"ok": True, "count": 1, "hits": [{"method": "GET", "ip": "9.9.9.9",
+                    "headers": {"user-agent": "Go-http-client/1.1"}}]}  # param 2 poll-attempt: HIT
+        oob.poll_collaborator = fake_poll
+        res = oob.confirm_blind_ssrf(
+            "https://app.example.com/?url=x&next=y", base="https://collab.example", secret="s" * 16,
+            scope="app.example.com", settings=get_settings(), http=FakeHttp(), poll_attempts=1, poll_delay_s=0.0)
+        self.assertEqual(res["status"], "confirmed")
+        self.assertEqual(res["param"], "next")  # confirmed via the SECOND param, after param 1's transient failure
+
 
 class XxeTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -60,6 +60,18 @@ class ParseOpenApiTests(unittest.TestCase):
         self.assertEqual(api.parse_openapi({"hello": "world"}, "https://x/y"), {})
         self.assertEqual(api.parse_openapi("not a dict", "https://x/y"), {})
 
+    def test_cross_origin_servers_url_is_resolved_verbatim(self) -> None:
+        # parse_openapi is a PURE parser with no scope awareness -- an OpenAPI spec
+        # served from one host can legitimately (or maliciously) declare servers[].url
+        # pointing at a COMPLETELY DIFFERENT origin; the parser builds absolute endpoint
+        # URLs on THAT origin verbatim. Scope filtering is the CALLER's job
+        # (discover_api_surface, tested below) -- pinning that split here.
+        spec = {"openapi": "3.0.1", "info": {"title": "X"},
+                "servers": [{"url": "https://internal-admin.other-host.example"}],
+                "paths": {"/secrets": {"get": {}}}}
+        p = api.parse_openapi(spec, "https://api.example.com/openapi.json")
+        self.assertIn("https://internal-admin.other-host.example/secrets", p["endpoints"])
+
 
 class GraphQLTests(unittest.TestCase):
     def test_introspection_parsed(self) -> None:
@@ -117,6 +129,22 @@ class DiscoverDriverTests(unittest.TestCase):
         self.assertEqual(out["endpoints"], [])
         self.assertEqual(out["findings"], [])
         self.assertIsNone(out["openapi"])
+
+    def test_cross_origin_servers_url_endpoints_are_filtered_out_by_scope(self) -> None:
+        # The spec ITSELF is in-scope (served from api.example.com) but its
+        # servers[].url points at a different, out-of-scope host -- discover_api_surface's
+        # `out["endpoints"] = [e for e in parsed["endpoints"] if in_scope(e)]` must drop
+        # those cross-origin endpoints from the active prover's surface.
+        origin = "https://api.example.com"
+        spec = {"openapi": "3.0.1", "info": {"title": "X"},
+                "servers": [{"url": "https://internal-admin.other-host.example"}],
+                "paths": {"/secrets": {"get": {"parameters": [{"name": "token", "in": "query"}]}}}}
+        mapping = {f"{origin}/openapi.json": {"status": 200, "body": json.dumps(spec), "final_url": f"{origin}/openapi.json"}}
+        in_scope = lambda u: u.startswith(origin)  # noqa: E731 -- only the spec's own origin is in scope
+        out = api.discover_api_surface(f"{origin}/", fetch=self._fetch_map(mapping), in_scope=in_scope)
+        self.assertIsNotNone(out["openapi"])  # the spec itself was fetched (it's in-scope)
+        self.assertEqual(out["endpoints"], [])  # but its cross-origin endpoint never made it into the surface
+        self.assertNotIn("https://internal-admin.other-host.example/secrets", out["endpoints"])
 
 
 if __name__ == "__main__":

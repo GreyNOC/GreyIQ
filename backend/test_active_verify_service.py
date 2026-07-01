@@ -276,6 +276,35 @@ class ActiveCheckTests(unittest.TestCase):
         self.assertIsNotNone(f)
         self.assertEqual(f["_active_proof"]["status"], "candidate")
 
+    def test_host_header_location_reflection_is_confirmed(self) -> None:
+        # Host reflected into a redirect Location (password-reset/cache poisoning) is
+        # genuinely actionable -> CONFIRMED, medium severity, distinct from the
+        # body-only candidate case above. No coverage of this branch before this.
+        class LocationEchoStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                h = {k.lower(): v for k, v in (extra_headers or {}).items()}
+                if h.get("host") == av._MARKER_HOST:
+                    return {"status": 302, "headers": {}, "cookies": [], "body": "",
+                            "final_url": url, "location": f"https://{av._MARKER_HOST}/reset?token=abc"}
+                return {"status": 200, "headers": {}, "cookies": [], "body": "<html>ok</html>",
+                        "final_url": url, "location": None}
+        f = av._check_host_header(LocationEchoStub(), "https://app.example.com/")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertEqual(f["severity"], "medium")
+        self.assertEqual(f["rule_id"], "active.host-header-injection")
+        self.assertIn("Location header", f["proof_evidence"]["matched_value"])
+
+    def test_host_header_marker_present_in_unmodified_control_is_not_host_driven(self) -> None:
+        # The marker host shows up EVEN WITHOUT our injected Host header (e.g. it's
+        # coincidentally part of the real site's own content) -> not attacker-controlled,
+        # must not report anything at all.
+        class AlwaysPresentStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                return {"status": 302, "headers": {}, "cookies": [], "body": "",
+                        "final_url": url, "location": f"https://{av._MARKER_HOST}/always"}
+        self.assertIsNone(av._check_host_header(AlwaysPresentStub(), "https://app.example.com/"))
+
     def test_crlf_confirms_when_header_is_split_out(self) -> None:
         class CrlfStub:  # server reflects the CRLF-injected value as a real header
             def fetch(self, url, *, method="GET", extra_headers=None):
@@ -473,6 +502,93 @@ class ActiveCheckTests(unittest.TestCase):
         self.assertIsNone(f)
 
 
+class WithOperatorTests(unittest.TestCase):
+    """_with_operator's URL transformation (param -> param[$ne]=value, plain param
+    dropped) -- only ever exercised indirectly through _check_nosqli before this."""
+
+    def test_replaces_scalar_param_with_operator_object_key(self) -> None:
+        out = av._with_operator("https://x/y?id=1&other=2", "id", "1")
+        parsed = urlparse(out)
+        q = dict(parse_qs(parsed.query))
+        self.assertNotIn("id", q)                 # plain scalar param removed
+        self.assertIn("id[$ne]", q)
+        self.assertEqual(q["id[$ne]"], ["1"])
+        self.assertEqual(q["other"], ["2"])        # unrelated params preserved
+
+    def test_param_not_present_still_adds_operator_key(self) -> None:
+        out = av._with_operator("https://x/y", "id", "1")
+        self.assertIn("id%5B%24ne%5D=1", out)  # URL-encoded param[$ne]=1
+
+    def test_path_and_host_are_untouched(self) -> None:
+        out = av._with_operator("https://app.example.com/search?id=1", "id", "1")
+        parsed = urlparse(out)
+        self.assertEqual(parsed.scheme, "https")
+        self.assertEqual(parsed.hostname, "app.example.com")
+        self.assertEqual(parsed.path, "/search")
+
+
+class NormLenTests(unittest.TestCase):
+    """_norm_len collapses volatile whitespace so a stable page compares stably --
+    only ever exercised indirectly through _check_bool_sqli before this."""
+
+    def test_collapses_runs_of_whitespace_to_a_single_space(self) -> None:
+        self.assertEqual(av._norm_len("a\n\n  b\t\tc"), len("a b c"))
+
+    def test_identical_content_different_whitespace_normalizes_equal(self) -> None:
+        self.assertEqual(av._norm_len("a\nb\nc"), av._norm_len("a   b   c"))
+
+    def test_empty_and_none_are_zero(self) -> None:
+        self.assertEqual(av._norm_len(""), 0)
+        self.assertEqual(av._norm_len(None), 0)
+
+    def test_leading_and_trailing_whitespace_still_counts_as_one_space(self) -> None:
+        # re.sub collapses the run but does not strip() -- pinning current behavior.
+        self.assertEqual(av._norm_len("  x  "), len(" x "))
+
+
+class HttpPerHuntBudgetTests(unittest.TestCase):
+    """_Http's per-hunt request budget (max_requests) is a SEPARATE ceiling from the
+    per-host governor -- exhausting it must raise _RateLimited without ever touching
+    the governor or the network for the request that trips it."""
+
+    def setUp(self) -> None:
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _SiteHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}/"
+        self._prev = os.environ.get("GREYIQ_SCAN_ALLOW_PRIVATE_URLS")
+        os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        if self._prev is None:
+            os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+        else:
+            os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = self._prev
+
+    def test_budget_exhaustion_raises_rate_limited_after_the_nth_request(self) -> None:
+        # Governor capacity is generous (20) so the GOVERNOR never trips here -- only
+        # the per-hunt budget (max_requests=2) should.
+        http = av._Http(get_settings(), HostRateGovernor(capacity=20, min_interval_s=0.0), max_requests=2)
+        http.fetch(self.url)
+        http.fetch(self.url)
+        self.assertEqual(http.sent, 2)
+        with self.assertRaises(av._RateLimited):
+            http.fetch(self.url)
+        self.assertEqual(http.sent, 2)  # the trip itself does not consume a slot
+
+    def test_rate_limited_is_not_an_active_error_and_is_not_swallowed_by_per_check_handling(self) -> None:
+        # _RateLimited is deliberately NOT an _ActiveError subclass so a per-check
+        # `except _ActiveError` can't accidentally eat it and keep the pass going.
+        self.assertFalse(issubclass(av._RateLimited, av._ActiveError))
+        http = av._Http(get_settings(), HostRateGovernor(capacity=20, min_interval_s=0.0), max_requests=1)
+        http.fetch(self.url)
+        with self.assertRaises(av._RateLimited):
+            try:
+                http.fetch(self.url)
+            except av._ActiveError:
+                self.fail("_RateLimited must not be caught by an `except _ActiveError` handler")
+
+
 class ParamDiscoveryTests(unittest.TestCase):
     """Recon-discovered parameter names let the param-keyed checks bite on endpoints
     that carry no query string of their own — the surface recon found but the prover
@@ -658,6 +774,20 @@ class ActiveE2ETests(unittest.TestCase):
         gov = HostRateGovernor(capacity=1, min_interval_s=0.0)
         findings, meta = av.verify_active(url, [], scope="127.0.0.1", governor=gov)
         self.assertTrue(meta["rate_limited"])
+
+    def test_per_hunt_budget_exhaustion_stops_the_pass_independent_of_the_governor(self) -> None:
+        # A GENEROUS governor (won't trip) but a tight per-hunt requests_budget --
+        # proves the _Http.max_requests ceiling (independent of the host governor)
+        # also cleanly ends the pass via _RateLimited propagation, not a raise.
+        url = f"http://127.0.0.1:{self.port}/?q=x&next=/home"
+        gov = HostRateGovernor(capacity=100, min_interval_s=0.0)
+        findings, meta = av.verify_active(url, [], scope="127.0.0.1", governor=gov, requests_budget=1)
+        self.assertTrue(meta["rate_limited"])
+        self.assertEqual(meta["requests_used"], 1)
+        # No finding needing a SECOND fetch (cors/xss/redirect/etc.) could possibly
+        # have run once the sole request slot was spent on the landing page.
+        classes = {f["_active_class_hint"] for f in findings}
+        self.assertFalse(classes & {"cors", "xss", "redirect", "sqli", "nosqli"})
 
     def test_bounty_hunt_active_renders_confirmed(self) -> None:
         from bughunter.bounty import run_bounty_hunt

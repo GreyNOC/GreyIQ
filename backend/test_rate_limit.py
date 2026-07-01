@@ -40,6 +40,41 @@ class RateGovernorTests(unittest.TestCase):
         self.assertEqual(g.remaining("h"), 2)
         self.assertEqual(g.remaining("never-touched"), 3)
 
+    def test_refills_over_real_elapsed_time(self) -> None:
+        import time
+        g = HostRateGovernor(capacity=2, min_interval_s=0.0, refill_per_s=20.0)  # fast refill for a quick test
+        self.assertTrue(g.throttle("h"))
+        self.assertTrue(g.throttle("h"))
+        self.assertFalse(g.throttle("h"))  # bucket empty
+        time.sleep(0.1)  # 0.1s * 20/s = ~2 tokens refilled
+        self.assertTrue(g.throttle("h"))  # the real elapsed time replenished the bucket
+
+    def test_refill_never_exceeds_capacity(self) -> None:
+        import time
+        g = HostRateGovernor(capacity=2, min_interval_s=0.0, refill_per_s=1000.0)
+        g.throttle("h")
+        time.sleep(0.05)  # would refill far past capacity at this rate if uncapped
+        self.assertLessEqual(g.remaining("h"), 2)
+
+    def test_host_key_normalization_case_and_whitespace(self) -> None:
+        g = HostRateGovernor(capacity=1, min_interval_s=0.0, refill_per_s=0.0)
+        self.assertTrue(g.throttle("Example.COM"))
+        # The SAME host in a different case / with surrounding whitespace shares the
+        # one bucket already spent above -- not a fresh budget.
+        self.assertFalse(g.throttle("example.com"))
+        self.assertFalse(g.throttle("  EXAMPLE.COM  "))
+
+    def test_empty_and_whitespace_only_host_share_one_bucket(self) -> None:
+        g = HostRateGovernor(capacity=1, min_interval_s=0.0, refill_per_s=0.0)
+        self.assertTrue(g.throttle(""))
+        self.assertFalse(g.throttle("   "))  # normalizes to the same "" key
+        self.assertFalse(g.throttle(None))
+
+    def test_unicode_host_normalized_consistently(self) -> None:
+        g = HostRateGovernor(capacity=1, min_interval_s=0.0, refill_per_s=0.0)
+        self.assertTrue(g.throttle("MÜNCHEN.de"))
+        self.assertFalse(g.throttle("münchen.de"))  # same bucket, lowercased
+
 
 if __name__ == "__main__":
     unittest.main()

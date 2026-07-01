@@ -334,6 +334,79 @@ class IdorGatingTests(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("scope", r["error"].lower())
 
+    def test_guard_url_failure_after_scope_passes(self) -> None:
+        # A host can be IN active scope (named verbatim as a token in scope text -- a
+        # no-DNS, free-text match) while still failing the SEPARATE SSRF/_guard_url check
+        # (e.g. private-host refusal when allow_private_urls is off). Names the host
+        # itself in scope text -- host_in_active_scope matches it via the token-equality
+        # branch with no DNS lookup -- then _guard_url's own (DNS-resolving) private-host
+        # check refuses it, since this settings object has allow_private_urls=False.
+        s = get_settings()
+        try:
+            object.__setattr__(s, "allow_private_urls", False)
+        except Exception:  # frozen-dataclass fallback
+            s.allow_private_urls = False  # type: ignore[attr-defined]
+        r = ac.run_idor_check("http://127.0.0.1/a", "http://127.0.0.1/b",
+                              account_a={"cookie": "a"}, account_b={"cookie": "b"}, scope="127.0.0.1", settings=s)
+        self.assertFalse(r["ok"])
+        self.assertIn("guard", r["error"].lower())
+
+    def test_norm_truncation_means_bodies_identical_only_within_the_cap_are_indistinguishable(self) -> None:
+        # PINS a real, intentional (performance-bounding) limitation: _norm caps body
+        # comparison at 6000 chars, so two bodies that are byte-identical for the first
+        # 6000 chars but DIVERGE only after that are treated as IDENTICAL (ratio 1.0).
+        head = "x" * 6000
+        a = head + "AAAA_TAIL_DIFFERS_FOR_A"
+        b = head + "BBBB_TAIL_DIFFERS_FOR_B_AND_IS_A_DIFFERENT_LENGTH_TOO"
+        self.assertEqual(ac._norm(a), ac._norm(b))  # both truncate to the identical head
+        self.assertEqual(ac._ratio(a, b), 1.0)       # so the differential sees them as the same object
+
+
+class IdorProbeTwoIdTests(unittest.TestCase):
+    """run_idor_probe's docstring advertises mutating "a URL carrying TWO ids" -- only
+    single-id cases had a test before."""
+
+    def test_url_with_two_path_ids_tries_both_positions(self) -> None:
+        # /order/<id>/item/<id> -- both numeric segments are candidate mutation points.
+        # run_idor_probe returns on the FIRST candidate match, so to prove the SECOND
+        # position is genuinely reached (not just present in `positions`), the first
+        # id's neighbours must be denied/enforced -- only the second id's neighbour
+        # yields the distinct-valid-object signal that ends the search.
+        seen_mutations: list[str] = []
+
+        def by_url(url):
+            seen_mutations.append(url)
+            if "/order/1001/item/55" in url:
+                return (200, _CHROME + "<p>" + _OBJECTS["1001"] + "</p></div></body></html>")
+            if "/order/1002/item/55" in url or "/order/1000/item/55" in url:
+                return (403, "<html>Forbidden</html>")  # order-id neighbours: enforced
+            if "/order/1001/item/56" in url or "/order/1001/item/54" in url:
+                return (200, _CHROME + "<p>" + _OBJECTS["1002"] + "</p></div></body></html>")  # item-id: distinct object
+            return (404, "not found")
+
+        res = _run_probe(by_url, "http://127.0.0.1/api/order/1001/item/55")
+        self.assertEqual(res["status"], "candidate")
+        # Both id positions were genuinely tried -- the search did not stop after the
+        # first (enforced) position; it continued to the second and found the signal there.
+        self.assertTrue(any("/order/1002/item/55" in u or "/order/1000/item/55" in u for u in seen_mutations))
+        self.assertTrue(any("/order/1001/item/56" in u or "/order/1001/item/54" in u for u in seen_mutations))
+
+    def test_digit_count_changing_mutation_targets_the_correct_url(self) -> None:
+        # 9 -> 10 grows the id from 1 to 2 digits, shifting every later path offset.
+        # _mutate_id must still build a correctly-formed URL (it always mutates the
+        # ORIGINAL su, never a previously-mutated string, so offsets stay valid).
+        seen_mutations: list[str] = []
+
+        def by_url(url):
+            seen_mutations.append(url)
+            if url.rstrip("/").endswith("/order/9"):
+                return (200, _CHROME + "<p>" + _OBJECTS["1001"] + "</p></div></body></html>")
+            return (200, _CHROME + "<p>" + _OBJECTS["1002"] + "</p></div></body></html>")
+
+        res = _run_probe(by_url, "http://127.0.0.1/api/order/9")
+        self.assertEqual(res["status"], "candidate")
+        self.assertIn("http://127.0.0.1/api/order/10", seen_mutations)  # the 2-digit neighbour, well-formed
+
 
 if __name__ == "__main__":
     unittest.main()

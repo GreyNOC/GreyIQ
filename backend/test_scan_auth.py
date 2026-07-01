@@ -43,6 +43,17 @@ class SameSiteTests(unittest.TestCase):
         self.assertFalse(sa.same_site("", "example.com"))
         self.assertFalse(sa.same_site("example.com", ""))
 
+    def test_trailing_dot_fqdn_is_unrecognized_fails_closed(self) -> None:
+        # PINS the current behavior (a coverage gap, not a security bug): same_site does
+        # a raw string compare with no trailing-dot normalization, so the root-zone FQDN
+        # form ('example.com.' -- semantically identical to 'example.com') does NOT match
+        # unless BOTH sides carry the dot. This only ever causes a session to be withheld
+        # (fail-closed), never attached somewhere it shouldn't be -- a correctness/
+        # usability gap, not an exploitable widening.
+        self.assertFalse(sa.same_site("app.example.com.", "example.com"))
+        self.assertFalse(sa.same_site("app.example.com", "example.com."))
+        self.assertTrue(sa.same_site("app.example.com.", "example.com."))  # both dotted -> matches
+
     def test_ip_hosts_require_exact_match(self) -> None:
         # An IP has no subdomains; the dotted-suffix test must not treat an IP whose
         # label-suffix coincides as same-site.

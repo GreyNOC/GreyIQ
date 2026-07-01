@@ -84,5 +84,72 @@ class DnsMiniTests(unittest.TestCase):
         self.assertEqual(dns_mini.resolve_cname("localhost"), [])  # no dot -> rejected before any socket
 
 
+class ReadNameMalformedTests(unittest.TestCase):
+    """_read_name is fed attacker-controlled bytes (a DNS response from whatever
+    resolver a scanned host happens to use) -- it must never hang or crash on a
+    hostile/malformed name, only degrade to a partial/empty result. No dedicated
+    coverage of these edge cases before this (only indirect exercise via well-formed
+    packets and the >63-byte-label fix)."""
+
+    def test_pointer_to_self_terminates_without_hanging(self) -> None:
+        # offset 0 is a compression pointer whose target is offset 0 -- an infinite
+        # cycle if unbounded. The `for _ in range(128)` loop guard must still
+        # terminate this in bounded time with an empty name.
+        data = b"\xc0\x00"
+        name, next_off = dns_mini._read_name(data, 0)
+        self.assertEqual(name, "")
+        self.assertEqual(next_off, 2)  # first (non-jumped) pointer's own 2-byte width
+
+    def test_pointer_cycle_between_two_offsets_terminates(self) -> None:
+        # offset 0 points to offset 2, offset 2 points back to offset 0.
+        data = b"\xc0\x02\xc0\x00"
+        name, next_off = dns_mini._read_name(data, 0)
+        self.assertEqual(name, "")
+        self.assertEqual(next_off, 2)
+
+    def test_pointer_target_beyond_buffer_end_fails_closed(self) -> None:
+        # Pointer claims offset 9999, far past the 2-byte buffer -- must not IndexError.
+        data = bytes([0xC0, 0x0F])  # ptr = 0x0F = 15, past len(data) == 2
+        name, next_off = dns_mini._read_name(data, 0)
+        self.assertEqual(name, "")
+        self.assertEqual(next_off, 2)
+
+    def test_forward_pointer_to_a_later_valid_label_still_resolves(self) -> None:
+        # Nothing in the wire format actually requires compression pointers to point
+        # BACKWARD; a pointer to a later, well-formed label sequence must still parse.
+        data = bytes([0xC0, 0x02]) + b"\x03www\x00"
+        name, next_off = dns_mini._read_name(data, 0)
+        self.assertEqual(name, "www")
+        self.assertEqual(next_off, 2)  # caller resumes right after the 2-byte pointer
+
+    def test_unterminated_name_at_end_of_buffer_does_not_crash(self) -> None:
+        # length byte claims 3 bytes but only 2 remain, and there's no 0x00 terminator
+        # anywhere -- Python slicing clips silently rather than raising, so this must
+        # return whatever partial label it could read, not throw.
+        data = b"\x03ww"
+        name, next_off = dns_mini._read_name(data, 0)
+        self.assertEqual(name, "ww")  # clipped label, decoded from what bytes existed
+
+    def test_zero_length_root_name_is_empty_string(self) -> None:
+        name, next_off = dns_mini._read_name(b"\x00", 0)
+        self.assertEqual(name, "")
+        self.assertEqual(next_off, 1)
+
+    def test_offset_at_end_of_buffer_returns_empty_without_crash(self) -> None:
+        name, next_off = dns_mini._read_name(b"\x03www\x00", 5)
+        self.assertEqual(name, "")
+        self.assertEqual(next_off, 5)
+
+    def test_reserved_length_prefix_bits_are_read_as_a_literal_over_length_label(self) -> None:
+        # 0x40 has high bits 01 -- neither the 00 (plain label) nor 11 (pointer) forms
+        # RFC 1035 defines. _read_name has no explicit rejection for this reserved
+        # pattern; it's treated as a literal length byte. Pinning the current
+        # (permissive, non-crashing) behavior.
+        data = bytes([0x40]) + b"x" * 64 + b"\x00"
+        name, next_off = dns_mini._read_name(data, 0)
+        self.assertEqual(len(name), 64)
+        self.assertEqual(next_off, 66)
+
+
 if __name__ == "__main__":
     unittest.main()
