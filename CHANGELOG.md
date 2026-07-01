@@ -2,6 +2,48 @@
 
 Notable changes to GreyIQ.
 
+## v0.57.0
+
+### Program setup: HackerOne scope import (API + CSV) and a guided first-run flow
+Promotes "Program" to a first-class object with its own cockpit tab, so a bug-bounty
+program's scope, HackerOne handle, and SSRF/OOB posture are set up once and reused
+everywhere — the launch rail's active-program picker, the Operator tab's autonomous
+scheduling, and a program-specific SSRF setup shortcut.
+
+**New:**
+- **Program tab** (first in the cockpit nav): a structured-scope table (identifier,
+  asset type, eligibility, severity, instructions) editable by hand, imported from a
+  CSV/paste, or pulled live from HackerOne's own hacker API
+  (`GET /v1/hackers/programs/{handle}/structured_scopes`, reusing the API credentials
+  already saved for submission — the first read-only call in the engine to a fixed,
+  non-target host, gated to a single explicit button click).
+- **Active-program picker** on the launch rail: selecting a saved program autofills
+  Target/Scope for a hunt, instead of retyping scope every run.
+- **Program-specific SSRF/OOB setup**: a policy-gate reminder plus a one-click jump to
+  the Access-control tab's OOB/collaborator panel with scope pre-filled, and a checklist
+  of common SSRF injection points.
+- **Guided first-run wizard**: a 7-step tour that drives the real cockpit UI (not a
+  simulation), shown automatically on a clean install and reopenable via a
+  "🧭 Guide me" button in the top bar.
+- `docs/USER_GUIDE.md`: the first user-facing operator's guide — program setup, SSRF
+  setup, running a hunt, and reports/submission.
+
+**Fixed (found during an adversarial QA pass on the above before shipping):**
+- A real SSRF/credential-exfiltration path in the HackerOne import: pagination followed
+  the API's `links.next` with no host validation, and the default HTTP client silently
+  follows redirects while re-forwarding the Basic-auth token. Every fetched URL is now
+  pinned to `api.hackerone.com`, and redirects are refused rather than followed.
+- Editing a program's structured-scope table didn't propagate to the fields the scanner
+  and operator actually read (`scope_text`/`in_scope_hosts`/`out_of_scope_hosts`) —
+  removing a host silently left it still in scope, adding one silently left it never
+  hunted.
+- Editing a program via the Operator tab's compact form silently wiped the new
+  structured-scope table, `oob_allowed`, and notes back to empty.
+- A HackerOne CSV column-matching collision (`asset_type` shadowing `asset_identifier`
+  when listed first) that discarded every real hostname.
+
+853 tests green (+50).
+
 ## v0.56.0
 
 ### QAQC pass, part 4 — closing the test-coverage backlog
