@@ -2,6 +2,25 @@
 
 Notable changes to GreyIQ.
 
+## v0.60.0
+
+### Live campaign dashboard
+A running campaign no longer makes you wait for the whole run to finish — findings and
+per-target status now stream in and update automatically on a dedicated **Campaign**
+dashboard.
+
+- Starting a Full campaign opens the dashboard automatically. It shows an overall
+  progress bar (targets complete / total), stat tiles (findings, confirmed, critical/high,
+  medium, low), a per-target list with a live status dot (queued → running → done/error)
+  plus each target's finding count / top severity / elapsed, and a live findings list
+  (newest first, with severity, class, and proof status) — all refreshing as work
+  completes. A "View all findings" jump and the full activity log are there too.
+- Backend: the progress module now carries a structured per-run snapshot (work-unit status
+  + streamed findings + rolled-up stats) alongside the text log; campaigns emit it per
+  discovered URL (single-target) and per named target (program span, streamed from the
+  concurrent workers), and `/api/bounty/progress` returns it.
+- Themed and responsive (collapses to a single column on narrow windows).
+
 ## v0.59.0
 
 ### Sharper reports + a full UX/UI/robustness QAQC pass

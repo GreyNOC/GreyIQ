@@ -1391,7 +1391,9 @@ class GreyIQRuntime:
         return result
 
     def bounty_progress(self, run_id: str, after: int = 0) -> dict[str, Any]:
-        return {"ok": True, **bounty_progress.tail(run_id, after)}
+        # `snapshot` carries the structured campaign-dashboard state (per-target status +
+        # streamed findings + rolled-up stats); `events`/`count` remain the text log.
+        return {"ok": True, **bounty_progress.tail(run_id, after), "snapshot": bounty_progress.snapshot(run_id)}
 
     def run_campaign(self, request: "CampaignRequest") -> dict[str, Any]:
         # authorized passes straight through — campaign.run_campaign fails closed when
@@ -1431,6 +1433,7 @@ class GreyIQRuntime:
             disclose_automation=disclose_automation,
             excluded_hosts=excluded_hosts,
             on_progress=bounty_progress.sink(run_id) if run_id else None,
+            progress_run_id=run_id or None,
         )
         self._cache_bounty_run(result, target=request.target, scope=request.scope, program=request.program,
                                 program_id=str(program_obj.get("id")) if program_obj else None,
@@ -1474,6 +1477,7 @@ class GreyIQRuntime:
             disclose_automation=disclose_automation,
             excluded_hosts=excluded_hosts,
             on_progress=bounty_progress.sink(run_id) if run_id else None,
+            progress_run_id=run_id or None,
         )
         target_label = f"{program_label} — {len(targets)} in-scope target(s)"
         # program_id is the REAL portfolio id (program_label above is the display name,

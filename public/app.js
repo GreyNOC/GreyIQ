@@ -4312,6 +4312,7 @@ const ck = {
   status: document.querySelector("#ckStatus"),
   views: {
     program: document.querySelector("#ckViewProgram"),
+    campaign: document.querySelector("#ckViewCampaign"),
     findings: document.querySelector("#ckViewFindings"),
     surface: document.querySelector("#ckViewSurface"),
     submissions: document.querySelector("#ckViewSubmissions"),
@@ -4380,6 +4381,7 @@ function ckSetView(view) {
   for (const btn of ck.navButtons) btn.classList.toggle("is-active", btn.dataset.ckView === view);
   for (const [name, node] of Object.entries(ck.views)) node.hidden = name !== view;
   if (view === "program") void ckRenderProgram();
+  if (view === "campaign") ckRenderCampaign();
   if (view === "findings") ckRenderFindings();
   if (view === "learn") void ckRenderLearn();
   if (view === "surface") ckRenderSurface();
@@ -7002,7 +7004,16 @@ async function ckRun() {
       : "Hunting — running scanners and proving findings…"
   );
   const progressRunId = crypto.randomUUID();
-  ckStartLiveLog(progressRunId);
+  if (isCampaign) {
+    // A campaign opens its live dashboard (per-target status + streamed findings);
+    // a single hunt keeps the compact launch-rail activity log.
+    const dashLabel = spanning
+      ? ((ck.activeProgram?.selectedOptions?.[0]?.textContent || state.ckProgram || "Program").trim() + " — span scope")
+      : `Campaign · ${target}`;
+    ckStartCampaignDashboard(progressRunId, dashLabel);
+  } else {
+    ckStartLiveLog(progressRunId);
+  }
   try {
     let res;
     if (isCampaign) {
@@ -7047,14 +7058,21 @@ async function ckRun() {
       ckBumpTitleBadge(confirmed || ckState.findings.length);
       void ckNotify("GreyIQ — hunt complete", doneMsg);
     }
-    ckSetView("findings");
     ckRenderFindings();
+    // A campaign stays on its live dashboard (which shows the final summary); a single
+    // hunt jumps to the Findings board as before.
+    if (!isCampaign) ckSetView("findings");
+    else if (ckState.view === "campaign") ckRenderCampaign();
   } catch (err) {
     ckStatus(err.message || "The run failed.", true);
   } finally {
     ck.run.disabled = false;
-    ckStopLiveLog();
-    void ckPollLiveLog(progressRunId); // catch any trailing line(s) emitted right before the response returned
+    if (isCampaign) {
+      void ckFinishCampaignDashboard();  // stop polling, mark done, final render
+    } else {
+      ckStopLiveLog();
+      void ckPollLiveLog(progressRunId); // catch any trailing line(s) emitted right before the response returned
+    }
   }
 }
 
@@ -7093,6 +7111,172 @@ function ckStatus(text, isError) {
   if (!ck.status) return;
   ck.status.textContent = text;
   ck.status.classList.toggle("is-error", Boolean(isError));
+}
+
+// --- Campaign dashboard: a live, easy-to-scan view of a running campaign. Polls the
+// structured snapshot from /api/bounty/progress and renders overall progress, stat tiles,
+// per-target status, and findings as they stream in — updating automatically. ---
+const ckCampaign = { runId: "", poll: null, snapshot: null, events: [], eventCount: 0, done: false, label: "", startedAt: 0 };
+
+function ckStartCampaignDashboard(runId, label) {
+  if (ckCampaign.poll) { clearInterval(ckCampaign.poll); ckCampaign.poll = null; }
+  Object.assign(ckCampaign, { runId, label: label || "Campaign", snapshot: null, events: [], eventCount: 0, done: false, startedAt: Date.now() });
+  ckSetView("campaign");
+  void ckPollCampaign();
+  ckCampaign.poll = setInterval(() => { void ckPollCampaign(); }, 1200);
+}
+
+async function ckPollCampaign() {
+  if (!ckCampaign.runId) return;
+  let res = null;
+  try { res = await apiFetch("/api/bounty/progress", { method: "POST", timeoutMs: 6000, body: JSON.stringify({ run_id: ckCampaign.runId, after: ckCampaign.eventCount }) }); } catch (_) { return; }
+  if (!res || res.ok === false) return;
+  if ((res.events || []).length) {
+    ckCampaign.events.push(...res.events);
+    if (ckCampaign.events.length > 400) ckCampaign.events = ckCampaign.events.slice(-400);
+    ckCampaign.eventCount = res.count || (ckCampaign.eventCount + res.events.length);
+  }
+  if (res.snapshot) ckCampaign.snapshot = res.snapshot;
+  if (ckState.view === "campaign") ckRenderCampaign();
+}
+
+async function ckFinishCampaignDashboard() {
+  if (ckCampaign.poll) { clearInterval(ckCampaign.poll); ckCampaign.poll = null; }
+  ckCampaign.done = true;
+  await ckPollCampaign();  // one last poll to capture the final target/finding
+  if (ckState.view === "campaign") ckRenderCampaign();
+}
+
+function ckFmtElapsed(s) { const m = Math.floor(s / 60), sec = s % 60; return m ? `${m}m ${sec}s` : `${sec}s`; }
+
+function ckShortTarget(t) {
+  const s = String(t || "");
+  try { const u = new URL(s); return (u.host + (u.pathname === "/" ? "" : u.pathname)) || s; }
+  catch (_) { return s.length > 52 ? s.slice(0, 49) + "…" : s; }
+}
+
+function ckCdTile(value, label, cls) {
+  const tile = cel("div", `ck-cd-tile ${cls || ""}`.trim());
+  tile.append(cel("div", "ck-cd-tile-value", value), cel("div", "ck-cd-tile-label", label));
+  return tile;
+}
+
+function ckCdTargetRow(t) {
+  const status = String(t.status || "queued");
+  const row = cel("div", "ck-cd-target");
+  row.append(cel("span", `ck-cd-dot is-${status}`));
+  const main = cel("div", "ck-cd-target-main");
+  main.append(cel("div", "ck-cd-target-name", ckShortTarget(t.target)));
+  const meta = cel("div", "ck-cd-target-meta");
+  meta.append(cel("span", "ck-cd-target-status", status));
+  if (t.findings) meta.append(cel("span", null, `${t.findings} finding${t.findings === 1 ? "" : "s"}`));
+  if (t.top_severity) meta.append(cel("span", `ck-sev sev-${t.top_severity}`, t.top_severity));
+  if (t.elapsed_s != null && status === "done") meta.append(cel("span", null, `${t.elapsed_s}s`));
+  if (t.error) meta.append(cel("span", "ck-cd-err", String(t.error).slice(0, 70)));
+  main.append(meta);
+  row.append(main);
+  return row;
+}
+
+function ckCdFindingRow(f) {
+  const sev = f.severity || "info";
+  const row = cel("div", "ck-cd-finding");
+  row.append(cel("span", `ck-cd-sevpill sev-${sev}`, sev.slice(0, 4)));
+  const main = cel("div", "ck-cd-finding-main");
+  main.append(cel("div", "ck-cd-finding-title", f.title || "Finding"));
+  const meta = cel("div", "ck-cd-finding-meta");
+  if (f.cls) meta.append(cel("span", null, f.cls));
+  if (f.proof) meta.append(cel("span", `ck-cd-proof is-${f.proof}`, f.proof));
+  meta.append(cel("span", "ck-cd-finding-target", ckShortTarget(f.target)));
+  main.append(meta);
+  row.append(main);
+  return row;
+}
+
+function ckRenderCampaign() {
+  const host = ck.views.campaign;
+  if (!host) return;
+  host.replaceChildren();
+  host.append(cel("h2", "ck-section-title", "Campaign dashboard"));
+
+  if (!ckCampaign.runId) {
+    host.append(cel("p", "ck-hint",
+      "No campaign is running. Start a Full campaign from the launch rail — pick a saved program and tick “span scope” to hunt its whole scope, or enter a single target — and every target's status and each finding will appear here live."));
+    return;
+  }
+
+  const snap = ckCampaign.snapshot || { targets: [], findings: [], stats: {} };
+  const st = snap.stats || {};
+  const sev = st.severity_counts || {};
+  const running = !ckCampaign.done;
+
+  // Header: label + status pill + elapsed.
+  const head = cel("div", "ck-cd-head");
+  head.append(cel("div", "ck-cd-label", ckCampaign.label));
+  head.append(cel("span", `ck-cd-status ${running ? "is-running" : "is-done"}`, running ? "● Running" : "✓ Done"));
+  head.append(cel("span", "ck-cd-elapsed", ckFmtElapsed(Math.max(0, Math.round((Date.now() - ckCampaign.startedAt) / 1000)))));
+  host.append(head);
+
+  // Progress bar (targets complete / total).
+  const total = st.targets_total || 0, done = st.targets_done || 0;
+  const pct = total ? Math.round((done / total) * 100) : (running ? 6 : 100);
+  host.append(cel("p", "ck-cd-progress-label", total ? `${done} / ${total} target(s) complete` : (running ? "Mapping the surface…" : "Complete")));
+  const bar = cel("div", "ck-cd-progress");
+  const fill = cel("div", `ck-cd-progress-fill ${running ? "" : "is-done"}`.trim());
+  fill.style.width = pct + "%";
+  bar.append(fill);
+  host.append(bar);
+
+  // Stat tiles.
+  const tiles = cel("div", "ck-cd-tiles");
+  tiles.append(ckCdTile(String(st.findings_total || 0), "Findings"));
+  tiles.append(ckCdTile(String(st.confirmed_total || 0), "Confirmed", (st.confirmed_total || 0) ? "is-ok" : ""));
+  tiles.append(ckCdTile(String((sev.critical || 0) + (sev.high || 0)), "Critical / high", ((sev.critical || 0) + (sev.high || 0)) ? "is-hot" : ""));
+  tiles.append(ckCdTile(String(sev.medium || 0), "Medium"));
+  tiles.append(ckCdTile(String(sev.low || 0), "Low"));
+  host.append(tiles);
+
+  // Two columns: targets + live findings.
+  const cols = cel("div", "ck-cd-cols");
+
+  const tcol = cel("div", "ck-cd-col");
+  tcol.append(cel("h3", "ck-cd-subtitle", `Targets (${(snap.targets || []).length})`));
+  const tlist = cel("div", "ck-cd-targets");
+  if (!(snap.targets || []).length) tlist.append(cel("p", "ck-hint", running ? "Discovering targets…" : "No targets."));
+  for (const t of snap.targets || []) tlist.append(ckCdTargetRow(t));
+  tcol.append(tlist);
+  cols.append(tcol);
+
+  const fcount = (snap.findings || []).length;
+  const fcol = cel("div", "ck-cd-col");
+  fcol.append(cel("h3", "ck-cd-subtitle", `Findings so far (${fcount})`));
+  const flist = cel("div", "ck-cd-findings");
+  if (!fcount) flist.append(cel("p", "ck-hint", running ? "No findings yet — hunting…" : "No findings surfaced."));
+  for (const f of [...(snap.findings || [])].reverse().slice(0, 80)) flist.append(ckCdFindingRow(f));
+  fcol.append(flist);
+  cols.append(fcol);
+
+  host.append(cols);
+
+  if (fcount) {
+    const go = cel("button", "ck-btn", `View all ${fcount} finding${fcount === 1 ? "" : "s"} →`);
+    go.type = "button";
+    go.addEventListener("click", () => ckSetView("findings"));
+    host.append(go);
+  }
+
+  // Activity log.
+  host.append(cel("h3", "ck-cd-subtitle", "Activity"));
+  const log = cel("div", "ck-op-log ck-cd-log");
+  const recent = ckCampaign.events.slice(-120);
+  if (!recent.length) log.append(cel("p", "ck-hint", "Starting…"));
+  for (const ev of recent) {
+    const row = cel("div", "ck-op-event");
+    row.append(cel("span", "ck-op-time", (ev.at || "").slice(11, 19)), cel("span", null, ev.message || ""));
+    log.append(row);
+  }
+  host.append(log);
+  log.scrollTop = log.scrollHeight;
 }
 
 // --- Completion alerts: a hunt/campaign can run for minutes, and the autonomous

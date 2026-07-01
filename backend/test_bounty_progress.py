@@ -225,5 +225,51 @@ class RunCampaignProgressChainTests(unittest.TestCase):
         self.assertIn("running scanner(s)", joined, "the nested run_bounty_hunt's own checkpoints must surface too")
 
 
+class StructuredSnapshotTests(unittest.TestCase):
+    def test_snapshot_unknown_run_is_empty(self) -> None:
+        snap = progress.snapshot("nope-none")
+        self.assertEqual(snap["targets"], [])
+        self.assertEqual(snap["stats"]["targets_total"], 0)
+
+    def test_targets_findings_and_stats_rollup(self) -> None:
+        progress.start_run("snap-a")
+        progress.set_targets("snap-a", ["https://a.example", "https://b.example"])
+        progress.mark_target("snap-a", "https://a.example", "running")
+        progress.add_findings("snap-a", "https://a.example", [
+            {"ref": "F1", "title": "XSS", "severity": "high", "class_name": "XSS", "proof_status": "confirmed"},
+            {"ref": "F2", "title": "Missing CSP", "severity": "low", "class_name": "headers", "proof_status": "missing"},
+        ])
+        progress.mark_target("snap-a", "https://a.example", "done", elapsed_s=4.2)
+        progress.mark_target("snap-a", "https://b.example", "error", error="boom")
+        snap = progress.snapshot("snap-a")
+        a = next(t for t in snap["targets"] if t["target"].endswith("a.example"))
+        b = next(t for t in snap["targets"] if t["target"].endswith("b.example"))
+        self.assertEqual((a["status"], a["findings"], a["confirmed"], a["top_severity"], a["elapsed_s"]), ("done", 2, 1, "high", 4.2))
+        self.assertEqual((b["status"], b["error"]), ("error", "boom"))
+        self.assertEqual(snap["stats"], {
+            "targets_total": 2, "targets_done": 2, "findings_total": 2, "confirmed_total": 1,
+            "severity_counts": {"critical": 0, "high": 1, "medium": 0, "low": 1, "info": 0},
+        })
+        # Order preserved as registered.
+        self.assertEqual([t["target"] for t in snap["targets"]], ["https://a.example", "https://b.example"])
+
+    def test_set_targets_is_idempotent_and_findings_capped(self) -> None:
+        progress.start_run("snap-b")
+        progress.set_targets("snap-b", ["t1"])
+        progress.mark_target("snap-b", "t1", "running")
+        progress.set_targets("snap-b", ["t1", "t2"])  # re-registering t1 must not reset its status
+        self.assertEqual(next(t for t in progress.snapshot("snap-b")["targets"] if t["target"] == "t1")["status"], "running")
+        many = [{"ref": f"F{i}", "title": "x", "severity": "info", "proof_status": "missing"} for i in range(progress._MAX_FINDINGS_PER_RUN + 50)]
+        progress.add_findings("snap-b", "t1", many)
+        self.assertEqual(progress.snapshot("snap-b")["stats"]["findings_total"], progress._MAX_FINDINGS_PER_RUN)
+
+    def test_structured_helpers_before_start_run_are_noops(self) -> None:
+        # No start_run for this id — every structured helper must be a safe no-op.
+        progress.set_targets("ghost-run", ["x"])
+        progress.mark_target("ghost-run", "x", "running")
+        progress.add_findings("ghost-run", "x", [{"ref": "F1", "severity": "high"}])
+        self.assertEqual(progress.snapshot("ghost-run")["stats"]["targets_total"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

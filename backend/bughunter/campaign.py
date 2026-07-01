@@ -31,6 +31,7 @@ from bughunter import (
     fsutil,
     ledger,
     learning,
+    progress,
     ranking,
     recon,
     research,
@@ -102,9 +103,14 @@ def run_campaign(
     on_progress: Any = None,
     disclose_automation: bool = False,
     excluded_hosts: tuple[str, ...] = (),
+    progress_run_id: str | None = None,
 ) -> dict[str, Any]:
     """Run a full campaign. Returns {ok, campaign_path, json_path, urls_scanned,
-    finding_count, confirmed_count, submission_paths, ...} or {ok: False, error}."""
+    finding_count, confirmed_count, submission_paths, ...} or {ok: False, error}.
+
+    ``progress_run_id`` (set only when this is the TOP-level call — the span runner passes
+    None to its inner per-target campaigns) streams structured per-URL status + findings to
+    the live campaign dashboard via the ``progress`` module."""
     clean_target = str(target or "").strip()
     if not clean_target:
         return {"ok": False, "error": "No target provided."}
@@ -178,8 +184,11 @@ def run_campaign(
     per_target: list[dict[str, Any]] = []
     consolidated: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
+    # Register the discovered URLs as the dashboard's work units (top-level call only).
+    progress.set_targets(progress_run_id, urls)
     for index, url in enumerate(urls, 1):
         _emit(f"hunt {index}/{len(urls)}: {url}")
+        progress.mark_target(progress_run_id, url, "running")
         profile = "source-code" if kind in {"path", "git"} else "web-app"
         result = run_bounty_hunt(
             url, profile, None, str(out_root / "targets"), scope, True, coder_cfg,
@@ -190,8 +199,10 @@ def run_campaign(
         per_target.append({"target": url, "ok": result.get("ok", False),
                            "report_path": result.get("report_path", ""), "error": result.get("error", "")})
         if not result.get("ok"):
+            progress.mark_target(progress_run_id, url, "error", error=str(result.get("error") or ""))
             continue
         doc = _read_json(result.get("json_path", ""))
+        url_new: list[dict[str, Any]] = []  # findings first-seen at THIS url, for the live dashboard
         for finding in doc.get("findings") or []:
             # Dedup across targets by class + rule + normalized location.
             norm_loc = re.sub(r"\d+", "N", str(finding.get("location") or ""))
@@ -200,14 +211,19 @@ def run_campaign(
                 continue
             seen_keys.add(key)
             ref = str(finding.get("ref") or "")
+            proof_status = _proof_status(doc, ref)
             consolidated.append({
                 "finding": finding,
                 "source_url": url,
                 "source_report": result.get("report_path", ""),
                 "source_json": result.get("json_path", ""),
-                "proof_status": _proof_status(doc, ref),
+                "proof_status": proof_status,
                 "cvss": (doc.get("cvss") or {}).get(ref) or {},
             })
+            url_new.append({"ref": ref, "title": finding.get("title"), "severity": finding.get("severity"),
+                            "class_name": finding.get("class_name") or finding.get("class_id"), "proof_status": proof_status})
+        progress.add_findings(progress_run_id, url, url_new)
+        progress.mark_target(progress_run_id, url, "done")
 
     # --- Secrets mined from served JS (recon-sourced) — classify + dedup + add. ---
     for index, secret in enumerate(rec_js_secrets, 1):
@@ -481,6 +497,7 @@ def run_campaign_over_targets(
     max_targets: int = _MAX_PROGRAM_TARGETS,
     disclose_automation: bool = False,
     excluded_hosts: tuple[str, ...] = (),
+    progress_run_id: str | None = None,
 ) -> dict[str, Any]:
     """Run one full ``run_campaign`` per target (bounded, deduped, best-effort — one
     bad target never aborts the rest) and merge the results into a single combined
@@ -537,7 +554,10 @@ def run_campaign_over_targets(
             _emit(f"[{index}/{len(capped)} {target}] {msg}")
 
         _target_emit("starting…")
+        progress.mark_target(progress_run_id, target, "running")
         try:
+            # Inner run_campaign gets progress_run_id=None: for a SPAN, the dashboard's work
+            # units are the named targets (streamed here), not each target's discovered URLs.
             result = run_campaign(
                 target, scope=scope, authorized=authorized, coder_cfg=coder_cfg,
                 default_reports_dir=span_root, seed_dir=seed_dir, runtime_dir=runtime_dir,
@@ -545,8 +565,22 @@ def run_campaign_over_targets(
                 program=program, max_pages=max_pages, platform=platform, deep=deep,
                 disclose_automation=disclose_automation, on_progress=_target_emit, excluded_hosts=excluded_hosts,
             )
+            if result.get("ok"):
+                proof = result.get("proof_of_impact") or {}
+                fs = []
+                for f in result.get("findings") or []:
+                    ref = str(f.get("ref") or "")
+                    p = proof.get(ref)
+                    fs.append({"ref": ref, "title": f.get("title"), "severity": f.get("severity"),
+                               "class_name": f.get("class_name") or f.get("class_id"),
+                               "proof_status": str(p.get("status") or "") if isinstance(p, dict) else ""})
+                progress.add_findings(progress_run_id, target, fs)
+                progress.mark_target(progress_run_id, target, "done")
+            else:
+                progress.mark_target(progress_run_id, target, "error", error=str(result.get("error") or ""))
             return (target, result, None)
         except Exception as exc:  # noqa: BLE001 - one bad target must never abort the span
+            progress.mark_target(progress_run_id, target, "error", error=f"{type(exc).__name__}: {exc}")
             return (target, None, exc)
 
     # Bounded concurrency: targets run in parallel (each on its own OS thread, exactly
@@ -555,6 +589,7 @@ def run_campaign_over_targets(
     # numbering and per_target ordering stay fully deterministic regardless of which
     # target happens to finish first -- concurrency changes only the WALL-CLOCK time,
     # never the shape of the combined result.
+    progress.set_targets(progress_run_id, capped)  # register the named targets as the dashboard's work units
     _emit(f"campaign span: hunting {len(capped)} target(s), up to {min(_SPAN_MAX_WORKERS, len(capped))} at a time…")
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(_SPAN_MAX_WORKERS, len(capped))) as executor:
         futures = [executor.submit(_hunt_one, i, t) for i, t in enumerate(capped, 1)]
