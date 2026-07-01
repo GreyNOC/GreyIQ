@@ -2,6 +2,26 @@
 
 Notable changes to GreyIQ.
 
+## v0.57.1
+
+### Fixed: CSV identifier column shadowed by asset_type
+Reported live right after v0.57.0 shipped: pasting a real HackerOne scope export
+(`identifier,asset_type,...` columns) into the Program tab's importer with kind=`csv`
+produced "Nothing parsed" — the bare `"asset"` column hint matched `asset_type` (an enum
+column, never a dotted host) before the real `identifier` column was ever considered, the
+same collision class already fixed for the HackerOne-specific parser in v0.57.0.
+
+- `_pick_column` (the generic CSV parser) now prefers an exact header match over a
+  substring one, and `"identifier"` is now a recognized column hint.
+- `kind="auto"` now recognizes a HackerOne-shaped header and routes to the richer
+  structured-scope parser automatically instead of flattening it to a bare host list —
+  an explicit kind selection is never overridden.
+- The Program tab's importer no longer dead-ends when a plain CSV/Burp/HAR parse
+  succeeds but carries no structured scope — it now synthesizes bare-identifier rows so
+  the "Add" button always appears when there's something to add.
+
+858 tests green (+5).
+
 ## v0.57.0
 
 ### Program setup: HackerOne scope import (API + CSV) and a guided first-run flow
