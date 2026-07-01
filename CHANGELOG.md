@@ -2,6 +2,28 @@
 
 Notable changes to GreyIQ.
 
+## v0.57.3
+
+### Full campaign: span a program's entire scope, not just one Target
+Reported live: previously a campaign only ever crawled from the single Target field,
+discovering in-scope hosts opportunistically via links — a program's dozens of named
+assets (seed targets, or a HackerOne-imported structured scope) were never actually
+hunted unless linked from that one starting page.
+
+- A "Hunt this program's entire scope (N targets)" toggle on Full campaign, shown once
+  a program with more than one derivable target is selected, defaulting on. Runs one
+  full campaign per in-scope target (from seed targets, or every eligible row in the
+  program's structured scope — HackerOne-imported wildcards are stripped to a concrete
+  apex) and merges them into one findings board.
+- The autonomous operator now derives targets the same way, so a HackerOne-imported
+  program (no hand-typed seed targets) is no longer silently skipped by scheduled runs.
+- **Fixed a real folder-collision bug** surfaced while building this: two campaigns for
+  the same program within the same second produced the identical output folder name and
+  silently clobbered each other's on-disk artifacts. Closed for the existing
+  single-target and operator paths too, not just the new span mode.
+
+879 tests green (+11). Live-verified end-to-end against a real 2-seed-target program.
+
 ## v0.57.2
 
 ### Fixed: launch-rail Program picker not updating on Operator-tab changes
