@@ -2,6 +2,20 @@
 
 Notable changes to GreyIQ.
 
+## v0.57.2
+
+### Fixed: launch-rail Program picker not updating on Operator-tab changes
+Reported live: adding, editing, enabling/disabling, or deleting a program from the
+**Operator** tab never refreshed the launch rail's `#ckActiveProgram` picker — only the
+**Program** tab's own save/render did, even though both tabs edit the same saved-program
+list. A program changed via Operator stayed invisible in the picker until the user
+happened to revisit the Program tab.
+
+- All 5 program-mutation call sites (create/edit + enable/disable toggle + delete, from
+  either tab) now refresh the picker immediately through one shared helper.
+- Deleting the currently-selected active program (from either tab) now correctly clears
+  the selection instead of leaving a dangling reference.
+
 ## v0.57.1
 
 ### Fixed: CSV identifier column shadowed by asset_type
