@@ -27,6 +27,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from bughunter import active_verify_service as av  # noqa: E402
+from bughunter import web_ingest  # noqa: E402
 from bughunter.rate_limit import HostRateGovernor  # noqa: E402
 from bughunter.settings import get_settings  # noqa: E402
 
@@ -1020,6 +1021,58 @@ class OpenBucketE2ETests(unittest.TestCase):
         f = av._check_open_bucket(self._http(), landing, "evil-rebind.s3.amazonaws.com", get_settings())
         self.assertIsNone(f, "a bucket host resolving to a private IP must be refused, not reported")
         self.assertEqual(_BucketHandler.hits, 0, "the guard must block before any socket reaches the listener")
+
+    def test_true_dns_rebinding_the_guard_passes_then_dns_changes_is_still_pinned(self) -> None:
+        # This is the scenario test_private_resolving_bucket_is_refused_when_private_urls_off
+        # (above) CANNOT exercise: that test's shim returns the SAME answer for every call,
+        # so it only proves the guard works when DNS is consistent. Here the underlying
+        # resolver (web_ingest._real_getaddrinfo -- the fallback _pinned_getaddrinfo calls
+        # when nothing is pinned yet) answers DIFFERENTLY on the second lookup for the exact
+        # same hostname -- exactly what a real DNS-rebinding attacker does between the
+        # guard's check and the real HTTP connect a moment later. socket.getaddrinfo itself
+        # is left as _pinned_getaddrinfo throughout (never replaced) -- deliberately NOT using
+        # self._serve() here, since that helper replaces socket.getaddrinfo with a lambda that
+        # collapses EVERY hostname to "127.0.0.1" before _pinned_getaddrinfo ever sees the
+        # original hostname, which would defeat the pin-matching this test exercises. So this
+        # exercises the REAL production code path end to end: without the fix, _Http.fetch's
+        # real connect would re-resolve and reach the SECOND (attacker) answer instead of the
+        # one the guard actually validated.
+        _BucketHandler.status = 200
+        _BucketHandler.body = (b'<?xml version="1.0"?><ListBucketResult>'
+                               b'<Contents><Key>x</Key></Contents></ListBucketResult>')
+        _BucketHandler.hits = 0
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _BucketHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        real_port = self.server.server_port
+        calls = {"n": 0}
+        orig_real = web_ingest._real_getaddrinfo
+
+        def rebinding_resolver(host, p, *a, **k):
+            calls["n"] += 1
+            # First lookup (the guard's _host_is_private check, made through
+            # socket.getaddrinfo == _pinned_getaddrinfo, which falls through to this
+            # function since nothing is pinned yet): the real, expected server.
+            # Every lookup after that: a different port with NOTHING listening -- if
+            # the real HTTP connect re-resolved independently (the pre-fix behavior,
+            # i.e. if _pinned_getaddrinfo's pin didn't match), it would try to reach
+            # this dead port instead and the fetch would fail, never reaching
+            # _BucketHandler at all.
+            target_port = real_port if calls["n"] == 1 else 1
+            return orig_real("127.0.0.1", target_port, *a, **k)
+
+        web_ingest._real_getaddrinfo = rebinding_resolver
+        try:
+            bucket = "http://rebind-test.s3.amazonaws.com/"
+            landing = {"body": f'<img src="{bucket}p.png">', "status": 200, "headers": {}}
+            f = av._check_open_bucket(self._http(), landing, "rebind-test.s3.amazonaws.com", get_settings())
+        finally:
+            web_ingest._real_getaddrinfo = orig_real
+            with web_ingest._dns_pin_lock:
+                web_ingest._dns_pins.clear()
+        self.assertIsNotNone(f, "the pinned (first, guard-validated) resolution must be what the real connect uses")
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertEqual(_BucketHandler.hits, 1, "the real connect must reach the SAME server the guard validated")
+        self.assertGreaterEqual(calls["n"], 1)
 
     def test_operator_session_never_leaks_to_a_foreign_bucket(self) -> None:
         # The CRITICAL invariant: an authenticated scan binds the operator's cookie to

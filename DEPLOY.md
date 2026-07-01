@@ -38,6 +38,15 @@ Important local defaults:
 - `GREYIQ_ALLOWED_ORIGINS` allows a separate trusted frontend origin.
 - `GREYIQ_RUNTIME_DIR` controls local runtime data location.
 - `GREYIQ_CODE_SCAN_BASE_PATH` and `GREYIQ_SCAN_ALLOW_PRIVATE_URLS` control BugHunter scan scope.
+- `GREYIQ_ACCESS_KEY` — **required before exposing the backend beyond `127.0.0.1`/`localhost`** (see
+  [Reverse Proxy](#reverse-proxy) below). The backend's own per-session token is generated for
+  same-machine use only and is embedded in the page it serves; it is not a substitute for real
+  authentication once the process can be reached by anyone. Setting `GREYIQ_ACCESS_KEY` requires
+  every request (via HTTP Basic Auth — any username, the key as the password) before the backend
+  serves anything, including the home page. If `GREYIQ_HOST` is set to anything other than
+  `127.0.0.1`/`::1`/`localhost` and this is unset, the backend refuses to start (set
+  `GREYIQ_ALLOW_INSECURE_PUBLIC_BIND=1` only if you already have an equivalent auth layer in front
+  of it and accept the risk).
 
 GreyIQ provider keys are configured through the app UI. Do not place real API
 keys or tokens in `.env.example`.
@@ -94,13 +103,32 @@ specific Python executable.
 
 ## Reverse Proxy
 
+**Do not expose the Python backend on a public domain without an authentication layer in
+front of it.** The backend's own per-session token exists only to stop *other local
+processes* on the same machine from driving the API — it is generated once per process
+and is embedded, in plain text, in the home page it serves. Once the backend (or anything
+that proxies to it) is reachable from the internet, that page — and the token in it — is
+reachable by anyone, and the token can then be replayed against every `/api/*` route
+(including endpoints that read/write files and make outbound requests). Set
+`GREYIQ_ACCESS_KEY` (see [Environment Variables](#environment-variables)) **before** putting
+GreyIQ on a public domain; the backend refuses to start on a non-loopback `GREYIQ_HOST`
+without it. Nginx's own `auth_basic` (below) is a good *additional* layer but is not a
+substitute — `GREYIQ_HOST` normally stays `127.0.0.1` in this setup (Nginx does the public
+listening), so GreyIQ's own startup check can't detect a reverse proxy exposing it; the
+`GREYIQ_ACCESS_KEY` check runs per-request inside the backend itself and protects it
+regardless of what's in front of it.
+
 The Python backend serves both the UI and API, so a public Nginx site usually
-proxies to `127.0.0.1:8766`. Replace `example.com` with your real domain.
+proxies to `127.0.0.1:8766`. Replace `example.com` with your real domain, and
+generate `/etc/nginx/.htpasswd` with `sudo htpasswd -c /etc/nginx/.htpasswd <user>`.
 
 ```nginx
 server {
     listen 80;
     server_name example.com;
+
+    auth_basic "GreyIQ";
+    auth_basic_user_file /etc/nginx/.htpasswd;
 
     location / {
         proxy_pass http://127.0.0.1:8766;

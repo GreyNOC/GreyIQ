@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import ipaddress
 import re
 import socket
+import threading
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Final
@@ -151,72 +153,74 @@ def normalize_website_url(url: str) -> str:
 def fetch_website_text(url: str) -> FetchedWebsite:
     settings = get_settings()
     normalized_url = normalize_website_url(url)
-    sanitized_url = _enforce_url_policy(normalized_url, settings.allow_private_urls)
 
-    request = Request(
-        sanitized_url,
-        headers={
-            "Accept": "text/html,text/plain,application/xhtml+xml;q=0.9,*/*;q=0.5",
-            # Refuse compressed responses so a tiny gzipped payload cannot expand
-            # past the configured byte cap during decoding.
-            "Accept-Encoding": "identity",
-            "User-Agent": "GreyNOC-Slop-Detection/0.1",
-        },
-        method="GET",
-    )
+    request_headers = {
+        "Accept": "text/html,text/plain,application/xhtml+xml;q=0.9,*/*;q=0.5",
+        # Refuse compressed responses so a tiny gzipped payload cannot expand
+        # past the configured byte cap during decoding.
+        "Accept-Encoding": "identity",
+        "User-Agent": "GreyNOC-Slop-Detection/0.1",
+    }
     redirect_handler = SafeRedirectHandler(settings.allow_private_urls)
     opener = build_opener(redirect_handler)
 
-    try:
-        with opener.open(request, timeout=settings.web_fetch_timeout_seconds) as response:
-            final_url = response.geturl()
-            # Validate the post-redirect URL one last time before consuming the
-            # response body — defence in depth against any redirect we missed.
-            _enforce_url_policy(final_url, settings.allow_private_urls)
+    # guarded_dns_scope() covers the ENTIRE guarded fetch (initial URL through
+    # every redirect hop the handler follows) so the DNS pin _enforce_url_policy
+    # installs for each hop's hostname is guaranteed to still be in effect when
+    # the real connection to that hop is made a moment later.
+    with guarded_dns_scope():
+        sanitized_url = _enforce_url_policy(normalized_url, settings.allow_private_urls)
+        request = Request(sanitized_url, headers=request_headers, method="GET")
+        try:
+            with opener.open(request, timeout=settings.web_fetch_timeout_seconds) as response:
+                final_url = response.geturl()
+                # Validate the post-redirect URL one last time before consuming the
+                # response body — defence in depth against any redirect we missed.
+                _enforce_url_policy(final_url, settings.allow_private_urls)
 
-            content_type = response.headers.get_content_type()
-            if content_type not in TEXT_CONTENT_TYPES:
-                raise WebsiteFetchError(f"Unsupported content type: {content_type}")
+                content_type = response.headers.get_content_type()
+                if content_type not in TEXT_CONTENT_TYPES:
+                    raise WebsiteFetchError(f"Unsupported content type: {content_type}")
 
-            content_encoding = (response.headers.get("Content-Encoding") or "").strip().lower()
-            if content_encoding and content_encoding not in ALLOWED_CONTENT_ENCODINGS:
-                raise WebsiteFetchError(
-                    f"Unsupported content encoding: {content_encoding}"
-                )
-
-            announced_length = response.headers.get("Content-Length")
-            if announced_length is not None:
-                try:
-                    announced = int(announced_length)
-                except ValueError as error:
-                    raise WebsiteFetchError("Server returned an invalid Content-Length.") from error
-                if announced > settings.web_fetch_max_bytes:
+                content_encoding = (response.headers.get("Content-Encoding") or "").strip().lower()
+                if content_encoding and content_encoding not in ALLOWED_CONTENT_ENCODINGS:
                     raise WebsiteFetchError(
-                        "Website response exceeded the configured analysis limit."
+                        f"Unsupported content encoding: {content_encoding}"
                     )
 
-            charset = response.headers.get_content_charset() or "utf-8"
-            raw = response.read(settings.web_fetch_max_bytes + 1)
-            if len(raw) > settings.web_fetch_max_bytes:
-                raise WebsiteFetchError("Website response exceeded the configured analysis limit.")
+                announced_length = response.headers.get("Content-Length")
+                if announced_length is not None:
+                    try:
+                        announced = int(announced_length)
+                    except ValueError as error:
+                        raise WebsiteFetchError("Server returned an invalid Content-Length.") from error
+                    if announced > settings.web_fetch_max_bytes:
+                        raise WebsiteFetchError(
+                            "Website response exceeded the configured analysis limit."
+                        )
 
-            try:
-                body = raw.decode(charset, errors="replace")
-            except LookupError as error:
-                # Unknown charset names land here; fall back to utf-8 to keep
-                # the analysis useful instead of aborting the whole request.
-                body = raw.decode("utf-8", errors="replace")
-                del error
-            status_code = response.status
-    except WebsiteFetchError:
-        raise
-    except HTTPError as error:
-        raise WebsiteFetchError(f"Website returned HTTP {error.code}.") from error
-    except URLError as error:
-        reason = getattr(error, "reason", error)
-        raise WebsiteFetchError(f"Could not fetch website: {reason}") from error
-    except TimeoutError as error:
-        raise WebsiteFetchError("Website fetch timed out.") from error
+                charset = response.headers.get_content_charset() or "utf-8"
+                raw = response.read(settings.web_fetch_max_bytes + 1)
+                if len(raw) > settings.web_fetch_max_bytes:
+                    raise WebsiteFetchError("Website response exceeded the configured analysis limit.")
+
+                try:
+                    body = raw.decode(charset, errors="replace")
+                except LookupError as error:
+                    # Unknown charset names land here; fall back to utf-8 to keep
+                    # the analysis useful instead of aborting the whole request.
+                    body = raw.decode("utf-8", errors="replace")
+                    del error
+                status_code = response.status
+        except WebsiteFetchError:
+            raise
+        except HTTPError as error:
+            raise WebsiteFetchError(f"Website returned HTTP {error.code}.") from error
+        except URLError as error:
+            reason = getattr(error, "reason", error)
+            raise WebsiteFetchError(f"Could not fetch website: {reason}") from error
+        except TimeoutError as error:
+            raise WebsiteFetchError("Website fetch timed out.") from error
 
     meta_description: str | None = None
     open_graph_title: str | None = None
@@ -318,18 +322,79 @@ def _ascii_hostname(hostname: str) -> str:
         raise WebsiteFetchError("URL host is invalid or contains unsupported characters.") from error
 
 
+# --- DNS-rebinding TOCTOU mitigation -------------------------------------------
+# _host_is_private() resolves a hostname purely to decide pass/fail. Without this,
+# the actual HTTP connection made afterwards (urllib -> http.client -> socket.
+# create_connection) performs its OWN, completely independent getaddrinfo() call at
+# connect time -- so an attacker's authoritative DNS server can answer with a public
+# IP for the guard's lookup and a private/cloud-metadata IP moments later for the
+# real connection, defeating the guard entirely (classic check-then-connect / DNS
+# rebinding). Every caller here (web_ingest, web_scan_service, active_verify_service
+# all share this one function) resolves through it, so pinning HERE closes the gap
+# everywhere at once, with no custom socket/connection class needed in each module.
+#
+# Mechanism: the module installs ONE process-wide wrapper around socket.getaddrinfo.
+# _host_is_private() records its OWN resolution as "the pinned answer for hostname X
+# on thread N"; the wrapper serves that exact answer back to any nested getaddrinfo()
+# call for the SAME hostname on the SAME thread (which is exactly what the real HTTP
+# connect step performs a few lines later) instead of re-resolving DNS. Any lookup
+# for a different host, or on a thread with no active pin, passes straight through
+# to the real resolver untouched -- this only affects the narrow window of a single
+# guarded fetch. guarded_dns_scope() wraps one logical request (all its redirect
+# hops included) and guarantees the pin is cleared afterward either way.
+_real_getaddrinfo = socket.getaddrinfo
+_dns_pin_lock = threading.Lock()
+_dns_pins: dict[int, tuple[str, list[tuple]]] = {}
+
+
+def _pinned_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):  # noqa: A002 - matches socket.getaddrinfo's own signature
+    if isinstance(host, str):
+        with _dns_pin_lock:
+            pin = _dns_pins.get(threading.get_ident())
+        if pin is not None and host.strip().lower() == pin[0]:
+            return pin[1]
+    return _real_getaddrinfo(host, port, family, type, proto, flags)
+
+
+socket.getaddrinfo = _pinned_getaddrinfo
+
+
+@contextlib.contextmanager
+def guarded_dns_scope():
+    """Wrap ONE logical outbound request (including any redirect hops) so every
+    _host_is_private() call inside it pins its resolution for the current thread —
+    and the pin is always cleared afterward, success or failure. Every fetch helper
+    that calls _host_is_private()/_guard_url() and then opens the connection must
+    run inside this context manager for the pin to actually protect anything."""
+    ident = threading.get_ident()
+    try:
+        yield
+    finally:
+        with _dns_pin_lock:
+            _dns_pins.pop(ident, None)
+
+
 def _host_is_private(hostname: str) -> bool:
     try:
         addresses = [ipaddress.ip_address(hostname)]
     except ValueError:
         try:
+            # Call socket.getaddrinfo (the dynamic module attribute, NOT the frozen
+            # _real_getaddrinfo) so this still goes through whatever resolver is
+            # currently installed -- our own _pinned_getaddrinfo wrapper in normal
+            # operation, but also any test's own getaddrinfo monkeypatch. Calling
+            # _real_getaddrinfo directly here would silently bypass such a shim,
+            # since it was captured once at import time before any patch (ours or a
+            # test's) is ever installed.
             results = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
         except socket.gaierror as error:
             raise WebsiteFetchError(f"Could not resolve host: {hostname}") from error
-        addresses = []
-        for result in results:
-            sockaddr = result[4]
-            addresses.append(ipaddress.ip_address(sockaddr[0]))
+        addresses = [ipaddress.ip_address(result[4][0]) for result in results]
+        # Pin THIS exact resolution for the current thread so the real HTTP connect
+        # that follows (inside the same guarded_dns_scope) is guaranteed to see the
+        # identical answer instead of re-resolving DNS independently.
+        with _dns_pin_lock:
+            _dns_pins[threading.get_ident()] = (hostname.strip().lower(), results)
 
     return any(_address_is_private(address) for address in addresses)
 

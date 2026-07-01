@@ -515,12 +515,24 @@ def _safe_slug(value: str, fallback: str = "target") -> str:
 
 
 def _resolve_output_dir(output_dir: str | None, default_reports_dir: Path) -> Path:
+    """Resolve the reports output directory. A caller-supplied ``output_dir`` may
+    point anywhere on disk (a local, single-operator "choose my own output folder"
+    feature — the same posture ``workspace.resolve_workspace()`` already takes for
+    the coding-agent's workspace root), but unlike a bare default it may NOT conjure
+    a brand-new, multi-level directory tree at an arbitrary path: the target itself
+    may be freshly created, but its PARENT must already exist. This still supports
+    "put my reports in a new subfolder of somewhere I already have" while closing
+    off using this as a write-anywhere-including-never-existed-before-paths
+    primitive (e.g. a startup/scheduled-task directory that doesn't exist yet).
+    Falls back to ``default_reports_dir`` for anything else."""
     if output_dir and str(output_dir).strip():
-        target = Path(str(output_dir).strip()).expanduser()
+        target = Path(str(output_dir).strip()).expanduser().resolve()
+        if not target.is_dir() and not target.parent.is_dir():
+            target = Path(default_reports_dir).resolve()
     else:
-        target = Path(default_reports_dir)
-    target.mkdir(parents=True, exist_ok=True)
-    return target.resolve()
+        target = Path(default_reports_dir).resolve()
+    target.mkdir(parents=False, exist_ok=True)
+    return target
 
 
 def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: int, run_live: bool, auth: AuthContext | None = None) -> tuple[list[dict[str, Any]], list[str], dict[str, Any], str, float]:

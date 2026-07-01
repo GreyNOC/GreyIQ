@@ -31,10 +31,22 @@ def main() -> None:
 
     import uvicorn  # noqa: E402 - server-only deps, imported lazily so CLI mode stays light
 
-    from greyiq_api import app  # noqa: E402
+    from greyiq_api import GREYIQ_ACCESS_KEY, _is_loopback_bind, app  # noqa: E402
 
     host = os.getenv("GREYIQ_HOST", "127.0.0.1")
     port = int(os.getenv("GREYIQ_PORT", os.getenv("PORT", "8766")))
+    # Same fail-closed check as greyiq_api.main() -- this frozen entry point has its
+    # OWN uvicorn.run() call (it can't reuse that one; see the module docstring), so
+    # the guard has to be duplicated here too or a packaged/frozen deployment could
+    # be exposed beyond loopback without it.
+    if not _is_loopback_bind(host) and not GREYIQ_ACCESS_KEY and os.getenv("GREYIQ_ALLOW_INSECURE_PUBLIC_BIND", "").strip() != "1":
+        print(
+            f"Refusing to start: GREYIQ_HOST={host!r} is not loopback-only, but no GREYIQ_ACCESS_KEY is set.\n"
+            "Set GREYIQ_ACCESS_KEY to a strong secret before exposing this server, or set "
+            "GREYIQ_ALLOW_INSECURE_PUBLIC_BIND=1 if you already have an equivalent auth layer in front of it.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     # Pass the app instance (not an import string) so this works inside a frozen
     # bundle where re-importing "backend.greyiq_api" is not possible.
     uvicorn.run(

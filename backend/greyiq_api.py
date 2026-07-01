@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import functools
 import hashlib
 import hmac
@@ -61,9 +63,52 @@ MAX_REQUEST_BYTES = int(os.getenv("GREYIQ_MAX_REQUEST_BYTES", str(16 * 1024 * 10
 # every /api/* call. This blocks *other local processes* from driving the API
 # over 127.0.0.1 — the Origin check alone can't, since a non-browser client can
 # omit Origin. Explicitly allowlisted cross-origin frontends are exempt.
+#
+# IMPORTANT: this token is NOT real authentication once the server is reachable
+# beyond loopback. It is embedded in the unauthenticated index page (send_index)
+# and the unauthenticated static-file fallback, both served before any /api/*
+# gate ever runs — by design, since the app's own JS needs it before it can make
+# its first authenticated call. Anyone who can send ONE unauthenticated GET to
+# this process (trivial once it's bound beyond 127.0.0.1, e.g. behind a bare
+# reverse proxy) can read the token and replay it against every /api/* route.
+# GREYIQ_ACCESS_KEY (below) is the actual credential for that scenario.
 SESSION_TOKEN = secrets.token_urlsafe(32)
 SESSION_TOKEN_PLACEHOLDER = "__GREYIQ_SESSION_TOKEN__"
 SESSION_TOKEN_PATH = RUNTIME_DIR / "session.token"
+
+# Optional operator-configured shared secret for deployments reachable beyond
+# 127.0.0.1/localhost (e.g. behind a reverse proxy on a public domain — see
+# DEPLOY.md). Unset by default, which preserves today's local/Electron behavior
+# exactly (no extra prompt, nothing changes for the single-user desktop case).
+# When set, EVERY request — including the unauthenticated index page that
+# embeds SESSION_TOKEN — must present it via HTTP Basic Auth before anything
+# else is served, closing the gap where SESSION_TOKEN could be harvested
+# without ever presenting a real credential.
+GREYIQ_ACCESS_KEY = os.getenv("GREYIQ_ACCESS_KEY", "").strip()
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _is_loopback_bind(host: str) -> bool:
+    return str(host or "").strip().lower() in _LOOPBACK_HOSTS
+
+
+def _access_key_authorized(scope: dict[str, Any] | None) -> bool:
+    """True when no GREYIQ_ACCESS_KEY is configured (the default — nothing changes
+    for local/Electron use), or the request presents it via HTTP Basic Auth (any
+    username, password == the key). This is the FIRST gate route_http checks, ahead
+    of the session-token/origin logic, so it also protects send_index/send_file —
+    the very responses that hand out SESSION_TOKEN."""
+    if not GREYIQ_ACCESS_KEY:
+        return True
+    header = _header(scope, "authorization")
+    if not header.lower().startswith("basic "):
+        return False
+    try:
+        decoded = base64.b64decode(header[6:].strip(), validate=True).decode("utf-8")
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return False
+    _, _, password = decoded.partition(":")
+    return hmac.compare_digest(password, GREYIQ_ACCESS_KEY)
 
 # API keys live here (owner-only perms), separate from the general plaintext
 # config, instead of inside solin_runtime_config.json.
@@ -175,6 +220,24 @@ def _migrate_coder_secrets() -> None:
             moved = True
     if moved:
         write_json(runtime_path, payload)
+
+
+_CODE_ROUTER_SECRET_KEY = "code_router.remote_api_key"
+
+
+def _migrate_code_router_secret() -> None:
+    """One-time: same as _migrate_coder_secrets, but for code_router.remote_api_key
+    (backend/bughunter/triage.py's remote-triage feature) -- this field lived in the
+    plaintext, non-owner-restricted solin_runtime_config.json with no equivalent split
+    step, unlike every coder.<provider>.api_key."""
+    runtime_path = RUNTIME_DIR / "solin_runtime_config.json"
+    payload = read_json(runtime_path, {})
+    router_cfg = payload.get("code_router") if isinstance(payload, dict) else None
+    if not isinstance(router_cfg, dict) or not router_cfg.get("remote_api_key"):
+        return
+    _store_secret(_CODE_ROUTER_SECRET_KEY, str(router_cfg["remote_api_key"]))
+    router_cfg["remote_api_key"] = ""
+    write_json(runtime_path, payload)
 
 
 def _session_authorized(scope: dict[str, Any] | None) -> bool:
@@ -968,7 +1031,14 @@ class GreyIQRuntime:
     def _code_router_config(self) -> dict[str, Any]:
         payload = read_json(RUNTIME_DIR / "solin_runtime_config.json", {})
         config = payload.get("code_router") if isinstance(payload, dict) else None
-        return config if isinstance(config, dict) else {}
+        config = dict(config) if isinstance(config, dict) else {}
+        # remote_api_key is migrated out of the plaintext file on boot (see
+        # _migrate_code_router_secret); overlay it back from the perms-restricted
+        # secrets store here, mirroring _merge_coder_secrets' pattern for coder.*.
+        stored_key = _load_secrets().get(_CODE_ROUTER_SECRET_KEY)
+        if stored_key:
+            config["remote_api_key"] = stored_key
+        return config
 
     def _coder_config(self) -> dict[str, Any]:
         payload = read_json(RUNTIME_DIR / "solin_runtime_config.json", {})
@@ -2485,6 +2555,7 @@ def ensure_runtime() -> None:
     (RUNTIME_DIR / "data").mkdir(parents=True, exist_ok=True)
     _write_session_token()
     _migrate_coder_secrets()
+    _migrate_code_router_secret()
     for name in SEED_FILES:
         src = SEED_DIR / name
         dst = RUNTIME_DIR / name
@@ -2659,7 +2730,11 @@ runtime = GreyIQRuntime()
 
 
 def health() -> dict[str, Any]:
-    return {"status": "ok", "app": APP_NAME, "version": VERSION}
+    """/api/health is the one /api/* path exempt from the session-token gate (it's
+    the liveness check Electron polls before a session even exists), so it must never
+    reveal more than a bare liveness signal to an unauthenticated caller — no app name
+    or version string for a scanner to fingerprint."""
+    return {"status": "ok"}
 
 
 def toolkit_catalog() -> dict[str, Any]:
@@ -2900,7 +2975,7 @@ async def send_json(send: Any, payload: Any, status_code: int = 200) -> None:
 
 async def send_file(send: Any, path: Path, status_code: int = 200) -> None:
     try:
-        body = path.read_bytes()
+        body = await asyncio.to_thread(path.read_bytes)
     except OSError:
         await send_json(send, {"error": "not found"}, 404)
         return
@@ -2919,7 +2994,7 @@ async def send_index(send: Any) -> None:
     """Serve index.html with the per-session token injected into its <meta> tag, so
     the same-origin app can authenticate its /api/* calls."""
     try:
-        html = (PUBLIC_DIR / "index.html").read_text(encoding="utf-8")
+        html = await asyncio.to_thread((PUBLIC_DIR / "index.html").read_text, encoding="utf-8")
     except OSError:
         await send_json(send, {"error": "not found"}, 404)
         return
@@ -2945,10 +3020,28 @@ async def send_empty(send: Any, status_code: int = 204) -> None:
     await send({"type": "http.response.body", "body": b""})
 
 
+async def send_unauthorized(send: Any) -> None:
+    """401 challenge for the GREYIQ_ACCESS_KEY gate — a browser hitting this shows its
+    native Basic Auth prompt, same UX as the reverse-proxy auth_basic pattern operators
+    already know from DEPLOY.md."""
+    body = json.dumps({"error": "authentication required"}).encode("utf-8")
+    headers = response_headers("application/json; charset=utf-8", len(body))
+    headers.append((b"www-authenticate", b'Basic realm="GreyIQ"'))
+    await send({"type": "http.response.start", "status": 401, "headers": headers})
+    await send({"type": "http.response.body", "body": body})
+
+
 async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
     _CURRENT_SCOPE.set(scope)
     method = str(scope.get("method") or "GET").upper()
     path = str(scope.get("path") or "/")
+
+    # Access-key gate runs before EVERYTHING else, including the unauthenticated index
+    # page and static-file fallback that embed/precede SESSION_TOKEN — a no-op when
+    # GREYIQ_ACCESS_KEY isn't set (the default local/Electron case).
+    if not _access_key_authorized(scope):
+        await send_unauthorized(send)
+        return
 
     if method == "OPTIONS":
         if not _request_origin_allowed(scope):
@@ -3341,6 +3434,19 @@ app = GreyIQASGI()
 def main() -> None:
     host = os.getenv("GREYIQ_HOST", "127.0.0.1")
     port = int(os.getenv("GREYIQ_PORT", os.getenv("PORT", "8766")))
+    if not _is_loopback_bind(host) and not GREYIQ_ACCESS_KEY and os.getenv("GREYIQ_ALLOW_INSECURE_PUBLIC_BIND", "").strip() != "1":
+        print(
+            f"Refusing to start: GREYIQ_HOST={host!r} is not loopback-only, but no GREYIQ_ACCESS_KEY is set.\n"
+            "Binding this API beyond 127.0.0.1/localhost without a real access credential lets anyone who can "
+            "reach it read the per-session token from the unauthenticated home page and replay it against every "
+            "/api/* route (including workspace file read/write and outbound scan requests) -- the token was only "
+            "ever designed to stop other local processes, not a remote client.\n"
+            "Set GREYIQ_ACCESS_KEY to a strong secret before exposing this server, or set "
+            "GREYIQ_ALLOW_INSECURE_PUBLIC_BIND=1 if you already have an equivalent auth layer in front of it "
+            "(e.g. a reverse proxy doing its own authentication) and accept the risk.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     uvicorn.run(
         "backend.greyiq_api:app",
         host=host,

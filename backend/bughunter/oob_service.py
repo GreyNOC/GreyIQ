@@ -52,7 +52,7 @@ from bughunter.active_verify_service import (
 )
 from bughunter.rate_limit import HostRateGovernor
 from bughunter.settings import get_settings
-from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
+from bughunter.web_ingest import WebsiteFetchError, guarded_dns_scope, normalize_website_url
 from bughunter.web_scan_service import _USER_AGENT, _guard_url
 
 
@@ -416,7 +416,17 @@ def confirm_blind_xxe(
             return {"ok": False, "error": pre.get("error", "collaborator poll failed")}
         if pre.get("count"):
             return {"ok": False, "error": "the collaborator token already has hits before the probe — mint a fresh one and retry."}
-        post = _post_xml(sanitized, payloads["classic"], timeout=settings.web_fetch_timeout_seconds)
+        # Re-validate + pin the DNS resolution IMMEDIATELY before the real POST (rather
+        # than relying on the guard check higher up, which happened before the
+        # collaborator round-trips above) so an attacker-controlled DNS server can't
+        # rebind the target hostname to a private/metadata IP in the gap between the
+        # guard and the actual connection. See web_ingest.guarded_dns_scope().
+        with guarded_dns_scope():
+            try:
+                _guard_url(sanitized, settings.allow_private_urls, settings.web_allowed_ports)
+            except WebsiteFetchError as exc:
+                return {"ok": False, "error": f"target refused by the URL guard: {exc}"}
+            post = _post_xml(sanitized, payloads["classic"], timeout=settings.web_fetch_timeout_seconds)
         if not post.get("ok"):
             return {"ok": True, "status": "send-failed", "token": token, "payloads": payloads, "error": post.get("error")}
         poll_errors: list[str] = []
