@@ -15,6 +15,7 @@ on top. Frozen-safe; the only network is the engine's own guarded scanners.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import UTC, datetime
@@ -35,8 +36,10 @@ from bughunter import (
 )
 from bughunter.bounty import _classify, _infer_kind, _safe_slug, run_bounty_hunt
 from bughunter.settings import get_settings
+from bughunter.target_ingest import _normalize_one
 
 _SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+_MAX_PROGRAM_TARGETS = 25  # a "span the whole program" campaign is N full campaigns -- bound it
 
 
 def _read_json(path: str) -> dict[str, Any]:
@@ -111,7 +114,13 @@ def run_campaign(
                 pass
 
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    out_root = Path(default_reports_dir) / f"campaign-{_safe_slug(prog_key)}-{stamp}"
+    # A short hash of the FULL (untruncated) target, not just its slug, so two targets
+    # whose _safe_slug output shares a long common prefix (e.g. similarly-pathed local
+    # source folders, or a "span this program's whole scope" run hunting several targets
+    # inside the same second) can never collide onto the same output folder and silently
+    # clobber each other's on-disk artifacts.
+    target_fp = hashlib.sha1(clean_target.encode("utf-8", "replace")).hexdigest()[:8]
+    out_root = Path(default_reports_dir) / f"campaign-{_safe_slug(prog_key)}-{stamp}-{target_fp}"
     out_root.mkdir(parents=True, exist_ok=True)
 
     # --- Surface mapping (URL targets) → the list of targets to hunt. ---
@@ -367,6 +376,231 @@ def run_campaign(
         "severity_counts": _severity_counts([item["finding"] for item in consolidated]),
         "risk": _campaign_risk(consolidated),
     }
+
+
+def _representative_host(identifier: str) -> str:
+    """Best-effort concrete, fetchable URL for a structured-scope identifier — strips a
+    leading wildcard (``*.tiktok.com`` -> ``tiktok.com``) so a wildcard scope entry still
+    seeds a real crawl from its apex. Non-host identifiers (app-store IDs, free-text
+    asset labels like "Other Asset (Campaigns)") fall through ``_normalize_one``'s
+    dotted-host requirement and return "" — they aren't web targets, so a "span the
+    program's scope" campaign silently skips them as SEEDS (they still gate scope
+    normally; they're just never something to point a crawler at)."""
+    token = (identifier or "").strip().lstrip("*").lstrip(".")
+    return _normalize_one(token)
+
+
+def program_campaign_targets(program: dict[str, Any], max_targets: int = _MAX_PROGRAM_TARGETS) -> list[str]:
+    """The list of concrete URLs a "hunt this program's whole scope" campaign should
+    run. Prefers ``seed_targets`` (an operator's own hand-curated hunt list) when
+    present; otherwise derives one representative, deduped target per ELIGIBLE
+    ``structured_scope`` entry (a HackerOne API/CSV-imported program), so a program
+    built purely from an imported scope table still has something to hunt. Bounded —
+    this feeds directly into a real active-probing pipeline, never an unbounded fan-out."""
+    seeds = [str(t).strip() for t in (program.get("seed_targets") or []) if str(t or "").strip()]
+    if seeds:
+        return list(dict.fromkeys(seeds))[:max_targets]
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in program.get("structured_scope") or []:
+        if not isinstance(entry, dict) or not entry.get("eligible_for_submission", True):
+            continue
+        url = _representative_host(str(entry.get("identifier") or ""))
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
+        if len(out) >= max_targets:
+            break
+    return out
+
+
+def run_campaign_over_targets(
+    targets: list[str],
+    *,
+    scope: str,
+    authorized: bool,
+    coder_cfg: dict[str, Any] | None,
+    default_reports_dir: Path,
+    seed_dir: Path | None = None,
+    runtime_dir: Path | None = None,
+    version: str = "",
+    active: bool = False,
+    time_based: bool = False,
+    auth: dict[str, Any] | None = None,
+    live: bool = False,
+    program: str | None = None,
+    max_pages: int = 12,
+    platform: str = "hackerone",
+    deep: bool = False,
+    on_progress: Any = None,
+    max_targets: int = _MAX_PROGRAM_TARGETS,
+) -> dict[str, Any]:
+    """Run one full ``run_campaign`` per target (bounded, deduped, best-effort — one
+    bad target never aborts the rest) and merge the results into a single combined
+    payload SHAPED LIKE a single campaign's return value, so the cockpit's Findings
+    board renders a "span the whole program" hunt exactly like a single-target one.
+    Reuses ``run_campaign`` verbatim per target — no change to its internals, so every
+    existing safety property (fail-closed scope, GET-only defaults, opt-in active
+    probing) applies identically to each target."""
+    clean_targets = list(dict.fromkeys(str(t).strip() for t in targets if str(t or "").strip()))
+    capped = clean_targets[:max_targets]
+    if not capped:
+        return {"ok": False, "error": "No huntable targets found for this program's scope."}
+    if not authorized:
+        return {"ok": False, "error": "Confirm you're authorized and in scope before running a campaign."}
+
+    def _emit(msg: str) -> None:
+        if callable(on_progress):
+            try:
+                on_progress(msg)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # One wrapping folder for the whole span; each per-target run_campaign() call nests
+    # its OWN campaign-<slug>-<stamp> folder inside it (run_campaign builds that path
+    # itself from whatever default_reports_dir it's given) -- so the existing "download
+    # everything" bundler (which zips a folder recursively) picks up every target's full
+    # artifacts for free, and a SPAN index below ties them together.
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    # Same collision guard as run_campaign's own out_root: two spans of the same program
+    # within the same second (e.g. a quick re-click) must never land on the same folder.
+    span_fp = hashlib.sha1("\n".join(capped).encode("utf-8", "replace")).hexdigest()[:8]
+    span_root = Path(default_reports_dir) / f"span-{_safe_slug(program or 'program')}-{stamp}-{span_fp}"
+    span_root.mkdir(parents=True, exist_ok=True)
+
+    per_target: list[dict[str, Any]] = []
+    findings_out: list[dict[str, Any]] = []
+    proof_out: dict[str, Any] = {}
+    cvss_out: dict[str, Any] = {}
+    plans_out: dict[str, Any] = {}
+    submission_paths: list[str] = []
+    surface_urls: list[str] = []
+    surface_notes: list[str] = []
+    surface_tech: list[str] = []
+    surface_sources: dict[str, int] = {}
+    errors: list[str] = []
+    ref_counter = 0
+    ok_count = 0
+
+    for index, target in enumerate(capped, 1):
+        _emit(f"campaign {index}/{len(capped)}: {target}")
+        try:
+            result = run_campaign(
+                target, scope=scope, authorized=authorized, coder_cfg=coder_cfg,
+                default_reports_dir=span_root, seed_dir=seed_dir, runtime_dir=runtime_dir,
+                version=version, active=active, time_based=time_based, auth=auth, live=live,
+                program=program, max_pages=max_pages, platform=platform, deep=deep,
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad target must never abort the span
+            errors.append(f"{target}: {type(exc).__name__}: {exc}")
+            per_target.append({"target": target, "ok": False, "campaign_path": "", "error": str(exc)})
+            continue
+        per_target.append({
+            "target": target, "ok": bool(result.get("ok")),
+            "campaign_path": result.get("campaign_path", ""), "error": result.get("error", ""),
+        })
+        if not result.get("ok"):
+            errors.append(f"{target}: {result.get('error', 'campaign failed')}")
+            continue
+        ok_count += 1
+        proof = result.get("proof_of_impact") or {}
+        cvss = result.get("cvss") or {}
+        plans = result.get("attack_plans") or {}
+        for finding in result.get("findings") or []:
+            old_ref = str(finding.get("ref") or "")
+            ref_counter += 1
+            new_ref = f"C{ref_counter}"
+            finding = {**finding, "ref": new_ref}
+            findings_out.append(finding)
+            if old_ref in proof:
+                proof_out[new_ref] = proof[old_ref]
+            if old_ref in cvss:
+                cvss_out[new_ref] = cvss[old_ref]
+            if old_ref in plans:
+                plans_out[new_ref] = plans[old_ref]
+        submission_paths.extend(result.get("submission_paths") or [])
+        surf = result.get("surface") or {}
+        surface_urls.extend(surf.get("urls") or [])
+        surface_notes.extend(surf.get("notes") or [])
+        for tech in surf.get("tech") or []:
+            if tech not in surface_tech:
+                surface_tech.append(tech)
+        for source, count in (surf.get("sources") or {}).items():
+            surface_sources[source] = surface_sources.get(source, 0) + (count or 0)
+
+    if not ok_count:
+        return {"ok": False, "error": "Every target in this program's scope failed: " + "; ".join(errors[:5])}
+    if len(clean_targets) > len(capped):
+        errors.insert(0, f"Capped to the first {max_targets} of {len(clean_targets)} in-scope targets.")
+
+    confirmed_count = len([f for f in findings_out if (proof_out.get(f["ref"], {}) or {}).get("status") == "confirmed"])
+    span_ctx = {
+        "program": program or "", "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
+        "version": version, "scope": scope, "targets_total": len(clean_targets), "targets_hunted": ok_count,
+        "per_target": per_target, "errors": errors, "finding_count": len(findings_out), "confirmed_count": confirmed_count,
+        "submission_count": len(submission_paths),
+    }
+    span_md_path = span_root / "SPAN.md"
+    span_json_path = span_root / "span.json"
+    fsutil.write_text_safe(span_md_path, _render_span_markdown(span_ctx))
+    fsutil.write_text_safe(span_json_path, json.dumps(span_ctx, indent=2, default=str))
+
+    return {
+        "ok": True,
+        "program": program or "",
+        "campaign_path": str(span_md_path),
+        "json_path": str(span_json_path),
+        "output_dir": str(span_root),
+        "targets_total": len(clean_targets),
+        "targets_hunted": ok_count,
+        "per_target": per_target,
+        "errors": errors,
+        "urls_scanned": ok_count,
+        "urls_discovered": len(surface_urls),
+        "finding_count": len(findings_out),
+        "confirmed_count": confirmed_count,
+        "submission_paths": submission_paths,
+        "findings": findings_out,
+        "proof_of_impact": proof_out,
+        "cvss": cvss_out,
+        "attack_plans": plans_out,
+        "surface": {"urls": surface_urls, "sources": surface_sources, "notes": surface_notes, "tech": surface_tech},
+        "severity_counts": _severity_counts(findings_out),
+        "risk": _campaign_risk([{"finding": f} for f in findings_out]),
+    }
+
+
+def _render_span_markdown(ctx: dict[str, Any]) -> str:
+    """A top-level index for a "span the whole program" run — points at each target's
+    own full CAMPAIGN.md (written by run_campaign) for the complete per-target detail;
+    this file is just the roll-up + navigation."""
+    out: list[str] = []
+    out.append(f"# Program Campaign — {ctx['program']}\n")
+    out.append("| | |")
+    out.append("|---|---|")
+    out.append(f"| **Targets hunted** | {ctx['targets_hunted']} of {ctx['targets_total']} in-scope target(s) |")
+    out.append(f"| **Findings** | {ctx['finding_count']} consolidated · **{ctx['confirmed_count']} actively confirmed** |")
+    out.append(f"| **Submission packages** | {ctx['submission_count']} |")
+    out.append(f"| **Generated** | {ctx['generated_at']} · GreyIQ v{ctx['version']} |")
+    out.append("")
+    out.append("## Authorization & scope\n")
+    out.append("> Authorized testing only. " + (ctx.get("scope") or "(scope not provided)"))
+    out.append("")
+    if ctx.get("errors"):
+        out.append("## Notes\n")
+        for note in ctx["errors"]:
+            out.append(f"- {note}")
+        out.append("")
+    out.append("## Targets\n")
+    out.append("Each target ran its own full campaign — open its `CAMPAIGN.md` for the complete detail "
+               "(surface map, per-finding evidence, ready-to-submit packages). This index only rolls them up.\n")
+    for t in ctx["per_target"]:
+        status = t["campaign_path"] if t["ok"] else f"FAILED — {t['error']}"
+        out.append(f"- `{t['target']}` → {status}")
+    out.append("")
+    out.append("---")
+    out.append(f"_GreyIQ BugHunter — one campaign per in-scope target, this program's whole scope in one run._")
+    return "\n".join(out)
 
 
 def _ctx_from_doc(doc: dict[str, Any]) -> dict[str, Any]:

@@ -33,7 +33,7 @@ from collections import deque
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
-from bughunter import ledger, portfolio
+from bughunter import campaign, ledger, portfolio
 
 
 def _emit(on_event: Callable[[str], None] | None, message: str) -> None:
@@ -61,7 +61,10 @@ def run_program_cycle(
     ``submit_fn(run_id, ref) -> {ok, report_id, url} | {ok: False, error}`` is the
     runtime's hard-gated submit; None => review-only (never submits)."""
     pid = program["id"]
-    targets = program.get("seed_targets") or []
+    # Prefers hand-typed seed_targets; falls back to deriving one target per eligible
+    # structured_scope entry (a HackerOne API/CSV-imported program) so a program built
+    # purely from an imported scope table still gets hunted, not silently skipped.
+    targets = campaign.program_campaign_targets(program)
     summary = {"program": pid, "targets_run": 0, "findings": 0, "confirmed": 0, "submitted": 0, "errors": []}
     auto = bool(submit_fn) and bool(program.get("auto_submit"))
     budget = _remaining_submit_budget(runtime_dir, program) if auto else 0

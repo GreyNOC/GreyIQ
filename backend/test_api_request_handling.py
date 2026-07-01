@@ -240,6 +240,84 @@ class ImportScopeRouteTests(unittest.TestCase):
         self.assertEqual(cap.status, 404)
 
 
+class CampaignProgramIdTests(unittest.TestCase):
+    """POST /api/bounty/campaign with program_id -- "span this program's whole scope"
+    mode. Drives the real route (CampaignRequest validation, program lookup, target
+    derivation) with bounty_campaign.run_campaign_over_targets mocked out (its own real
+    behavior is covered end-to-end by test_campaign.py)."""
+
+    def setUp(self) -> None:
+        self.rt = g.runtime
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_runtime_dir = g.RUNTIME_DIR
+        g.RUNTIME_DIR = Path(self._tmp.name)
+        self._orig_span = g.bounty_campaign.run_campaign_over_targets
+        self._orig_single = g.bounty_campaign.run_campaign
+
+    def tearDown(self) -> None:
+        g.RUNTIME_DIR = self._orig_runtime_dir
+        g.bounty_campaign.run_campaign_over_targets = self._orig_span
+        g.bounty_campaign.run_campaign = self._orig_single
+        self._tmp.cleanup()
+
+    def _seed_program(self, **kw):
+        record = {"name": "Acme", "scope_text": "*.acme.com",
+                  "structured_scope": [{"identifier": "a.acme.com", "eligible_for_submission": True},
+                                        {"identifier": "b.acme.com", "eligible_for_submission": True}]}
+        record.update(kw)
+        return g.bounty_portfolio.upsert_program(g.RUNTIME_DIR, record)
+
+    def test_spans_every_derived_target(self) -> None:
+        program = self._seed_program()
+        calls = []
+
+        def fake_span(targets, *, scope, program, **kw):
+            calls.append((tuple(targets), scope, program))
+            return {"ok": True, "targets_total": len(targets), "targets_hunted": len(targets),
+                    "findings": [], "proof_of_impact": {}, "cvss": {}, "attack_plans": {},
+                    "surface": {"urls": [], "sources": {}, "notes": [], "tech": []},
+                    "severity_counts": {}, "risk": "clean", "per_target": [], "errors": [],
+                    "submission_paths": [], "finding_count": 0, "confirmed_count": 0}
+        g.bounty_campaign.run_campaign_over_targets = fake_span
+
+        cap = _run_post_route("/api/bounty/campaign", {"program_id": program["id"], "authorized": True})
+        self.assertEqual(cap.status, 200)
+        data = json.loads(cap.body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(len(calls), 1)
+        targets, scope, program_label = calls[0]
+        self.assertEqual(set(targets), {"https://a.acme.com", "https://b.acme.com"})
+        self.assertEqual(scope, "*.acme.com")   # the program's OWN scope_text, not a client-sent one
+        self.assertEqual(program_label, "Acme")
+
+    def test_unknown_program_id_is_a_clean_error_not_500(self) -> None:
+        cap = _run_post_route("/api/bounty/campaign", {"program_id": "does-not-exist", "authorized": True})
+        self.assertEqual(cap.status, 200)
+        data = json.loads(cap.body)
+        self.assertFalse(data["ok"])
+        self.assertIn("not found", data["error"].lower())
+
+    def test_program_with_no_huntable_targets_is_a_clean_error(self) -> None:
+        program = self._seed_program(structured_scope=[])
+        cap = _run_post_route("/api/bounty/campaign", {"program_id": program["id"], "authorized": True})
+        data = json.loads(cap.body)
+        self.assertFalse(data["ok"])
+        self.assertIn("no huntable targets", data["error"].lower())
+
+    def test_program_id_absent_falls_back_to_single_target_unchanged(self) -> None:
+        calls = []
+        g.bounty_campaign.run_campaign = lambda target, **kw: (calls.append(target), {"ok": True, "findings": []})[1]
+        cap = _run_post_route("/api/bounty/campaign", {"target": "https://solo.example.com", "authorized": True})
+        self.assertEqual(cap.status, 200)
+        self.assertEqual(calls, ["https://solo.example.com"])
+
+    def test_no_target_and_no_program_id_is_a_clean_error(self) -> None:
+        cap = _run_post_route("/api/bounty/campaign", {"authorized": True})
+        data = json.loads(cap.body)
+        self.assertFalse(data["ok"])
+        self.assertIn("no target", data["error"].lower())
+
+
 class ConcurrentRunMutationTests(unittest.TestCase):
     """Two /api/* calls against the SAME run_id+ref (e.g. screenshot + research) run on
     different asyncio.to_thread worker threads and mutate the same cached finding/run

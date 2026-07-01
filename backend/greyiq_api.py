@@ -521,10 +521,11 @@ class BountyScanRequest(BaseModel):
 
 
 class CampaignRequest(BaseModel):
-    target: str = Field(min_length=1, max_length=4000)
+    target: str = Field(default="", max_length=4000)   # required UNLESS program_id is set (then targets are derived from the saved program)
     scope: str = Field(default="", max_length=2000)
     authorized: bool = False
     program: str | None = Field(default=None, max_length=200)
+    program_id: str | None = Field(default=None, max_length=120)  # "span this program's whole scope" mode
     active: bool = False
     time_based: bool = False
     auth_cookie: str = Field(default="", max_length=8000)
@@ -1272,6 +1273,10 @@ class GreyIQRuntime:
     def run_campaign(self, request: "CampaignRequest") -> dict[str, Any]:
         # authorized passes straight through — campaign.run_campaign fails closed when
         # it is False, exactly like the CLI. No default-True anywhere.
+        if request.program_id:
+            return self._run_program_campaign(request)
+        if not request.target.strip():
+            return {"ok": False, "error": "No target provided."}
         result = bounty_campaign.run_campaign(
             request.target,
             scope=request.scope,
@@ -1290,6 +1295,42 @@ class GreyIQRuntime:
             deep=request.deep,
         )
         self._cache_bounty_run(result, target=request.target, scope=request.scope, program=request.program)
+        return result
+
+    def _run_program_campaign(self, request: "CampaignRequest") -> dict[str, Any]:
+        """"Span the whole program's scope" mode: resolve the saved program, derive its
+        huntable target list (bughunter.campaign.program_campaign_targets — seed_targets,
+        else eligible structured_scope entries), and run one full campaign per target,
+        merged into a single combined result. The program's OWN scope_text is
+        authoritative (not whatever free text happens to be in the request) so the span
+        can never drift from the scope the operator actually saved for this program."""
+        program = bounty_portfolio.get_program(RUNTIME_DIR, request.program_id)
+        if not program:
+            return {"ok": False, "error": "Program not found — it may have been deleted."}
+        targets = bounty_campaign.program_campaign_targets(program)
+        if not targets:
+            return {"ok": False, "error": "This program has no huntable targets — add seed targets, or import/build its structured scope, in the Program tab."}
+        scope = str(program.get("scope_text") or "").strip() or request.scope
+        program_label = str(program.get("name") or program.get("id") or request.program_id)
+        result = bounty_campaign.run_campaign_over_targets(
+            targets,
+            scope=scope,
+            authorized=request.authorized,
+            coder_cfg=self._coder_config(),
+            default_reports_dir=RUNTIME_DIR / "reports",
+            seed_dir=SEED_DIR,
+            runtime_dir=RUNTIME_DIR,
+            version=VERSION,
+            active=request.active,
+            time_based=request.time_based,
+            auth={"cookie": request.auth_cookie, "headers": request.auth_headers},
+            live=request.live,
+            program=program_label,
+            max_pages=request.max_pages,
+            deep=request.deep,
+        )
+        target_label = f"{program_label} — {len(targets)} in-scope target(s)"
+        self._cache_bounty_run(result, target=target_label, scope=scope, program=program_label)
         return result
 
     # ---- After-testing / submission workflow -------------------------------------

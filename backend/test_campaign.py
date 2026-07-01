@@ -250,5 +250,164 @@ class ReadyToSubmitRenderingTests(unittest.TestCase):
         self.assertNotIn("already reported", ready_section)
 
 
+class ProgramCampaignTargetsTests(unittest.TestCase):
+    """program_campaign_targets -- the "span this program's whole scope" target list.
+    Prefers hand-typed seed_targets; falls back to deriving one target per eligible
+    structured_scope entry so a HackerOne-imported program (no seed_targets) still has
+    something to hunt."""
+
+    def test_prefers_seed_targets_over_structured_scope(self) -> None:
+        program = {
+            "seed_targets": ["https://a.example.com", "https://a.example.com", "https://b.example.com"],
+            "structured_scope": [{"identifier": "c.example.com", "eligible_for_submission": True}],
+        }
+        self.assertEqual(campaign.program_campaign_targets(program), ["https://a.example.com", "https://b.example.com"])
+
+    def test_falls_back_to_structured_scope_when_no_seed_targets(self) -> None:
+        program = {"structured_scope": [
+            {"identifier": "a.example.com", "eligible_for_submission": True},
+            {"identifier": "b.example.com", "eligible_for_submission": True},
+        ]}
+        self.assertEqual(campaign.program_campaign_targets(program), ["https://a.example.com", "https://b.example.com"])
+
+    def test_excludes_ineligible_entries(self) -> None:
+        program = {"structured_scope": [
+            {"identifier": "in.example.com", "eligible_for_submission": True},
+            {"identifier": "out.example.com", "eligible_for_submission": False},
+        ]}
+        self.assertEqual(campaign.program_campaign_targets(program), ["https://in.example.com"])
+
+    def test_strips_wildcard_to_a_concrete_apex(self) -> None:
+        # A real HackerOne export uses *.tiktok.com-style wildcards; "*" itself isn't
+        # a fetchable host, so a wildcard entry should still seed the bare apex.
+        program = {"structured_scope": [{"identifier": "*.example.com", "eligible_for_submission": True}]}
+        self.assertEqual(campaign.program_campaign_targets(program), ["https://example.com"])
+
+    def test_excludes_non_host_identifiers(self) -> None:
+        # Real HackerOne scope shapes: an Apple Store numeric id (no dots -> not a host),
+        # an Android package (has dots -> normalizes fine), and a free-text asset label.
+        program = {"structured_scope": [
+            {"identifier": "835599320", "eligible_for_submission": True},
+            {"identifier": "com.acme.app", "eligible_for_submission": True},
+            {"identifier": "Other Asset (Campaigns)", "eligible_for_submission": True},
+        ]}
+        self.assertEqual(campaign.program_campaign_targets(program), ["https://com.acme.app"])
+
+    def test_dedupes_across_structured_scope_entries(self) -> None:
+        program = {"structured_scope": [
+            {"identifier": "a.example.com", "eligible_for_submission": True},
+            {"identifier": "a.example.com", "eligible_for_submission": True},
+        ]}
+        self.assertEqual(campaign.program_campaign_targets(program), ["https://a.example.com"])
+
+    def test_capped_at_max_targets(self) -> None:
+        program = {"structured_scope": [
+            {"identifier": f"h{i}.example.com", "eligible_for_submission": True} for i in range(30)
+        ]}
+        self.assertEqual(len(campaign.program_campaign_targets(program, max_targets=5)), 5)
+
+    def test_empty_program_returns_empty_list(self) -> None:
+        self.assertEqual(campaign.program_campaign_targets({}), [])
+
+
+class RunCampaignOverTargetsTests(unittest.TestCase):
+    """run_campaign_over_targets -- one full campaign per target, merged. Offline: uses
+    local source-folder targets (kind=path), matching CampaignTests' no-network style,
+    so the merge/loop logic itself is under test, not recon/network."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.src_a = self.root / "src_a"
+        self.src_a.mkdir()
+        (self.src_a / "app.py").write_text(_VULN_SRC, encoding="utf-8")
+        self.src_b = self.root / "src_b"
+        self.src_b.mkdir()
+        (self.src_b / "app.py").write_text(_VULN_SRC, encoding="utf-8")
+        self.reports = self.root / "reports"
+        self.runtime = self.root / "runtime"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _run(self, targets, **kw):
+        return campaign.run_campaign_over_targets(
+            targets, scope="demo scope", authorized=True, coder_cfg={},
+            default_reports_dir=self.reports, seed_dir=BACKEND_DIR / "seed",
+            runtime_dir=self.runtime, version="9.9.9", program="demo-program", **kw,
+        )
+
+    def test_requires_authorization(self) -> None:
+        result = campaign.run_campaign_over_targets(
+            [str(self.src_a)], scope="", authorized=False, coder_cfg={},
+            default_reports_dir=self.reports, runtime_dir=self.runtime, version="9.9.9",
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("authorized", result["error"].lower())
+
+    def test_no_targets_is_a_clean_error(self) -> None:
+        result = self._run([])
+        self.assertFalse(result["ok"])
+        self.assertIn("no huntable targets", result["error"].lower())
+
+    def test_merges_findings_across_targets_with_unique_refs(self) -> None:
+        # Derive the expected per-target count from a real single-target scan of the
+        # SAME fixture, rather than hardcode a magic number that would silently go
+        # stale if the detection rules' finding count for _VULN_SRC ever changes.
+        single = campaign.run_campaign(
+            str(self.src_a), scope="demo scope", authorized=True, coder_cfg={},
+            default_reports_dir=self.reports, seed_dir=BACKEND_DIR / "seed",
+            runtime_dir=self.runtime, version="9.9.9", program="baseline",
+        )
+        per_target_count = single["finding_count"]
+        self.assertGreaterEqual(per_target_count, 2)  # cmd-injection + secret, at minimum
+
+        result = self._run([str(self.src_a), str(self.src_b)])
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["targets_total"], 2)
+        self.assertEqual(result["targets_hunted"], 2)
+        self.assertEqual(result["finding_count"], per_target_count * 2)
+        refs = [f["ref"] for f in result["findings"]]
+        self.assertEqual(len(refs), len(set(refs)))
+        self.assertTrue(all(r.startswith("C") for r in refs))
+        for f in result["findings"]:
+            self.assertIn(f["ref"], result["proof_of_impact"])
+
+    def test_dedupes_identical_targets(self) -> None:
+        result = self._run([str(self.src_a), str(self.src_a)])
+        self.assertEqual(result["targets_total"], 1)
+
+    def test_writes_a_span_index_and_a_bundleable_output_dir(self) -> None:
+        result = self._run([str(self.src_a), str(self.src_b)])
+        self.assertTrue(Path(result["campaign_path"]).is_file())
+        self.assertTrue(Path(result["json_path"]).is_file())
+        out_dir = Path(result["output_dir"])
+        self.assertTrue(out_dir.is_dir())
+        # each target's own full campaign folder nests inside the span root, so the
+        # existing recursive-zip bundler picks up every target's artifacts for free.
+        subfolders = [p for p in out_dir.iterdir() if p.is_dir()]
+        self.assertEqual(len(subfolders), 2)
+
+    def test_one_bad_target_does_not_abort_the_rest(self) -> None:
+        # A non-existent local path is NOT itself a run_campaign failure (the underlying
+        # scanner just finds nothing to scan and reports ok:True/0 findings) -- use a
+        # target string _infer_kind genuinely can't classify (unknown kind -> ok:False).
+        unclassifiable = "not a real target at all"
+        result = self._run([str(self.src_a), unclassifiable])
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["targets_hunted"], 1)
+        self.assertEqual(len(result["errors"]), 1)
+
+    def test_all_targets_failing_is_a_clean_error_not_ok_true(self) -> None:
+        result = self._run(["not a real target at all", "also not a real target"])
+        self.assertFalse(result["ok"])
+
+    def test_capped_at_max_targets_and_discloses_the_cap(self) -> None:
+        result = self._run([str(self.src_a), str(self.src_b)], max_targets=1)
+        self.assertEqual(result["targets_total"], 2)
+        self.assertEqual(result["targets_hunted"], 1)
+        self.assertTrue(any("capped" in e.lower() for e in result["errors"]))
+
+
 if __name__ == "__main__":
     unittest.main()

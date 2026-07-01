@@ -4276,6 +4276,9 @@ const ck = {
   segHunt: document.querySelector("#ckRunHunt"),
   segCampaign: document.querySelector("#ckRunCampaign"),
   activeProgram: document.querySelector("#ckActiveProgram"),
+  spanScopeWrap: document.querySelector("#ckSpanScopeWrap"),
+  spanScope: document.querySelector("#ckSpanScope"),
+  spanScopeCount: document.querySelector("#ckSpanScopeCount"),
   target: document.querySelector("#ckTarget"),
   scope: document.querySelector("#ckScope"),
   profile: document.querySelector("#ckProfile"),
@@ -4380,6 +4383,7 @@ function ckSetRunType(type) {
     node.hidden = node.dataset.ckWhen !== state.ckRunType;
   }
   if (ck.run) ck.run.textContent = state.ckRunType === "campaign" ? "Run campaign" : "Run hunt";
+  ckUpdateSpanScopeToggle();
 }
 
 async function ckPopulateProfiles() {
@@ -5134,6 +5138,7 @@ const CK_WALKTHROUGHS = {
         "Target — the authorized URL (or local repo path) to hunt.",
         "Scope — name the host(s) you're allowed to probe; this is the fail-closed gate for every active check (an unnamed host stays passive-only).",
         "Profile / Focus class — bias the hunt toward a program's payouts or a single bug class (single hunt only).",
+        ["Hunt this program's entire scope (Full campaign only). ", "Appears once you pick a program with more than one derivable target — runs one full campaign per in-scope target (from seed targets, or every eligible row in the program's structured scope) and merges them into one findings board, instead of just the single Target box."],
       ] },
       { h4: "Choose how hard it probes", list: [
         ["Test for proof of impact (active). ", "Fires one benign crafted request per check to turn a lead into a Confirmed proof. Off = passive only."],
@@ -5261,7 +5266,7 @@ function ckApplyActiveProgram(id) {
   state.ckActiveProgramId = id;
   saveState();
   const prog = ckProgramsCache.find((p) => p.id === id);
-  if (!prog) return;
+  if (!prog) { ckUpdateSpanScopeToggle({ resetDefault: true }); return; }
   if (ck.target && prog.seed_targets && prog.seed_targets.length) ck.target.value = prog.seed_targets[0];
   if (ck.scope && prog.scope_text) ck.scope.value = prog.scope_text;
   if (ck.program) ck.program.value = prog.platform_handle || "";
@@ -5269,6 +5274,52 @@ function ckApplyActiveProgram(id) {
   state.ckScope = ck.scope ? ck.scope.value : state.ckScope;
   state.ckProgram = ck.program ? ck.program.value : state.ckProgram;
   saveState();
+  ckUpdateSpanScopeToggle({ resetDefault: true });
+}
+
+// "Span this program's whole scope" -- client-side ESTIMATE of the target list the
+// server's campaign.program_campaign_targets would derive (seed_targets, else eligible
+// structured_scope entries, wildcard-stripped). Approximate on purpose -- only used for
+// a UI count hint; the server always does the authoritative derivation when a campaign
+// actually runs, so an estimate mismatch here can never widen what gets hunted.
+function ckEstimateSpanTargets(prog) {
+  if (!prog) return [];
+  const seeds = (prog.seed_targets || []).map((t) => String(t || "").trim()).filter(Boolean);
+  if (seeds.length) return [...new Set(seeds)];
+  const out = [];
+  const seen = new Set();
+  for (const entry of prog.structured_scope || []) {
+    if (!entry || entry.eligible_for_submission === false) continue;
+    const id = String(entry.identifier || "").trim().replace(/^\*\.?/, "").toLowerCase();
+    if (id && id.includes(".") && !seen.has(id)) { seen.add(id); out.push(id); }
+  }
+  return out;
+}
+
+function ckUpdateSpanScopeToggle(opts) {
+  if (!ck.spanScopeWrap) return;
+  const isCampaign = state.ckRunType === "campaign";
+  const prog = state.ckActiveProgramId ? ckProgramsCache.find((p) => p.id === state.ckActiveProgramId) : null;
+  const n = prog ? ckEstimateSpanTargets(prog).length : 0;
+  const show = isCampaign && Boolean(prog) && n > 0;
+  ck.spanScopeWrap.hidden = !show;
+  if (ck.spanScopeCount) ck.spanScopeCount.textContent = show ? `(${n} target${n === 1 ? "" : "s"})` : "";
+  if (!show && ck.spanScope) ck.spanScope.checked = false;
+  // Default ON only at the moment a NEW program is picked (opts.resetDefault), and only
+  // when there's actually more than one target to span -- never fight a user who
+  // explicitly unchecked it afterward on an unrelated re-render (e.g. switching tabs).
+  if (show && ck.spanScope && opts && opts.resetDefault) ck.spanScope.checked = n > 1;
+  ckUpdateAuthorizedLabel();
+}
+
+function ckUpdateAuthorizedLabel() {
+  if (!ck.authorized) return;
+  const label = ck.authorized.closest("label")?.querySelector("strong");
+  if (!label) return;
+  const spanning = state.ckRunType === "campaign" && ck.spanScope && !ck.spanScopeWrap?.hidden && ck.spanScope.checked;
+  label.textContent = spanning
+    ? "I'm authorized to test every in-scope asset in this program (in scope)."
+    : "I'm authorized to test this target (in scope).";
 }
 
 function ckScopeRowEl(entry) {
@@ -6620,9 +6671,11 @@ function ckBadgeCount(view, n) {
 }
 
 async function ckRun() {
+  const isCampaign = state.ckRunType === "campaign";
+  const spanning = isCampaign && Boolean(ck.spanScope?.checked) && !ck.spanScopeWrap?.hidden && Boolean(state.ckActiveProgramId);
   const target = (ck.target?.value || "").trim();
-  if (!target) { ckStatus("Enter a target URL or folder/repo path.", true); return; }
-  if (!ck.authorized?.checked) { ckStatus("Confirm you are authorized to test this target (tick the box).", true); return; }
+  if (!spanning && !target) { ckStatus("Enter a target URL or folder/repo path.", true); return; }
+  if (!ck.authorized?.checked) { ckStatus("Confirm you are authorized to test " + (spanning ? "this program's scope" : "this target") + " (tick the box).", true); return; }
   if (!(service.available || (await refreshServiceStatus({ silent: true })))) { ckStatus("Local GreyIQ engine is not running.", true); return; }
   state.ckTarget = target;
   state.ckScope = (ck.scope?.value || "").trim();
@@ -6637,15 +6690,19 @@ async function ckRun() {
   saveState();
   const authHeaderLines = state.ckAuthHeaders.split("\n").map((s) => s.trim()).filter(Boolean);
   ck.run.disabled = true;
-  const isCampaign = state.ckRunType === "campaign";
-  ckStatus(isCampaign ? "Campaign running — mapping the surface, hunting each URL (this can take a few minutes)…" : "Hunting — running scanners and proving findings…");
+  ckStatus(
+    spanning ? "Campaign running — hunting every target in this program's scope (this can take a while for a large program)…"
+      : isCampaign ? "Campaign running — mapping the surface, hunting each URL (this can take a few minutes)…"
+      : "Hunting — running scanners and proving findings…"
+  );
   try {
     let res;
     if (isCampaign) {
       res = await apiFetch("/api/bounty/campaign", {
-        method: "POST", timeoutMs: 900000,
+        method: "POST", timeoutMs: 1800000,
         body: JSON.stringify({
           target, scope: state.ckScope, authorized: true, program: state.ckProgram || null,
+          program_id: spanning ? state.ckActiveProgramId : null,
           active: state.ckActive, time_based: state.ckTimeBased, live: state.ckLive, deep: state.ckDeep,
           max_pages: Number(ck.maxPages?.value) || 12,
           auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines
@@ -6673,7 +6730,10 @@ async function ckRun() {
     ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);
     const confirmed = ckState.findings.filter((f) => f.proof === "confirmed").length;
     const where = res.report_path || res.campaign_path || "the reports folder";
-    ckStatus(`Done — ${isCampaign ? `${res.urls_scanned ?? "?"}/${res.urls_discovered ?? "?"} target(s), ` : ""}${ckState.findings.length} finding(s), ${confirmed} confirmed. Report: ${where}`);
+    const scopeNote = spanning ? `${res.targets_hunted ?? "?"}/${res.targets_total ?? "?"} in-scope target(s), `
+      : isCampaign ? `${res.urls_scanned ?? "?"}/${res.urls_discovered ?? "?"} target(s), ` : "";
+    const errNote = spanning && (res.errors || []).length ? ` (${res.errors.length} note(s) — see the report)` : "";
+    ckStatus(`Done — ${scopeNote}${ckState.findings.length} finding(s), ${confirmed} confirmed${errNote}. Report: ${where}`);
     ckSetView("findings");
     ckRenderFindings();
   } catch (err) {
@@ -6699,6 +6759,11 @@ function bootCockpit() {
   ck.segHunt?.addEventListener("click", () => ckSetRunType("hunt"));
   ck.segCampaign?.addEventListener("click", () => ckSetRunType("campaign"));
   ck.activeProgram?.addEventListener("change", () => ckApplyActiveProgram(ck.activeProgram.value));
+  ck.spanScope?.addEventListener("change", () => {
+    state.ckSpanScope = Boolean(ck.spanScope.checked);
+    saveState();
+    ckUpdateAuthorizedLabel();
+  });
   ck.profile?.addEventListener("change", () => { state.bountyProfile = ck.profile.value; saveState(); ckUpdateProfileHint(); });
   ck.launch?.addEventListener("submit", (e) => { e.preventDefault(); void ckRun(); });
   // Drop the (collapsed-by-default) hunt walkthrough at the top of the launch form.
@@ -6711,6 +6776,7 @@ function bootCockpit() {
   if (ck.timeBased) ck.timeBased.checked = Boolean(state.ckTimeBased);
   if (ck.deep) ck.deep.checked = Boolean(state.ckDeep);
   if (ck.live) ck.live.checked = Boolean(state.ckLive);
+  if (ck.spanScope) ck.spanScope.checked = Boolean(state.ckSpanScope);
   if (ck.authCookie) ck.authCookie.value = state.ckAuthCookie || "";
   if (ck.authHeaders) ck.authHeaders.value = state.ckAuthHeaders || "";
   if (ck.authFold && (state.ckAuthCookie || state.ckAuthHeaders)) ck.authFold.open = true;
@@ -6720,6 +6786,7 @@ function bootCockpit() {
   void (async () => {
     await ckFetchCreds();
     await ckRenderProgram();   // also fetches + populates the launch rail's Program picker
+    ckUpdateSpanScopeToggle();  // reflect a restored active program without clobbering the restored checked state
     ckMaybeShowWizard();
   })();
 }
