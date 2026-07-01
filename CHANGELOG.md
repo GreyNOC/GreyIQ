@@ -2,6 +2,22 @@
 
 Notable changes to GreyIQ.
 
+## v0.57.4
+
+### Proof-of-impact CVSS confidence, and no more self-identifying in submitted reports
+- Actively confirmed findings (dual-session IDOR/BFLA, blind SSRF/XXE via collaborator,
+  stored XSS, subdomain takeover, and any active-verify check folded into a hunt) now
+  carry a CVSS marked "confirmed" — with a justification tied to the real captured
+  differential — instead of always claiming a static-template estimate even once real
+  evidence backs the score. The confirmed flag can never disagree with the proof-of-impact
+  status shown next to it, since both are gated by the same evidence check.
+- Submitted report bodies (the actual content pasted or pushed into a HackerOne/Bugcrowd/
+  YesWeHack/Intigriti report) no longer self-identify as "GreyIQ BugHunter" by default.
+  A new per-program toggle in the Program tab ("This program's terms require disclosing
+  automated-tool assistance") lets you opt back in with a neutral disclosure line for the
+  rare program whose rules require it. Local-only reports and JSON metadata (never
+  transmitted to a platform) are unaffected.
+
 ## v0.57.3
 
 ### Full campaign: span a program's entire scope, not just one Target
