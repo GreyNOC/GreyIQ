@@ -2,6 +2,39 @@
 
 Notable changes to GreyIQ.
 
+## v0.59.0
+
+### Sharper reports + a full UX/UI/robustness QAQC pass
+
+**Hunt engine & report writing**
+- **Consistent severity everywhere.** Findings are now ordered and numbered (F1, F2…)
+  by the same CVSS-resolved severity used for their labels and triage, so the findings
+  table, ref numbers, and the "highest priority" line can never disagree.
+- **Duplicate leads are grouped.** Near-identical, artifact-less leads (same class/rule/
+  title across locations) collapse into one entry with a "(+N more)" hint and an affected-
+  locations list, so reports — especially campaign spans — aren't spammed with duplicates.
+  Confirmed / distinct-evidence findings are never grouped.
+- **Tighter executive summary** (no more analyst summary and a generic one stacked), plus
+  an optional one-line **TL;DR** and a **suggested report title** from the coding brain.
+
+**UX / UI / robustness (from a multi-agent QAQC pass)**
+- Electron: recover from a backend crash *after* the UI loads (a clear "engine stopped —
+  restart" page instead of a silently-dead app), a renderer-crash reload, and an actionable
+  error when a packaged build's backend component is missing (vs a misleading Python error).
+- The Program tab no longer shows "No programs yet" when the engine is simply unreachable —
+  it says so and offers a retry.
+- The autonomous operator's Stop now surfaces failures (never silently), with a guard
+  against a double Start; program toggle/delete/save actions surface errors and can't
+  double-submit.
+- A "thinking" indicator while a chat/agent reply is in flight; report copy/download buttons
+  show progress and disable during the (up to 20s) server fetch.
+- A first-run wizard step on connecting a coding brain (local / Claude / OpenAI).
+- Visual: the evidence chip and the confirmed-proof badge use theme tokens (were unreadable/
+  low-contrast in one theme); the cockpit now stacks to a single column on narrow windows
+  instead of crushing the main panel.
+- Detection: the open-cloud-bucket check no longer lets an earlier access-denied bucket mask
+  a later publicly-listable (high-severity) one on the same page.
+
 ## v0.58.1
 
 ### Token-first HackerOne credentials + live "Test connection"

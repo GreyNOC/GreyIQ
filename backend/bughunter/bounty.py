@@ -589,7 +589,7 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
 def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], vuln_class: dict[str, Any] | None, scope: str, findings: list[dict[str, Any]], playbook: str, recommended_tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Best-effort LLM enrichment. Returns a brain dict; on any failure the
     caller falls back to the deterministic report."""
-    brain: dict[str, Any] = {"used": False, "provider": "", "model": "", "summary": "", "notes": "", "attack_plans": {}, "manual_tests": [], "next_steps": []}
+    brain: dict[str, Any] = {"used": False, "provider": "", "model": "", "tldr": "", "report_title": "", "summary": "", "notes": "", "attack_plans": {}, "manual_tests": [], "next_steps": []}
     if not coder.coder_enabled(coder_cfg):
         return brain
     cfg = dict(coder.coder_config(coder_cfg))
@@ -623,7 +623,10 @@ def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], 
         f"{tool_hint}"
         f"Automated findings (JSON):\n{json.dumps(compact, default=str)[:8000]}\n\n"
         "Return ONLY a JSON object:\n"
-        '{"executive_summary": "2-4 sentences, most important issue first",\n'
+        '{"tldr": "one sentence, <=25 words — the single most important takeaway for a triager",\n'
+        ' "report_title": "a specific, submission-ready report title for the highest-impact finding '
+        '(name the bug class + the affected endpoint/parameter, e.g. \'Reflected XSS in /search via q\')",\n'
+        ' "executive_summary": "2-4 sentences, most important issue first",\n'
         ' "attack_plans": [{"ref": "F1", "steps": ["..."], "poc": "short PoC outline", "impact": "...", '
         '"cvss_vector": "CVSS:3.1 base vector, e.g. AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N", '
         '"proof_of_impact": {"status": "confirmed|candidate|missing", "method": "authorized test used", '
@@ -654,6 +657,8 @@ def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], 
     if parsed is None:
         brain["notes"] = str(result.get("text", "")).strip()[:4000]
         return brain
+    brain["tldr"] = str(parsed.get("tldr") or "").strip()[:300]
+    brain["report_title"] = str(parsed.get("report_title") or "").strip()[:200]
     brain["summary"] = str(parsed.get("executive_summary") or "").strip()
     brain["notes"] = str(parsed.get("notes") or "").strip()
     brain["manual_tests"] = [str(t).strip() for t in (parsed.get("manual_tests") or []) if str(t).strip()][:12]
@@ -709,6 +714,85 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
         return obj if isinstance(obj, dict) else None
     except (json.JSONDecodeError, ValueError):
         return None
+
+
+def _finding_has_artifact(finding: dict[str, Any]) -> bool:
+    """True when a finding captured a DISTINCT, per-instance artifact worth keeping on its
+    own row — an active-prover proof, secret hits, a screenshot, or a passive proof block
+    that captured a real value (a matched string or a Set-Cookie). Such findings are NEVER
+    grouped away. NOTE: a bare passive proof block (just the request line + 'header absent'
+    + response status — what every missing-header lead carries, identical across paths) is
+    NOT a distinct artifact, so those identical leads remain groupable — that's the
+    duplicate spam the grouping exists to collapse."""
+    if finding.get("_active_proof") or finding.get("secret_hits") or str(finding.get("screenshot_path") or "").strip():
+        return True
+    pe = finding.get("proof_evidence")
+    if isinstance(pe, dict) and (str(pe.get("matched_value") or "").strip() or str(pe.get("set_cookie") or "").strip()):
+        return True
+    return False
+
+
+def _group_duplicate_leads(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse near-identical LEAD findings — same class + rule + title, carrying no
+    captured artifact — into one representative that lists every affected location. This
+    cuts the duplicate-header / duplicate-sink spam a triager penalizes (most visible
+    across a campaign span), while every confirmed / artifact-bearing finding stays
+    standalone because its evidence is distinct and valuable. The representative is the
+    FIRST occurrence (findings arrive severity-sorted, so that's the strongest instance);
+    it gains ``grouped_locations`` (all affected locations, deduped) + ``group_count``.
+    A non-duplicated finding is returned untouched (no group markers)."""
+    groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+    order: list[dict[str, Any]] = []
+    for finding in findings:
+        rule_id = str(finding.get("rule_id") or "")
+        title = str(finding.get("title") or "")
+        key = (str(finding.get("class_id") or ""), rule_id, title)
+        location = str(finding.get("location") or finding.get("file_path") or "")
+        # Only collapse pure leads that have a real (rule + title) identity; anything
+        # carrying its own artifact, or missing a grouping key, always stands alone.
+        if _finding_has_artifact(finding) or not rule_id or not title:
+            order.append(finding)
+            continue
+        representative = groups.get(key)
+        if representative is None:
+            finding["grouped_locations"] = [location] if location else []
+            finding["group_count"] = 1
+            groups[key] = finding
+            order.append(finding)
+        else:
+            if location and location not in representative["grouped_locations"]:
+                representative["grouped_locations"].append(location)
+            representative["group_count"] = int(representative.get("group_count", 1)) + 1
+    # Strip the markers off any finding that turned out to be unique, so it renders
+    # exactly as it did before grouping existed.
+    for finding in order:
+        if finding.get("group_count") == 1:
+            finding.pop("grouped_locations", None)
+            finding.pop("group_count", None)
+    return order
+
+
+def _order_by_resolved_severity(display: list[dict[str, Any]], attack_plans: dict[str, Any]) -> dict[str, Any]:
+    """Re-order findings by their FINAL resolved severity (the CVSS-aware
+    ``report.resolve_severity`` every other surface uses) and re-number refs ``F1..N`` in
+    that order, returning ``attack_plans`` rekeyed to the new refs. Called only AFTER the
+    CVSS is finalized (deterministic floor + brain enrichment + active-proof confirmation
+    merged), so ``F1`` is the true highest-severity finding and the report's findings
+    table, ref numbers, and the triage 'highest priority' line can never disagree. Stable:
+    findings of equal resolved severity keep their prior (scanner-severity) order."""
+    rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+    display.sort(
+        key=lambda f: rank.get(report_lib.resolve_severity(f, attack_plans.get(f.get("ref"))), 0),
+        reverse=True,
+    )
+    remapped: dict[str, Any] = {}
+    for index, finding in enumerate(display, 1):
+        old_ref = finding.get("ref")
+        new_ref = f"F{index}"
+        finding["ref"] = new_ref
+        if old_ref in attack_plans:
+            remapped[new_ref] = attack_plans[old_ref]
+    return remapped
 
 
 def run_bounty_hunt(
@@ -856,7 +940,10 @@ def run_bounty_hunt(
         primary = annotated
     focus_unmatched = bool(vuln_class_id and not primary)
     other_findings_count = (len(annotated) - len(primary)) if vuln_class_id else 0
-    display = primary
+    # Collapse near-identical, artifact-less lead findings (same class/rule/title across
+    # locations) into one entry each, so the report isn't spammed with duplicates a
+    # triager would reject — confirmed/artifact findings are never grouped.
+    display = _group_duplicate_leads(primary)
 
     for index, finding in enumerate(display, 1):
         finding["ref"] = f"F{index}"
@@ -921,6 +1008,11 @@ def run_bounty_hunt(
             detail = report_lib._proof_of_impact_detail(finding, attack_plans[ref])
             if detail["status"] == "confirmed":
                 attack_plans[ref]["cvss"] = impact_model.cvss_for_class(finding.get("class_id", ""), confirmed=True)
+
+    # CVSS is now final (deterministic floor + brain + active confirmation). Re-order the
+    # findings and re-number refs by that final resolved severity, so F1 is genuinely the
+    # top-severity finding and the report's table / ref numbers / triage all agree.
+    attack_plans = _order_by_resolved_severity(display, attack_plans)
 
     # Manual checklist = profile + selected-class + brain ideas.
     checklist = list(profile.get("checklist", []))

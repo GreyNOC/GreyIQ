@@ -366,5 +366,137 @@ class BountyReportTests(unittest.TestCase):
         self.assertTrue(any("Passive web review" in c for c in cov["covered"]))
 
 
+class SeverityOrderingTests(unittest.TestCase):
+    def test_order_by_resolved_severity_renumbers_and_rekeys(self) -> None:
+        from bughunter.bounty import _order_by_resolved_severity
+        # F1 reads high on the raw label but its CVSS is low; F2 is the reverse. The final
+        # resolved severity (CVSS) must drive the order AND the ref numbers.
+        display = [
+            {"ref": "F1", "severity": "high", "title": "raw-high-cvss-low"},
+            {"ref": "F2", "severity": "low", "title": "raw-low-cvss-critical"},
+        ]
+        plans = {"F1": {"cvss": {"base_severity": "low"}}, "F2": {"cvss": {"base_severity": "critical"}}}
+        new_plans = _order_by_resolved_severity(display, plans)
+        self.assertEqual(display[0]["title"], "raw-low-cvss-critical")
+        self.assertEqual(display[0]["ref"], "F1")  # renumbered: critical is now F1
+        self.assertEqual(display[1]["title"], "raw-high-cvss-low")
+        self.assertEqual(display[1]["ref"], "F2")
+        # Plans follow their finding to the new ref.
+        self.assertEqual(new_plans["F1"]["cvss"]["base_severity"], "critical")
+        self.assertEqual(new_plans["F2"]["cvss"]["base_severity"], "low")
+
+    def test_order_is_stable_within_a_resolved_tier(self) -> None:
+        from bughunter.bounty import _order_by_resolved_severity
+        display = [
+            {"ref": "F1", "severity": "high", "title": "first-high"},
+            {"ref": "F2", "severity": "high", "title": "second-high"},
+        ]
+        _order_by_resolved_severity(display, {"F1": {}, "F2": {}})
+        self.assertEqual([f["title"] for f in display], ["first-high", "second-high"])
+
+
+class GroupDuplicateLeadsTests(unittest.TestCase):
+    def test_collapses_same_rule_title_leads_across_locations(self) -> None:
+        from bughunter.bounty import _group_duplicate_leads
+        findings = [
+            {"severity": "low", "class_id": "headers", "rule_id": "web.missing-header.csp", "title": "Missing CSP", "location": f"https://a.example/{i}"}
+            for i in range(1, 4)
+        ]
+        grouped = _group_duplicate_leads(findings)
+        self.assertEqual(len(grouped), 1)
+        self.assertEqual(grouped[0]["group_count"], 3)
+        self.assertEqual(grouped[0]["grouped_locations"], ["https://a.example/1", "https://a.example/2", "https://a.example/3"])
+
+    def test_distinct_artifact_findings_never_collapse(self) -> None:
+        from bughunter.bounty import _group_duplicate_leads
+        # A captured VALUE (matched_value) or an active proof keeps a finding standalone;
+        # a bare passive template (request_line only) is still groupable spam.
+        findings = [
+            {"class_id": "cors", "rule_id": "r", "title": "T", "location": "l1", "_active_proof": {"status": "confirmed"}},
+            {"class_id": "cors", "rule_id": "r", "title": "T", "location": "l2", "proof_evidence": {"matched_value": "ACAO: *"}},
+        ]
+        grouped = _group_duplicate_leads(findings)
+        self.assertEqual(len(grouped), 2)  # both carry distinct proof -> each stands alone
+        for f in grouped:
+            self.assertNotIn("group_count", f)
+
+    def test_bare_passive_template_leads_are_grouped(self) -> None:
+        from bughunter.bounty import _group_duplicate_leads
+        # Identical missing-header leads whose only 'proof' is the GET template collapse.
+        findings = [
+            {"class_id": "headers", "rule_id": "web.missing-header.csp", "title": "Missing CSP",
+             "location": f"https://a.example/{i}", "proof_evidence": {"request_line": f"GET https://a.example/{i}", "response_status": "HTTP 200"}}
+            for i in range(1, 4)
+        ]
+        grouped = _group_duplicate_leads(findings)
+        self.assertEqual(len(grouped), 1)
+        self.assertEqual(grouped[0]["group_count"], 3)
+
+    def test_unique_findings_are_untouched(self) -> None:
+        from bughunter.bounty import _group_duplicate_leads
+        findings = [
+            {"class_id": "headers", "rule_id": "r1", "title": "A", "location": "l1"},
+            {"class_id": "headers", "rule_id": "r2", "title": "B", "location": "l2"},
+        ]
+        grouped = _group_duplicate_leads(findings)
+        self.assertEqual(len(grouped), 2)
+        for f in grouped:
+            self.assertNotIn("grouped_locations", f)
+            self.assertNotIn("group_count", f)
+
+    def test_grouped_finding_renders_instances_and_hint(self) -> None:
+        ctx = {
+            "tool": "GreyIQ BugHunter", "target": "https://a.example",
+            "profile": {"id": "web-app", "name": "Web application", "description": ""},
+            "findings": [{
+                "ref": "F1", "severity": "low", "confidence": "low", "class_id": "headers",
+                "class_name": "Security hardening (headers)", "title": "Missing CSP",
+                "location": "https://a.example/1", "rule_id": "web.missing-header.csp",
+                "group_count": 3, "grouped_locations": ["https://a.example/1", "https://a.example/2", "https://a.example/3"],
+            }],
+            "attack_plans": {"F1": {"steps": ["Add a CSP header."]}},
+            "recommended_tools": [], "brain": {"used": False},
+        }
+        md = report_lib.build_markdown(ctx)
+        self.assertIn("(+2 more)", md)          # findings-table hint
+        self.assertIn("**Instances:**", md)     # detail list
+        self.assertIn("https://a.example/3", md)
+        single = report_lib.build_finding_markdown(ctx, ctx["findings"][0])
+        self.assertIn("## Affected locations", single)
+        self.assertIn("https://a.example/2", single)
+
+
+class ExecutiveSummaryTests(unittest.TestCase):
+    def _ctx(self, brain: dict) -> dict:
+        return {
+            "tool": "GreyIQ BugHunter", "target": "https://a.example",
+            "profile": {"id": "web-app", "name": "Web application", "description": ""},
+            "findings": [{"ref": "F1", "severity": "high", "confidence": "high", "class_id": "ssrf",
+                          "class_name": "SSRF", "title": "SSRF", "location": "https://a.example/fetch", "rule_id": "active.ssrf"}],
+            "attack_plans": {"F1": {"steps": ["a", "b"]}},
+            "recommended_tools": [], "brain": brain,
+        }
+
+    def test_generic_summary_suppressed_when_brain_summary_present(self) -> None:
+        md = report_lib.build_markdown(self._ctx({"used": True, "summary": "Analyst-written executive summary."}))
+        self.assertIn("Analyst-written executive summary.", md)
+        # The generic deterministic summary must NOT also print alongside it.
+        self.assertNotIn("warrant immediate review", md)
+
+    def test_default_summary_still_prints_without_a_brain(self) -> None:
+        md = report_lib.build_markdown(self._ctx({"used": False}))
+        self.assertIn("warrant immediate review", md)  # the high-impact default summary
+
+    def test_tldr_and_report_title_render(self) -> None:
+        md = report_lib.build_markdown(self._ctx({
+            "used": True, "tldr": "One critical SSRF reaches cloud metadata.",
+            "report_title": "SSRF in /fetch via the url parameter", "summary": "Details.",
+        }))
+        self.assertIn("TL;DR", md)
+        self.assertIn("One critical SSRF reaches cloud metadata.", md)
+        self.assertIn("Suggested report title:", md)
+        self.assertIn("SSRF in /fetch via the url parameter", md)
+
+
 if __name__ == "__main__":
     unittest.main()

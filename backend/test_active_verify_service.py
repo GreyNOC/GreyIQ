@@ -434,6 +434,29 @@ class ActiveCheckTests(unittest.TestCase):
         self.assertEqual(f["_active_proof"]["status"], "candidate")
         self.assertEqual(f["rule_id"], "active.open-bucket")
 
+    def test_open_bucket_public_after_denied_is_not_masked(self) -> None:
+        # Two in-scope buckets referenced on the page: the FIRST denies (403), the SECOND
+        # is publicly listable. The check must keep probing and return the HIGH public
+        # finding, not stop at the earlier low candidate.
+        s = get_settings()
+        locked = "https://acme-locked.s3.amazonaws.com/"
+        openb = "https://acme-open.s3.amazonaws.com/"
+        landing = {"body": f'first {locked}a second {openb}b', "status": 200, "headers": {}}
+
+        class MixedStub:
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                if "acme-open" in url:
+                    return {"status": 200, "headers": {}, "cookies": [], "final_url": url, "location": None,
+                            "body": '<?xml version="1.0"?><ListBucketResult><Contents><Key>secret.sql</Key></Contents></ListBucketResult>'}
+                return {"status": 403, "headers": {}, "cookies": [], "final_url": url, "location": None,
+                        "body": '<Error><Code>AccessDenied</Code></Error>'}
+
+        f = av._check_open_bucket(MixedStub(), landing, "acme-locked.s3.amazonaws.com acme-open.s3.amazonaws.com", s)
+        self.assertIsNotNone(f)
+        self.assertEqual(f["severity"], "high")  # the public listing wins over the earlier denial
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertIn("acme-open", f["file_path"])  # points at the public bucket, not the denied one
+
     def test_open_bucket_out_of_scope_host_is_never_probed(self) -> None:
         s = get_settings()
         bucket = "https://thirdparty.s3.amazonaws.com/"

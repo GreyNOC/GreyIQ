@@ -1593,6 +1593,19 @@ els.composer.addEventListener("submit", async (event) => {
   saveState();
 
   els.sendButton.disabled = true;
+  // A transient "thinking" bubble appended straight to the stream (NOT persisted chat
+  // state), so a multi-second reply — or a multi-minute Agent-mode run — never looks
+  // frozen. Removed in finally the instant the reply (or error) lands.
+  const pending = document.createElement("article");
+  pending.className = "message is-bot is-pending";
+  const pMeta = document.createElement("div"); pMeta.className = "message-meta"; pMeta.textContent = activeBot().name;
+  const pBody = document.createElement("div"); pBody.className = "message-body";
+  const dots = document.createElement("span"); dots.className = "typing-dots";
+  dots.append(document.createElement("span"), document.createElement("span"), document.createElement("span"));
+  pBody.append(dots);
+  pending.append(pMeta, pBody);
+  els.messageStream.append(pending);
+  els.messageStream.scrollTop = els.messageStream.scrollHeight;
   try {
     // scan/bughunt commands always go to the chat endpoint so BugHunter's scanner
     // runs — even in Agent mode, where the agent endpoint wouldn't detect them.
@@ -1631,6 +1644,7 @@ els.composer.addEventListener("submit", async (event) => {
     });
   } finally {
     els.sendButton.disabled = false;
+    pending.remove();  // drop the thinking bubble no matter how the reply resolved
   }
   render();
 });
@@ -4684,17 +4698,22 @@ function ckRenderDetail(f) {
   const copyBtn = cel("button", "ck-btn primary", "Copy submission report");
   copyBtn.type = "button";
   copyBtn.addEventListener("click", async () => {
-    const pkg = await ckSubmissionMarkdown(f);
-    const ok = await ckCopy(pkg.text);
-    copyBtn.textContent = ok ? (pkg.canonical ? "Copied ✓" : "Copied (offline)") : "Copy failed";
-    setTimeout(() => { copyBtn.textContent = "Copy submission report"; }, 1600);
+    copyBtn.disabled = true; copyBtn.textContent = "Preparing…";  // the server package can take up to 20s
+    try {
+      const pkg = await ckSubmissionMarkdown(f);
+      const ok = await ckCopy(pkg.text);
+      copyBtn.textContent = ok ? (pkg.canonical ? "Copied ✓" : "Copied (offline)") : "Copy failed";
+    } finally { copyBtn.disabled = false; setTimeout(() => { copyBtn.textContent = "Copy submission report"; }, 1600); }
   });
   actions.append(copyBtn);
   const dlBtn = cel("button", "ck-btn", "Download .md");
   dlBtn.type = "button";
   dlBtn.addEventListener("click", async () => {
-    const pkg = await ckSubmissionMarkdown(f);
-    ckDownloadText(`${f.ref}-${ckSlug(f.title)}.md`, pkg.text);
+    dlBtn.disabled = true; dlBtn.textContent = "Preparing…";
+    try {
+      const pkg = await ckSubmissionMarkdown(f);
+      ckDownloadText(`${f.ref}-${ckSlug(f.title)}.md`, pkg.text);
+    } finally { dlBtn.disabled = false; dlBtn.textContent = "Download .md"; }
   });
   actions.append(dlBtn);
 
@@ -5248,11 +5267,14 @@ function ckWalkthrough(key) {
 let ckProgEdit = null;   // the program being edited here (null = adding a new one)
 let ckProgramsCache = []; // last-fetched program list, shared with the launch-rail picker
 
+let ckProgramsReachable = true;  // false after the last fetch FAILED (engine down) — so an
+                                 // empty list is never mislabeled "no programs yet".
 async function ckFetchProgramsList() {
   try {
     const data = await apiFetch("/api/operator/programs");
     ckProgramsCache = data.programs || [];
-  } catch (_) { ckProgramsCache = []; }
+    ckProgramsReachable = true;
+  } catch (_) { ckProgramsCache = []; ckProgramsReachable = false; }
   return ckProgramsCache;
 }
 
@@ -5452,7 +5474,7 @@ function ckProgramSetupRow(p) {
       await apiFetch("/api/operator/programs/delete", { method: "POST", body: JSON.stringify({ id: p.id }) });
       if (state.ckActiveProgramId === p.id) { state.ckActiveProgramId = ""; saveState(); }
       void ckRenderProgram();
-    } catch (_) {}
+    } catch (err) { window.alert(err.message || "Could not delete the program — the engine may be unreachable, so it may still exist."); }
   });
   acts.append(edit, ssrf, del);
   li.append(acts);
@@ -5617,6 +5639,7 @@ function ckProgramSetupForm() {
       // in the request instead of resetting it to that field's bare default.
       payload.enabled = editing.enabled;
     }
+    submit.disabled = true;  // no double upsert on a slow save
     try {
       await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify(payload) });
       ckProgEdit = null;
@@ -5624,6 +5647,7 @@ function ckProgramSetupForm() {
       await ckRefreshProgramsEverywhere();
       void ckRenderProgram();
     } catch (err) { saveNote.textContent = err.message || "Could not save."; saveNote.classList.add("is-error"); }
+    finally { submit.disabled = false; }
   });
   form.append(saveNote);
   return form;
@@ -5645,7 +5669,13 @@ async function ckRenderProgram() {
   host.append(ckWalkthrough("program"));
 
   host.append(cel("h3", "ck-section-title", `Programs (${programs.length})`));
-  if (!programs.length) {
+  if (!programs.length && !ckProgramsReachable) {
+    host.append(cel("p", "ck-status is-error", "Couldn't reach the local engine — your programs weren't loaded. This does NOT mean they're gone; retry once the engine is back."));
+    const retry = cel("button", "ck-btn", "Retry");
+    retry.type = "button";
+    retry.addEventListener("click", () => void ckRenderProgram());
+    host.append(retry);
+  } else if (!programs.length) {
     host.append(cel("p", "ck-hint", "No programs yet — add one below, or fetch/import a scope to get started."));
   } else {
     const list = cel("ul", "ck-list");
@@ -5663,6 +5693,7 @@ async function ckRenderProgram() {
 // button. Persisted dismissal is local-only (localStorage), not a server call. ------------
 const CK_WIZARD_STEPS = [
   { title: "Welcome to GreyIQ", body: "Authorized testing only — your own assets, an authorized engagement, or a bug-bounty program you're enrolled in. Every active probe is scope-bound and fails closed: a host you don't name in Scope is never touched. This tour walks Program → Hunt → Reports." },
+  { title: "Optional: connect a coding brain", body: "GreyIQ's scanners, proofs, and reports all work fully offline with no model. To get sharper reproduction steps, richer write-ups, and the chat/agent features, connect a brain — the built-in local model (a one-time ~1 GB download), or your own Claude or OpenAI API key. Set it in the Studio (chat) side under model settings; you can do this any time." },
   { title: "1. Add your first program", body: "Give it a name (and its HackerOne handle if it has one). Then pull in real scope: “Fetch scope from HackerOne” (uses the API creds you save in Submissions), or import/paste a CSV, or add rows by hand.", view: "program" },
   { title: "2. Review the scope", body: "Check the structured-scope table — untick “In scope” on anything you don't want probed (that's an exclusion, never an expansion). Click Save program when it looks right.", view: "program" },
   { title: "3. SSRF/OOB setup (optional)", body: "If the program's policy allows out-of-band/collaborator testing, tick that on its form, then use “Set up SSRF/OOB →” on the program row to land here with scope pre-filled. Skip this step if you don't need it.", view: "idor" },
@@ -6140,18 +6171,23 @@ function ckRenderSubmissions() {
     const copyBtn = cel("button", "ck-btn", "Copy report");
     copyBtn.type = "button";
     copyBtn.addEventListener("click", async () => {
-      const pkg = await ckSubmissionMarkdown(f);
-      const ok = await ckCopy(pkg.text);
-      copyBtn.textContent = ok ? (pkg.canonical ? "Copied ✓" : "Copied (offline)") : "Failed";
-      setTimeout(() => { copyBtn.textContent = "Copy report"; }, 1600);
+      copyBtn.disabled = true; copyBtn.textContent = "Preparing…";
+      try {
+        const pkg = await ckSubmissionMarkdown(f);
+        const ok = await ckCopy(pkg.text);
+        copyBtn.textContent = ok ? (pkg.canonical ? "Copied ✓" : "Copied (offline)") : "Failed";
+      } finally { copyBtn.disabled = false; setTimeout(() => { copyBtn.textContent = "Copy report"; }, 1600); }
     });
     acts.append(copyBtn);
 
     const dlBtn = cel("button", "ck-btn", "Download .md");
     dlBtn.type = "button";
     dlBtn.addEventListener("click", async () => {
-      const pkg = await ckSubmissionMarkdown(f);
-      ckDownloadText(`${f.ref}-${ckSlug(f.title)}.md`, pkg.text);
+      dlBtn.disabled = true; dlBtn.textContent = "Preparing…";
+      try {
+        const pkg = await ckSubmissionMarkdown(f);
+        ckDownloadText(`${f.ref}-${ckSlug(f.title)}.md`, pkg.text);
+      } finally { dlBtn.disabled = false; dlBtn.textContent = "Download .md"; }
     });
     acts.append(dlBtn);
 
@@ -6649,18 +6685,30 @@ function ckArmLabel() {
   return span;
 }
 
+// Guards against a double Start (two /operator/start calls) and a Start racing a Stop —
+// important because the operator can auto-submit to live bounty programs.
+let ckOperatorBusy = false;
+
 async function ckOperatorStart(allowSubmit) {
+  if (ckOperatorBusy) return;
   if (allowSubmit && !window.confirm("ARM AUTO-SUBMIT?\n\nThe operator will FILE confirmed findings to your HackerOne programs automatically (only programs you set auto-submit on, only confirmed + non-duplicate findings, within each program's daily cap). Only do this for authorized, in-scope programs.")) return;
   if (!window.confirm("Start the operator on your portfolio? You confirm you are AUTHORIZED to test every enabled program's scope.")) return;
+  ckOperatorBusy = true;
   try {
     await apiFetch("/api/operator/start", { method: "POST", body: JSON.stringify({ authorized: true, allow_submit: Boolean(allowSubmit) }) });
     void ckRenderOperator();
   } catch (err) { window.alert(err.message || "Could not start."); }
+  finally { ckOperatorBusy = false; }
 }
 
 async function ckOperatorStop() {
-  try { await apiFetch("/api/operator/stop", { method: "POST", body: JSON.stringify({}) }); } catch (_) {}
-  setTimeout(() => void ckRenderOperator(), 400);
+  if (ckOperatorBusy) return;
+  ckOperatorBusy = true;
+  // A failed Stop must NOT be silent — an operator that thinks it stopped (but is still
+  // auto-submitting) is the worst outcome here.
+  try { await apiFetch("/api/operator/stop", { method: "POST", body: JSON.stringify({}) }); }
+  catch (err) { window.alert((err.message || "Could not reach the engine") + "\n\nThe operator may still be running — reopen the Operator tab to check its status."); }
+  finally { ckOperatorBusy = false; setTimeout(() => void ckRenderOperator(), 400); }
 }
 
 async function ckOperatorPollEvents() {
@@ -6714,7 +6762,7 @@ function ckProgramRow(prog, funnel) {
       await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify({ id: prog.id, name: prog.name, scope_text: prog.scope_text, seed_targets: prog.seed_targets, active: prog.active, live: prog.live, auto_submit: prog.auto_submit, platform: prog.platform, platform_handle: prog.platform_handle, interval_minutes: prog.interval_minutes, max_submits_per_day: prog.max_submits_per_day, max_pages: prog.max_pages, enabled: !prog.enabled }) });
       await ckRefreshProgramsEverywhere();
       void ckRenderOperator();
-    } catch (_) {}
+    } catch (err) { window.alert(err.message || "Could not update the program — the engine may be unreachable, so the change may not have applied."); }
   });
   acts.append(toggle);
   const del = cel("button", "ck-btn", "Delete");
@@ -6726,7 +6774,7 @@ function ckProgramRow(prog, funnel) {
       if (state.ckActiveProgramId === prog.id) { state.ckActiveProgramId = ""; saveState(); }
       await ckRefreshProgramsEverywhere();
       void ckRenderOperator();
-    } catch (_) {}
+    } catch (err) { window.alert(err.message || "Could not delete the program — the engine may be unreachable, so it may still exist."); }
   });
   acts.append(del);
   li.append(acts);
@@ -6780,6 +6828,8 @@ function ckProgramForm() {
       payload.enabled = editing.enabled;
       if (editing.max_pages != null) payload.max_pages = editing.max_pages;
     }
+    const submitBtn = e.submitter;  // the Save button that fired this submit
+    if (submitBtn) submitBtn.disabled = true;  // no double upsert on a slow save
     try {
       await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify(payload) });
       ckOpEdit = null;
@@ -6787,6 +6837,7 @@ function ckProgramForm() {
       await ckRefreshProgramsEverywhere();
       void ckRenderOperator();
     } catch (err) { note.textContent = err.message || "Could not save."; note.classList.add("is-error"); }
+    finally { if (submitBtn) submitBtn.disabled = false; }
   });
   form.append(note);
   return form;

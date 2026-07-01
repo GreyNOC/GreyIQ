@@ -151,6 +151,43 @@ def _location(finding: dict[str, Any]) -> str:
     return loc
 
 
+def _grouped_locations(finding: dict[str, Any]) -> list[str]:
+    """The full affected-location list for a finding that collapsed duplicate leads
+    (bounty._group_duplicate_leads) — only when there are genuinely 2+, so a
+    non-grouped finding renders exactly as it did before grouping existed."""
+    count = finding.get("group_count")
+    locs = finding.get("grouped_locations")
+    if isinstance(count, int) and count > 1 and isinstance(locs, list) and len(locs) > 1:
+        return [str(loc).strip() for loc in locs if str(loc).strip()]
+    return []
+
+
+def _location_cell(finding: dict[str, Any]) -> str:
+    """Findings-table location cell — the representative location, plus a '(+N more)'
+    hint when this row stands in for several grouped duplicate leads."""
+    cell = _code(_location(finding))
+    grouped = _grouped_locations(finding)
+    if grouped:
+        cell += f" _(+{len(grouped) - 1} more)_"
+    return cell
+
+
+def _append_grouped_locations(out: list[str], finding: dict[str, Any]) -> None:
+    """List every location a grouped duplicate-lead finding covers, with the 'file once'
+    guidance. No-op for a normal (ungrouped) finding."""
+    grouped = _grouped_locations(finding)
+    if not grouped:
+        return
+    out.append(
+        f"- **Instances:** {len(grouped)} locations share this root cause — "
+        "file a single report and list every affected path:"
+    )
+    for loc in grouped[:25]:
+        out.append(f"  - {_code(loc)}")
+    if len(grouped) > 25:
+        out.append(f"  - _(+{len(grouped) - 25} more)_")
+
+
 def _class_counts(findings: list[dict[str, Any]]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for finding in findings:
@@ -602,10 +639,19 @@ def build_markdown(ctx: dict[str, Any]) -> str:
 
     # --- Executive summary ---
     out.append("## Executive summary\n")
-    if brain.get("summary"):
-        out.append(brain["summary"].strip())
+    tldr = str(brain.get("tldr") or "").strip()
+    if tldr:
+        out.append(f"> **TL;DR —** {tldr}")
         out.append("")
-    out.append(ctx.get("recommendation") or _default_summary(counts, len(findings)))
+    # Exactly ONE summary paragraph: the analyst's when present, else the operator's
+    # recommendation, else the deterministic default — never the analyst summary AND a
+    # generic one stacked.
+    summary = (
+        str(brain.get("summary") or "").strip()
+        or str(ctx.get("recommendation") or "").strip()
+        or _default_summary(counts, len(findings))
+    )
+    out.append(summary)
     out.append("")
 
     _append_bounty_triage(out, ctx, counts)
@@ -646,7 +692,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
             f"| {sev} "
             f"| {_md_escape_cell(finding.get('class_name') or finding.get('category') or '')} "
             f"| {_md_escape_cell(finding.get('title', ''))} "
-            f"| {_code(_location(finding))} |"
+            f"| {_location_cell(finding)} |"
         )
     out.append("")
 
@@ -668,6 +714,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
             out.append(f"- **Bugcrowd VRT (est.):** {_code(str(finding['vrt']))}")
         _append_cvss(out, plan)
         out.append(f"- **Location:** {_code(_location(finding))}")
+        _append_grouped_locations(out, finding)
         out.append(f"- **Rule:** {_code(finding.get('rule_id', ''))}")
         out.append("")
         if finding.get("description"):
@@ -731,7 +778,10 @@ def build_markdown(ctx: dict[str, Any]) -> str:
 def _append_bounty_triage(out: list[str], ctx: dict[str, Any], counts: dict[str, int]) -> None:
     findings = _reportable_findings(ctx.get("findings") or [])
     plans = ctx.get("attack_plans", {}) or {}
+    report_title = str((ctx.get("brain") or {}).get("report_title") or "").strip()
     out.append("## Bounty triage\n")
+    if report_title:
+        out.append(f"- **Suggested report title:** {_md_escape_cell(report_title)}")
     if findings:
         top = sorted(findings, key=lambda f: _sev_rank(f, plans.get(f.get("ref"))), reverse=True)[0]
         top_sev = _SEVERITY_LABEL.get(resolve_severity(top, plans.get(top.get("ref"))), "?")
@@ -983,6 +1033,17 @@ def build_finding_markdown(ctx: dict[str, Any], finding: dict[str, Any]) -> str:
     out.append(f"| **Location** | {_code(_location(finding))} |")
     out.append(f"| **Generated** | {ctx.get('generated_at', '')} |")
     out.append("")
+
+    grouped = _grouped_locations(finding)
+    if grouped:
+        out.append("## Affected locations\n")
+        out.append(f"{len(grouped)} locations share this root cause — file once and list each affected path:")
+        out.append("")
+        for loc in grouped[:25]:
+            out.append(f"- {_code(loc)}")
+        if len(grouped) > 25:
+            out.append(f"- _(+{len(grouped) - 25} more)_")
+        out.append("")
 
     out.append("## Authorization & scope\n")
     out.append("> Authorized testing only — reported against an in-scope target.")

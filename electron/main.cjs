@@ -143,6 +143,11 @@ function resolveBackendCommand() {
     if (fs.existsSync(frozen)) {
       return { exe: frozen, args: [], cwd: BACKEND_RESOURCE_DIR };
     }
+    // Packaged build but the frozen backend is GONE (a broken install or antivirus
+    // quarantine). Do NOT fall back to a dev Python path — an end-user machine has no
+    // Python and no source tree, so that produces a misleading "python failed" error.
+    // Signal a specific, actionable failure instead.
+    return { missing: true, exeName };
   }
   const py = resolvePython();
   return { exe: py.exe, args: py.args, cwd: PROJECT_ROOT };
@@ -198,6 +203,12 @@ function teeBackendOutput(chunk) {
 async function startBackend() {
   backendPort = await findFreePort(DEFAULT_PORT);
   const command = resolveBackendCommand();
+  if (command.missing) {
+    backendExited = true;
+    startupError = `GreyIQ's backend component (${command.exeName}) is missing from this install. `
+      + `Reinstall GreyIQ, and check whether antivirus quarantined a file.`;
+    return;  // nothing to spawn or wait for — showApp() will render the error page
+  }
   if (app.isPackaged) ensureExecutable(command.exe);
   const env = {
     ...process.env,
@@ -234,8 +245,16 @@ async function startBackend() {
   backendProcess.stderr.on('data', teeBackendOutput);
   backendProcess.on('exit', (code, signal) => {
     backendExited = true;
-    if (!quitting && !backendReady) {
+    if (quitting) return;
+    if (!backendReady) {
       startupError = `Backend exited before ready (code=${code} signal=${signal}). See ${backendLogPath()}`;
+    } else {
+      // The engine died AFTER the UI had loaded — every apiFetch now fails silently.
+      // Mark it not-ready (so the data: stopped-page is a trusted navigation again) and
+      // replace the now-dead UI with a clear "engine stopped, restart" page instead of
+      // leaving a frozen-looking app.
+      backendReady = false;
+      showBackendStoppedPage(code, signal);
     }
   });
 
@@ -266,6 +285,20 @@ function errorHtml() {
     </body>`)}`;
 }
 
+function backendStoppedHtml(code, signal) {
+  return `data:text/html;charset=utf-8,${encodeURIComponent(`
+    <body style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:32px;background:#f6f7f4;color:#1d2430">
+      <h1 style="font-size:20px;font-weight:500">GreyIQ engine stopped</h1>
+      <p style="color:#5f6b5a;line-height:1.6">The local bug-bounty engine exited unexpectedly (code=${code} signal=${signal}), so the app can no longer reach it. Your saved programs, scopes, and reports are on disk and are safe.</p>
+      <p style="color:#5f6b5a;line-height:1.6">Close and reopen GreyIQ to continue. A log is at:<br><code>${backendLogPath()}</code></p>
+    </body>`)}`;
+}
+
+function showBackendStoppedPage(code, signal) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try { void mainWindow.loadURL(backendStoppedHtml(code, signal)); } catch (_) { /* window may be tearing down */ }
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1320,
@@ -294,6 +327,16 @@ function createWindow() {
   mainWindow.webContents.on('will-navigate', (event, url) => {
     if (!isTrustedBackendUrl(url)) {
       event.preventDefault();
+    }
+  });
+
+  // If the renderer crashes (OOM, GPU fault) after the app loaded, reload the UI from the
+  // still-running backend rather than leaving a blank window. If the backend is already
+  // gone, its own exit handler shows the stopped page.
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    if (quitting || (details && details.reason === 'clean-exit')) return;
+    if (backendReady && !backendExited) {
+      try { void mainWindow.loadURL(`http://${HOST}:${backendPort}/`); } catch (_) { /* tearing down */ }
     }
   });
 

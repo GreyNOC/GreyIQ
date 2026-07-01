@@ -960,6 +960,7 @@ def _check_open_bucket(http: _Http, landing: dict[str, Any] | None, scope: str, 
         if len(candidates) >= 8:
             break
     referenced_out_of_scope = 0
+    denied_finding: dict[str, Any] | None = None
     for bucket_url in candidates[:6]:
         host = urlparse(bucket_url).hostname or ""
         if not host_in_active_scope(host, scope, settings):
@@ -993,13 +994,20 @@ def _check_open_bucket(http: _Http, landing: dict[str, Any] | None, scope: str, 
             )
             ev = {"request_line": f"GET {list_url}", "response_status": f"HTTP {status}", "matched_value": "public ListBucketResult (object keys redacted)"}
             return _finding("active.open-bucket", "Public cloud bucket (anonymous listing)", "high", "disclosure", "cloud-exposure", bucket_url, proof, ev)
-        if denied:
+        if denied and denied_finding is None:
+            # Record the FIRST denied bucket but KEEP probing the remaining candidates —
+            # a publicly-listable (high) bucket referenced after a denied one must never be
+            # masked by an early return on the low candidate.
             proof = _proof("candidate", method=f"GET {list_url}",
                            observed_result="the referenced bucket exists but denied anonymous listing (403/AccessDenied)",
                            limitations="The bucket is not publicly listable; individual objects or write access may still be testable.",
                            proof_obligation="Probe specific object keys / test write access within scope to assess impact.")
             ev = {"request_line": f"GET {list_url}", "response_status": f"HTTP {status}", "matched_value": "AccessDenied (bucket exists, not public)"}
-            return _finding("active.open-bucket", "Cloud bucket referenced (access denied — candidate)", "low", "disclosure", "cloud-exposure", bucket_url, proof, ev)
+            denied_finding = _finding("active.open-bucket", "Cloud bucket referenced (access denied — candidate)", "low", "disclosure", "cloud-exposure", bucket_url, proof, ev)
+    # No public listing among any in-scope bucket. Surface the denied candidate if we saw
+    # one, else the out-of-scope reference note.
+    if denied_finding is not None:
+        return denied_finding
     if referenced_out_of_scope:
         proof = _proof("candidate", method="page reference (not probed)",
                        observed_result=f"the page references {referenced_out_of_scope} cloud bucket(s) whose host is not in your scope",
