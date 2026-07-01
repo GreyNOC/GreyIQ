@@ -104,8 +104,8 @@ def fetch_structured_scope(
 
     ``fetch`` is injectable for offline testing: ``fetch(url, api_username=, api_token=,
     timeout=) -> parsed JSON`` (raises on HTTP error, matching urllib semantics). Returns
-    ``{"ok", "handle", "program_name", "policy_excerpt", "offers_bounty", "structured_scope",
-    "warnings", "error"}`` — never raises."""
+    ``{"ok", "handle", "program_name", "policy_excerpt", "offers_bounty", "program_stats",
+    "structured_scope", "warnings", "error"}`` — never raises."""
     handle = str(handle or "").strip()
     if not handle:
         return {"ok": False, "error": "A HackerOne program handle is required."}
@@ -115,12 +115,31 @@ def fetch_structured_scope(
     safe_handle = urllib.parse.quote(handle, safe="")
 
     program_name, policy_excerpt, offers_bounty = handle, "", False
+    program_stats: dict[str, Any] = {}
     try:
         program = fetch(f"{_API_BASE}/programs/{safe_handle}", api_username=api_username, api_token=api_token, timeout=timeout)
         attrs = (program.get("data") or {}).get("attributes") or {} if isinstance(program, dict) else {}
         program_name = str(attrs.get("name") or handle)
         policy_excerpt = str(attrs.get("policy") or "")[:4000]
         offers_bounty = bool(attrs.get("offers_bounties"))
+        # Real signals the program resource carries (verified against HackerOne's docs —
+        # there is NO structured per-severity bounty table anywhere in the API, only this
+        # handful of flags plus the free-text policy above). Coerced to fixed known types
+        # so a caller never receives an unbounded blob from the API.
+        program_stats = {
+            "offers_bounties": offers_bounty,
+            "submission_state": str(attrs.get("submission_state") or ""),
+            "currency": str(attrs.get("currency") or ""),
+            "open_scope": bool(attrs.get("open_scope")),
+            "fast_payments": bool(attrs.get("fast_payments")),
+            "gold_standard_safe_harbor": bool(attrs.get("gold_standard_safe_harbor")),
+            "allows_bounty_splitting": bool(attrs.get("allows_bounty_splitting")),
+            "number_of_reports_for_user": int(attrs.get("number_of_reports_for_user") or 0),
+            "number_of_valid_reports_for_user": int(attrs.get("number_of_valid_reports_for_user") or 0),
+            "bounty_earned_for_user": float(attrs.get("bounty_earned_for_user") or 0.0),
+            "state": str(attrs.get("state") or ""),
+            "started_accepting_at": str(attrs.get("started_accepting_at") or ""),
+        }
     except urllib.error.HTTPError as exc:
         return {"ok": False, "error": _error_for(exc)}
     except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
@@ -172,6 +191,7 @@ def fetch_structured_scope(
         "program_name": program_name,
         "policy_excerpt": policy_excerpt,
         "offers_bounty": offers_bounty,
+        "program_stats": program_stats,
         "structured_scope": entries,
         "warnings": warnings,
     }

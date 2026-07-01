@@ -12,6 +12,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 import greyiq_api as g  # noqa: E402
+from bughunter import ledger as bounty_ledger  # noqa: E402
 
 
 def _run_result() -> dict:
@@ -40,15 +41,19 @@ class SubmissionApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.rt = g.runtime
         self._tmp = tempfile.TemporaryDirectory()
-        # Isolate the secrets store so the test never reads/writes the real one.
+        # Isolate the secrets store AND the runtime dir (ledger/learning stores live
+        # there) so a successful-submit test never reads/writes the real ones.
         self._orig_secrets = g.SECRETS_PATH
+        self._orig_runtime_dir = g.RUNTIME_DIR
         g.SECRETS_PATH = Path(self._tmp.name) / "secrets.json"
+        g.RUNTIME_DIR = Path(self._tmp.name)
         result = _run_result()
         self.rt._cache_bounty_run(result, target="https://app.example.com", scope="app.example.com", program="acme")
         self.run_id = result["run_id"]
 
     def tearDown(self) -> None:
         g.SECRETS_PATH = self._orig_secrets
+        g.RUNTIME_DIR = self._orig_runtime_dir
         self._tmp.cleanup()
 
     def test_canonical_package_built_for_confirmed(self) -> None:
@@ -84,6 +89,23 @@ class SubmissionApiTests(unittest.TestCase):
         self.assertEqual(status["team_handle"], "acme")
         self.assertTrue(status["has_token"])
         self.assertNotIn("SUPERSECRET", str(status))
+
+    def test_successful_submit_registers_the_finding_in_the_ledger(self) -> None:
+        # F1 here was never registered via ledger.upsert_findings at discovery time (this
+        # cached run mimics a single-hunt/confirm-route result, which — unlike a campaign
+        # run — never touches the ledger before a submit). A successful submit must still
+        # end up trackable for report-status sync: it lazily creates the ledger record.
+        self.rt.save_hackerone_creds(g.HackerOneCredsRequest(team_handle="acme", api_username="me@x.com", api_token="TOK"))
+        orig_submit = g.bounty_submission.submit_to_hackerone
+        g.bounty_submission.submit_to_hackerone = lambda package, **kw: {"ok": True, "report_id": "999", "url": "https://hackerone.com/reports/999"}
+        try:
+            res = self.rt.submit_finding(g.SubmitRequest(run_id=self.run_id, ref="F1", confirm=True))
+        finally:
+            g.bounty_submission.submit_to_hackerone = orig_submit
+        self.assertTrue(res["ok"], res)
+        records = bounty_ledger.submitted_records(g.RUNTIME_DIR)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["h1_report_id"], "999")
 
     def test_run_cache_is_bounded(self) -> None:
         for _ in range(20):

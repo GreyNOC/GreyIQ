@@ -40,6 +40,7 @@ class BackwardCompatTests(TempRuntimeMixin, unittest.TestCase):
         self.assertEqual(programs[0]["structured_scope"], [])
         self.assertFalse(programs[0]["oob_allowed"])
         self.assertFalse(programs[0]["disclose_automation"])
+        self.assertEqual(programs[0]["h1_program_stats"], {})
         self.assertEqual(programs[0]["notes"], "")
         self.assertTrue(programs[0]["active"])   # untouched by the new derivation path
 
@@ -182,6 +183,29 @@ class FailClosedCouplingStillHoldsTests(TempRuntimeMixin, unittest.TestCase):
         reloaded = pf.get_program(self.runtime_dir, prog["id"])
         self.assertTrue(reloaded["oob_allowed"])
         self.assertTrue(reloaded["disclose_automation"])
+
+    def test_h1_program_stats_round_trip_and_unknown_keys_dropped(self) -> None:
+        prog = pf.upsert_program(self.runtime_dir, {
+            "name": "Acme", "scope_text": "acme.com",
+            "h1_program_stats": {
+                "offers_bounties": True, "fast_payments": True, "currency": "usd",
+                "number_of_valid_reports_for_user": 2, "bounty_earned_for_user": "1500.5",
+                "totally_unexpected_field": "should be dropped",
+            },
+        })
+        stats = prog["h1_program_stats"]
+        self.assertTrue(stats["offers_bounties"])
+        self.assertTrue(stats["fast_payments"])
+        self.assertEqual(stats["currency"], "usd")
+        self.assertEqual(stats["number_of_valid_reports_for_user"], 2)
+        self.assertEqual(stats["bounty_earned_for_user"], 1500.5)
+        self.assertNotIn("totally_unexpected_field", stats)
+        reloaded = pf.get_program(self.runtime_dir, prog["id"])
+        self.assertEqual(reloaded["h1_program_stats"]["currency"], "usd")
+
+    def test_h1_program_stats_non_dict_is_ignored(self) -> None:
+        prog = pf.upsert_program(self.runtime_dir, {"name": "Acme", "h1_program_stats": "not-a-dict"})
+        self.assertEqual(prog["h1_program_stats"], {})
 
     def test_oob_allowed_is_not_coupled_to_the_scope_fail_closed_gate(self) -> None:
         # oob_allowed is a policy-confirmation flag surfaced in the UI (a confirm-dialog

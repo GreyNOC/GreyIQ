@@ -240,6 +240,95 @@ class ImportScopeRouteTests(unittest.TestCase):
         self.assertEqual(cap.status, 404)
 
 
+class HackerOneActivityRouteTests(unittest.TestCase):
+    """The new hacktivity/my-reports/report-status/earnings/sync-submitted routes each
+    reach the real g.route_http dispatch (route match, session-token gate, JSON parsing,
+    credential lookup) -- mirrors ImportScopeRouteTests' pattern above."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_secrets = g.SECRETS_PATH
+        self._orig_runtime_dir = g.RUNTIME_DIR
+        g.SECRETS_PATH = Path(self._tmp.name) / "secrets.json"
+        g.RUNTIME_DIR = Path(self._tmp.name)
+        g._store_secret("hackerone.api_username", "me")
+        g._store_secret("hackerone.api_token", "tok")
+        self._orig_hacktivity = g.bounty_h1_activity.fetch_hacktivity
+        self._orig_my_reports = g.bounty_h1_activity.fetch_my_reports
+        self._orig_report_status = g.bounty_h1_activity.fetch_report_status
+        self._orig_earnings = g.bounty_h1_activity.fetch_earnings
+        self._orig_balance = g.bounty_h1_activity.fetch_balance
+
+    def tearDown(self) -> None:
+        g.SECRETS_PATH = self._orig_secrets
+        g.RUNTIME_DIR = self._orig_runtime_dir
+        g.bounty_h1_activity.fetch_hacktivity = self._orig_hacktivity
+        g.bounty_h1_activity.fetch_my_reports = self._orig_my_reports
+        g.bounty_h1_activity.fetch_report_status = self._orig_report_status
+        g.bounty_h1_activity.fetch_earnings = self._orig_earnings
+        g.bounty_h1_activity.fetch_balance = self._orig_balance
+        self._tmp.cleanup()
+
+    def test_hacktivity_route_reaches_the_real_function(self) -> None:
+        calls = []
+        g.bounty_h1_activity.fetch_hacktivity = lambda handle, u, t, **kw: calls.append(handle) or {"ok": True, "handle": handle, "items": []}
+        cap = _run_post_route("/api/hackerone/hacktivity", {"team_handle": "acme"})
+        self.assertEqual(cap.status, 200)
+        self.assertEqual(calls, ["acme"])
+
+    def test_hacktivity_missing_handle_is_422(self) -> None:
+        cap = _run_post_route("/api/hackerone/hacktivity", {})
+        self.assertEqual(cap.status, 422)
+
+    def test_my_reports_route_defaults_page_to_one(self) -> None:
+        calls = []
+        g.bounty_h1_activity.fetch_my_reports = lambda u, t, **kw: calls.append(kw.get("page")) or {"ok": True, "page": 1, "items": []}
+        cap = _run_post_route("/api/hackerone/my-reports", {})
+        self.assertEqual(cap.status, 200)
+        self.assertEqual(calls, [1])
+
+    def test_report_status_route_reaches_the_real_function(self) -> None:
+        calls = []
+        g.bounty_h1_activity.fetch_report_status = lambda rid, u, t, **kw: calls.append(rid) or {"ok": True, "id": rid, "state": "triaged"}
+        cap = _run_post_route("/api/hackerone/report-status", {"report_id": "42"})
+        self.assertEqual(cap.status, 200)
+        data = json.loads(cap.body)
+        self.assertEqual(data["state"], "triaged")
+        self.assertEqual(calls, ["42"])
+
+    def test_earnings_route_bundles_balance_in_one_response(self) -> None:
+        g.bounty_h1_activity.fetch_earnings = lambda u, t, **kw: {"ok": True, "page": 1, "items": [{"amount": 500}]}
+        g.bounty_h1_activity.fetch_balance = lambda u, t, **kw: {"ok": True, "balance": {"amount": 100}}
+        cap = _run_post_route("/api/hackerone/earnings", {})
+        data = json.loads(cap.body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["items"], [{"amount": 500}])
+        self.assertEqual(data["balance"], {"amount": 100})
+
+    def test_earnings_route_skips_balance_call_on_earnings_failure(self) -> None:
+        calls = []
+        g.bounty_h1_activity.fetch_earnings = lambda u, t, **kw: {"ok": False, "error": "401"}
+        g.bounty_h1_activity.fetch_balance = lambda u, t, **kw: calls.append(1) or {"ok": True, "balance": {}}
+        cap = _run_post_route("/api/hackerone/earnings", {})
+        data = json.loads(cap.body)
+        self.assertFalse(data["ok"])
+        self.assertEqual(calls, [])
+
+    def test_sync_submitted_route_reaches_the_real_orchestration(self) -> None:
+        g.bounty_h1_activity.fetch_report_status = lambda rid, u, t, **kw: {"ok": True, "state": "resolved", "bounty_awarded_at": "2026-01-01"}
+        cap = _run_post_route("/api/hackerone/sync-submitted", {})
+        self.assertEqual(cap.status, 200)
+        data = json.loads(cap.body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["checked"], 0)  # no submitted findings in this empty ledger -- still a clean 200
+
+    def test_token_never_echoed_by_any_new_route(self) -> None:
+        g._store_secret("hackerone.api_token", "TOP-SECRET-TOKEN-XYZ")
+        g.bounty_h1_activity.fetch_hacktivity = lambda *a, **k: {"ok": True, "handle": "acme", "items": []}
+        cap = _run_post_route("/api/hackerone/hacktivity", {"team_handle": "acme"})
+        self.assertNotIn(b"TOP-SECRET-TOKEN-XYZ", cap.body)
+
+
 class CampaignProgramIdTests(unittest.TestCase):
     """POST /api/bounty/campaign with program_id -- "span this program's whole scope"
     mode. Drives the real route (CampaignRequest validation, program lookup, target

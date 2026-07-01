@@ -40,7 +40,13 @@ class FetchSuccessTests(unittest.TestCase):
         def fake_fetch(url, **kw):
             calls.append(url)
             if url.endswith("/programs/acme"):
-                return {"data": {"attributes": {"name": "Acme Corp", "policy": "Be nice.", "offers_bounties": True}}}
+                return {"data": {"attributes": {
+                    "name": "Acme Corp", "policy": "Be nice.", "offers_bounties": True,
+                    "fast_payments": True, "gold_standard_safe_harbor": True, "open_scope": False,
+                    "submission_state": "open", "currency": "usd",
+                    "number_of_reports_for_user": 3, "number_of_valid_reports_for_user": 2,
+                    "bounty_earned_for_user": 1500.0, "state": "soft_launched",
+                }}}
             return {
                 "data": [
                     {"attributes": {"asset_identifier": "*.acme.com", "asset_type": "URL",
@@ -62,6 +68,13 @@ class FetchSuccessTests(unittest.TestCase):
         self.assertTrue(r["structured_scope"][0]["eligible_for_bounty"])
         self.assertFalse(r["structured_scope"][1]["eligible_for_submission"])
         self.assertEqual(calls[0], f"{h1._API_BASE}/programs/acme")
+        stats = r["program_stats"]
+        self.assertTrue(stats["offers_bounties"])
+        self.assertTrue(stats["fast_payments"])
+        self.assertTrue(stats["gold_standard_safe_harbor"])
+        self.assertFalse(stats["open_scope"])
+        self.assertEqual(stats["number_of_valid_reports_for_user"], 2)
+        self.assertEqual(stats["bounty_earned_for_user"], 1500.0)
 
     def test_pagination_follows_links_next(self) -> None:
         # links.next is a full absolute URL in HackerOne's real (JSON:API-style) pagination
@@ -85,6 +98,19 @@ class FetchSuccessTests(unittest.TestCase):
         self.assertTrue(r["ok"])
         identifiers = [e["identifier"] for e in r["structured_scope"]]
         self.assertEqual(identifiers, ["a.acme.com", "b.acme.com"])
+
+    def test_program_stats_default_when_fields_absent(self) -> None:
+        def fake_fetch(url, **kw):
+            if url.endswith("/programs/acme"):
+                return {"data": {"attributes": {"name": "Acme"}}}  # a minimal program response
+            return {"data": [{"attributes": {"asset_identifier": "a.acme.com"}}], "links": {}}
+
+        r = h1.fetch_structured_scope("acme", "user", "token", fetch=fake_fetch)
+        self.assertTrue(r["ok"])
+        stats = r["program_stats"]
+        self.assertFalse(stats["offers_bounties"])
+        self.assertEqual(stats["number_of_valid_reports_for_user"], 0)
+        self.assertEqual(stats["bounty_earned_for_user"], 0.0)
 
     def test_no_scope_entries_warns(self) -> None:
         def fake_fetch(url, **kw):

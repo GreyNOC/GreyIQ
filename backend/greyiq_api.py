@@ -290,6 +290,7 @@ from bughunter import stored_xss_service as bounty_stored_xss  # noqa: E402
 from bughunter import ledger as bounty_ledger  # noqa: E402
 from bughunter import portfolio as bounty_portfolio  # noqa: E402
 from bughunter import hackerone_import as bounty_h1_import  # noqa: E402
+from bughunter import hackerone_activity as bounty_h1_activity  # noqa: E402
 from bughunter.operator import OperatorLoop  # noqa: E402
 from bughunter import toolkit as toolkit_lib  # noqa: E402
 from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E402
@@ -674,6 +675,7 @@ class ProgramUpsertRequest(BaseModel):
     structured_scope: list[dict[str, Any]] = Field(default_factory=list, max_length=500)
     oob_allowed: bool = False
     disclose_automation: bool = False  # this program's terms require disclosing automated-tool assistance in submitted reports
+    h1_program_stats: dict[str, Any] = Field(default_factory=dict)  # real signals from HackerOne's program resource (offers_bounties, fast_payments, etc.)
     notes: str = Field(default="", max_length=4000)
     resync_scope: bool = False  # re-derive scope_text/hosts from structured_scope even if scope_text is already set (see portfolio.upsert_program)
     active: bool = False
@@ -692,6 +694,22 @@ class ProgramDeleteRequest(BaseModel):
 
 class HackerOneImportRequest(BaseModel):
     handle: str = Field(min_length=1, max_length=200)
+
+
+class HackerOneHacktivityRequest(BaseModel):
+    team_handle: str = Field(min_length=1, max_length=200)
+
+
+class HackerOnePageRequest(BaseModel):
+    page: int = Field(default=1, ge=1, le=10000)
+
+
+class HackerOneReportStatusRequest(BaseModel):
+    report_id: str = Field(min_length=1, max_length=32)
+
+
+class HackerOneSyncRequest(BaseModel):
+    limit: int = Field(default=25, ge=1, le=100)
 
 
 class OperatorStartRequest(BaseModel):
@@ -792,6 +810,19 @@ def _confirm_route(fn):
             self.log(traceback.format_exc())
             return {"ok": False, "error": f"{fn.__name__} failed: {exc.__class__.__name__}: {exc}"}
     return wrapper
+
+
+# Maps a HackerOne report's live 'state' to the learning store's outcome vocabulary
+# (bughunter.learning.OUTCOMES) — only for TERMINAL states; an in-progress state (new,
+# pending-program-review, triaged, needs-more-info, retesting) has no outcome yet and is
+# deliberately absent here, so a sync pass never records a premature "it's over" verdict.
+_H1_STATE_TO_LEARNING_OUTCOME = {
+    "resolved": "resolved",
+    "duplicate": "duplicate",
+    "not-applicable": "not-applicable",
+    "informative": "informative",
+    "spam": "spam",
+}
 
 
 class GreyIQRuntime:
@@ -1763,15 +1794,28 @@ class GreyIQRuntime:
         # Record the submission to the learning store + triage so the loop closes.
         _, finding, run = self._resolve_run_finding(request.run_id, request.ref)
         if finding is not None:
+            program, target = (run or {}).get("program"), (run or {}).get("target", "")
             try:
                 bounty_learning.record_outcome(
-                    RUNTIME_DIR, program=(run or {}).get("program"), target=(run or {}).get("target", ""),
+                    RUNTIME_DIR, program=program, target=target,
                     class_id=str(finding.get("class_id") or "other"), title=str(finding.get("title") or ""),
                     status="submitted", severity=str(finding.get("severity") or ""),
                     notes=f"HackerOne report {outcome.get('report_id', '')}",
                 )
             except ValueError:
                 pass
+            # Track the H1 report id in the ledger too — not just the learning store —
+            # so the report-status sync feature has something to poll. upsert_findings
+            # lazily creates the ledger record if this finding was never registered there
+            # (e.g. a single-hunt or confirm-route finding, which unlike a campaign run
+            # never goes through ledger.upsert_findings at discovery time); it's a no-op
+            # merge if the record already exists.
+            dedup_key = bounty_ledger.dedup_key(finding)
+            bounty_ledger.upsert_findings(RUNTIME_DIR, program, target, [
+                {"finding": finding, "source_url": finding.get("location", ""), "proof_status": "confirmed"}
+            ])
+            bounty_ledger.record_submission(RUNTIME_DIR, program, target, dedup_key,
+                                            str(outcome.get("report_id", "")), str(outcome.get("url", "")))
         return {"ok": True, **outcome}
 
     def hackerone_creds_status(self) -> dict[str, Any]:
@@ -1937,7 +1981,8 @@ class GreyIQRuntime:
 
     def upsert_program(self, request: "ProgramUpsertRequest") -> dict[str, Any]:
         # exclude_unset: a caller that doesn't know about a field (e.g. the Operator tab's
-        # compact edit form predates structured_scope/oob_allowed/disclose_automation/notes) must never reset
+        # compact edit form predates structured_scope/oob_allowed/disclose_automation/
+        # h1_program_stats/notes) must never reset
         # it to that field's bare default just by omitting it from the request body -- the
         # existing stored value is preserved instead. A caller that DOES send a field
         # (even a falsy one, like active=false) still gets it applied, since Pydantic marks
@@ -1953,6 +1998,78 @@ class GreyIQRuntime:
         submission — no new secret."""
         _, username, token = self._hackerone_creds()
         return bounty_h1_import.fetch_structured_scope(request.handle, username, token)
+
+    def hackerone_hacktivity(self, request: "HackerOneHacktivityRequest") -> dict[str, Any]:
+        """Recent disclosed reports for one program — reconnaissance only (what's
+        actually getting paid there), never fed into ranking automatically."""
+        _, username, token = self._hackerone_creds()
+        return bounty_h1_activity.fetch_hacktivity(request.team_handle, username, token)
+
+    def hackerone_my_reports(self, request: "HackerOnePageRequest") -> dict[str, Any]:
+        """The operator's own submitted HackerOne reports, across every program."""
+        _, username, token = self._hackerone_creds()
+        return bounty_h1_activity.fetch_my_reports(username, token, page=request.page)
+
+    def hackerone_report_status(self, request: "HackerOneReportStatusRequest") -> dict[str, Any]:
+        """Live status of one HackerOne report — usable standalone (paste any report id)
+        or right after a submit (the report id is already in hand)."""
+        _, username, token = self._hackerone_creds()
+        return bounty_h1_activity.fetch_report_status(request.report_id, username, token)
+
+    def hackerone_earnings(self, request: "HackerOnePageRequest") -> dict[str, Any]:
+        """The operator's own bounty/reward history + current balance, one round trip."""
+        _, username, token = self._hackerone_creds()
+        earnings = bounty_h1_activity.fetch_earnings(username, token, page=request.page)
+        if not earnings.get("ok"):
+            return earnings
+        balance = bounty_h1_activity.fetch_balance(username, token)
+        earnings["balance"] = balance.get("balance") if balance.get("ok") else None
+        return earnings
+
+    def sync_hackerone_reports(self, request: "HackerOneSyncRequest") -> dict[str, Any]:
+        """Poll HackerOne for the current status of every locally-'submitted' finding
+        (bounded, never automatic) and reflect real outcomes back onto the ledger + the
+        learning store, closing the loop that today requires manually running `gn learn`.
+        A bare state change (e.g. new -> triaged) only updates the ledger's h1_state; a
+        transition to a REWARDED terminal state also flips the ledger stage to 'paid'; any
+        terminal state (rewarded or not) is also recorded once to the learning store so
+        future EV ranking uses the real HackerOne outcome instead of the placeholder
+        'submitted' status recorded at submit time."""
+        _, username, token = self._hackerone_creds()
+        if not (username and token):
+            return {"ok": False, "error": "Save your HackerOne API username + token in the Submissions tab first."}
+        records = bounty_ledger.submitted_records(RUNTIME_DIR, limit=request.limit)
+        checked, updated, errors = 0, 0, []
+        for rec in records:
+            checked += 1
+            status = bounty_h1_activity.fetch_report_status(rec.get("h1_report_id", ""), username, token)
+            if not status.get("ok"):
+                errors.append(f"#{rec.get('h1_report_id')}: {status.get('error', 'unknown error')}")
+                continue
+            state = str(status.get("state") or "")
+            if state == str(rec.get("h1_state") or ""):
+                continue  # no change since the last sync
+            resolved_with_reward = bool(status.get("bounty_awarded_at") or status.get("swag_awarded_at"))
+            bounty_ledger.record_h1_sync(RUNTIME_DIR, rec["pid"], rec["key"], state=state, resolved_with_reward=resolved_with_reward)
+            updated += 1
+            learning_status = _H1_STATE_TO_LEARNING_OUTCOME.get(state)
+            if learning_status:
+                try:
+                    # rec["program"] is the ledger's already-slugified pid; passing it as
+                    # `program=` is safe — learning.program_key() treats a non-empty
+                    # `program` as authoritative and slugifies it again, which is a no-op
+                    # on an already-slug string, so this resolves to the SAME learning
+                    # bucket the ledger used, regardless of `target`.
+                    bounty_learning.record_outcome(
+                        RUNTIME_DIR, program=rec.get("program"), target=rec.get("source_url", ""),
+                        class_id=str(rec.get("class_id") or "other"), title=str(rec.get("title") or ""),
+                        status=learning_status, severity=str(rec.get("severity") or ""),
+                        bounty=float(rec.get("bounty") or 0.0) if resolved_with_reward else 0.0,
+                        notes=f"HackerOne report {rec.get('h1_report_id')} synced to '{state}'",
+                    )
+                except ValueError:
+                    pass
+        return {"ok": True, "checked": checked, "updated": updated, "errors": errors}
 
     def remove_program(self, program_id: str) -> dict[str, Any]:
         return {"ok": bounty_portfolio.remove_program(RUNTIME_DIR, program_id)}
@@ -3002,6 +3119,26 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/hackerone/import-scope":
             request = validate_payload(HackerOneImportRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.import_hackerone_scope, request))
+            return
+        if method == "POST" and path == "/api/hackerone/hacktivity":
+            request = validate_payload(HackerOneHacktivityRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.hackerone_hacktivity, request))
+            return
+        if method == "POST" and path == "/api/hackerone/my-reports":
+            request = validate_payload(HackerOnePageRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.hackerone_my_reports, request))
+            return
+        if method == "POST" and path == "/api/hackerone/report-status":
+            request = validate_payload(HackerOneReportStatusRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.hackerone_report_status, request))
+            return
+        if method == "POST" and path == "/api/hackerone/earnings":
+            request = validate_payload(HackerOnePageRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.hackerone_earnings, request))
+            return
+        if method == "POST" and path == "/api/hackerone/sync-submitted":
+            request = validate_payload(HackerOneSyncRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.sync_hackerone_reports, request))
             return
         if method == "POST" and path == "/api/operator/start":
             request = validate_payload(OperatorStartRequest, await read_json_body(receive))

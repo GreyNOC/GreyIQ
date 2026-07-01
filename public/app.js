@@ -4904,9 +4904,27 @@ async function ckSubmitFinding(f, btn, statusEl) {
 }
 
 function ckReportLink(url, reportId) {
+  const wrap = cel("span", "ck-report-link-group");
   const link = cel("a", "ck-btn", url ? `Submitted ✓ (#${reportId || ""})` : "Submitted ✓");
   if (url) { link.href = url; link.target = "_blank"; link.rel = "noopener noreferrer"; }
-  return link;
+  wrap.append(link);
+  if (reportId) {
+    const checkBtn = cel("button", "ck-btn", "Check status"); checkBtn.type = "button";
+    const statusSpan = cel("span", "ck-floc", "");
+    checkBtn.addEventListener("click", async () => {
+      const label = checkBtn.textContent; checkBtn.disabled = true; checkBtn.textContent = "Checking…";
+      try {
+        const res = await apiFetch("/api/hackerone/report-status", { method: "POST", body: JSON.stringify({ report_id: String(reportId) }) });
+        statusSpan.textContent = (res && res.ok) ? ` — ${res.state || "unknown"}` : ` — ${(res && res.error) || "could not check status"}`;
+      } catch (err) {
+        statusSpan.textContent = ` — ${err.message || "check failed"}`;
+      } finally {
+        checkBtn.disabled = false; checkBtn.textContent = label;
+      }
+    });
+    wrap.append(checkBtn, statusSpan);
+  }
+  return wrap;
 }
 
 function ckTakeoverForm() {
@@ -5389,8 +5407,17 @@ function ckProgramSetupRow(p) {
   if (p.platform_handle) left.append(document.createTextNode(" "), cel("span", "ck-tag", `HackerOne: ${p.platform_handle}`));
   if (p.oob_allowed) left.append(document.createTextNode(" "), cel("span", "ck-tag", "OOB allowed"));
   if (p.disclose_automation) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Discloses tool use"));
+  const stats = p.h1_program_stats || {};
+  if (stats.offers_bounties) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Offers bounties"));
+  if (stats.fast_payments) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Fast payments"));
+  if (stats.gold_standard_safe_harbor) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Gold Standard Safe Harbor"));
+  if (stats.open_scope) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Open scope"));
   const n = (p.structured_scope || []).length;
   left.append(cel("div", "ck-floc", `${p.scope_text || "(no scope)"} · ${n} structured scope entr${n === 1 ? "y" : "ies"}`));
+  if (stats.number_of_valid_reports_for_user > 0) {
+    const earned = stats.bounty_earned_for_user ? ` · $${stats.bounty_earned_for_user} earned` : "";
+    left.append(cel("div", "ck-floc", `Your track record: ${stats.number_of_valid_reports_for_user} valid report${stats.number_of_valid_reports_for_user === 1 ? "" : "s"}${earned}`));
+  }
   li.append(left);
 
   const acts = cel("div", "ck-actions"); acts.style.margin = "0";
@@ -5437,11 +5464,58 @@ function ckProgramSetupForm() {
   const handle = ckField("HackerOne team handle", "text", editing ? (editing.platform_handle || "") : "");
   form.append(name.wrap, handle.wrap);
 
+  // Program-level signals fetched alongside the scope (offers_bounties, fast_payments,
+  // etc.) — carried here so a Save persists them even though the form has no dedicated
+  // fields for them; re-fetching overwrites this with fresher data.
+  let fetchedProgramStats = editing ? (editing.h1_program_stats || {}) : {};
+
   const fetchBar = cel("div", "ck-import-row");
   const fetchBtn = cel("button", "ck-btn", "Fetch scope from HackerOne"); fetchBtn.type = "button";
-  fetchBar.append(fetchBtn);
+  const hacktivityBtn = cel("button", "ck-btn", "Recent hacktivity"); hacktivityBtn.type = "button";
+  fetchBar.append(fetchBtn, hacktivityBtn);
   const fetchNote = cel("p", "ck-status");
   form.append(fetchBar, fetchNote);
+  const hacktivityPanel = cel("div", "ck-hacktivity-panel"); hacktivityPanel.hidden = true;
+  form.append(hacktivityPanel);
+
+  hacktivityBtn.addEventListener("click", async () => {
+    const h = handle.input.value.trim();
+    if (!h) { fetchNote.className = "ck-status is-error"; fetchNote.textContent = "Enter a HackerOne team handle first."; return; }
+    const label = hacktivityBtn.textContent; hacktivityBtn.disabled = true; hacktivityBtn.textContent = "Loading…";
+    hacktivityPanel.hidden = false; hacktivityPanel.replaceChildren(cel("p", "ck-status", "Loading recent hacktivity…"));
+    try {
+      const res = await apiFetch("/api/hackerone/hacktivity", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ team_handle: h }) });
+      hacktivityPanel.replaceChildren();
+      if (!res || res.ok === false) {
+        hacktivityPanel.append(cel("p", "ck-status is-error", (res && res.error) || "Could not fetch hacktivity."));
+        return;
+      }
+      const items = res.items || [];
+      if (!items.length) { hacktivityPanel.append(cel("p", "ck-status", "No disclosed hacktivity found for this program.")); return; }
+      const table = cel("div", "ck-scope-table");
+      const head = cel("div", "ck-scope-row ck-scope-head");
+      for (const label of ["Severity", "CWE", "Bounty", "Disclosed", "Title"]) head.append(cel("span", null, label));
+      table.append(head);
+      const body = cel("div", "ck-scope-body");
+      for (const item of items) {
+        const row = cel("div", "ck-scope-row");
+        row.append(
+          cel("span", null, item.severity_rating || "—"),
+          cel("span", null, item.cwe || "—"),
+          cel("span", null, item.total_awarded_amount != null ? `$${item.total_awarded_amount}` : "—"),
+          cel("span", null, (item.disclosed_at || "").slice(0, 10) || "—"),
+          cel("span", null, item.title || ""),
+        );
+        body.append(row);
+      }
+      table.append(body);
+      hacktivityPanel.append(cel("p", "ck-floc", `${items.length} recent disclosed report${items.length === 1 ? "" : "s"} for "${h}" — what's actually getting paid here.`), table);
+    } catch (err) {
+      hacktivityPanel.replaceChildren(cel("p", "ck-status is-error", err.message || "Fetch failed."));
+    } finally {
+      hacktivityBtn.disabled = false; hacktivityBtn.textContent = label;
+    }
+  });
 
   form.append(cel("h4", null, "Structured scope"));
   const scopeTable = ckScopeTable(editing ? (editing.structured_scope || []) : []);
@@ -5459,6 +5533,7 @@ function ckProgramSetupForm() {
         fetchNote.textContent = (res && res.error) || "Could not fetch scope.";
         return;
       }
+      fetchedProgramStats = res.program_stats || {};
       const entries = res.structured_scope || [];
       let mergeNote = "";
       if (entries.length) {
@@ -5524,6 +5599,7 @@ function ckProgramSetupForm() {
       structured_scope: structuredScope,
       oob_allowed: oobAllowed.input.checked,
       disclose_automation: discloseAutomation.input.checked,
+      h1_program_stats: fetchedProgramStats,
       notes: notes.input.value,
       // This form owns the structured-scope table, so a save here should always re-derive
       // scope_text/in_scope_hosts/out_of_scope_hosts from whatever the table currently
@@ -6031,6 +6107,7 @@ function ckRenderSubmissions() {
   const host = ck.views.submissions;
   host.replaceChildren();
   host.append(ckCredsBar());
+  host.append(ckHackeroneActivityPanel());
   host.append(ckFormatBar());
   host.append(ckBundleBar());
 
@@ -6228,6 +6305,71 @@ function ckCredsBar() {
   return wrap;
 }
 
+function ckHackeroneActivityPanel() {
+  const wrap = cel("div", "ck-creds");
+  const head = cel("div", "ck-creds-head");
+  head.append(cel("strong", null, "My HackerOne activity"));
+  wrap.append(head);
+  wrap.append(cel("p", "ck-hint", "Your own report statuses and reward history, straight from the HackerOne API — refreshed on demand, never automatically."));
+
+  const connected = ckState.h1 && ckState.h1.has_token && ckState.h1.team_handle;
+  if (!connected) {
+    wrap.append(cel("p", "ck-status", "Save your HackerOne API credentials above to use this."));
+    return wrap;
+  }
+
+  const row = cel("div", "ck-import-row");
+  const reportsBtn = cel("button", "ck-btn", "Refresh my reports"); reportsBtn.type = "button";
+  const earningsBtn = cel("button", "ck-btn", "Refresh earnings"); earningsBtn.type = "button";
+  row.append(reportsBtn, earningsBtn);
+  wrap.append(row);
+
+  const reportsOut = cel("div", "ck-hacktivity-panel");
+  const earningsOut = cel("div", "ck-hacktivity-panel");
+  wrap.append(reportsOut, earningsOut);
+
+  reportsBtn.addEventListener("click", async () => {
+    const label = reportsBtn.textContent; reportsBtn.disabled = true; reportsBtn.textContent = "Loading…";
+    reportsOut.replaceChildren(cel("p", "ck-status", "Loading your reports…"));
+    try {
+      const res = await apiFetch("/api/hackerone/my-reports", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ page: 1 }) });
+      reportsOut.replaceChildren();
+      if (!res || res.ok === false) { reportsOut.append(cel("p", "ck-status is-error", (res && res.error) || "Could not fetch reports.")); return; }
+      const items = res.items || [];
+      if (!items.length) { reportsOut.append(cel("p", "ck-status", "No reports found on your HackerOne account.")); return; }
+      for (const item of items) {
+        reportsOut.append(cel("p", "ck-floc", `${item.title || "(untitled)"} — ${item.state || "?"}${item.bounty_awarded_at ? " · rewarded" : ""}`));
+      }
+    } catch (err) {
+      reportsOut.replaceChildren(cel("p", "ck-status is-error", err.message || "Fetch failed."));
+    } finally {
+      reportsBtn.disabled = false; reportsBtn.textContent = label;
+    }
+  });
+
+  earningsBtn.addEventListener("click", async () => {
+    const label = earningsBtn.textContent; earningsBtn.disabled = true; earningsBtn.textContent = "Loading…";
+    earningsOut.replaceChildren(cel("p", "ck-status", "Loading your earnings…"));
+    try {
+      const res = await apiFetch("/api/hackerone/earnings", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ page: 1 }) });
+      earningsOut.replaceChildren();
+      if (!res || res.ok === false) { earningsOut.append(cel("p", "ck-status is-error", (res && res.error) || "Could not fetch earnings.")); return; }
+      const items = res.items || [];
+      if (res.balance) earningsOut.append(cel("p", "ck-ftitle", `Balance: ${JSON.stringify(res.balance)}`));
+      if (!items.length) { earningsOut.append(cel("p", "ck-status", "No earnings recorded on your HackerOne account.")); return; }
+      for (const item of items) {
+        earningsOut.append(cel("p", "ck-floc", `${item.type || "earning"} — ${item.amount != null ? `$${item.amount}` : "?"} · ${(item.created_at || "").slice(0, 10)}`));
+      }
+    } catch (err) {
+      earningsOut.replaceChildren(cel("p", "ck-status is-error", err.message || "Fetch failed."));
+    } finally {
+      earningsBtn.disabled = false; earningsBtn.textContent = label;
+    }
+  });
+
+  return wrap;
+}
+
 function ckField(label, type, value) {
   const w = cel("label");
   w.append(cel("span", null, label));
@@ -6376,6 +6518,31 @@ async function ckRenderOperator() {
   money.append(cel("div", "n", `$${pf.bounty_total || 0}`), cel("div", "l", "Bounty"));
   funnel.append(money);
   host.append(funnel);
+
+  const syncBtn = cel("button", "ck-btn", "Sync submitted reports"); syncBtn.type = "button";
+  syncBtn.title = "Poll HackerOne for the current status of every locally-submitted finding and reflect real outcomes (resolved/duplicate/etc.) back into this funnel.";
+  const syncNote = cel("p", "ck-status");
+  syncBtn.addEventListener("click", async () => {
+    const label = syncBtn.textContent; syncBtn.disabled = true; syncBtn.textContent = "Syncing…";
+    syncNote.classList.remove("is-error"); syncNote.textContent = "";
+    try {
+      const res = await apiFetch("/api/hackerone/sync-submitted", { method: "POST", timeoutMs: 60000, body: JSON.stringify({}) });
+      if (!res || res.ok === false) {
+        syncNote.classList.add("is-error"); syncNote.textContent = (res && res.error) || "Sync failed.";
+      } else {
+        syncNote.textContent = `Checked ${res.checked} report(s), ${res.updated} updated.` + (res.errors && res.errors.length ? ` ${res.errors.length} error(s).` : "");
+        // Leave the summary on screen for a beat before the funnel re-render replaces
+        // this whole view (a full ckRenderOperator() re-render happens immediately —
+        // without the delay the toast would never actually be visible).
+        setTimeout(() => { void ckRenderOperator(); }, 1500);
+      }
+    } catch (err) {
+      syncNote.classList.add("is-error"); syncNote.textContent = err.message || "Sync failed.";
+    } finally {
+      syncBtn.disabled = false; syncBtn.textContent = label;
+    }
+  });
+  host.append(syncBtn, syncNote);
 
   // --- Live event log ---
   host.append(cel("h3", "ck-section-title", "Activity"));

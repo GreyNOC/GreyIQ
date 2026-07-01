@@ -44,6 +44,7 @@ _DEFAULTS: dict[str, Any] = {
     "structured_scope": [],        # [{identifier, asset_type, eligible_for_submission, eligible_for_bounty, instruction, max_severity}], from HackerOne API/CSV import or hand entry
     "oob_allowed": False,          # operator-confirmed: this program's policy permits out-of-band/collaborator testing
     "disclose_automation": False,  # operator-confirmed: this program's terms require disclosing automated-tool assistance in submitted reports
+    "h1_program_stats": {},        # real signals from HackerOne's program resource (offers_bounties, fast_payments, etc.) — see hackerone_import.fetch_structured_scope
     "notes": "",                   # free text — policy excerpt, reward table, anything pasted in
     "active": False,               # capture proof-of-impact (active verification)
     "live": False,                 # dynamic Playwright pass
@@ -118,6 +119,34 @@ def _clean_scope_entry(entry: Any) -> dict[str, Any] | None:
     }
 
 
+_H1_STATS_BOOL_FIELDS = ("offers_bounties", "open_scope", "fast_payments", "gold_standard_safe_harbor", "allows_bounty_splitting")
+_H1_STATS_STR_FIELDS = ("submission_state", "currency", "state", "started_accepting_at")
+_H1_STATS_INT_FIELDS = ("number_of_reports_for_user", "number_of_valid_reports_for_user")
+
+
+def _clean_h1_program_stats(stats: Any) -> dict[str, Any]:
+    """Coerce HackerOne program-resource stats to a fixed known-key shape — never store
+    an unbounded blob straight from a third-party API response."""
+    if not isinstance(stats, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for field in _H1_STATS_BOOL_FIELDS:
+        if field in stats:
+            out[field] = bool(stats.get(field))
+    for field in _H1_STATS_STR_FIELDS:
+        if field in stats:
+            out[field] = str(stats.get(field) or "")[:60]
+    for field in _H1_STATS_INT_FIELDS:
+        if field in stats:
+            out[field] = _safe_int(stats.get(field), 0)
+    if "bounty_earned_for_user" in stats:
+        try:
+            out["bounty_earned_for_user"] = float(stats.get("bounty_earned_for_user") or 0.0)
+        except (TypeError, ValueError):
+            out["bounty_earned_for_user"] = 0.0
+    return out
+
+
 def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     out = {**_DEFAULTS, **{k: v for k, v in record.items() if k in _DEFAULTS or k == "id"}}
     out["structured_scope"] = [
@@ -125,6 +154,7 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     ][:_MAX_SCOPE_ENTRIES]
     out["oob_allowed"] = bool(out.get("oob_allowed"))
     out["disclose_automation"] = bool(out.get("disclose_automation"))
+    out["h1_program_stats"] = _clean_h1_program_stats(out.get("h1_program_stats"))
     out["notes"] = str(out.get("notes") or "")[:4000]
     # Convenience default ONLY: derive scope_text/in_scope_hosts/out_of_scope_hosts from
     # structured_scope when the caller hasn't already typed a scope. Never overrides a
