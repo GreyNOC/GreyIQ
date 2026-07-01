@@ -2,6 +2,22 @@
 
 Notable changes to GreyIQ.
 
+## v0.58.1
+
+### Token-first HackerOne credentials + live "Test connection"
+The Submissions-tab HackerOne credential entry is now a single **API credential** box: paste
+just your token, or `identifier:token` (the pair HackerOne shows together when you click
+Generate API token). The server splits it into the identifier/token pair HackerOne's HTTP
+Basic auth requires — a bare token keeps any already-saved identifier, so rotating a token
+doesn't wipe a working username.
+
+A new **Test connection** button probes a real authenticated HackerOne endpoint and reports
+exactly what H1 returns (✓ accepted, or the reason on a 401) — turning "which username do I
+use?" into a one-click, server-authoritative answer instead of guessing. HackerOne's Hacker
+API has no token-only/Bearer mode (verified against its current docs — every endpoint's curl
+sample is `-u "<API_USERNAME>:<API_TOKEN>"`), so the identifier is still required; this just
+makes supplying and verifying it painless.
+
 ## v0.58.0
 
 ### Server security hardening, a live hunt progress log, and engine reliability/UX

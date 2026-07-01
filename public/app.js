@@ -6267,8 +6267,13 @@ function ckDownloadBase64(filename, b64, mime) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-// HackerOne credentials bar — shows configured state and a save form. The token is
-// a password field, never read back from the server (only has_token is returned).
+// HackerOne credentials bar — shows configured state and a token-first save form. The
+// credential is a password field, never read back from the server (only has_token +
+// api_username are returned). HackerOne's Hacker API uses HTTP Basic auth with the API
+// identifier as username and the token as password, so the single field accepts either
+// "identifier:token" (what HackerOne shows together at Generate API token) or a bare
+// token; the server splits it. A "Test" button probes a real authenticated endpoint so
+// the operator gets a server-authoritative answer instead of guessing the username.
 function ckCredsBar() {
   const wrap = cel("div", "ck-creds");
   const h1 = ckState.h1;
@@ -6280,29 +6285,53 @@ function ckCredsBar() {
 
   const form = cel("form", "ck-learn-form");
   const handle = ckField("Team handle", "text", (h1 && h1.team_handle) || "");
-  const user = ckField("API username", "text", (h1 && h1.api_username) || "");
-  const token = ckField("API token", "password", "");
-  token.input.placeholder = h1 && h1.has_token ? "•••••• (saved — leave blank to keep)" : "paste API token";
-  form.append(handle.wrap, user.wrap, token.wrap);
+  const cred = ckField("API credential", "password", "");
+  cred.input.placeholder = h1 && h1.has_token ? "•••••• (saved — leave blank to keep)" : "paste identifier:token (or just the token)";
+  const help = cel("p", "ck-hint", "Paste your HackerOne API token. HackerOne's API needs an identifier too — if it 401s below, paste them together as identifier:token (both are shown when you click “Generate API token”).");
+  help.style.flexBasis = "100%";
+  form.append(handle.wrap, cred.wrap, help);
+  if (h1 && h1.api_username) {
+    const who = cel("p", "ck-hint", `Saved identifier (username): ${h1.api_username}`);
+    who.style.flexBasis = "100%";
+    form.append(who);
+  }
   const save = cel("button", "ck-btn primary", "Save");
   save.type = "submit";
-  form.append(save);
+  const test = cel("button", "ck-btn", "Test connection");
+  test.type = "button";
+  form.append(save, test);
   const note = cel("p", "ck-status");
   note.style.flexBasis = "100%";
+  form.append(note);
+
+  const doSave = async () => {
+    const res = await apiFetch("/api/bounty/hackerone/creds", {
+      method: "POST",
+      body: JSON.stringify({ team_handle: handle.input.value.trim(), api_credential: cred.input.value })
+    });
+    ckState.h1 = res && res.ok ? res : ckState.h1;
+    return res;
+  };
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     try {
-      const res = await apiFetch("/api/bounty/hackerone/creds", {
-        method: "POST",
-        body: JSON.stringify({ team_handle: handle.input.value.trim(), api_username: user.input.value.trim(), api_token: token.input.value })
-      });
-      ckState.h1 = res && res.ok ? res : ckState.h1;
+      await doSave();
       note.classList.remove("is-error");
       note.textContent = "Saved.";
       ckRenderSubmissions();
     } catch (err) { note.textContent = err.message || "Could not save."; note.classList.add("is-error"); }
   });
-  form.append(note);
+  test.addEventListener("click", async () => {
+    note.classList.remove("is-error");
+    note.textContent = "Testing…";
+    try {
+      // Save first (so we test exactly what's in the box), then probe HackerOne.
+      if (cred.input.value.trim() || handle.input.value.trim()) await doSave();
+      const res = await apiFetch("/api/bounty/hackerone/test", { method: "POST", timeoutMs: 20000 });
+      if (res && res.ok) { note.classList.remove("is-error"); note.textContent = `✓ ${res.message || "HackerOne accepted these credentials."}`; }
+      else { note.classList.add("is-error"); note.textContent = `✗ ${(res && res.error) || "HackerOne rejected these credentials."}`; }
+    } catch (err) { note.classList.add("is-error"); note.textContent = err.message || "Could not reach HackerOne."; }
+  });
   wrap.append(form);
   return wrap;
 }

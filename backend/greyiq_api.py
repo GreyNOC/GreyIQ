@@ -732,6 +732,12 @@ class HackerOneCredsRequest(BaseModel):
     team_handle: str = Field(default="", max_length=200)
     api_username: str = Field(default="", max_length=200)
     api_token: str = Field(default="", max_length=400)
+    # Token-first entry: the operator can paste a single credential — either
+    # "identifier:token" (what HackerOne shows together when you Generate API token) or a
+    # bare token (identifier reused from what's already stored). Split server-side into
+    # the api_username/api_token pair HackerOne's Basic auth requires. Takes precedence
+    # over the separate fields above when non-empty.
+    api_credential: str = Field(default="", max_length=600)
 
 
 class ProgramUpsertRequest(BaseModel):
@@ -1949,10 +1955,31 @@ class GreyIQRuntime:
         # Empty string clears that field (matches _store_secret's pop). Stored in the
         # same perms-restricted, atomically-written secrets file as the provider keys.
         _store_secret("hackerone.team_handle", request.team_handle.strip())
-        _store_secret("hackerone.api_username", request.api_username.strip())
-        if request.api_token:  # never clear the token on an empty submit of the form
-            _store_secret("hackerone.api_token", request.api_token.strip())
+        cred = (request.api_credential or "").strip()
+        if cred:
+            # Token-first single paste. Split on the FIRST ":" only — HackerOne's
+            # userinfo is identifier:token and a token may itself contain no colon, but
+            # partition-on-first is the exact Basic-auth parse either way. A bare value
+            # (no colon) is treated as just the token, leaving any stored identifier
+            # untouched so a token rotation doesn't wipe a known-good username.
+            if ":" in cred:
+                username, _, token = cred.partition(":")
+                _store_secret("hackerone.api_username", username.strip())
+                _store_secret("hackerone.api_token", token.strip())
+            else:
+                _store_secret("hackerone.api_token", cred)
+        else:
+            _store_secret("hackerone.api_username", request.api_username.strip())
+            if request.api_token:  # never clear the token on an empty submit of the form
+                _store_secret("hackerone.api_token", request.api_token.strip())
         return self.hackerone_creds_status()
+
+    def test_hackerone_creds(self) -> dict[str, Any]:
+        """Probe the stored HackerOne creds against a real authenticated endpoint so the
+        operator gets a server-authoritative yes/no (and, on 401, the reason) instead of
+        guessing which username to use. Read-only — never mutates the secrets store."""
+        _, username, token = self._hackerone_creds()
+        return bounty_h1_import.verify_credentials(username, token)
 
     def _hackerone_creds(self) -> tuple[str, str, str]:
         stored = _load_secrets()
@@ -3279,6 +3306,9 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/hackerone/creds":
             request = validate_payload(HackerOneCredsRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.save_hackerone_creds, request))
+            return
+        if method == "POST" and path == "/api/bounty/hackerone/test":
+            await send_json(send, await asyncio.to_thread(runtime.test_hackerone_creds))
             return
         if method == "GET" and path == "/api/operator/programs":
             await send_json(send, await asyncio.to_thread(runtime.list_programs))

@@ -123,6 +123,48 @@ def _error_for(exc: urllib.error.HTTPError) -> str:
     return f"HackerOne API HTTP {exc.code}: {exc.reason}"
 
 
+def verify_credentials(
+    api_username: str,
+    api_token: str,
+    *,
+    fetch: Callable[..., Any] | None = None,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Cheap authenticated probe so an operator can confirm their creds BEFORE relying
+    on them: GET /programs?page[size]=1 with HTTP Basic auth. Returns
+    ``{"ok": True, "message": ...}`` on any 2xx, else ``{"ok": False, "status"?: int,
+    "error": ...}``. Never raises.
+
+    HackerOne's Hacker API authenticates via HTTP Basic auth with the API *identifier*
+    as the username and the API *token* as the password (verified against HackerOne's
+    own docs — every endpoint's curl sample is ``-u "<API_USERNAME>:<API_TOKEN>"``, and
+    there is no token-only/Bearer mode). So a token with no identifier comes through as
+    an empty Basic-auth username and HackerOne answers 401 — this probe surfaces exactly
+    that, turning "which username?" into a one-click, server-authoritative answer."""
+    if not api_token:
+        return {"ok": False, "error": "Paste your HackerOne API token first."}
+    fetch = fetch or _fetch_json
+    url = f"{_API_BASE}/programs?page%5Bsize%5D=1"
+    try:
+        fetch(url, api_username=api_username, api_token=api_token, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            hint = (
+                "HackerOne rejected these credentials (401). Its Hacker API needs BOTH the "
+                "API identifier and the token — paste them together as identifier:token. "
+                "The identifier is shown next to the token when you click Generate API token."
+                if not api_username else
+                "HackerOne rejected these credentials (401). Double-check the identifier and token "
+                "(regenerate on hackerone.com → Settings → API Token to see both together)."
+            )
+            return {"ok": False, "status": 401, "error": hint}
+        return {"ok": False, "status": exc.code, "error": _error_for(exc)}
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
+        return {"ok": False, "error": f"Could not reach HackerOne: {exc}"}
+    who = f" as {api_username}" if api_username else ""
+    return {"ok": True, "message": f"HackerOne accepted these credentials{who}."}
+
+
 def fetch_structured_scope(
     handle: str,
     api_username: str,

@@ -33,6 +33,50 @@ class MissingCredsTests(unittest.TestCase):
         self.assertIn("api username", r["error"].lower())
 
 
+class VerifyCredentialsTests(unittest.TestCase):
+    def test_missing_token_refused_without_a_network_call(self) -> None:
+        called = {"n": 0}
+
+        def fake_fetch(url, **kw):
+            called["n"] += 1
+            return {}
+
+        r = h1.verify_credentials("ident", "", fetch=fake_fetch)
+        self.assertFalse(r["ok"])
+        self.assertEqual(called["n"], 0)  # never touches the network on an empty token
+
+    def test_2xx_is_accepted(self) -> None:
+        r = h1.verify_credentials("ident", "TOK", fetch=lambda url, **kw: {"data": []})
+        self.assertTrue(r["ok"])
+        self.assertIn("ident", r["message"])
+
+    def test_401_with_no_identifier_explains_the_pair(self) -> None:
+        def fake_fetch(url, **kw):
+            raise _http_error(401, "Unauthorized")
+
+        r = h1.verify_credentials("", "TOK", fetch=fake_fetch)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["status"], 401)
+        self.assertIn("identifier:token", r["error"])
+
+    def test_401_with_identifier_suggests_regenerating(self) -> None:
+        def fake_fetch(url, **kw):
+            raise _http_error(401, "Unauthorized")
+
+        r = h1.verify_credentials("ident", "BADTOK", fetch=fake_fetch)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["status"], 401)
+        self.assertIn("regenerate", r["error"].lower())
+
+    def test_network_error_degrades_gracefully(self) -> None:
+        def fake_fetch(url, **kw):
+            raise urllib.error.URLError("boom")
+
+        r = h1.verify_credentials("ident", "TOK", fetch=fake_fetch)
+        self.assertFalse(r["ok"])
+        self.assertIn("could not reach", r["error"].lower())
+
+
 class FetchSuccessTests(unittest.TestCase):
     def test_single_page(self) -> None:
         calls = []

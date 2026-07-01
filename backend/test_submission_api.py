@@ -83,6 +83,42 @@ class SubmissionApiTests(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("Only the HackerOne", res["error"])
 
+    def test_api_credential_splits_identifier_and_token(self) -> None:
+        self.rt.save_hackerone_creds(g.HackerOneCredsRequest(team_handle="acme", api_credential="my-ident:SECRETTOK"))
+        _, username, token = self.rt._hackerone_creds()
+        self.assertEqual(username, "my-ident")
+        self.assertEqual(token, "SECRETTOK")
+
+    def test_api_credential_splits_on_first_colon_only(self) -> None:
+        # A token that itself contains a colon must not be truncated — partition on the
+        # FIRST colon (the Basic-auth userinfo boundary), everything after is the token.
+        self.rt.save_hackerone_creds(g.HackerOneCredsRequest(team_handle="acme", api_credential="ident:tok:en:more"))
+        _, username, token = self.rt._hackerone_creds()
+        self.assertEqual(username, "ident")
+        self.assertEqual(token, "tok:en:more")
+
+    def test_bare_token_credential_keeps_existing_identifier(self) -> None:
+        # First save a full pair, then rotate with a bare token — the identifier must
+        # survive (a token rotation shouldn't wipe a known-good username).
+        self.rt.save_hackerone_creds(g.HackerOneCredsRequest(team_handle="acme", api_credential="keep-me:OLDTOK"))
+        self.rt.save_hackerone_creds(g.HackerOneCredsRequest(team_handle="acme", api_credential="NEWTOK"))
+        _, username, token = self.rt._hackerone_creds()
+        self.assertEqual(username, "keep-me")
+        self.assertEqual(token, "NEWTOK")
+
+    def test_legacy_separate_fields_still_supported(self) -> None:
+        # api_username/api_token (no api_credential) is the pre-existing shape the CLI and
+        # older clients use — must keep working unchanged.
+        self.rt.save_hackerone_creds(g.HackerOneCredsRequest(team_handle="acme", api_username="me@x.com", api_token="TOK"))
+        _, username, token = self.rt._hackerone_creds()
+        self.assertEqual(username, "me@x.com")
+        self.assertEqual(token, "TOK")
+
+    def test_test_creds_reports_missing_token(self) -> None:
+        res = self.rt.test_hackerone_creds()
+        self.assertFalse(res["ok"])
+        self.assertIn("token", res["error"].lower())
+
     def test_creds_status_never_leaks_token(self) -> None:
         self.rt.save_hackerone_creds(g.HackerOneCredsRequest(team_handle="acme", api_username="me@x.com", api_token="SUPERSECRET"))
         status = self.rt.hackerone_creds_status()
