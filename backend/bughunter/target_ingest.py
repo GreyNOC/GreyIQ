@@ -37,7 +37,7 @@ MAX_SCOPE_ENTRIES = 500       # cap a HackerOne-style structured-scope import (m
 # CSV column-name hints (substring match, case-insensitive). URL columns win over host
 # columns when both are present (a full URL carries more — path + params).
 _URL_HINTS = ("url", "uri", "endpoint", "request", "link", "address", "location")
-_HOST_HINTS = ("host", "domain", "asset", "hostname", "fqdn", "site", "scope", "target")
+_HOST_HINTS = ("host", "domain", "asset", "hostname", "fqdn", "site", "scope", "target", "identifier")
 _DOCTYPE_RE = re.compile(r"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
 
 # HackerOne structured-scope CSV column hints (substring match, case-insensitive).
@@ -124,9 +124,18 @@ def _finalize(kind: str, targets: list[str], notes: list[str]) -> dict[str, Any]
 
 def _pick_column(header: list[str]) -> int | None:
     """Return the index of the best target column in a header row, or None when the row
-    has no recognizable target column (then the caller scans every cell)."""
+    has no recognizable target column (then the caller scans every cell). Prefers an
+    EXACT header match over a substring one within each hint tier, so a generic hint
+    (bare "asset" in _HOST_HINTS) can't shadow a more specific column ("asset_type"
+    coming before an actual host/identifier column just because of column order) --
+    the same collision class fixed in _match_column for the HackerOne CSV parser,
+    reported live: a real HackerOne scope export with `asset_type` before the real
+    identifier column silently mis-picked asset_type, yielding zero valid targets."""
     cells = [str(c or "").strip().lower() for c in header]
     for hints in (_URL_HINTS, _HOST_HINTS):
+        for index, cell in enumerate(cells):
+            if cell and cell in hints:
+                return index
         for index, cell in enumerate(cells):
             if cell and any(h in cell for h in hints):
                 return index
@@ -323,12 +332,44 @@ def parse_har(text: str) -> dict[str, Any]:
     return _finalize("har", targets, [])
 
 
+def _looks_like_hackerone_scope(text: str) -> bool:
+    """Best-effort sniff of the header row: does this look like a HackerOne-style
+    structured-scope export (an identifier column PLUS at least one asset-type/
+    eligibility column)? Deliberately narrow (requires the literal substring
+    "identifier", not the bare "asset" hint _H1_ID_HINTS also accepts) so an unrelated
+    CSV that merely has an "asset_type"-ish column doesn't get swept in. Only used to
+    steer kind="auto" toward the richer parser (which keeps asset_type/instruction/
+    eligible_for_bounty/max_severity instead of flattening to a bare host list) --
+    an explicit kind selection is never overridden."""
+    head_line = text.lstrip("﻿").split("\n", 1)[0]
+    try:
+        dialect: Any = csv.Sniffer().sniff(head_line[:2048], delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel
+    try:
+        row = next(csv.reader(io.StringIO(head_line), dialect), None)
+    except csv.Error:
+        return False
+    if not row:
+        return False
+    cells = [str(c or "").strip().lower() for c in row]
+    has_id = any("identifier" in cell for cell in cells)
+    has_signal = any(
+        any(h in cell for h in hints)
+        for cell in cells
+        for hints in (_H1_TYPE_HINTS, _H1_SUBMIT_HINTS, _H1_BOUNTY_HINTS)
+    )
+    return has_id and has_signal
+
+
 def _detect(text: str) -> str:
     head = text.lstrip("﻿ \t\r\n")
     if head.startswith("<"):
         return "burp"
     if head[:1] in ("{", "["):
         return "har"
+    if _looks_like_hackerone_scope(text):
+        return "hackerone_scope"
     return "csv"
 
 

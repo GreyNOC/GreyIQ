@@ -50,6 +50,23 @@ class CsvTests(unittest.TestCase):
         r = ti.ingest("host;port\nexample.com;443\n", "csv")
         self.assertEqual(r["targets"], ["https://example.com"])
 
+    def test_identifier_column_not_shadowed_by_asset_type(self) -> None:
+        # Regression, reported live: a real HackerOne scope export pasted with kind="csv"
+        # (not the HackerOne-specific parser) has an "identifier" column plus an
+        # "asset_type" column -- the bare "asset" hint in _HOST_HINTS used to match
+        # asset_type first (substring), so every row's enum-like type value
+        # (GOOGLE_PLAY_APP_ID) was tried as the target and none of them are dotted hosts,
+        # silently producing "Nothing parsed" even though real identifiers were right there.
+        csv = (
+            "identifier,asset_type,instruction,eligible_for_bounty\n"
+            "com.zhiliaoapp.musically,GOOGLE_PLAY_APP_ID,[Play Store id](x),true\n"
+            "id123456789,APPLE_STORE_APP_ID,[App Store id](y),true\n"
+        )
+        r = ti.ingest(csv, "csv")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["targets"], ["https://com.zhiliaoapp.musically"])   # the numeric-only id has no dot -> dropped, as expected
+        self.assertEqual(r["hosts"], ["com.zhiliaoapp.musically"])
+
 
 class BurpTests(unittest.TestCase):
     BURP = (
@@ -213,6 +230,41 @@ class HackerOneScopeCsvTests(unittest.TestCase):
         csv = "asset_identifier\napi.acme.com\napi.acme.com\n"
         r = ti.ingest(csv, "hackerone_scope")
         self.assertEqual(r["scope_count"], 1)
+
+
+class AutoDetectHackerOneScopeTests(unittest.TestCase):
+    """kind="auto" should recognize a HackerOne-shaped CSV (identifier + asset_type/
+    eligibility columns) and route to the richer parser instead of silently flattening
+    it to a bare host list -- the real-world case a user pasting an export and leaving
+    the picker on "Auto-detect" hits by default."""
+
+    def test_auto_detects_real_hackerone_export_shape(self) -> None:
+        csv = (
+            "identifier,asset_type,instruction,eligible_for_bounty,max_severity\n"
+            "com.zhiliaoapp.musically,GOOGLE_PLAY_APP_ID,[Play Store id](x),true,critical\n"
+        )
+        r = ti.ingest(csv, "auto")
+        self.assertEqual(r["kind"], "hackerone_scope")
+        self.assertEqual(r["structured_scope"][0]["asset_type"], "GOOGLE_PLAY_APP_ID")
+        self.assertEqual(r["structured_scope"][0]["max_severity"], "critical")
+
+    def test_explicit_csv_kind_is_never_overridden(self) -> None:
+        # The sniff only applies to kind="auto" -- an explicit "csv" selection must
+        # always get the plain parser, never silently redirected.
+        csv = "identifier,asset_type,eligible_for_bounty\ncom.acme.app,GOOGLE_PLAY_APP_ID,true\n"
+        r = ti.ingest(csv, "csv")
+        self.assertEqual(r["kind"], "csv")
+        self.assertNotIn("structured_scope", r)
+
+    def test_plain_csv_with_only_an_identifier_column_stays_plain(self) -> None:
+        # An "identifier" column alone (no asset_type/eligibility signal) is too weak a
+        # signal on its own -- must not sweep an unrelated CSV into the HackerOne parser.
+        r = ti.ingest("identifier\nexample.com\napi.example.com\n", "auto")
+        self.assertEqual(r["kind"], "csv")
+
+    def test_bare_word_host_csv_still_detected_as_plain_csv(self) -> None:
+        r = ti.ingest("example.com\nhttps://x.example.net/a\n", "auto")
+        self.assertEqual(r["kind"], "csv")
 
 
 if __name__ == "__main__":
