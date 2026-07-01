@@ -157,10 +157,17 @@ class EarningsAndBalanceTests(unittest.TestCase):
         self.assertTrue(r["ok"])
         self.assertEqual(r["items"][0]["type"], "earning-bounty-earned")
 
-    def test_balance_passes_through_raw_attributes(self) -> None:
-        r = h1a.fetch_balance("user", "token", fetch=lambda url, **k: {"data": {"attributes": {"amount": 42, "currency": "usd"}}})
+    def test_balance_reads_the_documented_data_balance_field(self) -> None:
+        # HackerOne's real response shape: {"data": {"balance": 105}} -- balance is a
+        # bare number directly on 'data', NOT wrapped in the usual 'attributes' envelope.
+        r = h1a.fetch_balance("user", "token", fetch=lambda url, **k: {"data": {"balance": 105}})
         self.assertTrue(r["ok"])
-        self.assertEqual(r["balance"], {"amount": 42, "currency": "usd"})
+        self.assertEqual(r["balance"], 105)
+
+    def test_balance_falls_back_to_attributes_if_ever_wrapped(self) -> None:
+        r = h1a.fetch_balance("user", "token", fetch=lambda url, **k: {"data": {"attributes": {"balance": 42}}})
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["balance"], 42)
 
     def test_network_error(self) -> None:
         import urllib.error as ue

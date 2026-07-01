@@ -6355,7 +6355,7 @@ function ckHackeroneActivityPanel() {
       earningsOut.replaceChildren();
       if (!res || res.ok === false) { earningsOut.append(cel("p", "ck-status is-error", (res && res.error) || "Could not fetch earnings.")); return; }
       const items = res.items || [];
-      if (res.balance) earningsOut.append(cel("p", "ck-ftitle", `Balance: ${JSON.stringify(res.balance)}`));
+      if (res.balance != null) earningsOut.append(cel("p", "ck-ftitle", `Balance: $${res.balance}`));
       if (!items.length) { earningsOut.append(cel("p", "ck-status", "No earnings recorded on your HackerOne account.")); return; }
       for (const item of items) {
         earningsOut.append(cel("p", "ck-floc", `${item.type || "earning"} — ${item.amount != null ? `$${item.amount}` : "?"} · ${(item.created_at || "").slice(0, 10)}`));

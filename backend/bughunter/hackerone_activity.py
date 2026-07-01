@@ -218,9 +218,12 @@ def fetch_balance(
     fetch: Callable[..., Any] | None = None,
     timeout: float = 30.0,
 ) -> dict[str, Any]:
-    """The operator's current HackerOne account balance. Returns {"ok", "balance": {...}}
-    (raw attributes, passed through as-is rather than guessing field names) or
-    {"ok": False, "error"}."""
+    """The operator's current HackerOne account balance. Returns {"ok", "balance": <amount>}
+    or {"ok": False, "error"}. Per HackerOne's documented response
+    (https://api.hackerone.com/hacker-resources/#get-balance) the amount is
+    ``data.balance`` directly (not wrapped in the usual JSON:API 'attributes' envelope
+    every other resource here uses) — read that field, with a defensive fallback to
+    'attributes.balance' in case HackerOne ever normalizes the shape."""
     missing = _missing_creds(api_username, api_token)
     if missing:
         return missing
@@ -229,4 +232,9 @@ def fetch_balance(
     if err:
         return err
     data = result.get("data") or {}
-    return {"ok": True, "balance": (data or {}).get("attributes") or {}}
+    if "balance" in data:
+        balance = data["balance"]
+    else:
+        attrs = data.get("attributes")
+        balance = attrs.get("balance") if isinstance(attrs, dict) else None
+    return {"ok": True, "balance": balance}
