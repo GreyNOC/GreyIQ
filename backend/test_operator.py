@@ -173,6 +173,60 @@ class LedgerTests(unittest.TestCase):
         acme_key = ledger.program_key("acme", "https://a")
         self.assertEqual(whole["programs"][acme_key]["stages"]["confirmed"], 1)
 
+    def test_submitted_records_only_lists_submitted_with_report_id(self) -> None:
+        confirmed_item = _item("C1", "xss", "r", "https://x/a")
+        ledger.upsert_findings(self.rt, "acme", "https://x", [confirmed_item])  # stays 'confirmed', no report id
+        submitted_item = _item("C2", "ssrf", "r", "https://x/b")
+        ledger.upsert_findings(self.rt, "acme", "https://x", [submitted_item])
+        ledger.record_submission(self.rt, "acme", "https://x", submitted_item["dedup_key"], "R1", "u")
+        records = ledger.submitted_records(self.rt)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["h1_report_id"], "R1")
+        self.assertEqual(records[0]["key"], submitted_item["dedup_key"])
+
+    def test_record_h1_sync_updates_state_without_advancing_stage(self) -> None:
+        item = _item("C1", "xss", "r", "https://x/a")
+        ledger.upsert_findings(self.rt, "acme", "https://x", [item])
+        ledger.record_submission(self.rt, "acme", "https://x", item["dedup_key"], "R1", "u")
+        [rec] = ledger.submitted_records(self.rt)
+        ledger.record_h1_sync(self.rt, rec["pid"], rec["key"], state="triaged", resolved_with_reward=False)
+        data = ledger._load(self.rt)
+        stored = data["programs"][rec["pid"]]["findings"][rec["key"]]
+        self.assertEqual(stored["h1_state"], "triaged")
+        self.assertTrue(stored["h1_synced_at"])
+        self.assertEqual(stored["stage"], "submitted")  # a bare state change never advances the stage
+
+    def test_record_h1_sync_advances_to_paid_on_reward(self) -> None:
+        item = _item("C1", "xss", "r", "https://x/a")
+        ledger.upsert_findings(self.rt, "acme", "https://x", [item])
+        ledger.record_submission(self.rt, "acme", "https://x", item["dedup_key"], "R1", "u")
+        [rec] = ledger.submitted_records(self.rt)
+        ledger.record_h1_sync(self.rt, rec["pid"], rec["key"], state="resolved", resolved_with_reward=True)
+        data = ledger._load(self.rt)
+        stored = data["programs"][rec["pid"]]["findings"][rec["key"]]
+        self.assertEqual(stored["stage"], "paid")
+        self.assertEqual(stored["h1_state"], "resolved")
+
+    def test_submitted_records_excludes_already_terminal_states(self) -> None:
+        # Once a record is synced to a terminal state, submitted_records must stop
+        # surfacing it — a repeat sync should never re-poll a closed report.
+        item = _item("C1", "xss", "r", "https://x/a")
+        ledger.upsert_findings(self.rt, "acme", "https://x", [item])
+        ledger.record_submission(self.rt, "acme", "https://x", item["dedup_key"], "R1", "u")
+        [rec] = ledger.submitted_records(self.rt)
+        ledger.record_h1_sync(self.rt, rec["pid"], rec["key"], state="duplicate", resolved_with_reward=False)
+        self.assertEqual(ledger.submitted_records(self.rt), [])
+
+    def test_submitted_records_capped_and_sorted_most_recent_first(self) -> None:
+        # Distinct rule ids (not just digits in the path) so each finding gets its own
+        # dedup key -- digits alone normalize to N and would collapse to one key.
+        for i, rule in enumerate(["xss.a", "xss.b", "xss.c"]):
+            item = _item(f"C{i}", "xss", rule, "https://x/path")
+            ledger.upsert_findings(self.rt, "acme", "https://x", [item])
+            ledger.record_submission(self.rt, "acme", "https://x", item["dedup_key"], f"R{i}", "u")
+        records = ledger.submitted_records(self.rt, limit=2)
+        self.assertEqual(len(records), 2)
+
 
 class PortfolioLifecycleTests(unittest.TestCase):
     """portfolio.remove_program / set_enabled / touch_run had no test coverage at all."""

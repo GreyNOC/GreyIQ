@@ -3083,8 +3083,11 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-prog-setup-form .ck-toggles,
 .ck-prog-setup-form .ck-status,
 .ck-prog-setup-form .ck-scope-table,
+.ck-prog-setup-form .ck-hacktivity-panel,
 .ck-prog-setup-form h4 { grid-column: 1 / -1; margin: 0; }
 .ck-scope-table { display: flex; flex-direction: column; gap: 0.4rem; }
+.ck-hacktivity-panel { display: flex; flex-direction: column; gap: 0.4rem; margin-top: 0.3rem; }
+.ck-report-link-group { display: inline-flex; align-items: center; gap: 0.4rem; }
 .ck-scope-body { display: flex; flex-direction: column; gap: 0.35rem; }
 .ck-scope-row {
   display: grid; grid-template-columns: 1.3fr 0.8fr auto auto 0.7fr 1.3fr auto;

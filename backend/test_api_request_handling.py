@@ -20,6 +20,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 import greyiq_api as g  # noqa: E402
+from bughunter import ledger as bounty_ledger  # noqa: E402
 
 
 def _receive_once(body: bytes):
@@ -238,6 +239,118 @@ class ImportScopeRouteTests(unittest.TestCase):
         scope = {"method": "GET", "path": "/api/hackerone/import-scope", "headers": headers, "scheme": "http", "query_string": b""}
         asyncio.run(g.route_http(scope, _receive_once(b""), cap.send))
         self.assertEqual(cap.status, 404)
+
+
+class HackerOneActivityRouteTests(unittest.TestCase):
+    """The new hacktivity/my-reports/report-status/earnings/sync-submitted routes each
+    reach the real g.route_http dispatch (route match, session-token gate, JSON parsing,
+    credential lookup) -- mirrors ImportScopeRouteTests' pattern above."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_secrets = g.SECRETS_PATH
+        self._orig_runtime_dir = g.RUNTIME_DIR
+        g.SECRETS_PATH = Path(self._tmp.name) / "secrets.json"
+        g.RUNTIME_DIR = Path(self._tmp.name)
+        g._store_secret("hackerone.api_username", "me")
+        g._store_secret("hackerone.api_token", "tok")
+        self._orig_hacktivity = g.bounty_h1_activity.fetch_hacktivity
+        self._orig_my_reports = g.bounty_h1_activity.fetch_my_reports
+        self._orig_report_status = g.bounty_h1_activity.fetch_report_status
+        self._orig_earnings = g.bounty_h1_activity.fetch_earnings
+        self._orig_balance = g.bounty_h1_activity.fetch_balance
+
+    def tearDown(self) -> None:
+        g.SECRETS_PATH = self._orig_secrets
+        g.RUNTIME_DIR = self._orig_runtime_dir
+        g.bounty_h1_activity.fetch_hacktivity = self._orig_hacktivity
+        g.bounty_h1_activity.fetch_my_reports = self._orig_my_reports
+        g.bounty_h1_activity.fetch_report_status = self._orig_report_status
+        g.bounty_h1_activity.fetch_earnings = self._orig_earnings
+        g.bounty_h1_activity.fetch_balance = self._orig_balance
+        self._tmp.cleanup()
+
+    def test_hacktivity_route_reaches_the_real_function(self) -> None:
+        calls = []
+        g.bounty_h1_activity.fetch_hacktivity = lambda handle, u, t, **kw: calls.append(handle) or {"ok": True, "handle": handle, "items": []}
+        cap = _run_post_route("/api/hackerone/hacktivity", {"team_handle": "acme"})
+        self.assertEqual(cap.status, 200)
+        self.assertEqual(calls, ["acme"])
+
+    def test_hacktivity_missing_handle_is_422(self) -> None:
+        cap = _run_post_route("/api/hackerone/hacktivity", {})
+        self.assertEqual(cap.status, 422)
+
+    def test_my_reports_route_defaults_page_to_one(self) -> None:
+        calls = []
+        g.bounty_h1_activity.fetch_my_reports = lambda u, t, **kw: calls.append(kw.get("page")) or {"ok": True, "page": 1, "items": []}
+        cap = _run_post_route("/api/hackerone/my-reports", {})
+        self.assertEqual(cap.status, 200)
+        self.assertEqual(calls, [1])
+
+    def test_report_status_route_reaches_the_real_function(self) -> None:
+        calls = []
+        g.bounty_h1_activity.fetch_report_status = lambda rid, u, t, **kw: calls.append(rid) or {"ok": True, "id": rid, "state": "triaged"}
+        cap = _run_post_route("/api/hackerone/report-status", {"report_id": "42"})
+        self.assertEqual(cap.status, 200)
+        data = json.loads(cap.body)
+        self.assertEqual(data["state"], "triaged")
+        self.assertEqual(calls, ["42"])
+
+    def test_earnings_route_bundles_balance_in_one_response(self) -> None:
+        g.bounty_h1_activity.fetch_earnings = lambda u, t, **kw: {"ok": True, "page": 1, "items": [{"amount": 500}]}
+        g.bounty_h1_activity.fetch_balance = lambda u, t, **kw: {"ok": True, "balance": {"amount": 100}}
+        cap = _run_post_route("/api/hackerone/earnings", {})
+        data = json.loads(cap.body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["items"], [{"amount": 500}])
+        self.assertEqual(data["balance"], {"amount": 100})
+
+    def test_earnings_route_skips_balance_call_on_earnings_failure(self) -> None:
+        calls = []
+        g.bounty_h1_activity.fetch_earnings = lambda u, t, **kw: {"ok": False, "error": "401"}
+        g.bounty_h1_activity.fetch_balance = lambda u, t, **kw: calls.append(1) or {"ok": True, "balance": {}}
+        cap = _run_post_route("/api/hackerone/earnings", {})
+        data = json.loads(cap.body)
+        self.assertFalse(data["ok"])
+        self.assertEqual(calls, [])
+
+    def test_sync_submitted_route_reaches_the_real_orchestration(self) -> None:
+        g.bounty_h1_activity.fetch_report_status = lambda rid, u, t, **kw: {"ok": True, "state": "resolved", "bounty_awarded_at": "2026-01-01"}
+        cap = _run_post_route("/api/hackerone/sync-submitted", {})
+        self.assertEqual(cap.status, 200)
+        data = json.loads(cap.body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["checked"], 0)  # no submitted findings in this empty ledger -- still a clean 200
+
+    def test_sync_advances_to_paid_on_a_reward_even_when_state_is_unchanged(self) -> None:
+        # Regression: a report can pick up bounty_awarded_at/swag_awarded_at before (or
+        # without) its state changing -- e.g. still 'triaged'. The sync must not skip a
+        # record just because state matches the last-seen h1_state; the reward signal
+        # alone is new information and must still advance the ledger to 'paid'.
+        finding = {"ref": "F1", "class_id": "xss", "rule_id": "active.reflected-xss", "location": "https://x/a"}
+        bounty_ledger.upsert_findings(g.RUNTIME_DIR, "acme", "https://x", [{"finding": finding, "proof_status": "confirmed"}])
+        key = bounty_ledger.dedup_key(finding)
+        pid = bounty_ledger.program_key("acme", "https://x")
+        bounty_ledger.record_submission(g.RUNTIME_DIR, "acme", "https://x", key, "555", "u")
+        bounty_ledger.record_h1_sync(g.RUNTIME_DIR, pid, key, state="triaged", resolved_with_reward=False)
+
+        g.bounty_h1_activity.fetch_report_status = lambda rid, u, t, **kw: {
+            "ok": True, "state": "triaged", "bounty_awarded_at": "2026-02-01T00:00:00Z",
+        }
+        cap = _run_post_route("/api/hackerone/sync-submitted", {})
+        self.assertEqual(cap.status, 200)
+        data = json.loads(cap.body)
+        self.assertEqual(data["updated"], 1)
+        stored = bounty_ledger._load(g.RUNTIME_DIR)["programs"][pid]["findings"][key]
+        self.assertEqual(stored["stage"], "paid")
+        self.assertEqual(stored["h1_state"], "triaged")
+
+    def test_token_never_echoed_by_any_new_route(self) -> None:
+        g._store_secret("hackerone.api_token", "TOP-SECRET-TOKEN-XYZ")
+        g.bounty_h1_activity.fetch_hacktivity = lambda *a, **k: {"ok": True, "handle": "acme", "items": []}
+        cap = _run_post_route("/api/hackerone/hacktivity", {"team_handle": "acme"})
+        self.assertNotIn(b"TOP-SECRET-TOKEN-XYZ", cap.body)
 
 
 class CampaignProgramIdTests(unittest.TestCase):

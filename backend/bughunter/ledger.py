@@ -116,6 +116,7 @@ def upsert_findings(
                     "cvss_base": (item.get("cvss") or {}).get("base_score"),
                     "first_seen": _now(), "last_seen": _now(), "updated_at": _now(),
                     "h1_report_id": "", "bounty": 0.0, "outcome": "",
+                    "h1_state": "", "h1_synced_at": "",
                 }
             else:
                 rec["last_seen"] = _now()
@@ -152,6 +153,54 @@ def record_submission(runtime_dir: str | Path, program: str | None, target: str,
 
 def record_paid(runtime_dir: str | Path, program: str | None, target: str, key: str, bounty: float, outcome: str = "accepted") -> None:
     advance_stage(runtime_dir, program, target, key, "paid", bounty=float(bounty or 0.0), outcome=outcome)
+
+
+# HackerOne report states that will never change again — once a record is synced to one
+# of these, a later sync pass skips it (never re-polls a closed report).
+_H1_TERMINAL_STATES = {"resolved", "not-applicable", "informative", "duplicate", "spam"}
+
+
+def record_h1_sync(runtime_dir: str | Path, pid: str, key: str, *, state: str, resolved_with_reward: bool) -> None:
+    """Update a finding's last-known HackerOne state after a status-sync poll, given the
+    ledger's own program-bucket id (``pid``, as returned by ``submitted_records`` —
+    bypasses ``program_key()`` re-derivation since the caller already has the exact
+    bucket the record lives in). Advances the local stage to 'paid' ONLY when the sync
+    confirms a real reward (bounty_awarded_at/swag_awarded_at was set on the live
+    report); a bare state change (e.g. 'triaged') never moves the stage on its own."""
+    with _LOCK:
+        data = _load(runtime_dir)
+        rec = data.get("programs", {}).get(pid, {}).get("findings", {}).get(key)
+        if not rec:
+            return
+        rec["h1_state"] = str(state or "")
+        rec["h1_synced_at"] = _now()
+        if resolved_with_reward and _STAGE_RANK.get(rec.get("stage"), 0) < _STAGE_RANK["paid"]:
+            rec["stage"] = "paid"
+        rec["updated_at"] = _now()
+        _save(runtime_dir, data)
+
+
+def submitted_records(runtime_dir: str | Path, limit: int = 25) -> list[dict[str, Any]]:
+    """Every finding across the whole portfolio still worth polling HackerOne for: at
+    stage 'submitted', with a real ``h1_report_id``, and NOT already synced to a
+    known-terminal HackerOne state (so a repeat sync never re-polls a report that's
+    already resolved/duplicate/informative/not-applicable/spam). Capped to the ``limit``
+    most-recently-submitted so a sync action can never blow through HackerOne's tighter
+    report-read rate limit (300/min). Each item carries ``pid``/``key`` so the caller can
+    pass them straight to ``record_h1_sync``."""
+    data = _load(runtime_dir).get("programs", {})
+    candidates: list[dict[str, Any]] = []
+    for pid, bucket in data.items():
+        for key, rec in (bucket.get("findings") or {}).items():
+            if rec.get("stage") != "submitted":
+                continue
+            if not str(rec.get("h1_report_id") or "").strip():
+                continue
+            if str(rec.get("h1_state") or "") in _H1_TERMINAL_STATES:
+                continue
+            candidates.append({**rec, "pid": pid, "key": key})
+    candidates.sort(key=lambda r: str(r.get("updated_at") or ""), reverse=True)
+    return candidates[: max(0, limit)]
 
 
 def is_duplicate(runtime_dir: str | Path, program: str | None, target: str, finding: dict[str, Any]) -> bool:
