@@ -5388,6 +5388,7 @@ function ckProgramSetupRow(p) {
   left.append(cel("span", "ck-ftitle", p.name || p.id));
   if (p.platform_handle) left.append(document.createTextNode(" "), cel("span", "ck-tag", `HackerOne: ${p.platform_handle}`));
   if (p.oob_allowed) left.append(document.createTextNode(" "), cel("span", "ck-tag", "OOB allowed"));
+  if (p.disclose_automation) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Discloses tool use"));
   const n = (p.structured_scope || []).length;
   left.append(cel("div", "ck-floc", `${p.scope_text || "(no scope)"} · ${n} structured scope entr${n === 1 ? "y" : "ies"}`));
   li.append(left);
@@ -5494,6 +5495,8 @@ function ckProgramSetupForm() {
   const toggles = cel("div", "ck-toggles");
   const oobAllowed = ckToggle("This program's policy allows out-of-band / collaborator testing (SSRF, blind XXE)", editing ? Boolean(editing.oob_allowed) : false);
   toggles.append(oobAllowed.wrap);
+  const discloseAutomation = ckToggle("This program's terms require disclosing automated-tool assistance — add a disclosure line to submitted reports", editing ? Boolean(editing.disclose_automation) : false);
+  toggles.append(discloseAutomation.wrap);
   form.append(toggles);
 
   const notes = ckTextareaField("Notes (policy excerpt, reward table, anything worth remembering)", "");
@@ -5520,6 +5523,7 @@ function ckProgramSetupForm() {
       platform_handle: handle.input.value.trim(),
       structured_scope: structuredScope,
       oob_allowed: oobAllowed.input.checked,
+      disclose_automation: discloseAutomation.input.checked,
       notes: notes.input.value,
       // This form owns the structured-scope table, so a save here should always re-derive
       // scope_text/in_scope_hosts/out_of_scope_hosts from whatever the table currently

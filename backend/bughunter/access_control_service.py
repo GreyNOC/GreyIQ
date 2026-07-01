@@ -485,7 +485,7 @@ def _build_bfla_finding(url: str, detail: dict[str, Any]) -> tuple[dict[str, Any
                 f"curl -s -i '{url}' -H 'Cookie: <low-priv session>'\n"
                 f"# -> HTTP {detail['status_user']} with the privileged (admin) response"),
         "impact": model.get("business_impact", ""),
-        "cvss": impact_model.cvss_for_class("access-control"),
+        "cvss": impact_model.cvss_for_class("access-control", confirmed=True),
         "remediation": impact_model.remediation_for_class("access-control"),
         "proof_of_impact": {
             "status": "confirmed",
@@ -545,7 +545,7 @@ def _build_finding(url_a: str, url_b: str, detail: dict[str, Any]) -> tuple[dict
                 f"curl -s -i '{url_a}' -H 'Cookie: <B session>'\n"
                 f"# -> HTTP {detail['status_ba']} with Account A's data (cross-tenant read)"),
         "impact": model.get("business_impact", ""),
-        "cvss": impact_model.cvss_for_class("access-control"),
+        "cvss": impact_model.cvss_for_class("access-control", confirmed=True),
         "remediation": impact_model.remediation_for_class("access-control"),
         "proof_of_impact": {
             "status": "confirmed",

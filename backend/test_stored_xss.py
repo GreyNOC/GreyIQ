@@ -55,6 +55,8 @@ class StoredXssTests(unittest.TestCase):
         self.assertEqual(res["finding"]["rule_id"], "active.stored-xss")
         self.assertEqual(res["finding"]["class_id"], "xss")
         self.assertEqual(res["attack_plan"]["proof_of_impact"]["status"], "confirmed")
+        self.assertFalse(res["attack_plan"]["cvss"]["estimated"])
+        self.assertIn("confirmed", res["attack_plan"]["cvss"]["justification"].lower())
 
     def test_escaped_marker_is_not_confirmed(self) -> None:
         marker = "gqsxcafef00d"

@@ -673,6 +673,7 @@ class ProgramUpsertRequest(BaseModel):
     seed_targets: list[str] = Field(default_factory=list)
     structured_scope: list[dict[str, Any]] = Field(default_factory=list, max_length=500)
     oob_allowed: bool = False
+    disclose_automation: bool = False  # this program's terms require disclosing automated-tool assistance in submitted reports
     notes: str = Field(default="", max_length=4000)
     resync_scope: bool = False  # re-derive scope_text/hosts from structured_scope even if scope_text is already set (see portfolio.upsert_program)
     active: bool = False
@@ -1312,6 +1313,7 @@ class GreyIQRuntime:
             return {"ok": False, "error": "This program has no huntable targets — add seed targets, or import/build its structured scope, in the Program tab."}
         scope = str(program.get("scope_text") or "").strip() or request.scope
         program_label = str(program.get("name") or program.get("id") or request.program_id)
+        disclose_automation = bool(program.get("disclose_automation"))
         result = bounty_campaign.run_campaign_over_targets(
             targets,
             scope=scope,
@@ -1328,13 +1330,16 @@ class GreyIQRuntime:
             program=program_label,
             max_pages=request.max_pages,
             deep=request.deep,
+            disclose_automation=disclose_automation,
         )
         target_label = f"{program_label} — {len(targets)} in-scope target(s)"
-        self._cache_bounty_run(result, target=target_label, scope=scope, program=program_label)
+        self._cache_bounty_run(result, target=target_label, scope=scope, program=program_label,
+                                disclose_automation=disclose_automation)
         return result
 
     # ---- After-testing / submission workflow -------------------------------------
-    def _cache_bounty_run(self, result: dict[str, Any], *, target: str, scope: str, program: str | None) -> None:
+    def _cache_bounty_run(self, result: dict[str, Any], *, target: str, scope: str, program: str | None,
+                          disclose_automation: bool = False) -> None:
         """Index a finished run by a fresh run_id so a canonical per-finding submission
         package can be rebuilt without re-scanning. Stores only the minimal ctx + the
         per-ref findings (already redacted/scope-filtered by the report layer); bounded
@@ -1347,6 +1352,7 @@ class GreyIQRuntime:
             "generated_at": result.get("generated_at", ""),
             "target": target, "scope": scope,
             "attack_plans": result.get("attack_plans") or {},
+            "disclose_automation": disclose_automation,
         }
         findings_by_ref = {str(f.get("ref")): f for f in (result.get("findings") or []) if f.get("ref")}
         # Remember where this run wrote its artifacts so the whole engagement can be
@@ -1491,7 +1497,8 @@ class GreyIQRuntime:
 
     def _persist_finding_run(self, *, findings: list[dict[str, Any]], plans: dict[str, Any],
                              target: str, scope: str, platform: str, slug: str, host: Any,
-                             json_extra: dict[str, Any] | None = None) -> dict[str, Any]:
+                             json_extra: dict[str, Any] | None = None,
+                             disclose_automation: bool = False) -> dict[str, Any]:
         """Shared tail for the confirm routes (IDOR / takeover / OOB-SSRF): build the report
         ctx, render every finding for the chosen platform, write the ``.md`` + ``.json``
         sidecar, and cache the result as a run so every per-finding action (per-platform
@@ -1508,7 +1515,8 @@ class GreyIQRuntime:
         gen = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
         platform = bounty_formats.normalize_platform(platform)
         ctx = {"tool": "GreyIQ BugHunter", "version": VERSION, "generated_at": gen,
-               "target": target, "scope": scope, "attack_plans": plans}
+               "target": target, "scope": scope, "attack_plans": plans,
+               "disclose_automation": disclose_automation}
         report_md = "\n\n---\n\n".join(bounty_formats.render_finding(ctx, f, platform) for f in findings)
 
         safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
@@ -1535,7 +1543,8 @@ class GreyIQRuntime:
         result = {"ok": True, "generated_at": gen, "findings": findings, "attack_plans": plans,
                   "proof_of_impact": {ref: {"status": str(((plans.get(ref) or {}).get("proof_of_impact") or {}).get("status", "confirmed"))} for ref in plans},
                   "report_path": report_path, "json_path": json_out, "output_dir": str(out_dir)}
-        self._cache_bounty_run(result, target=target, scope=scope, program=None)
+        self._cache_bounty_run(result, target=target, scope=scope, program=None,
+                                disclose_automation=disclose_automation)
         return {"run_id": result.get("run_id"), "platform": platform, "report": report_md,
                 "report_path": report_path, "json_path": json_out, "generated_at": gen}
 
@@ -1928,7 +1937,7 @@ class GreyIQRuntime:
 
     def upsert_program(self, request: "ProgramUpsertRequest") -> dict[str, Any]:
         # exclude_unset: a caller that doesn't know about a field (e.g. the Operator tab's
-        # compact edit form predates structured_scope/oob_allowed/notes) must never reset
+        # compact edit form predates structured_scope/oob_allowed/disclose_automation/notes) must never reset
         # it to that field's bare default just by omitting it from the request body -- the
         # existing stored value is preserved instead. A caller that DOES send a field
         # (even a falsy one, like active=false) still gets it applied, since Pydantic marks

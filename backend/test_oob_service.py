@@ -78,6 +78,8 @@ class ConfirmTests(unittest.TestCase):
         self.assertEqual(res["finding"]["class_id"], "ssrf")
         self.assertEqual(res["finding"]["rule_id"], "active.blind-ssrf-oob")
         self.assertEqual(res["attack_plan"]["proof_of_impact"]["status"], "confirmed")
+        # A real collaborator hit is no longer a template CVSS guess.
+        self.assertFalse(res["attack_plan"]["cvss"]["estimated"])
         # the probe injected the unique callback token into the target's 'url' param
         # (the callback URL is urlencoded, so the surrounding /oob/ becomes %2Foob%2F).
         self.assertTrue(any(seen["token"] in u for u in http.fetched))
@@ -92,6 +94,7 @@ class ConfirmTests(unittest.TestCase):
             scope="app.example.com", settings=get_settings(), http=FakeHttp(), poll_attempts=1, poll_delay_s=0.0)
         self.assertEqual(res["status"], "candidate")
         self.assertEqual(res["attack_plan"]["proof_of_impact"]["status"], "candidate")
+        self.assertTrue(res["attack_plan"]["cvss"]["estimated"])  # unverified source stays a template estimate
 
     def test_no_callback_does_not_confirm(self) -> None:
         oob.poll_collaborator = lambda base, secret, token, **k: {"ok": True, "count": 0, "hits": []}
@@ -199,6 +202,7 @@ class XxeTests(unittest.TestCase):
         self.assertEqual(res["finding"]["rule_id"], "active.blind-xxe-oob")
         self.assertEqual(res["finding"]["snippet"], "")  # no file exfiltrated
         self.assertEqual(res["attack_plan"]["proof_of_impact"]["status"], "confirmed")
+        self.assertFalse(res["attack_plan"]["cvss"]["estimated"])
 
     def test_auto_send_posts_then_confirms(self) -> None:
         sent = []

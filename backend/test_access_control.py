@@ -78,6 +78,10 @@ class IdorDifferentialTests(unittest.TestCase):
         self.assertEqual(f["snippet"], "")
         self.assertNotIn("card ****1111", f["proof_evidence"]["matched_value"])
         self.assertEqual(res["attack_plan"]["proof_of_impact"]["status"], "confirmed")
+        # A genuinely confirmed dual-session differential is no longer a template CVSS
+        # guess — 'estimated' flips false and the justification says why.
+        self.assertFalse(res["attack_plan"]["cvss"]["estimated"])
+        self.assertIn("confirmed", res["attack_plan"]["cvss"]["justification"].lower())
 
     def test_access_control_enforced_does_not_confirm(self) -> None:
         # B is denied A's object (403) -> access control held, no IDOR.
@@ -180,6 +184,7 @@ class BflaDifferentialTests(unittest.TestCase):
         self.assertEqual(f["snippet"], "")  # privileged body never embedded
         self.assertNotIn("alice", f["proof_evidence"]["matched_value"])
         self.assertEqual(res["attack_plan"]["proof_of_impact"]["status"], "confirmed")
+        self.assertFalse(res["attack_plan"]["cvss"]["estimated"])
 
     def test_enforced_when_user_is_denied(self) -> None:
         res = _run_bfla({

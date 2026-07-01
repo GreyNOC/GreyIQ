@@ -442,19 +442,27 @@ def impact_for_class(class_id: str) -> dict[str, str]:
     return IMPACT_MODEL.get(str(class_id or ""), _GENERIC_MODEL)
 
 
-def cvss_for_class(class_id: str) -> dict[str, Any]:
-    """{vector, score, severity, justification, estimated} for a class id. The
-    severity is 'estimated' because a static/passive scan can't measure every metric."""
+def cvss_for_class(class_id: str, *, confirmed: bool = False) -> dict[str, Any]:
+    """{vector, score, severity, justification, estimated} for a class id. Estimated
+    (the default) because a static/passive scan can't measure every metric — pass
+    confirmed=True only once active verification has actually captured a real
+    observed-vs-control differential proving the vector on the live target; the
+    justification and 'estimated' flag then reflect that it's no longer a template
+    guess. Callers must gate 'confirmed' the same way report.py gates proof status
+    (a real captured artifact, never a bare narrative status) so CVSS confidence can
+    never disagree with the proof-of-impact label shown alongside it."""
     model = impact_for_class(class_id)
     vector = model["cvss_vector"]
     scored = cvss_base_score(vector)
+    justification = f"{model['attacker_capability']} {model['business_impact'].capitalize()} " + (
+        "Actively confirmed with a captured observed-vs-control differential on the live target — not a template estimate."
+        if confirmed else
+        "Vector is an estimate for a static/passive finding; confirm the real metrics on the live target."
+    )
     return {
         "vector": vector,
         "base_score": scored["score"],
         "base_severity": scored["severity"],
-        "estimated": True,
-        "justification": (
-            f"{model['attacker_capability']} {model['business_impact'].capitalize()} "
-            "Vector is an estimate for a static/passive finding; confirm the real metrics on the live target."
-        ),
+        "estimated": not confirmed,
+        "justification": justification,
     }
