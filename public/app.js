@@ -6560,13 +6560,25 @@ function ckTargetImport(targetsField, scopeField, onStructuredRows) {
         addScope.addEventListener("click", () => { scopeField.input.value = mergeList(scopeField.input.value, res.hosts, " "); note.className = "ck-status"; note.textContent = `Added ${res.host_count} host(s) to scope.`; });
         acts.append(addScope);
       }
-      if (onStructuredRows && res.structured_scope && res.structured_scope.length) {
-        const addRows = cel("button", "ck-btn", `Add ${res.structured_scope.length} scope entries`); addRows.type = "button";
-        addRows.addEventListener("click", () => {
-          onStructuredRows(res.structured_scope);
-          note.className = "ck-status"; note.textContent = `Added ${res.structured_scope.length} scope entries.`;
-        });
-        acts.append(addRows);
+      if (onStructuredRows) {
+        // A HackerOne-shaped parse already carries the full row; a plain CSV/Burp/HAR
+        // success only has flat hosts — synthesize bare identifier rows from those so
+        // this callback (and its button) is never a dead end just because the operator
+        // picked (or auto-detect fell back to) a non-HackerOne kind.
+        const rows = (res.structured_scope && res.structured_scope.length)
+          ? res.structured_scope
+          : (res.hosts || []).map((h) => ({
+              identifier: h, asset_type: "", eligible_for_submission: true,
+              eligible_for_bounty: false, instruction: "", max_severity: "",
+            }));
+        if (rows.length) {
+          const addRows = cel("button", "ck-btn", `Add ${rows.length} scope entries`); addRows.type = "button";
+          addRows.addEventListener("click", () => {
+            onStructuredRows(rows);
+            note.className = "ck-status"; note.textContent = `Added ${rows.length} scope entries.`;
+          });
+          acts.append(addRows);
+        }
       }
       result.append(acts);
     } catch (err) {
