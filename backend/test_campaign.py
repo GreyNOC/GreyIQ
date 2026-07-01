@@ -309,6 +309,38 @@ class ProgramCampaignTargetsTests(unittest.TestCase):
     def test_empty_program_returns_empty_list(self) -> None:
         self.assertEqual(campaign.program_campaign_targets({}), [])
 
+    def test_out_of_scope_seed_target_is_never_hunted(self) -> None:
+        # Regression: out_of_scope_hosts was stored but never consulted anywhere, so an
+        # operator-excluded host could still become the literal target of a hunt just
+        # because it was hand-typed as a seed.
+        program = {
+            "seed_targets": ["https://a.example.com", "https://staging-admin.example.com"],
+            "out_of_scope_hosts": ["staging-admin.example.com"],
+        }
+        self.assertEqual(campaign.program_campaign_targets(program), ["https://a.example.com"])
+
+    def test_out_of_scope_structured_scope_entry_is_never_hunted(self) -> None:
+        program = {"structured_scope": [
+            {"identifier": "in.example.com", "eligible_for_submission": True},
+            {"identifier": "out.example.com", "eligible_for_submission": True},
+        ], "out_of_scope_hosts": ["out.example.com"]}
+        self.assertEqual(campaign.program_campaign_targets(program), ["https://in.example.com"])
+
+    def test_out_of_scope_host_excludes_its_subdomains_too(self) -> None:
+        program = {
+            "seed_targets": ["https://admin.staging.example.com"],
+            "out_of_scope_hosts": ["staging.example.com"],
+        }
+        self.assertEqual(campaign.program_campaign_targets(program), [])
+
+    def test_falls_back_to_structured_scope_when_every_seed_is_excluded(self) -> None:
+        program = {
+            "seed_targets": ["https://excluded.example.com"],
+            "out_of_scope_hosts": ["excluded.example.com"],
+            "structured_scope": [{"identifier": "fallback.example.com", "eligible_for_submission": True}],
+        }
+        self.assertEqual(campaign.program_campaign_targets(program), ["https://fallback.example.com"])
+
 
 class RunCampaignOverTargetsTests(unittest.TestCase):
     """run_campaign_over_targets -- one full campaign per target, merged. Offline: uses

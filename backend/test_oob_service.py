@@ -160,6 +160,31 @@ class ConfirmTests(unittest.TestCase):
         self.assertEqual(res["status"], "confirmed")
         self.assertEqual(res["param"], "next")  # confirmed via the SECOND param, after param 1's transient failure
 
+    def test_websitefetcherror_on_one_params_probe_does_not_abort_the_sweep(self) -> None:
+        # Regression: only _ActiveError was caught around http.fetch() in the
+        # per-param probe loop, but _Http.fetch() can also raise WebsiteFetchError (a
+        # ValueError subclass) -- e.g. this param's probe URL grew past
+        # MAX_URL_LENGTH, or the target's DNS answer changed to private mid-sweep.
+        # That used to propagate out of confirm_blind_ssrf entirely, aborting every
+        # param ordered after the one that raised.
+        class RaisingThenOkHttp:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def fetch(self, url, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise oob.WebsiteFetchError("simulated: URL too long")
+                return {"status": 200, "headers": {}, "body": "", "cookies": [], "final_url": url, "location": None}
+
+        oob.poll_collaborator = self._staged_poll({"method": "GET", "ip": "9.9.9.9",
+                                                    "headers": {"user-agent": "Go-http-client/1.1"}})
+        res = oob.confirm_blind_ssrf(
+            "https://app.example.com/?url=x&next=y", base="https://collab.example", secret="s" * 16,
+            scope="app.example.com", settings=get_settings(), http=RaisingThenOkHttp(), poll_attempts=1, poll_delay_s=0.0)
+        self.assertEqual(res["status"], "confirmed")
+        self.assertEqual(res["param"], "next")  # confirmed via the SECOND param, after param 1's WebsiteFetchError
+
 
 class XxeTests(unittest.TestCase):
     def setUp(self) -> None:

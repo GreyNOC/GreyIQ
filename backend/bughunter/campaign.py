@@ -15,12 +15,14 @@ on top. Frozen-safe; the only network is the engine's own guarded scanners.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from bughunter import (
     active_verify_service,
@@ -35,6 +37,7 @@ from bughunter import (
     submission,
 )
 from bughunter.bounty import _classify, _infer_kind, _safe_slug, run_bounty_hunt
+from bughunter.registrable_domain import registrable_domain
 from bughunter.settings import get_settings
 from bughunter.target_ingest import _normalize_one
 
@@ -90,6 +93,7 @@ def run_campaign(
     deep: bool = False,
     on_progress: Any = None,
     disclose_automation: bool = False,
+    excluded_hosts: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Run a full campaign. Returns {ok, campaign_path, json_path, urls_scanned,
     finding_count, confirmed_count, submission_paths, ...} or {ok: False, error}."""
@@ -101,6 +105,11 @@ def run_campaign(
     kind = _infer_kind(clean_target)
     if kind == "unknown":
         return {"ok": False, "error": "Could not tell if the target is a URL or a repo/path."}
+    # A saved program's out_of_scope_hosts (when the caller resolved one) rides on the
+    # settings object every scope check downstream already takes, so recon's discovery
+    # gate and run_bounty_hunt's own active-verification pass both honor it without
+    # each needing their own separate exclusion parameter.
+    campaign_settings = dataclasses.replace(get_settings(), excluded_hosts=tuple(excluded_hosts or ()))
 
     rt = runtime_dir
     priors = learning.learned_priors(rt, program, clean_target) if rt is not None else {}
@@ -133,9 +142,8 @@ def run_campaign(
         _emit("recon: mapping the surface…")
         # Bind discovery to the SAME fail-closed scope gate the active prover uses, so
         # in-scope cross-host expansion (a wildcard program) is followed and ONLY
-        # in-scope hosts are ever fetched.
-        settings = get_settings()
-        scope_gate = (lambda h: active_verify_service.host_in_active_scope(h, scope, settings)) if str(scope or "").strip() else None
+        # in-scope hosts are ever fetched -- excluded_hosts rides on campaign_settings.
+        scope_gate = (lambda h: active_verify_service.host_in_active_scope(h, scope, campaign_settings)) if str(scope or "").strip() else None
         rec = recon.discover(clean_target, max_pages=max_pages, scope_in=scope_gate)
         urls = rec.get("urls") or [clean_target]
         recon_notes = rec.get("notes") or []
@@ -169,7 +177,7 @@ def run_campaign(
             url, profile, None, str(out_root / "targets"), scope, True, coder_cfg,
             default_reports_dir=out_root / "targets", seed_dir=seed_dir, runtime_dir=runtime_dir,
             version=version, run_live=live, active=effective_active, time_based=(time_based or deep), auth=auth, per_finding=False,
-            extra_params=recon_params,
+            extra_params=recon_params, on_progress=_emit, settings=campaign_settings,
         )
         per_target.append({"target": url, "ok": result.get("ok", False),
                            "report_path": result.get("report_path", ""), "error": result.get("error", "")})
@@ -393,14 +401,40 @@ def _representative_host(identifier: str) -> str:
     return _normalize_one(token)
 
 
+def _target_host_excluded(candidate: str, excluded_hosts: list[str]) -> bool:
+    """True if candidate's host matches (or is a subdomain of) one of excluded_hosts —
+    the same exact/dotted-suffix/registrable-domain match host_in_active_scope() uses
+    for its own excluded_hosts check, applied here at target-SELECTION time so an
+    excluded host can never become the literal target of a hunt in the first place."""
+    if not excluded_hosts:
+        return False
+    raw = str(candidate or "").strip()
+    host = (urlparse(raw).hostname if "://" in raw else raw).strip().lower().strip("[]")
+    if not host:
+        return False
+    reg = registrable_domain(host)
+    for excluded in excluded_hosts:
+        token = str(excluded or "").strip().lower().strip("[]").lstrip("*").lstrip(".")
+        if not token:
+            continue
+        if host == token or host.endswith("." + token) or reg == token:
+            return True
+    return False
+
+
 def program_campaign_targets(program: dict[str, Any], max_targets: int = _MAX_PROGRAM_TARGETS) -> list[str]:
     """The list of concrete URLs a "hunt this program's whole scope" campaign should
     run. Prefers ``seed_targets`` (an operator's own hand-curated hunt list) when
     present; otherwise derives one representative, deduped target per ELIGIBLE
     ``structured_scope`` entry (a HackerOne API/CSV-imported program), so a program
     built purely from an imported scope table still has something to hunt. Bounded —
-    this feeds directly into a real active-probing pipeline, never an unbounded fan-out."""
+    this feeds directly into a real active-probing pipeline, never an unbounded fan-out.
+    A host in the program's own out_of_scope_hosts is filtered out here too — it must
+    never become the literal target of a hunt just because it was hand-typed as a seed
+    or matched a wildcard structured_scope entry."""
+    excluded_hosts = [str(h) for h in (program.get("out_of_scope_hosts") or [])]
     seeds = [str(t).strip() for t in (program.get("seed_targets") or []) if str(t or "").strip()]
+    seeds = [t for t in seeds if not _target_host_excluded(t, excluded_hosts)]
     if seeds:
         return list(dict.fromkeys(seeds))[:max_targets]
     out: list[str] = []
@@ -409,7 +443,7 @@ def program_campaign_targets(program: dict[str, Any], max_targets: int = _MAX_PR
         if not isinstance(entry, dict) or not entry.get("eligible_for_submission", True):
             continue
         url = _representative_host(str(entry.get("identifier") or ""))
-        if url and url not in seen:
+        if url and url not in seen and not _target_host_excluded(url, excluded_hosts):
             seen.add(url)
             out.append(url)
         if len(out) >= max_targets:
@@ -438,6 +472,7 @@ def run_campaign_over_targets(
     on_progress: Any = None,
     max_targets: int = _MAX_PROGRAM_TARGETS,
     disclose_automation: bool = False,
+    excluded_hosts: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Run one full ``run_campaign`` per target (bounded, deduped, best-effort — one
     bad target never aborts the rest) and merge the results into a single combined
@@ -494,7 +529,7 @@ def run_campaign_over_targets(
                 default_reports_dir=span_root, seed_dir=seed_dir, runtime_dir=runtime_dir,
                 version=version, active=active, time_based=time_based, auth=auth, live=live,
                 program=program, max_pages=max_pages, platform=platform, deep=deep,
-                disclose_automation=disclose_automation,
+                disclose_automation=disclose_automation, on_progress=_emit, excluded_hosts=excluded_hosts,
             )
         except Exception as exc:  # noqa: BLE001 - one bad target must never abort the span
             errors.append(f"{target}: {type(exc).__name__}: {exc}")

@@ -57,6 +57,7 @@ from bughunter.web_ingest import (
     WebsiteFetchError,
     _ascii_hostname,
     _host_is_private,
+    guarded_dns_scope,
     normalize_website_url,
 )
 from bughunter.web_scan_service import (
@@ -144,14 +145,23 @@ def host_in_active_scope(host: str, scope: str, settings: Any) -> bool:
     """Fail-closed scope binding: a host is eligible for ACTIVE probing only if the
     operator named it (its registrable domain or full host appears in the scope
     text), or it matches the env allowlist, or it's your own private/loopback infra
-    with private URLs explicitly allowed."""
+    with private URLs explicitly allowed. settings.excluded_hosts (a saved program's
+    out_of_scope_hosts, when the caller resolved one) is checked FIRST and always wins
+    over every positive match below — an exclusion the operator set can never be
+    silently overridden by a broader scope_text wildcard."""
     cleaned = (host or "").strip().lower().strip("[]")
     if not cleaned:
         return False
+    reg = _registrable(cleaned)
+    for excluded in getattr(settings, "excluded_hosts", ()) or ():
+        token = str(excluded or "").strip().lower().strip("[]").lstrip("*").lstrip(".")
+        if not token:
+            continue
+        if cleaned == token or cleaned.endswith("." + token) or reg == token:
+            return False
     # No-DNS checks first: the operator named the host. Match host TOKENS exactly or
     # by proper dotted suffix — not a substring of the free text (which would let
     # 'example.com' match scope 'notexample.com' and probe an out-of-scope host).
-    reg = _registrable(cleaned)
     for token in _scope_hosts(scope):
         if is_bare_public_suffix(token):
             # The token IS itself a known multi-label public suffix (e.g.
@@ -290,38 +300,44 @@ class _Http:
             raise _ActiveError(f"refused non-idempotent method {method}")
         if self.sent >= self.max_requests:  # per-hunt budget, independent of the host bucket
             raise _RateLimited()
-        sanitized = _guard_url(normalize_website_url(url), self.settings.allow_private_urls, self.settings.web_allowed_ports)
-        host = urlparse(sanitized).hostname or ""
-        if not self.governor.throttle(host):
-            raise _RateLimited()
-        self.sent += 1
-        headers = {"User-Agent": _USER_AGENT, "Accept": "*/*", "Accept-Encoding": "identity"}
-        # Operator auth is attached ONLY when this request's host is same-site as the
-        # bound host — so the open-bucket check's foreign-host fetch (and any other
-        # off-target host) never receives the session.
-        headers.update(auth_headers_for(host, self.auth))
-        if extra_headers:
-            headers.update(extra_headers)
-        request = Request(sanitized, headers=headers, method=method)
-        # Time ONLY the request (not the governor throttle above), so a time-based
-        # check measures the server, not our own rate-limit sleep.
-        started = time.monotonic()
-        try:
-            with self.opener.open(request, timeout=self.settings.web_fetch_timeout_seconds) as resp:
-                consumed = _consume(resp, self.settings)
-                consumed["final_url"] = resp.geturl()
-                consumed["location"] = resp.headers.get("Location") if resp.headers else None
+        # guarded_dns_scope() covers guard-check through the real connect so the DNS
+        # pin _guard_url() installs is still in effect when the actual HTTP connect
+        # (a few lines down) independently re-resolves the same hostname — closing the
+        # DNS-rebinding check-then-connect gap. Every active check funnels through
+        # this ONE fetch(), so fixing it here covers the whole active-verify engine.
+        with guarded_dns_scope():
+            sanitized = _guard_url(normalize_website_url(url), self.settings.allow_private_urls, self.settings.web_allowed_ports)
+            host = urlparse(sanitized).hostname or ""
+            if not self.governor.throttle(host):
+                raise _RateLimited()
+            self.sent += 1
+            headers = {"User-Agent": _USER_AGENT, "Accept": "*/*", "Accept-Encoding": "identity"}
+            # Operator auth is attached ONLY when this request's host is same-site as the
+            # bound host — so the open-bucket check's foreign-host fetch (and any other
+            # off-target host) never receives the session.
+            headers.update(auth_headers_for(host, self.auth))
+            if extra_headers:
+                headers.update(extra_headers)
+            request = Request(sanitized, headers=headers, method=method)
+            # Time ONLY the request (not the governor throttle above), so a time-based
+            # check measures the server, not our own rate-limit sleep.
+            started = time.monotonic()
+            try:
+                with self.opener.open(request, timeout=self.settings.web_fetch_timeout_seconds) as resp:
+                    consumed = _consume(resp, self.settings)
+                    consumed["final_url"] = resp.geturl()
+                    consumed["location"] = resp.headers.get("Location") if resp.headers else None
+                    consumed["elapsed"] = time.monotonic() - started
+                    return consumed
+            except HTTPError as exc:
+                # A 3xx (captured, not followed) or 4xx/5xx is a valid observation.
+                consumed = _consume(exc, self.settings)
+                consumed["final_url"] = sanitized
+                consumed["location"] = exc.headers.get("Location") if exc.headers else None
                 consumed["elapsed"] = time.monotonic() - started
                 return consumed
-        except HTTPError as exc:
-            # A 3xx (captured, not followed) or 4xx/5xx is a valid observation.
-            consumed = _consume(exc, self.settings)
-            consumed["final_url"] = sanitized
-            consumed["location"] = exc.headers.get("Location") if exc.headers else None
-            consumed["elapsed"] = time.monotonic() - started
-            return consumed
-        except (URLError, TimeoutError, OSError) as exc:
-            raise _ActiveError(str(exc)) from exc
+            except (URLError, TimeoutError, OSError) as exc:
+                raise _ActiveError(str(exc)) from exc
 
 
 def _redact(value: str) -> str:
@@ -1061,7 +1077,15 @@ def verify_active(
         except _RateLimited:
             rate_limited = True
             break
-        except _ActiveError:
+        except (_ActiveError, WebsiteFetchError):
+            # _Http.fetch() funnels every request through normalize_website_url() /
+            # _guard_url() inside guarded_dns_scope() -- a URL that grew past
+            # MAX_URL_LENGTH once THIS check appended its injected marker, or a host
+            # whose DNS answer changed to something private/reserved between the
+            # initial guard and this later request, raises WebsiteFetchError (a
+            # ValueError subclass), not _ActiveError. Skip just this one check, same
+            # as any other per-request failure -- it must never abort every check
+            # ordered after it.
             result = None
         if result:
             results.append(result)

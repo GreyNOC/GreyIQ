@@ -9,6 +9,7 @@ differential.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 import socket
@@ -27,6 +28,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from bughunter import active_verify_service as av  # noqa: E402
+from bughunter import web_ingest  # noqa: E402
 from bughunter.rate_limit import HostRateGovernor  # noqa: E402
 from bughunter.settings import get_settings  # noqa: E402
 
@@ -680,6 +682,23 @@ class ScopeBindingTests(unittest.TestCase):
         self.assertTrue(av.host_in_active_scope("app.example.com", "*.example.com", s))
         self.assertTrue(av.host_in_active_scope("example.com", "https://example.com/login in scope", s))
 
+    def test_excluded_hosts_win_over_a_positive_scope_match(self) -> None:
+        # Regression: out_of_scope_hosts was stored on a saved program but never
+        # consulted by host_in_active_scope at all -- an operator-excluded host
+        # (e.g. matched only via a broad "*.example.com" scope wildcard) was still
+        # actively probed. excluded_hosts must win even over an explicit, exact
+        # positive match -- an exclusion is never silently overridden.
+        base = get_settings()
+        s = dataclasses.replace(base, excluded_hosts=("staging-admin.example.com",))
+        self.assertFalse(av.host_in_active_scope("staging-admin.example.com", "*.example.com", s))
+        self.assertFalse(av.host_in_active_scope("staging-admin.example.com", "staging-admin.example.com", s))
+        # A subdomain of the excluded host is refused too.
+        self.assertFalse(av.host_in_active_scope("api.staging-admin.example.com", "*.example.com", s))
+        # An unrelated host under the SAME wildcard scope is unaffected.
+        self.assertTrue(av.host_in_active_scope("app.example.com", "*.example.com", s))
+        # With no exclusions configured, behavior is unchanged (backward compatible).
+        self.assertTrue(av.host_in_active_scope("staging-admin.example.com", "*.example.com", base))
+
     def test_bare_public_suffix_in_scope_text_does_not_authorize_the_whole_platform(self) -> None:
         # A scope token that is ITSELF a known multi-label public suffix (a shared PaaS
         # host) must never be treated as someone's own apex -- naming 'herokuapp.com' in
@@ -698,6 +717,21 @@ class ScopeBindingTests(unittest.TestCase):
         # an unrelated co.uk site, but a real owned co.uk apex still works normally.
         self.assertFalse(av.host_in_active_scope("victim.co.uk", "co.uk", s))
         self.assertTrue(av.host_in_active_scope("shop.example.co.uk", "example.co.uk", s))
+
+    def test_bare_parent_of_a_cloud_storage_suffix_does_not_authorize_the_whole_platform(self) -> None:
+        # Regression: is_bare_public_suffix used to only refuse the FULL suffix
+        # ("s3.amazonaws.com", "blob.core.windows.net"), not its own bare parent
+        # ("amazonaws.com", "core.windows.net", "windows.net") -- so an operator
+        # naming just the parent in scope text (e.g. because their own asset is
+        # "mycompany.s3.amazonaws.com" and they typed the parent) would authorize an
+        # active probe against ANY unrelated tenant's S3 bucket / Azure container.
+        s = get_settings()
+        self.assertFalse(av.host_in_active_scope("victim-secret-bucket.s3.amazonaws.com", "amazonaws.com", s))
+        self.assertFalse(av.host_in_active_scope("someone-elses.blob.core.windows.net", "core.windows.net", s))
+        self.assertFalse(av.host_in_active_scope("someone-elses.blob.core.windows.net", "windows.net", s))
+        # A real owned bucket/container still works when the operator names the FULL
+        # host they actually own.
+        self.assertTrue(av.host_in_active_scope("mycompany.s3.amazonaws.com", "mycompany.s3.amazonaws.com", s))
 
     def test_out_of_scope_target_makes_zero_requests(self) -> None:
         # No DNS, no network: scope is checked before the URL guard.
@@ -768,6 +802,33 @@ class ActiveE2ETests(unittest.TestCase):
         # Clickjacking is header-only (no differential) -> honestly a candidate, not confirmed.
         self.assertEqual(status.get("headers"), "candidate")
         self.assertTrue(set(_SiteHandler.seen_methods) <= {"GET", "HEAD", "OPTIONS"})
+
+    def test_one_checks_websitefetcherror_does_not_abort_the_rest_of_the_pass(self) -> None:
+        # Regression: only _RateLimited/_ActiveError were caught per-check, but every
+        # check funnels through _Http.fetch(), which can also raise WebsiteFetchError
+        # (a ValueError subclass) from normalize_website_url()/_guard_url() -- e.g. a
+        # URL that grew past MAX_URL_LENGTH once a check appended its own marker, or a
+        # host whose DNS answer changed to private mid-pass. That used to propagate
+        # out of verify_active entirely, silently skipping every check ordered after
+        # the one that raised.
+        url = f"http://127.0.0.1:{self.port}/?q=x&next=/home"
+        original = av._check_cors  # ordered BEFORE redirect/xss in verify_active's checks list
+
+        def boom(*a, **k):
+            raise av.WebsiteFetchError("simulated failure")
+
+        av._check_cors = boom
+        try:
+            findings, meta = av.verify_active(url, [], scope="127.0.0.1")
+        finally:
+            av._check_cors = original
+        self.assertTrue(meta["in_scope"])
+        status = {f["_active_class_hint"]: f["_active_proof"]["status"] for f in findings}
+        self.assertNotIn("cors", status)  # the check that raised produced no finding
+        # LATER checks in the list must still have run to completion instead of the
+        # whole pass silently aborting.
+        self.assertEqual(status.get("xss"), "confirmed")
+        self.assertEqual(status.get("redirect"), "confirmed")
 
     def test_governor_exhaustion_returns_partial_not_raise(self) -> None:
         url = f"http://127.0.0.1:{self.port}/?q=x&next=/home"
@@ -1020,6 +1081,71 @@ class OpenBucketE2ETests(unittest.TestCase):
         f = av._check_open_bucket(self._http(), landing, "evil-rebind.s3.amazonaws.com", get_settings())
         self.assertIsNone(f, "a bucket host resolving to a private IP must be refused, not reported")
         self.assertEqual(_BucketHandler.hits, 0, "the guard must block before any socket reaches the listener")
+
+    def test_true_dns_rebinding_the_guard_passes_then_dns_changes_is_still_pinned(self) -> None:
+        # This is the scenario test_private_resolving_bucket_is_refused_when_private_urls_off
+        # (above) CANNOT exercise: that test's shim returns the SAME answer for every call,
+        # so it only proves the guard works when DNS is consistent. Here the underlying
+        # resolver (web_ingest._real_getaddrinfo -- the fallback _pinned_getaddrinfo calls
+        # when nothing is pinned yet) answers DIFFERENTLY on the second lookup for the exact
+        # same hostname -- exactly what a real DNS-rebinding attacker does between the
+        # guard's check and the real HTTP connect a moment later. socket.getaddrinfo itself
+        # is left as _pinned_getaddrinfo throughout (never replaced) -- deliberately NOT using
+        # self._serve() here, since that helper replaces socket.getaddrinfo with a lambda that
+        # collapses EVERY hostname to "127.0.0.1" before _pinned_getaddrinfo ever sees the
+        # original hostname, which would defeat the pin-matching this test exercises. So this
+        # exercises the REAL production code path end to end: without the fix, _Http.fetch's
+        # real connect would re-resolve and reach the SECOND (attacker) answer instead of the
+        # one the guard actually validated.
+        #
+        # Uses _Http.fetch() directly (the shared primitive every active check funnels
+        # through) rather than _check_open_bucket(): the latter extracts candidate bucket
+        # URLs via a regex that only ever captures "scheme://host" (never a port), so it
+        # can't exercise a non-default port -- and _guard_url's own allowed-ports gate
+        # would refuse the local test server's ephemeral port anyway. Widening
+        # GREYIQ_WEB_ALLOWED_PORTS for the duration of the test lets the URL carry the
+        # real ephemeral port explicitly, so the real connect's getaddrinfo() asks for
+        # that exact port -- proving the pinned IP survives a rebinding attempt
+        # independent of port handling (port-rewrite correctness itself is covered in
+        # detail by test_dns_rebinding_pin.py).
+        _BucketHandler.status = 200
+        _BucketHandler.body = (b'<?xml version="1.0"?><ListBucketResult>'
+                               b'<Contents><Key>x</Key></Contents></ListBucketResult>')
+        _BucketHandler.hits = 0
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _BucketHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        real_port = self.server.server_port
+        calls = {"n": 0}
+        orig_real = web_ingest._real_getaddrinfo
+        prev_ports = os.environ.get("GREYIQ_WEB_ALLOWED_PORTS")
+        os.environ["GREYIQ_WEB_ALLOWED_PORTS"] = f"80,443,{real_port}"
+
+        def rebinding_resolver(host, p, *a, **k):
+            calls["n"] += 1
+            # First lookup (the guard's _host_is_private check, made through
+            # socket.getaddrinfo == _pinned_getaddrinfo, which falls through to this
+            # function since nothing is pinned yet): the real, reachable server. A
+            # second real lookup should NEVER happen while the pin is active; if it
+            # does (a regression), point it at a dead port so the failure is
+            # immediate and loud rather than silently masked.
+            target_port = p if calls["n"] == 1 else 1
+            return orig_real("127.0.0.1", target_port, *a, **k)
+
+        web_ingest._real_getaddrinfo = rebinding_resolver
+        try:
+            resp = self._http().fetch(f"http://rebind-test.s3.amazonaws.com:{real_port}/")
+        finally:
+            web_ingest._real_getaddrinfo = orig_real
+            with web_ingest._dns_pin_lock:
+                web_ingest._dns_pins.clear()
+            if prev_ports is None:
+                os.environ.pop("GREYIQ_WEB_ALLOWED_PORTS", None)
+            else:
+                os.environ["GREYIQ_WEB_ALLOWED_PORTS"] = prev_ports
+        self.assertEqual(resp.get("status"), 200, "the pinned (first, guard-validated) resolution must be what the real connect uses")
+        self.assertIn("ListBucketResult", resp.get("body") or "")
+        self.assertEqual(_BucketHandler.hits, 1, "the real connect must reach the SAME server the guard validated")
+        self.assertEqual(calls["n"], 1, "the pin must prevent a second real DNS lookup for the same host in this guarded scope")
 
     def test_operator_session_never_leaks_to_a_foreign_bucket(self) -> None:
         # The CRITICAL invariant: an authenticated scan binds the operator's cookie to

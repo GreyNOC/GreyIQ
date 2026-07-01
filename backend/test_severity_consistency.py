@@ -69,6 +69,36 @@ class SeverityConsistencyTests(unittest.TestCase):
         self.assertTrue(pkg["title"].startswith("[High]"), pkg["title"])
         self.assertEqual(pkg["severity_rating"], "high")
 
+    def test_cvss_none_severity_falls_back_to_the_findings_own_severity(self) -> None:
+        # Regression: impact_model.cvss_severity() returns the literal string "None"
+        # for a base score of 0.0 (e.g. a brain-supplied vector with C:N/I:N/A:N for
+        # a class it under-scores) -- resolve_severity used to treat that string as
+        # authoritative just because it was truthy, even though "none" is not a real
+        # severity tier. That silently discarded the finding's REAL severity (e.g.
+        # scanner-assigned "high"), rendered as the literal "?" everywhere, dropped
+        # the finding from every severity_counts bucket, and downgraded it to
+        # HackerOne severity_rating="none" on submission.
+        finding = {
+            "ref": "F1", "severity": "high",
+            "title": "Reflected XSS", "class_name": "XSS", "class_id": "xss",
+            "category": "client_sink", "confidence": "confirmed", "location": "https://app.example.com/search?q=",
+            "rule_id": "active.reflected-xss", "description": "Confirmed reflected XSS via the q param.",
+            "proof_of_impact": {"status": "confirmed"},
+        }
+        plan = {"cvss": {"vector": "AV:P/AC:H/PR:H/UI:R/S:U/C:N/I:N/A:N",
+                         "base_score": 0.0, "base_severity": "None", "estimated": True}}
+        ctx = {"tool": "GreyIQ", "version": "test", "generated_at": "now",
+               "target": "https://app.example.com", "scope": "example.com",
+               "findings": [finding], "attack_plans": {"F1": plan}}
+        # The finding's own real severity wins -- "none" is never authoritative.
+        self.assertEqual(R.resolve_severity(finding, plan), "high")
+        self.assertEqual(R.severity_counts([finding], {"F1": plan}), {"critical": 0, "high": 1, "medium": 0, "low": 0, "info": 0})
+        self.assertEqual(submission.severity_rating(finding, plan), "high")
+        md = R.build_markdown(ctx).lower()
+        self.assertNotIn("| ? |", md)  # never renders as the literal unresolved '?'
+        pkg = submission.build_submission(ctx, finding, "hackerone")
+        self.assertEqual(pkg["severity_rating"], "high")
+
 
 if __name__ == "__main__":
     unittest.main()

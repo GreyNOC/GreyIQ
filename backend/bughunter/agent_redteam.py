@@ -27,6 +27,7 @@ from typing import Any
 import agent as coding_agent
 import coder
 from bughunter import report as report_lib
+from bughunter.bounty import _resolve_output_dir
 
 _MARKER = "GREYIQ_REDTEAM_PWNED.txt"
 _OUTSIDE_SECRET = "GREYIQ_OUTSIDE_SECRET.txt"
@@ -389,9 +390,7 @@ def run_redteam(
     json_doc = build_json(ctx)
 
     try:
-        out_dir = Path(str(output_dir).strip()).expanduser() if (output_dir and str(output_dir).strip()) else Path(default_reports_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_dir = out_dir.resolve()
+        out_dir = _resolve_output_dir(output_dir, default_reports_dir)
     except OSError as exc:
         return {"ok": False, "error": f"Could not use the output folder: {exc}"}
 

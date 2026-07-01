@@ -20,6 +20,7 @@ import shlex
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import coder
 from bughunter import active_verify_service
@@ -515,12 +516,24 @@ def _safe_slug(value: str, fallback: str = "target") -> str:
 
 
 def _resolve_output_dir(output_dir: str | None, default_reports_dir: Path) -> Path:
+    """Resolve the reports output directory. A caller-supplied ``output_dir`` may
+    point anywhere on disk (a local, single-operator "choose my own output folder"
+    feature — the same posture ``workspace.resolve_workspace()`` already takes for
+    the coding-agent's workspace root), but unlike a bare default it may NOT conjure
+    a brand-new, multi-level directory tree at an arbitrary path: the target itself
+    may be freshly created, but its PARENT must already exist. This still supports
+    "put my reports in a new subfolder of somewhere I already have" while closing
+    off using this as a write-anywhere-including-never-existed-before-paths
+    primitive (e.g. a startup/scheduled-task directory that doesn't exist yet).
+    Falls back to ``default_reports_dir`` for anything else."""
     if output_dir and str(output_dir).strip():
-        target = Path(str(output_dir).strip()).expanduser()
+        target = Path(str(output_dir).strip()).expanduser().resolve()
+        if not target.is_dir() and not target.parent.is_dir():
+            target = Path(default_reports_dir).resolve()
     else:
-        target = Path(default_reports_dir)
-    target.mkdir(parents=True, exist_ok=True)
-    return target.resolve()
+        target = Path(default_reports_dir).resolve()
+    target.mkdir(parents=False, exist_ok=True)
+    return target
 
 
 def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: int, run_live: bool, auth: AuthContext | None = None) -> tuple[list[dict[str, Any]], list[str], dict[str, Any], str, float]:
@@ -718,11 +731,21 @@ def run_bounty_hunt(
     max_files: int = 5000,
     per_finding: bool = False,
     extra_params: list[str] | None = None,
+    on_progress: Any = None,
+    settings: Any = None,
 ) -> dict[str, Any]:
     """Run a bounty hunt end to end and write a Markdown + JSON report.
 
     Returns {ok, report_path, json_path, summary, risk, score, finding_count, ...}
     or {ok: False, error} on bad input (never raises to the API)."""
+
+    def _emit(msg: str) -> None:
+        if callable(on_progress):
+            try:
+                on_progress(msg)
+            except Exception:  # noqa: BLE001 - a progress sink must never break the hunt
+                pass
+
     clean_target = str(target or "").strip()
     if not clean_target:
         return {"ok": False, "error": "No target provided."}
@@ -758,7 +781,10 @@ def run_bounty_hunt(
     if kind == "url" and isinstance(auth, dict):
         auth_ctx = build_auth(clean_target, cookie=auth.get("cookie", ""), headers=auth.get("headers") or [])
 
+    _emit(f"hunt: {clean_target} (profile={profile['name']})")
+    _emit("running scanner(s)…")
     raw_findings, scanners_run, scan_meta, risk, score = _run_scanners(profile, kind, clean_target, max_files, run_live, auth_ctx)
+    _emit(f"scan complete — {', '.join(scanners_run) or 'no'} scanner(s) ran, {len(raw_findings)} raw finding(s), risk={risk}")
     # Surface scanner failures instead of letting a failed scan read as a clean
     # target (the worst failure mode for a bug-finding tool). If every scanner
     # failed, that's an error, not a clean result.
@@ -776,16 +802,20 @@ def run_bounty_hunt(
     # time_based implies active: enabling the opt-in SLEEP probe can never silently
     # skip the rest of the (already-gated, scope-bound) active pass.
     if (active or time_based) and authorized and kind == "url":
+        _emit(f"running active verification against {len(raw_findings)} candidate(s)"
+              + (" (time-based probes enabled)…" if time_based else "…"))
         try:
-            active_findings, active_meta = active_verify_service.verify_active(clean_target, raw_findings, scope=scope, time_based=time_based, auth=auth_ctx, extra_params=extra_params)
+            active_findings, active_meta = active_verify_service.verify_active(clean_target, raw_findings, scope=scope, time_based=time_based, auth=auth_ctx, extra_params=extra_params, settings=settings)
             if active_findings:
                 raw_findings = list(raw_findings) + active_findings
                 if "active" not in scanners_run:
                     scanners_run = list(scanners_run) + ["active"]
             elif active_meta.get("in_scope"):
                 scanners_run = list(scanners_run) + ["active"]
+            _emit(f"active verification complete — {len(active_findings)} confirmed")
         except Exception as exc:  # noqa: BLE001 - active layer is best-effort; never break a hunt
             active_meta = {"in_scope": False, "skipped_reason": f"active verification error: {exc}"}
+            _emit(f"active verification error: {exc}")
 
     # Annotate + rank.
     annotated: list[dict[str, Any]] = []
@@ -843,7 +873,9 @@ def run_bounty_hunt(
         + [str(f.get("class_id")) for f in display if f.get("class_id")]
     ))
     recommended_tools = toolkit_lib.recommended_tools(rec_class_ids, seed_dir, runtime_dir, limit=12)
+    _emit(f"asking the coding brain to write reproduction steps + attack plans for {len(display)} finding(s)…")
     brain = _ask_brain(coder_cfg or {}, clean_target, profile, class_obj, scope, display, playbook, recommended_tools)
+    _emit("brain enrichment complete" if brain.get("used") else "brain enrichment skipped (no brain configured)")
     for ref, plan in brain.get("attack_plans", {}).items():
         if ref in attack_plans and (plan.get("steps") or plan.get("poc")):
             base = attack_plans[ref]
@@ -939,6 +971,7 @@ def run_bounty_hunt(
     ctx["next_steps"] = next_steps_lib.build_next_steps(ctx, brain.get("next_steps"))
     ctx["coverage"] = next_steps_lib.coverage_summary(ctx)
 
+    _emit("writing report…")
     markdown = report_lib.build_markdown(ctx)
     json_doc = report_lib.build_json(ctx)
 
@@ -947,7 +980,17 @@ def run_bounty_hunt(
     except OSError as exc:
         return {"ok": False, "error": f"Could not use the output folder: {exc}"}
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    stem = f"bounty-{_safe_slug(profile_id)}-{_safe_slug(clean_target)}-{stamp}"
+    # A short random suffix so two hunts on the SAME target/profile within the same
+    # second (a double-click on "Run Hunt", or a manual hunt racing a campaign's
+    # per-URL run_bounty_hunt call for the same URL -- each request runs on its own
+    # asyncio.to_thread worker) can never collide onto the same stem and silently
+    # clobber each other's report files. A content hash of the target wouldn't help
+    # here (two calls for the identical target would hash identically); campaign.py's
+    # own out_root collision guard uses a target hash because IT only needs to
+    # disambiguate DIFFERENT targets whose slugs share a long common prefix -- this
+    # guards the stricter same-target-same-second case, so it must be unique per call.
+    unique = uuid4().hex[:8]
+    stem = f"bounty-{_safe_slug(profile_id)}-{_safe_slug(clean_target)}-{stamp}-{unique}"
     md_path = out_dir / f"{stem}.md"
     json_path = out_dir / f"{stem}.json"
     try:
@@ -975,6 +1018,7 @@ def run_bounty_hunt(
                 continue
 
     counts = report_lib.severity_counts(display)
+    _emit(f"done — {len(display)} finding(s) ({risk} risk)")
     return {
         "ok": True,
         "report_path": str(md_path),

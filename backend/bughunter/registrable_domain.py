@@ -43,6 +43,13 @@ _SHARED_HOSTING = frozenset({
     "web.app", "firebaseapp.com", "appspot.com", "s3.amazonaws.com", "azurewebsites.net",
     "blob.core.windows.net", "cloudfront.net", "surge.sh", "render.com", "fly.dev",
     "ngrok.io", "ngrok-free.app", "repl.co", "glitch.me", "azureedge.net", "z13.web.core.windows.net",
+    # Bare parent forms of the multi-label entries above: "amazonaws.com" and
+    # "core.windows.net"/"windows.net" must ALSO be refused as bare scope tokens --
+    # without these, is_bare_public_suffix("amazonaws.com") returns False, so naming
+    # the parent (not the full "s3.amazonaws.com"/"blob.core.windows.net") in
+    # free-text scope falls through to the dotted-suffix match and authorizes
+    # probing EVERY unrelated tenant's S3 bucket / Azure Storage container.
+    "amazonaws.com", "core.windows.net", "windows.net",
 })
 
 _KNOWN_MULTI_LABEL_SUFFIXES = _CC_SECOND_LEVEL | _SHARED_HOSTING

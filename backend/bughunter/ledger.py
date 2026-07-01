@@ -116,7 +116,7 @@ def upsert_findings(
                     "cvss_base": (item.get("cvss") or {}).get("base_score"),
                     "first_seen": _now(), "last_seen": _now(), "updated_at": _now(),
                     "h1_report_id": "", "bounty": 0.0, "outcome": "",
-                    "h1_state": "", "h1_synced_at": "",
+                    "h1_state": "", "h1_synced_at": "", "submitted_at": "",
                 }
             else:
                 rec["last_seen"] = _now()
@@ -148,7 +148,11 @@ def advance_stage(runtime_dir: str | Path, program: str | None, target: str, key
 
 
 def record_submission(runtime_dir: str | Path, program: str | None, target: str, key: str, report_id: str, url: str = "") -> None:
-    advance_stage(runtime_dir, program, target, key, "submitted", h1_report_id=report_id, report_url=url)
+    # submitted_at is stamped ONLY here, at the moment of actual filing -- unlike
+    # updated_at (bumped by every later stage transition, e.g. a routine HackerOne
+    # status-sync poll moving the record to 'paid'), it stays fixed forever after,
+    # so count_recent_submissions can't mistake an old submission for one made today.
+    advance_stage(runtime_dir, program, target, key, "submitted", h1_report_id=report_id, report_url=url, submitted_at=_now())
 
 
 def record_paid(runtime_dir: str | Path, program: str | None, target: str, key: str, bounty: float, outcome: str = "accepted") -> None:
@@ -238,8 +242,15 @@ def count_recent_submissions(runtime_dir: str | Path, program: str | None, withi
     for rec in recs.values():
         if _STAGE_RANK.get(rec.get("stage"), 0) < _STAGE_RANK["submitted"]:
             continue
+        # submitted_at (set once, at filing time — see record_submission) is the
+        # correct signal here, not updated_at, which is bumped by every later stage
+        # transition (a status-sync poll marking the record 'paid' would otherwise
+        # make a submission from 10 days ago look like it happened in the last 24h,
+        # wrongly eating into today's max_submits_per_day throttle). Records that
+        # predate this field fall back to updated_at, their only prior signal.
+        stamp = rec.get("submitted_at") or rec.get("updated_at")
         try:
-            if datetime.fromisoformat(str(rec.get("updated_at"))) >= cutoff:
+            if datetime.fromisoformat(str(stamp)) >= cutoff:
                 count += 1
         except (ValueError, TypeError):
             count += 1  # unparseable stamp — count it (fail toward the throttle)

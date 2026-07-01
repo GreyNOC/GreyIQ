@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import functools
 import hashlib
 import hmac
@@ -61,9 +63,52 @@ MAX_REQUEST_BYTES = int(os.getenv("GREYIQ_MAX_REQUEST_BYTES", str(16 * 1024 * 10
 # every /api/* call. This blocks *other local processes* from driving the API
 # over 127.0.0.1 — the Origin check alone can't, since a non-browser client can
 # omit Origin. Explicitly allowlisted cross-origin frontends are exempt.
+#
+# IMPORTANT: this token is NOT real authentication once the server is reachable
+# beyond loopback. It is embedded in the unauthenticated index page (send_index)
+# and the unauthenticated static-file fallback, both served before any /api/*
+# gate ever runs — by design, since the app's own JS needs it before it can make
+# its first authenticated call. Anyone who can send ONE unauthenticated GET to
+# this process (trivial once it's bound beyond 127.0.0.1, e.g. behind a bare
+# reverse proxy) can read the token and replay it against every /api/* route.
+# GREYIQ_ACCESS_KEY (below) is the actual credential for that scenario.
 SESSION_TOKEN = secrets.token_urlsafe(32)
 SESSION_TOKEN_PLACEHOLDER = "__GREYIQ_SESSION_TOKEN__"
 SESSION_TOKEN_PATH = RUNTIME_DIR / "session.token"
+
+# Optional operator-configured shared secret for deployments reachable beyond
+# 127.0.0.1/localhost (e.g. behind a reverse proxy on a public domain — see
+# DEPLOY.md). Unset by default, which preserves today's local/Electron behavior
+# exactly (no extra prompt, nothing changes for the single-user desktop case).
+# When set, EVERY request — including the unauthenticated index page that
+# embeds SESSION_TOKEN — must present it via HTTP Basic Auth before anything
+# else is served, closing the gap where SESSION_TOKEN could be harvested
+# without ever presenting a real credential.
+GREYIQ_ACCESS_KEY = os.getenv("GREYIQ_ACCESS_KEY", "").strip()
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _is_loopback_bind(host: str) -> bool:
+    return str(host or "").strip().lower() in _LOOPBACK_HOSTS
+
+
+def _access_key_authorized(scope: dict[str, Any] | None) -> bool:
+    """True when no GREYIQ_ACCESS_KEY is configured (the default — nothing changes
+    for local/Electron use), or the request presents it via HTTP Basic Auth (any
+    username, password == the key). This is the FIRST gate route_http checks, ahead
+    of the session-token/origin logic, so it also protects send_index/send_file —
+    the very responses that hand out SESSION_TOKEN."""
+    if not GREYIQ_ACCESS_KEY:
+        return True
+    header = _header(scope, "authorization")
+    if not header.lower().startswith("basic "):
+        return False
+    try:
+        decoded = base64.b64decode(header[6:].strip(), validate=True).decode("utf-8")
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return False
+    _, _, password = decoded.partition(":")
+    return hmac.compare_digest(password, GREYIQ_ACCESS_KEY)
 
 # API keys live here (owner-only perms), separate from the general plaintext
 # config, instead of inside solin_runtime_config.json.
@@ -175,6 +220,24 @@ def _migrate_coder_secrets() -> None:
             moved = True
     if moved:
         write_json(runtime_path, payload)
+
+
+_CODE_ROUTER_SECRET_KEY = "code_router.remote_api_key"
+
+
+def _migrate_code_router_secret() -> None:
+    """One-time: same as _migrate_coder_secrets, but for code_router.remote_api_key
+    (backend/bughunter/triage.py's remote-triage feature) -- this field lived in the
+    plaintext, non-owner-restricted solin_runtime_config.json with no equivalent split
+    step, unlike every coder.<provider>.api_key."""
+    runtime_path = RUNTIME_DIR / "solin_runtime_config.json"
+    payload = read_json(runtime_path, {})
+    router_cfg = payload.get("code_router") if isinstance(payload, dict) else None
+    if not isinstance(router_cfg, dict) or not router_cfg.get("remote_api_key"):
+        return
+    _store_secret(_CODE_ROUTER_SECRET_KEY, str(router_cfg["remote_api_key"]))
+    router_cfg["remote_api_key"] = ""
+    write_json(runtime_path, payload)
 
 
 def _session_authorized(scope: dict[str, Any] | None) -> bool:
@@ -291,6 +354,7 @@ from bughunter import ledger as bounty_ledger  # noqa: E402
 from bughunter import portfolio as bounty_portfolio  # noqa: E402
 from bughunter import hackerone_import as bounty_h1_import  # noqa: E402
 from bughunter import hackerone_activity as bounty_h1_activity  # noqa: E402
+from bughunter import progress as bounty_progress  # noqa: E402
 from bughunter.operator import OperatorLoop  # noqa: E402
 from bughunter import toolkit as toolkit_lib  # noqa: E402
 from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E402
@@ -519,6 +583,7 @@ class BountyScanRequest(BaseModel):
     auth_headers: list[str] = Field(default_factory=list, max_length=20)
     per_finding: bool = False
     max_files: int = Field(default=5000, ge=1, le=100_000)
+    run_id: str = Field(default="", max_length=100)  # client-minted id for polling live progress
 
 
 class CampaignRequest(BaseModel):
@@ -534,6 +599,12 @@ class CampaignRequest(BaseModel):
     live: bool = False
     max_pages: int = Field(default=12, ge=1, le=50)
     deep: bool = False  # aggressive: time-based SQLi + auto screenshot + research per confirmed lead
+    run_id: str = Field(default="", max_length=100)  # client-minted id for polling live progress
+
+
+class BountyProgressRequest(BaseModel):
+    run_id: str = Field(min_length=1, max_length=100)
+    after: int = Field(default=0, ge=0)
 
 
 class LearnRequest(BaseModel):
@@ -968,7 +1039,14 @@ class GreyIQRuntime:
     def _code_router_config(self) -> dict[str, Any]:
         payload = read_json(RUNTIME_DIR / "solin_runtime_config.json", {})
         config = payload.get("code_router") if isinstance(payload, dict) else None
-        return config if isinstance(config, dict) else {}
+        config = dict(config) if isinstance(config, dict) else {}
+        # remote_api_key is migrated out of the plaintext file on boot (see
+        # _migrate_code_router_secret); overlay it back from the perms-restricted
+        # secrets store here, mirroring _merge_coder_secrets' pattern for coder.*.
+        stored_key = _load_secrets().get(_CODE_ROUTER_SECRET_KEY)
+        if stored_key:
+            config["remote_api_key"] = stored_key
+        return config
 
     def _coder_config(self) -> dict[str, Any]:
         payload = read_json(RUNTIME_DIR / "solin_runtime_config.json", {})
@@ -1280,6 +1358,9 @@ class GreyIQRuntime:
             return {"ok": False, "error": str(exc), "facts": [], "updated_at": None}
 
     def run_bounty(self, request: "BountyScanRequest") -> dict[str, Any]:
+        run_id = str(request.run_id or "").strip()
+        if run_id:
+            bounty_progress.start_run(run_id)
         result = run_bounty_hunt(
             request.target,
             request.profile,
@@ -1298,17 +1379,33 @@ class GreyIQRuntime:
             auth={"cookie": request.auth_cookie, "headers": request.auth_headers},
             max_files=request.max_files,
             per_finding=request.per_finding,
+            on_progress=bounty_progress.sink(run_id) if run_id else None,
         )
         self._cache_bounty_run(result, target=request.target, scope=request.scope, program=None)
         return result
 
+    def bounty_progress(self, run_id: str, after: int = 0) -> dict[str, Any]:
+        return {"ok": True, **bounty_progress.tail(run_id, after)}
+
     def run_campaign(self, request: "CampaignRequest") -> dict[str, Any]:
         # authorized passes straight through — campaign.run_campaign fails closed when
         # it is False, exactly like the CLI. No default-True anywhere.
+        run_id = str(request.run_id or "").strip()
+        if run_id:
+            bounty_progress.start_run(run_id)
         if request.program_id:
             return self._run_program_campaign(request)
         if not request.target.strip():
             return {"ok": False, "error": "No target provided."}
+        # Best-effort: request.program is free text for an ad-hoc/cockpit campaign, but
+        # for the autonomous operator's own per-cycle calls it IS the saved program's
+        # real id (operator.py passes program=pid). When it resolves, apply that
+        # program's disclose_automation + out_of_scope_hosts -- previously this plain
+        # (non-span) path NEVER looked the program up at all, so the operator's every
+        # unattended cycle silently ignored both settings.
+        program_obj = bounty_portfolio.get_program(RUNTIME_DIR, request.program) if request.program else None
+        disclose_automation = bool(program_obj.get("disclose_automation")) if program_obj else False
+        excluded_hosts = tuple(str(h) for h in (program_obj.get("out_of_scope_hosts") or [])) if program_obj else ()
         result = bounty_campaign.run_campaign(
             request.target,
             scope=request.scope,
@@ -1325,8 +1422,13 @@ class GreyIQRuntime:
             program=request.program,
             max_pages=request.max_pages,
             deep=request.deep,
+            disclose_automation=disclose_automation,
+            excluded_hosts=excluded_hosts,
+            on_progress=bounty_progress.sink(run_id) if run_id else None,
         )
-        self._cache_bounty_run(result, target=request.target, scope=request.scope, program=request.program)
+        self._cache_bounty_run(result, target=request.target, scope=request.scope, program=request.program,
+                                program_id=str(program_obj.get("id")) if program_obj else None,
+                                disclose_automation=disclose_automation)
         return result
 
     def _run_program_campaign(self, request: "CampaignRequest") -> dict[str, Any]:
@@ -1345,6 +1447,8 @@ class GreyIQRuntime:
         scope = str(program.get("scope_text") or "").strip() or request.scope
         program_label = str(program.get("name") or program.get("id") or request.program_id)
         disclose_automation = bool(program.get("disclose_automation"))
+        excluded_hosts = tuple(str(h) for h in (program.get("out_of_scope_hosts") or []))
+        run_id = str(request.run_id or "").strip()
         result = bounty_campaign.run_campaign_over_targets(
             targets,
             scope=scope,
@@ -1362,15 +1466,21 @@ class GreyIQRuntime:
             max_pages=request.max_pages,
             deep=request.deep,
             disclose_automation=disclose_automation,
+            excluded_hosts=excluded_hosts,
+            on_progress=bounty_progress.sink(run_id) if run_id else None,
         )
         target_label = f"{program_label} — {len(targets)} in-scope target(s)"
+        # program_id is the REAL portfolio id (program_label above is the display name,
+        # used for the target label / learning-bucket key) -- capture_screenshot's
+        # scope-refresh lookup needs the id specifically, see program_id's docstring.
         self._cache_bounty_run(result, target=target_label, scope=scope, program=program_label,
+                                program_id=str(program.get("id") or request.program_id),
                                 disclose_automation=disclose_automation)
         return result
 
     # ---- After-testing / submission workflow -------------------------------------
     def _cache_bounty_run(self, result: dict[str, Any], *, target: str, scope: str, program: str | None,
-                          disclose_automation: bool = False) -> None:
+                          program_id: str | None = None, disclose_automation: bool = False) -> None:
         """Index a finished run by a fresh run_id so a canonical per-finding submission
         package can be rebuilt without re-scanning. Stores only the minimal ctx + the
         per-ref findings (already redacted/scope-filtered by the report layer); bounded
@@ -1401,6 +1511,11 @@ class GreyIQRuntime:
         with self.lock:
             self.bounty_runs[run_id] = {
                 "ctx": ctx, "findings": findings_by_ref, "program": program, "target": target,
+                # "program" above is a DISPLAY label (name, for the target label / learning
+                # bucket key) -- program_id is the real portfolio id for an exact-key
+                # lookup (capture_screenshot's scope refresh), falling back to "program"
+                # only when no real id is known (an ad-hoc, non-portfolio campaign).
+                "program_id": program_id or program,
                 "artifacts": artifacts,
             }
             while len(self.bounty_runs) > 16:
@@ -1462,7 +1577,9 @@ class GreyIQRuntime:
         # host_in_active_scope gate still runs against the union, so this only ever WIDENS
         # to hosts the operator has explicitly named.
         scope_sources = [str(ctx.get("scope") or "")]
-        program_id = str((run or {}).get("program") or "")
+        # "program_id" (not "program", which is a display label -- see _cache_bounty_run)
+        # is the real portfolio id needed for this exact-key lookup.
+        program_id = str((run or {}).get("program_id") or "")
         if program_id:
             prog = bounty_portfolio.get_program(RUNTIME_DIR, program_id)
             if prog:
@@ -2485,6 +2602,7 @@ def ensure_runtime() -> None:
     (RUNTIME_DIR / "data").mkdir(parents=True, exist_ok=True)
     _write_session_token()
     _migrate_coder_secrets()
+    _migrate_code_router_secret()
     for name in SEED_FILES:
         src = SEED_DIR / name
         dst = RUNTIME_DIR / name
@@ -2659,7 +2777,11 @@ runtime = GreyIQRuntime()
 
 
 def health() -> dict[str, Any]:
-    return {"status": "ok", "app": APP_NAME, "version": VERSION}
+    """/api/health is the one /api/* path exempt from the session-token gate (it's
+    the liveness check Electron polls before a session even exists), so it must never
+    reveal more than a bare liveness signal to an unauthenticated caller — no app name
+    or version string for a scanner to fingerprint."""
+    return {"status": "ok"}
 
 
 def toolkit_catalog() -> dict[str, Any]:
@@ -2900,7 +3022,7 @@ async def send_json(send: Any, payload: Any, status_code: int = 200) -> None:
 
 async def send_file(send: Any, path: Path, status_code: int = 200) -> None:
     try:
-        body = path.read_bytes()
+        body = await asyncio.to_thread(path.read_bytes)
     except OSError:
         await send_json(send, {"error": "not found"}, 404)
         return
@@ -2919,7 +3041,7 @@ async def send_index(send: Any) -> None:
     """Serve index.html with the per-session token injected into its <meta> tag, so
     the same-origin app can authenticate its /api/* calls."""
     try:
-        html = (PUBLIC_DIR / "index.html").read_text(encoding="utf-8")
+        html = await asyncio.to_thread((PUBLIC_DIR / "index.html").read_text, encoding="utf-8")
     except OSError:
         await send_json(send, {"error": "not found"}, 404)
         return
@@ -2945,10 +3067,28 @@ async def send_empty(send: Any, status_code: int = 204) -> None:
     await send({"type": "http.response.body", "body": b""})
 
 
+async def send_unauthorized(send: Any) -> None:
+    """401 challenge for the GREYIQ_ACCESS_KEY gate — a browser hitting this shows its
+    native Basic Auth prompt, same UX as the reverse-proxy auth_basic pattern operators
+    already know from DEPLOY.md."""
+    body = json.dumps({"error": "authentication required"}).encode("utf-8")
+    headers = response_headers("application/json; charset=utf-8", len(body))
+    headers.append((b"www-authenticate", b'Basic realm="GreyIQ"'))
+    await send({"type": "http.response.start", "status": 401, "headers": headers})
+    await send({"type": "http.response.body", "body": body})
+
+
 async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
     _CURRENT_SCOPE.set(scope)
     method = str(scope.get("method") or "GET").upper()
     path = str(scope.get("path") or "/")
+
+    # Access-key gate runs before EVERYTHING else, including the unauthenticated index
+    # page and static-file fallback that embed/precede SESSION_TOKEN — a no-op when
+    # GREYIQ_ACCESS_KEY isn't set (the default local/Electron case).
+    if not _access_key_authorized(scope):
+        await send_unauthorized(send)
+        return
 
     if method == "OPTIONS":
         if not _request_origin_allowed(scope):
@@ -3022,6 +3162,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/campaign":
             request = validate_payload(CampaignRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.run_campaign, request))
+            return
+        if method == "POST" and path == "/api/bounty/progress":
+            request = validate_payload(BountyProgressRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.bounty_progress, request.run_id, request.after))
             return
         if method == "POST" and path == "/api/bounty/learn":
             request = validate_payload(LearnRequest, await read_json_body(receive))
@@ -3341,6 +3485,19 @@ app = GreyIQASGI()
 def main() -> None:
     host = os.getenv("GREYIQ_HOST", "127.0.0.1")
     port = int(os.getenv("GREYIQ_PORT", os.getenv("PORT", "8766")))
+    if not _is_loopback_bind(host) and not GREYIQ_ACCESS_KEY and os.getenv("GREYIQ_ALLOW_INSECURE_PUBLIC_BIND", "").strip() != "1":
+        print(
+            f"Refusing to start: GREYIQ_HOST={host!r} is not loopback-only, but no GREYIQ_ACCESS_KEY is set.\n"
+            "Binding this API beyond 127.0.0.1/localhost without a real access credential lets anyone who can "
+            "reach it read the per-session token from the unauthenticated home page and replay it against every "
+            "/api/* route (including workspace file read/write and outbound scan requests) -- the token was only "
+            "ever designed to stop other local processes, not a remote client.\n"
+            "Set GREYIQ_ACCESS_KEY to a strong secret before exposing this server, or set "
+            "GREYIQ_ALLOW_INSECURE_PUBLIC_BIND=1 if you already have an equivalent auth layer in front of it "
+            "(e.g. a reverse proxy doing its own authentication) and accept the risk.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     uvicorn.run(
         "backend.greyiq_api:app",
         host=host,

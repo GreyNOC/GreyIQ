@@ -29,7 +29,7 @@ from bughunter.active_verify_service import _ActiveError, _Http, _NoRedirect, ho
 from bughunter.rate_limit import HostRateGovernor
 from bughunter.scan_auth import auth_headers_for, build_auth
 from bughunter.settings import get_settings
-from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
+from bughunter.web_ingest import WebsiteFetchError, guarded_dns_scope, normalize_website_url
 from bughunter.web_scan_service import _USER_AGENT, _guard_url
 
 
@@ -209,7 +209,16 @@ def confirm_stored_xss(
             return {"ok": False, "error": f"view fetch failed: {exc}"}
         if marker in (pre.get("body") or ""):
             return {"ok": False, "error": "the fresh marker already appears on the view page — mint another and retry."}
-        post = _post_form(sinj, {field: payloads["svg"]}, auth=auth, timeout=settings.web_fetch_timeout_seconds)
+        # Re-validate + pin the DNS resolution IMMEDIATELY before the real POST (rather
+        # than relying on the guard check higher up, before the pre-probe view fetch
+        # above) so an attacker-controlled DNS server can't rebind the inject-URL
+        # hostname to a private/metadata IP in that gap. See web_ingest.guarded_dns_scope().
+        with guarded_dns_scope():
+            try:
+                _guard_url(sinj, settings.allow_private_urls, settings.web_allowed_ports)
+            except WebsiteFetchError as exc:
+                return {"ok": False, "error": f"inject URL refused by the guard: {exc}"}
+            post = _post_form(sinj, {field: payloads["svg"]}, auth=auth, timeout=settings.web_fetch_timeout_seconds)
         if not post.get("ok"):
             return {"ok": True, "status": "send-failed", "marker": marker, "payloads": payloads, "error": post.get("error")}
         try:

@@ -3068,6 +3068,8 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-op-log { max-height: 14rem; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); padding: 0.5rem 0.7rem; margin-bottom: 1.2rem; }
 .ck-op-event { display: flex; gap: 0.6rem; font-size: 0.78rem; line-height: 1.6; font-family: var(--code-font); color: var(--text); }
 .ck-op-time { color: var(--muted); flex: none; }
+.ck-live-log { max-height: 11rem; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); padding: 0.5rem 0.7rem; margin-top: 0.5rem; }
+.ck-live-log .ck-op-event { white-space: pre-wrap; word-break: break-word; }
 .ck-prog-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 0.6rem; align-items: end; }
 .ck-prog-form label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.76rem; color: var(--muted); }
 .ck-prog-form input { font: inherit; font-size: 0.84rem; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 0.45rem 0.55rem; }

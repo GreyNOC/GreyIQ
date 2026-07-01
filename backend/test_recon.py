@@ -85,6 +85,33 @@ class ReconGuardTests(unittest.TestCase):
         self.assertTrue(any("skipped" in note for note in result["notes"]))
         self.assertEqual(result.get("sources"), {})
 
+    def test_malformed_robots_txt_directive_does_not_crash_discover(self) -> None:
+        # Regression: every OTHER urljoin() call site in this file (_extract_links,
+        # _extract_scripts) catches ValueError, but the robots.txt Disallow/Allow/
+        # Sitemap directive loop did not -- a malformed value (plausible on a real
+        # misconfigured server, or trivially plantable by a hostile/red-team
+        # authorized target) made urljoin() raise ValueError uncaught, escaping
+        # discover() and its only caller, campaign.run_campaign(), entirely.
+        original = recon._fetch_raw
+
+        def fake_fetch(url: str):
+            if url.endswith("/robots.txt"):
+                return {"status": 200, "body": "User-agent: *\nDisallow: http://[::1\nDisallow: /admin\n",
+                        "headers": {}, "final_url": url}
+            if url.endswith((".xml", "security.txt")):
+                return {"status": 404, "body": "", "headers": {}, "final_url": url}
+            return {"status": 200, "body": "<html></html>", "headers": {}, "final_url": url}
+
+        recon._fetch_raw = fake_fetch
+        try:
+            result = recon.discover("https://example.com/", max_pages=5)
+        finally:
+            recon._fetch_raw = original
+        # Must complete normally (no uncaught exception) and still pick up the VALID
+        # directive that came after the malformed one.
+        self.assertIn("https://example.com/admin", result["urls"])
+        self.assertNotIn("http://[::1", " ".join(result["urls"]))
+
 
 if __name__ == "__main__":
     unittest.main()

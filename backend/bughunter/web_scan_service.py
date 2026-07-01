@@ -32,6 +32,7 @@ from bughunter.web_ingest import (
     WebsiteFetchError,
     _ascii_hostname,
     _host_is_private,
+    guarded_dns_scope,
     normalize_website_url,
 )
 
@@ -184,7 +185,12 @@ def _guard_url(url: str, allow_private: bool, allowed_ports: frozenset[int]) -> 
         allowed = ", ".join(str(p) for p in sorted(allowed_ports))
         raise WebsiteFetchError(f"Port {port} is not allowed for public hosts. Allowed: {allowed}.")
 
-    netloc = ascii_host if port is None else f"{ascii_host}:{port}"
+    # An IPv6 literal -- urlparse().hostname strips the [brackets], so ascii_host is
+    # bracket-less here. Without re-adding them, the rebuilt URL is malformed:
+    # http.client splits host:port on the LAST colon, misreading it as an entirely
+    # different, invalid host than the one just validated as public/safe.
+    host_for_netloc = f"[{ascii_host}]" if ":" in ascii_host else ascii_host
+    netloc = host_for_netloc if port is None else f"{host_for_netloc}:{port}"
     return urlunparse(parsed._replace(netloc=netloc))
 
 
@@ -243,41 +249,46 @@ class _GuardedRedirect(HTTPRedirectHandler):
 def _fetch_raw(url: str, *, auth: AuthContext | None = None) -> dict[str, Any]:
     settings = get_settings()
     normalized = normalize_website_url(url)
-    sanitized = _guard_url(normalized, settings.allow_private_urls, settings.web_allowed_ports)
-    headers = {
-        "Accept": "*/*",
-        "Accept-Encoding": "identity",
-        "User-Agent": _USER_AGENT,
-    }
-    # Operator session attached SAME-SITE only; a cross-site redirect strips it again
-    # (see _GuardedRedirect), so it never leaves the target's host.
-    headers.update(auth_headers_for(urlparse(sanitized).hostname or "", auth))
-    request = Request(sanitized, headers=headers, method="GET")
-    opener = build_opener(_GuardedRedirect(settings.allow_private_urls, settings.web_allowed_ports, auth=auth))
-    try:
-        with opener.open(request, timeout=settings.web_fetch_timeout_seconds) as response:
-            final_url = response.geturl()
-            _guard_url(final_url, settings.allow_private_urls, settings.web_allowed_ports)
-            consumed = _consume(response, settings)
-    except HTTPError as error:
-        # An error response is still worth analyzing (stack traces, headers). Unlike the
-        # success path (a `with` block), HTTPError isn't auto-closed -- close it in
-        # finally or every 404/500 leaks the underlying socket/file descriptor.
+    # guarded_dns_scope() covers the whole guarded fetch (initial URL through every
+    # redirect hop _GuardedRedirect follows) so the DNS pin each _guard_url() call
+    # installs for its hop's hostname is still in effect when the real connection to
+    # that hop is made a moment later — see web_ingest.py for why this matters.
+    with guarded_dns_scope():
+        sanitized = _guard_url(normalized, settings.allow_private_urls, settings.web_allowed_ports)
+        headers = {
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+            "User-Agent": _USER_AGENT,
+        }
+        # Operator session attached SAME-SITE only; a cross-site redirect strips it again
+        # (see _GuardedRedirect), so it never leaves the target's host.
+        headers.update(auth_headers_for(urlparse(sanitized).hostname or "", auth))
+        request = Request(sanitized, headers=headers, method="GET")
+        opener = build_opener(_GuardedRedirect(settings.allow_private_urls, settings.web_allowed_ports, auth=auth))
         try:
-            final_url = getattr(error, "url", None) or sanitized
-            # Re-validate the FINAL url too (defence-in-depth, mirrors the success path):
-            # a redirect chain ending in an error response could still terminate at a
-            # malformed/private host even though each hop was guarded along the way.
-            _guard_url(final_url, settings.allow_private_urls, settings.web_allowed_ports)
-            consumed = _consume(error, settings)
-        finally:
-            error.close()
-    except http.client.HTTPException as exc:
-        # A truncated/short-closed body (e.g. Content-Length lies, or the connection drops
-        # mid-read -> http.client.IncompleteRead) is neither a URLError nor an HTTPError.
-        # Re-raise as the ONE error type every caller of _fetch_raw already catches, instead
-        # of letting it escape as a raw http.client exception none of them expect.
-        raise WebsiteFetchError(f"the response body was truncated or malformed: {exc}") from exc
+            with opener.open(request, timeout=settings.web_fetch_timeout_seconds) as response:
+                final_url = response.geturl()
+                _guard_url(final_url, settings.allow_private_urls, settings.web_allowed_ports)
+                consumed = _consume(response, settings)
+        except HTTPError as error:
+            # An error response is still worth analyzing (stack traces, headers). Unlike the
+            # success path (a `with` block), HTTPError isn't auto-closed -- close it in
+            # finally or every 404/500 leaks the underlying socket/file descriptor.
+            try:
+                final_url = getattr(error, "url", None) or sanitized
+                # Re-validate the FINAL url too (defence-in-depth, mirrors the success path):
+                # a redirect chain ending in an error response could still terminate at a
+                # malformed/private host even though each hop was guarded along the way.
+                _guard_url(final_url, settings.allow_private_urls, settings.web_allowed_ports)
+                consumed = _consume(error, settings)
+            finally:
+                error.close()
+        except http.client.HTTPException as exc:
+            # A truncated/short-closed body (e.g. Content-Length lies, or the connection drops
+            # mid-read -> http.client.IncompleteRead) is neither a URLError nor an HTTPError.
+            # Re-raise as the ONE error type every caller of _fetch_raw already catches, instead
+            # of letting it escape as a raw http.client exception none of them expect.
+            raise WebsiteFetchError(f"the response body was truncated or malformed: {exc}") from exc
     consumed["final_url"] = final_url
     consumed["requested_url"] = normalized
     return consumed

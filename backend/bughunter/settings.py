@@ -83,6 +83,11 @@ class ScannerSettings:
     active_scan_allowlist: tuple[str, ...] = ()
     active_time_sqli_delay_seconds: float = 4.0
     active_time_sqli_margin_seconds: float = 3.0
+    # Per-request exclusion filter (NOT sourced from env -- callers that resolve a
+    # saved portfolio program build a settings override via dataclasses.replace() with
+    # that program's out_of_scope_hosts). Checked first, and can only ever NARROW scope
+    # -- never an expansion, so an empty default is always safe.
+    excluded_hosts: tuple[str, ...] = ()
 
 
 def get_settings() -> ScannerSettings:
