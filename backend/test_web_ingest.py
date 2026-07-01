@@ -14,8 +14,14 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+import email.message  # noqa: E402
+import io  # noqa: E402
+import urllib.error  # noqa: E402
+
 from bughunter.web_ingest import (  # noqa: E402
+    _MAX_FETCH_ATTEMPTS,
     WebsiteFetchError,
+    _connect_with_retry,
     _enforce_url_policy,
     _host_is_private,
     normalize_website_url,
@@ -82,6 +88,45 @@ class UrlPolicyTests(unittest.TestCase):
         for bad in ("", "http://ex ample.com/", "http://e\\vil/"):
             with self.assertRaises(WebsiteFetchError):
                 normalize_website_url(bad)
+
+
+class ConnectWithRetryTests(unittest.TestCase):
+    """_connect_with_retry() retries a CONNECTION-LEVEL transient failure once, but
+    never an HTTPError (a real server answer) -- and only wraps the connect step
+    itself, not the caller's own response-processing (content-type/length checks)."""
+
+    class _FakeOpener:
+        def __init__(self, behaviors: list) -> None:
+            self._behaviors = list(behaviors)
+            self.calls = 0
+
+        def open(self, request, timeout=None):
+            self.calls += 1
+            behavior = self._behaviors.pop(0)
+            if isinstance(behavior, Exception):
+                raise behavior
+            return behavior
+
+    def test_one_transient_failure_is_retried_and_succeeds(self) -> None:
+        sentinel = object()
+        opener = self._FakeOpener([urllib.error.URLError("simulated connection reset"), sentinel])
+        result = _connect_with_retry(opener, object(), 5.0)
+        self.assertIs(result, sentinel)
+        self.assertEqual(opener.calls, 2)
+
+    def test_retries_are_exhausted_then_raise(self) -> None:
+        opener = self._FakeOpener([urllib.error.URLError("down")] * (_MAX_FETCH_ATTEMPTS + 1))
+        with self.assertRaises(urllib.error.URLError):
+            _connect_with_retry(opener, object(), 5.0)
+        self.assertEqual(opener.calls, _MAX_FETCH_ATTEMPTS)
+
+    def test_http_error_is_never_retried(self) -> None:
+        hdrs = email.message.Message()
+        http_error = urllib.error.HTTPError("http://x/", 503, "Service Unavailable", hdrs, io.BytesIO(b""))
+        opener = self._FakeOpener([http_error])
+        with self.assertRaises(urllib.error.HTTPError):
+            _connect_with_retry(opener, object(), 5.0)
+        self.assertEqual(opener.calls, 1, "an HTTPError must never trigger a retry")
 
 
 if __name__ == "__main__":

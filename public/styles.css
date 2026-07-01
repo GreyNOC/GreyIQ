@@ -3049,6 +3049,16 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-stat .l { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
 .ck-intel { margin: 0 0 1rem; padding-left: 1.1rem; font-size: 0.84rem; line-height: 1.55; color: var(--text); }
 .ck-section-title { margin: 1.3rem 0 0.6rem; font-size: 0.95rem; }
+
+.ck-row-between { display: flex; align-items: center; justify-content: space-between; gap: 0.6rem; flex-wrap: wrap; }
+.ck-row-between .ck-section-title { margin: 0; }
+
+.ck-funnel { display: flex; flex-direction: column; gap: 0.4rem; margin-bottom: 0.4rem; }
+.ck-funnel-row { display: grid; grid-template-columns: 6rem 1fr 2.5rem; align-items: center; gap: 0.6rem; }
+.ck-funnel-label { font-size: 0.76rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.ck-funnel-track { height: 0.6rem; border-radius: 6px; background: var(--surface-2); overflow: hidden; }
+.ck-funnel-fill { height: 100%; border-radius: 6px; background: var(--accent); transition: width 0.2s ease; }
+.ck-funnel-count { font-size: 0.8rem; font-weight: 600; color: var(--text); text-align: right; }
 .ck-learn-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: 0.6rem; align-items: end; }
 .ck-learn-form label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.76rem; color: var(--muted); }
 .ck-learn-form input, .ck-learn-form select { font: inherit; font-size: 0.84rem; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 0.45rem 0.55rem; }

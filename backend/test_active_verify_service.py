@@ -9,7 +9,11 @@ differential.
 """
 from __future__ import annotations
 
+import base64
 import dataclasses
+import email.message
+import io
+import json
 import os
 import re
 import socket
@@ -589,6 +593,102 @@ class HttpPerHuntBudgetTests(unittest.TestCase):
                 http.fetch(self.url)
             except av._ActiveError:
                 self.fail("_RateLimited must not be caught by an `except _ActiveError` handler")
+
+
+class HttpRetryTests(unittest.TestCase):
+    """_Http.fetch() retries a CONNECTION-LEVEL transient failure (reset/timeout/DNS
+    hiccup) once, but never an HTTPError (a real server answer) -- and a retry must
+    stay ONE logical probe: it never double-spends the per-hunt budget or the
+    per-host governor token."""
+
+    def setUp(self) -> None:
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _SiteHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}/"
+        self._prev = os.environ.get("GREYIQ_SCAN_ALLOW_PRIVATE_URLS")
+        os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        if self._prev is None:
+            os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+        else:
+            os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = self._prev
+
+    def test_one_transient_failure_is_retried_and_succeeds(self) -> None:
+        http = av._Http(get_settings(), HostRateGovernor(capacity=20, min_interval_s=0.0), max_requests=12)
+        real_open = http.opener.open
+        calls = {"n": 0}
+
+        def flaky_open(request, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise av.URLError("simulated connection reset")
+            return real_open(request, timeout=timeout)
+
+        http.opener.open = flaky_open
+        result = http.fetch(self.url)
+        self.assertEqual(calls["n"], 2, "exactly one retry after the transient failure")
+        self.assertEqual(result["status"], 200)
+        # A retry is still ONE logical probe -- never double-spent.
+        self.assertEqual(http.sent, 1)
+
+    def test_retries_are_exhausted_then_raise_active_error(self) -> None:
+        http = av._Http(get_settings(), HostRateGovernor(capacity=20, min_interval_s=0.0), max_requests=12)
+        calls = {"n": 0}
+
+        def always_fails(request, timeout=None):
+            calls["n"] += 1
+            raise av.URLError("simulated: target unreachable")
+
+        http.opener.open = always_fails
+        with self.assertRaises(av._ActiveError):
+            http.fetch(self.url)
+        self.assertEqual(calls["n"], av._MAX_FETCH_ATTEMPTS)
+        self.assertEqual(http.sent, 1, "a fully-failed fetch still counts as exactly one spent slot")
+
+    def test_http_error_is_never_retried(self) -> None:
+        # A 4xx/5xx is a real server answer the differential checks need to see
+        # as-is -- retrying it would blur boolean/error-based comparisons and could
+        # turn a benign 429 rate-limit signal into a flood.
+        http = av._Http(get_settings(), HostRateGovernor(capacity=20, min_interval_s=0.0), max_requests=12)
+        calls = {"n": 0}
+
+        def http_error(request, timeout=None):
+            calls["n"] += 1
+            hdrs = email.message.Message()
+            hdrs["Content-Type"] = "text/plain"
+            raise av.HTTPError(request.full_url, 503, "Service Unavailable", hdrs, io.BytesIO(b""))
+
+        http.opener.open = http_error
+        result = http.fetch(self.url)
+        self.assertEqual(calls["n"], 1, "an HTTPError must never trigger a retry")
+        self.assertEqual(result["status"], 503)
+
+    def test_retry_never_double_spends_the_governor_token(self) -> None:
+        governor = HostRateGovernor(capacity=20, min_interval_s=0.0)
+        original_throttle = governor.throttle
+        throttle_calls = {"n": 0}
+
+        def counting_throttle(host):
+            throttle_calls["n"] += 1
+            return original_throttle(host)
+
+        governor.throttle = counting_throttle
+        http = av._Http(get_settings(), governor, max_requests=12)
+        real_open = http.opener.open
+        calls = {"n": 0}
+
+        def flaky_open(request, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise av.URLError("simulated connection reset")
+            return real_open(request, timeout=timeout)
+
+        http.opener.open = flaky_open
+        http.fetch(self.url)
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(throttle_calls["n"], 1, "a retry must not consume a second governor token")
 
 
 class ParamDiscoveryTests(unittest.TestCase):
@@ -1221,6 +1321,184 @@ class AuthScanE2ETests(unittest.TestCase):
         # WITHOUT it -> only the login page is seen -> nothing to confirm.
         findings_anon, _ = av.verify_active(url, [], scope="127.0.0.1")
         self.assertFalse(self._xss(findings_anon), "without a session the bug is not reachable")
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _make_jwt(header: dict, payload: dict, sig: bytes = b"realsig") -> str:
+    return f"{_b64url(json.dumps(header, separators=(',', ':')).encode())}.{_b64url(json.dumps(payload, separators=(',', ':')).encode())}.{_b64url(sig)}"
+
+
+class JwtHelperTests(unittest.TestCase):
+    """Pure-function coverage for the forging/credential-location helpers, no network."""
+
+    def test_find_jwt_in_authorization_bearer_header(self) -> None:
+        from bughunter.scan_auth import AuthContext
+        token = _make_jwt({"alg": "HS256", "typ": "JWT"}, {"sub": "1"})
+        auth = AuthContext(host="x", headers={"Authorization": f"Bearer {token}"})
+        found = av._find_jwt_credential(auth)
+        self.assertIsNotNone(found)
+        header_name, real_token, rebuild = found
+        self.assertEqual(header_name, "Authorization")
+        self.assertEqual(real_token, token)
+        self.assertEqual(rebuild("NEWTOKEN"), "Bearer NEWTOKEN")
+
+    def test_find_jwt_in_cookie_crumb(self) -> None:
+        from bughunter.scan_auth import AuthContext
+        token = _make_jwt({"alg": "HS256"}, {"sub": "1"})
+        auth = AuthContext(host="x", headers={"Cookie": f"session=plain; token={token}; other=x"})
+        found = av._find_jwt_credential(auth)
+        self.assertIsNotNone(found)
+        header_name, real_token, rebuild = found
+        self.assertEqual(header_name, "Cookie")
+        self.assertEqual(real_token, token)
+        self.assertEqual(rebuild("NEWTOKEN"), "session=plain; token=NEWTOKEN; other=x")
+
+    def test_no_jwt_shaped_credential_returns_none(self) -> None:
+        from bughunter.scan_auth import AuthContext
+        self.assertIsNone(av._find_jwt_credential(None))
+        auth = AuthContext(host="x", headers={"Cookie": "session=not-a-jwt-value"})
+        self.assertIsNone(av._find_jwt_credential(auth))
+
+    def test_forge_alg_none_produces_both_variants_with_same_payload(self) -> None:
+        token = _make_jwt({"alg": "HS256", "typ": "JWT"}, {"sub": "1"})
+        payload_segment = token.split(".")[1]
+        variants = av._forge_alg_none_variants(token)
+        self.assertEqual(len(variants), 2)
+        self.assertTrue(variants[0].endswith("."))  # header.payload. (empty sig segment)
+        self.assertFalse(variants[1].endswith("."))  # header.payload (no trailing dot)
+        for v in variants:
+            header_b64 = v.split(".")[0]
+            forged_header = json.loads(av._b64url_decode(header_b64))
+            self.assertEqual(forged_header["alg"], "none")
+            self.assertEqual(forged_header["typ"], "JWT")  # every other header field preserved
+            self.assertEqual(v.split(".")[1], payload_segment)  # SAME payload bytes, never altered
+
+    def test_forge_already_alg_none_returns_empty(self) -> None:
+        token = _make_jwt({"alg": "none"}, {"sub": "1"})
+        self.assertEqual(av._forge_alg_none_variants(token), [])
+
+    def test_forge_malformed_token_returns_empty(self) -> None:
+        self.assertEqual(av._forge_alg_none_variants("not.a.jwt.token"), [])
+        self.assertEqual(av._forge_alg_none_variants("onlyonepart"), [])
+        self.assertEqual(av._forge_alg_none_variants("bm90anNvbg.e30.sig"), [])  # header isn't JSON
+
+
+class _JwtAuthHandler(BaseHTTPRequestHandler):
+    """Simulates a backend that authenticates via a Bearer JWT. `vulnerable=True`
+    accepts ANY alg:none token unconditionally (the bug); `vulnerable=False` always
+    requires the exact original signature, matching a properly-implemented verifier.
+    `signature_checked=False` simulates a backend with NO signature verification at
+    all (accepts anything, even a corrupted signature) -- the negative-control case."""
+    real_token = ""
+    vulnerable = True
+    signature_checked = True
+
+    def do_GET(self) -> None:  # noqa: N802
+        token = self._extract_token()
+        ok = self._is_authenticated(token)
+        body = b"authenticated" if ok else b"unauthorized"
+        self.send_response(200 if ok else 401)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _extract_token(self) -> str:
+        authz = self.headers.get("Authorization") or ""
+        if authz.lower().startswith("bearer "):
+            return authz[7:].strip()
+        cookie = self.headers.get("Cookie") or ""
+        for crumb in cookie.split(";"):
+            name, sep, value = crumb.strip().partition("=")
+            if sep and name == "token":
+                return value.strip()
+        return ""
+
+    def _is_authenticated(self, token: str) -> bool:
+        if not type(self).signature_checked:
+            return True  # no verification at all -- the negative-control scenario
+        parts = token.split(".")
+        if len(parts) != 3:
+            return False
+        try:
+            header = json.loads(av._b64url_decode(parts[0]))
+        except Exception:  # noqa: BLE001
+            return False
+        if type(self).vulnerable and str(header.get("alg", "")).lower() == "none":
+            return True  # THE BUG: an unsigned token is accepted as authenticated
+        real_parts = type(self).real_token.split(".")
+        return len(real_parts) == 3 and parts[1] == real_parts[1] and parts[2] == real_parts[2]
+
+    def log_message(self, *args: object) -> None:
+        return
+
+
+class JwtAlgNoneE2ETests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._prev = os.environ.get("GREYIQ_SCAN_ALLOW_PRIVATE_URLS")
+        os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _JwtAuthHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.port = self.server.server_port
+        self.token = _make_jwt({"alg": "HS256", "typ": "JWT"}, {"sub": "victim"})
+        _JwtAuthHandler.real_token = self.token
+        _JwtAuthHandler.vulnerable = True
+        _JwtAuthHandler.signature_checked = True
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        if self._prev is None:
+            os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+        else:
+            os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = self._prev
+
+    def _auth(self):
+        from bughunter.scan_auth import build_auth
+        return build_auth(f"http://127.0.0.1:{self.port}/", headers=[f"Authorization: Bearer {self.token}"])
+
+    def _http(self, auth=None):
+        return av._Http(get_settings(), HostRateGovernor(capacity=20, min_interval_s=0.0), max_requests=12, auth=auth)
+
+    def test_vulnerable_server_is_confirmed(self) -> None:
+        url = f"http://127.0.0.1:{self.port}/"
+        finding = av._check_jwt_alg_none(self._http(self._auth()), url)
+        self.assertIsNotNone(finding)
+        self.assertEqual(finding["_active_proof"]["status"], "confirmed")
+        self.assertEqual(finding["_active_class_hint"], "jwt")
+        self.assertEqual(finding["severity"], "critical")
+
+    def test_properly_verifying_server_is_not_flagged(self) -> None:
+        _JwtAuthHandler.vulnerable = False
+        url = f"http://127.0.0.1:{self.port}/"
+        self.assertIsNone(av._check_jwt_alg_none(self._http(self._auth()), url))
+
+    def test_server_with_no_signature_verification_at_all_is_not_flagged(self) -> None:
+        # The negative control (corrupted signature, same alg) is ALSO accepted here --
+        # this check can't attribute the bypass to alg:none specifically, so it must
+        # stay quiet rather than produce a misleading "alg:none" finding for what is
+        # really a much broader "no verification at all" bug.
+        _JwtAuthHandler.signature_checked = False
+        url = f"http://127.0.0.1:{self.port}/"
+        self.assertIsNone(av._check_jwt_alg_none(self._http(self._auth()), url))
+
+    def test_no_auth_supplied_makes_zero_requests(self) -> None:
+        url = f"http://127.0.0.1:{self.port}/"
+        http = self._http(None)
+        self.assertIsNone(av._check_jwt_alg_none(http, url))
+        self.assertEqual(http.sent, 0)
+
+    def test_wired_into_verify_active(self) -> None:
+        # A generous governor/budget so the (many) checks ordered BEFORE the JWT
+        # check in verify_active()'s list never starve it of budget before it runs.
+        url = f"http://127.0.0.1:{self.port}/"
+        gov = HostRateGovernor(capacity=200, min_interval_s=0.0)
+        findings, meta = av.verify_active(url, [], scope="127.0.0.1", auth=self._auth(), governor=gov, requests_budget=100)
+        self.assertTrue(meta["in_scope"])
+        jwt_findings = [f for f in findings if f.get("_active_class_hint") == "jwt"]
+        self.assertEqual(len(jwt_findings), 1)
+        self.assertEqual(jwt_findings[0]["_active_proof"]["status"], "confirmed")
 
 
 if __name__ == "__main__":

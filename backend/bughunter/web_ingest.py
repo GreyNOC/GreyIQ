@@ -6,9 +6,10 @@ import ipaddress
 import re
 import socket
 import threading
+import time
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
-from typing import Final
+from typing import Any, Final
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -25,6 +26,11 @@ MAX_REDIRECTS: Final = 5
 ALLOWED_PORTS: Final = {80, 443}
 ALLOWED_CONTENT_ENCODINGS: Final = {"", "identity"}
 CONTROL_OR_SPACE_RE: Final = re.compile(r"[\x00-\x20\x7f]")
+# A bounded retry for CONNECTION-LEVEL transient failures only (reset TCP, a DNS
+# hiccup, a timeout) -- never for an HTTPError (a real server answer). See
+# _connect_with_retry() below.
+_MAX_FETCH_ATTEMPTS: Final = 2
+_FETCH_RETRY_BACKOFF_S: Final = 0.4
 
 
 class WebsiteFetchError(ValueError):
@@ -150,6 +156,25 @@ def normalize_website_url(url: str) -> str:
     return cleaned
 
 
+def _connect_with_retry(opener: Any, request: Request, timeout: float) -> Any:
+    """opener.open(request), retried once for a CONNECTION-LEVEL transient failure
+    (reset/timeout/DNS hiccup) only -- an HTTPError (a real server answer, e.g. a
+    404/500) is never retried and propagates on the first attempt, exactly as
+    before this helper existed. Retrying here (rather than wrapping the whole body-
+    processing block below) keeps the retry scoped to the network connect step
+    only -- a content-type/length validation failure on a successfully-connected
+    response must never trigger a wasted second real request."""
+    for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
+        try:
+            return opener.open(request, timeout=timeout)
+        except HTTPError:
+            raise
+        except (URLError, TimeoutError, OSError):
+            if attempt >= _MAX_FETCH_ATTEMPTS:
+                raise
+            time.sleep(_FETCH_RETRY_BACKOFF_S * attempt)
+
+
 def fetch_website_text(url: str) -> FetchedWebsite:
     settings = get_settings()
     normalized_url = normalize_website_url(url)
@@ -172,7 +197,7 @@ def fetch_website_text(url: str) -> FetchedWebsite:
         sanitized_url = _enforce_url_policy(normalized_url, settings.allow_private_urls)
         request = Request(sanitized_url, headers=request_headers, method="GET")
         try:
-            with opener.open(request, timeout=settings.web_fetch_timeout_seconds) as response:
+            with _connect_with_retry(opener, request, settings.web_fetch_timeout_seconds) as response:
                 final_url = response.geturl()
                 # Validate the post-redirect URL one last time before consuming the
                 # response body — defence in depth against any redirect we missed.

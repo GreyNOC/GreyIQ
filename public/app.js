@@ -4859,8 +4859,8 @@ async function ckSubmissionMarkdown(f) {
 
 function ckSlug(s) { return String(s || "finding").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "finding"; }
 
-function ckDownloadText(filename, text) {
-  const blob = new Blob([text], { type: "text/markdown" });
+function ckDownloadText(filename, text, mime) {
+  const blob = new Blob([text], { type: mime || "text/markdown" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url; a.download = filename;
@@ -6384,12 +6384,29 @@ function ckField(label, type, value) {
 async function ckRenderLearn() {
   const host = ck.views.learn;
   host.replaceChildren();
-  host.append(cel("h2", "ck-section-title", "What the engine has learned"));
+  const titleRow = cel("div", "ck-row-between");
+  titleRow.append(cel("h2", "ck-section-title", "What the engine has learned"));
+  const program = (ck.program?.value || "").trim();
+  const statsQs = program ? `?program=${encodeURIComponent(program)}` : (ck.target?.value ? `?target=${encodeURIComponent(ck.target.value.trim())}` : "");
+  const exportBtn = cel("button", "ck-btn", "Export ledger (CSV)"); exportBtn.type = "button";
+  exportBtn.title = program || ck.target?.value ? "Export this program/target's finding ledger" : "Export the whole portfolio's finding ledger";
+  exportBtn.addEventListener("click", async () => {
+    const label = exportBtn.textContent; exportBtn.disabled = true; exportBtn.textContent = "Exporting…";
+    try {
+      const res = await apiFetch(`/api/bounty/ledger-csv${statsQs}`, { timeoutMs: 15000 });
+      if (res.ok === false || !res.csv) { window.alert(res.error || "No ledger data to export yet."); return; }
+      ckDownloadText(`greyiq-ledger-${new Date().toISOString().slice(0, 10)}.csv`, res.csv, "text/csv");
+    } catch (err) {
+      window.alert(err.message || "Export failed.");
+    } finally {
+      exportBtn.disabled = false; exportBtn.textContent = label;
+    }
+  });
+  titleRow.append(exportBtn);
+  host.append(titleRow);
   let data = null;
   if (service.available || (await refreshServiceStatus({ silent: true }))) {
-    const program = (ck.program?.value || "").trim();
-    const qs = program ? `?program=${encodeURIComponent(program)}` : (ck.target?.value ? `?target=${encodeURIComponent(ck.target.value.trim())}` : "");
-    try { data = await apiFetch(`/api/bounty/stats${qs}`, { timeoutMs: 8000 }); } catch (_) { data = null; }
+    try { data = await apiFetch(`/api/bounty/stats${statsQs}`, { timeoutMs: 8000 }); } catch (_) { data = null; }
   }
   const summary = data && data.summary ? data.summary : null;
   if (summary && summary.programs) {
@@ -6418,6 +6435,35 @@ async function ckRenderLearn() {
       const ul = cel("ul", "ck-intel");
       for (const note of intel) ul.append(cel("li", null, note.replace(/`/g, "")));
       host.append(ul);
+    }
+  }
+
+  // Pipeline funnel: already computed for the Operator tab -- surfaced here too so
+  // "what the engine has learned" shows where findings actually get stuck (e.g. a
+  // pile of confirmed findings never making it to reported/submitted), not just the
+  // flat submitted/rewarded/$ aggregate above.
+  const funnel = data && data.funnel ? data.funnel : null;
+  const funnelStages = funnel ? (funnel.programs ? funnel.portfolio.stages : funnel.stages) : null;
+  if (funnelStages) {
+    const stageLabels = [["discovered", "Discovered"], ["confirmed", "Confirmed"], ["reported", "Reported"], ["submitted", "Submitted"], ["paid", "Paid"]];
+    const counts = stageLabels.map(([k]) => Number(funnelStages[k]) || 0);
+    if (counts.some((n) => n > 0)) {
+      host.append(cel("h3", "ck-section-title", "Pipeline"));
+      const maxCount = Math.max(1, ...counts);
+      const box = cel("div", "ck-funnel");
+      stageLabels.forEach(([key, label], i) => {
+        const count = counts[i];
+        const row = cel("div", "ck-funnel-row");
+        row.append(cel("span", "ck-funnel-label", label));
+        const track = cel("div", "ck-funnel-track");
+        const fill = cel("div", "ck-funnel-fill");
+        fill.style.width = `${Math.max(count > 0 ? 3 : 0, Math.round((count / maxCount) * 100))}%`;
+        track.append(fill);
+        row.append(track, cel("span", "ck-funnel-count", String(count)));
+        box.append(row);
+      });
+      host.append(box);
+      host.append(cel("p", "ck-hint", "Current stage counts per finding, not a strict conversion funnel — a finding can be recorded directly at any stage."));
     }
   }
 
@@ -6597,6 +6643,13 @@ async function ckOperatorPollEvents() {
     const row = cel("div", "ck-op-event");
     row.append(cel("span", "ck-op-time", (ev.at || "").slice(11, 19)), cel("span", null, ev.message || ""));
     log.append(row);
+    // "submitted <pid>: <title> -> <url>" (operator.py's own _emit prefix) is the
+    // single most important background event in the app -- a confirmed finding was
+    // just auto-filed to a live bounty program while nobody was necessarily watching.
+    if (String(ev.message || "").startsWith("submitted ") && document.hidden) {
+      ckBumpTitleBadge(1);
+      void ckNotify("GreyIQ — finding submitted", ev.message);
+    }
   }
   if (res.events && res.events.length) { ckOpEventCount = res.count || (ckOpEventCount + res.events.length); log.scrollTop = log.scrollHeight; }
   if (!log.childNodes.length) log.append(cel("p", "ck-hint", "No activity yet. Start the operator to see live progress."));
@@ -6908,7 +6961,12 @@ async function ckRun() {
     const scopeNote = spanning ? `${res.targets_hunted ?? "?"}/${res.targets_total ?? "?"} in-scope target(s), `
       : isCampaign ? `${res.urls_scanned ?? "?"}/${res.urls_discovered ?? "?"} target(s), ` : "";
     const errNote = spanning && (res.errors || []).length ? ` (${res.errors.length} note(s) — see the report)` : "";
-    ckStatus(`Done — ${scopeNote}${ckState.findings.length} finding(s), ${confirmed} confirmed${errNote}. Report: ${where}`);
+    const doneMsg = `Done — ${scopeNote}${ckState.findings.length} finding(s), ${confirmed} confirmed${errNote}. Report: ${where}`;
+    ckStatus(doneMsg);
+    if (document.hidden) {
+      ckBumpTitleBadge(confirmed || ckState.findings.length);
+      void ckNotify("GreyIQ — hunt complete", doneMsg);
+    }
     ckSetView("findings");
     ckRenderFindings();
   } catch (err) {
@@ -6955,6 +7013,41 @@ function ckStatus(text, isError) {
   if (!ck.status) return;
   ck.status.textContent = text;
   ck.status.classList.toggle("is-error", Boolean(isError));
+}
+
+// --- Completion alerts: a hunt/campaign can run for minutes, and the autonomous
+// operator auto-submitting a confirmed bounty is arguably the most important event
+// in the app -- both need to reach an operator who has tabbed away, not just whoever
+// happens to be staring at the launch rail when it finishes. Two independent,
+// stacking signals: a tab-title badge (works everywhere, zero permissions) and a
+// native OS notification (louder, but needs a one-time permission grant). Both are
+// gated on document.hidden so a focused, watching operator never gets spammed with
+// what they can already see happening live in the log. ---
+const ckBaseTitle = document.title;
+let ckTitleBadgeCount = 0;
+
+// Adds -- never overwrites -- so a hunt-complete badge and an operator-submit badge
+// (two independent async sources) both contribute to one running unseen-event count
+// instead of the later call silently clobbering the earlier one's count.
+function ckBumpTitleBadge(delta) {
+  ckTitleBadgeCount = Math.max(0, ckTitleBadgeCount + (delta | 0));
+  document.title = ckTitleBadgeCount > 0 ? `(${ckTitleBadgeCount}) ${ckBaseTitle}` : ckBaseTitle;
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) { ckTitleBadgeCount = 0; document.title = ckBaseTitle; }
+});
+
+async function ckNotify(title, body) {
+  if (!("Notification" in window)) return;
+  if (Notification.permission === "default") {
+    try { await Notification.requestPermission(); } catch (_) { return; }
+  }
+  if (Notification.permission !== "granted") return;
+  try {
+    const n = new Notification(title, { body });
+    n.onclick = () => { window.focus(); n.close(); };
+  } catch (_) { /* best-effort -- OS/browser may still refuse (Do Not Disturb, etc.) */ }
 }
 
 function bootCockpit() {

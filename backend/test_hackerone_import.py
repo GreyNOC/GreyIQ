@@ -230,6 +230,162 @@ class PaginationHostPinningTests(unittest.TestCase):
         self.assertFalse(h1._is_hackerone_url("https://evil.example/v1/hackers/programs/acme"))
         self.assertFalse(h1._is_hackerone_url("https://api.hackerone.com.evil.example/x"))  # lookalike host
 
+
+class FetchJsonRetryTests(unittest.TestCase):
+    """_fetch_json() (the real, non-injected network call) retries a connection-level
+    failure and a transient/rate-limit HTTP status (429/5xx), but never a deterministic
+    401/403/404 -- and every retry reuses the SAME already-host-pinned request."""
+
+    def setUp(self) -> None:
+        self._orig_open = h1._OPENER.open
+
+    def tearDown(self) -> None:
+        h1._OPENER.open = self._orig_open
+
+    def _install(self, fake_open) -> None:
+        h1._OPENER.open = fake_open
+
+    class _FakeResponse:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+
+        def read(self, n: int) -> bytes:
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def test_connection_error_is_retried_and_succeeds(self) -> None:
+        calls = {"n": 0}
+
+        def fake_open(req, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise urllib.error.URLError("simulated connection reset")
+            return self._FakeResponse(b'{"ok": true}')
+
+        self._install(fake_open)
+        result = h1._fetch_json("https://api.hackerone.com/v1/hackers/x", api_username="u", api_token="t", timeout=5.0)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(calls["n"], 2)
+
+    def test_503_is_retried_and_succeeds(self) -> None:
+        calls = {"n": 0}
+
+        def fake_open(req, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _http_error(503)
+            return self._FakeResponse(b'{"ok": true}')
+
+        self._install(fake_open)
+        result = h1._fetch_json("https://api.hackerone.com/v1/hackers/x", api_username="u", api_token="t", timeout=5.0)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(calls["n"], 2)
+
+    def test_401_is_never_retried(self) -> None:
+        calls = {"n": 0}
+
+        def fake_open(req, timeout=None):
+            calls["n"] += 1
+            raise _http_error(401)
+
+        self._install(fake_open)
+        with self.assertRaises(urllib.error.HTTPError):
+            h1._fetch_json("https://api.hackerone.com/v1/hackers/x", api_username="u", api_token="t", timeout=5.0)
+        self.assertEqual(calls["n"], 1, "a deterministic auth failure must never be retried")
+
+    def test_404_is_never_retried(self) -> None:
+        calls = {"n": 0}
+
+        def fake_open(req, timeout=None):
+            calls["n"] += 1
+            raise _http_error(404)
+
+        self._install(fake_open)
+        with self.assertRaises(urllib.error.HTTPError):
+            h1._fetch_json("https://api.hackerone.com/v1/hackers/x", api_username="u", api_token="t", timeout=5.0)
+        self.assertEqual(calls["n"], 1, "a documented-expected 'not found' outcome must never be retried")
+
+    def test_retries_exhausted_then_raises(self) -> None:
+        calls = {"n": 0}
+
+        def fake_open(req, timeout=None):
+            calls["n"] += 1
+            raise _http_error(503)
+
+        self._install(fake_open)
+        with self.assertRaises(urllib.error.HTTPError):
+            h1._fetch_json("https://api.hackerone.com/v1/hackers/x", api_username="u", api_token="t", timeout=5.0)
+        self.assertEqual(calls["n"], h1._MAX_FETCH_ATTEMPTS)
+
+    def test_retry_after_header_is_capped_not_used_verbatim(self) -> None:
+        # A malicious/misconfigured server sending a huge Retry-After must never be
+        # able to stall an operator-triggered UI action for that long.
+        calls = {"n": 0}
+        sleeps: list[float] = []
+
+        def fake_open(req, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                hdrs = {"Retry-After": "9999"}
+
+                class _Msg(dict):
+                    def get(self, key, default=None):
+                        return dict.get(self, key, default)
+
+                exc = urllib.error.HTTPError("https://api.hackerone.com/v1/hackers/x", 429, "slow down", _Msg(hdrs), None)
+                raise exc
+            return self._FakeResponse(b'{"ok": true}')
+
+        self._install(fake_open)
+        import time as _time
+        original_sleep = _time.sleep
+        try:
+            _time.sleep = lambda s: sleeps.append(s)
+            result = h1._fetch_json("https://api.hackerone.com/v1/hackers/x", api_username="u", api_token="t", timeout=5.0)
+        finally:
+            _time.sleep = original_sleep
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(sleeps), 1)
+        self.assertLessEqual(sleeps[0], h1._MAX_RETRY_AFTER_S)
+
+    def test_negative_retry_after_is_clamped_to_zero_not_crashed(self) -> None:
+        # A negative Retry-After (hostile/misconfigured server or proxy) must be
+        # clamped to a non-negative wait, never reach time.sleep() with a negative
+        # value (which raises ValueError and would defeat the retry entirely).
+        calls = {"n": 0}
+        sleeps: list[float] = []
+
+        def fake_open(req, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                hdrs = {"Retry-After": "-5"}
+
+                class _Msg(dict):
+                    def get(self, key, default=None):
+                        return dict.get(self, key, default)
+
+                exc = urllib.error.HTTPError("https://api.hackerone.com/v1/hackers/x", 429, "slow down", _Msg(hdrs), None)
+                raise exc
+            return self._FakeResponse(b'{"ok": true}')
+
+        self._install(fake_open)
+        import time as _time
+        original_sleep = _time.sleep
+        try:
+            _time.sleep = lambda s: sleeps.append(s)
+            result = h1._fetch_json("https://api.hackerone.com/v1/hackers/x", api_username="u", api_token="t", timeout=5.0)
+        finally:
+            _time.sleep = original_sleep
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(calls["n"], 2, "the retry must still happen, not be defeated by the crash")
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreaterEqual(sleeps[0], 0.0)
+
     def test_fetch_json_refuses_a_non_hackerone_url(self) -> None:
         with self.assertRaises(ValueError):
             h1._fetch_json("https://evil.example/steal", api_username="u", api_token="t", timeout=5.0)

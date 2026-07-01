@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ from uuid import uuid4
 from bughunter.registrable_domain import registrable_domain
 
 _STORE_NAME = "bughunter_learning.json"
+_LOCK = threading.Lock()  # serialize read-modify-write (os.replace is atomic but not RMW-safe) -- mirrors ledger.py/portfolio.py
 
 # Outcome a submitted finding can have. Weighted toward "did this earn / matter?".
 OUTCOMES = ("submitted", "triaged", "accepted", "resolved", "duplicate", "informative", "not-applicable", "spam")
@@ -114,25 +116,26 @@ def record_outcome(
         raise ValueError(f"unknown status '{status}'. Use one of: {', '.join(OUTCOMES)}.")
     key = program_key(program, target)
     cls = str(class_id or "other").strip().lower() or "other"
-    data = _load(runtime_dir)
-    programs = data.setdefault("programs", {})
-    prog = programs.setdefault(key, _blank_program())
     stamp = now or datetime.now(UTC).isoformat()
-    prog["findings"].append({
-        "class_id": cls, "title": str(title)[:200], "status": status,
-        "bounty": float(bounty or 0.0), "severity": str(severity or "").lower(), "notes": str(notes)[:500], "at": stamp,
-    })
-    stats = prog["class_stats"].setdefault(cls, {"submitted": 0, "rewarded": 0, "noise": 0, "bounty_total": 0.0})
-    stats["submitted"] += 1
-    if status in _REWARDING:
-        stats["rewarded"] += 1
-    if status in _NOISE:
-        stats["noise"] += 1
-    stats["bounty_total"] = round(stats["bounty_total"] + float(bounty or 0.0), 2)
-    prog["updated_at"] = stamp
-    data["updated_at"] = stamp
-    _save(runtime_dir, data)
-    return prog
+    with _LOCK:
+        data = _load(runtime_dir)
+        programs = data.setdefault("programs", {})
+        prog = programs.setdefault(key, _blank_program())
+        prog["findings"].append({
+            "class_id": cls, "title": str(title)[:200], "status": status,
+            "bounty": float(bounty or 0.0), "severity": str(severity or "").lower(), "notes": str(notes)[:500], "at": stamp,
+        })
+        stats = prog["class_stats"].setdefault(cls, {"submitted": 0, "rewarded": 0, "noise": 0, "bounty_total": 0.0})
+        stats["submitted"] += 1
+        if status in _REWARDING:
+            stats["rewarded"] += 1
+        if status in _NOISE:
+            stats["noise"] += 1
+        stats["bounty_total"] = round(stats["bounty_total"] + float(bounty or 0.0), 2)
+        prog["updated_at"] = stamp
+        data["updated_at"] = stamp
+        _save(runtime_dir, data)
+        return prog
 
 
 def learned_priors(runtime_dir: str | Path, program: str | None, target: str = "") -> dict[str, float]:
