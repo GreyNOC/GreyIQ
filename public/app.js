@@ -5231,6 +5231,15 @@ async function ckFetchProgramsList() {
   return ckProgramsCache;
 }
 
+// Programs can be created/edited/enabled/disabled/deleted from EITHER the Program tab
+// or the Operator tab (both read/write the same /api/operator/programs list) -- call
+// this after ANY of those mutations, from EITHER tab, so the launch rail's picker never
+// goes stale just because the change happened to come from the other tab.
+async function ckRefreshProgramsEverywhere() {
+  await ckFetchProgramsList();
+  ckPopulateActiveProgramSelect();
+}
+
 function ckPopulateActiveProgramSelect() {
   if (!ck.activeProgram) return;
   const current = ck.activeProgram.value;
@@ -5479,8 +5488,7 @@ function ckProgramSetupForm() {
       await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify(payload) });
       ckProgEdit = null;
       saveNote.classList.remove("is-error"); saveNote.textContent = "Saved.";
-      await ckFetchProgramsList();
-      ckPopulateActiveProgramSelect();
+      await ckRefreshProgramsEverywhere();
       void ckRenderProgram();
     } catch (err) { saveNote.textContent = err.message || "Could not save."; saveNote.classList.add("is-error"); }
   });
@@ -6396,12 +6404,24 @@ function ckProgramRow(prog, funnel) {
   const toggle = cel("button", "ck-btn", prog.enabled ? "Disable" : "Enable");
   toggle.type = "button";
   toggle.addEventListener("click", async () => {
-    try { await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify({ id: prog.id, name: prog.name, scope_text: prog.scope_text, seed_targets: prog.seed_targets, active: prog.active, live: prog.live, auto_submit: prog.auto_submit, platform: prog.platform, platform_handle: prog.platform_handle, interval_minutes: prog.interval_minutes, max_submits_per_day: prog.max_submits_per_day, max_pages: prog.max_pages, enabled: !prog.enabled }) }); void ckRenderOperator(); } catch (_) {}
+    try {
+      await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify({ id: prog.id, name: prog.name, scope_text: prog.scope_text, seed_targets: prog.seed_targets, active: prog.active, live: prog.live, auto_submit: prog.auto_submit, platform: prog.platform, platform_handle: prog.platform_handle, interval_minutes: prog.interval_minutes, max_submits_per_day: prog.max_submits_per_day, max_pages: prog.max_pages, enabled: !prog.enabled }) });
+      await ckRefreshProgramsEverywhere();
+      void ckRenderOperator();
+    } catch (_) {}
   });
   acts.append(toggle);
   const del = cel("button", "ck-btn", "Delete");
   del.type = "button";
-  del.addEventListener("click", async () => { if (!window.confirm(`Delete program "${prog.name || prog.id}"?`)) return; try { await apiFetch("/api/operator/programs/delete", { method: "POST", body: JSON.stringify({ id: prog.id }) }); void ckRenderOperator(); } catch (_) {} });
+  del.addEventListener("click", async () => {
+    if (!window.confirm(`Delete program "${prog.name || prog.id}"?`)) return;
+    try {
+      await apiFetch("/api/operator/programs/delete", { method: "POST", body: JSON.stringify({ id: prog.id }) });
+      if (state.ckActiveProgramId === prog.id) { state.ckActiveProgramId = ""; saveState(); }
+      await ckRefreshProgramsEverywhere();
+      void ckRenderOperator();
+    } catch (_) {}
+  });
   acts.append(del);
   li.append(acts);
   return li;
@@ -6458,6 +6478,7 @@ function ckProgramForm() {
       await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify(payload) });
       ckOpEdit = null;
       note.classList.remove("is-error"); note.textContent = "Saved.";
+      await ckRefreshProgramsEverywhere();
       void ckRenderOperator();
     } catch (err) { note.textContent = err.message || "Could not save."; note.classList.add("is-error"); }
   });
