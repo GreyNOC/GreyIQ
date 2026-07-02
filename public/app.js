@@ -6380,6 +6380,7 @@ function ckNormalizeForReport(f, extra) {
     remediation: f.remediation || "",
     snippet: f.snippet || "",
     matched_value: f.matched_value || (f.proof_evidence && f.proof_evidence.matched_value) || "",
+    proofEvidence: f.proof_evidence || f.proofEvidence || null,  // captured request/response + read_data
     proofObj: f.proofObj || extra.proofObj || null,
     proof: ckEffectiveProof(f, f.proof_status),
     dedupKey: f.dedupKey || f.dedup_key || "",
@@ -6393,6 +6394,7 @@ function ckNormalizeForReport(f, extra) {
       focus.runId = focus.runId || m.runId || "";
       focus.plan = focus.plan || m.plan || null;
       focus.proofObj = focus.proofObj || m.proofObj || null;
+      focus.proofEvidence = focus.proofEvidence || m.proof_evidence || m.proofEvidence || null;
       focus.cvss = focus.cvss || m.cvss || null;
       if (focus.cvssScore == null) focus.cvssScore = m.cvssScore ?? null;
       focus.description = focus.description || m.description || "";
@@ -6524,6 +6526,18 @@ function ckFullReportPanel(focus) {
     } finally { copyBtn.disabled = false; setTimeout(() => { copyBtn.textContent = "Copy report"; }, 1600); }
   });
   actions.append(copyBtn);
+
+  // Copy JUST the proof of impact + steps + captured responses/data as plain text, to paste
+  // straight into a submission's "Proof of impact" field.
+  const poiBtn = cel("button", "ck-btn", "Copy proof of impact");
+  poiBtn.type = "button";
+  poiBtn.title = "Copy the proof of impact, steps to reproduce, and the captured request/response + sensitive data as plain text";
+  poiBtn.addEventListener("click", async () => {
+    const ok = await ckCopy(ckBuildProofOfImpactText(focus));
+    poiBtn.textContent = ok ? "Copied ✓" : "Copy failed";
+    setTimeout(() => { poiBtn.textContent = "Copy proof of impact"; }, 1600);
+  });
+  actions.append(poiBtn);
 
   const dlBtn = cel("button", "ck-btn", "Download .md");
   dlBtn.type = "button";
@@ -7085,9 +7099,55 @@ function ckBuildPocHtml(focus) {
   ].join("");
 }
 
-// One-click PoC bundle: report + PoC/evidence summary + a runnable PoC web page + every captured
-// screenshot + the finding JSON, zipped in the browser. Works for any finding (board / campaign /
-// history) with no run.
+// A plain-text Proof of impact + steps to reproduce + the captured request/response and the actual
+// sensitive data — for the operator to paste straight into their submission. Used by the "Copy
+// proof of impact" button AND the steps-and-evidence.txt in the zip.
+function ckBuildProofOfImpactText(focus) {
+  const L = [];
+  const rule = (c) => c.repeat(60);
+  L.push(`PROOF OF IMPACT — ${focus.title}`, rule("="), "");
+  L.push(`Severity:  ${String(focus.severity || "info").toUpperCase()}`);
+  if (focus.className) L.push(`Class:     ${focus.className}${focus.cwe ? ` (${focus.cwe})` : ""}`);
+  if (focus.location) L.push(`Location:  ${focus.location}`);
+  if (focus.cvss && focus.cvss.vector) L.push(`CVSS:      ${focus.cvss.vector}${focus.cvssScore != null ? ` (${Number(focus.cvssScore).toFixed(1)})` : ""}`);
+  L.push("");
+  const plan = focus.plan || {};
+  if (Array.isArray(plan.steps) && plan.steps.length) {
+    L.push("STEPS TO REPRODUCE", rule("-"));
+    plan.steps.forEach((s, i) => L.push(`${i + 1}. ${s}`));
+    L.push("");
+  }
+  if (plan.poc) L.push("PROOF OF CONCEPT", rule("-"), String(plan.poc), "");
+  const po = focus.proofObj || {};
+  if (po.status || po.observed_result || po.control_result || po.evidence || po.proof_obligation) {
+    L.push("PROOF OF IMPACT", rule("-"));
+    if (po.status) L.push(`Status:     ${String(po.status).replace(/^./, (c) => c.toUpperCase())}`);
+    if (po.method) L.push(`Method:     ${po.method}`);
+    if (po.affected_asset) L.push(`Affected:   ${po.affected_asset}`);
+    if (po.observed_result) L.push(`Observed:   ${po.observed_result}`);
+    if (po.control_result) L.push(`Control:    ${po.control_result}`);
+    if (po.evidence) L.push(`Evidence:   ${po.evidence}`);
+    if (po.status !== "confirmed" && po.proof_obligation) L.push(`To confirm: ${po.proof_obligation}`);
+    L.push("");
+  }
+  const pe = focus.proofEvidence || {};
+  if (pe.request_line || pe.request_header || pe.response_status || pe.matched_value) {
+    L.push("CAPTURED REQUEST / RESPONSE", rule("-"));
+    if (pe.request_line) L.push(`Request:   ${pe.request_line}`);
+    if (pe.request_header) L.push(`Header:    ${pe.request_header}`);
+    if (pe.response_status) L.push(`Response:  ${pe.response_status}`);
+    if (pe.matched_value) L.push(`Matched:   ${pe.matched_value}`);
+    L.push("");
+  }
+  const data = pe.read_data || focus.matched_value || focus.snippet || "";
+  if (data) L.push("SENSITIVE DATA / EVIDENCE READ", rule("-"), String(data), "");
+  L.push(rule("-"), "Captured by GreyIQ BugHunter. Review before sharing — screenshots and captured responses are not auto-redacted.");
+  return L.join("\n");
+}
+
+// One-click PoC bundle: report + PoC/evidence summary + a runnable PoC web page + a plain-text
+// steps/evidence file + every captured screenshot + the finding JSON, zipped in the browser. Works
+// for any finding (board / campaign / history) with no run.
 async function ckDownloadPocZip(focus, btn) {
   const old = btn.textContent; btn.disabled = true; btn.textContent = "Zipping…";
   try {
@@ -7097,6 +7157,7 @@ async function ckDownloadPocZip(focus, btn) {
     files.push({ name: "report.md", data: enc.encode(pkg.text || "") });
     files.push({ name: "poc.md", data: enc.encode(ckBuildPocSummary(focus)) });
     files.push({ name: "poc.html", data: enc.encode(ckBuildPocHtml(focus)) });
+    files.push({ name: "steps-and-evidence.txt", data: enc.encode(ckBuildProofOfImpactText(focus)) });
     const shots = [];
     if (focus.screenshot && focus.screenshot.data_url) shots.push({ data_url: focus.screenshot.data_url, kind: "evidence", path: "" });
     for (const s of (focus.shots || [])) if (s && s.data_url) shots.push(s);
