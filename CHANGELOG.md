@@ -2,6 +2,15 @@
 
 Notable changes to GreyIQ.
 
+## v0.67.3
+
+### The request/response/source proof as text
+Capturing a finding's screenshot now also saves the **plain-text** proof — the request line, the
+full request and response headers, and the served response body (where a secret/disclosure
+actually lives) — the same content as the proof-sheet image, but copy-pasteable. It's added to the
+one-click POC zip as **response-source.txt** and to each finding's "Download everything" bundle
+under **evidence/**, so you can paste the exact HTTP exchange straight into a submission.
+
 ## v0.67.2
 
 ### Copy the proof of impact straight into your submission
