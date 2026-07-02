@@ -186,5 +186,40 @@ class SstiMultiEngineTests(unittest.TestCase):
         self.assertIn("Freemarker/JSP-EL", f["proof_evidence"]["matched_value"])
 
 
+class _PrefixCorsStub:
+    """An ACL that trusts any Origin STARTING WITH https://<host> (no boundary check) — the
+    substring/prefix-trust bug that CORS variants 1-3 (exact marker, null, subdomain) don't catch,
+    so it exercises variant 4 specifically."""
+    def __init__(self, target_host: str = "app.example.com") -> None:
+        self.prefix = f"https://{target_host}"
+
+    def fetch(self, url, *, method="GET", extra_headers=None):
+        origin = {k.lower(): v for k, v in (extra_headers or {}).items()}.get("origin")
+        headers = {}
+        if origin and origin.startswith(self.prefix):
+            headers["access-control-allow-origin"] = origin
+            headers["access-control-allow-credentials"] = "true"
+        return {"status": 200, "headers": headers, "cookies": [], "body": "", "location": None}
+
+
+class CorsSubstringTrustTests(unittest.TestCase):
+    def test_prefix_trust_origin_confirms(self) -> None:
+        f = av._check_cors(_PrefixCorsStub(), "https://app.example.com/?q=x")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertIn("app.example.com." + av._MARKER_HOST, f["proof_evidence"]["matched_value"])
+
+    def test_strict_acl_not_flagged(self) -> None:
+        class _StrictCorsStub:  # only the exact site origin is trusted -> nothing to confirm
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                origin = {k.lower(): v for k, v in (extra_headers or {}).items()}.get("origin")
+                headers = {}
+                if origin == "https://app.example.com":
+                    headers["access-control-allow-origin"] = origin
+                    headers["access-control-allow-credentials"] = "true"
+                return {"status": 200, "headers": headers, "cookies": [], "body": "", "location": None}
+        self.assertIsNone(av._check_cors(_StrictCorsStub(), "https://app.example.com/?q=x"))
+
+
 if __name__ == "__main__":
     unittest.main()
