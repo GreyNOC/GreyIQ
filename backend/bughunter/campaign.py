@@ -237,7 +237,11 @@ def run_campaign(
                 "cvss": (doc.get("cvss") or {}).get(ref) or {},
             })
             url_new.append({"ref": ref, "title": finding.get("title"), "severity": finding.get("severity"),
-                            "class_name": finding.get("class_name") or finding.get("class_id"), "proof_status": proof_status})
+                            "class_name": finding.get("class_name") or finding.get("class_id"), "proof_status": proof_status,
+                            # Carried for the dashboard's investigate drawer + on-demand re-verify:
+                            # where the finding lives (the URL to re-probe), its CWE, and the rule id.
+                            "location": finding.get("location") or url, "cwe": finding.get("cwe"),
+                            "rule_id": finding.get("rule_id")})
         # Stream this URL's findings live — attributed to the span's named target when
         # running under one, else to the URL itself (single-target campaign).
         progress.add_findings(progress_run_id, progress_unit or url, url_new)

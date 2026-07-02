@@ -306,6 +306,20 @@ class StructuredSnapshotTests(unittest.TestCase):
         progress.add_findings("snap-b", "t1", many)
         self.assertEqual(progress.snapshot("snap-b")["stats"]["findings_total"], progress._MAX_FINDINGS_PER_RUN)
 
+    def test_add_findings_carries_investigate_fields(self) -> None:
+        # location/cwe/rule are streamed so the dashboard's investigate drawer + on-demand
+        # re-verify have real content (the URL to re-probe, the CWE, the rule that fired).
+        progress.start_run("enrich")
+        progress.set_targets("enrich", ["t1"])
+        progress.add_findings("enrich", "t1", [{
+            "ref": "F1", "title": "Reflected XSS", "severity": "high", "proof_status": "confirmed",
+            "class_name": "xss", "location": "https://t1/search?q=1", "cwe": "CWE-79", "rule_id": "xss-reflected",
+        }])
+        f = progress.snapshot("enrich")["findings"][0]
+        self.assertEqual(f["location"], "https://t1/search?q=1")
+        self.assertEqual(f["cwe"], "CWE-79")
+        self.assertEqual(f["rule"], "xss-reflected")
+
     def test_stop_flag_set_query_and_cleared_by_start_run(self) -> None:
         self.assertFalse(progress.is_stopped("stopflag"))
         progress.start_run("stopflag")

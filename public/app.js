@@ -7010,7 +7010,11 @@ async function ckRun() {
     const dashLabel = spanning
       ? ((ck.activeProgram?.selectedOptions?.[0]?.textContent || state.ckProgram || "Program").trim() + " — span scope")
       : `Campaign · ${target}`;
-    ckStartCampaignDashboard(progressRunId, dashLabel);
+    // Capture the scope + program + authorization so the dashboard's on-demand re-verify
+    // can re-probe a finding within the SAME authorized scope this campaign ran under.
+    ckStartCampaignDashboard(progressRunId, dashLabel, {
+      scope: state.ckScope, programId: spanning ? state.ckActiveProgramId : null, authorized: true,
+    });
   } else {
     ckStartLiveLog(progressRunId);
   }
@@ -7116,11 +7120,28 @@ function ckStatus(text, isError) {
 // --- Campaign dashboard: a live, easy-to-scan view of a running campaign. Polls the
 // structured snapshot from /api/bounty/progress and renders overall progress, stat tiles,
 // per-target status, and findings as they stream in — updating automatically. ---
-const ckCampaign = { runId: "", poll: null, snapshot: null, events: [], eventCount: 0, done: false, stopRequested: false, label: "", startedAt: 0 };
+// `scope`/`programId`/`authorized` are captured at launch so the dashboard's on-demand
+// re-verify can re-probe a finding within the same authorized scope. `sortBy`/`filterSev`
+// drive the findings controls; `selectedKey` is the finding open in the investigate drawer;
+// `reverify` holds each finding's re-probe state (survives polls so the drawer can re-render
+// without losing an in-flight/finished result); `dom` caches the built scaffold so polls
+// UPDATE it in place instead of rebuilding (which was resetting the findings scroll to top).
+const ckCampaign = {
+  runId: "", poll: null, snapshot: null, events: [], eventCount: 0, done: false,
+  stopRequested: false, label: "", startedAt: 0,
+  scope: "", programId: null, authorized: false,
+  sortBy: "severity", filterSev: "all", selectedKey: "", reverify: {}, reverifyVersion: 0,
+  dom: null,
+};
 
-function ckStartCampaignDashboard(runId, label) {
+function ckStartCampaignDashboard(runId, label, opts = {}) {
   if (ckCampaign.poll) { clearInterval(ckCampaign.poll); ckCampaign.poll = null; }
-  Object.assign(ckCampaign, { runId, label: label || "Campaign", snapshot: null, events: [], eventCount: 0, done: false, stopRequested: false, startedAt: Date.now() });
+  Object.assign(ckCampaign, {
+    runId, label: label || "Campaign", snapshot: null, events: [], eventCount: 0, done: false,
+    stopRequested: false, startedAt: Date.now(),
+    scope: opts.scope || "", programId: opts.programId || null, authorized: Boolean(opts.authorized),
+    selectedKey: "", reverify: {}, reverifyVersion: 0, dom: null,
+  });
   ckSetView("campaign");
   void ckPollCampaign();
   ckCampaign.poll = setInterval(() => { void ckPollCampaign(); }, 1200);
@@ -7189,9 +7210,33 @@ function ckCdTargetRow(t) {
   return row;
 }
 
-function ckCdFindingRow(f) {
+// Newest findings sort to the TOP (severity desc, then newest-first). Their stable key is
+// their index in snapshot.findings (append-only server-side, never reordered), so sorting/
+// filtering never breaks selection or the skip-if-unchanged signature.
+function ckSortFilterFindings(all, sortBy, filterSev) {
+  const list = filterSev === "all" ? all.slice() : all.filter((f) => (f.severity || "info") === filterSev);
+  if (sortBy === "severity") list.sort((a, b) => ((CK_SEV_RANK[b.severity] ?? 0) - (CK_SEV_RANK[a.severity] ?? 0)) || (b._i - a._i));
+  else list.sort((a, b) => b._i - a._i);
+  return list;
+}
+
+// Rebuild a scroll container's children while keeping the user's reading position stable.
+// New rows are added at/near the TOP (our sort order), so growth happens above the viewport —
+// adding the height delta keeps the row they were reading in place instead of yanking to top.
+function ckPreserveScroll(container, rebuild) {
+  const prevTop = container.scrollTop;
+  const prevH = container.scrollHeight;
+  rebuild();
+  const delta = container.scrollHeight - prevH;
+  container.scrollTop = (prevTop > 2 && delta > 0) ? prevTop + delta : prevTop;
+}
+
+function ckCdFindingRow(f, selectedKey) {
   const sev = f.severity || "info";
-  const row = cel("div", "ck-cd-finding");
+  const selected = String(f._i) === String(selectedKey);
+  const row = cel("div", "ck-cd-finding" + (selected ? " is-selected" : ""));
+  row.tabIndex = 0;
+  row.setAttribute("role", "button");
   row.append(cel("span", `ck-cd-sevpill sev-${sev}`, sev.slice(0, 4)));
   const main = cel("div", "ck-cd-finding-main");
   main.append(cel("div", "ck-cd-finding-title", f.title || "Finding"));
@@ -7201,103 +7246,363 @@ function ckCdFindingRow(f) {
   meta.append(cel("span", "ck-cd-finding-target", ckShortTarget(f.target)));
   main.append(meta);
   row.append(main);
+  row.append(cel("span", "ck-cd-finding-go", "›"));
+  const open = () => ckOpenFindingDrawer(f._i);
+  row.addEventListener("click", open);
+  row.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
   return row;
+}
+
+// Build the dashboard scaffold ONCE per run and cache element refs on ckCampaign.dom, so
+// each 1.2s poll UPDATES it in place (ckUpdateCampaign) rather than rebuilding the whole
+// view — which was resetting the findings list's scroll to the top on every poll.
+function ckBuildCampaignScaffold(host) {
+  host.replaceChildren();
+  host.append(cel("h2", "ck-section-title", "Campaign dashboard"));
+
+  const head = cel("div", "ck-cd-head");
+  const label = cel("div", "ck-cd-label", ckCampaign.label);
+  const statusEl = cel("span", "ck-cd-status is-running", "● Running");
+  const elapsedEl = cel("span", "ck-cd-elapsed", "0s");
+  const stopSlot = cel("span", "ck-cd-stopslot");
+  head.append(label, statusEl, elapsedEl, stopSlot);
+  host.append(head);
+
+  const progLabel = cel("p", "ck-cd-progress-label", "Mapping the surface…");
+  const bar = cel("div", "ck-cd-progress");
+  const progFill = cel("div", "ck-cd-progress-fill");
+  progFill.style.width = "6%";
+  bar.append(progFill);
+  host.append(progLabel, bar);
+
+  const tilesWrap = cel("div", "ck-cd-tiles");
+  host.append(tilesWrap);
+
+  const cols = cel("div", "ck-cd-cols");
+  const tcol = cel("div", "ck-cd-col");
+  const targetsTitle = cel("h3", "ck-cd-subtitle", "Targets (0)");
+  const targetsList = cel("div", "ck-cd-targets");
+  tcol.append(targetsTitle, targetsList);
+  cols.append(tcol);
+
+  const fcol = cel("div", "ck-cd-col");
+  const fhead = cel("div", "ck-cd-fhead");
+  const findingsTitle = cel("h3", "ck-cd-subtitle", "Findings so far (0)");
+  const controls = cel("div", "ck-cd-controls");
+  const sortSel = cel("select", "ck-cd-select");
+  for (const [val, txt] of [["severity", "Severity"], ["recent", "Most recent"]]) {
+    const o = cel("option", null, txt); o.value = val; sortSel.append(o);
+  }
+  sortSel.value = ckCampaign.sortBy;
+  sortSel.addEventListener("change", () => { ckCampaign.sortBy = sortSel.value; if (ckState.view === "campaign") ckRenderCampaign(); });
+  const filterSel = cel("select", "ck-cd-select");
+  const filterOpts = {};
+  for (const val of ["all", "critical", "high", "medium", "low", "info"]) {
+    const o = cel("option", null, val === "all" ? "All severities" : val); o.value = val; filterSel.append(o); filterOpts[val] = o;
+  }
+  filterSel.value = ckCampaign.filterSev;
+  filterSel.addEventListener("change", () => { ckCampaign.filterSev = filterSel.value; if (ckState.view === "campaign") ckRenderCampaign(); });
+  const sortLbl = cel("label", "ck-cd-ctl"); sortLbl.append(cel("span", null, "Sort"), sortSel);
+  const filterLbl = cel("label", "ck-cd-ctl"); filterLbl.append(cel("span", null, "Filter"), filterSel);
+  controls.append(sortLbl, filterLbl);
+  fhead.append(findingsTitle, controls);
+  const findingsList = cel("div", "ck-cd-findings");
+  fcol.append(fhead, findingsList);
+  cols.append(fcol);
+  host.append(cols);
+
+  const viewAllSlot = cel("div", "ck-cd-viewall");
+  host.append(viewAllSlot);
+
+  host.append(cel("h3", "ck-cd-subtitle", "Activity"));
+  const log = cel("div", "ck-op-log ck-cd-log");
+  host.append(log);
+
+  const drawer = cel("aside", "ck-cd-drawer");
+  drawer.hidden = true;
+  host.append(drawer);
+
+  return {
+    runId: ckCampaign.runId,
+    statusEl, elapsedEl, stopSlot, stopBtn: null, progLabel, progFill, tilesWrap,
+    targetsTitle, targetsList, findingsTitle, sortSel, filterSel, filterOpts, findingsList,
+    viewAllSlot, viewAllBtn: null, log, drawer,
+    targetsSig: "", findingsSig: "", drawerSig: "", logSeen: -1,
+  };
 }
 
 function ckRenderCampaign() {
   const host = ck.views.campaign;
   if (!host) return;
-  host.replaceChildren();
-  host.append(cel("h2", "ck-section-title", "Campaign dashboard"));
-
   if (!ckCampaign.runId) {
+    ckCampaign.dom = null;
+    host.replaceChildren();
+    host.append(cel("h2", "ck-section-title", "Campaign dashboard"));
     host.append(cel("p", "ck-hint",
       "No campaign is running. Start a Full campaign from the launch rail — pick a saved program and tick “span scope” to hunt its whole scope, or enter a single target — and every target's status and each finding will appear here live."));
     return;
   }
+  if (!ckCampaign.dom || ckCampaign.dom.runId !== ckCampaign.runId) {
+    ckCampaign.dom = ckBuildCampaignScaffold(host);
+  }
+  ckUpdateCampaign(ckCampaign.dom);
+}
 
+function ckUpdateCampaign(dom) {
   const snap = ckCampaign.snapshot || { targets: [], findings: [], stats: {} };
   const st = snap.stats || {};
   const sev = st.severity_counts || {};
   const running = !ckCampaign.done;
-
-  // Header: label + status pill + elapsed + (while running) a Stop button.
   const stopping = ckCampaign.stopRequested;
-  const head = cel("div", "ck-cd-head");
-  head.append(cel("div", "ck-cd-label", ckCampaign.label));
-  const statusText = running ? (stopping ? "● Stopping…" : "● Running") : (stopping ? "■ Stopped" : "✓ Done");
-  const statusCls = running ? (stopping ? "is-stopping" : "is-running") : (stopping ? "is-stopped" : "is-done");
-  head.append(cel("span", `ck-cd-status ${statusCls}`, statusText));
-  head.append(cel("span", "ck-cd-elapsed", ckFmtElapsed(Math.max(0, Math.round((Date.now() - ckCampaign.startedAt) / 1000)))));
-  if (running) {
-    const stop = cel("button", "ck-btn ck-cd-stop", stopping ? "Stopping…" : "Stop campaign");
-    stop.type = "button";
-    stop.disabled = stopping;
-    stop.addEventListener("click", () => void ckStopCampaign());
-    head.append(stop);
-  }
-  host.append(head);
 
-  // Progress bar (targets complete / total).
+  // Status pill + elapsed (cheap text updates — not scroll containers).
+  dom.statusEl.className = "ck-cd-status " + (running ? (stopping ? "is-stopping" : "is-running") : (stopping ? "is-stopped" : "is-done"));
+  dom.statusEl.textContent = running ? (stopping ? "● Stopping…" : "● Running") : (stopping ? "■ Stopped" : "✓ Done");
+  dom.elapsedEl.textContent = ckFmtElapsed(Math.max(0, Math.round((Date.now() - ckCampaign.startedAt) / 1000)));
+
+  // Stop button — present only while running.
+  if (running) {
+    if (!dom.stopBtn) {
+      const b = cel("button", "ck-btn ck-cd-stop", "Stop campaign");
+      b.type = "button";
+      b.addEventListener("click", () => void ckStopCampaign());
+      dom.stopSlot.append(b);
+      dom.stopBtn = b;
+    }
+    dom.stopBtn.textContent = stopping ? "Stopping…" : "Stop campaign";
+    dom.stopBtn.disabled = stopping;
+  } else if (dom.stopBtn) {
+    dom.stopBtn.remove();
+    dom.stopBtn = null;
+  }
+
+  // Progress.
   const total = st.targets_total || 0, done = st.targets_done || 0;
   const pct = total ? Math.round((done / total) * 100) : (running ? 6 : 100);
-  host.append(cel("p", "ck-cd-progress-label", total ? `${done} / ${total} target(s) complete` : (running ? "Mapping the surface…" : "Complete")));
-  const bar = cel("div", "ck-cd-progress");
-  const fill = cel("div", `ck-cd-progress-fill ${running ? "" : "is-done"}`.trim());
-  fill.style.width = pct + "%";
-  bar.append(fill);
-  host.append(bar);
+  dom.progLabel.textContent = total ? `${done} / ${total} target(s) complete` : (running ? "Mapping the surface…" : "Complete");
+  dom.progFill.style.width = pct + "%";
+  dom.progFill.className = "ck-cd-progress-fill" + (running ? "" : " is-done");
 
-  // Stat tiles.
-  const tiles = cel("div", "ck-cd-tiles");
-  tiles.append(ckCdTile(String(st.findings_total || 0), "Findings"));
-  tiles.append(ckCdTile(String(st.confirmed_total || 0), "Confirmed", (st.confirmed_total || 0) ? "is-ok" : ""));
-  tiles.append(ckCdTile(String((sev.critical || 0) + (sev.high || 0)), "Critical / high", ((sev.critical || 0) + (sev.high || 0)) ? "is-hot" : ""));
-  tiles.append(ckCdTile(String(sev.medium || 0), "Medium"));
-  tiles.append(ckCdTile(String(sev.low || 0), "Low"));
-  host.append(tiles);
+  // Tiles (5 cheap tiles, no scroll — rebuild is fine).
+  dom.tilesWrap.replaceChildren(
+    ckCdTile(String(st.findings_total || 0), "Findings"),
+    ckCdTile(String(st.confirmed_total || 0), "Confirmed", (st.confirmed_total || 0) ? "is-ok" : ""),
+    ckCdTile(String((sev.critical || 0) + (sev.high || 0)), "Critical / high", ((sev.critical || 0) + (sev.high || 0)) ? "is-hot" : ""),
+    ckCdTile(String(sev.medium || 0), "Medium"),
+    ckCdTile(String(sev.low || 0), "Low"),
+  );
 
-  // Two columns: targets + live findings.
-  const cols = cel("div", "ck-cd-cols");
-
-  const tcol = cel("div", "ck-cd-col");
-  tcol.append(cel("h3", "ck-cd-subtitle", `Targets (${(snap.targets || []).length})`));
-  const tlist = cel("div", "ck-cd-targets");
-  if (!(snap.targets || []).length) tlist.append(cel("p", "ck-hint", running ? "Discovering targets…" : "No targets."));
-  for (const t of snap.targets || []) tlist.append(ckCdTargetRow(t));
-  tcol.append(tlist);
-  cols.append(tcol);
-
-  const fcount = (snap.findings || []).length;
-  const fcol = cel("div", "ck-cd-col");
-  fcol.append(cel("h3", "ck-cd-subtitle", `Findings so far (${fcount})`));
-  const flist = cel("div", "ck-cd-findings");
-  if (!fcount) flist.append(cel("p", "ck-hint", running ? "No findings yet — hunting…" : "No findings surfaced."));
-  for (const f of [...(snap.findings || [])].reverse().slice(0, 80)) flist.append(ckCdFindingRow(f));
-  fcol.append(flist);
-  cols.append(fcol);
-
-  host.append(cols);
-
-  if (fcount) {
-    const go = cel("button", "ck-btn", `View all ${fcount} finding${fcount === 1 ? "" : "s"} →`);
-    go.type = "button";
-    go.addEventListener("click", () => ckSetView("findings"));
-    host.append(go);
+  // Targets — skip the rebuild entirely when nothing changed (so an idle poll never disturbs
+  // scroll); otherwise rebuild while preserving the reading position.
+  const targets = snap.targets || [];
+  dom.targetsTitle.textContent = `Targets (${targets.length})`;
+  const tSig = running + "|" + targets.map((t) => `${t.target}:${t.status}:${t.findings}:${t.top_severity}:${t.error}:${t.elapsed_s}`).join("~");
+  if (tSig !== dom.targetsSig) {
+    dom.targetsSig = tSig;
+    ckPreserveScroll(dom.targetsList, () => {
+      dom.targetsList.replaceChildren();
+      if (!targets.length) dom.targetsList.append(cel("p", "ck-hint", running ? "Discovering targets…" : "No targets."));
+      else for (const t of targets) dom.targetsList.append(ckCdTargetRow(t));
+    });
   }
 
-  // Activity log.
-  host.append(cel("h3", "ck-cd-subtitle", "Activity"));
-  const log = cel("div", "ck-op-log ck-cd-log");
-  const recent = ckCampaign.events.slice(-120);
-  if (!recent.length) log.append(cel("p", "ck-hint", "Starting…"));
-  for (const ev of recent) {
-    const row = cel("div", "ck-op-event");
-    row.append(cel("span", "ck-op-time", (ev.at || "").slice(11, 19)), cel("span", null, ev.message || ""));
-    log.append(row);
+  // Findings — controls (with live per-severity counts), then the sorted/filtered list, only
+  // rebuilt when the effective list, sort, filter, or selection actually changed.
+  const all = (snap.findings || []).map((f, i) => ({ ...f, _i: i }));
+  dom.findingsTitle.textContent = `Findings so far (${all.length})`;
+  const counts = { all: all.length, critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+  for (const f of all) counts[f.severity] = (counts[f.severity] || 0) + 1;
+  for (const k of Object.keys(dom.filterOpts)) {
+    dom.filterOpts[k].textContent = (k === "all" ? "All severities" : k[0].toUpperCase() + k.slice(1)) + ` (${counts[k] || 0})`;
   }
-  host.append(log);
-  log.scrollTop = log.scrollHeight;
+  dom.sortSel.value = ckCampaign.sortBy;
+  dom.filterSel.value = ckCampaign.filterSev;
+  const eff = ckSortFilterFindings(all, ckCampaign.sortBy, ckCampaign.filterSev);
+  const fSig = ckCampaign.sortBy + "|" + ckCampaign.filterSev + "|" + ckCampaign.selectedKey + "|" + running + "|" + eff.map((f) => f._i + ":" + f.proof).join(",");
+  if (fSig !== dom.findingsSig) {
+    dom.findingsSig = fSig;
+    ckPreserveScroll(dom.findingsList, () => {
+      dom.findingsList.replaceChildren();
+      if (!all.length) dom.findingsList.append(cel("p", "ck-hint", running ? "No findings yet — hunting…" : "No findings surfaced."));
+      else if (!eff.length) dom.findingsList.append(cel("p", "ck-hint", "No findings match this filter."));
+      else for (const f of eff) dom.findingsList.append(ckCdFindingRow(f, ckCampaign.selectedKey));
+    });
+  }
+
+  // "View all" jump to the full Findings board.
+  if (all.length) {
+    if (!dom.viewAllBtn) {
+      const b = cel("button", "ck-btn", "");
+      b.type = "button";
+      b.addEventListener("click", () => ckSetView("findings"));
+      dom.viewAllSlot.append(b);
+      dom.viewAllBtn = b;
+    }
+    dom.viewAllBtn.textContent = `View all ${all.length} finding${all.length === 1 ? "" : "s"} →`;
+  } else if (dom.viewAllBtn) {
+    dom.viewAllBtn.remove();
+    dom.viewAllBtn = null;
+  }
+
+  // Activity log — rebuilt (last 120) only when the absolute event count changed, then
+  // scrolled to the bottom (a log wants its newest line visible).
+  if (ckCampaign.eventCount !== dom.logSeen) {
+    dom.logSeen = ckCampaign.eventCount;
+    dom.log.replaceChildren();
+    const recent = ckCampaign.events.slice(-120);
+    if (!recent.length) dom.log.append(cel("p", "ck-hint", "Starting…"));
+    else for (const ev of recent) {
+      const row = cel("div", "ck-op-event");
+      row.append(cel("span", "ck-op-time", (ev.at || "").slice(11, 19)), cel("span", null, ev.message || ""));
+      dom.log.append(row);
+    }
+    dom.log.scrollTop = dom.log.scrollHeight;
+  }
+
+  // Investigate drawer — re-rendered only on a selection change or a re-verify state change.
+  const dsig = ckCampaign.selectedKey + ":" + ckCampaign.reverifyVersion;
+  if (dsig !== dom.drawerSig) {
+    dom.drawerSig = dsig;
+    ckRenderFindingDrawer(dom);
+  }
+}
+
+// --- Click-to-investigate: a read-only detail drawer + an on-demand active re-probe that
+// runs in PARALLEL to the campaign (a separate engine track), so you can dig into a finding
+// the moment it pops up without pausing the hunt. ---
+function ckOpenFindingDrawer(key) {
+  ckCampaign.selectedKey = String(key);
+  if (ckState.view === "campaign") ckRenderCampaign();
+}
+
+function ckCloseFindingDrawer() {
+  ckCampaign.selectedKey = "";
+  if (ckState.view === "campaign") ckRenderCampaign();
+}
+
+function ckRenderFindingDrawer(dom) {
+  const drawer = dom.drawer;
+  const key = ckCampaign.selectedKey;
+  const snap = ckCampaign.snapshot || { findings: [] };
+  const raw = key === "" ? null : (snap.findings || [])[Number(key)];
+  if (!raw) {
+    drawer.hidden = true;
+    drawer.replaceChildren();
+    ck.views.campaign?.classList.remove("has-cd-drawer");
+    return;
+  }
+  const f = { ...raw, _i: Number(key) };
+  drawer.replaceChildren();
+  drawer.hidden = false;
+  ck.views.campaign?.classList.add("has-cd-drawer");
+
+  const head = cel("div", "ck-cd-drawer-head");
+  head.append(cel("h3", null, f.title || "Finding"));
+  const close = cel("button", "ck-detail-close", "✕");
+  close.type = "button";
+  close.setAttribute("aria-label", "Close finding detail");
+  close.addEventListener("click", ckCloseFindingDrawer);
+  head.append(close);
+  drawer.append(head);
+
+  const badges = cel("div", "ck-summary");
+  const sev = f.severity || "info";
+  badges.append(cel("span", `ck-sev sev-${sev}`, sev.toUpperCase()));
+  if (f.proof) badges.append(cel("span", `ck-cd-proof is-${f.proof}`, f.proof));
+  if (f.cwe) badges.append(cel("span", "ck-tag", f.cwe));
+  drawer.append(badges);
+
+  const meta = cel("dl", "ck-meta-grid");
+  const add = (k, v) => { if (v) { meta.append(cel("dt", null, k)); meta.append(cel("dd", null, String(v))); } };
+  add("Class", f.cls);
+  add("Target", f.target);
+  add("Location", f.location);
+  add("Rule", f.rule);
+  add("Proof", f.proof);
+  drawer.append(meta);
+
+  drawer.append(cel("p", "ck-hint",
+    "Live summary streamed during the hunt. Full evidence + reproduction steps land on the Findings board once the campaign finishes — or re-verify below to actively re-probe this finding right now."));
+
+  drawer.append(ckRenderReverifySection(f));
+}
+
+function ckRenderReverifySection(f) {
+  const key = String(f._i);
+  const rv = ckCampaign.reverify[key];
+  const running = rv && rv.state === "running";
+  const wrap = cel("div", "ck-cd-reverify");
+  wrap.append(cel("h4", null, "Re-verify — active re-probe"));
+  wrap.append(cel("p", "ck-hint", "Re-runs the scope-gated active checks against this finding's URL in a separate track. The campaign keeps running."));
+  const btn = cel("button", "ck-btn primary", running ? "Re-verifying…" : "Re-verify this finding");
+  btn.type = "button";
+  btn.disabled = running || !ckCampaign.authorized;
+  btn.addEventListener("click", () => void ckReverifyFinding(f));
+  wrap.append(btn);
+  if (!ckCampaign.authorized) wrap.append(cel("p", "ck-hint", "Re-verify needs an authorized campaign (the authorization box was ticked at launch)."));
+  if (running) {
+    const busy = cel("div", "ck-cd-rv-busy");
+    busy.append(cel("span", "typing-dots"));
+    busy.append(cel("span", null, "Actively re-probing " + (f.location || f.target || "the target") + " in scope…"));
+    wrap.append(busy);
+  } else if (rv && rv.state === "error") {
+    wrap.append(cel("p", "ck-cd-rv-error", rv.error || "Re-verify failed."));
+  } else if (rv && rv.state === "done") {
+    wrap.append(ckRenderReverifyResult(rv.result));
+  }
+  return wrap;
+}
+
+function ckRenderReverifyResult(res) {
+  const box = cel("div", "ck-cd-rv-result");
+  const host = res.host || "the target";
+  const findings = res.findings || [];
+  const summary = findings.length
+    ? `${res.confirmed} confirmed · ${findings.length - res.confirmed} candidate — ${res.requests_used} request(s) to ${host}`
+    : `Nothing confirmable at ${host} right now (${res.requests_used} request(s)).`;
+  box.append(cel("p", "ck-cd-rv-summary" + (res.confirmed ? " is-hot" : ""), summary));
+  if (res.rate_limited) box.append(cel("p", "ck-hint", "Host rate limit reached — some checks were skipped. Try again shortly."));
+  for (const r of findings) {
+    const card = cel("div", `ck-cd-rv-card is-${r.status || ""}`);
+    const h = cel("div", "ck-cd-rv-card-head");
+    h.append(cel("span", `ck-sev sev-${r.severity || "info"}`, (r.severity || "info").toUpperCase()));
+    h.append(cel("strong", null, r.title || r.class_hint || "Active check"));
+    if (r.status) h.append(cel("span", `ck-cd-proof is-${r.status}`, r.status));
+    card.append(h);
+    const g = cel("dl", "ck-meta-grid");
+    const add = (k, v) => { if (v) { g.append(cel("dt", null, k)); g.append(cel("dd", null, String(v))); } };
+    add("Method", r.method);
+    add("Observed", r.observed);
+    add("Control", r.control);
+    add("Evidence", r.evidence);
+    add("Limitations", r.limitations);
+    if (g.childNodes.length) card.append(g);
+    box.append(card);
+  }
+  return box;
+}
+
+// The on-demand re-probe. Fires an independent request (does NOT block the campaign poll),
+// stashing state in ckCampaign.reverify[key] so the drawer re-renders through it whether the
+// user stays on this finding or clicks away and back.
+async function ckReverifyFinding(f) {
+  const key = String(f._i);
+  const url = (f.location || f.target || "").trim();
+  const setState = (s) => { ckCampaign.reverify[key] = s; ckCampaign.reverifyVersion++; if (ckState.view === "campaign") ckRenderCampaign(); };
+  if (!url) { setState({ state: "error", error: "This finding has no URL to re-verify." }); return; }
+  setState({ state: "running" });
+  let res;
+  try {
+    res = await apiFetch("/api/bounty/finding/reverify", {
+      method: "POST", timeoutMs: 120000,
+      body: JSON.stringify({ url, scope: ckCampaign.scope, program_id: ckCampaign.programId, authorized: ckCampaign.authorized }),
+    });
+  } catch (err) {
+    setState({ state: "error", error: err.message || "Could not reach the engine." });
+    return;
+  }
+  if (res && res.ok) setState({ state: "done", result: res });
+  else setState({ state: "error", error: (res && res.error) || "Re-verify failed." });
 }
 
 // --- Completion alerts: a hunt/campaign can run for minutes, and the autonomous

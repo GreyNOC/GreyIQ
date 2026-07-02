@@ -166,11 +166,17 @@ def add_findings(run_id: str, target: str, findings: list[dict[str, Any]]) -> No
                 if sev not in _SEV_RANK:
                     sev = "info"
                 proof = str(f.get("proof_status") or f.get("proof") or "").lower()
+                # Carry a few extra fields so the dashboard's click-to-investigate drawer
+                # (and its on-demand re-verify) has real content: where the finding lives
+                # (the URL to re-probe), its CWE, and the rule that raised it.
                 entry["findings"].append({
                     "target": name, "ref": str(f.get("ref") or ""),
                     "title": str(f.get("title") or "")[:160],
                     "severity": sev, "cls": str(f.get("class_name") or f.get("class_id") or ""),
                     "proof": proof, "at": datetime.now(UTC).isoformat(),
+                    "location": str(f.get("location") or f.get("source_url") or "")[:600],
+                    "cwe": str(f.get("cwe") or "")[:40],
+                    "rule": str(f.get("rule_id") or f.get("rule") or "")[:80],
                 })
                 added += 1
                 if proof == "confirmed":

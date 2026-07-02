@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import dataclasses
 import functools
 import hashlib
 import hmac
@@ -358,6 +359,9 @@ from bughunter import progress as bounty_progress  # noqa: E402
 from bughunter.operator import OperatorLoop  # noqa: E402
 from bughunter import toolkit as toolkit_lib  # noqa: E402
 from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E402
+from bughunter import active_verify_service as bounty_active_verify  # noqa: E402
+from bughunter import scan_auth as bounty_scan_auth  # noqa: E402
+from bughunter.settings import get_settings as _bounty_get_settings  # noqa: E402
 
 
 APP_NAME = "GreyIQ"
@@ -609,6 +613,19 @@ class BountyProgressRequest(BaseModel):
 
 class CampaignStopRequest(BaseModel):
     run_id: str = Field(min_length=1, max_length=100)
+
+
+class ReverifyRequest(BaseModel):
+    # On-demand re-probe of ONE finding's URL, launched from the live dashboard's
+    # investigate drawer. Runs in its own thread (parallel to any campaign) and is
+    # scope-gated + SSRF-guarded exactly like the campaign's own active pass.
+    url: str = Field(min_length=1, max_length=4000)
+    scope: str = Field(default="", max_length=2000)
+    program_id: str | None = Field(default=None, max_length=120)  # resolve the program's authoritative scope
+    authorized: bool = False
+    time_based: bool = False  # opt-in: allow the (executing) time-based blind-SQLi probe
+    auth_cookie: str = Field(default="", max_length=8000)
+    auth_headers: list[str] = Field(default_factory=list, max_length=20)
 
 
 class LearnRequest(BaseModel):
@@ -1405,6 +1422,60 @@ class GreyIQRuntime:
         results found so far. Idempotent and safe on an unknown/finished run."""
         bounty_progress.request_stop(run_id)
         return {"ok": True}
+
+    def reverify_finding(self, request: "ReverifyRequest") -> dict[str, Any]:
+        """On-demand active re-probe of ONE finding's URL — the dashboard's "investigate"
+        drawer 'Re-verify' action. Runs the SAME scope-gated, SSRF-guarded active checks the
+        campaign's active pass uses (``active_verify_service.verify_active``) against just this
+        URL, in its own thread (so it runs in PARALLEL to a live campaign, never blocking it),
+        and returns the fresh proof. Fail-closed: refuses unless authorized AND the URL's host
+        is named in the effective scope. Bounded request budget so one re-verify can't fan out."""
+        if not request.authorized:
+            return {"ok": False, "error": "Confirm you're authorized and in scope before re-verifying (tick the authorization box on the launch rail)."}
+        url = str(request.url or "").strip()
+        if not url:
+            return {"ok": False, "error": "This finding has no URL to re-verify."}
+        # Resolve the freshest, authoritative scope: the saved program's current scope_text
+        # (so editing a program's scope takes effect without re-running) unioned with any
+        # scope the caller passes. The program's out_of_scope_hosts ride on the settings the
+        # active pass takes, so an excluded host stays fail-closed on re-verify too.
+        scope_parts: list[str] = []
+        excluded: tuple[str, ...] = ()
+        if request.program_id:
+            program = bounty_portfolio.get_program(RUNTIME_DIR, request.program_id)
+            if program:
+                if str(program.get("scope_text") or "").strip():
+                    scope_parts.append(str(program["scope_text"]))
+                excluded = tuple(str(h) for h in (program.get("out_of_scope_hosts") or []))
+        if str(request.scope or "").strip():
+            scope_parts.append(str(request.scope))
+        scope = "\n".join(scope_parts)
+        settings = dataclasses.replace(_bounty_get_settings(), excluded_hosts=excluded)
+        auth = bounty_scan_auth.build_auth(url, cookie=request.auth_cookie, headers=request.auth_headers)
+        results, meta = bounty_active_verify.verify_active(
+            url, [], scope=scope, settings=settings, time_based=request.time_based,
+            auth=auth, requests_budget=16,
+        )
+        if not meta.get("in_scope"):
+            return {"ok": False, "in_scope": False, "host": meta.get("host", ""),
+                    "error": meta.get("skipped_reason") or "That target is not named in the current scope, so it can't be re-verified."}
+        compact: list[dict[str, Any]] = []
+        for r in results:
+            proof = r.get("_active_proof") or {}
+            compact.append({
+                "title": r.get("title", ""), "severity": r.get("severity", "info"),
+                "class_hint": r.get("_active_class_hint", ""), "rule_id": r.get("rule_id", ""),
+                "status": proof.get("status", ""), "method": proof.get("method", ""),
+                "observed": proof.get("observed_result", ""), "control": proof.get("control_result", ""),
+                "evidence": proof.get("evidence", ""), "limitations": proof.get("limitations", ""),
+                "affected_asset": proof.get("affected_asset", ""),
+            })
+        confirmed = sum(1 for c in compact if c["status"] == "confirmed")
+        return {
+            "ok": True, "host": meta.get("host", ""), "in_scope": True,
+            "requests_used": meta.get("requests_used", 0), "rate_limited": bool(meta.get("rate_limited")),
+            "findings": compact, "confirmed": confirmed,
+        }
 
     def run_campaign(self, request: "CampaignRequest") -> dict[str, Any]:
         # authorized passes straight through — campaign.run_campaign fails closed when
@@ -3232,6 +3303,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/campaign/stop":
             request = validate_payload(CampaignStopRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.stop_campaign, request.run_id))
+            return
+        if method == "POST" and path == "/api/bounty/finding/reverify":
+            request = validate_payload(ReverifyRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.reverify_finding, request))
             return
         if method == "POST" and path == "/api/bounty/learn":
             request = validate_payload(LearnRequest, await read_json_body(receive))

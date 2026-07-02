@@ -2,6 +2,25 @@
 
 Notable changes to GreyIQ.
 
+## v0.60.3
+
+### Investigate findings live: sort, filter, click-to-inspect, and on-demand re-verify
+The campaign dashboard's findings are now interactive while the hunt runs:
+
+- **No more scroll-jump.** The dashboard used to fully rebuild every 1.2s poll, resetting
+  the findings list to the top while you read. It now builds once and updates in place —
+  lists only re-render when their contents change, with scroll position preserved.
+- **Sort + filter by severity.** A controls bar sorts by severity (default) or most-recent,
+  and filters to a single severity, with live per-severity counts.
+- **Click a finding to investigate.** Each row opens a read-only drawer with its severity,
+  class, target, location, rule, CWE, and proof status (campaigns now stream those extra
+  fields).
+- **On-demand re-verify — a separate engine track.** A *Re-verify this finding* button in the
+  drawer actively re-probes that finding's URL right now, in parallel to the running
+  campaign, and shows the fresh proof. Fail-closed: it refuses without authorization and
+  refuses any out-of-scope host, and reuses the same scope-gated, SSRF-guarded active checks.
+  New `POST /api/bounty/finding/reverify` endpoint backs it.
+
 ## v0.60.2
 
 ### Stop campaign button
