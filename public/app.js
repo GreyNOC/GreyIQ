@@ -4339,7 +4339,7 @@ const ckState = {
   runId: "",             // server run id — keys canonical submission packages
   findings: [],          // normalized finding rows
   surface: null,         // recon { urls, sources, notes }
-  selectedRef: "",
+  selectedUid: "",
   filter: "all",         // all | confirmed | critical | high | medium | low
   sort: { key: "rank", dir: 1 },
   view: "program",
@@ -4544,6 +4544,15 @@ function ckFindingKey(f) {
   return key === "||" ? "" : key;
 }
 
+// A stable per-ROW identity for selection/highlight. ref is NOT unique across ckState.findings
+// (standalone confirm tools reuse "F1", so a hunt "F1" and a confirmed "F1" of a different
+// class coexist), so resolving a clicked row by ref alone opens/acts on the wrong finding.
+// This mirrors the compound identity ckDeleteFinding already uses.
+function ckFindingUid(f) {
+  if (!f) return "";
+  return [f.ref || "", f.className || "", f.class_id || "", f.location || ""].join("|");
+}
+
 function ckSaveStatusOverlay() {
   try { localStorage.setItem("greyiq-ck-status", JSON.stringify(ckStatusOverlay)); } catch (_) { /* private mode / quota */ }
 }
@@ -4584,8 +4593,8 @@ function ckProofMatchesFinding(activeFindings, f) {
 function ckSyncFindingViews() {
   if (ckState.view === "findings") {
     ckRenderFindings();
-    if (ckState.selectedRef) {
-      const sel = ckState.findings.find((x) => x.ref === ckState.selectedRef);
+    if (ckState.selectedUid) {
+      const sel = ckState.findings.find((x) => ckFindingUid(x) === ckState.selectedUid);
       if (sel && !ck.detail?.hidden) ckRenderDetail(sel);
     }
   } else if (ckState.view === "submissions") {
@@ -4715,7 +4724,7 @@ function ckRenderFindings() {
   const tbody = cel("tbody");
   for (const f of rows) {
     const tr = cel("tr", `ck-row sev-${f.severity}`);
-    if (f.ref === ckState.selectedRef) tr.classList.add("is-selected");
+    if (ckFindingUid(f) === ckState.selectedUid) tr.classList.add("is-selected");
     tr.append(td(cel("span", `ck-sev sev-${f.severity}`, f.severity.toUpperCase())));
     const cls = cel("span", null, f.className);
     const clsTd = td(cls);
@@ -4727,7 +4736,7 @@ function ckRenderFindings() {
     tr.append(td(cel("span", "ck-ftitle", f.title)));
     tr.append(td(cel("span", "ck-floc", f.location || "—")));
     tr.append(td(f.cvssScore != null ? cel("span", "ck-cvss", f.cvssScore.toFixed(1)) : cel("span", "ck-cvss", "—")));
-    tr.addEventListener("click", () => ckSelectFinding(f.ref));
+    tr.addEventListener("click", () => ckSelectFinding(f));
     tbody.append(tr);
   }
   table.append(tbody);
@@ -4743,10 +4752,11 @@ function ckPill(cls, label, value) {
   return pill;
 }
 
-function ckSelectFinding(ref) {
-  ckState.selectedRef = ref;
-  const f = ckState.findings.find((x) => x.ref === ref);
+function ckSelectFinding(f) {
   if (!f) return;
+  // Bind to the exact finding object the row holds (and key selection on its compound uid),
+  // never re-resolve by ref — ref collides across rows, which mis-targeted Delete/Submit.
+  ckState.selectedUid = ckFindingUid(f);
   for (const row of document.querySelectorAll(".ck-row")) row.classList.remove("is-selected");
   ckRenderDetail(f);
   ck.body?.classList.add("has-detail");
@@ -4756,7 +4766,7 @@ function ckSelectFinding(ref) {
 }
 
 function ckCloseDetail() {
-  ckState.selectedRef = "";
+  ckState.selectedUid = "";
   ck.detail.hidden = true;
   ck.body?.classList.remove("has-detail");
   ckRenderFindings();
@@ -4960,9 +4970,10 @@ async function ckResearchLead(f, btn, wrap) {
   }
 }
 
-async function ckCaptureScreenshot(f, btn, wrap) {
-  if (!(f.runId || ckState.runId)) {
-    wrap.replaceChildren(cel("p", "ck-status is-error", "Run a hunt first — screenshots attach to a cached finding."));
+async function ckCaptureScreenshot(f, btn, wrap, onShots) {
+  // Capture needs a URL (used directly when the run isn't cached) OR a cached run to resolve one.
+  if (!(f.location || f.sourceUrl || f.source_url || f.target || f.runId || ckState.runId)) {
+    wrap.replaceChildren(cel("p", "ck-status is-error", "No URL to screenshot for this finding."));
     return;
   }
   btn.disabled = true;
@@ -4971,15 +4982,30 @@ async function ckCaptureScreenshot(f, btn, wrap) {
   try {
     const res = await apiFetch("/api/bounty/screenshot", {
       method: "POST", timeoutMs: 60000,
-      // Send the cockpit's CURRENT Scope box too, so adding the host and re-capturing
-      // works without re-running the whole hunt (the server unions it with the run +
-      // live program scope and still fails closed via host_in_active_scope).
-      body: JSON.stringify({ run_id: f.runId || ckState.runId, ref: f.ref, scope: (ck.scope?.value || "").trim() })
+      // Carry the finding's OWN url/title/evidence so capture works even when the run is no
+      // longer cached (a history finding) — no re-hunt. Send the cockpit's current Scope box
+      // too; the server unions it with the run + live program scope and still fails closed.
+      body: JSON.stringify({
+        run_id: f.runId || ckState.runId, ref: f.ref || "",
+        url: f.location || f.sourceUrl || f.source_url || f.target || "",
+        title: f.title || "", location: f.location || f.source_url || "",
+        matched_value: f.matched_value || f.snippet || (f.proofObj && (f.proofObj.evidence || f.proofObj.observed_result)) || "",
+        scope: (ck.scope?.value || "").trim(),
+      })
     });
     if (res && res.ok) {
       btn.textContent = "Re-capture screenshot";
+      const shots = Array.isArray(res.shots) && res.shots.length ? res.shots
+        : (res.data_url ? [{ data_url: res.data_url, kind: "evidence" }] : []);
+      // When the caller owns persistent rendering (the full-report panel, which re-renders on
+      // its own async report fetch), hand it the shots to stash + re-render — appending into a
+      // wrap that a later re-render detaches would silently drop the just-captured images.
+      if (onShots) { onShots(shots, res); return; }
       if (res.warning) wrap.append(cel("p", "ck-status is-error", res.warning));
-      if (res.data_url) ckAppendScreenshot(wrap, res.data_url, f.title || f.ref);
+      const kindLabel = { "evidence": "Evidence (annotated)", "full-page": "Full page" };
+      for (const shot of shots) {
+        if (shot && shot.data_url) ckAppendScreenshot(wrap, shot.data_url, f.title || f.ref, kindLabel[shot.kind] || shot.kind || "");
+      }
       wrap.append(cel("p", "ck-hint", `Saved locally${res.path ? ": " + res.path : ""}. Now embedded in this finding's Copy report / Download .md.`));
     } else {
       btn.textContent = "Capture screenshot";
@@ -5163,11 +5189,15 @@ function ckTakeoverForm() {
         if (res.count > 0) {
           ckState.runId = res.run_id || ckState.runId;
           for (const f of (res.findings || [])) out.append(cel("p", "ck-ftitle", "✅ " + f.title));
-          ckState.findings = (res.findings || []).map((f, i) => ({
-            ref: `F${i + 1}`, title: f.title, severity: f.severity || "high", proof: "confirmed",
+          // Additive merge (like every other standalone confirm tool) — never wipe an existing
+          // hunt/campaign board. Namespaced refs (TK*) avoid colliding with a hunt's F-numbers.
+          const tkRows = (res.findings || []).map((f, i) => ({
+            ref: f.ref || `TK${i + 1}`, title: f.title, severity: f.severity || "high", proof: "confirmed",
             className: "Subdomain takeover", cwe: "CWE-350 / CWE-284", runId: res.run_id || ckState.runId, plan: {}, cvss: {},
-            proofObj: { status: "confirmed" }, description: ""
+            proofObj: { status: "confirmed" }, description: "", location: f.location || f.host || f.source_url || ""
           }));
+          const tkKeys = new Set(tkRows.map(ckFindingUid));
+          ckState.findings = (ckState.findings || []).filter((x) => !tkKeys.has(ckFindingUid(x))).concat(tkRows);
           ckBadgeCount("submissions", ckState.findings.length);
           if (res.report) {
             const pre = cel("pre", "ck-research-md");
@@ -5221,11 +5251,14 @@ function ckCveForm() {
         if (res.count > 0) {
           ckState.runId = res.run_id || ckState.runId;
           for (const f of (res.findings || [])) out.append(cel("p", "ck-ftitle", "⚠ " + f.title));
-          ckState.findings = (res.findings || []).map((f, i) => ({
-            ref: `F${i + 1}`, title: f.title, severity: f.severity || "medium", proof: "candidate",
+          // Additive merge — never discard an existing hunt/campaign board (see takeover above).
+          const cveRows = (res.findings || []).map((f, i) => ({
+            ref: f.ref || `CVE${i + 1}`, title: f.title, severity: f.severity || "medium", proof: "candidate",
             className: "Vulnerable / outdated component", cwe: "", runId: res.run_id || ckState.runId, plan: {}, cvss: {},
-            proofObj: { status: "candidate" }, description: ""
+            proofObj: { status: "candidate" }, description: "", location: f.location || f.host || f.source_url || ""
           }));
+          const cveKeys = new Set(cveRows.map(ckFindingUid));
+          ckState.findings = (ckState.findings || []).filter((x) => !cveKeys.has(ckFindingUid(x))).concat(cveRows);
           ckBadgeCount("submissions", ckState.findings.length);
           if (res.report) {
             const pre = cel("pre", "ck-research-md");
@@ -6345,6 +6378,8 @@ function ckNormalizeForReport(f, extra) {
     plan: f.plan || null,
     description: f.description || "",
     remediation: f.remediation || "",
+    snippet: f.snippet || "",
+    matched_value: f.matched_value || (f.proof_evidence && f.proof_evidence.matched_value) || "",
     proofObj: f.proofObj || extra.proofObj || null,
     proof: ckEffectiveProof(f, f.proof_status),
     dedupKey: f.dedupKey || f.dedup_key || "",
@@ -6369,6 +6404,10 @@ function ckNormalizeForReport(f, extra) {
 function ckViewFullReport(f, extra) {
   ckState.reportFocus = ckNormalizeForReport(f, extra);
   ckSetView("submissions");
+  // The panel pins to the top of the Submissions page; when opened from a history row deep in
+  // the list, bring it into view so the operator lands on the report they asked for.
+  const panel = document.querySelector(".ck-fullreport");
+  if (panel && panel.scrollIntoView) panel.scrollIntoView({ block: "start" });
 }
 
 // The canonical full report for a focused finding. Prefer the run package (build_submission)
@@ -6459,10 +6498,16 @@ function ckFullReportPanel(focus) {
     wrap.append(cel("pre", "ck-poc", pocText));
   }
 
-  // Screenshot: one captured during a campaign prove comes through on the focus; the Capture
-  // button below appends a fresh one here too. Each renders with its own Download button.
+  // Screenshots: a campaign-prove shot arrives on focus.screenshot; captures done here are
+  // stashed on focus.shots so they SURVIVE the panel's own async report-fetch re-render (which
+  // rebuilds this whole node). Each image renders with its own Download button.
   const shotWrap = cel("div", "ck-shot");
-  if (focus.screenshot && focus.screenshot.data_url) ckAppendScreenshot(shotWrap, focus.screenshot.data_url, focus.title);
+  const _shotKindLabel = { "evidence": "Evidence (annotated)", "full-page": "Full page" };
+  if (focus.screenshot && focus.screenshot.data_url) ckAppendScreenshot(shotWrap, focus.screenshot.data_url, focus.title, "Evidence");
+  for (const shot of (focus.shots || [])) {
+    if (shot && shot.data_url) ckAppendScreenshot(shotWrap, shot.data_url, focus.title, _shotKindLabel[shot.kind] || shot.kind || "");
+  }
+  if (focus.shots && focus.shots.length) shotWrap.append(cel("p", "ck-hint", "Saved locally. Review before attaching — screenshots are not auto-redacted."));
 
   const actions = cel("div", "ck-actions");
   const statusEl = cel("p", "ck-status"); statusEl.style.flexBasis = "100%";
@@ -6489,9 +6534,15 @@ function ckFullReportPanel(focus) {
   });
   actions.append(dlBtn);
 
-  const shotBtn = cel("button", "ck-btn", focus.screenshot && focus.screenshot.data_url ? "Re-capture screenshot" : "Capture screenshot");
+  const hasShots = (focus.shots && focus.shots.length) || (focus.screenshot && focus.screenshot.data_url);
+  const shotBtn = cel("button", "ck-btn", hasShots ? "Re-capture screenshot" : "Capture screenshot");
   shotBtn.type = "button";
-  shotBtn.addEventListener("click", () => ckCaptureScreenshot(focus, shotBtn, shotWrap));
+  shotBtn.title = "Capture annotated + full-page proof screenshots of this finding's page";
+  shotBtn.addEventListener("click", () => ckCaptureScreenshot(focus, shotBtn, shotWrap, (shots) => {
+    // Persist on the focus so the shots survive a panel re-render, then repaint.
+    focus.shots = shots;
+    if (ckState.reportFocus === focus && ckState.view === "submissions") ckRenderSubmissions();
+  }));
   actions.append(shotBtn);
 
   if (ckEffectiveProof(focus) === "candidate") {
@@ -6534,7 +6585,19 @@ function ckFullReportPanel(focus) {
         const pkg = await ckFullReportMarkdown(focus);
         focus._md = pkg.text;
         focus._mdLoading = false;
-        if (ckState.reportFocus === focus && ckState.view === "submissions") ckRenderSubmissions();
+        if (ckState.reportFocus === focus && ckState.view === "submissions") {
+          // Preserve the search box's focus/caret: this async re-render can land mid-typing
+          // (the fetch runs while the operator searches), and replaceChildren() would otherwise
+          // steal focus for one keystroke.
+          const active = document.activeElement;
+          const onSearch = active && active.id === "ckSubSearch";
+          const caret = onSearch ? active.selectionStart : null;
+          ckRenderSubmissions();
+          if (onSearch) {
+            const again = document.getElementById("ckSubSearch");
+            if (again) { again.focus(); try { again.setSelectionRange(caret, caret); } catch (_) { /* type=search */ } }
+          }
+        }
       })();
     }
   }
@@ -6694,6 +6757,12 @@ function ckSubmissionRow(f) {
   resultEl.style.flexBasis = "100%";
   resultEl.hidden = true;
 
+  const viewBtn = cel("button", "ck-btn", "View full report");
+  viewBtn.type = "button";
+  viewBtn.title = "Open the full report (proof of impact, screenshot, submit) at the top of this page";
+  viewBtn.addEventListener("click", () => ckViewFullReport(f));
+  acts.append(viewBtn);
+
   const copyBtn = cel("button", "ck-btn", "Copy report");
   copyBtn.type = "button";
   copyBtn.addEventListener("click", async () => {
@@ -6843,24 +6912,31 @@ function ckShotExt(dataUrl) {
 function ckDownloadDataUrl(dataUrl, filename) {
   const m = /^data:([^;,]*)(;base64)?,([\s\S]*)$/.exec(String(dataUrl || ""));
   if (!m) return false;
-  if (m[2]) { ckDownloadBase64(filename, m[3], m[1] || "application/octet-stream"); return true; }
-  try { ckDownloadText(filename, decodeURIComponent(m[3]), m[1] || "text/plain"); return true; }
-  catch (_) { return false; }
+  // Both branches can throw on a malformed payload (atob on non-base64, decodeURIComponent on
+  // a bad %-escape). Honor the documented false-return contract so the caller's "Download
+  // failed" fallback fires instead of an uncaught exception escaping the click handler.
+  try {
+    if (m[2]) ckDownloadBase64(filename, m[3], m[1] || "application/octet-stream");
+    else ckDownloadText(filename, decodeURIComponent(m[3]), m[1] || "text/plain");
+    return true;
+  } catch (_) { return false; }
 }
 
 // Render a captured screenshot into `wrap` with a "Download screenshot" button beside it, so
 // the operator can save just the image (for an attachment) without the whole report. Shared by
 // the capture flow, the full-report panel, and the prove/re-probe result.
-function ckAppendScreenshot(wrap, dataUrl, nameBase) {
+function ckAppendScreenshot(wrap, dataUrl, nameBase, label) {
+  if (label) wrap.append(cel("p", "ck-shot-label", label));
   const img = cel("img", "ck-shot-img");
   img.src = dataUrl;                       // data: URI, not markup — safe
-  img.alt = "Proof-of-concept screenshot";
+  img.alt = "Proof-of-concept screenshot" + (label ? " — " + label : "");
   wrap.append(img);
   const bar = cel("div", "ck-actions"); bar.style.margin = "0.3rem 0 0";
   const dl = cel("button", "ck-btn", "Download screenshot");
   dl.type = "button";
   dl.addEventListener("click", () => {
-    const ok = ckDownloadDataUrl(dataUrl, `${ckSlug(nameBase || "finding")}-screenshot.${ckShotExt(dataUrl)}`);
+    const base = ckSlug(nameBase || "finding") + (label ? "-" + ckSlug(label) : "");
+    const ok = ckDownloadDataUrl(dataUrl, `${base}-screenshot.${ckShotExt(dataUrl)}`);
     if (!ok) { dl.textContent = "Download failed"; setTimeout(() => { dl.textContent = "Download screenshot"; }, 1600); }
   });
   bar.append(dl);
@@ -7052,6 +7128,11 @@ function ckHistoryRow(rec) {
   li.append(left);
 
   const acts = cel("div", "ck-actions"); acts.style.margin = "0";
+  const viewBtn = cel("button", "ck-btn", "View full report");
+  viewBtn.type = "button";
+  viewBtn.title = "Open the full report for this finding at the top of this page";
+  viewBtn.addEventListener("click", () => ckViewFullReport(rec));
+  acts.append(viewBtn);
   const copyBtn = cel("button", "ck-btn", "Copy report");
   copyBtn.type = "button";
   copyBtn.addEventListener("click", async () => {
@@ -7891,7 +7972,7 @@ async function ckRunPortfolio() {
     ckState.triage = {};
     ckState.findings = ckNormalizeFindings(res);
     ckState.surface = res.surface || null;
-    ckState.selectedRef = "";
+    ckState.selectedUid = "";
     ckCloseDetail();
     ckBadgeCount("findings", ckState.findings.length);
     ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);
@@ -7980,7 +8061,7 @@ async function ckRun() {
     ckState.triage = {};
     ckState.findings = ckNormalizeFindings(res);
     ckState.surface = res.surface || (res.urls ? { urls: res.urls, sources: res.recon_sources, notes: res.recon_notes } : null);
-    ckState.selectedRef = "";
+    ckState.selectedUid = "";
     ckCloseDetail();
     ckBadgeCount("findings", ckState.findings.length);
     ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);

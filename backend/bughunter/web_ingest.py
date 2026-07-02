@@ -456,7 +456,23 @@ def _host_is_private(hostname: str) -> bool:
     return any(_address_is_private(address) for address in addresses)
 
 
+# RFC 6598 Carrier-Grade NAT. Python's is_private only added this in 3.13; the shipped
+# runtime is 3.11, and CGNAT space routes to internal load balancers / metadata front-ends
+# in many clouds, k8s node/pod networks, Tailscale, and ISP infra — exactly what the guard
+# must block. Kept as an explicit network so the classification holds on every Python.
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+
+
 def _address_is_private(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    # An IPv6 address that embeds an IPv4 one — ::ffff:a.b.c.d (mapped) or 2002:: (6to4) — is
+    # only as safe as the IPv4 it points at, so unwrap and re-check. Without this the guard is
+    # bypassed by expressing an internal IPv4 in IPv6 form.
+    if isinstance(address, ipaddress.IPv6Address):
+        embedded = address.ipv4_mapped or address.sixtofour
+        if embedded is not None and _address_is_private(embedded):
+            return True
+    if isinstance(address, ipaddress.IPv4Address) and address in _CGNAT_NET:
+        return True
     return (
         address.is_private
         or address.is_loopback
