@@ -2,6 +2,31 @@
 
 Notable changes to GreyIQ.
 
+## v0.66.1
+
+### Screenshots that prove the finding — and no more re-running the hunt
+Capturing a proof screenshot no longer needs the run to still be cached: a finding you opened
+from history (or after the run was evicted) now screenshots from its own URL, so you never have
+to re-run a whole campaign just to grab an image. Each capture also carries a proof banner with
+the finding's title, location, and evidence, and outlines the matched value on the page — so the
+shot proves the finding even when the page itself looks blank (a secret in source, a missing
+header). You get two shots per capture (annotated evidence + full page), each downloadable, and
+they stay put while you work.
+
+### Browse straight to a full report
+The Submissions queue and the "All findings" history now have a **View full report** button on
+every row, so you can pull up a finding's full report (proof of impact, screenshots, submit)
+while browsing — not only from a finding's drawer.
+
+### QA/QC audit — nine fixes
+A multi-agent review found and this release fixes: clicking a finding could act on the *wrong*
+finding when two shared a reference (Delete/Submit now target the exact one); subdomain-takeover
+and known-CVE scans no longer wipe your existing findings board; a malformed local-model response
+can't crash a hunt; a report can no longer be labeled "Confirmed" without a real
+observed-vs-control proof; the scan's private-host guard now covers CGNAT and IPv6-wrapped
+addresses; the open-redirect check no longer false-confirms on a look-alike subdomain; and the
+packaged build drops ~13.6 MB of unusable model checkpoints.
+
 ## v0.66.0
 
 ### Download just the screenshot
