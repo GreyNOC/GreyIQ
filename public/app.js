@@ -7139,8 +7139,15 @@ function ckBuildProofOfImpactText(focus) {
     if (pe.matched_value) L.push(`Matched:   ${pe.matched_value}`);
     L.push("");
   }
-  const data = pe.read_data || focus.matched_value || focus.snippet || "";
-  if (data) L.push("SENSITIVE DATA / EVIDENCE READ", rule("-"), String(data), "");
+  // Only claim an actual data READ when we captured a real response body (read_data). A bare
+  // matched header/banner (matched_value/snippet) is NOT sensitive data read — labeling it so
+  // overstates impact and gets reports rejected; show it under a neutral heading instead.
+  if (pe.read_data) {
+    L.push("SENSITIVE DATA READ (cross-origin / authenticated response)", rule("-"), String(pe.read_data), "");
+  } else {
+    const ev = focus.matched_value || focus.snippet || "";
+    if (ev && ev !== pe.matched_value) L.push("MATCHED EVIDENCE", rule("-"), String(ev), "");
+  }
   L.push(rule("-"), "Captured by GreyIQ BugHunter. Review before sharing — screenshots and captured responses are not auto-redacted.");
   return L.join("\n");
 }
