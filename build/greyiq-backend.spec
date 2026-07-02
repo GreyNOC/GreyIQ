@@ -17,9 +17,21 @@ ROOT = os.path.dirname(os.path.abspath(SPECPATH))  # noqa: F821 (SPECPATH inject
 BACKEND = os.path.join(ROOT, "backend")
 
 datas = [
-    (os.path.join(BACKEND, "seed"), "seed"),
     (os.path.join(ROOT, "public"), "public"),
 ]
+# Bundle the seed tree, but EXCLUDE the TinyGPT torch checkpoints (*.pt). torch is excluded
+# from this build (see the excludes list below), so solin_core can never load them — shipping
+# and first-launch-copying ~13.6 MB of *.pt is pure dead weight. Everything else under seed/
+# (bounty playbooks, skills, corpora, configs) is kept. Walk the tree so each surviving file
+# lands under the right seed/ subdir.
+_SEED_SRC = os.path.join(BACKEND, "seed")
+for _root, _dirs, _files in os.walk(_SEED_SRC):
+    _rel = os.path.relpath(_root, _SEED_SRC)
+    _dest = "seed" if _rel == os.curdir else os.path.join("seed", _rel)
+    for _fn in _files:
+        if _fn.lower().endswith(".pt"):
+            continue
+        datas.append((os.path.join(_root, _fn), _dest))
 binaries = []
 # NOTE: the offline TinyGPT brain (solin_core / solin_typo / solin_bpe /
 # training_runtime) is intentionally NOT bundled. It depends on PyTorch (~1.2 GB),

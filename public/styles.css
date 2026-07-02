@@ -3125,6 +3125,7 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-cd-rv-card-head { display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap; font-size: 0.82rem; }
 .ck-cd-rv-card .ck-meta-grid { margin-top: 0.4rem; }
 .ck-shot-img { display: block; max-width: 100%; margin: 0.5rem 0; border: 1px solid var(--border); border-radius: 8px; }
+.ck-shot-label { margin: 0.5rem 0 0.1rem; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
 
 /* Reporting hub: generated-report preview + findings history. */
 .ck-report-preview:empty { display: none; }

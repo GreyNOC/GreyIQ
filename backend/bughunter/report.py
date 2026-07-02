@@ -442,13 +442,18 @@ def _append_screenshot(out: list[str], finding: dict[str, Any]) -> None:
     the same folder) plus the not-auto-redacted caveat. Shared by the default report and
     the per-platform report so a captured screenshot lands on *every* report surface, not
     only the platform package."""
-    path = str(finding.get("screenshot_path") or "").strip()
-    if not path:
+    paths = finding.get("screenshot_paths")
+    if not isinstance(paths, list) or not paths:
+        single = str(finding.get("screenshot_path") or "").strip()
+        paths = [single] if single else []
+    paths = [str(p).strip() for p in paths if str(p or "").strip()]
+    if not paths:
         return
-    name = path.replace("\\", "/").rsplit("/", 1)[-1]
     out.append("## Screenshot evidence\n")
-    out.append(f"![Proof-of-concept screenshot]({name})")
-    out.append("")
+    for path in paths:
+        name = path.replace("\\", "/").rsplit("/", 1)[-1]
+        out.append(f"![Proof-of-concept screenshot]({name})")
+        out.append("")
     out.append(f"> {_SCREENSHOT_WARNING}")
     out.append("")
 

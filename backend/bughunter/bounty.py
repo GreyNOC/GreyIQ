@@ -667,9 +667,19 @@ def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], 
     brain["report_title"] = str(parsed.get("report_title") or "").strip()[:200]
     brain["summary"] = str(parsed.get("executive_summary") or "").strip()
     brain["notes"] = str(parsed.get("notes") or "").strip()
-    brain["manual_tests"] = [str(t).strip() for t in (parsed.get("manual_tests") or []) if str(t).strip()][:12]
-    brain["next_steps"] = [str(t).strip() for t in (parsed.get("next_steps") or []) if str(t).strip()][:8]
-    for plan in parsed.get("attack_plans") or []:
+    # The brain output is untrusted JSON: a model can return a field with the wrong container
+    # type — a scalar where a list is expected, attack_plans as an object keyed by ref, or the
+    # plans as bare strings. Coerce every shape defensively (isinstance-gate the iterables and
+    # skip non-dict plans) so a malformed response degrades to the deterministic report rather
+    # than raising and aborting the whole hunt — this function's documented fallback contract.
+    manual_tests = parsed.get("manual_tests")
+    brain["manual_tests"] = [str(t).strip() for t in manual_tests if str(t).strip()][:12] if isinstance(manual_tests, list) else []
+    next_steps = parsed.get("next_steps")
+    brain["next_steps"] = [str(t).strip() for t in next_steps if str(t).strip()][:8] if isinstance(next_steps, list) else []
+    attack_plans = parsed.get("attack_plans")
+    for plan in (attack_plans if isinstance(attack_plans, list) else []):
+        if not isinstance(plan, dict):
+            continue
         ref = str(plan.get("ref") or "").strip()
         if not ref:
             continue

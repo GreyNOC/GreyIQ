@@ -493,7 +493,13 @@ def _check_open_redirect(http: _Http, url: str, extra_params: list[str] | None =
         else:
             parse_target = "http://x" + location
         loc_host = urlparse(parse_target).hostname or ""
-        if loc_host == _MARKER_HOST or location.startswith(_MARKER_ORIGIN) or location.startswith("//" + _MARKER_HOST):
+        # Gate strictly on the parsed HOST equalling the marker (protocol-relative and absolute
+        # forms are already normalized above, so loc_host is correct for both). The old
+        # startswith(_MARKER_ORIGIN) / startswith('//'+marker) fallbacks lacked a host boundary,
+        # so a redirect to the target's OWN subdomain whose label merely begins with the marker
+        # (e.g. https://greyiq-marker.example.victim.com/) falsely reported a confirmed EXTERNAL
+        # open redirect — a bogus, unsubmittable finding.
+        if loc_host == _MARKER_HOST:
             try:
                 control = http.fetch(_with_query(url, {param: "/greyiq-control"}))
             except _ActiveError:

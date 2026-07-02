@@ -738,8 +738,16 @@ class SubmitRequest(BaseModel):
 
 
 class ScreenshotRequest(BaseModel):
-    run_id: str = Field(min_length=1, max_length=64)
-    ref: str = Field(min_length=1, max_length=40)
+    # run_id/ref locate a cached run (richest: the exact PoC request URL, and the shot auto-embeds
+    # on the report). Optional so a finding opened from history / an evicted run can still capture
+    # from its OWN url/location — no re-hunt. When there's no cached run the url/title/location/
+    # matched_value fields drive the capture + on-shot annotation.
+    run_id: str = Field(default="", max_length=64)
+    ref: str = Field(default="", max_length=40)
+    url: str = Field(default="", max_length=4000)             # PoC/finding URL used when no run is cached
+    title: str = Field(default="", max_length=255)            # finding title, overlaid on the shot
+    location: str = Field(default="", max_length=4000)        # finding location, overlaid on the shot
+    matched_value: str = Field(default="", max_length=2000)   # evidence to highlight + annotate
     full_page: bool = False
     scope: str = Field(default="", max_length=4000)   # optional extra scope (the cockpit's current Scope box), unioned with the run + live program scope at capture time
 
@@ -1700,8 +1708,15 @@ class GreyIQRuntime:
             # confirmed. The real HackerOne submit gate is separate (server-recomputed from
             # the cached engine run), but the report must not *claim* confirmed without proof.
             status = str(p.status or "").strip().lower()
-            has_differential = bool(str(p.observed_result or "").strip() and str(p.control_result or "").strip())
-            if status == "confirmed" and not has_differential:
+            observed = str(p.observed_result or "").strip()
+            has_differential = bool(observed and str(p.control_result or "").strip())
+            # Cap at 'candidate' for ANY incoming status that lacks a real observed-vs-control
+            # differential — including an EMPTY status. Otherwise a caller reaches 'confirmed'
+            # by staying silent: with no explicit status the overlay writes nothing, and the
+            # renderer auto-promotes on the observed artifact alone (report._has_captured_artifact).
+            # Pinning a concrete 'candidate' whenever there's an observation but no control blocks
+            # that promotion, so only a genuine differential can ever read 'confirmed'.
+            if not has_differential and (status == "confirmed" or observed):
                 status = "candidate"
             poi = dict(plan.get("proof_of_impact") or {})
             for k, v in (("status", status), ("method", p.method), ("observed_result", p.observed_result),
@@ -1979,25 +1994,32 @@ class GreyIQRuntime:
         import base64
 
         ctx, finding, run = self._resolve_run_finding(request.run_id, request.ref)
-        if ctx is None:
-            return {"ok": False, "error": "This run is no longer cached — re-run the hunt to capture a screenshot."}
-        if finding is None:
-            return {"ok": False, "error": "Unknown finding for this run."}
-        url = bounty_screenshot.poc_url_for_finding(finding, ctx)
+        # Source the PoC URL + annotation from the cached finding when we have one (richest:
+        # the exact crafted request URL, and the shot auto-embeds on the report). Otherwise fall
+        # back to the request's own url/title/location/matched_value — so a finding opened from
+        # HISTORY or an evicted run still screenshots from its OWN page with NO re-hunt.
+        if finding is not None:
+            url = bounty_screenshot.poc_url_for_finding(finding, ctx)
+            title = str(finding.get("title") or "")
+            location = str(finding.get("location") or finding.get("file_path") or "")
+            pe = finding.get("proof_evidence")
+            matched = str((pe.get("matched_value") if isinstance(pe, dict) else "") or finding.get("snippet") or "").strip()
+        else:
+            url = str(request.url or "").strip()
+            if not url.startswith(("http://", "https://")):
+                url = ""
+            title, location, matched = str(request.title or ""), str(request.location or ""), str(request.matched_value or "")
         if not url:
-            return {"ok": False, "error": "No proof-of-concept URL to screenshot for this finding (it has no captured request or URL location)."}
+            return {"ok": False, "error": "No proof-of-concept URL to screenshot — open this finding from a run or history entry that carries a URL."}
         safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
-        out_path = RUNTIME_DIR / "screenshots" / f"{safe(request.run_id)}-{safe(request.ref)}.png"
-        # Resolve the FRESHEST scope at capture time, not just the scope frozen into the
-        # cached run: union (1) the run's own scope, (2) the live program's current
-        # scope_text — so editing a saved program's scope takes effect WITHOUT re-running
-        # the hunt — and (3) an optional scope the caller passes (the cockpit's current
-        # Scope box). All three are operator-supplied authorizations; the fail-closed
-        # host_in_active_scope gate still runs against the union, so this only ever WIDENS
-        # to hosts the operator has explicitly named.
-        scope_sources = [str(ctx.get("scope") or "")]
-        # "program_id" (not "program", which is a display label -- see _cache_bounty_run)
-        # is the real portfolio id needed for this exact-key lookup.
+        stem = f"{safe(request.run_id or 'adhoc')}-{safe(request.ref or title or 'finding')}"
+        out_path = RUNTIME_DIR / "screenshots" / f"{stem}.png"
+        # Resolve the FRESHEST scope at capture time: union (1) the run's own scope, (2) the live
+        # program's current scope_text (so editing a saved program's scope takes effect WITHOUT a
+        # re-run), and (3) an optional scope the caller passes (the cockpit's Scope box). All three
+        # are operator-supplied authorizations; the fail-closed host_in_active_scope gate still runs
+        # against the union, so this only ever WIDENS to hosts the operator has explicitly named.
+        scope_sources = [str((ctx or {}).get("scope") or "")]
         program_id = str((run or {}).get("program_id") or "")
         if program_id:
             prog = bounty_portfolio.get_program(RUNTIME_DIR, program_id)
@@ -2006,30 +2028,44 @@ class GreyIQRuntime:
         if request.scope.strip():
             scope_sources.append(request.scope)
         scope = " ".join(s for s in scope_sources if s.strip())
+        # Annotate + highlight so the shot proves the finding (a rendered page often shows nothing
+        # about a source/header bug), and grab a whole-page shot alongside the focused evidence one.
+        annotate = {"title": title, "location": location or url, "matched": matched}
         result = bounty_screenshot.capture_screenshot(
             url, out_path, scope=scope, authorized=True, full_page=request.full_page,
+            annotate=annotate, highlight=matched, extra_full_page=True,
         )
         if not result.get("ok"):
             return result
-        # Record on the cached finding so build_submission/report embed it by basename.
-        # Each /api/* call runs in its own asyncio.to_thread worker, so two concurrent
-        # requests against the same run_id+ref (e.g. a screenshot + a research call) must
-        # not race on this read-modify-write of the shared cached dicts.
+        shots = result.get("shots") or [{"path": result.get("path", ""), "kind": "evidence"}]
+        # Record on the cached finding so build_submission/report embed the shot(s) by basename.
+        # Each /api/* call runs in its own asyncio.to_thread worker, so concurrent requests on the
+        # same run_id+ref must not race on this read-modify-write of the shared cached dicts.
         with self.lock:
-            finding["screenshot_path"] = result["path"]
-            if run is not None:
-                run.setdefault("screenshots", {})[request.ref] = result["path"]
-        data_url = ""
-        try:
-            raw = Path(result["path"]).read_bytes()
-            if len(raw) <= 4_000_000:  # inline preview for the cockpit; skip if huge
-                data_url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
-        except OSError:
-            pass
+            if finding is not None:
+                paths = [s["path"] for s in shots if s.get("path")]
+                if paths:
+                    finding["screenshot_path"] = paths[0]
+                    finding["screenshot_paths"] = paths
+                    if run is not None and request.ref:
+                        run.setdefault("screenshots", {})[request.ref] = paths
+        out_shots: list[dict[str, Any]] = []
+        for s in shots:
+            data_url = ""
+            try:
+                raw = Path(s["path"]).read_bytes()
+                if len(raw) <= 4_000_000:  # inline preview for the cockpit; skip if huge
+                    data_url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+            except OSError:
+                pass
+            out_shots.append({"path": s.get("path", ""), "kind": s.get("kind", ""), "data_url": data_url})
         return {
-            "ok": True, "path": result["path"], "url": result.get("url"), "final_url": result.get("final_url"),
-            "title": result.get("title"), "bytes": result.get("bytes"), "warning": result.get("warning"),
-            "data_url": data_url,
+            "ok": True, "shots": out_shots,
+            "data_url": out_shots[0]["data_url"] if out_shots else "",  # back-compat single-image field
+            "path": shots[0].get("path", "") if shots else "",
+            "url": result.get("url"), "final_url": result.get("final_url"),
+            "title": result.get("title"), "warning": result.get("warning"),
+            "highlighted": result.get("highlighted", False),
         }
 
     def research_finding(self, request: "ResearchRequest") -> dict[str, Any]:

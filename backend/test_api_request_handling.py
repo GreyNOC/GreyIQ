@@ -106,20 +106,21 @@ class ValidatePayloadTests(unittest.TestCase):
         self.assertEqual(req.run_id, "r1")
 
     def test_invalid_payload_raises_422_with_field_name_not_value(self) -> None:
-        # run_id has min_length=1 -- an empty string fails validation. The 422 detail
+        # run_id has max_length=64 -- an over-long value fails validation. The 422 detail
         # must name the field but NEVER echo the submitted value back to the client.
         secret_value = "TOP-SECRET-MARKER-XYZ"
         with self.assertRaises(g.HTTPError) as ctx:
-            g.validate_payload(g.ScreenshotRequest, {"run_id": "", "ref": secret_value * 3})
+            g.validate_payload(g.ScreenshotRequest, {"run_id": secret_value * 4})  # 84 > 64
         self.assertEqual(ctx.exception.status_code, 422)
         detail = str(ctx.exception.detail)
         self.assertIn("run_id", detail)            # names the failing field
         self.assertNotIn(secret_value, detail)      # never echoes a submitted value
         self.assertNotIn("pydantic.dev", detail)     # never leaks pydantic's internal error-doc URL
 
-    def test_missing_required_field_message_is_safe(self) -> None:
+    def test_multiple_invalid_fields_named_in_safe_message(self) -> None:
+        # Two fields exceed their max_length; the safe 422 detail names each failing field.
         with self.assertRaises(g.HTTPError) as ctx:
-            g.validate_payload(g.ScreenshotRequest, {})
+            g.validate_payload(g.ScreenshotRequest, {"run_id": "a" * 100, "ref": "b" * 100})
         detail = str(ctx.exception.detail)
         self.assertIn("run_id", detail)
         self.assertIn("ref", detail)
