@@ -4995,6 +4995,8 @@ async function ckCaptureScreenshot(f, btn, wrap, onShots) {
     });
     if (res && res.ok) {
       btn.textContent = "Re-capture screenshot";
+      // The plain-text request/response/source proof, for the report's Copy / POC zip.
+      if (res.source_text) f.sourceText = res.source_text;
       const shots = Array.isArray(res.shots) && res.shots.length ? res.shots
         : (res.data_url ? [{ data_url: res.data_url, kind: "evidence" }] : []);
       // When the caller owns persistent rendering (the full-report panel, which re-renders on
@@ -7165,6 +7167,7 @@ async function ckDownloadPocZip(focus, btn) {
     files.push({ name: "poc.md", data: enc.encode(ckBuildPocSummary(focus)) });
     files.push({ name: "poc.html", data: enc.encode(ckBuildPocHtml(focus)) });
     files.push({ name: "steps-and-evidence.txt", data: enc.encode(ckBuildProofOfImpactText(focus)) });
+    if (focus.sourceText) files.push({ name: "response-source.txt", data: enc.encode(String(focus.sourceText)) });
     const shots = [];
     if (focus.screenshot && focus.screenshot.data_url) shots.push({ data_url: focus.screenshot.data_url, kind: "evidence", path: "" });
     for (const s of (focus.shots || [])) if (s && s.data_url) shots.push(s);

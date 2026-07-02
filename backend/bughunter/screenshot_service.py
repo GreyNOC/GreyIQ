@@ -151,6 +151,29 @@ def _build_proof_sheet(*, url: str, request_line: str = "", method: str = "GET",
     )
 
 
+def _build_proof_text(*, url: str, request_line: str = "", method: str = "GET", req_headers: Any = None,
+                      status: int, resp_headers: Any, body: str, matched: str, title: str) -> str:
+    """The plain-TEXT proof — the same real HTTP exchange as the proof-sheet image (request line +
+    headers, response status + all headers, and the served response body), as copy-pasteable text
+    for a report/submission. NOT auto-redacted (it IS the evidence); carries the review warning."""
+    def _hdrs(h: Any) -> str:
+        items = list(h.items())[:120] if isinstance(h, dict) else []
+        return "\n".join(f"{k}: {v}" for k, v in items) or "(none captured)"
+    body_text = str(body or "")[:_PROOF_BODY_CAP]
+    tail = "\n\n… (truncated)" if len(str(body or "")) > _PROOF_BODY_CAP else ""
+    parts = [
+        f"GreyIQ — proof of concept: {(title or '').strip()}".rstrip(),
+        f"# {REDACTION_WARNING}", "=" * 72, "",
+        "REQUEST", "-" * 72, (request_line or f"{method or 'GET'} {url}").strip(), _hdrs(req_headers), "",
+        "RESPONSE", "-" * 72, f"HTTP {int(status) if status else '?'}", _hdrs(resp_headers), "",
+    ]
+    m = str(matched or "").strip()
+    if m:
+        parts += [f"MATCHED EVIDENCE: {m[:300]}", ""]
+    parts += ["RESPONSE BODY (served source — the proof)", "-" * 72, body_text + tail, ""]
+    return "\n".join(parts)
+
+
 def _not_installed(url: str) -> dict[str, Any]:
     return {
         "ok": False,
@@ -229,6 +252,7 @@ def capture_screenshot(
 
     wait_ms = int(max(0.0, wait_seconds) * 1000)
     highlighted = False
+    source_text, source_text_path = "", ""
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
@@ -304,6 +328,18 @@ def capture_screenshot(
             # loads a self-contained page (no navigation, no subresources -> guard untouched).
             if resp is not None:
                 source_out = out.with_name(f"{out.stem}-source{out.suffix}")
+                # Save the exchange as copy-pasteable TEXT (request/response/served source) too —
+                # the same content as the proof-sheet image, for pasting into a report / the POC zip.
+                try:
+                    source_text = _build_proof_text(
+                        url=final_url or target, request_line=str((annotate or {}).get("request_line") or ""),
+                        method=req_method, req_headers=req_headers, status=resp_status, resp_headers=resp_headers,
+                        body=resp_body, matched=str(highlight or ""), title=str((annotate or {}).get("title") or title))
+                    source_txt = out.with_name(f"{out.stem}-source.txt")
+                    source_txt.write_text(source_text, encoding="utf-8")
+                    source_text_path = str(source_txt)
+                except Exception:  # noqa: BLE001 - the text artifact is best-effort
+                    source_text, source_text_path = "", ""
                 try:
                     sheet = _build_proof_sheet(
                         url=final_url or target, request_line=str((annotate or {}).get("request_line") or ""),
@@ -345,4 +381,6 @@ def capture_screenshot(
         "bytes": shots[0].get("bytes", 0) if shots else 0,
         "warning": REDACTION_WARNING,
         "highlighted": highlighted,
+        "source_text": source_text,
+        "source_text_path": source_text_path,
     }
