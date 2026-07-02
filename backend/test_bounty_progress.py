@@ -250,6 +250,23 @@ class RunCampaignProgressChainTests(unittest.TestCase):
         self.assertTrue(all(f["target"] == "tiktok.com" for f in snap["findings"]))
         self.assertEqual(snap["targets"][0]["findings"], snap["stats"]["findings_total"])
 
+    def test_stop_request_halts_the_campaign_url_loop(self) -> None:
+        # A campaign whose run is stop-requested must break out of the per-URL hunt loop
+        # and return cleanly with nothing hunted (partial result), rather than running to
+        # completion — proving the Stop button's cooperative-cancellation wiring.
+        url = f"http://127.0.0.1:{self.server.server_port}/"
+        progress.start_run("halt-run")
+        progress.request_stop("halt-run")  # pre-cancel: the loop checks this before each URL
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_campaign(
+                url, scope="local QA fixture", authorized=True, coder_cfg={},
+                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
+                runtime_dir=REPO_ROOT / "runtime", max_pages=3, progress_run_id="halt-run",
+            )
+        self.assertTrue(result["ok"])                 # returns cleanly (partial), never raises
+        self.assertEqual(result.get("urls_scanned"), 0)  # broke before hunting any URL
+        self.assertEqual(result.get("finding_count"), 0)
+
 
 class StructuredSnapshotTests(unittest.TestCase):
     def test_snapshot_unknown_run_is_empty(self) -> None:
@@ -288,6 +305,15 @@ class StructuredSnapshotTests(unittest.TestCase):
         many = [{"ref": f"F{i}", "title": "x", "severity": "info", "proof_status": "missing"} for i in range(progress._MAX_FINDINGS_PER_RUN + 50)]
         progress.add_findings("snap-b", "t1", many)
         self.assertEqual(progress.snapshot("snap-b")["stats"]["findings_total"], progress._MAX_FINDINGS_PER_RUN)
+
+    def test_stop_flag_set_query_and_cleared_by_start_run(self) -> None:
+        self.assertFalse(progress.is_stopped("stopflag"))
+        progress.start_run("stopflag")
+        self.assertFalse(progress.is_stopped("stopflag"))
+        progress.request_stop("stopflag")
+        self.assertTrue(progress.is_stopped("stopflag"))
+        progress.start_run("stopflag")  # a fresh run clears any prior stop request
+        self.assertFalse(progress.is_stopped("stopflag"))
 
     def test_structured_helpers_before_start_run_are_noops(self) -> None:
         # No start_run for this id — every structured helper must be a safe no-op.

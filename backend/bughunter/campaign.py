@@ -196,6 +196,11 @@ def run_campaign(
     if progress_unit is None:
         progress.set_targets(progress_run_id, urls)
     for index, url in enumerate(urls, 1):
+        # Cooperative cancellation: the operator's Stop halts BETWEEN url hunts (a hunt
+        # in flight finishes its current url, then we bail with whatever's been found).
+        if progress.is_stopped(progress_run_id):
+            _emit("stop requested — halting this target after the current URL")
+            break
         _emit(f"hunt {index}/{len(urls)}: {url}")
         if progress_unit is None:
             progress.mark_target(progress_run_id, url, "running")
@@ -567,6 +572,13 @@ def run_campaign_over_targets(
         def _target_emit(msg: str) -> None:
             _emit(f"[{index}/{len(capped)} {target}] {msg}")
 
+        # Cooperative cancellation: a target that hasn't started yet when Stop is pressed
+        # is skipped outright (the executor may have it queued behind the running batch);
+        # a target already in flight winds down via run_campaign's own between-URL check.
+        if progress.is_stopped(progress_run_id):
+            progress.mark_target(progress_run_id, target, "skipped")
+            _target_emit("skipped — campaign stopped")
+            return (target, {"ok": False, "error": "campaign stopped", "stopped": True}, None)
         _target_emit("starting…")
         progress.mark_target(progress_run_id, target, "running")
         try:
@@ -613,7 +625,10 @@ def run_campaign_over_targets(
             "campaign_path": result.get("campaign_path", ""), "error": result.get("error", ""),
         })
         if not result.get("ok"):
-            errors.append(f"{target}: {result.get('error', 'campaign failed')}")
+            # A target skipped because the operator stopped the campaign is not a failure —
+            # keep it out of the errors list (it just wasn't run).
+            if not result.get("stopped"):
+                errors.append(f"{target}: {result.get('error', 'campaign failed')}")
             continue
         ok_count += 1
         proof = result.get("proof_of_impact") or {}

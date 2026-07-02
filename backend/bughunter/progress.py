@@ -20,6 +20,7 @@ _SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 _lock = threading.Lock()
 _runs: dict[str, dict[str, Any]] = {}
 _run_order: list[str] = []
+_stopped: set[str] = set()  # run_ids the operator asked to cancel (cooperative-cancellation flags)
 
 
 def start_run(run_id: str) -> None:
@@ -30,11 +31,30 @@ def start_run(run_id: str) -> None:
         # `events` is the text log (existing); `targets`/`target_index`/`findings` are the
         # structured campaign-dashboard state streamed as targets complete.
         _runs[run_id] = {"events": [], "base_seq": 0, "targets": [], "target_index": {}, "findings": []}
+        _stopped.discard(run_id)  # a fresh run is never pre-cancelled
         if run_id in _run_order:
             _run_order.remove(run_id)
         _run_order.append(run_id)
         while len(_run_order) > _MAX_RUNS:
-            _runs.pop(_run_order.pop(0), None)
+            evicted = _run_order.pop(0)
+            _runs.pop(evicted, None)
+            _stopped.discard(evicted)
+
+
+def request_stop(run_id: str) -> None:
+    """Ask a running campaign to cancel. The campaign loops poll ``is_stopped`` between
+    targets/URLs and wind down cleanly, returning whatever was found so far."""
+    if not run_id:
+        return
+    with _lock:
+        _stopped.add(str(run_id))
+
+
+def is_stopped(run_id: str) -> bool:
+    if not run_id:
+        return False
+    with _lock:
+        return str(run_id) in _stopped
 
 
 def log(run_id: str, message: str) -> None:

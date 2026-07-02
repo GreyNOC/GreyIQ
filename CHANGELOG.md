@@ -2,6 +2,15 @@
 
 Notable changes to GreyIQ.
 
+## v0.60.2
+
+### Stop campaign button
+The campaign dashboard now has a **Stop campaign** button (shown while a campaign is
+running). It cooperatively cancels the run — a target in flight finishes its current URL,
+any not-yet-started targets in a program span are skipped, and the campaign returns the
+partial results found so far. The status pill reflects Running → Stopping… → Stopped. New
+`POST /api/bounty/campaign/stop` endpoint backs it.
+
 ## v0.60.1
 
 ### Fix: campaign dashboard findings now stream per-URL, not per-completed-target

@@ -7116,14 +7116,25 @@ function ckStatus(text, isError) {
 // --- Campaign dashboard: a live, easy-to-scan view of a running campaign. Polls the
 // structured snapshot from /api/bounty/progress and renders overall progress, stat tiles,
 // per-target status, and findings as they stream in — updating automatically. ---
-const ckCampaign = { runId: "", poll: null, snapshot: null, events: [], eventCount: 0, done: false, label: "", startedAt: 0 };
+const ckCampaign = { runId: "", poll: null, snapshot: null, events: [], eventCount: 0, done: false, stopRequested: false, label: "", startedAt: 0 };
 
 function ckStartCampaignDashboard(runId, label) {
   if (ckCampaign.poll) { clearInterval(ckCampaign.poll); ckCampaign.poll = null; }
-  Object.assign(ckCampaign, { runId, label: label || "Campaign", snapshot: null, events: [], eventCount: 0, done: false, startedAt: Date.now() });
+  Object.assign(ckCampaign, { runId, label: label || "Campaign", snapshot: null, events: [], eventCount: 0, done: false, stopRequested: false, startedAt: Date.now() });
   ckSetView("campaign");
   void ckPollCampaign();
   ckCampaign.poll = setInterval(() => { void ckPollCampaign(); }, 1200);
+}
+
+// Ask the backend to cancel the running campaign. It winds down cooperatively (finishing
+// the URL in flight) and the main /api/bounty/campaign request returns partial results,
+// which ckFinishCampaignDashboard then renders as the final state.
+async function ckStopCampaign() {
+  if (!ckCampaign.runId || ckCampaign.done || ckCampaign.stopRequested) return;
+  ckCampaign.stopRequested = true;
+  if (ckState.view === "campaign") ckRenderCampaign();  // flip to "Stopping…" immediately
+  try { await apiFetch("/api/bounty/campaign/stop", { method: "POST", timeoutMs: 6000, body: JSON.stringify({ run_id: ckCampaign.runId }) }); }
+  catch (err) { window.alert((err.message || "Could not reach the engine") + "\n\nThe campaign may keep running — watch the dashboard."); }
 }
 
 async function ckPollCampaign() {
@@ -7210,11 +7221,21 @@ function ckRenderCampaign() {
   const sev = st.severity_counts || {};
   const running = !ckCampaign.done;
 
-  // Header: label + status pill + elapsed.
+  // Header: label + status pill + elapsed + (while running) a Stop button.
+  const stopping = ckCampaign.stopRequested;
   const head = cel("div", "ck-cd-head");
   head.append(cel("div", "ck-cd-label", ckCampaign.label));
-  head.append(cel("span", `ck-cd-status ${running ? "is-running" : "is-done"}`, running ? "● Running" : "✓ Done"));
+  const statusText = running ? (stopping ? "● Stopping…" : "● Running") : (stopping ? "■ Stopped" : "✓ Done");
+  const statusCls = running ? (stopping ? "is-stopping" : "is-running") : (stopping ? "is-stopped" : "is-done");
+  head.append(cel("span", `ck-cd-status ${statusCls}`, statusText));
   head.append(cel("span", "ck-cd-elapsed", ckFmtElapsed(Math.max(0, Math.round((Date.now() - ckCampaign.startedAt) / 1000)))));
+  if (running) {
+    const stop = cel("button", "ck-btn ck-cd-stop", stopping ? "Stopping…" : "Stop campaign");
+    stop.type = "button";
+    stop.disabled = stopping;
+    stop.addEventListener("click", () => void ckStopCampaign());
+    head.append(stop);
+  }
   host.append(head);
 
   // Progress bar (targets complete / total).

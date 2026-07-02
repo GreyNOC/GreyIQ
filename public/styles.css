@@ -3017,6 +3017,11 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-cd-status { font-size: 0.74rem; font-weight: 700; padding: 0.18rem 0.55rem; border-radius: 999px; white-space: nowrap; }
 .ck-cd-status.is-running { color: var(--accent); background: color-mix(in srgb, var(--accent) 16%, transparent); }
 .ck-cd-status.is-done { color: var(--ok); background: color-mix(in srgb, var(--ok) 16%, transparent); }
+.ck-cd-status.is-stopping { color: var(--sun); background: color-mix(in srgb, var(--sun) 16%, transparent); }
+.ck-cd-status.is-stopped { color: var(--coral); background: color-mix(in srgb, var(--coral) 16%, transparent); }
+.ck-cd-stop { margin-left: 0.4rem; border-color: color-mix(in srgb, var(--coral) 50%, var(--border)); color: var(--coral); }
+.ck-cd-stop:hover:not(:disabled) { background: color-mix(in srgb, var(--coral) 12%, transparent); }
+.ck-cd-stop:disabled { opacity: 0.6; cursor: progress; }
 .ck-cd-elapsed { font-size: 0.74rem; color: var(--muted); margin-left: auto; }
 .ck-cd-progress-label { margin: 0.1rem 0 0.3rem; font-size: 0.78rem; color: var(--muted); }
 .ck-cd-progress { height: 0.55rem; border-radius: 999px; background: var(--surface-2); overflow: hidden; border: 1px solid var(--border); }

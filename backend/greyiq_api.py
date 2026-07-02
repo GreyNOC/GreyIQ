@@ -607,6 +607,10 @@ class BountyProgressRequest(BaseModel):
     after: int = Field(default=0, ge=0)
 
 
+class CampaignStopRequest(BaseModel):
+    run_id: str = Field(min_length=1, max_length=100)
+
+
 class LearnRequest(BaseModel):
     class_id: str = Field(min_length=1, max_length=60)
     status: str = Field(min_length=1, max_length=40)
@@ -1394,6 +1398,13 @@ class GreyIQRuntime:
         # `snapshot` carries the structured campaign-dashboard state (per-target status +
         # streamed findings + rolled-up stats); `events`/`count` remain the text log.
         return {"ok": True, **bounty_progress.tail(run_id, after), "snapshot": bounty_progress.snapshot(run_id)}
+
+    def stop_campaign(self, run_id: str) -> dict[str, Any]:
+        """Cooperatively cancel a running campaign: set a stop flag the campaign loops poll
+        between targets/URLs, so it winds down and its blocking request returns the partial
+        results found so far. Idempotent and safe on an unknown/finished run."""
+        bounty_progress.request_stop(run_id)
+        return {"ok": True}
 
     def run_campaign(self, request: "CampaignRequest") -> dict[str, Any]:
         # authorized passes straight through — campaign.run_campaign fails closed when
@@ -3217,6 +3228,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/progress":
             request = validate_payload(BountyProgressRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.bounty_progress, request.run_id, request.after))
+            return
+        if method == "POST" and path == "/api/bounty/campaign/stop":
+            request = validate_payload(CampaignStopRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.stop_campaign, request.run_id))
             return
         if method == "POST" and path == "/api/bounty/learn":
             request = validate_payload(LearnRequest, await read_json_body(receive))
