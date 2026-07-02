@@ -2,6 +2,37 @@
 
 Notable changes to GreyIQ.
 
+## v0.64.0
+
+### Delete a finding — and it stays gone
+You can now delete a finding from the Findings board or the "All findings" history. A deleted
+finding is suppressed by its stable dedup key, so no future hunt, campaign, history view, funnel,
+or CSV export ever surfaces it again — for a false positive or an accepted risk you don't want
+re-reported. It's reversible (a restore path), and the money/stage data on an already-filed
+finding is preserved. Deleting one outdated-library (known-CVE) finding on a page no longer
+suppresses the other libraries found there, and the board delete removes exactly the finding you
+picked (not any other row that happened to share its reference).
+
+### Proof screenshots — and the live scan — now work in the packaged app
+The release build bundles Playwright + Chromium and points it at the bundled browser, so "Capture
+screenshot" and the dynamic live-app scan work out of the box, with no separate `playwright
+install` on the user's machine. (Adds ~170–270 MB to the download; Linux still needs the usual
+system libraries present.)
+
+### Report accuracy
+- Recon no longer leaks an HTML-encoded `&amp;` into a finding's URL and its curl proof-of-concept
+  (which broke a triager's copy-paste reproduction and mis-parsed the query), while still
+  preserving a raw `&` so real query parameters aren't silently dropped from the crawl.
+- CORS findings now carry **CWE-284** (Improper Access Control), which HackerOne's Weakness picker
+  accepts, instead of the Flash-era CWE-942.
+
+### Hardening
+- An adversarial multi-agent review of the change found and fixed four defects before release —
+  including a bundled-browser launch path that never set its browser directory and a board-delete
+  that could remove the wrong row.
+- Tests: suppression/restore, per-library CVE-key distinctness, recon entity handling, and the
+  frozen browser-path helper.
+
 ## v0.63.0
 
 ### Finding status now updates everywhere at once
