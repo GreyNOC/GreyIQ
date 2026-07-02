@@ -2,6 +2,22 @@
 
 Notable changes to GreyIQ.
 
+## v0.66.2
+
+### Proof screenshots that actually prove it
+A screenshot of a rendered page shows nothing for a finding whose evidence lives in the served
+response — a secret in the page source, a missing or weak security header — the page just looks
+normal. Capturing a finding now produces a **Response source (PoC)** shot: the real HTTP exchange
+the browser made — the request line and headers it sent, the response status and **every**
+response header, and the served response body with the matched value highlighted — the exact
+proof a triager wants. The rendered page and a full-page shot come along as supporting context.
+
+### One-click POC zip
+The full-report view has a **Download POC (.zip)** button that bundles everything needed to submit
+into a single archive — the report, a proof-of-concept/evidence summary, every captured screenshot
+(including the response-source PoC), and a machine-readable finding record. It's built right in the
+app, so it works for any finding, including one you opened from history with no active run.
+
 ## v0.66.1
 
 ### Screenshots that prove the finding — and no more re-running the hunt
