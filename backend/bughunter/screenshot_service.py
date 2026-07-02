@@ -25,6 +25,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from bughunter.active_verify_service import host_in_active_scope
+from bughunter.playwright_env import ensure_bundled_browsers_path
 from bughunter.settings import get_settings
 from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
 from bughunter.web_scan_service import _guard_url, playwright_request_allowed
@@ -102,6 +103,8 @@ def capture_screenshot(
     except WebsiteFetchError as exc:
         return {"ok": False, "error": f"target refused by the URL guard: {exc}", "url": target}
 
+    # In a frozen release, point Playwright at the Chromium we bundled before importing it.
+    ensure_bundled_browsers_path()
     try:
         from playwright.sync_api import sync_playwright
     except Exception:  # noqa: BLE001 - optional dependency

@@ -685,6 +685,25 @@ class FindingReportRequest(BaseModel):
     screenshot_path: str = Field(default="", max_length=4000)
 
 
+class FindingDismissRequest(BaseModel):
+    # Delete a finding: permanently suppress it so no future hunt/campaign/history/funnel
+    # surfaces it again (matched by the ledger's stable dedup key). A durable-history record
+    # already carries dedup_key; a board finding sends its class_id/rule_id/location so the
+    # server derives the same key the engine will compute on the next run.
+    dedup_key: str = Field(default="", max_length=64)
+    class_id: str = Field(default="", max_length=80)
+    rule_id: str = Field(default="", max_length=160)
+    location: str = Field(default="", max_length=4000)
+    title: str = Field(default="", max_length=255)
+    program: str | None = Field(default=None, max_length=200)
+    target: str = Field(default="", max_length=4000)
+
+
+class FindingRestoreRequest(BaseModel):
+    # Undo a delete — the finding can surface again. Keyed by the dedup_key the delete returned.
+    dedup_key: str = Field(default="", max_length=64)
+
+
 class AggregateReportRequest(BaseModel):
     # The "special report": one engagement document across many findings. Either a cached
     # run (run_id — rich, with proof/plans) or a saved program (its ledger history).
@@ -1609,6 +1628,39 @@ class GreyIQRuntime:
         # UI can say "showing the most recent N" and point at the CSV export for everything.
         total = int((funnel.get("portfolio") or {}).get("total") or len(records))
         return {"ok": True, "findings": records, "funnel": funnel, "truncated": len(records) < total, "total": total}
+
+    def dismiss_finding(self, request: "FindingDismissRequest") -> dict[str, Any]:
+        """Delete a finding: record its stable dedup key in the ledger's suppression set so no
+        future hunt, campaign, durable-history view, or funnel ever surfaces it again. Derives
+        the key from an explicit dedup_key (a durable-history record) or the finding's
+        class_id/rule_id/location (a board finding). Reversible via ``restore_finding``."""
+        # The dedup key is built from class_id/rule_id/location — with none of those (and no
+        # explicit key) an all-empty finding still hashes to a real-but-meaningless key that
+        # suppresses nothing useful. Reject it rather than record that junk key.
+        if not (request.dedup_key or request.class_id or request.rule_id or request.location):
+            return {"ok": False, "error": "Not enough detail to identify the finding to delete."}
+        finding = {
+            "class_id": str(request.class_id or ""), "rule_id": str(request.rule_id or ""),
+            "location": str(request.location or ""), "title": str(request.title or ""),
+        }
+        try:
+            entry = bounty_ledger.dismiss(
+                RUNTIME_DIR, finding=finding, dedup_key_str=str(request.dedup_key or ""),
+                program=request.program, target=str(request.target or ""),
+            )
+        except Exception as exc:  # noqa: BLE001 - a delete must never 500 the board
+            return {"ok": False, "error": f"Could not delete the finding: {exc}"}
+        if not entry:
+            return {"ok": False, "error": "Not enough detail to identify the finding to delete."}
+        return {"ok": True, "dedup_key": entry["dedup_key"]}
+
+    def restore_finding(self, request: "FindingRestoreRequest") -> dict[str, Any]:
+        """Undo a delete — the finding can surface again. Idempotent (safe if it wasn't deleted)."""
+        try:
+            restored = bounty_ledger.restore(RUNTIME_DIR, str(request.dedup_key or ""))
+        except Exception as exc:  # noqa: BLE001 - a restore must never 500 the board
+            return {"ok": False, "error": f"Could not restore the finding: {exc}"}
+        return {"ok": True, "restored": bool(restored)}
 
     def build_finding_report(self, request: "FindingReportRequest") -> dict[str, Any]:
         """Build a well-authored report for ONE finding on demand from its own fields (a
@@ -3676,6 +3728,14 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/finding/report":
             request = validate_payload(FindingReportRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.build_finding_report, request))
+            return
+        if method == "POST" and path == "/api/bounty/finding/dismiss":
+            request = validate_payload(FindingDismissRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.dismiss_finding, request))
+            return
+        if method == "POST" and path == "/api/bounty/finding/restore":
+            request = validate_payload(FindingRestoreRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.restore_finding, request))
             return
         if method == "POST" and path == "/api/bounty/report/aggregate":
             request = validate_payload(AggregateReportRequest, await read_json_body(receive))

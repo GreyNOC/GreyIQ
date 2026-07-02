@@ -302,7 +302,7 @@ _REFERENCES: dict[str, list[str]] = {
     "auth": [f"{_CS}/Session_Management_Cheat_Sheet.html", f"{_CWE}/384.html"],
     "sqli": [f"{_CS}/SQL_Injection_Prevention_Cheat_Sheet.html", f"{_CWE}/89.html", "https://portswigger.net/web-security/sql-injection"],
     "csrf": [f"{_CS}/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html", f"{_CWE}/352.html"],
-    "cors": [f"{_CS}/HTML5_Security_Cheat_Sheet.html", f"{_CWE}/942.html", "https://portswigger.net/web-security/cors"],
+    "cors": [f"{_CS}/HTML5_Security_Cheat_Sheet.html", f"{_CWE}/284.html", f"{_CWE}/346.html", f"{_CWE}/942.html", "https://portswigger.net/web-security/cors"],
     "redirect": [f"{_CS}/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html", f"{_CWE}/601.html"],
     "file-upload": [f"{_CS}/File_Upload_Cheat_Sheet.html", f"{_CWE}/434.html"],
     "business-logic": ["https://owasp.org/www-community/vulnerabilities/Business_logic_vulnerability", f"{_CWE}/840.html"],
@@ -319,10 +319,10 @@ _REFERENCES: dict[str, list[str]] = {
     "cloud-exposure": [f"{_CS}/Secrets_Management_Cheat_Sheet.html", f"{_CWE}/200.html"],
     "crypto": [f"{_CS}/Cryptographic_Storage_Cheat_Sheet.html", f"{_CWE}/327.html"],
     "dependency": [f"{_CS}/Vulnerable_Dependency_Management_Cheat_Sheet.html", f"{_CWE}/1395.html"],
-    "network": [f"{_CS}/Transport_Layer_Security_Cheat_Sheet.html", f"{_CWE}/319.html"],
+    "network": [f"{_CS}/Transport_Layer_Security_Cheat_Sheet.html", f"{_CWE}/295.html", f"{_CWE}/319.html"],
     "ci": ["https://docs.github.com/actions/security-guides/security-hardening-for-github-actions", f"{_CWE}/1395.html"],
     "headers": [f"{_CS}/HTTP_Security_Response_Headers_Cheat_Sheet.html", f"{_CWE}/693.html"],
-    "mixed_content": [f"{_CS}/HTTP_Security_Response_Headers_Cheat_Sheet.html", f"{_CWE}/319.html"],
+    "mixed_content": [f"{_CS}/HTTP_Security_Response_Headers_Cheat_Sheet.html", f"{_CWE}/311.html", f"{_CWE}/319.html"],
     "disclosure": [f"{_CS}/Error_Handling_Cheat_Sheet.html", f"{_CWE}/200.html"],
 }
 

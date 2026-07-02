@@ -26,6 +26,7 @@ import coder
 from bughunter import active_verify_service
 from bughunter import fsutil
 from bughunter import impact_model
+from bughunter import ledger
 from bughunter import next_steps as next_steps_lib
 from bughunter import report as report_lib
 from bughunter import toolkit as toolkit_lib
@@ -133,7 +134,12 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
     },
     "cors": {
         "name": "CORS / cross-origin trust misconfiguration",
-        "cwe": "CWE-942",
+        # HackerOne classifies a CORS ACAO misconfiguration under CWE-284 (Improper Access
+        # Control) in its Weakness taxonomy — that's what its picker accepts and suggests, so
+        # it's what goes in the report's Weakness field. The more precise technical CWEs
+        # (CWE-346 Origin Validation Error; CWE-942, the Flash cross-domain-policy weakness)
+        # are kept as secondary references in impact_model rather than as the primary label.
+        "cwe": "CWE-284",
         "owasp": "A05:2021 Security Misconfiguration",
         "categories": set(),
         "checklist": [
@@ -944,6 +950,15 @@ def run_bounty_hunt(
     # locations) into one entry each, so the report isn't spammed with duplicates a
     # triager would reject — confirmed/artifact findings are never grouped.
     display = _group_duplicate_leads(primary)
+
+    # Operator-deleted findings are permanently suppressed: never surface one the operator
+    # dismissed (matched by the same stable cross-run dedup key). Runtime-dir-gated — with
+    # no persistent store there's nothing recorded to suppress. This one choke point also
+    # covers every per-URL hunt a campaign runs (a campaign calls run_bounty_hunt per URL).
+    if runtime_dir is not None:
+        _dismissed = ledger.dismissed_keys(runtime_dir)
+        if _dismissed:
+            display = [f for f in display if ledger.dedup_key(f) not in _dismissed]
 
     for index, finding in enumerate(display, 1):
         finding["ref"] = f"F{index}"

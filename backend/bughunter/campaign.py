@@ -303,6 +303,15 @@ def run_campaign(
         except Exception:  # noqa: BLE001 - the CVE pass is enrichment; never break the campaign
             pass
 
+    # --- Drop operator-deleted findings before ranking/submission. The per-URL engine
+    # already filtered its own hunts; this pass also covers the synthetic leads added
+    # above (JS secrets, known-CVE, API-discovery), which never went through it — so a
+    # deleted finding of any origin stays gone. Same stable dedup key: the delete sticks. ---
+    if rt is not None:
+        _dismissed = ledger.dismissed_keys(rt)
+        if _dismissed:
+            consolidated = [c for c in consolidated if ledger.dedup_key(c["finding"]) not in _dismissed]
+
     # --- Rank by EXPECTED VALUE (confirmed outermost, then EV, severity, CVSS) so the
     # most-likely-to-pay findings sort first. ---
     program_stats = (learning.program_summary(rt, program, clean_target).get("class_stats") if rt is not None else {}) or {}
@@ -401,6 +410,10 @@ def run_campaign(
         finding["source_url"] = item["source_url"]
         finding["proof_status"] = item["proof_status"]
         finding["ev"] = item.get("ev")  # expected-value rank score for the dashboard
+        # Carry the exact stable dedup key so a "delete finding" from the board suppresses THIS
+        # finding precisely. The board only has class_id/rule_id/location, which can't
+        # reproduce a CVE finding's product-aware key — so the UI sends this back verbatim.
+        finding["dedup_key"] = item.get("dedup_key") or ledger.dedup_key(item["finding"])
         findings_out.append(finding)
         proof_out[ref] = {"status": item["proof_status"]}
         if item.get("cvss"):

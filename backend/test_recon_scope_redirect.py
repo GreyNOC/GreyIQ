@@ -15,6 +15,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qsl, urlparse
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
@@ -80,6 +81,44 @@ class ReconScopeBleedTests(unittest.TestCase):
         self.assertGreaterEqual(result["dropped_out_of_scope"], 1)
         # And the OOS page's JS asset was never even considered for mining.
         self.assertEqual(result.get("js_secrets"), [])
+
+
+class ReconHtmlEntityTests(unittest.TestCase):
+    """Regression: an href/src value in HTML encodes '&' as '&amp;'. Recon must DECODE it to
+    the real URL, or the '&amp;' survives into the finding location + curl PoC (breaking a
+    triager's copy-paste reproduction) and mis-parses the query into a bogus 'amp;<name>'
+    parameter the active prober would then chase."""
+
+    def test_extract_links_decodes_amp_entity(self) -> None:
+        body = '<a href="/?lang=en&amp;enter_method=bottom_navigation">x</a>'
+        [link] = recon._extract_links(body, "https://support.example.test/")
+        self.assertNotIn("&amp;", link)
+        params = dict(parse_qsl(urlparse(link).query))
+        self.assertEqual(params.get("enter_method"), "bottom_navigation")  # real 2nd param, not 'amp;enter_method'
+        self.assertNotIn("amp;enter_method", params)
+
+    def test_extract_scripts_decodes_amp_entity(self) -> None:
+        body = '<script src="/bundle.js?v=1&amp;t=2"></script>'
+        [src] = recon._extract_scripts(body, "https://support.example.test/")
+        self.assertNotIn("&amp;", src)
+        self.assertIn("v=1&t=2", src)
+
+    def test_raw_ampersand_is_preserved_not_over_decoded(self) -> None:
+        # A raw (unencoded) '&' in an href is invalid HTML but widespread. Decoding must NOT
+        # eat '&param' / '&copy' / '&notify' as semicolon-less HTML5 named references (which
+        # full html.unescape does), or those query parameters silently vanish from discovery.
+        body = '<a href="/p?id=1&param=2&copy=3&notify=4">x</a>'
+        [link] = recon._extract_links(body, "https://support.example.test/")
+        params = dict(parse_qsl(urlparse(link).query))
+        self.assertEqual(set(params), {"id", "param", "copy", "notify"})
+        for glyph in ("¶", "©", "§"):
+            self.assertNotIn(glyph, link)
+
+    def test_only_semicolon_terminated_entities_are_decoded(self) -> None:
+        # '&amp;' (';'-terminated) decodes; the trailing raw '&reg' (no ';') is left intact.
+        body = '<a href="/s?a=1&amp;b=2&reg=3">x</a>'
+        [link] = recon._extract_links(body, "https://support.example.test/")
+        self.assertEqual(set(dict(parse_qsl(urlparse(link).query))), {"a", "b", "reg"})
 
 
 if __name__ == "__main__":

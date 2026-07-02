@@ -19,6 +19,15 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 def main() -> None:
+    # Frozen release: point Playwright at the Chromium bundled under the app before any
+    # browser launch site runs (screenshots, live scan). Set once at startup so every
+    # current and future launch path is covered regardless of ordering; no-op in dev.
+    try:
+        from bughunter.playwright_env import ensure_bundled_browsers_path
+        ensure_bundled_browsers_path()
+    except Exception:  # noqa: BLE001 - never let a browser-path hint block startup
+        pass
+
     # Dual-purpose binary: with a CLI verb as the first argument, dispatch to the
     # `gn` CLI (importing ONLY the torch-free bughunter engine — no uvicorn/API);
     # with no arguments, run the API server. So the shipped backend exe is also the
