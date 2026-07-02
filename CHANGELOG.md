@@ -2,6 +2,25 @@
 
 Notable changes to GreyIQ.
 
+## v0.66.0
+
+### Download just the screenshot
+Every captured proof screenshot — in the finding drawer, the Submissions full-report panel, and
+the active-probe result — now has a **Download screenshot** button, so you can save the image on
+its own to attach to a report without exporting the whole thing.
+
+### Proof of concept in the full report
+The Submissions full-report view now shows a **Proof of concept** section, and folds it into the
+copied/downloaded report. On-demand reports for a campaign or history finding previously started
+from a template with an empty PoC, so their report had no PoC section — now the finding's PoC
+carries through.
+
+### Steps to reproduce always number cleanly
+Reproduction steps are now numbered correctly no matter how they arrive. A brain that returned the
+steps as one block of text used to render them one character per line ("1. S / 2. e / 3. n …"),
+and steps that already carried their own "1." got double-numbered — both are fixed, at the source
+and in every report format, so a submitted report reads as a clean 1..N list.
+
 ## v0.65.0
 
 ### Open a finding's full report — and submit from one place
