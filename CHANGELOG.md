@@ -2,6 +2,16 @@
 
 Notable changes to GreyIQ.
 
+## v0.67.2
+
+### Copy the proof of impact straight into your submission
+The full-report panel has a **Copy proof of impact** button that copies, as plain text you can
+paste into a report: the proof of impact, the numbered steps to reproduce, the captured
+request/response, and the actual sensitive data read. The one-click POC zip also now includes a
+**steps-and-evidence.txt** with the same content. It only labels a captured response body as
+"sensitive data read" — a bare matched header is shown as evidence, never overstated as a data
+read.
+
 ## v0.67.1
 
 ### CORS reports that HackerOne accepts
