@@ -229,5 +229,76 @@ class CorsSubstringTrustTests(unittest.TestCase):
         self.assertIsNone(av._check_cors(_StrictCorsStub(), "https://app.example.com/?q=x"))
 
 
+class _AuthedReflectCorsStub:
+    """Reflects an ARBITRARY attacker Origin with credentials AND returns an authenticated
+    response body — models a logged-in scan (``auth`` set) where the reflected ACAO + creds
+    let a foreign origin read real data. The control (site origin) reflects statically with no
+    creds so the differential still confirms."""
+    auth = object()  # truthy: an authenticated scan; fetch() would attach the operator session
+
+    def __init__(self, body: str = '{"email":"victim@example.com","token":"tok_live_xyz"}') -> None:
+        self.body = body
+
+    def fetch(self, url, *, method="GET", extra_headers=None):
+        origin = {k.lower(): v for k, v in (extra_headers or {}).items()}.get("origin")
+        host = urlparse(url).hostname or ""
+        headers, body = {}, ""
+        if origin and origin != f"https://{host}" and origin != "null":
+            headers = {"access-control-allow-origin": origin, "access-control-allow-credentials": "true"}
+            body = self.body
+        elif origin == f"https://{host}":
+            headers = {"access-control-allow-origin": origin}  # control: static, no creds
+        return {"status": 200, "headers": headers, "cookies": [], "body": body, "location": None, "final_url": url}
+
+
+class CorsAuthenticatedReadTests(unittest.TestCase):
+    def test_authenticated_scan_captures_cross_origin_read(self) -> None:
+        # An authenticated scan turns a header-only misconfig into a proven cross-origin READ:
+        # read_data holds the response body and the observation states the attacker origin READ it.
+        f = av._check_cors(_AuthedReflectCorsStub(), "https://api.example.com/user/me")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertIn("read_data", f["proof_evidence"])
+        self.assertIn("victim@example.com", f["proof_evidence"]["read_data"])
+        self.assertIn("READ", f["_active_proof"]["observed_result"])
+        # read_data is redacted exactly once — no nested "[REDACTED_SECRET:[REDACTED_SECRET" markers.
+        self.assertNotIn("[REDACTED_SECRET:[REDACTED_SECRET", f["proof_evidence"]["read_data"])
+
+    def test_unauthenticated_scan_reports_misconfig_without_read(self) -> None:
+        # No auth attribute -> _cors_enrich_read is a no-op: the misconfiguration is still
+        # confirmed, but nothing is claimed to have been read (fail-closed on the read claim).
+        class _Anon(_AuthedReflectCorsStub):
+            auth = None
+        f = av._check_cors(_Anon(), "https://api.example.com/user/me")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertNotIn("read_data", f["proof_evidence"])
+        self.assertNotIn("READ", f["_active_proof"]["observed_result"])
+
+    def test_report_shows_concrete_cors_repro_and_headers(self) -> None:
+        # The offline attack plan builds a class-specific concrete reproduction (a real
+        # curl -H 'Origin:' request) and a runnable credentialed-fetch PoC from the finding's
+        # captured evidence — the concrete steps + headers a triager demands.
+        from bughunter.bounty import _deterministic_attack_plan
+        from bughunter import report_formats as RF
+        f = av._check_cors(_AuthedReflectCorsStub(), "https://api.example.com/user/me")
+        finding = {
+            "ref": "F1", "title": f["title"], "severity": "high", "class_id": "cors",
+            "class_name": "CORS misconfiguration", "location": "https://api.example.com/user/me",
+            "cwe": "CWE-284", "category": "cors", "proof_evidence": f["proof_evidence"],
+            "rule_id": f["rule_id"], "snippet": f.get("snippet", ""),
+        }
+        plan = _deterministic_attack_plan(finding, "cors")
+        plan["proof_of_impact"] = f["_active_proof"]
+        ctx = {"tool": "GreyIQ", "version": "t", "generated_at": "now", "target": "",
+               "scope": "", "attack_plans": {"F1": plan}}
+        body = RF.render_finding(ctx, finding, "hackerone")
+        self.assertIn("curl -i -H 'Origin:", body)                     # concrete repro request
+        self.assertIn("credentials: \"include\"", body)                # runnable credentialed PoC
+        self.assertIn("Demonstrated cross-origin read", body)          # the read is shown
+        self.assertIn("victim@example.com", body)                      # the actual sensitive data
+        self.assertRegex(body, r"(?m)^Access-Control-Allow-Credentials: true$")  # ACAC on its own line
+
+
 if __name__ == "__main__":
     unittest.main()

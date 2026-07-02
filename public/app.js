@@ -6438,6 +6438,9 @@ async function ckFullReportMarkdown(focus) {
         scope: (ck.scope && ck.scope.value) || state.ckScope || ckCampaign.scope || "",
         platform: ckState.platform || "hackerone", proof: focus.proofObj || null,
         poc: (focus.plan && focus.plan.poc) || "",   // fold the PoC outline into the on-demand report
+        // Carry the engine's captured request/response so the report shows the concrete headers
+        // (e.g. CORS ACAO/ACAC) and builds the class-specific reproduction from the real evidence.
+        proof_evidence: focus.proofEvidence || null,
       }),
     });
     if (res && res.ok && res.package && res.package.vulnerability_information) {
