@@ -4289,6 +4289,10 @@ const ck = {
   launch: document.querySelector("#ckLaunch"),
   segHunt: document.querySelector("#ckRunHunt"),
   segCampaign: document.querySelector("#ckRunCampaign"),
+  segPortfolio: document.querySelector("#ckRunPortfolio"),
+  portfolioList: document.querySelector("#ckPortfolioPrograms"),
+  portfolioAll: document.querySelector("#ckPortfolioAll"),
+  portfolioCount: document.querySelector("#ckPortfolioCount"),
   activeProgram: document.querySelector("#ckActiveProgram"),
   spanScopeWrap: document.querySelector("#ckSpanScopeWrap"),
   spanScope: document.querySelector("#ckSpanScope"),
@@ -4393,15 +4397,55 @@ function ckSetView(view) {
 }
 
 function ckSetRunType(type) {
-  state.ckRunType = type === "campaign" ? "campaign" : "hunt";
+  state.ckRunType = ["campaign", "portfolio"].includes(type) ? type : "hunt";
   saveState();
   ck.segHunt?.classList.toggle("is-active", state.ckRunType === "hunt");
   ck.segCampaign?.classList.toggle("is-active", state.ckRunType === "campaign");
+  ck.segPortfolio?.classList.toggle("is-active", state.ckRunType === "portfolio");
   for (const node of document.querySelectorAll("[data-ck-when]")) {
     node.hidden = node.dataset.ckWhen !== state.ckRunType;
   }
-  if (ck.run) ck.run.textContent = state.ckRunType === "campaign" ? "Run campaign" : "Run hunt";
+  if (ck.run) ck.run.textContent = state.ckRunType === "campaign" ? "Run campaign" : (state.ckRunType === "portfolio" ? "Run portfolio hunt" : "Run hunt");
   ckUpdateSpanScopeToggle();
+  if (state.ckRunType === "portfolio") ckRenderPortfolioPicker();
+}
+
+// The Portfolio-mode program multi-select: a checkbox per saved program (marking which have
+// no huntable targets), plus a select-all. Populated from the shared programs cache.
+function ckRenderPortfolioPicker() {
+  const host = ck.portfolioList;
+  if (!host) return;
+  const prev = new Set([...host.querySelectorAll("input[type=checkbox]:checked")].map((c) => c.value));
+  host.replaceChildren();
+  const progs = ckProgramsCache || [];
+  if (!progs.length) {
+    host.append(cel("p", "ck-hint", ckProgramsReachable
+      ? "No saved programs yet — add one in the Program tab (import a HackerOne scope or add seed targets)."
+      : "Engine unreachable — can't load your programs."));
+    if (ck.portfolioCount) ck.portfolioCount.textContent = "";
+    return;
+  }
+  for (const p of progs) {
+    const n = (p.seed_targets || []).length || (p.structured_scope || []).filter((s) => s && s.eligible_for_submission !== false).length;
+    const row = cel("label", "ck-portfolio-row");
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.value = p.id; cb.checked = prev.has(p.id);
+    cb.disabled = !n;
+    cb.addEventListener("change", ckUpdatePortfolioCount);
+    row.append(cb);
+    const txt = cel("span", null, p.name || p.id);
+    if (!n) txt.append(cel("em", "ck-portfolio-empty", " — no huntable targets"));
+    else txt.append(cel("span", "ck-tag", ` ${n} target${n === 1 ? "" : "s"}`));
+    row.append(txt);
+    host.append(row);
+  }
+  ckUpdatePortfolioCount();
+}
+
+function ckUpdatePortfolioCount() {
+  if (!ck.portfolioCount) return;
+  const n = ck.portfolioList ? ck.portfolioList.querySelectorAll("input[type=checkbox]:checked").length : 0;
+  ck.portfolioCount.textContent = n ? `(${n} selected)` : "";
 }
 
 async function ckPopulateProfiles() {
@@ -5301,6 +5345,8 @@ function ckPopulateActiveProgramSelect() {
   }
   const restore = state.ckActiveProgramId || current;
   if (restore && [...ck.activeProgram.options].some((o) => o.value === restore)) ck.activeProgram.value = restore;
+  // Keep the Portfolio multi-select in sync with the same programs cache.
+  if (state.ckRunType === "portfolio") ckRenderPortfolioPicker();
 }
 
 // Fills Target/Scope from a saved program — still hand-editable after. Only runs on an
@@ -6509,8 +6555,8 @@ async function ckReportFromLedger(rec) {
       method: "POST", timeoutMs: 30000,
       body: JSON.stringify({
         title: rec.title || "Security finding", severity: rec.severity || "info",
-        class_name: rec.class_id || "", location: rec.source_url || "", rule_id: rec.rule_id || "",
-        target: rec.source_url || "", platform: ckState.platform || "hackerone",
+        class_name: rec.class_id || "", class_id: rec.class_id || "", location: rec.source_url || "",
+        rule_id: rec.rule_id || "", target: rec.source_url || "", platform: ckState.platform || "hackerone",
       }),
     });
     if (res && res.ok && res.package) return res.package.vulnerability_information || "";
@@ -7258,7 +7304,65 @@ function ckBadgeCount(view, n) {
   if (n) btn.append(cel("span", "ck-badge", String(n)));
 }
 
+// Portfolio Hunt: run campaigns across several selected programs at once. Reuses the live
+// campaign dashboard (programs are its units) + the Findings board + Submissions hub.
+async function ckRunPortfolio() {
+  const ids = ck.portfolioList ? [...ck.portfolioList.querySelectorAll("input[type=checkbox]:checked")].map((c) => c.value) : [];
+  if (!ids.length) { ckStatus("Pick at least one program to hunt.", true); return; }
+  if (!ck.authorized?.checked) { ckStatus("Confirm you are authorized to test these programs' scopes (tick the box).", true); return; }
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) { ckStatus("Local GreyIQ engine is not running.", true); return; }
+  state.ckActive = Boolean(ck.active?.checked);
+  state.ckTimeBased = Boolean(ck.timeBased?.checked);
+  state.ckDeep = Boolean(ck.deep?.checked);
+  state.ckLive = Boolean(ck.live?.checked);
+  state.ckAuthCookie = (ck.authCookie?.value || "").trim();
+  state.ckAuthHeaders = (ck.authHeaders?.value || "");
+  saveState();
+  const authHeaderLines = state.ckAuthHeaders.split("\n").map((s) => s.trim()).filter(Boolean);
+  ck.run.disabled = true;
+  ckStatus(`Portfolio hunt running — campaigns across ${ids.length} program(s), several at once (this can take a while)…`);
+  const progressRunId = crypto.randomUUID();
+  // Union the selected programs' scopes so the dashboard's on-demand re-verify / proof-of-impact
+  // can gate a finding's host correctly regardless of which program it came from.
+  const unionScope = (ckProgramsCache || []).filter((p) => ids.includes(p.id))
+    .map((p) => String(p.scope_text || "").trim()).filter(Boolean).join("\n");
+  ckStartCampaignDashboard(progressRunId, `Portfolio · ${ids.length} program(s)`, { scope: unionScope, programId: null, authorized: true });
+  try {
+    const res = await apiFetch("/api/bounty/portfolio", {
+      method: "POST", timeoutMs: 3600000,
+      body: JSON.stringify({
+        program_ids: ids, authorized: true, active: state.ckActive, time_based: state.ckTimeBased,
+        deep: state.ckDeep, live: state.ckLive, max_pages: Number(ck.maxPages?.value) || 12,
+        auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines, run_id: progressRunId,
+      }),
+    });
+    if (res.ok === false) { ckStatus(res.error || "The portfolio hunt could not complete.", true); return; }
+    ckState.result = res;
+    ckState.runId = res.run_id || "";
+    ckState.triage = {};
+    ckState.findings = ckNormalizeFindings(res);
+    ckState.surface = res.surface || null;
+    ckState.selectedRef = "";
+    ckCloseDetail();
+    ckBadgeCount("findings", ckState.findings.length);
+    ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);
+    const confirmed = ckState.findings.filter((f) => f.proof === "confirmed").length;
+    const errNote = (res.errors || []).length ? ` (${res.errors.length} note(s) — see the report)` : "";
+    const doneMsg = `Portfolio done — ${res.programs_hunted ?? "?"}/${res.programs_total ?? "?"} program(s), ${ckState.findings.length} finding(s), ${confirmed} confirmed${errNote}. Report: ${res.campaign_path || "the reports folder"}`;
+    ckStatus(doneMsg);
+    if (document.hidden) { ckBumpTitleBadge(confirmed || ckState.findings.length); void ckNotify("GreyIQ — portfolio hunt complete", doneMsg); }
+    ckRenderFindings();
+    if (ckState.view === "campaign") ckRenderCampaign();
+  } catch (err) {
+    ckStatus(err.message || "The portfolio hunt failed.", true);
+  } finally {
+    ck.run.disabled = false;
+    void ckFinishCampaignDashboard();
+  }
+}
+
 async function ckRun() {
+  if (state.ckRunType === "portfolio") { await ckRunPortfolio(); return; }
   const isCampaign = state.ckRunType === "campaign";
   const spanning = isCampaign && Boolean(ck.spanScope?.checked) && !ck.spanScopeWrap?.hidden && Boolean(state.ckActiveProgramId);
   const target = (ck.target?.value || "").trim();
@@ -7909,7 +8013,7 @@ async function ckDrawerReport(f) {
       method: "POST", timeoutMs: 30000,
       body: JSON.stringify({
         title: f.title || "Security finding", severity: f.severity || "info", class_name: f.cls || "",
-        location: f.location || f.target || "", cwe: f.cwe || "", rule_id: f.rule || "",
+        class_id: f.class_id || "", location: f.location || f.target || "", cwe: f.cwe || "", rule_id: f.rule || "",
         target: f.target || f.location || "", scope: ckCampaign.scope || "",
         platform: ckState.platform || "hackerone", proof,
       }),
@@ -7966,6 +8070,13 @@ function bootCockpit() {
   for (const btn of ck.navButtons) btn.addEventListener("click", () => ckSetView(btn.dataset.ckView));
   ck.segHunt?.addEventListener("click", () => ckSetRunType("hunt"));
   ck.segCampaign?.addEventListener("click", () => ckSetRunType("campaign"));
+  ck.segPortfolio?.addEventListener("click", () => ckSetRunType("portfolio"));
+  ck.portfolioAll?.addEventListener("click", () => {
+    const boxes = ck.portfolioList ? [...ck.portfolioList.querySelectorAll("input[type=checkbox]:not(:disabled)")] : [];
+    const allOn = boxes.length && boxes.every((c) => c.checked);
+    for (const c of boxes) c.checked = !allOn;
+    ckUpdatePortfolioCount();
+  });
   ck.activeProgram?.addEventListener("change", () => ckApplyActiveProgram(ck.activeProgram.value));
   ck.spanScope?.addEventListener("change", () => {
     state.ckSpanScope = Boolean(ck.spanScope.checked);

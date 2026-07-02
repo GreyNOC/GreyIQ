@@ -417,6 +417,16 @@
             <div class="ck-seg-group" role="group" aria-label="Run type">
               <button type="button" class="ck-seg is-active" id="ckRunHunt" data-ck-runtype="hunt">Single hunt</button>
               <button type="button" class="ck-seg" id="ckRunCampaign" data-ck-runtype="campaign">Full campaign</button>
+              <button type="button" class="ck-seg" id="ckRunPortfolio" data-ck-runtype="portfolio">Portfolio</button>
+            </div>
+
+            <div data-ck-when="portfolio" hidden class="ck-portfolio-pick">
+              <div class="ck-portfolio-head">
+                <span>Programs to hunt <strong id="ckPortfolioCount"></strong></span>
+                <button type="button" class="ck-btn" id="ckPortfolioAll">Select all</button>
+              </div>
+              <div id="ckPortfolioPrograms" class="ck-portfolio-list"></div>
+              <p class="ck-hint">Runs a full campaign on every selected program's <em>own saved scope</em> — several at once, bounded so it stays polite (per-host rate limits stay on). AI write-ups run on your selected device (GPU if set). Target/Scope above are ignored in this mode.</p>
             </div>
 
             <label><span>Program <em>(optional — fills in Target/Scope below)</em></span>

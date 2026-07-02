@@ -97,6 +97,17 @@ class BuildFindingReportTests(unittest.TestCase):
         self.assertIn("vulnerability_information", out["package"])
         self.assertTrue(out["package"]["vulnerability_information"].strip())
 
+    def test_report_always_has_reproduction_steps(self) -> None:
+        # Even a bare ledger/dashboard finding (no attack plan of its own) must produce a
+        # report with a populated "Steps to reproduce" section + a benign curl repro.
+        out = _Stub().build_finding_report(api.FindingReportRequest(
+            title="Reflected XSS", severity="high", class_name="xss", class_id="xss",
+            location="https://example.com/search?q=1", cwe="CWE-79", target="https://example.com"))
+        self.assertTrue(out["ok"], out)
+        body = out["package"]["vulnerability_information"]
+        self.assertIn("Steps to reproduce", body)
+        self.assertIn("curl", body.lower())
+
     def test_folds_in_gathered_proof(self) -> None:
         out = _Stub().build_finding_report(api.FindingReportRequest(
             title="Reflected XSS", severity="high", class_name="xss", location="https://example.com/s?q=1",

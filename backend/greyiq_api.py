@@ -336,7 +336,7 @@ from bughunter.web_scan_service import run_web_scan  # noqa: E402
 from bughunter.live_scan_service import run_live_scan  # noqa: E402
 from bughunter.triage import triage  # noqa: E402
 from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
-from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names  # noqa: E402
+from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names, _deterministic_attack_plan  # noqa: E402
 from bughunter import campaign as bounty_campaign  # noqa: E402
 from bughunter import learning as bounty_learning  # noqa: E402
 from bughunter import submission as bounty_submission  # noqa: E402
@@ -615,6 +615,21 @@ class CampaignStopRequest(BaseModel):
     run_id: str = Field(min_length=1, max_length=100)
 
 
+class PortfolioRequest(BaseModel):
+    # Portfolio Hunt: run a full campaign across MANY saved programs concurrently (bounded).
+    program_ids: list[str] = Field(default_factory=list, max_length=50)
+    all_programs: bool = False   # run every saved program (ignores program_ids)
+    authorized: bool = False
+    active: bool = False
+    time_based: bool = False
+    deep: bool = False           # GPU-brain deep AI write-ups + screenshots + research per confirmed lead
+    live: bool = False
+    max_pages: int = Field(default=12, ge=1, le=50)
+    auth_cookie: str = Field(default="", max_length=8000)
+    auth_headers: list[str] = Field(default_factory=list, max_length=20)
+    run_id: str = Field(default="", max_length=100)
+
+
 class ReverifyRequest(BaseModel):
     # On-demand re-probe of ONE finding's URL, launched from the live dashboard's
     # investigate drawer. Runs in its own thread (parallel to any campaign) and is
@@ -658,6 +673,7 @@ class FindingReportRequest(BaseModel):
     title: str = Field(default="Security finding", max_length=255)
     severity: str = Field(default="info", max_length=20)
     class_name: str = Field(default="", max_length=160)
+    class_id: str = Field(default="", max_length=80)  # canonical class key → class-specific reproduction steps
     location: str = Field(default="", max_length=4000)
     cwe: str = Field(default="", max_length=40)
     rule_id: str = Field(default="", max_length=160)
@@ -1597,21 +1613,30 @@ class GreyIQRuntime:
         the operator just gathered. Server recomputes proof_status — a client can't forge
         'confirmed'. Pure / no-network."""
         ref = "R1"
+        class_id = str(request.class_id or "").strip()
         finding = {
             "ref": ref, "title": str(request.title or "Security finding"),
             "severity": str(request.severity or "info"), "class_name": str(request.class_name or ""),
-            "location": str(request.location or request.target or ""), "cwe": str(request.cwe or ""),
-            "rule_id": str(request.rule_id or ""), "description": str(request.description or ""),
-            "screenshot_path": str(request.screenshot_path or ""),
+            "class_id": class_id, "location": str(request.location or request.target or ""),
+            "cwe": str(request.cwe or ""), "rule_id": str(request.rule_id or ""),
+            "description": str(request.description or ""), "screenshot_path": str(request.screenshot_path or ""),
         }
-        plan: dict[str, Any] = {}
+        # Every report gets REAL reproduction steps: the engine's offline attack-plan builder
+        # (class-aware steps + a benign curl repro for web findings + impact + CVSS estimate),
+        # the same steps a full hunt would emit — so an on-demand report for a ledger/dashboard
+        # finding is never a stub with an empty "Steps to reproduce".
+        plan = _deterministic_attack_plan(finding, class_id)
+        # Overlay operator-gathered proof (from Create proof of impact) onto the plan's
+        # proof-of-impact block — its observed/control/evidence make the report confirmable.
         if request.proof is not None:
             p = request.proof
-            plan["proof_of_impact"] = {
-                "status": p.status, "method": p.method, "observed_result": p.observed_result,
-                "control_result": p.control_result, "evidence": p.evidence,
-                "affected_asset": p.affected_asset, "limitations": p.limitations,
-            }
+            poi = dict(plan.get("proof_of_impact") or {})
+            for k, v in (("status", p.status), ("method", p.method), ("observed_result", p.observed_result),
+                         ("control_result", p.control_result), ("evidence", p.evidence),
+                         ("affected_asset", p.affected_asset), ("limitations", p.limitations)):
+                if str(v or "").strip():
+                    poi[k] = v
+            plan["proof_of_impact"] = poi
         ctx = {
             "tool": "GreyIQ BugHunter", "version": VERSION,
             "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
@@ -1739,6 +1764,64 @@ class GreyIQRuntime:
         self._cache_bounty_run(result, target=target_label, scope=scope, program=program_label,
                                 program_id=str(program.get("id") or request.program_id),
                                 disclose_automation=disclose_automation)
+        return result
+
+    def run_portfolio(self, request: "PortfolioRequest") -> dict[str, Any]:
+        """Portfolio Hunt: resolve the selected (or all) saved programs, derive each one's
+        huntable targets + authoritative scope, and run their campaigns CONCURRENTLY (bounded)
+        merged into a single campaign-shaped result. Each program's own scope_text governs it;
+        fail-closed on authorization. deep=True routes the AI-heavy write-ups through the
+        (GPU-accelerated) local brain."""
+        run_id = str(request.run_id or "").strip()
+        if run_id:
+            bounty_progress.start_run(run_id)
+        all_progs = bounty_portfolio.list_programs(RUNTIME_DIR)
+        if request.all_programs:
+            chosen = all_progs
+        else:
+            wanted = {str(pid) for pid in (request.program_ids or [])}
+            chosen = [p for p in all_progs if str(p.get("id")) in wanted]
+        if not chosen:
+            return {"ok": False, "error": "No programs selected — pick at least one saved program (or none exist yet; add one in the Program tab)."}
+        specs: list[dict[str, Any]] = []
+        skipped: list[str] = []
+        for program in chosen:
+            targets = bounty_campaign.program_campaign_targets(program)
+            label = str(program.get("name") or program.get("id"))
+            if not targets:
+                skipped.append(label)
+                continue
+            specs.append({
+                "label": label,
+                "scope": str(program.get("scope_text") or "").strip(),
+                "targets": targets,
+                "excluded_hosts": [str(h) for h in (program.get("out_of_scope_hosts") or [])],
+                "disclose_automation": bool(program.get("disclose_automation")),
+            })
+        if not specs:
+            return {"ok": False, "error": "None of the selected programs have huntable targets — add seed targets or import/build a structured scope in the Program tab."
+                                          + (f" (skipped: {', '.join(skipped[:8])})" if skipped else "")}
+        result = bounty_campaign.run_portfolio_campaign(
+            specs,
+            authorized=request.authorized,
+            coder_cfg=self._coder_config(),
+            default_reports_dir=RUNTIME_DIR / "reports",
+            seed_dir=SEED_DIR,
+            runtime_dir=RUNTIME_DIR,
+            version=VERSION,
+            active=request.active,
+            time_based=request.time_based,
+            auth={"cookie": request.auth_cookie, "headers": request.auth_headers},
+            live=request.live,
+            max_pages=request.max_pages,
+            deep=request.deep,
+            on_progress=bounty_progress.sink(run_id) if run_id else None,
+            progress_run_id=run_id or None,
+        )
+        if result.get("ok") and skipped:
+            result.setdefault("errors", []).insert(0, f"Skipped {len(skipped)} program(s) with no huntable targets: {', '.join(skipped[:8])}.")
+        self._cache_bounty_run(result, target=f"Portfolio — {len(specs)} program(s)", scope="", program="portfolio",
+                                program_id="portfolio")
         return result
 
     # ---- After-testing / submission workflow -------------------------------------
@@ -3550,6 +3633,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/campaign":
             request = validate_payload(CampaignRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.run_campaign, request))
+            return
+        if method == "POST" and path == "/api/bounty/portfolio":
+            request = validate_payload(PortfolioRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.run_portfolio, request))
             return
         if method == "POST" and path == "/api/bounty/progress":
             request = validate_payload(BountyProgressRequest, await read_json_body(receive))

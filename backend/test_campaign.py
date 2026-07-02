@@ -503,5 +503,78 @@ class RunCampaignOverTargetsTests(unittest.TestCase):
         self.assertTrue(any("capped" in e.lower() for e in result["errors"]))
 
 
+class PortfolioCampaignTests(unittest.TestCase):
+    """run_portfolio_campaign — many programs, one merged run. Offline: the per-program span
+    (run_campaign_over_targets) is stubbed so we test the ORCHESTRATION (concurrency merge,
+    global re-ref, per-program roll-up, auth gate, program-unit progress) without network."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._orig = campaign.run_campaign_over_targets
+
+    def tearDown(self) -> None:
+        campaign.run_campaign_over_targets = self._orig
+        self._tmp.cleanup()
+
+    def _stub_span(self):
+        # Each program returns one confirmed finding, streamed to the program's dashboard unit.
+        def fake(targets, *, program=None, progress_run_id=None, progress_unit=None, **kw):
+            ref = "F1"
+            finding = {"ref": ref, "title": f"{program} finding", "severity": "high", "class_name": "xss",
+                       "location": targets[0] if targets else "https://x", "source_url": targets[0] if targets else "https://x"}
+            if progress_run_id and progress_unit:
+                campaign.progress.add_findings(progress_run_id, progress_unit, [{**finding, "proof_status": "confirmed"}])
+            return {"ok": True, "findings": [finding], "proof_of_impact": {ref: {"status": "confirmed"}},
+                    "cvss": {}, "attack_plans": {}, "submission_paths": [], "finding_count": 1, "confirmed_count": 1,
+                    "surface": {"urls": targets, "sources": {}, "notes": [], "tech": []}}
+        campaign.run_campaign_over_targets = fake
+
+    def _specs(self):
+        return [
+            {"label": "prog-a", "scope": "a.example", "targets": ["https://a.example"], "excluded_hosts": [], "disclose_automation": False},
+            {"label": "prog-b", "scope": "b.example", "targets": ["https://b.example"], "excluded_hosts": [], "disclose_automation": False},
+        ]
+
+    def test_refuses_unauthorized(self) -> None:
+        out = campaign.run_portfolio_campaign(self._specs(), authorized=False, coder_cfg={}, default_reports_dir=self.root)
+        self.assertFalse(out["ok"])
+
+    def test_no_huntable_programs_is_clean_error(self) -> None:
+        specs = [{"label": "empty", "scope": "", "targets": [], "excluded_hosts": [], "disclose_automation": False}]
+        out = campaign.run_portfolio_campaign(specs, authorized=True, coder_cfg={}, default_reports_dir=self.root)
+        self.assertFalse(out["ok"])
+
+    def test_merges_multiple_programs_with_global_refs(self) -> None:
+        self._stub_span()
+        campaign.progress.start_run("port-1")
+        out = campaign.run_portfolio_campaign(self._specs(), authorized=True, coder_cfg={},
+                                              default_reports_dir=self.root, version="9.9.9", progress_run_id="port-1")
+        self.assertTrue(out["ok"], out.get("error"))
+        self.assertEqual(out["programs_hunted"], 2)
+        self.assertEqual(out["finding_count"], 2)
+        self.assertEqual([f["ref"] for f in out["findings"]], ["C1", "C2"])  # globally re-reffed
+        self.assertEqual(out["confirmed_count"], 2)
+        self.assertEqual(len(out["per_program"]), 2)
+        # PROGRAMS (not targets) are the dashboard units, and findings streamed under them.
+        snap = campaign.progress.snapshot("port-1")
+        self.assertEqual(sorted(t["target"] for t in snap["targets"]), ["prog-a", "prog-b"])
+        self.assertEqual(snap["stats"]["findings_total"], 2)
+
+    def test_one_bad_program_never_aborts_the_rest(self) -> None:
+        def fake(targets, *, program=None, **kw):
+            if program == "prog-a":
+                raise RuntimeError("boom")
+            return {"ok": True, "findings": [{"ref": "F1", "title": "ok", "severity": "low"}],
+                    "proof_of_impact": {"F1": {"status": "candidate"}}, "cvss": {}, "attack_plans": {},
+                    "submission_paths": [], "finding_count": 1, "confirmed_count": 0,
+                    "surface": {"urls": targets, "sources": {}, "notes": [], "tech": []}}
+        campaign.run_campaign_over_targets = fake
+        out = campaign.run_portfolio_campaign(self._specs(), authorized=True, coder_cfg={}, default_reports_dir=self.root)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["programs_hunted"], 1)
+        self.assertTrue(any("prog-a" in e for e in out["errors"]))
+
+
 if __name__ == "__main__":
     unittest.main()

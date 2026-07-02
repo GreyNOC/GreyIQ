@@ -177,6 +177,7 @@ def add_findings(run_id: str, target: str, findings: list[dict[str, Any]]) -> No
                     "location": str(f.get("location") or f.get("source_url") or "")[:600],
                     "cwe": str(f.get("cwe") or "")[:40],
                     "rule": str(f.get("rule_id") or f.get("rule") or "")[:80],
+                    "class_id": str(f.get("class_id") or "")[:80],
                 })
                 added += 1
                 if proof == "confirmed":

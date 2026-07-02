@@ -2,6 +2,29 @@
 
 Notable changes to GreyIQ.
 
+## v0.62.0
+
+### Portfolio Hunt — many programs, one run
+A new **Portfolio** run type on the launch rail: pick several saved programs (or all) and
+GreyIQ runs a full campaign on each one's own saved scope **concurrently**, merged into one
+live board. Bounded & polite — the per-host rate governors stay on, and only a few programs
+run at once, so a portfolio-scale hunt is fast without multiplying the request rate any single
+host sees or looking like abuse. The live dashboard shows each **program** as a unit with its
+own status + streamed findings; the click-to-investigate drawer (proof of impact, report) and
+the Submissions reporting hub work over the combined results. Deep mode routes the AI write-ups
+(reproduction, research, sharper reports) through your selected device — the GPU if set.
+New `POST /api/bounty/portfolio`.
+
+> Note: GPU accelerates the AI brain (write-ups/research), not the HTTP probing itself, which
+> is network-bound and deliberately rate-limited per host. Portfolio scale comes from bounded
+> concurrency across programs.
+
+### Reports always include reproduction steps
+On-demand reports (Create report, from a dashboard/history/ledger finding that isn't in the
+live run cache) now always carry a real **Steps to reproduce** section + a benign `curl` repro
+for web findings — built from the engine's offline attack-plan model, the same steps a full
+hunt emits — with any gathered proof of impact folded in.
+
 ## v0.61.0
 
 ### Reporting hub: findings wired across the app, proof-of-impact + reports per finding

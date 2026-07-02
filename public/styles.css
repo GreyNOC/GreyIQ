@@ -3116,6 +3116,15 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-hist-prog strong { font-size: 0.86rem; }
 .ck-hist-prog .ck-btn { margin-left: auto; }
 
+/* Portfolio Hunt: program multi-select on the launch rail. */
+.ck-portfolio-pick { border: 1px solid var(--border); border-radius: 10px; padding: 0.6rem 0.7rem; margin: 0.2rem 0 0.4rem; background: var(--panel-2); }
+.ck-portfolio-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; font-size: 0.8rem; font-weight: 600; margin-bottom: 0.4rem; }
+.ck-portfolio-head .ck-btn { font-size: 0.72rem; padding: 0.12rem 0.5rem; }
+.ck-portfolio-list { display: flex; flex-direction: column; gap: 0.15rem; max-height: 12rem; overflow-y: auto; }
+.ck-portfolio-row { display: flex; align-items: center; gap: 0.5rem; font-size: 0.82rem; padding: 0.15rem 0.1rem; cursor: pointer; }
+.ck-portfolio-row input:disabled { opacity: 0.4; }
+.ck-portfolio-empty { color: var(--muted); font-style: italic; }
+
 .ck-detail { border-left: 1px solid var(--border); overflow-y: auto; padding: 1rem 1.1rem; background: var(--surface); }
 .ck-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.6rem; margin-bottom: 0.7rem; }
 .ck-detail-head h3 { margin: 0; font-size: 1rem; line-height: 1.35; }

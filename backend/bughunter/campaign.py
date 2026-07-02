@@ -238,10 +238,11 @@ def run_campaign(
             })
             url_new.append({"ref": ref, "title": finding.get("title"), "severity": finding.get("severity"),
                             "class_name": finding.get("class_name") or finding.get("class_id"), "proof_status": proof_status,
-                            # Carried for the dashboard's investigate drawer + on-demand re-verify:
-                            # where the finding lives (the URL to re-probe), its CWE, and the rule id.
+                            # Carried for the dashboard's investigate drawer + on-demand re-verify/report:
+                            # where the finding lives (the URL), its CWE, rule id, and the canonical
+                            # class_id (so an on-demand report gets class-specific reproduction steps).
                             "location": finding.get("location") or url, "cwe": finding.get("cwe"),
-                            "rule_id": finding.get("rule_id")})
+                            "rule_id": finding.get("rule_id"), "class_id": finding.get("class_id")})
         # Stream this URL's findings live — attributed to the span's named target when
         # running under one, else to the URL itself (single-target campaign).
         progress.add_findings(progress_run_id, progress_unit or url, url_new)
@@ -521,6 +522,7 @@ def run_campaign_over_targets(
     disclose_automation: bool = False,
     excluded_hosts: tuple[str, ...] = (),
     progress_run_id: str | None = None,
+    progress_unit: str | None = None,
 ) -> dict[str, Any]:
     """Run one full ``run_campaign`` per target (bounded, deduped, best-effort — one
     bad target never aborts the rest) and merge the results into a single combined
@@ -528,7 +530,12 @@ def run_campaign_over_targets(
     board renders a "span the whole program" hunt exactly like a single-target one.
     Reuses ``run_campaign`` verbatim per target — no change to its internals, so every
     existing safety property (fail-closed scope, GET-only defaults, opt-in active
-    probing) applies identically to each target."""
+    probing) applies identically to each target.
+
+    ``progress_unit`` (portfolio mode): when set, this span is ONE unit of a larger
+    portfolio run — the caller already registered the PROGRAM as the dashboard unit, so we
+    don't register per-target units or mark them; instead every target's findings stream to
+    that named program unit (via each inner run_campaign's own ``progress_unit``)."""
     clean_targets = list(dict.fromkeys(str(t).strip() for t in targets if str(t or "").strip()))
     capped = clean_targets[:max_targets]
     if not capped:
@@ -579,32 +586,39 @@ def run_campaign_over_targets(
         # Cooperative cancellation: a target that hasn't started yet when Stop is pressed
         # is skipped outright (the executor may have it queued behind the running batch);
         # a target already in flight winds down via run_campaign's own between-URL check.
+        # The dashboard unit is the TARGET for a normal span, or the PROGRAM for a portfolio
+        # run (progress_unit set) — in portfolio mode the portfolio owns the program unit, so
+        # we don't mark per-target here; findings still stream to the program unit below.
+        unit = progress_unit or target
         if progress.is_stopped(progress_run_id):
-            progress.mark_target(progress_run_id, target, "skipped")
+            if progress_unit is None:
+                progress.mark_target(progress_run_id, target, "skipped")
             _target_emit("skipped — campaign stopped")
             return (target, {"ok": False, "error": "campaign stopped", "stopped": True}, None)
         _target_emit("starting…")
-        progress.mark_target(progress_run_id, target, "running")
+        if progress_unit is None:
+            progress.mark_target(progress_run_id, target, "running")
         try:
-            # Pass progress_unit=target so the inner campaign streams each URL's findings
-            # to the dashboard AS THEY'RE FOUND (attributed to this named target) instead of
-            # the whole target's findings landing only when it finishes. It does NOT register
-            # the URLs as their own dashboard units — the span owns the named-target list.
+            # Pass progress_unit so the inner campaign streams each URL's findings to the
+            # dashboard AS THEY'RE FOUND (attributed to the named target, or the program in a
+            # portfolio run) instead of landing only when the target finishes.
             result = run_campaign(
                 target, scope=scope, authorized=authorized, coder_cfg=coder_cfg,
                 default_reports_dir=span_root, seed_dir=seed_dir, runtime_dir=runtime_dir,
                 version=version, active=active, time_based=time_based, auth=auth, live=live,
                 program=program, max_pages=max_pages, platform=platform, deep=deep,
                 disclose_automation=disclose_automation, on_progress=_target_emit, excluded_hosts=excluded_hosts,
-                progress_run_id=progress_run_id, progress_unit=target,
+                progress_run_id=progress_run_id, progress_unit=unit,
             )
-            if result.get("ok"):
-                progress.mark_target(progress_run_id, target, "done")
-            else:
-                progress.mark_target(progress_run_id, target, "error", error=str(result.get("error") or ""))
+            if progress_unit is None:
+                if result.get("ok"):
+                    progress.mark_target(progress_run_id, target, "done")
+                else:
+                    progress.mark_target(progress_run_id, target, "error", error=str(result.get("error") or ""))
             return (target, result, None)
         except Exception as exc:  # noqa: BLE001 - one bad target must never abort the span
-            progress.mark_target(progress_run_id, target, "error", error=f"{type(exc).__name__}: {exc}")
+            if progress_unit is None:
+                progress.mark_target(progress_run_id, target, "error", error=f"{type(exc).__name__}: {exc}")
             return (target, None, exc)
 
     # Bounded concurrency: targets run in parallel (each on its own OS thread, exactly
@@ -613,7 +627,8 @@ def run_campaign_over_targets(
     # numbering and per_target ordering stay fully deterministic regardless of which
     # target happens to finish first -- concurrency changes only the WALL-CLOCK time,
     # never the shape of the combined result.
-    progress.set_targets(progress_run_id, capped)  # register the named targets as the dashboard's work units
+    if progress_unit is None:
+        progress.set_targets(progress_run_id, capped)  # register the named targets as the dashboard's work units
     _emit(f"campaign span: hunting {len(capped)} target(s), up to {min(_SPAN_MAX_WORKERS, len(capped))} at a time…")
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(_SPAN_MAX_WORKERS, len(capped))) as executor:
         futures = [executor.submit(_hunt_one, i, t) for i, t in enumerate(capped, 1)]
@@ -700,6 +715,216 @@ def run_campaign_over_targets(
         "severity_counts": _severity_counts(findings_out),
         "risk": _campaign_risk([{"finding": f} for f in findings_out]),
     }
+
+
+_PORTFOLIO_MAX_PROGRAMS = 3  # bounded & polite: how many programs' campaigns run concurrently
+
+
+def run_portfolio_campaign(
+    programs: list[dict[str, Any]],
+    *,
+    authorized: bool,
+    coder_cfg: dict[str, Any] | None,
+    default_reports_dir: Path,
+    seed_dir: Path | None = None,
+    runtime_dir: Path | None = None,
+    version: str = "",
+    active: bool = False,
+    time_based: bool = False,
+    auth: dict[str, Any] | None = None,
+    live: bool = False,
+    max_pages: int = 12,
+    platform: str = "hackerone",
+    deep: bool = False,
+    on_progress: Any = None,
+    progress_run_id: str | None = None,
+    max_concurrent_programs: int = _PORTFOLIO_MAX_PROGRAMS,
+) -> dict[str, Any]:
+    """Run a full campaign across MULTIPLE saved programs CONCURRENTLY (bounded), merged into
+    one combined result shaped like a single campaign — so the Findings board + Submissions hub
+    render a portfolio hunt exactly like a single one. Each program is a dashboard unit; its
+    findings stream under it as they surface. ``programs`` is a list of resolved specs:
+    ``{label, scope, targets, excluded_hosts, disclose_automation}``.
+
+    Reuses ``run_campaign_over_targets`` verbatim per program (portfolio mode:
+    ``progress_unit=<program label>``), so every fail-closed safety property (scope binding,
+    GET-only defaults, opt-in active probing, per-host rate governor) still applies per target.
+    Bounded & polite: the per-host HostRateGovernor caps traffic to any single host, and
+    ``max_concurrent_programs`` caps how many programs run at once — fast at portfolio scale
+    without multiplying the request rate any one host sees."""
+    if not authorized:
+        return {"ok": False, "error": "Confirm you're authorized and in scope before running a portfolio hunt."}
+    clean: list[dict[str, Any]] = []
+    seen_labels: set[str] = set()
+    for p in programs or []:
+        label = str(p.get("label") or "").strip()
+        targets = [str(t).strip() for t in (p.get("targets") or []) if str(t or "").strip()]
+        if not label or label in seen_labels or not targets:
+            continue
+        seen_labels.add(label)
+        clean.append({"label": label, "scope": str(p.get("scope") or ""), "targets": targets,
+                      "excluded_hosts": tuple(str(h) for h in (p.get("excluded_hosts") or [])),
+                      "disclose_automation": bool(p.get("disclose_automation"))})
+    if not clean:
+        return {"ok": False, "error": "No huntable programs — each needs seed targets or an imported/built structured scope."}
+
+    def _emit(msg: str) -> None:
+        if callable(on_progress):
+            try:
+                on_progress(msg)
+            except Exception:  # noqa: BLE001
+                pass
+
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    port_fp = hashlib.sha1("\n".join(sorted(seen_labels)).encode("utf-8", "replace")).hexdigest()[:8]
+    portfolio_root = Path(default_reports_dir) / f"portfolio-{stamp}-{port_fp}"
+    portfolio_root.mkdir(parents=True, exist_ok=True)
+
+    progress.set_targets(progress_run_id, [p["label"] for p in clean])  # PROGRAMS are the dashboard units
+
+    per_program: list[dict[str, Any]] = []
+    findings_out: list[dict[str, Any]] = []
+    proof_out: dict[str, Any] = {}
+    cvss_out: dict[str, Any] = {}
+    plans_out: dict[str, Any] = {}
+    submission_paths: list[str] = []
+    surface_urls: list[str] = []
+    surface_notes: list[str] = []
+    surface_tech: list[str] = []
+    surface_sources: dict[str, int] = {}
+    errors: list[str] = []
+    ref_counter = 0
+    ok_count = 0
+
+    def _hunt_program(index: int, spec: dict[str, Any]) -> tuple[str, dict[str, Any] | None, Exception | None]:
+        label = spec["label"]
+
+        def _p_emit(msg: str) -> None:
+            _emit(f"[{index}/{len(clean)} {label}] {msg}")
+
+        # Cooperative cancellation: a program not yet started when Stop is pressed is skipped;
+        # one in flight winds down via run_campaign's own between-URL checks.
+        if progress.is_stopped(progress_run_id):
+            progress.mark_target(progress_run_id, label, "skipped")
+            _p_emit("skipped — portfolio stopped")
+            return (label, {"ok": False, "error": "portfolio stopped", "stopped": True}, None)
+        progress.mark_target(progress_run_id, label, "running")
+        try:
+            result = run_campaign_over_targets(
+                spec["targets"], scope=spec["scope"], authorized=authorized, coder_cfg=coder_cfg,
+                default_reports_dir=portfolio_root, seed_dir=seed_dir, runtime_dir=runtime_dir, version=version,
+                active=active, time_based=time_based, auth=auth, live=live, program=label, max_pages=max_pages,
+                platform=platform, deep=deep, disclose_automation=spec["disclose_automation"],
+                excluded_hosts=spec["excluded_hosts"], on_progress=_p_emit,
+                progress_run_id=progress_run_id, progress_unit=label,
+            )
+            progress.mark_target(progress_run_id, label, "done" if result.get("ok") else "error",
+                                 error="" if result.get("ok") else str(result.get("error") or ""))
+            return (label, result, None)
+        except Exception as exc:  # noqa: BLE001 - one bad program must never abort the portfolio
+            progress.mark_target(progress_run_id, label, "error", error=f"{type(exc).__name__}: {exc}")
+            return (label, None, exc)
+
+    # Bounded concurrency across programs (per-host governors keep individual hosts polite).
+    # Results are aggregated in original program order for deterministic C1/C2… ref numbering.
+    _emit(f"portfolio hunt: {len(clean)} program(s), up to {min(max_concurrent_programs, len(clean))} at a time…")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_concurrent_programs, len(clean))) as executor:
+        futures = [executor.submit(_hunt_program, i, p) for i, p in enumerate(clean, 1)]
+        outcomes = [f.result() for f in futures]
+
+    for label, result, exc in outcomes:
+        if exc is not None:
+            errors.append(f"{label}: {type(exc).__name__}: {exc}")
+            per_program.append({"program": label, "ok": False, "error": str(exc)})
+            continue
+        per_program.append({
+            "program": label, "ok": bool(result.get("ok")),
+            "finding_count": result.get("finding_count", 0), "confirmed_count": result.get("confirmed_count", 0),
+            "error": result.get("error", ""),
+        })
+        if not result.get("ok"):
+            if not result.get("stopped"):
+                errors.append(f"{label}: {result.get('error', 'campaign failed')}")
+            continue
+        ok_count += 1
+        proof = result.get("proof_of_impact") or {}
+        cvss = result.get("cvss") or {}
+        plans = result.get("attack_plans") or {}
+        for finding in result.get("findings") or []:
+            old_ref = str(finding.get("ref") or "")
+            ref_counter += 1
+            new_ref = f"C{ref_counter}"
+            finding = {**finding, "ref": new_ref}
+            findings_out.append(finding)
+            if old_ref in proof:
+                proof_out[new_ref] = proof[old_ref]
+            if old_ref in cvss:
+                cvss_out[new_ref] = cvss[old_ref]
+            if old_ref in plans:
+                plans_out[new_ref] = plans[old_ref]
+        submission_paths.extend(result.get("submission_paths") or [])
+        surf = result.get("surface") or {}
+        surface_urls.extend(surf.get("urls") or [])
+        surface_notes.extend(surf.get("notes") or [])
+        for tech in surf.get("tech") or []:
+            if tech not in surface_tech:
+                surface_tech.append(tech)
+        for source, count in (surf.get("sources") or {}).items():
+            surface_sources[source] = surface_sources.get(source, 0) + (count or 0)
+
+    if not ok_count:
+        return {"ok": False, "error": "Every program in the portfolio failed: " + "; ".join(errors[:5])}
+
+    confirmed_count = len([f for f in findings_out if (proof_out.get(f["ref"], {}) or {}).get("status") == "confirmed"])
+    port_ctx = {
+        "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"), "version": version,
+        "programs_total": len(clean), "programs_hunted": ok_count, "per_program": per_program, "errors": errors,
+        "finding_count": len(findings_out), "confirmed_count": confirmed_count, "submission_count": len(submission_paths),
+    }
+    port_md_path = portfolio_root / "PORTFOLIO.md"
+    port_json_path = portfolio_root / "portfolio.json"
+    fsutil.write_text_safe(port_md_path, _render_portfolio_markdown(port_ctx))
+    fsutil.write_text_safe(port_json_path, json.dumps(port_ctx, indent=2, default=str))
+
+    return {
+        "ok": True, "campaign_path": str(port_md_path), "json_path": str(port_json_path),
+        "output_dir": str(portfolio_root), "programs_total": len(clean), "programs_hunted": ok_count,
+        "per_program": per_program, "errors": errors,
+        "urls_scanned": ok_count, "urls_discovered": len(surface_urls),
+        "finding_count": len(findings_out), "confirmed_count": confirmed_count, "submission_paths": submission_paths,
+        "findings": findings_out, "proof_of_impact": proof_out, "cvss": cvss_out, "attack_plans": plans_out,
+        "surface": {"urls": surface_urls, "sources": surface_sources, "notes": surface_notes, "tech": surface_tech},
+        "severity_counts": _severity_counts(findings_out), "risk": _campaign_risk([{"finding": f} for f in findings_out]),
+    }
+
+
+def _render_portfolio_markdown(ctx: dict[str, Any]) -> str:
+    """Top-level index for a portfolio hunt — rolls up each program (which wrote its own
+    SPAN.md / CAMPAIGN.md under the same folder)."""
+    out: list[str] = []
+    out.append("# Portfolio Hunt\n")
+    out.append("| | |")
+    out.append("|---|---|")
+    out.append(f"| **Programs hunted** | {ctx['programs_hunted']} of {ctx['programs_total']} |")
+    out.append(f"| **Findings** | {ctx['finding_count']} consolidated · **{ctx['confirmed_count']} actively confirmed** |")
+    out.append(f"| **Submission packages** | {ctx['submission_count']} |")
+    out.append(f"| **Generated** | {ctx['generated_at']} · GreyIQ v{ctx['version']} |")
+    out.append("")
+    if ctx.get("errors"):
+        out.append("## Notes\n")
+        for note in ctx["errors"]:
+            out.append(f"- {note}")
+        out.append("")
+    out.append("## Programs\n")
+    for t in ctx["per_program"]:
+        if t.get("ok"):
+            out.append(f"- `{t['program']}` → {t.get('finding_count', 0)} finding(s), {t.get('confirmed_count', 0)} confirmed")
+        else:
+            out.append(f"- `{t['program']}` → FAILED — {t.get('error', 'campaign failed')}")
+    out.append("")
+    out.append("---")
+    out.append("_GreyIQ Portfolio Hunt — many programs, one run. Each program's full CAMPAIGN.md/SPAN.md is under this folder._")
+    return "\n".join(out)
 
 
 def _render_span_markdown(ctx: dict[str, Any]) -> str:
