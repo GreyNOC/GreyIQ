@@ -1605,7 +1605,10 @@ class GreyIQRuntime:
             funnel = bounty_ledger.funnel(RUNTIME_DIR)
         except Exception as exc:  # noqa: BLE001 - a history read must never 500 the hub
             return {"ok": False, "error": f"Could not read the finding ledger: {exc}"}
-        return {"ok": True, "findings": records, "funnel": funnel}
+        # `truncated` when the (capped) list is shorter than the true portfolio total, so the
+        # UI can say "showing the most recent N" and point at the CSV export for everything.
+        total = int((funnel.get("portfolio") or {}).get("total") or len(records))
+        return {"ok": True, "findings": records, "funnel": funnel, "truncated": len(records) < total, "total": total}
 
     def build_finding_report(self, request: "FindingReportRequest") -> dict[str, Any]:
         """Build a well-authored report for ONE finding on demand from its own fields (a
@@ -1630,8 +1633,20 @@ class GreyIQRuntime:
         # proof-of-impact block — its observed/control/evidence make the report confirmable.
         if request.proof is not None:
             p = request.proof
+            # This is the ONE place arbitrary (client-supplied) proof enters the report
+            # pipeline. Never let it assert 'confirmed' on prose alone: only honor a
+            # confirmed status when it carries BOTH a positive observation AND a negative
+            # control (the same differential the engine's active prover always supplies) —
+            # otherwise cap at 'candidate'. This blocks a forged status (e.g. observed_result
+            # containing an "HTTP 200" string with no control) from flipping the report to
+            # confirmed. The real HackerOne submit gate is separate (server-recomputed from
+            # the cached engine run), but the report must not *claim* confirmed without proof.
+            status = str(p.status or "").strip().lower()
+            has_differential = bool(str(p.observed_result or "").strip() and str(p.control_result or "").strip())
+            if status == "confirmed" and not has_differential:
+                status = "candidate"
             poi = dict(plan.get("proof_of_impact") or {})
-            for k, v in (("status", p.status), ("method", p.method), ("observed_result", p.observed_result),
+            for k, v in (("status", status), ("method", p.method), ("observed_result", p.observed_result),
                          ("control_result", p.control_result), ("evidence", p.evidence),
                          ("affected_asset", p.affected_asset), ("limitations", p.limitations)):
                 if str(v or "").strip():
@@ -3474,6 +3489,10 @@ def response_headers(content_type: str, content_length: int = 0) -> list[tuple[b
     ]
     if content_type.startswith("text/html"):
         headers.append((b"content-security-policy", _CSP.encode("utf-8")))
+    # API/JSON responses carry finding/proof/credential-status data — never let a proxy or
+    # the webview disk-cache them.
+    if content_type.startswith("application/json"):
+        headers.append((b"cache-control", b"no-store"))
     headers.extend(_SECURITY_HEADERS)
     headers.extend(_cors_headers(_CURRENT_SCOPE.get()))
     return headers

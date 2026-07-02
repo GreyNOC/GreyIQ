@@ -2,6 +2,32 @@
 
 Notable changes to GreyIQ.
 
+## v0.63.0
+
+### Finding status now updates everywhere at once
+A finding's status used to live in each view separately, so confirming or submitting it in one
+place left the others stale. There's now one shared status model, keyed by a stable finding
+identity (the same class·rule·location the ledger dedups on) and persisted across restarts.
+Create-proof-of-impact (promoting a candidate to confirmed only when the active pass confirms
+*that finding's own class*) and Submit now propagate immediately to the campaign dashboard, the
+Findings board + detail drawer, the Submissions queue, and the "All findings" history — no more
+stale "candidate" in one view while another shows "confirmed"/"submitted".
+
+### GreyNOC globe brand mark
+The GreyNOC geodesic globe is now the app's mark: a procedurally-generated geodesic-sphere SVG
+(glowing edges, glassy blue core, subtle rotate/pulse, reduced-motion aware) in the cockpit +
+studio headers, a boot splash while the engine starts, the campaign-dashboard idle hero, and the
+favicon.
+
+### QAQC hardening (adversarially reviewed)
+- Report builder never claims **confirmed** from client-supplied proof without a real
+  observed-vs-control differential (caps at candidate otherwise).
+- All proof fields (method/actor/affected-asset/limitations, not just evidence/observed) are
+  redacted before landing in a report — closes a secret/PII leak path.
+- `GET /api/bounty/findings` history is bounded (most-recent cap + a `truncated` note; full set
+  still available via CSV export).
+- API/JSON responses now send `Cache-Control: no-store`.
+
 ## v0.62.0
 
 ### Portfolio Hunt — many programs, one run

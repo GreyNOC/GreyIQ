@@ -108,6 +108,25 @@ class BuildFindingReportTests(unittest.TestCase):
         self.assertIn("Steps to reproduce", body)
         self.assertIn("curl", body.lower())
 
+    def test_client_confirmed_without_control_caps_at_candidate(self) -> None:
+        # A client-supplied proof that claims 'confirmed' but carries no negative control
+        # (e.g. just an "HTTP 200" observed_result) must NOT produce a confirmed report.
+        out = _Stub().build_finding_report(api.FindingReportRequest(
+            title="X", severity="high", class_name="cors", class_id="cors", location="https://example.com",
+            target="https://example.com",
+            proof=api.ProofInput(status="confirmed", observed_result="HTTP 200 OK returned", control_result="")))
+        self.assertTrue(out["ok"], out)
+        self.assertNotEqual(out["package"]["proof_status"], "confirmed")
+
+    def test_report_redacts_secret_in_proof_fields(self) -> None:
+        # Proof fields (method/actor/etc.) must be redacted before landing in the report body.
+        out = _Stub().build_finding_report(api.FindingReportRequest(
+            title="X", severity="high", class_name="cors", class_id="cors", location="https://example.com",
+            target="https://example.com",
+            proof=api.ProofInput(status="candidate", method="probed with AKIAIOSFODNN7EXAMPLE", observed_result="reflected")))
+        self.assertTrue(out["ok"], out)
+        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", out["package"]["vulnerability_information"])
+
     def test_folds_in_gathered_proof(self) -> None:
         out = _Stub().build_finding_report(api.FindingReportRequest(
             title="Reflected XSS", severity="high", class_name="xss", location="https://example.com/s?q=1",

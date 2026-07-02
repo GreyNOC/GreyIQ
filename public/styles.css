@@ -2854,6 +2854,25 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-logo svg { width: 26px; height: 26px; fill: none; stroke: var(--accent); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .ck-brand h1 { margin: 0; font-size: 1.15rem; letter-spacing: -0.01em; }
 .ck-eyebrow { margin: 0; font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.13em; color: var(--muted); }
+
+/* --- GreyNOC globe brand mark --- */
+.ck-logo-globe { display: inline-flex; align-items: center; justify-content: center; background: none; border: 0; padding: 0; }
+.ck-logo-globe img { width: 34px; height: 34px; display: block; filter: drop-shadow(0 0 6px rgba(46, 168, 255, 0.6)); }
+.brand-row { display: flex; align-items: center; gap: 0.6rem; }
+.brand-row .icon-button { margin-left: auto; }
+.brand-globe { width: 30px; height: 30px; flex: none; filter: drop-shadow(0 0 6px rgba(46, 168, 255, 0.55)); }
+
+/* Boot splash — the globe while the local engine spins up. */
+.ck-splash { position: fixed; inset: 0; z-index: 120; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.7rem;
+  background: radial-gradient(circle at 50% 42%, #0a1a2e 0%, #03070e 70%); transition: opacity 0.5s ease; }
+.ck-splash.is-hidden { opacity: 0; pointer-events: none; }
+.ck-splash-globe { width: min(46vw, 208px); height: auto; filter: drop-shadow(0 0 24px rgba(46, 168, 255, 0.55)); }
+.ck-splash-name { font-size: 1.6rem; font-weight: 800; letter-spacing: 0.16em; color: #eafbff; }
+.ck-splash-sub { font-size: 0.82rem; letter-spacing: 0.05em; color: #7fb6e6; }
+
+/* Campaign-dashboard idle hero. */
+.ck-cd-hero { display: flex; flex-direction: column; align-items: center; gap: 0.6rem; padding: 1.6rem 0 0.4rem; text-align: center; }
+.ck-cd-hero img { width: min(38vw, 150px); height: auto; opacity: 0.92; filter: drop-shadow(0 0 16px rgba(46, 168, 255, 0.4)); }
 .ck-topbar-actions { display: flex; align-items: center; gap: 0.5rem; }
 .ck-service {
   font-size: 0.74rem; color: var(--muted); padding: 0.2rem 0.55rem;

@@ -309,19 +309,24 @@ def _defang_csv_cell(value: Any) -> Any:
     return "'" + text if text.startswith(_CSV_FORMULA_TRIGGERS) else value
 
 
-def list_all(runtime_dir: str | Path) -> list[dict[str, Any]]:
-    """Every finding record across the WHOLE portfolio, most-recently-updated first — the
-    durable finding/report history the UI surfaces (survives an app restart, unlike the
-    in-memory run cache). Read-only; each record carries its own ``program`` bucket id and
-    ``dedup_key`` so the caller can act on it (build a report, export, sync) without a
-    re-derivation. Raw records (not CSV-defanged) — the UI renders text, not a spreadsheet."""
+_MAX_LIST_ALL = 2000  # cap the history response so a huge ledger can't balloon one JSON payload
+
+
+def list_all(runtime_dir: str | Path, limit: int = _MAX_LIST_ALL) -> list[dict[str, Any]]:
+    """The most-recently-updated finding records across the WHOLE portfolio (capped at
+    ``limit``) — the durable finding/report history the UI surfaces (survives an app restart,
+    unlike the in-memory run cache). Read-only; each record carries its own ``program`` bucket
+    id and ``dedup_key`` so the caller can act on it (build a report, export, sync) without a
+    re-derivation. Raw records (not CSV-defanged) — the UI renders text, not a spreadsheet. The
+    cap bounds the response size for a very large history; the full ledger is always available
+    via the CSV export (streamed column rows) for spreadsheet/audit use."""
     data = _load(runtime_dir).get("programs", {})
     out: list[dict[str, Any]] = []
     for pid, bucket in data.items():
         for key, rec in (bucket.get("findings") or {}).items():
             out.append({**rec, "program": pid, "dedup_key": key})
     out.sort(key=lambda r: str(r.get("updated_at") or r.get("last_seen") or ""), reverse=True)
-    return out
+    return out[: max(1, limit)]
 
 
 def to_csv_rows(runtime_dir: str | Path, program: str | None = None, target: str = "") -> list[dict[str, Any]]:

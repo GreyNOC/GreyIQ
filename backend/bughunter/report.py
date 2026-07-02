@@ -323,12 +323,13 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
     else:
         detail["evidence"] = str(proof or "").strip()
 
-    # Re-redact any evidence/observed_result the brain echoed — a captured response
-    # can contain the very secret/token the finding is about; never double-leak it.
-    if detail["evidence"]:
-        detail["evidence"] = redact_text(str(detail["evidence"]))[0]
-    if detail["observed_result"]:
-        detail["observed_result"] = redact_text(str(detail["observed_result"]))[0]
+    # Re-redact EVERY proof string that lands in the rendered report — a captured
+    # response (or an operator-supplied proof field) can carry the very secret/token/PII
+    # the finding is about; never double-leak it. All of these are emitted by
+    # _append_proof_of_impact, so redact them all, not just evidence/observed_result.
+    for _k in ("evidence", "observed_result", "method", "affected_asset", "actor", "control_result", "limitations"):
+        if detail[_k]:
+            detail[_k] = redact_text(str(detail[_k]))[0]
 
     # Status: only a REAL captured artifact + concrete text earns 'confirmed';
     # concrete-looking prose alone caps at 'candidate'. (The descriptive

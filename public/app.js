@@ -4497,6 +4497,8 @@ function ckNormalizeFindings(res) {
       title: String(f.title || "Finding"),
       severity: String(f.severity || "info").toLowerCase(),
       className: String(f.class_name || f.class_id || "—"),
+      class_id: String(f.class_id || f.class_name || ""),   // stable identity for the cross-app status overlay
+      rule_id: String(f.rule_id || ""),
       cwe: String(f.cwe || ""),
       location: String(f.location || f.file_path || f.source_url || ""),
       proof: String(proof).toLowerCase(),
@@ -4516,6 +4518,82 @@ function ckProofBadge(status) {
   const s = ["confirmed", "candidate", "missing"].includes(status) ? status : "missing";
   const label = s === "confirmed" ? "Confirmed" : s === "candidate" ? "Candidate" : "Missing";
   return cel("span", `ck-proof ${s}`, label);
+}
+
+// --- Cross-app finding-status overlay ---------------------------------------------
+// A finding's status (proof + pipeline stage) is shown in many places — the campaign
+// dashboard, the Findings board + detail drawer, the Submissions queue + history, and the
+// persistent ledger. When an action changes it (Create proof of impact → confirmed; Submit
+// → submitted), that change must show EVERYWHERE the same finding appears. This overlay is
+// the one shared source of truth, keyed by a stable finding identity (the same
+// class|rule|normalized-location the ledger dedups on), resolved by every view — and it's
+// persisted so a confirm/submit survives a reload.
+const ckStatusOverlay = (() => {
+  try { return JSON.parse(localStorage.getItem("greyiq-ck-status") || "{}") || {}; } catch (_) { return {}; }
+})();
+
+function ckFindingKey(f) {
+  if (!f) return "";
+  const cls = String(f.class_id || f.className || f.cls || f.class_name || "").toLowerCase().trim();
+  const rule = String(f.rule_id || f.rule || "").toLowerCase().trim();
+  const loc = String(f.location || f.source_url || f.sourceUrl || f.target || "").replace(/\d+/g, "N").trim();
+  const key = `${cls}|${rule}|${loc}`;
+  return key === "||" ? "" : key;
+}
+
+function ckSaveStatusOverlay() {
+  try { localStorage.setItem("greyiq-ck-status", JSON.stringify(ckStatusOverlay)); } catch (_) { /* private mode / quota */ }
+}
+
+// Effective proof/stage = the overlay (if any) over the finding's own value.
+function ckEffectiveProof(f, fallback) {
+  const o = ckStatusOverlay[ckFindingKey(f)];
+  return String((o && o.proof) || fallback || f.proof || f.proof_status || "missing").toLowerCase();
+}
+function ckEffectiveStage(f) {
+  const o = ckStatusOverlay[ckFindingKey(f)];
+  return String((o && o.stage) || f.stage || "");
+}
+
+// Record a status change and reflect it across every finding view immediately.
+function ckMarkStatus(f, patch) {
+  const key = ckFindingKey(f);
+  if (!key) return;
+  ckStatusOverlay[key] = { ...(ckStatusOverlay[key] || {}), ...patch };
+  ckSaveStatusOverlay();
+  if (patch.proof && f && typeof f === "object") f.proof = patch.proof;  // keep the in-hand object consistent too
+  ckSyncFindingViews();
+}
+
+// True when an active-prover result's class matches this finding (so a re-probe that
+// confirms a DIFFERENT class at the same URL never falsely flips THIS finding to confirmed).
+function ckProofMatchesFinding(activeFindings, f) {
+  const cls = String(f.class_id || f.cls || f.className || "").toLowerCase();
+  if (!cls) return false;
+  return (activeFindings || []).some((r) => {
+    if (r.status !== "confirmed") return false;
+    const hint = String(r.class_hint || "").toLowerCase();
+    return hint && (hint === cls || cls.includes(hint) || hint.includes(cls));
+  });
+}
+
+// Re-render whichever finding views are live so a status change shows at once.
+function ckSyncFindingViews() {
+  if (ckState.view === "findings") {
+    ckRenderFindings();
+    if (ckState.selectedRef) {
+      const sel = ckState.findings.find((x) => x.ref === ckState.selectedRef);
+      if (sel && !ck.detail?.hidden) ckRenderDetail(sel);
+    }
+  } else if (ckState.view === "submissions") {
+    ckRenderSubmissions();
+  } else if (ckState.view === "campaign") {
+    ckRenderCampaign();
+  }
+  ckBadgeCount("submissions", ckState.findings.filter((f) => {
+    const p = ckEffectiveProof(f);
+    return p === "confirmed" || p === "candidate";
+  }).length);
 }
 
 // Worst severity present, in the SAME risk-word scheme campaign._campaign_risk uses
@@ -4593,13 +4671,13 @@ function ckRenderFindings() {
 
   // Filter + sort rows.
   let rows = ckState.findings.slice();
-  if (ckState.filter === "confirmed") rows = rows.filter((f) => f.proof === "confirmed");
+  if (ckState.filter === "confirmed") rows = rows.filter((f) => ckEffectiveProof(f) === "confirmed");
   else if (ckState.filter !== "all") rows = rows.filter((f) => f.severity === ckState.filter);
   const { key, dir } = ckState.sort;
   rows.sort((a, b) => {
     let av, bv;
     if (key === "severity") { av = CK_SEV_RANK[a.severity] || 0; bv = CK_SEV_RANK[b.severity] || 0; }
-    else if (key === "proof") { const r = { confirmed: 3, candidate: 2, missing: 1 }; av = r[a.proof] || 0; bv = r[b.proof] || 0; }
+    else if (key === "proof") { const r = { confirmed: 3, candidate: 2, missing: 1 }; av = r[ckEffectiveProof(a)] || 0; bv = r[ckEffectiveProof(b)] || 0; }
     else if (key === "cvss") { av = a.cvssScore || 0; bv = b.cvssScore || 0; }
     else { av = a.rank; bv = b.rank; }
     return (av < bv ? -1 : av > bv ? 1 : 0) * dir;
@@ -4640,7 +4718,9 @@ function ckRenderFindings() {
     const clsTd = td(cls);
     if (f.cwe) clsTd.append(cel("span", "ck-tag", f.cwe));
     tr.append(clsTd);
-    tr.append(td(ckProofBadge(f.proof)));
+    const proofTd = td(ckProofBadge(ckEffectiveProof(f)));
+    if (ckEffectiveStage(f) === "submitted") proofTd.append(document.createTextNode(" "), cel("span", "ck-tag", "submitted"));
+    tr.append(proofTd);
     tr.append(td(cel("span", "ck-ftitle", f.title)));
     tr.append(td(cel("span", "ck-floc", f.location || "—")));
     tr.append(td(f.cvssScore != null ? cel("span", "ck-cvss", f.cvssScore.toFixed(1)) : cel("span", "ck-cvss", "—")));
@@ -4694,7 +4774,8 @@ function ckRenderDetail(f) {
   // Badges row.
   const badges = cel("div", "ck-summary");
   badges.append(cel("span", `ck-sev sev-${f.severity}`, f.severity.toUpperCase()));
-  badges.append(ckProofBadge(f.proof));
+  badges.append(ckProofBadge(ckEffectiveProof(f)));
+  if (ckEffectiveStage(f) === "submitted" || ckState.triage[f.ref] === "submitted") badges.append(cel("span", "ck-tag", "submitted"));
   if (f.cwe) badges.append(cel("span", "ck-tag", f.cwe));
   host.append(badges);
 
@@ -4942,7 +5023,7 @@ async function ckFetchCreds() {
 }
 
 function ckCanSubmit(f) {
-  return f.proof === "confirmed" && ckState.h1 && ckState.h1.has_token && ckState.h1.team_handle;
+  return ckEffectiveProof(f) === "confirmed" && ckState.h1 && ckState.h1.has_token && ckState.h1.team_handle;
 }
 
 async function ckSubmitFinding(f, btn, statusEl) {
@@ -4960,6 +5041,8 @@ async function ckSubmitFinding(f, btn, statusEl) {
       ckState.triage[f.ref] = "submitted";
       btn.replaceWith(ckReportLink(res.url, res.report_id));
       if (statusEl) statusEl.textContent = "";
+      // Reflect the submitted stage across every view (dashboard, board, history) + persist it.
+      ckMarkStatus(f, { stage: "submitted" });
     } else {
       btn.disabled = false; btn.textContent = "Submit to HackerOne";
       if (statusEl) { statusEl.textContent = res.error || "Submit refused."; statusEl.classList.add("is-error"); }
@@ -6193,13 +6276,13 @@ function ckRenderSubmissions() {
   host.append(ckReportsExportBar());
 
   // --- This run: findings from the most recent hunt/campaign (in-memory). ---
-  const ready = ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate");
+  const ready = ckState.findings.filter((f) => ["confirmed", "candidate"].includes(ckEffectiveProof(f)));
   host.append(cel("h2", "ck-section-title", `This run — ${ready.length} reportable`));
   if (!ready.length) {
     host.append(cel("p", "ck-hint", "Confirmed and candidate findings from the current run land here. Create proof of impact to confirm a candidate — only a Confirmed finding can be filed to HackerOne. Past runs are in “All findings” below."));
   } else {
     // Confirmed-first, then candidate.
-    ready.sort((a, b) => (a.proof === "confirmed" ? 0 : 1) - (b.proof === "confirmed" ? 0 : 1));
+    ready.sort((a, b) => (ckEffectiveProof(a) === "confirmed" ? 0 : 1) - (ckEffectiveProof(b) === "confirmed" ? 0 : 1));
     const ul = cel("ul", "ck-list");
     for (const f of ready) ul.append(ckSubmissionRow(f));
     host.append(ul);
@@ -6218,8 +6301,9 @@ function ckSubmissionRow(f) {
   const left = cel("div");
   left.style.flex = "1";
   left.append(cel("span", "ck-ftitle", f.title), document.createTextNode(" "));
-  left.append(ckProofBadge(f.proof));
-  if (ckState.triage[f.ref] === "submitted") left.append(document.createTextNode(" "), cel("span", "ck-tag", "submitted"));
+  left.append(ckProofBadge(ckEffectiveProof(f)));
+  const submitted = ckEffectiveStage(f) === "submitted" || ckState.triage[f.ref] === "submitted";
+  if (submitted) left.append(document.createTextNode(" "), cel("span", "ck-tag", "submitted"));
   li.append(left);
 
   const acts = cel("div", "ck-actions");
@@ -6254,14 +6338,14 @@ function ckSubmissionRow(f) {
   acts.append(dlBtn);
 
   // Candidates can be actively proven right here (a separate track, scope-gated).
-  if (f.proof === "candidate") {
+  if (ckEffectiveProof(f) === "candidate") {
     const proveBtn = cel("button", "ck-btn", "Create proof of impact");
     proveBtn.type = "button";
     proveBtn.addEventListener("click", () => ckCreateProofOfImpact(f, proveBtn, statusEl, resultEl));
     acts.append(proveBtn);
   }
 
-  if (ckState.triage[f.ref] === "submitted") {
+  if (submitted) {
     acts.append(ckReportLink("", ""));
   } else {
     const submitBtn = cel("button", "ck-btn primary", "Submit to HackerOne");
@@ -6269,7 +6353,7 @@ function ckSubmissionRow(f) {
     const can = ckCanSubmit(f);
     submitBtn.disabled = !can;
     submitBtn.title = can ? "File this confirmed finding to your HackerOne program"
-      : (f.proof !== "confirmed" ? "Create proof of impact first — only a Confirmed finding can be filed."
+      : (ckEffectiveProof(f) !== "confirmed" ? "Create proof of impact first — only a Confirmed finding can be filed."
         : "Add your HackerOne team handle + API token below.");
     submitBtn.addEventListener("click", () => ckSubmitFinding(f, submitBtn, statusEl));
     acts.append(submitBtn);
@@ -6490,7 +6574,8 @@ async function ckLoadHistory(body) {
   const fn = (res.funnel && res.funnel.portfolio) || res.funnel || {};
   const st = fn.stages || {};
   body.append(cel("p", "ck-hint",
-    `${fn.total || findings.length} findings · ${st.confirmed || 0} confirmed · ${st.submitted || 0} submitted · ${st.paid || 0} paid · $${fn.bounty_total || 0} to date`));
+    `${fn.total || findings.length} findings · ${st.confirmed || 0} confirmed · ${st.submitted || 0} submitted · ${st.paid || 0} paid · $${fn.bounty_total || 0} to date`
+    + (res.truncated ? ` · showing the ${findings.length} most recent (export CSV for all)` : "")));
 
   // Group by program bucket; each program gets a header with a one-click engagement report.
   const byProg = {};
@@ -6521,8 +6606,9 @@ function ckHistoryRow(rec) {
   left.append(cel("span", "ck-ftitle", rec.title || "Finding"));
   const meta = cel("div", "ck-cd-finding-meta");
   if (rec.class_id) meta.append(cel("span", null, rec.class_id));
-  if (rec.proof_status) meta.append(ckProofBadge(rec.proof_status));
-  meta.append(cel("span", "ck-tag", rec.stage || "discovered"));
+  const rproof = ckEffectiveProof(rec, rec.proof_status);
+  if (rproof) meta.append(ckProofBadge(rproof));
+  meta.append(cel("span", "ck-tag", ckEffectiveStage(rec) || rec.stage || "discovered"));
   if (Number(rec.bounty)) meta.append(cel("span", null, `$${rec.bounty}`));
   if (rec.h1_state) meta.append(cel("span", "ck-tag", rec.h1_state));
   if (rec.source_url) meta.append(cel("span", "ck-cd-finding-target", ckShortTarget(rec.source_url)));
@@ -6596,6 +6682,10 @@ async function ckCreateProofOfImpact(f, btn, statusEl, resultEl) {
     : `Nothing confirmable at ${res.host} right now (${res.requests_used} request(s)).`;
   resultEl.hidden = false;
   ckRenderProofResult(resultEl, res);
+  // If the active pass confirmed THIS finding's class, promote it to confirmed everywhere
+  // (dashboard, board, history) and persist. Only on a class match — never on an unrelated
+  // confirmation at the same URL.
+  if (conf && ckProofMatchesFinding(res.findings, f)) ckMarkStatus(f, { proof: "confirmed" });
 }
 
 // Shared renderer for a prove/re-probe result: summary + optional screenshot + per-check proof.
@@ -7626,7 +7716,9 @@ function ckCdFindingRow(f, selectedKey) {
   main.append(cel("div", "ck-cd-finding-title", f.title || "Finding"));
   const meta = cel("div", "ck-cd-finding-meta");
   if (f.cls) meta.append(cel("span", null, f.cls));
-  if (f.proof) meta.append(cel("span", `ck-cd-proof is-${f.proof}`, f.proof));
+  const proof = ckEffectiveProof(f);
+  if (proof) meta.append(cel("span", `ck-cd-proof is-${proof}`, proof));
+  if (ckEffectiveStage(f) === "submitted") meta.append(cel("span", "ck-tag", "submitted"));
   meta.append(cel("span", "ck-cd-finding-target", ckShortTarget(f.target)));
   main.append(meta);
   row.append(main);
@@ -7722,8 +7814,13 @@ function ckRenderCampaign() {
     ckCampaign.dom = null;
     host.replaceChildren();
     host.append(cel("h2", "ck-section-title", "Campaign dashboard"));
-    host.append(cel("p", "ck-hint",
-      "No campaign is running. Start a Full campaign from the launch rail — pick a saved program and tick “span scope” to hunt its whole scope, or enter a single target — and every target's status and each finding will appear here live."));
+    const hero = cel("div", "ck-cd-hero");
+    const globe = document.createElement("img");
+    globe.src = "./globe.svg"; globe.alt = ""; globe.width = 150; globe.height = 150;
+    hero.append(globe);
+    hero.append(cel("p", "ck-hint",
+      "No campaign is running. Start a Full campaign or a Portfolio hunt from the launch rail — pick a saved program (tick “span scope” for its whole scope) or select several programs to hunt at once — and every target's status and each finding appears here live."));
+    host.append(hero);
     return;
   }
   if (!ckCampaign.dom || ckCampaign.dom.runId !== ckCampaign.runId) {
@@ -7802,7 +7899,7 @@ function ckUpdateCampaign(dom) {
   dom.sortSel.value = ckCampaign.sortBy;
   dom.filterSel.value = ckCampaign.filterSev;
   const eff = ckSortFilterFindings(all, ckCampaign.sortBy, ckCampaign.filterSev);
-  const fSig = ckCampaign.sortBy + "|" + ckCampaign.filterSev + "|" + ckCampaign.selectedKey + "|" + running + "|" + eff.map((f) => f._i + ":" + f.proof).join(",");
+  const fSig = ckCampaign.sortBy + "|" + ckCampaign.filterSev + "|" + ckCampaign.selectedKey + "|" + running + "|" + eff.map((f) => f._i + ":" + ckEffectiveProof(f) + ":" + ckEffectiveStage(f)).join(",");
   if (fSig !== dom.findingsSig) {
     dom.findingsSig = fSig;
     ckPreserveScroll(dom.findingsList, () => {
@@ -7891,8 +7988,10 @@ function ckRenderFindingDrawer(dom) {
 
   const badges = cel("div", "ck-summary");
   const sev = f.severity || "info";
+  const dproof = ckEffectiveProof(f);
   badges.append(cel("span", `ck-sev sev-${sev}`, sev.toUpperCase()));
-  if (f.proof) badges.append(cel("span", `ck-cd-proof is-${f.proof}`, f.proof));
+  if (dproof) badges.append(cel("span", `ck-cd-proof is-${dproof}`, dproof));
+  if (ckEffectiveStage(f) === "submitted") badges.append(cel("span", "ck-tag", "submitted"));
   if (f.cwe) badges.append(cel("span", "ck-tag", f.cwe));
   drawer.append(badges);
 
@@ -7902,7 +8001,7 @@ function ckRenderFindingDrawer(dom) {
   add("Target", f.target);
   add("Location", f.location);
   add("Rule", f.rule);
-  add("Proof", f.proof);
+  add("Proof", dproof);
   drawer.append(meta);
 
   drawer.append(cel("p", "ck-hint",
@@ -7990,8 +8089,14 @@ async function ckProveFinding(f) {
     setState({ state: "error", error: err.message || "Could not reach the engine." });
     return;
   }
-  if (res && res.ok) setState({ state: "done", result: res });
-  else setState({ state: "error", error: (res && res.error) || "Proof of impact could not be gathered." });
+  if (res && res.ok) {
+    setState({ state: "done", result: res });
+    // Promote this finding to confirmed across the app when the active pass confirmed its
+    // OWN class (matched), so the dashboard/board/history/submissions all agree + it persists.
+    if ((res.confirmed || 0) && ckProofMatchesFinding(res.findings, f)) ckMarkStatus(f, { proof: "confirmed" });
+  } else {
+    setState({ state: "error", error: (res && res.error) || "Proof of impact could not be gathered." });
+  }
 }
 
 async function ckDrawerReport(f) {
@@ -8140,3 +8245,19 @@ async function boot() {
 }
 
 boot();
+
+// Boot splash: hold the GreyNOC globe until the local engine is reachable (min ~0.7s so it
+// registers as a brand moment; hard cap ~7s so a slow/absent engine can never block the app).
+(function ckBootSplash() {
+  const el = document.getElementById("ckSplash");
+  if (!el) return;
+  const started = Date.now();
+  let done = false;
+  const hide = () => { if (done) return; done = true; el.classList.add("is-hidden"); setTimeout(() => el.remove(), 650); };
+  const tick = () => {
+    const elapsed = Date.now() - started;
+    if ((service && service.available && elapsed > 700) || elapsed > 7000) { hide(); return; }
+    setTimeout(tick, 250);
+  };
+  setTimeout(tick, 700);
+})();

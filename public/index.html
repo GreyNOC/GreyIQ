@@ -6,12 +6,19 @@
     <meta name="color-scheme" content="dark">
     <meta name="greyiq-session" content="__GREYIQ_SESSION_TOKEN__">
     <title>GreyIQ</title>
+    <link rel="icon" type="image/svg+xml" href="./globe.svg">
     <link rel="stylesheet" href="./styles.css">
   </head>
   <body data-theme="dark" data-app-mode="hunt">
+    <div class="ck-splash" id="ckSplash">
+      <img class="ck-splash-globe" src="./globe.svg" alt="">
+      <div class="ck-splash-name">GreyIQ</div>
+      <div class="ck-splash-sub">GreyNOC · starting the engine…</div>
+    </div>
     <main class="app-shell">
       <aside class="bot-panel" aria-label="Bot roster and persona">
         <header class="brand-row">
+          <img class="brand-globe" src="./globe.svg" alt="" width="30" height="30">
           <div>
             <p class="eyebrow">GreyNOC-IQ</p>
             <h1>GreyIQ</h1>
@@ -385,8 +392,8 @@
     <main class="cockpit" id="cockpit" aria-label="Bug bounty cockpit">
       <header class="ck-topbar">
         <div class="ck-brand">
-          <span class="ck-logo" aria-hidden="true">
-            <svg viewBox="0 0 24 24"><path d="M12 2 3 6v6c0 5 3.8 8.4 9 10 5.2-1.6 9-5 9-10V6l-9-4Z"></path><path d="m9 12 2 2 4-4"></path></svg>
+          <span class="ck-logo ck-logo-globe" aria-hidden="true">
+            <img src="./globe.svg" alt="" width="34" height="34">
           </span>
           <div>
             <p class="ck-eyebrow">GreyNOC-IQ · Bug Bounty</p>
