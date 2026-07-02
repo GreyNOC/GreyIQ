@@ -448,6 +448,16 @@ def _classify(finding: dict[str, Any]) -> tuple[str, str, str, str]:
     return category or "other", (category or "Other").replace("_", " ").title(), "", ""
 
 
+def cwe_for_class(class_id: str) -> str:
+    """The canonical, platform-accepted CWE for a class id (e.g. 'cors' -> 'CWE-284'), or ''
+    when the class has no vetted mapping. Used to fill the CWE on an on-demand report for a
+    ledger/history finding that arrived without one — otherwise the platform (HackerOne)
+    receives no weakness and infers a wrong one (e.g. CWE-16 Misconfiguration for CORS)."""
+    cid = str(class_id or "").strip().lower()
+    meta = VULN_CLASSES.get(cid) or _CATEGORY_LABELS.get(cid)
+    return str((meta or {}).get("cwe") or "")
+
+
 # Scanner categories / rule prefixes whose finding ALREADY carries a concrete
 # captured artifact (a real leaked value or error body) — enough for a 'candidate'
 # proof status. Everything else is 'missing' until the operator captures proof. A
