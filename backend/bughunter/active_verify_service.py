@@ -1438,6 +1438,13 @@ def verify_active(
     checks: list[Callable[[], dict[str, Any] | None]] = [
         lambda: _check_clickjacking(http, sanitized, landing),
         lambda: _check_csrf(landing, sanitized),
+        # Self-gated cheap checks run FIRST so the network-heavy probes below can't exhaust the
+        # request budget before they're reached: alg:none / weak-secret are no-ops unless the
+        # operator supplied a real JWT (weak-secret cracks the HMAC key OFFLINE and spends requests
+        # only on a hit), and GraphQL introspection only fires on a graphql-shaped path.
+        lambda: _check_jwt_alg_none(http, sanitized),
+        lambda: _check_jwt_weak_secret(http, sanitized),
+        lambda: _check_graphql_introspection(http, sanitized),
         lambda: _check_cors(http, sanitized),
         lambda: _check_open_redirect(http, sanitized, discovered_params),
         lambda: _check_host_header(http, sanitized),
@@ -1447,13 +1454,6 @@ def verify_active(
         lambda: _check_bool_sqli(http, sanitized, discovered_params),
         lambda: _check_nosqli(http, sanitized, discovered_params),
         lambda: _check_crlf(http, sanitized, discovered_params),
-        # GET-only and self-gating: no-ops unless the operator supplied a real JWT-shaped
-        # credential. alg:none forges an unsigned copy; weak-secret recovers the HMAC key
-        # OFFLINE (near-zero request cost) — so both run early, before the heavier probes.
-        lambda: _check_jwt_alg_none(http, sanitized),
-        lambda: _check_jwt_weak_secret(http, sanitized),
-        # GraphQL introspection only fires on a graphql-shaped path, so it's ~free elsewhere.
-        lambda: _check_graphql_introspection(http, sanitized),
         # Open-bucket is GET-only and scope-gated; safe in the default pass.
         lambda: _check_open_bucket(http, landing, scope, settings),
         # Sensitive-file exposure (.git/.env) only probes at the site root, so it's one cheap
