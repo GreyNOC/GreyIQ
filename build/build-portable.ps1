@@ -14,8 +14,9 @@
       5. Bundle the Ollama runtime into ./ollama (zero-setup local model).
       6. electron-builder --win portable  ->  release/GreyIQ-<version>-portable.exe
 
-    Heavy build: it downloads CPU torch (~200 MB) and the Ollama runtime (~0.6-1 GB),
-    and the finished portable .exe is ~2.5-3 GB. Allow plenty of disk + time.
+    Heavy build: it downloads CPU torch (~200 MB, into the build venv) and Chromium
+    (~170 MB); the finished portable .exe is ~345 MB (torch-free backend + bundled
+    Chromium; Ollama is downloaded on demand, not bundled). Allow plenty of disk + time.
 
 .PARAMETER Installer
     Also build the NSIS installer (release/GreyIQ-Setup-<version>.exe).
@@ -104,6 +105,12 @@ Write-Step "Installing Python build dependencies (CPU torch + requirements + PyI
 Assert-LastExit "CPU torch install"
 & $Py -m pip install -r requirements.txt; Assert-LastExit "requirements.txt install"
 & $Py -m pip install -r build/requirements-build.txt; Assert-LastExit "build requirements install"
+
+# Fetch the Chromium build that greyiq-backend.spec bundles under the app (proof
+# screenshots + live scan). Use THIS venv's playwright so the fetched revision matches
+# what collect_all bundles; installs into the shared per-user ms-playwright cache.
+Write-Step "Installing Playwright Chromium (bundled for proof screenshots)"
+& $Py -m playwright install chromium; Assert-LastExit "playwright install chromium"
 
 # --- Freeze the backend ---
 Write-Step "Freezing the backend with PyInstaller"

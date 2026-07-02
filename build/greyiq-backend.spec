@@ -87,21 +87,34 @@ def _playwright_browsers_cache():
 
 
 _pw_cache = _playwright_browsers_cache()
-_pw_shipped = 0
+# Ship ONLY the newest revision of each chromium family (never firefox/webkit, and not
+# ffmpeg/winldd — video/dep-check, unused). A dev machine that has run `playwright install`
+# across upgrades accumulates STALE revisions in the shared cache (e.g. chromium-1223 next to
+# chromium-1228); bundling all of them doubles the payload and — with the per-exe signing
+# electron-builder does — broke the portable packaging. CI runners are clean (one revision
+# each), so this is a no-op there. `launch(headless=True)` uses the full chromium build; the
+# headless-shell build is kept too so an explicit shell channel also works. Each folder carries
+# its own INSTALLATION_COMPLETE marker (copied along) so Playwright recognizes it offline.
+_pw_newest = {}  # family ("chromium" / "chromium_headless_shell") -> (revision:int, dir_name)
 if os.path.isdir(_pw_cache):
-    for _entry in sorted(os.listdir(_pw_cache)):
-        # Only the chromium builds (headless screenshotting) — never firefox/webkit, and
-        # not ffmpeg/winldd (video/dep-check, unused). `launch(headless=True)` uses the full
-        # chromium build; the headless-shell build is shipped too so an explicit shell channel
-        # also works. Each folder carries its own INSTALLATION_COMPLETE marker, copied along,
-        # so Playwright recognizes it offline.
-        if _entry.startswith(("chromium-", "chromium_headless_shell-")):
-            _src = os.path.join(_pw_cache, _entry)
-            if os.path.isdir(_src):
-                datas.append((_src, os.path.join("playwright-browsers", _entry)))
-                _pw_shipped += 1
+    for _entry in os.listdir(_pw_cache):
+        if not _entry.startswith(("chromium-", "chromium_headless_shell-")):
+            continue
+        if not os.path.isdir(os.path.join(_pw_cache, _entry)):
+            continue
+        _family, _, _rev = _entry.rpartition("-")
+        try:
+            _rev_n = int(_rev)
+        except ValueError:
+            continue
+        if _family not in _pw_newest or _rev_n > _pw_newest[_family][0]:
+            _pw_newest[_family] = (_rev_n, _entry)
+for _rev_n, _entry in _pw_newest.values():
+    datas.append((os.path.join(_pw_cache, _entry), os.path.join("playwright-browsers", _entry)))
+_pw_shipped = len(_pw_newest)
 if _pw_shipped:
-    print(f"[greyiq-backend.spec] bundling {_pw_shipped} Playwright chromium build(s) from {_pw_cache}")
+    print(f"[greyiq-backend.spec] bundling {_pw_shipped} Playwright chromium build(s) from {_pw_cache}: "
+          + ", ".join(sorted(e for _, e in _pw_newest.values())))
 else:
     print(f"[greyiq-backend.spec] WARNING: no Playwright chromium build in {_pw_cache}; screenshots will be "
           "unavailable in this build. Run `python -m playwright install chromium` before freezing to include it.")
