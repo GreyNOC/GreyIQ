@@ -681,6 +681,7 @@ class FindingReportRequest(BaseModel):
     scope: str = Field(default="", max_length=2000)
     platform: str = Field(default="hackerone", max_length=40)
     description: str = Field(default="", max_length=8000)
+    poc: str = Field(default="", max_length=8000)  # caller-supplied proof-of-concept outline (e.g. the brain's PoC)
     proof: ProofInput | None = None
     screenshot_path: str = Field(default="", max_length=4000)
 
@@ -1681,6 +1682,11 @@ class GreyIQRuntime:
         # the same steps a full hunt would emit — so an on-demand report for a ledger/dashboard
         # finding is never a stub with an empty "Steps to reproduce".
         plan = _deterministic_attack_plan(finding, class_id)
+        # Carry a caller-supplied proof-of-concept outline (e.g. the brain's PoC that came
+        # through with a campaign/board finding) into the report — the deterministic plan
+        # starts with an empty poc, so without this an on-demand report has no PoC section.
+        if str(request.poc or "").strip():
+            plan["poc"] = str(request.poc).strip()
         # Overlay operator-gathered proof (from Create proof of impact) onto the plan's
         # proof-of-impact block — its observed/control/evidence make the report confirmable.
         if request.proof is not None:
