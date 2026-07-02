@@ -336,6 +336,8 @@ def run_campaign(
                 shot = screenshot_service.capture_screenshot(poc, shot_dir / f"{stem}.png", scope=scope, authorized=True)
                 if shot.get("ok"):
                     finding["screenshot_path"] = shot["path"]
+                    if shot.get("source_text_path"):  # plain-text request/response/source proof
+                        finding["source_text_path"] = shot["source_text_path"]
             try:
                 dossier = research.build_dossier(finding, ictx, coder_cfg)
                 rpath = research_dir / f"{stem}.md"

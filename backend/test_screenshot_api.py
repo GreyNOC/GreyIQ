@@ -112,6 +112,22 @@ class ScreenshotScopeResolutionTests(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertEqual(self.calls, [])  # capture was never called
 
+    def test_source_text_flows_to_response_and_run(self) -> None:
+        # The plain-text request/response/source proof is returned to the cockpit (for the POC
+        # zip) AND recorded on the run so the engagement bundle can include the .txt.
+        run_id = self._cache(scope="app.example.com", program=None)
+
+        def _fake_text(url, out_path, *, scope="", authorized=False, full_page=False, **_kw):
+            return {"ok": True, "path": str(out_path), "shots": [{"path": str(out_path), "kind": "source"}],
+                    "url": url, "final_url": url, "title": "", "warning": "review",
+                    "source_text": "REQUEST\nGET /me\n\nRESPONSE\nHTTP 200\n\n...leaked-secret...",
+                    "source_text_path": str(out_path) + ".txt"}
+        g.bounty_screenshot.capture_screenshot = _fake_text
+        res = self.rt.capture_screenshot(g.ScreenshotRequest(run_id=run_id, ref="F1"))
+        self.assertTrue(res["ok"])
+        self.assertIn("leaked-secret", res["source_text"])
+        self.assertIn("F1", self.rt.bounty_runs[run_id].get("source_texts", {}))
+
 
 class ScreenshotStillFailsClosedTests(unittest.TestCase):
     """With NO source naming the PoC host, the real service still refuses — no override,

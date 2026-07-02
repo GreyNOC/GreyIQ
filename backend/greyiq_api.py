@@ -2044,6 +2044,8 @@ class GreyIQRuntime:
         if not result.get("ok"):
             return result
         shots = result.get("shots") or [{"path": result.get("path", ""), "kind": "evidence"}]
+        source_text = str(result.get("source_text") or "")
+        source_text_path = str(result.get("source_text_path") or "")
         # Record on the cached finding so build_submission/report embed the shot(s) by basename.
         # Each /api/* call runs in its own asyncio.to_thread worker, so concurrent requests on the
         # same run_id+ref must not race on this read-modify-write of the shared cached dicts.
@@ -2055,6 +2057,10 @@ class GreyIQRuntime:
                     finding["screenshot_paths"] = paths
                     if run is not None and request.ref:
                         run.setdefault("screenshots", {})[request.ref] = paths
+                if source_text_path:  # the plain-text request/response/source proof, for the bundle
+                    finding["source_text_path"] = source_text_path
+                    if run is not None and request.ref:
+                        run.setdefault("source_texts", {})[request.ref] = source_text_path
         out_shots: list[dict[str, Any]] = []
         for s in shots:
             data_url = ""
@@ -2072,6 +2078,7 @@ class GreyIQRuntime:
             "url": result.get("url"), "final_url": result.get("final_url"),
             "title": result.get("title"), "warning": result.get("warning"),
             "highlighted": result.get("highlighted", False),
+            "source_text": source_text,  # copy-pasteable request/response/source, for the POC zip / report
         }
 
     def research_finding(self, request: "ResearchRequest") -> dict[str, Any]:
@@ -2334,6 +2341,10 @@ class GreyIQRuntime:
                 specs.append((f"screenshots/{Path(p).name}", p))
             for p in (run.get("research_paths") or {}).values():
                 specs.append((f"research/{Path(p).name}", p))
+            # The plain-text request/response/source proof (.txt) captured per finding.
+            for p in (run.get("source_texts") or {}).values():
+                if p:
+                    specs.append((f"evidence/{Path(p).name}", p))
             res = bounty_bundle.bundle_files(specs, out_zip)
         if not res.get("ok"):
             return res
