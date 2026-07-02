@@ -2,6 +2,16 @@
 
 Notable changes to GreyIQ.
 
+## v0.60.1
+
+### Fix: campaign dashboard findings now stream per-URL, not per-completed-target
+On a program span, the dashboard only counted a target's findings once the *whole* target
+finished — so during a long, multi-URL target (e.g. a big program), findings showed up in
+the activity log but the stat tiles and findings list stayed at 0 until the target
+completed. Findings now stream to the dashboard as each URL finishes, attributed to the
+named target, so counts and the findings list climb live. Single-target campaigns are
+unchanged.
+
 ## v0.60.0
 
 ### Live campaign dashboard

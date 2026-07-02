@@ -224,6 +224,32 @@ class RunCampaignProgressChainTests(unittest.TestCase):
         self.assertIn("hunt 1/", joined)
         self.assertIn("running scanner(s)", joined, "the nested run_bounty_hunt's own checkpoints must surface too")
 
+    def test_span_mode_streams_findings_to_the_named_unit_not_the_urls(self) -> None:
+        # Regression: in a program span the dashboard's work units are the NAMED targets.
+        # With progress_unit set, a campaign must (a) NOT register its discovered URLs as
+        # their own units, and (b) stream each URL's findings attributed to the named unit
+        # as they're found — so a big multi-URL target's findings appear live, not only when
+        # the whole target finishes.
+        url = f"http://127.0.0.1:{self.server.server_port}/"
+        progress.start_run("span-run")
+        progress.set_targets("span-run", ["tiktok.com"])  # the span registers the named target
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_campaign(
+                url, scope="local QA fixture", authorized=True, coder_cfg={},
+                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
+                runtime_dir=REPO_ROOT / "runtime", max_pages=1,
+                progress_run_id="span-run", progress_unit="tiktok.com",
+            )
+        self.assertTrue(result["ok"])
+        snap = progress.snapshot("span-run")
+        # Only the ONE named unit exists — the crawled URL is NOT registered as its own unit.
+        self.assertEqual([t["target"] for t in snap["targets"]], ["tiktok.com"])
+        # The header-less fixture yields missing-header findings; they were streamed and
+        # every one is attributed to the named unit (not the URL).
+        self.assertGreater(snap["stats"]["findings_total"], 0)
+        self.assertTrue(all(f["target"] == "tiktok.com" for f in snap["findings"]))
+        self.assertEqual(snap["targets"][0]["findings"], snap["stats"]["findings_total"])
+
 
 class StructuredSnapshotTests(unittest.TestCase):
     def test_snapshot_unknown_run_is_empty(self) -> None:

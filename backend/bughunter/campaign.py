@@ -104,13 +104,19 @@ def run_campaign(
     disclose_automation: bool = False,
     excluded_hosts: tuple[str, ...] = (),
     progress_run_id: str | None = None,
+    progress_unit: str | None = None,
 ) -> dict[str, Any]:
     """Run a full campaign. Returns {ok, campaign_path, json_path, urls_scanned,
     finding_count, confirmed_count, submission_paths, ...} or {ok: False, error}.
 
-    ``progress_run_id`` (set only when this is the TOP-level call — the span runner passes
-    None to its inner per-target campaigns) streams structured per-URL status + findings to
-    the live campaign dashboard via the ``progress`` module."""
+    Live dashboard streaming (via the ``progress`` module) when ``progress_run_id`` is set:
+    - ``progress_unit is None`` (a top-level single-target campaign): the discovered URLs
+      ARE the dashboard's work units — each is registered, its status tracked, and its
+      findings attributed to it.
+    - ``progress_unit`` set (a per-target run inside a program span): the URLs are NOT their
+      own units (the span already registered the NAMED targets); findings are streamed AS
+      EACH URL FINISHES and attributed to ``progress_unit`` (the named target) — so a big
+      multi-URL target's findings appear live instead of only when the whole target ends."""
     clean_target = str(target or "").strip()
     if not clean_target:
         return {"ok": False, "error": "No target provided."}
@@ -184,11 +190,15 @@ def run_campaign(
     per_target: list[dict[str, Any]] = []
     consolidated: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
-    # Register the discovered URLs as the dashboard's work units (top-level call only).
-    progress.set_targets(progress_run_id, urls)
+    # Register the discovered URLs as the dashboard's work units — but ONLY for a top-level
+    # single-target campaign. In a program span the NAMED targets are the units (already
+    # registered by the span); here we just stream that target's findings as URLs finish.
+    if progress_unit is None:
+        progress.set_targets(progress_run_id, urls)
     for index, url in enumerate(urls, 1):
         _emit(f"hunt {index}/{len(urls)}: {url}")
-        progress.mark_target(progress_run_id, url, "running")
+        if progress_unit is None:
+            progress.mark_target(progress_run_id, url, "running")
         profile = "source-code" if kind in {"path", "git"} else "web-app"
         result = run_bounty_hunt(
             url, profile, None, str(out_root / "targets"), scope, True, coder_cfg,
@@ -199,7 +209,8 @@ def run_campaign(
         per_target.append({"target": url, "ok": result.get("ok", False),
                            "report_path": result.get("report_path", ""), "error": result.get("error", "")})
         if not result.get("ok"):
-            progress.mark_target(progress_run_id, url, "error", error=str(result.get("error") or ""))
+            if progress_unit is None:
+                progress.mark_target(progress_run_id, url, "error", error=str(result.get("error") or ""))
             continue
         doc = _read_json(result.get("json_path", ""))
         url_new: list[dict[str, Any]] = []  # findings first-seen at THIS url, for the live dashboard
@@ -222,8 +233,11 @@ def run_campaign(
             })
             url_new.append({"ref": ref, "title": finding.get("title"), "severity": finding.get("severity"),
                             "class_name": finding.get("class_name") or finding.get("class_id"), "proof_status": proof_status})
-        progress.add_findings(progress_run_id, url, url_new)
-        progress.mark_target(progress_run_id, url, "done")
+        # Stream this URL's findings live — attributed to the span's named target when
+        # running under one, else to the URL itself (single-target campaign).
+        progress.add_findings(progress_run_id, progress_unit or url, url_new)
+        if progress_unit is None:
+            progress.mark_target(progress_run_id, url, "done")
 
     # --- Secrets mined from served JS (recon-sourced) — classify + dedup + add. ---
     for index, secret in enumerate(rec_js_secrets, 1):
@@ -556,25 +570,19 @@ def run_campaign_over_targets(
         _target_emit("starting…")
         progress.mark_target(progress_run_id, target, "running")
         try:
-            # Inner run_campaign gets progress_run_id=None: for a SPAN, the dashboard's work
-            # units are the named targets (streamed here), not each target's discovered URLs.
+            # Pass progress_unit=target so the inner campaign streams each URL's findings
+            # to the dashboard AS THEY'RE FOUND (attributed to this named target) instead of
+            # the whole target's findings landing only when it finishes. It does NOT register
+            # the URLs as their own dashboard units — the span owns the named-target list.
             result = run_campaign(
                 target, scope=scope, authorized=authorized, coder_cfg=coder_cfg,
                 default_reports_dir=span_root, seed_dir=seed_dir, runtime_dir=runtime_dir,
                 version=version, active=active, time_based=time_based, auth=auth, live=live,
                 program=program, max_pages=max_pages, platform=platform, deep=deep,
                 disclose_automation=disclose_automation, on_progress=_target_emit, excluded_hosts=excluded_hosts,
+                progress_run_id=progress_run_id, progress_unit=target,
             )
             if result.get("ok"):
-                proof = result.get("proof_of_impact") or {}
-                fs = []
-                for f in result.get("findings") or []:
-                    ref = str(f.get("ref") or "")
-                    p = proof.get(ref)
-                    fs.append({"ref": ref, "title": f.get("title"), "severity": f.get("severity"),
-                               "class_name": f.get("class_name") or f.get("class_id"),
-                               "proof_status": str(p.get("status") or "") if isinstance(p, dict) else ""})
-                progress.add_findings(progress_run_id, target, fs)
                 progress.mark_target(progress_run_id, target, "done")
             else:
                 progress.mark_target(progress_run_id, target, "error", error=str(result.get("error") or ""))
