@@ -2,6 +2,34 @@
 
 Notable changes to GreyIQ.
 
+## v0.67.0
+
+### The engine finds more real bugs
+Six new or expanded active checks, each fired only against a target you named in scope and gated
+by a same-run negative control (or a self-certifying signal), so they add coverage without adding
+false positives:
+
+- **Weak JWT signing secret.** When your session token is HS256/384/512, GreyIQ recovers a
+  weak/guessable signing secret **offline** (by matching HMAC against the token's own signature)
+  and confirms account takeover — a critical finding, at zero request cost until a match.
+- **Path traversal / local file read.** Proves a file-read by returning one well-known system
+  file (`/etc/passwd`, `win.ini`), gated by the file's signature plus a benign-value control.
+- **GraphQL introspection.** Confirms schema disclosure on GraphQL endpoints.
+- **Exposed `.git` / `.env`.** Flags a served source repository or secrets file, gated so a
+  single-page app that answers 200 to everything can't trigger it.
+- **Host-header injection now also probes `X-Forwarded-Host`** — the reverse-proxy shape behind
+  most password-reset poisoning, which a plain Host probe misses.
+- **Template injection now probes four engines** in one request (`{{7*7}}`, `${7*7}`, `<%=7*7%>`,
+  `#{7*7}`), so it catches Freemarker/EL, ERB/EJS and Thymeleaf, not just Jinja/Twig.
+
+### Reports HackerOne accepts
+- A CORS report now carries **CWE-284** end-to-end even for a finding opened from history —
+  previously the weakness was blank and HackerOne inferred CWE-16.
+- The one-click POC zip now includes a runnable **`poc.html`**. For a CORS finding it's a real
+  proof-of-concept page: served from an origin you control and opened while logged in to the
+  target, it performs a credentialed cross-origin fetch and displays the authenticated response
+  — the working cross-origin-read PoC HackerOne asks for. Nothing runs until you click.
+
 ## v0.66.2
 
 ### Proof screenshots that actually prove it
