@@ -15,6 +15,7 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+from bughunter import report as R  # noqa: E402
 from bughunter import report_formats as rf  # noqa: E402
 from bughunter import submission as sub  # noqa: E402
 
@@ -171,6 +172,52 @@ class BuildSubmissionPlatformTests(unittest.TestCase):
         ctx, finding = _ctx_finding()
         pkg = sub.build_submission(ctx, finding, "totally-made-up")
         self.assertEqual(pkg["platform"], "hackerone")
+
+
+class StepsNumberingTests(unittest.TestCase):
+    """Steps to reproduce must render as a clean 1..N numbered list whatever shape the
+    brain hands us — a list, a single newline string, or items that already carry their
+    own "1."/"-" marker. Garbled or duplicated numbering reads as machine-generated and
+    gets the report closed (HackerOne wants clear, numbered reproduction steps)."""
+
+    def test_normalize_steps_shapes(self) -> None:
+        self.assertEqual(R.normalize_steps(["a", "b"]), ["a", "b"])
+        # a bare string is split on newlines, NOT iterated character by character.
+        self.assertEqual(R.normalize_steps("first\nsecond\nthird"), ["first", "second", "third"])
+        # existing enumerators are stripped so the renderer's numbering is the only one.
+        self.assertEqual(
+            R.normalize_steps(["1. first", "2) second", "- third", "* fourth"]),
+            ["first", "second", "third", "fourth"],
+        )
+        self.assertEqual(R.normalize_steps(None), [])
+        self.assertEqual(R.normalize_steps(["", "  ", "x"]), ["x"])
+        # a genuine decimal that isn't a list marker is preserved.
+        self.assertEqual(R.normalize_steps(["3.5x slowdown observed"]), ["3.5x slowdown observed"])
+
+    def test_string_steps_render_numbered_not_per_character(self) -> None:
+        ctx, finding = _ctx_finding()
+        ctx["attack_plans"]["F1"]["steps"] = "Send a GET to /login.\nObserve the response.\nNote the header."
+        md = rf.render_finding(ctx, finding, "hackerone")
+        self.assertIn("1. Send a GET to /login.", md)
+        self.assertIn("2. Observe the response.", md)
+        self.assertIn("3. Note the header.", md)
+        self.assertNotIn("2. e", md)  # would appear if the string were iterated char-by-char
+
+    def test_prenumbered_steps_not_double_numbered(self) -> None:
+        ctx, finding = _ctx_finding()
+        ctx["attack_plans"]["F1"]["steps"] = ["1. Send a GET.", "2. Observe.", "3. Note it."]
+        md = rf.render_finding(ctx, finding, "hackerone")
+        self.assertIn("1. Send a GET.", md)
+        self.assertNotIn("1. 1. Send a GET.", md)
+
+    def test_default_report_paths_also_number_string_steps(self) -> None:
+        # The default HackerOne-flavoured report (report.build_finding_markdown) shares the
+        # same normalizer, so a string-shaped steps value is numbered there too.
+        ctx, finding = _ctx_finding()
+        ctx["attack_plans"]["F1"]["steps"] = "Alpha step.\nBravo step."
+        md = R.build_finding_markdown(ctx, finding)
+        self.assertIn("1. Alpha step.", md)
+        self.assertIn("2. Bravo step.", md)
 
 
 if __name__ == "__main__":

@@ -4979,15 +4979,7 @@ async function ckCaptureScreenshot(f, btn, wrap) {
     if (res && res.ok) {
       btn.textContent = "Re-capture screenshot";
       if (res.warning) wrap.append(cel("p", "ck-status is-error", res.warning));
-      if (res.data_url) {
-        const img = cel("img", "ck-shot-img");
-        img.src = res.data_url;              // data: URI, not markup — safe
-        img.alt = "Proof-of-concept screenshot";
-        img.style.maxWidth = "100%";
-        img.style.borderRadius = "6px";
-        img.style.border = "1px solid var(--line, #d0d0d0)";
-        wrap.append(img);
-      }
+      if (res.data_url) ckAppendScreenshot(wrap, res.data_url, f.title || f.ref);
       wrap.append(cel("p", "ck-hint", `Saved locally${res.path ? ": " + res.path : ""}. Now embedded in this finding's Copy report / Download .md.`));
     } else {
       btn.textContent = "Capture screenshot";
@@ -6402,6 +6394,7 @@ async function ckFullReportMarkdown(focus) {
         location: focus.location, cwe: focus.cwe, rule_id: focus.rule_id, target: focus.target || focus.location,
         scope: (ck.scope && ck.scope.value) || state.ckScope || ckCampaign.scope || "",
         platform: ckState.platform || "hackerone", proof: focus.proofObj || null,
+        poc: (focus.plan && focus.plan.poc) || "",   // fold the PoC outline into the on-demand report
       }),
     });
     if (res && res.ok && res.package && res.package.vulnerability_information) {
@@ -6458,15 +6451,18 @@ function ckFullReportPanel(focus) {
     }
   }
 
-  // Screenshot: one captured during a campaign prove comes through on the focus; the Capture
-  // button below appends a fresh one here too.
-  const shotWrap = cel("div", "ck-shot");
-  if (focus.screenshot && focus.screenshot.data_url) {
-    const img = cel("img", "ck-shot-img");
-    img.src = focus.screenshot.data_url;
-    img.alt = "Proof-of-concept screenshot";
-    shotWrap.append(img);
+  // Proof of concept — the plan's PoC outline, shown in this view AND folded into the
+  // downloaded/copied report (ckFullReportMarkdown passes it through).
+  const pocText = focus.plan && focus.plan.poc ? String(focus.plan.poc).trim() : "";
+  if (pocText) {
+    wrap.append(cel("h4", null, "Proof of concept"));
+    wrap.append(cel("pre", "ck-poc", pocText));
   }
+
+  // Screenshot: one captured during a campaign prove comes through on the focus; the Capture
+  // button below appends a fresh one here too. Each renders with its own Download button.
+  const shotWrap = cel("div", "ck-shot");
+  if (focus.screenshot && focus.screenshot.data_url) ckAppendScreenshot(shotWrap, focus.screenshot.data_url, focus.title);
 
   const actions = cel("div", "ck-actions");
   const statusEl = cel("p", "ck-status"); statusEl.style.flexBasis = "100%";
@@ -6836,6 +6832,41 @@ function ckDownloadBase64(filename, b64, mime) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+// The file extension for a screenshot data: URI (jpeg -> jpg), defaulting to png.
+function ckShotExt(dataUrl) {
+  const m = /^data:image\/([a-z0-9.+-]+)/i.exec(String(dataUrl || ""));
+  const t = (m ? m[1] : "png").toLowerCase().replace(/[^a-z0-9]/g, "");
+  return t === "jpeg" ? "jpg" : (t || "png");
+}
+
+// Save a data: URI (a captured screenshot) to a real file. Returns false on a malformed URI.
+function ckDownloadDataUrl(dataUrl, filename) {
+  const m = /^data:([^;,]*)(;base64)?,([\s\S]*)$/.exec(String(dataUrl || ""));
+  if (!m) return false;
+  if (m[2]) { ckDownloadBase64(filename, m[3], m[1] || "application/octet-stream"); return true; }
+  try { ckDownloadText(filename, decodeURIComponent(m[3]), m[1] || "text/plain"); return true; }
+  catch (_) { return false; }
+}
+
+// Render a captured screenshot into `wrap` with a "Download screenshot" button beside it, so
+// the operator can save just the image (for an attachment) without the whole report. Shared by
+// the capture flow, the full-report panel, and the prove/re-probe result.
+function ckAppendScreenshot(wrap, dataUrl, nameBase) {
+  const img = cel("img", "ck-shot-img");
+  img.src = dataUrl;                       // data: URI, not markup — safe
+  img.alt = "Proof-of-concept screenshot";
+  wrap.append(img);
+  const bar = cel("div", "ck-actions"); bar.style.margin = "0.3rem 0 0";
+  const dl = cel("button", "ck-btn", "Download screenshot");
+  dl.type = "button";
+  dl.addEventListener("click", () => {
+    const ok = ckDownloadDataUrl(dataUrl, `${ckSlug(nameBase || "finding")}-screenshot.${ckShotExt(dataUrl)}`);
+    if (!ok) { dl.textContent = "Download failed"; setTimeout(() => { dl.textContent = "Download screenshot"; }, 1600); }
+  });
+  bar.append(dl);
+  wrap.append(bar);
+}
+
 // --- Reports & export bar: engagement (special) report for the current run, the full-run
 // .zip bundle, and a CSV of every finding across all runs. ---
 function ckReportsExportBar() {
@@ -7129,9 +7160,7 @@ function ckRenderProofResult(box, res) {
   if (res.rate_limited) box.append(cel("p", "ck-hint", "Host rate limit reached — some checks were skipped."));
   const shot = res.screenshot;
   if (shot && shot.ok && shot.data_url) {
-    const img = document.createElement("img");
-    img.src = shot.data_url; img.alt = "Proof screenshot"; img.className = "ck-shot-img";
-    box.append(img);
+    ckAppendScreenshot(box, shot.data_url, res.host || "finding");
     if (shot.warning) box.append(cel("p", "ck-hint", shot.warning));
   } else if (shot && !shot.ok && shot.error) {
     box.append(cel("p", "ck-hint", "Screenshot: " + shot.error));
