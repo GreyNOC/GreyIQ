@@ -35,6 +35,41 @@ class PocUrlTests(unittest.TestCase):
         self.assertEqual(ss.poc_url_for_finding({"location": "/relative/path"}, {"target": "nota url"}), "")
 
 
+class ProofSheetTests(unittest.TestCase):
+    """The 'proof sheet' shot renders the served RESPONSE SOURCE (where a secret-in-source /
+    header / disclosure finding actually lives) with the match highlighted — a rendered-page
+    screenshot shows none of it. Source is shown as escaped text, never executed."""
+
+    def test_real_request_response_shown_and_match_highlighted(self) -> None:
+        body = '<html><head><script>var cfg={apiKey:"AIzaSyD-REAL-KEY"}</script></head><body>Looks normal</body></html>'
+        sheet = ss._build_proof_sheet(
+            url="https://t/", method="GET",
+            req_headers={"user-agent": "Mozilla/5.0", "accept": "text/html"},
+            status=200, resp_headers={"content-type": "text/html", "server": "x", "set-cookie": "sid=abc"},
+            body=body, matched='AIzaSyD-REAL-KEY', title="Secret exposed <img src=x>",
+        )
+        # the REAL request headers + ALL response headers a dev/triager sees
+        self.assertIn("user-agent: Mozilla/5.0", sheet)
+        self.assertIn("accept: text/html", sheet)
+        self.assertIn("content-type: text/html", sheet)
+        self.assertIn("set-cookie: sid=abc", sheet)
+        self.assertIn("HTTP 200", sheet)
+        self.assertIn("GET https://t/", sheet)
+        self.assertIn("Response body (served source", sheet)
+        self.assertIn("<mark>AIzaSyD-REAL-KEY</mark>", sheet)     # the evidence is highlighted
+        # the page's own markup is escaped (shown as source), never live in the proof page
+        self.assertIn("&lt;script&gt;", sheet)
+        self.assertNotIn("<script>var cfg", sheet)
+        self.assertIn("&lt;img src=x&gt;", sheet)                 # title XSS escaped
+        self.assertNotIn("<img src=x>", sheet)
+
+    def test_body_capped(self) -> None:
+        sheet = ss._build_proof_sheet(url="https://t/", status=200, resp_headers={},
+                                      body="A" * (ss._PROOF_BODY_CAP + 5000), matched="", title="t")
+        self.assertIn("(truncated)", sheet)
+        self.assertLess(len(sheet), ss._PROOF_BODY_CAP + 4000)
+
+
 class CaptureGatingTests(unittest.TestCase):
     """The gate must fail closed BEFORE any browser launch or network call."""
 

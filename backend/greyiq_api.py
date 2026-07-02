@@ -2004,11 +2004,13 @@ class GreyIQRuntime:
             location = str(finding.get("location") or finding.get("file_path") or "")
             pe = finding.get("proof_evidence")
             matched = str((pe.get("matched_value") if isinstance(pe, dict) else "") or finding.get("snippet") or "").strip()
+            request_line = str((pe.get("request_line") if isinstance(pe, dict) else "") or "").strip()
         else:
             url = str(request.url or "").strip()
             if not url.startswith(("http://", "https://")):
                 url = ""
             title, location, matched = str(request.title or ""), str(request.location or ""), str(request.matched_value or "")
+            request_line = ""
         if not url:
             return {"ok": False, "error": "No proof-of-concept URL to screenshot — open this finding from a run or history entry that carries a URL."}
         safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
@@ -2030,7 +2032,7 @@ class GreyIQRuntime:
         scope = " ".join(s for s in scope_sources if s.strip())
         # Annotate + highlight so the shot proves the finding (a rendered page often shows nothing
         # about a source/header bug), and grab a whole-page shot alongside the focused evidence one.
-        annotate = {"title": title, "location": location or url, "matched": matched}
+        annotate = {"title": title, "location": location or url, "matched": matched, "request_line": request_line}
         result = bounty_screenshot.capture_screenshot(
             url, out_path, scope=scope, authorized=True, full_page=request.full_page,
             annotate=annotate, highlight=matched, extra_full_page=True,

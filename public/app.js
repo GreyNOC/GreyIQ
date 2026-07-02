@@ -5002,7 +5002,7 @@ async function ckCaptureScreenshot(f, btn, wrap, onShots) {
       // wrap that a later re-render detaches would silently drop the just-captured images.
       if (onShots) { onShots(shots, res); return; }
       if (res.warning) wrap.append(cel("p", "ck-status is-error", res.warning));
-      const kindLabel = { "evidence": "Evidence (annotated)", "full-page": "Full page" };
+      const kindLabel = { "source": "Response source (PoC)", "rendered": "Rendered page", "evidence": "Rendered page", "full-page": "Full page" };
       for (const shot of shots) {
         if (shot && shot.data_url) ckAppendScreenshot(wrap, shot.data_url, f.title || f.ref, kindLabel[shot.kind] || shot.kind || "");
       }
@@ -6502,7 +6502,7 @@ function ckFullReportPanel(focus) {
   // stashed on focus.shots so they SURVIVE the panel's own async report-fetch re-render (which
   // rebuilds this whole node). Each image renders with its own Download button.
   const shotWrap = cel("div", "ck-shot");
-  const _shotKindLabel = { "evidence": "Evidence (annotated)", "full-page": "Full page" };
+  const _shotKindLabel = { "source": "Response source (PoC)", "rendered": "Rendered page", "evidence": "Rendered page", "full-page": "Full page" };
   if (focus.screenshot && focus.screenshot.data_url) ckAppendScreenshot(shotWrap, focus.screenshot.data_url, focus.title, "Evidence");
   for (const shot of (focus.shots || [])) {
     if (shot && shot.data_url) ckAppendScreenshot(shotWrap, shot.data_url, focus.title, _shotKindLabel[shot.kind] || shot.kind || "");
@@ -6533,6 +6533,12 @@ function ckFullReportPanel(focus) {
     finally { dlBtn.disabled = false; dlBtn.textContent = "Download .md"; }
   });
   actions.append(dlBtn);
+
+  const zipBtn = cel("button", "ck-btn", "Download POC (.zip)");
+  zipBtn.type = "button";
+  zipBtn.title = "One zip: the report, a PoC/evidence summary, every captured screenshot, and the finding JSON";
+  zipBtn.addEventListener("click", () => ckDownloadPocZip(focus, zipBtn));
+  actions.append(zipBtn);
 
   const hasShots = (focus.shots && focus.shots.length) || (focus.screenshot && focus.screenshot.data_url);
   const shotBtn = cel("button", "ck-btn", hasShots ? "Re-capture screenshot" : "Capture screenshot");
@@ -6925,6 +6931,113 @@ function ckDownloadDataUrl(dataUrl, filename) {
 // Render a captured screenshot into `wrap` with a "Download screenshot" button beside it, so
 // the operator can save just the image (for an attachment) without the whole report. Shared by
 // the capture flow, the full-report panel, and the prove/re-probe result.
+// --- Minimal in-browser ZIP writer (store method; a CDN lib is blocked by CSP). Produces a
+// standard .zip a POC bundle downloads at one click, with no server round-trip so it works for
+// any finding including a history one. ---
+function ckCrc32(bytes) {
+  let c, crc = 0xFFFFFFFF;
+  if (!ckCrc32._t) {
+    const t = ckCrc32._t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) { c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; }
+  }
+  for (let i = 0; i < bytes.length; i++) crc = (crc >>> 8) ^ ckCrc32._t[(crc ^ bytes[i]) & 0xFF];
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+function ckZip(files) {
+  // files: [{name, data: Uint8Array}] -> Blob
+  const enc = new TextEncoder();
+  const chunks = []; const central = []; let offset = 0;
+  const u16 = (n) => [n & 0xFF, (n >>> 8) & 0xFF];
+  const u32 = (n) => [n & 0xFF, (n >>> 8) & 0xFF, (n >>> 16) & 0xFF, (n >>> 24) & 0xFF];
+  for (const f of files) {
+    const name = enc.encode(f.name); const data = f.data; const crc = ckCrc32(data);
+    const local = new Uint8Array([].concat(u32(0x04034b50), u16(20), u16(0), u16(0), u16(0), u16(0), u32(crc), u32(data.length), u32(data.length), u16(name.length), u16(0)));
+    chunks.push(local, name, data);
+    central.push({ header: new Uint8Array([].concat(u32(0x02014b50), u16(20), u16(20), u16(0), u16(0), u16(0), u16(0), u32(crc), u32(data.length), u32(data.length), u16(name.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(offset))), name });
+    offset += local.length + name.length + data.length;
+  }
+  const centralStart = offset; let centralSize = 0;
+  for (const c of central) { chunks.push(c.header, c.name); centralSize += c.header.length + c.name.length; }
+  chunks.push(new Uint8Array([].concat(u32(0x06054b50), u16(0), u16(0), u16(central.length), u16(central.length), u32(centralSize), u32(centralStart), u16(0))));
+  return new Blob(chunks, { type: "application/zip" });
+}
+function ckDataUrlBytes(dataUrl) {
+  const m = /^data:[^;,]*;base64,([\s\S]*)$/.exec(String(dataUrl || ""));
+  if (!m) return null;
+  try {
+    const bin = atob(m[1]); const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return arr;
+  } catch (_) { return null; }
+}
+
+// A human-readable PoC + evidence summary for the zip (self-contained even if report.md omits
+// a section). Built from the finding the panel already holds — no extra fetch.
+function ckBuildPocSummary(focus) {
+  const L = [];
+  const sev = String(focus.severity || "info").replace(/^./, (c) => c.toUpperCase());
+  L.push(`# Proof of concept — ${focus.title}`, "");
+  L.push(`- **Severity:** ${sev}`);
+  if (focus.className) L.push(`- **Class:** ${focus.className}${focus.cwe ? ` (${focus.cwe})` : ""}`);
+  if (focus.location) L.push(`- **Location:** ${focus.location}`);
+  if (focus.cvss && focus.cvss.vector) L.push(`- **CVSS:** ${focus.cvss.vector}${focus.cvssScore != null ? ` (${Number(focus.cvssScore).toFixed(1)})` : ""}`);
+  L.push("");
+  const plan = focus.plan || {};
+  if (Array.isArray(plan.steps) && plan.steps.length) { L.push("## Steps to reproduce"); plan.steps.forEach((s, i) => L.push(`${i + 1}. ${s}`)); L.push(""); }
+  if (plan.poc) L.push("## Proof of concept", "```", String(plan.poc), "```", "");
+  const po = focus.proofObj;
+  if (po && (po.observed_result || po.control_result || po.evidence || po.proof_obligation)) {
+    L.push("## Proof of impact");
+    if (po.status) L.push(`- **Status:** ${String(po.status).replace(/^./, (c) => c.toUpperCase())}`);
+    if (po.observed_result) L.push(`- **Observed:** ${po.observed_result}`);
+    if (po.control_result) L.push(`- **Control:** ${po.control_result}`);
+    if (po.evidence) L.push(`- **Evidence:** ${po.evidence}`);
+    if (po.status !== "confirmed" && po.proof_obligation) L.push(`- **To confirm:** ${po.proof_obligation}`);
+    L.push("");
+  }
+  L.push("## Screenshots", "See the `screenshots/` folder — the `*-source.png` shot shows the served response/source that proves the finding.", "");
+  L.push("---", "_Screenshots are NOT auto-redacted — review before sharing._");
+  return L.join("\n");
+}
+
+// One-click PoC bundle: report + PoC/evidence summary + every captured screenshot + the finding
+// JSON, zipped in the browser. Works for any finding (board / campaign / history) with no run.
+async function ckDownloadPocZip(focus, btn) {
+  const old = btn.textContent; btn.disabled = true; btn.textContent = "Zipping…";
+  try {
+    const enc = new TextEncoder();
+    const files = [];
+    const pkg = await ckFullReportMarkdown(focus);
+    files.push({ name: "report.md", data: enc.encode(pkg.text || "") });
+    files.push({ name: "poc.md", data: enc.encode(ckBuildPocSummary(focus)) });
+    const shots = [];
+    if (focus.screenshot && focus.screenshot.data_url) shots.push({ data_url: focus.screenshot.data_url, kind: "evidence", path: "" });
+    for (const s of (focus.shots || [])) if (s && s.data_url) shots.push(s);
+    let n = 0; const shotNames = [];
+    for (const s of shots) {
+      const bytes = ckDataUrlBytes(s.data_url); if (!bytes) continue;
+      n++;
+      const base = s.path ? s.path.replace(/\\/g, "/").split("/").pop() : `${n}-${ckSlug(s.kind || "shot")}.png`;
+      files.push({ name: "screenshots/" + base, data: bytes });
+      shotNames.push(base);
+    }
+    files.push({ name: "finding.json", data: enc.encode(JSON.stringify({
+      title: focus.title, severity: focus.severity, class: focus.className, class_id: focus.class_id,
+      cwe: focus.cwe, location: focus.location, cvss: focus.cvss || null, proof: focus.proofObj || null,
+      screenshots: shotNames,
+    }, null, 2)) });
+    const blob = ckZip(files);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.download = `${ckSlug(focus.title)}-poc.zip`;
+    document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+    btn.textContent = `Downloaded ✓ (${files.length} files)`;
+  } catch (err) {
+    btn.textContent = "Zip failed";
+  } finally {
+    setTimeout(() => { btn.disabled = false; btn.textContent = old; }, 1800);
+  }
+}
+
 function ckAppendScreenshot(wrap, dataUrl, nameBase, label) {
   if (label) wrap.append(cel("p", "ck-shot-label", label));
   const img = cel("img", "ck-shot-img");
