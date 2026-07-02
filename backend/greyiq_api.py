@@ -336,7 +336,7 @@ from bughunter.web_scan_service import run_web_scan  # noqa: E402
 from bughunter.live_scan_service import run_live_scan  # noqa: E402
 from bughunter.triage import triage  # noqa: E402
 from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
-from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names, _deterministic_attack_plan  # noqa: E402
+from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names, _deterministic_attack_plan, cwe_for_class  # noqa: E402
 from bughunter import campaign as bounty_campaign  # noqa: E402
 from bughunter import learning as bounty_learning  # noqa: E402
 from bughunter import submission as bounty_submission  # noqa: E402
@@ -1678,11 +1678,15 @@ class GreyIQRuntime:
         'confirmed'. Pure / no-network."""
         ref = "R1"
         class_id = str(request.class_id or "").strip()
+        # Fill the CWE from the class when the finding arrived without one (a ledger/history
+        # finding often has no cwe): otherwise the platform gets no weakness and infers a wrong
+        # one — e.g. HackerOne suggesting CWE-16 for a CORS report that should be CWE-284.
+        cwe = str(request.cwe or "").strip() or cwe_for_class(class_id)
         finding = {
             "ref": ref, "title": str(request.title or "Security finding"),
             "severity": str(request.severity or "info"), "class_name": str(request.class_name or ""),
             "class_id": class_id, "location": str(request.location or request.target or ""),
-            "cwe": str(request.cwe or ""), "rule_id": str(request.rule_id or ""),
+            "cwe": cwe, "rule_id": str(request.rule_id or ""),
             "description": str(request.description or ""), "screenshot_path": str(request.screenshot_path or ""),
         }
         # Every report gets REAL reproduction steps: the engine's offline attack-plan builder

