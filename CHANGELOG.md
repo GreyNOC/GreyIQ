@@ -2,6 +2,31 @@
 
 Notable changes to GreyIQ.
 
+## v0.67.1
+
+### CORS reports that HackerOne accepts
+A CORS finding now demonstrates the **actual cross-origin read of sensitive data**, not just the
+reflected header — the exact thing HackerOne's review kept flagging as ineligible. GreyIQ's CORS
+probe already carries your session, so on an **authenticated** scan the response it gets back is
+the very data an attacker page would read; the report's proof of impact now shows it ("a
+cross-origin request carrying the victim's session returned the authenticated response … that the
+reflected ACAO + Allow-Credentials let the attacker origin READ", with the data). Scan the target
+while logged in (Scan behind a login, or the new **Get proof of impact** button) to capture it; an
+unauthenticated scan still flags the misconfiguration but tells you to re-run authenticated.
+
+It also now catches a **substring / prefix-trust** ACL — one that trusts any origin merely
+*containing* the target host (e.g. `https://target.attacker.com`) — with the control/probe origins
+built from the target's real scheme and port so `http://` sites are covered too.
+
+### Better proof, fewer weak screenshots
+- Every finding's report now has an always-available **Get proof of impact** button that actively
+  re-probes the finding in scope and captures the live request/response + screenshot — it works
+  for a finding opened from history too.
+- A rendered-page screenshot that is just an app error page ("Something went wrong"), a loading
+  skeleton, or near-blank is no longer attached when the real **response-source** proof is
+  present — such a shot only weakened the report.
+- Broadened the confirm-grade SQL error signatures (DB2, Oracle, SQL Server, PostgreSQL/Npgsql).
+
 ## v0.67.0
 
 ### The engine finds more real bugs
