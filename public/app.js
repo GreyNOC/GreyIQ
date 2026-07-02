@@ -6551,12 +6551,15 @@ function ckFullReportPanel(focus) {
   }));
   actions.append(shotBtn);
 
-  if (ckEffectiveProof(focus) === "candidate") {
-    const proveBtn = cel("button", "ck-btn", "Create proof of impact");
-    proveBtn.type = "button";
-    proveBtn.addEventListener("click", () => ckCreateProofOfImpact(focus, proveBtn, statusEl, resultEl));
-    actions.append(proveBtn);
-  }
+  // Get proof of impact — actively re-probe this finding's URL in scope and capture the live
+  // request/response differential + a screenshot. Available on ANY finding: a candidate is
+  // promoted to Confirmed by it, and a Confirmed finding still benefits from a freshly-captured,
+  // submittable artifact.
+  const proveBtn = cel("button", "ck-btn", ckEffectiveProof(focus) === "confirmed" ? "Get proof of impact" : "Create proof of impact");
+  proveBtn.type = "button";
+  proveBtn.title = "Actively re-probe this finding in scope and capture the live proof-of-impact artifact (request/response differential + screenshot)";
+  proveBtn.addEventListener("click", () => ckCreateProofOfImpact(focus, proveBtn, statusEl, resultEl));
+  actions.append(proveBtn);
 
   if (ckEffectiveStage(focus) === "submitted") {
     actions.append(ckReportLink("", ""));
@@ -7396,6 +7399,11 @@ async function ckReportFromLedger(rec) {
 async function ckCreateProofOfImpact(f, btn, statusEl, resultEl) {
   const url = String(f.location || f.sourceUrl || "").trim();
   if (!url) { statusEl.textContent = "This finding has no URL to probe."; statusEl.className = "ck-status is-error"; return; }
+  // Union THIS finding's own host into the scope so proving works even for a finding opened from
+  // history (where the cockpit Scope box may be empty) — the host was already authorized when the
+  // hunt that produced the finding ran. The server still SSRF-guards and rate-limits the probe.
+  let scope = state.ckScope || "";
+  try { const h = new URL(url).hostname; if (h && !scope.split(/\s+/).includes(h)) scope = `${scope} ${h}`.trim(); } catch (_) { /* non-URL location */ }
   const old = btn.textContent;
   btn.disabled = true; btn.textContent = "Proving…";
   statusEl.className = "ck-status"; statusEl.textContent = `Actively probing ${url} in scope… (the campaign, if any, keeps running)`;
@@ -7403,7 +7411,7 @@ async function ckCreateProofOfImpact(f, btn, statusEl, resultEl) {
   try {
     res = await apiFetch("/api/bounty/finding/prove", {
       method: "POST", timeoutMs: 120000,
-      body: JSON.stringify({ url, scope: state.ckScope || "", program_id: state.ckActiveProgramId || null, authorized: true, screenshot: true }),
+      body: JSON.stringify({ url, scope, program_id: state.ckActiveProgramId || null, authorized: true, screenshot: true }),
     });
   } catch (err) {
     statusEl.className = "ck-status is-error"; statusEl.textContent = err.message || "Could not reach the engine.";
