@@ -82,8 +82,10 @@ _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 # SQL-specific error signatures only — a generic stack trace is not SQL injection.
 _SQL_ERROR_RE = re.compile(
     r"SQLSTATE\[|\bORA-\d{5}\b|SQL syntax.{0,40}near|\bpsql:|PostgreSQL.{0,30}ERROR|"
-    r"Microsoft OLE DB Provider for SQL Server|Unclosed quotation mark|"
-    r"You have an error in your SQL syntax|SQLite3?::|sqlite3.OperationalError",
+    r"Microsoft OLE DB Provider for SQL Server|Unclosed quotation mark|Incorrect syntax near|"
+    r"You have an error in your SQL syntax|SQLite3?::|sqlite3.OperationalError|"
+    r"quoted string not properly terminated|\bDB2 SQL error\b|\bSQL\d{4}N\b|"
+    r"Npgsql\.|System\.Data\.SqlClient\.SqlException|valid MySQL result",
     re.IGNORECASE,
 )
 # High-signal NoSQL backend error banners ONLY — unambiguous Mongo/Mongoose/BSON/PyMongo/
@@ -397,14 +399,24 @@ def _finding(rule_id: str, title: str, severity: str, category: str, class_hint:
 # 'confirmed' status requires a positive observation AND a control differential.
 
 def _check_cors(http: _Http, url: str) -> dict[str, Any] | None:
+    parsed = urlparse(url)
+    # The target's REAL origin (scheme + host + port) — an http:// target, or an https:// target
+    # on an allowed non-default port, reflects origins prefixed with THAT, not a hardcoded
+    # https://host, so build the control (and the substring probe) from the parsed origin.
+    site_origin = f"{parsed.scheme}://{parsed.netloc}"
     try:
         probe = http.fetch(url, extra_headers={"Origin": _MARKER_ORIGIN})
-        control = http.fetch(url, extra_headers={"Origin": f"https://{urlparse(url).hostname}"})
+        control = http.fetch(url, extra_headers={"Origin": site_origin})
     except _ActiveError:
         return None
     acao = (probe["headers"].get("access-control-allow-origin") or "").strip()
     acac = (probe["headers"].get("access-control-allow-credentials") or "").strip().lower()
     ctrl_acao = (control["headers"].get("access-control-allow-origin") or "").strip()
+    # The app DYNAMICALLY reflects the Origin it's sent (it echoed the site origin back). A
+    # substring/prefix-trusting ACL always reflects the host-containing control origin, so gating
+    # the extra substring probe (variant 4) on this adds ZERO requests on an app that returns a
+    # static/absent ACAO — keeping the request budget for the other checks.
+    reflects_control = ctrl_acao == site_origin
     reflects_marker = acao == _MARKER_ORIGIN
     credentialed = acac == "true"
     # Confirmed: the response reflects the ATTACKER origin (not a static value/wildcard)
@@ -471,6 +483,30 @@ def _check_cors(http: _Http, url: str) -> dict[str, Any] | None:
                 ev = {"request_line": f"GET {url}", "request_header": f"Origin: {sub_origin}", "response_status": f"HTTP {sub_probe['status']}",
                       "matched_value": f"Access-Control-Allow-Origin: {sub_origin}; Access-Control-Allow-Credentials: true"}
                 return _finding("active.cors-reflection", "CORS trusts arbitrary subdomain Origin with credentials", "high", "cors", "cors", url, proof, ev)
+
+    # Variant 4 — naive substring/prefix trust: an ACL that checks `if TARGET in origin` (or a
+    # `startswith` without a boundary) trusts `https://TARGET.attacker.example`. Send that shape;
+    # if it's reflected with credentials and a different origin isn't, an attacker-owned domain
+    # that merely CONTAINS the target host can read authenticated data.
+    if host and reflects_control:
+        substr_origin = f"{parsed.scheme}://{host}.{_MARKER_HOST}"
+        try:
+            substr_probe = http.fetch(url, extra_headers={"Origin": substr_origin})
+        except _ActiveError:
+            substr_probe = None
+        if substr_probe is not None:
+            b_acao = (substr_probe["headers"].get("access-control-allow-origin") or "").strip()
+            b_acac = (substr_probe["headers"].get("access-control-allow-credentials") or "").strip().lower()
+            if b_acao == substr_origin and b_acac == "true" and ctrl_acao != substr_origin:
+                proof = _proof(
+                    "confirmed", method=f"GET with Origin: {substr_origin}", affected_asset="authenticated API responses readable from an attacker domain that merely contains the target host",
+                    observed_result=f"an origin containing the target host as a leading label ({substr_origin}) was reflected with Allow-Credentials: true",
+                    control_result=f"a different Origin was reflected as {ctrl_acao or '(none)'} — the check trusts any origin whose string contains the host",
+                    evidence=f"ACAO={substr_origin}; ACAC={b_acac}",
+                )
+                ev = {"request_line": f"GET {url}", "request_header": f"Origin: {substr_origin}", "response_status": f"HTTP {substr_probe['status']}",
+                      "matched_value": f"Access-Control-Allow-Origin: {substr_origin}; Access-Control-Allow-Credentials: true"}
+                return _finding("active.cors-reflection", "CORS trusts an origin that merely contains the host (substring/prefix trust)", "high", "cors", "cors", url, proof, ev)
     return None
 
 
