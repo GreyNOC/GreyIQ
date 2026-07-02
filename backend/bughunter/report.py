@@ -61,6 +61,28 @@ _NEXT_STEP_TAG = {
 _JWT_CREDENTIAL_RULE_IDS = {"secret.jwt", "web.exposed.secret.jwt"}
 
 
+def normalize_steps(raw: Any) -> list[str]:
+    """Coerce reproduction ``steps`` into a clean list ready for 1-based numbering.
+
+    ``steps`` is meant to be a list of strings, but the LLM brain (or a cached/imported
+    ctx) can hand us a single newline-delimited string, or list items that already carry
+    their own ``1.`` / ``-`` marker. Numbering those naively double-numbers ("1. 1. …"),
+    or — for a bare string — iterates it CHARACTER by character ("1. S" / "2. e" / "3. n"
+    …), which is exactly the garbled "steps to reproduce" a HackerOne triager rejects.
+    This splits a string on newlines (never char-by-char), drops blanks, and strips any
+    leading enumerator the source already added, so the renderer's numbering is the only
+    numbering. Returns a list of clean step strings."""
+    if raw is None:
+        return []
+    items = raw.splitlines() if isinstance(raw, str) else (raw if isinstance(raw, (list, tuple)) else [raw])
+    out: list[str] = []
+    for item in items:
+        text = re.sub(r"^\s*(?:\d+[.)]|[-*•])\s+", "", str(item).strip()).strip()
+        if text:
+            out.append(text)
+    return out
+
+
 def resolve_severity(finding: dict[str, Any], plan: dict[str, Any] | None = None) -> str:
     """The single source of truth for a finding's severity word (lowercased).
 
@@ -733,10 +755,10 @@ def build_markdown(ctx: dict[str, Any]) -> str:
             out.append("")
 
         out.append("**Attack plan / steps to reproduce**\n")
-        steps = plan.get("steps") or []
+        steps = normalize_steps(plan.get("steps"))
         if steps:
             for i, step in enumerate(steps, 1):
-                out.append(f"{i}. {str(step).strip()}")
+                out.append(f"{i}. {step}")
         else:
             out.append("_No automated reproduction steps; see the class guidance and verify manually._")
         out.append("")
@@ -1070,10 +1092,10 @@ def build_finding_markdown(ctx: dict[str, Any], finding: dict[str, Any]) -> str:
         out.append("")
 
     out.append("## Steps to reproduce\n")
-    steps = plan.get("steps") or []
+    steps = normalize_steps(plan.get("steps"))
     if steps:
         for i, step in enumerate(steps, 1):
-            out.append(f"{i}. {str(step).strip()}")
+            out.append(f"{i}. {step}")
     else:
         out.append("_Verify manually within your authorized scope._")
     out.append("")

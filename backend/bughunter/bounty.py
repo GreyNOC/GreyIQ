@@ -689,7 +689,10 @@ def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], 
         else:
             proof_value = str(proof or "").strip()
         new_plan: dict[str, Any] = {
-            "steps": [str(s).strip() for s in (plan.get("steps") or []) if str(s).strip()],
+            # normalize_steps: the brain can return steps as a single string (which naive
+            # iteration would split into characters) or with its own "1."/"-" markers —
+            # coerce to a clean list so numbering is correct in every downstream render.
+            "steps": report_lib.normalize_steps(plan.get("steps")),
             "poc": str(plan.get("poc") or "").strip(),
             "impact": str(plan.get("impact") or "").strip(),
             "proof_of_impact": proof_value,

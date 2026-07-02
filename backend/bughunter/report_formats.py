@@ -143,10 +143,10 @@ def _section_summary(out: list[str], finding: dict[str, Any]) -> None:
 
 def _section_steps(out: list[str], plan: dict[str, Any]) -> None:
     out.append("## Steps to reproduce\n")
-    steps = plan.get("steps") or []
+    steps = R.normalize_steps(plan.get("steps"))
     if steps:
         for i, step in enumerate(steps, 1):
-            out.append(f"{i}. {str(step).strip()}")
+            out.append(f"{i}. {step}")
     else:
         out.append("_Verify manually within your authorized scope._")
     out.append("")
