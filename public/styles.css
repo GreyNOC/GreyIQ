@@ -3105,6 +3105,16 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-cd-rv-card.is-candidate { border-left-color: var(--sun); }
 .ck-cd-rv-card-head { display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap; font-size: 0.82rem; }
 .ck-cd-rv-card .ck-meta-grid { margin-top: 0.4rem; }
+.ck-shot-img { display: block; max-width: 100%; margin: 0.5rem 0; border: 1px solid var(--border); border-radius: 8px; }
+
+/* Reporting hub: generated-report preview + findings history. */
+.ck-report-preview:empty { display: none; }
+.ck-report-md { max-height: 22rem; overflow: auto; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 0.6rem 0.7rem; font-size: 0.76rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; color: var(--text); }
+.ck-hist { margin-top: 1.2rem; }
+.ck-hist-body { display: flex; flex-direction: column; gap: 0.4rem; }
+.ck-hist-prog { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; margin: 0.7rem 0 0.2rem; padding-top: 0.6rem; border-top: 1px solid var(--border); }
+.ck-hist-prog strong { font-size: 0.86rem; }
+.ck-hist-prog .ck-btn { margin-left: auto; }
 
 .ck-detail { border-left: 1px solid var(--border); overflow-y: auto; padding: 1rem 1.1rem; background: var(--surface); }
 .ck-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.6rem; margin-bottom: 0.7rem; }

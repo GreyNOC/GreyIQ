@@ -2,6 +2,28 @@
 
 Notable changes to GreyIQ.
 
+## v0.61.0
+
+### Reporting hub: findings wired across the app, proof-of-impact + reports per finding
+Findings used to live only in the current run (in-memory, lost on restart) while the durable
+finding **ledger** — every finding from every hunt + campaign — was never surfaced. The
+Submissions page is now the reporting hub:
+
+- **All findings — history.** A durable, cross-run finding history (from the persistent
+  ledger, grouped by program) alongside the current run — survives restarts. New
+  `GET /api/bounty/findings`.
+- **Create proof of impact** — on every candidate, in the campaign dashboard drawer and the
+  submissions queue: a scope-gated active re-probe **plus a proof screenshot**, run in a
+  separate track that never pauses the campaign. New `POST /api/bounty/finding/prove`.
+- **Create report** — a well-authored, platform-shaped report built on demand for any
+  finding (including durable-history findings not in the run cache), folding in gathered
+  proof + screenshots. New `POST /api/bounty/finding/report`.
+- **Engagement (special) report** — one polished document across a whole run or program
+  (executive summary + severity/risk overview + every finding). New
+  `POST /api/bounty/report/aggregate`.
+- **Export** — all-in-one `.zip` bundle, per-report `.md`, and a CSV of every finding across
+  all runs.
+
 ## v0.60.3
 
 ### Investigate findings live: sort, filter, click-to-inspect, and on-demand re-verify

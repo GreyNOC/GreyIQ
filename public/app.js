@@ -6144,76 +6144,93 @@ function ckRenderSubmissions() {
   host.append(ckCredsBar());
   host.append(ckHackeroneActivityPanel());
   host.append(ckFormatBar());
-  host.append(ckBundleBar());
+  host.append(ckReportsExportBar());
 
+  // --- This run: findings from the most recent hunt/campaign (in-memory). ---
   const ready = ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate");
-  host.append(cel("h2", "ck-section-title", `Submission queue — ${ready.length} reportable`));
+  host.append(cel("h2", "ck-section-title", `This run — ${ready.length} reportable`));
   if (!ready.length) {
-    host.append(cel("p", "ck-hint", "Confirmed and candidate findings land here as submission-ready packages. Run with “Test for proof of impact” to confirm leads — only a Confirmed finding can be filed to HackerOne."));
-    return;
+    host.append(cel("p", "ck-hint", "Confirmed and candidate findings from the current run land here. Create proof of impact to confirm a candidate — only a Confirmed finding can be filed to HackerOne. Past runs are in “All findings” below."));
+  } else {
+    // Confirmed-first, then candidate.
+    ready.sort((a, b) => (a.proof === "confirmed" ? 0 : 1) - (b.proof === "confirmed" ? 0 : 1));
+    const ul = cel("ul", "ck-list");
+    for (const f of ready) ul.append(ckSubmissionRow(f));
+    host.append(ul);
   }
-  // Confirmed-first, then candidate.
-  ready.sort((a, b) => (a.proof === "confirmed" ? 0 : 1) - (b.proof === "confirmed" ? 0 : 1));
 
-  const ul = cel("ul", "ck-list");
-  for (const f of ready) {
-    const li = cel("li");
-    li.style.flexWrap = "wrap";
+  // --- All findings: durable history across every run + program (persistent ledger). ---
+  host.append(ckHistorySection());
+}
 
-    const left = cel("div");
-    left.style.flex = "1";
-    left.append(cel("span", "ck-ftitle", f.title), document.createTextNode(" "));
-    left.append(ckProofBadge(f.proof));
-    if (ckState.triage[f.ref] === "submitted") left.append(document.createTextNode(" "), cel("span", "ck-tag", "submitted"));
-    li.append(left);
+// One row in the current-run submission queue: title + proof, Copy/Download report, Create
+// proof of impact (candidates), and Submit (confirmed).
+function ckSubmissionRow(f) {
+  const li = cel("li");
+  li.style.flexWrap = "wrap";
 
-    const acts = cel("div", "ck-actions");
-    acts.style.margin = "0";
+  const left = cel("div");
+  left.style.flex = "1";
+  left.append(cel("span", "ck-ftitle", f.title), document.createTextNode(" "));
+  left.append(ckProofBadge(f.proof));
+  if (ckState.triage[f.ref] === "submitted") left.append(document.createTextNode(" "), cel("span", "ck-tag", "submitted"));
+  li.append(left);
 
-    const copyBtn = cel("button", "ck-btn", "Copy report");
-    copyBtn.type = "button";
-    copyBtn.addEventListener("click", async () => {
-      copyBtn.disabled = true; copyBtn.textContent = "Preparing…";
-      try {
-        const pkg = await ckSubmissionMarkdown(f);
-        const ok = await ckCopy(pkg.text);
-        copyBtn.textContent = ok ? (pkg.canonical ? "Copied ✓" : "Copied (offline)") : "Failed";
-      } finally { copyBtn.disabled = false; setTimeout(() => { copyBtn.textContent = "Copy report"; }, 1600); }
-    });
-    acts.append(copyBtn);
+  const acts = cel("div", "ck-actions");
+  acts.style.margin = "0";
+  const statusEl = cel("p", "ck-status");
+  statusEl.style.flexBasis = "100%";
+  const resultEl = cel("div", "ck-cd-rv-result");
+  resultEl.style.flexBasis = "100%";
+  resultEl.hidden = true;
 
-    const dlBtn = cel("button", "ck-btn", "Download .md");
-    dlBtn.type = "button";
-    dlBtn.addEventListener("click", async () => {
-      dlBtn.disabled = true; dlBtn.textContent = "Preparing…";
-      try {
-        const pkg = await ckSubmissionMarkdown(f);
-        ckDownloadText(`${f.ref}-${ckSlug(f.title)}.md`, pkg.text);
-      } finally { dlBtn.disabled = false; dlBtn.textContent = "Download .md"; }
-    });
-    acts.append(dlBtn);
+  const copyBtn = cel("button", "ck-btn", "Copy report");
+  copyBtn.type = "button";
+  copyBtn.addEventListener("click", async () => {
+    copyBtn.disabled = true; copyBtn.textContent = "Preparing…";
+    try {
+      const pkg = await ckSubmissionMarkdown(f);
+      const ok = await ckCopy(pkg.text);
+      copyBtn.textContent = ok ? (pkg.canonical ? "Copied ✓" : "Copied (offline)") : "Failed";
+    } finally { copyBtn.disabled = false; setTimeout(() => { copyBtn.textContent = "Copy report"; }, 1600); }
+  });
+  acts.append(copyBtn);
 
-    const statusEl = cel("p", "ck-status");
-    statusEl.style.flexBasis = "100%";
+  const dlBtn = cel("button", "ck-btn", "Download .md");
+  dlBtn.type = "button";
+  dlBtn.addEventListener("click", async () => {
+    dlBtn.disabled = true; dlBtn.textContent = "Preparing…";
+    try {
+      const pkg = await ckSubmissionMarkdown(f);
+      ckDownloadText(`${f.ref}-${ckSlug(f.title)}.md`, pkg.text);
+    } finally { dlBtn.disabled = false; dlBtn.textContent = "Download .md"; }
+  });
+  acts.append(dlBtn);
 
-    if (ckState.triage[f.ref] === "submitted") {
-      acts.append(ckReportLink("", ""));
-    } else {
-      const submitBtn = cel("button", "ck-btn primary", "Submit to HackerOne");
-      submitBtn.type = "button";
-      const can = ckCanSubmit(f);
-      submitBtn.disabled = !can;
-      submitBtn.title = can ? "File this confirmed finding to your HackerOne program"
-        : (f.proof !== "confirmed" ? "Capture proof of impact first — only a Confirmed finding can be filed."
-          : "Add your HackerOne team handle + API token below.");
-      submitBtn.addEventListener("click", () => ckSubmitFinding(f, submitBtn, statusEl));
-      acts.append(submitBtn);
-    }
-
-    li.append(acts, statusEl);
-    ul.append(li);
+  // Candidates can be actively proven right here (a separate track, scope-gated).
+  if (f.proof === "candidate") {
+    const proveBtn = cel("button", "ck-btn", "Create proof of impact");
+    proveBtn.type = "button";
+    proveBtn.addEventListener("click", () => ckCreateProofOfImpact(f, proveBtn, statusEl, resultEl));
+    acts.append(proveBtn);
   }
-  host.append(ul);
+
+  if (ckState.triage[f.ref] === "submitted") {
+    acts.append(ckReportLink("", ""));
+  } else {
+    const submitBtn = cel("button", "ck-btn primary", "Submit to HackerOne");
+    submitBtn.type = "button";
+    const can = ckCanSubmit(f);
+    submitBtn.disabled = !can;
+    submitBtn.title = can ? "File this confirmed finding to your HackerOne program"
+      : (f.proof !== "confirmed" ? "Create proof of impact first — only a Confirmed finding can be filed."
+        : "Add your HackerOne team handle + API token below.");
+    submitBtn.addEventListener("click", () => ckSubmitFinding(f, submitBtn, statusEl));
+    acts.append(submitBtn);
+  }
+
+  li.append(acts, statusEl, resultEl);
+  return li;
 }
 
 // Report-format selector — the platform the Copy report / Download .md output is shaped
@@ -6303,6 +6320,269 @@ function ckDownloadBase64(filename, b64, mime) {
   a.href = url; a.download = filename;
   document.body.append(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// --- Reports & export bar: engagement (special) report for the current run, the full-run
+// .zip bundle, and a CSV of every finding across all runs. ---
+function ckReportsExportBar() {
+  const wrap = cel("div", "ck-creds");
+  const head = cel("div", "ck-creds-head");
+  head.append(cel("strong", null, "Reports & export"));
+  wrap.append(head);
+  const row = cel("div", "ck-actions"); row.style.margin = "0";
+  const preview = cel("div", "ck-report-preview");
+
+  const engBtn = cel("button", "ck-btn primary", "Generate engagement report");
+  engBtn.type = "button";
+  engBtn.disabled = !ckState.runId;
+  engBtn.title = ckState.runId ? "One document across all findings in this run" : "Run a hunt or campaign first";
+  engBtn.addEventListener("click", () => ckGenerateEngagementReport({ run_id: ckState.runId }, engBtn, preview));
+  row.append(engBtn);
+
+  const zipBtn = cel("button", "ck-btn", "Download everything (.zip)");
+  zipBtn.type = "button";
+  zipBtn.disabled = !ckState.runId;
+  const zipNote = cel("p", "ck-hint", "");
+  zipBtn.addEventListener("click", () => ckDownloadBundle(zipBtn, zipNote));
+  row.append(zipBtn);
+
+  const csvBtn = cel("button", "ck-btn", "Export CSV (all findings)");
+  csvBtn.type = "button";
+  csvBtn.addEventListener("click", () => ckExportLedgerCsv(csvBtn));
+  row.append(csvBtn);
+
+  wrap.append(row);
+  wrap.append(cel("p", "ck-hint",
+    "Engagement report = one polished document across a run's findings. .zip = the whole run (reports, evidence, screenshots). CSV = every finding across all runs, for a spreadsheet."));
+  wrap.append(zipNote);
+  wrap.append(preview);
+  return wrap;
+}
+
+async function ckGenerateEngagementReport(source, btn, previewEl) {
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = "Generating…";
+  try {
+    const res = await apiFetch("/api/bounty/report/aggregate", {
+      method: "POST", timeoutMs: 60000,
+      body: JSON.stringify({ ...source, platform: ckState.platform || "hackerone" }),
+    });
+    if (!res || res.ok === false) {
+      previewEl.replaceChildren(cel("p", "ck-status is-error", (res && res.error) || "Could not build the report."));
+    } else {
+      ckRenderReportPreview(previewEl, "Engagement report", res.markdown || "", res.filename || "engagement-report.md");
+    }
+  } catch (err) {
+    previewEl.replaceChildren(cel("p", "ck-status is-error", err.message || "Could not reach the engine."));
+  } finally {
+    btn.disabled = false; btn.textContent = old;
+  }
+}
+
+// A generated report: a Copy + Download bar above a scrollable markdown preview.
+function ckRenderReportPreview(container, title, markdown, filename) {
+  container.replaceChildren();
+  const bar = cel("div", "ck-actions"); bar.style.margin = "0.5rem 0 0.3rem";
+  bar.append(cel("strong", null, title));
+  const copy = cel("button", "ck-btn", "Copy");
+  copy.type = "button";
+  copy.addEventListener("click", async () => {
+    const ok = await ckCopy(markdown);
+    copy.textContent = ok ? "Copied ✓" : "Failed";
+    setTimeout(() => { copy.textContent = "Copy"; }, 1500);
+  });
+  const dl = cel("button", "ck-btn", "Download .md");
+  dl.type = "button";
+  dl.addEventListener("click", () => ckDownloadText(filename, markdown));
+  bar.append(copy, dl);
+  container.append(bar);
+  const pre = cel("pre", "ck-report-md");
+  pre.textContent = markdown;
+  container.append(pre);
+}
+
+async function ckExportLedgerCsv(btn) {
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = "Exporting…";
+  try {
+    const res = await apiFetch("/api/bounty/ledger-csv", { method: "GET", timeoutMs: 30000 });
+    if (!res || res.ok === false || !res.csv) {
+      btn.textContent = res && res.row_count === 0 ? "No findings yet" : "Failed";
+    } else {
+      ckDownloadText("greyiq-findings.csv", res.csv, "text/csv");
+      btn.textContent = `Downloaded (${res.row_count || 0})`;
+    }
+  } catch (_) {
+    btn.textContent = "Failed";
+  } finally {
+    setTimeout(() => { btn.textContent = old; btn.disabled = false; }, 1800);
+  }
+}
+
+// --- All findings (history): the durable, cross-run ledger, grouped by program. ---
+function ckHistorySection() {
+  const wrap = cel("div", "ck-hist");
+  wrap.append(cel("h2", "ck-section-title", "All findings — history"));
+  const body = cel("div", "ck-hist-body");
+  body.append(cel("p", "ck-hint", "Loading finding history…"));
+  wrap.append(body);
+  void ckLoadHistory(body);
+  return wrap;
+}
+
+async function ckLoadHistory(body) {
+  let res;
+  try { res = await apiFetch("/api/bounty/findings", { method: "GET", timeoutMs: 15000 }); }
+  catch (_) { body.replaceChildren(cel("p", "ck-hint", "Could not load history — the engine is unreachable.")); return; }
+  if (!res || res.ok === false) { body.replaceChildren(cel("p", "ck-hint", "Could not load history.")); return; }
+  const findings = res.findings || [];
+  body.replaceChildren();
+  if (!findings.length) {
+    body.append(cel("p", "ck-hint", "No findings recorded yet. Every hunt + campaign records its findings here — this list persists across restarts, unlike the current run above."));
+    return;
+  }
+  const fn = (res.funnel && res.funnel.portfolio) || res.funnel || {};
+  const st = fn.stages || {};
+  body.append(cel("p", "ck-hint",
+    `${fn.total || findings.length} findings · ${st.confirmed || 0} confirmed · ${st.submitted || 0} submitted · ${st.paid || 0} paid · $${fn.bounty_total || 0} to date`));
+
+  // Group by program bucket; each program gets a header with a one-click engagement report.
+  const byProg = {};
+  for (const r of findings) (byProg[r.program] = byProg[r.program] || []).push(r);
+  for (const [prog, recs] of Object.entries(byProg)) {
+    const phead = cel("div", "ck-hist-prog");
+    phead.append(cel("strong", null, prog || "(unnamed program)"));
+    phead.append(cel("span", "ck-tag", `${recs.length}`));
+    const engBtn = cel("button", "ck-btn", "Engagement report");
+    engBtn.type = "button";
+    const preview = cel("div", "ck-report-preview");
+    engBtn.addEventListener("click", () => ckGenerateEngagementReport({ program: prog }, engBtn, preview));
+    phead.append(engBtn);
+    body.append(phead);
+    const ul = cel("ul", "ck-list");
+    for (const r of recs) ul.append(ckHistoryRow(r));
+    body.append(ul, preview);
+  }
+}
+
+function ckHistoryRow(rec) {
+  const li = cel("li");
+  li.style.flexWrap = "wrap";
+  const left = cel("div");
+  left.style.flex = "1";
+  const sev = String(rec.severity || "info").toLowerCase();
+  left.append(cel("span", `ck-sev sev-${sev}`, String(rec.severity || "info").toUpperCase()), document.createTextNode(" "));
+  left.append(cel("span", "ck-ftitle", rec.title || "Finding"));
+  const meta = cel("div", "ck-cd-finding-meta");
+  if (rec.class_id) meta.append(cel("span", null, rec.class_id));
+  if (rec.proof_status) meta.append(ckProofBadge(rec.proof_status));
+  meta.append(cel("span", "ck-tag", rec.stage || "discovered"));
+  if (Number(rec.bounty)) meta.append(cel("span", null, `$${rec.bounty}`));
+  if (rec.h1_state) meta.append(cel("span", "ck-tag", rec.h1_state));
+  if (rec.source_url) meta.append(cel("span", "ck-cd-finding-target", ckShortTarget(rec.source_url)));
+  left.append(meta);
+  li.append(left);
+
+  const acts = cel("div", "ck-actions"); acts.style.margin = "0";
+  const copyBtn = cel("button", "ck-btn", "Copy report");
+  copyBtn.type = "button";
+  copyBtn.addEventListener("click", async () => {
+    copyBtn.disabled = true; copyBtn.textContent = "Preparing…";
+    try { const md = await ckReportFromLedger(rec); const ok = await ckCopy(md); copyBtn.textContent = ok ? "Copied ✓" : "Failed"; }
+    finally { copyBtn.disabled = false; setTimeout(() => { copyBtn.textContent = "Copy report"; }, 1600); }
+  });
+  const dlBtn = cel("button", "ck-btn", "Download .md");
+  dlBtn.type = "button";
+  dlBtn.addEventListener("click", async () => {
+    dlBtn.disabled = true; dlBtn.textContent = "Preparing…";
+    try { const md = await ckReportFromLedger(rec); ckDownloadText(`${ckSlug(rec.title || "finding")}.md`, md); }
+    finally { dlBtn.disabled = false; dlBtn.textContent = "Download .md"; }
+  });
+  acts.append(copyBtn, dlBtn);
+  li.append(acts);
+  return li;
+}
+
+async function ckReportFromLedger(rec) {
+  try {
+    const res = await apiFetch("/api/bounty/finding/report", {
+      method: "POST", timeoutMs: 30000,
+      body: JSON.stringify({
+        title: rec.title || "Security finding", severity: rec.severity || "info",
+        class_name: rec.class_id || "", location: rec.source_url || "", rule_id: rec.rule_id || "",
+        target: rec.source_url || "", platform: ckState.platform || "hackerone",
+      }),
+    });
+    if (res && res.ok && res.package) return res.package.vulnerability_information || "";
+    return `# ${rec.title || "Finding"}\n\n_(Report could not be built: ${(res && res.error) || "unknown error"})_`;
+  } catch (err) {
+    return `# ${rec.title || "Finding"}\n\n_(Report could not be built: ${err.message || "engine unreachable"})_`;
+  }
+}
+
+// Create proof of impact for a candidate (current-run queue): active re-probe + screenshot,
+// scope-gated, in a separate track. Renders the fresh proof + screenshot inline.
+async function ckCreateProofOfImpact(f, btn, statusEl, resultEl) {
+  const url = String(f.location || f.sourceUrl || "").trim();
+  if (!url) { statusEl.textContent = "This finding has no URL to probe."; statusEl.className = "ck-status is-error"; return; }
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = "Proving…";
+  statusEl.className = "ck-status"; statusEl.textContent = `Actively probing ${url} in scope… (the campaign, if any, keeps running)`;
+  let res;
+  try {
+    res = await apiFetch("/api/bounty/finding/prove", {
+      method: "POST", timeoutMs: 120000,
+      body: JSON.stringify({ url, scope: state.ckScope || "", program_id: state.ckActiveProgramId || null, authorized: true, screenshot: true }),
+    });
+  } catch (err) {
+    statusEl.className = "ck-status is-error"; statusEl.textContent = err.message || "Could not reach the engine.";
+    btn.disabled = false; btn.textContent = old; return;
+  }
+  btn.disabled = false; btn.textContent = old;
+  if (!res || res.ok === false) {
+    statusEl.className = "ck-status is-error"; statusEl.textContent = (res && res.error) || "Proof could not be gathered.";
+    return;
+  }
+  const conf = res.confirmed || 0;
+  statusEl.className = "ck-status";
+  statusEl.textContent = conf
+    ? `Confirmed ${conf} — proof of impact captured (${res.requests_used} request(s) to ${res.host}).`
+    : `Nothing confirmable at ${res.host} right now (${res.requests_used} request(s)).`;
+  resultEl.hidden = false;
+  ckRenderProofResult(resultEl, res);
+}
+
+// Shared renderer for a prove/re-probe result: summary + optional screenshot + per-check proof.
+function ckRenderProofResult(box, res) {
+  box.replaceChildren();
+  const findings = res.findings || [];
+  const summary = findings.length
+    ? `${res.confirmed} confirmed · ${findings.length - res.confirmed} candidate — ${res.requests_used} request(s) to ${res.host}`
+    : `Nothing confirmable at ${res.host} right now (${res.requests_used} request(s)).`;
+  box.append(cel("p", "ck-cd-rv-summary" + (res.confirmed ? " is-hot" : ""), summary));
+  if (res.rate_limited) box.append(cel("p", "ck-hint", "Host rate limit reached — some checks were skipped."));
+  const shot = res.screenshot;
+  if (shot && shot.ok && shot.data_url) {
+    const img = document.createElement("img");
+    img.src = shot.data_url; img.alt = "Proof screenshot"; img.className = "ck-shot-img";
+    box.append(img);
+    if (shot.warning) box.append(cel("p", "ck-hint", shot.warning));
+  } else if (shot && !shot.ok && shot.error) {
+    box.append(cel("p", "ck-hint", "Screenshot: " + shot.error));
+  }
+  for (const r of findings) {
+    const card = cel("div", `ck-cd-rv-card is-${r.status || ""}`);
+    const h = cel("div", "ck-cd-rv-card-head");
+    h.append(cel("span", `ck-sev sev-${r.severity || "info"}`, String(r.severity || "info").toUpperCase()));
+    h.append(cel("strong", null, r.title || r.class_hint || "Active check"));
+    if (r.status) h.append(cel("span", `ck-cd-proof is-${r.status}`, r.status));
+    card.append(h);
+    const g = cel("dl", "ck-meta-grid");
+    const add = (k, v) => { if (v) { g.append(cel("dt", null, k)); g.append(cel("dd", null, String(v))); } };
+    add("Observed", r.observed); add("Control", r.control); add("Evidence", r.evidence);
+    if (g.childNodes.length) card.append(g);
+    box.append(card);
+  }
 }
 
 // HackerOne credentials bar — shows configured state and a token-first save form. The
@@ -7130,7 +7410,7 @@ const ckCampaign = {
   runId: "", poll: null, snapshot: null, events: [], eventCount: 0, done: false,
   stopRequested: false, label: "", startedAt: 0,
   scope: "", programId: null, authorized: false,
-  sortBy: "severity", filterSev: "all", selectedKey: "", reverify: {}, reverifyVersion: 0,
+  sortBy: "severity", filterSev: "all", selectedKey: "", reverify: {}, report: {}, reverifyVersion: 0,
   dom: null,
 };
 
@@ -7140,7 +7420,7 @@ function ckStartCampaignDashboard(runId, label, opts = {}) {
     runId, label: label || "Campaign", snapshot: null, events: [], eventCount: 0, done: false,
     stopRequested: false, startedAt: Date.now(),
     scope: opts.scope || "", programId: opts.programId || null, authorized: Boolean(opts.authorized),
-    selectedKey: "", reverify: {}, reverifyVersion: 0, dom: null,
+    selectedKey: "", reverify: {}, report: {}, reverifyVersion: 0, dom: null,
   });
   ckSetView("campaign");
   void ckPollCampaign();
@@ -7522,87 +7802,124 @@ function ckRenderFindingDrawer(dom) {
   drawer.append(meta);
 
   drawer.append(cel("p", "ck-hint",
-    "Live summary streamed during the hunt. Full evidence + reproduction steps land on the Findings board once the campaign finishes — or re-verify below to actively re-probe this finding right now."));
+    "Live summary streamed during the hunt. Create proof of impact to actively probe + screenshot this finding now, then create a report — all without pausing the campaign."));
 
-  drawer.append(ckRenderReverifySection(f));
+  drawer.append(ckRenderProveSection(f));
+  drawer.append(ckRenderReportSection(f));
 }
 
-function ckRenderReverifySection(f) {
+// Proof-of-impact section (drawer): active probe (verify_active) + screenshot, in a
+// separate track. State lives in ckCampaign.reverify[key] so the poll-driven drawer
+// re-render reproduces it whether the user stays on this finding or clicks away and back.
+function ckRenderProveSection(f) {
   const key = String(f._i);
   const rv = ckCampaign.reverify[key];
   const running = rv && rv.state === "running";
   const wrap = cel("div", "ck-cd-reverify");
-  wrap.append(cel("h4", null, "Re-verify — active re-probe"));
-  wrap.append(cel("p", "ck-hint", "Re-runs the scope-gated active checks against this finding's URL in a separate track. The campaign keeps running."));
-  const btn = cel("button", "ck-btn primary", running ? "Re-verifying…" : "Re-verify this finding");
+  wrap.append(cel("h4", null, "Proof of impact — active"));
+  wrap.append(cel("p", "ck-hint", "Re-runs the scope-gated active checks against this finding's URL and captures a screenshot, in a separate track. The campaign keeps running."));
+  const btn = cel("button", "ck-btn primary", running ? "Working…" : "Create proof of impact");
   btn.type = "button";
   btn.disabled = running || !ckCampaign.authorized;
-  btn.addEventListener("click", () => void ckReverifyFinding(f));
+  btn.addEventListener("click", () => void ckProveFinding(f));
   wrap.append(btn);
-  if (!ckCampaign.authorized) wrap.append(cel("p", "ck-hint", "Re-verify needs an authorized campaign (the authorization box was ticked at launch)."));
+  if (!ckCampaign.authorized) wrap.append(cel("p", "ck-hint", "Needs an authorized campaign (the authorization box was ticked at launch)."));
   if (running) {
     const busy = cel("div", "ck-cd-rv-busy");
     busy.append(cel("span", "typing-dots"));
-    busy.append(cel("span", null, "Actively re-probing " + (f.location || f.target || "the target") + " in scope…"));
+    busy.append(cel("span", null, "Actively probing " + (f.location || f.target || "the target") + " in scope…"));
     wrap.append(busy);
   } else if (rv && rv.state === "error") {
-    wrap.append(cel("p", "ck-cd-rv-error", rv.error || "Re-verify failed."));
+    wrap.append(cel("p", "ck-cd-rv-error", rv.error || "Proof of impact could not be gathered."));
   } else if (rv && rv.state === "done") {
-    wrap.append(ckRenderReverifyResult(rv.result));
+    const box = cel("div", "ck-cd-rv-result");
+    ckRenderProofResult(box, rv.result);
+    wrap.append(box);
   }
   return wrap;
 }
 
-function ckRenderReverifyResult(res) {
-  const box = cel("div", "ck-cd-rv-result");
-  const host = res.host || "the target";
-  const findings = res.findings || [];
-  const summary = findings.length
-    ? `${res.confirmed} confirmed · ${findings.length - res.confirmed} candidate — ${res.requests_used} request(s) to ${host}`
-    : `Nothing confirmable at ${host} right now (${res.requests_used} request(s)).`;
-  box.append(cel("p", "ck-cd-rv-summary" + (res.confirmed ? " is-hot" : ""), summary));
-  if (res.rate_limited) box.append(cel("p", "ck-hint", "Host rate limit reached — some checks were skipped. Try again shortly."));
-  for (const r of findings) {
-    const card = cel("div", `ck-cd-rv-card is-${r.status || ""}`);
-    const h = cel("div", "ck-cd-rv-card-head");
-    h.append(cel("span", `ck-sev sev-${r.severity || "info"}`, (r.severity || "info").toUpperCase()));
-    h.append(cel("strong", null, r.title || r.class_hint || "Active check"));
-    if (r.status) h.append(cel("span", `ck-cd-proof is-${r.status}`, r.status));
-    card.append(h);
-    const g = cel("dl", "ck-meta-grid");
-    const add = (k, v) => { if (v) { g.append(cel("dt", null, k)); g.append(cel("dd", null, String(v))); } };
-    add("Method", r.method);
-    add("Observed", r.observed);
-    add("Control", r.control);
-    add("Evidence", r.evidence);
-    add("Limitations", r.limitations);
-    if (g.childNodes.length) card.append(g);
-    box.append(card);
+// Report section (drawer): build a well-authored report for this finding, folding in the
+// strongest proof gathered above. State in ckCampaign.report[key].
+function ckRenderReportSection(f) {
+  const key = String(f._i);
+  const rep = ckCampaign.report[key];
+  const running = rep && rep.state === "running";
+  const wrap = cel("div", "ck-cd-reverify");
+  wrap.append(cel("h4", null, "Report"));
+  wrap.append(cel("p", "ck-hint", "Builds a well-authored report for this finding, folding in any proof of impact captured above."));
+  const btn = cel("button", "ck-btn", running ? "Building…" : "Create report");
+  btn.type = "button";
+  btn.disabled = running;
+  btn.addEventListener("click", () => void ckDrawerReport(f));
+  wrap.append(btn);
+  if (running) {
+    const busy = cel("div", "ck-cd-rv-busy");
+    busy.append(cel("span", "typing-dots"));
+    busy.append(cel("span", null, "Building the report…"));
+    wrap.append(busy);
+  } else if (rep && rep.state === "error") {
+    wrap.append(cel("p", "ck-cd-rv-error", rep.error || "Report could not be built."));
+  } else if (rep && rep.state === "done") {
+    const box = cel("div", "ck-report-preview");
+    ckRenderReportPreview(box, "Report", rep.markdown, rep.filename || (ckSlug(f.title || "finding") + ".md"));
+    wrap.append(box);
   }
-  return box;
+  return wrap;
 }
 
-// The on-demand re-probe. Fires an independent request (does NOT block the campaign poll),
-// stashing state in ckCampaign.reverify[key] so the drawer re-renders through it whether the
-// user stays on this finding or clicks away and back.
-async function ckReverifyFinding(f) {
+// Create proof of impact: fires an independent /prove request (does NOT block the campaign
+// poll), stashing state in ckCampaign.reverify[key].
+async function ckProveFinding(f) {
   const key = String(f._i);
   const url = (f.location || f.target || "").trim();
   const setState = (s) => { ckCampaign.reverify[key] = s; ckCampaign.reverifyVersion++; if (ckState.view === "campaign") ckRenderCampaign(); };
-  if (!url) { setState({ state: "error", error: "This finding has no URL to re-verify." }); return; }
+  if (!url) { setState({ state: "error", error: "This finding has no URL to probe." }); return; }
   setState({ state: "running" });
   let res;
   try {
-    res = await apiFetch("/api/bounty/finding/reverify", {
+    res = await apiFetch("/api/bounty/finding/prove", {
       method: "POST", timeoutMs: 120000,
-      body: JSON.stringify({ url, scope: ckCampaign.scope, program_id: ckCampaign.programId, authorized: ckCampaign.authorized }),
+      body: JSON.stringify({ url, scope: ckCampaign.scope, program_id: ckCampaign.programId, authorized: ckCampaign.authorized, screenshot: true }),
     });
   } catch (err) {
     setState({ state: "error", error: err.message || "Could not reach the engine." });
     return;
   }
   if (res && res.ok) setState({ state: "done", result: res });
-  else setState({ state: "error", error: (res && res.error) || "Re-verify failed." });
+  else setState({ state: "error", error: (res && res.error) || "Proof of impact could not be gathered." });
+}
+
+async function ckDrawerReport(f) {
+  const key = String(f._i);
+  const setState = (s) => { ckCampaign.report[key] = s; ckCampaign.reverifyVersion++; if (ckState.view === "campaign") ckRenderCampaign(); };
+  setState({ state: "running" });
+  // Fold in the strongest proof gathered above (prefer a confirmed active check).
+  let proof = null;
+  const rv = ckCampaign.reverify[key];
+  if (rv && rv.state === "done" && (rv.result.findings || []).length) {
+    const fnds = rv.result.findings;
+    const best = fnds.find((x) => x.status === "confirmed") || fnds[0];
+    proof = { status: best.status || "candidate", method: best.method || "", observed_result: best.observed || "",
+              control_result: best.control || "", evidence: best.evidence || "", affected_asset: best.affected_asset || "" };
+  }
+  let res;
+  try {
+    res = await apiFetch("/api/bounty/finding/report", {
+      method: "POST", timeoutMs: 30000,
+      body: JSON.stringify({
+        title: f.title || "Security finding", severity: f.severity || "info", class_name: f.cls || "",
+        location: f.location || f.target || "", cwe: f.cwe || "", rule_id: f.rule || "",
+        target: f.target || f.location || "", scope: ckCampaign.scope || "",
+        platform: ckState.platform || "hackerone", proof,
+      }),
+    });
+  } catch (err) {
+    setState({ state: "error", error: err.message || "Could not reach the engine." });
+    return;
+  }
+  if (res && res.ok && res.package) setState({ state: "done", markdown: res.package.vulnerability_information || "", filename: ckSlug(f.title || "finding") + ".md" });
+  else setState({ state: "error", error: (res && res.error) || "Report could not be built." });
 }
 
 // --- Completion alerts: a hunt/campaign can run for minutes, and the autonomous

@@ -309,6 +309,21 @@ def _defang_csv_cell(value: Any) -> Any:
     return "'" + text if text.startswith(_CSV_FORMULA_TRIGGERS) else value
 
 
+def list_all(runtime_dir: str | Path) -> list[dict[str, Any]]:
+    """Every finding record across the WHOLE portfolio, most-recently-updated first — the
+    durable finding/report history the UI surfaces (survives an app restart, unlike the
+    in-memory run cache). Read-only; each record carries its own ``program`` bucket id and
+    ``dedup_key`` so the caller can act on it (build a report, export, sync) without a
+    re-derivation. Raw records (not CSV-defanged) — the UI renders text, not a spreadsheet."""
+    data = _load(runtime_dir).get("programs", {})
+    out: list[dict[str, Any]] = []
+    for pid, bucket in data.items():
+        for key, rec in (bucket.get("findings") or {}).items():
+            out.append({**rec, "program": pid, "dedup_key": key})
+    out.sort(key=lambda r: str(r.get("updated_at") or r.get("last_seen") or ""), reverse=True)
+    return out
+
+
 def to_csv_rows(runtime_dir: str | Path, program: str | None = None, target: str = "") -> list[dict[str, Any]]:
     """Flatten every finding record (one program, or the whole portfolio) into
     spreadsheet-friendly rows with a fixed, stable column set (CSV_COLUMNS). Read-

@@ -628,6 +628,55 @@ class ReverifyRequest(BaseModel):
     auth_headers: list[str] = Field(default_factory=list, max_length=20)
 
 
+class ProveRequest(BaseModel):
+    # "Create proof of impact" for a candidate: active re-probe (verify_active) PLUS a proof
+    # screenshot, both scope-gated. Same fail-closed posture as the campaign's active pass.
+    url: str = Field(min_length=1, max_length=4000)
+    scope: str = Field(default="", max_length=2000)
+    program_id: str | None = Field(default=None, max_length=120)
+    authorized: bool = False
+    time_based: bool = False
+    screenshot: bool = True
+    auth_cookie: str = Field(default="", max_length=8000)
+    auth_headers: list[str] = Field(default_factory=list, max_length=20)
+
+
+class ProofInput(BaseModel):
+    status: str = Field(default="candidate", max_length=20)
+    method: str = Field(default="", max_length=400)
+    observed_result: str = Field(default="", max_length=6000)
+    control_result: str = Field(default="", max_length=6000)
+    evidence: str = Field(default="", max_length=6000)
+    affected_asset: str = Field(default="", max_length=1000)
+    limitations: str = Field(default="", max_length=1000)
+
+
+class FindingReportRequest(BaseModel):
+    # Build a well-authored report for ONE finding on demand, from the finding's own fields
+    # (a ledger/dashboard finding that isn't in the in-memory run cache) plus any proof the
+    # operator just gathered. Server recomputes proof_status; a client can't forge "confirmed".
+    title: str = Field(default="Security finding", max_length=255)
+    severity: str = Field(default="info", max_length=20)
+    class_name: str = Field(default="", max_length=160)
+    location: str = Field(default="", max_length=4000)
+    cwe: str = Field(default="", max_length=40)
+    rule_id: str = Field(default="", max_length=160)
+    target: str = Field(default="", max_length=4000)
+    scope: str = Field(default="", max_length=2000)
+    platform: str = Field(default="hackerone", max_length=40)
+    description: str = Field(default="", max_length=8000)
+    proof: ProofInput | None = None
+    screenshot_path: str = Field(default="", max_length=4000)
+
+
+class AggregateReportRequest(BaseModel):
+    # The "special report": one engagement document across many findings. Either a cached
+    # run (run_id — rich, with proof/plans) or a saved program (its ledger history).
+    run_id: str = Field(default="", max_length=100)
+    program: str | None = Field(default=None, max_length=200)
+    platform: str = Field(default="hackerone", max_length=40)
+
+
 class LearnRequest(BaseModel):
     class_id: str = Field(min_length=1, max_length=60)
     status: str = Field(min_length=1, max_length=40)
@@ -1435,22 +1484,7 @@ class GreyIQRuntime:
         url = str(request.url or "").strip()
         if not url:
             return {"ok": False, "error": "This finding has no URL to re-verify."}
-        # Resolve the freshest, authoritative scope: the saved program's current scope_text
-        # (so editing a program's scope takes effect without re-running) unioned with any
-        # scope the caller passes. The program's out_of_scope_hosts ride on the settings the
-        # active pass takes, so an excluded host stays fail-closed on re-verify too.
-        scope_parts: list[str] = []
-        excluded: tuple[str, ...] = ()
-        if request.program_id:
-            program = bounty_portfolio.get_program(RUNTIME_DIR, request.program_id)
-            if program:
-                if str(program.get("scope_text") or "").strip():
-                    scope_parts.append(str(program["scope_text"]))
-                excluded = tuple(str(h) for h in (program.get("out_of_scope_hosts") or []))
-        if str(request.scope or "").strip():
-            scope_parts.append(str(request.scope))
-        scope = "\n".join(scope_parts)
-        settings = dataclasses.replace(_bounty_get_settings(), excluded_hosts=excluded)
+        scope, settings, _excluded = self._active_scope_for(request.scope, request.program_id)
         auth = bounty_scan_auth.build_auth(url, cookie=request.auth_cookie, headers=request.auth_headers)
         results, meta = bounty_active_verify.verify_active(
             url, [], scope=scope, settings=settings, time_based=request.time_based,
@@ -1459,23 +1493,160 @@ class GreyIQRuntime:
         if not meta.get("in_scope"):
             return {"ok": False, "in_scope": False, "host": meta.get("host", ""),
                     "error": meta.get("skipped_reason") or "That target is not named in the current scope, so it can't be re-verified."}
-        compact: list[dict[str, Any]] = []
-        for r in results:
-            proof = r.get("_active_proof") or {}
-            compact.append({
-                "title": r.get("title", ""), "severity": r.get("severity", "info"),
-                "class_hint": r.get("_active_class_hint", ""), "rule_id": r.get("rule_id", ""),
-                "status": proof.get("status", ""), "method": proof.get("method", ""),
-                "observed": proof.get("observed_result", ""), "control": proof.get("control_result", ""),
-                "evidence": proof.get("evidence", ""), "limitations": proof.get("limitations", ""),
-                "affected_asset": proof.get("affected_asset", ""),
-            })
+        compact = [self._compact_active(r) for r in results]
         confirmed = sum(1 for c in compact if c["status"] == "confirmed")
         return {
             "ok": True, "host": meta.get("host", ""), "in_scope": True,
             "requests_used": meta.get("requests_used", 0), "rate_limited": bool(meta.get("rate_limited")),
             "findings": compact, "confirmed": confirmed,
         }
+
+    # --- Shared active-probe helpers (used by reverify + prove) --------------------
+    def _active_scope_for(self, scope: str, program_id: str | None) -> tuple[str, Any, tuple[str, ...]]:
+        """Resolve the freshest, authoritative active-scan scope + settings: the saved
+        program's current scope_text (so editing a program's scope takes effect without
+        re-running) unioned with any scope the caller passes; the program's
+        out_of_scope_hosts ride on the settings so an excluded host stays fail-closed."""
+        scope_parts: list[str] = []
+        excluded: tuple[str, ...] = ()
+        if program_id:
+            program = bounty_portfolio.get_program(RUNTIME_DIR, program_id)
+            if program:
+                if str(program.get("scope_text") or "").strip():
+                    scope_parts.append(str(program["scope_text"]))
+                excluded = tuple(str(h) for h in (program.get("out_of_scope_hosts") or []))
+        if str(scope or "").strip():
+            scope_parts.append(str(scope))
+        settings = dataclasses.replace(_bounty_get_settings(), excluded_hosts=excluded)
+        return "\n".join(scope_parts), settings, excluded
+
+    @staticmethod
+    def _compact_active(r: dict[str, Any]) -> dict[str, Any]:
+        """Flatten one verify_active result (with its _active_proof) into the flat shape the
+        dashboard drawer + report builder consume."""
+        proof = r.get("_active_proof") or {}
+        return {
+            "title": r.get("title", ""), "severity": r.get("severity", "info"),
+            "class_hint": r.get("_active_class_hint", ""), "rule_id": r.get("rule_id", ""),
+            "status": proof.get("status", ""), "method": proof.get("method", ""),
+            "observed": proof.get("observed_result", ""), "control": proof.get("control_result", ""),
+            "evidence": proof.get("evidence", ""), "limitations": proof.get("limitations", ""),
+            "affected_asset": proof.get("affected_asset", ""),
+        }
+
+    def _capture_proof_screenshot(self, url: str, scope: str, settings: Any) -> dict[str, Any]:
+        """Best-effort proof screenshot of a PoC URL (scope-gated, SSRF-guarded, Playwright-
+        backed). Returns a small inline data_url for the drawer preview when the PNG is
+        under 4 MB. Never raises — a screenshot failure never fails proof-of-impact."""
+        safe = "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(url))[:60]
+        out_path = RUNTIME_DIR / "screenshots" / f"prove-{safe}.png"
+        shot = bounty_screenshot.capture_screenshot(url, out_path, scope=scope, authorized=True, settings=settings)
+        if not shot.get("ok"):
+            return {"ok": False, "error": str(shot.get("error") or "Screenshot could not be captured.")}
+        data_url = ""
+        try:
+            raw = Path(shot["path"]).read_bytes()
+            if len(raw) <= 4_000_000:
+                data_url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+        except OSError:
+            pass
+        return {"ok": True, "path": shot.get("path", ""), "data_url": data_url,
+                "warning": shot.get("warning", ""), "final_url": shot.get("final_url", "")}
+
+    def prove_finding(self, request: "ProveRequest") -> dict[str, Any]:
+        """Create proof of impact for a candidate: run the scope-gated active checks against
+        the finding's URL AND capture a proof screenshot, in its own thread (parallel to any
+        campaign). Fail-closed: refuses without authorization / out of scope."""
+        if not request.authorized:
+            return {"ok": False, "error": "Confirm you're authorized and in scope before creating proof of impact (tick the authorization box)."}
+        url = str(request.url or "").strip()
+        if not url:
+            return {"ok": False, "error": "This finding has no URL to probe."}
+        scope, settings, _excluded = self._active_scope_for(request.scope, request.program_id)
+        auth = bounty_scan_auth.build_auth(url, cookie=request.auth_cookie, headers=request.auth_headers)
+        results, meta = bounty_active_verify.verify_active(
+            url, [], scope=scope, settings=settings, time_based=request.time_based,
+            auth=auth, requests_budget=16,
+        )
+        if not meta.get("in_scope"):
+            return {"ok": False, "in_scope": False, "host": meta.get("host", ""),
+                    "error": meta.get("skipped_reason") or "That target is not named in the current scope, so proof of impact can't be gathered."}
+        compact = [self._compact_active(r) for r in results]
+        confirmed = sum(1 for c in compact if c["status"] == "confirmed")
+        out = {"ok": True, "host": meta.get("host", ""), "in_scope": True,
+               "requests_used": meta.get("requests_used", 0), "rate_limited": bool(meta.get("rate_limited")),
+               "findings": compact, "confirmed": confirmed, "screenshot": None}
+        if request.screenshot:
+            out["screenshot"] = self._capture_proof_screenshot(url, scope, settings)
+        return out
+
+    def list_all_findings(self) -> dict[str, Any]:
+        """The durable, cross-run finding/report history (persistent ledger) + the portfolio
+        funnel — so the Submissions hub can show ALL reports across every run and program,
+        surviving restarts, not just the current in-memory run. Read-only."""
+        try:
+            records = bounty_ledger.list_all(RUNTIME_DIR)
+            funnel = bounty_ledger.funnel(RUNTIME_DIR)
+        except Exception as exc:  # noqa: BLE001 - a history read must never 500 the hub
+            return {"ok": False, "error": f"Could not read the finding ledger: {exc}"}
+        return {"ok": True, "findings": records, "funnel": funnel}
+
+    def build_finding_report(self, request: "FindingReportRequest") -> dict[str, Any]:
+        """Build a well-authored report for ONE finding on demand from its own fields (a
+        ledger/dashboard finding that isn't in the in-memory run cache), folding in any proof
+        the operator just gathered. Server recomputes proof_status — a client can't forge
+        'confirmed'. Pure / no-network."""
+        ref = "R1"
+        finding = {
+            "ref": ref, "title": str(request.title or "Security finding"),
+            "severity": str(request.severity or "info"), "class_name": str(request.class_name or ""),
+            "location": str(request.location or request.target or ""), "cwe": str(request.cwe or ""),
+            "rule_id": str(request.rule_id or ""), "description": str(request.description or ""),
+            "screenshot_path": str(request.screenshot_path or ""),
+        }
+        plan: dict[str, Any] = {}
+        if request.proof is not None:
+            p = request.proof
+            plan["proof_of_impact"] = {
+                "status": p.status, "method": p.method, "observed_result": p.observed_result,
+                "control_result": p.control_result, "evidence": p.evidence,
+                "affected_asset": p.affected_asset, "limitations": p.limitations,
+            }
+        ctx = {
+            "tool": "GreyIQ BugHunter", "version": VERSION,
+            "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
+            "target": str(request.target or request.location or ""), "scope": str(request.scope or ""),
+            "attack_plans": {ref: plan}, "disclose_automation": False,
+        }
+        platform = bounty_formats.normalize_platform(request.platform)
+        package = bounty_submission.build_submission(ctx, finding, platform)
+        if package is None:
+            return {"ok": False, "error": "This finding isn't reportable (e.g. an unconfirmed credential lead)."}
+        return {"ok": True, "package": package, "platform": platform}
+
+    def aggregate_report(self, request: "AggregateReportRequest") -> dict[str, Any]:
+        """The special report: one engagement document across many findings — from a cached
+        run (rich: proof + attack plans, via per-finding render) or a saved program (its
+        durable ledger history)."""
+        platform = bounty_formats.normalize_platform(request.platform)
+        safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
+        if request.run_id:
+            with self.lock:
+                run = self.bounty_runs.get(request.run_id)
+            if not run:
+                return {"ok": False, "error": "That run is no longer cached — re-run the hunt, or generate a program report from the history instead."}
+            ctx = run["ctx"]
+            findings = list((run.get("findings") or {}).values())
+            md = _build_engagement_markdown_from_run(ctx, findings, platform, VERSION)
+            label = ctx.get("target") or run.get("program") or "report"
+            return {"ok": True, "markdown": md, "filename": f"engagement-{safe(label)}.md"}
+        if request.program:
+            records = [r for r in bounty_ledger.list_all(RUNTIME_DIR) if r.get("program") == request.program]
+            if not records:
+                return {"ok": False, "error": "No findings recorded for that program yet."}
+            md = _build_engagement_markdown_from_ledger(str(request.program), records, VERSION)
+            return {"ok": True, "markdown": md, "filename": f"engagement-{safe(request.program)}.md"}
+        return {"ok": False, "error": "Provide a run_id or a program to build an engagement report."}
 
     def run_campaign(self, request: "CampaignRequest") -> dict[str, Any]:
         # authorized passes straight through — campaign.run_campaign fails closed when
@@ -2989,6 +3160,90 @@ def repo_ingest(request: RepoIngestRequest) -> dict[str, Any]:
     )
 
 
+_ENGAGEMENT_SEV_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0, "none": 0, "": 0}
+
+
+def _build_engagement_markdown_from_run(ctx: dict[str, Any], findings: list[dict[str, Any]], platform: str, version: str) -> str:
+    """One aggregate engagement report from a cached run: executive summary + severity/risk
+    overview + each finding rendered IN FULL (reusing the per-finding report formatter, so
+    the proof-of-impact / screenshots / reproduction match the single-finding reports)."""
+    plans = ctx.get("attack_plans") or {}
+
+    def _sev(f: dict[str, Any]) -> str:
+        return bounty_report.resolve_severity(f, plans.get(f.get("ref")) or {})
+
+    ranked = sorted(findings, key=lambda f: _ENGAGEMENT_SEV_ORDER.get(_sev(f), 0), reverse=True)
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+    confirmed = 0
+    for f in ranked:
+        s = _sev(f)
+        if s in counts:
+            counts[s] += 1
+        if bounty_report._proof_of_impact_detail(f, plans.get(f.get("ref")) or {}).get("status") == "confirmed":
+            confirmed += 1
+    target = ctx.get("target", "")
+    out: list[str] = []
+    out.append(f"# Engagement report — {target or 'findings'}\n")
+    out.append("| | |")
+    out.append("|---|---|")
+    out.append(f"| **Target** | {target or '(various)'} |")
+    out.append(f"| **Findings** | {len(ranked)} total · **{confirmed} actively confirmed** |")
+    out.append(f"| **Severity** | {counts['critical']} critical · {counts['high']} high · {counts['medium']} medium · {counts['low']} low · {counts['info']} info |")
+    out.append(f"| **Generated** | {ctx.get('generated_at') or datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')} · GreyIQ v{version} |")
+    out.append("")
+    out.append("## Authorization & scope\n")
+    out.append("> Authorized testing only. " + (str(ctx.get("scope") or "") or "(scope not provided)"))
+    out.append("")
+    out.append("## Findings overview\n")
+    out.append("| # | Severity | Class | Proof | Finding | Location |")
+    out.append("|---|---|---|---|---|---|")
+    for i, f in enumerate(ranked, 1):
+        proof = bounty_report._proof_of_impact_detail(f, plans.get(f.get("ref")) or {}).get("status", "missing")
+        out.append(f"| {i} | {_sev(f).title()} | {str(f.get('class_name') or f.get('class_id') or '')} | {proof} "
+                   f"| {str(f.get('title', '')).replace('|', '/')} | `{f.get('location') or f.get('source_url') or ''}` |")
+    out.append("")
+    out.append("## Detailed findings\n")
+    for f in ranked:
+        body = bounty_formats.render_finding(ctx, f, platform)
+        if body.strip():
+            out.append(body.strip())
+            out.append("\n---\n")
+    return "\n".join(out)
+
+
+def _build_engagement_markdown_from_ledger(program: str, records: list[dict[str, Any]], version: str) -> str:
+    """Aggregate report from durable ledger history (no full attack plans): executive summary
+    + a findings table with proof/stage/bounty — for a program whose rich run cache has aged
+    out of memory but whose finding history persists."""
+    ranked = sorted(records, key=lambda r: _ENGAGEMENT_SEV_ORDER.get(str(r.get("severity") or "").lower(), 0), reverse=True)
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+    bounty = 0.0
+    for r in ranked:
+        s = str(r.get("severity") or "").lower()
+        if s in counts:
+            counts[s] += 1
+        bounty += float(r.get("bounty") or 0.0)
+    out: list[str] = []
+    out.append(f"# Engagement report — {program}\n")
+    out.append("| | |")
+    out.append("|---|---|")
+    out.append(f"| **Findings** | {len(ranked)} recorded |")
+    out.append(f"| **Severity** | {counts['critical']} critical · {counts['high']} high · {counts['medium']} medium · {counts['low']} low · {counts['info']} info |")
+    out.append(f"| **Bounty to date** | ${round(bounty, 2)} |")
+    out.append(f"| **Generated** | {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')} · GreyIQ v{version} |")
+    out.append("")
+    out.append("## Findings\n")
+    out.append("| Severity | Class | Title | Proof | Stage | Bounty | Location |")
+    out.append("|---|---|---|---|---|---|---|")
+    for r in ranked:
+        out.append(f"| {str(r.get('severity') or '').title()} | {r.get('class_id') or ''} | {str(r.get('title', '')).replace('|', '/')} "
+                   f"| {r.get('proof_status') or ''} | {r.get('stage') or ''} | {r.get('bounty') or 0} | `{r.get('source_url') or ''}` |")
+    out.append("")
+    out.append("---")
+    out.append("_GreyIQ engagement report — durable ledger history. Re-run a hunt for full per-finding evidence + reproduction steps._")
+    return "\n".join(out)
+
+
 def _safe_validation_summary(exc: Exception, max_errors: int = 10) -> str:
     """A 422 detail message naming WHICH fields failed and why, without ever reflecting
     the submitted values: pydantic's str(exc) embeds 'input_value=<the actual payload>',
@@ -3307,6 +3562,21 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/finding/reverify":
             request = validate_payload(ReverifyRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.reverify_finding, request))
+            return
+        if method == "POST" and path == "/api/bounty/finding/prove":
+            request = validate_payload(ProveRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.prove_finding, request))
+            return
+        if method == "POST" and path == "/api/bounty/finding/report":
+            request = validate_payload(FindingReportRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.build_finding_report, request))
+            return
+        if method == "POST" and path == "/api/bounty/report/aggregate":
+            request = validate_payload(AggregateReportRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.aggregate_report, request))
+            return
+        if method == "GET" and path == "/api/bounty/findings":
+            await send_json(send, await asyncio.to_thread(runtime.list_all_findings))
             return
         if method == "POST" and path == "/api/bounty/learn":
             request = validate_payload(LearnRequest, await read_json_body(receive))
