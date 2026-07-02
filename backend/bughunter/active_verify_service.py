@@ -399,19 +399,24 @@ def _finding(rule_id: str, title: str, severity: str, category: str, class_hint:
 # 'confirmed' status requires a positive observation AND a control differential.
 
 def _check_cors(http: _Http, url: str) -> dict[str, Any] | None:
+    parsed = urlparse(url)
+    # The target's REAL origin (scheme + host + port) — an http:// target, or an https:// target
+    # on an allowed non-default port, reflects origins prefixed with THAT, not a hardcoded
+    # https://host, so build the control (and the substring probe) from the parsed origin.
+    site_origin = f"{parsed.scheme}://{parsed.netloc}"
     try:
         probe = http.fetch(url, extra_headers={"Origin": _MARKER_ORIGIN})
-        control = http.fetch(url, extra_headers={"Origin": f"https://{urlparse(url).hostname}"})
+        control = http.fetch(url, extra_headers={"Origin": site_origin})
     except _ActiveError:
         return None
     acao = (probe["headers"].get("access-control-allow-origin") or "").strip()
     acac = (probe["headers"].get("access-control-allow-credentials") or "").strip().lower()
     ctrl_acao = (control["headers"].get("access-control-allow-origin") or "").strip()
-    # The app DYNAMICALLY reflects the Origin it's sent (it echoed the control origin back). A
+    # The app DYNAMICALLY reflects the Origin it's sent (it echoed the site origin back). A
     # substring/prefix-trusting ACL always reflects the host-containing control origin, so gating
     # the extra substring probe (variant 4) on this adds ZERO requests on an app that returns a
     # static/absent ACAO — keeping the request budget for the other checks.
-    reflects_control = ctrl_acao == f"https://{urlparse(url).hostname}"
+    reflects_control = ctrl_acao == site_origin
     reflects_marker = acao == _MARKER_ORIGIN
     credentialed = acac == "true"
     # Confirmed: the response reflects the ATTACKER origin (not a static value/wildcard)
@@ -484,7 +489,7 @@ def _check_cors(http: _Http, url: str) -> dict[str, Any] | None:
     # if it's reflected with credentials and a different origin isn't, an attacker-owned domain
     # that merely CONTAINS the target host can read authenticated data.
     if host and reflects_control:
-        substr_origin = f"https://{host}.{_MARKER_HOST}"
+        substr_origin = f"{parsed.scheme}://{host}.{_MARKER_HOST}"
         try:
             substr_probe = http.fetch(url, extra_headers={"Origin": substr_origin})
         except _ActiveError:

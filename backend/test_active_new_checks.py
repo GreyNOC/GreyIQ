@@ -187,11 +187,11 @@ class SstiMultiEngineTests(unittest.TestCase):
 
 
 class _PrefixCorsStub:
-    """An ACL that trusts any Origin STARTING WITH https://<host> (no boundary check) — the
+    """An ACL that trusts any Origin STARTING WITH a fixed origin prefix (no boundary check) — the
     substring/prefix-trust bug that CORS variants 1-3 (exact marker, null, subdomain) don't catch,
     so it exercises variant 4 specifically."""
-    def __init__(self, target_host: str = "app.example.com") -> None:
-        self.prefix = f"https://{target_host}"
+    def __init__(self, prefix: str = "https://app.example.com") -> None:
+        self.prefix = prefix
 
     def fetch(self, url, *, method="GET", extra_headers=None):
         origin = {k.lower(): v for k, v in (extra_headers or {}).items()}.get("origin")
@@ -208,6 +208,14 @@ class CorsSubstringTrustTests(unittest.TestCase):
         self.assertIsNotNone(f)
         self.assertEqual(f["_active_proof"]["status"], "confirmed")
         self.assertIn("app.example.com." + av._MARKER_HOST, f["proof_evidence"]["matched_value"])
+
+    def test_http_target_prefix_trust_confirms(self) -> None:
+        # On an http:// target the control/substring origins must be built from the URL's real
+        # scheme, or a middleware trusting http://<host>-prefixed origins is never probed.
+        f = av._check_cors(_PrefixCorsStub("http://app.example.com"), "http://app.example.com/?q=x")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertIn("http://app.example.com." + av._MARKER_HOST, f["proof_evidence"]["matched_value"])
 
     def test_strict_acl_not_flagged(self) -> None:
         class _StrictCorsStub:  # only the exact site origin is trusted -> nothing to confirm
