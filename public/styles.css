@@ -3187,6 +3187,8 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-btn { font: inherit; font-size: 0.8rem; cursor: pointer; padding: 0.45rem 0.8rem; border-radius: 9px; border: 1px solid var(--border); background: var(--surface); color: var(--text); }
 .ck-btn:hover { border-color: var(--accent); background: var(--surface-2); }
 .ck-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.ck-btn.ck-btn-danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
+.ck-btn.ck-btn-danger:hover { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, var(--surface)); }
 .ck-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .ck-stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); gap: 0.7rem; margin-bottom: 1rem; }

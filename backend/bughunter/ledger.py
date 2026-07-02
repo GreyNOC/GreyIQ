@@ -76,8 +76,18 @@ def _normalized_location(finding: dict[str, Any]) -> str:
 
 
 def dedup_key(finding: dict[str, Any]) -> str:
-    """Stable per-finding key: class + rule + digit-normalized location."""
-    raw = f"{finding.get('class_id')}|{finding.get('rule_id')}|{_normalized_location(finding)}"
+    """Stable per-finding key: class + rule + digit-normalized location (+ CVE product).
+
+    Known-CVE ("vulnerable-component") findings for DIFFERENT libraries served from the same
+    page all share an identical class_id/rule_id/location, so without the product they collapse
+    to ONE key — deleting one library's finding would then silently suppress every other
+    library's finding on that page (and the campaign's own in-run dedup keys them per product,
+    so they legitimately co-exist as separate rows). Folding in the deterministic
+    ``_cve_product`` keeps distinct libraries distinct while staying stable across runs. The
+    field is absent on every non-CVE finding, so their keys are byte-for-byte unchanged."""
+    product = str(finding.get("_cve_product") or "")
+    extra = f"|{product}" if product else ""
+    raw = f"{finding.get('class_id')}|{finding.get('rule_id')}|{_normalized_location(finding)}{extra}"
     return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:20]
 
 
@@ -231,6 +241,87 @@ def mark_reported(runtime_dir: str | Path, program: str | None, target: str, fin
     advance_stage(runtime_dir, program, target, dedup_key(finding), "reported")
 
 
+# --- Deletion / suppression -------------------------------------------------------
+# A finding the operator DELETES is recorded here by its stable dedup key. Every future
+# hunt/campaign filters these out, and the durable history + funnel + CSV export hide
+# them — so a deleted finding is never surfaced again (the same class+rule+normalized-
+# location match, so the delete sticks across runs, targets, and programs). Fully
+# reversible via ``restore`` (the record's money/stage data is preserved, just hidden).
+
+
+def dismissed_keys(runtime_dir: str | Path) -> set[str]:
+    """The set of deleted (suppressed) dedup keys — what the engine filters out."""
+    return set((_load(runtime_dir).get("dismissed") or {}))
+
+
+def is_dismissed(runtime_dir: str | Path, finding: dict[str, Any]) -> bool:
+    return dedup_key(finding) in (_load(runtime_dir).get("dismissed") or {})
+
+
+def dismiss(
+    runtime_dir: str | Path,
+    *,
+    finding: dict[str, Any] | None = None,
+    dedup_key_str: str = "",
+    program: str | None = None,
+    target: str = "",
+) -> dict[str, Any]:
+    """Delete a finding: permanently suppress it. Keyed by the stable cross-run dedup key,
+    taken from an explicit ``dedup_key_str`` (a durable-history record already carries one)
+    or derived from a ``finding`` dict. Best-effort metadata (class/rule/title/location) is
+    recorded alongside; any live ledger record with that key is flagged too. Reversible via
+    ``restore``. Returns the stored entry, or ``{}`` when no key could be derived."""
+    key = str(dedup_key_str or "").strip()
+    if not key and finding is not None:
+        key = dedup_key(finding)
+    if not key:
+        return {}
+    f = finding or {}
+    with _LOCK:
+        data = _load(runtime_dir)
+        dismissed = data.setdefault("dismissed", {})
+        prior = dismissed.get(key) or {}
+        entry = {
+            "dedup_key": key,
+            "class_id": f.get("class_id") or prior.get("class_id") or "",
+            "rule_id": f.get("rule_id") or prior.get("rule_id") or "",
+            "title": str(f.get("title") or "")[:200] or prior.get("title") or "",
+            "location": str(f.get("location") or f.get("source_url") or "") or prior.get("location") or "",
+            "program": (program_key(program, target) if (program or target) else prior.get("program", "")),
+            "dismissed_at": _now(),
+        }
+        dismissed[key] = entry
+        # Flag the live record too, wherever it lives, so a later restore can find it.
+        for bucket in data.get("programs", {}).values():
+            rec = (bucket.get("findings") or {}).get(key)
+            if rec is not None:
+                rec["dismissed"] = True
+                rec["dismissed_at"] = entry["dismissed_at"]
+        _save(runtime_dir, data)
+    return entry
+
+
+def restore(runtime_dir: str | Path, dedup_key_str: str) -> bool:
+    """Undo a ``dismiss`` — the finding can surface again. Returns True if it was deleted."""
+    key = str(dedup_key_str or "").strip()
+    if not key:
+        return False
+    with _LOCK:
+        data = _load(runtime_dir)
+        dismissed = data.get("dismissed") or {}
+        was = key in dismissed
+        if was:
+            del dismissed[key]
+            data["dismissed"] = dismissed
+            for bucket in data.get("programs", {}).values():
+                rec = (bucket.get("findings") or {}).get(key)
+                if rec is not None:
+                    rec.pop("dismissed", None)
+                    rec.pop("dismissed_at", None)
+            _save(runtime_dir, data)
+    return was
+
+
 def count_recent_submissions(runtime_dir: str | Path, program: str | None, within_hours: int = 24, target: str = "") -> int:
     """How many findings this program filed in the last ``within_hours`` — drives the
     operator's per-program max_submits_per_day throttle."""
@@ -260,7 +351,9 @@ def count_recent_submissions(runtime_dir: str | Path, program: str | None, withi
 def funnel(runtime_dir: str | Path, program: str | None = None, target: str = "") -> dict[str, Any]:
     """Per-program (or whole-portfolio) pipeline counts per stage + bounty totals — the
     money dashboard's source of truth."""
-    data = _load(runtime_dir).get("programs", {})
+    store = _load(runtime_dir)
+    dismissed = store.get("dismissed") or {}
+    data = store.get("programs", {})
     keys = [program_key(program, target)] if (program or target) else list(data)
 
     def _count(pids: list[str]) -> dict[str, Any]:
@@ -268,7 +361,9 @@ def funnel(runtime_dir: str | Path, program: str | None = None, target: str = ""
         bounty = 0.0
         total = 0
         for pid in pids:
-            for rec in (data.get(pid, {}).get("findings", {}) or {}).values():
+            for key, rec in (data.get(pid, {}).get("findings", {}) or {}).items():
+                if key in dismissed or rec.get("dismissed"):
+                    continue  # deleted findings are out of the pipeline entirely
                 total += 1
                 stage = rec.get("stage", "discovered")
                 if stage in counts:
@@ -320,10 +415,14 @@ def list_all(runtime_dir: str | Path, limit: int = _MAX_LIST_ALL) -> list[dict[s
     re-derivation. Raw records (not CSV-defanged) — the UI renders text, not a spreadsheet. The
     cap bounds the response size for a very large history; the full ledger is always available
     via the CSV export (streamed column rows) for spreadsheet/audit use."""
-    data = _load(runtime_dir).get("programs", {})
+    store = _load(runtime_dir)
+    dismissed = store.get("dismissed") or {}
+    data = store.get("programs", {})
     out: list[dict[str, Any]] = []
     for pid, bucket in data.items():
         for key, rec in (bucket.get("findings") or {}).items():
+            if key in dismissed or rec.get("dismissed"):
+                continue  # deleted — never surfaced in the durable history
             out.append({**rec, "program": pid, "dedup_key": key})
     out.sort(key=lambda r: str(r.get("updated_at") or r.get("last_seen") or ""), reverse=True)
     return out[: max(1, limit)]
@@ -333,11 +432,15 @@ def to_csv_rows(runtime_dir: str | Path, program: str | None = None, target: str
     """Flatten every finding record (one program, or the whole portfolio) into
     spreadsheet-friendly rows with a fixed, stable column set (CSV_COLUMNS). Read-
     only -- never mutates the store."""
-    data = _load(runtime_dir).get("programs", {})
+    store = _load(runtime_dir)
+    dismissed = store.get("dismissed") or {}
+    data = store.get("programs", {})
     pids = [program_key(program, target)] if (program or target) else list(data)
     rows: list[dict[str, Any]] = []
     for pid in pids:
-        for rec in (data.get(pid, {}).get("findings", {}) or {}).values():
+        for key, rec in (data.get(pid, {}).get("findings", {}) or {}).items():
+            if key in dismissed or rec.get("dismissed"):
+                continue  # deleted — kept out of the spreadsheet/audit export too
             row = {col: _defang_csv_cell(rec.get(col, "")) for col in CSV_COLUMNS}
             row["program"] = _defang_csv_cell(pid)  # authoritative -- rec["program"] may be stale/absent on an old record
             rows.append(row)

@@ -1,9 +1,10 @@
 """Tests for the Playwright-driven dynamic live-app scan -- had NO dedicated
-coverage before this. The real ``playwright`` package is not installed in this dev
-environment (nor assumed on a user machine without the opt-in install), so:
+coverage before this. ``playwright`` may or may not be importable (the release build now
+declares + bundles it), so tests that need it ABSENT simulate that via sys.modules rather
+than assuming the environment lacks it:
   - the pre-Playwright guard gates (empty URL, SSRF guard, not-installed fallback)
     are exercised directly, with no mocking, since they run before the optional
-    import is even attempted;
+    import is even attempted (the not-installed branch forces the ImportError);
   - the browser-driving path (console/pageerror/requestfailed/response capture,
     the per-request SSRF route guard, capture-cap overflow) is exercised via a
     minimal fake ``playwright.sync_api`` module injected into ``sys.modules`` --
@@ -136,9 +137,13 @@ class RunLiveScanGuardGateTests(unittest.TestCase):
         self.assertFalse(result["ok"])
 
     def test_playwright_not_installed_returns_structured_result(self) -> None:
-        # playwright genuinely isn't installed in this environment -- this exercises
-        # the real ImportError-handling branch, not a simulation of it.
-        with mock.patch.object(LS, "get_settings", return_value=ScannerSettings(allow_private_urls=True)):
+        # Force the ImportError fallback deterministically. playwright is now a DECLARED
+        # dependency (the release build bundles it for proof screenshots + live scan), so it
+        # may well be importable in the environment — simulate its absence via sys.modules
+        # instead of relying on it being missing, or this exercises the browser path and the
+        # result has no 'available' key.
+        with mock.patch.object(LS, "get_settings", return_value=ScannerSettings(allow_private_urls=True)), \
+             mock.patch.dict(sys.modules, {"playwright.sync_api": None}):
             result = LS.run_live_scan("http://127.0.0.1:9999/")
         self.assertFalse(result["ok"])
         self.assertFalse(result["available"])
@@ -351,6 +356,19 @@ class RunLiveScanDrivenTests(unittest.TestCase):
         result = self._run(ctx)
         self.assertFalse(result["ok"])
         self.assertIn("TimeoutError", result["error"])
+
+    def test_bundled_browser_path_is_ensured_before_launch(self) -> None:
+        # In the frozen release the bundled Chromium is only reachable once
+        # PLAYWRIGHT_BROWSERS_PATH is set; run_live_scan must call the shared helper before it
+        # launches (the screenshot path did, but a live scan can run before/without a shot).
+        called = {"n": 0}
+        modules = _fake_playwright_modules(_FakeContext())
+        with mock.patch.object(LS, "get_settings", return_value=ScannerSettings()), \
+             mock.patch.object(LS, "ensure_bundled_browsers_path", lambda: called.__setitem__("n", called["n"] + 1)), \
+             mock.patch.dict(sys.modules, modules):
+            result = LS.run_live_scan("https://example.com/", wait_seconds=0.0)
+        self.assertTrue(result["ok"])
+        self.assertGreaterEqual(called["n"], 1)
 
     def test_final_url_and_title_reflect_post_navigation_state(self) -> None:
         ctx = _FakeContext(final_url="https://example.com/redirected", title="Landed Here")

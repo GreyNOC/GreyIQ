@@ -9,6 +9,7 @@ them onto a light stub with just the lock + run cache they need."""
 from __future__ import annotations
 
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -29,6 +30,8 @@ class _Stub:
     prove_finding = api.GreyIQRuntime.prove_finding
     build_finding_report = api.GreyIQRuntime.build_finding_report
     list_all_findings = api.GreyIQRuntime.list_all_findings
+    dismiss_finding = api.GreyIQRuntime.dismiss_finding
+    restore_finding = api.GreyIQRuntime.restore_finding
     aggregate_report = api.GreyIQRuntime.aggregate_report
 
     def __init__(self) -> None:
@@ -155,6 +158,55 @@ class HistoryAndAggregateTests(unittest.TestCase):
         out = _Stub().aggregate_report(api.AggregateReportRequest(run_id="does-not-exist"))
         self.assertFalse(out["ok"])
         self.assertIn("cached", out["error"].lower())
+
+
+class DismissApiTests(unittest.TestCase):
+    """The delete-finding wrapper: derive the key, suppress it in the durable history, and
+    reject a request that carries no way to identify the finding. Uses a temp RUNTIME_DIR so
+    the test never writes to the real ledger."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._prev_rt = api.RUNTIME_DIR
+        api.RUNTIME_DIR = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        api.RUNTIME_DIR = self._prev_rt
+        self._tmp.cleanup()
+
+    def _seed_one(self) -> dict:
+        from bughunter import ledger
+        finding = {"ref": "C1", "class_id": "xss", "rule_id": "r", "location": "https://x/a",
+                   "severity": "high", "title": "reflected input"}
+        ledger.upsert_findings(str(api.RUNTIME_DIR), "acme", "https://x",
+                               [{"finding": finding, "source_url": "https://x/a",
+                                 "proof_status": "confirmed", "cvss": {"base_score": 8.0}, "source_json": ""}])
+        return finding
+
+    def test_dismiss_from_board_derives_key_and_hides_it(self) -> None:
+        self._seed_one()
+        self.assertEqual(len(_Stub().list_all_findings()["findings"]), 1)
+        out = _Stub().dismiss_finding(api.FindingDismissRequest(
+            class_id="xss", rule_id="r", location="https://x/a", title="reflected input"))
+        self.assertTrue(out["ok"], out)
+        self.assertTrue(out["dedup_key"])
+        self.assertEqual(_Stub().list_all_findings()["findings"], [])  # gone from history
+
+    def test_dismiss_without_any_detail_is_rejected(self) -> None:
+        out = _Stub().dismiss_finding(api.FindingDismissRequest())
+        self.assertFalse(out["ok"])
+        self.assertIn("identify", out["error"].lower())
+
+    def test_restore_reverses_a_delete(self) -> None:
+        from bughunter import ledger
+        finding = self._seed_one()
+        key = ledger.dedup_key(finding)
+        _Stub().dismiss_finding(api.FindingDismissRequest(dedup_key=key))
+        self.assertEqual(_Stub().list_all_findings()["findings"], [])
+        out = _Stub().restore_finding(api.FindingRestoreRequest(dedup_key=key))
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["restored"])
+        self.assertEqual(len(_Stub().list_all_findings()["findings"]), 1)
 
 
 if __name__ == "__main__":

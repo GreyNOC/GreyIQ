@@ -17,6 +17,7 @@ are counted, never fetched. Pure / frozen-safe.
 
 from __future__ import annotations
 
+import html
 import re
 from typing import Any
 from urllib.parse import parse_qsl, urldefrag, urljoin, urlparse
@@ -43,6 +44,18 @@ _SKIP_EXT = (".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", "
              ".ttf", ".eot", ".pdf", ".zip", ".mp4", ".webm", ".mp3", ".map")
 _MAX_JS = 8  # served-JS bundles mined per campaign (bounded)
 
+# Decode ONLY well-formed, ';'-terminated HTML/XML entities in an extracted URL (so a
+# properly-encoded '&amp;' becomes '&'), while leaving a RAW '&' untouched. Full
+# html.unescape() is the wrong tool here: it greedily resolves *semicolon-less* HTML5 named
+# references, so a raw query string like '?a=1&param=2' (invalid HTML but widespread) would
+# have '&param' eaten as '¶m' — silently dropping the 'param' parameter from the discovered
+# attack surface. This regex only matches the unambiguous ';'-terminated form.
+_URL_ENTITY_RE = re.compile(r"&(?:#[0-9]+|#[xX][0-9a-fA-F]+|[A-Za-z][A-Za-z0-9]*);")
+
+
+def _unescape_url(value: str) -> str:
+    return _URL_ENTITY_RE.sub(lambda m: html.unescape(m.group(0)), value)
+
 
 def _same_origin(url: str, host: str) -> bool:
     return (urlparse(url).hostname or "").lower() == host.lower()
@@ -59,6 +72,11 @@ def _extract_links(body: str, base_url: str) -> list[str]:
     for raw in _LINK_RE.findall(body or "")[:600]:
         if raw.lower().startswith(("javascript:", "mailto:", "tel:", "data:")):
             continue
+        # An href/src value in HTML encodes '&' as '&amp;' (and may carry other entities).
+        # Use the DECODED value as the real URL, or the '&amp;' survives into the finding
+        # location + curl PoC (breaking reproduction) and mis-parses the query into a bogus
+        # 'amp;<name>' parameter the active prober would then chase.
+        raw = _unescape_url(raw)
         try:
             absolute = _clean(urljoin(base_url, raw))
         except ValueError:
@@ -73,6 +91,7 @@ def _extract_links(body: str, base_url: str) -> list[str]:
 def _extract_scripts(body: str, base_url: str) -> list[str]:
     out: list[str] = []
     for raw in _SCRIPT_SRC_RE.findall(body or "")[:60]:
+        raw = _unescape_url(raw)  # decode ';'-terminated entities — the src is a real URL, not display HTML
         try:
             absolute = _clean(urljoin(base_url, raw))
         except ValueError:
@@ -183,7 +202,9 @@ def discover(
                     seen.add(url); discovered.append(url); found += 1
         elif kind == "sitemap":
             for loc in _SITEMAP_LOC_RE.findall(body)[:200]:
-                url = _clean(loc.strip())
+                # <loc> is XML — '&' is encoded as '&amp;'. Decode to the real URL (robots.txt
+                # below is plain text and is intentionally NOT unescaped).
+                url = _clean(_unescape_url(loc.strip()))
                 if url.startswith(("http://", "https://")) and in_scope(url) and url not in seen:
                     seen.add(url); discovered.append(url); found += 1
         else:

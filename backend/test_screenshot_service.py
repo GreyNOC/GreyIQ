@@ -7,7 +7,9 @@ captured screenshot, and the submission package co-locating the PNG next to the 
 """
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -15,6 +17,7 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+from bughunter import playwright_env as pe  # noqa: E402
 from bughunter import report_formats as rf  # noqa: E402
 from bughunter import screenshot_service as ss  # noqa: E402
 from bughunter import submission as sub  # noqa: E402
@@ -54,6 +57,64 @@ class CaptureGatingTests(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertFalse(r["available"])
         self.assertIn("playwright", r["install"].lower())
+
+
+class FrozenBrowserPathTests(unittest.TestCase):
+    """The release build ships Chromium under <bundle>/playwright-browsers; the runtime must
+    point PLAYWRIGHT_BROWSERS_PATH at it (an end-user machine has no ms-playwright cache).
+    Must be a no-op in dev, when unset-but-absent, and when the operator set it themselves."""
+
+    def setUp(self) -> None:
+        self._prev_env = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+        self._prev_meipass = getattr(sys, "_MEIPASS", None)
+        self._prev_frozen = getattr(sys, "frozen", None)
+        os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+
+    def tearDown(self) -> None:
+        if self._prev_env is None:
+            os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+        else:
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = self._prev_env
+        if self._prev_meipass is None:
+            if hasattr(sys, "_MEIPASS"):
+                del sys._MEIPASS
+        else:
+            sys._MEIPASS = self._prev_meipass
+        if self._prev_frozen is None:
+            if hasattr(sys, "frozen"):
+                del sys.frozen
+        else:
+            sys.frozen = self._prev_frozen
+
+    def test_noop_in_dev(self) -> None:
+        # Not frozen, no _MEIPASS -> nothing set.
+        if hasattr(sys, "_MEIPASS"):
+            del sys._MEIPASS
+        if hasattr(sys, "frozen"):
+            del sys.frozen
+        pe.ensure_bundled_browsers_path()
+        self.assertNotIn("PLAYWRIGHT_BROWSERS_PATH", os.environ)
+
+    def test_sets_path_when_bundled_dir_present(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "playwright-browsers").mkdir()
+            sys._MEIPASS = td
+            pe.ensure_bundled_browsers_path()
+            self.assertEqual(os.environ.get("PLAYWRIGHT_BROWSERS_PATH"), os.path.join(td, "playwright-browsers"))
+
+    def test_noop_when_bundled_dir_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sys._MEIPASS = td  # frozen root exists but no playwright-browsers inside it
+            pe.ensure_bundled_browsers_path()
+            self.assertNotIn("PLAYWRIGHT_BROWSERS_PATH", os.environ)
+
+    def test_respects_operator_set_value(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "playwright-browsers").mkdir()
+            sys._MEIPASS = td
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/operator/choice"
+            pe.ensure_bundled_browsers_path()
+            self.assertEqual(os.environ["PLAYWRIGHT_BROWSERS_PATH"], "/operator/choice")  # left untouched
 
 
 class EmbeddingTests(unittest.TestCase):

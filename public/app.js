@@ -4493,6 +4493,7 @@ function ckNormalizeFindings(res) {
     return {
       ref,
       runId: String(res.run_id || ""),   // the run this finding belongs to (submit/copy/screenshot use THIS, not the latest)
+      dedupKey: String(f.dedup_key || ""),  // exact ledger key (campaign findings) so delete targets THIS finding precisely
       rank: f.rank || i + 1,
       title: String(f.title || "Finding"),
       severity: String(f.severity || "info").toLowerCase(),
@@ -4859,9 +4860,62 @@ function ckRenderDetail(f) {
   researchBtn.addEventListener("click", () => ckResearchLead(f, researchBtn, researchWrap));
   actions.append(researchBtn);
 
+  // Delete this finding — removes it from the board AND permanently suppresses it, so no
+  // future hunt/campaign surfaces it again (a false positive or accepted-risk you never
+  // want to see re-reported). Destructive; confirmed first.
+  const delBtn = cel("button", "ck-btn ck-btn-danger", "Delete finding");
+  delBtn.type = "button";
+  delBtn.title = "Remove this finding and never surface it again in future hunts";
+  delBtn.addEventListener("click", () => ckDeleteFinding(f, delBtn));
+  actions.append(delBtn);
+
   host.append(actions);
   host.append(shotWrap);
   host.append(researchWrap);
+}
+
+// Delete a board finding: permanently suppress it (server records its stable dedup key) so
+// no future hunt or campaign surfaces it again, then drop it from the in-memory board and
+// close the drawer. The server derives the key from class_id/rule_id/location — the same
+// fields the engine keys on — so the deletion sticks across runs, targets, and programs.
+async function ckDeleteFinding(f, btn) {
+  if (!window.confirm(
+    `Delete "${f.title}"?\n\nIt's removed from this board and will never be surfaced again in future hunts or campaigns. `
+    + `Use this for a false positive or an accepted risk you don't want re-reported.`)) return;
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = "Deleting…";
+  let res;
+  try {
+    res = await apiFetch("/api/bounty/finding/dismiss", {
+      method: "POST", timeoutMs: 15000,
+      body: JSON.stringify({
+        dedup_key: f.dedupKey || "",
+        class_id: f.class_id || "", rule_id: f.rule_id || "",
+        location: f.location || f.sourceUrl || "", title: f.title || "",
+      }),
+    });
+  } catch (err) {
+    btn.disabled = false; btn.textContent = old;
+    window.alert(err.message || "Could not delete the finding.");
+    return;
+  }
+  if (!res || res.ok === false) {
+    btn.disabled = false; btn.textContent = old;
+    window.alert((res && res.error) || "Could not delete the finding.");
+    return;
+  }
+  // Drop THIS finding only, then refresh counts + drawer. ref is NOT unique across
+  // ckState.findings — standalone confirm tools reuse "F1", so a hunt finding and a
+  // separately-confirmed finding can share a ref. Match the same identity the insert-dedup
+  // uses (ref + className) plus class_id/location; filtering by ref alone would also silently
+  // remove unrelated rows that happen to share the ref.
+  ckState.findings = ckState.findings.filter((x) =>
+    !(x.ref === f.ref && x.className === f.className
+      && (x.class_id || "") === (f.class_id || "") && (x.location || "") === (f.location || "")));
+  ckCloseDetail();
+  ckRenderFindings();
+  ckBadgeCount("findings", ckState.findings.length);
+  ckBadgeCount("submissions", ckState.findings.filter((x) => x.proof === "confirmed" || x.proof === "candidate").length);
 }
 
 async function ckResearchLead(f, btn, wrap) {
@@ -6630,7 +6684,28 @@ function ckHistoryRow(rec) {
     try { const md = await ckReportFromLedger(rec); ckDownloadText(`${ckSlug(rec.title || "finding")}.md`, md); }
     finally { dlBtn.disabled = false; dlBtn.textContent = "Download .md"; }
   });
-  acts.append(copyBtn, dlBtn);
+  // Delete from history — permanently suppress it (by its stored dedup key) so no future
+  // hunt re-surfaces it and it drops out of the history + funnel + CSV export.
+  const delBtn = cel("button", "ck-btn ck-btn-danger", "Delete");
+  delBtn.type = "button";
+  delBtn.title = "Remove this finding from history and never surface it again";
+  delBtn.addEventListener("click", async () => {
+    if (!window.confirm(`Delete "${rec.title || "this finding"}" from history?\n\nIt won't be surfaced again in future hunts or campaigns.`)) return;
+    delBtn.disabled = true; delBtn.textContent = "Deleting…";
+    let res;
+    try {
+      res = await apiFetch("/api/bounty/finding/dismiss", {
+        method: "POST", timeoutMs: 15000,
+        body: JSON.stringify({
+          dedup_key: rec.dedup_key || "", class_id: rec.class_id || "",
+          rule_id: rec.rule_id || "", location: rec.source_url || "", title: rec.title || "",
+        }),
+      });
+    } catch (err) { delBtn.disabled = false; delBtn.textContent = "Delete"; window.alert(err.message || "Could not delete the finding."); return; }
+    if (!res || res.ok === false) { delBtn.disabled = false; delBtn.textContent = "Delete"; window.alert((res && res.error) || "Could not delete the finding."); return; }
+    li.remove();
+  });
+  acts.append(copyBtn, dlBtn, delBtn);
   li.append(acts);
   return li;
 }

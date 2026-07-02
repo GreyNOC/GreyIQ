@@ -646,5 +646,95 @@ class SupervisorLoopTests(unittest.TestCase):
         self.assertFalse(loop.running)
 
 
+class DismissTests(unittest.TestCase):
+    """Delete a finding -> permanently suppressed: gone from the durable history, the
+    funnel, and the CSV export, and filtered out of every future hunt by the SAME stable
+    dedup key the engine keys on. Reversible via restore (money/stage data preserved)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.rt = self._tmp.name
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_dismiss_hides_from_history_and_funnel_then_restore_brings_it_back(self) -> None:
+        item = _item("C1", "xss", "r", "https://x/a", proof="confirmed")
+        ledger.upsert_findings(self.rt, "acme", "https://x", [item])
+        self.assertEqual(len(ledger.list_all(self.rt)), 1)
+        self.assertEqual(ledger.funnel(self.rt, "acme")["total"], 1)
+
+        entry = ledger.dismiss(self.rt, finding=item["finding"], program="acme", target="https://x")
+        self.assertEqual(entry["dedup_key"], item["dedup_key"])
+        self.assertTrue(ledger.is_dismissed(self.rt, item["finding"]))
+        self.assertEqual(ledger.list_all(self.rt), [])            # gone from durable history
+        self.assertEqual(ledger.funnel(self.rt, "acme")["total"], 0)  # and out of the funnel
+        self.assertEqual(ledger.to_csv_rows(self.rt, "acme", "https://x"), [])  # and the export
+
+        self.assertTrue(ledger.restore(self.rt, item["dedup_key"]))
+        self.assertFalse(ledger.is_dismissed(self.rt, item["finding"]))
+        self.assertEqual(len(ledger.list_all(self.rt)), 1)        # reappears intact
+
+    def test_delete_sticks_across_a_digit_change_in_the_location(self) -> None:
+        # The whole point of "should not be found again": a re-run surfaces the SAME issue
+        # at a path whose only difference is digits (…/a/123 vs …/a/456). The dedup key
+        # normalizes digits, so the delete of one suppresses the other on the next run.
+        deleted = _finding("F1", "xss", "r", "https://x/a/123")
+        ledger.dismiss(self.rt, finding=deleted)
+        fresh_next_run = _finding("F1", "xss", "r", "https://x/a/456")
+        self.assertIn(ledger.dedup_key(fresh_next_run), ledger.dismissed_keys(self.rt))
+
+    def test_dismiss_by_explicit_key_is_the_history_delete_path(self) -> None:
+        # The durable-history row already carries a dedup_key; deleting from history sends
+        # that key directly (no finding dict needed) and it must suppress just the same.
+        item = _item("C1", "ssrf", "r", "https://x/b", proof="missing")
+        ledger.upsert_findings(self.rt, "acme", "https://x", [item])
+        entry = ledger.dismiss(self.rt, dedup_key_str=item["dedup_key"])
+        self.assertEqual(entry["dedup_key"], item["dedup_key"])
+        self.assertEqual(ledger.list_all(self.rt), [])
+
+    def test_dismiss_with_no_key_and_no_finding_returns_empty(self) -> None:
+        self.assertEqual(ledger.dismiss(self.rt), {})
+        self.assertEqual(ledger.dismissed_keys(self.rt), set())  # nothing recorded
+
+    def test_restore_unknown_key_is_a_safe_no_op(self) -> None:
+        self.assertFalse(ledger.restore(self.rt, "never-dismissed"))
+        self.assertFalse(ledger.restore(self.rt, ""))
+
+    def test_distinct_cve_products_on_one_page_get_distinct_keys(self) -> None:
+        # Known-CVE ("vulnerable-component") findings for different libraries on the SAME page
+        # share class_id/rule_id/location; without the product they collapse to one dedup key,
+        # so deleting one library would silently suppress the other. The product keeps them
+        # distinct, and a delete of one must NOT dismiss the other.
+        base = {"class_id": "vulnerable-component", "rule_id": "passive.known-cve", "location": "https://ex.com/app"}
+        jquery = {**base, "_cve_product": "jquery", "title": "Outdated jQuery"}
+        lodash = {**base, "_cve_product": "lodash", "title": "Outdated Lodash"}
+        self.assertNotEqual(ledger.dedup_key(jquery), ledger.dedup_key(lodash))
+        ledger.dismiss(self.rt, finding=jquery)
+        self.assertIn(ledger.dedup_key(jquery), ledger.dismissed_keys(self.rt))
+        self.assertNotIn(ledger.dedup_key(lodash), ledger.dismissed_keys(self.rt))  # Lodash survives
+
+    def test_non_cve_findings_keys_unchanged_by_product_logic(self) -> None:
+        # A finding with no _cve_product must key exactly as before (backward compatible).
+        f = {"class_id": "xss", "rule_id": "r", "location": "https://x/a"}
+        import hashlib
+        expected = hashlib.sha1(b"xss|r|https://x/a").hexdigest()[:20]
+        self.assertEqual(ledger.dedup_key(f), expected)
+
+    def test_restore_preserves_a_paid_findings_money(self) -> None:
+        # Deleting a submitted+paid finding hides its bounty from the funnel while dismissed,
+        # but the record (and its $) is preserved so a restore is lossless.
+        item = _item("C1", "xss", "r", "https://x/a", proof="confirmed")
+        ledger.upsert_findings(self.rt, "acme", "https://x", [item])
+        ledger.record_submission(self.rt, "acme", "https://x", item["dedup_key"], "R1", "u")
+        ledger.record_paid(self.rt, "acme", "https://x", item["dedup_key"], 500.0)
+        self.assertEqual(ledger.funnel(self.rt, "acme")["bounty_total"], 500.0)
+
+        ledger.dismiss(self.rt, dedup_key_str=item["dedup_key"])
+        self.assertEqual(ledger.funnel(self.rt, "acme")["bounty_total"], 0.0)  # hidden while deleted
+        ledger.restore(self.rt, item["dedup_key"])
+        self.assertEqual(ledger.funnel(self.rt, "acme")["bounty_total"], 500.0)  # lossless
+
+
 if __name__ == "__main__":
     unittest.main()

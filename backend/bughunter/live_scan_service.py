@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import Any
 
 from bughunter.code_scanner.redaction import redact_text
+from bughunter.playwright_env import ensure_bundled_browsers_path
 from bughunter.settings import get_settings
 from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
 from bughunter.web_scan_service import _guard_url, playwright_request_allowed
@@ -106,6 +107,10 @@ def run_live_scan(url: str, wait_seconds: float = 6.0, max_findings: int = 300) 
     except WebsiteFetchError as exc:
         return {"ok": False, "scan_type": "live", "target": target, "error": str(exc)}
 
+    # In a frozen release, point Playwright at the Chromium we bundled before importing it
+    # (the packaged app has no ms-playwright cache) — same as capture_screenshot. Without this
+    # a live scan run before/without a screenshot can't find the bundled browser.
+    ensure_bundled_browsers_path()
     try:
         from playwright.sync_api import sync_playwright
     except Exception:  # noqa: BLE001 - optional dependency

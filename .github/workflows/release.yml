@@ -48,6 +48,12 @@ jobs:
           pip install -r requirements.txt
           pip install -r build/requirements-build.txt
 
+      - name: Install Playwright Chromium (bundled for proof screenshots)
+        # Fetches the Chromium build that build/greyiq-backend.spec bundles under the app,
+        # so screenshot capture works in the shipped release on a machine that never ran
+        # `playwright install`. Must run before the freeze step.
+        run: python -m playwright install chromium
+
       - name: Freeze backend (PyInstaller)
         run: pyinstaller --noconfirm --clean build/greyiq-backend.spec
 
@@ -184,6 +190,12 @@ jobs:
           pip install "torch>=2.2,<2.8" --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
           pip install -r build/requirements-build.txt
+
+      - name: Install Playwright Chromium (bundled for proof screenshots)
+        # Fetches the Chromium build that build/greyiq-backend.spec bundles under the app,
+        # so screenshot capture works in the shipped release on a machine that never ran
+        # `playwright install`. Must run before the freeze step.
+        run: python -m playwright install chromium
 
       - name: Freeze backend (PyInstaller)
         run: pyinstaller --noconfirm --clean build/greyiq-backend.spec
