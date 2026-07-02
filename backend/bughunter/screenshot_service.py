@@ -331,9 +331,13 @@ def capture_screenshot(
             shot["bytes"] = Path(shot["path"]).stat().st_size
         except OSError:
             shot["bytes"] = 0
+    # The legacy top-level `path` is the PRIMARY shot — now the source proof sheet (shots[0])
+    # when we produced one. Callers that predate `shots` (campaign auto-attach, the prove-flow
+    # preview) read `path` directly, so this makes them embed the PoC, not the rendered page.
+    primary = shots[0]["path"] if shots else str(out)
     return {
         "ok": True,
-        "path": str(out),
+        "path": primary,
         "shots": shots,
         "url": target,
         "final_url": final_url,
