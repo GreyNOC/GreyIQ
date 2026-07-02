@@ -2,6 +2,27 @@
 
 Notable changes to GreyIQ.
 
+## v0.65.0
+
+### Open a finding's full report — and submit from one place
+Every finding's detail drawer now has a **View full report** button — on the Findings board
+(after a campaign) and in the live Campaign dashboard (while it's still running). It opens the
+finding on the Submissions page, where the full submission report now lives: the proof of impact,
+a captured screenshot, the platform-shaped report itself, and one-click Copy / Download / Capture
+screenshot / Submit to HackerOne (Submit stays gated until the finding is Confirmed). You can dig
+into a finding the moment it appears mid-campaign and land on the exact report you'd file.
+
+### Search, filter, and sort on the Submissions page
+The Submissions page gained a search box (title, URL, class, CWE), severity and proof-status
+filters, and sort (severity / title / most recent) — applied to both the current run's queue and
+the full findings history. The history is cached client-side so search filters instantly, with a
+Refresh button to reload it from the engine.
+
+### Packaging
+- The release now bundles only the newest Chromium revision Playwright needs, and installs
+  Chromium in the local build — trimming the download and making proof screenshots work out of
+  the box from a fresh checkout.
+
 ## v0.64.0
 
 ### Delete a finding — and it stays gone
