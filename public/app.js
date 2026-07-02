@@ -4345,7 +4345,9 @@ const ckState = {
   view: "program",
   h1: null,              // { team_handle, api_username, has_token } — never the token
   platform: "hackerone", // report format for Copy/Download (server re-shapes per platform)
-  triage: {}             // ref -> "submitted" | "drafted" (client-side worklist marks)
+  triage: {},            // ref -> "submitted" | "drafted" (client-side worklist marks)
+  reportFocus: null,     // a finding pinned open as a Full report on the Submissions page (from a drawer's "View full report")
+  sub: { query: "", sev: "all", proof: "all", sort: "severity" }  // Submissions page search / filter / sort
 };
 
 // Report formats — mirrors backend report_formats.PLATFORMS (HackerOne first).
@@ -4823,7 +4825,12 @@ function ckRenderDetail(f) {
 
   // Actions.
   const actions = cel("div", "ck-actions");
-  const copyBtn = cel("button", "ck-btn primary", "Copy submission report");
+  const fullBtn = cel("button", "ck-btn primary", "View full report →");
+  fullBtn.type = "button";
+  fullBtn.title = "Open the full submission report (proof of impact, screenshots, everything to submit) on the Submissions page";
+  fullBtn.addEventListener("click", () => ckViewFullReport(f));
+  actions.append(fullBtn);
+  const copyBtn = cel("button", "ck-btn", "Copy submission report");
   copyBtn.type = "button";
   copyBtn.addEventListener("click", async () => {
     copyBtn.disabled = true; copyBtn.textContent = "Preparing…";  // the server package can take up to 20s
@@ -6321,22 +6328,345 @@ function ckOobPanel() {
   return wrap;
 }
 
+// --- "View full report" — the drawers (Findings board + live Campaign) pin a finding open
+// on the Submissions page, where its full submission report lives (proof of impact,
+// screenshot, everything needed to submit). ---
+
+// Normalize either finding shape (board finding OR campaign-snapshot finding) into one the
+// Submissions Full-report panel + report/submit helpers understand, enriching from the board
+// findings by stable key so a campaign finding still gets its run/ref (needed to submit).
+function ckNormalizeForReport(f, extra) {
+  extra = extra || {};
+  const focus = {
+    ref: f.ref || "",
+    runId: f.runId || extra.runId || ckState.runId || "",
+    title: f.title || "Finding",
+    severity: String(f.severity || "info").toLowerCase(),
+    className: f.className || f.class_name || f.cls || f.class_id || "",
+    class_id: f.class_id || "",
+    rule_id: f.rule_id || f.rule || "",
+    cwe: f.cwe || "",
+    location: f.location || f.sourceUrl || f.source_url || f.target || "",
+    target: f.target || f.location || f.source_url || "",
+    cvss: f.cvss || null,
+    cvssScore: (f.cvssScore != null ? f.cvssScore : (f.cvss && (f.cvss.base_score ?? f.cvss.score))) ?? null,
+    plan: f.plan || null,
+    description: f.description || "",
+    remediation: f.remediation || "",
+    proofObj: f.proofObj || extra.proofObj || null,
+    proof: ckEffectiveProof(f, f.proof_status),
+    dedupKey: f.dedupKey || f.dedup_key || "",
+    screenshot: extra.screenshot || null,
+    _md: null,   // cached full-report markdown (so a Submissions re-render doesn't refetch)
+  };
+  if (!focus.ref) {
+    const m = ckState.findings.find((x) => ckFindingKey(x) === ckFindingKey(focus));
+    if (m) {
+      focus.ref = m.ref || "";
+      focus.runId = focus.runId || m.runId || "";
+      focus.plan = focus.plan || m.plan || null;
+      focus.proofObj = focus.proofObj || m.proofObj || null;
+      focus.cvss = focus.cvss || m.cvss || null;
+      if (focus.cvssScore == null) focus.cvssScore = m.cvssScore ?? null;
+      focus.description = focus.description || m.description || "";
+    }
+  }
+  return focus;
+}
+
+function ckViewFullReport(f, extra) {
+  ckState.reportFocus = ckNormalizeForReport(f, extra);
+  ckSetView("submissions");
+}
+
+// The canonical full report for a focused finding. Prefer the run package (build_submission)
+// when we have run+ref (board findings); otherwise the general finding→report builder
+// (campaign findings, ledger records); offline draft as the last resort.
+async function ckFullReportMarkdown(focus) {
+  if (focus.runId && focus.ref) {
+    try {
+      const res = await apiFetch("/api/bounty/submission", {
+        method: "POST", timeoutMs: 20000,
+        body: JSON.stringify({ run_id: focus.runId, ref: focus.ref, platform: ckState.platform || "hackerone" }),
+      });
+      if (res && res.ok && res.package && res.package.vulnerability_information) {
+        return { text: res.package.vulnerability_information, canonical: true, package: res.package };
+      }
+    } catch (_) { /* fall through */ }
+  }
+  try {
+    const res = await apiFetch("/api/bounty/finding/report", {
+      method: "POST", timeoutMs: 30000,
+      body: JSON.stringify({
+        title: focus.title, severity: focus.severity, class_name: focus.className, class_id: focus.class_id,
+        location: focus.location, cwe: focus.cwe, rule_id: focus.rule_id, target: focus.target || focus.location,
+        scope: (ck.scope && ck.scope.value) || state.ckScope || ckCampaign.scope || "",
+        platform: ckState.platform || "hackerone", proof: focus.proofObj || null,
+      }),
+    });
+    if (res && res.ok && res.package && res.package.vulnerability_information) {
+      return { text: res.package.vulnerability_information, canonical: true, package: res.package };
+    }
+  } catch (_) { /* fall through */ }
+  return { text: ckBuildSubmissionDraft(focus), canonical: false, package: null };
+}
+
+function ckFullReportPanel(focus) {
+  const wrap = cel("div", "ck-creds ck-fullreport");
+  const head = cel("div", "ck-creds-head");
+  head.append(cel("strong", null, "Full report"));
+  head.append(ckProofBadge(ckEffectiveProof(focus)));
+  const back = cel("button", "ck-btn", "✕ Close");
+  back.type = "button";
+  back.title = "Close this report";
+  back.style.marginLeft = "auto";
+  back.addEventListener("click", () => { ckState.reportFocus = null; ckRenderSubmissions(); });
+  head.append(back);
+  wrap.append(head);
+
+  wrap.append(cel("h3", "ck-ftitle", focus.title));
+  const badges = cel("div", "ck-summary");
+  badges.append(cel("span", `ck-sev sev-${focus.severity}`, focus.severity.toUpperCase()));
+  badges.append(ckProofBadge(ckEffectiveProof(focus)));
+  if (ckEffectiveStage(focus) === "submitted") badges.append(cel("span", "ck-tag", "submitted"));
+  if (focus.cwe) badges.append(cel("span", "ck-tag", focus.cwe));
+  wrap.append(badges);
+
+  const meta = cel("dl", "ck-meta-grid");
+  const add = (k, v) => { if (v) { meta.append(cel("dt", null, k)); meta.append(cel("dd", null, String(v))); } };
+  add("Class", focus.className);
+  add("Location", focus.location);
+  if (focus.target && focus.target !== focus.location) add("Target", focus.target);
+  if (focus.cvss && focus.cvss.vector) add("CVSS", `${focus.cvss.vector}${focus.cvssScore != null ? ` (${Number(focus.cvssScore).toFixed(1)})` : ""}`);
+  else if (focus.cvssScore != null) add("CVSS", Number(focus.cvssScore).toFixed(1));
+  wrap.append(meta);
+
+  const po = focus.proofObj;
+  if (po && (po.observed_result || po.control_result || po.evidence || po.proof_obligation)) {
+    wrap.append(cel("h4", null, "Proof of impact"));
+    const pm = cel("dl", "ck-meta-grid");
+    const a2 = (k, v) => { if (v) { pm.append(cel("dt", null, k)); pm.append(cel("dd", null, String(v))); } };
+    a2("Status", (po.status || "").replace(/^./, (c) => c.toUpperCase()));
+    a2("Observed", po.observed_result);
+    a2("Control", po.control_result);
+    a2("Evidence", po.evidence);
+    if (pm.childNodes.length) wrap.append(pm);
+    if (po.status !== "confirmed" && po.proof_obligation) {
+      const ob = cel("div", "ck-obligation");
+      ob.append(cel("strong", null, "To confirm: "), document.createTextNode(po.proof_obligation));
+      wrap.append(ob);
+    }
+  }
+
+  // Screenshot: one captured during a campaign prove comes through on the focus; the Capture
+  // button below appends a fresh one here too.
+  const shotWrap = cel("div", "ck-shot");
+  if (focus.screenshot && focus.screenshot.data_url) {
+    const img = cel("img", "ck-shot-img");
+    img.src = focus.screenshot.data_url;
+    img.alt = "Proof-of-concept screenshot";
+    shotWrap.append(img);
+  }
+
+  const actions = cel("div", "ck-actions");
+  const statusEl = cel("p", "ck-status"); statusEl.style.flexBasis = "100%";
+  const resultEl = cel("div", "ck-cd-rv-result"); resultEl.style.flexBasis = "100%"; resultEl.hidden = true;
+
+  const copyBtn = cel("button", "ck-btn primary", "Copy report");
+  copyBtn.type = "button";
+  copyBtn.addEventListener("click", async () => {
+    copyBtn.disabled = true; copyBtn.textContent = "Preparing…";
+    try {
+      const pkg = await ckFullReportMarkdown(focus);
+      const ok = await ckCopy(pkg.text);
+      copyBtn.textContent = ok ? (pkg.canonical ? "Copied ✓" : "Copied (offline)") : "Failed";
+    } finally { copyBtn.disabled = false; setTimeout(() => { copyBtn.textContent = "Copy report"; }, 1600); }
+  });
+  actions.append(copyBtn);
+
+  const dlBtn = cel("button", "ck-btn", "Download .md");
+  dlBtn.type = "button";
+  dlBtn.addEventListener("click", async () => {
+    dlBtn.disabled = true; dlBtn.textContent = "Preparing…";
+    try { const pkg = await ckFullReportMarkdown(focus); ckDownloadText(`${ckSlug(focus.title)}.md`, pkg.text); }
+    finally { dlBtn.disabled = false; dlBtn.textContent = "Download .md"; }
+  });
+  actions.append(dlBtn);
+
+  const shotBtn = cel("button", "ck-btn", focus.screenshot && focus.screenshot.data_url ? "Re-capture screenshot" : "Capture screenshot");
+  shotBtn.type = "button";
+  shotBtn.addEventListener("click", () => ckCaptureScreenshot(focus, shotBtn, shotWrap));
+  actions.append(shotBtn);
+
+  if (ckEffectiveProof(focus) === "candidate") {
+    const proveBtn = cel("button", "ck-btn", "Create proof of impact");
+    proveBtn.type = "button";
+    proveBtn.addEventListener("click", () => ckCreateProofOfImpact(focus, proveBtn, statusEl, resultEl));
+    actions.append(proveBtn);
+  }
+
+  if (ckEffectiveStage(focus) === "submitted") {
+    actions.append(ckReportLink("", ""));
+  } else {
+    const submitBtn = cel("button", "ck-btn primary", "Submit to HackerOne");
+    submitBtn.type = "button";
+    const can = ckCanSubmit(focus);
+    submitBtn.disabled = !can;
+    submitBtn.title = can ? "File this confirmed finding to your HackerOne program"
+      : (ckEffectiveProof(focus) !== "confirmed" ? "Create proof of impact first — only a Confirmed finding can be filed."
+        : (!focus.ref ? "Open this finding from the Findings board after the campaign to file it."
+          : "Add your HackerOne team handle + API token below."));
+    submitBtn.addEventListener("click", () => ckSubmitFinding(focus, submitBtn, statusEl));
+    actions.append(submitBtn);
+  }
+
+  wrap.append(actions, statusEl, shotWrap, resultEl);
+
+  // The full report markdown itself (cached on the focus so a search-keystroke re-render of
+  // this page doesn't refetch it).
+  const preview = cel("div", "ck-report-preview");
+  if (focus._md != null) {
+    ckRenderReportPreview(preview, "Submission report", focus._md, `${ckSlug(focus.title)}.md`);
+  } else {
+    preview.append(cel("p", "ck-hint", "Building the full report…"));
+    // Fetch once (a re-render mid-flight — e.g. a search keystroke — must not spawn another),
+    // then re-render the page so the cached markdown paints into the live DOM, not a node this
+    // render captured that a later re-render already detached.
+    if (!focus._mdLoading) {
+      focus._mdLoading = true;
+      void (async () => {
+        const pkg = await ckFullReportMarkdown(focus);
+        focus._md = pkg.text;
+        focus._mdLoading = false;
+        if (ckState.reportFocus === focus && ckState.view === "submissions") ckRenderSubmissions();
+      })();
+    }
+  }
+  wrap.append(preview);
+  return wrap;
+}
+
+// --- Search / filter / sort for the Submissions page (current-run queue + history). ---
+function ckSubMatch(f, opts) {
+  const q = String(opts.query || "").toLowerCase().trim();
+  if (q) {
+    const hay = [
+      f.title, f.location || f.source_url || f.sourceUrl || f.target,
+      f.className || f.class_name || f.cls || f.class_id, f.cwe, f.program,
+    ].map((x) => String(x || "").toLowerCase()).join(" ");
+    if (!hay.includes(q)) return false;
+  }
+  if (opts.sev !== "all" && String(f.severity || "info").toLowerCase() !== opts.sev) return false;
+  if (opts.proof !== "all") {
+    const p = ckEffectiveProof(f, f.proof_status);
+    if (opts.proof === "missing") { if (p === "confirmed" || p === "candidate") return false; }
+    else if (p !== opts.proof) return false;
+  }
+  return true;
+}
+
+function ckSubSort(list, sort) {
+  const arr = list.slice();
+  if (sort === "title") arr.sort((a, b) => String(a.title || "").localeCompare(String(b.title || "")));
+  else if (sort === "severity") arr.sort((a, b) =>
+    (CK_SEV_RANK[String(b.severity || "info").toLowerCase()] ?? 0) - (CK_SEV_RANK[String(a.severity || "info").toLowerCase()] ?? 0));
+  // "recent" keeps the incoming order (server returns newest-first; the run queue is rank order).
+  return arr;
+}
+
+function ckSubControlsBar() {
+  const opts = ckState.sub;
+  const wrap = cel("div", "ck-creds ck-sub-controls");
+  const head = cel("div", "ck-creds-head");
+  head.append(cel("strong", null, "Search · filter · sort"));
+  wrap.append(head);
+
+  const row = cel("div", "ck-sub-controls-row");
+
+  const searchLab = cel("label", "ck-sub-search");
+  searchLab.append(cel("span", null, "Search"));
+  const search = cel("input");
+  search.type = "search"; search.id = "ckSubSearch"; search.value = opts.query;
+  search.placeholder = "title, URL, class, CWE…"; search.autocomplete = "off";
+  search.addEventListener("input", () => {
+    const pos = search.selectionStart;
+    opts.query = search.value;
+    ckRenderSubmissions();
+    const again = document.getElementById("ckSubSearch");
+    if (again) { again.focus(); try { again.setSelectionRange(pos, pos); } catch (_) { /* type=search quirk */ } }
+  });
+  searchLab.append(search);
+  row.append(searchLab);
+
+  const mkSelect = (label, value, choices, onset) => {
+    const lab = cel("label");
+    lab.append(cel("span", null, label));
+    const sel = cel("select");
+    for (const [val, text] of choices) {
+      const opt = cel("option", null, text); opt.value = val;
+      if (val === value) opt.selected = true;
+      sel.append(opt);
+    }
+    sel.addEventListener("change", () => { onset(sel.value); ckRenderSubmissions(); });
+    lab.append(sel);
+    return lab;
+  };
+
+  row.append(mkSelect("Severity", opts.sev, [
+    ["all", "All severities"], ["critical", "Critical"], ["high", "High"],
+    ["medium", "Medium"], ["low", "Low"], ["info", "Info"],
+  ], (v) => { opts.sev = v; }));
+  row.append(mkSelect("Proof", opts.proof, [
+    ["all", "Any proof"], ["confirmed", "Confirmed"], ["candidate", "Candidate"], ["missing", "Unproven"],
+  ], (v) => { opts.proof = v; }));
+  row.append(mkSelect("Sort", opts.sort, [
+    ["severity", "Severity"], ["title", "Title (A–Z)"], ["recent", "Most recent"],
+  ], (v) => { opts.sort = v; }));
+
+  const active = opts.query || opts.sev !== "all" || opts.proof !== "all" || opts.sort !== "severity";
+  if (active) {
+    const clear = cel("button", "ck-btn", "Clear");
+    clear.type = "button";
+    clear.addEventListener("click", () => { ckState.sub = { query: "", sev: "all", proof: "all", sort: "severity" }; ckRenderSubmissions(); });
+    row.append(clear);
+  }
+  wrap.append(row);
+  return wrap;
+}
+
 function ckRenderSubmissions() {
   const host = ck.views.submissions;
   host.replaceChildren();
+
+  // A finding pinned open from a drawer's "View full report" lives at the top of this page,
+  // with everything needed to submit: proof of impact, screenshot, the full report, submit.
+  if (ckState.reportFocus) host.append(ckFullReportPanel(ckState.reportFocus));
+
   host.append(ckCredsBar());
   host.append(ckHackeroneActivityPanel());
   host.append(ckFormatBar());
   host.append(ckReportsExportBar());
+  host.append(ckSubControlsBar());
+  const opts = ckState.sub;
 
   // --- This run: findings from the most recent hunt/campaign (in-memory). ---
-  const ready = ckState.findings.filter((f) => ["confirmed", "candidate"].includes(ckEffectiveProof(f)));
-  host.append(cel("h2", "ck-section-title", `This run — ${ready.length} reportable`));
-  if (!ready.length) {
-    host.append(cel("p", "ck-hint", "Confirmed and candidate findings from the current run land here. Create proof of impact to confirm a candidate — only a Confirmed finding can be filed to HackerOne. Past runs are in “All findings” below."));
+  const reportable = ckState.findings.filter((f) => ["confirmed", "candidate"].includes(ckEffectiveProof(f)));
+  let ready = reportable.filter((f) => ckSubMatch(f, opts));
+  if (opts.sort === "severity") {
+    // Default: confirmed-first, then by severity rank.
+    ready = ready.slice().sort((a, b) =>
+      ((ckEffectiveProof(a) === "confirmed" ? 0 : 1) - (ckEffectiveProof(b) === "confirmed" ? 0 : 1))
+      || ((CK_SEV_RANK[String(b.severity || "info").toLowerCase()] ?? 0) - (CK_SEV_RANK[String(a.severity || "info").toLowerCase()] ?? 0)));
   } else {
-    // Confirmed-first, then candidate.
-    ready.sort((a, b) => (ckEffectiveProof(a) === "confirmed" ? 0 : 1) - (ckEffectiveProof(b) === "confirmed" ? 0 : 1));
+    ready = ckSubSort(ready, opts.sort);
+  }
+  host.append(cel("h2", "ck-section-title",
+    `This run — ${ready.length}${ready.length !== reportable.length ? ` of ${reportable.length}` : ""} reportable`));
+  if (!reportable.length) {
+    host.append(cel("p", "ck-hint", "Confirmed and candidate findings from the current run land here. Create proof of impact to confirm a candidate — only a Confirmed finding can be filed to HackerOne. Past runs are in “All findings” below."));
+  } else if (!ready.length) {
+    host.append(cel("p", "ck-hint", "No current-run findings match your search / filter."));
+  } else {
     const ul = cel("ul", "ck-list");
     for (const f of ready) ul.append(ckSubmissionRow(f));
     host.append(ul);
@@ -6606,11 +6936,20 @@ async function ckExportLedgerCsv(btn) {
 // --- All findings (history): the durable, cross-run ledger, grouped by program. ---
 function ckHistorySection() {
   const wrap = cel("div", "ck-hist");
-  wrap.append(cel("h2", "ck-section-title", "All findings — history"));
+  const head = cel("div", "ck-row-between");
+  head.append(cel("h2", "ck-section-title", "All findings — history"));
+  const refresh = cel("button", "ck-btn", "Refresh");
+  refresh.type = "button";
+  refresh.title = "Reload finding history from the engine";
+  refresh.addEventListener("click", () => { ckState._history = null; ckRenderSubmissions(); });
+  head.append(refresh);
+  wrap.append(head);
   const body = cel("div", "ck-hist-body");
-  body.append(cel("p", "ck-hint", "Loading finding history…"));
   wrap.append(body);
-  void ckLoadHistory(body);
+  // Cache the loaded ledger so search / filter / sort re-renders filter it instantly instead
+  // of refetching on every keystroke; the Refresh button clears the cache to reload.
+  if (ckState._history) ckRenderHistory(body, ckState._history);
+  else { body.append(cel("p", "ck-hint", "Loading finding history…")); void ckLoadHistory(body); }
   return wrap;
 }
 
@@ -6619,17 +6958,29 @@ async function ckLoadHistory(body) {
   try { res = await apiFetch("/api/bounty/findings", { method: "GET", timeoutMs: 15000 }); }
   catch (_) { body.replaceChildren(cel("p", "ck-hint", "Could not load history — the engine is unreachable.")); return; }
   if (!res || res.ok === false) { body.replaceChildren(cel("p", "ck-hint", "Could not load history.")); return; }
-  const findings = res.findings || [];
+  ckState._history = { findings: res.findings || [], funnel: res.funnel || null, truncated: Boolean(res.truncated) };
+  ckRenderHistory(body, ckState._history);
+}
+
+function ckRenderHistory(body, data) {
+  const allRecs = data.findings || [];
+  const opts = ckState.sub;
   body.replaceChildren();
-  if (!findings.length) {
+  if (!allRecs.length) {
     body.append(cel("p", "ck-hint", "No findings recorded yet. Every hunt + campaign records its findings here — this list persists across restarts, unlike the current run above."));
     return;
   }
-  const fn = (res.funnel && res.funnel.portfolio) || res.funnel || {};
+  const fn = (data.funnel && data.funnel.portfolio) || data.funnel || {};
   const st = fn.stages || {};
   body.append(cel("p", "ck-hint",
-    `${fn.total || findings.length} findings · ${st.confirmed || 0} confirmed · ${st.submitted || 0} submitted · ${st.paid || 0} paid · $${fn.bounty_total || 0} to date`
-    + (res.truncated ? ` · showing the ${findings.length} most recent (export CSV for all)` : "")));
+    `${fn.total || allRecs.length} findings · ${st.confirmed || 0} confirmed · ${st.submitted || 0} submitted · ${st.paid || 0} paid · $${fn.bounty_total || 0} to date`
+    + (data.truncated ? ` · showing the ${allRecs.length} most recent (export CSV for all)` : "")));
+
+  const findings = ckSubSort(allRecs.filter((r) => ckSubMatch(r, opts)), opts.sort);
+  if (!findings.length) {
+    body.append(cel("p", "ck-hint", `No findings match your search / filter (${allRecs.length} total).`));
+    return;
+  }
 
   // Group by program bucket; each program gets a header with a one-click engagement report.
   const byProg = {};
@@ -6703,6 +7054,10 @@ function ckHistoryRow(rec) {
       });
     } catch (err) { delBtn.disabled = false; delBtn.textContent = "Delete"; window.alert(err.message || "Could not delete the finding."); return; }
     if (!res || res.ok === false) { delBtn.disabled = false; delBtn.textContent = "Delete"; window.alert((res && res.error) || "Could not delete the finding."); return; }
+    // Drop it from the cached ledger too, or a search/filter re-render would resurrect the row.
+    if (ckState._history && Array.isArray(ckState._history.findings)) {
+      ckState._history.findings = ckState._history.findings.filter((x) => x !== rec);
+    }
     li.remove();
   });
   acts.append(copyBtn, dlBtn, delBtn);
@@ -8081,6 +8436,29 @@ function ckRenderFindingDrawer(dom) {
 
   drawer.append(cel("p", "ck-hint",
     "Live summary streamed during the hunt. Create proof of impact to actively probe + screenshot this finding now, then create a report — all without pausing the campaign."));
+
+  // Jump to the full submission report on the Submissions page, carrying any proof of impact /
+  // screenshot already captured in this drawer.
+  const fullActs = cel("div", "ck-actions");
+  const fullBtn = cel("button", "ck-btn primary", "View full report →");
+  fullBtn.type = "button";
+  fullBtn.title = "Open the full submission report (proof of impact, screenshot, everything to submit) on the Submissions page";
+  fullBtn.addEventListener("click", () => {
+    const rv = ckCampaign.reverify[String(f._i)];
+    let proofObj = null, shot = null;
+    if (rv && rv.state === "done" && rv.result) {
+      const fnds = rv.result.findings || [];
+      const best = fnds.find((x) => x.status === "confirmed") || fnds[0];
+      if (best) proofObj = {
+        status: best.status || "candidate", observed_result: best.observed || "",
+        control_result: best.control || "", evidence: best.evidence || "", proof_obligation: best.proof_obligation || "",
+      };
+      if (rv.result.screenshot && rv.result.screenshot.ok && rv.result.screenshot.data_url) shot = rv.result.screenshot;
+    }
+    ckViewFullReport(f, { runId: ckCampaign.runId, proofObj, screenshot: shot });
+  });
+  fullActs.append(fullBtn);
+  drawer.append(fullActs);
 
   drawer.append(ckRenderProveSection(f));
   drawer.append(ckRenderReportSection(f));
