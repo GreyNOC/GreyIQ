@@ -2,6 +2,17 @@
 
 Notable changes to GreyIQ.
 
+## v0.77.0
+
+### Confirmed source API proofs are now report-ready
+- Confirmed source/API credential findings now carry the one benign issuer validation into the main
+  PoC and proof-of-impact blocks: redacted authenticated-read request, issuer success response, and
+  blast radius are generated automatically from the validation result.
+- Reports render those proof artifacts anywhere the proof-of-impact section appears, while keeping
+  the secret itself redacted outside the sensitive credential block.
+- Guided next steps now treat already-confirmed proofs as review-ready artifacts instead of asking the
+  operator or submitter to prove the same impact again.
+
 ## v0.76.0
 
 ### Hunt programs the way they require — logged in, with your research account
