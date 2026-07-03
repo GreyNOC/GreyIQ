@@ -2,6 +2,20 @@
 
 Notable changes to GreyIQ.
 
+## v0.75.0
+
+### Proof of impact now updates the submission report
+- After **Create/Get proof of impact** (or the one-click **Prepare full report**) confirms a finding,
+  the captured request/response differential is now persisted onto the run — so the submission report,
+  the downloadable `.md`, and the HackerOne submit gate all render the finding as **Confirmed** with its
+  observed-vs-control proof, instead of still reading "Candidate / unverified".
+- Previously only the finding's status *badge* flipped to Confirmed while every rebuilt report kept
+  showing the candidate proof-obligation text, because the gathered proof was never written back to the
+  cached run the canonical report is built from.
+- The proof is only promoted when the active check confirms the finding's **own class** (an unrelated
+  confirmation at the same URL never flips it), and a client-supplied status still can't reach Confirmed
+  without a real negative control.
+
 ## v0.74.0
 
 ### Every leaked API key is now proven, not just detected
