@@ -162,8 +162,11 @@ def _compact_proof_evidence(pe: Any) -> dict[str, Any] | None:
     """A bounded copy of a finding's captured request/response artifact for the same on-demand report."""
     if not isinstance(pe, dict):
         return None
-    out = {k: str(pe.get(k))[:3000] for k in ("request_line", "request_headers", "response_status",
-                                             "response_headers", "matched_value", "read_data") if pe.get(k)}
+    # Singular request_header/response_header — the real proof_evidence schema (matches
+    # ProofEvidenceInput + the report builder); the plural forms would silently drop the crafted
+    # request / response header evidence a CORS / redirect / host-header report reproduces from.
+    out = {k: str(pe.get(k))[:3000] for k in ("request_line", "request_header", "response_header",
+                                             "response_status", "matched_value", "read_data") if pe.get(k)}
     return out or None
 
 

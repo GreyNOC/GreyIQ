@@ -23,7 +23,9 @@ class CampaignStreamsProofArtifactTests(unittest.TestCase):
         doc = {
             "findings": [{"ref": "F1", "title": "Reflected XSS", "severity": "high", "class_id": "xss",
                           "rule_id": "active.reflected-xss", "location": "https://t.example/q", "cwe": "CWE-79",
-                          "proof_evidence": {"request_line": "GET /q?x=<svg/onload=1>"}}],
+                          "proof_evidence": {"request_line": "GET /q?x=<svg/onload=1>",
+                                             "request_header": "Origin: https://evil.example",
+                                             "response_header": "Access-Control-Allow-Origin: https://evil.example"}}],
             "proof_of_impact": {"F1": {"status": "confirmed",
                                        "observed_result": "the <svg/onload> payload reflected UNENCODED in the HTML body",
                                        "control_result": "a benign marker with no tag did not reflect the payload"}},
@@ -49,7 +51,12 @@ class CampaignStreamsProofArtifactTests(unittest.TestCase):
         pd = f1.get("proof_detail") or {}
         self.assertIn("reflected UNENCODED", pd.get("observed_result", ""))  # the ARTIFACT rode along
         self.assertIn("did not reflect", pd.get("control_result", ""))      # ...both halves of the differential
-        self.assertEqual((f1.get("proof_evidence") or {}).get("request_line"), "GET /q?x=<svg/onload=1>")
+        pe = f1.get("proof_evidence") or {}
+        self.assertEqual(pe.get("request_line"), "GET /q?x=<svg/onload=1>")
+        # the SINGULAR header keys (the real schema) must survive compacting — a CORS/redirect report
+        # reproduces from exactly these
+        self.assertEqual(pe.get("request_header"), "Origin: https://evil.example")
+        self.assertEqual(pe.get("response_header"), "Access-Control-Allow-Origin: https://evil.example")
 
     def test_streamed_proof_detail_makes_the_on_demand_report_confirmed(self) -> None:
         # The drawer passes the streamed proof_detail as `proof`; build_finding_report must render it
