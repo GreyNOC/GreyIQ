@@ -2,6 +2,26 @@
 
 Notable changes to GreyIQ.
 
+## v0.76.0
+
+### Hunt programs the way they require — logged in, with your research account
+- A program can now carry its **hunting requirements**. Give a program your authorized **research-account
+  email + password** and its **login URL**, and the engine logs in through the program's own login page
+  (via the bundled browser) and hunts as that authenticated user — reaching everything behind the login.
+  A pasted **session cookie** works as a fallback when a login form is CAPTCHA/SSO-heavy.
+- Programs that require a **user-agent tag** on your traffic (common on HackerOne/YesWeHack — e.g.
+  `-BugBounty-<program>-31337`) get it appended to **every in-scope request** automatically.
+- Credentials are stored locally and used only against the program's own login page (scope- and
+  SSRF-guarded, fails closed). The password and session cookie are **never shown again** after saving,
+  and the required tag can never inject a header. Set it all in the Program form's new
+  **"Account access & hunting requirements"** section.
+
+### A finding confirmed during a hunt now reads confirmed in its report
+- Clicking a finding during a campaign and opening **View full report** now shows it as **Confirmed**
+  with its captured proof (the observed-vs-control differential + request/response evidence) — instead
+  of "Candidate / validate before submission" — with no manual re-verify needed. A genuinely
+  unconfirmed finding still reads candidate.
+
 ## v0.75.0
 
 ### Proof of impact now updates the submission report
