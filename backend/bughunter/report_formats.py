@@ -158,7 +158,7 @@ def _section_poc(out: list[str], plan: dict[str, Any]) -> None:
     poc = str(plan["poc"]).strip()[:1500]
     fence = R._fence(poc)
     out.append("## Proof of concept\n")
-    out.append(fence)
+    out.append(fence + R._poc_lang(poc))
     out.append(poc)
     out.append(fence)
     out.append("")

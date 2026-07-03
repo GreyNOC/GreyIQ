@@ -155,6 +155,17 @@ def _fence(text: str) -> str:
     return "`" * max(3, longest + 1)
 
 
+def _poc_lang(text: str) -> str:
+    """Language tag for a fenced PoC block so a reviewer — and HackerOne's automated report
+    check — recognizes it as code. A bare ``` fence around an HTML PoC gets flagged as
+    "missing PoC code", so tag the runnable-HTML shape GreyIQ emits (CORS/CSRF/redirect PoCs)
+    as ``html``. Returns "" (bare fence) for anything we can't confidently classify."""
+    t = (text or "").lstrip().lower()
+    if t.startswith(("<!doctype", "<html", "<meta", "<body", "<script")) or "<script" in t:
+        return "html"
+    return ""
+
+
 def _code(value: str) -> str:
     """Inline code span that can't be broken by a backtick in the value, and is
     safe inside a Markdown table cell (pipes/newlines neutralized)."""
@@ -1137,7 +1148,7 @@ def build_finding_markdown(ctx: dict[str, Any], finding: dict[str, Any]) -> str:
         poc = str(plan["poc"]).strip()[:1500]
         poc_fence = _fence(poc)
         out.append("## Proof of concept\n")
-        out.append(poc_fence)
+        out.append(poc_fence + _poc_lang(poc))
         out.append(poc)
         out.append(poc_fence)
         out.append("")

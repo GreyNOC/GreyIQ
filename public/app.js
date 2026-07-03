@@ -5022,6 +5022,15 @@ async function ckCaptureScreenshot(f, btn, wrap, onShots) {
   }
 }
 
+// Language tag for a fenced PoC so a reviewer (and HackerOne's automated report check)
+// recognizes it as code — a bare ``` fence around an HTML PoC gets flagged as "missing PoC
+// code". Mirrors report.py _poc_lang.
+function ckPocLang(poc) {
+  const t = String(poc || "").replace(/^\s+/, "").toLowerCase();
+  if (t.startsWith("<!doctype") || t.startsWith("<html") || t.startsWith("<meta") || t.startsWith("<body") || t.indexOf("<script") !== -1) return "html";
+  return "";
+}
+
 function ckBuildSubmissionDraft(f) {
   const lines = [];
   const sev = f.severity.replace(/^./, (c) => c.toUpperCase());
@@ -5037,7 +5046,7 @@ function ckBuildSubmissionDraft(f) {
     plan.steps.forEach((s, i) => lines.push(`${i + 1}. ${s}`));
     lines.push("");
   }
-  if (plan.poc) lines.push("## Proof of concept", "```", plan.poc, "```", "");
+  if (plan.poc) lines.push("## Proof of concept", "```" + ckPocLang(plan.poc), plan.poc, "```", "");
   const po = f.proofObj || null;
   if (po) {
     lines.push("## Proof of impact");
