@@ -2400,6 +2400,11 @@ class GreyIQRuntime:
         the request body. The ONLY path here that touches the network."""
         if bounty_formats.normalize_platform(request.platform) != "hackerone":
             return {"ok": False, "error": "Only the HackerOne API submit is wired. Export the package (Copy report / Download .md) and file it on the other platforms."}
+        # Resolve the finding + run BEFORE the network call and hold a LOCAL reference. The 16-entry
+        # run cache is drop-oldest, so the network round-trip below can evict this run; recording must
+        # NOT depend on it still being cached afterward — a re-resolve that returned None would file
+        # the report with no ledger dedup record, and a later cycle would re-file the identical report.
+        _, finding, run = self._resolve_run_finding(request.run_id, request.ref)
         pkg_result = self.build_submission_package(SubmissionPackageRequest(run_id=request.run_id, ref=request.ref, platform="hackerone"))
         if not pkg_result.get("ok"):
             return pkg_result
@@ -2411,8 +2416,7 @@ class GreyIQRuntime:
             )
         except bounty_submission.SubmissionError as exc:
             return {"ok": False, "error": str(exc)}
-        # Record the submission to the learning store + triage so the loop closes.
-        _, finding, run = self._resolve_run_finding(request.run_id, request.ref)
+        # Record the submission to the learning store + ledger from the PRE-resolved finding/run.
         if finding is not None:
             program, target = (run or {}).get("program"), (run or {}).get("target", "")
             try:
@@ -2696,7 +2700,12 @@ class GreyIQRuntime:
             # information worth recording here, regardless of the state comparison.
             if state == str(rec.get("h1_state") or "") and not resolved_with_reward:
                 continue  # nothing new to reflect since the last sync
-            bounty_ledger.record_h1_sync(RUNTIME_DIR, rec["pid"], rec["key"], state=state, resolved_with_reward=resolved_with_reward)
+            try:
+                reward_amount = float(status.get("total_awarded_amount") or 0.0)
+            except (TypeError, ValueError):
+                reward_amount = 0.0
+            bounty_ledger.record_h1_sync(RUNTIME_DIR, rec["pid"], rec["key"], state=state,
+                                         resolved_with_reward=resolved_with_reward, bounty=reward_amount)
             updated += 1
             learning_status = _H1_STATE_TO_LEARNING_OUTCOME.get(state)
             if learning_status:
@@ -2710,7 +2719,8 @@ class GreyIQRuntime:
                         RUNTIME_DIR, program=rec.get("program"), target=rec.get("source_url", ""),
                         class_id=str(rec.get("class_id") or "other"), title=str(rec.get("title") or ""),
                         status=learning_status, severity=str(rec.get("severity") or ""),
-                        bounty=float(rec.get("bounty") or 0.0) if resolved_with_reward else 0.0,
+                        # The freshly-fetched amount (rec['bounty'] is the pre-sync copy, still 0.0).
+                        bounty=reward_amount if resolved_with_reward else 0.0,
                         notes=f"HackerOne report {rec.get('h1_report_id')} synced to '{state}'",
                     )
                 except ValueError:

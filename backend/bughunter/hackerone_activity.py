@@ -176,6 +176,9 @@ def fetch_report_status(
         "title": str(attrs.get("title") or ""),
         "bounty_awarded_at": attrs.get("bounty_awarded_at"),
         "swag_awarded_at": attrs.get("swag_awarded_at"),
+        # The cumulative bounty paid on this report — so the sync can record the REAL amount into the
+        # ledger (feeds the 'paid' EV boost) instead of leaving bounty at 0.0.
+        "total_awarded_amount": attrs.get("total_awarded_amount"),
         "last_activity_at": attrs.get("last_activity_at"),
     }
 
