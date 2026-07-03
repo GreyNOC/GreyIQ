@@ -527,6 +527,22 @@ def _append_credential_proof(out: list[str], finding: dict[str, Any]) -> None:
         out.append("- **How it was validated:** a benign, read-only GET to the credential's own issuer "
                    f"(Google Identity Toolkit `getProjectConfig`) carrying only the found key — HTTP {proof.get('http_status', '?')}. "
                    "No target request, no data touched.")
+        # Runnable PoC + the ACTUAL issuer response — the reproducible command a triager runs and the
+        # captured artifact proving the key is live and what it reveals (not prose). The command carries
+        # the real key on purpose (this whole block is already flagged sensitive); the response is redacted.
+        poc = str(proof.get("poc") or "").strip()
+        if poc:
+            out.append("")
+            out.append("**Proof of concept — reproduce liveness (one benign, read-only GET to Google, never the target):**\n")
+            out.append("```bash")
+            out.append(poc)
+            out.append("```")
+            excerpt = str(proof.get("response_excerpt") or "").strip()
+            if excerpt:
+                out.append("Issuer response — proof the key is live and what it grants (redacted):\n")
+                out.append("```json")
+                out.append(redact_text(excerpt)[0][:900])
+                out.append("```")
     out.append("")
     if secret:
         out.append(f"> {_CREDENTIAL_WARNING}")

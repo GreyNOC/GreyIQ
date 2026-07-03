@@ -45,6 +45,27 @@ class ValidatorInterpretationTests(unittest.TestCase):
         self._mock(400, '{"error":{"message":"API key not valid. Please pass a valid API key."}}')
         self.assertIs(cv.validate_firebase_key(_KEY)["live"], False)
 
+    def test_live_key_captures_runnable_poc_and_issuer_response(self) -> None:
+        self._mock(200, '{"projectId":"acme-prod","authorizedDomains":["acme.com"]}')
+        r = cv.validate_firebase_key(_KEY)
+        self.assertIn(_KEY, r["poc"])                        # the PoC is a literal, runnable reproduction
+        self.assertIn("getProjectConfig", r["poc"])
+        self.assertIn("acme-prod", r["response_excerpt"])    # the ACTUAL issuer response is captured as proof
+
+    def test_poc_present_even_when_inconclusive(self) -> None:
+        self._mock(0, "Timeout")  # offline / no verdict — the operator still gets the command to run
+        r = cv.validate_firebase_key(_KEY)
+        self.assertIsNone(r["live"])
+        self.assertIn(_KEY, r["poc"])
+
+    def test_storage_exposure_captures_real_object_names(self) -> None:
+        cv._get = lambda url: ((200, '{"items":[{"name":"users/secret.json"},{"name":"backups/db.sql"}],"prefixes":["private/"]}')
+                               if "firebasestorage" in url else (200, "null"))  # RTDB locked, Storage open
+        exps = cv.probe_firebase_exposure("acme-prod")
+        storage = next(e for e in exps if e["service"] == "Firebase Cloud Storage")
+        self.assertIn("users/secret.json", storage["evidence"])   # concrete object name, not prose
+        self.assertIn("private/", storage["detail"])
+
     def test_live_but_restricted_still_live_and_extracts_project(self) -> None:
         self._mock(403, '{"error":{"message":"Identity Toolkit API has not been used in project 123456789012 before or it is disabled."}}')
         r = cv.validate_firebase_key(_KEY)
@@ -110,6 +131,16 @@ class CredentialReportTests(unittest.TestCase):
         self.assertIn("acme-prod-42", body)                       # specific project
         self.assertIn("acme.firebaseapp.com", body)               # data/domains it grants
         self.assertIn("UN-REDACTED", body)                        # review-before-sharing warning
+
+    def test_report_includes_runnable_poc_and_captured_response(self) -> None:
+        poc = f"curl -s 'https://www.googleapis.com/identitytoolkit/v3/relyingparty/getProjectConfig?key={_KEY}'"
+        body = self._render({"checked": True, "live": True, "project_id": "acme-prod-42",
+                             "authorized_domains": ["acme.com"], "detail": "LIVE", "http_status": 200,
+                             "poc": poc, "response_excerpt": '{"projectId":"acme-prod-42","authorizedDomains":["acme.com"]}'})
+        self.assertIn("Proof of concept", body)                       # a PoC section is present
+        self.assertIn(f"getProjectConfig?key={_KEY}", body)           # the runnable command, with the real key
+        self.assertIn("Issuer response", body)                        # the captured artifact heading
+        self.assertIn("acme-prod-42", body)                           # the actual issuer response content
 
     def test_live_credential_reads_as_confirmed(self) -> None:
         body = self._render({"checked": True, "live": True, "project_id": "p", "detail": "LIVE", "http_status": 200})
