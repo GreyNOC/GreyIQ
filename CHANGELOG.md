@@ -2,6 +2,32 @@
 
 Notable changes to GreyIQ.
 
+## v0.70.0
+
+### Finds more criticals & RCE — and proves them
+New actively-confirmed critical checks, each with a control differential and adversarially vetted
+against false positives (findings must be legit):
+- **OS command injection** — a benign `$(expr 111+111)` shell-substitution echo confirms code
+  execution without running any real command.
+- **Blind OS command injection** (opt-in) — a `sleep` timing differential with a *matched-
+  metacharacter* control, so a WAF that tarpits on `$(` can't produce a false positive.
+- **Unauthenticated debug/management endpoints** — Spring Boot actuator **heap dump** (every
+  in-memory secret) / env / index and **Jolokia** JMX (a path to RCE), confirmed by the product's
+  own signature plus a catch-all control.
+- **SSTI → RCE** escalation gadgets per engine, and the live-scan **uncaught JavaScript exception**
+  finding is now triaged into code-evaluation / prototype-pollution / DOM-sink leads.
+
+### Leaked API keys that HackerOne accepts
+A found **Firebase / Google API key** is now validated and reported to spec: the exact file, line,
+and **variable name**; a benign read-only check against the key's own issuer that proves it is
+**live** and names the **Firebase project** and authorized domains it grants; and the **actual key**
+shown un-redacted (with a review-before-sharing warning) so you can paste it straight into the
+report. A live key reads as Confirmed.
+
+### Delete a program, everywhere
+Deleting a program now cascades across the whole app and deletes its findings — **High/Critical
+findings are kept** in a History "Archived" subcategory, the rest are removed.
+
 ## v0.69.0
 
 ### Every confirmed finding now ships a real proof of concept
