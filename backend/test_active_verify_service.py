@@ -1102,8 +1102,10 @@ class TimeSqliE2ETests(unittest.TestCase):
     def test_full_verify_active_fires_time_check_only_when_opted_in(self) -> None:
         port = self._serve(_VulnTimeHandler)
         url = f"http://127.0.0.1:{port}/?id=1"
-        # Opt-in ON: the executing SLEEP probe runs and confirms.
-        findings, meta = av.verify_active(url, [], scope="127.0.0.1", time_based=True, requests_budget=40)
+        # Opt-in ON: the executing SLEEP probe runs and confirms. Budget is generous so the
+        # full check list (which grows as new checks land, e.g. the RCE command-injection probe)
+        # is exhausted through to the opt-in time check appended at the very end.
+        findings, meta = av.verify_active(url, [], scope="127.0.0.1", time_based=True, requests_budget=60)
         self.assertTrue(meta["in_scope"])
         self.assertIn("active.sqli-time", {f["rule_id"] for f in findings})
         # Opt-in OFF (default): no executing SLEEP probe, even against the vulnerable backend.

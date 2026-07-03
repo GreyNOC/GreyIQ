@@ -7,6 +7,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import sys
 import types
 import unittest
@@ -420,6 +421,34 @@ class DisclosureDemonstratedImpactTests(unittest.TestCase):
         self.assertIn("Demonstrated impact", body)
         self.assertNotIn("cross-origin", body.lower())  # generic heading, not the CORS one
         self.assertIn("root:x:0:0", body)
+
+
+class RceCommandInjectionTests(unittest.TestCase):
+    """The active RCE check confirms OS command injection with a BENIGN $(expr) shell-substitution
+    probe (arithmetic only), and stays quiet on an app that merely echoes the literal input."""
+
+    class _ShellStub:
+        auth = None
+        def fetch(self, url, *, method="GET", extra_headers=None):
+            val = dict(parse_qs(urlparse(url).query)).get("cmd", [""])[0]
+            # A real shell evaluates $(expr 111 + 111) / `expr 111 + 111` to 222.
+            out = re.sub(r"\$\(expr 111 \+ 111\)|`expr 111 \+ 111`", "222", val)
+            return {"status": 200, "headers": {}, "cookies": [], "body": "out: " + out, "location": None, "final_url": url}
+
+    def test_command_substitution_evaluated_confirms(self) -> None:
+        f = av._check_rce_command_injection(self._ShellStub(), "https://app.example.com/run?cmd=x")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertEqual(f["rule_id"], "active.rce-command-injection")
+        self.assertEqual(f["_active_class_hint"], "rce")
+        self.assertEqual(f["severity"], "critical")
+
+    def test_literal_echo_is_not_flagged(self) -> None:
+        class _EchoStub(self._ShellStub):  # echoes input verbatim, no shell -> must NOT confirm
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                val = dict(parse_qs(urlparse(url).query)).get("cmd", [""])[0]
+                return {"status": 200, "headers": {}, "cookies": [], "body": "echo: " + val, "location": None, "final_url": url}
+        self.assertIsNone(av._check_rce_command_injection(_EchoStub(), "https://app.example.com/run?cmd=x"))
 
 
 if __name__ == "__main__":

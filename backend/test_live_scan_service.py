@@ -103,6 +103,35 @@ class FindingBuilderTests(unittest.TestCase):
         self.assertEqual(f["severity"], "medium")
         self.assertEqual(f["confidence"], "high")
 
+    def test_finding_carries_remediation_note(self) -> None:
+        f = LS._finding("live.js-exception-code-eval", "…", "high", "high", "https://x/", "boom", remediation="look here")
+        self.assertEqual(f["remediation"], "look here")
+
+
+class JsExceptionClassificationTests(unittest.TestCase):
+    """An uncaught JS exception is triaged into the dangerous sink it touches — the 'better
+    uncaught-JS-exception' finding — while a plain error stays generic. Observational only."""
+
+    def test_code_eval_sink(self) -> None:
+        rid, _t, sev, note = LS._classify_js_exception("SyntaxError in eval() at app.js:5")
+        self.assertEqual(rid, "live.js-exception-code-eval")
+        self.assertEqual(sev, "high")
+        self.assertTrue(note)
+
+    def test_prototype_pollution(self) -> None:
+        rid, _t, _s, _n = LS._classify_js_exception("TypeError: cannot assign to read only property '__proto__'")
+        self.assertEqual(rid, "live.js-exception-proto")
+
+    def test_dom_html_sink(self) -> None:
+        rid, _t, sev, _n = LS._classify_js_exception("Error setting innerHTML on null")
+        self.assertEqual(rid, "live.js-exception-dom-sink")
+        self.assertEqual(sev, "medium")
+
+    def test_plain_exception_stays_generic(self) -> None:
+        rid, _t, _s, note = LS._classify_js_exception("ReferenceError: foo is not defined")
+        self.assertEqual(rid, "live.js-exception")
+        self.assertEqual(note, "")
+
 
 class NotInstalledShapeTests(unittest.TestCase):
     def test_shape(self) -> None:

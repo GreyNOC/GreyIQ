@@ -48,7 +48,8 @@ _RISK_ADVICE = {
 }
 
 
-def _finding(rule_id: str, title: str, severity: str, confidence: str, url: str, snippet: str) -> dict[str, Any]:
+def _finding(rule_id: str, title: str, severity: str, confidence: str, url: str, snippet: str,
+             remediation: str = "") -> dict[str, Any]:
     # Runtime evidence (console text, exception messages, request URLs) can carry
     # tokens/secrets — redact before it reaches the report, like the passive scanner.
     safe, redacted = redact_text(str(snippet))
@@ -62,9 +63,33 @@ def _finding(rule_id: str, title: str, severity: str, confidence: str, url: str,
         "line_start": 1,
         "line_end": 1,
         "snippet": safe[:240],
-        "remediation": "",
+        "remediation": remediation,
         "redacted": redacted,
     }
+
+
+def _classify_js_exception(text: str) -> tuple[str, str, str, str]:
+    """Turn a bare "Uncaught JavaScript exception" into a triaged lead by inspecting the error /
+    stack for the dangerous sink it touches. Returns (rule_id, title, severity, note). Purely
+    observational — a classified exception is a LEAD (where to look), never a confirmed vuln."""
+    t = (text or "").lower()
+    if any(s in t for s in ("eval(", "eval ", "new function", "function(", "settimeout", "setinterval")):
+        return ("live.js-exception-code-eval",
+                "Uncaught JS exception at a code-evaluation sink (possible client-side RCE)", "high",
+                "The exception involves eval / Function / setTimeout(string) — a client-side code-execution sink. "
+                "If attacker-influenced input (URL, hash, postMessage, JSON) reaches it, this is a DOM-XSS → "
+                "arbitrary-JS-execution path; on a Node SSR/edge runtime it can reach server-side code execution.")
+    if "__proto__" in t or "prototype" in t or "constructor" in t:
+        return ("live.js-exception-proto",
+                "Uncaught JS exception involving prototype manipulation (prototype pollution)", "high",
+                "The exception touches __proto__ / prototype / constructor — a prototype-pollution indicator that "
+                "commonly escalates to DOM XSS and, with a matching gadget on Node, to RCE.")
+    if any(s in t for s in ("innerhtml", "outerhtml", "insertadjacenthtml", "document.write")):
+        return ("live.js-exception-dom-sink",
+                "Uncaught JS exception at a DOM HTML sink (DOM-XSS lead)", "medium",
+                "The exception involves innerHTML / document.write — a DOM-XSS sink. Check whether "
+                "location/referrer/postMessage data reaches it unsanitized.")
+    return ("live.js-exception", "Uncaught JavaScript exception", "high", "")
 
 
 def _risk(findings: list[dict[str, Any]]) -> tuple[str, float]:
@@ -181,7 +206,8 @@ def run_live_scan(url: str, wait_seconds: float = 6.0, max_findings: int = 300) 
 
     findings: list[dict[str, Any]] = []
     for error in page_errors:
-        findings.append(_finding("live.js-exception", "Uncaught JavaScript exception", "high", "high", final_url, error))
+        rid, title, sev, note = _classify_js_exception(error)
+        findings.append(_finding(rid, title, sev, "high", final_url, error, remediation=note))
     for kind, text in console_msgs:
         severity = "medium" if kind == "error" else "low"
         findings.append(_finding(f"live.console-{kind}", f"Console {kind}", severity, "medium", final_url, text))

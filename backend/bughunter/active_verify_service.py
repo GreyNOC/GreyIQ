@@ -788,6 +788,48 @@ def _check_ssti(http: _Http, url: str, extra_params: list[str] | None = None) ->
     return None
 
 
+def _check_rce_command_injection(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
+    """Confirm OS command injection with a BENIGN shell-substitution arithmetic probe: if the
+    parameter reaches a shell, ``$(expr 111 + 111)`` / `` `expr 111 + 111` `` is evaluated and its
+    result (222) echoed back. Only ``expr`` runs — no real command, no side effect. A literal
+    control that is NOT substituted rules out a coincidental echo. GET-only; one marker per probe.
+    This is the arithmetic-echo sibling of the SSTI check, for a shell context rather than a
+    template engine — the safe way to prove RCE without executing a real payload."""
+    params = _candidate_params(url, extra_params, ("cmd", "exec", "ping", "host", "ip", "query", "q"), 2)
+    # BOTH substitution forms ($(...) and backticks) ride in ONE probe, each behind its own
+    # marker — so this check costs exactly what SSTI does: one control + one probe per param.
+    sig_dollar, sig_tick = f"{_MARK}D222", f"{_MARK}T222"
+    probe_payload = f"{_MARK}D$(expr 111 + 111){_MARK}T`expr 111 + 111`"
+    control_payload = f"{_MARK}Dexpr 111 + 111{_MARK}Texpr 111 + 111"
+    for param in params:
+        try:
+            control = http.fetch(_with_query(url, {param: control_payload}))
+        except _ActiveError:
+            continue
+        cbody = control.get("body") or ""
+        if sig_dollar in cbody or sig_tick in cbody:
+            continue  # the literal already yields the signature -> not substitution-driven
+        try:
+            probe = http.fetch(_with_query(url, {param: probe_payload}))
+        except _ActiveError:
+            break
+        body = probe.get("body") or ""
+        if sig_dollar in body or sig_tick in body:
+            form = "$(expr 111 + 111)" if sig_dollar in body else "`expr 111 + 111`"
+            proof = _proof(
+                "confirmed", method=f"GET with {param}=<benign {form} shell substitution>",
+                affected_asset="the application server — arbitrary OS command execution in the query's shell context",
+                observed_result=f"the '{param}' parameter's shell substitution {form} was evaluated by a server-side shell (→ 222) — OS command injection",
+                control_result="a literal 'expr 111 + 111' control did NOT yield 222 — the shell evaluated the substitution, it wasn't echoed",
+                evidence="the marker immediately followed by the evaluated result (222) appears in the response body",
+            )
+            ev = {"request_line": f"GET {_with_query(url, {param: probe_payload})}", "response_status": f"HTTP {probe['status']}",
+                  "matched_value": "shell command substitution evaluated to 222 (OS command injection)"}
+            return _finding("active.rce-command-injection", f"OS command injection via '{param}' parameter",
+                            "critical", "injection", "rce", url, proof, ev)
+    return None
+
+
 def _check_error_sqli(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
     parsed = urlparse(url)
     params = _candidate_params(url, extra_params, (), 2)
@@ -1529,6 +1571,10 @@ def verify_active(
         lambda: _check_host_header(http, sanitized),
         lambda: _check_reflected_xss(http, sanitized, discovered_params),
         lambda: _check_ssti(http, sanitized, discovered_params),
+        # OS command injection via benign $(expr) shell substitution — arithmetic only, no real
+        # command runs. Sits next to SSTI (both are safe arithmetic-echo injection probes) and
+        # ahead of the SQLi variants so a CRITICAL RCE gets request-budget priority.
+        lambda: _check_rce_command_injection(http, sanitized, discovered_params),
         lambda: _check_error_sqli(http, sanitized, discovered_params),
         lambda: _check_bool_sqli(http, sanitized, discovered_params),
         lambda: _check_nosqli(http, sanitized, discovered_params),
