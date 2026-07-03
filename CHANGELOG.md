@@ -16,6 +16,17 @@ Notable changes to GreyIQ.
   confirmation at the same URL never flips it), and a client-supplied status still can't reach Confirmed
   without a real negative control.
 
+### Stronger proof on every confirmed finding
+- A **proof screenshot** is now captured for *every* actively-confirmed finding (previously deep-mode
+  only) and ships in its submission package — a visual PoC of the vulnerable behaviour that speeds and
+  raises triage acceptance. Scope-gated and bounded; degrades cleanly when a browser engine is absent.
+- Data-disclosure findings (CORS cross-origin read, IDOR, exposed-file/dump) now **name the sensitive
+  data actually disclosed** — "the disclosed content includes a JWT (session/bearer token) and email
+  address(es)" — the concrete impact that lifts a finding from Low to High. Detection is deliberately
+  conservative (high-confidence secrets + JWTs + personal emails only; credit-card/phone/password
+  heuristics and the site's own public role addresses are excluded so the claim is never over-stated),
+  and it is shown only for disclosure findings, never for an injection finding's own payload effect.
+
 ## v0.74.0
 
 ### Every leaked API key is now proven, not just detected
