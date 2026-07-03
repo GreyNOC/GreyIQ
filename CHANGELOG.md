@@ -2,6 +2,35 @@
 
 Notable changes to GreyIQ.
 
+## v0.73.0
+
+### Finds more, proves more
+- **Context-aware reflected XSS** — a new check that catches JavaScript-string `</script>` breakouts
+  and double-quoted-attribute `"` breakouts the element-content check structurally misses. It confirms
+  only when the breakout character reflects **un-encoded** *and* the reflection physically sits inside
+  a `<script>` element or a double-quoted attribute (verified from the surrounding syntax), so an
+  encoded or non-executable reflection is never flagged.
+- **Live-validated GitHub & Slack tokens** — a leaked GitHub personal-access-token or Slack token is
+  now proven live by one benign, read-only request to its **own issuer** (never the target), naming
+  the account/workspace and the scopes it grants, with a runnable proof-of-concept — turning a
+  detection-only leak into a proven finding, the same way Firebase keys already are.
+- **Deeper SQL injection** — error-based SQLi now also tries double-quote and backslash quote-breaks
+  (the MySQL/MSSQL string contexts a single quote misses), keeping the database-error-banner-only
+  confirmation; boolean-blind SQLi now confirms the **inverse polarity** (endpoints whose default
+  response is the FALSE result) with every stability and reproduction guard intact; and each injection
+  check probes one more discovered parameter.
+- **Tech-stack steering** — the technology fingerprint's per-class hints (Flask/Django/Next → template
+  injection, PHP/WordPress/ASP.NET → command injection, Angular → XSS, GraphQL → introspection) now
+  reorder the active checks alongside the reasoning layer's per-endpoint priorities, so the request
+  budget is spent on the classes the observed stack actually implies. Pure reordering — it never
+  creates a finding, only changes the order they run in.
+
+### Proof that reaches the report
+- An end-to-end guarantee that every confirmed finding's proof-of-concept (reproduction steps + a
+  runnable command), proof-of-impact, and the exact **request sent + HTTP return code** render on
+  every report surface — the campaign report, the per-finding file, all four platform submissions,
+  and the JSON sidecar.
+
 ## v0.72.0
 
 ### The hunt sees more, and reasons about where to strike
