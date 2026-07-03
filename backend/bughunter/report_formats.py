@@ -189,6 +189,7 @@ def _section_screenshot(out: list[str], finding: dict[str, Any]) -> None:
     """Embed a captured proof screenshot — delegates to the shared ``report._append_screenshot``
     so the default report and every per-platform report render screenshot evidence identically."""
     R._append_screenshot(out, finding)
+    R._append_credential_proof(out, finding)
 
 
 def _section_impact(out: list[str], finding: dict[str, Any], plan: dict[str, Any]) -> None:

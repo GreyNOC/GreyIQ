@@ -24,6 +24,7 @@ from uuid import uuid4
 
 import coder
 from bughunter import active_verify_service
+from bughunter import credential_validation
 from bughunter import fsutil
 from bughunter import impact_model
 from bughunter import ledger
@@ -1190,6 +1191,27 @@ def run_bounty_hunt(
         except Exception as exc:  # noqa: BLE001 - active layer is best-effort; never break a hunt
             active_meta = {"in_scope": False, "skipped_reason": f"active verification error: {exc}"}
             _emit(f"active verification error: {exc}")
+
+    # Credential validation: a leaked Firebase/Google API key is only a REAL finding if it's live.
+    # Gated by ``authorized`` — it sends ONE benign, read-only GET to the credential's OWN issuer
+    # (Google, never the target), carrying only the found key, to prove liveness + name the project.
+    # Best-effort; an error never breaks a hunt.
+    if authorized:
+        for finding in raw_findings:
+            if not isinstance(finding, dict) or finding.get("_credential_proof") is not None:
+                continue
+            key = str(finding.get("secret_value") or "").strip()
+            if str(finding.get("rule_id") or "") == "secret.google-api-key" and credential_validation.is_google_api_key(key):
+                try:
+                    proof = credential_validation.validate_firebase_key(key)
+                except Exception as exc:  # noqa: BLE001
+                    _emit(f"credential validation error: {exc}")
+                    continue
+                finding["_credential_proof"] = proof
+                live = proof.get("live")
+                label = finding.get("variable_name") or "Firebase key"
+                _emit(f"validated {label}: " + ("LIVE — project " + (proof.get("project_id") or "?") if live
+                                                 else "not live" if live is False else "inconclusive"))
 
     # Annotate + rank.
     annotated: list[dict[str, Any]] = []

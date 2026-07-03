@@ -44,6 +44,13 @@ def _finding_to_dict(finding: Finding, *, redacted: bool = False) -> dict[str, A
         "snippet": finding.snippet,
         "remediation": finding.remediation,
         "redacted": redacted,
+        # The exact variable the secret is assigned to (for the report's "exact location"), and the
+        # RAW credential value. secret_value is deliberately NOT redacted — it is shown only in the
+        # report's clearly-labelled credential section and used to validate the key; it is never
+        # persisted to the ledger (which builds its own metadata record). Present only for
+        # category=="secret" findings.
+        **({"variable_name": finding.variable_name} if finding.variable_name else {}),
+        **({"secret_value": finding.secret_value} if finding.secret_value else {}),
     }
 
 
