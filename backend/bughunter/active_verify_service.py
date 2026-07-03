@@ -70,6 +70,7 @@ from bughunter.web_scan_service import (
     _USER_AGENT,
     _consume,
     _guard_url,
+    current_user_agent,
 )
 
 # A reserved, non-resolving marker host (RFC 2606 example.* is reserved and will
@@ -330,7 +331,7 @@ class _Http:
             if not self.governor.throttle(host):
                 raise _RateLimited()
             self.sent += 1
-            headers = {"User-Agent": _USER_AGENT, "Accept": "*/*", "Accept-Encoding": "identity"}
+            headers = {"User-Agent": current_user_agent(_USER_AGENT), "Accept": "*/*", "Accept-Encoding": "identity"}
             # Operator auth is attached ONLY when this request's host is same-site as the
             # bound host — so the open-bucket check's foreign-host fetch (and any other
             # off-target host) never receives the session.

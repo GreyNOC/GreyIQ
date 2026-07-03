@@ -26,6 +26,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from bughunter import (
+    account_login_service,
     active_verify_service,
     cve_service,
     fsutil,
@@ -38,6 +39,7 @@ from bughunter import (
     research,
     screenshot_service,
     submission,
+    web_ingest,
 )
 from bughunter.bounty import _classify, _infer_kind, _safe_slug, run_bounty_hunt
 from bughunter.registrable_domain import registrable_domain
@@ -108,7 +110,58 @@ def _capture_proof_screenshots(items: list[dict[str, Any]], shot_dir: Path, targ
     return captured
 
 
-def run_campaign(
+def _login_auth(account_access: dict[str, Any] | None, scope: str,
+                excluded_hosts: Any, emit: Any) -> dict[str, Any] | None:
+    """Resolve a program's research-account session to an ``auth`` dict (or None on any failure).
+    Benign + scope-gated + fail-closed inside account_login_service.login; emits the outcome note."""
+    if not account_access:
+        return None
+    settings = dataclasses.replace(get_settings(), excluded_hosts=tuple(excluded_hosts or ()))
+    session = account_login_service.login(account_access, scope, settings)
+    if callable(emit):
+        emit(f"account access: {session.get('note', '')}")
+    if session.get("ok") and session.get("cookie"):
+        return {"cookie": session["cookie"], "headers": session.get("headers") or []}
+    return None
+
+
+def run_campaign(target: str, *, account_access: dict[str, Any] | None = None,
+                 user_agent_suffix: str = "", **kwargs: Any) -> dict[str, Any]:
+    """Run a campaign, first honoring this program's HUNTING REQUIREMENTS:
+
+    - ``account_access`` (the program's research-account block): when set and the caller passed no
+      explicit ``auth``, log in to the program's own account (``account_login_service.login`` —
+      benign, scope-gated, fails closed) and hunt as that authenticated user.
+    - ``user_agent_suffix``: a mandatory UA tag the program requires; set for the whole hunt in THIS
+      thread (contextvar) so it rides on every in-scope request — recon, scan, and the active prover.
+
+    Everything else forwards verbatim to the campaign body. This thin wrapper keeps the hunting-
+    requirement plumbing (a login + a contextvar with a guaranteed reset) out of the long body."""
+    scope = str(kwargs.get("scope") or "")
+    on_progress = kwargs.get("on_progress")
+
+    def _emit(msg: str) -> None:
+        if callable(on_progress):
+            try:
+                on_progress(msg)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # Auto-login from the program's stored credentials (unless the caller already supplied a session —
+    # e.g. a multi-target span resolves the login ONCE and passes the session to each target).
+    if kwargs.get("auth") is None and account_access:
+        auth = _login_auth(account_access, scope, kwargs.get("excluded_hosts"), _emit)
+        if auth:
+            kwargs["auth"] = auth
+    # The program's required UA tag rides every in-scope request for the duration of this hunt.
+    ua_token = web_ingest.set_ua_suffix(user_agent_suffix or "")
+    try:
+        return _run_campaign_body(target, **kwargs)
+    finally:
+        web_ingest.reset_ua_suffix(ua_token)
+
+
+def _run_campaign_body(
     target: str,
     *,
     scope: str,
@@ -592,6 +645,8 @@ def run_campaign_over_targets(
     active: bool = False,
     time_based: bool = False,
     auth: dict[str, Any] | None = None,
+    account_access: dict[str, Any] | None = None,
+    user_agent_suffix: str = "",
     live: bool = False,
     program: str | None = None,
     max_pages: int = 12,
@@ -629,6 +684,11 @@ def run_campaign_over_targets(
                 on_progress(msg)
             except Exception:  # noqa: BLE001
                 pass
+
+    # Log in to the program's research account ONCE for the whole span (not once per target), then
+    # pass the resulting session to every target's run_campaign (which skips re-login when auth is set).
+    if auth is None and account_access:
+        auth = _login_auth(account_access, scope, excluded_hosts, _emit)
 
     # One wrapping folder for the whole span; each per-target run_campaign() call nests
     # its OWN campaign-<slug>-<stamp> folder inside it (run_campaign builds that path
@@ -685,7 +745,8 @@ def run_campaign_over_targets(
             result = run_campaign(
                 target, scope=scope, authorized=authorized, coder_cfg=coder_cfg,
                 default_reports_dir=span_root, seed_dir=seed_dir, runtime_dir=runtime_dir,
-                version=version, active=active, time_based=time_based, auth=auth, live=live,
+                version=version, active=active, time_based=time_based, auth=auth,
+                account_access=account_access, user_agent_suffix=user_agent_suffix, live=live,
                 program=program, max_pages=max_pages, platform=platform, deep=deep,
                 disclose_automation=disclose_automation, on_progress=_target_emit, excluded_hosts=excluded_hosts,
                 progress_run_id=progress_run_id, progress_unit=unit,
@@ -844,7 +905,9 @@ def run_portfolio_campaign(
         seen_labels.add(label)
         clean.append({"label": label, "scope": str(p.get("scope") or ""), "targets": targets,
                       "excluded_hosts": tuple(str(h) for h in (p.get("excluded_hosts") or [])),
-                      "disclose_automation": bool(p.get("disclose_automation"))})
+                      "disclose_automation": bool(p.get("disclose_automation")),
+                      "account_access": p.get("account_access") if isinstance(p.get("account_access"), dict) else {},
+                      "user_agent_suffix": str(p.get("user_agent_suffix") or "")})
     if not clean:
         return {"ok": False, "error": "No huntable programs — each needs seed targets or an imported/built structured scope."}
 
@@ -895,6 +958,7 @@ def run_portfolio_campaign(
                 default_reports_dir=portfolio_root, seed_dir=seed_dir, runtime_dir=runtime_dir, version=version,
                 active=active, time_based=time_based, auth=auth, live=live, program=label, max_pages=max_pages,
                 platform=platform, deep=deep, disclose_automation=spec["disclose_automation"],
+                account_access=spec["account_access"], user_agent_suffix=spec["user_agent_suffix"],
                 excluded_hosts=spec["excluded_hosts"], on_progress=_p_emit,
                 progress_run_id=progress_run_id, progress_unit=label,
             )

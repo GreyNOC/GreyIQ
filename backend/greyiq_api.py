@@ -888,6 +888,8 @@ class ProgramUpsertRequest(BaseModel):
     disclose_automation: bool = False  # this program's terms require disclosing automated-tool assistance in submitted reports
     h1_program_stats: dict[str, Any] = Field(default_factory=dict)  # real signals from HackerOne's program resource (offers_bounties, fast_payments, etc.)
     notes: str = Field(default="", max_length=4000)
+    account_access: dict[str, Any] = Field(default_factory=dict)  # research-account email/password/login_url/cookie — SENSITIVE (portfolio._clean_account_access bounds it; password/cookie redacted on read-back)
+    user_agent_suffix: str = Field(default="", max_length=120)    # a mandatory UA tag some programs require appended to every in-scope request
     resync_scope: bool = False  # re-derive scope_text/hosts from structured_scope even if scope_text is already set (see portfolio.upsert_program)
     active: bool = False
     live: bool = False
@@ -897,6 +899,19 @@ class ProgramUpsertRequest(BaseModel):
     interval_minutes: int = Field(default=1440, ge=5, le=20160)
     max_submits_per_day: int = Field(default=3, ge=0, le=25)
     enabled: bool = True
+
+
+def _program_for_read(program: dict[str, Any]) -> dict[str, Any]:
+    """Redact the research-account secrets before a program leaves the API: the UI never receives the
+    stored password or session cookie in plaintext — only booleans saying whether each is set. Email,
+    login/register URL, and notes are returned so the operator can see and edit them."""
+    acc = program.get("account_access")
+    if isinstance(acc, dict) and acc:
+        red: dict[str, Any] = {k: acc.get(k) for k in ("email", "login_url", "register_url", "notes") if acc.get(k)}
+        red["password_set"] = bool(acc.get("password"))
+        red["cookie_set"] = bool(acc.get("cookie"))
+        program = {**program, "account_access": red}
+    return program
 
 
 class ProgramDeleteRequest(BaseModel):
@@ -1882,6 +1897,12 @@ class GreyIQRuntime:
         program_obj = bounty_portfolio.get_program(RUNTIME_DIR, request.program) if request.program else None
         disclose_automation = bool(program_obj.get("disclose_automation")) if program_obj else False
         excluded_hosts = tuple(str(h) for h in (program_obj.get("out_of_scope_hosts") or [])) if program_obj else ()
+        account_access = program_obj.get("account_access") if program_obj else None
+        user_agent_suffix = str(program_obj.get("user_agent_suffix") or "") if program_obj else ""
+        # An explicit cookie/header in the request wins; otherwise pass auth=None so the program's
+        # stored research-account credentials (account_access) drive an auto-login in run_campaign.
+        req_auth = ({"cookie": request.auth_cookie, "headers": request.auth_headers}
+                    if (request.auth_cookie or request.auth_headers) else None)
         result = bounty_campaign.run_campaign(
             request.target,
             scope=request.scope,
@@ -1893,7 +1914,9 @@ class GreyIQRuntime:
             version=VERSION,
             active=request.active,
             time_based=request.time_based,
-            auth={"cookie": request.auth_cookie, "headers": request.auth_headers},
+            auth=req_auth,
+            account_access=account_access,
+            user_agent_suffix=user_agent_suffix,
             live=request.live,
             program=request.program,
             max_pages=request.max_pages,
@@ -1925,6 +1948,8 @@ class GreyIQRuntime:
         program_label = str(program.get("name") or program.get("id") or request.program_id)
         disclose_automation = bool(program.get("disclose_automation"))
         excluded_hosts = tuple(str(h) for h in (program.get("out_of_scope_hosts") or []))
+        req_auth = ({"cookie": request.auth_cookie, "headers": request.auth_headers}
+                    if (request.auth_cookie or request.auth_headers) else None)
         run_id = str(request.run_id or "").strip()
         result = bounty_campaign.run_campaign_over_targets(
             targets,
@@ -1937,7 +1962,9 @@ class GreyIQRuntime:
             version=VERSION,
             active=request.active,
             time_based=request.time_based,
-            auth={"cookie": request.auth_cookie, "headers": request.auth_headers},
+            auth=req_auth,
+            account_access=program.get("account_access"),
+            user_agent_suffix=str(program.get("user_agent_suffix") or ""),
             live=request.live,
             program=program_label,
             max_pages=request.max_pages,
@@ -1987,6 +2014,8 @@ class GreyIQRuntime:
                 "targets": targets,
                 "excluded_hosts": [str(h) for h in (program.get("out_of_scope_hosts") or [])],
                 "disclose_automation": bool(program.get("disclose_automation")),
+                "account_access": program.get("account_access"),
+                "user_agent_suffix": str(program.get("user_agent_suffix") or ""),
             })
         if not specs:
             return {"ok": False, "error": "None of the selected programs have huntable targets — add seed targets or import/build a structured scope in the Program tab."
@@ -2689,7 +2718,7 @@ class GreyIQRuntime:
             return self._operator
 
     def list_programs(self) -> dict[str, Any]:
-        return {"ok": True, "programs": bounty_portfolio.list_programs(RUNTIME_DIR)}
+        return {"ok": True, "programs": [_program_for_read(p) for p in bounty_portfolio.list_programs(RUNTIME_DIR)]}
 
     def upsert_program(self, request: "ProgramUpsertRequest") -> dict[str, Any]:
         # exclude_unset: a caller that doesn't know about a field (e.g. the Operator tab's
@@ -2700,7 +2729,19 @@ class GreyIQRuntime:
         # (even a falsy one, like active=false) still gets it applied, since Pydantic marks
         # any key present in the request JSON as "set" regardless of its value.
         record = request.model_dump(exclude_unset=True, exclude_none=True)
-        return {"ok": True, "program": bounty_portfolio.upsert_program(RUNTIME_DIR, record)}
+        # Merge-preserve the research-account secrets: the UI reads them REDACTED (password_set/
+        # cookie_set markers, no plaintext), so a normal edit round-trip carries no password/cookie —
+        # keep the stored ones rather than wiping them. A caller that DOES send a new secret overwrites.
+        if "account_access" in record:
+            acc = {k: v for k, v in dict(record.get("account_access") or {}).items()
+                   if k not in ("password_set", "cookie_set")}  # drop the read-only markers
+            existing = bounty_portfolio.get_program(RUNTIME_DIR, str(record.get("id") or "")) or {}
+            ex_acc = existing.get("account_access") if isinstance(existing.get("account_access"), dict) else {}
+            for secret in ("password", "cookie"):
+                if not str(acc.get(secret) or "").strip() and ex_acc.get(secret):
+                    acc[secret] = ex_acc[secret]  # preserve the saved secret the redacted edit didn't resend
+            record["account_access"] = acc
+        return {"ok": True, "program": _program_for_read(bounty_portfolio.upsert_program(RUNTIME_DIR, record))}
 
     def import_hackerone_scope(self, request: "HackerOneImportRequest") -> dict[str, Any]:
         """Preview a program's scope pulled from the HackerOne API — the ONLY read here

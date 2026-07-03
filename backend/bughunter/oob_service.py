@@ -53,7 +53,7 @@ from bughunter.active_verify_service import (
 from bughunter.rate_limit import HostRateGovernor
 from bughunter.settings import get_settings
 from bughunter.web_ingest import WebsiteFetchError, guarded_dns_scope, normalize_website_url
-from bughunter.web_scan_service import _USER_AGENT, _guard_url
+from bughunter.web_scan_service import _USER_AGENT, _guard_url, current_user_agent
 
 
 def mint_token() -> str:
@@ -286,7 +286,7 @@ def _post_xml(url: str, xml: str, *, timeout: float) -> dict[str, Any]:
     may still have been resolved during parsing before the error was produced."""
     request = urllib.request.Request(
         url, data=xml.encode("utf-8"), method="POST",
-        headers={"Content-Type": "application/xml", "User-Agent": _USER_AGENT, "Accept": "*/*"})
+        headers={"Content-Type": "application/xml", "User-Agent": current_user_agent(_USER_AGENT), "Accept": "*/*"})
     opener = urllib.request.build_opener(_NoRedirect())
     try:
         with opener.open(request, timeout=timeout) as resp:

@@ -30,7 +30,7 @@ from bughunter.rate_limit import HostRateGovernor
 from bughunter.scan_auth import auth_headers_for, build_auth
 from bughunter.settings import get_settings
 from bughunter.web_ingest import WebsiteFetchError, guarded_dns_scope, normalize_website_url
-from bughunter.web_scan_service import _USER_AGENT, _guard_url
+from bughunter.web_scan_service import _USER_AGENT, _guard_url, current_user_agent
 
 
 def mint_marker() -> str:
@@ -58,7 +58,7 @@ def _fetch_view(url: str, *, auth: Any, settings: Any) -> dict[str, Any]:
 def _post_form(url: str, data: dict[str, str], *, auth: Any, timeout: float) -> dict[str, Any]:
     """POST a form body to an ALREADY scope-checked + SSRF-guarded URL, no redirect followed.
     The operator's session is attached if present. Reached only via the opt-in ``send``."""
-    headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": _USER_AGENT, "Accept": "*/*"}
+    headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": current_user_agent(_USER_AGENT), "Accept": "*/*"}
     # Attach the operator session ONLY when the POST host is same-site as the host the
     # credentials were bound to — same invariant the GET path (_Http.fetch) enforces. The
     # inject URL is scope-checked independently and may be a DIFFERENT in-scope host, so a
