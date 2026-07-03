@@ -25,10 +25,14 @@ class _Stub:
     """A stand-in `self`: the real unbound methods + the minimal state they read."""
     _active_scope_for = api.GreyIQRuntime._active_scope_for
     _compact_active = staticmethod(api.GreyIQRuntime._compact_active)  # preserve staticmethod-ness
+    _proof_matches_class = staticmethod(api.GreyIQRuntime._proof_matches_class)
     _capture_proof_screenshot = api.GreyIQRuntime._capture_proof_screenshot
+    _resolve_run_finding = api.GreyIQRuntime._resolve_run_finding
+    _persist_proof_of_impact = api.GreyIQRuntime._persist_proof_of_impact
     reverify_finding = api.GreyIQRuntime.reverify_finding
     prove_finding = api.GreyIQRuntime.prove_finding
     build_finding_report = api.GreyIQRuntime.build_finding_report
+    build_submission_package = api.GreyIQRuntime.build_submission_package
     list_all_findings = api.GreyIQRuntime.list_all_findings
     dismiss_finding = api.GreyIQRuntime.dismiss_finding
     restore_finding = api.GreyIQRuntime.restore_finding
@@ -89,6 +93,72 @@ class CompactAndProveTests(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertEqual(out["confirmed"], 1)
         self.assertIsNone(out["screenshot"])  # screenshot disabled -> not attempted
+
+
+class PersistProvenProofTests(unittest.TestCase):
+    """A proof-of-impact pass that names a cached run finding must PERSIST the captured
+    differential onto that run, so the canonical submission package (build_submission) — the
+    same thing every rebuilt report and the submit gate read — renders it Confirmed instead of
+    leaving it 'candidate' after proof was gathered. Only a class-matched confirmed result is
+    persisted; an unrelated class confirmed at the same URL is not."""
+
+    def setUp(self) -> None:
+        self._orig = api.bounty_active_verify.verify_active
+        self.stub = _Stub()
+        self.stub.bounty_runs["run1"] = {
+            "ctx": {"target": "https://in-scope.example",
+                    "attack_plans": {"F1": {"steps": ["s1", "s2"], "impact": "Credentialed cross-origin read.",
+                                            "proof_of_impact": {"status": "candidate"}}}},
+            "findings": {"F1": {"ref": "F1", "class_id": "cors", "class_name": "CORS misconfiguration",
+                                "title": "CORS trusts arbitrary subdomain Origin with credentials",
+                                "location": "https://in-scope.example/api", "severity": "high", "cwe": "CWE-284"}},
+        }
+
+    def tearDown(self) -> None:
+        api.bounty_active_verify.verify_active = self._orig
+
+    def _fake_confirmed(self, class_hint):
+        def _run(url, findings, **kw):
+            results = [{"title": "CORS", "severity": "high", "rule_id": "cors", "_active_class_hint": class_hint,
+                        "_active_proof": {"status": "confirmed", "method": "OPTIONS+GET carrying a credentialed session",
+                                          "observed_result": "an arbitrary Origin was reflected with Allow-Credentials: true",
+                                          "control_result": "a different Origin was reflected too — any origin is trusted",
+                                          "evidence": "ACAO=https://evil.example; ACAC=true"}}]
+            return results, {"in_scope": True, "host": "in-scope.example", "requests_used": 3, "rate_limited": False}
+        return _run
+
+    def _req(self):
+        return api.ProveRequest(url="https://in-scope.example/api", scope="in-scope.example",
+                                authorized=True, screenshot=False, run_id="run1", ref="F1")
+
+    def test_matched_confirmed_proof_persists_and_report_reads_confirmed(self) -> None:
+        api.bounty_active_verify.verify_active = self._fake_confirmed("cors")
+        out = self.stub.prove_finding(self._req())
+        self.assertTrue(out["ok"])
+        self.assertTrue(out.get("persisted"))
+        # The cached run's plan now carries the confirmed differential...
+        poi = self.stub.bounty_runs["run1"]["ctx"]["attack_plans"]["F1"]["proof_of_impact"]
+        self.assertEqual(poi["status"], "confirmed")
+        self.assertIn("Allow-Credentials", poi["observed_result"])
+        # ...so the CANONICAL submission package (what the report + submit gate read) is confirmed.
+        pkg = self.stub.build_submission_package(api.SubmissionPackageRequest(run_id="run1", ref="F1", platform="hackerone"))
+        self.assertTrue(pkg["ok"], pkg)
+        self.assertEqual(pkg["package"]["proof_status"], "confirmed")
+        self.assertRegex(pkg["package"]["vulnerability_information"], r"(?i)status:\*\*\s*Confirmed")
+
+    def test_unrelated_class_confirmed_at_same_url_is_not_persisted(self) -> None:
+        api.bounty_active_verify.verify_active = self._fake_confirmed("xss")  # different class than the CORS finding
+        out = self.stub.prove_finding(self._req())
+        self.assertTrue(out["ok"])
+        self.assertFalse(out.get("persisted"))
+        self.assertEqual(self.stub.bounty_runs["run1"]["ctx"]["attack_plans"]["F1"]["proof_of_impact"]["status"], "candidate")
+
+    def test_no_run_ref_is_a_safe_noop(self) -> None:
+        api.bounty_active_verify.verify_active = self._fake_confirmed("cors")
+        out = self.stub.prove_finding(api.ProveRequest(url="https://in-scope.example/api", scope="in-scope.example",
+                                                       authorized=True, screenshot=False))
+        self.assertTrue(out["ok"])
+        self.assertNotIn("persisted", out)  # nothing to persist without run_id/ref
 
 
 class BuildFindingReportTests(unittest.TestCase):
