@@ -174,7 +174,8 @@ def record_paid(runtime_dir: str | Path, program: str | None, target: str, key: 
 _H1_TERMINAL_STATES = {"resolved", "not-applicable", "informative", "duplicate", "spam"}
 
 
-def record_h1_sync(runtime_dir: str | Path, pid: str, key: str, *, state: str, resolved_with_reward: bool) -> None:
+def record_h1_sync(runtime_dir: str | Path, pid: str, key: str, *, state: str, resolved_with_reward: bool,
+                   bounty: float = 0.0) -> None:
     """Update a finding's last-known HackerOne state after a status-sync poll, given the
     ledger's own program-bucket id (``pid``, as returned by ``submitted_records`` —
     bypasses ``program_key()`` re-derivation since the caller already has the exact
@@ -190,6 +191,15 @@ def record_h1_sync(runtime_dir: str | Path, pid: str, key: str, *, state: str, r
         rec["h1_synced_at"] = _now()
         if resolved_with_reward and _STAGE_RANK.get(rec.get("stage"), 0) < _STAGE_RANK["paid"]:
             rec["stage"] = "paid"
+        # Record the REAL reward amount (not just the paid stage) so bounty_total / the learned
+        # 'paid' EV boost reflect actual money. Only ever raise it — a later poll never zeroes a
+        # recorded bounty. Empty/absent amount leaves the existing value untouched.
+        try:
+            amount = float(bounty or 0.0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if amount > float(rec.get("bounty") or 0.0):
+            rec["bounty"] = amount
         rec["updated_at"] = _now()
         _save(runtime_dir, data)
 

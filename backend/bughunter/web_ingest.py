@@ -431,28 +431,33 @@ def guarded_dns_scope():
             _dns_pins.pop(ident, None)
 
 
+def resolve_and_pin(hostname: str) -> list[str]:
+    """Resolve ``hostname`` and PIN that exact answer for the current thread (inside a
+    ``guarded_dns_scope``), so a connect that follows can't re-resolve to a different IP — closing
+    the DNS-rebinding TOCTOU. Returns the resolved IP strings; raises ``WebsiteFetchError`` if the
+    host can't be resolved. Used by guards that apply their OWN IP policy on the pinned addresses
+    (e.g. net_probe allows RFC1918 but blocks link-local/metadata) while still getting the pin."""
+    try:
+        ipaddress.ip_address(hostname.strip().strip("[]"))
+        return [hostname.strip().strip("[]")]  # a literal IP -> no DNS, nothing to rebind
+    except ValueError:
+        pass
+    try:
+        # The dynamic module attribute (our _pinned_getaddrinfo wrapper / a test shim), not the
+        # frozen _real_getaddrinfo captured at import before any patch is installed.
+        results = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as error:
+        raise WebsiteFetchError(f"Could not resolve host: {hostname}") from error
+    with _dns_pin_lock:
+        _dns_pins[threading.get_ident()] = (hostname.strip().lower(), results)
+    return [str(result[4][0]).split("%")[0] for result in results]
+
+
 def _host_is_private(hostname: str) -> bool:
     try:
         addresses = [ipaddress.ip_address(hostname)]
     except ValueError:
-        try:
-            # Call socket.getaddrinfo (the dynamic module attribute, NOT the frozen
-            # _real_getaddrinfo) so this still goes through whatever resolver is
-            # currently installed -- our own _pinned_getaddrinfo wrapper in normal
-            # operation, but also any test's own getaddrinfo monkeypatch. Calling
-            # _real_getaddrinfo directly here would silently bypass such a shim,
-            # since it was captured once at import time before any patch (ours or a
-            # test's) is ever installed.
-            results = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
-        except socket.gaierror as error:
-            raise WebsiteFetchError(f"Could not resolve host: {hostname}") from error
-        addresses = [ipaddress.ip_address(result[4][0]) for result in results]
-        # Pin THIS exact resolution for the current thread so the real HTTP connect
-        # that follows (inside the same guarded_dns_scope) is guaranteed to see the
-        # identical answer instead of re-resolving DNS independently.
-        with _dns_pin_lock:
-            _dns_pins[threading.get_ident()] = (hostname.strip().lower(), results)
-
+        addresses = [ipaddress.ip_address(ip) for ip in resolve_and_pin(hostname)]
     return any(_address_is_private(address) for address in addresses)
 
 

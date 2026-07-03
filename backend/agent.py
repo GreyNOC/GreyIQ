@@ -38,6 +38,7 @@ import project_memory
 import repomap
 import skills as skills_lib
 import trust
+from bughunter.web_ingest import WebsiteFetchError, guarded_dns_scope, resolve_and_pin
 
 AGENT_DEFAULTS: dict[str, Any] = {
     "allow_commands": False,
@@ -859,17 +860,21 @@ class ToolBox:
         (169.254.0.0/16, fe80::/10, which includes cloud metadata) and multicast are
         blocked. Resolves first so a name pointing at metadata is caught too."""
         cleaned = (host or "").strip().strip("[]")
+        if not cleaned:
+            return None
+        # Resolve AND PIN the answer for this thread (the caller runs inside guarded_dns_scope), so
+        # the connect that follows sees the SAME IP this check validated — an attacker can't answer
+        # the guard with a public IP and the connect with 169.254.169.254 (DNS-rebind TOCTOU).
         try:
-            infos = socket.getaddrinfo(cleaned, None)
-        except OSError:
-            return None  # let the action's own resolution path report the error
-        for *_x, sockaddr in infos:
-            raw = str(sockaddr[0]).split("%")[0]
+            ips = resolve_and_pin(cleaned)
+        except WebsiteFetchError:
+            return None  # let the action's own connect report the resolution error
+        for raw in ips:
             try:
-                addr = ipaddress.ip_address(raw)
+                addr = ipaddress.ip_address(str(raw).split("%")[0])
             except ValueError:
                 continue
-            if addr.is_link_local or addr.is_multicast or raw in {"169.254.169.254", "fd00:ec2::254"}:
+            if addr.is_link_local or addr.is_multicast or str(raw) in {"169.254.169.254", "fd00:ec2::254"}:
                 return (
                     f"Refused: {host} resolves to a link-local/metadata address ({raw}); "
                     "net_probe will not reach cloud metadata or link-local hosts."
@@ -877,60 +882,64 @@ class ToolBox:
         return None
 
     def _net_tcp(self, host: str, port: int) -> str:
-        blocked = self._metadata_guard(host)
-        if blocked:
-            return blocked
-        start = time.monotonic()
-        try:
-            with socket.create_connection((host, port), timeout=self.net_timeout):
-                ms = (time.monotonic() - start) * 1000
-                return f"TCP {host}:{port} OPEN ({ms:.0f} ms)"
-        except (socket.timeout, TimeoutError):
-            return f"TCP {host}:{port} TIMEOUT after {self.net_timeout:.0f}s (filtered or unreachable)"
-        except ConnectionRefusedError:
-            return f"TCP {host}:{port} REFUSED (port closed, host reachable)"
-        except socket.gaierror as exc:
-            return f"TCP {host}:{port} DNS error: {exc.strerror or exc}"
-        except OSError as exc:
-            return f"TCP {host}:{port} unreachable: {exc}"
+        with guarded_dns_scope():  # the guard's resolution is PINNED for the connect below (no rebind)
+            blocked = self._metadata_guard(host)
+            if blocked:
+                return blocked
+            start = time.monotonic()
+            try:
+                with socket.create_connection((host, port), timeout=self.net_timeout):
+                    ms = (time.monotonic() - start) * 1000
+                    return f"TCP {host}:{port} OPEN ({ms:.0f} ms)"
+            except (socket.timeout, TimeoutError):
+                return f"TCP {host}:{port} TIMEOUT after {self.net_timeout:.0f}s (filtered or unreachable)"
+            except ConnectionRefusedError:
+                return f"TCP {host}:{port} REFUSED (port closed, host reachable)"
+            except socket.gaierror as exc:
+                return f"TCP {host}:{port} DNS error: {exc.strerror or exc}"
+            except OSError as exc:
+                return f"TCP {host}:{port} unreachable: {exc}"
 
     def _net_http(self, target: str) -> str:
         parsed = urlparse(target if "://" in target else "http://" + target)
         if parsed.scheme not in ("http", "https"):
             raise ToolError("http action only supports http:// and https:// URLs.")
-        blocked = self._metadata_guard(parsed.hostname or "")
-        if blocked:
-            return blocked
         url = parsed.geturl()
-        request = urllib.request.Request(
-            url, method="GET", headers={"User-Agent": "GreyIQ-netprobe/1.0", "Accept": "*/*"}
-        )
-        # Re-validate every redirect target — otherwise a 30x to a metadata IP would
-        # be auto-followed past the initial-host guard.
-        opener = urllib.request.build_opener(_MetadataGuardRedirect(self._metadata_guard))
-        start = time.monotonic()
-        try:
-            with opener.open(request, timeout=self.net_timeout) as resp:
+        # guard-check, initial connect, AND every redirect hop share ONE pinned DNS answer per host
+        # for the duration of this request, so none of them can be rebound to a metadata IP.
+        with guarded_dns_scope():
+            blocked = self._metadata_guard(parsed.hostname or "")
+            if blocked:
+                return blocked
+            request = urllib.request.Request(
+                url, method="GET", headers={"User-Agent": "GreyIQ-netprobe/1.0", "Accept": "*/*"}
+            )
+            # Re-validate every redirect target — otherwise a 30x to a metadata IP would
+            # be auto-followed past the initial-host guard.
+            opener = urllib.request.build_opener(_MetadataGuardRedirect(self._metadata_guard))
+            start = time.monotonic()
+            try:
+                with opener.open(request, timeout=self.net_timeout) as resp:
+                    ms = (time.monotonic() - start) * 1000
+                    resp.read(2048)  # touch the body so timing is realistic; content discarded
+                    status, reason, final, headers = resp.status, resp.reason, resp.geturl(), resp.headers
+            except _MetadataBlocked as exc:
+                return str(exc)
+            except urllib.error.HTTPError as exc:
+                # A 4xx/5xx is a valid diagnostic result, not a tool failure.
                 ms = (time.monotonic() - start) * 1000
-                resp.read(2048)  # touch the body so timing is realistic; content discarded
-                status, reason, final, headers = resp.status, resp.reason, resp.geturl(), resp.headers
-        except _MetadataBlocked as exc:
-            return str(exc)
-        except urllib.error.HTTPError as exc:
-            # A 4xx/5xx is a valid diagnostic result, not a tool failure.
-            ms = (time.monotonic() - start) * 1000
-            status, reason, final, headers = exc.code, exc.reason, url, exc.headers
-        except urllib.error.URLError as exc:
-            reason = getattr(exc, "reason", exc)
-            if isinstance(reason, (socket.timeout, TimeoutError)):
+                status, reason, final, headers = exc.code, exc.reason, url, exc.headers
+            except urllib.error.URLError as exc:
+                reason = getattr(exc, "reason", exc)
+                if isinstance(reason, (socket.timeout, TimeoutError)):
+                    return f"HTTP {url}: timed out after {self.net_timeout:.0f}s"
+                if isinstance(reason, ssl.SSLError):
+                    return f"HTTP {url}: TLS error ({reason})"
+                return f"HTTP {url}: connection failed ({reason})"
+            except (socket.timeout, TimeoutError):
                 return f"HTTP {url}: timed out after {self.net_timeout:.0f}s"
-            if isinstance(reason, ssl.SSLError):
-                return f"HTTP {url}: TLS error ({reason})"
-            return f"HTTP {url}: connection failed ({reason})"
-        except (socket.timeout, TimeoutError):
-            return f"HTTP {url}: timed out after {self.net_timeout:.0f}s"
-        except OSError as exc:
-            return f"HTTP {url}: error ({exc})"
+            except OSError as exc:
+                return f"HTTP {url}: error ({exc})"
         lines = [f"HTTP {url} -> {status} {reason} ({ms:.0f} ms)"]
         if final and final != url:
             lines.append(f"  final URL: {final}")
@@ -941,6 +950,7 @@ class ToolBox:
         return "\n".join(lines)
 
     def _net_tls(self, host: str, port: int) -> str:
+      with guarded_dns_scope():  # guard's resolution PINNED for the connect (server_hostname still validates the cert)
         blocked = self._metadata_guard(host)
         if blocked:
             return blocked

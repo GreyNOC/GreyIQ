@@ -1388,19 +1388,22 @@ def run_bounty_hunt(
         finding.pop("_active_cvss", None)
         finding.pop("_active_class_hint", None)
         ref = finding.get("ref")
-        if isinstance(active_proof, dict) and ref in attack_plans:
+        if ref not in attack_plans:
+            continue
+        if isinstance(active_proof, dict):
             base_proof = attack_plans[ref].get("proof_of_impact")
             if isinstance(base_proof, dict) and not active_proof.get("proof_obligation"):
                 active_proof = {**active_proof, "proof_obligation": base_proof.get("proof_obligation", "")}
             attack_plans[ref]["proof_of_impact"] = active_proof
-            # The CVSS vector was already right for a static/passive lead (chosen from
-            # finding['class_id'], which the _active_class_hint pass above may have already
-            # sharpened) — what changes on confirmation is confidence, not the vector. Reuse
-            # report.py's own evidence gate so "estimated: False" can never disagree with the
-            # proof-of-impact status shown right next to it in the same report.
-            detail = report_lib._proof_of_impact_detail(finding, attack_plans[ref])
-            if detail["status"] == "confirmed":
-                attack_plans[ref]["cvss"] = impact_model.cvss_for_class(finding.get("class_id", ""), confirmed=True)
+        # A CONFIRMED finding uses the DETERMINISTIC class CVSS (confirmed=True), never an
+        # attacker-influenceable brain-supplied vector. This runs for EVERY confirmation route —
+        # not just active-prover findings, but also JWT-replay / secret_hits / live-credential,
+        # which reach 'confirmed' WITHOUT an _active_proof and previously kept the brain CVSS
+        # driving their submitted severity_rating. What changes on confirmation is confidence, not
+        # the vector; report.py's own evidence gate decides the status so the two never disagree.
+        detail = report_lib._proof_of_impact_detail(finding, attack_plans[ref])
+        if detail["status"] == "confirmed":
+            attack_plans[ref]["cvss"] = impact_model.cvss_for_class(finding.get("class_id", ""), confirmed=True)
 
     # CVSS is now final (deterministic floor + brain + active confirmation). Re-order the
     # findings and re-number refs by that final resolved severity, so F1 is genuinely the

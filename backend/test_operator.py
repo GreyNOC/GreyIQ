@@ -135,6 +135,20 @@ class LedgerTests(unittest.TestCase):
         ledger.dismiss(self.rt, dedup_key_str=arch[0]["dedup_key"])
         self.assertEqual(ledger.list_archived(self.rt), [])  # a dismissed archived finding is hidden too
 
+    def test_record_h1_sync_writes_the_real_reward_amount(self) -> None:
+        item = _item("C1", "xss", "r", "https://x/a")
+        ledger.upsert_findings(self.rt, "acme", "https://x", [item])
+        key = ledger.dedup_key(item["finding"])
+        ledger.record_submission(self.rt, "acme", "https://x", key, "12345", "https://h1/12345")
+        pid = ledger.program_key("acme", "https://x")
+        ledger.record_h1_sync(self.rt, pid, key, state="resolved", resolved_with_reward=True, bounty=500.0)
+        rec = ledger._load(self.rt)["programs"][pid]["findings"][key]
+        self.assertEqual(rec["stage"], "paid")
+        self.assertEqual(rec["bounty"], 500.0)  # the actual reward is recorded, not left at 0.0
+        # A later poll never LOWERS a recorded bounty.
+        ledger.record_h1_sync(self.rt, pid, key, state="resolved", resolved_with_reward=True, bounty=0.0)
+        self.assertEqual(ledger._load(self.rt)["programs"][pid]["findings"][key]["bounty"], 500.0)
+
     def test_is_submitted_requires_a_real_submission_not_just_reported(self) -> None:
         item = _item("C1", "xss", "r", "https://x/a")
         ledger.upsert_findings(self.rt, "acme", "https://x", [item])
