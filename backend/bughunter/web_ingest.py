@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import hashlib
 import ipaddress
 import re
@@ -23,6 +24,36 @@ TEXT_CONTENT_TYPES: Final = {
 }
 MAX_URL_LENGTH: Final = 2048
 MAX_REDIRECTS: Final = 5
+
+# --- Per-program required user-agent suffix ---
+# A bug-bounty program can REQUIRE a tag appended to the User-Agent of every request it receives (so
+# it can identify authorized researcher traffic — common on HackerOne/YesWeHack). The active
+# program's suffix is held in a contextvar set for the duration of that program's hunt; it is
+# per-context/thread, so parallel program hunts never cross-contaminate. Every hunt-path fetcher
+# builds its UA via ``current_user_agent()`` so the tag rides on recon, the web scan, and the active
+# prover alike. Off-target requests (credential issuers, CT logs, the HackerOne API) don't use it.
+_UA_SUFFIX_VAR: contextvars.ContextVar[str] = contextvars.ContextVar("greyiq_ua_suffix", default="")
+_DEFAULT_UA: Final = "GreyNOC-Slop-Detection/0.1"
+
+
+def set_ua_suffix(suffix: str) -> contextvars.Token:
+    """Set the current program's required UA suffix for this context/thread; returns a restore token.
+    Control chars are dropped so the suffix can never inject a CR/LF into the header."""
+    clean = "".join(c for c in str(suffix or "") if c == " " or 0x20 < ord(c) < 0x7f)[:120]
+    return _UA_SUFFIX_VAR.set(clean)
+
+
+def reset_ua_suffix(token: contextvars.Token) -> None:
+    try:
+        _UA_SUFFIX_VAR.reset(token)
+    except (ValueError, LookupError):  # token minted in another context — clear instead
+        _UA_SUFFIX_VAR.set("")
+
+
+def current_user_agent(base: str = _DEFAULT_UA) -> str:
+    """The base UA with the active program's required suffix appended (or just the base)."""
+    suffix = _UA_SUFFIX_VAR.get()
+    return f"{base}{suffix}" if suffix else base
 ALLOWED_PORTS: Final = {80, 443}
 ALLOWED_CONTENT_ENCODINGS: Final = {"", "identity"}
 CONTROL_OR_SPACE_RE: Final = re.compile(r"[\x00-\x20\x7f]")
@@ -184,7 +215,7 @@ def fetch_website_text(url: str) -> FetchedWebsite:
         # Refuse compressed responses so a tiny gzipped payload cannot expand
         # past the configured byte cap during decoding.
         "Accept-Encoding": "identity",
-        "User-Agent": "GreyNOC-Slop-Detection/0.1",
+        "User-Agent": current_user_agent(),
     }
     redirect_handler = SafeRedirectHandler(settings.allow_private_urls)
     opener = build_opener(redirect_handler)

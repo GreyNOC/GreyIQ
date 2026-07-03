@@ -46,6 +46,8 @@ _DEFAULTS: dict[str, Any] = {
     "disclose_automation": False,  # operator-confirmed: this program's terms require disclosing automated-tool assistance in submitted reports
     "h1_program_stats": {},        # real signals from HackerOne's program resource (offers_bounties, fast_payments, etc.) — see hackerone_import.fetch_structured_scope
     "notes": "",                   # free text — policy excerpt, reward table, anything pasted in
+    "account_access": {},          # program research-account access (email/password/login_url/cookie) — see _clean_account_access. SENSITIVE: only ever sent to the program's OWN login page / in-scope hosts, never logged, password redacted in API responses.
+    "user_agent_suffix": "",       # a mandatory UA tag some programs require appended to every in-scope request (e.g. " -BugBounty-acme-31337 ")
     "active": False,               # capture proof-of-impact (active verification)
     "live": False,                 # dynamic Playwright pass
     "deep": False,                 # aggressive: time-based SQLi + auto screenshot + research per confirmed lead
@@ -147,6 +149,40 @@ def _clean_h1_program_stats(stats: Any) -> dict[str, Any]:
     return out
 
 
+# The program research-account block: the operator's OWN credentials for THIS program's authorized
+# research account (email + password to auto-login, or a pasted session cookie / auth headers as a
+# fallback), plus the login/register URLs. Sent ONLY to the program's own login page (same-site,
+# scope-gated by the login service), never to a third party. `cookie`/`notes` may be long; the rest
+# are short. Nothing here is ever logged; the HTTP API redacts `password`/`cookie` on read-back.
+_ACCOUNT_ACCESS_SHORT = ("email", "login_url", "register_url")
+_ACCOUNT_ACCESS_LONG = ("password", "cookie", "notes")
+
+
+def _clean_account_access(value: Any) -> dict[str, Any]:
+    """Coerce the research-account block to a fixed known-key shape (never an unbounded blob).
+    Drops empty fields; returns {} when nothing is configured."""
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for f in _ACCOUNT_ACCESS_SHORT:
+        v = str(value.get(f) or "").strip()
+        if v:
+            out[f] = v[:500]
+    for f in _ACCOUNT_ACCESS_LONG:
+        v = str(value.get(f) or "").strip()
+        if v:
+            out[f] = v[:8000]
+    return out
+
+
+def _clean_ua_suffix(value: Any) -> str:
+    """A program's mandatory user-agent tag, appended verbatim to the UA header. Keep the operator's
+    intended spaces (the requirement value often has them), but STRIP control chars — a CR/LF here
+    would be HTTP header injection into every request. Printable ASCII + space only, bounded."""
+    raw = str(value or "")
+    return "".join(c for c in raw if c == " " or 0x20 < ord(c) < 0x7f)[:120]
+
+
 def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     out = {**_DEFAULTS, **{k: v for k, v in record.items() if k in _DEFAULTS or k == "id"}}
     out["structured_scope"] = [
@@ -156,6 +192,8 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     out["disclose_automation"] = bool(out.get("disclose_automation"))
     out["h1_program_stats"] = _clean_h1_program_stats(out.get("h1_program_stats"))
     out["notes"] = str(out.get("notes") or "")[:4000]
+    out["account_access"] = _clean_account_access(out.get("account_access"))
+    out["user_agent_suffix"] = _clean_ua_suffix(out.get("user_agent_suffix"))
     # Convenience default ONLY: derive scope_text/in_scope_hosts/out_of_scope_hosts from
     # structured_scope when the caller hasn't already typed a scope. Never overrides a
     # hand-edited scope_text -- structured_scope is a source to pull FROM, not a mirror.

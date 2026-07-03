@@ -5857,6 +5857,23 @@ function ckProgramSetupForm() {
   notes.input.rows = 3;
   form.append(notes.wrap);
 
+  // --- Hunting requirements: research-account access + a program-mandated user-agent tag ---
+  const acc = (editing && editing.account_access) || {};
+  const accWrap = cel("div", "ck-subsection");
+  accWrap.append(cel("h4", "ck-subhead", "Account access & hunting requirements"));
+  accWrap.append(cel("p", "ck-hint", "Give the engine your authorized research account so it hunts logged-in, and any user-agent tag the program requires. Credentials are stored locally and sent only to this program's own login page — the password and session cookie are never shown again after saving."));
+  const accEmail = ckField("Research-account email (e.g. your program-assigned alias)", "text", acc.email || "");
+  const accPassword = ckField("Password (the engine logs in with this each run)", "password", "");
+  if (acc.password_set) accPassword.input.placeholder = "•••••••• saved — leave blank to keep";
+  const accLoginUrl = ckField("Login URL (where the engine submits the login)", "text", acc.login_url || "");
+  const accRegisterUrl = ckField("Self-register URL (for your reference — register manually first)", "text", acc.register_url || "");
+  const accCookie = ckTextareaField("Session cookie — optional fallback if auto-login can't drive the form (CAPTCHA/SSO)", "");
+  if (acc.cookie_set) accCookie.input.placeholder = "•••• saved session cookie — leave blank to keep";
+  accCookie.input.rows = 2;
+  const uaSuffix = ckField('Required user-agent suffix (appended to every request, e.g. " -BugBounty-acme-31337 ")', "text", (editing && editing.user_agent_suffix) || "");
+  accWrap.append(accEmail.wrap, accPassword.wrap, accLoginUrl.wrap, accRegisterUrl.wrap, accCookie.wrap, uaSuffix.wrap);
+  form.append(accWrap);
+
   const submit = cel("button", "ck-btn primary", editing ? "Update program" : "Save program");
   submit.type = "submit";
   form.append(submit);
@@ -5879,6 +5896,16 @@ function ckProgramSetupForm() {
       disclose_automation: discloseAutomation.input.checked,
       h1_program_stats: fetchedProgramStats,
       notes: notes.input.value,
+      // A blank password/cookie means "keep the saved one" (the server merge-preserves them, since
+      // they're read back redacted); email/URLs/suffix are sent verbatim so clearing them takes effect.
+      account_access: {
+        email: accEmail.input.value.trim(),
+        password: accPassword.input.value,
+        login_url: accLoginUrl.input.value.trim(),
+        register_url: accRegisterUrl.input.value.trim(),
+        cookie: accCookie.input.value.trim(),
+      },
+      user_agent_suffix: uaSuffix.input.value,
       // This form owns the structured-scope table, so a save here should always re-derive
       // scope_text/in_scope_hosts/out_of_scope_hosts from whatever the table currently
       // holds — never echo back a stale value from before this edit. The server no-ops

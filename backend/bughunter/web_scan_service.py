@@ -39,6 +39,11 @@ from bughunter.web_ingest import (
 _USER_AGENT = "GreyIQ-BugHunter/0.1 (+authorized-scan)"
 _MAX_FINDINGS_RETURNED = 300
 
+# The per-program required-UA machinery lives in web_ingest (the lowest-level fetcher, imported here);
+# re-exported so this module and its importers (active_verify/oob/stored_xss) can build a UA carrying
+# the active program's mandatory suffix without a circular import.
+from bughunter.web_ingest import current_user_agent, reset_ua_suffix, set_ua_suffix  # noqa: E402,F401
+
 # Security response headers expected on a modern site -> (severity, advice).
 _EXPECTED_HEADERS: dict[str, tuple[str, str]] = {
     "content-security-policy": (
@@ -258,7 +263,7 @@ def _fetch_raw(url: str, *, auth: AuthContext | None = None) -> dict[str, Any]:
         headers = {
             "Accept": "*/*",
             "Accept-Encoding": "identity",
-            "User-Agent": _USER_AGENT,
+            "User-Agent": current_user_agent(_USER_AGENT),
         }
         # Operator session attached SAME-SITE only; a cross-site redirect strips it again
         # (see _GuardedRedirect), so it never leaves the target's host.
