@@ -2,6 +2,35 @@
 
 Notable changes to GreyIQ.
 
+## v0.72.0
+
+### The hunt sees more, and reasons about where to strike
+- **All-knowing recon (within scope)** — discovery now crawls the surface it mines, not just the
+  landing page: endpoints and in-scope sibling hosts pulled from served JS, inline `<script>`/config
+  blobs, and HTML comments, plus the full sitemap-index + robots `Sitemap:` inventory. `<form>`
+  action targets, OIDC/OAuth `.well-known` auth endpoints, and OpenAPI/Swagger specs (JSON **and**
+  YAML, templated paths instantiated, Swagger-UI spec URLs scraped) join the probe surface. Every new
+  host/URL passes the same fail-closed scope gate before it is ever fetched.
+- **Reasoning-steered hunting** — the model now reads the mapped surface and (a) proposes the
+  target-specific parameter names the heuristics miss and (b) prioritizes the vuln class most likely
+  to hit each endpoint, which reorders the active checks so the request budget is spent where a real
+  bug is most likely. The model never emits a finding: a hypothesis is reported only when the
+  deterministic differential prover independently confirms it — recall up, precision unchanged. Fully
+  scope-gated, prompt-injection-hardened, and fail-closed to today's behavior when no brain is set.
+
+### Proof of impact that survives triage
+- Confirmed findings now capture the **actual vulnerable behavior in the live response**: the
+  shell-evaluated result for OS command injection, the reflected host for host-header injection, the
+  NoSQL error text, the injected header for CRLF, the authenticated body a forged `alg:none` JWT
+  unlocked, the real `Location` for open redirect, and the disclosed schema for GraphQL introspection.
+  IDOR/BFLA carry the size differential without ever embedding another user's data.
+- **Leaked Google/Firebase API key** — a runnable `curl` proof-of-concept (a benign, read-only call
+  to Google's issuer, never the target) plus the captured issuer response proving the key is live and
+  what it grants; an open Firebase Storage bucket now lists the real object names an attacker can
+  enumerate.
+- Missing-HSTS and exposed-source-map findings now carry captured proof, and a static finding's
+  multi-line span renders as a range.
+
 ## v0.71.0
 
 ### More money-classes found, and proof that survives triage
