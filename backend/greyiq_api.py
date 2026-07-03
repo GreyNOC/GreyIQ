@@ -361,6 +361,8 @@ from bughunter import toolkit as toolkit_lib  # noqa: E402
 from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E402
 from bughunter import active_verify_service as bounty_active_verify  # noqa: E402
 from bughunter import scan_auth as bounty_scan_auth  # noqa: E402
+from bughunter import credential_validation as bounty_credential_validation  # noqa: E402
+from bughunter.code_scanner.redaction import redact_text  # noqa: E402
 from bughunter.settings import get_settings as _bounty_get_settings  # noqa: E402
 
 
@@ -770,6 +772,15 @@ class ScreenshotRequest(BaseModel):
     matched_value: str = Field(default="", max_length=2000)   # evidence to highlight + annotate
     full_page: bool = False
     scope: str = Field(default="", max_length=4000)   # optional extra scope (the cockpit's current Scope box), unioned with the run + live program scope at capture time
+
+
+class CredentialTestRequest(BaseModel):
+    # Explicit, one-click source-secret validation: send the found API key only to its
+    # own allowlisted issuer, record the read-only response artifact, and attach it to
+    # the run so the PoC/download bundle carries the proof.
+    run_id: str = Field(min_length=1, max_length=64)
+    ref: str = Field(min_length=1, max_length=40)
+    authorized: bool = False
 
 
 class IngestTargetsRequest(BaseModel):
@@ -2116,6 +2127,126 @@ class GreyIQRuntime:
             return {"ok": False, "error": "This finding is not reportable (the report rules drop it, e.g. an unconfirmed credential lead)."}
         return {"ok": True, "package": package, "platform": platform}
 
+    def test_source_credential(self, request: "CredentialTestRequest") -> dict[str, Any]:
+        """Explicit source API-key test for one cached finding.
+
+        Sends exactly one benign read-only request to the key's own allowlisted issuer,
+        records the issuer response and derived access scope, then attaches the artifact
+        to the cached run so both the PoC zip and engagement bundle can carry it. The raw
+        key is never returned to the browser and is redacted from the artifact."""
+        if not request.authorized:
+            return {"ok": False, "error": "Confirm this source API key is in scope and you are authorized to test it."}
+        ctx, finding, run = self._resolve_run_finding(request.run_id, request.ref)
+        if ctx is None or run is None:
+            return {"ok": False, "error": "This run is no longer cached - re-run the hunt to test this source API key."}
+        if finding is None:
+            return {"ok": False, "error": "Unknown finding for this run."}
+        if str(finding.get("class_id") or "").lower() != "secrets":
+            return {"ok": False, "error": "This option is only available for API-key/credential findings in source."}
+        key = str(finding.get("secret_value") or "").strip()
+        if not key:
+            return {"ok": False, "error": "This cached finding does not include the raw API key needed for a live issuer check."}
+        rule_id = str(finding.get("rule_id") or "")
+        validators = {
+            "secret.github-pat": bounty_credential_validation.validate_github_token,
+            "secret.slack-bot-token": bounty_credential_validation.validate_slack_token,
+            "secret.openai-key": bounty_credential_validation.validate_openai_key,
+            "secret.anthropic-key": bounty_credential_validation.validate_anthropic_key,
+            "secret.stripe-key": bounty_credential_validation.validate_stripe_key,
+        }
+        validator = validators.get(rule_id)
+        if rule_id == "secret.google-api-key" and bounty_credential_validation.is_google_api_key(key):
+            validator = bounty_credential_validation.validate_firebase_key
+        if validator is None:
+            return {"ok": False, "error": "No safe read-only issuer test is available for this key type yet."}
+
+        proof = validator(key)
+        proof["checked"] = True
+        redacted_poc = redact_text(str(proof.get("poc") or ""))[0]
+        redacted_response = redact_text(str(proof.get("response_excerpt") or proof.get("detail") or ""))[0]
+        access_bits = [
+            str(proof.get("principal") or "").strip(),
+            str(proof.get("project_id") or "").strip(),
+            str(proof.get("scopes") or "").strip(),
+            ", ".join(str(d) for d in (proof.get("authorized_domains") or []) if str(d).strip()),
+        ]
+        access_summary = "; ".join(bit for bit in access_bits if bit)
+        live = proof.get("live")
+        status = "confirmed" if live is True else "not_live" if live is False else "inconclusive"
+        artifact = {
+            "finding_ref": request.ref,
+            "title": str(finding.get("title") or ""),
+            "location": str(finding.get("location") or finding.get("file_path") or ""),
+            "rule_id": rule_id,
+            "status": status,
+            "live": live,
+            "http_status": proof.get("http_status"),
+            "endpoint": str(proof.get("endpoint") or ""),
+            "access_summary": access_summary,
+            "detail": redact_text(str(proof.get("detail") or ""))[0],
+            "request_sent": redacted_poc,
+            "api_response": redacted_response,
+            "no_data_read": bool(proof.get("no_data_read")),
+            "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
+        }
+
+        lines = [
+            f"API KEY ACCESS TEST - {artifact['title'] or request.ref}",
+            "=" * 72,
+            "",
+            f"Finding: {request.ref}",
+            f"Location: {artifact['location']}",
+            f"Rule: {rule_id}",
+            f"Status: {status}",
+            f"Endpoint: {artifact['endpoint']}",
+            f"HTTP status: {artifact['http_status']}",
+        ]
+        if access_summary:
+            lines.append(f"Accessible with key: {access_summary}")
+        if artifact["detail"]:
+            lines.extend(["", "Access detail", "-" * 72, artifact["detail"]])
+        if redacted_poc:
+            lines.extend(["", "Request sent (secret redacted)", "-" * 72, redacted_poc])
+        if redacted_response:
+            lines.extend(["", "API response returned by issuer", "-" * 72, redacted_response])
+        lines.extend([
+            "",
+            "Safety note",
+            "-" * 72,
+            "This artifact was created by one read-only request to the key's own allowlisted issuer. The API key is redacted.",
+        ])
+        artifact_text = "\n".join(lines) + "\n"
+
+        safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
+        out_dir = RUNTIME_DIR / "credential-proofs"
+        stem = f"{safe(request.run_id)}-{safe(request.ref)}-api-key-access"
+        txt_path = out_dir / f"{stem}.txt"
+        json_path = out_dir / f"{stem}.json"
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            txt_path.write_text(artifact_text, encoding="utf-8")
+            json_path.write_text(json.dumps(artifact, indent=2, default=str), encoding="utf-8")
+        except OSError as exc:
+            return {"ok": False, "error": f"Could not write API-key proof artifact: {exc}"}
+
+        with self.lock:
+            finding["_credential_proof"] = proof
+            finding["credential_artifact_path"] = str(txt_path)
+            finding["credential_artifact_json_path"] = str(json_path)
+            finding["credential_access_artifact"] = artifact
+            plans = run["ctx"].setdefault("attack_plans", {})
+            plans[request.ref] = _deterministic_attack_plan(finding, str(finding.get("class_id") or "secrets"))
+            run.setdefault("credential_artifacts", {})[request.ref] = [str(txt_path), str(json_path)]
+        return {
+            "ok": True,
+            "status": status,
+            "live": live,
+            "proof": artifact,
+            "artifact_text": artifact_text,
+            "path": str(txt_path),
+            "json_path": str(json_path),
+        }
+
     def capture_screenshot(self, request: "ScreenshotRequest") -> dict[str, Any]:
         """Capture a proof screenshot of a finding's PoC URL in a headless browser and
         record it on the cached run so the report/submission embed it. OPT-IN, scope-bound
@@ -2464,14 +2595,23 @@ class GreyIQRuntime:
                 specs.append((f"findings/{Path(p).name}", p))
             for p in art.get("submission_paths") or []:
                 specs.append((f"submissions/{Path(p).name}", p))
-            for p in (run.get("screenshots") or {}).values():
-                specs.append((f"screenshots/{Path(p).name}", p))
-            for p in (run.get("research_paths") or {}).values():
-                specs.append((f"research/{Path(p).name}", p))
+            for entry in (run.get("screenshots") or {}).values():
+                for p in (entry if isinstance(entry, list) else [entry]):
+                    if p:
+                        specs.append((f"screenshots/{Path(p).name}", p))
+            for entry in (run.get("research_paths") or {}).values():
+                for p in (entry if isinstance(entry, list) else [entry]):
+                    if p:
+                        specs.append((f"research/{Path(p).name}", p))
             # The plain-text request/response/source proof (.txt) captured per finding.
-            for p in (run.get("source_texts") or {}).values():
-                if p:
-                    specs.append((f"evidence/{Path(p).name}", p))
+            for entry in (run.get("source_texts") or {}).values():
+                for p in (entry if isinstance(entry, list) else [entry]):
+                    if p:
+                        specs.append((f"evidence/{Path(p).name}", p))
+            for entry in (run.get("credential_artifacts") or {}).values():
+                for p in (entry if isinstance(entry, list) else [entry]):
+                    if p:
+                        specs.append((f"evidence/{Path(p).name}", p))
             res = bounty_bundle.bundle_files(specs, out_zip)
         if not res.get("ok"):
             return res
@@ -4005,6 +4145,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/screenshot":
             request = validate_payload(ScreenshotRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.capture_screenshot, request))
+            return
+        if method == "POST" and path == "/api/bounty/credential-test":
+            request = validate_payload(CredentialTestRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.test_source_credential, request))
             return
         if method == "POST" and path == "/api/bounty/ingest-targets":
             request = validate_payload(IngestTargetsRequest, await read_json_body(receive))

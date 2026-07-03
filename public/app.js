@@ -4512,7 +4512,9 @@ function ckNormalizeFindings(res) {
       description: String(f.description || ""),
       remediation: String(f.remediation || ""),
       snippet: String(f.snippet || ""),
-      sourceUrl: String(f.source_url || "")
+      sourceUrl: String(f.source_url || ""),
+      apiKeyAccessProof: f.credential_access_artifact || null,
+      apiKeyAccessText: ""
     };
   });
 }
@@ -4870,6 +4872,15 @@ function ckRenderDetail(f) {
   shotBtn.addEventListener("click", () => ckCaptureScreenshot(f, shotBtn, shotWrap));
   actions.append(shotBtn);
 
+  const keyWrap = cel("div", "ck-research");
+  if (ckCanTestApiKeyAccess(f)) {
+    const keyBtn = cel("button", "ck-btn", f.apiKeyAccessText ? "Re-test API key" : "Test API key access");
+    keyBtn.type = "button";
+    keyBtn.title = "Send one read-only request to the key's own issuer, record what the API key can access, and include it in the PoC bundle";
+    keyBtn.addEventListener("click", () => ckTestApiKeyAccess(f, keyBtn, keyWrap));
+    actions.append(keyBtn);
+  }
+
   // Research this lead with the configured brain (or a deterministic dossier).
   const researchBtn = cel("button", "ck-btn", "Research this lead");
   researchBtn.type = "button";
@@ -4888,6 +4899,7 @@ function ckRenderDetail(f) {
 
   host.append(actions);
   host.append(shotWrap);
+  host.append(keyWrap);
   host.append(researchWrap);
 }
 
@@ -4965,6 +4977,73 @@ async function ckResearchLead(f, btn, wrap) {
   } catch (err) {
     btn.textContent = label;
     wrap.append(cel("p", "ck-status is-error", err.message || "Research failed."));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function ckCanTestApiKeyAccess(f) {
+  if (!(f && (f.runId || ckState.runId) && f.ref)) return false;
+  const cls = String(f.class_id || f.className || "").toLowerCase();
+  const rule = String(f.rule_id || "").toLowerCase();
+  return cls === "secrets" && [
+    "secret.google-api-key",
+    "secret.github-pat",
+    "secret.slack-bot-token",
+    "secret.openai-key",
+    "secret.anthropic-key",
+    "secret.stripe-key",
+  ].includes(rule);
+}
+
+async function ckTestApiKeyAccess(f, btn, wrap) {
+  if (!ckCanTestApiKeyAccess(f)) {
+    if (wrap) wrap.replaceChildren(cel("p", "ck-status is-error", "This source finding is not a supported API-key type."));
+    return;
+  }
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Testing key...";
+  if (wrap) { wrap.hidden = false; wrap.replaceChildren(); }
+  try {
+    const res = await apiFetch("/api/bounty/credential-test", {
+      method: "POST", timeoutMs: 30000,
+      body: JSON.stringify({ run_id: f.runId || ckState.runId, ref: f.ref, authorized: true }),
+    });
+    if (!res || res.ok === false) {
+      if (wrap) wrap.append(cel("p", "ck-status is-error", (res && res.error) || "API-key test failed."));
+      btn.textContent = old;
+      return;
+    }
+    f.apiKeyAccessProof = res.proof || null;
+    f.apiKeyAccessText = res.artifact_text || "";
+    f.apiKeyAccessPath = res.path || "";
+    f.apiKeyAccessJsonPath = res.json_path || "";
+    if (res.live === true) {
+      f.proof = "confirmed";
+      if (ckFindingKey(f)) {
+        ckStatusOverlay[ckFindingKey(f)] = { ...(ckStatusOverlay[ckFindingKey(f)] || {}), proof: "confirmed" };
+        ckSaveStatusOverlay();
+      }
+    }
+    btn.textContent = "Re-test API key";
+    if (wrap) {
+      const p = res.proof || {};
+      wrap.append(cel("p", "ck-hint", `Saved API-key access proof${res.path ? ": " + res.path : ""}. It is included in the PoC zip and engagement bundle.`));
+      const pre = cel("pre", "ck-research-md");
+      pre.textContent = res.artifact_text || [
+        `Status: ${res.status || ""}`,
+        p.access_summary ? `Accessible with key: ${p.access_summary}` : "",
+        p.api_response ? `API response:\n${p.api_response}` : "",
+      ].filter(Boolean).join("\n\n");
+      pre.style.whiteSpace = "pre-wrap";
+      pre.style.maxHeight = "340px";
+      pre.style.overflow = "auto";
+      wrap.append(pre);
+    }
+  } catch (err) {
+    btn.textContent = old;
+    if (wrap) wrap.append(cel("p", "ck-status is-error", err.message || "API-key test failed."));
   } finally {
     btn.disabled = false;
   }
@@ -6452,6 +6531,10 @@ function ckNormalizeForReport(f, extra) {
     proof: ckEffectiveProof(f, f.proof_status),
     dedupKey: f.dedupKey || f.dedup_key || "",
     screenshot: extra.screenshot || null,
+    apiKeyAccessProof: f.apiKeyAccessProof || f.credential_access_artifact || null,
+    apiKeyAccessText: f.apiKeyAccessText || "",
+    apiKeyAccessPath: f.apiKeyAccessPath || "",
+    apiKeyAccessJsonPath: f.apiKeyAccessJsonPath || "",
     _md: null,   // cached full-report markdown (so a Submissions re-render doesn't refetch)
   };
   if (!focus.ref) {
@@ -6462,6 +6545,10 @@ function ckNormalizeForReport(f, extra) {
       focus.plan = focus.plan || m.plan || null;
       focus.proofObj = focus.proofObj || m.proofObj || null;
       focus.proofEvidence = focus.proofEvidence || m.proof_evidence || m.proofEvidence || null;
+      focus.apiKeyAccessProof = focus.apiKeyAccessProof || m.apiKeyAccessProof || null;
+      focus.apiKeyAccessText = focus.apiKeyAccessText || m.apiKeyAccessText || "";
+      focus.apiKeyAccessPath = focus.apiKeyAccessPath || m.apiKeyAccessPath || "";
+      focus.apiKeyAccessJsonPath = focus.apiKeyAccessJsonPath || m.apiKeyAccessJsonPath || "";
       focus.cvss = focus.cvss || m.cvss || null;
       if (focus.cvssScore == null) focus.cvssScore = m.cvssScore ?? null;
       focus.description = focus.description || m.description || "";
@@ -6569,6 +6656,11 @@ function ckFullReportPanel(focus) {
     wrap.append(cel("h4", null, "Proof of concept"));
     wrap.append(cel("pre", "ck-poc", pocText));
   }
+  if (focus.apiKeyAccessText || focus.apiKeyAccessProof) {
+    wrap.append(cel("h4", null, "API key access proof"));
+    const pre = cel("pre", "ck-poc", focus.apiKeyAccessText || JSON.stringify(focus.apiKeyAccessProof, null, 2));
+    wrap.append(pre);
+  }
 
   // Screenshots: a campaign-prove shot arrives on focus.screenshot; captures done here are
   // stashed on focus.shots so they SURVIVE the panel's own async report-fetch re-render (which
@@ -6628,6 +6720,24 @@ function ckFullReportPanel(focus) {
     if (ckState.reportFocus === focus && ckState.view === "submissions") ckRenderSubmissions();
   }));
   s1.row.append(proveBtn, shotBtn);
+  if (ckCanTestApiKeyAccess(focus)) {
+    const keyBtn = cel("button", "ck-btn", focus.apiKeyAccessText ? "Re-test API key access" : "Test API key access");
+    keyBtn.type = "button";
+    keyBtn.title = "Send one read-only request to the API key's own issuer and save the returned access proof into the PoC bundle";
+    keyBtn.addEventListener("click", async () => {
+      await ckTestApiKeyAccess(focus, keyBtn, resultEl);
+      const m = ckState.findings.find((x) => ckFindingKey(x) === ckFindingKey(focus));
+      if (m) {
+        m.apiKeyAccessProof = focus.apiKeyAccessProof;
+        m.apiKeyAccessText = focus.apiKeyAccessText;
+        m.apiKeyAccessPath = focus.apiKeyAccessPath;
+        m.apiKeyAccessJsonPath = focus.apiKeyAccessJsonPath;
+      }
+      focus._md = null;
+      if (ckState.reportFocus === focus && ckState.view === "submissions") ckRenderSubmissions();
+    });
+    s1.row.append(keyBtn);
+  }
   actions.append(s1.el);
 
   // ---- Stage 2 · Package — every export of the finished report, each still separate. ----
@@ -7318,6 +7428,12 @@ function ckBuildProofOfImpactText(focus) {
     L.push("");
   }
   if (plan.poc) L.push("PROOF OF CONCEPT", rule("-"), String(plan.poc), "");
+  if (focus.apiKeyAccessText || focus.apiKeyAccessProof) {
+    L.push("API KEY ACCESS TEST", rule("-"));
+    if (focus.apiKeyAccessText) L.push(String(focus.apiKeyAccessText));
+    else L.push(JSON.stringify(focus.apiKeyAccessProof, null, 2));
+    L.push("");
+  }
   const po = focus.proofObj || {};
   if (po.status || po.observed_result || po.control_result || po.evidence || po.proof_obligation) {
     L.push("PROOF OF IMPACT", rule("-"));
@@ -7366,6 +7482,8 @@ async function ckDownloadPocZip(focus, btn) {
     files.push({ name: "poc.html", data: enc.encode(ckBuildPocHtml(focus)) });
     files.push({ name: "steps-and-evidence.txt", data: enc.encode(ckBuildProofOfImpactText(focus)) });
     if (focus.sourceText) files.push({ name: "response-source.txt", data: enc.encode(String(focus.sourceText)) });
+    if (focus.apiKeyAccessText) files.push({ name: "api-key-access.txt", data: enc.encode(String(focus.apiKeyAccessText)) });
+    if (focus.apiKeyAccessProof) files.push({ name: "api-key-access.json", data: enc.encode(JSON.stringify(focus.apiKeyAccessProof, null, 2)) });
     const shots = [];
     if (focus.screenshot && focus.screenshot.data_url) shots.push({ data_url: focus.screenshot.data_url, kind: "evidence", path: "" });
     for (const s of (focus.shots || [])) if (s && s.data_url) shots.push(s);
@@ -7380,6 +7498,7 @@ async function ckDownloadPocZip(focus, btn) {
     files.push({ name: "finding.json", data: enc.encode(JSON.stringify({
       title: focus.title, severity: focus.severity, class: focus.className, class_id: focus.class_id,
       cwe: focus.cwe, location: focus.location, cvss: focus.cvss || null, proof: focus.proofObj || null,
+      api_key_access: focus.apiKeyAccessProof || null,
       screenshots: shotNames,
     }, null, 2)) });
     const blob = ckZip(files);
