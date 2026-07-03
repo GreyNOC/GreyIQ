@@ -243,6 +243,13 @@ IMPACT_MODEL: dict[str, dict[str, str]] = {
         "proof_obligation": "Capture the exact response disclosing the information (stack trace, version, internal path, source map) and explain the concrete follow-on it enables.",
         "cvss_vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
     },
+    "chrome-extension": {
+        "attacker_capability": "An over-privileged or page-scriptable browser extension turns any XSS/compromise into broad access to the user's browsing (all sites, cookies, requests) or code execution in a privileged context.",
+        "affected_asset": "every site the user visits and the data the extension can reach (cookies, requests, storage).",
+        "business_impact": "mass account/session compromise across the extension's user base; a lucrative target under Google's Chrome extension security program.",
+        "proof_obligation": "Show the manifest setting (over-broad host_permissions, unsafe-eval CSP, externally_connectable to any site, or a high-privilege permission) and demonstrate the concrete abuse it enables within scope.",
+        "cvss_vector": "AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:L/A:N",
+    },
 }
 
 _GENERIC_MODEL: dict[str, str] = {

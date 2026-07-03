@@ -23,6 +23,7 @@ from bughunter.code_scanner.rules.open_redirect import RULES as REDIRECT_RULES
 from bughunter.code_scanner.rules.ssti_source import RULES as SSTI_SOURCE_RULES
 from bughunter.code_scanner.rules.xxe import RULES as XXE_RULES
 from bughunter.code_scanner.rules.jwt_weak import RULES as JWT_WEAK_RULES
+from bughunter.code_scanner.rules.chrome_extension import RULES as CHROME_EXT_RULES
 
 ALL_RULES: tuple[Rule, ...] = (
     *SECRET_RULES,
@@ -40,6 +41,7 @@ ALL_RULES: tuple[Rule, ...] = (
     *SSTI_SOURCE_RULES,
     *XXE_RULES,
     *JWT_WEAK_RULES,
+    *CHROME_EXT_RULES,
 )
 
 

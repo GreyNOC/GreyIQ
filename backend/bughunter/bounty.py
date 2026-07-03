@@ -321,6 +321,7 @@ _CATEGORY_LABELS: dict[str, dict[str, str]] = {
     "headers": {"name": "Security hardening (headers)", "cwe": "CWE-693"},
     "mixed_content": {"name": "Mixed content", "cwe": "CWE-311"},
     "disclosure": {"name": "Information disclosure", "cwe": "CWE-200"},
+    "chrome-extension": {"name": "Browser extension misconfiguration", "cwe": "CWE-272"},
 }
 
 
@@ -727,6 +728,40 @@ def _concrete_repro(finding: dict[str, Any], class_id: str) -> tuple[list[str], 
     if not str(finding.get("rule_id") or "").startswith("active."):
         return [], ""
     return _generic_concrete_repro(finding, class_id, url, pe)
+
+
+def _firebase_exposure_finding(exp: dict[str, Any], project: str) -> dict[str, Any]:
+    """Build a CONFIRMED finding for an unauthenticated-readable Firebase data store discovered by
+    credential_validation.probe_firebase_exposure — an actively-proven cloud-exposure (the probe
+    already READ it unauthenticated), with the default-deny rules as the negative control."""
+    service = str(exp.get("service") or "Firebase data store")
+    endpoint = str(exp.get("endpoint") or "")
+    proof = {
+        "status": "confirmed",
+        "method": "benign unauthenticated GET (Realtime DB shallow read / Storage list — no stored values read)",
+        "actor": "an unauthenticated attacker (no credentials, no key)",
+        "affected_asset": f"the Firebase project '{project}' {service}",
+        "observed_result": str(exp.get("detail") or f"{service} returned data to an unauthenticated request"),
+        "control_result": "Firebase's DEFAULT security rules deny anonymous read; this project's rules allow it — a misconfiguration, not the platform default",
+        "evidence": str(exp.get("evidence") or ""),
+        "limitations": "", "proof_obligation": "",
+    }
+    ev = {
+        "request_line": f"GET {endpoint}",
+        "request_header": "", "response_status": "HTTP 200",
+        "matched_value": f"{service} readable unauthenticated",
+        "read_data": str(exp.get("evidence") or ""),
+    }
+    return {
+        "rule_id": "active.firebase-exposure",
+        "title": f"Open {service} — unauthenticated read (project {project})",
+        "severity": str(exp.get("severity") or "high"), "confidence": "high",
+        "category": "disclosure", "file_path": endpoint, "location": endpoint,
+        "line_start": 1, "line_end": 1, "snippet": str(exp.get("detail") or "")[:240],
+        "remediation": "Lock the Firebase security rules to require authentication (deny public read) and scope access per authenticated user.",
+        "redacted": True, "proof_evidence": ev,
+        "_active_proof": proof, "_active_cvss": None, "_active_class_hint": "cloud-exposure",
+    }
 
 
 def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[str, Any]:
@@ -1197,6 +1232,7 @@ def run_bounty_hunt(
     # (Google, never the target), carrying only the found key, to prove liveness + name the project.
     # Best-effort; an error never breaks a hunt.
     if authorized:
+        exposure_findings: list[dict[str, Any]] = []
         for finding in raw_findings:
             if not isinstance(finding, dict) or finding.get("_credential_proof") is not None:
                 continue
@@ -1212,6 +1248,19 @@ def run_bounty_hunt(
                 label = finding.get("variable_name") or "Firebase key"
                 _emit(f"validated {label}: " + ("LIVE — project " + (proof.get("project_id") or "?") if live
                                                  else "not live" if live is False else "inconclusive"))
+                # VRP: a live key names a Firebase project — probe it for UNAUTHENTICATED data-store
+                # exposure (the RTDB shallow read reveals only key names, never values). Each open
+                # store is its own confirmed finding.
+                project = str(proof.get("project_id") or "").strip()
+                if live and project:
+                    try:
+                        for exp in credential_validation.probe_firebase_exposure(project, key):
+                            exposure_findings.append(_firebase_exposure_finding(exp, project))
+                            _emit(f"OPEN {exp.get('service')} on project {project} — unauthenticated read")
+                    except Exception as exc:  # noqa: BLE001
+                        _emit(f"firebase exposure probe error: {exc}")
+        if exposure_findings:
+            raw_findings = list(raw_findings) + exposure_findings
 
     # Annotate + rank.
     annotated: list[dict[str, Any]] = []
