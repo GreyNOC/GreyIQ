@@ -83,6 +83,31 @@ def _campaign_risk(consolidated: list[dict[str, Any]]) -> str:
     return "low" if consolidated else "clean"
 
 
+def _capture_proof_screenshots(items: list[dict[str, Any]], shot_dir: Path, target: str, scope: Any) -> int:
+    """Capture a scope-gated proof screenshot for each confirmed finding and record its path on the
+    finding (+ the plain-text request/response proof if any). Bounded by the caller, best-effort:
+    every step is wrapped so a missing Playwright / a capture error is a clean no-op, never a break.
+    Returns the number of screenshots captured. Reused for BOTH the every-confirmed pass and deep."""
+    captured = 0
+    for index, item in enumerate(items, 1):
+        finding = item["finding"]
+        stem = f"{index:02d}-{_safe_slug(str(finding.get('ref') or 'finding'))}"
+        ictx = {"target": item.get("source_url") or target, "scope": scope, "attack_plans": {}}
+        try:
+            poc = screenshot_service.poc_url_for_finding(finding, ictx)
+            if not poc:
+                continue
+            shot = screenshot_service.capture_screenshot(poc, shot_dir / f"{stem}.png", scope=scope, authorized=True)
+        except Exception:  # noqa: BLE001 - proof screenshot is enrichment; never break the campaign
+            continue
+        if shot.get("ok"):
+            finding["screenshot_path"] = shot["path"]
+            if shot.get("source_text_path"):  # plain-text request/response/source proof
+                finding["source_text_path"] = shot["source_text_path"]
+            captured += 1
+    return captured
+
+
 def run_campaign(
     target: str,
     *,
@@ -360,26 +385,24 @@ def run_campaign(
     ranking.rank_by_ev(consolidated, priors, program_stats)
     confirmed = [c for c in consolidated if c["proof_status"] == "confirmed"]
 
-    # --- DEEP mode: autonomously WORK each confirmed lead — capture a proof screenshot
-    # (scope-gated; degrades cleanly without Playwright) and write a brain-researched
-    # dossier (deterministic offline fallback). Both land in the campaign folder (so the
-    # downloadable bundle carries them) and the screenshot is embedded in the finding's
-    # submission package. Bounded so a big campaign can't launch unbounded browsers/calls.
+    # --- Proof screenshot for EVERY actively-confirmed finding (not just deep mode): a visual PoC
+    # of the vulnerable behaviour lands in the campaign folder and the finding's submission package,
+    # which measurably speeds/raises triage acceptance. Scope-gated, degrades cleanly without
+    # Playwright, bounded to 8 so a big campaign can't launch unbounded browsers.
+    if effective_active and confirmed:
+        n = _capture_proof_screenshots(confirmed[:8], out_root / "screenshots", clean_target, scope)
+        if n:
+            _emit(f"captured {n} proof screenshot(s) for confirmed finding(s).")
+
+    # --- DEEP mode ALSO writes a brain-researched dossier per confirmed lead (the expensive part,
+    # deterministic offline fallback). The screenshot above already ran for these findings. ---
     if deep and confirmed:
-        _emit(f"deep: researching + capturing {min(len(confirmed), 8)} confirmed lead(s)…")
-        shot_dir = out_root / "screenshots"
+        _emit(f"deep: researching {min(len(confirmed), 8)} confirmed lead(s)…")
         research_dir = out_root / "research"
         for index, item in enumerate(confirmed[:8], 1):
             finding = item["finding"]
             stem = f"{index:02d}-{_safe_slug(str(finding.get('ref') or 'finding'))}"
             ictx = {"target": item.get("source_url") or clean_target, "scope": scope, "attack_plans": {}}
-            poc = screenshot_service.poc_url_for_finding(finding, ictx)
-            if poc:
-                shot = screenshot_service.capture_screenshot(poc, shot_dir / f"{stem}.png", scope=scope, authorized=True)
-                if shot.get("ok"):
-                    finding["screenshot_path"] = shot["path"]
-                    if shot.get("source_text_path"):  # plain-text request/response/source proof
-                        finding["source_text_path"] = shot["source_text_path"]
             try:
                 dossier = research.build_dossier(finding, ictx, coder_cfg)
                 rpath = research_dir / f"{stem}.md"
