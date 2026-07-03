@@ -3135,6 +3135,8 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-hist-prog { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; margin: 0.7rem 0 0.2rem; padding-top: 0.6rem; border-top: 1px solid var(--border); }
 .ck-hist-prog strong { font-size: 0.86rem; }
 .ck-hist-prog .ck-btn { margin-left: auto; }
+.ck-hist-archived { border-top-style: dashed; opacity: 0.92; }
+.ck-hist-archived strong { color: var(--warn, #f0a500); }
 
 /* Portfolio Hunt: program multi-select on the launch rail. */
 .ck-portfolio-pick { border: 1px solid var(--border); border-radius: 10px; padding: 0.6rem 0.7rem; margin: 0.2rem 0 0.4rem; background: var(--panel-2); }

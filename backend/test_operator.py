@@ -105,6 +105,36 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(f["stages"]["confirmed"], 0)
         self.assertEqual(f["stages"]["discovered"], 1)
 
+    def test_delete_program_archives_high_crit_and_purges_rest(self) -> None:
+        ledger.upsert_findings(self.rt, "acme", "https://acme.com", [
+            _item("C1", "xss", "r", "https://acme.com/a", sev="high"),
+            _item("C2", "rce", "r", "https://acme.com/b", sev="critical"),
+            _item("C3", "headers", "r", "https://acme.com/c", sev="low"),
+            _item("C4", "info", "r", "https://acme.com/d", sev="medium"),
+        ])
+        ledger.upsert_findings(self.rt, "other", "https://other.com", [
+            _item("C5", "xss", "r", "https://other.com/x", sev="high")])
+        res = ledger.archive_and_purge_program(self.rt, "acme")
+        self.assertEqual(res, {"archived": 2, "purged": 2})
+        # acme is gone from the live history; only 'other' remains untouched.
+        self.assertEqual([r["program"] for r in ledger.list_all(self.rt)], ["other"])
+        # Only High + Critical survive, in the archive, tagged with their old program.
+        arch = ledger.list_archived(self.rt)
+        self.assertEqual({a["severity"] for a in arch}, {"high", "critical"})
+        self.assertTrue(all(a["archived_from"] == "acme" for a in arch))
+
+    def test_delete_missing_program_is_noop(self) -> None:
+        self.assertEqual(ledger.archive_and_purge_program(self.rt, "ghost"), {"archived": 0, "purged": 0})
+
+    def test_dismissing_an_archived_finding_hides_it(self) -> None:
+        ledger.upsert_findings(self.rt, "acme", "https://acme.com", [
+            _item("C1", "rce", "r", "https://acme.com/b", sev="critical")])
+        ledger.archive_and_purge_program(self.rt, "acme")
+        arch = ledger.list_archived(self.rt)
+        self.assertEqual(len(arch), 1)
+        ledger.dismiss(self.rt, dedup_key_str=arch[0]["dedup_key"])
+        self.assertEqual(ledger.list_archived(self.rt), [])  # a dismissed archived finding is hidden too
+
     def test_is_submitted_requires_a_real_submission_not_just_reported(self) -> None:
         item = _item("C1", "xss", "r", "https://x/a")
         ledger.upsert_findings(self.rt, "acme", "https://x", [item])

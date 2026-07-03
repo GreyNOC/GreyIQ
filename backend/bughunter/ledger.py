@@ -322,6 +322,45 @@ def restore(runtime_dir: str | Path, dedup_key_str: str) -> bool:
     return was
 
 
+def archive_and_purge_program(runtime_dir: str | Path, program_id: str) -> dict[str, int]:
+    """Cascade a PROGRAM deletion to its findings: the program's whole ledger bucket is removed,
+    but its HIGH/CRITICAL findings are MOVED into the archive ("history subcategory") first —
+    kept read-only so a serious finding is never silently lost when a program is deleted. Lower-
+    severity findings are purged with the bucket. Returns {'archived': n, 'purged': m}."""
+    pid = program_key(program_id)  # normalize to the same key the ledger bucket uses
+    with _LOCK:
+        data = _load(runtime_dir)
+        bucket = (data.get("programs") or {}).get(pid)
+        if not bucket:
+            return {"archived": 0, "purged": 0}
+        dismissed = data.get("dismissed") or {}
+        archive = data.setdefault("archived", {})
+        n_arch = n_purge = 0
+        for key, rec in (bucket.get("findings") or {}).items():
+            severity = str(rec.get("severity") or "").strip().lower()
+            keep = severity in ("high", "critical") and key not in dismissed and not rec.get("dismissed")
+            if keep:
+                archive[key] = {**rec, "program": pid, "archived_from": pid, "archived_at": _now()}
+                n_arch += 1
+            else:
+                n_purge += 1
+        data.get("programs", {}).pop(pid, None)  # remove the bucket; kept ones now live in `archived`
+        _save(runtime_dir, data)
+    return {"archived": n_arch, "purged": n_purge}
+
+
+def list_archived(runtime_dir: str | Path, limit: int | None = None) -> list[dict[str, Any]]:
+    """The "history subcategory": HIGH/CRITICAL findings preserved from DELETED programs. Kept
+    out of the live history/funnel/CSV (their program is gone) but surfaced here so the operator
+    can still see — and report — a serious finding from a program they removed."""
+    store = _load(runtime_dir)
+    archive = store.get("archived") or {}
+    dismissed = store.get("dismissed") or {}
+    out = [{**rec, "dedup_key": key} for key, rec in archive.items() if key not in dismissed]
+    out.sort(key=lambda r: str(r.get("archived_at") or r.get("updated_at") or ""), reverse=True)
+    return out[: max(1, limit or _MAX_LIST_ALL)]
+
+
 def count_recent_submissions(runtime_dir: str | Path, program: str | None, within_hours: int = 24, target: str = "") -> int:
     """How many findings this program filed in the last ``within_hours`` — drives the
     operator's per-program max_submits_per_day throttle."""
