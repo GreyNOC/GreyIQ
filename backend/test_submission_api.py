@@ -2,9 +2,11 @@
 hard-gated HackerOne submit (no network), and the creds store (token never echoed)."""
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -68,6 +70,45 @@ class SubmissionApiTests(unittest.TestCase):
     def test_unknown_run_or_ref_errors_gracefully(self) -> None:
         self.assertFalse(self.rt.build_submission_package(g.SubmissionPackageRequest(run_id="nope", ref="F1"))["ok"])
         self.assertFalse(self.rt.build_submission_package(g.SubmissionPackageRequest(run_id=self.run_id, ref="ZZ"))["ok"])
+
+    def test_source_api_key_test_writes_bundle_artifact_without_leaking_key(self) -> None:
+        raw = "sk-proj-" + ("G" * 32)
+        result = {
+            "ok": True,
+            "findings": [{
+                "ref": "F1", "title": "OpenAI API key", "severity": "high", "class_id": "secrets",
+                "class_name": "Secrets / exposed credentials", "cwe": "CWE-798", "location": "src/settings.py",
+                "rule_id": "secret.openai-key", "secret_value": raw,
+                "snippet": 'OPENAI_API_KEY = "[REDACTED_SECRET]"',
+            }],
+            "attack_plans": {"F1": {"steps": ["Inspect source"], "proof_of_impact": {"status": "candidate"}}},
+        }
+        self.rt._cache_bounty_run(result, target="src", scope="source", program="acme")
+        old_get_full = g.bounty_credential_validation._get_full
+        try:
+            g.bounty_credential_validation._get_full = lambda url, extra_headers=None: (
+                200, {}, '{"data":[{"id":"gpt-4o"}]}'
+            )
+            res = self.rt.test_source_credential(g.CredentialTestRequest(
+                run_id=result["run_id"], ref="F1", authorized=True))
+        finally:
+            g.bounty_credential_validation._get_full = old_get_full
+
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["status"], "confirmed")
+        self.assertIn("gpt-4o", res["artifact_text"])
+        self.assertNotIn(raw, json.dumps(res))
+        self.assertTrue(Path(res["path"]).is_file())
+
+        bundle = self.rt.export_bundle(g.BundleRequest(run_id=result["run_id"]))
+        self.assertTrue(bundle["ok"], bundle)
+        with zipfile.ZipFile(bundle["path"]) as zf:
+            names = zf.namelist()
+            txt_name = next(name for name in names if name.endswith("api-key-access.txt"))
+            body = zf.read(txt_name).decode("utf-8")
+        self.assertIn("API response returned by issuer", body)
+        self.assertIn("gpt-4o", body)
+        self.assertNotIn(raw, body)
 
     def test_submit_gate_is_server_authoritative(self) -> None:
         # No creds -> refuse.
