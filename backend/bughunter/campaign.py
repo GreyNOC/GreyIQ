@@ -362,7 +362,14 @@ def _run_campaign_body(
                             # where the finding lives (the URL), its CWE, rule id, and the canonical
                             # class_id (so an on-demand report gets class-specific reproduction steps).
                             "location": finding.get("location") or url, "cwe": finding.get("cwe"),
-                            "rule_id": finding.get("rule_id"), "class_id": finding.get("class_id")})
+                            "rule_id": finding.get("rule_id"), "class_id": finding.get("class_id"),
+                            # The ACTIVE proof itself — the observed-vs-control differential + evidence the
+                            # active pass already captured. Streaming it (not just the status STRING) lets the
+                            # drawer's "View full report" render a campaign-confirmed finding as CONFIRMED with
+                            # its proof, WITHOUT a manual re-verify: the report's confirmed gate needs the
+                            # captured artifact, which a bare status can't supply.
+                            "proof_detail": (doc.get("proof_of_impact") or {}).get(ref) or {},
+                            "proof_evidence": finding.get("proof_evidence") or None})
         # Stream this URL's findings live — attributed to the span's named target when
         # running under one, else to the URL itself (single-target campaign).
         progress.add_findings(progress_run_id, progress_unit or url, url_new)
