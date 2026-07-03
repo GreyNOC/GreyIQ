@@ -180,6 +180,11 @@ def run_campaign(
         recon_params = rec.get("params") or []
         # GraphQL-introspection (and future API-discovery) candidates, each with an inline plan.
         recon_api_findings = rec.get("api_findings") or []
+        recon_forms = rec.get("forms") or []
+        # Tech fingerprint hints are {class_id: reason} — host-global vuln classes the observed stack
+        # implies (Flask/Django/Next -> ssti; PHP/WordPress/ASP.NET -> rce; Angular -> xss; GraphQL ->
+        # graphql). Their class_ids steer the active check order alongside the brain's per-endpoint picks.
+        hint_classes = [c for c in (rec.get("hints") or {}).keys() if c]
 
         # Reasoning layer: let the configured brain read the mapped surface and propose
         # target-specific parameter NAMES the heuristics miss (e.g. returnUrl/callback on a login,
@@ -189,7 +194,7 @@ def run_campaign(
         # precision unchanged). Best-effort + fail-closed: no brain / any error keeps current behaviour.
         try:
             hb = hunt_brain.plan_hunt(coder_cfg, clean_target, scope,
-                                      {"endpoints": urls, "params": recon_params, "tech": recon_tech, "forms": []})
+                                      {"endpoints": urls, "params": recon_params, "tech": recon_tech, "forms": recon_forms})
             new_params = [p for p in (hb.get("param_hypotheses") or [])
                           if p.lower() not in {q.lower() for q in recon_params}]
             if new_params:
@@ -206,6 +211,13 @@ def run_campaign(
                 _emit(f"hunt-brain: prioritised probe classes on {len(hunt_priority)} endpoint(s)")
         except Exception:  # noqa: BLE001 - the reasoning layer must never break a hunt
             pass
+        # Merge the host-global tech-fingerprint hints into EVERY url's priority: the brain's
+        # per-endpoint classes come first (most specific), then the stack-implied hint classes,
+        # de-duped. URLs the brain didn't flag still get steered by the fingerprint alone. Pure
+        # reordering downstream (_apply_class_priority never creates a finding) — zero FP risk.
+        if hint_classes:
+            for u in urls:
+                hunt_priority[u] = list(dict.fromkeys((hunt_priority.get(u) or []) + hint_classes))
     else:
         urls = [clean_target]
         recon_notes, recon_sources = [], {}

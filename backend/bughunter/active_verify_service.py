@@ -770,7 +770,7 @@ def _context_excerpt(body: str, needle: str, pad: int = 140) -> str:
 
 
 def _check_reflected_xss(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
-    params = _candidate_params(url, extra_params, ("q",), 2)
+    params = _candidate_params(url, extra_params, ("q",), 3)
     marker_payload = f"{_MARK}<svg/onload=1>"
     for param in params:
         try:
@@ -802,8 +802,95 @@ def _check_reflected_xss(http: _Http, url: str, extra_params: list[str] | None =
     return None
 
 
-def _check_ssti(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
+def _in_script_context(body: str, idx: int) -> bool:
+    """True if position ``idx`` sits inside an OPEN ``<script>…</script>`` element — the nearest
+    script tag before it is an opening one with no intervening close. (Browsers terminate a script
+    element on a literal ``</script>`` even inside a JS string, so a reflected raw ``</script>`` here
+    is a real breakout.)"""
+    if idx < 0:
+        return False
+    before = body[:idx].lower()
+    open_i = before.rfind("<script")
+    return open_i >= 0 and open_i > before.rfind("</script>")
+
+
+def _in_double_quoted_attr(body: str, idx: int) -> bool:
+    """True if ``idx`` sits inside a double-quoted attribute value of an open HTML tag (an unclosed
+    ``<`` precedes it and an odd number of ``"`` lie between that ``<`` and ``idx``)."""
+    if idx < 0:
+        return False
+    before = body[:idx]
+    lt = before.rfind("<")
+    if lt < 0 or lt < before.rfind(">"):
+        return False  # not inside an open tag
+    return before[lt:].count('"') % 2 == 1  # odd quotes => currently inside a "…" value
+
+
+def _check_reflected_xss_context(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
+    """Reflected XSS in a JS-string or HTML-attribute context that the element-content check (which
+    needs a raw ``<svg/onload>``) cannot confirm: the app HTML-encodes ``<`` but leaves ``</script>``
+    or a ``"`` unescaped, so the payload still breaks out. Confirmed ONLY when the breakout chars
+    reflect UNENCODED *and* the reflection physically sits inside a ``<script>`` element / a double-
+    quoted attribute (verified from the surrounding syntax) — a real, browser-executable differential.
+    Runs after the element-content check, so it only spends budget when that one didn't fire."""
     params = _candidate_params(url, extra_params, ("q",), 2)
+    for param in params:
+        try:
+            control = http.fetch(_with_query(url, {param: _MARK}))
+        except _ActiveError:
+            continue
+        if _MARK not in (control.get("body") or ""):
+            continue  # the param is not echoed at all — nothing to break out of
+        # 1) JS-string context: a </script> breakout. The browser closes the script element even
+        #    inside a JS string literal, so whatever follows becomes live HTML.
+        js_payload = f"{_MARK}</script>"
+        try:
+            probe = http.fetch(_with_query(url, {param: js_payload}))
+        except _ActiveError:
+            continue
+        body = probe.get("body") or ""
+        ctype = (probe["headers"].get("content-type") or "").lower()
+        if not ((not ctype) or "html" in ctype or "xml" in ctype):
+            continue  # a reflection into JSON/plain text is not browser-executable
+        idx = body.find(js_payload)  # requires the raw </script> to survive un-encoded
+        if idx >= 0 and _in_script_context(body, idx):
+            proof = _proof(
+                "confirmed", method=f"GET with {param}={js_payload}", affected_asset="victim sessions/cookies and any action the victim can take",
+                observed_result=f"the '{param}' parameter reflected a raw '</script>' UNENCODED inside a <script> block — the script element is terminated and attacker markup follows (browser-executable XSS)",
+                control_result="a plain marker reflected too, confirming the param is echoed — the difference is the unescaped '</script>' breakout",
+                evidence="a literal </script> from the parameter appears inside a script element in the response",
+            )
+            ev = {"request_line": f"GET {_with_query(url, {param: js_payload})}", "response_status": f"HTTP {probe['status']}",
+                  "matched_value": "unescaped </script> breakout inside a <script> block",
+                  "read_data": _context_excerpt(body, js_payload)}
+            return _finding("active.reflected-xss", f"Reflected XSS via '{param}' (JavaScript-context breakout)", "high", "client_sink", "xss", url, proof, ev)
+        # 2) Attribute context: a double-quote breakout of a "…"-quoted attribute value.
+        attr_payload = f'{_MARK}"'
+        try:
+            aprobe = http.fetch(_with_query(url, {param: attr_payload + "x"}))
+        except _ActiveError:
+            continue
+        abody = aprobe.get("body") or ""
+        actype = (aprobe["headers"].get("content-type") or "").lower()
+        if not ((not actype) or "html" in actype or "xml" in actype):
+            continue
+        aidx = abody.find(attr_payload)  # the marker immediately followed by a RAW "
+        if aidx >= 0 and f"{_MARK}&quot;" not in abody and f"{_MARK}&#34;" not in abody and _in_double_quoted_attr(abody, aidx):
+            proof = _proof(
+                "confirmed", method=f'GET with {param}={attr_payload}x', affected_asset="victim sessions/cookies and any action the victim can take",
+                observed_result=f"the '{param}' parameter reflected a raw double-quote UNENCODED inside a double-quoted HTML attribute — the quote closes the attribute, allowing a new attribute/handler to be injected",
+                control_result="a plain marker reflected too, confirming the param is echoed — the difference is the unescaped '\"' that breaks out of the attribute",
+                evidence="a literal double-quote from the parameter closes the surrounding attribute value in the response",
+            )
+            ev = {"request_line": f"GET {_with_query(url, {param: attr_payload + 'x'})}", "response_status": f"HTTP {aprobe['status']}",
+                  "matched_value": "unescaped double-quote breakout of a quoted HTML attribute",
+                  "read_data": _context_excerpt(abody, attr_payload)}
+            return _finding("active.reflected-xss", f"Reflected XSS via '{param}' (attribute-context breakout)", "high", "client_sink", "xss", url, proof, ev)
+    return None
+
+
+def _check_ssti(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
+    params = _candidate_params(url, extra_params, ("q",), 3)
     # Probe the common template engines in ONE request — each 7*7 expression tagged with its OWN
     # adjacent marker so an evaluated 49 is unambiguous, attributable to the engine, and can't
     # coincide with page text. Covers Jinja/Twig, Freemarker/JSP-EL, ERB/EJS, Thymeleaf/Ruby.
@@ -847,7 +934,7 @@ def _check_rce_command_injection(http: _Http, url: str, extra_params: list[str] 
     control that is NOT substituted rules out a coincidental echo. GET-only; one marker per probe.
     This is the arithmetic-echo sibling of the SSTI check, for a shell context rather than a
     template engine — the safe way to prove RCE without executing a real payload."""
-    params = _candidate_params(url, extra_params, ("cmd", "exec", "ping", "host", "ip", "query", "q"), 2)
+    params = _candidate_params(url, extra_params, ("cmd", "exec", "ping", "host", "ip", "query", "q"), 3)
     # BOTH substitution forms ($(...) and backticks) ride in ONE probe, each behind its own
     # marker — so this check costs exactly what SSTI does: one control + one probe per param.
     sig_dollar, sig_tick = f"{_MARK}D222", f"{_MARK}T222"
@@ -886,34 +973,47 @@ def _check_rce_command_injection(http: _Http, url: str, extra_params: list[str] 
     return None
 
 
+# Quote-break variants: a single quote breaks a '…' string literal; a double quote breaks a "…"
+# literal (common in MySQL/MSSQL and quoted identifiers); a lone backslash can break an escaped-
+# string context. Each is a benign one-character perturbation — the DB-error-banner-only gate keeps
+# every variant false-positive-proof (a generic stack trace never confirms; only a real DB banner).
+_SQLI_QUOTE_VARIANTS: tuple[tuple[str, str], ...] = (("'", "a single quote"), ('"', "a double quote"), ("\\", "a backslash"))
+
+
 def _check_error_sqli(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
     parsed = urlparse(url)
-    params = _candidate_params(url, extra_params, (), 2)
+    params = _candidate_params(url, extra_params, (), 3)
     if not params:
         return None  # need a URL or recon-discovered param to perturb; never invent one blindly
     for param in params:
         original = dict(parse_qsl(parsed.query, keep_blank_values=True)).get(param, "1")
         try:
-            probe = http.fetch(_with_query(url, {param: original + "'"}))
-            control = http.fetch(_with_query(url, {param: original}))
+            control = http.fetch(_with_query(url, {param: original}))  # unmodified baseline, once per param
         except _ActiveError:
             continue
-        body, ctrl_body = probe.get("body") or "", control.get("body") or ""
-        # SQL-ONLY signature: a generic Python/PHP/Java stack trace from a broken
-        # quote is NOT SQL injection. Only a real database error banner confirms.
-        sql_hit = _SQL_ERROR_RE.search(body)
-        ctrl_matched = bool(_SQL_ERROR_RE.search(ctrl_body))
-        if sql_hit and not ctrl_matched:
-            proof = _proof(
-                "confirmed", method=f"GET with {param}={original}' (a single quote)", affected_asset="the database reachable by the query's role",
-                observed_result=f"appending a single quote to '{param}' produced a SQL database error in the response",
-                control_result="the unmodified parameter returned no SQL error — the quote broke the query",
-                evidence="a SQL error banner (SQLSTATE/ORA-/SQL syntax) surfaced after the injected quote",
-            )
-            ev = {"request_line": f"GET {_with_query(url, {param: original + chr(39)})}", "response_status": f"HTTP {probe['status']}",
-                  "matched_value": "SQL database error banner surfaced by the injected quote",
-                  "read_data": _context_excerpt(body, sql_hit.group(0))}  # the actual DB error text in the response
-            return _finding("active.sqli-error", f"SQL error elicited via '{param}' (probable SQL injection)", "high", "disclosure", "sqli", url, proof, ev)
+        ctrl_body = control.get("body") or ""
+        if _SQL_ERROR_RE.search(ctrl_body):
+            continue  # the unmodified response already carries a SQL banner -> not perturbation-driven
+        for payload, shown in _SQLI_QUOTE_VARIANTS:
+            try:
+                probe = http.fetch(_with_query(url, {param: original + payload}))
+            except _ActiveError:
+                break  # out of budget for this param — move on
+            body = probe.get("body") or ""
+            # SQL-ONLY signature: a generic Python/PHP/Java stack trace from a broken quote is NOT SQL
+            # injection. Only a real database error banner (absent from the control) confirms.
+            sql_hit = _SQL_ERROR_RE.search(body)
+            if sql_hit:
+                proof = _proof(
+                    "confirmed", method=f"GET with {param}={original}{payload} ({shown})", affected_asset="the database reachable by the query's role",
+                    observed_result=f"appending {shown} to '{param}' produced a SQL database error in the response",
+                    control_result="the unmodified parameter returned no SQL error — the perturbation broke the query",
+                    evidence="a SQL error banner (SQLSTATE/ORA-/SQL syntax) surfaced after the injected character",
+                )
+                ev = {"request_line": f"GET {_with_query(url, {param: original + payload})}", "response_status": f"HTTP {probe['status']}",
+                      "matched_value": f"SQL database error banner surfaced by the injected {shown}",
+                      "read_data": _context_excerpt(body, sql_hit.group(0))}  # the actual DB error text in the response
+                return _finding("active.sqli-error", f"SQL error elicited via '{param}' (probable SQL injection)", "high", "disclosure", "sqli", url, proof, ev)
     return None
 
 
@@ -934,7 +1034,7 @@ def _check_nosqli(http: _Http, url: str, extra_params: list[str] | None = None) 
     a NoSQL injection point (e.g. Mongoose casting {$ne:...} to a typed field). High precision,
     mirroring the SQL-error check; a generic stack trace never confirms."""
     parsed = urlparse(url)
-    params = _candidate_params(url, extra_params, (), 2)
+    params = _candidate_params(url, extra_params, (), 3)
     if not params:
         return None  # need a URL or recon-discovered param; never invent an injection point
     base_q = dict(parse_qsl(parsed.query, keep_blank_values=True))
@@ -996,9 +1096,15 @@ def _check_bool_sqli(http: _Http, url: str, extra_params: list[str] | None = Non
         # Page must be STABLE (two unmodified reads near-identical) to be differentiable.
         if abs(b1 - b2) > max(8, ref * 0.02):
             continue  # dynamic page — not safely confirmable here
-        true_tracks = abs(tl - b1) <= max(8, ref * 0.02)
-        false_diverges = abs(fl - b1) > max(24, ref * 0.05)
-        if not (true_tracks and false_diverges):
+        tight, loose = max(8, ref * 0.02), max(24, ref * 0.05)
+        # A real boolean bit makes TRUE and FALSE produce DIFFERENT pages, ONE of which matches the
+        # stable baseline. NORMAL polarity: the baseline is the TRUE result (TRUE tracks, FALSE
+        # diverges). INVERSE polarity: the baseline is the empty/FALSE result (FALSE tracks, TRUE
+        # diverges) — the identical real bug on an endpoint that returns nothing by default, which the
+        # old TRUE-only gate silently dropped. The two are mutually exclusive (tight < loose).
+        normal = abs(tl - b1) <= tight and abs(fl - b1) > loose
+        inverse = abs(fl - b1) <= tight and abs(tl - b1) > loose
+        if not (normal or inverse):
             continue
         # Reject an INFRASTRUCTURE differential masquerading as a DB boolean: a WAF/error
         # page of a different length satisfies the length test without any DB involvement.
@@ -1008,26 +1114,28 @@ def _check_bool_sqli(http: _Http, url: str, extra_params: list[str] | None = Non
             continue
         if _SQL_ERROR_RE.search(f_resp.get("body") or "") or _SQL_ERROR_RE.search(t_resp.get("body") or ""):
             continue
-        # Second confirmation pass: the TRUE/FALSE divergence must REPRODUCE in the same
-        # direction, ruling out a coincidental one-off length flap (cache, rotating ad,
-        # per-request token) that happened to look like a boolean.
+        # Second confirmation pass: the divergence must REPRODUCE in the SAME direction, ruling out a
+        # coincidental one-off length flap (cache, rotating ad, per-request token).
         try:
             t2 = http.fetch(_with_query(url, {param: original + "' AND '1'='1"}))
             f2 = http.fetch(_with_query(url, {param: original + "' AND '1'='2"}))
         except _ActiveError:
             continue
         tl2, fl2 = _norm_len(t2.get("body") or ""), _norm_len(f2.get("body") or "")
-        if not (abs(tl2 - b1) <= max(8, ref * 0.02) and abs(fl2 - b1) > max(24, ref * 0.05)):
-            continue  # divergence did not reproduce — not safely confirmable
+        reproduced = (abs(tl2 - b1) <= tight and abs(fl2 - b1) > loose) if normal else (abs(fl2 - b1) <= tight and abs(tl2 - b1) > loose)
+        if not reproduced:
+            continue  # divergence did not reproduce in the same direction — not safely confirmable
+        tracking, diverging = ("TRUE", "FALSE") if normal else ("FALSE", "TRUE")
+        div_len = fl if normal else tl
         proof = _proof(
             "confirmed", method=f"GET with {param}=...' AND '1'='1 vs ...' AND '1'='2 (reproduced twice)",
             affected_asset="the database reachable by the query's role (boolean-inferable)",
-            observed_result=f"the TRUE condition returned a page matching the stable baseline (~{b1} chars) while the FALSE condition diverged (~{fl} chars), reproduced on a second pass",
-            control_result=f"two unmodified requests returned near-identical pages (~{b1}/{b2} chars), both TRUE/FALSE were 200 with no SQL-error banner, so the difference tracks the injected boolean — not a WAF/error page",
-            evidence=f"normalized lengths baseline={b1}/{b2}, TRUE={tl}/{tl2}, FALSE={fl}/{fl2}",
+            observed_result=f"the {tracking} condition returned a page matching the stable baseline (~{b1} chars) while the {diverging} condition diverged (~{div_len} chars), reproduced on a second pass",
+            control_result=f"two unmodified requests returned near-identical pages (~{b1}/{b2} chars), both conditions were 200 with no SQL-error banner, so the difference tracks the injected boolean — not a WAF/error page",
+            evidence=f"normalized lengths baseline={b1}/{b2}, TRUE={tl}/{tl2}, FALSE={fl}/{fl2} ({'normal' if normal else 'inverse'} polarity)",
         )
         ev = {"request_line": f"GET {_with_query(url, {param: original + chr(39) + ' AND ' + chr(39) + '1' + chr(39) + '=' + chr(39) + '2'})}",
-              "response_status": f"HTTP {f_resp['status']}", "matched_value": f"FALSE page diverged by {abs(fl - b1)} chars from a stable baseline"}
+              "response_status": f"HTTP {t_resp['status']}", "matched_value": f"{diverging} page diverged by {abs(div_len - b1)} chars from a stable baseline"}
         return _finding("active.sqli-boolean", f"Boolean-based blind SQL injection via '{param}'", "high", "disclosure", "sqli", url, proof, ev)
     return None
 
@@ -1768,6 +1876,9 @@ def verify_active(
         ("redirect", lambda: _check_open_redirect(http, sanitized, discovered_params)),
         ("host-header", lambda: _check_host_header(http, sanitized)),
         ("xss", lambda: _check_reflected_xss(http, sanitized, discovered_params)),
+        # Context-aware XSS runs right after the element-content check — catches the JS-string /
+        # attribute breakouts that check structurally can't confirm, spending budget only if it didn't fire.
+        ("xss", lambda: _check_reflected_xss_context(http, sanitized, discovered_params)),
         ("ssti", lambda: _check_ssti(http, sanitized, discovered_params)),
         # OS command injection via benign $(expr) shell substitution — arithmetic only, no real
         # command runs. Sits next to SSTI (both are safe arithmetic-echo injection probes) and

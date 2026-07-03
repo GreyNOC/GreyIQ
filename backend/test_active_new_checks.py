@@ -546,6 +546,51 @@ class TimeBasedRceTests(unittest.TestCase):
         self.assertIsNone(av._check_time_rce(_Waf(), "https://app.example.com/run?cmd=1", settings=_RceTimingSettings()))
 
 
+class ContextXssTests(unittest.TestCase):
+    """Context-aware reflected XSS: confirms a JS-string </script> breakout or a double-quoted-
+    attribute " breakout, but stays SILENT when the breakout char is encoded or the reflection
+    isn't in an executable context (no false positives)."""
+
+    def _stub(self, render):
+        class S:
+            auth = None
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                val = dict(parse_qs(urlparse(url).query)).get("q", [""])[0]
+                return {"status": 200, "headers": {"content-type": "text/html"}, "cookies": [],
+                        "body": render(val), "location": None, "final_url": url}
+        return S()
+
+    def test_js_context_breakout_confirms(self) -> None:
+        f = av._check_reflected_xss_context(self._stub(lambda v: f"<html><script>var x='{v}';</script></html>"),
+                                            "https://app.example.com/p?q=x")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertIn("JavaScript-context", f["title"])
+
+    def test_attribute_context_breakout_confirms(self) -> None:
+        f = av._check_reflected_xss_context(self._stub(lambda v: f'<html><input value="{v}"></html>'),
+                                            "https://app.example.com/p?q=x")
+        self.assertIsNotNone(f)
+        self.assertIn("attribute-context", f["title"])
+
+    def test_script_close_in_html_body_is_not_confirmed(self) -> None:
+        # </script> reflected in a <div>, NOT inside a script element -> not executable -> no FP
+        self.assertIsNone(av._check_reflected_xss_context(
+            self._stub(lambda v: f"<html><div>{v}</div></html>"), "https://app.example.com/p?q=x"))
+
+    def test_encoded_breakout_is_not_confirmed(self) -> None:
+        import html as _h  # app HTML-encodes < and " -> no raw breakout survives -> no FP
+        self.assertIsNone(av._check_reflected_xss_context(
+            self._stub(lambda v: f"<html><script>var x='{_h.escape(v)}';</script></html>"),
+            "https://app.example.com/p?q=x"))
+
+    def test_context_helpers(self) -> None:
+        self.assertTrue(av._in_script_context("<script>abc", 9))       # inside an open script
+        self.assertFalse(av._in_script_context("<script>a</script>b", 18))  # after the close
+        self.assertTrue(av._in_double_quoted_attr('<input value="ab', 15))  # inside a "…" value
+        self.assertFalse(av._in_double_quoted_attr("<div>ab", 6))      # not inside a tag
+
+
 class ClassPriorityReorderTests(unittest.TestCase):
     """The reasoning layer's per-endpoint class priorities steer the active pass — it only reorders
     checks (never adds/removes), so a prioritised class gets request-budget priority."""

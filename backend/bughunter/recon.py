@@ -220,6 +220,7 @@ def discover(
     js_secrets: list[dict[str, Any]] = []
     tech: list[str] = []
     hints: dict[str, str] = {}
+    forms_out: list[dict[str, Any]] = []  # structured in-scope forms (action/method/fields) for the reasoning layer
     dropped_oos = 0
     js_done: set[str] = set()
 
@@ -357,10 +358,14 @@ def discover(
         for form in _extract_forms(body, final):
             params.update(form["params"])
             action = form["action"]
-            if action in seen:
-                continue
             if not in_scope(action):
                 dropped_oos += 1
+                continue
+            # Record the in-scope form (action + method + fields) for the reasoning layer, even if
+            # its action URL was already discovered — the brain reasons about the form's shape.
+            if len(forms_out) < 30 and not any(f["action"] == action for f in forms_out):
+                forms_out.append({"action": action, "method": form["method"], "params": form["params"]})
+            if action in seen:
                 continue
             seen.add(action); discovered.append(action)
             sources["form"] = sources.get("form", 0) + 1
@@ -481,6 +486,6 @@ def discover(
         "urls": discovered[:max_pages], "host": host, "sources": sources, "notes": notes,
         "endpoints": [u for u in discovered if u != sanitized][:max_pages],
         "params": sorted(params)[:60], "js_secrets": js_secrets, "tech": tech, "hints": hints,
-        "api_findings": api_findings,
+        "forms": forms_out, "api_findings": api_findings,
         "dropped_out_of_scope": dropped_oos, "requests_used": used["n"],
     }

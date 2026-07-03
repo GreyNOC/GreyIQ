@@ -1261,7 +1261,23 @@ def run_bounty_hunt(
             if not isinstance(finding, dict) or finding.get("_credential_proof") is not None:
                 continue
             key = str(finding.get("secret_value") or "").strip()
-            if str(finding.get("rule_id") or "") == "secret.google-api-key" and credential_validation.is_google_api_key(key):
+            rule_id = str(finding.get("rule_id") or "")
+            # Non-Google credentials: prove liveness the same benign way — one read-only GET to the
+            # token's OWN issuer (never the target), turning a detection-only leak into a proven one.
+            if rule_id in ("secret.github-pat", "secret.slack-bot-token") and key:
+                validator = (credential_validation.validate_github_token if rule_id == "secret.github-pat"
+                             else credential_validation.validate_slack_token)
+                try:
+                    finding["_credential_proof"] = proof = validator(key)
+                except Exception as exc:  # noqa: BLE001 - liveness check is best-effort; never break a hunt
+                    _emit(f"credential validation error: {exc}")
+                    continue
+                label = finding.get("variable_name") or rule_id.split(".")[-1]
+                live = proof.get("live")
+                _emit(f"validated {label}: " + ("LIVE — " + (proof.get("principal") or "?") if live
+                                                else "not live" if live is False else "inconclusive"))
+                continue
+            if rule_id == "secret.google-api-key" and credential_validation.is_google_api_key(key):
                 try:
                     proof = credential_validation.validate_firebase_key(key)
                 except Exception as exc:  # noqa: BLE001

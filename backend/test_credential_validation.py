@@ -82,6 +82,41 @@ class ValidatorInterpretationTests(unittest.TestCase):
         self.assertEqual(cv._get("https://evil.example.com/x?key=1")[0], 0)
 
 
+class TokenLivenessTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        import importlib
+        importlib.reload(cv)  # restore the real _get_full after monkeypatching
+
+    def test_github_token_live_names_account_and_scopes(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (200, {"X-OAuth-Scopes": "repo, read:org"}, '{"login":"octocat"}')
+        r = cv.validate_github_token("ghp_" + "A" * 36)
+        self.assertIs(r["live"], True)
+        self.assertEqual(r["principal"], "octocat")           # the account it controls
+        self.assertIn("repo", r["scopes"])                    # what it grants
+        self.assertIn("api.github.com/user", r["poc"])        # runnable PoC to the issuer
+
+    def test_github_token_dead(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (401, {}, '{"message":"Bad credentials"}')
+        self.assertIs(cv.validate_github_token("ghp_bad")["live"], False)
+
+    def test_slack_token_live_names_workspace(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (200, {}, '{"ok":true,"team":"acme-corp","user":"deploybot"}')
+        r = cv.validate_slack_token("xoxb-1-1")
+        self.assertIs(r["live"], True)
+        self.assertIn("acme-corp", r["principal"])
+
+    def test_slack_token_dead(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (200, {}, '{"ok":false,"error":"invalid_auth"}')
+        self.assertIs(cv.validate_slack_token("xoxb-bad")["live"], False)
+
+    def test_new_issuer_hosts_allowlisted_others_blocked(self) -> None:
+        self.assertTrue(cv._host_allowed("api.github.com"))
+        self.assertTrue(cv._host_allowed("slack.com"))
+        self.assertFalse(cv._host_allowed("evil.example.com"))
+        # a token is only ever sent to its allowlisted issuer — never an arbitrary host
+        self.assertEqual(cv._get_full("https://evil.example.com/steal")[0], 0)
+
+
 class SecretCaptureTests(unittest.TestCase):
     def test_variable_name_and_raw_value_captured(self) -> None:
         f = list(_GOOGLE_RULE.scan(path="src/fb.js", text=f'const apiKey = "{_KEY}";'))[0]
@@ -145,6 +180,17 @@ class CredentialReportTests(unittest.TestCase):
     def test_live_credential_reads_as_confirmed(self) -> None:
         body = self._render({"checked": True, "live": True, "project_id": "p", "detail": "LIVE", "http_status": 200})
         self.assertRegex(body, r"(?i)status:\*\*\s*Confirmed")
+
+    def test_report_renders_github_token_account_scopes_and_confirmed(self) -> None:
+        body = self._render({"checked": True, "live": True, "principal": "octocat", "scopes": "repo, read:org",
+                             "detail": "LIVE — GitHub account octocat", "http_status": 200,
+                             "endpoint": "GitHub api.github.com/user",
+                             "poc": "curl -s -H 'Authorization: Bearer ghp_XXX' https://api.github.com/user",
+                             "response_excerpt": '{"login":"octocat"}'})
+        self.assertIn("octocat", body)                          # the account the token controls
+        self.assertIn("repo, read:org", body)                  # granted scopes
+        self.assertIn("api.github.com/user", body)             # runnable PoC + generic issuer wording
+        self.assertRegex(body, r"(?i)status:\*\*\s*Confirmed")  # a live token is a confirmed finding
 
     def test_dead_credential_is_shown_but_not_confirmed(self) -> None:
         body = self._render({"checked": True, "live": False, "detail": "NOT live", "http_status": 400})
