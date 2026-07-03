@@ -180,6 +180,9 @@ def _location(finding: dict[str, Any]) -> str:
     loc = str(finding.get("location") or finding.get("file_path") or "")
     line = finding.get("line") or finding.get("line_start")
     if line and str(line) not in loc:
+        end = finding.get("line_end")
+        if end and end != line:  # a multi-line sink renders as a range, not just the first line
+            return f"{loc}:{line}-{end}"
         return f"{loc}:{line}"
     return loc
 
@@ -611,7 +614,7 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
         cls = str(finding.get("class_id") or "").lower()
         rid = str(finding.get("rule_id") or "").lower()
         _DISCLOSURE = ("disclosure", "cloud-exposure")
-        _DISCLOSURE_RID = ("traversal", "exposed", "firebase", "graphql", "bucket", "sensitive")
+        _DISCLOSURE_RID = ("traversal", "exposed", "firebase", "graphql", "bucket", "sensitive", "jwt")
         if cls == "cors" or "cors" in rid:
             heading = (
                 "**Demonstrated cross-origin read** — a request carrying the victim's authenticated "

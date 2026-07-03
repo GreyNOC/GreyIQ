@@ -593,7 +593,11 @@ def _check_open_redirect(http: _Http, url: str, extra_params: list[str] | None =
                     control_result=f"a same-origin '{param}' value redirected to {ctrl_loc or '(same origin)'} — the external host is attacker-supplied",
                     evidence=f"Location: {location}",
                 )
-                ev = {"request_line": f"GET {_with_query(url, {param: _MARKER_ORIGIN + '/'})}", "response_status": f"HTTP {probe['status']}", "matched_value": f"Location: {location}"}
+                ev = {"request_line": f"GET {_with_query(url, {param: _MARKER_ORIGIN + '/'})}", "response_status": f"HTTP {probe['status']}",
+                      # The off-host Location IS the proof — emit it as a real response-header line (wire
+                      # order) so the reconstructed response shows it as a header, not only prose.
+                      "response_header": f"Location: {location.strip()}"[:300],
+                      "matched_value": f"redirect target {loc_host} (off-host) in the Location header"}
                 return _finding("active.open-redirect", f"Open redirect via '{param}' parameter", "medium", "redirect", "redirect", url, proof, ev)
     return None
 
@@ -1243,6 +1247,11 @@ def _check_open_bucket(http: _Http, landing: dict[str, Any] | None, scope: str, 
                 control_result="a locked bucket returns 403/AccessDenied — this one listed its contents to an unauthenticated request",
                 evidence="anonymous ListBucketResult with object keys",
             )
+            # NOTE: object keys are deliberately NOT echoed as read_data — unlike other disclosure
+            # checks (which capture the TARGET's own data), a bucket listing is a third party's file
+            # NAMES, which can themselves be sensitive. The structural match + control differential +
+            # reconstructed request/response prove the anonymous listing without leaking the keys; a
+            # triager reproduces the full listing with the request line shown above.
             ev = {"request_line": f"GET {list_url}", "response_status": f"HTTP {status}", "matched_value": "public ListBucketResult (object keys redacted)"}
             return _finding("active.open-bucket", "Public cloud bucket (anonymous listing)", "high", "disclosure", "cloud-exposure", bucket_url, proof, ev)
         if denied and denied_finding is None:
@@ -1382,6 +1391,12 @@ def _check_jwt_alg_none(http: _Http, url: str) -> dict[str, Any] | None:
                 "response_status": f"HTTP {probe['status']}",
                 "matched_value": "unsigned token accepted as authenticated",
             }
+            # The authenticated response the forged token unlocked — the concrete data an attacker
+            # reads once signature verification is bypassed. Guarded so a trivially-empty body is
+            # not rendered; _finding() redacts it once.
+            auth_body = str(probe.get("body") or "")
+            if len(auth_body.strip()) >= 8:
+                ev["read_data"] = auth_body[:1200]
             return _finding(
                 "active.jwt-alg-none", "JWT alg:none accepted (signature verification bypass)",
                 "critical", "jwt", "jwt", url, proof, ev,

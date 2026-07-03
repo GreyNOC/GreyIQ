@@ -223,6 +223,14 @@ def _graphql_finding(gql_url: str, info: dict[str, Any]) -> dict[str, Any]:
             "response_status": "200 with data.__schema",
             "matched_value": (f"GraphQL introspection returned the full schema ({info.get('type_count', 0)} types; "
                               f"queryType {info.get('query_type') or '?'}, mutationType {info.get('mutation_type') or '—'})"),
+            # The verbatim disclosed schema (the concrete data introspection leaks) — rendered as the
+            # demonstrated-disclosure excerpt, not just a count.
+            "read_data": (
+                f"queryType: {info.get('query_type') or '?'}\n"
+                f"mutationType: {info.get('mutation_type') or '—'}\n"
+                f"Types ({info.get('type_count', 0)} total, sample of {len(info.get('types') or [])}): "
+                + ", ".join(info.get("types") or [])
+            ),
         },
     }
     finding["_plan"] = {
