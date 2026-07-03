@@ -338,17 +338,23 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
     if isinstance(cred, dict) and cred.get("live") is True:
         project = str(cred.get("project_id") or "").strip()
         domains = [str(d) for d in (cred.get("authorized_domains") or []) if str(d).strip()]
-        asset = (f"Firebase project '{project}'" if project else "the Firebase/Google project the key authenticates to")
-        if domains:
-            asset += f" (authorized domains: {', '.join(domains[:20])})"
+        principal = str(cred.get("principal") or "").strip()
+        scopes = str(cred.get("scopes") or "").strip()
+        endpoint = str(cred.get("endpoint") or "the credential's own issuer").strip()
+        if project:  # Firebase / Google key
+            asset = f"Firebase project '{project}'" + (f" (authorized domains: {', '.join(domains[:20])})" if domains else "")
+        elif principal:  # GitHub / Slack token — the account/workspace it controls
+            asset = f"the account/workspace the token controls: {principal}" + (f" (scopes: {scopes})" if scopes else "")
+        else:
+            asset = "the account/project the credential authenticates to"
         return {
             "status": "confirmed", "ready": True,
-            "method": "benign read-only GET to the credential's issuer (Google Identity Toolkit getProjectConfig), carrying only the found key",
-            "actor": "an unauthenticated attacker holding the leaked key",
+            "method": f"benign read-only GET to the credential's issuer ({endpoint}), carrying only the found credential",
+            "actor": "an unauthenticated attacker holding the leaked credential",
             "affected_asset": asset,
-            "observed_result": f"the leaked key authenticated successfully (HTTP {cred.get('http_status', '?')})"
-                               + (f" to Firebase project '{project}'" if project else ""),
-            "control_result": "an invalid/revoked key is rejected by the same endpoint (API_KEY_INVALID) — this key is genuinely live",
+            "observed_result": f"the leaked credential authenticated successfully (HTTP {cred.get('http_status', '?')})"
+                               + (f" to Firebase project '{project}'" if project else (f" as {principal}" if principal else "")),
+            "control_result": "an invalid/revoked credential is rejected by the same endpoint — this credential is genuinely live",
             "evidence": str(cred.get("detail") or "").strip(),
             "limitations": "", "proof_obligation": "",
         }
@@ -527,16 +533,21 @@ def _append_credential_proof(out: list[str], finding: dict[str, Any]) -> None:
         domains = proof.get("authorized_domains") or []
         if domains:
             out.append(f"- **Authorized domains:** {_code(', '.join(str(d) for d in domains))}")
+        if str(proof.get("principal") or "").strip():  # GitHub account / Slack workspace the token controls
+            out.append(f"- **Account / workspace:** {_code(str(proof['principal']))}")
+        if str(proof.get("scopes") or "").strip():
+            out.append(f"- **Granted scopes:** {_code(str(proof['scopes']))}")
+        issuer = str(proof.get("endpoint") or "the credential's own issuer").strip()
         out.append("- **How it was validated:** a benign, read-only GET to the credential's own issuer "
-                   f"(Google Identity Toolkit `getProjectConfig`) carrying only the found key — HTTP {proof.get('http_status', '?')}. "
+                   f"(`{issuer}`) carrying only the found credential — HTTP {proof.get('http_status', '?')}. "
                    "No target request, no data touched.")
         # Runnable PoC + the ACTUAL issuer response — the reproducible command a triager runs and the
-        # captured artifact proving the key is live and what it reveals (not prose). The command carries
-        # the real key on purpose (this whole block is already flagged sensitive); the response is redacted.
+        # captured artifact proving the credential is live and what it reveals (not prose). The command
+        # carries the real value on purpose (this block is already flagged sensitive); response redacted.
         poc = str(proof.get("poc") or "").strip()
         if poc:
             out.append("")
-            out.append("**Proof of concept — reproduce liveness (one benign, read-only GET to Google, never the target):**\n")
+            out.append("**Proof of concept — reproduce liveness (one benign, read-only GET to the issuer, never the target):**\n")
             out.append("```bash")
             out.append(poc)
             out.append("```")

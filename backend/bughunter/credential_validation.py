@@ -23,12 +23,13 @@ import urllib.request
 from typing import Any
 from urllib.parse import quote, urlparse
 
-# Only Google/Firebase infrastructure is ever contacted — a fixed host allowlist + the *.firebaseio.com
-# Realtime-Database suffix. The project id is derived from Google's OWN getProjectConfig response, so
-# even that dynamic host can only ever be Google's RTDB — never a target- or attacker-controlled host.
+# Only a credential ISSUER's own infrastructure is ever contacted — a fixed host allowlist (+ the
+# *.firebaseio.com RTDB suffix). Each dynamic host (Firebase project id) is derived from the issuer's
+# OWN response, so it can only ever be the issuer's infra — never a target- or attacker-controlled host.
 _ALLOWED_HOSTS = frozenset({
     "www.googleapis.com", "identitytoolkit.googleapis.com",
     "firestore.googleapis.com", "firebasestorage.googleapis.com",
+    "api.github.com", "slack.com",  # issuers for GitHub PAT / Slack token liveness checks
 })
 _ALLOWED_SUFFIXES = (".firebaseio.com",)
 _TIMEOUT_S = 8
@@ -57,23 +58,34 @@ def is_google_api_key(value: str) -> bool:
     return bool(_GOOGLE_KEY_RE.match(str(value or "").strip()))
 
 
-def _get(url: str) -> tuple[int, str]:
-    """GET a URL on the Google/Firebase allowlist and return (status, body). Never raises."""
-    if not _host_allowed(urlparse(url).hostname or ""):  # only Google/Firebase infra is contactable
-        return 0, "host not allowlisted"
-    req = urllib.request.Request(url, method="GET", headers={"User-Agent": _UA, "Accept": "application/json"})
+def _get_full(url: str, extra_headers: dict[str, str] | None = None) -> tuple[int, dict[str, str], str]:
+    """GET a URL on the issuer allowlist and return (status, response_headers, body). Never raises.
+    ``extra_headers`` carries the credential to its OWN issuer (e.g. an Authorization header) — the
+    only place a found token is ever transmitted, exactly as the leaking app already does."""
+    if not _host_allowed(urlparse(url).hostname or ""):  # only allowlisted issuer infra is contactable
+        return 0, {}, "host not allowlisted"
+    hdrs = {"User-Agent": _UA, "Accept": "application/json"}
+    if extra_headers:
+        hdrs.update(extra_headers)
+    req = urllib.request.Request(url, method="GET", headers=hdrs)
     try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:  # noqa: S310 - fixed https host, GET only
-            return int(getattr(resp, "status", 0) or 200), resp.read(_MAX_BYTES).decode("utf-8", "replace")
+            return int(getattr(resp, "status", 0) or 200), dict(resp.headers or {}), resp.read(_MAX_BYTES).decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         body = ""
         try:
             body = exc.read(_MAX_BYTES).decode("utf-8", "replace")
         except Exception:  # noqa: BLE001
             pass
-        return int(exc.code or 0), body
+        return int(exc.code or 0), dict(getattr(exc, "headers", {}) or {}), body
     except Exception as exc:  # noqa: BLE001 - network/DNS/timeout -> inconclusive, never fatal
-        return 0, f"{type(exc).__name__}: {exc}"
+        return 0, {}, f"{type(exc).__name__}: {exc}"
+
+
+def _get(url: str) -> tuple[int, str]:
+    """GET a URL on the issuer allowlist and return (status, body). Never raises."""
+    status, _headers, body = _get_full(url)
+    return status, body
 
 
 _DEAD_MARKERS = ("api key not valid", "api_key_invalid", "keyinvalid", "invalid api key")
@@ -201,3 +213,80 @@ def probe_firebase_exposure(project: str, key: str = "") -> list[dict[str, Any]]
             "repro": f"curl -s 'https://firebasestorage.googleapis.com/v0/b/{project}.appspot.com/o'",
         })
     return findings
+
+
+def _credential_result(endpoint: str) -> dict[str, Any]:
+    """The shared shape every issuer-liveness check returns (parallels validate_firebase_key)."""
+    return {"checked": False, "live": None, "principal": "", "scopes": "", "detail": "",
+            "http_status": 0, "endpoint": endpoint, "poc": "", "response_excerpt": ""}
+
+
+def validate_github_token(token: str) -> dict[str, Any]:
+    """Validate a leaked GitHub token is live by identifying its own account — ONE benign, read-only
+    GET to api.github.com/user (the token's issuer, never the target). A 200 + a login proves it is
+    live and names the account; the ``X-OAuth-Scopes`` header names what it grants. 401/403 = dead."""
+    token = str(token or "").strip()
+    result = _credential_result("GitHub api.github.com/user")
+    if not token:
+        return result
+    result["poc"] = f"curl -s -H 'Authorization: Bearer {token}' https://api.github.com/user"
+    status, headers, body = _get_full("https://api.github.com/user",
+                                      {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
+    result["checked"] = True
+    result["http_status"] = status
+    result["response_excerpt"] = body[:700]
+    if status == 200:
+        try:
+            data = json.loads(body)
+        except ValueError:
+            data = {}
+        login = str(data.get("login") or "").strip()
+        scopes = str(headers.get("X-OAuth-Scopes") or headers.get("x-oauth-scopes") or "").strip()
+        result.update(live=True, principal=login, scopes=scopes)
+        result["detail"] = (
+            f"LIVE — the token authenticates to GitHub account '{login or '(unknown)'}'"
+            + (f" with scopes: {scopes}" if scopes else "")
+            + ". It can act on every repository and resource those scopes grant (read/write code, "
+              "secrets, and org resources depending on scope) as that account."
+        )
+        return result
+    if status in (401, 403):
+        result.update(live=False)
+        result["detail"] = f"NOT live — GitHub rejected the token (HTTP {status})."
+        return result
+    result["detail"] = f"Inconclusive (HTTP {status or 'no response'}) — validate manually within scope."
+    return result
+
+
+def validate_slack_token(token: str) -> dict[str, Any]:
+    """Validate a leaked Slack token is live via auth.test — ONE benign, read-only GET to slack.com
+    (the token's issuer, never the target). ``ok:true`` + a team/user proves it is live and names the
+    workspace it belongs to; ``invalid_auth``/``token_revoked`` = dead."""
+    token = str(token or "").strip()
+    result = _credential_result("Slack auth.test")
+    if not token:
+        return result
+    result["poc"] = f"curl -s -H 'Authorization: Bearer {token}' https://slack.com/api/auth.test"
+    status, _headers, body = _get_full("https://slack.com/api/auth.test", {"Authorization": f"Bearer {token}"})
+    result["checked"] = True
+    result["http_status"] = status
+    result["response_excerpt"] = body[:700]
+    try:
+        data = json.loads(body)
+    except ValueError:
+        data = {}
+    if status == 200 and isinstance(data, dict) and data.get("ok") is True:
+        team, user = str(data.get("team") or "").strip(), str(data.get("user") or "").strip()
+        result.update(live=True, principal=(f"{user} @ {team}".strip(" @") or "(unknown)"))
+        result["detail"] = (
+            f"LIVE — the token authenticates to Slack workspace '{team or '(unknown)'}' as '{user or '(unknown)'}'. "
+            "It can act on everything the token's scopes grant (read messages/files, post, etc.)."
+        )
+        return result
+    err = str((data or {}).get("error") or "").strip()
+    if err in ("invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired"):
+        result.update(live=False)
+        result["detail"] = f"NOT live — Slack rejected the token ({err})."
+        return result
+    result["detail"] = f"Inconclusive (HTTP {status}; {err or 'no ok field'}) — validate manually within scope."
+    return result
