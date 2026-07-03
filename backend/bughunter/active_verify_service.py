@@ -355,12 +355,18 @@ class _Http:
                         return consumed
                 except HTTPError as exc:
                     # A 3xx (captured, not followed) or 4xx/5xx is a valid observation
-                    # from the server -- never retried.
-                    consumed = _consume(exc, self.settings)
-                    consumed["final_url"] = sanitized
-                    consumed["location"] = exc.headers.get("Location") if exc.headers else None
-                    consumed["elapsed"] = time.monotonic() - started
-                    return consumed
+                    # from the server -- never retried. HTTPError is itself a response object
+                    # holding a socket; several checks deliberately elicit 4xx/5xx (sensitive-
+                    # path/debug probes, error-SQLi, alg:none control), so close it or every
+                    # errored probe leaks an FD until GC.
+                    try:
+                        consumed = _consume(exc, self.settings)
+                        consumed["final_url"] = sanitized
+                        consumed["location"] = exc.headers.get("Location") if exc.headers else None
+                        consumed["elapsed"] = time.monotonic() - started
+                        return consumed
+                    finally:
+                        exc.close()
                 except (URLError, TimeoutError, OSError) as exc:
                     if attempt >= _MAX_FETCH_ATTEMPTS:
                         raise _ActiveError(str(exc)) from exc
@@ -646,9 +652,18 @@ def _check_csrf(landing: dict[str, Any] | None, url: str) -> dict[str, Any] | No
     )
     if not tokenless:
         return None
-    cookies = " ".join(str(c) for c in (landing.get("cookies") or [])).lower()
-    samesite_none = "samesite=none" in cookies
-    samesite_lax_strict = ("samesite=lax" in cookies) or ("samesite=strict" in cookies)
+    # Evaluate SameSite PER COOKIE on the session-looking cookie(s), not a global substring over all
+    # cookies joined: otherwise an unrelated SameSite=None tracker alongside a SameSite=Lax session
+    # cookie would defeat the "protected" skip and wrongly report CSRF on an actually-protected session.
+    raw_cookies = [str(c) for c in (landing.get("cookies") or [])]
+    _session_re = re.compile(r"(session|sess|sid|auth|token|jwt|login|user|connect\.sid|phpsessid|jsessionid|asp\.net)", re.IGNORECASE)
+    def _samesite(cookie: str) -> str:
+        m = re.search(r"samesite\s*=\s*(none|lax|strict)", cookie, re.IGNORECASE)
+        return m.group(1).lower() if m else ""
+    session_cookies = [c for c in raw_cookies if _session_re.search(c.split("=", 1)[0])]
+    consider = session_cookies or raw_cookies  # if no session cookie is identifiable, stay conservative over all
+    samesite_none = any(_samesite(c) == "none" for c in consider)          # a session cookie usable cross-site
+    samesite_lax_strict = any(_samesite(c) in ("lax", "strict") for c in consider)
     if samesite_lax_strict and not samesite_none:
         return None  # the session cookie is SameSite Lax/Strict -> cross-site POST blocked
     sev = "medium" if samesite_none else "low"
@@ -722,6 +737,16 @@ def _check_host_header(http: _Http, url: str) -> dict[str, Any] | None:
     return _finding("active.host-header-injection", "Host / X-Forwarded-Host reflected (host-header injection)", sev, "redirect", "redirect", url, proof, ev)
 
 
+def _context_excerpt(body: str, needle: str, pad: int = 140) -> str:
+    """A window of the response around ``needle`` — the payload IN CONTEXT (the actual reflected
+    HTML / evaluated expression / SQL error the server returned), which is the concrete proof a
+    triager wants instead of a prose description. Raw here; _finding() redacts it exactly once."""
+    idx = str(body or "").find(needle)
+    if idx < 0:
+        return ""
+    return body[max(0, idx - pad): idx + len(needle) + pad]
+
+
 def _check_reflected_xss(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
     params = _candidate_params(url, extra_params, ("q",), 2)
     marker_payload = f"{_MARK}<svg/onload=1>"
@@ -746,7 +771,11 @@ def _check_reflected_xss(http: _Http, url: str, extra_params: list[str] | None =
                 control_result=f"a plain marker reflected too, confirming '{param}' is echoed — the difference is the unescaped special characters",
                 evidence="reflected payload appears raw (not entity-encoded) in the response body",
             )
-            ev = {"request_line": f"GET {_with_query(url, {param: marker_payload})}", "response_status": f"HTTP {probe['status']}", "matched_value": "unescaped reflection of <svg/onload=...>"}
+            ev = {"request_line": f"GET {_with_query(url, {param: marker_payload})}", "response_status": f"HTTP {probe['status']}",
+                  "matched_value": "unescaped reflection of <svg/onload=...>",
+                  # The ACTUAL response excerpt showing the payload reflected raw into the HTML — the
+                  # concrete proof a triager needs, not just a description of it.
+                  "read_data": _context_excerpt(body, marker_payload)}
             return _finding("active.reflected-xss", f"Reflected XSS via '{param}' parameter", "high", "client_sink", "xss", url, proof, ev)
     return None
 
@@ -783,7 +812,8 @@ def _check_ssti(http: _Http, url: str, extra_params: list[str] | None = None) ->
                 evidence=f"the marker immediately followed by the evaluated result ({sig}) appears in the response body",
             )
             ev = {"request_line": f"GET {_with_query(url, {param: probe_payload})}", "response_status": f"HTTP {probe['status']}",
-                  "matched_value": f"template expression evaluated to 49 ({engine})"}
+                  "matched_value": f"template expression evaluated to 49 ({engine})",
+                  "read_data": _context_excerpt(body, sig)}  # the response showing 7*7 evaluated to 49
             return _finding("active.ssti", f"Server-side template injection via '{param}' parameter", "high", "injection", "ssti", url, proof, ev)
     return None
 
@@ -845,16 +875,18 @@ def _check_error_sqli(http: _Http, url: str, extra_params: list[str] | None = No
         body, ctrl_body = probe.get("body") or "", control.get("body") or ""
         # SQL-ONLY signature: a generic Python/PHP/Java stack trace from a broken
         # quote is NOT SQL injection. Only a real database error banner confirms.
-        matched = bool(_SQL_ERROR_RE.search(body))
+        sql_hit = _SQL_ERROR_RE.search(body)
         ctrl_matched = bool(_SQL_ERROR_RE.search(ctrl_body))
-        if matched and not ctrl_matched:
+        if sql_hit and not ctrl_matched:
             proof = _proof(
                 "confirmed", method=f"GET with {param}={original}' (a single quote)", affected_asset="the database reachable by the query's role",
                 observed_result=f"appending a single quote to '{param}' produced a SQL database error in the response",
                 control_result="the unmodified parameter returned no SQL error — the quote broke the query",
                 evidence="a SQL error banner (SQLSTATE/ORA-/SQL syntax) surfaced after the injected quote",
             )
-            ev = {"request_line": f"GET {_with_query(url, {param: original + chr(39)})}", "response_status": f"HTTP {probe['status']}", "matched_value": f"{matched} error banner"}
+            ev = {"request_line": f"GET {_with_query(url, {param: original + chr(39)})}", "response_status": f"HTTP {probe['status']}",
+                  "matched_value": "SQL database error banner surfaced by the injected quote",
+                  "read_data": _context_excerpt(body, sql_hit.group(0))}  # the actual DB error text in the response
             return _finding("active.sqli-error", f"SQL error elicited via '{param}' (probable SQL injection)", "high", "disclosure", "sqli", url, proof, ev)
     return None
 

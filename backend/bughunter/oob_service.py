@@ -95,6 +95,7 @@ def poll_collaborator(base: str, secret: str, token: str, *, timeout: float = 8.
 
 def _build_ssrf_finding(target_url: str, param: str, token: str, base: str, hit: dict[str, Any], confirmed: bool = True) -> dict[str, Any]:
     word = "confirmed" if confirmed else "callback from a non-server source — candidate"
+    plan = _ssrf_plan(target_url, param, token, base, hit, confirmed)
     return {
         "rule_id": "active.blind-ssrf-oob",
         "title": f"Blind SSRF via '{param}' (out-of-band {word})",
@@ -115,6 +116,12 @@ def _build_ssrf_finding(target_url: str, param: str, token: str, base: str, hit:
         "remediation": ("Validate and allow-list the outbound destination; resolve and pin it, reject internal/"
                         "metadata ranges, and disable unused URL schemes/redirfollowing."),
         "snippet": "",  # the proof is the OOB callback, not target data
+        # Active-proof carriers so a hunt that appends this finding renders it confirmed (with the
+        # collaborator hit as the observed-vs-fresh-token-control differential), exactly like the
+        # in-active-pass checks — not downgraded to a deterministic 'candidate'.
+        "_active_class_hint": "ssrf",
+        "_active_proof": plan["proof_of_impact"],
+        "_active_cvss": plan["cvss"],
         "proof_evidence": {
             "request_line": f"GET {_with_query(target_url, {param: callback_url(base, token)})}",
             "response_status": f"collaborator hit: {hit.get('method', 'GET')} {hit.get('path', '/oob/' + token)}",

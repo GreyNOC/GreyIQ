@@ -28,7 +28,7 @@ _ENDPOINT_RE = re.compile(r"""["'`](/[A-Za-z0-9_][A-Za-z0-9_./{}\-]{1,120})["'`]
 # fetch/axios/XHR call targets.
 _CALL_URL_RE = re.compile(r"""(?:fetch|axios(?:\.\s*\w+)?|\.open)\s*\(\s*["'`]([^"'`]{2,200})["'`]""")
 # Query-param names from URL strings and explicit param assignments.
-_PARAM_RE = re.compile(r"""[?&]([A-Za-z_][A-Za-z0-9_]{1,39})=""")
+_PARAM_RE = re.compile(r"""[?&]([A-Za-z_][A-Za-z0-9_]{0,39})=""")  # {0,39}: single-letter params (?q= ?s= ?p=) are real attack surface
 # Absolute hostnames (for same-apex asset discovery).
 _HOST_RE = re.compile(r"""https?://([A-Za-z0-9][A-Za-z0-9.\-]{1,250}\.[A-Za-z]{2,24})""")
 

@@ -39,6 +39,21 @@ class HelperTests(unittest.TestCase):
 
     def test_poll_requires_config(self) -> None:
         self.assertFalse(oob.poll_collaborator("", "secret", "tok")["ok"])
+
+    def test_ssrf_finding_carries_confirmed_active_proof(self) -> None:
+        # A hunt appends this finding to raw_findings, so it MUST carry the active-proof carriers or
+        # it renders as a deterministic 'candidate' instead of the confirmed OOB SSRF it is.
+        hit = {"method": "GET", "ip": "10.0.0.5", "path": "/oob/tok", "headers": {"user-agent": "curl"}}
+        f = oob._build_ssrf_finding("https://app.example.com/?url=x", "url", "tok", "https://c.example", hit, True)
+        self.assertEqual(f["_active_class_hint"], "ssrf")
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertIn("control_result", f["_active_proof"])   # fresh-token negative control
+        self.assertEqual(f["_active_cvss"]["base_severity"], "high")
+
+    def test_candidate_ssrf_finding_is_not_confirmed(self) -> None:
+        hit = {"method": "GET", "ip": "1.2.3.4", "headers": {"user-agent": "bot"}}
+        f = oob._build_ssrf_finding("https://app.example.com/?url=x", "url", "tok", "https://c.example", hit, False)
+        self.assertEqual(f["_active_proof"]["status"], "candidate")
         self.assertFalse(oob.poll_collaborator("https://c.example", "", "tok")["ok"])
         self.assertFalse(oob.poll_collaborator("https://c.example", "secret", "")["ok"])
 

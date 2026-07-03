@@ -43,8 +43,8 @@ class ConfirmRouteDecoratorTests(unittest.TestCase):
         out = r.boom(object())
         self.assertFalse(out["ok"])
         self.assertIn("boom failed", out["error"])
-        self.assertIn("RuntimeError", out["error"])
-        self.assertIn("kaboom", out["error"])
+        self.assertIn("RuntimeError", out["error"])          # the exception TYPE is surfaced (useful, safe)
+        self.assertNotIn("kaboom", out["error"])             # but NOT the raw message — it can echo scanned/attacker content
         self.assertTrue(r.logged, "the full traceback must be logged server-side")
 
     def test_success_passes_through_untouched(self) -> None:

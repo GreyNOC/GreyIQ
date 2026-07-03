@@ -23,14 +23,26 @@ import urllib.request
 from typing import Any
 from urllib.parse import quote, urlparse
 
-# Only the credential's own issuer is ever contacted — a fixed allowlist, no target-derived host.
-_ALLOWED_HOSTS = frozenset({"www.googleapis.com", "identitytoolkit.googleapis.com"})
+# Only Google/Firebase infrastructure is ever contacted — a fixed host allowlist + the *.firebaseio.com
+# Realtime-Database suffix. The project id is derived from Google's OWN getProjectConfig response, so
+# even that dynamic host can only ever be Google's RTDB — never a target- or attacker-controlled host.
+_ALLOWED_HOSTS = frozenset({
+    "www.googleapis.com", "identitytoolkit.googleapis.com",
+    "firestore.googleapis.com", "firebasestorage.googleapis.com",
+})
+_ALLOWED_SUFFIXES = (".firebaseio.com",)
 _TIMEOUT_S = 8
 _MAX_BYTES = 65536
 _UA = "GreyIQ-CredentialCheck/1.0"
 _GOOGLE_KEY_RE = re.compile(r"\AAIza[0-9A-Za-z_\-]{35}\Z")
+_PROJECT_RE = re.compile(r"\A[a-z0-9][a-z0-9\-]{3,58}[a-z0-9]\Z")  # a Firebase project id shape
 # The legacy Identity Toolkit endpoint that returns a project's config for a Firebase Web API key.
 _PROJECT_CONFIG_URL = "https://www.googleapis.com/identitytoolkit/v3/relyingparty/getProjectConfig?key={key}"
+
+
+def _host_allowed(host: str) -> bool:
+    host = (host or "").lower()
+    return host in _ALLOWED_HOSTS or host.endswith(_ALLOWED_SUFFIXES)
 
 
 def is_google_api_key(value: str) -> bool:
@@ -38,9 +50,8 @@ def is_google_api_key(value: str) -> bool:
 
 
 def _get(url: str) -> tuple[int, str]:
-    """GET a URL on the allowlist and return (status, body). Never raises."""
-    host = (urlparse(url).hostname or "").lower()
-    if host not in _ALLOWED_HOSTS:  # belt-and-suspenders — the URL is built from a constant host
+    """GET a URL on the Google/Firebase allowlist and return (status, body). Never raises."""
+    if not _host_allowed(urlparse(url).hostname or ""):  # only Google/Firebase infra is contactable
         return 0, "host not allowlisted"
     req = urllib.request.Request(url, method="GET", headers={"User-Agent": _UA, "Accept": "application/json"})
     try:
@@ -86,12 +97,15 @@ def validate_firebase_key(key: str) -> dict[str, Any]:
             data = {}
         project = str(data.get("projectId") or data.get("projectNumber") or "").strip()
         domains = [str(d) for d in (data.get("authorizedDomains") or []) if str(d).strip()][:20]
-        result.update(live=True, project_id=project, authorized_domains=domains)
+        result.update(live=True, project_id=project, authorized_domains=domains, unrestricted=True)
         result["detail"] = (
             f"LIVE — the key authenticates to Firebase project '{project or '(unnamed)'}'"
             + (f"; authorized domains: {', '.join(domains)}" if domains else "")
             + ". It can reach that project's Firebase services (Identity Toolkit sign-in/sign-up and, "
-              "subject to security rules, Firestore / Realtime Database / Storage)."
+              "subject to security rules, Firestore / Realtime Database / Storage). The key is also "
+              "UNRESTRICTED: this validation came from a server with no HTTP referrer and an arbitrary "
+              "IP, so it has no HTTP-referrer / IP application restriction and is usable from anywhere "
+              "(API-abuse / quota-theft exposure on its own)."
         )
         return result
     if any(m in low for m in _DEAD_MARKERS):
@@ -115,3 +129,49 @@ def validate_firebase_key(key: str) -> dict[str, Any]:
         "benign endpoint — validate manually within scope."
     )
     return result
+
+
+def probe_firebase_exposure(project: str, key: str = "") -> list[dict[str, Any]]:
+    """Given a Firebase project id (from ``validate_firebase_key``), probe its data stores for
+    UNAUTHENTICATED read exposure — the high-value, VRP-eligible misconfiguration. Benign + GET-only:
+    the Realtime Database check uses ``?shallow=true`` so it reads only top-level KEY NAMES, never the
+    stored values. Returns a list of exposure dicts (``[]`` when locked / unreachable / bad project)."""
+    project = str(project or "").strip().lower()
+    findings: list[dict[str, Any]] = []
+    if not _PROJECT_RE.match(project):
+        return findings
+    # --- Realtime Database: a shallow read (top-level keys only) proves anon read w/o exfiltration.
+    for host in (f"https://{project}.firebaseio.com", f"https://{project}-default-rtdb.firebaseio.com"):
+        status, body = _get(host + "/.json?shallow=true")
+        stripped = body.strip()
+        if status == 200 and stripped and stripped.lower() != "null":
+            keys: list[str] = []
+            try:
+                data = json.loads(body)
+                if isinstance(data, dict):
+                    keys = [str(k) for k in list(data.keys())[:40]]
+            except ValueError:
+                pass
+            findings.append({
+                "service": "Firebase Realtime Database", "endpoint": f"{host}/.json",
+                "severity": "high",  # unauthenticated READ (C:H) = High by CVSS; escalate in-report if it also holds PII
+                "detail": (f"The Realtime Database at {host} is readable UNAUTHENTICATED (HTTP 200 to "
+                           "/.json?shallow=true — a shallow read that returns top-level keys only, no values). "
+                           + (f"Top-level keys exposed: {', '.join(keys)}." if keys else "Data is present and readable.")),
+                "evidence": ("top-level keys: " + ", ".join(keys)) if keys else "shallow read returned data (not null)",
+                "repro": f"curl -s '{host}/.json?shallow=true'",
+            })
+            break  # one reachable RTDB host is enough
+    # --- Cloud Storage: a public default bucket lists its objects to an unauthenticated GET.
+    status, body = _get(f"https://firebasestorage.googleapis.com/v0/b/{quote(project, safe='')}.appspot.com/o?maxResults=1")
+    low = body.lower()
+    if status == 200 and ('"items"' in low or '"prefixes"' in low):
+        findings.append({
+            "service": "Firebase Cloud Storage", "endpoint": f"gs://{project}.appspot.com",
+            "severity": "high",
+            "detail": f"The default Firebase Storage bucket {project}.appspot.com lists objects to an "
+                      "unauthenticated request (HTTP 200) — stored files are enumerable/readable.",
+            "evidence": "object listing returned (items/prefixes present)",
+            "repro": f"curl -s 'https://firebasestorage.googleapis.com/v0/b/{project}.appspot.com/o'",
+        })
+    return findings
