@@ -451,5 +451,100 @@ class RceCommandInjectionTests(unittest.TestCase):
         self.assertIsNone(av._check_rce_command_injection(_EchoStub(), "https://app.example.com/run?cmd=x"))
 
 
+class DebugEndpointExposureTests(unittest.TestCase):
+    """Spring actuator heapdump/env + Jolokia exposure — critical secret-exfil / RCE, confirmed by
+    an unmistakable product signature AND a catch-all control, so a 200s-everything app can't FP."""
+
+    def _stub(self, path_body):
+        class _S:
+            auth = None
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                for suffix, body in path_body.items():
+                    if url.endswith(suffix):
+                        return {"status": 200, "headers": {}, "cookies": [], "body": body, "location": None, "final_url": url}
+                return {"status": 404, "headers": {}, "cookies": [], "body": "Whitelabel Error Page", "location": None, "final_url": url}
+        return _S()
+
+    def test_heapdump_is_critical(self) -> None:
+        f = av._check_debug_endpoints(self._stub({"/actuator/heapdump": "JAVA PROFILE 1.0.2\x00binary"}), "https://app.example.com/")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["severity"], "critical")
+        self.assertEqual(f["rule_id"], "active.debug-endpoint")
+
+    def test_jolokia_maps_to_rce_class(self) -> None:
+        body = '{"request":{"type":"list"},"value":{"java.lang":{"type=Memory":{}}},"status":200}'
+        f = av._check_debug_endpoints(self._stub({"/jolokia/list": body}), "https://app.example.com/")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["severity"], "critical")
+        self.assertEqual(f["_active_class_hint"], "rce")
+
+    def test_catch_all_200_app_is_not_flagged(self) -> None:
+        class _All:
+            auth = None
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                return {"status": 200, "headers": {}, "cookies": [], "body": "<html>app</html>", "location": None, "final_url": url}
+        self.assertIsNone(av._check_debug_endpoints(_All(), "https://app.example.com/"))
+
+    def test_only_probes_at_root(self) -> None:
+        self.assertIsNone(av._check_debug_endpoints(self._stub({"/actuator/heapdump": "JAVA PROFILE 1.0.2"}),
+                                                    "https://app.example.com/some/page"))
+
+    def test_docs_page_mentioning_hprof_is_not_flagged(self) -> None:
+        # A route-dependent docs/soft-404 page that merely CONTAINS "JAVA PROFILE" mid-body must
+        # not match — the HPROF magic is anchored to the START of the response (real heap dump only).
+        body = "<html><body><h1>JAVA PROFILE format explained</h1><p>heap dumps...</p></body></html>"
+        self.assertIsNone(av._check_debug_endpoints(self._stub({"/actuator/heapdump": body}), "https://app.example.com/"))
+
+
+class _RceTimingSettings:
+    web_fetch_timeout_seconds = 8
+    active_time_sqli_delay_seconds = 4
+    active_time_sqli_margin_seconds = 3.0
+
+
+class TimeBasedRceTests(unittest.TestCase):
+    """Blind OS command injection confirmed ONLY by a stable two-trial timing differential vs a
+    'sleep 0' control — a non-vulnerable app never sleeps, and a uniformly-slow page can't confirm."""
+
+    class _ShellStub:
+        auth = None
+        def fetch(self, url, *, method="GET", extra_headers=None):
+            from urllib.parse import unquote_plus  # a real server decodes + -> space before the shell
+            m = re.search(r"sleep (\d+)", unquote_plus(url))
+            secs = float(m.group(1)) if m else 0.0
+            return {"status": 200, "headers": {}, "cookies": [], "body": "ok", "location": None, "final_url": url, "elapsed": secs + 0.05}
+
+    def test_sleep_differential_confirms_critical(self) -> None:
+        f = av._check_time_rce(self._ShellStub(), "https://app.example.com/run?cmd=1", settings=_RceTimingSettings())
+        self.assertIsNotNone(f)
+        self.assertEqual(f["severity"], "critical")
+        self.assertEqual(f["rule_id"], "active.rce-time")
+        self.assertEqual(f["_active_class_hint"], "rce")
+
+    def test_non_vulnerable_app_never_confirms(self) -> None:
+        class _NoSleep(self._ShellStub):
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                return {"status": 200, "headers": {}, "cookies": [], "body": "ok", "location": None, "final_url": url, "elapsed": 0.05}
+        self.assertIsNone(av._check_time_rce(_NoSleep(), "https://app.example.com/run?cmd=1", settings=_RceTimingSettings()))
+
+    def test_uniformly_slow_page_does_not_confirm(self) -> None:
+        class _Slow(self._ShellStub):
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                return {"status": 200, "headers": {}, "cookies": [], "body": "ok", "location": None, "final_url": url, "elapsed": 6.0}
+        self.assertIsNone(av._check_time_rce(_Slow(), "https://app.example.com/run?cmd=1", settings=_RceTimingSettings()))
+
+    def test_waf_tarpit_on_metacharacter_does_not_confirm(self) -> None:
+        # A WAF/bot-defense that TARPITS on the shell metacharacter ($( or backtick) — regardless of
+        # the sleep value — must NOT confirm: the matched 'sleep 0' control carries the same
+        # metacharacter and absorbs the same delay, so the differential cancels (no command injection).
+        from urllib.parse import unquote_plus
+        class _Waf(self._ShellStub):
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                val = unquote_plus(url)
+                secs = 5.0 if ("$(" in val or "`" in val) else 0.05  # penalizes syntax, ignores the sleep arg
+                return {"status": 200, "headers": {}, "cookies": [], "body": "ok", "location": None, "final_url": url, "elapsed": secs}
+        self.assertIsNone(av._check_time_rce(_Waf(), "https://app.example.com/run?cmd=1", settings=_RceTimingSettings()))
+
+
 if __name__ == "__main__":
     unittest.main()
