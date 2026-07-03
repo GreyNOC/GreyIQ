@@ -386,6 +386,18 @@ def _proof(status: str, **fields: Any) -> dict[str, Any]:
     return base
 
 
+def _apply_class_priority(checks: list[tuple[str, Any]], class_priority: list[str] | None) -> list[tuple[str, Any]]:
+    """Stable-partition class-tagged ``(class_key, thunk)`` checks so the reasoning layer's
+    prioritised classes run FIRST, preserving the tuned default order within each partition. Pure:
+    never adds, removes, or mutates a check — only reorders. Empty/None priority => unchanged."""
+    if not class_priority:
+        return checks
+    wanted = {str(c).strip().lower() for c in class_priority if str(c or "").strip()}
+    if not wanted:
+        return checks
+    return sorted(checks, key=lambda ck: 0 if ck[0] in wanted else 1)  # sorted() is stable
+
+
 def _finding(rule_id: str, title: str, severity: str, category: str, class_hint: str, url: str,
              proof: dict[str, Any], proof_evidence: dict[str, str], cvss: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
@@ -1688,6 +1700,7 @@ def verify_active(
     time_based: bool = False,
     auth: AuthContext | None = None,
     extra_params: list[str] | None = None,
+    class_priority: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run the active checks against an in-scope target. Returns
     ``(active_findings, meta)``. ``active_findings`` are confirmed/candidate finding
@@ -1739,49 +1752,55 @@ def verify_active(
     results: list[dict[str, Any]] = []
     # Order: header-only first (cheap), then the request-heavier probes. Each check
     # is wrapped so a budget exhaustion stops cleanly without raising.
-    checks: list[Callable[[], dict[str, Any] | None]] = [
-        lambda: _check_clickjacking(http, sanitized, landing),
-        lambda: _check_csrf(landing, sanitized),
+    # Each check is tagged with the normalized vuln class it confirms, so the reasoning layer's
+    # per-endpoint priorities can promote the classes most likely to hit on THIS target (see below).
+    checks: list[tuple[str, Callable[[], dict[str, Any] | None]]] = [
+        ("clickjacking", lambda: _check_clickjacking(http, sanitized, landing)),
+        ("csrf", lambda: _check_csrf(landing, sanitized)),
         # Self-gated cheap checks run FIRST so the network-heavy probes below can't exhaust the
         # request budget before they're reached: alg:none / weak-secret are no-ops unless the
         # operator supplied a real JWT (weak-secret cracks the HMAC key OFFLINE and spends requests
         # only on a hit), and GraphQL introspection only fires on a graphql-shaped path.
-        lambda: _check_jwt_alg_none(http, sanitized),
-        lambda: _check_jwt_weak_secret(http, sanitized),
-        lambda: _check_graphql_introspection(http, sanitized),
-        lambda: _check_cors(http, sanitized),
-        lambda: _check_open_redirect(http, sanitized, discovered_params),
-        lambda: _check_host_header(http, sanitized),
-        lambda: _check_reflected_xss(http, sanitized, discovered_params),
-        lambda: _check_ssti(http, sanitized, discovered_params),
+        ("jwt", lambda: _check_jwt_alg_none(http, sanitized)),
+        ("jwt", lambda: _check_jwt_weak_secret(http, sanitized)),
+        ("graphql", lambda: _check_graphql_introspection(http, sanitized)),
+        ("cors", lambda: _check_cors(http, sanitized)),
+        ("redirect", lambda: _check_open_redirect(http, sanitized, discovered_params)),
+        ("host-header", lambda: _check_host_header(http, sanitized)),
+        ("xss", lambda: _check_reflected_xss(http, sanitized, discovered_params)),
+        ("ssti", lambda: _check_ssti(http, sanitized, discovered_params)),
         # OS command injection via benign $(expr) shell substitution — arithmetic only, no real
         # command runs. Sits next to SSTI (both are safe arithmetic-echo injection probes) and
         # ahead of the SQLi variants so a CRITICAL RCE gets request-budget priority.
-        lambda: _check_rce_command_injection(http, sanitized, discovered_params),
-        lambda: _check_error_sqli(http, sanitized, discovered_params),
-        lambda: _check_bool_sqli(http, sanitized, discovered_params),
-        lambda: _check_nosqli(http, sanitized, discovered_params),
-        lambda: _check_crlf(http, sanitized, discovered_params),
+        ("rce", lambda: _check_rce_command_injection(http, sanitized, discovered_params)),
+        ("sqli", lambda: _check_error_sqli(http, sanitized, discovered_params)),
+        ("sqli", lambda: _check_bool_sqli(http, sanitized, discovered_params)),
+        ("nosqli", lambda: _check_nosqli(http, sanitized, discovered_params)),
+        ("crlf", lambda: _check_crlf(http, sanitized, discovered_params)),
         # Open-bucket is GET-only and scope-gated; safe in the default pass.
-        lambda: _check_open_bucket(http, landing, scope, settings),
+        ("cloud-exposure", lambda: _check_open_bucket(http, landing, scope, settings)),
         # Sensitive-file exposure (.git/.env) only probes at the site root, so it's one cheap
         # set per host; signature + catch-all control keeps it false-positive-proof.
-        lambda: _check_sensitive_paths(http, sanitized),
+        ("sensitive", lambda: _check_sensitive_paths(http, sanitized)),
         # Unauthenticated debug/management endpoints (Spring actuator heapdump/env, Jolokia JMX)
         # — critical secret-exfil / RCE, root-only, same signature + catch-all control gate.
-        lambda: _check_debug_endpoints(http, sanitized),
+        ("debug", lambda: _check_debug_endpoints(http, sanitized)),
         # Path traversal / LFI reads ONE well-known system file as proof (signature + control),
-        # extracting nothing else; GET-only. Heaviest of the new checks, so it runs LAST and only
-        # uses whatever request budget the earlier checks left.
-        lambda: _check_path_traversal(http, sanitized, discovered_params),
+        # extracting nothing else; GET-only. Heaviest of the new checks, so it runs LAST by default
+        # and only uses whatever request budget the earlier checks left.
+        ("path-traversal", lambda: _check_path_traversal(http, sanitized, discovered_params)),
     ]
+    # Reasoning-steered ordering: promote the classes the brain flagged as most likely to hit on
+    # THIS endpoint so the shared request budget is spent where a real bug is most likely. It only
+    # REORDERS (never adds/removes a check) and preserves the tuned default order within each group.
+    checks = _apply_class_priority(checks, class_priority)
     # The time-based checks are the only ones that emit an executing payload (a bounded SLEEP /
-    # sleep), so they are OPT-IN — appended only when the operator explicitly enables time_based.
-    # Blind RCE (critical) is confirmed first so it gets budget priority over blind SQLi.
+    # sleep), so they are OPT-IN — appended AFTER any reorder (never promoted) so the loud executing
+    # probes always stay last. Blind RCE (critical) is confirmed first so it gets budget priority.
     if time_based:
-        checks.append(lambda: _check_time_rce(http, sanitized, settings, discovered_params))
-        checks.append(lambda: _check_time_sqli(http, sanitized, settings, discovered_params))
-    for check in checks:
+        checks.append(("rce", lambda: _check_time_rce(http, sanitized, settings, discovered_params)))
+        checks.append(("sqli", lambda: _check_time_sqli(http, sanitized, settings, discovered_params)))
+    for _cls, check in checks:
         if rate_limited:
             break
         try:
