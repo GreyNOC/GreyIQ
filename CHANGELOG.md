@@ -2,6 +2,30 @@
 
 Notable changes to GreyIQ.
 
+## v0.69.0
+
+### Every confirmed finding now ships a real proof of concept
+The proof-of-concept engine used to write a concrete reproduction only for CORS — every other
+class fell back to a generic `curl <url>`. Now **every actively-confirmed finding** carries:
+the *exact* crafted request GreyIQ used to confirm it, rebuilt as a copy-paste `curl`; the
+confirming evidence as the demonstration; a class-specific escalation step; and — for the
+browser-exploitable classes — a **runnable PoC page** (reflected-XSS, open-redirect, CSRF,
+clickjacking). A JWT weak-secret finding gets a **forged-token PoC** built from the recovered
+secret. Host-header / CRLF findings get escalation guidance instead of a misleading open-URL
+PoC.
+
+### Findings that show the data, not just the flaw
+The disclosure/read checks (path traversal, exposed `.git`/`.env`, GraphQL introspection) now
+capture a redacted excerpt of the **actual retrieved content** and render it under a
+"Demonstrated impact — data disclosed" heading — the same "show the real data" treatment that
+made CORS reports submittable, now across the board.
+
+### Cleaner PoC formatting + staged report actions
+HTML PoCs are fenced as ` ```html ` so a reviewer recognizes them as code, and the report's
+reproduction origin always matches the finding (a subdomain-trust finding uses an attacker
+subdomain, not an unrelated origin). The report panel gains a staged **Prove → Package →
+Submit** action pipeline.
+
 ## v0.68.0
 
 ### CORS reports HackerOne stops rejecting
