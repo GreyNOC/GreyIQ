@@ -2,6 +2,17 @@
 
 Notable changes to GreyIQ.
 
+## v0.78.0
+
+### API-key access proof on demand
+- Source API-key findings now have a separate **Test API key access** action. It sends one
+  read-only request to the key's own allowlisted issuer, records what the key can access, and
+  keeps the secret redacted in the returned artifact.
+- The captured API response and access summary are saved as `api-key-access.txt` / `.json` in
+  the PoC download folder and are also included in the engagement bundle under `evidence/`.
+- Live API-key tests update the cached proof plan so the full report can carry the fresh issuer
+  request/response proof without asking the operator to reproduce it manually.
+
 ## v0.77.0
 
 ### Confirmed source API proofs are now report-ready
