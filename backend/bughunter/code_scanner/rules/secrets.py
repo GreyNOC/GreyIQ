@@ -146,7 +146,9 @@ RULES = (
         confidence=Confidence.HIGH,
         category="secret",
         remediation="Revoke the key on platform.openai.com, scrub history, load via env var or secret store.",
-        pattern=r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{20,}\b",
+        # (?!ant-): an Anthropic 'sk-ant-...' key must NOT also match the OpenAI rule, or it would be
+        # double-detected and validated against the wrong issuer (api.openai.com) — see secret.anthropic-key.
+        pattern=r"\bsk-(?!ant-)(?:proj-)?[A-Za-z0-9_\-]{20,}\b",
         line_must_contain=("sk-",),
         unique=True,
     ),

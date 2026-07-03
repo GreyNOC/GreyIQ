@@ -313,7 +313,8 @@ def validate_openai_key(token: str) -> dict[str, Any]:
     catalog is public (not account data), so nothing sensitive is read."""
     token = str(token or "").strip()
     result = _credential_result("OpenAI api.openai.com/v1/models")
-    if not token:
+    result["no_data_read"] = True  # only the public model catalog is read — never account data
+    if not token or token.startswith("sk-ant-"):  # sk-ant- is an Anthropic key — never send it to OpenAI
         return result
     result["poc"] = f"curl -s -H 'Authorization: Bearer {token}' https://api.openai.com/v1/models"
     status, _h, body = _get_full("https://api.openai.com/v1/models", {"Authorization": f"Bearer {token}"})
@@ -344,6 +345,7 @@ def validate_anthropic_key(token: str) -> dict[str, Any]:
     catalog is public (not account data)."""
     token = str(token or "").strip()
     result = _credential_result("Anthropic api.anthropic.com/v1/models")
+    result["no_data_read"] = True  # only the public model catalog is read — never account data
     if not token:
         return result
     result["poc"] = f"curl -s -H 'x-api-key: {token}' -H 'anthropic-version: 2023-06-01' https://api.anthropic.com/v1/models"
@@ -377,6 +379,7 @@ def validate_stripe_key(token: str) -> dict[str, Any]:
     read-only GET to the key's OWN issuer (never the target)."""
     token = str(token or "").strip()
     result = _credential_result("Stripe api.stripe.com/v1/customers/<nonexistent>")
+    result["no_data_read"] = True  # probes a non-existent resource — no account data is ever returned
     if not token:
         return result
     probe_url = "https://api.stripe.com/v1/customers/cus_00000000000000"  # a resource that cannot exist
