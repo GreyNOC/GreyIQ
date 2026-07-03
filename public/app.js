@@ -6525,12 +6525,60 @@ function ckFullReportPanel(focus) {
   }
   if (focus.shots && focus.shots.length) shotWrap.append(cel("p", "ck-hint", "Saved locally. Review before attaching — screenshots are not auto-redacted."));
 
-  const actions = cel("div", "ck-actions");
+  // Report actions are laid out as a workflow, not a flat button pile: a single hero
+  // "Prepare full report" that chains the whole pipeline, then the same steps broken out
+  // into three ordered stages (Prove → Package → Submit) so the operator keeps full control
+  // and every piece stays individually available.
+  const actions = cel("div", "ck-report-actions");
   const statusEl = cel("p", "ck-status"); statusEl.style.flexBasis = "100%";
   const resultEl = cel("div", "ck-cd-rv-result"); resultEl.style.flexBasis = "100%"; resultEl.hidden = true;
 
+  // A labeled stage group: a short label column + a wrapping row of its buttons.
+  const stage = (label) => {
+    const el = cel("div", "ck-stage");
+    el.append(cel("div", "ck-stage-label", label));
+    const row = cel("div", "ck-stage-row");
+    el.append(row);
+    return { el, row };
+  };
+
+  // ---- Hero: one click runs prove → screenshot → build so the report comes back "done and
+  // ready". It only chains steps the operator could run by hand below, so nothing is hidden. ----
+  const hero = cel("div", "ck-hero");
+  const prepBtn = cel("button", "ck-btn primary ck-hero-btn", "⚡ Prepare full report");
+  prepBtn.type = "button";
+  prepBtn.title = "One click: prove impact (if not already confirmed), capture a screenshot, and assemble the complete report";
+  prepBtn.addEventListener("click", () => ckPrepareFullReport(focus, prepBtn, statusEl, shotWrap));
+  hero.append(prepBtn, cel("span", "ck-hero-note", ckReadinessNote(focus)));
+  actions.append(hero);
+
+  // ---- Stage 1 · Prove — the two active steps that CHANGE the finding's state. ----
+  const s1 = stage("1 · Prove");
+  // Actively re-probe this finding's URL in scope and capture the live request/response
+  // differential + a screenshot. A candidate is promoted to Confirmed; a Confirmed finding
+  // still benefits from a freshly-captured, submittable artifact.
+  const proveBtn = cel("button", "ck-btn", ckEffectiveProof(focus) === "confirmed" ? "Get proof of impact" : "Create proof of impact");
+  proveBtn.type = "button";
+  proveBtn.title = "Actively re-probe this finding in scope and capture the live proof-of-impact artifact (request/response differential + screenshot)";
+  proveBtn.addEventListener("click", () => ckCreateProofOfImpact(focus, proveBtn, statusEl, resultEl));
+  const hasShots = (focus.shots && focus.shots.length) || (focus.screenshot && focus.screenshot.data_url);
+  const shotBtn = cel("button", "ck-btn", hasShots ? "Re-capture screenshot" : "Capture screenshot");
+  shotBtn.type = "button";
+  shotBtn.title = "Capture annotated + full-page proof screenshots of this finding's page";
+  shotBtn.addEventListener("click", () => ckCaptureScreenshot(focus, shotBtn, shotWrap, (shots) => {
+    // Persist on the focus so the shots survive a panel re-render, then repaint.
+    focus.shots = shots;
+    focus._prepMsg = "";  // a fresh manual capture invalidates the last "prepare" caption
+    if (ckState.reportFocus === focus && ckState.view === "submissions") ckRenderSubmissions();
+  }));
+  s1.row.append(proveBtn, shotBtn);
+  actions.append(s1.el);
+
+  // ---- Stage 2 · Package — every export of the finished report, each still separate. ----
+  const s2 = stage("2 · Package");
   const copyBtn = cel("button", "ck-btn primary", "Copy report");
   copyBtn.type = "button";
+  copyBtn.title = "Copy the full submission report (Markdown) to the clipboard";
   copyBtn.addEventListener("click", async () => {
     copyBtn.disabled = true; copyBtn.textContent = "Preparing…";
     try {
@@ -6539,70 +6587,46 @@ function ckFullReportPanel(focus) {
       copyBtn.textContent = ok ? (pkg.canonical ? "Copied ✓" : "Copied (offline)") : "Failed";
     } finally { copyBtn.disabled = false; setTimeout(() => { copyBtn.textContent = "Copy report"; }, 1600); }
   });
-  actions.append(copyBtn);
-
-  // Copy JUST the proof of impact + steps + captured responses/data as plain text, to paste
-  // straight into a submission's "Proof of impact" field.
-  const poiBtn = cel("button", "ck-btn", "Copy proof of impact");
-  poiBtn.type = "button";
-  poiBtn.title = "Copy the proof of impact, steps to reproduce, and the captured request/response + sensitive data as plain text";
-  poiBtn.addEventListener("click", async () => {
-    const ok = await ckCopy(ckBuildProofOfImpactText(focus));
-    poiBtn.textContent = ok ? "Copied ✓" : "Copy failed";
-    setTimeout(() => { poiBtn.textContent = "Copy proof of impact"; }, 1600);
-  });
-  actions.append(poiBtn);
-
   const dlBtn = cel("button", "ck-btn", "Download .md");
   dlBtn.type = "button";
+  dlBtn.title = "Download the full report as a Markdown file";
   dlBtn.addEventListener("click", async () => {
     dlBtn.disabled = true; dlBtn.textContent = "Preparing…";
     try { const pkg = await ckFullReportMarkdown(focus); ckDownloadText(`${ckSlug(focus.title)}.md`, pkg.text); }
     finally { dlBtn.disabled = false; dlBtn.textContent = "Download .md"; }
   });
-  actions.append(dlBtn);
-
-  const zipBtn = cel("button", "ck-btn", "Download POC (.zip)");
+  // Copy JUST the proof of impact + steps + captured responses/data as plain text, to paste
+  // straight into a submission's "Proof of impact" field.
+  const poiBtn = cel("button", "ck-btn", "Copy proof of impact");
+  poiBtn.type = "button";
+  poiBtn.title = "Copy just the proof of impact, steps to reproduce, and the captured request/response + sensitive data as plain text";
+  poiBtn.addEventListener("click", async () => {
+    const ok = await ckCopy(ckBuildProofOfImpactText(focus));
+    poiBtn.textContent = ok ? "Copied ✓" : "Copy failed";
+    setTimeout(() => { poiBtn.textContent = "Copy proof of impact"; }, 1600);
+  });
+  const zipBtn = cel("button", "ck-btn", "Download bundle (.zip)");
   zipBtn.type = "button";
-  zipBtn.title = "One zip: the report, a PoC/evidence summary, every captured screenshot, and the finding JSON";
+  zipBtn.title = "One zip: the report, a PoC/evidence summary, a runnable PoC page, every captured screenshot, and the finding JSON";
   zipBtn.addEventListener("click", () => ckDownloadPocZip(focus, zipBtn));
-  actions.append(zipBtn);
+  s2.row.append(copyBtn, dlBtn, poiBtn, zipBtn);
+  actions.append(s2.el);
 
-  const hasShots = (focus.shots && focus.shots.length) || (focus.screenshot && focus.screenshot.data_url);
-  const shotBtn = cel("button", "ck-btn", hasShots ? "Re-capture screenshot" : "Capture screenshot");
-  shotBtn.type = "button";
-  shotBtn.title = "Capture annotated + full-page proof screenshots of this finding's page";
-  shotBtn.addEventListener("click", () => ckCaptureScreenshot(focus, shotBtn, shotWrap, (shots) => {
-    // Persist on the focus so the shots survive a panel re-render, then repaint.
-    focus.shots = shots;
-    if (ckState.reportFocus === focus && ckState.view === "submissions") ckRenderSubmissions();
-  }));
-  actions.append(shotBtn);
-
-  // Get proof of impact — actively re-probe this finding's URL in scope and capture the live
-  // request/response differential + a screenshot. Available on ANY finding: a candidate is
-  // promoted to Confirmed by it, and a Confirmed finding still benefits from a freshly-captured,
-  // submittable artifact.
-  const proveBtn = cel("button", "ck-btn", ckEffectiveProof(focus) === "confirmed" ? "Get proof of impact" : "Create proof of impact");
-  proveBtn.type = "button";
-  proveBtn.title = "Actively re-probe this finding in scope and capture the live proof-of-impact artifact (request/response differential + screenshot)";
-  proveBtn.addEventListener("click", () => ckCreateProofOfImpact(focus, proveBtn, statusEl, resultEl));
-  actions.append(proveBtn);
-
+  // ---- Stage 3 · Submit — terminal step, with an inline reason when it's gated. ----
+  const s3 = stage("3 · Submit");
   if (ckEffectiveStage(focus) === "submitted") {
-    actions.append(ckReportLink("", ""));
+    s3.row.append(ckReportLink("", ""));
   } else {
     const submitBtn = cel("button", "ck-btn primary", "Submit to HackerOne");
     submitBtn.type = "button";
     const can = ckCanSubmit(focus);
     submitBtn.disabled = !can;
-    submitBtn.title = can ? "File this confirmed finding to your HackerOne program"
-      : (ckEffectiveProof(focus) !== "confirmed" ? "Create proof of impact first — only a Confirmed finding can be filed."
-        : (!focus.ref ? "Open this finding from the Findings board after the campaign to file it."
-          : "Add your HackerOne team handle + API token below."));
+    submitBtn.title = can ? "File this confirmed finding to your HackerOne program" : "Blocked — see the reason next to this button";
     submitBtn.addEventListener("click", () => ckSubmitFinding(focus, submitBtn, statusEl));
-    actions.append(submitBtn);
+    s3.row.append(submitBtn);
+    if (!can) s3.row.append(cel("p", "ck-gate-note", ckSubmitGateReason(focus)));
   }
+  actions.append(s3.el);
 
   wrap.append(actions, statusEl, shotWrap, resultEl);
 
@@ -6640,6 +6664,102 @@ function ckFullReportPanel(focus) {
   }
   wrap.append(preview);
   return wrap;
+}
+
+// The one-line caption under the hero "Prepare full report" button: the last prepare outcome
+// if there is one, otherwise what the pipeline still has to gather to make this submit-ready.
+function ckReadinessNote(f) {
+  if (f._prepMsg) return f._prepMsg;
+  const proof = ckEffectiveProof(f);
+  const hasShot = (f.shots && f.shots.length) || (f.screenshot && f.screenshot.data_url);
+  if (proof === "confirmed" && hasShot) return "Confirmed with a screenshot attached — ready to package and submit.";
+  const missing = [];
+  if (proof !== "confirmed") missing.push("proof of impact");
+  if (!hasShot) missing.push("a screenshot");
+  return `One click runs prove → screenshot → build. Still missing: ${missing.join(" + ")}.`;
+}
+
+// Why Submit is gated, in plain terms, shown inline next to the disabled button — mirrors
+// exactly the conditions ckCanSubmit checks so the reason is never out of sync with the gate.
+function ckSubmitGateReason(f) {
+  if (ckEffectiveProof(f) !== "confirmed")
+    return "Blocked — impact isn’t confirmed. Run “Prepare full report” or “Create proof of impact” first; only a Confirmed finding can be filed.";
+  if (!(ckState.h1 && ckState.h1.has_token))
+    return "Blocked — add your HackerOne API token in the credentials bar below.";
+  if (!(ckState.h1 && ckState.h1.team_handle))
+    return "Blocked — set your HackerOne team handle in the credentials bar below.";
+  if (!f.ref)
+    return "Blocked — open this finding from the Findings board after the campaign to file it.";
+  return "Blocked.";
+}
+
+// One-click pipeline behind "Prepare full report": prove (only when not already confirmed, to
+// avoid needless live traffic) → capture a screenshot (only if none yet) → build the full report
+// markdown. Drives a single status line and stashes everything on the finding, then re-renders so
+// the panel paints the finished, submit-ready state. Every step here is ALSO an individual button,
+// so this only chains what the operator could do by hand — no hidden behavior.
+async function ckPrepareFullReport(f, btn, statusEl, shotWrap) {
+  const old = btn.textContent;
+  btn.disabled = true;
+  f._prepMsg = "";
+  const step = (msg) => { statusEl.className = "ck-status"; statusEl.textContent = msg; };
+  try {
+    // 1 · Prove — only when not already confirmed.
+    if (ckEffectiveProof(f) !== "confirmed") {
+      const url = String(f.location || f.sourceUrl || "").trim();
+      if (url) {
+        btn.textContent = "Proving…";
+        step(`Step 1 of 3 — actively probing ${url} in scope…`);
+        let scope = state.ckScope || "";
+        try { const h = new URL(url).hostname; if (h && !scope.split(/\s+/).includes(h)) scope = `${scope} ${h}`.trim(); } catch (_) { /* non-URL location */ }
+        try {
+          const res = await apiFetch("/api/bounty/finding/prove", {
+            method: "POST", timeoutMs: 120000,
+            body: JSON.stringify({ url, scope, program_id: state.ckActiveProgramId || null, authorized: true, screenshot: true }),
+          });
+          if (res && res.ok !== false) {
+            if ((res.confirmed || 0) && ckProofMatchesFinding(res.findings, f)) ckMarkStatus(f, { proof: "confirmed" });
+            const shot = res.screenshot;
+            if (shot && shot.ok && shot.data_url) f.shots = (f.shots || []).concat([{ data_url: shot.data_url, kind: "evidence" }]);
+          }
+        } catch (_) { /* keep going — we still build the report from what we have */ }
+      }
+    }
+    // 2 · Screenshot — only if we still have none (prove with screenshot:true may already have one).
+    const hasShot = (f.shots && f.shots.length) || (f.screenshot && f.screenshot.data_url);
+    if (!hasShot && (f.location || f.sourceUrl || f.source_url || f.target || f.runId || ckState.runId)) {
+      btn.textContent = "Capturing…";
+      step("Step 2 of 3 — capturing a proof screenshot…");
+      try {
+        const res = await apiFetch("/api/bounty/screenshot", {
+          method: "POST", timeoutMs: 60000,
+          body: JSON.stringify({
+            run_id: f.runId || ckState.runId, ref: f.ref || "",
+            url: f.location || f.sourceUrl || f.source_url || f.target || "",
+            title: f.title || "", location: f.location || f.source_url || "",
+            matched_value: f.matched_value || f.snippet || (f.proofObj && (f.proofObj.evidence || f.proofObj.observed_result)) || "",
+            scope: (ck.scope?.value || "").trim(),
+          }),
+        });
+        if (res && res.ok) {
+          if (res.source_text) f.sourceText = res.source_text;
+          const shots = Array.isArray(res.shots) && res.shots.length ? res.shots
+            : (res.data_url ? [{ data_url: res.data_url, kind: "evidence" }] : []);
+          if (shots.length) f.shots = (f.shots || []).concat(shots);
+        }
+      } catch (_) { /* keep going — we still build the report */ }
+    }
+    // 3 · Build the report markdown (cached on the finding so the preview paints without a refetch).
+    btn.textContent = "Assembling…";
+    step("Step 3 of 3 — assembling the full report…");
+    try { const pkg = await ckFullReportMarkdown(f); f._md = pkg.text; } catch (_) { /* the preview block will retry */ }
+    f._prepMsg = ckEffectiveProof(f) === "confirmed"
+      ? "Full report ready — confirmed, screenshot attached, report built. Package or submit below."
+      : "Report built, but impact isn’t confirmed — Submit stays gated. Re-run “Create proof of impact” to confirm it.";
+  } finally {
+    btn.disabled = false; btn.textContent = old;
+    if (ckState.reportFocus === f && ckState.view === "submissions") ckRenderSubmissions();
+  }
 }
 
 // --- Search / filter / sort for the Submissions page (current-run queue + history). ---
@@ -7480,6 +7600,7 @@ async function ckReportFromLedger(rec) {
 // Create proof of impact for a candidate (current-run queue): active re-probe + screenshot,
 // scope-gated, in a separate track. Renders the fresh proof + screenshot inline.
 async function ckCreateProofOfImpact(f, btn, statusEl, resultEl) {
+  f._prepMsg = "";  // a manual prove invalidates the last "Prepare full report" caption
   const url = String(f.location || f.sourceUrl || "").trim();
   if (!url) { statusEl.textContent = "This finding has no URL to probe."; statusEl.className = "ck-status is-error"; return; }
   // Union THIS finding's own host into the scope so proving works even for a finding opened from
