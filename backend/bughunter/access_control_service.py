@@ -143,7 +143,9 @@ def run_idor_check(
     r_ba_bb = _ratio(body_ba, body_bb)   # B-on-A vs B-on-B  (or did B just get its own/generic?)
     r_a_bb = _ratio(body_a, body_bb)     # A-on-A vs B-on-B  (are the two objects actually distinct?)
     detail = {"status_a": st_a, "status_bb": st_bb, "status_ba": st_ba,
-              "ratio_BonA_vs_A": round(r_ba_a, 3), "ratio_BonA_vs_BownB": round(r_ba_bb, 3), "ratio_A_vs_BownB": round(r_a_bb, 3)}
+              "ratio_BonA_vs_A": round(r_ba_a, 3), "ratio_BonA_vs_BownB": round(r_ba_bb, 3), "ratio_A_vs_BownB": round(r_a_bb, 3),
+              # Normalized response lengths — the concrete differential proving B received A's object.
+              "len_BonA": len(_norm(body_ba)), "len_BownB": len(_norm(body_bb)), "len_A": len(_norm(body_a))}
 
     if r_a_bb >= _DISTINCT:
         # A's object and B's object return ~identical content -> the endpoint isn't
@@ -410,7 +412,11 @@ def run_bfla_check(
     r_user_admin = _ratio(body_user, body_admin)
     r_anon_admin = _ratio(body_anon, body_admin)
     detail = {"status_admin": st_admin, "status_user": st_user, "status_anon": st_anon,
-              "ratio_user_vs_admin": round(r_user_admin, 3), "ratio_anon_vs_admin": round(r_anon_admin, 3)}
+              "ratio_user_vs_admin": round(r_user_admin, 3), "ratio_anon_vs_admin": round(r_anon_admin, 3),
+              # Concrete artifacts: the size match (user got the admin page) + the anonymous control's
+              # denial (proving the endpoint is genuinely privilege-gated), rendered as proof.
+              "len_user": len(_norm(body_user)), "len_admin": len(_norm(body_admin)),
+              "anon_location": (r_anon.get("location") or "").strip()[:200]}
 
     # Control 2: the endpoint must be access-CONTROLLED — an anonymous request must be denied
     # or clearly different. If anon sees the same thing as admin, the page is just PUBLIC.
@@ -469,6 +475,10 @@ def _build_bfla_finding(url: str, detail: dict[str, Any]) -> tuple[dict[str, Any
             "request_line": f"GET {url}",
             "request_header": "Cookie: <low-privilege account session>",
             "response_status": f"HTTP {detail['status_user']}",
+            # Concrete non-body proof: the size match to admin + the anonymous control's denial.
+            "response_header": (f"normalized length: low-priv ~{detail.get('len_user', '?')} bytes matches admin "
+                                f"~{detail.get('len_admin', '?')}; anonymous control denied (HTTP {detail['status_anon']}"
+                                + (f" → {detail['anon_location']}" if detail.get("anon_location") else "") + ")"),
             "matched_value": matched,
         },
     }
@@ -530,6 +540,10 @@ def _build_finding(url_a: str, url_b: str, detail: dict[str, Any]) -> tuple[dict
             "request_line": f"GET {url_a}",
             "request_header": "Cookie: <account B session>  (B's own credentials)",
             "response_status": f"HTTP {detail['status_ba']}",
+            # The size differential is concrete proof B got A's object — WITHOUT ever embedding the
+            # other user's body. Rendered as a response-header line + a bullet on every report surface.
+            "response_header": (f"normalized length: B-on-A ~{detail['len_BonA']} bytes matches A's own "
+                                f"~{detail['len_A']}, not B's own object ~{detail['len_BownB']}"),
             "matched_value": matched,
         },
     }

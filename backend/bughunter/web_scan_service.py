@@ -332,6 +332,7 @@ def _analyze(fetched: dict[str, Any]) -> list[dict[str, Any]]:
                 "headers",
                 final_url,
                 remediation="Add 'Strict-Transport-Security: max-age=63072000; includeSubDomains'.",
+                proof_evidence={**base_proof, "matched_value": "strict-transport-security header absent from the response"},
             )
         )
 
@@ -442,7 +443,8 @@ def _analyze(fetched: dict[str, Any]) -> list[dict[str, Any]]:
             )
 
     # 7. Source map exposure.
-    if "sourcemappingurl=" in body.lower():
+    sm_match = re.search(r"(?i)sourceMappingURL\s*=\s*\S+", body)  # match the ORIGINAL body so the excerpt keeps the real URL
+    if sm_match:
         findings.append(
             _finding(
                 "web.source-map-exposed",
@@ -451,7 +453,9 @@ def _analyze(fetched: dict[str, Any]) -> list[dict[str, Any]]:
                 "medium",
                 "disclosure",
                 final_url,
+                snippet=_snippet(body, sm_match),
                 remediation="Do not ship source maps to production, or restrict access to them.",
+                proof_evidence={**base_proof, "matched_value": _snippet(body, sm_match)},
             )
         )
 

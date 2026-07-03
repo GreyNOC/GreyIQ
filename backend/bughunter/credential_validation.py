@@ -45,6 +45,14 @@ def _host_allowed(host: str) -> bool:
     return host in _ALLOWED_HOSTS or host.endswith(_ALLOWED_SUFFIXES)
 
 
+def _poc_curl(key: str) -> str:
+    """The exact, copy-pasteable command a triager runs to reproduce liveness — one benign,
+    read-only GET to the key's OWN issuer (Google), never the target. Carries the real key so the
+    reproduction is literal; the caller renders it in the already-'sensitive' credential block."""
+    return ("curl -s 'https://www.googleapis.com/identitytoolkit/v3/relyingparty/"
+            f"getProjectConfig?key={key}'")
+
+
 def is_google_api_key(value: str) -> bool:
     return bool(_GOOGLE_KEY_RE.match(str(value or "").strip()))
 
@@ -82,13 +90,18 @@ def validate_firebase_key(key: str) -> dict[str, Any]:
     result: dict[str, Any] = {
         "checked": False, "live": None, "project_id": "", "authorized_domains": [],
         "detail": "", "http_status": 0, "endpoint": "identitytoolkit getProjectConfig",
+        # A copy-pasteable reproduction command + the ACTUAL issuer response, so the report proves
+        # liveness with a runnable PoC and a captured artifact — not prose alone.
+        "poc": "", "response_excerpt": "",
     }
     if not is_google_api_key(key):
         result["detail"] = "Not a Google/Firebase API key format (AIza…) — no validation attempted."
         return result
+    result["poc"] = _poc_curl(key)  # always present for a well-formed key, whatever the liveness verdict
     status, body = _get(_PROJECT_CONFIG_URL.format(key=quote(key, safe="")))
     result["checked"] = True
     result["http_status"] = status
+    result["response_excerpt"] = body[:900]  # the issuer's real response — the concrete proof artifact
     low = body.lower()
     if status == 200:
         try:
@@ -163,15 +176,28 @@ def probe_firebase_exposure(project: str, key: str = "") -> list[dict[str, Any]]
             })
             break  # one reachable RTDB host is enough
     # --- Cloud Storage: a public default bucket lists its objects to an unauthenticated GET.
-    status, body = _get(f"https://firebasestorage.googleapis.com/v0/b/{quote(project, safe='')}.appspot.com/o?maxResults=1")
+    # A small maxResults keeps it minimal while returning REAL object/prefix names as proof.
+    status, body = _get(f"https://firebasestorage.googleapis.com/v0/b/{quote(project, safe='')}.appspot.com/o?maxResults=10")
     low = body.lower()
     if status == 200 and ('"items"' in low or '"prefixes"' in low):
+        # Parse the actual object/prefix NAMES (mirrors the RTDB branch) so the report shows the
+        # concrete files an attacker can enumerate — not a prose "listing returned". Names/metadata
+        # only; nothing is downloaded. Falls back to prose when the body doesn't parse.
+        names: list[str] = []
+        try:
+            data = json.loads(body)
+            if isinstance(data, dict):
+                names = [str(i.get("name")) for i in (data.get("items") or []) if isinstance(i, dict) and i.get("name")][:40]
+                names += [str(p) for p in (data.get("prefixes") or []) if str(p or "").strip()][:40]
+        except ValueError:
+            pass
         findings.append({
             "service": "Firebase Cloud Storage", "endpoint": f"gs://{project}.appspot.com",
             "severity": "high",
-            "detail": f"The default Firebase Storage bucket {project}.appspot.com lists objects to an "
-                      "unauthenticated request (HTTP 200) — stored files are enumerable/readable.",
-            "evidence": "object listing returned (items/prefixes present)",
+            "detail": (f"The default Firebase Storage bucket {project}.appspot.com lists objects to an "
+                       "unauthenticated request (HTTP 200) — stored files are enumerable/readable. "
+                       + (f"Objects/prefixes exposed: {', '.join(names)}." if names else "Object listing is present.")),
+            "evidence": ("objects/prefixes: " + ", ".join(names)) if names else "object listing returned (items/prefixes present)",
             "repro": f"curl -s 'https://firebasestorage.googleapis.com/v0/b/{project}.appspot.com/o'",
         })
     return findings

@@ -29,6 +29,7 @@ from bughunter import (
     active_verify_service,
     cve_service,
     fsutil,
+    hunt_brain,
     ledger,
     learning,
     progress,
@@ -158,6 +159,9 @@ def run_campaign(
     recon_tech: list[str] = []
     recon_params: list[str] = []
     recon_api_findings: list[dict[str, Any]] = []
+    # Per-endpoint vuln-class priorities from the reasoning layer — {url: [classes]} — used to steer
+    # each URL's active pass toward the classes most likely to hit there (empty = default order).
+    hunt_priority: dict[str, list[str]] = {}
     if kind == "url":
         _emit("recon: mapping the surface…")
         # Bind discovery to the SAME fail-closed scope gate the active prover uses, so
@@ -176,6 +180,32 @@ def run_campaign(
         recon_params = rec.get("params") or []
         # GraphQL-introspection (and future API-discovery) candidates, each with an inline plan.
         recon_api_findings = rec.get("api_findings") or []
+
+        # Reasoning layer: let the configured brain read the mapped surface and propose
+        # target-specific parameter NAMES the heuristics miss (e.g. returnUrl/callback on a login,
+        # tpl on a renderer, file/path on a download). These are unioned into recon_params and thus
+        # flow to every per-URL active pass's benign differential checks — so an LLM hypothesis is
+        # only ever REPORTED if the deterministic prover independently confirms it (recall up,
+        # precision unchanged). Best-effort + fail-closed: no brain / any error keeps current behaviour.
+        try:
+            hb = hunt_brain.plan_hunt(coder_cfg, clean_target, scope,
+                                      {"endpoints": urls, "params": recon_params, "tech": recon_tech, "forms": []})
+            new_params = [p for p in (hb.get("param_hypotheses") or [])
+                          if p.lower() not in {q.lower() for q in recon_params}]
+            if new_params:
+                recon_params = list(recon_params) + new_params
+                _emit(f"hunt-brain: +{len(new_params)} target-specific param hypothesis(es) to probe "
+                      f"via the differential checks ({hb.get('provider') or 'brain'})")
+            # Per-endpoint class priorities steer each URL's active pass (the endpoints are already
+            # verbatim from `urls`, so they map straight onto the per-URL run below).
+            for row in (hb.get("probe_priority") or []):
+                ep, classes = row.get("endpoint"), row.get("classes") or []
+                if ep and classes:
+                    hunt_priority[ep] = classes
+            if hunt_priority:
+                _emit(f"hunt-brain: prioritised probe classes on {len(hunt_priority)} endpoint(s)")
+        except Exception:  # noqa: BLE001 - the reasoning layer must never break a hunt
+            pass
     else:
         urls = [clean_target]
         recon_notes, recon_sources = [], {}
@@ -209,7 +239,7 @@ def run_campaign(
             url, profile, None, str(out_root / "targets"), scope, True, coder_cfg,
             default_reports_dir=out_root / "targets", seed_dir=seed_dir, runtime_dir=runtime_dir,
             version=version, run_live=live, active=effective_active, time_based=(time_based or deep), auth=auth, per_finding=False,
-            extra_params=recon_params, on_progress=_emit, settings=campaign_settings,
+            extra_params=recon_params, on_progress=_emit, settings=campaign_settings, class_priority=hunt_priority.get(url),
         )
         per_target.append({"target": url, "ok": result.get("ok", False),
                            "report_path": result.get("report_path", ""), "error": result.get("error", "")})

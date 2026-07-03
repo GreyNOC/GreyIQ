@@ -180,6 +180,9 @@ def _location(finding: dict[str, Any]) -> str:
     loc = str(finding.get("location") or finding.get("file_path") or "")
     line = finding.get("line") or finding.get("line_start")
     if line and str(line) not in loc:
+        end = finding.get("line_end")
+        if end and end != line:  # a multi-line sink renders as a range, not just the first line
+            return f"{loc}:{line}-{end}"
         return f"{loc}:{line}"
     return loc
 
@@ -527,6 +530,22 @@ def _append_credential_proof(out: list[str], finding: dict[str, Any]) -> None:
         out.append("- **How it was validated:** a benign, read-only GET to the credential's own issuer "
                    f"(Google Identity Toolkit `getProjectConfig`) carrying only the found key — HTTP {proof.get('http_status', '?')}. "
                    "No target request, no data touched.")
+        # Runnable PoC + the ACTUAL issuer response — the reproducible command a triager runs and the
+        # captured artifact proving the key is live and what it reveals (not prose). The command carries
+        # the real key on purpose (this whole block is already flagged sensitive); the response is redacted.
+        poc = str(proof.get("poc") or "").strip()
+        if poc:
+            out.append("")
+            out.append("**Proof of concept — reproduce liveness (one benign, read-only GET to Google, never the target):**\n")
+            out.append("```bash")
+            out.append(poc)
+            out.append("```")
+            excerpt = str(proof.get("response_excerpt") or "").strip()
+            if excerpt:
+                out.append("Issuer response — proof the key is live and what it grants (redacted):\n")
+                out.append("```json")
+                out.append(redact_text(excerpt)[0][:900])
+                out.append("```")
     out.append("")
     if secret:
         out.append(f"> {_CREDENTIAL_WARNING}")
@@ -595,7 +614,7 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
         cls = str(finding.get("class_id") or "").lower()
         rid = str(finding.get("rule_id") or "").lower()
         _DISCLOSURE = ("disclosure", "cloud-exposure")
-        _DISCLOSURE_RID = ("traversal", "exposed", "firebase", "graphql", "bucket", "sensitive")
+        _DISCLOSURE_RID = ("traversal", "exposed", "firebase", "graphql", "bucket", "sensitive", "jwt")
         if cls == "cors" or "cors" in rid:
             heading = (
                 "**Demonstrated cross-origin read** — a request carrying the victim's authenticated "

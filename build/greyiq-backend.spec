@@ -51,6 +51,7 @@ hiddenimports = [
     "workspace",
     "_version",
     "gn_cli",  # run_frozen imports it at function level (CLI dispatch) — force-include
+    "yaml",    # api_discovery_service parses YAML OpenAPI specs; import is guarded, force-include so it's bundled
 ]
 
 # The ASGI stack + clients load a lot dynamically; pull everything in. numpy stays

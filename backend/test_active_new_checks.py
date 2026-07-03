@@ -546,5 +546,32 @@ class TimeBasedRceTests(unittest.TestCase):
         self.assertIsNone(av._check_time_rce(_Waf(), "https://app.example.com/run?cmd=1", settings=_RceTimingSettings()))
 
 
+class ClassPriorityReorderTests(unittest.TestCase):
+    """The reasoning layer's per-endpoint class priorities steer the active pass — it only reorders
+    checks (never adds/removes), so a prioritised class gets request-budget priority."""
+
+    def _checks(self):
+        return [("clickjacking", 1), ("csrf", 2), ("jwt", 3), ("cors", 4), ("redirect", 5),
+                ("xss", 6), ("rce", 7), ("sqli", 8), ("path-traversal", 9)]
+
+    def test_priority_promotes_and_preserves_order(self) -> None:
+        out = av._apply_class_priority(self._checks(), ["path-traversal", "rce"])
+        # prioritised classes move to the front; within each partition the default order is kept
+        self.assertEqual([c for c, _ in out][:2], ["rce", "path-traversal"])  # rce(7) before traversal(9): default order preserved
+        self.assertEqual([c for c, _ in out][2:], ["clickjacking", "csrf", "jwt", "cors", "redirect", "xss", "sqli"])
+
+    def test_reorder_never_adds_or_drops_a_check(self) -> None:
+        original = self._checks()
+        out = av._apply_class_priority(original, ["xss"])
+        self.assertEqual(sorted(out), sorted(original))  # exact same multiset of checks
+        self.assertEqual(len(out), len(original))
+
+    def test_empty_or_unknown_priority_is_a_noop(self) -> None:
+        original = self._checks()
+        self.assertEqual(av._apply_class_priority(original, None), original)
+        self.assertEqual(av._apply_class_priority(original, []), original)
+        self.assertEqual(av._apply_class_priority(original, ["nonexistent-class"]), original)  # no match -> unchanged order
+
+
 if __name__ == "__main__":
     unittest.main()
