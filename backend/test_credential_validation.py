@@ -109,9 +109,74 @@ class TokenLivenessTests(unittest.TestCase):
         cv._get_full = lambda url, extra_headers=None: (200, {}, '{"ok":false,"error":"invalid_auth"}')
         self.assertIs(cv.validate_slack_token("xoxb-bad")["live"], False)
 
+    def test_openai_key_live_lists_models(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (200, {}, '{"data":[{"id":"gpt-4o"},{"id":"o1"}]}')
+        r = cv.validate_openai_key("sk-proj-abc")
+        self.assertIs(r["live"], True)
+        self.assertIn("gpt-4o", r["scopes"])
+        self.assertIn("api.openai.com/v1/models", r["poc"])
+
+    def test_openai_key_dead(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (401, {}, '{"error":{"message":"Incorrect API key"}}')
+        self.assertIs(cv.validate_openai_key("sk-bad")["live"], False)
+
+    def test_anthropic_key_never_validated_against_openai(self) -> None:
+        # defensive: even if an sk-ant- key reached the OpenAI validator, it must NOT be sent there
+        sent = []
+        cv._get_full = lambda url, extra_headers=None: (sent.append(url), (200, {}, "{}"))[1]
+        r = cv.validate_openai_key("sk-ant-api03-" + "A" * 30)
+        self.assertEqual(sent, [])                 # no request was made to OpenAI
+        self.assertNotEqual(r.get("live"), True)   # and no live OpenAI finding is produced
+
+    def test_anthropic_key_live_lists_models(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (200, {}, '{"data":[{"id":"claude-sonnet-4"}]}')
+        r = cv.validate_anthropic_key("sk-ant-abc")
+        self.assertIs(r["live"], True)
+        self.assertIn("claude-sonnet-4", r["scopes"])
+
+    def test_stripe_key_live_via_nonexistent_resource(self) -> None:
+        # a VALID key returns 404 "No such customer" for the non-existent probe; NO account data read
+        cv._get_full = lambda url, extra_headers=None: (404, {}, '{"error":{"type":"invalid_request_error","message":"No such customer"}}')
+        r = cv.validate_stripe_key("sk_live_abc")
+        self.assertIs(r["live"], True)
+        self.assertIn("live-mode", r["principal"])
+        self.assertIn("move real money", r["detail"])          # live-mode impact called out
+        self.assertNotIn("No such customer", r["response_excerpt"])  # only the error TYPE captured, no data
+
+    def test_stripe_key_dead_on_401(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (401, {}, '{"error":{"type":"invalid_request_error","message":"Invalid API Key"}}')
+        self.assertIs(cv.validate_stripe_key("sk_live_bad")["live"], False)
+
+    def test_stripe_transient_5xx_is_inconclusive_not_live(self) -> None:
+        # a 500/429 is transient/ambiguous — it must NOT be misread as a live key
+        cv._get_full = lambda url, extra_headers=None: (500, {}, '{"error":{"type":"api_error"}}')
+        self.assertIsNone(cv.validate_stripe_key("sk_live_x")["live"])
+
+    def test_redirects_are_never_followed(self) -> None:
+        # the token is never replayed to a redirect target: the handler refuses to follow any 3xx
+        self.assertIsNone(cv._NoRedirect().redirect_request(None, None, 302, "moved", {}, "https://evil.example.com/steal"))
+
+    def test_anthropic_key_does_not_double_match_openai_rule(self) -> None:
+        # an sk-ant- key must fire ONLY secret.anthropic-key — never secret.openai-key, or it would be
+        # validated against the wrong issuer (the P1 own-issuer violation)
+        from bughunter.code_scanner.rules import SECRET_RULES
+
+        def rule_ids(text: str) -> set[str]:
+            ids: set[str] = set()
+            for rule in SECRET_RULES:
+                for hit in rule.scan(path="app.js", text=text):
+                    ids.add(getattr(hit, "rule_id", ""))
+            return ids
+
+        ant = rule_ids('const k = "sk-ant-api03-' + "A" * 40 + '";')
+        self.assertIn("secret.anthropic-key", ant)
+        self.assertNotIn("secret.openai-key", ant)              # the fix: no double-detection
+        # a genuine OpenAI key still fires the OpenAI rule
+        self.assertIn("secret.openai-key", rule_ids('const k = "sk-proj-' + "B" * 40 + '";'))
+
     def test_new_issuer_hosts_allowlisted_others_blocked(self) -> None:
-        self.assertTrue(cv._host_allowed("api.github.com"))
-        self.assertTrue(cv._host_allowed("slack.com"))
+        for h in ("api.github.com", "slack.com", "api.openai.com", "api.anthropic.com", "api.stripe.com"):
+            self.assertTrue(cv._host_allowed(h), h)
         self.assertFalse(cv._host_allowed("evil.example.com"))
         # a token is only ever sent to its allowlisted issuer — never an arbitrary host
         self.assertEqual(cv._get_full("https://evil.example.com/steal")[0], 0)
@@ -176,6 +241,25 @@ class CredentialReportTests(unittest.TestCase):
         self.assertIn(f"getProjectConfig?key={_KEY}", body)           # the runnable command, with the real key
         self.assertIn("Issuer response", body)                        # the captured artifact heading
         self.assertIn("acme-prod-42", body)                           # the actual issuer response content
+
+    def test_report_shows_explicit_request_sent_and_return_code(self) -> None:
+        body = self._render({"checked": True, "live": True, "principal": "OpenAI API key",
+                             "detail": "LIVE — OpenAI API", "http_status": 200, "no_data_read": True,
+                             "endpoint": "OpenAI api.openai.com/v1/models",
+                             "poc": "curl -s -H 'Authorization: Bearer sk-XXX' https://api.openai.com/v1/models"})
+        self.assertIn("**Request sent:**", body)                # the exact request is stated
+        self.assertIn("**Return code:** HTTP 200", body)        # the pure return-code evidence
+        self.assertIn("api.openai.com/v1/models", body)         # the issuer it was sent to
+        self.assertIn("No account data was read", body)         # accurate: OpenAI reads only the public catalog
+
+    def test_no_data_read_claim_omitted_when_issuer_metadata_was_read(self) -> None:
+        # a GitHub/Slack/Firebase validator reads + shows the account, so it must NOT claim no-data-read
+        body = self._render({"checked": True, "live": True, "principal": "octocat",
+                             "detail": "LIVE — GitHub", "http_status": 200,
+                             "endpoint": "GitHub api.github.com/user", "scopes": "repo, read:org",
+                             "poc": "curl -s -H 'Authorization: Bearer ghp_XXX' https://api.github.com/user"})
+        self.assertIn("Account / workspace", body)              # the account IS shown
+        self.assertNotIn("No account data was read", body)      # so the contradictory claim is suppressed
 
     def test_live_credential_reads_as_confirmed(self) -> None:
         body = self._render({"checked": True, "live": True, "project_id": "p", "detail": "LIVE", "http_status": 200})

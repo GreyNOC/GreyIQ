@@ -30,6 +30,7 @@ _ALLOWED_HOSTS = frozenset({
     "www.googleapis.com", "identitytoolkit.googleapis.com",
     "firestore.googleapis.com", "firebasestorage.googleapis.com",
     "api.github.com", "slack.com",  # issuers for GitHub PAT / Slack token liveness checks
+    "api.openai.com", "api.anthropic.com", "api.stripe.com",  # OpenAI / Anthropic / Stripe key liveness
 })
 _ALLOWED_SUFFIXES = (".firebaseio.com",)
 _TIMEOUT_S = 8
@@ -58,10 +59,24 @@ def is_google_api_key(value: str) -> bool:
     return bool(_GOOGLE_KEY_RE.match(str(value or "").strip()))
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow ANY redirect during credential validation. stdlib urllib re-sends the
+    Authorization/x-api-key header across a cross-host redirect; the allowlist is checked only on the
+    initial URL, so following a 3xx could replay the found token to a non-allowlisted host. Blocking
+    redirects keeps the token strictly on its own (allowlisted) issuer — matching every other guarded
+    HTTP call site in this codebase (_NoRedirect / _GuardedRedirect)."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None  # do not follow -> urllib surfaces the 3xx as an HTTPError, token never re-sent
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
 def _get_full(url: str, extra_headers: dict[str, str] | None = None) -> tuple[int, dict[str, str], str]:
     """GET a URL on the issuer allowlist and return (status, response_headers, body). Never raises.
     ``extra_headers`` carries the credential to its OWN issuer (e.g. an Authorization header) — the
-    only place a found token is ever transmitted, exactly as the leaking app already does."""
+    only place a found token is ever transmitted, exactly as the leaking app already does. Redirects
+    are NOT followed, so the token can never be replayed to a redirect target off the allowlist."""
     if not _host_allowed(urlparse(url).hostname or ""):  # only allowlisted issuer infra is contactable
         return 0, {}, "host not allowlisted"
     hdrs = {"User-Agent": _UA, "Accept": "application/json"}
@@ -69,7 +84,7 @@ def _get_full(url: str, extra_headers: dict[str, str] | None = None) -> tuple[in
         hdrs.update(extra_headers)
     req = urllib.request.Request(url, method="GET", headers=hdrs)
     try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:  # noqa: S310 - fixed https host, GET only
+        with _OPENER.open(req, timeout=_TIMEOUT_S) as resp:  # noqa: S310 - fixed https host, GET only, no redirects
             return int(getattr(resp, "status", 0) or 200), dict(resp.headers or {}), resp.read(_MAX_BYTES).decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         body = ""
@@ -289,4 +304,112 @@ def validate_slack_token(token: str) -> dict[str, Any]:
         result["detail"] = f"NOT live — Slack rejected the token ({err})."
         return result
     result["detail"] = f"Inconclusive (HTTP {status}; {err or 'no ok field'}) — validate manually within scope."
+    return result
+
+
+def validate_openai_key(token: str) -> dict[str, Any]:
+    """Validate a leaked OpenAI key via GET /v1/models — ONE benign, read-only request to the key's
+    OWN issuer (never the target). 200 + a model list proves it is live; 401/403 = dead. The model
+    catalog is public (not account data), so nothing sensitive is read."""
+    token = str(token or "").strip()
+    result = _credential_result("OpenAI api.openai.com/v1/models")
+    result["no_data_read"] = True  # only the public model catalog is read — never account data
+    if not token or token.startswith("sk-ant-"):  # sk-ant- is an Anthropic key — never send it to OpenAI
+        return result
+    result["poc"] = f"curl -s -H 'Authorization: Bearer {token}' https://api.openai.com/v1/models"
+    status, _h, body = _get_full("https://api.openai.com/v1/models", {"Authorization": f"Bearer {token}"})
+    result["checked"] = True
+    result["http_status"] = status
+    result["response_excerpt"] = body[:500]
+    if status == 200:
+        try:
+            models = [str(m.get("id")) for m in (json.loads(body).get("data") or []) if isinstance(m, dict) and m.get("id")][:8]
+        except ValueError:
+            models = []
+        result.update(live=True, principal="OpenAI API key", scopes=", ".join(models))
+        result["detail"] = ("LIVE — the key authenticates to the OpenAI API"
+                            + (f"; models available: {', '.join(models)}" if models else "")
+                            + ". It can spend the account's API credits / quota (billing abuse) and use every enabled model.")
+        return result
+    if status in (401, 403):
+        result.update(live=False)
+        result["detail"] = f"NOT live — OpenAI rejected the key (HTTP {status})."
+        return result
+    result["detail"] = f"Inconclusive (HTTP {status or 'no response'}) — validate manually within scope."
+    return result
+
+
+def validate_anthropic_key(token: str) -> dict[str, Any]:
+    """Validate a leaked Anthropic key via GET /v1/models — ONE benign, read-only request to the
+    key's OWN issuer (never the target). 200 + a model list proves it is live; 401 = dead. The model
+    catalog is public (not account data)."""
+    token = str(token or "").strip()
+    result = _credential_result("Anthropic api.anthropic.com/v1/models")
+    result["no_data_read"] = True  # only the public model catalog is read — never account data
+    if not token:
+        return result
+    result["poc"] = f"curl -s -H 'x-api-key: {token}' -H 'anthropic-version: 2023-06-01' https://api.anthropic.com/v1/models"
+    status, _h, body = _get_full("https://api.anthropic.com/v1/models",
+                                 {"x-api-key": token, "anthropic-version": "2023-06-01"})
+    result["checked"] = True
+    result["http_status"] = status
+    result["response_excerpt"] = body[:500]
+    if status == 200:
+        try:
+            models = [str(m.get("id")) for m in (json.loads(body).get("data") or []) if isinstance(m, dict) and m.get("id")][:8]
+        except ValueError:
+            models = []
+        result.update(live=True, principal="Anthropic API key", scopes=", ".join(models))
+        result["detail"] = ("LIVE — the key authenticates to the Anthropic API"
+                            + (f"; models available: {', '.join(models)}" if models else "")
+                            + ". It can spend the account's API credits (billing abuse).")
+        return result
+    if status in (401, 403):
+        result.update(live=False)
+        result["detail"] = f"NOT live — Anthropic rejected the key (HTTP {status})."
+        return result
+    result["detail"] = f"Inconclusive (HTTP {status or 'no response'}) — validate manually within scope."
+    return result
+
+
+def validate_stripe_key(token: str) -> dict[str, Any]:
+    """Validate a leaked Stripe secret key WITHOUT reading any account data: probe a deliberately
+    NON-EXISTENT resource so a VALID key returns 404 ("No such customer") and an INVALID key returns
+    401 — liveness from the status code alone, no charges/balance/customers ever read. ONE benign,
+    read-only GET to the key's OWN issuer (never the target)."""
+    token = str(token or "").strip()
+    result = _credential_result("Stripe api.stripe.com/v1/customers/<nonexistent>")
+    result["no_data_read"] = True  # probes a non-existent resource — no account data is ever returned
+    if not token:
+        return result
+    probe_url = "https://api.stripe.com/v1/customers/cus_00000000000000"  # a resource that cannot exist
+    result["poc"] = f"curl -s -H 'Authorization: Bearer {token}' {probe_url}"
+    status, _h, body = _get_full(probe_url, {"Authorization": f"Bearer {token}"})
+    result["checked"] = True
+    result["http_status"] = status
+    err_type = ""
+    try:  # capture ONLY the error type, never account data (the resource doesn't exist, so there is none)
+        err_type = str((json.loads(body).get("error") or {}).get("type") or "")
+    except ValueError:
+        pass
+    result["response_excerpt"] = f"error.type={err_type}" if err_type else body[:150]
+    if status == 401:
+        result.update(live=False)
+        result["detail"] = "NOT live — Stripe rejected the key (HTTP 401, invalid API key)."
+        return result
+    # Only a status that unambiguously means "the key AUTHENTICATED but the resource/permission
+    # failed" confirms live: 404 (our non-existent customer), 403 (valid but restricted key), 402.
+    # A 5xx / 429 / 3xx is transient/ambiguous, NOT proof of a live key -> inconclusive.
+    if status in (402, 403, 404):
+        mode = "live" if token.startswith("sk_live") else "test" if token.startswith("sk_test") else ""
+        result.update(live=True, principal=(f"Stripe {mode}-mode secret key" if mode else "Stripe secret key"))
+        result["detail"] = (
+            f"LIVE — the key authenticated (HTTP {status} for a non-existent resource, not 401). "
+            + ("This is a LIVE-mode key — it can move real money and read customer/payment data."
+               if mode == "live" else "This is a test-mode key." if mode == "test"
+               else "It authenticates to the Stripe API.")
+            + " Validated against a non-existent resource, so NO account data was read."
+        )
+        return result
+    result["detail"] = f"Inconclusive (HTTP {status or 'no response'}) — validate manually within scope."
     return result

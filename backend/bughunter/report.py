@@ -538,9 +538,17 @@ def _append_credential_proof(out: list[str], finding: dict[str, Any]) -> None:
         if str(proof.get("scopes") or "").strip():
             out.append(f"- **Granted scopes:** {_code(str(proof['scopes']))}")
         issuer = str(proof.get("endpoint") or "the credential's own issuer").strip()
-        out.append("- **How it was validated:** a benign, read-only GET to the credential's own issuer "
-                   f"(`{issuer}`) carrying only the found credential — HTTP {proof.get('http_status', '?')}. "
-                   "No target request, no data touched.")
+        # Explicit "pure evidence of sent and return code": the exact request that was made and the
+        # HTTP status it returned — the two facts a triager needs to trust the liveness verdict. The
+        # "no account data read" clause is added ONLY for validators that read none (OpenAI/Anthropic
+        # model catalog, Stripe non-existent resource); GitHub/Slack/Firebase read + show the account
+        # identity/project below, so claiming no-data-read there would contradict this very block.
+        no_data = " No account data was read." if proof.get("no_data_read") else ""
+        out.append(f"- **Request sent:** one benign, read-only request to the credential's own issuer "
+                   f"(`{issuer}`) carrying only the found credential — never the target." + no_data)
+        verdict = ("authenticated — the credential is LIVE" if live is True
+                   else "rejected — not live / revoked" if live is False else "inconclusive")
+        out.append(f"- **Return code:** HTTP {proof.get('http_status', '?')} ({verdict}).")
         # Runnable PoC + the ACTUAL issuer response — the reproducible command a triager runs and the
         # captured artifact proving the credential is live and what it reveals (not prose). The command
         # carries the real value on purpose (this block is already flagged sensitive); response redacted.
