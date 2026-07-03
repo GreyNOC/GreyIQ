@@ -2,6 +2,28 @@
 
 Notable changes to GreyIQ.
 
+## v0.74.0
+
+### Every leaked API key is now proven, not just detected
+- **OpenAI & Anthropic keys** are validated with one benign, read-only request to their own issuer
+  (`GET /v1/models` — the public model catalog, never account data): a live key is confirmed and the
+  models it can spend credits on are named; a dead/revoked key is marked not-live.
+- **Stripe keys** are validated by probing a deliberately **non-existent** customer, so a live key
+  returns a 404 ("no such customer") and a dead key returns 401 — liveness is read from the status
+  code alone and **no account data is ever read**. Live-mode vs test-mode is called out.
+- This joins the existing Firebase / GitHub / Slack liveness checks, so every API-key class the
+  scanner detects (except AWS, which needs the paired secret) ships as a **proven** finding with the
+  exact **request sent** and **HTTP return code** shown in the report.
+
+### Safer credential handling
+- Credential validation never follows redirects, so a found token can only ever be sent to its own
+  allowlisted issuer — it can never be replayed to a redirect target. (Also hardens the existing
+  Firebase / GitHub / Slack checks.)
+- An Anthropic `sk-ant-…` key is no longer mis-detected as an OpenAI key, so it is only ever validated
+  against Anthropic.
+- The report's "no account data was read" statement now appears only for the checks where it is
+  literally true, and is omitted for the checks that read and display the account/workspace/project.
+
 ## v0.73.0
 
 ### Finds more, proves more
