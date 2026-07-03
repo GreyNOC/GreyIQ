@@ -576,5 +576,55 @@ class PortfolioCampaignTests(unittest.TestCase):
         self.assertTrue(any("prog-a" in e for e in out["errors"]))
 
 
+class ProofScreenshotCaptureTests(unittest.TestCase):
+    """campaign._capture_proof_screenshots — the proof screenshot pass now runs for EVERY
+    actively-confirmed finding (not only deep mode). It records the shot path (+ the plain-text
+    request/response proof) on each finding, is best-effort (a missing PoC URL or a capture error
+    is a clean skip), and never raises — a broken/absent Playwright must never break the campaign.
+    screenshot_service is stubbed so the test stays offline."""
+
+    def setUp(self) -> None:
+        self._orig = (campaign.screenshot_service.poc_url_for_finding,
+                      campaign.screenshot_service.capture_screenshot)
+
+    def tearDown(self) -> None:
+        (campaign.screenshot_service.poc_url_for_finding,
+         campaign.screenshot_service.capture_screenshot) = self._orig
+
+    @staticmethod
+    def _items(n: int) -> list[dict]:
+        return [{"finding": {"ref": f"C{i}"}, "source_url": f"https://in-scope.example/{i}"} for i in range(n)]
+
+    def test_records_path_and_source_text_on_each_confirmed_finding(self) -> None:
+        campaign.screenshot_service.poc_url_for_finding = lambda finding, ctx: ctx["target"]
+        campaign.screenshot_service.capture_screenshot = lambda url, path, **kw: {
+            "ok": True, "path": str(path), "source_text_path": str(path) + ".txt"}
+        items = self._items(3)
+        n = campaign._capture_proof_screenshots(items, Path("shots"), "https://in-scope.example", "in-scope.example")
+        self.assertEqual(n, 3)
+        for it in items:
+            self.assertTrue(str(it["finding"]["screenshot_path"]).endswith(".png"))
+            self.assertTrue(str(it["finding"]["source_text_path"]).endswith(".txt"))
+
+    def test_capture_error_is_a_clean_skip_never_raises(self) -> None:
+        def boom(url, path, **kw):
+            raise RuntimeError("playwright not installed")
+        campaign.screenshot_service.poc_url_for_finding = lambda finding, ctx: ctx["target"]
+        campaign.screenshot_service.capture_screenshot = boom
+        items = self._items(2)
+        n = campaign._capture_proof_screenshots(items, Path("shots"), "https://in-scope.example", "in-scope.example")
+        self.assertEqual(n, 0)
+        self.assertNotIn("screenshot_path", items[0]["finding"])
+
+    def test_missing_poc_url_skips_without_calling_capture(self) -> None:
+        calls: list[int] = []
+        campaign.screenshot_service.poc_url_for_finding = lambda finding, ctx: ""
+        campaign.screenshot_service.capture_screenshot = lambda *a, **k: calls.append(1) or {"ok": True, "path": "x"}
+        items = self._items(2)
+        n = campaign._capture_proof_screenshots(items, Path("shots"), "t", "s")
+        self.assertEqual(n, 0)
+        self.assertEqual(calls, [])  # no PoC URL -> capture is never attempted
+
+
 if __name__ == "__main__":
     unittest.main()

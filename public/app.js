@@ -6741,10 +6741,20 @@ async function ckPrepareFullReport(f, btn, statusEl, shotWrap) {
         try {
           const res = await apiFetch("/api/bounty/finding/prove", {
             method: "POST", timeoutMs: 120000,
-            body: JSON.stringify({ url, scope, program_id: state.ckActiveProgramId || null, authorized: true, screenshot: true }),
+            // run_id + ref so the engine persists the captured proof onto this cached run —
+            // otherwise step 3 below rebuilds the canonical report and it still reads "candidate".
+            body: JSON.stringify({ url, scope, program_id: state.ckActiveProgramId || null,
+              run_id: f.runId || "", ref: f.ref || "", authorized: true, screenshot: true }),
           });
           if (res && res.ok !== false) {
-            if ((res.confirmed || 0) && ckProofMatchesFinding(res.findings, f)) ckMarkStatus(f, { proof: "confirmed" });
+            if ((res.confirmed || 0) && ckProofMatchesFinding(res.findings, f)) {
+              const best = (res.findings || []).find((x) => x.status === "confirmed");
+              if (best) {
+                f.proofObj = { status: "confirmed", method: best.method || "", observed_result: best.observed || "",
+                               control_result: best.control || "", evidence: best.evidence || "", affected_asset: best.affected_asset || "" };
+              }
+              ckMarkStatus(f, { proof: "confirmed" });
+            }
             const shot = res.screenshot;
             if (shot && shot.ok && shot.data_url) f.shots = (f.shots || []).concat([{ data_url: shot.data_url, kind: "evidence" }]);
           }
@@ -7653,7 +7663,10 @@ async function ckCreateProofOfImpact(f, btn, statusEl, resultEl) {
   try {
     res = await apiFetch("/api/bounty/finding/prove", {
       method: "POST", timeoutMs: 120000,
-      body: JSON.stringify({ url, scope, program_id: state.ckActiveProgramId || null, authorized: true, screenshot: true }),
+      // run_id + ref let the engine persist the captured proof back onto THIS cached run
+      // finding, so the rebuilt (canonical) report renders it confirmed — not just the badge.
+      body: JSON.stringify({ url, scope, program_id: state.ckActiveProgramId || null,
+        run_id: f.runId || "", ref: f.ref || "", authorized: true, screenshot: true }),
     });
   } catch (err) {
     statusEl.className = "ck-status is-error"; statusEl.textContent = err.message || "Could not reach the engine.";
@@ -7674,7 +7687,19 @@ async function ckCreateProofOfImpact(f, btn, statusEl, resultEl) {
   // If the active pass confirmed THIS finding's class, promote it to confirmed everywhere
   // (dashboard, board, history) and persist. Only on a class match — never on an unrelated
   // confirmation at the same URL.
-  if (conf && ckProofMatchesFinding(res.findings, f)) ckMarkStatus(f, { proof: "confirmed" });
+  if (conf && ckProofMatchesFinding(res.findings, f)) {
+    // Fold the captured differential onto the finding so the rebuilt report shows it (the
+    // /finding/report fallback reads f.proofObj), and drop the cached markdown so the preview
+    // refetches the now-confirmed report instead of the stale "candidate" one. The engine has
+    // also persisted this proof onto the cached run, so the canonical package agrees.
+    const best = (res.findings || []).find((x) => x.status === "confirmed");
+    if (best) {
+      f.proofObj = { status: "confirmed", method: best.method || "", observed_result: best.observed || "",
+                     control_result: best.control || "", evidence: best.evidence || "", affected_asset: best.affected_asset || "" };
+    }
+    f._md = null;
+    ckMarkStatus(f, { proof: "confirmed" });
+  }
 }
 
 // Shared renderer for a prove/re-probe result: summary + optional screenshot + per-check proof.
@@ -9087,7 +9112,10 @@ async function ckProveFinding(f) {
   try {
     res = await apiFetch("/api/bounty/finding/prove", {
       method: "POST", timeoutMs: 120000,
-      body: JSON.stringify({ url, scope: ckCampaign.scope, program_id: ckCampaign.programId, authorized: ckCampaign.authorized, screenshot: true }),
+      // run_id + ref persist the captured proof onto the cached run finding so its canonical
+      // submission report renders confirmed (no-op server-side until this finding has a ref).
+      body: JSON.stringify({ url, scope: ckCampaign.scope, program_id: ckCampaign.programId,
+        run_id: ckCampaign.runId || "", ref: f.ref || "", authorized: ckCampaign.authorized, screenshot: true }),
     });
   } catch (err) {
     setState({ state: "error", error: err.message || "Could not reach the engine." });

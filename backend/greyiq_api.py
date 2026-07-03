@@ -654,6 +654,13 @@ class ProveRequest(BaseModel):
     screenshot: bool = True
     auth_cookie: str = Field(default="", max_length=8000)
     auth_headers: list[str] = Field(default_factory=list, max_length=20)
+    # When this proof-of-impact pass belongs to a cached run finding, the caller passes its
+    # run_id + ref so the captured differential can be persisted back onto that run (see
+    # prove_finding) — this is what makes the CANONICAL submission package, the submit gate,
+    # and every rebuilt report render the finding as a confirmed proof of impact instead of
+    # leaving it "candidate" even after proof was gathered.
+    run_id: str = Field(default="", max_length=120)
+    ref: str = Field(default="", max_length=60)
 
 
 class ProofInput(BaseModel):
@@ -1639,9 +1646,69 @@ class GreyIQRuntime:
         out = {"ok": True, "host": meta.get("host", ""), "in_scope": True,
                "requests_used": meta.get("requests_used", 0), "rate_limited": bool(meta.get("rate_limited")),
                "findings": compact, "confirmed": confirmed, "screenshot": None}
+        # Persist the captured proof-of-impact differential back onto the cached run finding
+        # (when the caller named one) — the same way capture_screenshot records a screenshot on
+        # the run. Without this, proof gathered here flips only the status BADGE while the
+        # canonical submission package (rebuilt from the untouched cached run) keeps rendering
+        # "candidate", which is exactly the report/badge disagreement the operator hits.
+        if confirmed and request.run_id and request.ref:
+            out["persisted"] = self._persist_proof_of_impact(request.run_id, request.ref, compact)
         if request.screenshot:
             out["screenshot"] = self._capture_proof_screenshot(url, scope, settings)
         return out
+
+    @staticmethod
+    def _proof_matches_class(class_hint: str, class_id: str) -> bool:
+        """The SAME class-match rule the UI applies (ckProofMatchesFinding): an active check
+        only promotes a finding when its class matches the finding's class, so a re-probe that
+        confirms a DIFFERENT class at the same URL never flips THIS finding to confirmed."""
+        hint = str(class_hint or "").strip().lower()
+        cls = str(class_id or "").strip().lower()
+        return bool(hint and cls and (hint == cls or cls in hint or hint in cls))
+
+    def _persist_proof_of_impact(self, run_id: str, ref: str, compact: list[dict[str, Any]]) -> bool:
+        """Write the captured proof-of-impact differential from an active-prover pass onto the
+        cached run's attack plan for ``ref`` so the canonical submission package renders it as a
+        Confirmed proof of impact. Only a class-matched, confirmed result that carries a REAL
+        observed-vs-control differential is persisted — never client prose or an unrelated class
+        confirmed at the same URL. Returns True when a proof was persisted."""
+        ctx, finding, _run = self._resolve_run_finding(run_id, ref)
+        if ctx is None or finding is None:
+            return False
+        class_id = str(finding.get("class_id") or finding.get("category") or "")
+        best = next(
+            (c for c in compact
+             if c.get("status") == "confirmed"
+             and str(c.get("observed") or "").strip() and str(c.get("control") or "").strip()
+             and self._proof_matches_class(c.get("class_hint", ""), class_id)),
+            None,
+        )
+        if best is None:
+            return False
+        fields = {
+            "method": str(best.get("method") or "").strip(),
+            "observed_result": str(best.get("observed") or "").strip(),
+            "control_result": str(best.get("control") or "").strip(),
+            "evidence": str(best.get("evidence") or "").strip(),
+            "affected_asset": str(best.get("affected_asset") or "").strip(),
+            "limitations": str(best.get("limitations") or "").strip(),
+        }
+        # Concurrent /api/* calls (and any running campaign) share these cached dicts, so the
+        # read-modify-write of the plan's proof block must hold the lock — same as
+        # capture_screenshot's write-back of the screenshot paths.
+        with self.lock:
+            plans = ctx.setdefault("attack_plans", {})
+            plan = plans.get(ref)
+            if not isinstance(plan, dict):
+                plan = {}
+                plans[ref] = plan
+            poi = dict(plan.get("proof_of_impact") or {})
+            poi.update({k: v for k, v in fields.items() if v})
+            poi["status"] = "confirmed"
+            plan["proof_of_impact"] = poi
+            # Stamp the finding too, so a finding-level proof reader agrees with the plan.
+            finding["proof_status"] = "confirmed"
+        return True
 
     def list_all_findings(self) -> dict[str, Any]:
         """The durable, cross-run finding/report history (persistent ledger) + the portfolio

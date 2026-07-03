@@ -2,6 +2,31 @@
 
 Notable changes to GreyIQ.
 
+## v0.75.0
+
+### Proof of impact now updates the submission report
+- After **Create/Get proof of impact** (or the one-click **Prepare full report**) confirms a finding,
+  the captured request/response differential is now persisted onto the run — so the submission report,
+  the downloadable `.md`, and the HackerOne submit gate all render the finding as **Confirmed** with its
+  observed-vs-control proof, instead of still reading "Candidate / unverified".
+- Previously only the finding's status *badge* flipped to Confirmed while every rebuilt report kept
+  showing the candidate proof-obligation text, because the gathered proof was never written back to the
+  cached run the canonical report is built from.
+- The proof is only promoted when the active check confirms the finding's **own class** (an unrelated
+  confirmation at the same URL never flips it), and a client-supplied status still can't reach Confirmed
+  without a real negative control.
+
+### Stronger proof on every confirmed finding
+- A **proof screenshot** is now captured for *every* actively-confirmed finding (previously deep-mode
+  only) and ships in its submission package — a visual PoC of the vulnerable behaviour that speeds and
+  raises triage acceptance. Scope-gated and bounded; degrades cleanly when a browser engine is absent.
+- Data-disclosure findings (CORS cross-origin read, IDOR, exposed-file/dump) now **name the sensitive
+  data actually disclosed** — "the disclosed content includes a JWT (session/bearer token) and email
+  address(es)" — the concrete impact that lifts a finding from Low to High. Detection is deliberately
+  conservative (high-confidence secrets + JWTs + personal emails only; credit-card/phone/password
+  heuristics and the site's own public role addresses are excluded so the claim is never over-stated),
+  and it is shown only for disclosure findings, never for an injection finding's own payload effect.
+
 ## v0.74.0
 
 ### Every leaked API key is now proven, not just detected

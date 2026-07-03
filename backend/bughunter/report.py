@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from bughunter import sensitive_data
 from bughunter.code_scanner.redaction import redact_text
 
 _SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
@@ -634,7 +635,9 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
         rid = str(finding.get("rule_id") or "").lower()
         _DISCLOSURE = ("disclosure", "cloud-exposure")
         _DISCLOSURE_RID = ("traversal", "exposed", "firebase", "graphql", "bucket", "sensitive", "jwt")
+        is_disclosure = False
         if cls == "cors" or "cors" in rid:
+            is_disclosure = True
             heading = (
                 "**Demonstrated cross-origin read** — a request carrying the victim's authenticated "
                 "session returned the response body below. Because the CORS headers above make this "
@@ -642,6 +645,7 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
                 "attacker page exfiltrates:"
             )
         elif cls in _DISCLOSURE or any(t in rid for t in _DISCLOSURE_RID):
+            is_disclosure = True
             heading = (
                 "**Demonstrated impact — data disclosed** — the request above returned the content "
                 "below, proving the sensitive data is actually retrievable (not merely that the "
@@ -659,6 +663,15 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
         out.append(rd_fence)
         out.append(rd)
         out.append(rd_fence)
+        # Name the high-confidence sensitive data actually present in the disclosed body — the "so-what"
+        # that raises a data-disclosure finding's severity. Only for disclosure classes: for injection
+        # classes the body is the payload's own effect, not data exfiltrated to an attacker.
+        if is_disclosure:
+            exposed = sensitive_data.summarize(rd)
+            if exposed:
+                out.append("")
+                out.append(f"**Sensitive data exposed:** the disclosed content includes {exposed} — "
+                           "directly usable by an attacker, which raises the real-world impact.")
         out.append("")
 
 
