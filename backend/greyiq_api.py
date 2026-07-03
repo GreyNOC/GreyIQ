@@ -1516,6 +1516,9 @@ class GreyIQRuntime:
             max_files=request.max_files,
             per_finding=request.per_finding,
             on_progress=bounty_progress.sink(run_id) if run_id else None,
+            # When a collaborator is configured, an active+authorized URL hunt also runs the blind-SSRF
+            # OOB probe automatically (the token is the reproducible 'sheriff flag').
+            oob_base=self._oob_config()[0], oob_secret=self._oob_config()[1],
         )
         self._cache_bounty_run(result, target=request.target, scope=request.scope, program=None)
         return result

@@ -25,6 +25,7 @@ from uuid import uuid4
 import coder
 from bughunter import active_verify_service
 from bughunter import credential_validation
+from bughunter import oob_service
 from bughunter import fsutil
 from bughunter import impact_model
 from bughunter import ledger
@@ -1143,6 +1144,8 @@ def run_bounty_hunt(
     extra_params: list[str] | None = None,
     on_progress: Any = None,
     settings: Any = None,
+    oob_base: str = "",
+    oob_secret: str = "",
 ) -> dict[str, Any]:
     """Run a bounty hunt end to end and write a Markdown + JSON report.
 
@@ -1226,6 +1229,26 @@ def run_bounty_hunt(
         except Exception as exc:  # noqa: BLE001 - active layer is best-effort; never break a hunt
             active_meta = {"in_scope": False, "skipped_reason": f"active verification error: {exc}"}
             _emit(f"active verification error: {exc}")
+
+        # Blind SSRF over the OOB collaborator — the one active probe that needs external infra, so
+        # it runs only when the operator has configured a collaborator (base+secret). It injects a
+        # fresh, unguessable callback token per candidate param, probes, and polls the collaborator;
+        # a hit that appears ONLY after the probe (fresh-token negative control) is a confirmed blind
+        # SSRF, with the token as the reproducible "sheriff flag". Best-effort; never breaks a hunt.
+        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+            try:
+                _emit("running blind-SSRF OOB probe (collaborator configured)…")
+                ssrf = oob_service.confirm_blind_ssrf(clean_target, base=oob_base, secret=oob_secret,
+                                                      scope=scope, settings=settings, extra_params=extra_params)
+                if ssrf.get("ok") and ssrf.get("finding") and ssrf.get("status") in ("confirmed", "candidate"):
+                    raw_findings = list(raw_findings) + [ssrf["finding"]]
+                    if "active" not in scanners_run:
+                        scanners_run = list(scanners_run) + ["active"]
+                    _emit(f"blind-SSRF OOB: {ssrf.get('status')} via '{ssrf.get('param')}'")
+                else:
+                    _emit(f"blind-SSRF OOB: {ssrf.get('status') or ssrf.get('error') or 'no callback'}")
+            except Exception as exc:  # noqa: BLE001
+                _emit(f"blind-SSRF OOB probe error: {exc}")
 
     # Credential validation: a leaked Firebase/Google API key is only a REAL finding if it's live.
     # Gated by ``authorized`` — it sends ONE benign, read-only GET to the credential's OWN issuer
