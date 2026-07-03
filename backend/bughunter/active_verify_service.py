@@ -733,7 +733,13 @@ def _check_host_header(http: _Http, url: str) -> dict[str, Any] | None:
             proof_obligation="Show the reflected host lands in a password-reset/confirmation link or a cacheable response — not just printed in the page.",
         )
         sev = "low"
-    ev = {"request_line": f"GET {url}", "request_header": f"{probe_header}: {_MARKER_HOST}", "response_status": f"HTTP {probe['status']}", "matched_value": f"{_MARKER_HOST} in {where}"}
+    ev = {"request_line": f"GET {url}", "request_header": f"{probe_header}: {_MARKER_HOST}", "response_status": f"HTTP {probe['status']}",
+          "matched_value": f"{_MARKER_HOST} in {where}",
+          # The ACTUAL reflected value in context — the marker host as it landed in the Location
+          # header / body, so the report shows where the attacker input surfaced, not just that it did.
+          "read_data": _context_excerpt(location if in_location else body, _MARKER_HOST)}
+    if in_location:
+        ev["response_header"] = f"Location: {location.strip()}"[:300]
     return _finding("active.host-header-injection", "Host / X-Forwarded-Host reflected (host-header injection)", sev, "redirect", "redirect", url, proof, ev)
 
 
@@ -845,6 +851,7 @@ def _check_rce_command_injection(http: _Http, url: str, extra_params: list[str] 
             break
         body = probe.get("body") or ""
         if sig_dollar in body or sig_tick in body:
+            hit_sig = sig_dollar if sig_dollar in body else sig_tick
             form = "$(expr 111 + 111)" if sig_dollar in body else "`expr 111 + 111`"
             proof = _proof(
                 "confirmed", method=f"GET with {param}=<benign {form} shell substitution>",
@@ -854,7 +861,10 @@ def _check_rce_command_injection(http: _Http, url: str, extra_params: list[str] 
                 evidence="the marker immediately followed by the evaluated result (222) appears in the response body",
             )
             ev = {"request_line": f"GET {_with_query(url, {param: probe_payload})}", "response_status": f"HTTP {probe['status']}",
-                  "matched_value": "shell command substitution evaluated to 222 (OS command injection)"}
+                  "matched_value": "shell command substitution evaluated to 222 (OS command injection)",
+                  # The ACTUAL response excerpt showing the shell-evaluated 222 next to its marker — the
+                  # concrete proof a triager needs for a CRITICAL RCE, not merely a description of it.
+                  "read_data": _context_excerpt(body, hit_sig)}
             return _finding("active.rce-command-injection", f"OS command injection via '{param}' parameter",
                             "critical", "injection", "rce", url, proof, ev)
     return None
@@ -920,9 +930,9 @@ def _check_nosqli(http: _Http, url: str, extra_params: list[str] | None = None) 
         except _ActiveError:
             continue
         body, ctrl_body = probe.get("body") or "", control.get("body") or ""
-        matched = bool(_NOSQL_ERROR_RE.search(body))
+        nosql_hit = _NOSQL_ERROR_RE.search(body)
         ctrl_matched = bool(_NOSQL_ERROR_RE.search(ctrl_body))
-        if matched and not ctrl_matched:
+        if nosql_hit and not ctrl_matched:
             proof = _proof(
                 "confirmed", method=f"GET with {param}[$ne]={original} (operator-object injection)",
                 affected_asset="the NoSQL datastore reachable by this query's role",
@@ -930,7 +940,10 @@ def _check_nosqli(http: _Http, url: str, extra_params: list[str] | None = None) 
                 control_result="the same parameter as a plain scalar returned no NoSQL error — the operator object broke the query",
                 evidence="a NoSQL backend error banner (MongoError / Mongoose CastError / BSONError) surfaced after the operator injection",
             )
-            ev = {"request_line": f"GET {_with_operator(url, param, original)}", "response_status": f"HTTP {probe['status']}", "matched_value": "NoSQL error banner"}
+            ev = {"request_line": f"GET {_with_operator(url, param, original)}", "response_status": f"HTTP {probe['status']}",
+                  "matched_value": "NoSQL error banner",
+                  # The ACTUAL NoSQL error text in the response — the concrete proof, mirroring error-SQLi.
+                  "read_data": _context_excerpt(body, nosql_hit.group(0))}
             return _finding("active.nosqli-error", f"NoSQL injection via '{param}' (operator object elicited a NoSQL error)", "high", "injection", "nosqli", url, proof, ev)
     return None
 
@@ -1030,6 +1043,9 @@ def _check_crlf(http: _Http, url: str, extra_params: list[str] | None = None) ->
                 evidence=f"X-Greyiq-Crlf: {_MARK} present in the response headers",
             )
             ev = {"request_line": f"GET {_with_query(url, {param: marker_value})}", "response_status": f"HTTP {probe['status']}",
+                  # Emit the split-out header as a real response-header line so the reconstructed
+                  # request/response shows the injected header exactly as it landed on the wire.
+                  "response_header": f"X-Greyiq-Crlf: {_MARK}",
                   "matched_value": f"injected response header X-Greyiq-Crlf: {_MARK}"}
             return _finding("active.crlf", f"CRLF / response-header injection via '{param}'", "high", "disclosure", "redirect", url, proof, ev)
     return None
