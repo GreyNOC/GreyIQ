@@ -14,6 +14,7 @@ review across a report easier.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import re
 from typing import Final
@@ -165,23 +166,11 @@ def redact_finding_snippets(findings: list[Finding]) -> tuple[list[Finding], dic
         if not was_redacted and not desc_redacted:
             out.append(finding)
             continue
-        out.append(
-            Finding(
-                rule_id=finding.rule_id,
-                title=finding.title,
-                description=new_desc,
-                severity=finding.severity,
-                confidence=finding.confidence,
-                category=finding.category,
-                file_path=finding.file_path,
-                line_start=finding.line_start,
-                line_end=finding.line_end,
-                snippet=new_snippet,
-                remediation=finding.remediation,
-                column_start=finding.column_start,
-                column_end=finding.column_end,
-            )
-        )
+        # replace() preserves every OTHER field (variable_name, secret_value, columns) while
+        # overriding only the two we redact — the raw secret_value is intentionally kept so the
+        # report's credential section can show/validate the real key; snippet/description are the
+        # surfaces that must never leak it.
+        out.append(dataclasses.replace(finding, description=new_desc, snippet=new_snippet))
         redacted_map[
             f"{finding.rule_id}@{finding.file_path}:{finding.line_start}"
         ] = True

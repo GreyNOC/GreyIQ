@@ -86,6 +86,17 @@ def _line_span(text: str, match: re.Match[str]) -> tuple[int, int]:
     return line_start, line_end
 
 
+# The identifier immediately to the LEFT of the matched secret's assignment operator — captures
+# `apiKey = "..."`, `"apiKey": "..."`, `FIREBASE_KEY=...`, `const apiKey = '...'`. Anchored to the
+# end of the pre-match text so it's the nearest assignment target, not some earlier token.
+_ASSIGN_NAME_RE = re.compile(r"""([A-Za-z_$][\w$.\-]{0,60})['"]?\s*[:=]\s*(?:f|r|b|u|rb|br)?['"]?\s*$""")
+
+
+def _assignment_name(pre_match_text: str) -> str:
+    m = _ASSIGN_NAME_RE.search(pre_match_text)
+    return m.group(1) if m else ""
+
+
 @dataclass(frozen=True)
 class RegexRule(Rule):
     """A rule whose hit set is a regex search over the raw file text.
@@ -134,6 +145,14 @@ class RegexRule(Rule):
                     continue
                 seen_snippets.add(key)  # type: ignore[arg-type]
             line_start, line_end = _line_span(text, match)
+            # For a secret finding, capture the assigned variable name and the RAW value so the
+            # report can name the exact variable and (for a credential) validate + show the real
+            # key. Non-secret rules keep both empty — no raw match value is ever retained.
+            variable_name = secret_value = ""
+            if self.category == "secret":
+                line_offset = text.rfind("\n", 0, match.start()) + 1
+                variable_name = _assignment_name(text[line_offset:match.start()])
+                secret_value = match.group(0)
             yield Finding(
                 rule_id=self.rule_id,
                 title=self.title,
@@ -146,6 +165,8 @@ class RegexRule(Rule):
                 line_end=line_end,
                 snippet=snippet,
                 remediation=self.remediation,
+                variable_name=variable_name,
+                secret_value=secret_value,
             )
 
 

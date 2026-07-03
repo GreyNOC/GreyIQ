@@ -314,6 +314,11 @@ def _has_captured_artifact(finding: dict[str, Any], proof: Any, observed_result:
         return True
     if finding.get("secret_hits"):
         return True
+    # A credential the engine actively validated as LIVE is a proven finding — a benign read to
+    # the credential's own issuer confirmed it authenticates (see _append_credential_proof).
+    cred = finding.get("_credential_proof")
+    if isinstance(cred, dict) and cred.get("live") is True:
+        return True
     if isinstance(proof, dict) and str(proof.get("observed_result") or "").strip() and str(proof.get("control_result") or "").strip():
         return True
     if observed_result and _HTTP_RESULT_RE.search(observed_result):
@@ -322,6 +327,28 @@ def _has_captured_artifact(finding: dict[str, Any], proof: Any, observed_result:
 
 
 def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> dict[str, str | bool]:
+    # A credential the engine validated as LIVE is a proven finding: it has a real observed vs
+    # control differential (the issuer accepted this key; an invalid key is rejected). Render that
+    # as a confirmed proof of impact directly — the project/domains are impact, not secrets, and the
+    # raw key itself lives only in the dedicated credential section, never here.
+    cred = finding.get("_credential_proof")
+    if isinstance(cred, dict) and cred.get("live") is True:
+        project = str(cred.get("project_id") or "").strip()
+        domains = [str(d) for d in (cred.get("authorized_domains") or []) if str(d).strip()]
+        asset = (f"Firebase project '{project}'" if project else "the Firebase/Google project the key authenticates to")
+        if domains:
+            asset += f" (authorized domains: {', '.join(domains[:20])})"
+        return {
+            "status": "confirmed", "ready": True,
+            "method": "benign read-only GET to the credential's issuer (Google Identity Toolkit getProjectConfig), carrying only the found key",
+            "actor": "an unauthenticated attacker holding the leaked key",
+            "affected_asset": asset,
+            "observed_result": f"the leaked key authenticated successfully (HTTP {cred.get('http_status', '?')})"
+                               + (f" to Firebase project '{project}'" if project else ""),
+            "control_result": "an invalid/revoked key is rejected by the same endpoint (API_KEY_INVALID) — this key is genuinely live",
+            "evidence": str(cred.get("detail") or "").strip(),
+            "limitations": "", "proof_obligation": "",
+        }
     proof = _proof_value(finding, plan)
     detail: dict[str, str | bool] = {
         "status": "missing",
@@ -467,6 +494,43 @@ def _append_screenshot(out: list[str], finding: dict[str, Any]) -> None:
         out.append("")
     out.append(f"> {_SCREENSHOT_WARNING}")
     out.append("")
+
+
+_CREDENTIAL_WARNING = ("The credential above is shown UN-REDACTED so you can validate it and paste the "
+                       "real value into your report — treat this document as sensitive and share it only "
+                       "with the program you are reporting to.")
+
+
+def _append_credential_proof(out: list[str], finding: dict[str, Any]) -> None:
+    """Render the exact-location + real-key + live-validation block a triager demands for a leaked
+    credential: the precise file:line and variable, the ACTUAL (un-redacted) key, and — when the
+    engine validated it — whether it is live plus the Firebase project/data it grants. Only fires
+    for a secret finding that carried a raw ``secret_value`` and/or a ``_credential_proof``."""
+    secret = str(finding.get("secret_value") or "").strip()
+    proof = finding.get("_credential_proof") if isinstance(finding.get("_credential_proof"), dict) else {}
+    if not secret and not proof:
+        return
+    out.append("## Credential — exact location, key, and live validation\n")
+    var = str(finding.get("variable_name") or "").strip()
+    out.append(f"- **Exact location:** {_code(_location(finding))}" + (f" — variable {_code(var)}" if var else ""))
+    if secret:
+        out.append(f"- **Credential (actual value, NOT redacted):** {_code(secret)}")
+    if proof and proof.get("checked"):
+        live = proof.get("live")
+        label = "**LIVE** (validated)" if live is True else "not live / revoked" if live is False else "inconclusive"
+        out.append(f"- **Validation:** {label} — {proof.get('detail', '')}")
+        if proof.get("project_id"):
+            out.append(f"- **Firebase project:** {_code(str(proof['project_id']))}")
+        domains = proof.get("authorized_domains") or []
+        if domains:
+            out.append(f"- **Authorized domains:** {_code(', '.join(str(d) for d in domains))}")
+        out.append("- **How it was validated:** a benign, read-only GET to the credential's own issuer "
+                   f"(Google Identity Toolkit `getProjectConfig`) carrying only the found key — HTTP {proof.get('http_status', '?')}. "
+                   "No target request, no data touched.")
+    out.append("")
+    if secret:
+        out.append(f"> {_CREDENTIAL_WARNING}")
+        out.append("")
 
 
 def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
@@ -829,6 +893,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
             out.append("")
         _append_proof_of_impact(out, finding, plan, heading="**Proof of impact:**")
         _append_screenshot(out, finding)
+        _append_credential_proof(out, finding)
         remediation = finding.get("remediation") or plan.get("remediation")
         if remediation:
             out.append(f"**Remediation:** {remediation}")
@@ -1168,6 +1233,7 @@ def build_finding_markdown(ctx: dict[str, Any], finding: dict[str, Any]) -> str:
         out.append(f"## Impact\n\n{impact}\n")
     _append_proof_of_impact(out, finding, plan, heading="## Proof of impact\n")
     _append_screenshot(out, finding)
+    _append_credential_proof(out, finding)
     remediation = finding.get("remediation") or plan.get("remediation")
     if remediation:
         out.append(f"## Remediation\n\n{remediation}\n")

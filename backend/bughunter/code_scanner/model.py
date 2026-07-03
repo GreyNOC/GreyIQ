@@ -70,6 +70,13 @@ class Finding:
     remediation: str = ""
     column_start: int | None = None
     column_end: int | None = None
+    # The identifier the secret is assigned to (e.g. `apiKey`, `FIREBASE_KEY`) — a HackerOne
+    # triager wants the exact variable, not just the line. Empty when not an assignment.
+    variable_name: str = ""
+    # The RAW matched credential value (secret rules only). Deliberately un-redacted so the
+    # operator can validate it and paste the real key into their own report — the credential is
+    # shown only in the report's clearly-labelled, review-before-sharing section, never elsewhere.
+    secret_value: str = ""
 
 
 @dataclass(frozen=True)
