@@ -7,6 +7,7 @@ value. The validator's network layer is mocked; no real request is ever made in 
 """
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -16,6 +17,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from bughunter import credential_validation as cv  # noqa: E402
+from bughunter import report as report_lib  # noqa: E402
 from bughunter import report_formats as RF  # noqa: E402
 from bughunter.bounty import _deterministic_attack_plan  # noqa: E402
 from bughunter.code_scanner.redaction import redact_finding_snippets  # noqa: E402
@@ -280,6 +282,68 @@ class CredentialReportTests(unittest.TestCase):
         body = self._render({"checked": True, "live": False, "detail": "NOT live", "http_status": 400})
         self.assertIn(_KEY, body)                                 # still shows the key + location
         self.assertNotRegex(body, r"(?i)status:\*\*\s*Confirmed")  # but a dead key is not a confirmed finding
+
+    def test_source_api_credential_plan_carries_redacted_read_proof(self) -> None:
+        raw = "sk-proj-" + ("C" * 32)
+        finding = {
+            "ref": "F1", "title": "OpenAI API key", "severity": "high", "confidence": "high",
+            "class_id": "secrets", "category": "secret", "location": "src/settings.py",
+            "rule_id": "secret.openai-key", "description": "An OpenAI API key is hardcoded.",
+            "snippet": 'OPENAI_API_KEY = "sk-p...[REDACTED_SECRET:sha256:x]"',
+            "variable_name": "OPENAI_API_KEY", "secret_value": raw,
+            "_credential_proof": {
+                "checked": True, "live": True, "principal": "OpenAI API key",
+                "scopes": "gpt-4o", "detail": "LIVE - OpenAI API; models available: gpt-4o",
+                "http_status": 200, "no_data_read": True,
+                "endpoint": "OpenAI api.openai.com/v1/models",
+                "poc": f"curl -s -H 'Authorization: Bearer {raw}' https://api.openai.com/v1/models",
+                "response_excerpt": '{"data":[{"id":"gpt-4o"}]}',
+            },
+        }
+        plan = _deterministic_attack_plan(finding, "secrets")
+        proof = plan["proof_of_impact"]
+        detail = report_lib._proof_of_impact_detail(finding, plan)
+
+        self.assertNotIn(raw, json.dumps(plan))
+        self.assertIn("[REDACTED_SECRET", proof["authenticated_read_request"])
+        self.assertIn("api.openai.com/v1/models", proof["authenticated_read_request"])
+        self.assertIn("gpt-4o", proof["authenticated_read_response"])
+        self.assertIn("OpenAI API key", proof["blast_radius"])
+        self.assertEqual(detail["status"], "confirmed")
+        self.assertTrue(detail["ready"])
+
+        ctx = {"tool": "g", "version": "t", "generated_at": "now", "target": "src/settings.py",
+               "scope": "", "attack_plans": {"F1": plan}}
+        body = RF.render_finding(ctx, finding, "hackerone")
+        self.assertIn("Authenticated read request", body)
+        self.assertIn("Authenticated read success response", body)
+        self.assertIn("Blast radius", body)
+        self.assertIn("[REDACTED_SECRET", body)
+
+    def test_inconclusive_source_api_credential_stays_candidate_with_poc(self) -> None:
+        raw = "sk-proj-" + ("D" * 32)
+        finding = {
+            "ref": "F1", "title": "OpenAI API key", "severity": "high", "confidence": "high",
+            "class_id": "secrets", "category": "secret", "location": "src/settings.py",
+            "rule_id": "secret.openai-key", "description": "An OpenAI API key is hardcoded.",
+            "snippet": 'OPENAI_API_KEY = "sk-p...[REDACTED_SECRET:sha256:x]"',
+            "variable_name": "OPENAI_API_KEY", "secret_value": raw,
+            "_credential_proof": {
+                "checked": True, "live": None, "detail": "Inconclusive timeout", "http_status": 0,
+                "endpoint": "OpenAI api.openai.com/v1/models",
+                "poc": f"curl -s -H 'Authorization: Bearer {raw}' https://api.openai.com/v1/models",
+                "response_excerpt": "Timeout",
+            },
+        }
+        plan = _deterministic_attack_plan(finding, "secrets")
+        detail = report_lib._proof_of_impact_detail(finding, plan)
+
+        self.assertNotIn(raw, json.dumps(plan))
+        self.assertEqual(plan["proof_of_impact"]["status"], "candidate")
+        self.assertEqual(detail["status"], "candidate")
+        self.assertFalse(detail["ready"])
+        self.assertIn("Benign source-credential validation PoC", plan["poc"])
+        self.assertIn("[REDACTED_SECRET", plan["poc"])
 
 
 if __name__ == "__main__":

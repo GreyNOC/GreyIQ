@@ -64,6 +64,28 @@ class SeverityResolutionTests(unittest.TestCase):
         confirm_step = next(s for s in steps if s["phase"] == "Confirm findings" and s["ref"] == "F1")
         self.assertEqual(confirm_step["priority"], "medium")  # no CVSS override available -> raw label stands
 
+    def test_confirmed_source_secret_step_reviews_captured_proof(self) -> None:
+        finding = _finding("F1", "high", class_id="secrets")
+        finding.update({"class_name": "Secrets / exposed credentials", "location": "src/settings.py"})
+        plan = {
+            "proof_of_impact": {
+                "status": "confirmed",
+                "authenticated_read_request": "curl -H 'Authorization: Bearer [REDACTED_SECRET]' https://api.openai.com/v1/models",
+                "authenticated_read_response": '{"data":[{"id":"gpt-4o"}]}',
+                "blast_radius": "OpenAI API key; scopes: gpt-4o",
+            }
+        }
+        ctx = {"findings": [finding], "attack_plans": {"F1": plan}, "scanners_run": ["code"], "kind": "path"}
+        steps = next_steps.build_next_steps(ctx)
+        confirm_step = next(s for s in steps if s["phase"] == "Confirm findings" and s["ref"] == "F1")
+
+        self.assertIn("Review confirmed proof for F1", confirm_step["action"])
+        self.assertIn("already captured", confirm_step["detail"])
+        self.assertIn("redacted authenticated-read request", confirm_step["detail"])
+        self.assertIn("issuer success response", confirm_step["detail"])
+        self.assertIn("blast radius", confirm_step["detail"])
+        self.assertNotIn("Capture the exact request/response", confirm_step["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

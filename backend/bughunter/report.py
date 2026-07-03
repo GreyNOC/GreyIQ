@@ -348,6 +348,8 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
             asset = f"the account/workspace the token controls: {principal}" + (f" (scopes: {scopes})" if scopes else "")
         else:
             asset = "the account/project the credential authenticates to"
+        poc = redact_text(str(cred.get("poc") or "").strip())[0]
+        response = redact_text(str(cred.get("response_excerpt") or cred.get("detail") or "").strip())[0]
         return {
             "status": "confirmed", "ready": True,
             "method": f"benign read-only GET to the credential's issuer ({endpoint}), carrying only the found credential",
@@ -357,6 +359,9 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
                                + (f" to Firebase project '{project}'" if project else (f" as {principal}" if principal else "")),
             "control_result": "an invalid/revoked credential is rejected by the same endpoint — this credential is genuinely live",
             "evidence": str(cred.get("detail") or "").strip(),
+            "authenticated_read_request": poc,
+            "authenticated_read_response": response,
+            "blast_radius": asset,
             "limitations": "", "proof_obligation": "",
         }
     proof = _proof_value(finding, plan)
@@ -369,6 +374,9 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
         "affected_asset": "",
         "actor": "",
         "control_result": "",
+        "authenticated_read_request": "",
+        "authenticated_read_response": "",
+        "blast_radius": "",
         "limitations": "",
         "proof_obligation": "",
     }
@@ -388,6 +396,29 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
         detail["affected_asset"] = str(proof.get("affected_asset") or proof.get("asset") or proof.get("data") or "").strip()
         detail["actor"] = str(proof.get("actor") or proof.get("role") or proof.get("account") or "").strip()
         detail["control_result"] = str(proof.get("control_result") or proof.get("negative_control") or "").strip()
+        detail["authenticated_read_request"] = str(
+            proof.get("authenticated_read_request")
+            or proof.get("benign_authenticated_read_request")
+            or proof.get("validation_request")
+            or proof.get("read_request")
+            or proof.get("request")
+            or ""
+        ).strip()
+        detail["authenticated_read_response"] = str(
+            proof.get("authenticated_read_response")
+            or proof.get("benign_authenticated_read_response")
+            or proof.get("success_response")
+            or proof.get("validation_response")
+            or proof.get("read_response")
+            or proof.get("response")
+            or ""
+        ).strip()
+        detail["blast_radius"] = str(
+            proof.get("blast_radius")
+            or proof.get("access_scope")
+            or proof.get("impact_scope")
+            or ""
+        ).strip()
         detail["limitations"] = str(proof.get("limitations") or proof.get("scope_limitations") or proof.get("notes") or "").strip()
         detail["proof_obligation"] = str(proof.get("proof_obligation") or proof.get("obligation") or "").strip()
     else:
@@ -397,7 +428,18 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
     # response (or an operator-supplied proof field) can carry the very secret/token/PII
     # the finding is about; never double-leak it. All of these are emitted by
     # _append_proof_of_impact, so redact them all, not just evidence/observed_result.
-    for _k in ("evidence", "observed_result", "method", "affected_asset", "actor", "control_result", "limitations"):
+    for _k in (
+        "evidence",
+        "observed_result",
+        "method",
+        "affected_asset",
+        "actor",
+        "control_result",
+        "authenticated_read_request",
+        "authenticated_read_response",
+        "blast_radius",
+        "limitations",
+    ):
         if detail[_k]:
             detail[_k] = redact_text(str(detail[_k]))[0]
 
@@ -455,6 +497,9 @@ def _append_proof_of_impact(out: list[str], finding: dict[str, Any], plan: dict[
         ("method", "Method"),
         ("actor", "Actor / role"),
         ("affected_asset", "Affected asset or data"),
+        ("authenticated_read_request", "Authenticated read request"),
+        ("authenticated_read_response", "Authenticated read success response"),
+        ("blast_radius", "Blast radius"),
         ("observed_result", "Observed result"),
         ("control_result", "Control / expected result"),
         ("evidence", "Evidence"),

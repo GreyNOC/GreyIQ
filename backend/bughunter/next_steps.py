@@ -131,6 +131,15 @@ def _first_actions(ref: str, attack_plans: dict[str, Any], fallback: list[str]) 
     return "Confirm the lead is reachable from untrusted input, then capture request/response evidence."
 
 
+def _proof_already_confirmed(finding: dict[str, Any], plan: dict[str, Any] | None) -> bool:
+    """True when the proof engine has already captured a confirmed impact artifact."""
+    proof = (plan or {}).get("proof_of_impact") if isinstance(plan, dict) else None
+    if isinstance(proof, dict) and str(proof.get("status") or "").strip().lower() == "confirmed":
+        return True
+    credential = finding.get("_credential_proof") if isinstance(finding.get("_credential_proof"), dict) else {}
+    return credential.get("live") is True
+
+
 def chain_actions(findings: list[dict[str, Any]]) -> list[str]:
     """Do-this chain notes for the class combinations present in the findings."""
     present = {str(f.get("class_id") or f.get("category") or "").lower() for f in findings}
@@ -222,12 +231,29 @@ def build_next_steps(ctx: dict[str, Any], brain_next_steps: list[str] | None = N
         class_checklist = []  # class-specific fallback comes from the attack plan already
         opening = _first_actions(ref, attack_plans, class_checklist)
         tool = _tool_for_class(class_id, recommended_tools)
-        detail = (
-            f"{class_name} at {finding.get('location') or 'the flagged location'}. "
-            f"Start here: {opening} "
-            "Capture the exact request/response and the before/after state as evidence."
-        )
-        add("Confirm findings", sev, f"Confirm {ref}: {title}".strip(), detail, ref=ref, tool=tool)
+        plan = attack_plans.get(ref) if isinstance(attack_plans, dict) else {}
+        if _proof_already_confirmed(finding, plan):
+            if class_id == "secrets":
+                detail = (
+                    f"{class_name} at {finding.get('location') or 'the flagged location'} is already confirmed. "
+                    "The proof engine already captured the redacted authenticated-read request, issuer success response, "
+                    "and blast radius; review those generated artifacts for scope accuracy before submission."
+                )
+            else:
+                detail = (
+                    f"{class_name} at {finding.get('location') or 'the flagged location'} is already confirmed. "
+                    "Review the captured request/response evidence, observed result, control result, and remediation "
+                    "for scope accuracy before submission."
+                )
+            action = f"Review confirmed proof for {ref}: {title}".strip()
+        else:
+            detail = (
+                f"{class_name} at {finding.get('location') or 'the flagged location'}. "
+                f"Start here: {opening} "
+                "Capture the exact request/response and the before/after state as evidence."
+            )
+            action = f"Confirm {ref}: {title}".strip()
+        add("Confirm findings", sev, action, detail, ref=ref, tool=tool)
     if remainder:
         lows = ", ".join(str(f.get("ref") or "") for f in remainder[:12])
         add(
