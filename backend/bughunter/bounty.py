@@ -487,10 +487,18 @@ def _concrete_repro(finding: dict[str, Any], class_id: str) -> tuple[list[str], 
     url = str(finding.get("location") or "").strip()
     if class_id != "cors" or not url.startswith(("http://", "https://")):
         return [], ""
-    # The exact Origin GreyIQ sent (and the target reflected). Fall back to a clear
-    # attacker placeholder if a passive finding carried no captured request header.
+    # The exact Origin GreyIQ sent (and the target reflected) — for a subdomain/substring
+    # variant this IS a subdomain/host-containing origin, so the repro matches the finding
+    # title. Only when a degraded/passive finding carried no captured request header do we
+    # fall back to a placeholder — and even then pick one that does NOT contradict the title
+    # (a "subdomain"-trust finding needs an attacker SUBDOMAIN, not an unrelated origin).
     req_hdr = str(pe.get("request_header") or "")
-    origin = req_hdr.split(":", 1)[1].strip() if req_hdr.lower().startswith("origin:") else "https://attacker.example"
+    if req_hdr.lower().startswith("origin:"):
+        origin = req_hdr.split(":", 1)[1].strip()
+    else:
+        host = url.split("://", 1)[-1].split("/", 1)[0].split("?", 1)[0].split("@")[-1]
+        title = str(finding.get("title") or "").lower()
+        origin = f"https://attacker.{host}" if (host and "subdomain" in title) else "https://attacker.example"
     # The ACAO/ACAC the target returned, shown as DISTINCT headers (not one combined line).
     matched = str(pe.get("matched_value") or "")
     hdr_parts = [h.strip() for h in matched.split(";") if h.strip()]
