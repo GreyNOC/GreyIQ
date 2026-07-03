@@ -33,6 +33,10 @@ _PARAM_RE = re.compile(r"""[?&]([A-Za-z_][A-Za-z0-9_]{0,39})=""")  # {0,39}: sin
 _HOST_RE = re.compile(r"""https?://([A-Za-z0-9][A-Za-z0-9.\-]{1,250}\.[A-Za-z]{2,24})""")
 
 _ENDPOINT_HINTS = ("api", "graphql", "/v1", "/v2", "/v3", "rest", "/query", "/admin", "/internal")
+# Static assets a fetch()/axios() call may load but that are NOT injectable routes — excluded from
+# the hint-exempt call-target path so relaxing the hint gate doesn't add asset noise to the surface.
+_STATIC_EXT = (".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".woff", ".woff2",
+               ".ttf", ".eot", ".map", ".mp4", ".webm", ".pdf", ".zip", ".woff2")
 _CAP_ENDPOINTS, _CAP_PARAMS, _CAP_HOSTS, _CAP_SECRETS = 80, 60, 40, 20
 
 
@@ -60,11 +64,19 @@ def mine_js(js_text: str, base_url: str, *, host_filter: Callable[[str], bool] |
 
     endpoints: list[str] = []
     seen_ep: set[str] = set()
-    raw_paths = _ENDPOINT_RE.findall(text)[:1500] + _CALL_URL_RE.findall(text)[:500]
-    for raw in raw_paths:
+    # A _CALL_URL_RE target (fetch(...)/axios(...)/.open(...)) is a FIRST-CLASS endpoint — a literal
+    # `fetch('/checkout')` is a real route and must not need an api/v1/admin hint to survive. Only bare
+    # _ENDPOINT_RE string literals (much noisier) keep the precision hint gate. Scope is unaffected:
+    # every candidate, hinted or not, still passes keep_host() below and in_scope() at the caller.
+    raw_paths = [(r, True) for r in _ENDPOINT_RE.findall(text)[:1500]] + [(r, False) for r in _CALL_URL_RE.findall(text)[:500]]
+    for raw, needs_hint in raw_paths:
         if not (raw.startswith("/") or raw.startswith(("http://", "https://"))):
             continue
-        if not any(h in raw.lower() for h in _ENDPOINT_HINTS):
+        if needs_hint and not any(h in raw.lower() for h in _ENDPOINT_HINTS):
+            continue
+        # A call-target exempt from the hint gate must still not be a STATIC asset
+        # (fetch('/static/app.css') is not an injectable route) — those are noise, not surface.
+        if not needs_hint and raw.split("?", 1)[0].split("#", 1)[0].lower().endswith(_STATIC_EXT):
             continue
         try:
             absolute = urljoin(base_url, raw)
