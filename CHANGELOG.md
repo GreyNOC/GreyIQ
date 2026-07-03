@@ -2,6 +2,28 @@
 
 Notable changes to GreyIQ.
 
+## v0.68.0
+
+### CORS reports HackerOne stops rejecting
+HackerOne kept flagging our CORS reports for *"No CORS headers shown in proof; missing concrete
+reproduction steps and demonstration of vulnerability."* All three are now closed:
+
+- **The CORS headers are shown, plainly.** The reconstructed response now prints
+  `Access-Control-Allow-Origin` and `Access-Control-Allow-Credentials` as **separate header lines**
+  instead of one combined value. And on-demand reports (a history/board finding opened from the
+  full-report panel) used to drop the captured request/response entirely — so they showed *no* CORS
+  headers at all; that evidence is now carried through.
+- **Concrete, copy-pasteable reproduction.** Instead of a generic `curl` with no `Origin`, a CORS
+  report now gives the exact request —
+  `curl -i -H 'Origin: <attacker>' -H 'Cookie: <your session>' '<url>'` — the ACAO/ACAC headers to
+  look for, and a **runnable HTML PoC** (a credentialed `fetch(..., {credentials:'include'})`) as the
+  report's Proof of concept.
+- **The read is demonstrated.** On an **authenticated** scan the probe carries your same-site
+  session, so the response body it reads back is the very data an attacker origin could steal. The
+  report shows it under **Demonstrated cross-origin read**, with the observation stating the attacker
+  origin READ it. Unauthenticated scans still report the misconfiguration but claim no read
+  (fail-closed) — so scan while logged in to capture the demonstration.
+
 ## v0.67.3
 
 ### The request/response/source proof as text
