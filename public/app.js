@@ -5513,6 +5513,37 @@ async function ckRefreshProgramsEverywhere() {
   ckPopulateActiveProgramSelect();
 }
 
+// Delete a program and CASCADE the deletion across the whole app: remove it from the portfolio
+// and every view, clear it as the active program, drop its in-memory findings, and delete its
+// ledger findings — HIGH/CRITICAL findings are KEPT in the History "Archived" subcategory, the
+// rest are purged. Confirms once, returns true on success so the caller can re-render its view.
+async function ckDeleteProgram(programId, programName) {
+  if (!window.confirm(
+    `Delete program "${programName || programId}"?\n\n`
+    + `Its findings are deleted too — High/Critical findings are KEPT in History (Archived), `
+    + `everything else is permanently removed.`)) return false;
+  let res;
+  try {
+    res = await apiFetch("/api/operator/programs/delete", { method: "POST", body: JSON.stringify({ id: programId }) });
+  } catch (err) {
+    window.alert(err.message || "Could not delete the program — the engine may be unreachable, so it may still exist.");
+    return false;
+  }
+  if (res && res.ok === false) { window.alert(res.error || "Could not delete the program."); return false; }
+  // Register the deletion everywhere so no stale reference survives.
+  if (state.ckActiveProgramId === programId) { state.ckActiveProgramId = ""; saveState(); }
+  ckState._history = null;   // force the Submissions/History view to reload (findings gone + Archived populated)
+  if (Array.isArray(ckState.findings)) {
+    ckState.findings = ckState.findings.filter((f) => String(f.program || "") !== String(programId));
+  }
+  await ckRefreshProgramsEverywhere();
+  const kept = (res && res.archived) || 0, purged = (res && res.purged) || 0;
+  if (kept || purged) {
+    window.alert(`Program deleted. Kept ${kept} High/Critical finding(s) in History → Archived; removed ${purged} other finding(s).`);
+  }
+  return true;
+}
+
 function ckPopulateActiveProgramSelect() {
   if (!ck.activeProgram) return;
   const current = ck.activeProgram.value;
@@ -5697,12 +5728,7 @@ function ckProgramSetupRow(p) {
   });
   const del = cel("button", "ck-btn", "Delete"); del.type = "button";
   del.addEventListener("click", async () => {
-    if (!window.confirm(`Delete program "${p.name || p.id}"? This does not affect anything already hunted or reported.`)) return;
-    try {
-      await apiFetch("/api/operator/programs/delete", { method: "POST", body: JSON.stringify({ id: p.id }) });
-      if (state.ckActiveProgramId === p.id) { state.ckActiveProgramId = ""; saveState(); }
-      void ckRenderProgram();
-    } catch (err) { window.alert(err.message || "Could not delete the program — the engine may be unreachable, so it may still exist."); }
+    if (await ckDeleteProgram(p.id, p.name)) void ckRenderProgram();
   });
   acts.append(edit, ssrf, del);
   li.append(acts);
@@ -7468,7 +7494,7 @@ async function ckLoadHistory(body) {
   try { res = await apiFetch("/api/bounty/findings", { method: "GET", timeoutMs: 15000 }); }
   catch (_) { body.replaceChildren(cel("p", "ck-hint", "Could not load history — the engine is unreachable.")); return; }
   if (!res || res.ok === false) { body.replaceChildren(cel("p", "ck-hint", "Could not load history.")); return; }
-  ckState._history = { findings: res.findings || [], funnel: res.funnel || null, truncated: Boolean(res.truncated) };
+  ckState._history = { findings: res.findings || [], funnel: res.funnel || null, truncated: Boolean(res.truncated), archived: res.archived || [] };
   ckRenderHistory(body, ckState._history);
 }
 
@@ -7487,7 +7513,8 @@ function ckRenderHistory(body, data) {
     + (data.truncated ? ` · showing the ${allRecs.length} most recent (export CSV for all)` : "")));
 
   const findings = ckSubSort(allRecs.filter((r) => ckSubMatch(r, opts)), opts.sort);
-  if (!findings.length) {
+  const archived = ckSubSort((data.archived || []).filter((r) => ckSubMatch(r, opts)), opts.sort);
+  if (!findings.length && !archived.length) {
     body.append(cel("p", "ck-hint", `No findings match your search / filter (${allRecs.length} total).`));
     return;
   }
@@ -7508,6 +7535,17 @@ function ckRenderHistory(body, data) {
     const ul = cel("ul", "ck-list");
     for (const r of recs) ul.append(ckHistoryRow(r));
     body.append(ul, preview);
+  }
+
+  // History subcategory: HIGH/CRITICAL findings KEPT from deleted programs (read-only archive).
+  if (archived.length) {
+    const ahead = cel("div", "ck-hist-prog ck-hist-archived");
+    ahead.append(cel("strong", null, "Archived — High/Critical from deleted programs"));
+    ahead.append(cel("span", "ck-tag", `${archived.length}`));
+    body.append(ahead);
+    const aul = cel("ul", "ck-list");
+    for (const r of archived) aul.append(ckHistoryRow(r));
+    body.append(aul);
   }
 }
 
@@ -8135,13 +8173,7 @@ function ckProgramRow(prog, funnel) {
   const del = cel("button", "ck-btn", "Delete");
   del.type = "button";
   del.addEventListener("click", async () => {
-    if (!window.confirm(`Delete program "${prog.name || prog.id}"?`)) return;
-    try {
-      await apiFetch("/api/operator/programs/delete", { method: "POST", body: JSON.stringify({ id: prog.id }) });
-      if (state.ckActiveProgramId === prog.id) { state.ckActiveProgramId = ""; saveState(); }
-      await ckRefreshProgramsEverywhere();
-      void ckRenderOperator();
-    } catch (err) { window.alert(err.message || "Could not delete the program — the engine may be unreachable, so it may still exist."); }
+    if (await ckDeleteProgram(prog.id, prog.name)) void ckRenderOperator();
   });
   acts.append(del);
   li.append(acts);

@@ -788,6 +788,48 @@ def _check_ssti(http: _Http, url: str, extra_params: list[str] | None = None) ->
     return None
 
 
+def _check_rce_command_injection(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
+    """Confirm OS command injection with a BENIGN shell-substitution arithmetic probe: if the
+    parameter reaches a shell, ``$(expr 111 + 111)`` / `` `expr 111 + 111` `` is evaluated and its
+    result (222) echoed back. Only ``expr`` runs — no real command, no side effect. A literal
+    control that is NOT substituted rules out a coincidental echo. GET-only; one marker per probe.
+    This is the arithmetic-echo sibling of the SSTI check, for a shell context rather than a
+    template engine — the safe way to prove RCE without executing a real payload."""
+    params = _candidate_params(url, extra_params, ("cmd", "exec", "ping", "host", "ip", "query", "q"), 2)
+    # BOTH substitution forms ($(...) and backticks) ride in ONE probe, each behind its own
+    # marker — so this check costs exactly what SSTI does: one control + one probe per param.
+    sig_dollar, sig_tick = f"{_MARK}D222", f"{_MARK}T222"
+    probe_payload = f"{_MARK}D$(expr 111 + 111){_MARK}T`expr 111 + 111`"
+    control_payload = f"{_MARK}Dexpr 111 + 111{_MARK}Texpr 111 + 111"
+    for param in params:
+        try:
+            control = http.fetch(_with_query(url, {param: control_payload}))
+        except _ActiveError:
+            continue
+        cbody = control.get("body") or ""
+        if sig_dollar in cbody or sig_tick in cbody:
+            continue  # the literal already yields the signature -> not substitution-driven
+        try:
+            probe = http.fetch(_with_query(url, {param: probe_payload}))
+        except _ActiveError:
+            break
+        body = probe.get("body") or ""
+        if sig_dollar in body or sig_tick in body:
+            form = "$(expr 111 + 111)" if sig_dollar in body else "`expr 111 + 111`"
+            proof = _proof(
+                "confirmed", method=f"GET with {param}=<benign {form} shell substitution>",
+                affected_asset="the application server — arbitrary OS command execution in the query's shell context",
+                observed_result=f"the '{param}' parameter's shell substitution {form} was evaluated by a server-side shell (→ 222) — OS command injection",
+                control_result="a literal 'expr 111 + 111' control did NOT yield 222 — the shell evaluated the substitution, it wasn't echoed",
+                evidence="the marker immediately followed by the evaluated result (222) appears in the response body",
+            )
+            ev = {"request_line": f"GET {_with_query(url, {param: probe_payload})}", "response_status": f"HTTP {probe['status']}",
+                  "matched_value": "shell command substitution evaluated to 222 (OS command injection)"}
+            return _finding("active.rce-command-injection", f"OS command injection via '{param}' parameter",
+                            "critical", "injection", "rce", url, proof, ev)
+    return None
+
+
 def _check_error_sqli(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
     parsed = urlparse(url)
     params = _candidate_params(url, extra_params, (), 2)
@@ -1011,6 +1053,67 @@ def _check_time_sqli(http: _Http, url: str, settings: Any = None, extra_params: 
             ev = {"request_line": f"GET {_with_query(url, {param: original + slow})}", "response_status": f"HTTP {p1['status']}",
                   "matched_value": f"SLEEP({d_str}) caused a ~{e1:.1f}s delay vs ~{fast_max:.1f}s control"}
             return _finding("active.sqli-time", f"Time-based blind SQL injection via '{param}'", "high", "disclosure", "sqli", url, proof, ev)
+    return None
+
+
+def _check_time_rce(http: _Http, url: str, settings: Any = None, extra_params: list[str] | None = None) -> dict[str, Any] | None:
+    """Blind OS command injection confirmed by TIMING — the RCE sibling of the time-based SQLi
+    check. Injects a bounded ``sleep`` across the common shell-injection contexts and confirms
+    ONLY on a stable two-trial delay differential vs a ``sleep 0`` negative control (the delay
+    must track the injected sleep, not a slow page). ``sleep`` touches nothing and reads nothing —
+    one timing bit. Because it emits an executing payload it is OPT-IN (time_based), exactly like
+    time-based SQLi. A non-vulnerable app never actually sleeps, so it stays fast."""
+    settings = settings or get_settings()
+    parsed = urlparse(url)
+    params = _candidate_params(url, extra_params, ("cmd", "exec", "ping", "host", "ip", "query", "q"), 1)
+    if not params:
+        return None  # need a URL or recon-discovered param; never invent injection points
+    d = getattr(settings, "active_time_sqli_delay_seconds", _TIME_DELAY_S) or _TIME_DELAY_S
+    margin = getattr(settings, "active_time_sqli_margin_seconds", _TIME_MARGIN_S) or _TIME_MARGIN_S
+    d = min(float(d), max(1.0, float(settings.web_fetch_timeout_seconds) - 1.0))
+    ds = str(int(d)) if float(d).is_integer() else f"{d:.1f}"
+    # The common places a value lands in a shell: command separator, substitution (both forms),
+    # and pipe. Each confirmed independently by its own two-trial timing differential.
+    slow_variants = (f";sleep {ds}", f"$(sleep {ds})", f"`sleep {ds}`", f"|sleep {ds}")
+    for param in params:  # one param — the timing pass is request-heavy
+        original = dict(parse_qsl(parsed.query, keep_blank_values=True)).get(param, "1")
+        try:
+            base = http.fetch(_with_query(url, {param: original}))
+        except _ActiveError:
+            continue
+        base_e = float(base.get("elapsed") or 0.0)
+        for payload in slow_variants:
+            try:
+                p1 = http.fetch(_with_query(url, {param: original + payload}))
+            except _ActiveError:
+                break
+            if float(p1.get("elapsed") or 0.0) - base_e < margin:
+                continue  # not slow -> this context isn't injectable (a non-vulnerable app returns fast)
+            # It IS slow — but a WAF / bot-defense that tarpits on the shell metacharacter (`$(`, a
+            # backtick, `;`) would delay it too, WITHOUT any command injection. Disambiguate with a
+            # MATCHED control: the SAME wrapper carrying 'sleep 0'. A per-metacharacter tarpit delays
+            # this control equally (differential cancels -> not confirmed); a real shell runs 'sleep 0'
+            # fast, so only genuine execution keeps the differential. Second slow trial rules out jitter.
+            control_payload = payload.replace(f"sleep {ds}", "sleep 0")
+            try:
+                ctrl = http.fetch(_with_query(url, {param: original + control_payload}))
+                p2 = http.fetch(_with_query(url, {param: original + payload}))
+            except _ActiveError:
+                break
+            fast_max = max(base_e, float(ctrl.get("elapsed") or 0.0))
+            e1, e2 = float(p1.get("elapsed") or 0.0), float(p2.get("elapsed") or 0.0)
+            if e1 - fast_max >= margin and e2 - fast_max >= margin:
+                proof = _proof(
+                    "confirmed", method=f"GET with {param}=...{payload} (bounded sleep, nothing read or changed)",
+                    affected_asset="the application server — blind OS command execution in the query's shell context",
+                    observed_result=f"injecting a shell '{payload.strip()}' delayed the response to ~{e1:.1f}s/{e2:.1f}s across two trials",
+                    control_result=f"the SAME wrapper carrying 'sleep 0' ({control_payload.strip()}) returned in ~{fast_max:.1f}s — the delay tracks the injected sleep VALUE, not the metacharacter, so a WAF tarpit on the syntax is ruled out",
+                    evidence=f"request-only timing: matched 'sleep 0' control≈{fast_max:.1f}s, sleep({ds})≈{e1:.1f}s and {e2:.1f}s",
+                )
+                ev = {"request_line": f"GET {_with_query(url, {param: original + payload})}", "response_status": f"HTTP {p1['status']}",
+                      "matched_value": f"shell 'sleep {ds}' caused a ~{e1:.1f}s delay vs ~{fast_max:.1f}s control"}
+                return _finding("active.rce-time", f"Blind OS command injection via '{param}' (time-based)",
+                                "critical", "injection", "rce", url, proof, ev)
     return None
 
 
@@ -1451,6 +1554,65 @@ def _check_sensitive_paths(http: _Http, url: str) -> dict[str, Any] | None:
     return None
 
 
+# Unauthenticated debug/management endpoints that leak secrets or grant code execution. Each is
+# confirmed by an UNMISTAKABLE product signature AND the catch-all control (like _EXPOSED_FILES),
+# so an app that 200s everything can't false-positive. (path, signature, name, severity, class,
+# impact). Ordered most-severe first so the worst exposure on a host is the one reported.
+_DEBUG_ENDPOINTS: tuple[tuple[str, "re.Pattern[str]", str, str, str, str], ...] = (
+    # The HPROF magic is ANCHORED to the start of the response (\A) + the version framing, so a docs
+    # / blog / soft-404 page that merely contains the words "JAVA PROFILE" mid-body cannot match —
+    # only a real heap dump (which BEGINS with "JAVA PROFILE 1.0.x\0") does.
+    ("/actuator/heapdump", re.compile("\\AJAVA PROFILE 1\\.0\\.\\d"), "Spring Boot actuator heap dump", "critical", "disclosure",
+     "an unauthenticated full JVM heap dump — every in-memory secret, token, and active session is downloadable"),
+    ("/jolokia/list", re.compile(r'"request"[\s\S]{0,200}"type"\s*:\s*"list"[\s\S]{0,4000}"value"'),
+     "Jolokia JMX-over-HTTP endpoint", "critical", "rce",
+     "Jolokia exposes JMX over HTTP unauthenticated — MBean operations can be abused to load and execute remote code (RCE)"),
+    ("/actuator/env", re.compile(r'"propertySources"'), "Spring Boot actuator env", "high", "disclosure",
+     "the application's full configuration (property sources — commonly DB credentials, API keys, tokens) is exposed unauthenticated"),
+    ("/actuator", re.compile(r'"_links"[\s\S]{0,4000}/actuator'), "Spring Boot actuator index", "medium", "disclosure",
+     "the actuator endpoint index is exposed, mapping further sensitive management endpoints (env, heapdump, mappings)"),
+)
+
+
+def _check_debug_endpoints(http: _Http, url: str) -> dict[str, Any] | None:
+    """Confirm an unauthenticated debug/management endpoint (Spring Boot actuator env/heapdump,
+    Jolokia JMX) is served, by fetching it at the origin root and gating on the product's own
+    signature PLUS a catch-all control — so an app that 200s everything can't false-positive.
+    Root-only (one probe set per host). GET-only, read-only. Heapdump/Jolokia are critical
+    (secret exfiltration / RCE); env is high; the index is medium."""
+    parts = urlparse(url)
+    if (parts.path or "/").strip("/"):
+        return None  # only at the site root -> one probe set per host, not per discovered URL
+    origin = f"{parts.scheme}://{parts.netloc}"
+    try:
+        control = http.fetch(f"{origin}/{_MARK}-nonexistent-{_MARK}")
+    except _ActiveError:
+        return None
+    ctrl_body = control.get("body") or ""
+    for path, signature, name, severity, class_hint, why in _DEBUG_ENDPOINTS:
+        if signature.search(ctrl_body):
+            continue  # the catch-all already carries this signature -> not a genuinely served endpoint
+        try:
+            probe = http.fetch(f"{origin}{path}")
+        except _ActiveError:
+            break
+        body = probe.get("body") or ""
+        status = int(probe.get("status") or 0)
+        if 200 <= status < 300 and signature.search(body) and body != ctrl_body:
+            proof = _proof(
+                "confirmed", method=f"GET {path}",
+                affected_asset=why,
+                observed_result=f"{name} is served unauthenticated at {path} (HTTP {status}) with its characteristic response",
+                control_result="a non-existent control path did NOT return this content — the endpoint is genuinely exposed, not a catch-all 200",
+                evidence=f"the response carries the unmistakable {name} signature",
+            )
+            ev = {"request_line": f"GET {origin}{path}", "response_status": f"HTTP {status}",
+                  "matched_value": f"{name} exposed at {path}", "read_data": body[:1200]}
+            return _finding("active.debug-endpoint", f"{name} exposed unauthenticated: {path}",
+                            severity, "disclosure", class_hint, url, proof, ev)
+    return None
+
+
 def verify_active(
     target_url: str,
     findings: list[dict[str, Any]],
@@ -1529,6 +1691,10 @@ def verify_active(
         lambda: _check_host_header(http, sanitized),
         lambda: _check_reflected_xss(http, sanitized, discovered_params),
         lambda: _check_ssti(http, sanitized, discovered_params),
+        # OS command injection via benign $(expr) shell substitution — arithmetic only, no real
+        # command runs. Sits next to SSTI (both are safe arithmetic-echo injection probes) and
+        # ahead of the SQLi variants so a CRITICAL RCE gets request-budget priority.
+        lambda: _check_rce_command_injection(http, sanitized, discovered_params),
         lambda: _check_error_sqli(http, sanitized, discovered_params),
         lambda: _check_bool_sqli(http, sanitized, discovered_params),
         lambda: _check_nosqli(http, sanitized, discovered_params),
@@ -1538,14 +1704,19 @@ def verify_active(
         # Sensitive-file exposure (.git/.env) only probes at the site root, so it's one cheap
         # set per host; signature + catch-all control keeps it false-positive-proof.
         lambda: _check_sensitive_paths(http, sanitized),
+        # Unauthenticated debug/management endpoints (Spring actuator heapdump/env, Jolokia JMX)
+        # — critical secret-exfil / RCE, root-only, same signature + catch-all control gate.
+        lambda: _check_debug_endpoints(http, sanitized),
         # Path traversal / LFI reads ONE well-known system file as proof (signature + control),
         # extracting nothing else; GET-only. Heaviest of the new checks, so it runs LAST and only
         # uses whatever request budget the earlier checks left.
         lambda: _check_path_traversal(http, sanitized, discovered_params),
     ]
-    # Time-based blind SQLi is the only check that emits an executing payload (a bounded
-    # SLEEP), so it is OPT-IN — appended only when the operator explicitly enables it.
+    # The time-based checks are the only ones that emit an executing payload (a bounded SLEEP /
+    # sleep), so they are OPT-IN — appended only when the operator explicitly enables time_based.
+    # Blind RCE (critical) is confirmed first so it gets budget priority over blind SQLi.
     if time_based:
+        checks.append(lambda: _check_time_rce(http, sanitized, settings, discovered_params))
         checks.append(lambda: _check_time_sqli(http, sanitized, settings, discovered_params))
     for check in checks:
         if rate_limited:

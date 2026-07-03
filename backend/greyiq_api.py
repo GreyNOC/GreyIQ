@@ -1644,12 +1644,15 @@ class GreyIQRuntime:
         try:
             records = bounty_ledger.list_all(RUNTIME_DIR)
             funnel = bounty_ledger.funnel(RUNTIME_DIR)
+            archived = bounty_ledger.list_archived(RUNTIME_DIR)
         except Exception as exc:  # noqa: BLE001 - a history read must never 500 the hub
             return {"ok": False, "error": f"Could not read the finding ledger: {exc}"}
         # `truncated` when the (capped) list is shorter than the true portfolio total, so the
         # UI can say "showing the most recent N" and point at the CSV export for everything.
+        # `archived` is the history subcategory: HIGH/CRITICAL findings kept from deleted programs.
         total = int((funnel.get("portfolio") or {}).get("total") or len(records))
-        return {"ok": True, "findings": records, "funnel": funnel, "truncated": len(records) < total, "total": total}
+        return {"ok": True, "findings": records, "funnel": funnel, "archived": archived,
+                "truncated": len(records) < total, "total": total}
 
     def dismiss_finding(self, request: "FindingDismissRequest") -> dict[str, Any]:
         """Delete a finding: record its stable dedup key in the ledger's suppression set so no
@@ -2709,7 +2712,17 @@ class GreyIQRuntime:
         return {"ok": True, "checked": checked, "updated": updated, "errors": errors}
 
     def remove_program(self, program_id: str) -> dict[str, Any]:
-        return {"ok": bounty_portfolio.remove_program(RUNTIME_DIR, program_id)}
+        """Delete a program AND cascade to its findings: the program is removed from the
+        portfolio, and its ledger findings are deleted — HIGH/CRITICAL findings are archived
+        into the 'history subcategory' (kept, read-only) while the rest are purged. Returns the
+        cascade counts so the UI can confirm what was kept vs removed."""
+        removed = bounty_portfolio.remove_program(RUNTIME_DIR, program_id)
+        cascade = {"archived": 0, "purged": 0}
+        try:
+            cascade = bounty_ledger.archive_and_purge_program(RUNTIME_DIR, program_id)
+        except Exception:  # noqa: BLE001 - a portfolio delete must still succeed if the ledger read hiccups
+            pass
+        return {"ok": bool(removed), "archived": cascade.get("archived", 0), "purged": cascade.get("purged", 0)}
 
     def operator_start(self, request: "OperatorStartRequest") -> dict[str, Any]:
         if not request.authorized:
