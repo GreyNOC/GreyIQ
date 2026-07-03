@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -47,6 +48,22 @@ class NetProbeToolTests(unittest.TestCase):
         self.assertIn("net_probe", {t["name"] for t in agent._TOOLS})
         self.assertIn("net_probe", {t["name"] for t in agent._anthropic_tools()})
         self.assertIn("net_probe", {t["function"]["name"] for t in agent._openai_tools()})
+
+    def test_metadata_guard_blocks_link_local_resolution(self) -> None:
+        # The guard now resolves+pins via resolve_and_pin, then applies its metadata policy on the
+        # PINNED IPs — so a host resolving to cloud metadata is refused (and the connect can't rebind).
+        box = self._box()
+        with mock.patch.object(agent, "resolve_and_pin", return_value=["169.254.169.254"]):
+            msg = box._metadata_guard("evil.example")
+        self.assertIsNotNone(msg)
+        self.assertIn("link-local/metadata", msg)
+
+    def test_metadata_guard_allows_public_and_private(self) -> None:
+        # net_probe is a NOC tool: public and RFC1918 private hosts are allowed; only link-local/metadata blocked.
+        box = self._box()
+        for ip in ("93.184.216.34", "10.0.0.5", "127.0.0.1"):
+            with mock.patch.object(agent, "resolve_and_pin", return_value=[ip]):
+                self.assertIsNone(box._metadata_guard("host.example"), ip)
 
     def test_dns_resolves_localhost(self) -> None:
         out, is_error = self._box().run("net_probe", {"action": "dns", "target": "localhost"})
