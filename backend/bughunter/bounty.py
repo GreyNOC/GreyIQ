@@ -37,6 +37,19 @@ from bughunter.scan_service import run_code_scan
 from bughunter.scan_auth import AuthContext, build_auth
 from bughunter.web_scan_service import run_web_scan
 
+# Leaked-token liveness validators, keyed by the secret rule that detected the token. Each proves
+# liveness with ONE benign, read-only request to the token's OWN issuer (never the target) — see
+# credential_validation. (Google/Firebase keys have a richer, separate branch below; AWS keys need
+# the paired secret + SigV4 signing and stay detection-only for now; private keys / generic secrets
+# have no single issuer to validate against.)
+_TOKEN_ISSUER_VALIDATORS = {
+    "secret.github-pat": credential_validation.validate_github_token,
+    "secret.slack-bot-token": credential_validation.validate_slack_token,
+    "secret.openai-key": credential_validation.validate_openai_key,
+    "secret.anthropic-key": credential_validation.validate_anthropic_key,
+    "secret.stripe-key": credential_validation.validate_stripe_key,
+}
+
 # --- Vuln classes: how a finding category maps to a bounty bug class, plus the
 # CWE/OWASP refs and a deterministic attack-plan template used when no brain is
 # configured (the brain enriches these when it is). ---
@@ -1262,11 +1275,10 @@ def run_bounty_hunt(
                 continue
             key = str(finding.get("secret_value") or "").strip()
             rule_id = str(finding.get("rule_id") or "")
-            # Non-Google credentials: prove liveness the same benign way — one read-only GET to the
+            # Non-Google credentials: prove liveness the same benign way — one read-only request to the
             # token's OWN issuer (never the target), turning a detection-only leak into a proven one.
-            if rule_id in ("secret.github-pat", "secret.slack-bot-token") and key:
-                validator = (credential_validation.validate_github_token if rule_id == "secret.github-pat"
-                             else credential_validation.validate_slack_token)
+            validator = _TOKEN_ISSUER_VALIDATORS.get(rule_id)
+            if validator and key:
                 try:
                     finding["_credential_proof"] = proof = validator(key)
                 except Exception as exc:  # noqa: BLE001 - liveness check is best-effort; never break a hunt
