@@ -2,6 +2,33 @@
 
 Notable changes to GreyIQ.
 
+## v0.71.0
+
+### More money-classes found, and proof that survives triage
+- **Open Firebase exposure** — a live leaked Firebase key now leads straight into an unauthenticated
+  read check of the project's **Realtime Database** (via a shallow read that returns only top-level
+  key names, never the data) and **Cloud Storage** bucket. An open store is a confirmed,
+  VRP-eligible finding.
+- **Blind SSRF, automatically** — when a collaborator is configured, an active hunt runs the
+  out-of-band SSRF probe itself: a fresh, unguessable callback token (the reproducible "sheriff
+  flag") per parameter, confirmed only when a hit appears after the probe. Crawler/preview bots stay
+  candidate.
+- **Chrome extension analysis** — scans a browser-extension `manifest.json` for access-to-all-sites
+  permissions, `unsafe-eval` CSP, an `externally_connectable` open to any site, and high-privilege
+  permissions (no false positives on web-app manifests).
+- **Proof of impact that shows the real response** — confirmed reflected-XSS / SSTI / SQLi findings
+  now include the server's **actual response excerpt** with the payload's effect (reflected /
+  evaluated / DB error), not just a description — the concrete evidence a triager accepts.
+
+### Whole-app QAQC hardening
+Fixed a batch of audited defects: the backend version is now single-sourced with a CI parity gate;
+deleting a program cascades to all its findings (High/Critical kept in a History archive); two
+prompt-injection vectors (workspace skills, README-derived memory) fenced as untrusted; the DNS
+resolver validates transaction id + question (spoof-proof) and net_probe pins DNS against rebinding;
+per-cookie CSRF SameSite; a confirmed finding's severity always comes from the deterministic CVSS
+(never an attacker-influenceable brain vector); submissions record before the network round-trip
+(no duplicate HackerOne filings); and the real reward amount is recorded to the pipeline.
+
 ## v0.70.0
 
 ### Finds more criticals & RCE — and proves them
