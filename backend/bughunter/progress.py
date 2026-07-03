@@ -146,6 +146,27 @@ def mark_target(run_id: str, target: str, status: str, *, error: str = "", elaps
         pass
 
 
+def _compact_proof_detail(pd: Any) -> dict[str, Any] | None:
+    """A bounded copy of a finding's ACTIVE proof (observed-vs-control differential + evidence) so the
+    dashboard drawer's "View full report" can render a campaign-confirmed finding as CONFIRMED without a
+    manual re-verify. Only the fields the on-demand report consumes, size-bounded to keep the polled
+    snapshot light."""
+    if not isinstance(pd, dict):
+        return None
+    out = {k: str(pd.get(k))[:3000] for k in ("status", "method", "observed_result", "control_result",
+                                              "evidence", "affected_asset", "limitations") if pd.get(k)}
+    return out or None
+
+
+def _compact_proof_evidence(pe: Any) -> dict[str, Any] | None:
+    """A bounded copy of a finding's captured request/response artifact for the same on-demand report."""
+    if not isinstance(pe, dict):
+        return None
+    out = {k: str(pe.get(k))[:3000] for k in ("request_line", "request_headers", "response_status",
+                                             "response_headers", "matched_value", "read_data") if pe.get(k)}
+    return out or None
+
+
 def add_findings(run_id: str, target: str, findings: list[dict[str, Any]]) -> None:
     """Append compact findings discovered for a work unit and roll their counts into it."""
     if not run_id:
@@ -178,6 +199,10 @@ def add_findings(run_id: str, target: str, findings: list[dict[str, Any]]) -> No
                     "cwe": str(f.get("cwe") or "")[:40],
                     "rule": str(f.get("rule_id") or f.get("rule") or "")[:80],
                     "class_id": str(f.get("class_id") or "")[:80],
+                    # The captured active proof (differential) + request/response artifact, so a
+                    # campaign-confirmed finding's full report renders CONFIRMED straight from the drawer.
+                    "proof_detail": _compact_proof_detail(f.get("proof_detail")),
+                    "proof_evidence": _compact_proof_evidence(f.get("proof_evidence")),
                 })
                 added += 1
                 if proof == "confirmed":

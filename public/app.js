@@ -6445,7 +6445,10 @@ function ckNormalizeForReport(f, extra) {
     snippet: f.snippet || "",
     matched_value: f.matched_value || (f.proof_evidence && f.proof_evidence.matched_value) || "",
     proofEvidence: f.proof_evidence || f.proofEvidence || null,  // captured request/response + read_data
-    proofObj: f.proofObj || extra.proofObj || null,
+    // proofObj precedence: an explicit manual re-verify wins, then the finding's OWN active proof
+    // captured during the campaign (proof_detail — observed-vs-control differential), so a campaign-
+    // confirmed finding's full report renders CONFIRMED without needing a manual re-verify.
+    proofObj: f.proofObj || extra.proofObj || (f.proof_detail && typeof f.proof_detail === "object" && f.proof_detail.status ? f.proof_detail : null),
     proof: ckEffectiveProof(f, f.proof_status),
     dedupKey: f.dedupKey || f.dedup_key || "",
     screenshot: extra.screenshot || null,
