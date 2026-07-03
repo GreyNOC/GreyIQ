@@ -32,6 +32,7 @@ from bughunter import ledger
 from bughunter import next_steps as next_steps_lib
 from bughunter import report as report_lib
 from bughunter import toolkit as toolkit_lib
+from bughunter.code_scanner.redaction import redact_text
 from bughunter.live_scan_service import run_live_scan
 from bughunter.scan_service import run_code_scan
 from bughunter.scan_auth import AuthContext, build_auth
@@ -778,6 +779,57 @@ def _firebase_exposure_finding(exp: dict[str, Any], project: str) -> dict[str, A
     }
 
 
+def _credential_plan_artifacts(finding: dict[str, Any]) -> dict[str, str]:
+    """Safe, redacted proof-plan artifacts from the source-credential validator.
+
+    The credential report section intentionally shows the actual key in a sensitive block.
+    The core PoC/proof-of-impact sections should not: they carry the reproducible request
+    and issuer response with the secret redacted, plus a blast-radius statement.
+    """
+    proof = finding.get("_credential_proof") if isinstance(finding.get("_credential_proof"), dict) else {}
+    if not proof:
+        return {}
+    endpoint = str(proof.get("endpoint") or "the credential's own issuer").strip()
+    poc = redact_text(str(proof.get("poc") or "").strip())[0]
+    response = redact_text(str(proof.get("response_excerpt") or proof.get("detail") or "").strip())[0]
+    principal = str(proof.get("principal") or "").strip()
+    scopes = str(proof.get("scopes") or "").strip()
+    project = str(proof.get("project_id") or "").strip()
+    domains = [str(d) for d in (proof.get("authorized_domains") or []) if str(d).strip()]
+    if project:
+        blast = f"Firebase/Google project {project}"
+        if domains:
+            blast += f"; authorized domains: {', '.join(domains[:20])}"
+    elif principal:
+        blast = principal
+        if scopes:
+            blast += f"; scopes: {scopes}"
+    else:
+        blast = "the account/project accepted by the credential issuer"
+    detail = str(proof.get("detail") or "").strip()
+    if detail:
+        blast = f"{blast}. {detail}"
+    live = proof.get("live")
+    status = proof.get("http_status", "?")
+    if live is True:
+        observed = f"The credential issuer accepted the leaked credential via a benign read-only request (HTTP {status})."
+    elif live is False:
+        observed = f"The credential issuer rejected the leaked credential during the benign read-only check (HTTP {status})."
+    else:
+        observed = f"The benign issuer read returned inconclusive liveness status (HTTP {status})."
+    return {
+        "method": f"one benign read-only request to the credential's own issuer ({endpoint})",
+        "actor": "anyone holding the source-exposed credential",
+        "affected_asset": blast,
+        "observed_result": observed,
+        "control_result": "an invalid/revoked credential is rejected by the same issuer endpoint",
+        "evidence": response,
+        "authenticated_read_request": poc,
+        "authenticated_read_response": response or observed,
+        "blast_radius": blast,
+    }
+
+
 def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[str, Any]:
     """Build the offline attack plan: reproduction steps PLUS a real impact
     narrative, a structured proof-of-impact block whose *proof obligation* names the
@@ -824,6 +876,28 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
         "limitations": "Static/passive scan cannot confirm exploitation; capture the proof obligation below to prove impact.",
         "proof_obligation": model["proof_obligation"],
     }
+    credential_artifacts = _credential_plan_artifacts(finding) if class_id == "secrets" else {}
+    poc = concrete_poc
+    if credential_artifacts:
+        proof_of_impact.update(credential_artifacts)
+        credential_proof = finding.get("_credential_proof") if isinstance(finding.get("_credential_proof"), dict) else {}
+        proof_of_impact["limitations"] = (
+            "Live credential validation is complete." if credential_proof.get("live") is True
+            else "Credential validation did not prove the key live; keep this as candidate until an in-scope success response proves impact."
+        )
+        if credential_proof.get("live") is True:
+            proof_of_impact["proof_obligation"] = ""
+        request = credential_artifacts.get("authenticated_read_request", "")
+        response = credential_artifacts.get("authenticated_read_response", "")
+        blast = credential_artifacts.get("blast_radius", "")
+        if request:
+            poc = (
+                "Benign source-credential validation PoC (secret redacted):\n\n"
+                f"{request}\n\n"
+                f"Issuer response / expected proof:\n{response or '(capture the issuer success response)'}\n\n"
+                f"Blast radius:\n{blast or model['affected_asset']}\n\n"
+                "Use only one read-only issuer request. Do not perform writes, enumeration, prompt submission, or data extraction."
+            )
     return {
         "steps": steps,
         "impact": impact_text,
@@ -832,7 +906,7 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
         # Deterministic remediation floor — a per-rule remediation still wins in the
         # report via `finding.get('remediation') or plan.get('remediation')`.
         "remediation": impact_model.remediation_for_class(class_id),
-        "poc": concrete_poc,
+        "poc": poc,
     }
 
 
