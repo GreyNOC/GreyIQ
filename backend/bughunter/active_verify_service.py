@@ -398,6 +398,39 @@ def _finding(rule_id: str, title: str, severity: str, category: str, class_hint:
 # Each returns a finding dict (confirmed/candidate) or None. Conservative: a
 # 'confirmed' status requires a positive observation AND a control differential.
 
+def _cors_enrich_read(http: _Http, probe: dict[str, Any], proof: dict[str, Any], ev: dict[str, str]) -> None:
+    """Turn a proven CORS *misconfiguration* into a proven cross-origin *read*.
+
+    When the scan is authenticated, ``fetch`` attaches the operator's SAME-SITE session to
+    the probe, so a 2xx response body IS the authenticated data an attacker origin can read
+    once ACAO reflects it with Allow-Credentials. Embed a redacted excerpt as ``read_data``
+    (the report renders it as the demonstrated cross-origin read) and note the read in the
+    observation — this is the concrete "reads sensitive authenticated data cross-origin"
+    a HackerOne triager rejects a header-only CORS report for lacking. No-op on an
+    unauthenticated scan / non-2xx / trivially-empty body (misconfig still reported)."""
+    if getattr(http, "auth", None) is None:
+        return
+    try:
+        status = int(probe.get("status") or 0)
+    except (TypeError, ValueError):
+        return
+    if not (200 <= status < 300):
+        return
+    body = str(probe.get("body") or "")
+    if len(body.strip()) < 8:
+        return
+    proof["observed_result"] = (
+        (proof.get("observed_result") or "").rstrip(". ")
+        + f"; a cross-origin GET carrying the victim's session then returned the authenticated "
+          f"response ({len(body)} bytes) that the reflected Access-Control-Allow-Origin + "
+          f"Allow-Credentials let the attacker origin READ"
+    )
+    proof["affected_asset"] = "the authenticated response body an attacker origin reads cross-origin"
+    # Store the RAW excerpt; _finding() redacts every proof_evidence value exactly once.
+    # (Redacting here too would nest the markers: "[REDACTED_SECRET:[REDACTED_SECRET:…".)
+    ev["read_data"] = body[:1500]
+
+
 def _check_cors(http: _Http, url: str) -> dict[str, Any] | None:
     parsed = urlparse(url)
     # The target's REAL origin (scheme + host + port) — an http:// target, or an https:// target
@@ -431,6 +464,7 @@ def _check_cors(http: _Http, url: str) -> dict[str, Any] | None:
         )
         ev = {"request_line": f"GET {url}", "request_header": f"Origin: {_MARKER_ORIGIN}",
               "response_status": f"HTTP {probe['status']}", "matched_value": f"Access-Control-Allow-Origin: {acao}; Access-Control-Allow-Credentials: {acac}"}
+        _cors_enrich_read(http, probe, proof, ev)
         return _finding("active.cors-reflection", "CORS reflects attacker Origin with credentials", "high",
                         "cors", "cors", url, proof, ev)
     if reflects_marker and not credentialed:
@@ -459,6 +493,7 @@ def _check_cors(http: _Http, url: str) -> dict[str, Any] | None:
             )
             ev = {"request_line": f"GET {url}", "request_header": "Origin: null", "response_status": f"HTTP {null_probe['status']}",
                   "matched_value": "Access-Control-Allow-Origin: null; Access-Control-Allow-Credentials: true"}
+            _cors_enrich_read(http, null_probe, proof, ev)
             return _finding("active.cors-reflection", "CORS trusts Origin: null with credentials", "high", "cors", "cors", url, proof, ev)
 
     # Variant 3 — attacker-controlled subdomain of the in-scope host reflected with
@@ -482,6 +517,7 @@ def _check_cors(http: _Http, url: str) -> dict[str, Any] | None:
                 )
                 ev = {"request_line": f"GET {url}", "request_header": f"Origin: {sub_origin}", "response_status": f"HTTP {sub_probe['status']}",
                       "matched_value": f"Access-Control-Allow-Origin: {sub_origin}; Access-Control-Allow-Credentials: true"}
+                _cors_enrich_read(http, sub_probe, proof, ev)
                 return _finding("active.cors-reflection", "CORS trusts arbitrary subdomain Origin with credentials", "high", "cors", "cors", url, proof, ev)
 
     # Variant 4 — naive substring/prefix trust: an ACL that checks `if TARGET in origin` (or a
@@ -506,6 +542,7 @@ def _check_cors(http: _Http, url: str) -> dict[str, Any] | None:
                 )
                 ev = {"request_line": f"GET {url}", "request_header": f"Origin: {substr_origin}", "response_status": f"HTTP {substr_probe['status']}",
                       "matched_value": f"Access-Control-Allow-Origin: {substr_origin}; Access-Control-Allow-Credentials: true"}
+                _cors_enrich_read(http, substr_probe, proof, ev)
                 return _finding("active.cors-reflection", "CORS trusts an origin that merely contains the host (substring/prefix trust)", "high", "cors", "cors", url, proof, ev)
     return None
 

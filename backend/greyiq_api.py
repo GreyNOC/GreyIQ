@@ -666,6 +666,18 @@ class ProofInput(BaseModel):
     limitations: str = Field(default="", max_length=1000)
 
 
+class ProofEvidenceInput(BaseModel):
+    # The engine's captured request/response artifact for a finding (the ACAO/ACAC headers
+    # for CORS, the reflected marker for XSS, etc.). A history/board finding carries this from
+    # its original hunt; threading it into an on-demand report is what makes the report's
+    # "Supporting material / evidence" section show the concrete headers a triager demands.
+    request_line: str = Field(default="", max_length=4000)
+    request_header: str = Field(default="", max_length=2000)
+    response_status: str = Field(default="", max_length=400)
+    matched_value: str = Field(default="", max_length=6000)
+    read_data: str = Field(default="", max_length=8000)
+
+
 class FindingReportRequest(BaseModel):
     # Build a well-authored report for ONE finding on demand, from the finding's own fields
     # (a ledger/dashboard finding that isn't in the in-memory run cache) plus any proof the
@@ -683,6 +695,7 @@ class FindingReportRequest(BaseModel):
     description: str = Field(default="", max_length=8000)
     poc: str = Field(default="", max_length=8000)  # caller-supplied proof-of-concept outline (e.g. the brain's PoC)
     proof: ProofInput | None = None
+    proof_evidence: ProofEvidenceInput | None = None  # engine-captured request/response (e.g. CORS ACAO/ACAC headers)
     screenshot_path: str = Field(default="", max_length=4000)
 
 
@@ -1689,6 +1702,15 @@ class GreyIQRuntime:
             "cwe": cwe, "rule_id": str(request.rule_id or ""),
             "description": str(request.description or ""), "screenshot_path": str(request.screenshot_path or ""),
         }
+        # Carry the engine's captured request/response artifact (a history/board finding brings
+        # it from its original hunt) so BOTH the evidence section renders the concrete headers
+        # (e.g. CORS ACAO/ACAC) AND the class-specific concrete reproduction below is built from
+        # the real reflected Origin/headers rather than a placeholder. This is why an on-demand
+        # CORS report now shows the actual CORS headers a triager rejects the report for lacking.
+        if request.proof_evidence is not None:
+            pe = {k: v for k, v in request.proof_evidence.model_dump().items() if str(v or "").strip()}
+            if pe:
+                finding["proof_evidence"] = pe
         # Every report gets REAL reproduction steps: the engine's offline attack-plan builder
         # (class-aware steps + a benign curl repro for web findings + impact + CVSS estimate),
         # the same steps a full hunt would emit — so an on-demand report for a ledger/dashboard

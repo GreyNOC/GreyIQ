@@ -490,7 +490,17 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
             lines.append(status)  # already 'HTTP <code>' — do not double-prefix
         for key in ("response_header", "set_cookie", "matched_value"):
             value = str(pe.get(key) or "").strip()
-            if value:
+            if not value:
+                continue
+            # CORS (and similar) checks pack several response headers into one matched
+            # value ("Access-Control-Allow-Origin: x; Access-Control-Allow-Credentials:
+            # true"). Split them onto separate lines so the reconstructed response reads
+            # like the real wire response and each header is unambiguously visible — a
+            # triager rejects a CORS report that doesn't clearly show the CORS headers.
+            parts = [p.strip() for p in value.split(";") if p.strip()]
+            if key == "matched_value" and len(parts) > 1 and all(": " in p for p in parts):
+                lines.extend(parts)
+            else:
                 lines.append(value)
         body = "\n".join(lines)
         fence = _fence(body)
@@ -498,6 +508,24 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
         out.append(f"{fence}http")
         out.append(body)
         out.append(fence)
+        out.append("")
+    # The demonstrated cross-origin read: a request carrying the victim's authenticated
+    # session returned this body, which the reflected CORS headers let an attacker origin
+    # READ. This is the concrete "sensitive data exploited" a HackerOne triager demands —
+    # not just the header reflection. Already redacted by the capturing check.
+    read_data = str(pe.get("read_data") or "").strip()
+    if read_data:
+        rd = read_data[:1500]
+        rd_fence = _fence(rd)
+        out.append(
+            "**Demonstrated cross-origin read** — a request carrying the victim's authenticated "
+            "session returned the response body below. Because the CORS headers above make this "
+            "response readable from an attacker-controlled origin, this is the sensitive data an "
+            "attacker page exfiltrates:\n"
+        )
+        out.append(rd_fence)
+        out.append(rd)
+        out.append(rd_fence)
         out.append("")
 
 
