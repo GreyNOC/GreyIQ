@@ -90,6 +90,15 @@ class MineJsHintExemptionTests(unittest.TestCase):
         m = mine_js('fetch("https://evil.com/checkout")', "https://app.acme.com/", host_filter=lambda h: h == "app.acme.com")
         self.assertEqual(m["endpoints"], [])  # keep_host drops it even though it's a route
 
+    def test_hinted_static_asset_literal_is_dropped(self) -> None:
+        # vet finding: a static asset whose path carries an endpoint-hint substring ('/api/...report.pdf')
+        # previously bypassed the _STATIC_EXT filter (which only ran on hint-exempt call targets).
+        js = 'var a="/api/v1/report.pdf"; var b="/api/assets/logo.png"; axios.get("/api/v1/orders");'
+        m = mine_js(js, "https://app.acme.com/", host_filter=lambda h: h == "app.acme.com")
+        self.assertNotIn("https://app.acme.com/api/v1/report.pdf", m["endpoints"])  # asset dropped
+        self.assertNotIn("https://app.acme.com/api/assets/logo.png", m["endpoints"])
+        self.assertIn("https://app.acme.com/api/v1/orders", m["endpoints"])  # a real route survives
+
 
 if __name__ == "__main__":
     unittest.main()

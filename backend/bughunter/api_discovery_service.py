@@ -20,15 +20,35 @@ fully unit-testable with no sockets. Frozen-safe (stdlib only).
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Callable
 from urllib.parse import quote, urljoin, urlparse
 
+try:  # YAML specs are common (/openapi.yaml). Best-effort: if the parser isn't in this
+    import yaml as _yaml  # build we silently skip YAML specs and still handle every JSON one.
+except Exception:  # pragma: no cover - only when PyYAML is unavailable in a stripped build
+    _yaml = None
+
 # Common, high-signal spec locations (bounded — one GET each, stops at the first valid spec).
+# Ordered by prevalence with JSON+YAML variants of the top names interleaved so both are reached
+# within the probe budget (max_specs). Every entry here is actually probed — no dead fallbacks.
 _OPENAPI_PATHS = (
-    "/openapi.json", "/swagger.json", "/v3/api-docs", "/v2/api-docs", "/api-docs",
-    "/api/openapi.json", "/api/swagger.json", "/swagger/v1/swagger.json", "/openapi/v3",
+    "/openapi.json", "/openapi.yaml", "/swagger.json", "/swagger.yaml",
+    "/v3/api-docs", "/v2/api-docs", "/api-docs", "/api/openapi.json",
+    "/swagger/v1/swagger.json", "/apispec_1.json",
 )
 _GRAPHQL_PATHS = ("/graphql", "/api/graphql", "/v1/graphql", "/query", "/graphql/console")
+
+# Swagger-UI / Redoc / RapiDoc HTML pages that EMBED the real spec URL (which may live at a
+# non-standard path none of _OPENAPI_PATHS would guess). We fetch a few, scrape the spec URL,
+# then fetch+parse it — every scraped URL is scope-gated before it is fetched.
+_SWAGGER_UI_PATHS = ("/swagger-ui.html", "/swagger-ui/index.html", "/api/docs", "/docs",
+                     "/swagger", "/redoc", "/api-docs/index.html")
+# The spec URL as embedded by Swagger-UI (`url: "/v3/api-docs"`), Redoc (`spec-url="..."`),
+# or a swagger-config (`configUrl`/`SwaggerUIBundle({url:...})`). Value captured, then vetted
+# by _looks_like_spec_url() so we don't chase every string on the page.
+_SPEC_URL_RE = re.compile(
+    r"""(?:\b(?:url|spec-?url|configUrl)\b)\s*[:=]\s*["']([^"'{}<>\s]{2,300})["']""", re.IGNORECASE)
 
 # A minimal introspection query — enough to prove introspection is on and size the schema.
 GRAPHQL_INTROSPECTION_QUERY = (
@@ -36,6 +56,45 @@ GRAPHQL_INTROSPECTION_QUERY = (
 )
 
 _HTTP_METHODS = {"get", "post", "put", "patch", "delete", "options", "head"}
+
+# One inert, obviously-synthetic placeholder per templated path segment. GET-only + read-only,
+# so instantiating `/users/{id}` as `/users/1` is a benign probe of the target's own API (the
+# active prover then decides whether that concrete endpoint is worth testing). `1` is chosen
+# because it most often resolves to a live resource, giving the prover real surface to bite on.
+# One {...} token (no nested braces). `[^{}]*` (not `[^}/]+`) so it also collapses an empty
+# `{}` and a slash-containing single token; the caller still drops any path that isn't fully
+# brace-free after substitution, so a nested/malformed template never reaches the surface.
+_TEMPLATE_PARAM_RE = re.compile(r"\{[^{}]*\}")
+_TEMPLATE_PLACEHOLDER = "1"
+
+
+def _instantiate_template(path: str) -> str:
+    """`/users/{id}/posts/{postId}` -> `/users/1/posts/1` (inert placeholder per segment)."""
+    return _TEMPLATE_PARAM_RE.sub(_TEMPLATE_PLACEHOLDER, path)
+
+
+def parse_spec_body(body: str, is_yaml_hint: bool = False) -> Any:
+    """Parse a spec body as JSON, falling back to YAML (if PyYAML is present). Returns the
+    decoded object or ``None``. Pure; never raises."""
+    text = body or ""
+    s = text.lstrip()
+    if not is_yaml_hint and (s.startswith("{") or s.startswith("[")):
+        try:
+            return json.loads(text)
+        except (ValueError, TypeError):
+            pass
+    if _yaml is not None:
+        try:
+            loaded = _yaml.safe_load(text)  # safe_load: no arbitrary object construction
+            if isinstance(loaded, (dict, list)):
+                return loaded
+        except Exception:  # pragma: no cover - malformed YAML
+            return None
+    # last resort: a JSON body that didn't start with {/[ (rare) but is still valid JSON
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return None
 
 
 def _origin(url: str) -> str:
@@ -73,6 +132,7 @@ def parse_openapi(spec: Any, spec_url: str) -> dict[str, Any]:
     base_url = _resolve_base(origin, base)
 
     endpoints: list[str] = []
+    templated = 0
     params: set[str] = set()
     for path, item in paths.items():
         if not isinstance(item, dict):
@@ -87,9 +147,23 @@ def parse_openapi(spec: Any, spec_url: str) -> dict[str, Any]:
             for p in (op.get("parameters") or []):
                 if isinstance(p, dict) and p.get("name"):
                     params.add(str(p["name"]))
-            if str(method).lower() == "get" and "{" not in str(path):
-                full = base_url.rstrip("/") + "/" + str(path).lstrip("/")
-                endpoints.append(full)
+            if str(method).lower() != "get":
+                continue
+            raw_path = str(path)
+            # A templated GET path (`/users/{id}`) is a real endpoint the HTML crawl never
+            # reaches — instantiate it with an inert placeholder so the active prover gets a
+            # concrete, GET-only URL to probe (IDOR/auth surface). Non-templated paths pass through.
+            if "{" in raw_path or "}" in raw_path:
+                concrete = _instantiate_template(raw_path)
+                # A nested/malformed template ({{x}}, unbalanced) can leave a stray brace; never
+                # surface a non-concrete URL — the active prover must not receive raw { } junk.
+                if "{" in concrete or "}" in concrete:
+                    continue
+                templated += 1
+            else:
+                concrete = raw_path
+            full = base_url.rstrip("/") + "/" + concrete.lstrip("/")
+            endpoints.append(full)
     # de-dupe, preserve order
     seen: set[str] = set()
     uniq = [e for e in endpoints if not (e in seen or seen.add(e))]
@@ -97,6 +171,7 @@ def parse_openapi(spec: Any, spec_url: str) -> dict[str, Any]:
         "title": str((spec.get("info") or {}).get("title") or ""),
         "version": str(spec.get("openapi") or spec.get("swagger") or ""),
         "endpoints": uniq,
+        "templated_count": templated,
         "params": sorted(params),
     }
 
@@ -180,12 +255,47 @@ def _looks_like_json(body: str) -> bool:
     return s.startswith("{") or s.startswith("[")
 
 
+def _looks_like_spec_url(value: str) -> bool:
+    """A scraped Swagger-UI/Redoc URL that plausibly points at an actual spec document."""
+    v = (value or "").split("?", 1)[0].split("#", 1)[0].lower()
+    if not v or v.startswith(("javascript:", "data:", "mailto:")):
+        return False
+    return (v.endswith((".json", ".yaml", ".yml"))
+            or "api-docs" in v or "openapi" in v or "swagger" in v or "api-spec" in v)
+
+
+def _ingest_spec(spec_url: str, r: dict[str, Any], in_scope: Callable[[str], bool],
+                 out: dict[str, Any]) -> bool:
+    """Parse a fetched spec response (JSON or YAML) and, if it's a real spec, populate ``out``
+    with its scope-gated endpoints + params. Returns True when a spec was ingested."""
+    body = r.get("body") or ""
+    final = r.get("final_url") or spec_url
+    is_yaml = final.split("?", 1)[0].lower().endswith((".yaml", ".yml"))
+    spec = parse_spec_body(body, is_yaml_hint=is_yaml)
+    if not isinstance(spec, dict):
+        return False
+    parsed = parse_openapi(spec, final)
+    if not parsed or not (parsed.get("endpoints") or parsed.get("params")):
+        return False
+    eps = [e for e in parsed["endpoints"] if in_scope(e)]  # never surface an OOS server[].url endpoint
+    out["openapi"] = {"spec_url": spec_url, "title": parsed["title"], "version": parsed["version"],
+                      "endpoint_count": len(eps), "templated_count": parsed.get("templated_count", 0)}
+    out["endpoints"] = eps
+    out["params"] = parsed["params"]
+    tmpl = parsed.get("templated_count", 0)
+    tmpl_note = f" ({tmpl} templated path(s) instantiated)" if tmpl else ""
+    out["notes"].append(
+        f"OpenAPI/Swagger spec at {spec_url} ({parsed['title'] or 'untitled'}): "
+        f"{len(eps)} GET endpoint(s){tmpl_note} + {len(parsed['params'])} param(s) added to the surface.")
+    return True
+
+
 def discover_api_surface(
     target_url: str,
     *,
     fetch: Callable[[str], dict[str, Any] | None],
     in_scope: Callable[[str], bool],
-    max_specs: int = 3,
+    max_specs: int = 10,
 ) -> dict[str, Any]:
     """Probe the target's origin for an OpenAPI/Swagger spec and a GraphQL endpoint using the
     injected ``fetch`` (GET-only, already SSRF-guarded by the caller) and ``in_scope`` gate.
@@ -199,10 +309,10 @@ def discover_api_surface(
     if not origin:
         return out
 
-    # --- OpenAPI / Swagger (first valid spec wins). ---
+    # --- OpenAPI / Swagger: try the well-known spec locations (JSON + YAML), first valid wins. ---
     tried = 0
     for path in _OPENAPI_PATHS:
-        if tried >= max_specs:
+        if tried >= max_specs or out["openapi"]:
             break
         url = origin + path
         if not in_scope(url):
@@ -211,23 +321,40 @@ def discover_api_surface(
         r = fetch(url)
         if not r or int(r.get("status") or 0) != 200:
             continue
-        body = r.get("body") or ""
-        if not _looks_like_json(body):
-            continue
-        try:
-            spec = json.loads(body)
-        except (ValueError, TypeError):
-            continue
-        parsed = parse_openapi(spec, r.get("final_url") or url)
-        if parsed and (parsed.get("endpoints") or parsed.get("params")):
-            out["openapi"] = {"spec_url": url, "title": parsed["title"], "version": parsed["version"],
-                              "endpoint_count": len(parsed["endpoints"])}
-            out["endpoints"] = [e for e in parsed["endpoints"] if in_scope(e)]
-            out["params"] = parsed["params"]
-            out["notes"].append(
-                f"OpenAPI/Swagger spec at {path} ({parsed['title'] or 'untitled'}): "
-                f"{len(out['endpoints'])} GET endpoint(s) + {len(parsed['params'])} param(s) added to the surface.")
-            break
+        _ingest_spec(url, r, in_scope, out)
+
+    # --- Fallback: no spec at a guessed path, so scrape a Swagger-UI/Redoc page for the spec URL
+    #     it embeds (the spec often lives at a non-standard path). Bounded; every scraped URL is
+    #     scope-gated before fetch, and re-parsed through the same _ingest_spec path. ---
+    if not out["openapi"]:
+        scraped_seen: set[str] = set()
+        for ui_path in _SWAGGER_UI_PATHS:
+            if out["openapi"] or tried >= max_specs + len(_SWAGGER_UI_PATHS):
+                break
+            ui_url = origin + ui_path
+            if not in_scope(ui_url):
+                continue
+            r = fetch(ui_url)
+            if not r or int(r.get("status") or 0) != 200:
+                continue
+            body = r.get("body") or ""
+            for raw in _SPEC_URL_RE.findall(body)[:12]:
+                if not _looks_like_spec_url(raw):
+                    continue
+                try:
+                    spec_url = urljoin(r.get("final_url") or ui_url, raw)
+                except ValueError:
+                    continue
+                if (not spec_url.startswith(("http://", "https://")) or spec_url in scraped_seen
+                        or not in_scope(spec_url)):
+                    continue
+                scraped_seen.add(spec_url)
+                sr = fetch(spec_url)
+                if not sr or int(sr.get("status") or 0) != 200:
+                    continue
+                if _ingest_spec(spec_url, sr, in_scope, out):
+                    out["notes"].append(f"spec URL discovered via Swagger-UI page {ui_path}.")
+                    break
 
     # --- GraphQL introspection (first responsive endpoint wins). ---
     enc = quote(GRAPHQL_INTROSPECTION_QUERY, safe="")

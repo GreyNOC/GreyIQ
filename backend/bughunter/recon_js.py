@@ -74,9 +74,10 @@ def mine_js(js_text: str, base_url: str, *, host_filter: Callable[[str], bool] |
             continue
         if needs_hint and not any(h in raw.lower() for h in _ENDPOINT_HINTS):
             continue
-        # A call-target exempt from the hint gate must still not be a STATIC asset
-        # (fetch('/static/app.css') is not an injectable route) — those are noise, not surface.
-        if not needs_hint and raw.split("?", 1)[0].split("#", 1)[0].lower().endswith(_STATIC_EXT):
+        # A STATIC asset is not an injectable route (fetch('/static/app.css'), or a hinted literal
+        # like '/api/v1/report.pdf') — drop it on BOTH paths. Applying this only to hint-exempt call
+        # targets let an endpoint-hint substring smuggle asset files (.pdf/.png/...) onto the surface.
+        if raw.split("?", 1)[0].split("#", 1)[0].lower().endswith(_STATIC_EXT):
             continue
         try:
             absolute = urljoin(base_url, raw)

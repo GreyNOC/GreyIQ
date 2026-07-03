@@ -18,6 +18,7 @@ are counted, never fetched. Pure / frozen-safe.
 from __future__ import annotations
 
 import html
+import json
 import re
 from typing import Any
 from urllib.parse import parse_qsl, urldefrag, urljoin, urlparse
@@ -44,6 +45,20 @@ _FORM_NAME_RE = re.compile(
     r"""<(?:input|textarea|select|button)\b[^>]*?\bname\s*=\s*["']([A-Za-z_][A-Za-z0-9_\-\[\]\.]{0,39})["']""",
     re.IGNORECASE,
 )
+# A whole <form> block: its action target + method + the fields it submits. The action is a
+# real endpoint that RECEIVES those params, so it belongs on the crawl/probe surface even when
+# no <a href> points at it. Non-greedy body match handles the common (non-nested) case.
+_FORM_BLOCK_RE = re.compile(r"<form\b([^>]*)>(.*?)</form>", re.IGNORECASE | re.DOTALL)
+_ATTR_ACTION_RE = re.compile(r"""\baction\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
+_ATTR_METHOD_RE = re.compile(r"""\bmethod\s*=\s*["']([A-Za-z]+)["']""", re.IGNORECASE)
+# /.well-known/ OIDC & OAuth discovery documents — JSON that enumerates the real
+# authorization/token/userinfo/jwks endpoints (prime auth surface a crawl never reaches).
+# Bounded, one GET each, scope-gated, budget-shared; extracted endpoints are in_scope-gated too.
+_WELL_KNOWN_JSON = ("/.well-known/openid-configuration", "/.well-known/oauth-authorization-server")
+# The URL-valued keys in an OIDC/OAuth discovery document — each is a concrete endpoint.
+_OIDC_ENDPOINT_KEYS = ("authorization_endpoint", "token_endpoint", "userinfo_endpoint", "jwks_uri",
+                       "registration_endpoint", "end_session_endpoint", "revocation_endpoint",
+                       "introspection_endpoint", "device_authorization_endpoint")
 _SKIP_EXT = (".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".woff", ".woff2",
              ".ttf", ".eot", ".pdf", ".zip", ".mp4", ".webm", ".mp3", ".map")
 _MAX_JS = 8  # served-JS bundles mined per campaign (bounded)
@@ -110,6 +125,29 @@ def _extract_scripts(body: str, base_url: str) -> list[str]:
 def _html_param_names(body: str) -> set[str]:
     """Parameter names from a page's own form fields (input/select/textarea/button)."""
     return set(_FORM_NAME_RE.findall(body or "")[:200])
+
+
+def _extract_forms(body: str, base_url: str) -> list[dict[str, Any]]:
+    """Each <form> as {action, method, params}. ``action`` is absolute (empty/self-submit ->
+    the page URL); ``params`` are that form's own field names. NOT scope-filtered here — the
+    caller scope-gates every action before queuing it."""
+    out: list[dict[str, Any]] = []
+    for attrs, inner in _FORM_BLOCK_RE.findall(body or "")[:40]:
+        am = _ATTR_ACTION_RE.search(attrs)
+        raw_action = _unescape_url(am.group(1).strip()) if am else ""
+        if raw_action.lower().startswith(("javascript:", "mailto:", "tel:", "data:", "#")):
+            continue
+        try:
+            action = _clean(urljoin(base_url, raw_action) if raw_action else base_url)
+        except ValueError:
+            continue
+        if not action.startswith(("http://", "https://")):
+            continue
+        mm = _ATTR_METHOD_RE.search(attrs)
+        method = (mm.group(1).upper() if mm else "GET") or "GET"
+        out.append({"action": action, "method": method,
+                    "params": sorted(set(_FORM_NAME_RE.findall(inner)[:200]))})
+    return out
 
 
 def _qs_param_names(url: str) -> set[str]:
@@ -251,6 +289,43 @@ def discover(
     if sm_found:
         sources["sitemap"] = sm_found
 
+    # --- OIDC / OAuth discovery documents. A self-hosted auth server publishes its real
+    # authorization/token/userinfo/jwks endpoints here — endpoints the HTML crawl never sees.
+    # GATE-BEFORE-FETCH the descriptor, RE-GATE its final_url, and in_scope-gate every endpoint
+    # it names (an external IdP's endpoints are out of scope and dropped, never added). ---
+    wk_found = 0
+    for wk in _WELL_KNOWN_JSON:
+        if used["n"] >= max_requests:
+            break
+        fetched = budgeted_fetch(base + wk)
+        if not fetched or fetched.get("status", 0) >= 400:
+            continue
+        if not in_scope(fetched.get("final_url") or (base + wk)):  # descriptor could 302 out of scope
+            dropped_oos += 1
+            continue
+        try:
+            doc = json.loads(fetched.get("body") or "")
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        for key in _OIDC_ENDPOINT_KEYS:
+            val = doc.get(key)
+            if not isinstance(val, str) or not val.startswith(("http://", "https://")):
+                continue
+            ep = _clean(val)
+            if ep in seen or len(discovered) >= max_pages:
+                continue
+            if not in_scope(ep):  # a federated endpoint on an external IdP host — drop it
+                dropped_oos += 1
+                continue
+            seen.add(ep); discovered.append(ep); wk_found += 1
+        issuer = doc.get("issuer")
+        if isinstance(issuer, str) and issuer:
+            notes.append(f"OIDC/OAuth discovery at {wk} (issuer {issuer[:80]}).")
+    if wk_found:
+        sources["well-known"] = wk_found
+
     # --- Bounded BFS crawl + served-JS mine + fingerprint. ---
     queue: list[tuple[str, int]] = [(sanitized, 0)]
     crawled = 0
@@ -275,6 +350,24 @@ def discover(
             dropped_oos += 1
             continue
         params.update(_html_param_names(body))  # the page's own form-field names
+
+        # A <form>'s action target is a real endpoint that RECEIVES the form's params — surface
+        # the active prover would otherwise miss (no <a href> points at a POST action). Queue each
+        # in-scope action + union its field names; the action URL is scope-gated before queuing.
+        for form in _extract_forms(body, final):
+            params.update(form["params"])
+            action = form["action"]
+            if action in seen:
+                continue
+            if not in_scope(action):
+                dropped_oos += 1
+                continue
+            seen.add(action); discovered.append(action)
+            sources["form"] = sources.get("form", 0) + 1
+            if len(discovered) < max_pages:
+                queue.append((action, depth + 1))
+            if len(discovered) >= max_pages:
+                break
 
         # Mine the landing HTML body ITSELF (zero extra fetches) — reaches endpoints/params living in
         # inline <script>, __NEXT_DATA__/__STATE__ blobs, and inline config. Union params/secrets +
