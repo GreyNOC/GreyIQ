@@ -594,6 +594,8 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
         rd_fence = _fence(rd)
         cls = str(finding.get("class_id") or "").lower()
         rid = str(finding.get("rule_id") or "").lower()
+        _DISCLOSURE = ("disclosure", "cloud-exposure")
+        _DISCLOSURE_RID = ("traversal", "exposed", "firebase", "graphql", "bucket", "sensitive")
         if cls == "cors" or "cors" in rid:
             heading = (
                 "**Demonstrated cross-origin read** — a request carrying the victim's authenticated "
@@ -601,11 +603,19 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
                 "response readable from an attacker-controlled origin, this is the sensitive data an "
                 "attacker page exfiltrates:"
             )
-        else:
+        elif cls in _DISCLOSURE or any(t in rid for t in _DISCLOSURE_RID):
             heading = (
                 "**Demonstrated impact — data disclosed** — the request above returned the content "
                 "below, proving the sensitive data is actually retrievable (not merely that the "
                 "endpoint exists). Already redacted; review before sharing:"
+            )
+        else:
+            # Injection / reflection classes (XSS, SSTI, SQLi, RCE): the payload's EFFECT captured
+            # verbatim from the live response — the concrete proof a triager wants, not a description.
+            heading = (
+                "**Demonstrated proof — the vulnerable behavior in the live response** — the excerpt "
+                "below is the server's ACTUAL response, showing the injected payload's effect "
+                "(reflected unescaped / evaluated / DB error) exactly as returned. Already redacted:"
             )
         out.append(heading + "\n")
         out.append(rd_fence)

@@ -77,5 +77,32 @@ class ProgramDeleteCascadeAliasTests(unittest.TestCase):
         self.assertEqual(len(ledger.list_archived(d)), 2)          # both High/Crit preserved
 
 
+class DemonstratedProofCaptureTests(unittest.TestCase):
+    """The reflection/injection active checks now capture the ACTUAL response excerpt (read_data)
+    showing the payload's effect — the concrete proof of impact a triager accepts, not a description."""
+
+    def test_reflected_xss_captures_the_reflected_response(self) -> None:
+        import urllib.parse as up
+        class _Xss:
+            auth = None
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                val = (list(dict(up.parse_qsl(up.urlparse(url).query)).values()) or [""])[0]
+                return {"status": 200, "headers": {"content-type": "text/html"}, "cookies": [],
+                        "body": f"<p>You searched: {val}</p>", "location": None, "final_url": url}
+        f = av._check_reflected_xss(_Xss(), "https://app.example.com/?q=x")
+        self.assertIsNotNone(f)
+        self.assertIn("read_data", f["proof_evidence"])
+        self.assertIn("<svg/onload", f["proof_evidence"]["read_data"])  # the actual reflected payload, in context
+
+    def test_context_excerpt_windows_around_the_needle(self) -> None:
+        body = "x" * 500 + "NEEDLE" + "y" * 500
+        exc = av._context_excerpt(body, "NEEDLE", pad=20)
+        self.assertIn("NEEDLE", exc)
+        self.assertLessEqual(len(exc), 20 + len("NEEDLE") + 20)
+
+    def test_context_excerpt_absent_needle_is_empty(self) -> None:
+        self.assertEqual(av._context_excerpt("hello world", "missing"), "")
+
+
 if __name__ == "__main__":
     unittest.main()
