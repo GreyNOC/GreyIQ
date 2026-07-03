@@ -1364,7 +1364,9 @@ def _check_path_traversal(http: _Http, url: str, extra_params: list[str] | None 
                     evidence=f"the unmistakable {fname} signature appears in the response body",
                 )
                 ev = {"request_line": f"GET {_with_query(url, {param: payload})}", "response_status": f"HTTP {probe['status']}",
-                      "matched_value": f"{fname} contents disclosed via '{param}'"}
+                      "matched_value": f"{fname} contents disclosed via '{param}'",
+                      # The retrieved file content IS the demonstrated impact (redacted once by _finding).
+                      "read_data": body[:1200]}
                 return _finding("active.path-traversal", f"Path traversal / local file read via '{param}' parameter",
                                 "high", "disclosure", "file-upload", url, proof, ev)
     return None
@@ -1395,7 +1397,9 @@ def _check_graphql_introspection(http: _Http, url: str) -> dict[str, Any] | None
             evidence="the response body contains the GraphQL __schema/queryType introspection result",
         )
         ev = {"request_line": f"GET {_with_query(url, {'query': _GRAPHQL_INTROSPECTION_QUERY})}",
-              "response_status": f"HTTP {probe['status']}", "matched_value": "__schema introspection returned"}
+              "response_status": f"HTTP {probe['status']}", "matched_value": "__schema introspection returned",
+              # The returned schema IS the disclosure — capture an excerpt as the demonstration.
+              "read_data": body[:1200]}
         return _finding("active.graphql-introspection", "GraphQL introspection enabled (schema disclosure)",
                         "low", "disclosure", "graphql", url, proof, ev)
     return None
@@ -1440,7 +1444,9 @@ def _check_sensitive_paths(http: _Http, url: str) -> dict[str, Any] | None:
                 control_result="a non-existent control path did NOT return this content — the file is genuinely exposed, not a catch-all 200",
                 evidence=f"the response body carries the unmistakable {name} signature",
             )
-            ev = {"request_line": f"GET {origin}{path}", "response_status": f"HTTP {status}", "matched_value": f"{name} exposed"}
+            ev = {"request_line": f"GET {origin}{path}", "response_status": f"HTTP {status}", "matched_value": f"{name} exposed",
+                  # The served file content IS the demonstrated exposure (secrets redacted once by _finding).
+                  "read_data": body[:1200]}
             return _finding("active.exposed-file", f"Sensitive file exposed: {path}", "high", "disclosure", "disclosure", url, proof, ev)
     return None
 

@@ -528,12 +528,22 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
     if read_data:
         rd = read_data[:1500]
         rd_fence = _fence(rd)
-        out.append(
-            "**Demonstrated cross-origin read** — a request carrying the victim's authenticated "
-            "session returned the response body below. Because the CORS headers above make this "
-            "response readable from an attacker-controlled origin, this is the sensitive data an "
-            "attacker page exfiltrates:\n"
-        )
+        cls = str(finding.get("class_id") or "").lower()
+        rid = str(finding.get("rule_id") or "").lower()
+        if cls == "cors" or "cors" in rid:
+            heading = (
+                "**Demonstrated cross-origin read** — a request carrying the victim's authenticated "
+                "session returned the response body below. Because the CORS headers above make this "
+                "response readable from an attacker-controlled origin, this is the sensitive data an "
+                "attacker page exfiltrates:"
+            )
+        else:
+            heading = (
+                "**Demonstrated impact — data disclosed** — the request above returned the content "
+                "below, proving the sensitive data is actually retrievable (not merely that the "
+                "endpoint exists). Already redacted; review before sharing:"
+            )
+        out.append(heading + "\n")
         out.append(rd_fence)
         out.append(rd)
         out.append(rd_fence)
