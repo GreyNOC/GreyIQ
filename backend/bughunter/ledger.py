@@ -322,30 +322,45 @@ def restore(runtime_dir: str | Path, dedup_key_str: str) -> bool:
     return was
 
 
-def archive_and_purge_program(runtime_dir: str | Path, program_id: str) -> dict[str, int]:
+def archive_and_purge_program(runtime_dir: str | Path, program_id: str,
+                              also_bucket_ids: "list[str] | tuple[str, ...]" = ()) -> dict[str, int]:
     """Cascade a PROGRAM deletion to its findings: the program's whole ledger bucket is removed,
     but its HIGH/CRITICAL findings are MOVED into the archive ("history subcategory") first —
     kept read-only so a serious finding is never silently lost when a program is deleted. Lower-
-    severity findings are purged with the bucket. Returns {'archived': n, 'purged': m}."""
-    pid = program_key(program_id)  # normalize to the same key the ledger bucket uses
+    severity findings are purged with the bucket. Returns {'archived': n, 'purged': m}.
+
+    ``also_bucket_ids`` covers the program's findings that were written under a DIFFERENT bucket
+    key than its id: a cockpit/ad-hoc run with ``program=None`` keys its bucket by the target's
+    registrable domain (e.g. ``acme.com``), so deleting the saved program ``acme`` must also sweep
+    those domain buckets or its HIGH/CRITICAL findings would orphan and keep being counted for a
+    program that no longer exists. The caller derives the domain keys from the program's scope."""
+    pids = [program_key(program_id)] + [program_key(b) for b in also_bucket_ids if str(b or "").strip()]
+    seen: set[str] = set()
     with _LOCK:
         data = _load(runtime_dir)
-        bucket = (data.get("programs") or {}).get(pid)
-        if not bucket:
-            return {"archived": 0, "purged": 0}
         dismissed = data.get("dismissed") or {}
         archive = data.setdefault("archived", {})
         n_arch = n_purge = 0
-        for key, rec in (bucket.get("findings") or {}).items():
-            severity = str(rec.get("severity") or "").strip().lower()
-            keep = severity in ("high", "critical") and key not in dismissed and not rec.get("dismissed")
-            if keep:
-                archive[key] = {**rec, "program": pid, "archived_from": pid, "archived_at": _now()}
-                n_arch += 1
-            else:
-                n_purge += 1
-        data.get("programs", {}).pop(pid, None)  # remove the bucket; kept ones now live in `archived`
-        _save(runtime_dir, data)
+        changed = False
+        for pid in pids:
+            if pid in seen:
+                continue
+            seen.add(pid)
+            bucket = (data.get("programs") or {}).get(pid)
+            if not bucket:
+                continue
+            for key, rec in (bucket.get("findings") or {}).items():
+                severity = str(rec.get("severity") or "").strip().lower()
+                keep = severity in ("high", "critical") and key not in dismissed and not rec.get("dismissed")
+                if keep:
+                    archive[key] = {**rec, "program": pid, "archived_from": pid, "archived_at": _now()}
+                    n_arch += 1
+                else:
+                    n_purge += 1
+            data.get("programs", {}).pop(pid, None)  # remove the bucket; kept ones now live in `archived`
+            changed = True
+        if changed:
+            _save(runtime_dir, data)
     return {"archived": n_arch, "purged": n_purge}
 
 
@@ -438,9 +453,12 @@ _CSV_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
 
 def _defang_csv_cell(value: Any) -> Any:
     """A leading apostrophe is rendered as literal text (never evaluated) by every
-    mainstream spreadsheet app -- the standard CSV-formula-injection mitigation."""
+    mainstream spreadsheet app -- the standard CSV-formula-injection mitigation. Test the
+    LEFT-STRIPPED text against the triggers: Google Sheets and some Excel import paths trim
+    leading whitespace/tabs before evaluating, so ' =WEBSERVICE(...)' would otherwise slip past
+    a first-character-only check and run as a formula."""
     text = value if isinstance(value, str) else str(value if value is not None else "")
-    return "'" + text if text.startswith(_CSV_FORMULA_TRIGGERS) else value
+    return "'" + text if text.lstrip().startswith(_CSV_FORMULA_TRIGGERS) else value
 
 
 _MAX_LIST_ALL = 2000  # cap the history response so a huge ledger can't balloon one JSON payload

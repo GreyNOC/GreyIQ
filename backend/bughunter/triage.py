@@ -92,7 +92,10 @@ def remote_triage(result: dict[str, Any], remote_config: dict[str, Any] | None) 
     if not url or not model:
         return None
     api_key = str(remote_config.get("remote_api_key") or "").strip()
-    timeout = float(remote_config.get("remote_timeout_s") or 60.0)
+    try:  # a hand-edited config can hold a truthy non-numeric ("5s"); never let it 500 the reply
+        timeout = float(remote_config.get("remote_timeout_s") or 60.0)
+    except (TypeError, ValueError):
+        timeout = 60.0
 
     findings = result.get("findings", [])[:30]
     prompt = (

@@ -355,12 +355,18 @@ class _Http:
                         return consumed
                 except HTTPError as exc:
                     # A 3xx (captured, not followed) or 4xx/5xx is a valid observation
-                    # from the server -- never retried.
-                    consumed = _consume(exc, self.settings)
-                    consumed["final_url"] = sanitized
-                    consumed["location"] = exc.headers.get("Location") if exc.headers else None
-                    consumed["elapsed"] = time.monotonic() - started
-                    return consumed
+                    # from the server -- never retried. HTTPError is itself a response object
+                    # holding a socket; several checks deliberately elicit 4xx/5xx (sensitive-
+                    # path/debug probes, error-SQLi, alg:none control), so close it or every
+                    # errored probe leaks an FD until GC.
+                    try:
+                        consumed = _consume(exc, self.settings)
+                        consumed["final_url"] = sanitized
+                        consumed["location"] = exc.headers.get("Location") if exc.headers else None
+                        consumed["elapsed"] = time.monotonic() - started
+                        return consumed
+                    finally:
+                        exc.close()
                 except (URLError, TimeoutError, OSError) as exc:
                     if attempt >= _MAX_FETCH_ATTEMPTS:
                         raise _ActiveError(str(exc)) from exc
@@ -646,9 +652,18 @@ def _check_csrf(landing: dict[str, Any] | None, url: str) -> dict[str, Any] | No
     )
     if not tokenless:
         return None
-    cookies = " ".join(str(c) for c in (landing.get("cookies") or [])).lower()
-    samesite_none = "samesite=none" in cookies
-    samesite_lax_strict = ("samesite=lax" in cookies) or ("samesite=strict" in cookies)
+    # Evaluate SameSite PER COOKIE on the session-looking cookie(s), not a global substring over all
+    # cookies joined: otherwise an unrelated SameSite=None tracker alongside a SameSite=Lax session
+    # cookie would defeat the "protected" skip and wrongly report CSRF on an actually-protected session.
+    raw_cookies = [str(c) for c in (landing.get("cookies") or [])]
+    _session_re = re.compile(r"(session|sess|sid|auth|token|jwt|login|user|connect\.sid|phpsessid|jsessionid|asp\.net)", re.IGNORECASE)
+    def _samesite(cookie: str) -> str:
+        m = re.search(r"samesite\s*=\s*(none|lax|strict)", cookie, re.IGNORECASE)
+        return m.group(1).lower() if m else ""
+    session_cookies = [c for c in raw_cookies if _session_re.search(c.split("=", 1)[0])]
+    consider = session_cookies or raw_cookies  # if no session cookie is identifiable, stay conservative over all
+    samesite_none = any(_samesite(c) == "none" for c in consider)          # a session cookie usable cross-site
+    samesite_lax_strict = any(_samesite(c) in ("lax", "strict") for c in consider)
     if samesite_lax_strict and not samesite_none:
         return None  # the session cookie is SameSite Lax/Strict -> cross-site POST blocked
     sev = "medium" if samesite_none else "low"

@@ -14,6 +14,7 @@ from __future__ import annotations
 import secrets
 import socket
 import struct
+import time
 
 _TYPE_CNAME = 5
 _CLASS_IN = 1
@@ -67,6 +68,16 @@ def _read_name(data: bytes, offset: int) -> tuple[str, int]:
     return ".".join(labels), next_off
 
 
+def _reply_matches(data: bytes, qid: int, host: str) -> bool:
+    """A UDP DNS reply is only ours if its transaction ID and echoed question name match what we
+    asked — without this any datagram arriving within the timeout is trusted, letting a spoofer
+    inject a false CNAME target (fabricating or masking a subdomain-takeover finding)."""
+    if len(data) < 12 or struct.unpack(">H", data[0:2])[0] != qid:
+        return False
+    qname, _ = _read_name(data, 12)
+    return qname.strip(".").lower() == str(host or "").strip(".").lower()
+
+
 def parse_cname_response(data: bytes) -> list[str]:
     """Parse a DNS response packet, returning the CNAME target(s) in the answer section."""
     if len(data) < 12:
@@ -105,8 +116,18 @@ def resolve_cname(host: str, *, server: str = "8.8.8.8", timeout: float = 4.0) -
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
-        sock.sendto(packet, (server, 53))
-        data, _addr = sock.recvfrom(4096)
+        sock.connect((server, 53))  # kernel drops datagrams whose source isn't server:53 (off-path spoof filter)
+        sock.send(packet)
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return []
+            sock.settimeout(remaining)
+            data = sock.recv(4096)
+            if _reply_matches(data, qid, host):  # transaction ID + echoed question name must be OURS
+                return parse_cname_response(data)
+            # a stale/spoofed datagram slipped past the source filter -> ignore it, keep waiting
     except (OSError, socket.timeout, ValueError):
         return []
     finally:
@@ -115,4 +136,3 @@ def resolve_cname(host: str, *, server: str = "8.8.8.8", timeout: float = 4.0) -
                 sock.close()
             except OSError:
                 pass
-    return parse_cname_response(data)

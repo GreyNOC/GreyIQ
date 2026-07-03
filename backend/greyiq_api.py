@@ -1012,7 +1012,10 @@ def _confirm_route(fn):
             return fn(self, request)
         except Exception as exc:  # noqa: BLE001 - surfaced to the operator UI, never crashes the route
             self.log(traceback.format_exc())
-            return {"ok": False, "error": f"{fn.__name__} failed: {exc.__class__.__name__}: {exc}"}
+            # Return the exception TYPE only, not str(exc): the raw message can echo a scanned
+            # response body / attacker-influenced input (with secrets or an injection payload) back
+            # into the operator UI. The full traceback is logged server-side for debugging.
+            return {"ok": False, "error": f"{fn.__name__} failed ({exc.__class__.__name__}) — see server log for detail."}
     return wrapper
 
 
@@ -2716,10 +2719,23 @@ class GreyIQRuntime:
         portfolio, and its ledger findings are deleted — HIGH/CRITICAL findings are archived
         into the 'history subcategory' (kept, read-only) while the rest are purged. Returns the
         cascade counts so the UI can confirm what was kept vs removed."""
+        # Capture the program's scope-domain bucket keys BEFORE deleting it: a cockpit/ad-hoc run
+        # with program=None keyed its findings by the target's registrable domain, not the program
+        # id, so the cascade must sweep those too or HIGH/CRITICAL findings orphan (and keep being
+        # counted for a program that no longer exists).
+        domain_aliases: list[str] = []
+        try:
+            prog = bounty_portfolio.get_program(RUNTIME_DIR, program_id) or {}
+            for host in list(prog.get("in_scope_hosts") or []) + list(prog.get("seed_targets") or []):
+                dom = bounty_ledger.program_key(None, str(host or "").strip())
+                if dom:
+                    domain_aliases.append(dom)
+        except Exception:  # noqa: BLE001 - best-effort alias gathering; the pid bucket is swept regardless
+            pass
         removed = bounty_portfolio.remove_program(RUNTIME_DIR, program_id)
         cascade = {"archived": 0, "purged": 0}
         try:
-            cascade = bounty_ledger.archive_and_purge_program(RUNTIME_DIR, program_id)
+            cascade = bounty_ledger.archive_and_purge_program(RUNTIME_DIR, program_id, also_bucket_ids=domain_aliases)
         except Exception:  # noqa: BLE001 - a portfolio delete must still succeed if the ledger read hiccups
             pass
         return {"ok": bool(removed), "archived": cascade.get("archived", 0), "purged": cascade.get("purged", 0)}
@@ -3599,7 +3615,11 @@ def _same_origin(scope: dict[str, Any] | None) -> str:
     host = _header(scope, "host").strip().lower()
     if not host:
         return ""
-    scheme = str((scope or {}).get("scheme") or "http").lower()
+    # Behind the documented Nginx TLS-terminating proxy the raw scope scheme is 'http' while the
+    # browser's Origin is 'https://host'; honor a trusted X-Forwarded-Proto so a legitimate
+    # same-site request isn't 403'd. Trusted only because the operator's own proxy sets it.
+    fwd = _header(scope, "x-forwarded-proto").split(",")[0].strip().lower()
+    scheme = fwd if fwd in ("http", "https") else str((scope or {}).get("scheme") or "http").lower()
     return f"{scheme}://{host}"
 
 
@@ -3622,7 +3642,10 @@ def _cors_headers(scope: dict[str, Any] | None) -> list[tuple[bytes, bytes]]:
     return [
         (b"access-control-allow-origin", normalized.encode("ascii")),
         (b"access-control-allow-methods", b"GET,POST,OPTIONS"),
-        (b"access-control-allow-headers", b"content-type,accept,x-greyiq-token"),
+        # `authorization` is required: the GREYIQ_ACCESS_KEY beyond-loopback deployment carries the
+        # key via HTTP Basic Auth, which is not CORS-safelisted, so a credentialed cross-origin
+        # request preflights on it — omitting it makes that deployment unauthenticatable.
+        (b"access-control-allow-headers", b"content-type,accept,x-greyiq-token,authorization"),
         (b"access-control-max-age", b"600"),
         (b"vary", b"Origin"),
     ]

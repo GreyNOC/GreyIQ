@@ -22,6 +22,8 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+import trust
+
 SKILLS_DIRNAME = "skills"
 
 _FRONTMATTER = re.compile(r"^﻿?---\s*\n(.*?)\n---\s*\n", re.DOTALL)
@@ -115,14 +117,30 @@ def select_skills(task: str, skills: list[Skill], limit: int = 2) -> list[Skill]
     return [skill for _, skill in scored[:limit]]
 
 
+def _safe_body(skill: "Skill") -> str:
+    # A "workspace" skill comes from the UNTRUSTED repo checkout — fence its body as DATA so a
+    # malicious playbook can't inject first-party instructions into the trusted system prompt
+    # (same boundary read_file/grep use). "user"/bundled skills are operator-owned → trusted.
+    if skill.source == "workspace":
+        return trust.wrap_for_model(skill.body, path=skill.path or "workspace skill")
+    return skill.body
+
+
+def _safe_desc(skill: "Skill") -> str:
+    desc = str(skill.description or "")
+    if skill.source == "workspace":  # collapse to one line + cap so the index can't carry an injection
+        desc = re.sub(r"\s+", " ", desc).strip()[:200]
+    return desc
+
+
 def skills_prompt(selected: list[Skill], all_skills: list[Skill]) -> str:
     parts: list[str] = []
     if selected:
         parts.append("Relevant playbook(s) for this task — follow the steps in order:")
         for skill in selected:
-            parts.append(f"\n## Playbook: {skill.name}\n{skill.body}")
+            parts.append(f"\n## Playbook: {skill.name}\n{_safe_body(skill)}")
     others = [s for s in all_skills if s not in selected and s.description]
     if others:
-        index = "\n".join(f"- {s.name}: {s.description}" for s in others)
+        index = "\n".join(f"- {s.name}: {_safe_desc(s)}" for s in others)
         parts.append("\nOther available playbooks (read/apply one if it fits better):\n" + index)
     return "\n".join(parts).strip()
