@@ -24,6 +24,7 @@ from uuid import uuid4
 
 import coder
 from bughunter import active_verify_service
+from bughunter import brain_narrative
 from bughunter import credential_validation
 from bughunter import oob_service
 from bughunter import fsutil
@@ -1486,6 +1487,7 @@ def run_bounty_hunt(
     # Active proof wins last: a REAL captured request/response outranks the brain's
     # prose and the deterministic candidate. Fold it into the finding's attack plan
     # (preserving the deterministic proof obligation) and strip the private carriers.
+    narrated = 0  # bound the per-confirmed-finding impact-narrative brain calls
     for finding in display:
         active_proof = finding.pop("_active_proof", None)
         finding.pop("_active_cvss", None)
@@ -1507,6 +1509,16 @@ def run_bounty_hunt(
         detail = report_lib._proof_of_impact_detail(finding, attack_plans[ref])
         if detail["status"] == "confirmed":
             attack_plans[ref]["cvss"] = impact_model.cvss_for_class(finding.get("class_id", ""), confirmed=True)
+            # Enrich the "so-what": ask the brain to write the impact/blast-radius statement from the
+            # ALREADY-CAPTURED artifacts. It goes into a DESCRIPTIVE field only (impact_narrative) — it
+            # cannot touch proof_status/CVSS (already frozen above) — is sanitized + fail-closed, and is
+            # bounded to a few findings so a big confirmed set doesn't fan out brain calls.
+            if coder_cfg and narrated < 6:
+                narrated += 1
+                narrative = brain_narrative.narrate_impact(coder_cfg, finding, attack_plans[ref])
+                poi = attack_plans[ref].get("proof_of_impact")
+                if narrative and isinstance(poi, dict):
+                    poi["impact_narrative"] = narrative
 
     # CVSS is now final (deterministic floor + brain + active confirmation). Re-order the
     # findings and re-number refs by that final resolved severity, so F1 is genuinely the
@@ -1541,6 +1553,9 @@ def run_bounty_hunt(
         "score": score,
         "findings": display,
         "attack_plans": attack_plans,
+        # Carried so the per-platform submission renderer can ask the brain for a platform-voiced
+        # Summary (submission_writer); absent -> the deterministic description is used (fail-closed).
+        "coder_cfg": coder_cfg,
         "manual_checklist": checklist,
         "methodology": methodology,
         "brain": brain,

@@ -19,6 +19,23 @@ from __future__ import annotations
 from typing import Any
 
 from bughunter import report as R
+from bughunter import submission_writer
+
+
+def _ai_summary(ctx: dict[str, Any], finding: dict[str, Any], plan: dict[str, Any], platform: str) -> str | None:
+    """The AI-written platform-voiced summary, generated once per (finding, platform) and cached on the
+    finding so a re-render / platform toggle doesn't re-call the brain. Only when ctx carries a brain
+    config; fail-closed (any problem -> None -> the deterministic description is used)."""
+    cfg = ctx.get("coder_cfg")
+    if not cfg:
+        return None
+    cache = finding.setdefault("_ai_summary_cache", {})
+    if platform not in cache:
+        try:
+            cache[platform] = submission_writer.write_summary(cfg, finding, plan, platform) or ""
+        except Exception:  # noqa: BLE001 - summary is enrichment; never break a render
+            cache[platform] = ""
+    return cache.get(platform) or None
 
 # Ordered so the UI lists HackerOne first, then YesWeHack, then the next two most
 # popular crowdsourced platforms.
@@ -134,10 +151,14 @@ def _section_authorization(out: list[str], ctx: dict[str, Any]) -> None:
     out.append("")
 
 
-def _section_summary(out: list[str], finding: dict[str, Any]) -> None:
-    if str(finding.get("description") or "").strip():
+def _section_summary(out: list[str], finding: dict[str, Any], summary: str | None = None) -> None:
+    # The AI-written platform-voiced summary (submission_writer) when present; else the finding's own
+    # deterministic description. Either way this is opening PROSE — every evidence/proof section that
+    # follows is deterministic and authoritative.
+    text = str(summary or finding.get("description") or "").strip()
+    if text:
         out.append("## Description\n")
-        out.append(str(finding["description"]).strip())
+        out.append(text)
         out.append("")
 
 
@@ -231,7 +252,7 @@ def render_finding(ctx: dict[str, Any], finding: dict[str, Any], platform: str =
 
     _meta_table(out, ctx, finding, plan, platform)
     _section_authorization(out, ctx)
-    _section_summary(out, finding)
+    _section_summary(out, finding, _ai_summary(ctx, finding, plan, platform))
     _section_steps(out, plan)
     _section_poc(out, finding, plan)
     _section_evidence(out, finding, heading=profile["evidence"])

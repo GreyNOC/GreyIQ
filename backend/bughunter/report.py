@@ -377,6 +377,7 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
         "authenticated_read_request": "",
         "authenticated_read_response": "",
         "blast_radius": "",
+        "impact_narrative": "",
         "limitations": "",
         "proof_obligation": "",
     }
@@ -419,6 +420,9 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
             or proof.get("impact_scope")
             or ""
         ).strip()
+        # AI-written impact statement, grounded in the captured artifacts (brain_narrative). A purely
+        # DESCRIPTIVE field — it is never read by _has_captured_artifact / the status gate / CVSS.
+        detail["impact_narrative"] = str(proof.get("impact_narrative") or "").strip()
         detail["limitations"] = str(proof.get("limitations") or proof.get("scope_limitations") or proof.get("notes") or "").strip()
         detail["proof_obligation"] = str(proof.get("proof_obligation") or proof.get("obligation") or "").strip()
     else:
@@ -438,6 +442,7 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
         "authenticated_read_request",
         "authenticated_read_response",
         "blast_radius",
+        "impact_narrative",
         "limitations",
     ):
         if detail[_k]:
@@ -500,6 +505,7 @@ def _append_proof_of_impact(out: list[str], finding: dict[str, Any], plan: dict[
         ("authenticated_read_request", "Authenticated read request"),
         ("authenticated_read_response", "Authenticated read success response"),
         ("blast_radius", "Blast radius"),
+        ("impact_narrative", "Impact (assessed from the captured proof)"),
         ("observed_result", "Observed result"),
         ("control_result", "Control / expected result"),
         ("evidence", "Evidence"),
