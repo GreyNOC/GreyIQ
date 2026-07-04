@@ -243,6 +243,10 @@ def _run_campaign_body(
     # Endpoints the reasoning layer judged object-scoped (worth a single-session IDOR probe) — each is
     # verbatim from the in-scope discovered set; the prover re-gates scope+SSRF before touching one.
     idor_candidates: list[str] = []
+    # Param NAMES the reasoning layer judged the SSRF (url-taking) / XSS (reflective) surface — steer
+    # WHICH params those two checks try first; the checks still supply the payload and confirm.
+    brain_ssrf_params: list[str] = []
+    brain_xss_params: list[str] = []
     if kind == "url":
         _emit("recon: mapping the surface…")
         # Bind discovery to the SAME fail-closed scope gate the active prover uses, so
@@ -291,6 +295,10 @@ def _run_campaign_body(
             if hunt_priority:
                 _emit(f"hunt-brain: prioritised probe classes on {len(hunt_priority)} endpoint(s)")
             idor_candidates = [e for e in (hb.get("idor_candidates") or []) if e in set(urls)]
+            brain_ssrf_params = list(hb.get("ssrf_params") or [])
+            brain_xss_params = list(hb.get("xss_params") or [])
+            if brain_ssrf_params or brain_xss_params:
+                _emit(f"hunt-brain: {len(brain_ssrf_params)} SSRF + {len(brain_xss_params)} XSS param candidate(s) to steer those checks")
         except Exception:  # noqa: BLE001 - the reasoning layer must never break a hunt
             pass
         # Merge the host-global tech-fingerprint hints into EVERY url's priority: the brain's
@@ -334,6 +342,7 @@ def _run_campaign_body(
             default_reports_dir=out_root / "targets", seed_dir=seed_dir, runtime_dir=runtime_dir,
             version=version, run_live=live, active=effective_active, time_based=(time_based or deep), auth=auth, per_finding=False,
             extra_params=recon_params, on_progress=_emit, settings=campaign_settings, class_priority=hunt_priority.get(url),
+            ssrf_params=brain_ssrf_params, xss_params=brain_xss_params,
         )
         per_target.append({"target": url, "ok": result.get("ok", False),
                            "report_path": result.get("report_path", ""), "error": result.get("error", "")})
