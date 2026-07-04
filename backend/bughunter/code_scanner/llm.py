@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Final
 from urllib.parse import urlparse
 
+import coder
 from bughunter.code_scanner.model import Finding, LlmVerification
 from bughunter.code_scanner.redaction import redact_text
 
@@ -292,8 +293,8 @@ def _call_openai_compatible(config: LlmConfig, system: str, user: str) -> str:
             {"role": "user", "content": user},
         ],
         "temperature": 0.0,
-        "max_tokens": config.max_tokens,
     }
+    coder.apply_chat_completion_token_limit(body, config.base_url or "https://api.openai.com/v1", config.model, config.max_tokens)
     headers = {
         "Authorization": f"Bearer {config.api_key}",
         "Content-Type": "application/json",

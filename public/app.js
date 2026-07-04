@@ -4513,6 +4513,8 @@ function ckNormalizeFindings(res) {
       remediation: String(f.remediation || ""),
       snippet: String(f.snippet || ""),
       sourceUrl: String(f.source_url || ""),
+      matched_value: String(f.matched_value || (f.proof_evidence && f.proof_evidence.matched_value) || ""),
+      proofEvidence: f.proof_evidence || f.proofEvidence || null,
       apiKeyAccessProof: f.credential_access_artifact || null,
       apiKeyAccessText: ""
     };
@@ -4812,7 +4814,9 @@ function ckRenderDetail(f) {
     for (const s of steps) ol.append(cel("li", null, s));
     host.append(ol);
   }
-  if (plan.poc) { host.append(cel("h4", null, "Proof of concept")); host.append(cel("pre", null, plan.poc)); }
+  const pocArtifact = ckProofOfConceptArtifact(f);
+  host.append(cel("h4", null, "Proof of concept"));
+  host.append(cel("pre", null, pocArtifact || "No runnable PoC artifact is captured yet. Attach an authorized request, command, saved HTML PoC, or working screenshot before submission."));
 
   // Proof of impact block.
   const po = f.proofObj || (plan.proof_of_impact && typeof plan.proof_of_impact === "object" ? plan.proof_of_impact : null);
@@ -4832,6 +4836,8 @@ function ckRenderDetail(f) {
       host.append(ob);
     }
   }
+  host.append(cel("h4", null, "Proof of exploitability"));
+  host.append(cel("pre", null, ckBuildProofOfExploitabilityText(f)));
   if (plan.impact) { host.append(cel("h4", null, "Impact")); host.append(cel("p", null, plan.impact)); }
   if (f.remediation) { host.append(cel("h4", null, "Remediation")); host.append(cel("p", null, f.remediation)); }
 
@@ -5110,6 +5116,81 @@ function ckPocLang(poc) {
   return "";
 }
 
+function ckProofStatusLabel(status) {
+  const s = String(status || "missing").toLowerCase();
+  if (s === "confirmed") return "Confirmed";
+  if (s === "candidate") return "Candidate / unverified";
+  return s.replace(/^./, (c) => c.toUpperCase()) || "Missing";
+}
+
+function ckCapturedRequestResponseText(focus, includeReadData) {
+  const pe = (focus && focus.proofEvidence) || {};
+  const L = [];
+  if (pe.request_line) {
+    L.push(String(pe.request_line));
+    if (pe.request_header) L.push(String(pe.request_header));
+    L.push("");
+  }
+  if (pe.response_status) L.push(String(pe.response_status));
+  if (pe.response_header) L.push(String(pe.response_header));
+  if (pe.set_cookie) L.push(String(pe.set_cookie));
+  if (pe.matched_value) L.push(String(pe.matched_value));
+  if (includeReadData && pe.read_data) {
+    if (L.length) L.push("");
+    L.push("Exploit output / response body excerpt:");
+    L.push(String(pe.read_data));
+  }
+  return L.join("\n").trim();
+}
+
+function ckProofOfConceptArtifact(focus) {
+  const plan = (focus && focus.plan) || {};
+  if (plan.poc) return String(plan.poc).trim();
+  return ckCapturedRequestResponseText(focus, false);
+}
+
+function ckScreenshotProofNames(focus) {
+  const out = [];
+  if (focus && focus.screenshot && focus.screenshot.data_url) out.push("captured proof screenshot");
+  for (const s of ((focus && focus.shots) || [])) {
+    if (!s || !s.data_url) continue;
+    const base = s.path ? String(s.path).replace(/\\/g, "/").split("/").pop() : "";
+    out.push(base || String(s.kind || "screenshot"));
+  }
+  return out;
+}
+
+function ckBuildProofOfExploitabilityText(focus) {
+  const plan = (focus && focus.plan) || {};
+  const po = (focus && focus.proofObj) || {};
+  const shots = ckScreenshotProofNames(focus);
+  const chunks = [];
+  let hasText = false;
+  if (plan.poc) { chunks.push("Proof of concept used:\n" + String(plan.poc).trim()); hasText = true; }
+  const req = ckCapturedRequestResponseText(focus, true);
+  if (req) { chunks.push("Captured exploit request/response:\n" + req); hasText = true; }
+  const observed = [];
+  if (po.method) observed.push("Method: " + po.method);
+  if (po.observed_result) observed.push("Observed result: " + po.observed_result);
+  if (po.control_result) observed.push("Negative control: " + po.control_result);
+  if (po.evidence) observed.push("Evidence: " + po.evidence);
+  if (observed.length) { chunks.push("Observed exploit behavior:\n" + observed.join("\n")); hasText = true; }
+  if (focus && (focus.apiKeyAccessText || focus.apiKeyAccessProof)) {
+    chunks.push("API key access proof:\n" + (focus.apiKeyAccessText || JSON.stringify(focus.apiKeyAccessProof, null, 2)));
+    hasText = true;
+  }
+  if (shots.length) chunks.push("Working exploit screenshot(s): " + shots.join(", "));
+  const status = chunks.length ? ckProofStatusLabel((po && po.status) || (focus && focus.proof)) : "Missing";
+  if (!chunks.length) {
+    const obligation = po && po.proof_obligation ? "\n- Capture required: " + po.proof_obligation : "";
+    return "- Status: Missing - no exploit proof artifact is attached yet." + obligation + "\n- Accepted artifact: a redacted request/response text proof or a screenshot showing the exploit working.";
+  }
+  const kinds = [];
+  if (hasText) kinds.push("text");
+  if (shots.length) kinds.push("screenshot");
+  return "- Status: " + status + "\n- Exploit proof artifact: " + (kinds.join(" and ") || "captured artifact") + ".\n\n" + chunks.join("\n\n");
+}
+
 function ckBuildSubmissionDraft(f) {
   const lines = [];
   const sev = f.severity.replace(/^./, (c) => c.toUpperCase());
@@ -5125,7 +5206,10 @@ function ckBuildSubmissionDraft(f) {
     plan.steps.forEach((s, i) => lines.push(`${i + 1}. ${s}`));
     lines.push("");
   }
-  if (plan.poc) lines.push("## Proof of concept", "```" + ckPocLang(plan.poc), plan.poc, "```", "");
+  const poc = ckProofOfConceptArtifact(f);
+  lines.push("## Proof of concept");
+  if (poc) lines.push("```" + ckPocLang(poc), poc, "```", "");
+  else lines.push("_No runnable PoC artifact is captured yet. Attach an authorized request, command, saved HTML PoC, or working screenshot before submission._", "");
   const po = f.proofObj || null;
   if (po) {
     lines.push("## Proof of impact");
@@ -5135,6 +5219,7 @@ function ckBuildSubmissionDraft(f) {
     if (po.status !== "confirmed" && po.proof_obligation) lines.push(`- To confirm: ${po.proof_obligation}`);
     lines.push("");
   }
+  lines.push("## Proof of exploitability", ckBuildProofOfExploitabilityText(f), "");
   if (plan.impact) lines.push("## Impact", plan.impact, "");
   if (f.remediation) lines.push("## Remediation", f.remediation, "");
   lines.push("---", "_Drafted by GreyIQ BugHunter. Verify the proof obligation before you submit._");
@@ -6651,11 +6736,11 @@ function ckFullReportPanel(focus) {
 
   // Proof of concept — the plan's PoC outline, shown in this view AND folded into the
   // downloaded/copied report (ckFullReportMarkdown passes it through).
-  const pocText = focus.plan && focus.plan.poc ? String(focus.plan.poc).trim() : "";
-  if (pocText) {
-    wrap.append(cel("h4", null, "Proof of concept"));
-    wrap.append(cel("pre", "ck-poc", pocText));
-  }
+  const pocText = ckProofOfConceptArtifact(focus);
+  wrap.append(cel("h4", null, "Proof of concept"));
+  wrap.append(cel("pre", "ck-poc", pocText || "No runnable PoC artifact is captured yet. Attach an authorized request, command, saved HTML PoC, or working screenshot before submission."));
+  wrap.append(cel("h4", null, "Proof of exploitability"));
+  wrap.append(cel("pre", "ck-poc", ckBuildProofOfExploitabilityText(focus)));
   if (focus.apiKeyAccessText || focus.apiKeyAccessProof) {
     wrap.append(cel("h4", null, "API key access proof"));
     const pre = cel("pre", "ck-poc", focus.apiKeyAccessText || JSON.stringify(focus.apiKeyAccessProof, null, 2));
@@ -7311,7 +7396,10 @@ function ckBuildPocSummary(focus) {
   L.push("");
   const plan = focus.plan || {};
   if (Array.isArray(plan.steps) && plan.steps.length) { L.push("## Steps to reproduce"); plan.steps.forEach((s, i) => L.push(`${i + 1}. ${s}`)); L.push(""); }
-  if (plan.poc) L.push("## Proof of concept", "```", String(plan.poc), "```", "");
+  const poc = ckProofOfConceptArtifact(focus);
+  L.push("## Proof of concept");
+  if (poc) L.push("```", poc, "```", "");
+  else L.push("_No runnable PoC artifact is captured yet. Attach an authorized request, command, saved HTML PoC, or working screenshot before submission._", "");
   const po = focus.proofObj;
   if (po && (po.observed_result || po.control_result || po.evidence || po.proof_obligation)) {
     L.push("## Proof of impact");
@@ -7322,6 +7410,7 @@ function ckBuildPocSummary(focus) {
     if (po.status !== "confirmed" && po.proof_obligation) L.push(`- **To confirm:** ${po.proof_obligation}`);
     L.push("");
   }
+  L.push("## Proof of exploitability", ckBuildProofOfExploitabilityText(focus), "");
   L.push("## Screenshots", "See the `screenshots/` folder — the `*-source.png` shot shows the served response/source that proves the finding.", "");
   L.push("---", "_Screenshots are NOT auto-redacted — review before sharing._");
   return L.join("\n");
@@ -7369,7 +7458,10 @@ function ckBuildPocHtml(focus) {
   const section = (h, inner) => inner ? `<section><h2>${esc(h)}</h2>${inner}</section>` : "";
   const stepsHtml = (Array.isArray(plan.steps) && plan.steps.length)
     ? section("Steps to reproduce", "<ol>" + plan.steps.map((s) => `<li>${esc(s)}</li>`).join("") + "</ol>") : "";
-  const pocHtml = plan.poc ? section("PoC outline", `<pre>${esc(String(plan.poc))}</pre>`) : "";
+  const pocArtifact = ckProofOfConceptArtifact(focus);
+  const pocHtml = section("Proof of concept", pocArtifact
+    ? `<pre>${esc(pocArtifact)}</pre>`
+    : "<p class=\"note\">No runnable PoC artifact is captured yet. Attach an authorized request, command, saved HTML PoC, or working screenshot before submission.</p>");
   let poiHtml = "";
   if (po.observed_result || po.control_result || po.evidence || po.proof_obligation) {
     const row = (k, v) => v ? `<div><b>${esc(k)}:</b> ${esc(String(v))}</div>` : "";
@@ -7382,6 +7474,7 @@ function ckBuildPocHtml(focus) {
   for (const s of (focus.shots || [])) if (s && s.data_url) shots.push(s);
   const shotsHtml = shots.length ? section("Screenshots",
     shots.map((s) => `<figure><figcaption>${esc(s.kind || "screenshot")}</figcaption><img src="${s.data_url}" alt="proof screenshot"></figure>`).join("")) : "";
+  const exploitHtml = section("Proof of exploitability", `<pre>${esc(ckBuildProofOfExploitabilityText(focus))}</pre>`);
 
   const cvss = focus.cvss && focus.cvss.vector
     ? `${esc(focus.cvss.vector)}${focus.cvssScore != null ? ` (${Number(focus.cvssScore).toFixed(1)})` : ""}` : "";
@@ -7403,7 +7496,7 @@ function ckBuildPocHtml(focus) {
     `<div class="meta">Target: <code>${esc(url)}</code></div>`,
     cvss ? `<div class="meta">CVSS: <code>${cvss}</code></div>` : "",
     section("Live proof of concept", (note ? `<p class="note">${esc(note)}</p>` : "") + runnable),
-    stepsHtml, pocHtml, poiHtml, shotsHtml,
+    stepsHtml, pocHtml, poiHtml, exploitHtml, shotsHtml,
     "<footer>Generated by GreyIQ BugHunter. Screenshots and responses are NOT auto-redacted — review before sharing.</footer>",
     "</body></html>",
   ].join("");
@@ -7427,7 +7520,10 @@ function ckBuildProofOfImpactText(focus) {
     plan.steps.forEach((s, i) => L.push(`${i + 1}. ${s}`));
     L.push("");
   }
-  if (plan.poc) L.push("PROOF OF CONCEPT", rule("-"), String(plan.poc), "");
+  const poc = ckProofOfConceptArtifact(focus);
+  L.push("PROOF OF CONCEPT", rule("-"));
+  if (poc) L.push(poc, "");
+  else L.push("No runnable PoC artifact is captured yet. Attach an authorized request, command, saved HTML PoC, or working screenshot before submission.", "");
   if (focus.apiKeyAccessText || focus.apiKeyAccessProof) {
     L.push("API KEY ACCESS TEST", rule("-"));
     if (focus.apiKeyAccessText) L.push(String(focus.apiKeyAccessText));
@@ -7446,6 +7542,7 @@ function ckBuildProofOfImpactText(focus) {
     if (po.status !== "confirmed" && po.proof_obligation) L.push(`To confirm: ${po.proof_obligation}`);
     L.push("");
   }
+  L.push("PROOF OF EXPLOITABILITY", rule("-"), ckBuildProofOfExploitabilityText(focus), "");
   const pe = focus.proofEvidence || {};
   if (pe.request_line || pe.request_header || pe.response_status || pe.matched_value) {
     L.push("CAPTURED REQUEST / RESPONSE", rule("-"));

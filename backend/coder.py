@@ -20,6 +20,7 @@ import json
 import socket
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -106,6 +107,45 @@ _PROVIDERS_OFF = {"", "off", "none", "disabled"}
 
 class CoderError(RuntimeError):
     """A coding-brain request failed in a way worth showing the user."""
+
+
+def chat_completion_token_limit_field(base_url: str, model: str) -> str:
+    """Return the chat-completions output-token field this endpoint/model expects.
+
+    OpenAI's newer hosted models reject the legacy ``max_tokens`` field and require
+    ``max_completion_tokens``. Most local OpenAI-compatible servers still expect the
+    legacy field, so keep that default unless the request is clearly headed to OpenAI
+    or the selected model name is from the newer OpenAI families.
+    """
+    host = (urllib.parse.urlparse(str(base_url or "")).hostname or "").lower()
+    name = str(model or "").strip().lower()
+    if host == "api.openai.com" or name.startswith(("gpt-5", "gpt-4.1", "o1", "o3", "o4", "chatgpt-")):
+        return "max_completion_tokens"
+    return "max_tokens"
+
+
+def apply_chat_completion_token_limit(payload: dict[str, Any], base_url: str, model: str, max_tokens: int) -> str:
+    field = chat_completion_token_limit_field(base_url, model)
+    payload.pop("max_tokens" if field == "max_completion_tokens" else "max_completion_tokens", None)
+    payload[field] = int(max_tokens)
+    return field
+
+
+def retry_payload_with_alternate_token_limit(payload: dict[str, Any], detail: str) -> dict[str, Any] | None:
+    """If a chat endpoint rejects one token-limit field, build a one-shot retry payload
+    with the other spelling. Returns None when the error is unrelated."""
+    lower = str(detail or "").lower()
+    if "unsupported parameter" not in lower:
+        return None
+    if "max_tokens" in payload and "max_tokens" in lower:
+        retry = dict(payload)
+        retry["max_completion_tokens"] = retry.pop("max_tokens")
+        return retry
+    if "max_completion_tokens" in payload and "max_completion_tokens" in lower:
+        retry = dict(payload)
+        retry["max_tokens"] = retry.pop("max_completion_tokens")
+        return retry
+    return None
 
 
 def coder_config(raw: dict[str, Any] | None) -> dict[str, Any]:
@@ -453,28 +493,38 @@ def _generate_openai_compatible(
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system_prompt}, *messages],
-        "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": False,
     }
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    if api_key:
-        request.add_header("Authorization", f"Bearer {api_key}")
+    apply_chat_completion_token_limit(payload, base_url, model, max_tokens)
 
-    def _open() -> bytes:
+    def _open(body_payload: dict[str, Any]) -> bytes:
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(body_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        if api_key:
+            request.add_header("Authorization", f"Bearer {api_key}")
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.read()
 
     try:
-        body = json.loads(with_retries(_open).decode("utf-8"))
+        body = json.loads(with_retries(lambda: _open(payload)).decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "ignore")[:400] if hasattr(exc, "read") else ""
-        raise CoderError(f"{label} HTTP {exc.code}: {detail or exc.reason}") from exc
+        retry_payload = retry_payload_with_alternate_token_limit(payload, detail)
+        if retry_payload:
+            try:
+                body = json.loads(with_retries(lambda: _open(retry_payload)).decode("utf-8"))
+            except urllib.error.HTTPError as retry_exc:
+                retry_detail = retry_exc.read().decode("utf-8", "ignore")[:400] if hasattr(retry_exc, "read") else ""
+                raise CoderError(f"{label} HTTP {retry_exc.code}: {retry_detail or retry_exc.reason}") from retry_exc
+            except Exception as retry_exc:  # noqa: BLE001
+                raise CoderError(f"{label} request failed: {retry_exc}") from retry_exc
+        else:
+            raise CoderError(f"{label} HTTP {exc.code}: {detail or exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise CoderError(
             f"Could not reach {label} at {base_url} ({exc.reason}). "

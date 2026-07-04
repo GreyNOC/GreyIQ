@@ -152,16 +152,8 @@ def _section_steps(out: list[str], plan: dict[str, Any]) -> None:
     out.append("")
 
 
-def _section_poc(out: list[str], plan: dict[str, Any]) -> None:
-    if not str(plan.get("poc") or "").strip():
-        return
-    poc = str(plan["poc"]).strip()[:1500]
-    fence = R._fence(poc)
-    out.append("## Proof of concept\n")
-    out.append(fence + R._poc_lang(poc))
-    out.append(poc)
-    out.append(fence)
-    out.append("")
+def _section_poc(out: list[str], finding: dict[str, Any], plan: dict[str, Any]) -> None:
+    R._append_proof_of_concept(out, finding, plan, heading="## Proof of concept\n")
 
 
 def _section_evidence(out: list[str], finding: dict[str, Any], *, heading: str) -> None:
@@ -197,6 +189,7 @@ def _section_impact(out: list[str], finding: dict[str, Any], plan: dict[str, Any
     if impact:
         out.append(f"## Impact\n\n{impact}\n")
     R._append_proof_of_impact(out, finding, plan, heading="## Proof of impact\n")
+    R._append_proof_of_exploitability(out, finding, plan, heading="## Proof of exploitability\n")
 
 
 def _section_remediation(out: list[str], finding: dict[str, Any], plan: dict[str, Any], *, heading: str) -> None:
@@ -240,7 +233,7 @@ def render_finding(ctx: dict[str, Any], finding: dict[str, Any], platform: str =
     _section_authorization(out, ctx)
     _section_summary(out, finding)
     _section_steps(out, plan)
-    _section_poc(out, plan)
+    _section_poc(out, finding, plan)
     _section_evidence(out, finding, heading=profile["evidence"])
     _section_screenshot(out, finding)
     _section_impact(out, finding, plan)

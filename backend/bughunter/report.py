@@ -516,6 +516,163 @@ def _append_proof_of_impact(out: list[str], finding: dict[str, Any], plan: dict[
     out.append("")
 
 
+def _captured_request_response_text(finding: dict[str, Any], *, include_read_data: bool = True) -> str:
+    """Return the already-captured request/response proof as a plain-text artifact.
+
+    This does not synthesize a new exploit. It only formats fields the scanner or active
+    prover already captured and redacts them again before they are rendered in reports.
+    """
+    pe = finding.get("proof_evidence")
+    if not isinstance(pe, dict) or not pe:
+        return ""
+    request_line = str(pe.get("request_line") or "").strip()
+    lines: list[str] = []
+    if request_line:
+        lines.append(request_line)
+        request_header = str(pe.get("request_header") or "").strip()
+        if request_header:
+            lines.append(request_header)
+        lines.append("")
+    status = str(pe.get("response_status") or "").strip()
+    if status:
+        lines.append(status)
+    for key in ("response_header", "set_cookie", "matched_value"):
+        value = str(pe.get(key) or "").strip()
+        if not value:
+            continue
+        parts = [p.strip() for p in value.split(";") if p.strip()]
+        if key == "matched_value" and len(parts) > 1 and all(": " in p for p in parts):
+            lines.extend(parts)
+        else:
+            lines.append(value)
+    if include_read_data:
+        read_data = str(pe.get("read_data") or "").strip()
+        if read_data:
+            if lines:
+                lines.append("")
+            lines.append("Exploit output / response body excerpt:")
+            lines.append(read_data[:1500])
+    return redact_text("\n".join(lines).strip())[0]
+
+
+def _screenshot_names(finding: dict[str, Any]) -> list[str]:
+    paths = finding.get("screenshot_paths")
+    if not isinstance(paths, list) or not paths:
+        single = str(finding.get("screenshot_path") or "").strip()
+        paths = [single] if single else []
+    out: list[str] = []
+    for path in paths:
+        text = str(path or "").strip()
+        if not text:
+            continue
+        out.append(text.replace("\\", "/").rsplit("/", 1)[-1])
+    return out
+
+
+def _proof_of_concept_text(finding: dict[str, Any], plan: dict[str, Any]) -> str:
+    poc = str(plan.get("poc") or "").strip()
+    if poc:
+        return redact_text(poc[:1500])[0]
+    request_response = _captured_request_response_text(finding, include_read_data=False)
+    return request_response[:1500]
+
+
+def _append_proof_of_concept(out: list[str], finding: dict[str, Any], plan: dict[str, Any], *, heading: str) -> None:
+    """Render a Proof of concept section on every report surface.
+
+    Prefer the runnable PoC from the attack plan. If there is no standalone command/body,
+    fall back to the captured request/response as a text PoC artifact. When neither exists,
+    keep the section visible and state exactly what must be captured before submission.
+    """
+    out.append(heading)
+    poc = _proof_of_concept_text(finding, plan)
+    if poc:
+        fence = _fence(poc)
+        out.append(fence + _poc_lang(poc))
+        out.append(poc)
+        out.append(fence)
+    else:
+        out.append("_No runnable PoC artifact is captured yet. Attach an authorized request, command, saved HTML PoC, or working screenshot before submission._")
+    out.append("")
+
+
+def _exploitability_artifact_text(finding: dict[str, Any], plan: dict[str, Any]) -> str:
+    detail = _proof_of_impact_detail(finding, plan)
+    chunks: list[str] = []
+    poc = str(plan.get("poc") or "").strip()
+    if poc:
+        chunks.append("Proof of concept used:\n" + redact_text(poc[:1500])[0])
+    request_response = _captured_request_response_text(finding, include_read_data=True)
+    if request_response:
+        chunks.append("Captured exploit request/response:\n" + request_response)
+    observed: list[str] = []
+    for key, label in (
+        ("method", "Method"),
+        ("observed_result", "Observed result"),
+        ("control_result", "Negative control"),
+        ("authenticated_read_request", "Authenticated read request"),
+        ("authenticated_read_response", "Authenticated read response"),
+        ("evidence", "Evidence"),
+    ):
+        value = str(detail.get(key) or "").strip()
+        if value:
+            observed.append(f"{label}: {value}")
+    if observed:
+        chunks.append("Observed exploit behavior:\n" + "\n".join(observed))
+    return "\n\n".join(chunks).strip()[:4500]
+
+
+def _proof_of_exploitability_detail(finding: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    poi = _proof_of_impact_detail(finding, plan)
+    artifact_text = _exploitability_artifact_text(finding, plan)
+    screenshots = _screenshot_names(finding)
+    status = "missing"
+    if artifact_text or screenshots:
+        explicit = _explicit_proof_status(finding, plan, _proof_value(finding, plan))
+        status = "confirmed" if str(poi.get("status")) == "confirmed" or (screenshots and explicit == "confirmed") else "candidate"
+    return {
+        "status": status,
+        "ready": status == "confirmed",
+        "artifact_type": "text and screenshot" if artifact_text and screenshots else "text" if artifact_text else "screenshot" if screenshots else "",
+        "text_artifact": artifact_text,
+        "screenshot_files": screenshots,
+        "proof_obligation": str(poi.get("proof_obligation") or "").strip(),
+    }
+
+
+def _append_proof_of_exploitability(out: list[str], finding: dict[str, Any], plan: dict[str, Any], *, heading: str) -> None:
+    """Render proof that the exploit actually works: text artifact and/or screenshot."""
+    detail = _proof_of_exploitability_detail(finding, plan)
+    status = str(detail.get("status") or "missing")
+    out.append(heading)
+    if status == "missing":
+        obligation = str(detail.get("proof_obligation") or "").strip()
+        out.append("- **Status:** Missing - no exploit proof artifact is attached yet.")
+        if obligation:
+            out.append(f"- **Capture required:** {obligation}")
+        out.append("- **Accepted artifact:** a redacted request/response text proof or a screenshot showing the exploit working.")
+        out.append("")
+        return
+    out.append(f"- **Status:** {_proof_status_label(status)}")
+    artifact_type = str(detail.get("artifact_type") or "").strip()
+    if artifact_type:
+        out.append(f"- **Exploit proof artifact:** {artifact_type}.")
+    screenshots = detail.get("screenshot_files") or []
+    if screenshots:
+        out.append("- **Working exploit screenshot(s):** " + ", ".join(_code(str(name)) for name in screenshots))
+    text_artifact = str(detail.get("text_artifact") or "").strip()
+    if text_artifact:
+        fence = _fence(text_artifact)
+        out.append("")
+        out.append("Exploitability proof (captured text artifact):")
+        out.append(f"{fence}text")
+        out.append(text_artifact)
+        out.append(fence)
+    if status != "confirmed":
+        out.append("- **Gap:** The artifact is present, but the finding is not confirmed until the observed exploit result is tied to a negative control or equivalent live validation.")
+    out.append("")
+
+
 _PROOF_EVIDENCE_LABELS = (
     ("request_line", "Request"),
     ("request_header", "Request header"),
@@ -535,16 +692,11 @@ def _append_screenshot(out: list[str], finding: dict[str, Any]) -> None:
     the same folder) plus the not-auto-redacted caveat. Shared by the default report and
     the per-platform report so a captured screenshot lands on *every* report surface, not
     only the platform package."""
-    paths = finding.get("screenshot_paths")
-    if not isinstance(paths, list) or not paths:
-        single = str(finding.get("screenshot_path") or "").strip()
-        paths = [single] if single else []
-    paths = [str(p).strip() for p in paths if str(p or "").strip()]
-    if not paths:
+    names = _screenshot_names(finding)
+    if not names:
         return
     out.append("## Screenshot evidence\n")
-    for path in paths:
-        name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    for name in names:
         out.append(f"![Proof-of-concept screenshot]({name})")
         out.append("")
     out.append(f"> {_SCREENSHOT_WARNING}")
@@ -986,18 +1138,12 @@ def build_markdown(ctx: dict[str, Any]) -> str:
         else:
             out.append("_No automated reproduction steps; see the class guidance and verify manually._")
         out.append("")
-        if plan.get("poc"):
-            poc = str(plan["poc"]).strip()[:1500]
-            poc_fence = _fence(poc)
-            out.append("**Proof-of-concept outline**\n")
-            out.append(poc_fence)
-            out.append(poc)
-            out.append(poc_fence)
-            out.append("")
+        _append_proof_of_concept(out, finding, plan, heading="**Proof of concept:**")
         if plan.get("impact") or finding.get("impact"):
             out.append(f"**Impact:** {plan.get('impact') or finding.get('impact')}")
             out.append("")
         _append_proof_of_impact(out, finding, plan, heading="**Proof of impact:**")
+        _append_proof_of_exploitability(out, finding, plan, heading="**Proof of exploitability:**")
         _append_screenshot(out, finding)
         _append_credential_proof(out, finding)
         remediation = finding.get("remediation") or plan.get("remediation")
@@ -1223,6 +1369,14 @@ def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
             for finding in findings
             if finding.get("ref")
         },
+        "proof_of_exploitability": {
+            str(finding.get("ref") or ""): _proof_of_exploitability_detail(
+                finding,
+                attack_plans.get(finding.get("ref")) or {},
+            )
+            for finding in findings
+            if finding.get("ref")
+        },
         "cvss": {
             str(finding.get("ref") or ""): (attack_plans.get(finding.get("ref")) or {}).get("cvss")
             for finding in findings
@@ -1325,19 +1479,13 @@ def build_finding_markdown(ctx: dict[str, Any], finding: dict[str, Any]) -> str:
         out.append("_Verify manually within your authorized scope._")
     out.append("")
 
-    if plan.get("poc"):
-        poc = str(plan["poc"]).strip()[:1500]
-        poc_fence = _fence(poc)
-        out.append("## Proof of concept\n")
-        out.append(poc_fence + _poc_lang(poc))
-        out.append(poc)
-        out.append(poc_fence)
-        out.append("")
+    _append_proof_of_concept(out, finding, plan, heading="## Proof of concept\n")
 
     impact = plan.get("impact") or finding.get("impact")
     if impact:
         out.append(f"## Impact\n\n{impact}\n")
     _append_proof_of_impact(out, finding, plan, heading="## Proof of impact\n")
+    _append_proof_of_exploitability(out, finding, plan, heading="## Proof of exploitability\n")
     _append_screenshot(out, finding)
     _append_credential_proof(out, finding)
     remediation = finding.get("remediation") or plan.get("remediation")

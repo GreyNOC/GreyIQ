@@ -68,6 +68,9 @@ class PocPoiPlumbingTests(unittest.TestCase):
         # POI: the impact + a Confirmed proof-of-impact
         self.assertIn("Arbitrary OS command execution", text, f"{surface}: impact missing")
         self.assertRegex(text, r"(?i)status:\*\*\s*Confirmed")  # POI renders as confirmed
+        # POE: the working exploit artifact must be explicit, not implied.
+        self.assertIn("Proof of exploitability", text, f"{surface}: proof-of-exploitability section missing")
+        self.assertIn("Captured exploit request/response", text, f"{surface}: exploitability artifact missing")
 
     def test_campaign_report_carries_poc_poi_and_evidence(self) -> None:
         self._assert_all_present(R.build_markdown(_ctx()), "build_markdown")
@@ -82,10 +85,21 @@ class PocPoiPlumbingTests(unittest.TestCase):
     def test_json_sidecar_carries_poc_and_confirmed_poi(self) -> None:
         doc = R.build_json(_ctx())
         self.assertEqual(doc["proof_of_impact"]["F1"]["status"], "confirmed")     # POI in the machine-readable sidecar
+        self.assertEqual(doc["proof_of_exploitability"]["F1"]["status"], "confirmed")
+        self.assertIn("Captured exploit request/response", doc["proof_of_exploitability"]["F1"]["text_artifact"])
         self.assertEqual(doc["attack_plans"]["F1"]["poc"], _PLAN["poc"])          # POC command in the sidecar
         # the request-sent + return-code evidence rides on the finding dict itself
         self.assertEqual(doc["findings"][0]["proof_evidence"]["response_status"], "HTTP 200")
         self.assertIn("run?cmd=", doc["findings"][0]["proof_evidence"]["request_line"])
+
+    def test_poc_section_falls_back_to_captured_request_when_plan_has_no_poc(self) -> None:
+        ctx = _ctx()
+        ctx["attack_plans"]["F1"] = dict(_PLAN)
+        ctx["attack_plans"]["F1"].pop("poc")
+        md = R.build_finding_markdown(ctx, dict(_FINDING))
+        self.assertIn("## Proof of concept", md)
+        self.assertIn("GET https://example.test/run?cmd=$(expr 111 + 111)", md)
+        self.assertIn("## Proof of exploitability", md)
 
 
 if __name__ == "__main__":

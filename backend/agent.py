@@ -1699,28 +1699,38 @@ def _run_tool_loop(
             "messages": convo,
             "tools": tools,
             "tool_choice": "auto",
-            "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": False,
         }
-        request = urllib.request.Request(
-            endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        if api_key:
-            request.add_header("Authorization", f"Bearer {api_key}")
+        coder.apply_chat_completion_token_limit(payload, base_url, model, max_tokens)
 
-        def _open() -> bytes:
+        def _open(body_payload: dict[str, Any]) -> bytes:
+            request = urllib.request.Request(
+                endpoint,
+                data=json.dumps(body_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            if api_key:
+                request.add_header("Authorization", f"Bearer {api_key}")
             with urllib.request.urlopen(request, timeout=timeout) as resp:
                 return resp.read()
 
         try:
-            body = json.loads(coder.with_retries(_open).decode("utf-8"))
+            body = json.loads(coder.with_retries(lambda: _open(payload)).decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "ignore")[:400] if hasattr(exc, "read") else ""
-            raise AgentError(f"{label} HTTP {exc.code}: {detail or exc.reason}") from exc
+            retry_payload = coder.retry_payload_with_alternate_token_limit(payload, detail)
+            if retry_payload:
+                try:
+                    body = json.loads(coder.with_retries(lambda: _open(retry_payload)).decode("utf-8"))
+                except urllib.error.HTTPError as retry_exc:
+                    retry_detail = retry_exc.read().decode("utf-8", "ignore")[:400] if hasattr(retry_exc, "read") else ""
+                    raise AgentError(f"{label} HTTP {retry_exc.code}: {retry_detail or retry_exc.reason}") from retry_exc
+                except Exception as retry_exc:  # noqa: BLE001
+                    raise AgentError(f"{label} request failed: {retry_exc}") from retry_exc
+            else:
+                raise AgentError(f"{label} HTTP {exc.code}: {detail or exc.reason}") from exc
         except urllib.error.URLError as exc:
             raise AgentError(f"Could not reach {label} ({exc.reason}). Is it running?") from exc
         except Exception as exc:  # noqa: BLE001

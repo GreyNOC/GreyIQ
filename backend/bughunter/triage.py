@@ -11,8 +11,11 @@ covers Ollama, llama.cpp, LM Studio, vLLM, and hosted gateways.
 from __future__ import annotations
 
 import json
+import urllib.error
 import urllib.request
 from typing import Any
+
+import coder
 
 _TOP = 8
 _CITATION_WEIGHT = {"critical": 0.99, "high": 0.85, "medium": 0.6, "low": 0.4, "info": 0.2}
@@ -117,26 +120,42 @@ def remote_triage(result: dict[str, Any], remote_config: dict[str, Any] | None) 
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.2,
-        "max_tokens": 700,
         "stream": False,
     }
-    request = urllib.request.Request(
-        _completions_endpoint(url),
-        data=json.dumps(payload).encode("utf-8"),
-        method="POST",
-        headers={"Content-Type": "application/json"},
-    )
-    if api_key:
-        request.add_header("Authorization", f"Bearer {api_key}")
+    coder.apply_chat_completion_token_limit(payload, url, model, 700)
+
+    def _send(body_payload: dict[str, Any]) -> dict[str, Any]:
+        request = urllib.request.Request(
+            _completions_endpoint(url),
+            data=json.dumps(body_payload).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        if api_key:
+            request.add_header("Authorization", f"Bearer {api_key}")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8", errors="replace"))
 
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = json.loads(response.read().decode("utf-8", errors="replace"))
+        body = _send(payload)
         choices = body.get("choices") or []
         if choices:
             message = choices[0].get("message", {}).get("content") or choices[0].get("text")
             if message:
                 return str(message).strip()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "ignore")[:400] if hasattr(exc, "read") else ""
+        retry_payload = coder.retry_payload_with_alternate_token_limit(payload, detail)
+        if retry_payload:
+            try:
+                body = _send(retry_payload)
+                choices = body.get("choices") or []
+                if choices:
+                    message = choices[0].get("message", {}).get("content") or choices[0].get("text")
+                    if message:
+                        return str(message).strip()
+            except Exception:  # noqa: BLE001 - remote is best-effort; fall back to local
+                return None
     except Exception:  # noqa: BLE001 - remote is best-effort; fall back to local
         return None
     return None

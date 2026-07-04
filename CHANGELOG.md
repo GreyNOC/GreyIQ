@@ -2,6 +2,13 @@
 
 Notable changes to GreyIQ.
 
+## v0.78.1
+
+### Proof artifacts, bigger findings, and ChatGPT API compatibility
+- Reports now include **Proof of concept**, **Proof of impact**, and **Proof of exploitability** sections for confirmed findings, with captured request/response or screenshot evidence carried into downloads.
+- The active proof engine now detects more high-impact exposed management/debug surfaces, including phpinfo, Go expvar/pprof, Spring logfiles, Docker Registry catalogs, Kubernetes namespace lists, and Apache server-status, guarded by root-only probes and catch-all controls.
+- OpenAI/ChatGPT-hosted model requests now use `max_completion_tokens` where required, keep `max_tokens` for local OpenAI-compatible servers, and retry once with the alternate field when a gateway reports an unsupported token parameter.
+
 ## v0.78.0
 
 ### API-key access proof on demand

@@ -1738,10 +1738,11 @@ def _check_sensitive_paths(http: _Http, url: str) -> dict[str, Any] | None:
     return None
 
 
-# Unauthenticated debug/management endpoints that leak secrets or grant code execution. Each is
-# confirmed by an UNMISTAKABLE product signature AND the catch-all control (like _EXPOSED_FILES),
-# so an app that 200s everything can't false-positive. (path, signature, name, severity, class,
-# impact). Ordered most-severe first so the worst exposure on a host is the one reported.
+# Unauthenticated debug/management/registry endpoints that leak secrets, map backend internals, or
+# grant code execution. Each is confirmed by an UNMISTAKABLE product signature AND the catch-all
+# control (like _EXPOSED_FILES), so an app that 200s everything can't false-positive. (path,
+# signature, name, severity, class, impact). Ordered most-severe first so the worst exposure on a
+# host is the one reported.
 _DEBUG_ENDPOINTS: tuple[tuple[str, "re.Pattern[str]", str, str, str, str], ...] = (
     # The HPROF magic is ANCHORED to the start of the response (\A) + the version framing, so a docs
     # / blog / soft-404 page that merely contains the words "JAVA PROFILE" mid-body cannot match —
@@ -1753,17 +1754,41 @@ _DEBUG_ENDPOINTS: tuple[tuple[str, "re.Pattern[str]", str, str, str, str], ...] 
      "Jolokia exposes JMX over HTTP unauthenticated — MBean operations can be abused to load and execute remote code (RCE)"),
     ("/actuator/env", re.compile(r'"propertySources"'), "Spring Boot actuator env", "high", "disclosure",
      "the application's full configuration (property sources — commonly DB credentials, API keys, tokens) is exposed unauthenticated"),
+    ("/actuator/logfile", re.compile(r"(?im)^\d{4}-\d{2}-\d{2}[ T][^\r\n]{0,120}\b(?:TRACE|DEBUG|INFO|WARN|ERROR)\b"),
+     "Spring Boot actuator logfile", "high", "disclosure",
+     "application logs are exposed unauthenticated - logs commonly contain session identifiers, stack traces, API errors, and operational secrets"),
+    ("/phpinfo.php", re.compile(r"(?is)(?=.*<title>\s*phpinfo\(\)\s*</title>)(?=.*PHP Version)(?=.*Configuration File)"),
+     "PHP phpinfo() diagnostic page", "high", "disclosure",
+     "phpinfo() exposes server paths, loaded extensions, environment variables, and configuration values that often include credentials or deployment secrets"),
+    ("/_profiler/phpinfo", re.compile(r"(?is)(?=.*<title>\s*phpinfo\(\)\s*</title>)(?=.*PHP Version)(?=.*Configuration File)"),
+     "Symfony profiler phpinfo() diagnostic page", "high", "disclosure",
+     "the Symfony profiler exposes phpinfo() unauthenticated, revealing runtime configuration, environment variables, and deployment internals"),
+    ("/debug/vars", re.compile(r'(?is)(?=.*"cmdline"\s*:\s*\[)(?=.*"memstats"\s*:\s*\{)'),
+     "Go expvar debug variables", "high", "disclosure",
+     "Go expvar runtime variables are exposed unauthenticated - command line, counters, build/runtime state, and custom application variables can disclose internals or secrets"),
+    ("/debug/pprof/goroutine?debug=1", re.compile(r"(?im)^goroutine\s+\d+\s+\[[^\]]+\]:|runtime\.goexit|net/http/pprof"),
+     "Go pprof goroutine dump", "high", "disclosure",
+     "Go pprof is exposed unauthenticated - stack traces and profiles reveal sensitive routes, internal services, goroutines, and operational state"),
+    ("/v2/_catalog", re.compile(r'(?is)^\s*\{\s*"repositories"\s*:\s*\['),
+     "Docker Registry catalog", "high", "disclosure",
+     "the Docker Registry catalog is anonymously listable, exposing container image names that can reveal source, services, environments, and deployment supply-chain targets"),
+    ("/api/v1/namespaces", re.compile(r'(?is)^\s*\{\s*"kind"\s*:\s*"NamespaceList"[\s\S]{0,2000}"items"\s*:\s*\['),
+     "Kubernetes namespace list", "high", "disclosure",
+     "the Kubernetes API server lists cluster namespaces unauthenticated, exposing workload organization and confirming broad control-plane read surface"),
+    ("/server-status?auto", re.compile(r"(?im)^Total Accesses:\s*\d+\s*$[\s\S]{0,2000}^BusyWorkers:\s*\d+\s*$"),
+     "Apache mod_status server-status", "medium", "disclosure",
+     "Apache mod_status is exposed unauthenticated, leaking live worker, vhost, request, and backend operational details useful for attack chaining"),
     ("/actuator", re.compile(r'"_links"[\s\S]{0,4000}/actuator'), "Spring Boot actuator index", "medium", "disclosure",
      "the actuator endpoint index is exposed, mapping further sensitive management endpoints (env, heapdump, mappings)"),
 )
 
 
 def _check_debug_endpoints(http: _Http, url: str) -> dict[str, Any] | None:
-    """Confirm an unauthenticated debug/management endpoint (Spring Boot actuator env/heapdump,
-    Jolokia JMX) is served, by fetching it at the origin root and gating on the product's own
-    signature PLUS a catch-all control — so an app that 200s everything can't false-positive.
-    Root-only (one probe set per host). GET-only, read-only. Heapdump/Jolokia are critical
-    (secret exfiltration / RCE); env is high; the index is medium."""
+    """Confirm an unauthenticated debug/management/registry endpoint is served by fetching it at
+    the origin root and gating on the product's own signature PLUS a catch-all control, so an app
+    that 200s everything can't false-positive. Root-only (one probe set per host), GET-only, and
+    read-only. Critical endpoints prove direct secret exfiltration or RCE reachability; high
+    endpoints prove unauthenticated runtime/config/source/supply-chain disclosure."""
     parts = urlparse(url)
     if (parts.path or "/").strip("/"):
         return None  # only at the site root -> one probe set per host, not per discovered URL
@@ -1898,8 +1923,10 @@ def verify_active(
         # — critical secret-exfil / RCE, root-only, same signature + catch-all control gate.
         ("debug", lambda: _check_debug_endpoints(http, sanitized)),
         # Path traversal / LFI reads ONE well-known system file as proof (signature + control),
-        # extracting nothing else; GET-only. Heaviest of the new checks, so it runs LAST by default
-        # and only uses whatever request budget the earlier checks left.
+        # extracting nothing else; GET-only. Heaviest of the new checks, so it normally runs last
+        # and only uses whatever request budget the earlier checks left. When time_based=True below,
+        # it is shifted after the opt-in timing proofs so the executing proof checks the operator
+        # explicitly requested cannot be starved by this heavier file-read sweep.
         ("path-traversal", lambda: _check_path_traversal(http, sanitized, discovered_params)),
     ]
     # Reasoning-steered ordering: promote the classes the brain flagged as most likely to hit on
@@ -1907,11 +1934,15 @@ def verify_active(
     # REORDERS (never adds/removes a check) and preserves the tuned default order within each group.
     checks = _apply_class_priority(checks, class_priority)
     # The time-based checks are the only ones that emit an executing payload (a bounded SLEEP /
-    # sleep), so they are OPT-IN — appended AFTER any reorder (never promoted) so the loud executing
-    # probes always stay last. Blind RCE (critical) is confirmed first so it gets budget priority.
+    # sleep), so they are OPT-IN. They run after the lightweight/static-differential checks and are
+    # never promoted by class_priority. The heavier LFI sweep is deferred behind them on opt-in
+    # timing hunts so requested exploitability proofs cannot be starved by a broad file-read pass.
     if time_based:
+        path_checks = [ck for ck in checks if ck[0] == "path-traversal"]
+        checks = [ck for ck in checks if ck[0] != "path-traversal"]
         checks.append(("rce", lambda: _check_time_rce(http, sanitized, settings, discovered_params)))
         checks.append(("sqli", lambda: _check_time_sqli(http, sanitized, settings, discovered_params)))
+        checks.extend(path_checks)
     for _cls, check in checks:
         if rate_limited:
             break

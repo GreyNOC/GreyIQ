@@ -478,12 +478,72 @@ class DebugEndpointExposureTests(unittest.TestCase):
         self.assertEqual(f["severity"], "critical")
         self.assertEqual(f["_active_class_hint"], "rce")
 
+    def test_phpinfo_exposure_is_high(self) -> None:
+        body = (
+            "<html><head><title>phpinfo()</title></head><body>"
+            "<h1>PHP Version 8.2.12</h1><tr><td>Configuration File (php.ini) Path</td></tr>"
+            "</body></html>"
+        )
+        f = av._check_debug_endpoints(self._stub({"/phpinfo.php": body}), "https://app.example.com/")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["severity"], "high")
+        self.assertIn("phpinfo", f["title"])
+
+    def test_go_expvar_exposure_is_high(self) -> None:
+        body = '{"cmdline":["/srv/api"],"memstats":{"Alloc":12345},"app_secret_status":"configured"}'
+        f = av._check_debug_endpoints(self._stub({"/debug/vars": body}), "https://app.example.com/")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["severity"], "high")
+        self.assertIn("Go expvar", f["title"])
+
+    def test_go_pprof_exposure_is_high(self) -> None:
+        body = "goroutine 17 [running]:\nmain.handler()\n\t/app/server.go:42\nruntime.goexit()\n"
+        f = av._check_debug_endpoints(self._stub({"/debug/pprof/goroutine?debug=1": body}), "https://app.example.com/")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["severity"], "high")
+        self.assertIn("pprof", f["title"])
+
+    def test_docker_registry_catalog_exposure_is_high(self) -> None:
+        body = '{"repositories":["backend-api","prod/payment-worker"]}'
+        f = av._check_debug_endpoints(self._stub({"/v2/_catalog": body}), "https://registry.example.com/")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["severity"], "high")
+        self.assertIn("Docker Registry", f["title"])
+
+    def test_kubernetes_namespace_list_exposure_is_high(self) -> None:
+        body = '{"kind":"NamespaceList","apiVersion":"v1","items":[{"metadata":{"name":"prod"}}]}'
+        f = av._check_debug_endpoints(self._stub({"/api/v1/namespaces": body}), "https://k8s.example.com/")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["severity"], "high")
+        self.assertIn("Kubernetes", f["title"])
+
+    def test_apache_server_status_is_medium(self) -> None:
+        body = "Total Accesses: 123\nTotal kBytes: 456\nCPULoad: .01\nBusyWorkers: 2\nIdleWorkers: 8\n"
+        f = av._check_debug_endpoints(self._stub({"/server-status?auto": body}), "https://www.example.com/")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["severity"], "medium")
+        self.assertIn("server-status", f["title"])
+
     def test_catch_all_200_app_is_not_flagged(self) -> None:
         class _All:
             auth = None
             def fetch(self, url, *, method="GET", extra_headers=None):
                 return {"status": 200, "headers": {}, "cookies": [], "body": "<html>app</html>", "location": None, "final_url": url}
         self.assertIsNone(av._check_debug_endpoints(_All(), "https://app.example.com/"))
+
+    def test_catch_all_phpinfo_signature_not_flagged(self) -> None:
+        body = (
+            "<html><head><title>phpinfo()</title></head><body>"
+            "PHP Version 8.1.0 Configuration File (php.ini) Path"
+            "</body></html>"
+        )
+
+        class _AllPhpinfo:
+            auth = None
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                return {"status": 200, "headers": {}, "cookies": [], "body": body, "location": None, "final_url": url}
+
+        self.assertIsNone(av._check_debug_endpoints(_AllPhpinfo(), "https://app.example.com/"))
 
     def test_only_probes_at_root(self) -> None:
         self.assertIsNone(av._check_debug_endpoints(self._stub({"/actuator/heapdump": "JAVA PROFILE 1.0.2"}),
