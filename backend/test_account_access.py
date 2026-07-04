@@ -144,5 +144,34 @@ class AdminAccountAccessTests(unittest.TestCase):
                          greyiq_api._program_for_read({"id": "p", "name": "P", "account_access": {"email": "u@x"}}))
 
 
+class IdorPairsTests(unittest.TestCase):
+    """Operator-supplied cross-tenant IDOR test pairs — object URLs only (no secrets), bounded/deduped/
+    capped, and NEVER auto-derived by the engine (the operator asserts the ownership)."""
+
+    def test_pairs_are_bounded_deduped_and_incomplete_dropped(self) -> None:
+        r = portfolio._normalize({"name": "P", "idor_pairs": [
+            {"url_a": "https://app/a/1", "url_b": "https://app/b/2", "label": "orders", "junk": "x"},
+            {"url_a": "https://app/a/1", "url_b": "https://app/b/2"},   # exact duplicate -> dropped
+            {"url_a": "https://app/a/9"},                               # missing url_b -> dropped
+            {"url_a": "https://app/same", "url_b": "https://app/same"},  # identical URLs -> dropped
+            {"nonsense": True},                                         # not a pair -> dropped
+        ]})
+        pairs = r["idor_pairs"]
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0], {"url_a": "https://app/a/1", "url_b": "https://app/b/2", "label": "orders"})
+        self.assertNotIn("junk", pairs[0])
+        self.assertEqual(portfolio._normalize({"name": "P"})["idor_pairs"], [])   # default empty
+
+    def test_pairs_list_is_capped(self) -> None:
+        many = [{"url_a": f"https://app/a/{i}", "url_b": f"https://app/b/{i}"} for i in range(50)]
+        pairs = portfolio._normalize({"name": "P", "idor_pairs": many})["idor_pairs"]
+        self.assertLessEqual(len(pairs), portfolio._MAX_IDOR_PAIRS)
+
+    def test_read_back_passes_pairs_through_unredacted(self) -> None:
+        # object URLs aren't secrets — they round-trip verbatim so an edit re-sends them
+        prog = {"id": "p1", "name": "P", "idor_pairs": [{"url_a": "https://app/a/1", "url_b": "https://app/b/2"}]}
+        self.assertEqual(greyiq_api._program_for_read(prog)["idor_pairs"], prog["idor_pairs"])
+
+
 if __name__ == "__main__":
     unittest.main()

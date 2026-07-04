@@ -48,6 +48,7 @@ _DEFAULTS: dict[str, Any] = {
     "notes": "",                   # free text — policy excerpt, reward table, anything pasted in
     "account_access": {},          # program research-account access (email/password/login_url/cookie) — see _clean_account_access. SENSITIVE: only ever sent to the program's OWN login page / in-scope hosts, never logged, password redacted in API responses.
     "admin_account_access": {},    # OPTIONAL second, HIGHER-privilege research account (same shape as account_access). When set, unlocks the autonomous BFLA / cross-tenant checks — the low-priv account_access is the "attacker" session, this is the ground-truth admin session. SENSITIVE, same handling.
+    "idor_pairs": [],              # OPTIONAL operator-supplied cross-tenant IDOR test pairs [{url_a, url_b, label}] — url_a is an object the PRIMARY account owns, url_b a DIFFERENT object the SECOND account owns. NEVER auto-derived (auto-pairing corrupts the ownership control); the operator asserts ownership. Object URLs only, no secrets. See _clean_idor_pairs.
     "user_agent_suffix": "",       # a mandatory UA tag some programs require appended to every in-scope request (e.g. " -BugBounty-acme-31337 ")
     "active": False,               # capture proof-of-impact (active verification)
     "live": False,                 # dynamic Playwright pass
@@ -176,6 +177,42 @@ def _clean_account_access(value: Any) -> dict[str, Any]:
     return out
 
 
+# Operator-supplied cross-tenant IDOR test pairs. Each is two object URLs on the same app: url_a is an
+# object the PRIMARY research account owns, url_b a DIFFERENT object the SECOND account owns. The
+# autonomous loop NEVER guesses these (auto-pairing a neighbour id corrupts the ownership control and
+# yields false confirmeds) — the operator supplies them, asserting the ownership. No secrets, URLs only.
+_MAX_IDOR_PAIRS = 12
+
+
+def _clean_idor_pairs(value: Any) -> list[dict[str, str]]:
+    """Coerce the cross-tenant IDOR test-pair list to a bounded, known-key shape. Each kept entry has a
+    non-empty ``url_a`` and ``url_b`` (distinct) plus an optional short ``label``; junk/incomplete pairs
+    and exact duplicates are dropped; the list is capped."""
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        url_a = str(item.get("url_a") or "").strip()[:2000]
+        url_b = str(item.get("url_b") or "").strip()[:2000]
+        if not url_a or not url_b or url_a == url_b:
+            continue
+        key = (url_a, url_b)
+        if key in seen:
+            continue
+        seen.add(key)
+        pair = {"url_a": url_a, "url_b": url_b}
+        label = str(item.get("label") or "").strip()[:200]
+        if label:
+            pair["label"] = label
+        out.append(pair)
+        if len(out) >= _MAX_IDOR_PAIRS:
+            break
+    return out
+
+
 def _clean_ua_suffix(value: Any) -> str:
     """A program's mandatory user-agent tag, appended verbatim to the UA header. Keep the operator's
     intended spaces (the requirement value often has them), but STRIP control chars — a CR/LF here
@@ -195,6 +232,7 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     out["notes"] = str(out.get("notes") or "")[:4000]
     out["account_access"] = _clean_account_access(out.get("account_access"))
     out["admin_account_access"] = _clean_account_access(out.get("admin_account_access"))
+    out["idor_pairs"] = _clean_idor_pairs(out.get("idor_pairs"))
     out["user_agent_suffix"] = _clean_ua_suffix(out.get("user_agent_suffix"))
     # Convenience default ONLY: derive scope_text/in_scope_hosts/out_of_scope_hosts from
     # structured_scope when the caller hasn't already typed a scope. Never overrides a

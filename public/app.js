@@ -6103,6 +6103,36 @@ function ckProgramSetupForm() {
   admWrap.append(admEmail.wrap, admPassword.wrap, admLoginUrl.wrap, admCookie.wrap);
   form.append(admWrap);
 
+  // --- Optional cross-tenant IDOR test pairs. The operator explicitly supplies object URLs their two
+  // accounts own; the engine checks whether the SECOND account can read the FIRST account's object.
+  // These are NEVER auto-derived (auto-pairing a neighbour id would corrupt the ownership control), so
+  // the operator provides them by hand. Needs both accounts above configured. ---
+  const idorWrap = cel("div", "ck-subsection");
+  idorWrap.append(cel("h4", "ck-subhead", "Cross-tenant IDOR test pairs (optional — needs both accounts above)"));
+  idorWrap.append(cel("p", "ck-hint", "Prove broken object-level authorization: give the engine an object your FIRST account owns and a DIFFERENT object your SECOND account owns (same app). It confirms an IDOR only when the second account can read the first account's object. Object URLs only — no secrets. The engine never guesses these; leave empty to skip."));
+  const idorBody = cel("div", "ck-idor-body");
+  const addIdorRow = (pair) => {
+    pair = pair || {};
+    const row = cel("div", "ck-idor-row");
+    const a = cel("input"); a.type = "text"; a.placeholder = "Account A's object URL (e.g. https://app/api/orders/1001)"; a.value = pair.url_a || "";
+    const b = cel("input"); b.type = "text"; b.placeholder = "Account B's OWN object URL (a DIFFERENT object, same app)"; b.value = pair.url_b || "";
+    const rm = cel("button", "ck-btn ck-scope-rm", "✕"); rm.type = "button"; rm.title = "Remove pair";
+    rm.addEventListener("click", () => row.remove());
+    row.append(a, b, rm);
+    row._ckGet = () => ({ url_a: a.value.trim(), url_b: b.value.trim() });
+    idorBody.append(row);
+  };
+  for (const pair of ((editing && Array.isArray(editing.idor_pairs)) ? editing.idor_pairs : [])) addIdorRow(pair);
+  idorWrap.append(idorBody);
+  const addPairBtn = cel("button", "ck-btn", "+ Add IDOR pair"); addPairBtn.type = "button";
+  addPairBtn.addEventListener("click", () => addIdorRow());
+  idorWrap.append(addPairBtn);
+  form.append(idorWrap);
+  // Collect only complete pairs (both URLs present); the server bounds/dedups/caps them again.
+  const collectIdorPairs = () => Array.from(idorBody.children)
+    .map((r) => (typeof r._ckGet === "function" ? r._ckGet() : null))
+    .filter((p) => p && p.url_a && p.url_b);
+
   const submit = cel("button", "ck-btn primary", editing ? "Update program" : "Save program");
   submit.type = "submit";
   form.append(submit);
@@ -6141,6 +6171,8 @@ function ckProgramSetupForm() {
         login_url: admLoginUrl.input.value.trim(),
         cookie: admCookie.input.value.trim(),
       },
+      // Operator-supplied cross-tenant IDOR object-URL pairs (not secret, sent verbatim).
+      idor_pairs: collectIdorPairs(),
       user_agent_suffix: uaSuffix.input.value,
       // This form owns the structured-scope table, so a save here should always re-derive
       // scope_text/in_scope_hosts/out_of_scope_hosts from whatever the table currently

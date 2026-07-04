@@ -208,6 +208,98 @@ class CampaignTests(unittest.TestCase):
              campaign.hunt_brain.plan_hunt, acs.run_bfla_check) = orig
         self.assertEqual(called, [])                               # BFLA never invoked without the second account
 
+    def test_operator_supplied_idor_pairs_run_the_dual_session_cross_tenant_prover(self) -> None:
+        # The operator supplies object-URL pairs their two accounts own; with BOTH accounts, the campaign
+        # runs the dual-session cross-tenant IDOR prover on each pair and folds a CONFIRMED read in.
+        from bughunter import access_control_service as acs
+
+        target = "https://app.example.com/"
+        obj_a = target + "api/orders/1001"   # account A owns this
+        obj_b = target + "api/orders/2002"   # account B owns this (different object)
+        idor_finding = {"title": "IDOR / broken access control at /api/orders/1001", "severity": "high",
+                        "class_id": "access-control", "rule_id": "active.idor", "location": obj_a, "cwe": "CWE-639"}
+        idor_plan = {"proof_of_impact": {"status": "confirmed", "observed_result": "B read A's object",
+                                         "control_result": "distinct from B's own object"}, "cvss": {"base_score": 8.1}}
+        calls: list = []
+        orig = (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves,
+                campaign.hunt_brain.plan_hunt, campaign.account_login_service.login, acs.run_idor_check)
+        campaign.recon.discover = lambda t, **k: {"urls": [t, obj_a], "notes": [], "sources": {}, "js_secrets": [], "tech": [], "params": [], "forms": []}
+        campaign.run_bounty_hunt = lambda *a, **k: {"ok": True, "json_path": "", "report_path": ""}
+        campaign.cve_service.scan_known_cves = lambda t, **k: {"ok": True, "findings": []}
+        campaign.hunt_brain.plan_hunt = lambda *a, **k: {"used": True, "provider": "x", "model": "y",
+            "param_hypotheses": [], "probe_priority": [], "idor_candidates": [], "privileged_endpoints": [], "notes": ""}
+        campaign.account_login_service.login = lambda acc, scope, settings=None: {"ok": True, "cookie": "sid=B", "note": "logged in"}
+        acs.run_idor_check = lambda ua, ub, **k: (calls.append((ua, ub, k.get("account_a"), k.get("account_b"))),
+            {"ok": True, "status": "confirmed", "finding": dict(idor_finding), "attack_plan": idor_plan})[1]
+        try:
+            result = campaign.run_campaign(
+                target, scope="app.example.com", authorized=True, coder_cfg={"provider": "x"},
+                default_reports_dir=self.reports, runtime_dir=self.runtime, version="9.9.9", program="demo",
+                active=True, auth={"cookie": "sid=A"}, admin_account_access={"cookie": "sid=B"},
+                idor_pairs=[{"url_a": obj_a, "url_b": obj_b}])
+        finally:
+            (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves,
+             campaign.hunt_brain.plan_hunt, campaign.account_login_service.login, acs.run_idor_check) = orig
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(calls[0][0], obj_a)                       # A's object URL
+        self.assertEqual(calls[0][1], obj_b)                       # B's own object URL
+        self.assertEqual(calls[0][2], {"cookie": "sid=A"})         # account_a = the PRIMARY (owns obj_a)
+        self.assertEqual(calls[0][3].get("cookie"), "sid=B")       # account_b = the SECOND account (owns obj_b)
+        xidor_refs = [f["ref"] for f in result["findings"] if f.get("rule_id") == "active.idor"]
+        self.assertEqual(len(xidor_refs), 1)                       # the confirmed cross-tenant read was folded in
+        self.assertEqual(result["proof_of_impact"][xidor_refs[0]]["status"], "confirmed")  # prover's differential confirms
+
+    def test_idor_pairs_skipped_without_a_second_account(self) -> None:
+        # a pair but only ONE account -> the cross-tenant IDOR pass is skipped (needs two sessions)
+        from bughunter import access_control_service as acs
+        target = "https://app.example.com/"
+        obj_a, obj_b = target + "api/orders/1001", target + "api/orders/2002"
+        called: list = []
+        orig = (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves,
+                campaign.hunt_brain.plan_hunt, acs.run_idor_check)
+        campaign.recon.discover = lambda t, **k: {"urls": [t, obj_a], "notes": [], "sources": {}, "js_secrets": [], "tech": [], "params": [], "forms": []}
+        campaign.run_bounty_hunt = lambda *a, **k: {"ok": True, "json_path": "", "report_path": ""}
+        campaign.cve_service.scan_known_cves = lambda t, **k: {"ok": True, "findings": []}
+        campaign.hunt_brain.plan_hunt = lambda *a, **k: {"used": True, "provider": "x", "model": "y",
+            "param_hypotheses": [], "probe_priority": [], "idor_candidates": [], "privileged_endpoints": [], "notes": ""}
+        acs.run_idor_check = lambda ua, ub, **k: called.append(ua)
+        try:
+            campaign.run_campaign(target, scope="app.example.com", authorized=True, coder_cfg={"provider": "x"},
+                default_reports_dir=self.reports, runtime_dir=self.runtime, version="9.9.9", program="demo",
+                active=True, auth={"cookie": "sid=A"}, idor_pairs=[{"url_a": obj_a, "url_b": obj_b}])  # no admin account
+        finally:
+            (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves,
+             campaign.hunt_brain.plan_hunt, acs.run_idor_check) = orig
+        self.assertEqual(called, [])                               # never invoked without the second account
+
+    def test_idor_pair_off_campaign_host_is_not_tested(self) -> None:
+        # a pair whose object is on a host this campaign didn't touch is skipped (so a program-wide pair
+        # isn't re-tested once per target in a span) — even with both accounts present
+        from bughunter import access_control_service as acs
+        target = "https://app.example.com/"
+        other_a = "https://other.example.com/api/orders/1001"   # NOT in this campaign's surface
+        other_b = "https://other.example.com/api/orders/2002"
+        called: list = []
+        orig = (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves,
+                campaign.hunt_brain.plan_hunt, campaign.account_login_service.login, acs.run_idor_check)
+        campaign.recon.discover = lambda t, **k: {"urls": [t], "notes": [], "sources": {}, "js_secrets": [], "tech": [], "params": [], "forms": []}
+        campaign.run_bounty_hunt = lambda *a, **k: {"ok": True, "json_path": "", "report_path": ""}
+        campaign.cve_service.scan_known_cves = lambda t, **k: {"ok": True, "findings": []}
+        campaign.hunt_brain.plan_hunt = lambda *a, **k: {"used": True, "provider": "x", "model": "y",
+            "param_hypotheses": [], "probe_priority": [], "idor_candidates": [], "privileged_endpoints": [], "notes": ""}
+        campaign.account_login_service.login = lambda acc, scope, settings=None: {"ok": True, "cookie": "sid=B", "note": "ok"}
+        acs.run_idor_check = lambda ua, ub, **k: called.append(ua)
+        try:
+            campaign.run_campaign(target, scope="app.example.com", authorized=True, coder_cfg={"provider": "x"},
+                default_reports_dir=self.reports, runtime_dir=self.runtime, version="9.9.9", program="demo",
+                active=True, auth={"cookie": "sid=A"}, admin_account_access={"cookie": "sid=B"},
+                idor_pairs=[{"url_a": other_a, "url_b": other_b}])
+        finally:
+            (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves,
+             campaign.hunt_brain.plan_hunt, campaign.account_login_service.login, acs.run_idor_check) = orig
+        self.assertEqual(called, [])                               # off-host pair never tested in this campaign
+
     def test_idor_prover_is_not_run_without_a_session(self) -> None:
         # no session -> the IDOR pass is skipped entirely (the probe needs the operator's own object)
         from bughunter import access_control_service as acs
