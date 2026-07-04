@@ -2,6 +2,28 @@
 
 Notable changes to GreyIQ.
 
+## v0.80.0
+
+### The AI writes the impact and the report — from the real proof only
+- **AI impact statement.** Every finding the engine *confirms* now carries an AI-written impact /
+  blast-radius sentence — the concrete "so-what" a triager rewards ("an unauthenticated attacker page
+  reads any logged-in user's orders and email") — written **only** from the captured proof. It can
+  never change what was proven: it's a descriptive line the proof gate ignores, so it can't turn an
+  unconfirmed finding into a confirmed one.
+- **AI-written submission summary.** The opening Description of a submission is now written by the AI
+  in the destination platform's voice (HackerOne / Bugcrowd), grounded in the finding and its captured
+  proof — replacing the generic one-size-fits-all text that gets reports rejected. Every evidence and
+  proof section still renders exactly as before.
+- Both are secret-redacted and screened for tampering before they can appear, and the engine falls
+  back to its own wording whenever the AI is unavailable.
+
+### The AI aims the XSS and SSRF checks
+- The AI reads a target's endpoints and points the **SSRF** probe at the parameters that actually take
+  a URL here (`image_url`, `webhook`, `feed`, `avatar_url`, …) and the **XSS** checks at the parameters
+  that reflect input — the target-specific surface the generic defaults miss. It only ever *names* a
+  parameter; the engine supplies the test and confirms the result, so this finds more without ever
+  reporting something unproven.
+
 ## v0.79.0
 
 ### The AI now helps find an entire bug class it missed before
