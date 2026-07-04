@@ -1705,6 +1705,15 @@ def _check_graphql_introspection(http: _Http, url: str) -> dict[str, Any] | None
 _EXPOSED_FILES: tuple[tuple[str, "re.Pattern[str]", str], ...] = (
     ("/.git/config", re.compile(r"\[core\][\s\S]*repositoryformatversion", re.IGNORECASE), ".git/config (source repository)"),
     ("/.env", re.compile(r"(?m)^[A-Z][A-Z0-9_]{2,}\s*=\S"), ".env (application secrets/config)"),
+    # An [profile] INI section immediately followed by an aws_access_key_id line — the unmistakable
+    # shape of a served AWS credentials file (cloud account takeover). Anchored so prose can't match.
+    ("/.aws/credentials", re.compile(r"(?im)^\[[^\]\r\n]{1,64}\]\s*$[\s\S]{0,200}^\s*aws_access_key_id\s*="),
+     ".aws/credentials (AWS account keys)"),
+    # An npm registry auth-token line — a served .npmrc leaks a publish/read token for the account's
+    # private packages (supply-chain). `//<host[:port][/path]>/:_authToken=` — non-greedy so it covers
+    # bare registries (npmjs.org), port-qualified (Verdaccio :4873, Nexus :8081), and path-qualified
+    # private registries (Artifactory/GitLab/Azure), which are the highest-value leaked-token case.
+    ("/.npmrc", re.compile(r"(?im)^//[^\s]+?/:_authToken="), ".npmrc (npm registry auth token)"),
 )
 
 
@@ -1788,6 +1797,19 @@ _DEBUG_ENDPOINTS: tuple[tuple[str, "re.Pattern[str]", str, str, str, str], ...] 
      "Apache mod_status is exposed unauthenticated, leaking live worker, vhost, request, and backend operational details useful for attack chaining"),
     ("/actuator", re.compile(r'"_links"[\s\S]{0,4000}/actuator'), "Spring Boot actuator index", "medium", "disclosure",
      "the actuator endpoint index is exposed, mapping further sensitive management endpoints (env, heapdump, mappings)"),
+    # Elasticsearch _cat/indices?v — the header row is anchored (`health status index ...`), so only a
+    # real _cat table matches, not a docs page. An anonymously-listable ES cluster is a serious exposure.
+    ("/_cat/indices?v", re.compile(r"(?im)^health\s+status\s+index\s+"), "Elasticsearch _cat/indices", "high", "disclosure",
+     "the Elasticsearch _cat API responds unauthenticated, listing every index (data-store names, document "
+     "counts, sizes) — the cluster's data is queryable without authentication"),
+    # WordPress REST user enumeration — a leading array-of-objects whose first object carries BOTH a
+    # "slug" and the WP-user-specific "avatar_urls" key, matched ORDER-INDEPENDENTLY via lookaheads (WP
+    # core emits name/link BEFORE slug, and single-author sites are the highest-value case). avatar_urls
+    # keeps it WP-specific so an arbitrary slug-bearing JSON array can't match. Leaks login names.
+    ("/wp-json/wp/v2/users", re.compile(r'(?is)\A\s*\[\s*\{(?=[\s\S]*?"slug"\s*:\s*"[^"]+")(?=[\s\S]*?"avatar_urls"\s*:)'),
+     "WordPress REST user enumeration", "medium", "disclosure",
+     "the WordPress REST API lists user accounts (login slugs and display names) unauthenticated, handing "
+     "an attacker the valid usernames for targeted password / credential-stuffing attacks"),
 )
 
 

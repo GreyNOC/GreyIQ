@@ -79,6 +79,16 @@ class NewProviderTokenDetectionTests(unittest.TestCase):
         for rule_id in ("secret.gitlab-pat", "secret.npm-token", "secret.sendgrid-key", "secret.digitalocean-token"):
             self.assertNotIn(rule_id, ids, rule_id)
 
+    def test_gcp_service_account_json_is_detected_whole(self) -> None:
+        sa = ('{\n  "type": "service_account",\n  "project_id": "p",\n  "private_key_id": "abc",\n'
+              '  "private_key": "-----BEGIN PRIVATE KEY-----\\nMIIBVg...\\n-----END PRIVATE KEY-----\\n",\n'
+              '  "client_email": "svc@p.iam.gserviceaccount.com"\n}')
+        ids = self._rule_ids("key.json", sa)
+        self.assertIn("secret.gcp-service-account", ids)
+        # a JSON object of the same type but WITHOUT a private_key must not fire the SA-key rule
+        self.assertNotIn("secret.gcp-service-account",
+                         self._rule_ids("cfg.json", '{"type": "service_account", "client_email": "x@y"}'))
+
 
 if __name__ == "__main__":
     unittest.main()

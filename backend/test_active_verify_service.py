@@ -1052,7 +1052,9 @@ class TimeSqliE2ETests(unittest.TestCase):
     ENV = {
         "GREYIQ_SCAN_ALLOW_PRIVATE_URLS": "1",
         "GREYIQ_ACTIVE_MIN_INTERVAL_MS": "0",
-        "GREYIQ_ACTIVE_MAX_REQUESTS_PER_HOST": "60",
+        # Per-host request cap: must exceed the full active check list so the opt-in time check (appended
+        # last) is reached. Bump when a batch adds checks — the exposed-file/debug-endpoint rows grew it.
+        "GREYIQ_ACTIVE_MAX_REQUESTS_PER_HOST": "90",
         "GREYIQ_ACTIVE_TIME_SQLI_DELAY_S": "0.8",
         "GREYIQ_ACTIVE_TIME_SQLI_MARGIN_S": "0.3",  # 0.5s headroom — robust under CI scheduler jitter
     }
@@ -1103,9 +1105,10 @@ class TimeSqliE2ETests(unittest.TestCase):
         port = self._serve(_VulnTimeHandler)
         url = f"http://127.0.0.1:{port}/?id=1"
         # Opt-in ON: the executing SLEEP probe runs and confirms. Budget is generous so the
-        # full check list (which grows as new checks land, e.g. the RCE command-injection probe)
-        # is exhausted through to the opt-in time check appended at the very end.
-        findings, meta = av.verify_active(url, [], scope="127.0.0.1", time_based=True, requests_budget=60)
+        # full check list (which grows as new checks land, e.g. the RCE command-injection probe and the
+        # exposed-file / debug-endpoint signature rows) is exhausted through to the opt-in time check
+        # appended at the very end — bump this if a future batch adds enough checks to starve it again.
+        findings, meta = av.verify_active(url, [], scope="127.0.0.1", time_based=True, requests_budget=90)
         self.assertTrue(meta["in_scope"])
         self.assertIn("active.sqli-time", {f["rule_id"] for f in findings})
         # Opt-in OFF (default): no executing SLEEP probe, even against the vulnerable backend.

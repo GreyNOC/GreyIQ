@@ -215,6 +215,27 @@ class XxeTests(unittest.TestCase):
         oob.poll_collaborator = self._poll
         oob._post_xml = self._post
 
+    def test_xxe_finding_carries_confirmed_active_proof(self) -> None:
+        # The autonomous XXE pass appends this finding to raw_findings; like the SSRF sibling it MUST
+        # carry the active-proof carriers, or a genuinely OOB-proven XXE renders as 'missing' (class
+        # 'xxe' is not a deterministic-artifact category) instead of confirmed. Regression guard.
+        from bughunter import report
+        hit = {"method": "GET", "ip": "203.0.113.9", "path": "/oob/tok", "headers": {"user-agent": "curl/8.0"}}
+        f = oob._xxe_finding_from_hit("https://app.example.com/import", "tok", "https://collab.example", hit)["finding"]
+        self.assertEqual(f["_active_class_hint"], "xxe")
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertIn("control_result", f["_active_proof"])          # fresh-token negative control
+        self.assertEqual(f["_active_cvss"]["base_severity"], "high")
+        # end-to-end: the carriers make it a CAPTURED ARTIFACT, so the report renders it confirmed
+        poi = f["_active_proof"]
+        self.assertTrue(report._has_captured_artifact(f, poi, poi.get("observed_result", "")))
+
+    def test_crawler_ua_xxe_hit_is_candidate_not_confirmed(self) -> None:
+        hit = {"method": "GET", "ip": "1.2.3.4", "path": "/oob/tok", "headers": {"user-agent": "Slackbot-LinkExpanding 1.0"}}
+        res = oob._xxe_finding_from_hit("https://app.example.com/import", "tok", "https://collab.example", hit)
+        self.assertEqual(res["status"], "candidate")
+        self.assertEqual(res["finding"]["_active_proof"]["status"], "candidate")
+
     def test_payloads_embed_the_callback_as_an_external_entity(self) -> None:
         p = oob.build_xxe_payloads("https://collab.example", "deadbeef")
         cb = "https://collab.example/oob/deadbeef"

@@ -153,6 +153,47 @@ class RunBountyHuntProgressTests(unittest.TestCase):
             )
         self.assertTrue(report["ok"])
 
+    def test_blind_xxe_oob_probe_runs_autonomously_when_a_collaborator_is_configured(self) -> None:
+        # The built-but-dormant confirm_blind_xxe prover now runs beside blind SSRF in the active pass,
+        # gated on a configured collaborator (base+secret). Stub both provers (no real OOB network).
+        from bughunter import bounty
+        url = f"http://127.0.0.1:{self.server.server_port}/"
+        calls: list = []
+        xxe_finding = {"rule_id": "active.xxe", "title": "Blind XXE", "severity": "high", "class_id": "xxe",
+                       "location": url, "category": "xxe", "proof_evidence": {"request_line": f"POST {url}"}}
+        orig = (bounty.oob_service.confirm_blind_ssrf, bounty.oob_service.confirm_blind_xxe)
+        bounty.oob_service.confirm_blind_ssrf = lambda *a, **k: {"ok": True, "status": "no-callback"}
+        bounty.oob_service.confirm_blind_xxe = lambda target, **k: (calls.append((target, k.get("send"))),
+            {"ok": True, "status": "confirmed", "finding": dict(xxe_finding)})[1]
+        lines: list[str] = []
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                report = run_bounty_hunt(
+                    url, "web-app", None, tmp, "127.0.0.1", True, {}, active=True,
+                    oob_base="https://collab.example", oob_secret="s3cr3t",
+                    default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed", on_progress=lines.append)
+        finally:
+            bounty.oob_service.confirm_blind_ssrf, bounty.oob_service.confirm_blind_xxe = orig
+        self.assertTrue(report.get("ok"), report.get("error"))
+        self.assertEqual(len(calls), 1)                          # the XXE prover ran once
+        self.assertEqual(calls[0][0], url)                       # against the target
+        self.assertIs(calls[0][1], True)                         # in AUTO mode (send=True)
+        self.assertTrue(any("blind-XXE OOB: confirmed" in ln for ln in lines))
+
+    def test_blind_xxe_is_skipped_without_a_collaborator(self) -> None:
+        from bughunter import bounty
+        url = f"http://127.0.0.1:{self.server.server_port}/"
+        called: list = []
+        orig = bounty.oob_service.confirm_blind_xxe
+        bounty.oob_service.confirm_blind_xxe = lambda *a, **k: called.append(1)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                run_bounty_hunt(url, "web-app", None, tmp, "127.0.0.1", True, {}, active=True,
+                                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed")  # no oob_base/secret
+        finally:
+            bounty.oob_service.confirm_blind_xxe = orig
+        self.assertEqual(called, [])                             # no collaborator -> the XXE pass never fires
+
     def test_run_id_bound_sink_lands_in_the_shared_progress_buffer(self) -> None:
         url = f"http://127.0.0.1:{self.server.server_port}/"
         progress.start_run("hunt-run-1")

@@ -172,6 +172,20 @@ RULES = (
         unique=True,
     ),
     RegexRule(
+        rule_id="secret.gcp-service-account",
+        title="GCP service-account key (JSON)",
+        description="A Google Cloud service-account key file (type=service_account with a private_key) is committed.",
+        severity=Severity.CRITICAL,
+        confidence=Confidence.HIGH,
+        category="secret",
+        remediation="Delete and rotate the key in the GCP console (IAM → Service Accounts → Keys), scrub history, use Workload Identity instead.",
+        # Match the whole FLAT JSON object (service-account keys have no nested braces) that carries both
+        # the service_account type and an inline private_key PEM — captured verbatim so the liveness
+        # validator can parse client_email + private_key from it. (?s) so it spans the multi-line JSON.
+        pattern=r'(?s)\{[^{}]*"type"\s*:\s*"service_account"[^{}]*"private_key"\s*:\s*"-----BEGIN[^{}]*\}',
+        unique=True,
+    ),
+    RegexRule(
         rule_id="secret.google-api-key",
         title="Google API key",
         description="A Google Cloud API key (AIza...) is hardcoded.",
