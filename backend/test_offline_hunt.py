@@ -27,6 +27,20 @@ class OfflinePlanTests(unittest.TestCase):
         self.assertIn("https://t/order/1042", p["idor_candidates"])  # numeric-id object endpoint
         self.assertIn("https://t/users/9f8e7d6c-1234-4321-8888-abcdef012345", p["idor_candidates"])  # uuid too
 
+    def test_admin_path_endpoints_recon_feed_is_verbatim_and_bounded(self) -> None:
+        urls = ["https://t/admin/users", "https://t/api/orders/42", "https://t/settings/roles",
+                "https://t/internal/config", "https://t/home", "https://t/manage/billing"]
+        got = offline_hunt.admin_path_endpoints(urls)
+        self.assertIn("https://t/admin/users", got)          # /admin
+        self.assertIn("https://t/settings/roles", got)       # /settings + /role
+        self.assertIn("https://t/internal/config", got)      # /internal + /config
+        self.assertIn("https://t/manage/billing", got)       # /manage + /billing
+        self.assertNotIn("https://t/api/orders/42", got)     # an object endpoint is IDOR, not a privileged FUNCTION
+        self.assertNotIn("https://t/home", got)              # a plain page is not privileged
+        for u in got:
+            self.assertIn(u, set(urls))                      # verbatim in-scope only, never invented
+        self.assertLessEqual(len(offline_hunt.admin_path_endpoints(["https://t/admin/%d" % i for i in range(40)])), 8)
+
     def test_flags_admin_privileged_endpoints_for_bfla(self) -> None:
         p = offline_hunt.offline_plan(_SURFACE)
         self.assertIn("https://t/admin/users", p["privileged_endpoints"])   # /admin function
