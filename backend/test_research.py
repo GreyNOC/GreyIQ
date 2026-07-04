@@ -48,6 +48,16 @@ class DeterministicDossierTests(unittest.TestCase):
         # The plan's proof obligation is folded into the confirm steps.
         self.assertTrue(any("proof obligation" in step.lower() for step in s["how_to_confirm"]))
 
+    def test_confirmed_lead_dossier_does_not_ask_to_capture_proof(self) -> None:
+        # deep mode researches per CONFIRMED lead: a proven finding must NOT be told to "capture the
+        # proof obligation" or be called an unproven lead — the proof is already captured.
+        ctx, finding = _ctx_finding()
+        ctx["attack_plans"]["F1"]["proof_of_impact"]["status"] = "confirmed"
+        s = research.build_dossier(finding, ctx, None)["structured"]
+        self.assertFalse(any("proof obligation" in step.lower() for step in s["how_to_confirm"]))
+        self.assertNotIn("unproven lead", s["residual_risk"].lower())
+        self.assertIn("already captured", s["residual_risk"].lower())
+
     def test_markdown_has_the_sections(self) -> None:
         ctx, finding = _ctx_finding()
         md = research.build_dossier(finding, ctx, {})["markdown"]   # {} == brain off

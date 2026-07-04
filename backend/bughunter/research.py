@@ -61,8 +61,12 @@ def _deterministic_dossier(finding: dict[str, Any], ctx: dict[str, Any]) -> dict
         "Establish a same-context negative control so the effect is attributable.",
     ]
     proof = plan.get("proof_of_impact") if isinstance(plan.get("proof_of_impact"), dict) else {}
+    # A finding whose proof engine already captured a confirmed artifact is NOT a lead — never tell the
+    # operator to "capture the proof obligation" (deep mode researches per CONFIRMED lead, so this fires
+    # on proven findings) or call it unproven; the proof is already in the report.
+    already_confirmed = str((proof or {}).get("status") or "").strip().lower() == "confirmed"
     obligation = str((proof or {}).get("proof_obligation") or "").strip()
-    if obligation:
+    if obligation and not already_confirmed:
         how = how + [f"Capture the proof obligation: {obligation}"]
     references = list(finding.get("references") or [])
     if not references and cid:
@@ -76,7 +80,9 @@ def _deterministic_dossier(finding: dict[str, Any], ctx: dict[str, Any]) -> dict
             or "Keep verification non-destructive and in scope; do not pivot beyond the authorized target.",
         "variants_to_try": [],
         "references": references,
-        "residual_risk": "Treat as an unproven lead until the proof obligation above is captured.",
+        "residual_risk": ("Proof of impact is already captured — this is a confirmed finding; verify scope and submit."
+                          if already_confirmed else
+                          "Treat as an unproven lead until the proof obligation above is captured."),
     }
 
 

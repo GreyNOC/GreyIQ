@@ -244,6 +244,38 @@ class CredentialReportTests(unittest.TestCase):
         self.assertIn("Issuer response", body)                        # the captured artifact heading
         self.assertIn("acme-prod-42", body)                           # the actual issuer response content
 
+    def _render_plan_proof(self, poi: dict) -> str:
+        # A secret finding whose proof-of-impact is supplied directly (no _credential_proof branch),
+        # so we exercise the general confirmed/candidate obligation logic exactly as a hunt does.
+        finding = {"ref": "F1", "title": "Google API key", "severity": "high", "class_id": "secrets",
+                   "location": "src/firebase.js", "line_start": 12, "rule_id": "secret.google-api-key",
+                   "cwe": "CWE-798", "secret_value": _KEY, "variable_name": "apiKey"}
+        plan = _deterministic_attack_plan(finding, "secrets")
+        plan["proof_of_impact"] = {**(plan.get("proof_of_impact") or {}), **poi}
+        ctx = {"tool": "g", "version": "t", "generated_at": "now", "target": "src/firebase.js",
+               "scope": "", "attack_plans": {"F1": plan}}
+        return RF.render_finding(ctx, finding, "hackerone")
+
+    def test_confirmed_finding_never_shows_the_capture_this_obligation(self) -> None:
+        # THE reported bug: a finding CONFIRMED by a captured authenticated-read differential must not
+        # ALSO carry "Proof obligation (capture this to prove impact)" — the proof is already in the
+        # report; asking the operator to prove what the engine proved is the contradiction.
+        body = self._render_plan_proof({
+            "status": "confirmed",
+            "observed_result": "the leaked key authenticated (HTTP 200) to Firebase project acme-prod",
+            "control_result": "an invalid/revoked key is rejected by the same endpoint — the key is genuinely live",
+            "authenticated_read_request": "GET https://www.googleapis.com/.../getProjectConfig?key=[REDACTED_SECRET]",
+            "authenticated_read_response": '{"projectId":"acme-prod"}'})
+        self.assertNotIn("Proof obligation (capture this to prove impact)", body)  # suppressed on a proven finding
+        self.assertNotIn("Treat this as a lead", body)                             # nor the lead "Gap"
+        self.assertIn("Authenticated read request", body)                          # the ALREADY-captured proof IS shown
+        self.assertIn("Authenticated read success response", body)
+
+    def test_unconfirmed_finding_still_shows_the_obligation(self) -> None:
+        # a genuine lead (nothing captured) still tells the operator exactly what to grab
+        body = self._render_plan_proof({})  # deterministic plan only -> not captured
+        self.assertIn("Proof obligation (capture this to prove impact)", body)
+
     def test_report_shows_explicit_request_sent_and_return_code(self) -> None:
         body = self._render({"checked": True, "live": True, "principal": "OpenAI API key",
                              "detail": "LIVE — OpenAI API", "http_status": 200, "no_data_read": True,
