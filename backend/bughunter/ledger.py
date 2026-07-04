@@ -116,9 +116,15 @@ def _captured_proof(finding: dict[str, Any], item: dict[str, Any]) -> dict[str, 
         out["credential_proof"] = {k: cred.get(k) for k in
             ("live", "http_status", "endpoint", "project_id", "authorized_domains", "principal", "scopes",
              "detail", "poc", "response_excerpt", "no_data_read") if cred.get(k) not in (None, "")}
-    # The observed-vs-control differential lives in the attack plan; persist it when the caller attached it.
+    # The observed-vs-control differential lives in the attack plan for synthetic findings (CVE/IDOR/
+    # BFLA carry an inline "plan"); per-URL active findings carry it directly on the item as
+    # "proof_of_impact" instead (the "plan" key is reserved as the synthetic-vs-sidecar sentinel in
+    # campaign.py). Persist it from whichever the caller supplied, so a rebuilt-from-history report of a
+    # confirmed finding of EITHER origin still shows the concrete differential, never an empty shell.
     plan = item.get("plan") if isinstance(item.get("plan"), dict) else {}
     poi = plan.get("proof_of_impact") if isinstance(plan.get("proof_of_impact"), dict) else {}
+    if not poi and isinstance(item.get("proof_of_impact"), dict):
+        poi = item["proof_of_impact"]
     poi_out = {k: str(poi.get(k))[:3000] for k in _POI_KEYS if str(poi.get(k) or "").strip()}
     if poi_out:
         out["proof_of_impact"] = poi_out

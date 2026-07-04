@@ -387,6 +387,12 @@ def _run_campaign_body(
                 "source_json": result.get("json_path", ""),
                 "proof_status": proof_status,
                 "cvss": (doc.get("cvss") or {}).get(ref) or {},
+                # The captured observed-vs-control differential for THIS finding, carried on the item
+                # (NOT under "plan" — that key is the synthetic-vs-sidecar sentinel below) so the ledger
+                # persists it. Without this, a per-URL finding confirmed by the active pass records an
+                # EMPTY differential and a report rebuilt from history after a restart/eviction loses the
+                # very proof that earned "confirmed". The differential lives in the run JSON's proof map.
+                "proof_of_impact": (doc.get("proof_of_impact") or {}).get(ref) or {},
             })
             url_new.append({"ref": ref, "title": finding.get("title"), "severity": finding.get("severity"),
                             "class_name": finding.get("class_name") or finding.get("class_id"), "proof_status": proof_status,

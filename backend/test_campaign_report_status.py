@@ -80,5 +80,42 @@ class CampaignStreamsProofArtifactTests(unittest.TestCase):
         self.assertEqual(api.GreyIQRuntime.build_finding_report(rt, req)["package"]["proof_status"], "candidate")
 
 
+class CampaignPersistsActiveDifferentialTests(unittest.TestCase):
+    """A per-URL finding confirmed by the active pass must persist its observed-vs-control differential
+    to the durable ledger, so a report rebuilt from history after a restart keeps the proof that earned
+    'confirmed' (regression: the per-URL consolidation carried no differential to the ledger)."""
+
+    def test_confirmed_active_finding_differential_reaches_the_ledger(self) -> None:
+        from bughunter import ledger
+        tmp = Path(tempfile.mkdtemp())
+        rt = Path(tempfile.mkdtemp())
+        doc = {
+            "findings": [{"ref": "F1", "title": "Reflected XSS", "severity": "high", "class_id": "xss",
+                          "rule_id": "active.reflected-xss", "location": "https://t.example/q", "cwe": "CWE-79",
+                          "proof_evidence": {"request_line": "GET /q?x=<svg/onload=1>", "response_status": "HTTP 200"}}],
+            "proof_of_impact": {"F1": {"status": "confirmed",
+                                       "observed_result": "the <svg/onload> payload reflected UNENCODED in the HTML body",
+                                       "control_result": "a benign marker with no tag did not reflect"}},
+            "cvss": {"F1": {"base_score": 6.1}}, "attack_plans": {},
+        }
+        (tmp / "run.json").write_text(json.dumps(doc), encoding="utf-8")
+        orig = (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves)
+        campaign.recon.discover = lambda t, **k: {"urls": [t], "notes": [], "sources": {}, "js_secrets": [], "tech": [], "params": [], "forms": []}
+        campaign.run_bounty_hunt = lambda *a, **k: {"ok": True, "json_path": str(tmp / "run.json"), "report_path": ""}
+        campaign.cve_service.scan_known_cves = lambda *a, **k: []
+        try:
+            campaign.run_campaign("https://t.example/", scope="t.example", authorized=True, coder_cfg=None,
+                                  default_reports_dir=tmp, runtime_dir=rt, program="demo", active=True)
+        finally:
+            campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves = orig
+
+        rows = ledger.list_all(rt)
+        rec = next((r for r in rows if r.get("rule_id") == "active.reflected-xss"), None)
+        self.assertIsNotNone(rec, "the confirmed finding was recorded")
+        poi = (rec.get("captured_proof") or {}).get("proof_of_impact") or {}
+        self.assertIn("reflected UNENCODED", poi.get("observed_result", ""))   # the differential is durable
+        self.assertIn("did not reflect", poi.get("control_result", ""))
+
+
 if __name__ == "__main__":
     unittest.main()
