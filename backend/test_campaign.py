@@ -107,6 +107,65 @@ class CampaignTests(unittest.TestCase):
         self.assertIn(ref, result["cvss"])              # CVSS surfaced for ranking/severity
         self.assertGreaterEqual(len(result["submission_paths"]), 1)  # a report package was written
 
+    def test_brain_selected_idor_candidates_run_the_dormant_prover(self) -> None:
+        # The reasoning layer flags object-scoped endpoints; the campaign runs the (previously
+        # never-autonomously-called) single-session IDOR prover on them WITH the operator's session,
+        # and folds the candidate-grade finding in. recon / hunt / brain / prover all stubbed (offline).
+        from bughunter import access_control_service as acs
+
+        target = "https://app.example.com/"
+        orders = target + "api/orders/42"
+        idor_finding = {"title": "Possible IDOR on /api/orders/42", "severity": "high",
+                        "class_id": "access-control", "rule_id": "active.idor-probe", "location": orders, "cwe": "CWE-639"}
+        idor_plan = {"proof_of_impact": {"status": "candidate", "proof_obligation": "confirm with a second account"},
+                     "cvss": {"base_score": 6.5}}
+        calls: list = []
+        orig = (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves,
+                campaign.hunt_brain.plan_hunt, acs.run_idor_probe)
+        campaign.recon.discover = lambda t, **k: {"urls": [t, orders], "notes": [], "sources": {}, "js_secrets": [], "tech": [], "params": [], "forms": []}
+        campaign.run_bounty_hunt = lambda *a, **k: {"ok": True, "json_path": "", "report_path": ""}
+        campaign.cve_service.scan_known_cves = lambda t, **k: {"ok": True, "findings": []}
+        campaign.hunt_brain.plan_hunt = lambda *a, **k: {"used": True, "provider": "x", "model": "y",
+            "param_hypotheses": [], "probe_priority": [], "idor_candidates": [orders], "notes": ""}
+        acs.run_idor_probe = lambda url, **k: (calls.append((url, k.get("account"))),
+            {"ok": True, "status": "candidate", "finding": dict(idor_finding), "attack_plan": idor_plan})[1]
+        try:
+            result = campaign.run_campaign(
+                target, scope="app.example.com", authorized=True, coder_cfg={"provider": "x"},
+                default_reports_dir=self.reports, runtime_dir=self.runtime, version="9.9.9", program="demo",
+                active=True, auth={"cookie": "sid=abc"})
+        finally:
+            (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves,
+             campaign.hunt_brain.plan_hunt, acs.run_idor_probe) = orig
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(calls[0][0], orders)                      # the prover ran on the brain-selected endpoint
+        self.assertEqual(calls[0][1], {"cookie": "sid=abc"})       # ...with the operator's authenticated session
+        idor_refs = [f["ref"] for f in result["findings"] if "IDOR" in f["title"]]
+        self.assertEqual(len(idor_refs), 1)                        # the lead was folded into the board
+        self.assertEqual(result["proof_of_impact"][idor_refs[0]]["status"], "candidate")  # never confirmed
+
+    def test_idor_prover_is_not_run_without_a_session(self) -> None:
+        # no session -> the IDOR pass is skipped entirely (the probe needs the operator's own object)
+        from bughunter import access_control_service as acs
+        target = "https://app.example.com/"
+        called: list = []
+        orig = (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves,
+                campaign.hunt_brain.plan_hunt, acs.run_idor_probe)
+        campaign.recon.discover = lambda t, **k: {"urls": [t], "notes": [], "sources": {}, "js_secrets": [], "tech": [], "params": [], "forms": []}
+        campaign.run_bounty_hunt = lambda *a, **k: {"ok": True, "json_path": "", "report_path": ""}
+        campaign.cve_service.scan_known_cves = lambda t, **k: {"ok": True, "findings": []}
+        campaign.hunt_brain.plan_hunt = lambda *a, **k: {"used": True, "provider": "x", "model": "y",
+            "param_hypotheses": [], "probe_priority": [], "idor_candidates": [target], "notes": ""}
+        acs.run_idor_probe = lambda url, **k: called.append(url)
+        try:
+            campaign.run_campaign(target, scope="app.example.com", authorized=True, coder_cfg={"provider": "x"},
+                default_reports_dir=self.reports, runtime_dir=self.runtime, version="9.9.9", program="demo", active=True)  # no auth
+        finally:
+            (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves,
+             campaign.hunt_brain.plan_hunt, acs.run_idor_probe) = orig
+        self.assertEqual(called, [])                               # prover never invoked without a session
+
     def test_url_campaign_folds_in_api_discovery_findings(self) -> None:
         # recon's api_findings (e.g. GraphQL introspection) — each carrying an inline plan —
         # must land on the campaign board as candidates with their plan/CVSS.
