@@ -95,6 +95,41 @@ def _prog_bucket(data: dict[str, Any], pid: str) -> dict[str, Any]:
     return data.setdefault("programs", {}).setdefault(pid, {"findings": {}})
 
 
+_PE_KEYS = ("request_line", "request_header", "response_status", "response_header", "set_cookie", "matched_value", "read_data")
+_POI_KEYS = ("status", "method", "observed_result", "control_result", "evidence", "affected_asset",
+             "blast_radius", "impact_narrative", "authenticated_read_request", "authenticated_read_response")
+
+
+def _captured_proof(finding: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    """The captured EXPLOIT EVIDENCE worth persisting to the durable ledger so a report rebuilt from
+    history (after cache eviction / restart) still shows the concrete proof — the request/response
+    artifact, the live-credential/Firebase proof, the observed-vs-control differential, and the
+    screenshot path. Bounded (each string capped) so the ledger stays lean."""
+    out: dict[str, Any] = {}
+    pe = finding.get("proof_evidence")
+    if isinstance(pe, dict):
+        pe_out = {k: str(pe.get(k))[:3000] for k in _PE_KEYS if str(pe.get(k) or "").strip()}
+        if pe_out:
+            out["proof_evidence"] = pe_out
+    cred = finding.get("_credential_proof")
+    if isinstance(cred, dict) and cred.get("checked"):
+        out["credential_proof"] = {k: cred.get(k) for k in
+            ("live", "http_status", "endpoint", "project_id", "authorized_domains", "principal", "scopes",
+             "detail", "poc", "response_excerpt", "no_data_read") if cred.get(k) not in (None, "")}
+    # The observed-vs-control differential lives in the attack plan; persist it when the caller attached it.
+    plan = item.get("plan") if isinstance(item.get("plan"), dict) else {}
+    poi = plan.get("proof_of_impact") if isinstance(plan.get("proof_of_impact"), dict) else {}
+    poi_out = {k: str(poi.get(k))[:3000] for k in _POI_KEYS if str(poi.get(k) or "").strip()}
+    if poi_out:
+        out["proof_of_impact"] = poi_out
+    if finding.get("secret_hits"):
+        out["secret_hits"] = True
+    sp = str(finding.get("screenshot_path") or finding.get("source_text_path") or "").strip()
+    if sp:
+        out["screenshot_path"] = sp[:600]
+    return out
+
+
 def upsert_findings(
     runtime_dir: str | Path, program: str | None, target: str, consolidated: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -117,6 +152,7 @@ def upsert_findings(
             prior_stage = _STAGE_RANK.get(rec.get("stage"), 0) if rec else -1
             item["duplicate_of_prior"] = prior_stage >= _STAGE_RANK["reported"]
             new_stage = "confirmed" if proof == "confirmed" else "discovered"
+            captured = _captured_proof(finding, item)  # the actual exploit evidence (bounded), for a rebuilt report
             if rec is None:
                 findings[key] = {
                     "dedup_key": key, "program": pid, "class_id": finding.get("class_id"),
@@ -124,6 +160,10 @@ def upsert_findings(
                     "severity": str(finding.get("severity") or ""), "source_url": item.get("source_url") or finding.get("location") or "",
                     "proof_status": proof, "stage": new_stage,
                     "cvss_base": (item.get("cvss") or {}).get("base_score"),
+                    # The captured exploit artifacts (request/response, live-credential/Firebase proof,
+                    # observed-vs-control differential, screenshot) — so a report REBUILT from history
+                    # after a restart/eviction still shows the concrete proof, not an empty shell.
+                    "captured_proof": captured,
                     "first_seen": _now(), "last_seen": _now(), "updated_at": _now(),
                     "h1_report_id": "", "bounty": 0.0, "outcome": "",
                     "h1_state": "", "h1_synced_at": "", "submitted_at": "",
@@ -131,6 +171,10 @@ def upsert_findings(
             else:
                 rec["last_seen"] = _now()
                 rec["proof_status"] = proof
+                # Refresh the persisted proof whenever this pass carried richer captured evidence (e.g.
+                # a later Prove/confirm), so the durable record keeps the best proof we've captured.
+                if captured and (proof == "confirmed" or not rec.get("captured_proof")):
+                    rec["captured_proof"] = captured
                 # Promote discovered->confirmed if it now confirms; never regress.
                 if _STAGE_RANK.get(new_stage, 0) > _STAGE_RANK.get(rec.get("stage"), 0):
                     rec["stage"] = new_stage

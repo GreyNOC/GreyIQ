@@ -1361,6 +1361,8 @@ function renderChat() {
     body.textContent = message.text;
     renderMessageEvidence(article, message);
 
+    like.setAttribute("aria-pressed", String(message.rating === "like"));
+    dislike.setAttribute("aria-pressed", String(message.rating === "dislike"));
     if (message.rating === "like") {
       like.classList.add("is-active");
     }
@@ -1563,7 +1565,8 @@ function escapeHtml(value) {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 function updateBotFromEditor() {
@@ -1581,6 +1584,9 @@ els.botEditor.addEventListener("input", updateBotFromEditor);
 
 els.composer.addEventListener("submit", async (event) => {
   event.preventDefault();
+  // Single-flight guard: Enter calls requestSubmit(), which ignores sendButton.disabled,
+  // so a second Enter while a reply is in flight would start an overlapping run.
+  if (els.sendButton.disabled) return;
   const text = els.promptInput.value.trim();
   if (!text) {
     return;
@@ -1804,6 +1810,7 @@ els.trainingFolderForm?.addEventListener("submit", async (event) => {
 });
 
 els.trainButton.addEventListener("click", async () => {
+  if (els.trainButton.disabled) return;  // single-flight: block re-clicks while a run is in flight
   const bot = activeBot();
   trainBot(bot);
   queueCoreSync();
@@ -1813,6 +1820,7 @@ els.trainButton.addEventListener("click", async () => {
     return;
   }
 
+  els.trainButton.disabled = true;
   try {
     els.modelState.textContent = "Training";
     await apiFetch("/api/train/start", {
@@ -1830,6 +1838,8 @@ els.trainButton.addEventListener("click", async () => {
   } catch (error) {
     service.lastError = error.message || "Training did not start";
     await refreshServiceStatus({ silent: true });
+  } finally {
+    els.trainButton.disabled = false;
   }
   render();
 });
@@ -2092,7 +2102,11 @@ function applyTheme() {
     meta.setAttribute("content", theme === "dark" ? "dark" : "light");
   }
   if (els.themeToggle) {
+    // Visible text is the *action* ("Light" = switch to light). A stable aria-label keeps the
+    // announced toggle name consistent with aria-pressed, so a screen reader says "Dark mode,
+    // pressed" in dark — not "Light, pressed", which describes the opposite theme.
     els.themeToggle.textContent = theme === "dark" ? "Light" : "Dark";
+    els.themeToggle.setAttribute("aria-label", "Dark mode");
     els.themeToggle.setAttribute("aria-pressed", String(theme === "dark"));
     els.themeToggle.title = theme === "dark" ? "Switch to light theme" : "Switch to dark theme";
   }
@@ -4384,7 +4398,13 @@ function ckSyncService() {
 
 function ckSetView(view) {
   ckState.view = view;
-  for (const btn of ck.navButtons) btn.classList.toggle("is-active", btn.dataset.ckView === view);
+  for (const btn of ck.navButtons) {
+    const active = btn.dataset.ckView === view;
+    btn.classList.toggle("is-active", active);
+    // Expose the active view to assistive tech — otherwise "which view" is conveyed by color alone.
+    if (active) btn.setAttribute("aria-current", "page");
+    else btn.removeAttribute("aria-current");
+  }
   for (const [name, node] of Object.entries(ck.views)) node.hidden = name !== view;
   if (view === "program") void ckRenderProgram();
   if (view === "campaign") ckRenderCampaign();
@@ -4710,14 +4730,22 @@ function ckRenderFindings() {
   for (const [label, sortKey] of [["Sev", "severity"], ["Class", null], ["Proof", "proof"], ["Finding", null], ["Where", null], ["CVSS", "cvss"]]) {
     const th = cel("th", null, label);
     if (sortKey) {
+      const isCurrent = ckState.sort.key === sortKey;
       // dir=-1 sorts DESCENDING (the default on first click — critical/high first); the
       // glyph must match the conventional meaning (▼ descending, ▲ ascending), not invert it.
-      const arrow = cel("span", "ck-sort", ckState.sort.key === sortKey ? (ckState.sort.dir < 0 ? " ▼" : " ▲") : " ⇅");
+      const arrow = cel("span", "ck-sort", isCurrent ? (ckState.sort.dir < 0 ? " ▼" : " ▲") : " ⇅");
       th.append(arrow);
-      th.addEventListener("click", () => {
+      // Keyboard-operable sortable header: focusable, Enter/Space toggles, aria-sort exposes state.
+      th.tabIndex = 0;
+      th.setAttribute("aria-sort", isCurrent ? (ckState.sort.dir < 0 ? "descending" : "ascending") : "none");
+      const doSort = () => {
         if (ckState.sort.key === sortKey) ckState.sort.dir *= -1;
         else ckState.sort = { key: sortKey, dir: -1 };
         ckRenderFindings();
+      };
+      th.addEventListener("click", doSort);
+      th.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); doSort(); }
       });
     } else { th.style.cursor = "default"; }
     htr.append(th);
@@ -4727,8 +4755,14 @@ function ckRenderFindings() {
 
   const tbody = cel("tbody");
   for (const f of rows) {
+    const uid = ckFindingUid(f);
     const tr = cel("tr", `ck-row sev-${f.severity}`);
-    if (ckFindingUid(f) === ckState.selectedUid) tr.classList.add("is-selected");
+    if (uid === ckState.selectedUid) tr.classList.add("is-selected");
+    // Keyboard-operable row: focusable + Enter/Space opens the detail (was mouse-only). data-uid
+    // lets ckCloseDetail() return focus here on close.
+    tr.tabIndex = 0;
+    tr.dataset.uid = uid;
+    tr.setAttribute("aria-label", `${f.severity} ${f.className || "finding"}: ${f.title} — open detail`);
     tr.append(td(cel("span", `ck-sev sev-${f.severity}`, f.severity.toUpperCase())));
     const cls = cel("span", null, f.className);
     const clsTd = td(cls);
@@ -4741,6 +4775,9 @@ function ckRenderFindings() {
     tr.append(td(cel("span", "ck-floc", f.location || "—")));
     tr.append(td(f.cvssScore != null ? cel("span", "ck-cvss", f.cvssScore.toFixed(1)) : cel("span", "ck-cvss", "—")));
     tr.addEventListener("click", () => ckSelectFinding(f));
+    tr.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); ckSelectFinding(f); }
+    });
     tbody.append(tr);
   }
   table.append(tbody);
@@ -4767,13 +4804,23 @@ function ckSelectFinding(f) {
   ck.detail.hidden = false;
   // Re-mark the selected row (cheap re-render of the board keeps it in sync).
   ckRenderFindings();
+  // Move focus into the aside so keyboard/AT users land on it (and Escape can close it).
+  ck.detail.querySelector(".ck-detail-close")?.focus();
 }
 
 function ckCloseDetail() {
+  // Only return focus to the originating row when the user closed an open aside (focus was
+  // inside it) — not when a background refresh closes it, which would otherwise steal focus.
+  const focusWasInDetail = ck.detail.contains(document.activeElement);
+  const prevUid = ckState.selectedUid;
   ckState.selectedUid = "";
   ck.detail.hidden = true;
   ck.body?.classList.remove("has-detail");
   ckRenderFindings();
+  if (focusWasInDetail && prevUid) {
+    const row = [...document.querySelectorAll(".ck-row")].find((r) => r.dataset.uid === prevUid);
+    if (row) row.focus();
+  }
 }
 
 function ckRenderDetail(f) {
@@ -6609,11 +6656,16 @@ function ckNormalizeForReport(f, extra) {
     remediation: f.remediation || "",
     snippet: f.snippet || "",
     matched_value: f.matched_value || (f.proof_evidence && f.proof_evidence.matched_value) || "",
-    proofEvidence: f.proof_evidence || f.proofEvidence || null,  // captured request/response + read_data
+    // captured request/response + read_data — live finding, else the proof persisted to the durable
+    // ledger (captured_proof) so a report rebuilt from HISTORY (after a restart) still shows the artifact.
+    proofEvidence: f.proof_evidence || f.proofEvidence || (f.captured_proof && f.captured_proof.proof_evidence) || null,
     // proofObj precedence: an explicit manual re-verify wins, then the finding's OWN active proof
-    // captured during the campaign (proof_detail — observed-vs-control differential), so a campaign-
-    // confirmed finding's full report renders CONFIRMED without needing a manual re-verify.
-    proofObj: f.proofObj || extra.proofObj || (f.proof_detail && typeof f.proof_detail === "object" && f.proof_detail.status ? f.proof_detail : null),
+    // captured during the campaign (proof_detail — observed-vs-control differential), then the proof
+    // persisted to the ledger for a history rebuild — so a confirmed finding's full report renders
+    // CONFIRMED with its real proof without a manual re-verify, even after an app restart.
+    proofObj: f.proofObj || extra.proofObj
+      || (f.proof_detail && typeof f.proof_detail === "object" && f.proof_detail.status ? f.proof_detail : null)
+      || (f.captured_proof && f.captured_proof.proof_of_impact) || null,
     proof: ckEffectiveProof(f, f.proof_status),
     dedupKey: f.dedupKey || f.dedup_key || "",
     screenshot: extra.screenshot || null,
@@ -7475,7 +7527,7 @@ function ckBuildPocHtml(focus) {
   if (focus.screenshot && focus.screenshot.data_url) shots.push(focus.screenshot);
   for (const s of (focus.shots || [])) if (s && s.data_url) shots.push(s);
   const shotsHtml = shots.length ? section("Screenshots",
-    shots.map((s) => `<figure><figcaption>${esc(s.kind || "screenshot")}</figcaption><img src="${s.data_url}" alt="proof screenshot"></figure>`).join("")) : "";
+    shots.map((s) => `<figure><figcaption>${esc(s.kind || "screenshot")}</figcaption><img src="${esc(s.data_url)}" alt="proof screenshot"></figure>`).join("")) : "";
   const exploitHtml = section("Proof of exploitability", `<pre>${esc(ckBuildProofOfExploitabilityText(focus))}</pre>`);
 
   const cvss = focus.cvss && focus.cvss.vector
@@ -9481,10 +9533,22 @@ async function ckNotify(title, body) {
 function bootCockpit() {
   if (!ck.root) return;
   document.body.dataset.appMode = state.appMode || "hunt";
-  ck.studio?.addEventListener("click", () => setAppMode("studio"));
-  ck.huntReturn?.addEventListener("click", () => setAppMode("hunt"));
+  ck.studio?.addEventListener("click", () => {
+    // The clicked button lives in the surface we're about to display:none, which drops focus to
+    // <body>. Move focus into the newly shown surface so keyboard/AT users don't lose their place.
+    setAppMode("studio");
+    els.promptInput?.focus();
+  });
+  ck.huntReturn?.addEventListener("click", () => {
+    setAppMode("hunt");
+    (ck.navButtons.find((b) => b.classList.contains("is-active")) || ck.navButtons[0])?.focus();
+  });
   ck.theme?.addEventListener("click", () => toggleTheme());
   for (const btn of ck.navButtons) btn.addEventListener("click", () => ckSetView(btn.dataset.ckView));
+  // Escape closes the finding-detail aside (only reachable when it's open, i.e. hunt mode).
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && ck.detail && !ck.detail.hidden) ckCloseDetail();
+  });
   ck.segHunt?.addEventListener("click", () => ckSetRunType("hunt"));
   ck.segCampaign?.addEventListener("click", () => ckSetRunType("campaign"));
   ck.segPortfolio?.addEventListener("click", () => ckSetRunType("portfolio"));
