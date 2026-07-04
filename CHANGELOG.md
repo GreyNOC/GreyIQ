@@ -2,6 +2,20 @@
 
 Notable changes to GreyIQ.
 
+## v0.81.0
+
+### Offline hunts are now steered — and they learn
+- When no cloud AI (Claude/Ollama) is configured, the hunt used to run with no targeting at all. Now a
+  built-in offline engine reads the mapped surface and points the checks where bugs actually live: the
+  parameters that take a URL (for SSRF), the ones that reflect input (for XSS), object endpoints worth
+  an IDOR check (`/order/1042`, UUID paths), and — per endpoint — the vulnerability classes its path,
+  parameters, and technology stack imply (a Flask/Jinja app gets template-injection first, a
+  download/file endpoint gets path-traversal, and so on).
+- It **learns from your hunting**: the classes a program has actually rewarded before are tried first,
+  so the offline hunt sharpens itself the more you use it.
+- Fully offline, private, and safe — it only ever *names* parameters and picks which check to run; the
+  engine does the probing, stays in scope, and confirms the result.
+
 ## v0.80.2
 
 ### Hardening pass — the AI can never overstate a finding, and the exploit proof is always recorded
