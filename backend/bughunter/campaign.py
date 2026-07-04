@@ -279,7 +279,8 @@ def _run_campaign_body(
         # precision unchanged). Best-effort + fail-closed: no brain / any error keeps current behaviour.
         try:
             hb = hunt_brain.plan_hunt(coder_cfg, clean_target, scope,
-                                      {"endpoints": urls, "params": recon_params, "tech": recon_tech, "forms": recon_forms})
+                                      {"endpoints": urls, "params": recon_params, "tech": recon_tech, "forms": recon_forms},
+                                      priors=priors)
             new_params = [p for p in (hb.get("param_hypotheses") or [])
                           if p.lower() not in {q.lower() for q in recon_params}]
             if new_params:
