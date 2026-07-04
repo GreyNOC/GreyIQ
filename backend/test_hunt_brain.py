@@ -43,11 +43,18 @@ class HuntBrainTests(unittest.TestCase):
     def _brain_returns(self, text: str) -> None:
         coder.generate = lambda messages, cfg: {"text": text, "provider": "anthropic", "model": "claude"}
 
-    def test_disabled_brain_returns_empty_plan(self) -> None:
+    def test_disabled_brain_falls_back_to_the_offline_engine(self) -> None:
+        # No LLM configured -> the offline knowledge-rule engine steers the hunt (was: empty plan).
         coder.coder_enabled = lambda cfg: False
         plan = hunt_brain.plan_hunt({}, "https://app.example.com/", "app.example.com", SURFACE)
+        self.assertEqual(plan["provider"], "offline")
+        for row in plan["probe_priority"]:                     # every endpoint is verbatim in-scope
+            self.assertIn(row["endpoint"], set(SURFACE.get("endpoints") or []))
+
+    def test_disabled_brain_empty_surface_is_still_an_empty_plan(self) -> None:
+        coder.coder_enabled = lambda cfg: False
+        plan = hunt_brain.plan_hunt({}, "https://app.example.com/", "app.example.com", {"endpoints": [], "params": []})
         self.assertFalse(plan["used"])
-        self.assertEqual(plan["param_hypotheses"], [])
         self.assertEqual(plan["probe_priority"], [])
 
     def test_valid_output_yields_new_params_and_scoped_priority(self) -> None:

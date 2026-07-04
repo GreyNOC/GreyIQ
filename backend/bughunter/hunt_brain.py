@@ -37,6 +37,7 @@ from urllib.parse import urlparse
 
 import coder
 import trust
+from bughunter import offline_hunt
 
 # The vuln classes the active prover (active_verify_service) can actually CONFIRM with a benign
 # differential. The brain's class suggestions are filtered to this set — a suggestion the prover
@@ -260,16 +261,27 @@ def _validate_plan(parsed: Any, surface: dict[str, Any]) -> tuple[list[str], lis
     return params, priority, idor_candidates, ssrf_params, xss_params
 
 
-def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface: dict[str, Any]) -> dict[str, Any]:
-    """Ask the configured brain to reason over the recon surface and propose where to probe.
+def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface: dict[str, Any],
+              priors: dict[str, float] | None = None) -> dict[str, Any]:
+    """Reason over the recon surface and propose where to probe.
 
-    Returns ``{used, provider, model, param_hypotheses, probe_priority, notes}``. ``param_hypotheses``
-    are NEW parameter names (validated, capped, scope-safe by construction — a name can't carry a
-    payload) meant to be unioned into the active prover's ``extra_params``; ``probe_priority`` is
-    advisory per-endpoint class targeting. Best-effort: any failure returns an empty plan and the
-    caller proceeds exactly as it does today."""
+    Returns ``{used, provider, model, param_hypotheses, probe_priority, idor_candidates, ssrf_params,
+    xss_params, notes}``. With a brain configured, the LLM produces the plan; with NO brain configured
+    the OFFLINE knowledge-rule engine (offline_hunt, sharpened by learned ``priors``) produces the same
+    shape — so an offline hunt is steered too, no longer flying blind. All outputs (names + verbatim
+    in-scope endpoints + class orderings) pass through _validate_plan either way; a name can't carry a
+    payload, so this only raises recall. Best-effort: any failure returns an empty plan."""
     plan = _empty_plan()
     if not coder.coder_enabled(coder_cfg):
+        # Offline hunt intelligence: knowledge rules + what the program has confirmed before.
+        try:
+            raw = offline_hunt.offline_plan(surface, priors)
+            params, priority, idor, ssrf, xss = _validate_plan(raw, surface)
+            plan.update({"used": bool(raw.get("used")), "provider": "offline", "model": "greyiq-offline-hunt",
+                         "param_hypotheses": params, "probe_priority": priority, "idor_candidates": idor,
+                         "ssrf_params": ssrf, "xss_params": xss, "notes": str(raw.get("notes") or "")})
+        except Exception:  # noqa: BLE001 - the offline planner must never break a hunt
+            pass
         return plan
     target = str(target or "").strip()
     if not target:
