@@ -2,6 +2,17 @@
 
 Notable changes to GreyIQ.
 
+## v0.80.1
+
+### The AI can now drive the hunt as a loop (opt-in)
+- A new **iterative hunt loop**: instead of the AI reasoning once before the hunt and going quiet, it
+  now probes, **reads what came back**, and decides what to try next — the reactive "second look" that
+  turns near-misses (a parameter that reflected but was encoded, a stack trace that points at template
+  injection, an oddly-named redirect parameter) into real findings.
+- It stays strictly bounded: the AI only ever names parameters and picks which check to run — the
+  engine does the probing, stays in scope, and confirms the result — and the whole loop can never use
+  more requests than a single normal hunt. Off by default; enable with `GREYIQ_HUNT_LOOP_ENABLED=1`.
+
 ## v0.80.0
 
 ### The AI writes the impact and the report — from the real proof only
