@@ -2,6 +2,35 @@
 
 Notable changes to GreyIQ.
 
+## v0.87.0
+
+### Every confirmed finding now ships a runnable proof of exploit
+- Alongside the screenshot, each confirmed finding now exports the exact benign request that proved it:
+  a copy-paste **`replay.sh`** (one `curl` per finding) and a **`findings.har`** you can import into Burp
+  or browser devtools. Both land in the campaign folder and the downloadable evidence bundle. They carry
+  only the crafted request — never a response body or another user's data — and any secret riding in a
+  request URL or header is redacted.
+
+### More leaked cloud keys get *proven* live — now AWS and GCP too
+- The engine already proved leaked GitHub/Slack/Stripe/OpenAI/Anthropic/Google/GitLab/npm/SendGrid/
+  DigitalOcean keys are live. It now covers the two highest-value cloud key types:
+  - **AWS access keys** — validated with a signed `sts:GetCallerIdentity` call that returns only the
+    key's own account/identity (no resource is read). The engine pairs a leaked access-key ID with its
+    secret from the same file to sign the check.
+  - **GCP service-account keys** — validated by minting a short-lived token at Google's own token
+    endpoint; the token proves the key authenticates and is never used to read anything. A malicious
+    key file can't redirect the check anywhere but Google.
+- Both contact only the credential's own issuer, never your target, and a dead or revoked key stays a
+  candidate.
+
+### More things the engine can confirm are exposed
+- New always-on checks (each proven by a distinctive signature plus a control, so they can't
+  false-positive): a served **`.aws/credentials`** file, a served **`.npmrc`** with a registry auth
+  token (including private registries on a port or path), an unauthenticated **Elasticsearch** `_cat`
+  API, and **WordPress** REST user enumeration.
+- **Blind XXE** confirmation now runs automatically during a hunt when you've configured an out-of-band
+  collaborator — the same benign, callback-only technique already used for blind SSRF.
+
 ## v0.86.0
 
 ### Confirmed findings keep their proof after a restart
