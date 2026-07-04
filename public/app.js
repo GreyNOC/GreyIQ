@@ -4825,6 +4825,7 @@ function ckRenderDetail(f) {
     const pm = cel("dl", "ck-meta-grid");
     const add = (k, v) => { if (v) { pm.append(cel("dt", null, k)); pm.append(cel("dd", null, v)); } };
     add("Status", (po.status || "").replace(/^./, (c) => c.toUpperCase()));
+    add("Impact", po.impact_narrative);
     add("Observed", po.observed_result);
     add("Control", po.control_result);
     add("Evidence", po.evidence);
@@ -6718,11 +6719,12 @@ function ckFullReportPanel(focus) {
   wrap.append(meta);
 
   const po = focus.proofObj;
-  if (po && (po.observed_result || po.control_result || po.evidence || po.proof_obligation)) {
+  if (po && (po.observed_result || po.control_result || po.evidence || po.impact_narrative || po.proof_obligation)) {
     wrap.append(cel("h4", null, "Proof of impact"));
     const pm = cel("dl", "ck-meta-grid");
     const a2 = (k, v) => { if (v) { pm.append(cel("dt", null, k)); pm.append(cel("dd", null, String(v))); } };
     a2("Status", (po.status || "").replace(/^./, (c) => c.toUpperCase()));
+    a2("Impact", po.impact_narrative);
     a2("Observed", po.observed_result);
     a2("Control", po.control_result);
     a2("Evidence", po.evidence);
@@ -9256,6 +9258,33 @@ function ckRenderFindingDrawer(dom) {
   add("Proof", dproof);
   drawer.append(meta);
 
+  // Show the CAPTURED exploit evidence right here in the live drawer — the campaign streams it with the
+  // finding (proof_detail = observed-vs-control differential + impact; proof_evidence = request/response),
+  // so a confirmed finding shouldn't look identical to a candidate.
+  const pd = f.proof_detail || null;
+  const pe = f.proof_evidence || null;
+  if (pd && (pd.observed_result || pd.impact_narrative || pd.control_result || pd.evidence)) {
+    drawer.append(cel("h4", null, "Captured proof of impact"));
+    const box = cel("dl", "ck-meta-grid");
+    const pa = (k, v) => { if (v) { box.append(cel("dt", null, k)); box.append(cel("dd", null, String(v))); } };
+    pa("Impact", pd.impact_narrative);
+    pa("Observed", pd.observed_result);
+    pa("Control", pd.control_result);
+    pa("Evidence", pd.evidence);
+    drawer.append(box);
+  }
+  if (pe && (pe.request_line || pe.response_status || pe.request_header || pe.response_header || pe.read_data)) {
+    drawer.append(cel("h4", null, "Captured request / response"));
+    const eb = cel("dl", "ck-meta-grid");
+    const ea = (k, v) => { if (v) { eb.append(cel("dt", null, k)); eb.append(cel("dd", null, String(v))); } };
+    ea("Request", pe.request_line);
+    ea("Request header", pe.request_header);
+    ea("Response", pe.response_status);
+    ea("Response header", pe.response_header);
+    ea("Data disclosed", pe.read_data);
+    drawer.append(eb);
+  }
+
   drawer.append(cel("p", "ck-hint",
     "Live summary streamed during the hunt. Create proof of impact to actively probe + screenshot this finding now, then create a report — all without pausing the campaign."));
 
@@ -9276,6 +9305,11 @@ function ckRenderFindingDrawer(dom) {
         control_result: best.control || "", evidence: best.evidence || "", proof_obligation: best.proof_obligation || "",
       };
       if (rv.result.screenshot && rv.result.screenshot.ok && rv.result.screenshot.data_url) shot = rv.result.screenshot;
+    }
+    // Never let a NON-confirmed re-verify override a finding the campaign ALREADY confirmed: prefer the
+    // streamed proof_detail (its captured differential) so the full report keeps reading Confirmed.
+    if ((!proofObj || proofObj.status !== "confirmed") && f.proof_detail && f.proof_detail.status === "confirmed") {
+      proofObj = f.proof_detail;
     }
     ckViewFullReport(f, { runId: ckCampaign.runId, proofObj, screenshot: shot });
   });
