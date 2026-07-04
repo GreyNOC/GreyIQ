@@ -66,6 +66,15 @@ class HuntBrainTests(unittest.TestCase):
         self.assertEqual(row["endpoint"], "https://app.example.com/download")
         self.assertEqual(row["classes"], ["path-traversal"])      # 'lfi' folds onto 'path-traversal', deduped
 
+    def test_idor_candidates_only_keep_verbatim_in_scope_endpoints(self) -> None:
+        self._brain_returns(
+            '{"param_hypotheses": [], "probe_priority": [],'
+            ' "idor_candidates": ["https://app.example.com/api/orders",'   # verbatim in-scope -> kept
+            '                     "https://evil.com/order/1",'             # invented host -> dropped
+            '                     "https://app.example.com/api/orders"]}')  # duplicate -> deduped
+        plan = hunt_brain.plan_hunt({}, "https://app.example.com/", "app.example.com", SURFACE)
+        self.assertEqual(plan["idor_candidates"], ["https://app.example.com/api/orders"])  # only the real in-scope one
+
     def test_payloads_and_urls_are_rejected_as_param_names(self) -> None:
         self._brain_returns(
             '{"param_hypotheses": ["<script>alarm(1)</script>", "https://evil.com/x", "q=1&a=2",'

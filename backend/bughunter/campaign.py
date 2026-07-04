@@ -240,6 +240,9 @@ def _run_campaign_body(
     # Per-endpoint vuln-class priorities from the reasoning layer — {url: [classes]} — used to steer
     # each URL's active pass toward the classes most likely to hit there (empty = default order).
     hunt_priority: dict[str, list[str]] = {}
+    # Endpoints the reasoning layer judged object-scoped (worth a single-session IDOR probe) — each is
+    # verbatim from the in-scope discovered set; the prover re-gates scope+SSRF before touching one.
+    idor_candidates: list[str] = []
     if kind == "url":
         _emit("recon: mapping the surface…")
         # Bind discovery to the SAME fail-closed scope gate the active prover uses, so
@@ -287,6 +290,7 @@ def _run_campaign_body(
                     hunt_priority[ep] = classes
             if hunt_priority:
                 _emit(f"hunt-brain: prioritised probe classes on {len(hunt_priority)} endpoint(s)")
+            idor_candidates = [e for e in (hb.get("idor_candidates") or []) if e in set(urls)]
         except Exception:  # noqa: BLE001 - the reasoning layer must never break a hunt
             pass
         # Merge the host-global tech-fingerprint hints into EVERY url's priority: the brain's
@@ -428,6 +432,40 @@ def _run_campaign_body(
                     "cvss": plan.get("cvss") or {}, "plan": plan,
                 })
         except Exception:  # noqa: BLE001 - the CVE pass is enrichment; never break the campaign
+            pass
+
+    # --- Brain-selected IDOR probe pass: the reasoning layer flagged these endpoints as object-scoped
+    # (a numeric/uuid id the session owns). Run the single-session IDOR DISCOVERY prover
+    # (access_control_service.run_idor_probe) — built + tested + scope-gated but until now NEVER called
+    # in the autonomous loop — on each, with the operator's authenticated session. GET-only, re-gates
+    # scope+SSRF itself, CANDIDATE-grade (one session can't prove cross-tenant, so it points at the
+    # dual-session confirm). Only when the active pass is on AND a session exists; a hallucinated pick
+    # with no numeric id is a clean no-op. Bounded + best-effort — never breaks the campaign. ---
+    if effective_active and idor_candidates and isinstance(auth, dict) and (str(auth.get("cookie") or "").strip() or auth.get("headers")):
+        try:
+            from bughunter import access_control_service
+            idor_n = 0
+            for ep in idor_candidates:
+                res = access_control_service.run_idor_probe(ep, account=auth, scope=scope, settings=campaign_settings)
+                fnd = res.get("finding") if isinstance(res, dict) else None
+                if not fnd:
+                    continue
+                plan = res.get("attack_plan") or {}
+                norm_loc = re.sub(r"\d+", "N", str(fnd.get("location") or ep))
+                key = f"{fnd.get('class_id')}|{fnd.get('rule_id')}|{norm_loc}"
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                idor_n += 1
+                fnd["ref"] = f"IDOR{idor_n}"
+                consolidated.append({
+                    "finding": fnd, "source_url": ep, "source_report": "", "source_json": "",
+                    "proof_status": str((plan.get("proof_of_impact") or {}).get("status") or "candidate"),
+                    "cvss": plan.get("cvss") or {}, "plan": plan,
+                })
+            if idor_n:
+                _emit(f"hunt-brain IDOR: {idor_n} object-authorization lead(s) from brain-selected endpoint(s)")
+        except Exception:  # noqa: BLE001 - the IDOR pass is enrichment; never break the campaign
             pass
 
     # --- Drop operator-deleted findings before ranking/submission. The per-URL engine

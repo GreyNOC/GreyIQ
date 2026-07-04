@@ -69,8 +69,12 @@ HUNT_BRAIN_SYSTEM_PROMPT = (
 )
 
 
+_MAX_IDOR_CANDIDATES = 6  # bound the brain-selected object-scoped endpoints handed to the IDOR prover
+
+
 def _empty_plan() -> dict[str, Any]:
-    return {"used": False, "provider": "", "model": "", "param_hypotheses": [], "probe_priority": [], "notes": ""}
+    return {"used": False, "provider": "", "model": "", "param_hypotheses": [], "probe_priority": [],
+            "idor_candidates": [], "notes": ""}
 
 
 def _norm_class(value: str) -> str:
@@ -142,6 +146,10 @@ def _build_prompt(target: str, scope: str, surface: dict[str, Any]) -> str:
         '  "probe_priority": [{"endpoint": "<copy ONE endpoint verbatim from the list above>", '
         '"classes": ["xss"|"sqli"|"redirect"|"ssti"|"rce"|"crlf"|"path-traversal"|"cors"|"nosqli"|'
         '"host-header"], "why": "one short clause"}],\n'
+        '  "idor_candidates": ["copy verbatim ONLY the endpoints that address a specific OBJECT by a '
+        "numeric or uuid id (a path segment like /order/1001 or /users/42, or an id/account/order/"
+        "invoice/user query param) — these are worth a single-session IDOR check. Endpoints copied "
+        'verbatim from the list above, most-sensitive object FIRST. Omit if none look object-scoped."],\n'
         '  "notes": "optional one-line reasoning"\n'
         "}\n"
         "Order probe_priority MOST-LIKELY-and-highest-impact FIRST (rce/sqli/ssti/path-traversal before "
@@ -153,11 +161,12 @@ def _build_prompt(target: str, scope: str, surface: dict[str, Any]) -> str:
     )
 
 
-def _validate_plan(parsed: Any, surface: dict[str, Any]) -> tuple[list[str], list[dict[str, Any]]]:
-    """Coerce + allowlist-filter the brain's JSON. Returns (param_hypotheses, probe_priority) with
-    only genuine, in-scope, non-duplicate entries. Never trusts a shape or value from the model."""
+def _validate_plan(parsed: Any, surface: dict[str, Any]) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+    """Coerce + allowlist-filter the brain's JSON. Returns (param_hypotheses, probe_priority,
+    idor_candidates) with only genuine, in-scope, non-duplicate entries. Never trusts a shape or
+    value from the model."""
     if not isinstance(parsed, dict):
-        return [], []
+        return [], [], []
     known = {str(p).strip().lower() for p in (surface.get("params") or [])}
     allowed_endpoints = {str(u).strip() for u in (surface.get("endpoints") or []) if str(u or "").strip()}
 
@@ -204,7 +213,23 @@ def _validate_plan(parsed: Any, surface: dict[str, Any]) -> tuple[list[str], lis
                          "why": str(row.get("why") or "").strip()[:160]})
         if len(priority) >= _MAX_PRIORITY_ROWS:
             break
-    return params, priority
+
+    # idor_candidates: endpoints the brain judges are object-scoped (a numeric/uuid id it owns) and
+    # thus worth a single-session IDOR probe. PURE SELECTION — like probe_priority, each must be an
+    # endpoint recon ALREADY discovered in scope (copied verbatim); a URL the brain didn't copy is
+    # dropped, so it can never introduce a host/URL. The prover self-gates scope+SSRF again anyway.
+    raw_idor = parsed.get("idor_candidates")
+    raw_idor = raw_idor if isinstance(raw_idor, list) else []
+    idor_candidates: list[str] = []
+    seen_i: set[str] = set()
+    for raw in raw_idor:
+        ep = str(raw or "").strip()
+        if ep in allowed_endpoints and ep not in seen_i:
+            seen_i.add(ep)
+            idor_candidates.append(ep)
+        if len(idor_candidates) >= _MAX_IDOR_CANDIDATES:
+            break
+    return params, priority, idor_candidates
 
 
 def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface: dict[str, Any]) -> dict[str, Any]:
@@ -230,14 +255,14 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
     try:
         result = coder.generate([{"role": "user", "content": _build_prompt(target, scope, surface)}], cfg)
         parsed = _parse_json_object(str(result.get("text") or ""))
-        params, priority = _validate_plan(parsed, surface)
+        params, priority, idor_candidates = _validate_plan(parsed, surface)
     except coder.CoderError:
         return plan
     except Exception:  # noqa: BLE001 - the reasoning layer must never break a hunt
         return plan
     plan.update({
         "used": True, "provider": str(result.get("provider") or ""), "model": str(result.get("model") or ""),
-        "param_hypotheses": params, "probe_priority": priority,
+        "param_hypotheses": params, "probe_priority": priority, "idor_candidates": idor_candidates,
         "notes": str((parsed or {}).get("notes") or "").strip()[:300] if isinstance(parsed, dict) else "",
     })
     return plan
