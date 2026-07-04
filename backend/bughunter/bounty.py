@@ -1483,6 +1483,27 @@ def run_bounty_hunt(
             except Exception as exc:  # noqa: BLE001
                 _emit(f"blind-SSRF OOB probe error: {exc}")
 
+        # Blind XXE over the OOB collaborator — the built-but-previously-dormant prover, now run
+        # autonomously beside blind SSRF (same collaborator gate). Auto mode POSTs the classic
+        # external-entity payload (the ONLY sanctioned non-GET egress) to the in-scope, SSRF-guarded,
+        # DNS-pinned target and polls; the entity fetches ONLY the collaborator callback (no target file
+        # is ever read), and a hit that appears solely after the probe (fresh-token negative control)
+        # confirms blind XXE. Best-effort; a target that doesn't parse XML is a clean no-op; never breaks a hunt.
+        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+            try:
+                _emit("running blind-XXE OOB probe (collaborator configured)…")
+                xxe = oob_service.confirm_blind_xxe(clean_target, base=oob_base, secret=oob_secret,
+                                                    scope=scope, settings=settings, send=True)
+                if xxe.get("ok") and xxe.get("finding") and xxe.get("status") in ("confirmed", "candidate"):
+                    raw_findings = list(raw_findings) + [xxe["finding"]]
+                    if "active" not in scanners_run:
+                        scanners_run = list(scanners_run) + ["active"]
+                    _emit(f"blind-XXE OOB: {xxe.get('status')}")
+                else:
+                    _emit(f"blind-XXE OOB: {xxe.get('status') or xxe.get('error') or 'no callback'}")
+            except Exception as exc:  # noqa: BLE001
+                _emit(f"blind-XXE OOB probe error: {exc}")
+
     # Credential validation: a leaked Firebase/Google API key is only a REAL finding if it's live.
     # Gated by ``authorized`` — it sends ONE benign, read-only GET to the credential's OWN issuer
     # (Google, never the target), carrying only the found key, to prove liveness + name the project.

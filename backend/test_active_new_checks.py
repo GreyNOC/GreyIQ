@@ -151,6 +151,65 @@ class SensitiveFileTests(unittest.TestCase):
         self.assertIsNone(av._check_sensitive_paths(_FileHttp(expose=True), "https://t/some/page"))
 
 
+class _ServesOne:
+    """Serves ONE path (path+query) with a given body, 404s everything else (incl. the control)."""
+    def __init__(self, served_path: str, body: str) -> None:
+        self.served_path, self.body = served_path, body
+
+    def fetch(self, url, *, method="GET", extra_headers=None):
+        p = urlparse(url)
+        pq = p.path + (("?" + p.query) if p.query else "")
+        if pq == self.served_path:
+            return {"status": 200, "headers": {}, "body": self.body, "location": None}
+        return {"status": 404, "headers": {}, "body": "Not Found", "location": None}
+
+
+class NewSignatureTableTests(unittest.TestCase):
+    def test_aws_credentials_file_exposed_confirmed(self) -> None:
+        body = "[default]\naws_access_key_id = AKIAIOSFODNN7EXAMPLE\naws_secret_access_key = wJalr...\n"
+        f = av._check_sensitive_paths(_ServesOne("/.aws/credentials", body), "https://t/")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["rule_id"], "active.exposed-file")
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+
+    def test_npmrc_auth_token_exposed_confirmed(self) -> None:
+        # port- AND path-qualified PRIVATE registries (the high-value case) must match, not just npmjs.org
+        for line in ("//registry.npmjs.org/:_authToken=npm_abc123\n",
+                     "//registry.internal:8443/:_authToken=abc\n",
+                     "//company.jfrog.io/artifactory/api/npm/npm-local/:_authToken=abc\n"):
+            f = av._check_sensitive_paths(_ServesOne("/.npmrc", line), "https://t/")
+            self.assertIsNotNone(f, line)
+            self.assertEqual(f["_active_proof"]["status"], "confirmed")
+
+    def test_elasticsearch_cat_indices_exposed_confirmed(self) -> None:
+        body = "health status index          uuid   pri rep docs.count\ngreen  open   logs-2024-01 aBcD   1   1   1200\n"
+        f = av._check_debug_endpoints(_ServesOne("/_cat/indices?v", body), "https://t/")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["rule_id"], "active.debug-endpoint")
+        self.assertEqual(f["severity"], "high")
+
+    def test_wordpress_user_enumeration_confirmed(self) -> None:
+        # REAL WP core field order (name/link BEFORE slug) on a SINGLE-author site — the highest-value
+        # case an earlier too-strict "slug before name/link" regex silently missed.
+        body = ('[{"id":1,"name":"admin","url":"","description":"","link":"https://t/author/admin/",'
+                '"slug":"admin","avatar_urls":{"24":"https://s/a"},"meta":[],"_links":{}}]')
+        f = av._check_debug_endpoints(_ServesOne("/wp-json/wp/v2/users", body), "https://t/")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        # an arbitrary slug-bearing JSON array without WP's avatar_urls must NOT match (no false positive)
+        self.assertIsNone(av._check_debug_endpoints(
+            _ServesOne("/wp-json/wp/v2/users", '[{"slug":"x","name":"y"}]'), "https://t/"))
+
+    def test_new_signatures_do_not_flag_a_catchall_or_benign_body(self) -> None:
+        # a site that 200s a benign page for the sensitive paths must NOT be flagged (no false positive)
+        benign = _FileHttp(catchall=True)
+        self.assertIsNone(av._check_sensitive_paths(benign, "https://t/"))
+        self.assertIsNone(av._check_debug_endpoints(benign, "https://t/"))
+        # and a docs page merely MENTIONING the strings mid-body doesn't match the anchored signatures
+        docs = _ServesOne("/.aws/credentials", "See the docs: set aws_access_key_id in your [profile] block.")
+        self.assertIsNone(av._check_sensitive_paths(docs, "https://t/"))
+
+
 class _XfhHttp:
     """Host is PINNED (ignored); only X-Forwarded-Host is trusted into the Location — the
     dominant reverse-proxy shape a raw-Host probe misses."""
