@@ -509,9 +509,14 @@ def _append_proof_of_impact(out: list[str], finding: dict[str, Any], plan: dict[
         value = str(detail.get(key) or "").strip()
         if value:
             out.append(f"- **{label}:** {value}")
-    if obligation:
-        out.append(f"- **Proof obligation (capture this to prove impact):** {obligation}")
+    # A CONFIRMED finding has ALREADY met its proof obligation — the captured artifacts above (the
+    # benign authenticated read request + success response + blast radius, or the observed-vs-control
+    # differential) ARE the proof. Never print the "capture this to prove impact" obligation, nor the
+    # lead "Gap", on a proven finding: asking the operator to prove what the engine already proved is
+    # exactly the contradiction that makes a confirmed report read as unproven.
     if status != "confirmed":
+        if obligation:
+            out.append(f"- **Proof obligation (capture this to prove impact):** {obligation}")
         out.append("- **Gap:** Treat this as a lead until an authorized replay or dynamic check proves the effect.")
     out.append("")
 
