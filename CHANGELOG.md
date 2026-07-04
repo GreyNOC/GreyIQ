@@ -2,6 +2,18 @@
 
 Notable changes to GreyIQ.
 
+## v0.85.0
+
+### Broken-admin-function checks now fire on every admin path the scan finds
+- When you've configured a second (admin) account, the engine's dual-account **BFLA** check — does a
+  low-privilege account reach an admin-only function? — used to run only on endpoints the AI flagged.
+  Now it also runs, deterministically, on any endpoint the crawl finds whose path looks like a
+  privileged function (`/admin`, `/internal`, `/manage`, `/settings`, role/permission/config/audit
+  routes) — so it fires even with no AI configured, or when the AI missed one.
+- This only widens what's *checked*, never what's *confirmed*: the three-session admin/user/anonymous
+  differential still owns every confirmation, and a path that turns out to be public (the anonymous
+  request isn't denied) is a harmless no-op.
+
 ## v0.84.0
 
 ### More leaked keys now get *proven* live — not just flagged
