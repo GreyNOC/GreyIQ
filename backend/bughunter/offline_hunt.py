@@ -58,6 +58,29 @@ def _hit(name: str, hints: tuple[str, ...]) -> bool:
     return any(h in low for h in hints)
 
 
+def admin_path_endpoints(urls: list[str], cap: int = 8) -> list[str]:
+    """The subset of ``urls`` whose PATH looks like an ADMIN / privileged FUNCTION (/admin, /internal,
+    /manage, /role, /permission, /settings, /config, /audit, ...) — the deterministic, recon-derived
+    feed for the dual-account BFLA prover, so it fires on privileged endpoints the recon surface
+    revealed even when no reasoning brain flagged them. Verbatim in-scope URLs only (each is copied
+    from the discovered set), deduped and capped. This only raises RECALL: the prover's three-session
+    admin/user/anon gate still owns the confirm, and a non-privileged pick fails its anon-denied control."""
+    out: list[str] = []
+    for u in urls:
+        url = str(u or "").strip()
+        if not url:
+            continue
+        try:
+            low_path = urlparse(url).path.lower()
+        except ValueError:
+            continue
+        if any(h in low_path for h in _PRIV_PATH_HINTS) and url not in out:
+            out.append(url)
+        if len(out) >= cap:
+            break
+    return out
+
+
 def _endpoint_params(url: str) -> list[str]:
     try:
         return [k for k, _ in parse_qsl(urlparse(url).query) if k]

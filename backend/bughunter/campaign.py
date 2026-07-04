@@ -33,6 +33,7 @@ from bughunter import (
     hunt_brain,
     ledger,
     learning,
+    offline_hunt,
     progress,
     ranking,
     recon,
@@ -310,6 +311,15 @@ def _run_campaign_body(
                 _emit(f"hunt-brain: {len(privileged_endpoints)} privileged endpoint(s) flagged for a dual-session BFLA check")
         except Exception:  # noqa: BLE001 - the reasoning layer must never break a hunt
             pass
+        # Deterministic recon-derived BFLA feed: union in endpoints whose path looks like an admin /
+        # privileged FUNCTION (offline_hunt.admin_path_endpoints) so the dual-account BFLA prover fires
+        # on privileged endpoints the surface revealed even when no brain flagged them (or no brain is
+        # configured). Verbatim in-scope only; the prover's anon-denied control still owns the confirm,
+        # so a non-privileged pick is a clean no-op — this only raises recall. Capped to bound requests.
+        for ep in offline_hunt.admin_path_endpoints(urls):
+            if ep not in privileged_endpoints:
+                privileged_endpoints.append(ep)
+        privileged_endpoints = privileged_endpoints[:8]
         # Merge the host-global tech-fingerprint hints into EVERY url's priority: the brain's
         # per-endpoint classes come first (most specific), then the stack-implied hint classes,
         # de-duped. URLs the brain didn't flag still get steered by the fingerprint alone. Pure
