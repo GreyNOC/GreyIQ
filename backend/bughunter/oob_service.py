@@ -379,8 +379,16 @@ def _xxe_finding_from_hit(sanitized: str, token: str, base: str, hit: dict[str, 
     confirmed = not _is_crawler_ua(ua)
     finding = _build_xxe_finding(sanitized, token, base, hit, confirmed)
     finding["ref"] = "F1"
+    plan = _xxe_plan(sanitized, token, base, hit, confirmed)
+    # Active-proof carriers so a hunt that appends this finding renders it CONFIRMED (with the
+    # collaborator hit as the observed-vs-fresh-token-control differential), exactly like the SSRF
+    # sibling (_build_ssrf_finding). Without them the fold-in drops the differential and a genuinely
+    # OOB-proven XXE renders 'missing' (class 'xxe' isn't a deterministic-artifact category).
+    finding["_active_class_hint"] = "xxe"
+    finding["_active_proof"] = plan["proof_of_impact"]
+    finding["_active_cvss"] = plan["cvss"]
     return {"ok": True, "status": "confirmed" if confirmed else "candidate", "token": token,
-            "finding": finding, "attack_plan": _xxe_plan(sanitized, token, base, hit, confirmed),
+            "finding": finding, "attack_plan": plan,
             "detail": {"hit": hit, "negative_control": "the fresh token was empty before the probe"}}
 
 
