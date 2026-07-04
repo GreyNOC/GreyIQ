@@ -131,6 +131,26 @@ def apply_chat_completion_token_limit(payload: dict[str, Any], base_url: str, mo
     return field
 
 
+def chat_completion_requires_default_temperature(base_url: str, model: str) -> bool:
+    """True for OpenAI chat models that reject non-default temperature values."""
+    name = str(model or "").strip().lower()
+    return name.startswith(("gpt-5", "o1", "o3", "o4", "chatgpt-"))
+
+
+def apply_chat_completion_temperature(payload: dict[str, Any], base_url: str, model: str, temperature: float) -> bool:
+    """Apply temperature only when the model accepts custom sampling.
+
+    Newer OpenAI reasoning/chat models reject ``temperature`` values other than the
+    default. Omitting the field uses the provider default and avoids a hard 400, while
+    local OpenAI-compatible servers still receive the configured value.
+    """
+    if chat_completion_requires_default_temperature(base_url, model):
+        payload.pop("temperature", None)
+        return False
+    payload["temperature"] = float(temperature)
+    return True
+
+
 def retry_payload_with_alternate_token_limit(payload: dict[str, Any], detail: str) -> dict[str, Any] | None:
     """If a chat endpoint rejects one token-limit field, build a one-shot retry payload
     with the other spelling. Returns None when the error is unrelated."""
@@ -146,6 +166,25 @@ def retry_payload_with_alternate_token_limit(payload: dict[str, Any], detail: st
         retry["max_tokens"] = retry.pop("max_completion_tokens")
         return retry
     return None
+
+
+def retry_payload_without_unsupported_temperature(payload: dict[str, Any], detail: str) -> dict[str, Any] | None:
+    """If a chat endpoint rejects custom temperature, retry once with provider default."""
+    lower = str(detail or "").lower()
+    if "temperature" not in lower or "temperature" not in payload:
+        return None
+    if "unsupported value" not in lower and "unsupported parameter" not in lower:
+        return None
+    retry = dict(payload)
+    retry.pop("temperature", None)
+    return retry
+
+
+def retry_payload_for_chat_completion_compat(payload: dict[str, Any], detail: str) -> dict[str, Any] | None:
+    return (
+        retry_payload_with_alternate_token_limit(payload, detail)
+        or retry_payload_without_unsupported_temperature(payload, detail)
+    )
 
 
 def coder_config(raw: dict[str, Any] | None) -> dict[str, Any]:
@@ -493,9 +532,9 @@ def _generate_openai_compatible(
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system_prompt}, *messages],
-        "temperature": temperature,
         "stream": False,
     }
+    apply_chat_completion_temperature(payload, base_url, model, temperature)
     apply_chat_completion_token_limit(payload, base_url, model, max_tokens)
 
     def _open(body_payload: dict[str, Any]) -> bytes:
@@ -514,7 +553,7 @@ def _generate_openai_compatible(
         body = json.loads(with_retries(lambda: _open(payload)).decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "ignore")[:400] if hasattr(exc, "read") else ""
-        retry_payload = retry_payload_with_alternate_token_limit(payload, detail)
+        retry_payload = retry_payload_for_chat_completion_compat(payload, detail)
         if retry_payload:
             try:
                 body = json.loads(with_retries(lambda: _open(retry_payload)).decode("utf-8"))

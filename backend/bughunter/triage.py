@@ -119,9 +119,9 @@ def remote_triage(result: dict[str, Any], remote_config: dict[str, Any] | None) 
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
         "stream": False,
     }
+    coder.apply_chat_completion_temperature(payload, url, model, 0.2)
     coder.apply_chat_completion_token_limit(payload, url, model, 700)
 
     def _send(body_payload: dict[str, Any]) -> dict[str, Any]:
@@ -145,7 +145,7 @@ def remote_triage(result: dict[str, Any], remote_config: dict[str, Any] | None) 
                 return str(message).strip()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "ignore")[:400] if hasattr(exc, "read") else ""
-        retry_payload = coder.retry_payload_with_alternate_token_limit(payload, detail)
+        retry_payload = coder.retry_payload_for_chat_completion_compat(payload, detail)
         if retry_payload:
             try:
                 body = _send(retry_payload)

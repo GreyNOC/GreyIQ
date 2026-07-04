@@ -1699,9 +1699,9 @@ def _run_tool_loop(
             "messages": convo,
             "tools": tools,
             "tool_choice": "auto",
-            "temperature": temperature,
             "stream": False,
         }
+        coder.apply_chat_completion_temperature(payload, base_url, model, temperature)
         coder.apply_chat_completion_token_limit(payload, base_url, model, max_tokens)
 
         def _open(body_payload: dict[str, Any]) -> bytes:
@@ -1720,7 +1720,7 @@ def _run_tool_loop(
             body = json.loads(coder.with_retries(lambda: _open(payload)).decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "ignore")[:400] if hasattr(exc, "read") else ""
-            retry_payload = coder.retry_payload_with_alternate_token_limit(payload, detail)
+            retry_payload = coder.retry_payload_for_chat_completion_compat(payload, detail)
             if retry_payload:
                 try:
                     body = json.loads(coder.with_retries(lambda: _open(retry_payload)).decode("utf-8"))

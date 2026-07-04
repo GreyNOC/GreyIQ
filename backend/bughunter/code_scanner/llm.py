@@ -292,8 +292,8 @@ def _call_openai_compatible(config: LlmConfig, system: str, user: str) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "temperature": 0.0,
     }
+    coder.apply_chat_completion_temperature(body, config.base_url or "https://api.openai.com/v1", config.model, 0.0)
     coder.apply_chat_completion_token_limit(body, config.base_url or "https://api.openai.com/v1", config.model, config.max_tokens)
     headers = {
         "Authorization": f"Bearer {config.api_key}",

@@ -1,8 +1,9 @@
-"""OpenAI chat-completions token-limit compatibility.
+"""OpenAI chat-completions parameter compatibility.
 
 OpenAI-hosted newer models reject the legacy ``max_tokens`` request field and
 expect ``max_completion_tokens`` instead. Local OpenAI-compatible servers often
-still expect ``max_tokens``. These tests pin both sides of that split.
+still expect ``max_tokens``. Some newer hosted models also reject custom
+``temperature`` values. These tests pin both sides of that split.
 """
 from __future__ import annotations
 
@@ -32,7 +33,7 @@ class _Response:
         return b'{"choices":[{"message":{"content":"ok"}}]}'
 
 
-class OpenAiTokenParamTests(unittest.TestCase):
+class OpenAiChatParamTests(unittest.TestCase):
     def _call_coder(self, block: dict[str, str], captured: list[dict]) -> dict:
         def fake_urlopen(request, timeout=0):  # noqa: ANN001
             captured.append(json.loads(request.data.decode("utf-8")))
@@ -58,6 +59,15 @@ class OpenAiTokenParamTests(unittest.TestCase):
         self.assertEqual(out["text"], "ok")
         self.assertEqual(captured[0]["max_completion_tokens"], 321)
         self.assertNotIn("max_tokens", captured[0])
+        self.assertNotIn("temperature", captured[0])
+
+    def test_openai_model_that_accepts_temperature_keeps_it(self) -> None:
+        captured: list[dict] = []
+        self._call_coder(
+            {"base_url": "https://api.openai.com/v1", "model": "gpt-4o", "api_key": "sk-test"},
+            captured,
+        )
+        self.assertEqual(captured[0]["temperature"], 0.2)
 
     def test_local_openai_compatible_endpoint_keeps_max_tokens(self) -> None:
         captured: list[dict] = []
@@ -67,6 +77,7 @@ class OpenAiTokenParamTests(unittest.TestCase):
         )
         self.assertEqual(captured[0]["max_tokens"], 321)
         self.assertNotIn("max_completion_tokens", captured[0])
+        self.assertEqual(captured[0]["temperature"], 0.2)
 
     def test_gateway_retry_swaps_unsupported_max_tokens(self) -> None:
         captured: list[dict] = []
@@ -93,6 +104,34 @@ class OpenAiTokenParamTests(unittest.TestCase):
         self.assertIn("max_tokens", captured[0])
         self.assertEqual(captured[1]["max_completion_tokens"], 222)
         self.assertNotIn("max_tokens", captured[1])
+
+    def test_gateway_retry_strips_unsupported_temperature(self) -> None:
+        captured: list[dict] = []
+
+        def fake_urlopen(request, timeout=0):  # noqa: ANN001
+            captured.append(json.loads(request.data.decode("utf-8")))
+            if len(captured) == 1:
+                detail = (
+                    b'{"error":{"message":"Unsupported value: \\"temperature\\" does not support 0.2 '
+                    b'with this model. Only the default (1) value is supported.","param":"temperature"}}'
+                )
+                raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(detail))
+            return _Response()
+
+        with mock.patch("coder.urllib.request.urlopen", side_effect=fake_urlopen):
+            out = coder._generate_openai_compatible(
+                [{"role": "user", "content": "hi"}],
+                "system",
+                {"base_url": "https://gateway.example/v1", "model": "custom-chat", "api_key": "sk-test"},
+                222,
+                0.2,
+                5.0,
+                "openai",
+            )
+
+        self.assertEqual(out["text"], "ok")
+        self.assertEqual(captured[0]["temperature"], 0.2)
+        self.assertNotIn("temperature", captured[1])
 
 
 if __name__ == "__main__":

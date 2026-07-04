@@ -2,6 +2,12 @@
 
 Notable changes to GreyIQ.
 
+## v0.78.2
+
+### OpenAI hosted model compatibility
+- OpenAI/ChatGPT requests now omit custom `temperature` for newer hosted models that only accept the provider default, fixing HTTP 400 errors like `Unsupported value: 'temperature' does not support 0.2 with this model`.
+- The OpenAI-compatible retry path now also strips `temperature` once when a gateway reports it unsupported, while local OpenAI-compatible servers keep the configured temperature.
+
 ## v0.78.1
 
 ### Proof artifacts, bigger findings, and ChatGPT API compatibility
