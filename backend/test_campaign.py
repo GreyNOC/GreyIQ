@@ -145,6 +145,69 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(len(idor_refs), 1)                        # the lead was folded into the board
         self.assertEqual(result["proof_of_impact"][idor_refs[0]]["status"], "candidate")  # never confirmed
 
+    def test_brain_selected_privileged_endpoints_run_the_dual_account_bfla_prover(self) -> None:
+        # The reasoning layer flags ADMIN/privileged functions; when the program has BOTH a low-priv
+        # research account (auth) AND an admin account (admin_account_access), the campaign logs into the
+        # admin account and runs the dual-account BFLA prover, folding a CONFIRMED bypass in. All stubbed.
+        from bughunter import access_control_service as acs
+
+        target = "https://app.example.com/"
+        admin_ep = target + "admin/users"
+        bfla_finding = {"title": "Broken function-level authorization at /admin/users", "severity": "high",
+                        "class_id": "access-control", "rule_id": "active.bfla", "location": admin_ep, "cwe": "CWE-862"}
+        bfla_plan = {"proof_of_impact": {"status": "confirmed", "observed_result": "low-priv reached admin response",
+                                         "control_result": "anon denied"}, "cvss": {"base_score": 8.1}}
+        calls: list = []
+        orig = (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves,
+                campaign.hunt_brain.plan_hunt, campaign.account_login_service.login, acs.run_bfla_check)
+        campaign.recon.discover = lambda t, **k: {"urls": [t, admin_ep], "notes": [], "sources": {}, "js_secrets": [], "tech": [], "params": [], "forms": []}
+        campaign.run_bounty_hunt = lambda *a, **k: {"ok": True, "json_path": "", "report_path": ""}
+        campaign.cve_service.scan_known_cves = lambda t, **k: {"ok": True, "findings": []}
+        campaign.hunt_brain.plan_hunt = lambda *a, **k: {"used": True, "provider": "x", "model": "y",
+            "param_hypotheses": [], "probe_priority": [], "idor_candidates": [], "privileged_endpoints": [admin_ep], "notes": ""}
+        campaign.account_login_service.login = lambda acc, scope, settings=None: {"ok": True, "cookie": "sid=admin", "note": "logged in"}
+        acs.run_bfla_check = lambda url, **k: (calls.append((url, k.get("admin_account"), k.get("user_account"))),
+            {"ok": True, "status": "confirmed", "finding": dict(bfla_finding), "attack_plan": bfla_plan})[1]
+        try:
+            result = campaign.run_campaign(
+                target, scope="app.example.com", authorized=True, coder_cfg={"provider": "x"},
+                default_reports_dir=self.reports, runtime_dir=self.runtime, version="9.9.9", program="demo",
+                active=True, auth={"cookie": "sid=user"}, admin_account_access={"cookie": "sid=admin"})
+        finally:
+            (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves,
+             campaign.hunt_brain.plan_hunt, campaign.account_login_service.login, acs.run_bfla_check) = orig
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(calls[0][0], admin_ep)                    # prover ran on the brain-selected privileged endpoint
+        self.assertEqual(calls[0][1].get("cookie"), "sid=admin")   # admin session = high-privilege ground truth
+        self.assertEqual(calls[0][2], {"cookie": "sid=user"})      # user session = the low-privilege attacker
+        bfla_refs = [f["ref"] for f in result["findings"] if "function-level" in f["title"]]
+        self.assertEqual(len(bfla_refs), 1)                        # folded into the board
+        self.assertEqual(result["proof_of_impact"][bfla_refs[0]]["status"], "confirmed")  # prover's differential confirms
+
+    def test_bfla_prover_is_not_run_without_an_admin_account(self) -> None:
+        # only a low-priv session, no admin account -> the BFLA pass is skipped (needs BOTH sessions)
+        from bughunter import access_control_service as acs
+        target = "https://app.example.com/"
+        admin_ep = target + "admin/users"
+        called: list = []
+        orig = (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves,
+                campaign.hunt_brain.plan_hunt, acs.run_bfla_check)
+        campaign.recon.discover = lambda t, **k: {"urls": [t, admin_ep], "notes": [], "sources": {}, "js_secrets": [], "tech": [], "params": [], "forms": []}
+        campaign.run_bounty_hunt = lambda *a, **k: {"ok": True, "json_path": "", "report_path": ""}
+        campaign.cve_service.scan_known_cves = lambda t, **k: {"ok": True, "findings": []}
+        campaign.hunt_brain.plan_hunt = lambda *a, **k: {"used": True, "provider": "x", "model": "y",
+            "param_hypotheses": [], "probe_priority": [], "idor_candidates": [], "privileged_endpoints": [admin_ep], "notes": ""}
+        acs.run_bfla_check = lambda url, **k: called.append(url)
+        try:
+            campaign.run_campaign(target, scope="app.example.com", authorized=True, coder_cfg={"provider": "x"},
+                default_reports_dir=self.reports, runtime_dir=self.runtime, version="9.9.9", program="demo",
+                active=True, auth={"cookie": "sid=user"})  # no admin_account_access
+        finally:
+            (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves,
+             campaign.hunt_brain.plan_hunt, acs.run_bfla_check) = orig
+        self.assertEqual(called, [])                               # BFLA never invoked without the second account
+
     def test_idor_prover_is_not_run_without_a_session(self) -> None:
         # no session -> the IDOR pass is skipped entirely (the probe needs the operator's own object)
         from bughunter import access_control_service as acs

@@ -115,5 +115,34 @@ class ApiRedactionTests(unittest.TestCase):
         self.assertEqual(greyiq_api._program_for_read({"id": "p", "name": "P"}).get("account_access"), None)
 
 
+class AdminAccountAccessTests(unittest.TestCase):
+    """The SECOND (high-privilege) research account that unlocks dual-account BFLA — same shape,
+    bounding, and redaction as the low-privilege account_access."""
+
+    def test_admin_account_access_is_bounded_and_junk_dropped(self) -> None:
+        r = portfolio._normalize({"name": "P", "admin_account_access": {
+            "email": "admin@ywh.example", "password": "apw", "cookie": "sid=admin", "junk": "x"}})
+        acc = r["admin_account_access"]
+        self.assertEqual(acc["email"], "admin@ywh.example")
+        self.assertEqual(acc["password"], "apw")
+        self.assertNotIn("junk", acc)
+        self.assertEqual(portfolio._normalize({"name": "P"})["admin_account_access"], {})  # default empty
+
+    def test_read_back_redacts_admin_secrets(self) -> None:
+        prog = {"id": "p1", "name": "P", "admin_account_access": {
+            "email": "admin@ywh.example", "password": "topsecret", "cookie": "sid=admin"}}
+        red = greyiq_api._program_for_read(prog)["admin_account_access"]
+        self.assertEqual(red["email"], "admin@ywh.example")
+        self.assertNotIn("password", red)                     # admin secret never leaves the API either
+        self.assertNotIn("cookie", red)
+        self.assertTrue(red["password_set"])
+        self.assertTrue(red["cookie_set"])
+
+    def test_read_back_no_admin_account_is_untouched(self) -> None:
+        # a program with only the low-priv account must not sprout an empty admin_account_access on read
+        self.assertNotIn("admin_account_access",
+                         greyiq_api._program_for_read({"id": "p", "name": "P", "account_access": {"email": "u@x"}}))
+
+
 if __name__ == "__main__":
     unittest.main()

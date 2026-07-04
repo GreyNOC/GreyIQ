@@ -114,7 +114,7 @@ def _react_plan(coder_cfg: dict[str, Any] | None, target: str, scope: str, surfa
         result = coder.generate([{"role": "user", "content":
             _build_react_prompt(target, scope, surface, observations, params_tried, budget_remaining)}], cfg)
         parsed = hunt_brain._parse_json_object(str(result.get("text") or ""))
-        params, priority, _idor, _ssrf, xss = hunt_brain._validate_plan(parsed, surface)
+        params, priority, _idor, _ssrf, xss, _priv = hunt_brain._validate_plan(parsed, surface)
     except coder.CoderError:
         return empty
     except Exception:  # noqa: BLE001 - the reasoning layer must never break a hunt

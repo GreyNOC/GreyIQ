@@ -34,7 +34,7 @@ class BrainParamSelectionTests(unittest.TestCase):
         return hunt_brain._validate_plan(parsed, {"endpoints": ["https://t/x"], "params": []})
 
     def test_ssrf_and_xss_params_are_names_only(self) -> None:
-        _, _, _, ssrf, xss = self._validate({
+        _, _, _, ssrf, xss, _ = self._validate({
             "ssrf_params": ["image_url", "webhook", "https://evil.com/x", "<script>alert(1)</script>", "a b"],
             "xss_params": ["search", "q", "http://x", "'; DROP"]})
         self.assertEqual(ssrf, ["image_url", "webhook"])       # the URL, payload, and spaced value are rejected
@@ -42,7 +42,7 @@ class BrainParamSelectionTests(unittest.TestCase):
 
     def test_non_list_values_coerced_safely(self) -> None:
         # a hijacked model returning a scalar must not crash or leak
-        _, _, _, ssrf, xss = self._validate({"ssrf_params": 5, "xss_params": True})
+        _, _, _, ssrf, xss, _ = self._validate({"ssrf_params": 5, "xss_params": True})
         self.assertEqual((ssrf, xss), ([], []))
 
     def test_empty_plan_has_the_fields(self) -> None:
@@ -51,7 +51,7 @@ class BrainParamSelectionTests(unittest.TestCase):
         self.assertEqual(plan["xss_params"], [])
 
     def test_names_capped(self) -> None:
-        _, _, _, ssrf, _ = self._validate({"ssrf_params": [f"p{i}" for i in range(40)]})
+        _, _, _, ssrf, _, _ = self._validate({"ssrf_params": [f"p{i}" for i in range(40)]})
         self.assertLessEqual(len(ssrf), 12)
 
 

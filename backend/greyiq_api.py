@@ -905,6 +905,7 @@ class ProgramUpsertRequest(BaseModel):
     h1_program_stats: dict[str, Any] = Field(default_factory=dict)  # real signals from HackerOne's program resource (offers_bounties, fast_payments, etc.)
     notes: str = Field(default="", max_length=4000)
     account_access: dict[str, Any] = Field(default_factory=dict)  # research-account email/password/login_url/cookie — SENSITIVE (portfolio._clean_account_access bounds it; password/cookie redacted on read-back)
+    admin_account_access: dict[str, Any] = Field(default_factory=dict)  # SECOND (high-privilege) research account for dual-account BFLA — same shape+redaction as account_access; the low-priv account_access is the "user" session
     user_agent_suffix: str = Field(default="", max_length=120)    # a mandatory UA tag some programs require appended to every in-scope request
     resync_scope: bool = False  # re-derive scope_text/hosts from structured_scope even if scope_text is already set (see portfolio.upsert_program)
     active: bool = False
@@ -921,12 +922,20 @@ def _program_for_read(program: dict[str, Any]) -> dict[str, Any]:
     """Redact the research-account secrets before a program leaves the API: the UI never receives the
     stored password or session cookie in plaintext — only booleans saying whether each is set. Email,
     login/register URL, and notes are returned so the operator can see and edit them."""
-    acc = program.get("account_access")
-    if isinstance(acc, dict) and acc:
+    def _redact(acc: Any) -> dict[str, Any] | None:
+        if not (isinstance(acc, dict) and acc):
+            return None
         red: dict[str, Any] = {k: acc.get(k) for k in ("email", "login_url", "register_url", "notes") if acc.get(k)}
         red["password_set"] = bool(acc.get("password"))
         red["cookie_set"] = bool(acc.get("cookie"))
-        program = {**program, "account_access": red}
+        return red
+
+    red_acc = _redact(program.get("account_access"))
+    if red_acc is not None:
+        program = {**program, "account_access": red_acc}
+    red_admin = _redact(program.get("admin_account_access"))
+    if red_admin is not None:
+        program = {**program, "admin_account_access": red_admin}
     return program
 
 
@@ -1924,6 +1933,7 @@ class GreyIQRuntime:
         disclose_automation = bool(program_obj.get("disclose_automation")) if program_obj else False
         excluded_hosts = tuple(str(h) for h in (program_obj.get("out_of_scope_hosts") or [])) if program_obj else ()
         account_access = program_obj.get("account_access") if program_obj else None
+        admin_account_access = program_obj.get("admin_account_access") if program_obj else None
         user_agent_suffix = str(program_obj.get("user_agent_suffix") or "") if program_obj else ""
         # An explicit cookie/header in the request wins; otherwise pass auth=None so the program's
         # stored research-account credentials (account_access) drive an auto-login in run_campaign.
@@ -1942,6 +1952,7 @@ class GreyIQRuntime:
             time_based=request.time_based,
             auth=req_auth,
             account_access=account_access,
+            admin_account_access=admin_account_access,
             user_agent_suffix=user_agent_suffix,
             live=request.live,
             program=request.program,
@@ -1990,6 +2001,7 @@ class GreyIQRuntime:
             time_based=request.time_based,
             auth=req_auth,
             account_access=program.get("account_access"),
+            admin_account_access=program.get("admin_account_access"),
             user_agent_suffix=str(program.get("user_agent_suffix") or ""),
             live=request.live,
             program=program_label,
@@ -2041,6 +2053,7 @@ class GreyIQRuntime:
                 "excluded_hosts": [str(h) for h in (program.get("out_of_scope_hosts") or [])],
                 "disclose_automation": bool(program.get("disclose_automation")),
                 "account_access": program.get("account_access"),
+                "admin_account_access": program.get("admin_account_access"),
                 "user_agent_suffix": str(program.get("user_agent_suffix") or ""),
             })
         if not specs:
@@ -2613,8 +2626,12 @@ class GreyIQRuntime:
         art = run.get("artifacts") or {}
         safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
         out_zip = RUNTIME_DIR / "bundles" / f"engagement-{safe(request.run_id)}.zip"
+        # Stamp the run's identity + generation time into the evidence-integrity manifest so
+        # the chain of custody names the exact tool/version and when the evidence was bundled.
+        bundle_meta = {"tool": "GreyIQ BugHunter", "version": VERSION,
+                       "generated_at": str(run.get("generated_at") or art.get("generated_at") or "")}
         if art.get("is_campaign") and art.get("output_dir") and Path(art["output_dir"]).is_dir():
-            res = bounty_bundle.bundle_directory(art["output_dir"], out_zip)
+            res = bounty_bundle.bundle_directory(art["output_dir"], out_zip, meta=bundle_meta)
         else:
             specs: list[tuple[str, str]] = []
             for key in ("report_path", "json_path"):
@@ -2641,7 +2658,7 @@ class GreyIQRuntime:
                 for p in (entry if isinstance(entry, list) else [entry]):
                     if p:
                         specs.append((f"evidence/{Path(p).name}", p))
-            res = bounty_bundle.bundle_files(specs, out_zip)
+            res = bounty_bundle.bundle_files(specs, out_zip, meta=bundle_meta)
         if not res.get("ok"):
             return res
         download_b64 = ""
@@ -2654,6 +2671,7 @@ class GreyIQRuntime:
         return {
             "ok": True, "path": res["path"], "filename": f"greyiq-engagement-{safe(request.run_id)[:12]}.zip",
             "zip_bytes": zip_bytes, "file_count": res.get("file_count"), "skipped": res.get("skipped") or [],
+            "manifest": res.get("manifest") or [],  # evidence-integrity files bundled (chain of custody)
             "download_b64": download_b64, "inline": bool(download_b64),
         }
 
@@ -2901,15 +2919,20 @@ class GreyIQRuntime:
         # Merge-preserve the research-account secrets: the UI reads them REDACTED (password_set/
         # cookie_set markers, no plaintext), so a normal edit round-trip carries no password/cookie —
         # keep the stored ones rather than wiping them. A caller that DOES send a new secret overwrites.
-        if "account_access" in record:
-            acc = {k: v for k, v in dict(record.get("account_access") or {}).items()
+        # Identical treatment for the low-priv `account_access` and the high-priv `admin_account_access`.
+        existing = None
+        for field in ("account_access", "admin_account_access"):
+            if field not in record:
+                continue
+            acc = {k: v for k, v in dict(record.get(field) or {}).items()
                    if k not in ("password_set", "cookie_set")}  # drop the read-only markers
-            existing = bounty_portfolio.get_program(RUNTIME_DIR, str(record.get("id") or "")) or {}
-            ex_acc = existing.get("account_access") if isinstance(existing.get("account_access"), dict) else {}
+            if existing is None:
+                existing = bounty_portfolio.get_program(RUNTIME_DIR, str(record.get("id") or "")) or {}
+            ex_acc = existing.get(field) if isinstance(existing.get(field), dict) else {}
             for secret in ("password", "cookie"):
                 if not str(acc.get(secret) or "").strip() and ex_acc.get(secret):
                     acc[secret] = ex_acc[secret]  # preserve the saved secret the redacted edit didn't resend
-            record["account_access"] = acc
+            record[field] = acc
         return {"ok": True, "program": _program_for_read(bounty_portfolio.upsert_program(RUNTIME_DIR, record))}
 
     def import_hackerone_scope(self, request: "HackerOneImportRequest") -> dict[str, Any]:
