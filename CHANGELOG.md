@@ -2,6 +2,20 @@
 
 Notable changes to GreyIQ.
 
+## v0.86.0
+
+### Confirmed findings keep their proof after a restart
+- When the engine confirms a finding during a hunt, it captures the exact proof — the request it sent,
+  the response, and the observed-vs-control difference that proves the bug. For findings confirmed by
+  the active pass (reflected XSS, SQL injection, CORS, open redirect, and the like), that captured
+  difference was being shown live but not saved to the finding's durable history. If you closed and
+  reopened the app and rebuilt the report from history, a genuinely-confirmed finding could come back
+  with an empty proof section.
+- Now that observed-vs-control difference is persisted with every confirmed finding, so a report
+  rebuilt at any later time still carries the concrete, reproducible proof that earned the "confirmed"
+  status. (Findings still can't be over-promoted — the status is decided separately from the stored
+  evidence.)
+
 ## v0.85.0
 
 ### Broken-admin-function checks now fire on every admin path the scan finds

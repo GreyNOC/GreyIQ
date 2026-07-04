@@ -51,6 +51,27 @@ class LedgerProofPersistTests(unittest.TestCase):
         reloaded = ledger.list_all(self.dir)[0]
         self.assertTrue((reloaded.get("captured_proof") or {}).get("proof_evidence"))
 
+    def test_per_url_active_finding_persists_differential_without_an_inline_plan(self) -> None:
+        # A per-URL active finding carries the observed-vs-control differential DIRECTLY on the item
+        # (item["proof_of_impact"]) — never under "plan", which is the synthetic-vs-sidecar sentinel. The
+        # ledger must persist it from there too, else a confirmed reflected-XSS/SQLi/etc. rebuilt from
+        # history would render with an empty differential (the pre-fix bug).
+        finding = {"class_id": "xss", "rule_id": "active.reflected-xss", "title": "Reflected XSS",
+                   "severity": "high", "location": "https://t/q", "proof_status": "confirmed",
+                   "proof_evidence": {"request_line": "GET /q?x=<svg/onload=1>", "response_status": "HTTP 200"}}
+        item = {"finding": finding, "source_url": "https://t/q", "proof_status": "confirmed",
+                "source_json": "", "cvss": {"base_score": 6.1},
+                # no "plan" key — exactly like campaign.py's per-URL consolidation
+                "proof_of_impact": {"status": "confirmed",
+                                    "observed_result": "the <svg/onload> payload reflected UNENCODED in the HTML body",
+                                    "control_result": "a benign marker with no tag did not reflect"}}
+        ledger.upsert_findings(self.dir, "prog", "https://t", [item])
+        cp = self._rec().get("captured_proof") or {}
+        self.assertIn("proof_of_impact", cp)
+        self.assertIn("reflected UNENCODED", cp["proof_of_impact"]["observed_result"])   # the differential survives
+        self.assertIn("did not reflect", cp["proof_of_impact"]["control_result"])
+        self.assertNotIn("plan", item)   # the fix did NOT introduce the synthetic-plan sentinel
+
     def test_field_is_captured_proof_not_proof(self) -> None:
         # must NOT be named 'proof' — the UI treats f.proof as a status STRING; an object there breaks it
         ledger.upsert_findings(self.dir, "prog", "https://t", [self._item("confirmed")])
