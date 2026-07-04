@@ -14,7 +14,8 @@ if str(BACKEND_DIR) not in sys.path:
 from bughunter import hunt_brain, offline_hunt  # noqa: E402
 
 _SURFACE = {"endpoints": ["https://t/search?q=x", "https://t/order/1042", "https://t/download?file=a.pdf",
-                          "https://t/api/me", "https://t/redirect?url=x", "https://t/users/9f8e7d6c-1234-4321-8888-abcdef012345"],
+                          "https://t/api/me", "https://t/redirect?url=x", "https://t/users/9f8e7d6c-1234-4321-8888-abcdef012345",
+                          "https://t/admin/users", "https://t/settings/roles"],
             "params": ["q", "file"], "tech": ["Flask", "Jinja"]}
 
 
@@ -25,6 +26,15 @@ class OfflinePlanTests(unittest.TestCase):
         self.assertIn("q", p["xss_params"])                        # search q= reflects
         self.assertIn("https://t/order/1042", p["idor_candidates"])  # numeric-id object endpoint
         self.assertIn("https://t/users/9f8e7d6c-1234-4321-8888-abcdef012345", p["idor_candidates"])  # uuid too
+
+    def test_flags_admin_privileged_endpoints_for_bfla(self) -> None:
+        p = offline_hunt.offline_plan(_SURFACE)
+        self.assertIn("https://t/admin/users", p["privileged_endpoints"])   # /admin function
+        self.assertIn("https://t/settings/roles", p["privileged_endpoints"])  # /settings + /role
+        # object endpoints are NOT privileged-function candidates (that's IDOR, not BFLA)
+        self.assertNotIn("https://t/order/1042", p["privileged_endpoints"])
+        for ep in p["privileged_endpoints"]:
+            self.assertIn(ep, set(_SURFACE["endpoints"]))                    # verbatim in-scope only
 
     def test_probe_priority_endpoints_are_verbatim_in_scope(self) -> None:
         p = offline_hunt.offline_plan(_SURFACE)

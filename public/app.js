@@ -6086,6 +6086,23 @@ function ckProgramSetupForm() {
   accWrap.append(accEmail.wrap, accPassword.wrap, accLoginUrl.wrap, accRegisterUrl.wrap, accCookie.wrap, uaSuffix.wrap);
   form.append(accWrap);
 
+  // --- Optional SECOND, higher-privilege research account: unlocks the autonomous dual-account
+  // BFLA check (does the low-privilege account above reach an admin-only function?). Same storage,
+  // scope-gating and redaction as the primary account. Left blank, the engine just skips BFLA. ---
+  const adm = (editing && editing.admin_account_access) || {};
+  const admWrap = cel("div", "ck-subsection");
+  admWrap.append(cel("h4", "ck-subhead", "Admin account (optional — enables dual-account BFLA)"));
+  admWrap.append(cel("p", "ck-hint", "Add a SECOND, higher-privilege account (e.g. an admin/manager role you also control) to let the engine prove broken function-level authorization: it checks whether the low-privilege account above can reach an admin-only function. The account above is the “attacker”; this one is the ground-truth admin. Stored and redacted exactly like the account above; leave blank to skip BFLA."));
+  const admEmail = ckField("Admin-account email", "text", adm.email || "");
+  const admPassword = ckField("Admin password (the engine logs in with this)", "password", "");
+  if (adm.password_set) admPassword.input.placeholder = "•••••••• saved — leave blank to keep";
+  const admLoginUrl = ckField("Admin login URL (defaults to the login URL above if blank)", "text", adm.login_url || "");
+  const admCookie = ckTextareaField("Admin session cookie — optional fallback if auto-login can't drive the form", "");
+  if (adm.cookie_set) admCookie.input.placeholder = "•••• saved session cookie — leave blank to keep";
+  admCookie.input.rows = 2;
+  admWrap.append(admEmail.wrap, admPassword.wrap, admLoginUrl.wrap, admCookie.wrap);
+  form.append(admWrap);
+
   const submit = cel("button", "ck-btn primary", editing ? "Update program" : "Save program");
   submit.type = "submit";
   form.append(submit);
@@ -6116,6 +6133,13 @@ function ckProgramSetupForm() {
         login_url: accLoginUrl.input.value.trim(),
         register_url: accRegisterUrl.input.value.trim(),
         cookie: accCookie.input.value.trim(),
+      },
+      // Second, higher-privilege account (optional) — same blank-means-keep semantics as above.
+      admin_account_access: {
+        email: admEmail.input.value.trim(),
+        password: admPassword.input.value,
+        login_url: admLoginUrl.input.value.trim(),
+        cookie: admCookie.input.value.trim(),
       },
       user_agent_suffix: uaSuffix.input.value,
       // This form owns the structured-scope table, so a save here should always re-derive
@@ -9545,6 +9569,9 @@ function bootCockpit() {
   });
   ck.theme?.addEventListener("click", () => toggleTheme());
   for (const btn of ck.navButtons) btn.addEventListener("click", () => ckSetView(btn.dataset.ckView));
+  // Seed aria-current on the initially-active nav button — the default view is set via the HTML
+  // is-active class (not through ckSetView), so it would otherwise stay unset until the first click.
+  ck.navButtons.find((b) => b.classList.contains("is-active"))?.setAttribute("aria-current", "page");
   // Escape closes the finding-detail aside (only reachable when it's open, i.e. hunt mode).
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && ck.detail && !ck.detail.hidden) ckCloseDetail();

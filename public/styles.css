@@ -3251,8 +3251,9 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-list .ck-floc { flex: 1; }
 .ck-tag { font-size: 0.7rem; color: var(--muted); padding: 0.12rem 0.45rem; border: 1px solid var(--border); border-radius: 999px; white-space: nowrap; }
 
-/* Operator tab */
-.ck-nav-5 { grid-template-columns: 1fr 1fr 1fr; }
+/* Operator tab — the cockpit nav holds 8 views; keep an even 2-column grid
+   (3 columns left a ragged trailing row of 2). */
+.ck-nav-5 { grid-template-columns: repeat(2, 1fr); }
 .ck-op-ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; margin: 0.4rem 0 1.2rem; }
 .ck-op-log { max-height: 14rem; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); padding: 0.5rem 0.7rem; margin-bottom: 1.2rem; }
 .ck-op-event { display: flex; gap: 0.6rem; font-size: 0.78rem; line-height: 1.6; font-family: var(--code-font); color: var(--text); }

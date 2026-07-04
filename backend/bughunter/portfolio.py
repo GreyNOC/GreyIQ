@@ -47,6 +47,7 @@ _DEFAULTS: dict[str, Any] = {
     "h1_program_stats": {},        # real signals from HackerOne's program resource (offers_bounties, fast_payments, etc.) — see hackerone_import.fetch_structured_scope
     "notes": "",                   # free text — policy excerpt, reward table, anything pasted in
     "account_access": {},          # program research-account access (email/password/login_url/cookie) — see _clean_account_access. SENSITIVE: only ever sent to the program's OWN login page / in-scope hosts, never logged, password redacted in API responses.
+    "admin_account_access": {},    # OPTIONAL second, HIGHER-privilege research account (same shape as account_access). When set, unlocks the autonomous BFLA / cross-tenant checks — the low-priv account_access is the "attacker" session, this is the ground-truth admin session. SENSITIVE, same handling.
     "user_agent_suffix": "",       # a mandatory UA tag some programs require appended to every in-scope request (e.g. " -BugBounty-acme-31337 ")
     "active": False,               # capture proof-of-impact (active verification)
     "live": False,                 # dynamic Playwright pass
@@ -193,6 +194,7 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     out["h1_program_stats"] = _clean_h1_program_stats(out.get("h1_program_stats"))
     out["notes"] = str(out.get("notes") or "")[:4000]
     out["account_access"] = _clean_account_access(out.get("account_access"))
+    out["admin_account_access"] = _clean_account_access(out.get("admin_account_access"))
     out["user_agent_suffix"] = _clean_ua_suffix(out.get("user_agent_suffix"))
     # Convenience default ONLY: derive scope_text/in_scope_hosts/out_of_scope_hosts from
     # structured_scope when the caller hasn't already typed a scope. Never overrides a

@@ -82,6 +82,15 @@ class HuntBrainTests(unittest.TestCase):
         plan = hunt_brain.plan_hunt({}, "https://app.example.com/", "app.example.com", SURFACE)
         self.assertEqual(plan["idor_candidates"], ["https://app.example.com/api/orders"])  # only the real in-scope one
 
+    def test_privileged_endpoints_only_keep_verbatim_in_scope_endpoints(self) -> None:
+        self._brain_returns(
+            '{"param_hypotheses": [], "probe_priority": [],'
+            ' "privileged_endpoints": ["https://app.example.com/download",'   # verbatim in-scope -> kept
+            '                          "https://evil.com/admin",'             # invented host -> dropped
+            '                          "https://app.example.com/download"]}')  # duplicate -> deduped
+        plan = hunt_brain.plan_hunt({}, "https://app.example.com/", "app.example.com", SURFACE)
+        self.assertEqual(plan["privileged_endpoints"], ["https://app.example.com/download"])  # only the real in-scope one
+
     def test_payloads_and_urls_are_rejected_as_param_names(self) -> None:
         self._brain_returns(
             '{"param_hypotheses": ["<script>alarm(1)</script>", "https://evil.com/x", "q=1&a=2",'

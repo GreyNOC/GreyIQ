@@ -182,6 +182,7 @@ def _run_campaign_body(
     on_progress: Any = None,
     disclose_automation: bool = False,
     excluded_hosts: tuple[str, ...] = (),
+    admin_account_access: dict[str, Any] | None = None,
     progress_run_id: str | None = None,
     progress_unit: str | None = None,
 ) -> dict[str, Any]:
@@ -243,6 +244,9 @@ def _run_campaign_body(
     # Endpoints the reasoning layer judged object-scoped (worth a single-session IDOR probe) — each is
     # verbatim from the in-scope discovered set; the prover re-gates scope+SSRF before touching one.
     idor_candidates: list[str] = []
+    # Endpoints the reasoning layer judged ADMIN / privileged functions (worth a dual-session BFLA
+    # check — is the privileged action reachable by a low-priv session?) — verbatim in-scope only.
+    privileged_endpoints: list[str] = []
     # Param NAMES the reasoning layer judged the SSRF (url-taking) / XSS (reflective) surface — steer
     # WHICH params those two checks try first; the checks still supply the payload and confirm.
     brain_ssrf_params: list[str] = []
@@ -296,10 +300,13 @@ def _run_campaign_body(
             if hunt_priority:
                 _emit(f"hunt-brain: prioritised probe classes on {len(hunt_priority)} endpoint(s)")
             idor_candidates = [e for e in (hb.get("idor_candidates") or []) if e in set(urls)]
+            privileged_endpoints = [e for e in (hb.get("privileged_endpoints") or []) if e in set(urls)]
             brain_ssrf_params = list(hb.get("ssrf_params") or [])
             brain_xss_params = list(hb.get("xss_params") or [])
             if brain_ssrf_params or brain_xss_params:
                 _emit(f"hunt-brain: {len(brain_ssrf_params)} SSRF + {len(brain_xss_params)} XSS param candidate(s) to steer those checks")
+            if privileged_endpoints:
+                _emit(f"hunt-brain: {len(privileged_endpoints)} privileged endpoint(s) flagged for a dual-session BFLA check")
         except Exception:  # noqa: BLE001 - the reasoning layer must never break a hunt
             pass
         # Merge the host-global tech-fingerprint hints into EVERY url's priority: the brain's
@@ -476,6 +483,52 @@ def _run_campaign_body(
             if idor_n:
                 _emit(f"hunt-brain IDOR: {idor_n} object-authorization lead(s) from brain-selected endpoint(s)")
         except Exception:  # noqa: BLE001 - the IDOR pass is enrichment; never break the campaign
+            pass
+
+    # --- Brain-selected BFLA probe pass: the reasoning layer flagged these endpoints as ADMIN /
+    # privileged FUNCTIONS. When the program supplied BOTH a regular research account (the low-priv
+    # `auth` session already logged in above) AND a separate admin account (`admin_account_access`),
+    # run the DUAL-ACCOUNT BFLA prover (access_control_service.run_bfla_check) — a three-session
+    # admin/user/anon GET-only differential that CONFIRMS only when the low-privilege session receives
+    # the admin-only response WHILE an anonymous request is denied (so the endpoint is genuinely
+    # privilege-gated, not public). The DETERMINISTIC prover owns the confirm via that captured
+    # differential (observed_result + control_result) — the brain only SELECTED the endpoint, it never
+    # flips a finding to confirmed. Re-gates scope+SSRF itself; the admin login is benign + fail-closed;
+    # a hallucinated pick that isn't really gated falls to enforced/candidate (a clean no-op). Only when
+    # the active pass is on and BOTH sessions resolve. Bounded + best-effort — never breaks the campaign. ---
+    if (effective_active and privileged_endpoints and admin_account_access
+            and isinstance(auth, dict) and (str(auth.get("cookie") or "").strip() or auth.get("headers"))):
+        try:
+            from bughunter import access_control_service
+            admin_auth = _login_auth(admin_account_access, scope, excluded_hosts, _emit)
+            if isinstance(admin_auth, dict) and (str(admin_auth.get("cookie") or "").strip() or admin_auth.get("headers")):
+                bfla_n = 0
+                for ep in privileged_endpoints:
+                    res = access_control_service.run_bfla_check(
+                        ep, admin_account=admin_auth, user_account=auth, scope=scope, settings=campaign_settings)
+                    if not (isinstance(res, dict) and res.get("status") == "confirmed"):
+                        continue
+                    fnd = res.get("finding")
+                    if not fnd:
+                        continue
+                    plan = res.get("attack_plan") or {}
+                    norm_loc = re.sub(r"\d+", "N", str(fnd.get("location") or ep))
+                    key = f"{fnd.get('class_id')}|{fnd.get('rule_id')}|{norm_loc}"
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    bfla_n += 1
+                    fnd["ref"] = f"BFLA{bfla_n}"
+                    consolidated.append({
+                        "finding": fnd, "source_url": ep, "source_report": "", "source_json": "",
+                        "proof_status": str((plan.get("proof_of_impact") or {}).get("status") or "confirmed"),
+                        "cvss": plan.get("cvss") or {}, "plan": plan,
+                    })
+                if bfla_n:
+                    _emit(f"hunt-brain BFLA: {bfla_n} confirmed function-level authorization bypass(es) via the dual-account differential")
+            else:
+                _emit("hunt-brain BFLA: skipped — the admin account did not resolve a session (fail-closed).")
+        except Exception:  # noqa: BLE001 - the BFLA pass is enrichment; never break the campaign
             pass
 
     # --- Drop operator-deleted findings before ranking/submission. The per-URL engine
@@ -711,6 +764,7 @@ def run_campaign_over_targets(
     max_targets: int = _MAX_PROGRAM_TARGETS,
     disclose_automation: bool = False,
     excluded_hosts: tuple[str, ...] = (),
+    admin_account_access: dict[str, Any] | None = None,
     progress_run_id: str | None = None,
     progress_unit: str | None = None,
 ) -> dict[str, Any]:
@@ -804,6 +858,7 @@ def run_campaign_over_targets(
                 account_access=account_access, user_agent_suffix=user_agent_suffix, live=live,
                 program=program, max_pages=max_pages, platform=platform, deep=deep,
                 disclose_automation=disclose_automation, on_progress=_target_emit, excluded_hosts=excluded_hosts,
+                admin_account_access=admin_account_access,
                 progress_run_id=progress_run_id, progress_unit=unit,
             )
             if progress_unit is None:
@@ -962,6 +1017,7 @@ def run_portfolio_campaign(
                       "excluded_hosts": tuple(str(h) for h in (p.get("excluded_hosts") or [])),
                       "disclose_automation": bool(p.get("disclose_automation")),
                       "account_access": p.get("account_access") if isinstance(p.get("account_access"), dict) else {},
+                      "admin_account_access": p.get("admin_account_access") if isinstance(p.get("admin_account_access"), dict) else {},
                       "user_agent_suffix": str(p.get("user_agent_suffix") or "")})
     if not clean:
         return {"ok": False, "error": "No huntable programs — each needs seed targets or an imported/built structured scope."}
@@ -1013,7 +1069,8 @@ def run_portfolio_campaign(
                 default_reports_dir=portfolio_root, seed_dir=seed_dir, runtime_dir=runtime_dir, version=version,
                 active=active, time_based=time_based, auth=auth, live=live, program=label, max_pages=max_pages,
                 platform=platform, deep=deep, disclose_automation=spec["disclose_automation"],
-                account_access=spec["account_access"], user_agent_suffix=spec["user_agent_suffix"],
+                account_access=spec["account_access"], admin_account_access=spec.get("admin_account_access"),
+                user_agent_suffix=spec["user_agent_suffix"],
                 excluded_hosts=spec["excluded_hosts"], on_progress=_p_emit,
                 progress_run_id=progress_run_id, progress_unit=label,
             )

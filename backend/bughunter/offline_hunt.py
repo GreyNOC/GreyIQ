@@ -44,6 +44,11 @@ _TECH_CLASS = {
 
 _NUMERIC_SEG_RE = re.compile(r"/\d+(?:/|$)")
 _UUID_SEG_RE = re.compile(r"/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?:/|$)")
+# path substrings that mark an ADMIN / privileged FUNCTION worth a dual-session BFLA check (is the
+# privileged action reachable by a low-privilege session?). Distinct from IDOR — this is function-level.
+_PRIV_PATH_HINTS = ("/admin", "/internal", "/manage", "/moderat", "/staff", "/superuser", "/root/",
+                    "/console", "/dashboard/admin", "/settings", "/config", "/audit", "/approve",
+                    "/promote", "/grant", "/role", "/permission", "/impersonat", "/billing", "/payout")
 _ACTIVE_CLASSES = ("xss", "sqli", "redirect", "ssti", "rce", "crlf", "path-traversal", "cors", "nosqli", "host-header")
 _CAP = 24
 
@@ -115,6 +120,7 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
     xss_params: list[str] = []
     param_hypotheses: list[str] = []
     idor_candidates: list[str] = []
+    privileged_endpoints: list[str] = []
     priority: list[dict[str, Any]] = []
     seen_pri: set[str] = set()
 
@@ -134,6 +140,10 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
         if _NUMERIC_SEG_RE.search(url) or _UUID_SEG_RE.search(url) or any(_hit(n, _IDOR_PARAM_HINTS) for n in names):
             if url not in idor_candidates:
                 idor_candidates.append(url)
+        # admin / privileged FUNCTION path -> BFLA candidate (function-level, not object-level)
+        low_path = urlparse(url).path.lower()
+        if any(h in low_path for h in _PRIV_PATH_HINTS) and url not in privileged_endpoints:
+            privileged_endpoints.append(url)
         for n in names + list(recon_params):
             if _hit(n, _SSRF_HINTS) and n not in ssrf_params:
                 ssrf_params.append(n)
@@ -151,6 +161,7 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
         "ssrf_params": ssrf_params[:12],
         "xss_params": xss_params[:12],
         "idor_candidates": idor_candidates[:6],
+        "privileged_endpoints": privileged_endpoints[:6],
         "notes": (f"offline knowledge-rule plan over {len(endpoints)} endpoint(s)"
                   + (" (sharpened by learned priors)" if priors else "")),
     }

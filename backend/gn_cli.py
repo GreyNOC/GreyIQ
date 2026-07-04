@@ -554,12 +554,15 @@ def _cmd_bundle(args: argparse.Namespace) -> int:
     if not src or not Path(src).is_dir():
         return _err(f"not a folder: {src or '(none)'} — point this at an engagement/campaign output directory.")
     out = args.out or (src.rstrip("/\\") + ".zip")
-    res = bundle.bundle_directory(src, out)
+    res = bundle.bundle_directory(src, out, meta={"tool": "GreyIQ BugHunter", "version": VERSION})
     if not res.get("ok"):
         return _err(res.get("error", "could not build the bundle."))
     print(f"{_c('Bundle written', '1')}: {res['path']}")
     print(f"  {res['file_count']} file(s), {res.get('zip_bytes', 0)} bytes"
           + (f", {len(res['skipped'])} skipped" if res.get("skipped") else ""))
+    if res.get("manifest"):
+        print(f"  evidence integrity manifest: {', '.join(res['manifest'])} "
+              f"(verify with: sha256sum -c MANIFEST.sha256)")
     return 0
 
 
