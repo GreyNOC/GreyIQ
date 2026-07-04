@@ -183,6 +183,7 @@ def _run_campaign_body(
     disclose_automation: bool = False,
     excluded_hosts: tuple[str, ...] = (),
     admin_account_access: dict[str, Any] | None = None,
+    idor_pairs: list[dict[str, Any]] | None = None,
     progress_run_id: str | None = None,
     progress_unit: str | None = None,
 ) -> dict[str, Any]:
@@ -485,50 +486,102 @@ def _run_campaign_body(
         except Exception:  # noqa: BLE001 - the IDOR pass is enrichment; never break the campaign
             pass
 
+    # --- Dual-account access-control passes (BFLA + cross-tenant IDOR). Both need a SECOND owned
+    # session, so resolve the admin/second-account login ONCE and share it. Only when the active pass is
+    # on, the program supplied a second account (`admin_account_access`), the primary `auth` session
+    # exists, and there's actually work for it (brain-flagged privileged endpoints and/or operator-
+    # supplied IDOR pairs). The login is benign + scope-gated + fail-closed inside `_login_auth`. ---
+    _has_primary = isinstance(auth, dict) and (str(auth.get("cookie") or "").strip() or auth.get("headers"))
+    admin_auth: dict[str, Any] | None = None
+    if (effective_active and admin_account_access and _has_primary and (privileged_endpoints or idor_pairs)):
+        admin_auth = _login_auth(admin_account_access, scope, excluded_hosts, _emit)
+        if not (isinstance(admin_auth, dict) and (str(admin_auth.get("cookie") or "").strip() or admin_auth.get("headers"))):
+            admin_auth = None
+            _emit("dual-account access-control: skipped — the second account did not resolve a session (fail-closed).")
+
     # --- Brain-selected BFLA probe pass: the reasoning layer flagged these endpoints as ADMIN /
-    # privileged FUNCTIONS. When the program supplied BOTH a regular research account (the low-priv
-    # `auth` session already logged in above) AND a separate admin account (`admin_account_access`),
-    # run the DUAL-ACCOUNT BFLA prover (access_control_service.run_bfla_check) — a three-session
-    # admin/user/anon GET-only differential that CONFIRMS only when the low-privilege session receives
-    # the admin-only response WHILE an anonymous request is denied (so the endpoint is genuinely
-    # privilege-gated, not public). The DETERMINISTIC prover owns the confirm via that captured
+    # privileged FUNCTIONS. Run the DUAL-ACCOUNT BFLA prover (access_control_service.run_bfla_check) —
+    # a three-session admin/user/anon GET-only differential that CONFIRMS only when the low-privilege
+    # session receives the admin-only response WHILE an anonymous request is denied (so the endpoint is
+    # genuinely privilege-gated, not public). The DETERMINISTIC prover owns the confirm via that captured
     # differential (observed_result + control_result) — the brain only SELECTED the endpoint, it never
-    # flips a finding to confirmed. Re-gates scope+SSRF itself; the admin login is benign + fail-closed;
-    # a hallucinated pick that isn't really gated falls to enforced/candidate (a clean no-op). Only when
-    # the active pass is on and BOTH sessions resolve. Bounded + best-effort — never breaks the campaign. ---
-    if (effective_active and privileged_endpoints and admin_account_access
-            and isinstance(auth, dict) and (str(auth.get("cookie") or "").strip() or auth.get("headers"))):
+    # flips a finding to confirmed. Re-gates scope+SSRF itself; a hallucinated pick that isn't really
+    # gated falls to enforced/candidate (a clean no-op). Bounded + best-effort — never breaks the campaign. ---
+    if admin_auth and privileged_endpoints:
         try:
             from bughunter import access_control_service
-            admin_auth = _login_auth(admin_account_access, scope, excluded_hosts, _emit)
-            if isinstance(admin_auth, dict) and (str(admin_auth.get("cookie") or "").strip() or admin_auth.get("headers")):
-                bfla_n = 0
-                for ep in privileged_endpoints:
-                    res = access_control_service.run_bfla_check(
-                        ep, admin_account=admin_auth, user_account=auth, scope=scope, settings=campaign_settings)
-                    if not (isinstance(res, dict) and res.get("status") == "confirmed"):
-                        continue
-                    fnd = res.get("finding")
-                    if not fnd:
-                        continue
-                    plan = res.get("attack_plan") or {}
-                    norm_loc = re.sub(r"\d+", "N", str(fnd.get("location") or ep))
-                    key = f"{fnd.get('class_id')}|{fnd.get('rule_id')}|{norm_loc}"
-                    if key in seen_keys:
-                        continue
-                    seen_keys.add(key)
-                    bfla_n += 1
-                    fnd["ref"] = f"BFLA{bfla_n}"
-                    consolidated.append({
-                        "finding": fnd, "source_url": ep, "source_report": "", "source_json": "",
-                        "proof_status": str((plan.get("proof_of_impact") or {}).get("status") or "confirmed"),
-                        "cvss": plan.get("cvss") or {}, "plan": plan,
-                    })
-                if bfla_n:
-                    _emit(f"hunt-brain BFLA: {bfla_n} confirmed function-level authorization bypass(es) via the dual-account differential")
-            else:
-                _emit("hunt-brain BFLA: skipped — the admin account did not resolve a session (fail-closed).")
+            bfla_n = 0
+            for ep in privileged_endpoints:
+                res = access_control_service.run_bfla_check(
+                    ep, admin_account=admin_auth, user_account=auth, scope=scope, settings=campaign_settings)
+                if not (isinstance(res, dict) and res.get("status") == "confirmed"):
+                    continue
+                fnd = res.get("finding")
+                if not fnd:
+                    continue
+                plan = res.get("attack_plan") or {}
+                norm_loc = re.sub(r"\d+", "N", str(fnd.get("location") or ep))
+                key = f"{fnd.get('class_id')}|{fnd.get('rule_id')}|{norm_loc}"
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                bfla_n += 1
+                fnd["ref"] = f"BFLA{bfla_n}"
+                consolidated.append({
+                    "finding": fnd, "source_url": ep, "source_report": "", "source_json": "",
+                    "proof_status": str((plan.get("proof_of_impact") or {}).get("status") or "confirmed"),
+                    "cvss": plan.get("cvss") or {}, "plan": plan,
+                })
+            if bfla_n:
+                _emit(f"hunt-brain BFLA: {bfla_n} confirmed function-level authorization bypass(es) via the dual-account differential")
         except Exception:  # noqa: BLE001 - the BFLA pass is enrichment; never break the campaign
+            pass
+
+    # --- Operator-supplied cross-tenant IDOR pass: for each object-URL pair the operator explicitly
+    # provided (url_a owned by the PRIMARY account, url_b a different object owned by the SECOND
+    # account), run the DUAL-SESSION IDOR prover (access_control_service.run_idor_check) — a three-
+    # request differential (A reads A's object / B reads B's object / B reads A's object) that CONFIRMS
+    # only when B receives A's specific object, distinct from B's own. The pairs are NEVER auto-derived
+    # (auto-pairing a neighbour id corrupts the ownership control → false confirmeds); the operator
+    # asserts the ownership. The prover owns the confirm and re-gates scope+SSRF; the captured proof is
+    # the differential only, never the cross-tenant body. Scoped to pairs whose object is on a host this
+    # campaign actually touched, so a program-wide pair isn't re-tested once per target in a span.
+    # Bounded + best-effort — never breaks the campaign. ---
+    if admin_auth and idor_pairs:
+        try:
+            from bughunter import access_control_service
+            campaign_hosts = {(urlparse(str(u)).hostname or "").lower() for u in urls if u}
+            xidor_n = 0
+            for pair in idor_pairs:
+                url_a = str((pair or {}).get("url_a") or "").strip()
+                url_b = str((pair or {}).get("url_b") or "").strip()
+                if not url_a or not url_b:
+                    continue
+                if (urlparse(url_a).hostname or "").lower() not in campaign_hosts:
+                    continue   # this pair's object isn't on a host this campaign covered — skip (a span re-run tests it under its own target)
+                res = access_control_service.run_idor_check(
+                    url_a, url_b, account_a=auth, account_b=admin_auth, scope=scope, settings=campaign_settings)
+                if not (isinstance(res, dict) and res.get("status") == "confirmed"):
+                    continue
+                fnd = res.get("finding")
+                if not fnd:
+                    continue
+                plan = res.get("attack_plan") or {}
+                norm_loc = re.sub(r"\d+", "N", str(fnd.get("location") or url_a))
+                key = f"{fnd.get('class_id')}|{fnd.get('rule_id')}|{norm_loc}"
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                xidor_n += 1
+                fnd["ref"] = f"XIDOR{xidor_n}"
+                consolidated.append({
+                    "finding": fnd, "source_url": url_a, "source_report": "", "source_json": "",
+                    "proof_status": str((plan.get("proof_of_impact") or {}).get("status") or "confirmed"),
+                    "cvss": plan.get("cvss") or {}, "plan": plan,
+                })
+            if xidor_n:
+                _emit(f"cross-tenant IDOR: {xidor_n} confirmed cross-account object read(s) from operator-supplied pair(s)")
+        except Exception:  # noqa: BLE001 - the IDOR pass is enrichment; never break the campaign
             pass
 
     # --- Drop operator-deleted findings before ranking/submission. The per-URL engine
@@ -765,6 +818,7 @@ def run_campaign_over_targets(
     disclose_automation: bool = False,
     excluded_hosts: tuple[str, ...] = (),
     admin_account_access: dict[str, Any] | None = None,
+    idor_pairs: list[dict[str, Any]] | None = None,
     progress_run_id: str | None = None,
     progress_unit: str | None = None,
 ) -> dict[str, Any]:
@@ -858,7 +912,7 @@ def run_campaign_over_targets(
                 account_access=account_access, user_agent_suffix=user_agent_suffix, live=live,
                 program=program, max_pages=max_pages, platform=platform, deep=deep,
                 disclose_automation=disclose_automation, on_progress=_target_emit, excluded_hosts=excluded_hosts,
-                admin_account_access=admin_account_access,
+                admin_account_access=admin_account_access, idor_pairs=idor_pairs,
                 progress_run_id=progress_run_id, progress_unit=unit,
             )
             if progress_unit is None:
@@ -1018,6 +1072,7 @@ def run_portfolio_campaign(
                       "disclose_automation": bool(p.get("disclose_automation")),
                       "account_access": p.get("account_access") if isinstance(p.get("account_access"), dict) else {},
                       "admin_account_access": p.get("admin_account_access") if isinstance(p.get("admin_account_access"), dict) else {},
+                      "idor_pairs": p.get("idor_pairs") if isinstance(p.get("idor_pairs"), list) else [],
                       "user_agent_suffix": str(p.get("user_agent_suffix") or "")})
     if not clean:
         return {"ok": False, "error": "No huntable programs — each needs seed targets or an imported/built structured scope."}
@@ -1070,7 +1125,7 @@ def run_portfolio_campaign(
                 active=active, time_based=time_based, auth=auth, live=live, program=label, max_pages=max_pages,
                 platform=platform, deep=deep, disclose_automation=spec["disclose_automation"],
                 account_access=spec["account_access"], admin_account_access=spec.get("admin_account_access"),
-                user_agent_suffix=spec["user_agent_suffix"],
+                idor_pairs=spec.get("idor_pairs"), user_agent_suffix=spec["user_agent_suffix"],
                 excluded_hosts=spec["excluded_hosts"], on_progress=_p_emit,
                 progress_run_id=progress_run_id, progress_unit=label,
             )

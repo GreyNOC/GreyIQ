@@ -3293,6 +3293,14 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-scope-check { display: flex; align-items: center; gap: 0.3rem; font-size: 0.74rem; color: var(--muted); cursor: pointer; white-space: nowrap; }
 .ck-scope-rm { padding: 0.3rem 0.55rem; color: var(--muted); }
 
+/* Cross-tenant IDOR test-pair rows (Program form) */
+.ck-idor-body { display: flex; flex-direction: column; gap: 0.35rem; margin-bottom: 0.5rem; }
+.ck-idor-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 0.4rem; align-items: center; }
+.ck-idor-row input[type="text"] {
+  font: inherit; font-size: 0.78rem; color: var(--text); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 7px; padding: 0.35rem 0.5rem; width: 100%; box-sizing: border-box;
+}
+
 /* Guided first-run wizard */
 .ck-wizard {
   position: fixed; inset: 0; z-index: 80; display: flex; align-items: flex-end; justify-content: flex-end;

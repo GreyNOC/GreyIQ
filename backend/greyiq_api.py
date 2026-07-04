@@ -906,6 +906,7 @@ class ProgramUpsertRequest(BaseModel):
     notes: str = Field(default="", max_length=4000)
     account_access: dict[str, Any] = Field(default_factory=dict)  # research-account email/password/login_url/cookie — SENSITIVE (portfolio._clean_account_access bounds it; password/cookie redacted on read-back)
     admin_account_access: dict[str, Any] = Field(default_factory=dict)  # SECOND (high-privilege) research account for dual-account BFLA — same shape+redaction as account_access; the low-priv account_access is the "user" session
+    idor_pairs: list[dict[str, Any]] = Field(default_factory=list, max_length=50)  # operator-supplied cross-tenant IDOR test pairs [{url_a, url_b, label}] — object URLs only, no secrets (portfolio._clean_idor_pairs bounds/dedups/caps)
     user_agent_suffix: str = Field(default="", max_length=120)    # a mandatory UA tag some programs require appended to every in-scope request
     resync_scope: bool = False  # re-derive scope_text/hosts from structured_scope even if scope_text is already set (see portfolio.upsert_program)
     active: bool = False
@@ -1934,6 +1935,7 @@ class GreyIQRuntime:
         excluded_hosts = tuple(str(h) for h in (program_obj.get("out_of_scope_hosts") or [])) if program_obj else ()
         account_access = program_obj.get("account_access") if program_obj else None
         admin_account_access = program_obj.get("admin_account_access") if program_obj else None
+        idor_pairs = program_obj.get("idor_pairs") if program_obj else None
         user_agent_suffix = str(program_obj.get("user_agent_suffix") or "") if program_obj else ""
         # An explicit cookie/header in the request wins; otherwise pass auth=None so the program's
         # stored research-account credentials (account_access) drive an auto-login in run_campaign.
@@ -1953,6 +1955,7 @@ class GreyIQRuntime:
             auth=req_auth,
             account_access=account_access,
             admin_account_access=admin_account_access,
+            idor_pairs=idor_pairs,
             user_agent_suffix=user_agent_suffix,
             live=request.live,
             program=request.program,
@@ -2002,6 +2005,7 @@ class GreyIQRuntime:
             auth=req_auth,
             account_access=program.get("account_access"),
             admin_account_access=program.get("admin_account_access"),
+            idor_pairs=program.get("idor_pairs"),
             user_agent_suffix=str(program.get("user_agent_suffix") or ""),
             live=request.live,
             program=program_label,
@@ -2054,6 +2058,7 @@ class GreyIQRuntime:
                 "disclose_automation": bool(program.get("disclose_automation")),
                 "account_access": program.get("account_access"),
                 "admin_account_access": program.get("admin_account_access"),
+                "idor_pairs": program.get("idor_pairs"),
                 "user_agent_suffix": str(program.get("user_agent_suffix") or ""),
             })
         if not specs:
@@ -2069,7 +2074,13 @@ class GreyIQRuntime:
             version=VERSION,
             active=request.active,
             time_based=request.time_based,
-            auth={"cookie": request.auth_cookie, "headers": request.auth_headers},
+            # An explicit request-level cookie/header wins; otherwise pass auth=None (NOT an empty dict)
+            # so each program's own stored account_access drives a per-program auto-login. A non-None
+            # empty dict here would suppress that login (run_campaign_over_targets only logs in when
+            # `auth is None`), silently disabling ALL authenticated hunting — single-account AND the
+            # dual-account BFLA / cross-tenant IDOR confirmation passes — for every portfolio run.
+            auth=({"cookie": request.auth_cookie, "headers": request.auth_headers}
+                  if (request.auth_cookie or request.auth_headers) else None),
             live=request.live,
             max_pages=request.max_pages,
             deep=request.deep,

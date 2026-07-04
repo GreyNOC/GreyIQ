@@ -2,6 +2,26 @@
 
 Notable changes to GreyIQ.
 
+## v0.83.0
+
+### Cross-tenant IDOR — the engine now proves one account can read another's data
+- Building on the two-account setup, you can now list **object-URL pairs** on a program: an object your
+  *first* account owns and a *different* object your *second* account owns. During an active hunt the
+  engine runs the dual-session **IDOR / BOLA** check on each pair — it reads your first account's object
+  as your *second* account and confirms the bug only when the second account receives the first
+  account's specific object (distinct from its own data). A properly-scoped app returns the second
+  account's own data or a 403, so this can't false-positive on a shared or static page.
+- The pairs are **always operator-supplied** — the engine never guesses which object belongs to which
+  account (guessing would corrupt the ownership control and invent findings). The captured proof is the
+  differential only (statuses + similarity ratios), never the other user's data. GET-only, in scope,
+  and fail-closed: no pairs, no second account, or any error simply skips the check.
+
+### Fixed: authenticated hunting was silently off in Portfolio Hunt
+- Running a **Portfolio Hunt** (many programs at once) was ignoring each program's saved research
+  account, so every program hunted logged-*out* — which also meant the dual-account BFLA and cross-tenant
+  IDOR checks never ran there. Portfolio Hunt now logs into each program's own account just like a
+  single-program run, so authenticated findings (and the two-account proofs) work in every run mode.
+
 ## v0.82.0
 
 ### Dual-account testing — the engine now proves admin-only functions aren't really admin-only
