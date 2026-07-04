@@ -28,6 +28,7 @@ from bughunter import brain_narrative
 from bughunter import credential_validation
 from bughunter import oob_service
 from bughunter import fsutil
+from bughunter import hunt_loop
 from bughunter import impact_model
 from bughunter import ledger
 from bughunter import next_steps as next_steps_lib
@@ -1309,7 +1310,17 @@ def run_bounty_hunt(
         _emit(f"running active verification against {len(raw_findings)} candidate(s)"
               + (" (time-based probes enabled)…" if time_based else "…"))
         try:
-            active_findings, active_meta = active_verify_service.verify_active(clean_target, raw_findings, scope=scope, time_based=time_based, auth=auth_ctx, extra_params=extra_params, settings=settings, class_priority=class_priority, xss_params=xss_params)
+            # Opt-in AI-driven iterative loop (probe -> observe -> re-plan): a bounded SCHEDULER over the
+            # SAME verify_active, so every scope/SSRF/budget/confirm guardrail applies unchanged. Off by
+            # default; falls back to the single pass below whenever it isn't enabled.
+            if hunt_loop.iterative_enabled(coder_cfg, settings):
+                active_findings, active_meta = hunt_loop.run_iterative_verify(
+                    clean_target, raw_findings, scope=scope, time_based=time_based, auth=auth_ctx,
+                    extra_params=extra_params, settings=settings, class_priority=class_priority,
+                    xss_params=xss_params, coder_cfg=coder_cfg,
+                    surface={"endpoints": [clean_target], "params": list(extra_params or [])}, on_progress=_emit)
+            else:
+                active_findings, active_meta = active_verify_service.verify_active(clean_target, raw_findings, scope=scope, time_based=time_based, auth=auth_ctx, extra_params=extra_params, settings=settings, class_priority=class_priority, xss_params=xss_params)
             if active_findings:
                 raw_findings = list(raw_findings) + active_findings
                 if "active" not in scanners_run:

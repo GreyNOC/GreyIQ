@@ -83,6 +83,11 @@ class ScannerSettings:
     active_scan_allowlist: tuple[str, ...] = ()
     active_time_sqli_delay_seconds: float = 4.0
     active_time_sqli_margin_seconds: float = 3.0
+    # Iterative hunt loop (the AI-driven reactive pass): OFF by default (opt-in) — it adds a brain
+    # round-trip per re-plan, so it should only run when the operator turns it on. Bounded by
+    # max-iters AND the shared per-host governor + the single hunt's request budget (never expanded).
+    hunt_loop_enabled: bool = False
+    hunt_loop_max_iters: int = 3
     # Per-request exclusion filter (NOT sourced from env -- callers that resolve a
     # saved portfolio program build a settings override via dataclasses.replace() with
     # that program's out_of_scope_hosts). Checked first, and can only ever NARROW scope
@@ -102,4 +107,6 @@ def get_settings() -> ScannerSettings:
         active_scan_allowlist=_suffixes_env("GREYIQ_ACTIVE_SCAN_ALLOWLIST"),
         active_time_sqli_delay_seconds=_float_env("GREYIQ_ACTIVE_TIME_SQLI_DELAY_S", 4.0),
         active_time_sqli_margin_seconds=_float_env("GREYIQ_ACTIVE_TIME_SQLI_MARGIN_S", 3.0),
+        hunt_loop_enabled=_bool_env("GREYIQ_HUNT_LOOP_ENABLED", False),
+        hunt_loop_max_iters=max(1, min(_int_env("GREYIQ_HUNT_LOOP_MAX_ITERS", 3), 6)),
     )
