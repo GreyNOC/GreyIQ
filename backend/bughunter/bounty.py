@@ -1553,6 +1553,9 @@ def run_bounty_hunt(
         "score": score,
         "findings": display,
         "attack_plans": attack_plans,
+        # Carried so the per-platform submission renderer can ask the brain for a platform-voiced
+        # Summary (submission_writer); absent -> the deterministic description is used (fail-closed).
+        "coder_cfg": coder_cfg,
         "manual_checklist": checklist,
         "methodology": methodology,
         "brain": brain,
