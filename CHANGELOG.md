@@ -2,6 +2,34 @@
 
 Notable changes to GreyIQ.
 
+## v0.82.0
+
+### Dual-account testing — the engine now proves admin-only functions aren't really admin-only
+- You can now give a program a **second, higher-privilege research account** (an admin/manager role you
+  also control) alongside your regular one. When both are set, the engine runs a **broken function-level
+  authorization (BFLA)** check: it takes an admin-only function the AI flagged, requests it as your
+  *low-privilege* account, and confirms the bug only when that account gets the same admin response
+  *and* an anonymous request is denied — so the endpoint is genuinely privilege-gated, yet the
+  under-privileged user reached it.
+- The proof carries only the differential (response sizes, status codes, the anonymous control's
+  denial) — never the privileged page's body. Everything stays benign and GET-only, in scope, and
+  fails closed: no admin account, no session, or any error simply skips the check.
+- The AI only *selects* which admin function to test; the engine's three-session differential is what
+  confirms it. Both accounts' passwords and cookies are stored locally, sent only to the program's own
+  login page, and never shown again after saving.
+
+### Every evidence bundle now ships a chain-of-custody manifest
+- Downloaded evidence zips now include an **integrity manifest**: `EVIDENCE-MANIFEST.json` (the tool,
+  version, time, and a SHA-256 + size for every artifact) and `MANIFEST.sha256` in the standard
+  `sha256sum -c` format. After unzipping, a triager runs `sha256sum -c MANIFEST.sha256` (macOS:
+  `shasum -a 256 -c`) and a matching digest proves every proof file — request/response transcripts,
+  the JSON sidecar, the screenshots — is byte-for-byte unaltered. That's what turns a pile of captured
+  files into verifiable evidence.
+
+### UI polish
+- Cockpit navigation marks the current view for screen readers (`aria-current`), the live hunt log is
+  quieter, and the nav grid is evenly spaced.
+
 ## v0.81.0
 
 ### Offline hunts are now steered — and they learn
