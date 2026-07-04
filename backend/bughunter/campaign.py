@@ -42,7 +42,7 @@ from bughunter import (
     submission,
     web_ingest,
 )
-from bughunter.bounty import _classify, _infer_kind, _safe_slug, run_bounty_hunt
+from bughunter.bounty import _classify, _infer_kind, _safe_slug, build_findings_har, build_replay_script, run_bounty_hunt
 from bughunter.registrable_domain import registrable_domain
 from bughunter.settings import get_settings
 from bughunter.target_ingest import _normalize_one
@@ -623,6 +623,25 @@ def _run_campaign_body(
         n = _capture_proof_screenshots(confirmed[:8], out_root / "screenshots", clean_target, scope)
         if n:
             _emit(f"captured {n} proof screenshot(s) for confirmed finding(s).")
+
+    # --- Replayable proof-of-exploit artifacts: a copy-paste `replay.sh` (each confirmed finding's
+    # benign crafted request as curl) + a `findings.har` (importable into Burp/browser devtools),
+    # written to the campaign folder so the "download everything" bundle ships a machine-replayable
+    # reproduction of every confirmed finding. Requests only — no response bodies embedded (the
+    # differential-only proof discipline); secrets redacted. Best-effort, never breaks the campaign. ---
+    if confirmed:
+        try:
+            replay, replay_n = build_replay_script(confirmed)
+            if replay_n:
+                fsutil.write_text_safe(out_root / "replay.sh", replay)
+            har, har_n = build_findings_har(confirmed, version=version,
+                                            generated_at=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"))
+            if har_n:
+                fsutil.write_text_safe(out_root / "findings.har", json.dumps(har, indent=2))
+            if replay_n or har_n:
+                _emit(f"wrote replayable PoC artifacts (replay.sh: {replay_n}, findings.har: {har_n} request(s)).")
+        except Exception:  # noqa: BLE001 - artifact export is best-effort; never break the campaign
+            pass
 
     # --- DEEP mode ALSO writes a brain-researched dossier per confirmed lead (the expensive part,
     # deterministic offline fallback). The screenshot above already ran for these findings. ---

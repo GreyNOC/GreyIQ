@@ -20,6 +20,7 @@ import shlex
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlparse
 from uuid import uuid4
 
 import coder
@@ -56,6 +57,11 @@ _TOKEN_ISSUER_VALIDATORS = {
     "secret.npm-token": credential_validation.validate_npm_token,
     "secret.sendgrid-key": credential_validation.validate_sendgrid_key,
     "secret.digitalocean-token": credential_validation.validate_digitalocean_token,
+    # GCP service-account key: the detected secret_value is the whole SA JSON, so the generic
+    # single-value dispatch works (the validator parses client_email + private_key from it).
+    "secret.gcp-service-account": credential_validation.validate_gcp_service_account,
+    # NOTE: AWS access keys are NOT here — they need the PAIRED secret access key (SigV4), handled as a
+    # special case in the credential-validation loop below (a single value can't sign a request).
 }
 
 # --- Vuln classes: how a finding category maps to a bounty bug class, plus the
@@ -524,6 +530,101 @@ def _curl_from_evidence(pe: dict[str, Any], url: str) -> tuple[str, str]:
         parts.append(f"-H {shlex.quote(req_hdr)}")
     parts.append(shlex.quote(target))
     return " ".join(parts), target
+
+
+def _poi_of(item: dict[str, Any]) -> dict[str, Any]:
+    """The observed-vs-control differential for a consolidated item — from an inline ``plan``
+    (synthetic CVE/IDOR/BFLA findings) or carried directly on the item (per-URL active findings)."""
+    plan = item.get("plan") if isinstance(item.get("plan"), dict) else {}
+    poi = plan.get("proof_of_impact") if isinstance(plan.get("proof_of_impact"), dict) else {}
+    if not poi and isinstance(item.get("proof_of_impact"), dict):
+        poi = item["proof_of_impact"]
+    return poi if isinstance(poi, dict) else {}
+
+
+def build_replay_script(items: list[dict[str, Any]]) -> tuple[str, int]:
+    """A runnable ``replay.sh`` reproducing each CONFIRMED finding's crafted benign request as a
+    copy-paste ``curl`` (reusing ``_curl_from_evidence``). Every GreyIQ active probe is an idempotent
+    GET/HEAD/OPTIONS, so the reproductions are safe to re-run IN SCOPE with the operator's own
+    authorization. Any detected secret is redacted as a belt-and-suspenders. Returns
+    ``(script_text, count)``; ``("", 0)`` when no confirmed finding captured a crafted request line."""
+    body: list[str] = []
+    n = 0
+    for it in (items or []):
+        finding = it.get("finding") if isinstance(it.get("finding"), dict) else {}
+        pe = finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {}
+        url = str(finding.get("location") or it.get("source_url") or "")
+        curl, _target = _curl_from_evidence(pe, url)
+        if not curl:
+            continue
+        n += 1
+        ref = str(finding.get("ref") or f"F{n}")
+        title = str(finding.get("title") or "").replace("\n", " ")[:120]
+        obs = str(_poi_of(it).get("observed_result") or "").replace("\n", " ").strip()[:200]
+        body.append(f"# [{ref}] {title}")
+        if obs:
+            body.append(f"#   observed: {obs}")
+        body.append(curl)
+        body.append("")
+    if n == 0:
+        return "", 0
+    header = [
+        "#!/usr/bin/env bash",
+        "# GreyIQ — replay the benign request that CONFIRMED each finding.",
+        "# Each is an idempotent GET/HEAD/OPTIONS; run ONLY in scope, with your own authorization.",
+        "set -u",
+        "",
+    ]
+    text, _redacted = redact_text("\n".join(header + body))
+    return text + "\n", n
+
+
+def build_findings_har(items: list[dict[str, Any]], version: str = "", generated_at: str = "") -> tuple[dict[str, Any], int]:
+    """A minimal, valid HAR 1.2 log of the crafted requests that confirmed each finding — importable
+    into Burp / browser devtools to re-issue. Each entry carries only the benign crafted request line +
+    a literal (non-placeholder) crafted header; response BODIES are never embedded (GreyIQ's
+    differential-only proof discipline) — only the redacted observed-differential summary. Returns
+    ``(har, count)``."""
+    stamp = str(generated_at or "").strip() or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    entries: list[dict[str, Any]] = []
+    for it in (items or []):
+        finding = it.get("finding") if isinstance(it.get("finding"), dict) else {}
+        pe = finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {}
+        req_line = str(pe.get("request_line") or "").strip()
+        method, _sep, target = req_line.partition(" ")
+        target = target.strip()
+        if not target.startswith(("http://", "https://")):
+            continue
+        # Redact any detected secret riding in the crafted URL / header BEFORE it lands in the HAR — the
+        # same guarantee build_replay_script gives (it redacts its whole output). A finding confirmed on
+        # one param of a URL whose sibling param carries a token must not leak that token into the
+        # auto-bundled findings.har. Parse the query from the REDACTED url so its values are redacted too.
+        target, _rt = redact_text(target)
+        headers: list[dict[str, str]] = []
+        rh = str(pe.get("request_header") or "").strip()
+        if rh and "<" not in rh and ":" in rh:
+            name, _c, val = rh.partition(":")
+            rval, _rv = redact_text(val.strip()[:400])
+            headers.append({"name": name.strip()[:120], "value": rval})
+        try:
+            query = [{"name": k, "value": v} for k, v in parse_qsl(urlparse(target).query)]
+        except ValueError:
+            query = []
+        status_m = re.search(r"\b(\d{3})\b", str(pe.get("response_status") or ""))
+        status = int(status_m.group(1)) if status_m else 0
+        obs, _r = redact_text(str(_poi_of(it).get("observed_result") or "")[:500])
+        entries.append({
+            "startedDateTime": stamp, "time": 0,
+            "request": {"method": (method.strip().upper() or "GET"), "url": target, "httpVersion": "HTTP/1.1",
+                        "cookies": [], "headers": headers, "queryString": query, "headersSize": -1, "bodySize": 0},
+            "response": {"status": status, "statusText": "", "httpVersion": "HTTP/1.1", "cookies": [], "headers": [],
+                         "content": {"size": len(obs), "mimeType": "text/plain", "text": obs},
+                         "redirectURL": "", "headersSize": -1, "bodySize": len(obs)},
+            "cache": {}, "timings": {"send": 0, "wait": 0, "receive": 0},
+            "comment": f"[{finding.get('ref') or ''}] {str(finding.get('title') or '')[:120]}",
+        })
+    har = {"log": {"version": "1.2", "creator": {"name": "GreyIQ BugHunter", "version": str(version)}, "entries": entries}}
+    return har, len(entries)
 
 
 def _html_open_poc(target: str, title: str, lead: str) -> str:
@@ -1388,11 +1489,35 @@ def run_bounty_hunt(
     # Best-effort; an error never breaks a hunt.
     if authorized:
         exposure_findings: list[dict[str, Any]] = []
+        # AWS keys need the access-key-id AND its paired secret to sign a SigV4 request, but the two are
+        # detected as SEPARATE findings. Index each file's secret access key (the 40-char tail of the
+        # aws_secret_access_key match) so an access-key-id in the SAME file can be paired for validation.
+        # A wrong pairing only ever yields a SignatureDoesNotMatch/403 -> not-live, never a false confirm.
+        aws_secret_by_file: dict[str, str] = {}
+        for f in raw_findings:
+            if isinstance(f, dict) and f.get("rule_id") == "secret.aws-secret-access-key":
+                m = re.search(r"([A-Za-z0-9/+=]{40})\s*$", str(f.get("secret_value") or ""))
+                if m:
+                    aws_secret_by_file.setdefault(str(f.get("file_path") or ""), m.group(1))
         for finding in raw_findings:
             if not isinstance(finding, dict) or finding.get("_credential_proof") is not None:
                 continue
             key = str(finding.get("secret_value") or "").strip()
             rule_id = str(finding.get("rule_id") or "")
+            # AWS access key: pair it with its file's secret access key and prove liveness via a
+            # SigV4-signed sts:GetCallerIdentity (reads only the caller's OWN identity, no resource).
+            if rule_id == "secret.aws-access-key-id" and key:
+                aws_secret = aws_secret_by_file.get(str(finding.get("file_path") or ""))
+                if aws_secret:
+                    try:
+                        finding["_credential_proof"] = proof = credential_validation.validate_aws_key(key, aws_secret)
+                    except Exception as exc:  # noqa: BLE001 - liveness check is best-effort; never break a hunt
+                        _emit(f"credential validation error: {exc}")
+                        continue
+                    live = proof.get("live")
+                    _emit(f"validated AWS key: " + ("LIVE — " + (proof.get("principal") or "?") if live
+                                                    else "not live" if live is False else "inconclusive"))
+                continue  # no paired secret -> stays a detected (candidate) leak; don't run other validators
             # Non-Google credentials: prove liveness the same benign way — one read-only request to the
             # token's OWN issuer (never the target), turning a detection-only leak into a proven one.
             validator = _TOKEN_ISSUER_VALIDATORS.get(rule_id)

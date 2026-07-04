@@ -16,12 +16,16 @@ scan target):
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import re
 import urllib.error
 import urllib.request
+from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 # Only a credential ISSUER's own infrastructure is ever contacted — a fixed host allowlist (+ the
 # *.firebaseio.com RTDB suffix). Each dynamic host (Firebase project id) is derived from the issuer's
@@ -33,6 +37,8 @@ _ALLOWED_HOSTS = frozenset({
     "api.openai.com", "api.anthropic.com", "api.stripe.com",  # OpenAI / Anthropic / Stripe key liveness
     "gitlab.com", "registry.npmjs.org",  # GitLab PAT / npm token liveness
     "api.sendgrid.com", "api.digitalocean.com",  # SendGrid / DigitalOcean token liveness
+    "sts.amazonaws.com",  # AWS key liveness — sts:GetCallerIdentity (reads only the caller's own ARN)
+    "oauth2.googleapis.com",  # GCP service-account key liveness — JWT token exchange (proves auth, reads nothing)
 })
 _ALLOWED_SUFFIXES = (".firebaseio.com",)
 _TIMEOUT_S = 8
@@ -543,6 +549,182 @@ def validate_digitalocean_token(token: str) -> dict[str, Any]:
     if status in (401, 403):
         result.update(live=False)
         result["detail"] = f"NOT live — DigitalOcean rejected the token (HTTP {status})."
+        return result
+    result["detail"] = f"Inconclusive (HTTP {status or 'no response'}) — validate manually within scope."
+    return result
+
+
+def _post_form(url: str, data: dict[str, str], extra_headers: dict[str, str] | None = None) -> tuple[int, str]:
+    """POST a form-encoded body to a URL on the issuer allowlist and return (status, body). Never
+    raises. Used ONLY for a credential's own issuer token exchange (GCP). Redirects are not followed.
+    The host is re-checked against the allowlist so a POST can never reach a non-issuer host."""
+    if not _host_allowed(urlparse(url).hostname or ""):
+        return 0, "host not allowlisted"
+    body = urlencode(data).encode("utf-8")
+    hdrs = {"User-Agent": _UA, "Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
+    if extra_headers:
+        hdrs.update(extra_headers)
+    req = urllib.request.Request(url, method="POST", data=body, headers=hdrs)
+    try:
+        with _OPENER.open(req, timeout=_TIMEOUT_S) as resp:  # noqa: S310 - fixed https issuer host, no redirects
+            return int(getattr(resp, "status", 0) or 200), resp.read(_MAX_BYTES).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        body_s = ""
+        try:
+            body_s = exc.read(_MAX_BYTES).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            pass
+        return int(exc.code or 0), body_s
+    except Exception as exc:  # noqa: BLE001 - network/DNS/timeout -> inconclusive, never fatal
+        return 0, f"{type(exc).__name__}: {exc}"
+
+
+# --- AWS access key liveness via SigV4-signed sts:GetCallerIdentity --------------------------------
+# GetCallerIdentity returns ONLY the caller's own ARN / account / user id — it reads no resource and
+# changes nothing, so it is the canonical benign "is this key live and whose is it?" probe. SigV4 uses
+# HMAC-SHA256 (stdlib), so no crypto dependency. The request goes only to sts.amazonaws.com.
+_AWS_REGION = "us-east-1"
+_AWS_SERVICE = "sts"
+_STS_HOST = "sts.amazonaws.com"
+_STS_QUERY = "Action=GetCallerIdentity&Version=2011-06-15"
+_AKID_RE = re.compile(r"\A(?:AKIA|ASIA)[0-9A-Z]{16}\Z")
+
+
+def _sign(key: bytes, msg: str) -> bytes:
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _sigv4_headers(access_key_id: str, secret_access_key: str, amzdate: str, datestamp: str) -> dict[str, str]:
+    """Build the SigV4 Authorization + X-Amz-Date headers for a GET sts:GetCallerIdentity call. Signed
+    headers are host;x-amz-date; the body is empty (GET). Pure HMAC-SHA256 per the AWS SigV4 spec."""
+    canonical_headers = f"host:{_STS_HOST}\nx-amz-date:{amzdate}\n"
+    signed_headers = "host;x-amz-date"
+    payload_hash = hashlib.sha256(b"").hexdigest()
+    canonical_request = "\n".join(["GET", "/", _STS_QUERY, canonical_headers, signed_headers, payload_hash])
+    credential_scope = f"{datestamp}/{_AWS_REGION}/{_AWS_SERVICE}/aws4_request"
+    string_to_sign = "\n".join([
+        "AWS4-HMAC-SHA256", amzdate, credential_scope,
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    ])
+    k_date = _sign(("AWS4" + secret_access_key).encode("utf-8"), datestamp)
+    k_region = _sign(k_date, _AWS_REGION)
+    k_service = _sign(k_region, _AWS_SERVICE)
+    k_signing = _sign(k_service, "aws4_request")
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    authorization = (f"AWS4-HMAC-SHA256 Credential={access_key_id}/{credential_scope}, "
+                     f"SignedHeaders={signed_headers}, Signature={signature}")
+    return {"X-Amz-Date": amzdate, "Authorization": authorization}
+
+
+def validate_aws_key(access_key_id: str, secret_access_key: str) -> dict[str, Any]:
+    """Validate a leaked AWS access key + secret via SigV4-signed ``sts:GetCallerIdentity`` — ONE
+    benign, read-only GET to the key's OWN issuer (AWS STS, never the target). A 200 returns the
+    caller's ARN/account (the key is live and identified); a 403 (SignatureDoesNotMatch /
+    InvalidClientTokenId) means the pair is invalid/inactive. NO resource is read — GetCallerIdentity
+    returns only the caller's own identity."""
+    access_key_id = str(access_key_id or "").strip()
+    secret_access_key = str(secret_access_key or "").strip()
+    result = _credential_result("AWS sts:GetCallerIdentity")
+    result["no_data_read"] = True  # returns only the caller's OWN identity — no resource is ever read
+    if not _AKID_RE.match(access_key_id) or len(secret_access_key) < 40:
+        return result  # not a well-formed AWS pair -> unchecked (never sign junk)
+    url = f"https://{_STS_HOST}/?{_STS_QUERY}"
+    result["poc"] = ("# with the paired key configured (aws configure):\n"
+                     "aws sts get-caller-identity")
+    now = datetime.now(UTC)
+    headers = _sigv4_headers(access_key_id, secret_access_key, now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d"))
+    status, _h, body = _get_full(url, headers)
+    result["checked"] = True
+    result["http_status"] = status
+    if status == 200:
+        arn = (re.search(r"<Arn>([^<]+)</Arn>", body) or [None, ""])[1]
+        account = (re.search(r"<Account>([^<]+)</Account>", body) or [None, ""])[1]
+        result.update(live=True, principal=arn or account or "(unknown)")
+        result["response_excerpt"] = f"Arn={arn}; Account={account}"
+        result["detail"] = (
+            f"LIVE — the key authenticates to AWS as '{arn or account or '(unknown)'}'. It can act on every "
+            "AWS resource that principal's IAM policy grants (potentially full account access). Validated "
+            "with GetCallerIdentity, which reads only the caller's own identity — NO resource was accessed."
+        )
+        return result
+    err = (re.search(r"<Code>([^<]+)</Code>", body) or [None, ""])[1]
+    if status in (403, 401):
+        result.update(live=False)
+        result["response_excerpt"] = f"error={err}" if err else body[:150]
+        result["detail"] = f"NOT live — AWS STS rejected the key (HTTP {status}{f'; {err}' if err else ''})."
+        return result
+    result["detail"] = f"Inconclusive (HTTP {status or 'no response'}) — validate manually within scope."
+    return result
+
+
+# --- GCP service-account key liveness via a JWT token exchange --------------------------------------
+_GCP_TOKEN_URL = "https://oauth2.googleapis.com/token"  # HARDCODED issuer — never the JSON's token_uri (SSRF-safe)
+_GCP_SCOPE = "https://www.googleapis.com/auth/cloud-platform.read-only"  # read-only, though the token is never used to read
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def validate_gcp_service_account(sa_json: str) -> dict[str, Any]:
+    """Validate a leaked GCP service-account key (the JSON with ``private_key`` + ``client_email``) by
+    minting a short-lived RS256 JWT signed with the key and exchanging it at Google's OWN token
+    endpoint — ONE benign POST to oauth2.googleapis.com (never the target, and NEVER the JSON's own
+    ``token_uri``, which is ignored to stay SSRF-safe). A 200 returning an access_token proves the key
+    is live and names the service account; a 400/401 means it is revoked/disabled. Getting the token
+    proves authentication — it is never used to read any resource."""
+    result = _credential_result("GCP oauth2.googleapis.com/token")
+    result["no_data_read"] = True  # only proves the key can mint a token — the token is never used
+    try:
+        data = json.loads(sa_json) if isinstance(sa_json, str) else (sa_json or {})
+    except (ValueError, TypeError):
+        return result
+    if not isinstance(data, dict) or str(data.get("type") or "") != "service_account":
+        return result
+    client_email = str(data.get("client_email") or "").strip()
+    private_key = str(data.get("private_key") or "").strip()
+    if not client_email or "BEGIN" not in private_key:
+        return result
+    result["poc"] = ("# save the key JSON, then:\n"
+                     "gcloud auth activate-service-account --key-file=key.json && gcloud auth print-access-token")
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+    except ImportError:
+        result["detail"] = "Inconclusive — RSA signing (cryptography) is unavailable in this build; validate manually within scope."
+        return result
+    now = int(datetime.now(UTC).timestamp())
+    header = _b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode("utf-8"))
+    claims = _b64url(json.dumps({
+        "iss": client_email, "scope": _GCP_SCOPE, "aud": _GCP_TOKEN_URL, "iat": now, "exp": now + 300,
+    }).encode("utf-8"))
+    signing_input = f"{header}.{claims}".encode("ascii")
+    try:
+        key = serialization.load_pem_private_key(private_key.encode("utf-8"), password=None)
+        signature = key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+    except Exception as exc:  # noqa: BLE001 - malformed key -> inconclusive, never fatal
+        result["detail"] = f"Inconclusive — could not load/sign with the private key ({type(exc).__name__})."
+        return result
+    assertion = f"{header}.{claims}.{_b64url(signature)}"
+    status, body = _post_form(_GCP_TOKEN_URL, {
+        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion,
+    })
+    result["checked"] = True
+    result["http_status"] = status
+    if status == 200 and '"access_token"' in body:
+        result.update(live=True, principal=client_email)
+        result["response_excerpt"] = "access_token issued (value withheld)"  # never store the minted token
+        result["detail"] = (
+            f"LIVE — the service-account key '{client_email}' minted a Google access token. It can act on "
+            "every GCP resource that service account's IAM roles grant. Proven by a token exchange only — "
+            "the token was NOT used to read any resource."
+        )
+        return result
+    if status in (400, 401, 403):
+        err = (re.search(r'"error"\s*:\s*"([^"]+)"', body) or [None, ""])[1]
+        result.update(live=False)
+        result["response_excerpt"] = f"error={err}" if err else body[:150]
+        result["detail"] = f"NOT live — Google rejected the key (HTTP {status}{f'; {err}' if err else ''})."
         return result
     result["detail"] = f"Inconclusive (HTTP {status or 'no response'}) — validate manually within scope."
     return result

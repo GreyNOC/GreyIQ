@@ -117,5 +117,41 @@ class CampaignPersistsActiveDifferentialTests(unittest.TestCase):
         self.assertIn("did not reflect", poi.get("control_result", ""))
 
 
+class CampaignWritesReplayArtifactsTests(unittest.TestCase):
+    """A confirmed finding's benign crafted request is exported to the campaign folder as replay.sh +
+    findings.har, so the download bundle ships a machine-replayable reproduction."""
+
+    def test_confirmed_finding_emits_replay_sh_and_findings_har(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        doc = {
+            "findings": [{"ref": "F1", "title": "Reflected XSS", "severity": "high", "class_id": "xss",
+                          "rule_id": "active.reflected-xss", "location": "https://t.example/q?x=1", "cwe": "CWE-79",
+                          "proof_evidence": {"request_line": "GET https://t.example/q?x=1",
+                                             "request_header": "Origin: https://evil.example", "response_status": "HTTP 200"}}],
+            "proof_of_impact": {"F1": {"status": "confirmed", "observed_result": "the payload reflected UNENCODED",
+                                       "control_result": "a benign marker did not reflect"}},
+            "cvss": {"F1": {"base_score": 6.1}}, "attack_plans": {},
+        }
+        (tmp / "run.json").write_text(json.dumps(doc), encoding="utf-8")
+        orig = (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves)
+        campaign.recon.discover = lambda t, **k: {"urls": [t], "notes": [], "sources": {}, "js_secrets": [], "tech": [], "params": [], "forms": []}
+        campaign.run_bounty_hunt = lambda *a, **k: {"ok": True, "json_path": str(tmp / "run.json"), "report_path": ""}
+        campaign.cve_service.scan_known_cves = lambda *a, **k: []
+        try:
+            result = campaign.run_campaign("https://t.example/", scope="t.example", authorized=True, coder_cfg=None,
+                                           default_reports_dir=tmp, program="demo", active=True, version="9.9.9")
+        finally:
+            campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves = orig
+
+        out_root = Path(result["campaign_path"]).parent
+        replay = out_root / "replay.sh"
+        har = out_root / "findings.har"
+        self.assertTrue(replay.is_file(), "replay.sh was written")
+        self.assertIn("curl -i -H 'Origin: https://evil.example' 'https://t.example/q?x=1'", replay.read_text(encoding="utf-8"))
+        self.assertTrue(har.is_file(), "findings.har was written")
+        har_doc = json.loads(har.read_text(encoding="utf-8"))
+        self.assertEqual(har_doc["log"]["entries"][0]["request"]["url"], "https://t.example/q?x=1")
+
+
 if __name__ == "__main__":
     unittest.main()

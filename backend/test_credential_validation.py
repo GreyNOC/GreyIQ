@@ -199,6 +199,68 @@ class TokenLivenessTests(unittest.TestCase):
         cv._get_full = lambda url, extra_headers=None: (401, {}, '{"id":"unauthorized"}')
         self.assertIs(cv.validate_digitalocean_token("dop_v1_bad")["live"], False)
 
+    def test_aws_sigv4_matches_the_published_get_vanilla_vector(self) -> None:
+        # correctness of the SigV4 signing primitive against AWS's canonical published test case
+        import hashlib
+        import hmac
+        secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+        amzdate, datestamp, region, service = "20150830T123600Z", "20150830", "us-east-1", "service"
+        ch = f"host:example.amazonaws.com\nx-amz-date:{amzdate}\n"
+        cr = "\n".join(["GET", "/", "", ch, "host;x-amz-date", hashlib.sha256(b"").hexdigest()])
+        sts = "\n".join(["AWS4-HMAC-SHA256", amzdate, f"{datestamp}/{region}/{service}/aws4_request",
+                         hashlib.sha256(cr.encode()).hexdigest()])
+        kd = cv._sign(("AWS4" + secret).encode(), datestamp)
+        ksign = cv._sign(cv._sign(cv._sign(kd, region), service), "aws4_request")
+        sig = hmac.new(ksign, sts.encode(), hashlib.sha256).hexdigest()
+        self.assertEqual(sig, "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31")
+
+    def test_aws_key_live_names_the_caller_identity(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (200, {}, "<GetCallerIdentityResponse><GetCallerIdentityResult>"
+            "<Arn>arn:aws:iam::123456789012:user/leaked</Arn><Account>123456789012</Account>"
+            "</GetCallerIdentityResult></GetCallerIdentityResponse>")
+        r = cv.validate_aws_key("AKIA" + "A" * 16, "w" * 40)
+        self.assertIs(r["live"], True)
+        self.assertIn("arn:aws:iam::123456789012:user/leaked", r["principal"])
+        self.assertTrue(r["no_data_read"])                       # GetCallerIdentity reads only the caller's own identity
+        self.assertIn("get-caller-identity", r["poc"])
+
+    def test_aws_key_dead_on_403(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (403, {}, "<ErrorResponse><Error><Code>InvalidClientTokenId</Code></Error></ErrorResponse>")
+        self.assertIs(cv.validate_aws_key("AKIA" + "B" * 16, "x" * 40)["live"], False)
+
+    def test_aws_junk_pair_is_never_signed(self) -> None:
+        sent = []
+        cv._get_full = lambda url, extra_headers=None: (sent.append(url), (200, {}, ""))[1]
+        r = cv.validate_aws_key("not-an-akid", "short")
+        self.assertFalse(r["checked"])                           # malformed pair -> never contacts AWS
+        self.assertEqual(sent, [])
+
+    def test_gcp_service_account_live_and_ssrf_safe(self) -> None:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        pem = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
+        sa = json.dumps({"type": "service_account", "client_email": "svc@proj.iam.gserviceaccount.com",
+                         "private_key": pem, "token_uri": "https://evil.example/token"})   # attacker token_uri
+        posted = {}
+        cv._post_form = lambda url, data, extra_headers=None: (posted.update(url=url), (200, '{"access_token":"ya29.SECRET"}'))[1]
+        r = cv.validate_gcp_service_account(sa)
+        self.assertIs(r["live"], True)
+        self.assertEqual(r["principal"], "svc@proj.iam.gserviceaccount.com")
+        self.assertEqual(posted["url"], "https://oauth2.googleapis.com/token")   # HARDCODED issuer, NOT the JSON's evil token_uri
+        self.assertNotIn("ya29.SECRET", r["response_excerpt"])                    # the minted token is never stored
+
+    def test_gcp_dead_key_and_non_service_account_json(self) -> None:
+        cv._post_form = lambda url, data, extra_headers=None: (401, '{"error":"invalid_grant"}')
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        pem = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
+        dead = json.dumps({"type": "service_account", "client_email": "x@y.iam", "private_key": pem})
+        self.assertIs(cv.validate_gcp_service_account(dead)["live"], False)
+        # a JSON that is not a service-account key is never checked (never signs/sends)
+        self.assertFalse(cv.validate_gcp_service_account('{"type":"authorized_user"}')["checked"])
+
     def test_new_validators_are_registered_for_their_detection_rules(self) -> None:
         # compare by name, not identity: this class's tearDown reload of cv swaps function objects while
         # bounty still holds the originals — same function, different id.
@@ -235,11 +297,45 @@ class TokenLivenessTests(unittest.TestCase):
 
     def test_new_issuer_hosts_allowlisted_others_blocked(self) -> None:
         for h in ("api.github.com", "slack.com", "api.openai.com", "api.anthropic.com", "api.stripe.com",
-                  "gitlab.com", "registry.npmjs.org", "api.sendgrid.com", "api.digitalocean.com"):
+                  "gitlab.com", "registry.npmjs.org", "api.sendgrid.com", "api.digitalocean.com",
+                  "sts.amazonaws.com", "oauth2.googleapis.com"):
             self.assertTrue(cv._host_allowed(h), h)
         self.assertFalse(cv._host_allowed("evil.example.com"))
         # a token is only ever sent to its allowlisted issuer — never an arbitrary host
         self.assertEqual(cv._get_full("https://evil.example.com/steal")[0], 0)
+
+
+class AwsPairingIntegrationTests(unittest.TestCase):
+    """AWS keys are detected as two SEPARATE findings (id + secret); the hunt must pair the two from the
+    same file and hand the SigV4 validator BOTH, since a single value cannot sign a request."""
+
+    def test_hunt_pairs_the_access_key_id_with_its_file_secret(self) -> None:
+        import tempfile
+        from bughunter import bounty
+        from bughunter.bounty import run_bounty_hunt
+
+        captured: list = []
+        orig = bounty.credential_validation.validate_aws_key
+        bounty.credential_validation.validate_aws_key = lambda akid, secret: (
+            captured.append((akid, secret)),
+            {"checked": True, "live": True, "principal": "arn:aws:iam::1:user/x", "http_status": 200,
+             "endpoint": "AWS sts:GetCallerIdentity", "no_data_read": True, "detail": "LIVE", "poc": "aws sts get-caller-identity",
+             "scopes": "", "project_id": "", "authorized_domains": [], "response_excerpt": "Arn=..."})[1]
+        try:
+            with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as out:
+                (Path(src) / "creds.env").write_text(
+                    "aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n"
+                    "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY\n", encoding="utf-8")
+                report = run_bounty_hunt(src, "source-code", None, out, "local", True, {},
+                                         default_reports_dir=Path(out), seed_dir=BACKEND_DIR / "seed")
+        finally:
+            bounty.credential_validation.validate_aws_key = orig
+
+        self.assertTrue(report.get("ok"), report.get("error"))
+        self.assertEqual(len(captured), 1, "the AWS validator ran exactly once for the paired key")
+        akid, secret = captured[0]
+        self.assertEqual(akid, "AKIAIOSFODNN7EXAMPLE")                       # the access-key-id verbatim
+        self.assertEqual(secret, "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")  # the paired 40-char secret, extracted
 
 
 class SecretCaptureTests(unittest.TestCase):
