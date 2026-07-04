@@ -683,6 +683,11 @@ class ProofEvidenceInput(BaseModel):
     request_line: str = Field(default="", max_length=4000)
     request_header: str = Field(default="", max_length=2000)
     response_status: str = Field(default="", max_length=400)
+    # The RESPONSE header IS the proof for open-redirect / CRLF / host-header findings (the injected
+    # Location: / X-Greyiq-Crlf: line); without these the on-demand report drops the actual exploit
+    # evidence for that whole class. set_cookie likewise for session-fixation-style proofs.
+    response_header: str = Field(default="", max_length=2000)
+    set_cookie: str = Field(default="", max_length=2000)
     matched_value: str = Field(default="", max_length=6000)
     read_data: str = Field(default="", max_length=8000)
 
@@ -1628,6 +1633,10 @@ class GreyIQRuntime:
             "observed": proof.get("observed_result", ""), "control": proof.get("control_result", ""),
             "evidence": proof.get("evidence", ""), "limitations": proof.get("limitations", ""),
             "affected_asset": proof.get("affected_asset", ""),
+            # The captured request/response artifact (redirect Location:, CORS ACAO/ACAC, the reflected
+            # marker, read_data) — carried through so the on-demand "Prove" flow records the ACTUAL
+            # exploit evidence, not just the observed/control prose.
+            "proof_evidence": r.get("proof_evidence") or {},
         }
 
     def _capture_proof_screenshot(self, url: str, scope: str, settings: Any) -> dict[str, Any]:
@@ -1732,6 +1741,12 @@ class GreyIQRuntime:
             poi.update({k: v for k, v in fields.items() if v})
             poi["status"] = "confirmed"
             plan["proof_of_impact"] = poi
+            # Record the ACTUAL captured request/response exploit artifact on the finding (the on-demand
+            # Prove flow previously kept only the observed/control prose and threw the artifact away), so
+            # the submission report renders the concrete headers / reflected marker / disclosed data.
+            pe = best.get("proof_evidence")
+            if isinstance(pe, dict) and pe:
+                finding["proof_evidence"] = pe
             # Stamp the finding too, so a finding-level proof reader agrees with the plan.
             finding["proof_status"] = "confirmed"
         return True
@@ -2189,6 +2204,20 @@ class GreyIQRuntime:
             "no_data_read": bool(proof.get("no_data_read")),
             "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
         }
+
+        # A LIVE Firebase key: also probe the open RTDB / Storage exposure (the actual DATA-STORE
+        # exposure, not just liveness) — mirroring the inline hunt so re-testing a key from the UI
+        # records the Firebase project/DB exposure too. Best-effort; never breaks the credential test.
+        firebase_exposure: list[dict[str, Any]] = []
+        if live is True and str(proof.get("project_id") or "").strip():
+            try:
+                for exp in bounty_credential_validation.probe_firebase_exposure(str(proof["project_id"]), key):
+                    if isinstance(exp, dict) and exp.get("evidence"):
+                        exp["evidence"] = redact_text(str(exp["evidence"]))[0]
+                    firebase_exposure.append(exp)
+            except Exception:  # noqa: BLE001 - exposure probe is enrichment; never fail the test
+                pass
+        artifact["firebase_exposure"] = firebase_exposure
 
         lines = [
             f"API KEY ACCESS TEST - {artifact['title'] or request.ref}",
