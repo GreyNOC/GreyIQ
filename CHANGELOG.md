@@ -2,6 +2,20 @@
 
 Notable changes to GreyIQ.
 
+## v0.79.0
+
+### The AI now helps find an entire bug class it missed before
+- **Autonomous IDOR / broken object-level authorization.** When a program has an account configured
+  and the active pass is on, the AI reads the discovered endpoints, picks the ones that address a
+  specific object by id, and the engine runs its single-session IDOR probe on them **as your logged-in
+  research account** — surfacing "this object id can be walked to a neighbour's data" leads the hunt
+  produced none of before. Reported as candidates (a single session can't prove cross-tenant on its
+  own), pointing at the dual-account confirm. The AI only ever *selects* an already-in-scope endpoint;
+  the engine does the probing, stays in scope, and owns the verdict.
+- **Safer AI-written text.** Every piece of text the AI contributes to a report is now secret-redacted
+  and screened for prompt-injection before it can appear, and dropped entirely if it looks tampered —
+  so nothing an AI echoes from a scanned page can mislead a triager.
+
 ## v0.78.2
 
 ### OpenAI hosted model compatibility
