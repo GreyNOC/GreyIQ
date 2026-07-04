@@ -9545,6 +9545,9 @@ function bootCockpit() {
   });
   ck.theme?.addEventListener("click", () => toggleTheme());
   for (const btn of ck.navButtons) btn.addEventListener("click", () => ckSetView(btn.dataset.ckView));
+  // Seed aria-current on the initially-active nav button — the default view is set via the HTML
+  // is-active class (not through ckSetView), so it would otherwise stay unset until the first click.
+  ck.navButtons.find((b) => b.classList.contains("is-active"))?.setAttribute("aria-current", "page");
   // Escape closes the finding-detail aside (only reachable when it's open, i.e. hunt mode).
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && ck.detail && !ck.detail.hidden) ckCloseDetail();
