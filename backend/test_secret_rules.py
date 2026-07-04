@@ -49,5 +49,36 @@ class SecretRuleRegressionTests(unittest.TestCase):
         self.assertIn("[REDACTED_SECRET", finding["snippet"])
 
 
+class NewProviderTokenDetectionTests(unittest.TestCase):
+    """The GitLab / npm / SendGrid / DigitalOcean tokens each have an unmistakable vendor prefix, so
+    detection is HIGH-confidence with a near-zero false-positive rate — the raw material that the live
+    issuer-read validators then confirm."""
+
+    def _rule_ids(self, filename: str, text: str) -> set[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / filename
+            path.write_text(text, encoding="utf-8")
+            result = run_code_scan(str(path), "path")
+        self.assertTrue(result["ok"])
+        return {f["rule_id"] for f in result["findings"]}
+
+    def test_each_provider_token_is_detected(self) -> None:
+        cases = {
+            "secret.gitlab-pat": 'const t = "glpat-' + "A1b2C3d4E5f6G7h8I9j0" + '";',
+            "secret.npm-token": 'const t = "npm_' + "a" * 36 + '";',
+            "secret.sendgrid-key": 'const k = "SG.' + "a" * 22 + "." + "b" * 43 + '";',
+            "secret.digitalocean-token": 'const t = "dop_v1_' + "0123456789abcdef" * 4 + '";',
+        }
+        for rule_id, code in cases.items():
+            self.assertIn(rule_id, self._rule_ids("config.js", code), rule_id)
+
+    def test_near_miss_prefixes_do_not_fire(self) -> None:
+        # too-short / wrong-shape lookalikes must NOT be detected (keeps the FP rate at zero)
+        ids = self._rule_ids("config.js",
+            'a="glpat-short"; b="npm_short"; c="SG.short.short"; d="dop_v1_nothex";')
+        for rule_id in ("secret.gitlab-pat", "secret.npm-token", "secret.sendgrid-key", "secret.digitalocean-token"):
+            self.assertNotIn(rule_id, ids, rule_id)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -52,6 +52,10 @@ _TOKEN_ISSUER_VALIDATORS = {
     "secret.openai-key": credential_validation.validate_openai_key,
     "secret.anthropic-key": credential_validation.validate_anthropic_key,
     "secret.stripe-key": credential_validation.validate_stripe_key,
+    "secret.gitlab-pat": credential_validation.validate_gitlab_token,
+    "secret.npm-token": credential_validation.validate_npm_token,
+    "secret.sendgrid-key": credential_validation.validate_sendgrid_key,
+    "secret.digitalocean-token": credential_validation.validate_digitalocean_token,
 }
 
 # --- Vuln classes: how a finding category maps to a bounty bug class, plus the
