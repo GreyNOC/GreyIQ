@@ -2,6 +2,20 @@
 
 Notable changes to GreyIQ.
 
+## v0.80.2
+
+### Hardening pass — the AI can never overstate a finding, and the exploit proof is always recorded
+- **The AI can never mark a finding "confirmed."** Only the engine's own captured exploit (its
+  request-vs-control differential, a live-credential read, etc.) can confirm a finding — AI wording can
+  no longer make an unproven finding read as proven, and every AI-written line in a report is now
+  scrubbed of secrets and screened for tampering before it can appear.
+- **The actual exploit proof is always recorded.** Confirming a finding after the fact now keeps the
+  real captured request/response (not just a summary), the injected header that proves an open-redirect
+  or header-injection bug is preserved, and re-checking a Firebase key also records the open
+  database/storage exposure — so every report carries the concrete, reproducible proof.
+- The live campaign view now shows that captured proof (and the plain-English impact line) inline,
+  instead of only a status badge.
+
 ## v0.80.1
 
 ### The AI can now drive the hunt as a loop (opt-in)
