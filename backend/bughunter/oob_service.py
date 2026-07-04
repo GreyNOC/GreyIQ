@@ -178,6 +178,7 @@ def confirm_blind_ssrf(
     scope: str = "",
     settings: Any = None,
     extra_params: list[str] | None = None,
+    priority: list[str] | None = None,
     governor: HostRateGovernor | None = None,
     http: _Http | None = None,
     poll_attempts: int = 4,
@@ -205,7 +206,10 @@ def confirm_blind_ssrf(
     governor = governor or HostRateGovernor(
         capacity=settings.active_max_requests_per_host, min_interval_s=settings.active_min_interval_ms / 1000.0)
     http = http or _Http(settings, governor, max_requests=10)
-    params = _candidate_params(sanitized, extra_params, ("url", "next", "dest", "uri", "callback", "u"), 3)
+    # The brain's SSRF picks (params it judges take a URL/host here — image_url, webhook, feed, …) are
+    # tried FIRST, so the budget-heavy blind probe lands on target-specific URL-takers the generic
+    # defaults miss. Names only; the probe supplies the callback URL and confirms via the collaborator.
+    params = _candidate_params(sanitized, extra_params, ("url", "next", "dest", "uri", "callback", "u"), 3, priority=priority)
     tried: list[str] = []
     poll_errors: list[str] = []
     for param in params:

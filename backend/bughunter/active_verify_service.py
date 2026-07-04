@@ -235,14 +235,18 @@ def _clean_param_names(names: Any) -> list[str]:
     return out
 
 
-def _candidate_params(url: str, extra: list[str] | None, default: tuple[str, ...], limit: int) -> list[str]:
-    """Ordered, deduped parameter names a param-keyed check should probe: params already
-    present in the URL FIRST (most likely live), then recon-discovered names, then a small
-    built-in default — capped at ``limit`` (the SAME small per-check cap as before, so an
-    already-parametered URL costs the same number of requests; only param-poor endpoints,
-    which previously tested nothing, gain coverage). Pass ``default=()`` for the SQLi checks
-    so a param-less endpoint with no discovered name still bails — they never invent an
-    injection point."""
+def _candidate_params(url: str, extra: list[str] | None, default: tuple[str, ...], limit: int,
+                      priority: list[str] | None = None) -> list[str]:
+    """Ordered, deduped parameter names a param-keyed check should probe: ``priority`` names FIRST
+    (the reasoning layer's class-specific picks — e.g. the params it judges take a URL for SSRF, or
+    reflect input for XSS — the highest-signal targets, so within the small per-check cap they get
+    tried), then params already present in the URL, then recon-discovered names, then a small built-in
+    default — capped at ``limit`` (the SAME small per-check cap as before, so an already-parametered
+    URL costs the same number of requests). Pass ``default=()`` for the SQLi checks so a param-less
+    endpoint with no discovered name still bails — they never invent an injection point.
+
+    ``priority`` is NAMES ONLY (a name can never carry a payload); the check still supplies the payload
+    and independently confirms, so a brain-suggested name can raise recall but never precision."""
     out: list[str] = []
     seen: set[str] = set()
 
@@ -253,6 +257,8 @@ def _candidate_params(url: str, extra: list[str] | None, default: tuple[str, ...
             seen.add(key)
             out.append(clean)
 
+    for name in priority or []:  # the brain's class-specific picks, tried first within the cap
+        _add(name)
     for key, _ in parse_qsl(urlparse(url).query, keep_blank_values=True):
         _add(key)
     for name in extra or []:
@@ -770,8 +776,9 @@ def _context_excerpt(body: str, needle: str, pad: int = 140) -> str:
     return body[max(0, idx - pad): idx + len(needle) + pad]
 
 
-def _check_reflected_xss(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
-    params = _candidate_params(url, extra_params, ("q",), 3)
+def _check_reflected_xss(http: _Http, url: str, extra_params: list[str] | None = None,
+                         priority: list[str] | None = None) -> dict[str, Any] | None:
+    params = _candidate_params(url, extra_params, ("q",), 3, priority=priority)
     marker_payload = f"{_MARK}<svg/onload=1>"
     for param in params:
         try:
@@ -827,14 +834,15 @@ def _in_double_quoted_attr(body: str, idx: int) -> bool:
     return before[lt:].count('"') % 2 == 1  # odd quotes => currently inside a "…" value
 
 
-def _check_reflected_xss_context(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
+def _check_reflected_xss_context(http: _Http, url: str, extra_params: list[str] | None = None,
+                                 priority: list[str] | None = None) -> dict[str, Any] | None:
     """Reflected XSS in a JS-string or HTML-attribute context that the element-content check (which
     needs a raw ``<svg/onload>``) cannot confirm: the app HTML-encodes ``<`` but leaves ``</script>``
     or a ``"`` unescaped, so the payload still breaks out. Confirmed ONLY when the breakout chars
     reflect UNENCODED *and* the reflection physically sits inside a ``<script>`` element / a double-
     quoted attribute (verified from the surrounding syntax) — a real, browser-executable differential.
     Runs after the element-content check, so it only spends budget when that one didn't fire."""
-    params = _candidate_params(url, extra_params, ("q",), 2)
+    params = _candidate_params(url, extra_params, ("q",), 2, priority=priority)
     for param in params:
         try:
             control = http.fetch(_with_query(url, {param: _MARK}))
@@ -1835,6 +1843,7 @@ def verify_active(
     auth: AuthContext | None = None,
     extra_params: list[str] | None = None,
     class_priority: list[str] | None = None,
+    xss_params: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run the active checks against an in-scope target. Returns
     ``(active_findings, meta)``. ``active_findings`` are confirmed/candidate finding
@@ -1901,10 +1910,10 @@ def verify_active(
         ("cors", lambda: _check_cors(http, sanitized)),
         ("redirect", lambda: _check_open_redirect(http, sanitized, discovered_params)),
         ("host-header", lambda: _check_host_header(http, sanitized)),
-        ("xss", lambda: _check_reflected_xss(http, sanitized, discovered_params)),
+        ("xss", lambda: _check_reflected_xss(http, sanitized, discovered_params, priority=xss_params)),
         # Context-aware XSS runs right after the element-content check — catches the JS-string /
         # attribute breakouts that check structurally can't confirm, spending budget only if it didn't fire.
-        ("xss", lambda: _check_reflected_xss_context(http, sanitized, discovered_params)),
+        ("xss", lambda: _check_reflected_xss_context(http, sanitized, discovered_params, priority=xss_params)),
         ("ssti", lambda: _check_ssti(http, sanitized, discovered_params)),
         # OS command injection via benign $(expr) shell substitution — arithmetic only, no real
         # command runs. Sits next to SSTI (both are safe arithmetic-echo injection probes) and

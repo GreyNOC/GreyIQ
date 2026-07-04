@@ -1235,6 +1235,8 @@ def run_bounty_hunt(
     oob_base: str = "",
     oob_secret: str = "",
     class_priority: list[str] | None = None,
+    ssrf_params: list[str] | None = None,
+    xss_params: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run a bounty hunt end to end and write a Markdown + JSON report.
 
@@ -1307,7 +1309,7 @@ def run_bounty_hunt(
         _emit(f"running active verification against {len(raw_findings)} candidate(s)"
               + (" (time-based probes enabled)…" if time_based else "…"))
         try:
-            active_findings, active_meta = active_verify_service.verify_active(clean_target, raw_findings, scope=scope, time_based=time_based, auth=auth_ctx, extra_params=extra_params, settings=settings, class_priority=class_priority)
+            active_findings, active_meta = active_verify_service.verify_active(clean_target, raw_findings, scope=scope, time_based=time_based, auth=auth_ctx, extra_params=extra_params, settings=settings, class_priority=class_priority, xss_params=xss_params)
             if active_findings:
                 raw_findings = list(raw_findings) + active_findings
                 if "active" not in scanners_run:
@@ -1328,7 +1330,8 @@ def run_bounty_hunt(
             try:
                 _emit("running blind-SSRF OOB probe (collaborator configured)…")
                 ssrf = oob_service.confirm_blind_ssrf(clean_target, base=oob_base, secret=oob_secret,
-                                                      scope=scope, settings=settings, extra_params=extra_params)
+                                                      scope=scope, settings=settings, extra_params=extra_params,
+                                                      priority=ssrf_params)
                 if ssrf.get("ok") and ssrf.get("finding") and ssrf.get("status") in ("confirmed", "candidate"):
                     raw_findings = list(raw_findings) + [ssrf["finding"]]
                     if "active" not in scanners_run:

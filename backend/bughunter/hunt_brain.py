@@ -74,7 +74,7 @@ _MAX_IDOR_CANDIDATES = 6  # bound the brain-selected object-scoped endpoints han
 
 def _empty_plan() -> dict[str, Any]:
     return {"used": False, "provider": "", "model": "", "param_hypotheses": [], "probe_priority": [],
-            "idor_candidates": [], "notes": ""}
+            "idor_candidates": [], "ssrf_params": [], "xss_params": [], "notes": ""}
 
 
 def _norm_class(value: str) -> str:
@@ -150,6 +150,12 @@ def _build_prompt(target: str, scope: str, surface: dict[str, Any]) -> str:
         "numeric or uuid id (a path segment like /order/1001 or /users/42, or an id/account/order/"
         "invoice/user query param) — these are worth a single-session IDOR check. Endpoints copied "
         'verbatim from the list above, most-sensitive object FIRST. Omit if none look object-scoped."],\n'
+        '  "ssrf_params": ["parameter NAMES that likely take a URL or host the server then FETCHES '
+        "(url/uri/dest/target/callback/webhook/image_url/avatar_url/feed/rss/proxy/fetch/load/site/"
+        'link/source/xml/endpoint/api/redirect_uri) — the SSRF injection surface. NAMES ONLY."],\n'
+        '  "xss_params": ["parameter NAMES whose value likely REFLECTS into the HTML response '
+        "(search/q/query/keyword/name/title/message/comment/text/return/error/redirect/lang) — the "
+        'reflected-XSS surface. NAMES ONLY."],\n'
         '  "notes": "optional one-line reasoning"\n'
         "}\n"
         "Order probe_priority MOST-LIKELY-and-highest-impact FIRST (rce/sqli/ssti/path-traversal before "
@@ -161,12 +167,28 @@ def _build_prompt(target: str, scope: str, surface: dict[str, Any]) -> str:
     )
 
 
-def _validate_plan(parsed: Any, surface: dict[str, Any]) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+def _validate_names(raw: Any, cap: int = 12) -> list[str]:
+    """Validate a model-supplied list of PARAMETER NAMES: names only (rejects URLs/payloads/values via
+    _PARAM_NAME_RE), deduped, capped. A name can never carry a payload — the deterministic check does."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for r in (raw if isinstance(raw, list) else []):
+        name = str(r or "").strip()
+        low = name.lower()
+        if _PARAM_NAME_RE.match(name) and low not in seen:
+            seen.add(low)
+            out.append(name)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _validate_plan(parsed: Any, surface: dict[str, Any]) -> tuple[list[str], list[dict[str, Any]], list[str], list[str], list[str]]:
     """Coerce + allowlist-filter the brain's JSON. Returns (param_hypotheses, probe_priority,
-    idor_candidates) with only genuine, in-scope, non-duplicate entries. Never trusts a shape or
-    value from the model."""
+    idor_candidates, ssrf_params, xss_params) with only genuine, in-scope, non-duplicate entries.
+    Never trusts a shape or value from the model."""
     if not isinstance(parsed, dict):
-        return [], [], []
+        return [], [], [], [], []
     known = {str(p).strip().lower() for p in (surface.get("params") or [])}
     allowed_endpoints = {str(u).strip() for u in (surface.get("endpoints") or []) if str(u or "").strip()}
 
@@ -229,7 +251,13 @@ def _validate_plan(parsed: Any, surface: dict[str, Any]) -> tuple[list[str], lis
             idor_candidates.append(ep)
         if len(idor_candidates) >= _MAX_IDOR_CANDIDATES:
             break
-    return params, priority, idor_candidates
+
+    # ssrf_params / xss_params: the params the brain judges take a URL/host (SSRF surface) or reflect
+    # user input into the page (XSS surface). NAMES ONLY — they steer WHICH params the SSRF and XSS
+    # checks try FIRST (within their tiny cap); the checks still supply the payload and confirm.
+    ssrf_params = _validate_names(parsed.get("ssrf_params"))
+    xss_params = _validate_names(parsed.get("xss_params"))
+    return params, priority, idor_candidates, ssrf_params, xss_params
 
 
 def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface: dict[str, Any]) -> dict[str, Any]:
@@ -255,7 +283,7 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
     try:
         result = coder.generate([{"role": "user", "content": _build_prompt(target, scope, surface)}], cfg)
         parsed = _parse_json_object(str(result.get("text") or ""))
-        params, priority, idor_candidates = _validate_plan(parsed, surface)
+        params, priority, idor_candidates, ssrf_params, xss_params = _validate_plan(parsed, surface)
     except coder.CoderError:
         return plan
     except Exception:  # noqa: BLE001 - the reasoning layer must never break a hunt
@@ -263,6 +291,7 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
     plan.update({
         "used": True, "provider": str(result.get("provider") or ""), "model": str(result.get("model") or ""),
         "param_hypotheses": params, "probe_priority": priority, "idor_candidates": idor_candidates,
+        "ssrf_params": ssrf_params, "xss_params": xss_params,
         "notes": str((parsed or {}).get("notes") or "").strip()[:300] if isinstance(parsed, dict) else "",
     })
     return plan
