@@ -2,6 +2,20 @@
 
 Notable changes to GreyIQ.
 
+## v0.84.0
+
+### More leaked keys now get *proven* live — not just flagged
+- The engine already confirmed leaked GitHub, Slack, Stripe, OpenAI, Anthropic, and Google/Firebase
+  keys by sending one benign, read-only request to the key's **own** issuer. That proof now covers four
+  more of the highest-value token types: **GitLab** personal/project tokens (`glpat-…`), **npm** tokens
+  (`npm_…`), **SendGrid** keys (`SG.…`), and **DigitalOcean** tokens (`dop_v1_…`).
+- When one of these turns up in source, the engine reads only the token's own issuer to prove it
+  authenticates and to name what it controls (the GitLab/npm/DigitalOcean account, or the SendGrid
+  key's scopes) — never touching the target, never mutating anything, and never following a redirect
+  that could replay the token elsewhere. A live key becomes a **confirmed** finding with a runnable,
+  copy-pasteable proof; a dead or revoked one stays a candidate. Detection uses each vendor's
+  unmistakable prefix, so the false-positive rate stays at zero.
+
 ## v0.83.0
 
 ### Cross-tenant IDOR — the engine now proves one account can read another's data

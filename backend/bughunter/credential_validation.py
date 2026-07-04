@@ -31,6 +31,8 @@ _ALLOWED_HOSTS = frozenset({
     "firestore.googleapis.com", "firebasestorage.googleapis.com",
     "api.github.com", "slack.com",  # issuers for GitHub PAT / Slack token liveness checks
     "api.openai.com", "api.anthropic.com", "api.stripe.com",  # OpenAI / Anthropic / Stripe key liveness
+    "gitlab.com", "registry.npmjs.org",  # GitLab PAT / npm token liveness
+    "api.sendgrid.com", "api.digitalocean.com",  # SendGrid / DigitalOcean token liveness
 })
 _ALLOWED_SUFFIXES = (".firebaseio.com",)
 _TIMEOUT_S = 8
@@ -410,6 +412,137 @@ def validate_stripe_key(token: str) -> dict[str, Any]:
                else "It authenticates to the Stripe API.")
             + " Validated against a non-existent resource, so NO account data was read."
         )
+        return result
+    result["detail"] = f"Inconclusive (HTTP {status or 'no response'}) — validate manually within scope."
+    return result
+
+
+def validate_gitlab_token(token: str) -> dict[str, Any]:
+    """Validate a leaked GitLab token (``glpat-…``) is live by identifying its own account — ONE
+    benign, read-only GET to gitlab.com/api/v4/user (the token's issuer, never the target). 200 +
+    a username proves it is live and names the account; 401 = dead."""
+    token = str(token or "").strip()
+    result = _credential_result("GitLab gitlab.com/api/v4/user")
+    if not token:
+        return result
+    result["poc"] = f"curl -s -H 'PRIVATE-TOKEN: {token}' https://gitlab.com/api/v4/user"
+    status, _h, body = _get_full("https://gitlab.com/api/v4/user", {"PRIVATE-TOKEN": token})
+    result["checked"] = True
+    result["http_status"] = status
+    result["response_excerpt"] = body[:300]
+    if status == 200:
+        try:
+            data = json.loads(body)
+        except ValueError:
+            data = {}
+        username = str((data or {}).get("username") or "").strip()
+        result.update(live=True, principal=username or "(unknown)")
+        result["detail"] = (
+            f"LIVE — the token authenticates to GitLab account '{username or '(unknown)'}'. It can act on "
+            "every project and resource that account/token scope grants (read/write code, CI, registry)."
+        )
+        return result
+    if status in (401, 403):
+        result.update(live=False)
+        result["detail"] = f"NOT live — GitLab rejected the token (HTTP {status})."
+        return result
+    result["detail"] = f"Inconclusive (HTTP {status or 'no response'}) — validate manually within scope."
+    return result
+
+
+def validate_npm_token(token: str) -> dict[str, Any]:
+    """Validate a leaked npm token (``npm_…``) is live by identifying its own account — ONE benign,
+    read-only GET to registry.npmjs.org/-/npm/v1/user (the token's issuer, never the target). 200 +
+    a username proves it is live; 401 = dead."""
+    token = str(token or "").strip()
+    result = _credential_result("npm registry.npmjs.org/-/npm/v1/user")
+    if not token:
+        return result
+    result["poc"] = f"curl -s -H 'Authorization: Bearer {token}' https://registry.npmjs.org/-/npm/v1/user"
+    status, _h, body = _get_full("https://registry.npmjs.org/-/npm/v1/user", {"Authorization": f"Bearer {token}"})
+    result["checked"] = True
+    result["http_status"] = status
+    result["response_excerpt"] = body[:300]
+    if status == 200:
+        try:
+            data = json.loads(body)
+        except ValueError:
+            data = {}
+        name = str((data or {}).get("name") or "").strip()
+        result.update(live=True, principal=name or "(unknown)")
+        result["detail"] = (
+            f"LIVE — the token authenticates to npm account '{name or '(unknown)'}'. It can publish/yank "
+            "packages and read private packages that account can access (supply-chain risk)."
+        )
+        return result
+    if status in (401, 403):
+        result.update(live=False)
+        result["detail"] = f"NOT live — npm rejected the token (HTTP {status})."
+        return result
+    result["detail"] = f"Inconclusive (HTTP {status or 'no response'}) — validate manually within scope."
+    return result
+
+
+def validate_sendgrid_key(token: str) -> dict[str, Any]:
+    """Validate a leaked SendGrid key (``SG.…``) is live via GET /v3/scopes — ONE benign, read-only
+    request to the key's OWN issuer (never the target). 200 + a scope list proves it is live and
+    names what it grants; the scope list is capability metadata, not account/recipient data. 401 = dead."""
+    token = str(token or "").strip()
+    result = _credential_result("SendGrid api.sendgrid.com/v3/scopes")
+    result["no_data_read"] = True  # only the key's own permission scopes are read — never mail/recipient data
+    if not token:
+        return result
+    result["poc"] = f"curl -s -H 'Authorization: Bearer {token}' https://api.sendgrid.com/v3/scopes"
+    status, _h, body = _get_full("https://api.sendgrid.com/v3/scopes", {"Authorization": f"Bearer {token}"})
+    result["checked"] = True
+    result["http_status"] = status
+    result["response_excerpt"] = body[:400]
+    if status == 200:
+        try:
+            scopes = [str(s) for s in (json.loads(body).get("scopes") or []) if s][:12]
+        except ValueError:
+            scopes = []
+        result.update(live=True, principal="SendGrid API key", scopes=", ".join(scopes))
+        result["detail"] = ("LIVE — the key authenticates to the SendGrid API"
+                            + (f"; scopes include: {', '.join(scopes)}" if scopes else "")
+                            + ". It can send mail as the account (phishing/spoofing) and read its templates/settings.")
+        return result
+    if status in (401, 403):
+        result.update(live=False)
+        result["detail"] = f"NOT live — SendGrid rejected the key (HTTP {status})."
+        return result
+    result["detail"] = f"Inconclusive (HTTP {status or 'no response'}) — validate manually within scope."
+    return result
+
+
+def validate_digitalocean_token(token: str) -> dict[str, Any]:
+    """Validate a leaked DigitalOcean token (``dop_v1_…``) is live via GET /v2/account — ONE benign,
+    read-only request to the token's OWN issuer (never the target). 200 proves it is live and names
+    the account it controls; 401 = dead."""
+    token = str(token or "").strip()
+    result = _credential_result("DigitalOcean api.digitalocean.com/v2/account")
+    if not token:
+        return result
+    result["poc"] = f"curl -s -H 'Authorization: Bearer {token}' https://api.digitalocean.com/v2/account"
+    status, _h, body = _get_full("https://api.digitalocean.com/v2/account", {"Authorization": f"Bearer {token}"})
+    result["checked"] = True
+    result["http_status"] = status
+    result["response_excerpt"] = body[:300]
+    if status == 200:
+        try:
+            acct = (json.loads(body) or {}).get("account") or {}
+        except ValueError:
+            acct = {}
+        principal = str(acct.get("email") or acct.get("uuid") or "").strip()
+        result.update(live=True, principal=principal or "(unknown)")
+        result["detail"] = (
+            f"LIVE — the token authenticates to DigitalOcean account '{principal or '(unknown)'}'. It can "
+            "read and control that account's droplets, DNS, databases, and spaces (full infrastructure takeover)."
+        )
+        return result
+    if status in (401, 403):
+        result.update(live=False)
+        result["detail"] = f"NOT live — DigitalOcean rejected the token (HTTP {status})."
         return result
     result["detail"] = f"Inconclusive (HTTP {status or 'no response'}) — validate manually within scope."
     return result

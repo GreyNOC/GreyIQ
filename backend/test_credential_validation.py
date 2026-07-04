@@ -154,6 +154,63 @@ class TokenLivenessTests(unittest.TestCase):
         cv._get_full = lambda url, extra_headers=None: (500, {}, '{"error":{"type":"api_error"}}')
         self.assertIsNone(cv.validate_stripe_key("sk_live_x")["live"])
 
+    def test_gitlab_token_live_names_account(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (200, {}, '{"id":42,"username":"deploybot"}')
+        r = cv.validate_gitlab_token("glpat-" + "A" * 20)
+        self.assertIs(r["live"], True)
+        self.assertEqual(r["principal"], "deploybot")
+        self.assertIn("gitlab.com/api/v4/user", r["poc"])
+
+    def test_gitlab_token_dead(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (401, {}, '{"message":"401 Unauthorized"}')
+        self.assertIs(cv.validate_gitlab_token("glpat-bad")["live"], False)
+
+    def test_npm_token_live_names_account(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (200, {}, '{"name":"acme-ci"}')
+        r = cv.validate_npm_token("npm_" + "a" * 36)
+        self.assertIs(r["live"], True)
+        self.assertEqual(r["principal"], "acme-ci")
+        self.assertIn("registry.npmjs.org/-/npm/v1/user", r["poc"])
+
+    def test_npm_token_dead(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (401, {}, '{"error":"Unauthorized"}')
+        self.assertIs(cv.validate_npm_token("npm_bad")["live"], False)
+
+    def test_sendgrid_key_live_lists_scopes_no_data_read(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (200, {}, '{"scopes":["mail.send","templates.read"]}')
+        r = cv.validate_sendgrid_key("SG." + "a" * 22 + "." + "b" * 43)
+        self.assertIs(r["live"], True)
+        self.assertIn("mail.send", r["scopes"])        # capability, not recipient data
+        self.assertTrue(r["no_data_read"])
+        self.assertIn("api.sendgrid.com/v3/scopes", r["poc"])
+
+    def test_sendgrid_key_dead(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (401, {}, '{"errors":[{"message":"authorization required"}]}')
+        self.assertIs(cv.validate_sendgrid_key("SG.bad")["live"], False)
+
+    def test_digitalocean_token_live_names_account(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (200, {}, '{"account":{"email":"ops@acme.example","status":"active"}}')
+        r = cv.validate_digitalocean_token("dop_v1_" + "0" * 64)
+        self.assertIs(r["live"], True)
+        self.assertEqual(r["principal"], "ops@acme.example")
+        self.assertIn("api.digitalocean.com/v2/account", r["poc"])
+
+    def test_digitalocean_token_dead(self) -> None:
+        cv._get_full = lambda url, extra_headers=None: (401, {}, '{"id":"unauthorized"}')
+        self.assertIs(cv.validate_digitalocean_token("dop_v1_bad")["live"], False)
+
+    def test_new_validators_are_registered_for_their_detection_rules(self) -> None:
+        # compare by name, not identity: this class's tearDown reload of cv swaps function objects while
+        # bounty still holds the originals — same function, different id.
+        from bughunter import bounty
+        for rid, name in (("secret.gitlab-pat", "validate_gitlab_token"),
+                          ("secret.npm-token", "validate_npm_token"),
+                          ("secret.sendgrid-key", "validate_sendgrid_key"),
+                          ("secret.digitalocean-token", "validate_digitalocean_token")):
+            fn = bounty._TOKEN_ISSUER_VALIDATORS.get(rid)
+            self.assertTrue(callable(fn), rid)
+            self.assertEqual(getattr(fn, "__name__", ""), name, rid)
+
     def test_redirects_are_never_followed(self) -> None:
         # the token is never replayed to a redirect target: the handler refuses to follow any 3xx
         self.assertIsNone(cv._NoRedirect().redirect_request(None, None, 302, "moved", {}, "https://evil.example.com/steal"))
@@ -177,7 +234,8 @@ class TokenLivenessTests(unittest.TestCase):
         self.assertIn("secret.openai-key", rule_ids('const k = "sk-proj-' + "B" * 40 + '";'))
 
     def test_new_issuer_hosts_allowlisted_others_blocked(self) -> None:
-        for h in ("api.github.com", "slack.com", "api.openai.com", "api.anthropic.com", "api.stripe.com"):
+        for h in ("api.github.com", "slack.com", "api.openai.com", "api.anthropic.com", "api.stripe.com",
+                  "gitlab.com", "registry.npmjs.org", "api.sendgrid.com", "api.digitalocean.com"):
             self.assertTrue(cv._host_allowed(h), h)
         self.assertFalse(cv._host_allowed("evil.example.com"))
         # a token is only ever sent to its allowlisted issuer — never an arbitrary host
