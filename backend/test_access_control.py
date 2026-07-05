@@ -523,6 +523,136 @@ class MassAssignmentTests(unittest.TestCase):
         self.assertEqual(r["status"], "candidate", r)
         self.assertNotIn("finding", r)
 
+# --- Session not invalidated after logout (real local server: authed GET, logout, replay) ---------
+class _SessionHandler(BaseHTTPRequestHandler):
+    """A backend with SERVER-SIDE session state. ``invalidate_on_logout=True`` (secure) destroys the
+    session on logout; False (vulnerable) leaves it valid. ``public=True`` returns the same content with
+    or without a session (not session-gated)."""
+    invalidate_on_logout = False
+    public = False
+    catchall = False   # SPA/proxy: serves the SAME 200 index shell for ANY non-API path (incl. a bogus logout URL)
+    valid = {"tok-abc"}
+
+    def _send(self, code: int, body: str) -> None:
+        b = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def _sid(self) -> str:
+        for crumb in (self.headers.get("Cookie") or "").split(";"):
+            n, sep, v = crumb.strip().partition("=")
+            if sep and n == "sid":
+                return v.strip()
+        return ""
+
+    def _authed_body(self) -> str:
+        return _json.dumps({"user": "alice", "email": "alice@example.com", "account": "premium", "id": 7})
+
+    def _index_shell(self) -> str:
+        return "<html><head><title>App</title></head><body><div id='root'>Loading the single-page app…</div></body></html>"
+
+    def do_GET(self) -> None:  # noqa: N802
+        if not self.path.startswith("/api/me"):
+            if type(self).catchall:
+                self._send(200, self._index_shell()); return   # catch-all: 200 shell for /logout AND bogus paths
+            if self.path.startswith("/logout"):
+                self._logout(); return
+            self._send(404, _json.dumps({"error": "not found"})); return   # unknown path -> 404 (a real app)
+        if type(self).public or (self._sid() in type(self).valid):
+            self._send(200, self._authed_body())
+        else:
+            self._send(401, _json.dumps({"error": "unauthorized"}))
+
+    def do_POST(self) -> None:  # noqa: N802
+        if type(self).catchall and not self.path.startswith("/api/me"):
+            self._send(200, self._index_shell()); return   # catch-all: 200 shell for a bogus logout POST too
+        if self.path.startswith("/logout"):
+            self._logout(); return
+        self._send(404, "not found")
+
+    def _logout(self) -> None:
+        sid = self._sid()
+        if type(self).invalidate_on_logout and sid:
+            type(self).valid.discard(sid)   # secure: destroy the server-side session
+        self._send(200, _json.dumps({"ok": True}))   # vulnerable: cookie cleared client-side only
+
+    def log_message(self, *a: object) -> None:
+        return
+
+
+class SessionInvalidationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._prev = _os.environ.get("GREYIQ_SCAN_ALLOW_PRIVATE_URLS")
+        _os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
+        _SessionHandler.invalidate_on_logout = False
+        _SessionHandler.public = False
+        _SessionHandler.catchall = False
+        _SessionHandler.valid = {"tok-abc"}
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _SessionHandler)
+        _threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        p = self.server.server_port
+        self.authed = f"http://127.0.0.1:{p}/api/me"
+        self.logout = f"http://127.0.0.1:{p}/logout"
+        self.account = {"cookie": "sid=tok-abc"}
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        if self._prev is None:
+            _os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+        else:
+            _os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = self._prev
+
+    def test_session_survives_logout_is_confirmed(self) -> None:
+        r = ac.run_session_invalidation_check(self.authed, self.logout, account=self.account, scope="127.0.0.1")
+        self.assertEqual(r["status"], "confirmed", r)
+        self.assertEqual(r["finding"]["rule_id"], "active.session-not-invalidated")
+        self.assertEqual(r["attack_plan"]["proof_of_impact"]["status"], "confirmed")
+
+    def test_properly_invalidated_session_is_enforced(self) -> None:
+        _SessionHandler.invalidate_on_logout = True   # secure: server destroys the session
+        r = ac.run_session_invalidation_check(self.authed, self.logout, account=self.account, scope="127.0.0.1")
+        self.assertEqual(r["status"], "enforced", r)
+        self.assertNotIn("finding", r)
+
+    def test_public_endpoint_is_candidate_not_confirmed(self) -> None:
+        _SessionHandler.public = True   # anon sees the same content -> not session-gated
+        r = ac.run_session_invalidation_check(self.authed, self.logout, account=self.account, scope="127.0.0.1")
+        self.assertEqual(r["status"], "candidate", r)
+
+    def test_catchall_logout_url_is_candidate_not_confirmed(self) -> None:
+        # QAQC regression: an SPA/proxy catch-all returns 200 for a bogus logout URL, so a bare-status
+        # "logout succeeded" would false-confirm (the session was never actually logged out). The
+        # catch-all control (logout response == a non-existent path's response) must downgrade to candidate.
+        _SessionHandler.catchall = True   # /logout AND bogus paths both return the same 200 index shell
+        r = ac.run_session_invalidation_check(self.authed, self.logout, account=self.account, scope="127.0.0.1")
+        self.assertEqual(r["status"], "candidate", r)
+        self.assertNotIn("finding", r)
+
+    def test_unreachable_logout_is_candidate(self) -> None:
+        bad_logout = self.logout.replace("/logout", "/nope-not-a-logout")   # 404 -> couldn't log out
+        r = ac.run_session_invalidation_check(self.authed, bad_logout, account=self.account, scope="127.0.0.1")
+        self.assertEqual(r["status"], "candidate", r)
+
+    def test_cross_host_is_rejected(self) -> None:
+        r = ac.run_session_invalidation_check(self.authed, "http://other.example/logout",
+                                              account=self.account, scope="127.0.0.1", settings=_settings())
+        self.assertFalse(r["ok"])
+        self.assertIn("same host", r["error"].lower())
+
+    def test_out_of_scope_is_fail_closed(self) -> None:
+        r = ac.run_session_invalidation_check("http://other.example/me", "http://other.example/logout",
+                                              account=self.account, scope="127.0.0.1", settings=_settings())
+        self.assertFalse(r["ok"])
+        self.assertIn("scope", r["error"].lower())
+
+    def test_no_session_fails_closed(self) -> None:
+        r = ac.run_session_invalidation_check(self.authed, self.logout, account={}, scope="127.0.0.1")
+        self.assertFalse(r["ok"])
+        self.assertIn("session", r["error"].lower())
+
 
 if __name__ == "__main__":
     unittest.main()

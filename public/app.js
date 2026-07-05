@@ -6430,6 +6430,7 @@ function ckRenderIdor() {
   host.append(ckIdorProbeForm());
   host.append(ckBflaForm());
   host.append(ckMassAssignForm());
+  host.append(ckSessionInvalForm());
   host.append(ckStoredXssForm());
   host.append(ckWalkthrough("ssrf-setup"));
   host.append(ckOobPanel());
@@ -6633,6 +6634,59 @@ function ckMassAssignForm() {
         const row = { runId: res.run_id || ckState.runId, ref: res.ref || "F1", title: res.title || "Mass assignment → privilege escalation",
                       severity: res.severity || "high", proof: "confirmed",
                       className: "Mass assignment / privilege escalation", cwe: "CWE-915 / CWE-269",
+                      plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" };
+        ckState.findings = (ckState.findings || []).filter((f) => !(f.ref === row.ref && f.className === row.className)).concat(row);
+        ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);
+        const pre = cel("pre", "ck-research-md"); pre.textContent = res.report || ""; pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "360px"; pre.style.overflow = "auto"; out.append(pre);
+      } else {
+        note.textContent = `Not confirmed (${res.status}). ${res.reason || ""}`;
+        if (res.detail) out.append(cel("p", "ck-hint", "Differential: " + JSON.stringify(res.detail)));
+      }
+    } catch (err) { note.classList.add("is-error"); note.textContent = err.message || "Check failed."; }
+    finally { run.disabled = false; run.textContent = label; }
+  });
+  form.append(note); wrap.append(form); wrap.append(out);
+  return wrap;
+}
+
+function ckSessionInvalForm() {
+  const wrap = cel("div");
+  wrap.append(cel("h2", "ck-section-title", "Auth — session not invalidated after logout"));
+  wrap.append(cel("p", "ck-hint",
+    "Confirm your session stays valid AFTER you log out (the server never destroyed it). Give an endpoint that shows YOUR account content + the logout endpoint + that account's session. GET-only reads + your own logout; an anonymous control proves the endpoint is session-gated."));
+  const form = cel("form", "ck-learn-form");
+  const authed = ckField("Authenticated endpoint (shows YOUR data, e.g. https://app/api/me)", "text", "");
+  const logout = ckField("Logout endpoint (same host, e.g. https://app/logout)", "text", "");
+  const cookie = ckField("Account — Cookie", "text", "");
+  const hdr = ckTextareaField("Account — extra headers (optional)", "Authorization: Bearer ...");
+  const scope = ckField("Scope (name the host to allow testing)", "text", state.ckScope || "");
+  form.append(authed.wrap, logout.wrap, cookie.wrap, hdr.wrap, scope.wrap);
+  const run = cel("button", "ck-btn primary", "Confirm session persistence"); run.type = "submit"; form.append(run);
+  const note = cel("p", "ck-status"); note.style.flexBasis = "100%";
+  const out = cel("div", "ck-research");
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!authed.input.value.trim() || !logout.input.value.trim()) { note.classList.add("is-error"); note.textContent = "Both the authenticated URL and the logout URL are required."; return; }
+    const label = run.textContent; run.disabled = true; run.textContent = "Testing…";
+    note.classList.remove("is-error"); note.textContent = ""; out.replaceChildren();
+    const lines = (v) => v.split("\n").map((s) => s.trim()).filter(Boolean);
+    try {
+      const res = await apiFetch("/api/bounty/session-invalidation", {
+        method: "POST", timeoutMs: 60000, body: JSON.stringify({
+          authed_url: authed.input.value.trim(), logout_url: logout.input.value.trim(),
+          cookie: cookie.input.value.trim(), headers: lines(hdr.input.value),
+          scope: scope.input.value.trim(), platform: ckState.platform || "hackerone"
+        })
+      });
+      if (!res || res.ok === false) {
+        note.classList.add("is-error"); note.textContent = (res && res.error) || "Could not run the check.";
+      } else if (res.status === "confirmed") {
+        out.append(cel("p", "ck-ftitle", "✅ Session not invalidated after logout CONFIRMED"));
+        out.append(cel("p", "ck-hint", "Added to Submissions — Copy report / Download / Submit it there."));
+        ckState.runId = res.run_id || ckState.runId;
+        const row = { runId: res.run_id || ckState.runId, ref: res.ref || "F1", title: res.title || "Session not invalidated after logout",
+                      severity: res.severity || "medium", proof: "confirmed",
+                      className: "Session not invalidated after logout", cwe: "CWE-613",
                       plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" };
         ckState.findings = (ckState.findings || []).filter((f) => !(f.ref === row.ref && f.className === row.className)).concat(row);
         ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);

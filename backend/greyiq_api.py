@@ -915,6 +915,15 @@ class MassAssignRequest(BaseModel):
     platform: str = Field(default="hackerone", max_length=20)
 
 
+class SessionInvalRequest(BaseModel):
+    authed_url: str = Field(min_length=1, max_length=4000)   # an endpoint that returns YOUR account content
+    logout_url: str = Field(min_length=1, max_length=4000)   # the logout endpoint (same host)
+    cookie: str = Field(default="", max_length=8000)
+    headers: list[str] = Field(default_factory=list, max_length=20)
+    scope: str = Field(default="", max_length=2000)
+    platform: str = Field(default="hackerone", max_length=20)
+
+
 class IdorProbeRequest(BaseModel):
     url: str = Field(min_length=1, max_length=4000)   # one authenticated object URL with a numeric id
     cookie: str = Field(default="", max_length=8000)
@@ -2694,6 +2703,32 @@ class GreyIQRuntime:
             "title": finding["title"], "severity": finding["severity"],
         }
 
+    def check_session_invalidation(self, request: "SessionInvalRequest") -> dict[str, Any]:
+        """Confirm a SESSION STAYS VALID AFTER LOGOUT: log in, verify an authenticated endpoint, log out,
+        then replay the SAME session and confirm it still authenticates (while an anonymous request is
+        denied). Only the operator's OWN session is used. On CONFIRMED, cache it as a run."""
+        res = bounty_access.run_session_invalidation_check(
+            request.authed_url, request.logout_url,
+            account={"cookie": request.cookie, "headers": request.headers},
+            scope=request.scope,
+        )
+        if not res.get("ok"):
+            return res
+        status = res["status"]
+        if status != "confirmed":
+            return {"ok": True, "status": status, "reason": res.get("reason", ""), "detail": res.get("detail")}
+        finding = dict(res["finding"]); finding["ref"] = "F1"
+        plan = res["attack_plan"]
+        host = urlparse(request.authed_url).hostname or "target"
+        persisted = self._persist_finding_run(
+            findings=[finding], plans={"F1": plan}, target=request.authed_url, scope=request.scope,
+            platform=request.platform, slug="session-invalidation", host=host, json_extra={"detail": res.get("detail")})
+        return {
+            "ok": True, "status": "confirmed", "run_id": persisted["run_id"], "ref": "F1",
+            "platform": persisted["platform"], "report": persisted["report"], "detail": res.get("detail"),
+            "title": finding["title"], "severity": finding["severity"],
+        }
+
     def check_bfla(self, request: "BflaRequest") -> dict[str, Any]:
         """Confirm BFLA (broken function-level authorization) via a three-session differential
         (admin / low-priv user / anon). On a CONFIRMED bypass, cache it as a run so every
@@ -4390,6 +4425,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/mass-assignment":
             request = validate_payload(MassAssignRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.check_mass_assignment, request))
+            return
+        if method == "POST" and path == "/api/bounty/session-invalidation":
+            request = validate_payload(SessionInvalRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.check_session_invalidation, request))
             return
         if method == "POST" and path == "/api/bounty/idor-probe":
             request = validate_payload(IdorProbeRequest, await read_json_body(receive))
