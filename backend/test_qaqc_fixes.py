@@ -59,6 +59,34 @@ class BrainIngestionShapeTests(unittest.TestCase):
         self.assertIn("F1", brain["attack_plans"])
         self.assertEqual(brain["attack_plans"]["F1"]["steps"], ["one", "two"])  # string split, not char-by-char
 
+    def test_response_digest_grounds_target_specific_leads(self) -> None:
+        # The brain must SEE the real response structure so its leads are target-specific — and the
+        # digest is UNTRUSTED target data, so it must be trust-wrapped like the findings.
+        import bughunter.bounty as bounty
+        captured = {}
+        self._coder.coder_enabled = lambda cfg: True
+        self._coder.coder_config = lambda cfg: {}
+        self._coder.generate = lambda msgs, cfg: (captured.update(prompt=msgs[0]["content"]),
+                                                  {"provider": "x", "model": "m", "text": '{"next_steps": ["x"]}'})[1]
+        digest = {"interesting_names": ["owner_id", "is_admin"], "jwt": {"alg": "HS256"}, "error_family": "sql"}
+        bounty._ask_brain({}, "http://t", {"name": "P"}, None, "scope", [{"ref": "F1"}], "pb", response_digest=digest)
+        p = captured["prompt"]
+        self.assertIn("owner_id", p)                              # the brain sees the real field names
+        self.assertIn("is_admin", p)
+        self.assertIn("response structure", p.lower())            # labeled + guidance present
+        # the digest sits INSIDE the untrusted-data boundary, not as bare instruction text
+        self.assertIn("mass-assignment", p.lower())               # lead guidance is present
+
+    def test_no_digest_is_a_clean_no_op(self) -> None:
+        import bughunter.bounty as bounty
+        captured = {}
+        self._coder.coder_enabled = lambda cfg: True
+        self._coder.coder_config = lambda cfg: {}
+        self._coder.generate = lambda msgs, cfg: (captured.update(prompt=msgs[0]["content"]),
+                                                  {"provider": "x", "model": "m", "text": "{}"})[1]
+        bounty._ask_brain({}, "http://t", {"name": "P"}, None, "scope", [{"ref": "F1"}], "pb")  # no digest
+        self.assertNotIn("Observed response structure", captured["prompt"])  # the block is simply absent
+
 
 class ForgedConfirmedProofTests(unittest.TestCase):
     """A client/brain proof may only read 'confirmed' with a real observed-vs-control

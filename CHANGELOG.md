@@ -2,6 +2,28 @@
 
 Notable changes to GreyIQ.
 
+## v0.89.0
+
+### The hunt now reads the response and reasons like an analyst
+- The engine already fetched each response in full but only ever looked at a 200-character slice of it.
+  Now it builds a **response digest** from what it already has — the JSON field names an endpoint
+  returns, the (including hidden) form fields, which security headers are missing, weak session-cookie
+  flags, the JWT algorithm in play, and a shortlist of the *interesting* names it saw (`owner_id`,
+  `is_admin`, `price`, a token). It extracts names and shapes only — never a value.
+- That structure feeds the AI in two places: the iterative probe loop now steers its checks at **this**
+  target's real weak spots instead of guessing parameter names blindly, and every report's
+  "what to try next" section now carries **concrete, target-specific leads** grounded in what was
+  actually seen — "the response exposes `owner_id`, test it for IDOR", "there's an `is_admin` field,
+  try mass-assignment", "the token uses HS256, check for signing-key weaknesses". These are leads to
+  pursue by hand — they're never counted as confirmed findings.
+
+### Forged-token (alg:none) check now runs on tokens the app hands out
+- The signature-bypass (JWT `alg:none`) check previously only ran when you supplied a session token.
+  Now, if the target itself returns a JWT (in a cookie, the page, or a header), the engine tests **that**
+  token for the bypass — proving the app accepts an unsigned copy of its own token — even when you
+  gave it no credentials. It stays a confirmed finding only via the same strict proof as before
+  (the real token works, a corrupted-signature copy is rejected, and the unsigned copy is accepted).
+
 ## v0.88.0
 
 ### Stored XSS you can prove *executes* — via an out-of-band beacon

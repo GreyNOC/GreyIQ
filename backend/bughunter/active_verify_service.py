@@ -53,6 +53,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from bughunter import digest_builder
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.rate_limit import HostRateGovernor
 from bughunter.registrable_domain import is_bare_public_suffix, registrable_domain
@@ -109,6 +110,10 @@ _MARK = "gq7x4q2v"
 # A JWT-shaped value: three base64url segments (the third may be empty for an
 # already-unsigned token).
 _JWT_RE = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$")
+# A JWT EMBEDDED in free text (body/header) — anchored to the `eyJ` prefix (the base64url of a JSON
+# object opening `{"`), so it locates a real token, not any dotted string. Bounded quantifiers (no
+# nested repetition) keep it linear-time on hostile input.
+_EMBEDDED_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*")
 
 
 class _ActiveError(Exception):
@@ -1445,6 +1450,31 @@ def _find_jwt_credential(auth: AuthContext | None) -> tuple[str, str, Callable[[
     return None
 
 
+def _extract_jwt_token(response: dict[str, Any] | None) -> str:
+    """The first JWT-shaped token the target itself exposed in a response — its body, a Set-Cookie
+    crumb, or a header. Lets the alg:none check run on a token the APP issued even when the operator
+    supplied no credential (the exact reasoning a human does: 'the app handed me a JWT — is it
+    forgeable?'). Returns "" if none/ambiguous. The check independently re-validates that the token
+    actually authenticates (a 200 baseline) before proving anything, so a stray/expired token is a
+    clean no-op, never a false positive."""
+    if not isinstance(response, dict):
+        return ""
+    # Cookies first (a Set-Cookie JWT is the app's own session), then the body, then other headers.
+    for crumb in (response.get("cookies") or []):
+        _n, sep, cval = str(crumb).split(";", 1)[0].partition("=")
+        if sep and _JWT_RE.match(cval.strip()):
+            return cval.strip()
+    for source in (str(response.get("body") or "")[:_JWT_SCAN_CAP],
+                   "\n".join(str(v) for v in (response.get("headers") or {}).values())):
+        for m in _EMBEDDED_JWT_RE.finditer(source):
+            if _forge_alg_none_variants(m.group(0)):  # only a well-formed, non-alg:none token
+                return m.group(0)
+    return ""
+
+
+_JWT_SCAN_CAP = 200_000  # never scan more than ~200 KB of body for a token
+
+
 def _forge_alg_none_variants(token: str) -> list[str]:
     """The alg:none-forged variants of `token` (same header keys except alg, SAME
     payload bytes, empty signature) -- both the RFC-correct 'header.payload.' form
@@ -1468,22 +1498,36 @@ def _forge_alg_none_variants(token: str) -> list[str]:
     return [f"{forged_header}.{parts[1]}.", f"{forged_header}.{parts[1]}"]
 
 
-def _check_jwt_alg_none(http: _Http, url: str) -> dict[str, Any] | None:
-    """Confirm the server accepts an UNSIGNED (alg:none) copy of the operator's own
-    session token as authenticated — one of the highest-signal, lowest-effort JWT
-    bugs in real programs. Only runs when the operator supplied a real JWT-shaped
-    credential (never invents one); the forged/control requests reuse that SAME
-    authenticated GET endpoint, so this proves nothing beyond what the operator
-    already authorized scanning."""
+def _check_jwt_alg_none(http: _Http, url: str, discovered_token: str = "") -> dict[str, Any] | None:
+    """Confirm the server accepts an UNSIGNED (alg:none) copy of a real session token as
+    authenticated — one of the highest-signal, lowest-effort JWT bugs in real programs.
+
+    Two token sources, never an invented one:
+    * The operator's supplied JWT credential (Authorization/Cookie) — the forged/control requests
+      reuse that SAME authenticated GET, proving nothing beyond what the operator authorized.
+    * A JWT the TARGET ITSELF exposed (``discovered_token`` from the landing response) when the
+      operator gave none — attached as ``Authorization: Bearer`` with a SELF-CONTAINED baseline
+      (a request that carries the discovered token), so the differential is entirely about that token.
+
+    Either way the proof is the differential: the real token authenticates (200 baseline) AND a
+    corrupted-signature copy is REJECTED (the server does verify) AND the alg:none copy is ACCEPTED."""
     found = _find_jwt_credential(http.auth)
-    if found is None:
+    baseline_headers: dict[str, str] | None = None
+    if found is not None:
+        header_name, real_token, rebuild = found
+    elif discovered_token and _JWT_RE.match(discovered_token):
+        # The target handed us a JWT but the operator supplied no auth — test the app's OWN token.
+        header_name, real_token = "Authorization", discovered_token
+        rebuild = lambda new: f"Bearer {new}"  # noqa: E731
+        baseline_headers = {header_name: rebuild(real_token)}  # the baseline must CARRY the discovered token
+    else:
         return None
-    header_name, real_token, rebuild = found
     forged_variants = _forge_alg_none_variants(real_token)
     if not forged_variants:
         return None
     try:
-        baseline = http.fetch(url)  # the operator's own real, valid token (auto-attached)
+        # Operator path: http.auth is auto-attached. Discovered path: attach the discovered token.
+        baseline = http.fetch(url, extra_headers=baseline_headers) if baseline_headers else http.fetch(url)
     except _ActiveError:
         return None
     if not (200 <= int(baseline.get("status") or 0) < 300):
@@ -1915,6 +1959,11 @@ def verify_active(
         landing = None
 
     results: list[dict[str, Any]] = []
+    # A JWT the TARGET ITSELF handed back in the landing response (Set-Cookie / body / header) — reused
+    # by the alg:none check when the operator supplied no JWT credential, so it can test the app's OWN
+    # token for a signature-verification bypass. Extracted from a response already fetched (no request);
+    # the check re-validates the token authenticates before proving anything, so a stray token is a no-op.
+    discovered_jwt = _extract_jwt_token(landing)
     # Order: header-only first (cheap), then the request-heavier probes. Each check
     # is wrapped so a budget exhaustion stops cleanly without raising.
     # Each check is tagged with the normalized vuln class it confirms, so the reasoning layer's
@@ -1923,10 +1972,10 @@ def verify_active(
         ("clickjacking", lambda: _check_clickjacking(http, sanitized, landing)),
         ("csrf", lambda: _check_csrf(landing, sanitized)),
         # Self-gated cheap checks run FIRST so the network-heavy probes below can't exhaust the
-        # request budget before they're reached: alg:none / weak-secret are no-ops unless the
-        # operator supplied a real JWT (weak-secret cracks the HMAC key OFFLINE and spends requests
-        # only on a hit), and GraphQL introspection only fires on a graphql-shaped path.
-        ("jwt", lambda: _check_jwt_alg_none(http, sanitized)),
+        # request budget before they're reached: alg:none fires on the operator's OR the target's own
+        # JWT (weak-secret cracks the HMAC key OFFLINE and spends requests only on a hit), and GraphQL
+        # introspection only fires on a graphql-shaped path.
+        ("jwt", lambda: _check_jwt_alg_none(http, sanitized, discovered_token=discovered_jwt)),
         ("jwt", lambda: _check_jwt_weak_secret(http, sanitized)),
         ("graphql", lambda: _check_graphql_introspection(http, sanitized)),
         ("cors", lambda: _check_cors(http, sanitized)),
@@ -2000,6 +2049,12 @@ def verify_active(
         "in_scope": True, "host": host, "requests_used": getattr(http, "sent", 0),
         "rate_limited": rate_limited, "verified_classes": verified,
         "discovered_params_used": len(discovered_params),
+        # Deterministic, redacted STRUCTURAL digest of the landing response (JSON key names, form
+        # fields, security headers, cookie flag gaps, JWT header shape, error family) — built from a
+        # response already fetched (no new request). It lets the re-plan brain reason about THIS
+        # target's real structure instead of a 200-char excerpt; it carries no value and confirms
+        # nothing. Empty dict when the landing fetch failed or nothing structural was present.
+        "digest": digest_builder.build_digest(landing),
         "skipped_reason": "",
     }
     return results, meta
