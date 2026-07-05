@@ -1744,6 +1744,62 @@ def _check_graphql_introspection(http: _Http, url: str) -> dict[str, Any] | None
     return None
 
 
+# A syntactically-valid query naming a field that CANNOT exist (unguessable-unique), so a "Did you
+# mean <X>" reply naming a DIFFERENT token is a genuine schema suggestion, never an echo of our probe.
+_GRAPHQL_BOGUS_FIELD = "gqxNoSuchField_zx9q7"
+_GRAPHQL_SUGGEST_PROBE = "{__typename " + _GRAPHQL_BOGUS_FIELD + "}"
+# graphql-js / graphql-php style "did you mean" phrasing, capturing the FIRST suggested identifier.
+# The reference GraphQL engines ALWAYS QUOTE the suggested name (Did you mean "user"), so REQUIRE a
+# quote (optionally backslash-escaped in the raw JSON body: \"user\") immediately before the
+# identifier. This rejects unquoted English prose ("Did you mean to POST?", "the query root?") that
+# would otherwise false-confirm a schema leak on a graphql-ish path.
+_GRAPHQL_SUGGEST_RE = re.compile(r'[Dd]id you mean\s+\\?["\'“‘`]([A-Za-z_][A-Za-z0-9_]{0,63})')
+
+
+def _check_graphql_field_suggestions(http: _Http, url: str) -> dict[str, Any] | None:
+    """Confirm GraphQL 'field suggestions' leak the schema even when introspection is DISABLED — the
+    common misconfig the introspection check misses. A query naming a nonexistent field triggers a
+    'Did you mean <real field>' validation error that enumerates the type's real fields one probe at a
+    time. Benign: one syntactically-valid but nonexistent-field READ query (GraphQL validates, never
+    executes it); the suggestion of a REAL name we didn't send IS the captured disclosure. Fires only
+    on a graphql-shaped path; FP-proof — the response must be JSON, must be a GraphQL validation error
+    ABOUT OUR probe (it echoes the unguessable bogus field), AND must suggest a DIFFERENT real name."""
+    path = (urlparse(url).path or "").lower()
+    if "graphql" not in path and "graphiql" not in path:
+        return None
+    try:
+        probe = http.fetch(_with_query(url, {"query": _GRAPHQL_SUGGEST_PROBE}))
+    except _ActiveError:
+        return None
+    body = probe.get("body") or ""
+    ctype = (probe["headers"].get("content-type") or "").lower()
+    if not ("json" in ctype or body.lstrip().startswith("{")):
+        return None  # a GraphQL error is a JSON object — an HTML "did you mean" search page is not this
+    # ANCHOR to a genuine GraphQL field-validation error about OUR probe: the server must ECHO the
+    # unguessable field we sent (graphql-js/graphql-php: `Cannot query field "<bogus>" on type ...`).
+    # Without this, arbitrary prose on a graphql-ish path ("Unknown operation. Did you mean to POST?")
+    # would false-confirm a schema leak that isn't there.
+    if _GRAPHQL_BOGUS_FIELD not in body:
+        return None
+    m = _GRAPHQL_SUGGEST_RE.search(body)
+    if not m or m.group(1) == _GRAPHQL_BOGUS_FIELD:
+        return None  # no suggestion, or it merely echoed our bogus field (not a real schema leak)
+    suggested = m.group(1)  # a field OR a type name — either is a schema disclosure
+    proof = _proof(
+        "confirmed", method="GET a query naming a nonexistent field on the GraphQL endpoint",
+        affected_asset="the GraphQL schema — field and type names are enumerable via error 'suggestions' even when introspection is disabled",
+        observed_result=f"a query naming the nonexistent field the engine sent returned a 'Did you mean' error suggesting a REAL schema name ('{suggested}')",
+        control_result="a randomly-named field cannot match anything, so a suggestion naming a real schema name proves the schema leaks through validation errors (introspection need not be enabled)",
+        evidence="the GraphQL validation error echoes the unguessable probe field AND suggests a real schema name",
+    )
+    ev = {"request_line": f"GET {_with_query(url, {'query': _GRAPHQL_SUGGEST_PROBE})}",
+          "response_status": f"HTTP {probe['status']}", "matched_value": f"field-suggestion schema leak (suggested '{suggested}')",
+          "read_data": body[:1200]}
+    return _finding("active.graphql-field-suggestions",
+                    "GraphQL field suggestions leak the schema (introspection-independent)",
+                    "low", "disclosure", "graphql", url, proof, ev)
+
+
 # High-signal files that must never be web-served. Each is confirmed by its own unmistakable
 # signature AND a catch-all control, so an app that 200s everything can't false-positive.
 _EXPOSED_FILES: tuple[tuple[str, "re.Pattern[str]", str], ...] = (
@@ -1978,6 +2034,9 @@ def verify_active(
         ("jwt", lambda: _check_jwt_alg_none(http, sanitized, discovered_token=discovered_jwt)),
         ("jwt", lambda: _check_jwt_weak_secret(http, sanitized)),
         ("graphql", lambda: _check_graphql_introspection(http, sanitized)),
+        # Schema disclosure via error field-suggestions — fires even when introspection is disabled,
+        # so it catches the leak the introspection check misses. Graphql-path-gated, one benign query.
+        ("graphql", lambda: _check_graphql_field_suggestions(http, sanitized)),
         ("cors", lambda: _check_cors(http, sanitized)),
         ("redirect", lambda: _check_open_redirect(http, sanitized, discovered_params)),
         ("host-header", lambda: _check_host_header(http, sanitized)),

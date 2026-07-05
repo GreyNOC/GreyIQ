@@ -122,6 +122,76 @@ class GraphqlIntrospectionTests(unittest.TestCase):
         self.assertIsNone(av._check_graphql_introspection(_GqlHttp(False), "https://t/graphql"))
 
 
+class _GqlSuggestHttp:
+    """A GraphQL endpoint whose validation errors leak the schema via 'Did you mean' suggestions,
+    EVEN with introspection off. `mode` picks the failure shape."""
+    def __init__(self, mode: str = "suggests") -> None:
+        self.mode = mode
+
+    def fetch(self, url, *, method="GET", extra_headers=None):
+        q = parse_qs(urlparse(url).query, keep_blank_values=True)[("query")]
+        query = (q or [""])[0]
+        if self.mode == "suggests" and av._GRAPHQL_BOGUS_FIELD in query:
+            # graphql-js phrasing: suggests a REAL field ('user') for our nonexistent one
+            return {"status": 400, "headers": {"content-type": "application/json"},
+                    "body": '{"errors":[{"message":"Cannot query field \\"' + av._GRAPHQL_BOGUS_FIELD + '\\" on type \\"Query\\". Did you mean \\"user\\"?"}]}', "location": None}
+        if self.mode == "no_suggest":
+            return {"status": 400, "headers": {"content-type": "application/json"},
+                    "body": '{"errors":[{"message":"Cannot query field on type Query."}]}', "location": None}
+        if self.mode == "html_didyoumean":  # a search page saying "did you mean" — NOT a graphql leak
+            return {"status": 200, "headers": {"content-type": "text/html"}, "body": "<html>Did you mean user?</html>", "location": None}
+        if self.mode == "echo_only":  # only echoes our own bogus field back — not a real schema field
+            return {"status": 400, "headers": {"content-type": "application/json"},
+                    "body": '{"errors":[{"message":"Did you mean \\"' + av._GRAPHQL_BOGUS_FIELD + '\\"?"}]}', "location": None}
+        if self.mode == "prose_gateway":  # a NON-graphql JSON error whose prose says "did you mean" — no probe echo
+            return {"status": 400, "headers": {"content-type": "application/json"},
+                    "body": '{"error":"Unknown operation. Did you mean to POST?"}', "location": None}
+        if self.mode == "prose_queryroot":  # "Did you mean the query root?" — no probe echo, generic prose
+            return {"status": 400, "headers": {"content-type": "application/json"},
+                    "body": '{"errors":[{"message":"Did you mean the query root?"}]}', "location": None}
+        if self.mode == "type_suggest":  # echoes our probe AND suggests a real TYPE — still a schema leak
+            return {"status": 400, "headers": {"content-type": "application/json"},
+                    "body": '{"errors":[{"message":"Cannot query field \\"' + av._GRAPHQL_BOGUS_FIELD + '\\" on type \\"Query\\". Did you mean \\"User\\"?"}]}', "location": None}
+        return {"status": 200, "headers": {"content-type": "application/json"}, "body": '{"data":{}}', "location": None}
+
+
+class GraphqlFieldSuggestionTests(unittest.TestCase):
+    def test_suggestion_leak_is_confirmed(self) -> None:
+        f = av._check_graphql_field_suggestions(_GqlSuggestHttp("suggests"), "https://t/graphql")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["rule_id"], "active.graphql-field-suggestions")
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertIn("user", f["proof_evidence"]["matched_value"])
+
+    def test_non_graphql_path_skipped(self) -> None:
+        self.assertIsNone(av._check_graphql_field_suggestions(_GqlSuggestHttp("suggests"), "https://t/api/users"))
+
+    def test_no_suggestion_is_not_flagged(self) -> None:
+        self.assertIsNone(av._check_graphql_field_suggestions(_GqlSuggestHttp("no_suggest"), "https://t/graphql"))
+
+    def test_html_did_you_mean_page_is_not_flagged(self) -> None:
+        # a non-JSON "did you mean" (a search page) must not false-positive as a GraphQL leak
+        self.assertIsNone(av._check_graphql_field_suggestions(_GqlSuggestHttp("html_didyoumean"), "https://t/graphql"))
+
+    def test_echo_of_our_own_bogus_field_is_not_flagged(self) -> None:
+        # a suggestion that only names the unguessable field WE sent is not a real schema leak
+        self.assertIsNone(av._check_graphql_field_suggestions(_GqlSuggestHttp("echo_only"), "https://t/graphql"))
+
+    def test_generic_did_you_mean_prose_without_probe_echo_is_not_flagged(self) -> None:
+        # QAQC regression: arbitrary JSON prose on a graphql-ish path ("Did you mean to POST?" /
+        # "Did you mean the query root?") must NOT confirm — a real leak echoes OUR probe field.
+        self.assertIsNone(av._check_graphql_field_suggestions(_GqlSuggestHttp("prose_gateway"), "https://t/graphql"))
+        self.assertIsNone(av._check_graphql_field_suggestions(_GqlSuggestHttp("prose_queryroot"), "https://t/graphql"))
+
+    def test_type_name_suggestion_is_a_valid_disclosure(self) -> None:
+        # a suggested TYPE (not field) is still a schema disclosure — confirmed, and the proof text says
+        # "schema name" (not "field") so it's honest about what leaked.
+        f = av._check_graphql_field_suggestions(_GqlSuggestHttp("type_suggest"), "https://t/graphql")
+        self.assertIsNotNone(f)
+        self.assertIn("User", f["proof_evidence"]["matched_value"])
+        self.assertIn("schema name", f["_active_proof"]["observed_result"])
+
+
 class _FileHttp:
     def __init__(self, expose: bool = True, catchall: bool = False) -> None:
         self.expose, self.catchall = expose, catchall
