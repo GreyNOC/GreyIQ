@@ -2,6 +2,18 @@
 
 Notable changes to GreyIQ.
 
+## v0.96.0
+
+### Confirms sessions that stay valid after logout
+- A new check proves a **session isn't destroyed on logout** — so a stolen or leaked session (from a
+  proxy log, a shared device, an XSS exfil) keeps working even after the victim logs out. Give it an
+  endpoint that shows your account's data, the logout endpoint, and that account's session: the engine
+  confirms it end-to-end by authenticating, verifying an anonymous request is denied (so the endpoint
+  is genuinely session-gated), logging out, then replaying the **same** session and showing it still
+  returns your authenticated content. If logout properly kills the session, it's reported as enforced.
+- Uses only your own session and your own logout; GET-only reads. Available in the access-control panel
+  beside the IDOR, BFLA, and mass-assignment checks, and at `POST /api/bounty/session-invalidation`.
+
 ## v0.95.0
 
 ### Confirms mass assignment → privilege escalation

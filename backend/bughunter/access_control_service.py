@@ -617,9 +617,15 @@ def _json_write(url: str, method: str, payload: dict[str, Any], *, auth: Any, se
             return {"ok": False, "error": f"target refused by the URL guard: {exc}"}
         try:
             with opener.open(request, timeout=timeout) as resp:
-                return {"ok": True, "status": int(getattr(resp, "status", 0) or 0)}
+                body = resp.read(settings.web_fetch_max_bytes + 1)[: settings.web_fetch_max_bytes]
+                return {"ok": True, "status": int(getattr(resp, "status", 0) or 0),
+                        "body": body.decode("utf-8", "replace")}
         except urllib.error.HTTPError as exc:
-            return {"ok": True, "status": int(exc.code)}
+            try:
+                body = exc.read(settings.web_fetch_max_bytes + 1)[: settings.web_fetch_max_bytes].decode("utf-8", "replace")
+            except Exception:  # noqa: BLE001
+                body = ""
+            return {"ok": True, "status": int(exc.code), "body": body}
         except (urllib.error.URLError, OSError, ValueError) as exc:
             return {"ok": False, "error": f"{method} failed: {exc}"}
 
@@ -792,6 +798,192 @@ def _build_mass_assignment_finding(url: str, field: str, detail: dict[str, Any])
             "control_result": f"an EMPTY write to the same object did NOT change '{field}', so the escalation is attributable to the client-supplied value, not any write",
             "evidence": f"'{field}' false->true across a client PATCH, confirmed by an authoritative GET; empty-write control left it false",
             "proof_obligation": model.get("proof_obligation", ""),
+        },
+    }
+    return finding, plan
+
+
+# --- Session not invalidated after logout --------------------------------------------------------
+_SESS_META = {"class_id": "auth", "class_name": "Session not invalidated after logout",
+              "cwe": "CWE-613", "owasp": "A07:2021 Identification and Authentication Failures"}
+
+
+def run_session_invalidation_check(
+    authed_url: str,
+    logout_url: str,
+    *,
+    account: dict[str, Any],
+    scope: str = "",
+    settings: Any = None,
+    governor: HostRateGovernor | None = None,
+) -> dict[str, Any]:
+    """Confirm a session STAYS VALID AFTER LOGOUT (server-side session not destroyed). The operator
+    supplies an authenticated endpoint (returns their own account content) and the logout endpoint, with
+    the session. Differential, GET-only reads + one logout call, all on the operator's OWN session:
+
+      baseline GET authed_url (session)  -> authenticated 200
+      anon     GET authed_url (NO session) -> DENIED (proves the endpoint is genuinely auth-gated)
+      logout   POST/GET logout_url (session) -> succeeds (2xx/3xx)
+      replay   GET authed_url (SAME session) -> STILL authenticated (~= baseline, != anon)
+
+    Confirmed iff the endpoint is auth-gated AND logout succeeded AND the old session still authenticates
+    afterward. If the replay is denied, the session was properly invalidated (enforced). Only the
+    operator's own session is used; nothing another user owns is touched."""
+    settings = settings or get_settings()
+    au, lo = str(authed_url or "").strip(), str(logout_url or "").strip()
+    if not au or not lo:
+        return _err("Provide both an authenticated endpoint (your own account content) and the logout endpoint.")
+    try:
+        nau, nlo = normalize_website_url(au), normalize_website_url(lo)
+    except WebsiteFetchError as exc:
+        return _err(str(exc))
+    host_a, host_l = (urlparse(nau).hostname or ""), (urlparse(nlo).hostname or "")
+    if host_a.lower() != host_l.lower():
+        return _err("The authenticated URL and the logout URL must be on the same host (same app/session).")
+    if not host_in_active_scope(host_a, scope, settings):
+        return _err(f"'{host_a}' is not named in your scope -- session testing is fail-closed. Add it to Scope.")
+    try:
+        sau = _guard_url(nau, settings.allow_private_urls, settings.web_allowed_ports)
+        slo = _guard_url(nlo, settings.allow_private_urls, settings.web_allowed_ports)
+    except WebsiteFetchError as exc:
+        return _err(f"target refused by the URL guard: {exc}")
+    auth = build_auth(sau, cookie=account.get("cookie", ""), headers=account.get("headers") or [])
+    if auth is None:
+        return _err("Session testing needs your session -- supply a cookie and/or auth headers for the account.")
+
+    governor = governor or HostRateGovernor(
+        capacity=settings.active_max_requests_per_host, min_interval_s=settings.active_min_interval_ms / 1000.0)
+    http = _Http(settings, governor, max_requests=6, auth=auth)
+    http_anon = _Http(settings, governor, max_requests=2, auth=None)   # unauthenticated control
+    try:
+        r_base = http.fetch(sau)          # authenticated ground truth
+        r_anon = http_anon.fetch(sau)     # control: is the endpoint actually auth-gated?
+    except _ActiveError as exc:
+        return _err(f"request failed: {exc}")
+    body_base, body_anon = (r_base.get("body") or ""), (r_anon.get("body") or "")
+    st_base, st_anon = int(r_base.get("status") or 0), int(r_anon.get("status") or 0)
+
+    if st_base != 200 or len(_norm(body_base)) < _MIN_BODY:
+        return {"ok": True, "status": "candidate",
+                "reason": f"the authenticated endpoint did not return a readable 200 with your session (HTTP {st_base}) -- check the session / URL."}
+    r_anon_base = _ratio(body_anon, body_base)
+    if st_anon == 200 and r_anon_base >= _ANON_DENIED:
+        return {"ok": True, "status": "candidate",
+                "reason": ("an anonymous request returned ~the same content as your authenticated one, so this endpoint "
+                           "isn't session-gated (it's public) -- pick an endpoint that shows YOUR account data and re-test."),
+                "detail": {"status_base": st_base, "status_anon": st_anon, "ratio_anon_vs_base": round(r_anon_base, 3)}}
+
+    # A catch-all CONTROL: a non-existent path at the same origin. A site that serves a generic 200 page
+    # for ANY path (SPA/proxy catch-all) would make a bogus logout URL look "successful" -> a false
+    # confirm. If the logout endpoint's response is indistinguishable from this non-route, we cannot
+    # verify a real logout occurred.  (The logout must be a genuinely DISTINCT route, or a redirect.)
+    origin = f"{urlparse(sau).scheme}://{urlparse(sau).netloc}"
+    catchall_body, catchall_status = "", 0
+    try:
+        cg = http_anon.fetch(f"{origin}/greyiq-{'x' * 6}-no-such-route")
+        catchall_body, catchall_status = (cg.get("body") or ""), int(cg.get("status") or 0)
+    except _ActiveError:
+        pass
+
+    # Log out (the operator's OWN session). Try POST (the modern default), then GET for link-style logout.
+    logout = _json_write(slo, "POST", {}, auth=auth, settings=settings, timeout=settings.web_fetch_timeout_seconds)
+    logout_ok = bool(logout.get("ok") and 200 <= int(logout.get("status") or 0) < 400)
+    if not logout_ok:
+        try:
+            g = http.fetch(slo)
+            logout_ok = 200 <= int(g.get("status") or 0) < 400
+            logout = {"ok": True, "status": int(g.get("status") or 0), "body": g.get("body") or "", "method": "GET"}
+        except _ActiveError:
+            pass
+    if not logout_ok:
+        return {"ok": True, "status": "candidate",
+                "reason": f"could not complete a logout (POST/GET to the logout URL did not return 2xx/3xx, HTTP {logout.get('status')}) -- supply the exact logout endpoint.",
+                "detail": {"logout_status": logout.get("status")}}
+    # Verify the logout endpoint is REAL, not a catch-all: a redirect (3xx) is a genuine logout action;
+    # otherwise its 200 response must DIFFER from the non-existent-route control (a distinct route).
+    lo_status, lo_body = int(logout.get("status") or 0), str(logout.get("body") or "")
+    is_redirect = 300 <= lo_status < 400
+    looks_catchall = (not is_redirect and lo_status == 200 and catchall_status == 200
+                      and _ratio(lo_body, catchall_body) >= 0.90)
+    if looks_catchall:
+        return {"ok": True, "status": "candidate",
+                "reason": ("the logout URL returns the same generic page as a non-existent path (an SPA/proxy catch-all), "
+                           "so a real server-side logout can't be verified -- supply the exact logout endpoint (or the one "
+                           "that redirects / clears the session)."),
+                "detail": {"logout_status": lo_status, "ratio_logout_vs_nonroute": round(_ratio(lo_body, catchall_body), 3)}}
+
+    try:
+        r_replay = http.fetch(sau)        # the SAME session, AFTER logout
+    except _ActiveError as exc:
+        return _err(f"replay request failed: {exc}")
+    body_replay, st_replay = (r_replay.get("body") or ""), int(r_replay.get("status") or 0)
+    r_replay_base = _ratio(body_replay, body_base)
+    detail = {"status_base": st_base, "status_anon": st_anon, "status_replay": st_replay,
+              "ratio_replay_vs_base": round(r_replay_base, 3), "ratio_anon_vs_base": round(r_anon_base, 3),
+              "logout_status": logout.get("status")}
+    still_authed = st_replay == 200 and r_replay_base >= _SAME
+    if not still_authed:
+        return {"ok": True, "status": "enforced",
+                "reason": (f"after logout the same session no longer returned your authenticated content (HTTP {st_replay}, "
+                           f"similarity to the pre-logout response {r_replay_base:.2f}) -- the session was invalidated. Enforced."),
+                "detail": detail}
+    finding, plan = _build_session_invalidation_finding(sau, slo, detail)
+    return {"ok": True, "status": "confirmed", "finding": finding, "attack_plan": plan, "detail": detail}
+
+
+def _build_session_invalidation_finding(authed_url: str, logout_url: str, detail: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    path = urlparse(authed_url).path or "/"
+    matched = (f"after a successful logout (HTTP {detail.get('logout_status')}), the SAME session still returned the "
+               f"authenticated response at {path} (HTTP {detail.get('status_replay')}, {detail.get('ratio_replay_vs_base')} "
+               f"similar to the pre-logout response) while an anonymous request was denied")
+    model = impact_model.impact_for_class("auth")
+    finding = {
+        "rule_id": "active.session-not-invalidated",
+        "title": f"Session not invalidated after logout at {path}",
+        "severity": "medium", "confidence": "high", "category": "auth",
+        "location": authed_url, "file_path": authed_url, "line_start": 1, "line_end": 1,
+        "class_id": _SESS_META["class_id"], "class_name": _SESS_META["class_name"],
+        "cwe": _SESS_META["cwe"], "owasp": _SESS_META["owasp"],
+        "references": ["https://cwe.mitre.org/data/definitions/613.html",
+                       "https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures/"],
+        "vrt": "", "remediation": ("Destroy the session SERVER-SIDE on logout (invalidate the session record / rotate the "
+                                   "token), not just by clearing the client cookie; expire tokens and reject a logged-out "
+                                   "session identifier on every subsequent request."),
+        "snippet": "",
+        "proof_evidence": {
+            "request_line": f"GET {authed_url} (session)  ->  logout  ->  GET {authed_url} (SAME session)",
+            "request_header": "Cookie: <your account session, reused after logout>",
+            "response_status": f"HTTP {detail.get('status_replay')} (still authenticated post-logout)",
+            "matched_value": matched,
+        },
+    }
+    plan = {
+        "steps": [
+            "Log in with your test account and capture the session cookie/token.",
+            f"Confirm it authenticates: GET {authed_url} -> your account content (an anonymous request is denied).",
+            f"Log out via {logout_url}.",
+            f"Re-send the ORIGINAL session to {authed_url} -- it still returns your authenticated content, so the server "
+            "never destroyed the session (only the client cookie was cleared).",
+            "Impact: a stolen/leaked session (proxy log, shared device, XSS-exfil) stays valid after the victim logs out.",
+        ],
+        "poc": (f"# After logout, replay the ORIGINAL session:\n"
+                f"curl -s -i '{authed_url}' -H 'Cookie: <pre-logout session>'\n"
+                f"# -> HTTP {detail.get('status_replay')} with your authenticated content (session still alive)"),
+        "impact": model.get("business_impact", ""),
+        "cvss": {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:L/A:N", "base_score": 6.5, "base_severity": "medium", "estimated": False,
+                 "justification": "Actively confirmed: the same session authenticated after a successful logout (anonymous control denied)."},
+        "remediation": finding["remediation"],
+        "proof_of_impact": {
+            "status": "confirmed",
+            "method": "authenticated GET, logout, then replay of the same session (GET-only reads + the operator's own logout)",
+            "actor": "the account owner (own session, replayed after logout)",
+            "affected_asset": "every user whose session outlives their logout -- stolen/leaked sessions remain usable",
+            "observed_result": matched,
+            "control_result": "an anonymous (no-session) request to the same endpoint was denied, so it is genuinely session-gated -- yet the post-logout session still worked",
+            "evidence": "post-logout session response == pre-logout authenticated response and != the anonymous response (ratios captured)",
+            "proof_obligation": ("Capture the full exchange: the authenticated GET before logout, the logout request + its 2xx/3xx "
+                                 "response, and the SAME session replayed after logout still returning your account content (with the "
+                                 "anonymous-request denial as the control) -- proving the session was not destroyed server-side."),
         },
     }
     return finding, plan
