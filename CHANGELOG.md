@@ -2,6 +2,20 @@
 
 Notable changes to GreyIQ.
 
+## v0.94.0
+
+### Confirms JWT algorithm-confusion (RS256→HS256) token forgery
+- Some servers verify their login tokens (JWTs) with a **public** key but can be tricked into treating
+  a token as if it used a shared-secret algorithm — which lets anyone forge a valid token using that
+  public key, and impersonate any user. The engine now **proves** this end-to-end and on its own: it
+  fetches the target's own public key, forges a token with it, and confirms **critical** only when the
+  forged token is accepted *and* a tampered-signature token is rejected (so the forgery working can
+  only mean the bug is real — no false positives).
+- Runs automatically on a token you supply or one the app itself hands out — no setup. GET-only, and it
+  only ever sends the forged token back to the same in-scope target.
+- Also sharpened the tamper-signature control used by both this and the existing "unsigned token"
+  (`alg:none`) check, so it no longer occasionally misses a real bug.
+
 ## v0.93.0
 
 ### Confirms exposed database dumps and config backups
