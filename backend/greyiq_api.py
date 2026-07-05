@@ -907,6 +907,14 @@ class BflaRequest(BaseModel):
     platform: str = Field(default="hackerone", max_length=20)
 
 
+class MassAssignRequest(BaseModel):
+    object_url: str = Field(min_length=1, max_length=4000)   # a JSON object the account OWNS (e.g. /api/users/me)
+    cookie: str = Field(default="", max_length=8000)
+    headers: list[str] = Field(default_factory=list, max_length=20)
+    scope: str = Field(default="", max_length=2000)
+    platform: str = Field(default="hackerone", max_length=20)
+
+
 class IdorProbeRequest(BaseModel):
     url: str = Field(min_length=1, max_length=4000)   # one authenticated object URL with a numeric id
     cookie: str = Field(default="", max_length=8000)
@@ -2659,6 +2667,33 @@ class GreyIQRuntime:
         }
 
     @_confirm_route
+    def check_mass_assignment(self, request: "MassAssignRequest") -> dict[str, Any]:
+        """Confirm MASS ASSIGNMENT -> privilege escalation on an object the account OWNS: the session
+        sets a boolean privilege flag (is_admin / is_verified / ...) the server should never accept from
+        a client, proven by a before/after re-read plus an empty-write control. Benign + reversible (the
+        flag is restored). On a CONFIRMED escalation, cache it as a run so every per-finding action works."""
+        res = bounty_access.run_mass_assignment_check(
+            request.object_url,
+            account={"cookie": request.cookie, "headers": request.headers},
+            scope=request.scope,
+        )
+        if not res.get("ok"):
+            return res
+        status = res["status"]
+        if status != "confirmed":
+            return {"ok": True, "status": status, "reason": res.get("reason", ""), "detail": res.get("detail")}
+        finding = dict(res["finding"]); finding["ref"] = "F1"
+        plan = res["attack_plan"]
+        host = urlparse(request.object_url).hostname or "target"
+        persisted = self._persist_finding_run(
+            findings=[finding], plans={"F1": plan}, target=request.object_url, scope=request.scope,
+            platform=request.platform, slug="mass-assignment", host=host, json_extra={"detail": res.get("detail")})
+        return {
+            "ok": True, "status": "confirmed", "run_id": persisted["run_id"], "ref": "F1",
+            "platform": persisted["platform"], "report": persisted["report"], "detail": res.get("detail"),
+            "title": finding["title"], "severity": finding["severity"],
+        }
+
     def check_bfla(self, request: "BflaRequest") -> dict[str, Any]:
         """Confirm BFLA (broken function-level authorization) via a three-session differential
         (admin / low-priv user / anon). On a CONFIRMED bypass, cache it as a run so every
@@ -4351,6 +4386,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/bfla":
             request = validate_payload(BflaRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.check_bfla, request))
+            return
+        if method == "POST" and path == "/api/bounty/mass-assignment":
+            request = validate_payload(MassAssignRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.check_mass_assignment, request))
             return
         if method == "POST" and path == "/api/bounty/idor-probe":
             request = validate_payload(IdorProbeRequest, await read_json_body(receive))

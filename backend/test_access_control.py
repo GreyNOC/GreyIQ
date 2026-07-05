@@ -410,6 +410,119 @@ class IdorProbeTwoIdTests(unittest.TestCase):
         self.assertEqual(res["status"], "candidate")
         self.assertIn("http://127.0.0.1/api/order/10", seen_mutations)  # the 2-digit neighbour, well-formed
 
+# --- Mass assignment / privilege escalation (real local server: GET reads + PATCH writes) ---------
+import json as _json  # noqa: E402
+import os as _os  # noqa: E402
+import threading as _threading  # noqa: E402
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
+
+
+class _MassAssignHandler(BaseHTTPRequestHandler):
+    """A JSON object endpoint the operator owns. ``vulnerable=True`` accepts a client-set is_admin on
+    PATCH (the bug); ``vulnerable=False`` ignores privilege fields (secure). Empty PATCH is a no-op."""
+    vulnerable = True
+    recompute = False   # secure-but-side-effecting: sets is_admin on ANY content write, IGNORING the client value
+    state = {"id": 7, "name": "alice", "is_admin": False}
+
+    def _send(self, code: int, body: str) -> None:
+        b = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._send(200, _json.dumps(type(self).state))
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = _json.loads(self.rfile.read(length) or b"{}") if length else {}
+        except Exception:  # noqa: BLE001
+            body = {}
+        if type(self).recompute and isinstance(body, dict) and body:
+            type(self).state = {**type(self).state, "is_admin": True}  # side-effect on ANY content; ignores client value
+        elif type(self).vulnerable and isinstance(body, dict) and "is_admin" in body:
+            type(self).state = {**type(self).state, "is_admin": bool(body["is_admin"])}  # THE BUG
+        self._send(200, _json.dumps(type(self).state))
+
+    def log_message(self, *a: object) -> None:
+        return
+
+
+class MassAssignmentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._prev = _os.environ.get("GREYIQ_SCAN_ALLOW_PRIVATE_URLS")
+        _os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
+        _MassAssignHandler.vulnerable = True
+        _MassAssignHandler.recompute = False
+        _MassAssignHandler.state = {"id": 7, "name": "alice", "is_admin": False}
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _MassAssignHandler)
+        _threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}/api/users/me"
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        if self._prev is None:
+            _os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+        else:
+            _os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = self._prev
+
+    def test_vulnerable_server_is_confirmed_and_restored(self) -> None:
+        r = ac.run_mass_assignment_check(self.url, account={"cookie": "sess=x"}, scope="127.0.0.1")
+        self.assertEqual(r["status"], "confirmed", r)
+        self.assertEqual(r["finding"]["rule_id"], "active.mass-assignment")
+        self.assertEqual(r["finding"]["class_name"], "Mass assignment / privilege escalation")
+        self.assertEqual(r["attack_plan"]["proof_of_impact"]["status"], "confirmed")
+        self.assertEqual(r["detail"]["field"], "is_admin")
+        self.assertFalse(_MassAssignHandler.state["is_admin"])   # restored to false afterward (good citizen)
+
+    def test_secure_server_is_enforced(self) -> None:
+        _MassAssignHandler.vulnerable = False   # ignores the client-set is_admin
+        r = ac.run_mass_assignment_check(self.url, account={"cookie": "sess=x"}, scope="127.0.0.1")
+        self.assertEqual(r["status"], "enforced", r)
+        self.assertNotIn("finding", r)
+
+    def test_no_privilege_flag_present_is_enforced(self) -> None:
+        _MassAssignHandler.state = {"id": 7, "name": "alice"}   # no is_admin-style field
+        r = ac.run_mass_assignment_check(self.url, account={"cookie": "sess=x"}, scope="127.0.0.1")
+        self.assertEqual(r["status"], "enforced")
+
+    def test_flag_already_true_is_not_confirmed(self) -> None:
+        _MassAssignHandler.state = {"id": 7, "is_admin": True}   # baseline must be FALSE to prove a flip
+        r = ac.run_mass_assignment_check(self.url, account={"cookie": "sess=x"}, scope="127.0.0.1")
+        self.assertEqual(r["status"], "enforced")
+
+    def test_out_of_scope_is_fail_closed(self) -> None:
+        r = ac.run_mass_assignment_check("http://other.example/api/me", account={"cookie": "x"},
+                                         scope="127.0.0.1", settings=_settings())
+        self.assertFalse(r["ok"])
+        self.assertIn("scope", r["error"].lower())
+
+    def test_no_session_fails_closed(self) -> None:
+        r = ac.run_mass_assignment_check(self.url, account={}, scope="127.0.0.1")
+        self.assertFalse(r["ok"])
+        self.assertIn("session", r["error"].lower())
+
+    def test_owner_settable_field_is_not_flagged(self) -> None:
+        # QAQC regression: a context-dependent, legitimately owner-settable boolean (verified/approved/
+        # premium/owner) must NOT confirm — only universal role/admin flags do. Even a "vulnerable"
+        # server accepting a client-set 'verified' is expected behaviour for a self-attested field.
+        for owner_field in ("verified", "is_verified", "approved", "premium", "is_owner"):
+            _MassAssignHandler.state = {"id": 7, "name": "alice", owner_field: False}
+            r = ac.run_mass_assignment_check(self.url, account={"cookie": "sess=x"}, scope="127.0.0.1")
+            self.assertEqual(r["status"], "enforced", f"{owner_field} must not be treated as a privilege flag: {r}")
+
+    def test_server_recompute_side_effect_is_not_confirmed(self) -> None:
+        # QAQC regression: a SECURE server that recomputes is_admin as a side-effect of ANY content
+        # write (ignoring the client-supplied value) must NOT confirm — the content-bearing control
+        # write (which omits is_admin) flips it, exposing the recompute -> candidate, never confirmed.
+        _MassAssignHandler.recompute = True
+        r = ac.run_mass_assignment_check(self.url, account={"cookie": "sess=x"}, scope="127.0.0.1")
+        self.assertEqual(r["status"], "candidate", r)
+        self.assertNotIn("finding", r)
+
 
 if __name__ == "__main__":
     unittest.main()

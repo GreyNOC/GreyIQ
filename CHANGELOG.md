@@ -2,6 +2,20 @@
 
 Notable changes to GreyIQ.
 
+## v0.95.0
+
+### Confirms mass assignment → privilege escalation
+- A new check proves **mass assignment**: when an app lets a normal user set a field they should never
+  control — like `is_admin`, `is_verified`, or `is_staff` — by just including it in an update request.
+  Give it a JSON object your test account owns (e.g. `/api/users/me`) and that account's session, and
+  the engine confirms it end-to-end: it reads the object, sends a client update flipping the privilege
+  flag on, re-reads to prove the change actually persisted, and checks that an empty update *doesn't*
+  flip it (so the escalation is genuinely caused by the value you set) — then **restores the flag**, so
+  the test is benign and reversible.
+- Only ever touches the object you own, stays in scope, flips a single boolean and puts it back, and
+  attaches your session same-site only. Available from the access-control panel next to the IDOR and
+  BFLA checks, and at `POST /api/bounty/mass-assignment`.
+
 ## v0.94.0
 
 ### Confirms JWT algorithm-confusion (RS256→HS256) token forgery
