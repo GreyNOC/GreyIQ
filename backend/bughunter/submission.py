@@ -93,9 +93,13 @@ def write_submission_package(ctx: dict[str, Any], finding: dict[str, Any], out_d
     # ![](basename) reference resolves wherever the package folder is opened. The
     # report embeds by basename, so keep the same name. Best-effort: a copy failure
     # must not drop the package.
-    shot = str(finding.get("screenshot_path") or "").strip()
-    if shot:
-        src = Path(shot)
+    # Co-locate the proof screenshot AND the graphical attack-plan map (each optional) with the .md so
+    # their embedded ![](basename) references resolve wherever the package folder is opened.
+    for artifact in (finding.get("screenshot_path"), finding.get("attack_map_path")):
+        p = str(artifact or "").strip()
+        if not p:
+            continue
+        src = Path(p)
         try:
             if src.is_file() and src.resolve() != (out_dir / src.name).resolve():
                 shutil.copyfile(src, out_dir / src.name)

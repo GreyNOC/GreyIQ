@@ -629,6 +629,26 @@ class RunCampaignOverTargetsTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("authorized", result["error"].lower())
 
+    def test_attack_map_option_is_forwarded_to_each_target(self) -> None:
+        # QAQC regression: the span path must HONOR the attack-map opt-out (it was silently defaulting
+        # to True). Prove the per-target run_campaign receives whatever include_attack_map the span got.
+        original = campaign.run_campaign
+        seen: list = []
+
+        def fake_run_campaign(target, **kw):
+            seen.append(kw.get("include_attack_map"))
+            return {"ok": True, "campaign_path": "", "json_path": "", "urls_scanned": 1, "urls_discovered": 1,
+                    "finding_count": 0, "confirmed_count": 0, "submission_paths": [], "findings": [],
+                    "proof_of_impact": {}, "cvss": {}, "attack_plans": {}, "surface": {}, "risk": "clean"}
+
+        campaign.run_campaign = fake_run_campaign
+        try:
+            self._run([str(self.src_a)], include_attack_map=False)   # opt OUT
+            self._run([str(self.src_b)], include_attack_map=True)    # opt IN
+        finally:
+            campaign.run_campaign = original
+        self.assertEqual(seen, [False, True])                        # the toggle reaches every target
+
     def test_no_targets_is_a_clean_error(self) -> None:
         result = self._run([])
         self.assertFalse(result["ok"])
@@ -850,7 +870,7 @@ class ProofScreenshotCaptureTests(unittest.TestCase):
         campaign.screenshot_service.capture_screenshot = lambda url, path, **kw: {
             "ok": True, "path": str(path), "source_text_path": str(path) + ".txt"}
         items = self._items(3)
-        n = campaign._capture_proof_screenshots(items, Path("shots"), "https://in-scope.example", "in-scope.example")
+        n = campaign._capture_proof_screenshots(items, Path("shots"), "https://in-scope.example", "in-scope.example", with_attack_map=False)
         self.assertEqual(n, 3)
         for it in items:
             self.assertTrue(str(it["finding"]["screenshot_path"]).endswith(".png"))
@@ -862,7 +882,7 @@ class ProofScreenshotCaptureTests(unittest.TestCase):
         campaign.screenshot_service.poc_url_for_finding = lambda finding, ctx: ctx["target"]
         campaign.screenshot_service.capture_screenshot = boom
         items = self._items(2)
-        n = campaign._capture_proof_screenshots(items, Path("shots"), "https://in-scope.example", "in-scope.example")
+        n = campaign._capture_proof_screenshots(items, Path("shots"), "https://in-scope.example", "in-scope.example", with_attack_map=False)
         self.assertEqual(n, 0)
         self.assertNotIn("screenshot_path", items[0]["finding"])
 
@@ -871,7 +891,7 @@ class ProofScreenshotCaptureTests(unittest.TestCase):
         campaign.screenshot_service.poc_url_for_finding = lambda finding, ctx: ""
         campaign.screenshot_service.capture_screenshot = lambda *a, **k: calls.append(1) or {"ok": True, "path": "x"}
         items = self._items(2)
-        n = campaign._capture_proof_screenshots(items, Path("shots"), "t", "s")
+        n = campaign._capture_proof_screenshots(items, Path("shots"), "t", "s", with_attack_map=False)
         self.assertEqual(n, 0)
         self.assertEqual(calls, [])  # no PoC URL -> capture is never attempted
 

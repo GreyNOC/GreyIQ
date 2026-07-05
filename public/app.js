@@ -418,6 +418,7 @@ function loadState() {
     ckProgram: "",
     ckActive: false,
     ckTimeBased: false,
+    ckAttackMap: true,
     ckLive: false,
     ckAuthCookie: "",
     ckAuthHeaders: ""
@@ -4321,6 +4322,7 @@ const ck = {
   active: document.querySelector("#ckActive"),
   timeBased: document.querySelector("#ckTimeBased"),
   deep: document.querySelector("#ckDeep"),
+  attackMap: document.querySelector("#ckAttackMap"),
   live: document.querySelector("#ckLive"),
   authFold: document.querySelector("#ckAuthFold"),
   authCookie: document.querySelector("#ckAuthCookie"),
@@ -8766,6 +8768,7 @@ async function ckRunPortfolio() {
   state.ckActive = Boolean(ck.active?.checked);
   state.ckTimeBased = Boolean(ck.timeBased?.checked);
   state.ckDeep = Boolean(ck.deep?.checked);
+  state.ckAttackMap = ck.attackMap ? Boolean(ck.attackMap.checked) : true;  // graphical attack-plan map (default on)
   state.ckLive = Boolean(ck.live?.checked);
   state.ckAuthCookie = (ck.authCookie?.value || "").trim();
   state.ckAuthHeaders = (ck.authHeaders?.value || "");
@@ -8784,7 +8787,7 @@ async function ckRunPortfolio() {
       method: "POST", timeoutMs: 3600000,
       body: JSON.stringify({
         program_ids: ids, authorized: true, active: state.ckActive, time_based: state.ckTimeBased,
-        deep: state.ckDeep, live: state.ckLive, max_pages: Number(ck.maxPages?.value) || 12,
+        deep: state.ckDeep, attack_map: state.ckAttackMap, live: state.ckLive, max_pages: Number(ck.maxPages?.value) || 12,
         auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines, run_id: progressRunId,
       }),
     });
@@ -8827,6 +8830,7 @@ async function ckRun() {
   state.ckActive = Boolean(ck.active?.checked);
   state.ckTimeBased = Boolean(ck.timeBased?.checked);
   state.ckDeep = Boolean(ck.deep?.checked);
+  state.ckAttackMap = ck.attackMap ? Boolean(ck.attackMap.checked) : true;  // graphical attack-plan map (default on)
   state.ckLive = Boolean(ck.live?.checked);
   state.ckAuthCookie = (ck.authCookie?.value || "").trim();
   state.ckAuthHeaders = (ck.authHeaders?.value || "");
@@ -8863,6 +8867,7 @@ async function ckRun() {
           target, scope: state.ckScope, authorized: true, program: state.ckProgram || null,
           program_id: spanning ? state.ckActiveProgramId : null,
           active: state.ckActive, time_based: state.ckTimeBased, live: state.ckLive, deep: state.ckDeep,
+          attack_map: state.ckAttackMap,
           max_pages: Number(ck.maxPages?.value) || 12,
           auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines, run_id: progressRunId
         })
@@ -9634,6 +9639,7 @@ function bootCockpit() {
   if (ck.active) ck.active.checked = Boolean(state.ckActive);
   if (ck.timeBased) ck.timeBased.checked = Boolean(state.ckTimeBased);
   if (ck.deep) ck.deep.checked = Boolean(state.ckDeep);
+  if (ck.attackMap) ck.attackMap.checked = state.ckAttackMap !== false;  // default on
   if (ck.live) ck.live.checked = Boolean(state.ckLive);
   if (ck.spanScope) ck.spanScope.checked = Boolean(state.ckSpanScope);
   if (ck.authCookie) ck.authCookie.value = state.ckAuthCookie || "";

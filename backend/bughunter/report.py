@@ -699,19 +699,29 @@ _SCREENSHOT_WARNING = ("Screenshot is NOT auto-redacted — review it for secret
 
 
 def _append_screenshot(out: list[str], finding: dict[str, Any]) -> None:
-    """Embed a captured proof screenshot by basename (so the .md and the .png resolve from
-    the same folder) plus the not-auto-redacted caveat. Shared by the default report and
-    the per-platform report so a captured screenshot lands on *every* report surface, not
-    only the platform package."""
+    """Embed the captured VISUAL evidence by basename (so the .md and the .png resolve from the same
+    folder): the proof screenshot AND the graphical attack-plan map, each optional and independent.
+    Shared by the default report and the per-platform report so the visuals land on *every* report
+    surface, not only the platform package."""
     names = _screenshot_names(finding)
-    if not names:
-        return
-    out.append("## Screenshot evidence\n")
-    for name in names:
-        out.append(f"![Proof-of-concept screenshot]({name})")
+    if names:
+        out.append("## Screenshot evidence\n")
+        for name in names:
+            out.append(f"![Proof-of-concept screenshot]({name})")
+            out.append("")
+        out.append(f"> {_SCREENSHOT_WARNING}")
         out.append("")
-    out.append(f"> {_SCREENSHOT_WARNING}")
-    out.append("")
+    # Graphical attack-plan map (optional) — embedded by basename like the screenshot; the .png is
+    # co-located in the submission package by submission.write_submission_package.
+    amap = str(finding.get("attack_map_path") or "").strip()
+    if amap:
+        name = amap.replace("\\", "/").rsplit("/", 1)[-1]
+        out.append("## Attack-plan map\n")
+        out.append(f"![Attack-plan map — the attack GreyIQ used to confirm this finding]({name})")
+        out.append("")
+        out.append("> A visual map of the confirmed attack flow (actor → crafted probe → observed tell "
+                   "vs negative control → confirmed impact). The .png is included in this POC package.")
+        out.append("")
 
 
 _CREDENTIAL_WARNING = ("The credential above is shown UN-REDACTED so you can validate it and paste the "
