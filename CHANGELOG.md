@@ -2,6 +2,23 @@
 
 Notable changes to GreyIQ.
 
+## v0.88.0
+
+### Stored XSS you can prove *executes* — via an out-of-band beacon
+- Stored XSS was already confirmed when the injected payload appeared unescaped in the page source. New
+  in this release: a stronger, dynamic confirmation that catches stored XSS which only appears after the
+  browser renders the page (DOM/JavaScript-built content a plain source fetch misses).
+- With an out-of-band collaborator configured, the engine injects a harmless `<img src=…your
+  collaborator…>` beacon into the stored field, renders the view page in a real headless browser, and
+  treats it as confirmed only when your collaborator records the beacon firing for a fresh,
+  previously-silent token. If the app escaped the input, the image renders as inert text and nothing
+  fires — so there's no false positive. A crawler/preview-bot callback is downgraded to a candidate.
+- Benign and safe: the beacon does nothing but request your own collaborator (no data read, no session
+  theft); the view and inject URLs are scope-bound and SSRF-guarded, every request the render makes is
+  filtered so it can never reach an internal host, your session is attached only to same-site requests
+  (never leaked to a cross-origin host the page references), and it's fully opt-in. Available as an
+  assisted mode (get the payloads, submit them yourself, then re-render) or an auto mode.
+
 ## v0.87.0
 
 ### Every confirmed finding now ships a runnable proof of exploit

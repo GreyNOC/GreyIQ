@@ -849,6 +849,20 @@ class StoredXssRequest(BaseModel):
     headers: list[str] = Field(default_factory=list, max_length=20)
 
 
+class StoredXssBeaconRequest(BaseModel):
+    view_url: str = Field(min_length=1, max_length=4000)   # where the stored content renders
+    inject_url: str = Field(default="", max_length=4000)   # the form endpoint (auto-send only)
+    field: str = Field(default="", max_length=200)         # the field to submit into (auto-send only)
+    scope: str = Field(default="", max_length=2000)
+    platform: str = Field(default="hackerone", max_length=20)
+    base: str = Field(default="", max_length=2000)         # OOB collaborator base URL
+    secret: str = Field(default="", max_length=200)        # OOB collaborator secret
+    send: bool = Field(default=False)               # opt-in: POST the beacon into the field, then render + poll
+    token: str = Field(default="", max_length=64)   # re-render/re-poll an assisted token after injecting manually
+    cookie: str = Field(default="", max_length=8000)
+    headers: list[str] = Field(default_factory=list, max_length=20)
+
+
 class IdorRequest(BaseModel):
     url_a: str = Field(min_length=1, max_length=4000)   # account A's object URL
     url_b: str = Field(min_length=1, max_length=4000)   # account B's object URL (B owns this)
@@ -2886,6 +2900,31 @@ class GreyIQRuntime:
                 "platform": persisted["platform"], "report": persisted["report"], "marker": res.get("marker"),
                 "title": finding["title"], "severity": finding["severity"]}
 
+    def check_stored_xss_beacon(self, request: "StoredXssBeaconRequest") -> dict[str, Any]:
+        """Confirm stored XSS via an OOB collaborator beacon rendered in a browser — proves the injected
+        markup EXECUTES on render (catches DOM/JS-rendered stored XSS a source fetch misses). Assisted by
+        default (mint a token + beacon payloads, hand back to submit, then re-render/poll); ``send=True``
+        opts in to GreyIQ POSTing the beacon, rendering the view headlessly, and polling the collaborator."""
+        res = bounty_stored_xss.confirm_stored_xss_beacon(
+            view_url=request.view_url, inject_url=request.inject_url, field=request.field,
+            base=request.base, secret=request.secret, scope=request.scope, send=bool(request.send),
+            token=(request.token or None), cookie=request.cookie, headers=request.headers)
+        if not res.get("ok"):
+            return res
+        if res.get("status") != "confirmed":
+            return {"ok": True, "status": res.get("status"), "token": res.get("token"),
+                    "payloads": res.get("payloads"), "callback_url": res.get("callback_url", ""),
+                    "reason": res.get("reason", ""), "error": res.get("error", "")}
+        finding = dict(res["finding"]); finding["ref"] = "F1"
+        plan = res["attack_plan"]
+        host = urlparse(request.view_url).hostname or "target"
+        persisted = self._persist_finding_run(
+            findings=[finding], plans={"F1": plan}, target=request.view_url, scope=request.scope,
+            platform=request.platform, slug="stored-xss-beacon", host=host, json_extra={"detail": res.get("detail")})
+        return {"ok": True, "status": "confirmed", "run_id": persisted["run_id"], "ref": "F1",
+                "platform": persisted["platform"], "report": persisted["report"], "token": res.get("token"),
+                "title": finding["title"], "severity": finding["severity"]}
+
     # ---- Autonomous operator ------------------------------------------------------
     def _operator_run_campaign(self, target: str, *, scope: str, program: str, active: bool, live: bool,
                                deep: bool = False, max_pages: int = 12) -> dict[str, Any]:
@@ -4270,6 +4309,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/stored-xss":
             request = validate_payload(StoredXssRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.check_stored_xss, request))
+            return
+        if method == "POST" and path == "/api/bounty/stored-xss-beacon":
+            request = validate_payload(StoredXssBeaconRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.check_stored_xss_beacon, request))
             return
         if method == "POST" and path == "/api/bounty/submit":
             request = validate_payload(SubmitRequest, await read_json_body(receive))

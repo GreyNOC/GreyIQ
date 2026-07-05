@@ -162,5 +162,103 @@ class PostFormSameSiteTests(unittest.TestCase):
         self.assertNotIn("Cookie", self.captured[0])  # session must NOT leak to a different host
 
 
+class StoredXssBeaconTests(unittest.TestCase):
+    """OOB-beacon stored XSS: inject an <img src=collaborator> beacon, render the view in a browser,
+    and a callback for the fresh (pre-injection empty) token proves the stored markup executes on
+    render. Browser + collaborator are stubbed; no real network/browser is used."""
+
+    def setUp(self) -> None:
+        self._save = (sx._guard_url, sx._render_beacon, sx._post_form, sx.poll_collaborator)
+        sx._guard_url = lambda u, *a, **k: u
+        sx._render_beacon = lambda url, **k: {"ok": True, "final_url": url}       # no real browser
+        sx._post_form = lambda url, data, **k: {"ok": True, "status": 200}        # no real POST
+        self.cfg = {"base": "https://collab.example", "secret": "s" * 16, "scope": "app.example.com",
+                    "settings": get_settings(), "poll_delay_s": 0.0, "poll_attempts": 1}
+        self.V = {"view_url": "https://app.example.com/profile", "inject_url": "https://app.example.com/bio", "field": "bio"}
+
+    def tearDown(self) -> None:
+        sx._guard_url, sx._render_beacon, sx._post_form, sx.poll_collaborator = self._save
+
+    def _poll_seq(self, second):
+        state = {"n": 0}
+        def poll(base, secret, token, **k):
+            state["n"] += 1
+            return {"ok": True, "count": 0} if state["n"] == 1 else second(token)
+        return poll
+
+    def test_beacon_payloads_embed_the_callback(self) -> None:
+        p = sx._beacon_payloads("https://collab.example/oob/tok", "tok")
+        self.assertIn("https://collab.example/oob/tok", p["img"])
+        self.assertIn("<img", p["img"])
+
+    def test_auto_send_render_hit_confirms_and_carries_active_proof(self) -> None:
+        from bughunter import report
+        sx.poll_collaborator = self._poll_seq(lambda t: {"ok": True, "count": 1, "hits": [
+            {"method": "GET", "path": "/oob/" + t, "ip": "203.0.113.9", "headers": {"user-agent": "HeadlessChrome/120"}}]})
+        res = sx.confirm_stored_xss_beacon(send=True, **self.V, **self.cfg)
+        self.assertEqual(res["status"], "confirmed")
+        f = res["finding"]
+        self.assertEqual(f["rule_id"], "active.stored-xss-beacon")
+        self.assertEqual(f["_active_class_hint"], "xss")                          # renders confirmed in a hunt/report
+        poi = f["_active_proof"]
+        self.assertTrue(report._has_captured_artifact(f, poi, poi.get("observed_result", "")))
+        self.assertIn("control_result", poi)                                     # fresh-token negative control
+
+    def test_no_callback_is_not_confirmed(self) -> None:
+        sx.poll_collaborator = lambda *a, **k: {"ok": True, "count": 0}
+        res = sx.confirm_stored_xss_beacon(send=True, **self.V, **self.cfg)
+        self.assertEqual(res["status"], "no-callback")
+
+    def test_preexisting_token_hit_aborts_negative_control(self) -> None:
+        sx.poll_collaborator = lambda *a, **k: {"ok": True, "count": 5}
+        res = sx.confirm_stored_xss_beacon(send=True, **self.V, **self.cfg)
+        self.assertFalse(res["ok"])
+        self.assertIn("already has hits", res["error"])
+
+    def test_crawler_ua_callback_downgrades_to_candidate(self) -> None:
+        sx.poll_collaborator = self._poll_seq(lambda t: {"ok": True, "count": 1, "hits": [
+            {"method": "GET", "path": "/x", "ip": "1.2.3.4", "headers": {"user-agent": "Slackbot-LinkExpanding 1.0"}}]})
+        res = sx.confirm_stored_xss_beacon(send=True, **self.V, **self.cfg)
+        self.assertEqual(res["status"], "candidate")
+        self.assertEqual(res["finding"]["_active_proof"]["status"], "candidate")
+
+    def test_assisted_ready_hands_back_beacon_kit_without_rendering(self) -> None:
+        rendered = []
+        sx._render_beacon = lambda url, **k: rendered.append(url) or {"ok": True, "final_url": url}
+        res = sx.confirm_stored_xss_beacon(view_url="https://app.example.com/profile", **self.cfg)
+        self.assertEqual(res["status"], "ready")
+        self.assertIn("collab.example", res["payloads"]["img"])
+        self.assertTrue(res["token"])
+        self.assertEqual(rendered, [])                                           # nothing rendered, nothing sent
+
+    def test_requires_collaborator_and_scope(self) -> None:
+        self.assertFalse(sx.confirm_stored_xss_beacon(view_url="https://app.example.com/p", base="", secret="",
+                                                      scope="app.example.com", settings=get_settings())["ok"])
+        # out-of-scope view is refused
+        self.assertFalse(sx.confirm_stored_xss_beacon(view_url="https://evil.example/p", base="https://c", secret="s",
+                                                      scope="app.example.com", settings=get_settings())["ok"])
+
+    def test_auto_send_requires_inject_url_and_field(self) -> None:
+        res = sx.confirm_stored_xss_beacon(view_url="https://app.example.com/profile", send=True, **self.cfg)
+        self.assertFalse(res["ok"])
+        self.assertIn("inject_url", res["error"])
+
+    def test_render_session_never_rides_an_off_site_request(self) -> None:
+        # SECURITY: the render must attach the operator session ONLY to same-site requests. A cross-origin
+        # sub-resource the (attacker-controlled) stored markup references must receive NO credentials, or a
+        # header-based session (Authorization) would leak off-target. Regression for the QAQC P0.
+        from bughunter.scan_auth import build_auth
+        auth = build_auth("https://app.example.com/profile", cookie="session=SECRET",
+                          headers=["Authorization: Bearer OP_TOKEN"])
+        # same-site (the view host + subdomains) -> session attached
+        same = sx._beacon_route_headers("https://app.example.com/api/me", {"accept": "*/*"}, auth)
+        self.assertIsNotNone(same)
+        self.assertEqual(same.get("authorization"), "Bearer OP_TOKEN")
+        self.assertIn("session=SECRET", same.get("cookie", ""))
+        # off-site attacker host (the beacon-referenced <img> host / a public CDN) -> NO credentials
+        for evil in ("https://attacker.example/steal", "https://cdn.evil.net/x", "https://collab.example/oob/tok"):
+            self.assertIsNone(sx._beacon_route_headers(evil, {"accept": "*/*"}, auth), evil)
+
+
 if __name__ == "__main__":
     unittest.main()
