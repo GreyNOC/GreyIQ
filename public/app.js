@@ -6429,6 +6429,7 @@ function ckRenderIdor() {
   host.append(out);
   host.append(ckIdorProbeForm());
   host.append(ckBflaForm());
+  host.append(ckMassAssignForm());
   host.append(ckStoredXssForm());
   host.append(ckWalkthrough("ssrf-setup"));
   host.append(ckOobPanel());
@@ -6580,6 +6581,58 @@ function ckBflaForm() {
         const row = { runId: res.run_id || ckState.runId, ref: res.ref || "F1", title: res.title || "Broken function-level authorization",
                       severity: res.severity || "high", proof: "confirmed",
                       className: "Broken function-level authorization (BFLA)", cwe: "CWE-862 / CWE-285",
+                      plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" };
+        ckState.findings = (ckState.findings || []).filter((f) => !(f.ref === row.ref && f.className === row.className)).concat(row);
+        ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);
+        const pre = cel("pre", "ck-research-md"); pre.textContent = res.report || ""; pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "360px"; pre.style.overflow = "auto"; out.append(pre);
+      } else {
+        note.textContent = `Not confirmed (${res.status}). ${res.reason || ""}`;
+        if (res.detail) out.append(cel("p", "ck-hint", "Differential: " + JSON.stringify(res.detail)));
+      }
+    } catch (err) { note.classList.add("is-error"); note.textContent = err.message || "Check failed."; }
+    finally { run.disabled = false; run.textContent = label; }
+  });
+  form.append(note); wrap.append(form); wrap.append(out);
+  return wrap;
+}
+
+function ckMassAssignForm() {
+  const wrap = cel("div");
+  wrap.append(cel("h2", "ck-section-title", "Access control — mass assignment (privilege escalation)"));
+  wrap.append(cel("p", "ck-hint",
+    "Confirm mass assignment: your low-privilege account can set a privilege flag (is_admin / is_verified / …) it should never control, on an object it OWNS. Give a JSON object URL you own (e.g. /api/users/me) + that account's session. Benign + reversible — it flips one boolean and restores it, proving it with a before/after re-read plus an empty-write control."));
+  const form = cel("form", "ck-learn-form");
+  const url = ckField("Your object URL (JSON you own, e.g. https://app/api/users/me)", "text", "");
+  const cookie = ckField("Account — Cookie", "text", "");
+  const hdr = ckTextareaField("Account — extra headers (optional)", "Authorization: Bearer ...");
+  const scope = ckField("Scope (name the host to allow testing)", "text", state.ckScope || "");
+  form.append(url.wrap, cookie.wrap, hdr.wrap, scope.wrap);
+  const run = cel("button", "ck-btn primary", "Confirm mass assignment"); run.type = "submit"; form.append(run);
+  const note = cel("p", "ck-status"); note.style.flexBasis = "100%";
+  const out = cel("div", "ck-research");
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!url.input.value.trim()) { note.classList.add("is-error"); note.textContent = "Your object URL is required."; return; }
+    const label = run.textContent; run.disabled = true; run.textContent = "Testing…";
+    note.classList.remove("is-error"); note.textContent = ""; out.replaceChildren();
+    const lines = (v) => v.split("\n").map((s) => s.trim()).filter(Boolean);
+    try {
+      const res = await apiFetch("/api/bounty/mass-assignment", {
+        method: "POST", timeoutMs: 60000, body: JSON.stringify({
+          object_url: url.input.value.trim(),
+          cookie: cookie.input.value.trim(), headers: lines(hdr.input.value),
+          scope: scope.input.value.trim(), platform: ckState.platform || "hackerone"
+        })
+      });
+      if (!res || res.ok === false) {
+        note.classList.add("is-error"); note.textContent = (res && res.error) || "Could not run the check.";
+      } else if (res.status === "confirmed") {
+        out.append(cel("p", "ck-ftitle", "✅ Mass assignment / privilege escalation CONFIRMED"));
+        out.append(cel("p", "ck-hint", "Added to Submissions — Copy report / Download / Submit it there."));
+        ckState.runId = res.run_id || ckState.runId;
+        const row = { runId: res.run_id || ckState.runId, ref: res.ref || "F1", title: res.title || "Mass assignment → privilege escalation",
+                      severity: res.severity || "high", proof: "confirmed",
+                      className: "Mass assignment / privilege escalation", cwe: "CWE-915 / CWE-269",
                       plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" };
         ckState.findings = (ckState.findings || []).filter((f) => !(f.ref === row.ref && f.className === row.className)).concat(row);
         ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);

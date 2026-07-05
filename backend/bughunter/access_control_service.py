@@ -27,18 +27,23 @@ import re
 from typing import Any
 from urllib.parse import parse_qsl, urlparse, urlunparse
 
+import json
+import urllib.error
+import urllib.request
+
 from bughunter import impact_model
 from bughunter.active_verify_service import (
     _ActiveError,
     _Http,
+    _NoRedirect,
     _with_query,
     host_in_active_scope,
 )
 from bughunter.rate_limit import HostRateGovernor
-from bughunter.scan_auth import build_auth
+from bughunter.scan_auth import auth_headers_for, build_auth
 from bughunter.settings import get_settings
-from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
-from bughunter.web_scan_service import _guard_url
+from bughunter.web_ingest import WebsiteFetchError, guarded_dns_scope, normalize_website_url
+from bughunter.web_scan_service import _USER_AGENT, _guard_url, current_user_agent
 
 # Confirm thresholds (body similarity in [0,1] over whitespace-normalized, capped text).
 # The dispositive signal is that B's response to A's object matches A's OWN response, and
@@ -570,6 +575,222 @@ def _build_finding(url_a: str, url_b: str, detail: dict[str, Any]) -> tuple[dict
             "control_result": ("B reading B's own object returned distinct data, and A's vs B's objects differ "
                                f"(similarity {detail['ratio_A_vs_BownB']}) — so B's match to A is a genuine cross-tenant read, not a shared/static page"),
             "evidence": "B-on-A response ≈ A-on-A response, and ≠ B-on-B response (ratios captured; raw bodies withheld as they are another user's data)",
+            "proof_obligation": model.get("proof_obligation", ""),
+        },
+    }
+    return finding, plan
+
+
+# --- Mass assignment / privilege escalation ------------------------------------------------------
+# Boolean ROLE/ADMIN flags a client must NEVER be able to set on its own object — universally a
+# server-only authorization attribute, so a client-set true is unambiguous vertical privilege
+# escalation. Deliberately EXCLUDES context-dependent booleans (verified / approved / premium / pro /
+# owner) that many apps legitimately let the owner self-set on their own object — flagging those would
+# false-confirm, since "the owner can set this field on their own object" is expected there.
+_PRIV_BOOL_FIELD_RE = re.compile(
+    r"^(?:is[_-]?admin|admin|is[_-]?staff|staff|is[_-]?superuser|superuser|is[_-]?super|"
+    r"is[_-]?moderator|moderator|can[_-]?admin|is[_-]?root|root[_-]?user|is[_-]?sysadmin|sysadmin)$",
+    re.IGNORECASE,
+)
+_MA_META = {"class_id": "access-control", "class_name": "Mass assignment / privilege escalation",
+            "cwe": "CWE-915 / CWE-269", "owasp": "A01:2021 Broken Access Control"}
+
+
+def _json_write(url: str, method: str, payload: dict[str, Any], *, auth: Any, settings: Any, timeout: float) -> dict[str, Any]:
+    """Send a JSON body via ``method`` (PATCH/PUT/POST), the operator session attached SAME-SITE only
+    (auth_headers_for), no redirect followed. Used to write a benign, reversible value to the operator's
+    OWN object. Returns ``{ok, status}`` / ``{ok: False, error}`` -- never raises for the common failures.
+
+    SSRF: re-validates + DNS-PINS the host in its OWN guarded scope IMMEDIATELY before the connect, so
+    the write always lands on the freshly-checked IP. This must be self-contained -- the surrounding
+    prover interleaves GET reads (each opening/closing its own DNS-pin scope), so a single outer pin is
+    already gone by the time a write runs; without this, urllib would re-resolve via live DNS and a
+    rebind could point the session-bearing write at an internal/metadata host."""
+    headers = {"Content-Type": "application/json", "Accept": "*/*", "User-Agent": current_user_agent(_USER_AGENT)}
+    headers.update(auth_headers_for(urlparse(url).hostname or "", auth))
+    request = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), method=method, headers=headers)
+    opener = urllib.request.build_opener(_NoRedirect())
+    with guarded_dns_scope():
+        try:
+            _guard_url(url, settings.allow_private_urls, settings.web_allowed_ports)  # re-check + PIN right before connect
+        except WebsiteFetchError as exc:
+            return {"ok": False, "error": f"target refused by the URL guard: {exc}"}
+        try:
+            with opener.open(request, timeout=timeout) as resp:
+                return {"ok": True, "status": int(getattr(resp, "status", 0) or 0)}
+        except urllib.error.HTTPError as exc:
+            return {"ok": True, "status": int(exc.code)}
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            return {"ok": False, "error": f"{method} failed: {exc}"}
+
+
+def _get_json(http: _Http, url: str) -> dict[str, Any] | None:
+    """GET ``url`` and parse a top-level JSON object, or None if not a JSON object / fetch failed."""
+    try:
+        r = http.fetch(url)
+    except _ActiveError:
+        return None
+    try:
+        obj = json.loads(r.get("body") or "")
+    except (ValueError, json.JSONDecodeError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def run_mass_assignment_check(
+    object_url: str,
+    *,
+    account: dict[str, Any],
+    scope: str = "",
+    settings: Any = None,
+    governor: HostRateGovernor | None = None,
+) -> dict[str, Any]:
+    """Confirm MASS ASSIGNMENT -> privilege escalation on the operator's OWN object: the session can set
+    a boolean PRIVILEGE FLAG (is_admin / is_verified / is_staff / ...) the server should never accept
+    from a client. Benign + reversible -- every request targets the operator's own object, the write
+    flips ONE boolean flag, and it is RESTORED afterward. GET reads + JSON PATCH writes only.
+
+    Differential (all on the operator's own object):
+      baseline GET  -> a known-privilege boolean field F is present and FALSE
+      control PATCH -> an empty {} write does NOT flip F (F stays false; rules out "F flips on any write")
+      mutate  PATCH -> {F: true}, then a FRESH GET shows F == true (the bug: a client set a privilege flag)
+      restore PATCH -> {F: false} (best-effort cleanup)
+    Confirmed iff the control keeps F false AND the mutate makes F true via an authoritative re-read."""
+    settings = settings or get_settings()
+    u = str(object_url or "").strip()
+    if not u:
+        return _err("Provide the URL of a JSON object you OWN (e.g. /api/users/me) to test for mass assignment.")
+    try:
+        nu = normalize_website_url(u)
+    except WebsiteFetchError as exc:
+        return _err(str(exc))
+    host = urlparse(nu).hostname or ""
+    if not host_in_active_scope(host, scope, settings):
+        return _err(f"'{host}' is not named in your scope -- mass-assignment testing is fail-closed. Add it to Scope.")
+    try:
+        su = _guard_url(nu, settings.allow_private_urls, settings.web_allowed_ports)
+    except WebsiteFetchError as exc:
+        return _err(f"target refused by the URL guard: {exc}")
+    auth = build_auth(su, cookie=account.get("cookie", ""), headers=account.get("headers") or [])
+    if auth is None:
+        return _err("Mass-assignment testing needs your session -- supply a cookie and/or auth headers for the account that owns the object.")
+
+    governor = governor or HostRateGovernor(
+        capacity=settings.active_max_requests_per_host, min_interval_s=settings.active_min_interval_ms / 1000.0)
+    http = _Http(settings, governor, max_requests=8, auth=auth)
+    timeout = settings.web_fetch_timeout_seconds
+
+    baseline = _get_json(http, su)
+    if baseline is None:
+        return {"ok": True, "status": "candidate",
+                "reason": "the object URL didn't return a readable JSON object -- point this at a JSON object you own (e.g. /api/users/me)."}
+    field = next((k for k, v in baseline.items()
+                  if isinstance(v, bool) and v is False and _PRIV_BOOL_FIELD_RE.match(str(k))), None)
+    if not field:
+        return {"ok": True, "status": "enforced",
+                "reason": "no client-visible ROLE/ADMIN flag (is_admin / is_staff / is_superuser / ...) is present and false on this object -- nothing to escalate via mass assignment here."}
+    # A benign NON-privilege scalar field to drive a CONTENT-BEARING control write (prefer a string,
+    # rewritten with its OWN current value = a true no-op). Writing content WITHOUT the privilege field
+    # is what distinguishes a client-set escalation from a server that recomputes the flag as a
+    # side-effect of ANY content write (an empty {} write wouldn't trigger such a recompute, so it can't
+    # tell them apart). Without a benign field we can only run the weaker empty control -> candidate.
+    control_body: dict[str, Any] = {}
+    for k, v in baseline.items():
+        if k == field or _PRIV_BOOL_FIELD_RE.match(str(k)):
+            continue
+        if isinstance(v, str) or (isinstance(v, (int, float)) and not isinstance(v, bool)):
+            control_body = {k: v}
+            if isinstance(v, str):
+                break  # a string no-op is the safest content control; take the first one
+
+    # Each _json_write self-pins DNS right before its connect, and each _get_json (http.fetch) pins for
+    # its GET, so every request lands on a freshly-validated IP (no single-outer-pin TOCTOU).
+    ctl_w = _json_write(su, "PATCH", control_body, auth=auth, settings=settings, timeout=timeout)
+    control = _get_json(http, su)
+    if control is not None and control.get(field) is True:
+        return {"ok": True, "status": "candidate",
+                "reason": (f"the '{field}' flag became true after a control write that did NOT set it, so the server "
+                           "recomputes it as a side-effect rather than accepting a client-supplied value -- not a "
+                           "mass-assignment escalation. Inspect manually."),
+                "detail": {"field": field, "control_body_keys": list(control_body), "control_write_status": ctl_w.get("status")}}
+    # The attack: set the privilege flag, then AUTHORITATIVELY re-read (not the write's echo).
+    mut_w = _json_write(su, "PATCH", {field: True}, auth=auth, settings=settings, timeout=timeout)
+    after = _get_json(http, su)
+    escalated = bool(after is not None and after.get(field) is True)
+    # Restore (best-effort) -- leave the operator's own object as we found it.
+    _json_write(su, "PATCH", {field: False}, auth=auth, settings=settings, timeout=timeout)
+
+    detail = {"field": field, "baseline": False, "content_control": bool(control_body),
+              "mutate_write_status": mut_w.get("status"),
+              "after_value": (after.get(field) if isinstance(after, dict) else None)}
+    if not escalated:
+        return {"ok": True, "status": "enforced",
+                "reason": (f"setting '{field}' to true was NOT reflected on an authoritative re-read (write HTTP "
+                           f"{mut_w.get('status')}) -- the server rejects the client-supplied privilege flag. Enforced."),
+                "detail": detail}
+    if not control_body:
+        # No non-privilege field was available for a content-bearing control, so we can't fully rule out
+        # a content-triggered server recompute -> report as a strong CANDIDATE, never an auto-confirm.
+        return {"ok": True, "status": "candidate",
+                "reason": (f"setting '{field}' to true persisted, but this object had no other field to run a "
+                           "content-bearing control against, so a server-side recompute can't be fully excluded. "
+                           "Verify by hand that the client value caused the change."),
+                "detail": detail}
+    finding, plan = _build_mass_assignment_finding(su, field, detail)
+    return {"ok": True, "status": "confirmed", "finding": finding, "attack_plan": plan, "detail": detail}
+
+
+def _build_mass_assignment_finding(url: str, field: str, detail: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    path = urlparse(url).path or "/"
+    matched = (f"the low-privilege session set the privilege flag '{field}' to true on its own object via a "
+               f"client write, and an authoritative re-read confirmed the value persisted (HTTP "
+               f"{detail.get('mutate_write_status')})")
+    model = impact_model.impact_for_class("access-control")
+    finding = {
+        "rule_id": "active.mass-assignment",
+        "title": f"Mass assignment -> privilege escalation via '{field}' at {path}",
+        "severity": "high", "confidence": "high", "category": "access-control",
+        "location": url, "file_path": url, "line_start": 1, "line_end": 1,
+        "class_id": _MA_META["class_id"], "class_name": _MA_META["class_name"],
+        "cwe": _MA_META["cwe"], "owasp": _MA_META["owasp"],
+        "references": impact_model.references_for_class("access-control"),
+        "vrt": impact_model.bugcrowd_vrt("access-control"),
+        "remediation": ("Allow-list the fields a client may write (never bind request bodies straight to the "
+                        "model); reject or ignore privilege/authorization attributes on user-facing create/update "
+                        "endpoints and set them only server-side."),
+        "snippet": "",
+        "proof_evidence": {
+            "request_line": f'PATCH {url}  (body: {{"{field}": true}})  then  GET {url}',
+            "request_header": "Content-Type: application/json; <the low-privilege account session>",
+            "response_status": f"re-read reflects {field}=true",
+            "matched_value": matched,
+        },
+    }
+    plan = {
+        "steps": [
+            "Authenticate as your low-privilege test account (the object's owner).",
+            f"Read the object to confirm '{field}' is present and false: GET {url}",
+            f'Send a client update adding the privilege flag: PATCH {url} with body {{"{field}": true}}.',
+            f"Re-read the object (GET {url}) and observe '{field}' is now true -- the server accepted a privilege "
+            "attribute the client should never be able to set (mass assignment -> privilege escalation).",
+            "Control: an empty write did NOT flip the flag, so the change is attributable to the client-set value.",
+            "Map the blast radius: what the elevated flag unlocks (admin UI, other users' data, privileged actions).",
+        ],
+        "poc": (f"# As the low-privilege account (its own object):\n"
+                f"curl -s -X PATCH '{url}' -H 'Content-Type: application/json' -H 'Cookie: <session>' "
+                f"-d '{{\"{field}\": true}}'\n"
+                f"curl -s '{url}' -H 'Cookie: <session>'   # -> \"{field}\": true"),
+        "impact": model.get("business_impact", ""),
+        "cvss": impact_model.cvss_for_class("access-control", confirmed=True),
+        "remediation": finding["remediation"],
+        "proof_of_impact": {
+            "status": "confirmed",
+            "method": "client PATCH of a privilege flag on the operator's own object + authoritative re-read (benign, reversible; the flag was restored)",
+            "actor": "authenticated low-privilege account (the object's owner)",
+            "affected_asset": "any privilege/authorization attribute a client can set -- vertical privilege escalation",
+            "observed_result": matched,
+            "control_result": f"an EMPTY write to the same object did NOT change '{field}', so the escalation is attributable to the client-supplied value, not any write",
+            "evidence": f"'{field}' false->true across a client PATCH, confirmed by an authoritative GET; empty-write control left it false",
             "proof_obligation": model.get("proof_obligation", ""),
         },
     }
