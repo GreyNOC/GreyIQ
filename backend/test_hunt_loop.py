@@ -114,6 +114,19 @@ class HuntLoopTests(unittest.TestCase):
         coder.coder_enabled = lambda cfg: False
         self.assertFalse(hunt_loop.iterative_enabled(None, ScannerSettings(hunt_loop_enabled=True)))
 
+    def test_observations_digest_surfaces_response_structure_to_the_brain(self) -> None:
+        # The re-plan brain must READ the real response structure (the digest), not just an excerpt —
+        # this is the "stop starving the brain" wiring. It stays trust-wrapped (UNTRUSTED data).
+        meta = {"verified_classes": ["xss"], "requests_used": 3,
+                "digest": {"interesting_names": ["owner_id", "is_admin"], "error_family": "sql", "jwt": {"alg": "HS256"}}}
+        blob = hunt_loop._observations_digest([], meta)
+        self.assertIn("owner_id", blob)                          # the brain sees the real key names
+        self.assertIn("is_admin", blob)
+        self.assertIn("sql", blob)                               # ...and the error family
+        self.assertIn("response_structure", blob)
+        # a missing/empty digest degrades cleanly (no crash, empty structure)
+        self.assertIn("response_structure", hunt_loop._observations_digest([], {"verified_classes": []}))
+
 
 if __name__ == "__main__":
     unittest.main()

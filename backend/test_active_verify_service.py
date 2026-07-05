@@ -1528,6 +1528,27 @@ class JwtAlgNoneE2ETests(unittest.TestCase):
         self.assertEqual(len(jwt_findings), 1)
         self.assertEqual(jwt_findings[0]["_active_proof"]["status"], "confirmed")
 
+    def test_discovered_token_confirms_with_no_operator_auth(self) -> None:
+        # The engine's own reasoning: the app HANDED us a JWT (extracted from the landing response),
+        # the operator supplied NO credential, yet alg:none is still proven on the app's OWN token.
+        url = f"http://127.0.0.1:{self.port}/"
+        http = self._http(None)  # NO operator auth
+        finding = av._check_jwt_alg_none(http, url, discovered_token=self.token)
+        self.assertIsNotNone(finding)
+        self.assertEqual(finding["_active_proof"]["status"], "confirmed")
+        self.assertEqual(finding["severity"], "critical")
+
+    def test_discovered_token_not_flagged_on_a_verifying_server(self) -> None:
+        _JwtAuthHandler.vulnerable = False
+        url = f"http://127.0.0.1:{self.port}/"
+        self.assertIsNone(av._check_jwt_alg_none(self._http(None), url, discovered_token=self.token))
+
+    def test_extract_jwt_token_from_response_sources(self) -> None:
+        self.assertEqual(av._extract_jwt_token({"cookies": [f"session={self.token}; Path=/"], "body": "", "headers": {}}), self.token)
+        self.assertEqual(av._extract_jwt_token({"cookies": [], "body": f'{{"jwt":"{self.token}"}}', "headers": {}}), self.token)
+        self.assertEqual(av._extract_jwt_token({"cookies": [], "body": "no token here", "headers": {}}), "")
+        self.assertEqual(av._extract_jwt_token(None), "")
+
 
 if __name__ == "__main__":
     unittest.main()
