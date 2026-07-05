@@ -2,6 +2,17 @@
 
 Notable changes to GreyIQ.
 
+## v0.90.0
+
+### Catches GraphQL schema leaks even when introspection is off
+- GraphQL servers often disable introspection but still hand out the schema field-by-field through
+  error "suggestions" — ask for a field that doesn't exist and the server replies *Did you mean
+  "<a real field>"?*. The engine now confirms this: it sends one harmless query naming an
+  unguessable nonexistent field and, if the server suggests a real one back, records the disclosure.
+  It's proven only when the response is a genuine GraphQL validation error about the exact field we
+  sent (so ordinary "did you mean to POST?" gateway messages never trigger it), and it never changes
+  any data.
+
 ## v0.89.0
 
 ### The hunt now reads the response and reasons like an analyst
