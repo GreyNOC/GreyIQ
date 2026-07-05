@@ -354,6 +354,7 @@ from bughunter import oob_service as bounty_oob  # noqa: E402
 from bughunter import stored_xss_service as bounty_stored_xss  # noqa: E402
 from bughunter import ledger as bounty_ledger  # noqa: E402
 from bughunter import portfolio as bounty_portfolio  # noqa: E402
+from bughunter import vdp_policy as bounty_vdp  # noqa: E402
 from bughunter import hackerone_import as bounty_h1_import  # noqa: E402
 from bughunter import hackerone_activity as bounty_h1_activity  # noqa: E402
 from bughunter import progress as bounty_progress  # noqa: E402
@@ -599,6 +600,7 @@ class CampaignRequest(BaseModel):
     authorized: bool = False
     program: str | None = Field(default=None, max_length=200)
     program_id: str | None = Field(default=None, max_length=120)  # "span this program's whole scope" mode
+    active_program_id: str | None = Field(default=None, max_length=120)  # the saved program bound to a single-target (non-span) cockpit run — used ONLY to look up that program's policy/scope/creds; does NOT trigger span mode (that's program_id)
     active: bool = False
     time_based: bool = False
     auth_cookie: str = Field(default="", max_length=8000)
@@ -714,6 +716,7 @@ class FindingReportRequest(BaseModel):
     proof: ProofInput | None = None
     proof_evidence: ProofEvidenceInput | None = None  # engine-captured request/response (e.g. CORS ACAO/ACAC headers)
     screenshot_path: str = Field(default="", max_length=4000)
+    policy_profile: str = Field(default="", max_length=40)  # VDP profile of the bound program (e.g. "nasa"): the report builder RE-APPLIES that program's rules here so a finding the campaign withheld can't be reconstituted into a submittable report via the dashboard/ledger "View full report" path
 
 
 class FindingDismissRequest(BaseModel):
@@ -961,6 +964,7 @@ class ProgramUpsertRequest(BaseModel):
     account_access: dict[str, Any] = Field(default_factory=dict)  # research-account email/password/login_url/cookie — SENSITIVE (portfolio._clean_account_access bounds it; password/cookie redacted on read-back)
     admin_account_access: dict[str, Any] = Field(default_factory=dict)  # SECOND (high-privilege) research account for dual-account BFLA — same shape+redaction as account_access; the low-priv account_access is the "user" session
     idor_pairs: list[dict[str, Any]] = Field(default_factory=list, max_length=50)  # operator-supplied cross-tenant IDOR test pairs [{url_a, url_b, label}] — object URLs only, no secrets (portfolio._clean_idor_pairs bounds/dedups/caps)
+    policy_profile: str = Field(default="", max_length=40)  # OPTIONAL VDP profile id (e.g. "nasa") binding this program to a program's rules of engagement (scope + excluded endpoints/classes + confirmed-only + no-DoS); validated in portfolio._normalize against bughunter.vdp_policy
     user_agent_suffix: str = Field(default="", max_length=120)    # a mandatory UA tag some programs require appended to every in-scope request
     resync_scope: bool = False  # re-derive scope_text/hosts from structured_scope even if scope_text is already set (see portfolio.upsert_program)
     active: bool = False
@@ -996,6 +1000,10 @@ def _program_for_read(program: dict[str, Any]) -> dict[str, Any]:
 
 class ProgramDeleteRequest(BaseModel):
     id: str = Field(min_length=1, max_length=120)
+
+
+class VdpPresetRequest(BaseModel):
+    profile: str = Field(min_length=1, max_length=40)  # a built-in VDP policy profile id (e.g. "nasa") to create a program from
 
 
 class HackerOneImportRequest(BaseModel):
@@ -1938,6 +1946,23 @@ class GreyIQRuntime:
             "target": str(request.target or request.location or ""), "scope": str(request.scope or ""),
             "attack_plans": {ref: plan}, "disclose_automation": False,
         }
+        # VDP POLICY GATE — the on-demand report builder is the single choke point every hand-filed
+        # report flows through (the live dashboard drawer and the durable ledger both POST here). The
+        # campaign consolidation applies the program's VDP policy, but the live snapshot streams findings
+        # PRE-filter, so without this a finding the policy withheld could be reconstituted into a
+        # submittable report here. Re-apply the SAME policy: refuse to author a report for a finding on
+        # an excluded endpoint, of an always-rejected class, or (confirmed-only) that isn't confirmed.
+        profile = bounty_vdp.get_profile(request.policy_profile) if request.policy_profile else None
+        if profile:
+            proof_dict = request.proof.model_dump() if request.proof is not None else None
+            observed = str((request.proof.observed_result if request.proof is not None else "") or "")
+            is_confirmed = bounty_report._has_captured_artifact(finding, proof_dict, observed)
+            gate_item = {"proof_status": "confirmed" if is_confirmed else "candidate", "finding": finding}
+            _kept, _dropped = bounty_vdp.filter_findings([gate_item], profile)
+            if not _kept:
+                reason = (_dropped[0].get("reason") if _dropped else "not reportable under this program's policy")
+                return {"ok": False, "withheld": True, "policy": profile.get("name"), "reason": reason,
+                        "error": f"Withheld by {profile.get('name')} policy: {reason}"}
         platform = bounty_formats.normalize_platform(request.platform)
         package = bounty_submission.build_submission(ctx, finding, platform)
         if package is None:
@@ -1984,12 +2009,20 @@ class GreyIQRuntime:
         # program's disclose_automation + out_of_scope_hosts -- previously this plain
         # (non-span) path NEVER looked the program up at all, so the operator's every
         # unattended cycle silently ignored both settings.
-        program_obj = bounty_portfolio.get_program(RUNTIME_DIR, request.program) if request.program else None
+        # active_program_id is the RELIABLE binding: the cockpit sends the picked program's real id here
+        # for a single-target run so its VDP policy / creds / scope always apply, even when `program`
+        # holds only the free-text handle (or is empty, e.g. a preset program with no HackerOne handle).
+        # Look it up by id FIRST; fall back to the free-text `program` for the operator's pid path.
+        program_obj = (bounty_portfolio.get_program(RUNTIME_DIR, request.active_program_id)
+                       if request.active_program_id else None)
+        if program_obj is None and request.program:
+            program_obj = bounty_portfolio.get_program(RUNTIME_DIR, request.program)
         disclose_automation = bool(program_obj.get("disclose_automation")) if program_obj else False
         excluded_hosts = tuple(str(h) for h in (program_obj.get("out_of_scope_hosts") or [])) if program_obj else ()
         account_access = program_obj.get("account_access") if program_obj else None
         admin_account_access = program_obj.get("admin_account_access") if program_obj else None
         idor_pairs = program_obj.get("idor_pairs") if program_obj else None
+        policy_profile = str(program_obj.get("policy_profile") or "") if program_obj else ""
         user_agent_suffix = str(program_obj.get("user_agent_suffix") or "") if program_obj else ""
         # An explicit cookie/header in the request wins; otherwise pass auth=None so the program's
         # stored research-account credentials (account_access) drive an auto-login in run_campaign.
@@ -2010,6 +2043,7 @@ class GreyIQRuntime:
             account_access=account_access,
             admin_account_access=admin_account_access,
             idor_pairs=idor_pairs,
+            policy_profile=policy_profile,
             user_agent_suffix=user_agent_suffix,
             live=request.live,
             program=request.program,
@@ -2061,6 +2095,7 @@ class GreyIQRuntime:
             account_access=program.get("account_access"),
             admin_account_access=program.get("admin_account_access"),
             idor_pairs=program.get("idor_pairs"),
+            policy_profile=str(program.get("policy_profile") or ""),
             user_agent_suffix=str(program.get("user_agent_suffix") or ""),
             live=request.live,
             program=program_label,
@@ -2115,6 +2150,7 @@ class GreyIQRuntime:
                 "account_access": program.get("account_access"),
                 "admin_account_access": program.get("admin_account_access"),
                 "idor_pairs": program.get("idor_pairs"),
+                "policy_profile": str(program.get("policy_profile") or ""),
                 "user_agent_suffix": str(program.get("user_agent_suffix") or ""),
             })
         if not specs:
@@ -3130,6 +3166,48 @@ class GreyIQRuntime:
                     acc[secret] = ex_acc[secret]  # preserve the saved secret the redacted edit didn't resend
             record[field] = acc
         return {"ok": True, "program": _program_for_read(bounty_portfolio.upsert_program(RUNTIME_DIR, record))}
+
+    def list_vdp_profiles(self) -> dict[str, Any]:
+        """The built-in VDP policy profiles offered as one-click program presets (id, name, scope, channel)."""
+        from bughunter import vdp_policy
+        return {"ok": True, "profiles": [
+            {"id": p["id"], "name": p["name"], "scope_hosts": list(p.get("scope_hosts") or ()),
+             "report_channel": p.get("report_channel", ""), "notes": p.get("notes", "")}
+            for p in vdp_policy.PROFILES.values()
+        ]}
+
+    def create_program_from_preset(self, request: "VdpPresetRequest") -> dict[str, Any]:
+        """Create-or-update a saved program from a built-in VDP policy preset (e.g. "nasa") in one click.
+        The preset carries the program's in-scope hosts + policy binding (scope narrowing + excluded
+        endpoints/classes + confirmed-only + no-DoS). It AUTHORIZES nothing the engine's own scope/SSRF
+        gates don't already — it only constrains the hunt to that program's published rules of engagement.
+
+        IDEMPOTENT + NON-DESTRUCTIVE: if a program is already bound to this VDP profile, re-running the
+        preset must NEVER widen a scope the operator narrowed (e.g. down to a NASA test host per NASA's
+        own "prefer a test environment" guidance). We reuse that program's id and PRESERVE its existing
+        scope/targets/creds; only the policy binding, disclosure flag, and notes are (re)asserted. A
+        profile can only ever narrow — never widen scope."""
+        from bughunter import vdp_policy
+        preset = vdp_policy.program_preset(request.profile)
+        if not preset:
+            return {"ok": False, "error": f"unknown VDP profile: {request.profile!r}"}
+        existing = None
+        for prog in bounty_portfolio.list_programs(RUNTIME_DIR):
+            if str(prog.get("policy_profile") or "").strip().lower() == preset["policy_profile"]:
+                existing = prog
+                break
+        created = existing is None
+        if existing:
+            preset["id"] = existing.get("id")
+            # For an EXISTING program the preset must not touch scope/targets AT ALL — re-clicking it
+            # can't restore hosts the operator removed. upsert merges {**existing, **record}, so dropping
+            # these keys from the record preserves exactly what the operator saved (narrowed scope, even
+            # an emptied span list). Creds live only in `existing` and are preserved by the merge too.
+            # The preset then only (re)asserts the policy binding + disclosure flag + notes.
+            for scope_key in ("scope_text", "in_scope_hosts", "out_of_scope_hosts", "structured_scope", "seed_targets"):
+                preset.pop(scope_key, None)
+        saved = bounty_portfolio.upsert_program(RUNTIME_DIR, preset)
+        return {"ok": True, "created": created, "program": _program_for_read(saved)}
 
     def import_hackerone_scope(self, request: "HackerOneImportRequest") -> dict[str, Any]:
         """Preview a program's scope pulled from the HackerOne API — the ONLY read here
@@ -4496,6 +4574,13 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/operator/programs/delete":
             request = validate_payload(ProgramDeleteRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.remove_program, request.id))
+            return
+        if method == "GET" and path == "/api/operator/vdp-profiles":
+            await send_json(send, await asyncio.to_thread(runtime.list_vdp_profiles))
+            return
+        if method == "POST" and path == "/api/operator/programs/preset":
+            request = validate_payload(VdpPresetRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.create_program_from_preset, request))
             return
         if method == "POST" and path == "/api/hackerone/import-scope":
             request = validate_payload(HackerOneImportRequest, await read_json_body(receive))

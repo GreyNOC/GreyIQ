@@ -41,6 +41,7 @@ from bughunter import (
     research,
     screenshot_service,
     submission,
+    vdp_policy,
     web_ingest,
 )
 from bughunter.bounty import _classify, _infer_kind, _safe_slug, build_findings_har, build_replay_script, run_bounty_hunt
@@ -203,6 +204,7 @@ def _run_campaign_body(
     admin_account_access: dict[str, Any] | None = None,
     idor_pairs: list[dict[str, Any]] | None = None,
     include_attack_map: bool = True,
+    policy_profile: str = "",
     progress_run_id: str | None = None,
     progress_unit: str | None = None,
 ) -> dict[str, Any]:
@@ -348,6 +350,16 @@ def _run_campaign_body(
     else:
         urls = [clean_target]
         recon_notes, recon_sources = [], {}
+
+    # A VDP profile with avoid_dos (e.g. NASA) forbids DoS/rate/spam testing — so the executing
+    # time-based SLEEP probes and the aggressive deep mode are FORCED OFF for this program, no matter
+    # what the request asked for. The rest of the active pass stays benign GET-only.
+    _policy_pre = vdp_policy.get_profile(policy_profile) if policy_profile else None
+    if _policy_pre and _policy_pre.get("avoid_dos"):
+        if time_based or deep:
+            _emit(f"{_policy_pre['name']} policy: disabling time-based/deep probing (no DoS/rate testing).")
+        time_based = False
+        deep = False
 
     # --- Hunt each target with the full engine. ---
     # `deep` and `time_based` BOTH trigger the (already-gated, scope-bound) active pass in
@@ -627,6 +639,18 @@ def _run_campaign_body(
         if _dismissed:
             consolidated = [c for c in consolidated if ledger.dedup_key(c["finding"]) not in _dismissed]
 
+    # --- VDP policy profile (e.g. NASA mode): drop findings the program's Vulnerability Disclosure
+    # Policy does not authorize reporting — excluded endpoints, always-rejected classes, and (for a
+    # confirmed-only policy) anything without a captured proof of exploit. The dropped items are
+    # reported transparently in the progress log (never silently), and this only NARROWS the report;
+    # the engine's own scope+SSRF gates are unchanged. ---
+    _policy = vdp_policy.get_profile(policy_profile) if policy_profile else None
+    if _policy:
+        consolidated, _pol_dropped = vdp_policy.filter_findings(consolidated, _policy)
+        if _pol_dropped:
+            _emit(f"{_policy['name']} policy: withheld {len(_pol_dropped)} finding(s) not reportable under "
+                  f"this program's rules (excluded endpoint / rejected class / not confirmed).")
+
     # --- Rank by EXPECTED VALUE (confirmed outermost, then EV, severity, CVSS) so the
     # most-likely-to-pay findings sort first. ---
     program_stats = (learning.program_summary(rt, program, clean_target).get("class_stats") if rt is not None else {}) or {}
@@ -878,6 +902,7 @@ def run_campaign_over_targets(
     admin_account_access: dict[str, Any] | None = None,
     idor_pairs: list[dict[str, Any]] | None = None,
     include_attack_map: bool = True,
+    policy_profile: str = "",
     progress_run_id: str | None = None,
     progress_unit: str | None = None,
 ) -> dict[str, Any]:
@@ -972,6 +997,7 @@ def run_campaign_over_targets(
                 program=program, max_pages=max_pages, platform=platform, deep=deep,
                 disclose_automation=disclose_automation, on_progress=_target_emit, excluded_hosts=excluded_hosts,
                 admin_account_access=admin_account_access, idor_pairs=idor_pairs, include_attack_map=include_attack_map,
+                policy_profile=policy_profile,
                 progress_run_id=progress_run_id, progress_unit=unit,
             )
             if progress_unit is None:
@@ -1105,6 +1131,7 @@ def run_portfolio_campaign(
     progress_run_id: str | None = None,
     max_concurrent_programs: int = _PORTFOLIO_MAX_PROGRAMS,
 ) -> dict[str, Any]:
+    # (policy_profile is per-program here; read from each spec below, not a portfolio-wide arg.)
     """Run a full campaign across MULTIPLE saved programs CONCURRENTLY (bounded), merged into
     one combined result shaped like a single campaign — so the Findings board + Submissions hub
     render a portfolio hunt exactly like a single one. Each program is a dashboard unit; its
@@ -1133,6 +1160,7 @@ def run_portfolio_campaign(
                       "account_access": p.get("account_access") if isinstance(p.get("account_access"), dict) else {},
                       "admin_account_access": p.get("admin_account_access") if isinstance(p.get("admin_account_access"), dict) else {},
                       "idor_pairs": p.get("idor_pairs") if isinstance(p.get("idor_pairs"), list) else [],
+                      "policy_profile": str(p.get("policy_profile") or ""),
                       "user_agent_suffix": str(p.get("user_agent_suffix") or "")})
     if not clean:
         return {"ok": False, "error": "No huntable programs — each needs seed targets or an imported/built structured scope."}
@@ -1185,7 +1213,8 @@ def run_portfolio_campaign(
                 active=active, time_based=time_based, auth=auth, live=live, program=label, max_pages=max_pages,
                 platform=platform, deep=deep, disclose_automation=spec["disclose_automation"],
                 account_access=spec["account_access"], admin_account_access=spec.get("admin_account_access"),
-                idor_pairs=spec.get("idor_pairs"), user_agent_suffix=spec["user_agent_suffix"],
+                idor_pairs=spec.get("idor_pairs"), policy_profile=spec.get("policy_profile", ""),
+                user_agent_suffix=spec["user_agent_suffix"],
                 excluded_hosts=spec["excluded_hosts"], include_attack_map=include_attack_map, on_progress=_p_emit,
                 progress_run_id=progress_run_id, progress_unit=label,
             )

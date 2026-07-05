@@ -49,6 +49,7 @@ _DEFAULTS: dict[str, Any] = {
     "account_access": {},          # program research-account access (email/password/login_url/cookie) — see _clean_account_access. SENSITIVE: only ever sent to the program's OWN login page / in-scope hosts, never logged, password redacted in API responses.
     "admin_account_access": {},    # OPTIONAL second, HIGHER-privilege research account (same shape as account_access). When set, unlocks the autonomous BFLA / cross-tenant checks — the low-priv account_access is the "attacker" session, this is the ground-truth admin session. SENSITIVE, same handling.
     "idor_pairs": [],              # OPTIONAL operator-supplied cross-tenant IDOR test pairs [{url_a, url_b, label}] — url_a is an object the PRIMARY account owns, url_b a DIFFERENT object the SECOND account owns. NEVER auto-derived (auto-pairing corrupts the ownership control); the operator asserts ownership. Object URLs only, no secrets. See _clean_idor_pairs.
+    "policy_profile": "",          # OPTIONAL VDP policy profile id (e.g. "nasa") — binds the program to a program's rules of engagement (scope + excluded endpoints/classes + confirmed-only + no-DoS). See bughunter.vdp_policy.
     "user_agent_suffix": "",       # a mandatory UA tag some programs require appended to every in-scope request (e.g. " -BugBounty-acme-31337 ")
     "active": False,               # capture proof-of-impact (active verification)
     "live": False,                 # dynamic Playwright pass
@@ -233,6 +234,10 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     out["account_access"] = _clean_account_access(out.get("account_access"))
     out["admin_account_access"] = _clean_account_access(out.get("admin_account_access"))
     out["idor_pairs"] = _clean_idor_pairs(out.get("idor_pairs"))
+    # policy_profile: a short id validated against the known VDP profiles (unknown -> "" = no policy).
+    from bughunter import vdp_policy
+    _pp = str(out.get("policy_profile") or "").strip().lower()[:40]
+    out["policy_profile"] = _pp if vdp_policy.get_profile(_pp) else ""
     out["user_agent_suffix"] = _clean_ua_suffix(out.get("user_agent_suffix"))
     # Convenience default ONLY: derive scope_text/in_scope_hosts/out_of_scope_hosts from
     # structured_scope when the caller hasn't already typed a scope. Never overrides a
