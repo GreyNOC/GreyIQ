@@ -1408,6 +1408,18 @@ class JwtHelperTests(unittest.TestCase):
         token = _make_jwt({"alg": "none"}, {"sub": "1"})
         self.assertEqual(av._forge_alg_none_variants(token), [])
 
+    def test_corrupt_signature_always_decodes_different(self) -> None:
+        # QAQC regression: flipping only the last base64url char is a no-op ~25% of the time for
+        # RSA-sized sigs (its high bits are padding), so the "corrupted" control could decode IDENTICAL
+        # to the real sig and silently defeat a real signature-bypass confirm. Corrupting a decoded byte
+        # must ALWAYS change the signature — check every 256-byte sig whose last b64 char is class-0.
+        for last_byte in range(256):
+            raw = bytes([0xAB] * 255 + [last_byte])            # 256-byte sig (2048-bit RSA size)
+            sig_b64 = av._b64url_encode(raw)
+            corrupted = av._corrupt_jwt_signature(sig_b64)
+            self.assertNotEqual(av._b64url_decode(corrupted), raw)   # decoded bytes genuinely differ
+        self.assertEqual(av._corrupt_jwt_signature(""), "AAAA")      # empty sig -> non-empty placeholder
+
     def test_forge_malformed_token_returns_empty(self) -> None:
         self.assertEqual(av._forge_alg_none_variants("not.a.jwt.token"), [])
         self.assertEqual(av._forge_alg_none_variants("onlyonepart"), [])
@@ -1548,6 +1560,133 @@ class JwtAlgNoneE2ETests(unittest.TestCase):
         self.assertEqual(av._extract_jwt_token({"cookies": [], "body": f'{{"jwt":"{self.token}"}}', "headers": {}}), self.token)
         self.assertEqual(av._extract_jwt_token({"cookies": [], "body": "no token here", "headers": {}}), "")
         self.assertEqual(av._extract_jwt_token(None), "")
+
+
+# --- RS256->HS256 algorithm confusion -------------------------------------------------------------
+import hashlib as _hashlib  # noqa: E402
+import hmac as _hmac  # noqa: E402
+from cryptography.hazmat.primitives import hashes as _hashes, serialization as _ser  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import padding as _pad, rsa as _rsa  # noqa: E402
+
+_CONF_KEY = _rsa.generate_private_key(public_exponent=65537, key_size=2048)  # module-level: one keypair
+_CONF_PEM = _CONF_KEY.public_key().public_bytes(_ser.Encoding.PEM, _ser.PublicFormat.SubjectPublicKeyInfo)
+
+
+def _rs256_token(payload: dict) -> str:
+    hb = _b64url(json.dumps({"alg": "RS256", "typ": "JWT", "kid": "k1"}, separators=(",", ":")).encode())
+    pb = _b64url(json.dumps(payload, separators=(",", ":")).encode())
+    sig = _CONF_KEY.sign(f"{hb}.{pb}".encode("ascii"), _pad.PKCS1v15(), _hashes.SHA256())
+    return f"{hb}.{pb}.{_b64url(sig)}"
+
+
+class _JwtConfusionHandler(BaseHTTPRequestHandler):
+    """A backend that verifies its RS256 JWTs with the RSA PUBLIC key, published at a JWKS path.
+    ``vulnerable=True`` is the classic confusion bug: it verifies whatever alg the token DECLARES
+    using that same public key — so an HS256 token HMAC-signed with the public key is accepted."""
+    vulnerable = True
+    signature_checked = True
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path.startswith("/.well-known/jwks.json"):
+            pn = _CONF_KEY.public_key().public_numbers()
+            n = _b64url(pn.n.to_bytes((pn.n.bit_length() + 7) // 8, "big"))
+            e = _b64url(pn.e.to_bytes((pn.e.bit_length() + 7) // 8, "big"))
+            body = json.dumps({"keys": [{"kty": "RSA", "kid": "k1", "use": "sig", "alg": "RS256", "n": n, "e": e}]}).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
+        authz = self.headers.get("Authorization") or ""
+        token = authz[7:].strip() if authz.lower().startswith("bearer ") else ""
+        ok = self._auth(token)
+        body = b"authenticated" if ok else b"unauthorized"
+        self.send_response(200 if ok else 401); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+
+    def _auth(self, token: str) -> bool:
+        if not type(self).signature_checked:
+            return True
+        parts = token.split(".")
+        if len(parts) != 3:
+            return False
+        try:
+            header = json.loads(av._b64url_decode(parts[0]))
+            sig = av._b64url_decode(parts[2])
+        except Exception:  # noqa: BLE001
+            return False
+        alg = str(header.get("alg", "")).upper()
+        si = f"{parts[0]}.{parts[1]}".encode("ascii")
+        if alg == "RS256":
+            try:
+                _CONF_KEY.public_key().verify(sig, si, _pad.PKCS1v15(), _hashes.SHA256())
+                return True
+            except Exception:  # noqa: BLE001
+                return False
+        if alg == "HS256" and type(self).vulnerable:  # THE BUG: HMAC-verify with the RSA public key
+            return _hmac.compare_digest(_hmac.new(_CONF_PEM, si, _hashlib.sha256).digest(), sig)
+        return False
+
+    def log_message(self, *a: object) -> None:
+        return
+
+
+class JwtAlgConfusionE2ETests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._prev = os.environ.get("GREYIQ_SCAN_ALLOW_PRIVATE_URLS")
+        os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _JwtConfusionHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.port = self.server.server_port
+        self.token = _rs256_token({"sub": "victim", "role": "user"})
+        _JwtConfusionHandler.vulnerable = True
+        _JwtConfusionHandler.signature_checked = True
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        if self._prev is None:
+            os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+        else:
+            os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = self._prev
+
+    def _http(self, auth=None):
+        return av._Http(get_settings(), HostRateGovernor(capacity=40, min_interval_s=0.0), max_requests=20, auth=auth)
+
+    def _auth(self):
+        from bughunter.scan_auth import build_auth
+        return build_auth(f"http://127.0.0.1:{self.port}/", headers=[f"Authorization: Bearer {self.token}"])
+
+    def test_confusion_confirmed_on_operator_token(self) -> None:
+        url = f"http://127.0.0.1:{self.port}/"
+        finding = av._check_jwt_alg_confusion(self._http(self._auth()), url)
+        self.assertIsNotNone(finding)
+        self.assertEqual(finding["rule_id"], "active.jwt-alg-confusion")
+        self.assertEqual(finding["severity"], "critical")
+        self.assertEqual(finding["_active_proof"]["status"], "confirmed")
+
+    def test_confusion_confirmed_on_discovered_token_no_operator_auth(self) -> None:
+        url = f"http://127.0.0.1:{self.port}/"
+        finding = av._check_jwt_alg_confusion(self._http(None), url, discovered_token=self.token)
+        self.assertIsNotNone(finding)
+        self.assertEqual(finding["severity"], "critical")
+
+    def test_properly_verifying_server_is_not_flagged(self) -> None:
+        _JwtConfusionHandler.vulnerable = False   # only true RS256 verify -> HS forgery rejected
+        url = f"http://127.0.0.1:{self.port}/"
+        self.assertIsNone(av._check_jwt_alg_confusion(self._http(self._auth()), url))
+
+    def test_no_signature_verification_at_all_is_not_flagged(self) -> None:
+        _JwtConfusionHandler.signature_checked = False   # accepts corrupted sig too -> control catches it
+        url = f"http://127.0.0.1:{self.port}/"
+        self.assertIsNone(av._check_jwt_alg_confusion(self._http(self._auth()), url))
+
+    def test_hs256_token_is_skipped_confusion_needs_asymmetric(self) -> None:
+        # confusion only applies when the server EXPECTS RS*; an HS256 operator token is a no-op here
+        from bughunter.scan_auth import build_auth
+        hs = _make_jwt({"alg": "HS256", "typ": "JWT"}, {"sub": "x"})
+        auth = build_auth(f"http://127.0.0.1:{self.port}/", headers=[f"Authorization: Bearer {hs}"])
+        self.assertIsNone(av._check_jwt_alg_confusion(self._http(auth), f"http://127.0.0.1:{self.port}/"))
+
+    def test_no_jwt_makes_zero_requests(self) -> None:
+        http = self._http(None)
+        self.assertIsNone(av._check_jwt_alg_confusion(http, f"http://127.0.0.1:{self.port}/"))
+        self.assertEqual(http.sent, 0)
 
 
 if __name__ == "__main__":
