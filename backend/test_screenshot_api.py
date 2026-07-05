@@ -188,5 +188,68 @@ class ScreenshotStillFailsClosedTests(unittest.TestCase):
         self._assert_passed_scope_gate(self.rt.capture_screenshot(g.ScreenshotRequest(run_id=result["run_id"], ref="F1")))
 
 
+class AttackMapApiTests(unittest.TestCase):
+    """/api/bounty/attack-map — render the graphical attack-plan map on demand. Renderer stubbed
+    (writes a tiny PNG) so the test stays offline; verifies both the cached-run and history-fallback
+    paths, the data_url, recording on the cached finding, and clean error handling."""
+
+    def setUp(self) -> None:
+        self.rt = g.runtime
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_runtime_dir = g.RUNTIME_DIR
+        g.RUNTIME_DIR = Path(self._tmp.name)
+        self._orig = g.bounty_attack_map.render_attack_map
+        self.calls: list[dict] = []
+
+        def _fake_render(finding, plan, out_path, settings=None):
+            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(out_path).write_bytes(b"\x89PNG\r\n\x1a\n" + b"stub-png-bytes")   # a tiny real file
+            self.calls.append({"finding": finding, "plan": plan, "out": str(out_path)})
+            return {"ok": True, "path": str(out_path)}
+
+        g.bounty_attack_map.render_attack_map = _fake_render
+
+    def tearDown(self) -> None:
+        g.bounty_attack_map.render_attack_map = self._orig
+        g.RUNTIME_DIR = self._orig_runtime_dir
+        self._tmp.cleanup()
+
+    def _cache(self) -> str:
+        result = _run_result()
+        result["findings"][0]["_active_proof"] = {"observed_result": "reflected raw", "control_result": "encoded", "status": "confirmed"}
+        self.rt._cache_bounty_run(result, target="https://app.example.com", scope="app.example.com", program=None)
+        return result["run_id"]
+
+    def test_cached_run_renders_and_records_on_the_finding(self) -> None:
+        run_id = self._cache()
+        res = self.rt.render_attack_plan_map(g.AttackMapRequest(run_id=run_id, ref="F1"))
+        self.assertTrue(res["ok"], res.get("error"))
+        self.assertTrue(res["data_url"].startswith("data:image/png;base64,"))
+        # the map used the cached finding's own differential (from _active_proof)
+        self.assertEqual(self.calls[0]["plan"]["proof_of_impact"]["observed_result"], "reflected raw")
+        # recorded on the cached finding so the report/submission embed it
+        _ctx, finding, _run = self.rt._resolve_run_finding(run_id, "F1")
+        self.assertTrue(str(finding.get("attack_map_path") or "").endswith("-attack-map.png"))
+
+    def test_history_fallback_renders_from_request_fields(self) -> None:
+        res = self.rt.render_attack_plan_map(g.AttackMapRequest(
+            title="Stored XSS", severity="high", class_name="Stored XSS", location="https://t/profile",
+            observed_result="beacon fired", control_result="fresh token empty before injection"))
+        self.assertTrue(res["ok"], res.get("error"))
+        self.assertTrue(res["data_url"].startswith("data:image/png;base64,"))
+        self.assertEqual(self.calls[0]["finding"]["title"], "Stored XSS")
+
+    def test_no_run_and_no_fields_is_a_clean_error(self) -> None:
+        res = self.rt.render_attack_plan_map(g.AttackMapRequest())
+        self.assertFalse(res["ok"])
+        self.assertIn("run or history", res["error"].lower())
+
+    def test_render_failure_is_reported_not_raised(self) -> None:
+        g.bounty_attack_map.render_attack_map = lambda *a, **k: {"ok": False, "error": "Chromium unavailable"}
+        res = self.rt.render_attack_plan_map(g.AttackMapRequest(title="X", location="https://t/"))
+        self.assertFalse(res["ok"])
+        self.assertIn("chromium", res["error"].lower())
+
+
 if __name__ == "__main__":
     unittest.main()

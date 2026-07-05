@@ -5157,6 +5157,46 @@ async function ckCaptureScreenshot(f, btn, wrap, onShots) {
   }
 }
 
+// Render (server-side) the GRAPHICAL attack-plan map for a finding and show it inline with a Download
+// button. Built from the finding's captured proof (no network); mirrors ckCaptureScreenshot's flow so
+// it works from a live run OR a history finding, and the .png is embedded in the report + POC download.
+async function ckRenderAttackMap(f, btn, wrap) {
+  btn.disabled = true;
+  btn.textContent = "Rendering…";
+  try {
+    const po = f.proofObj || {};
+    const res = await apiFetch("/api/bounty/attack-map", {
+      method: "POST", timeoutMs: 60000,
+      body: JSON.stringify({
+        run_id: f.runId || ckState.runId || "", ref: f.ref || "",
+        title: f.title || "", severity: f.severity || "", class_name: f.className || f.class_name || "",
+        location: f.location || f.source_url || f.target || "",
+        actor: po.actor || "", observed_result: po.observed_result || "", control_result: po.control_result || "",
+        request_line: (f.proofEvidence && f.proofEvidence.request_line) || f.request_line || "",
+        request_header: (f.proofEvidence && f.proofEvidence.request_header) || "",
+        matched_value: f.matched_value || f.snippet || po.evidence || "",
+        impact: po.impact_narrative || po.proof_obligation || "",
+      })
+    });
+    if (res && res.ok && res.data_url) {
+      f.attackMap = { data_url: res.data_url, path: res.path || "" };
+      btn.textContent = "Re-render attack plan";
+      // Re-render the report panel so the map appears in the visual-evidence area + embeds in the report.
+      if (ckState.reportFocus === f && ckState.view === "submissions") { ckRenderSubmissions(); return; }
+      ckAppendScreenshot(wrap, res.data_url, `${f.title || f.ref}-attack-plan`, "Attack-plan map");
+      wrap.append(cel("p", "ck-hint", `Saved locally${res.path ? ": " + res.path : ""}. Now embedded in this finding's report / POC download.`));
+    } else {
+      btn.textContent = "🗺 Attack plan map";
+      wrap.append(cel("p", "ck-status is-error", (res && res.error) || "Could not render the attack-plan map."));
+    }
+  } catch (err) {
+    btn.textContent = "🗺 Attack plan map";
+    wrap.append(cel("p", "ck-status is-error", err.message || "Could not render the attack-plan map."));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 // Language tag for a fenced PoC so a reviewer (and HackerOne's automated report check)
 // recognizes it as code — a bare ``` fence around an HTML PoC gets flagged as "missing PoC
 // code". Mirrors report.py _poc_lang.
@@ -6869,6 +6909,8 @@ function ckFullReportPanel(focus) {
     if (shot && shot.data_url) ckAppendScreenshot(shotWrap, shot.data_url, focus.title, _shotKindLabel[shot.kind] || shot.kind || "");
   }
   if (focus.shots && focus.shots.length) shotWrap.append(cel("p", "ck-hint", "Saved locally. Review before attaching — screenshots are not auto-redacted."));
+  // The graphical attack-plan map (if rendered) — shown with its own Download button, like a screenshot.
+  if (focus.attackMap && focus.attackMap.data_url) ckAppendScreenshot(shotWrap, focus.attackMap.data_url, `${focus.title}-attack-plan`, "Attack-plan map");
 
   // Report actions are laid out as a workflow, not a flat button pile: a single hero
   // "Prepare full report" that chains the whole pipeline, then the same steps broken out
@@ -6916,7 +6958,14 @@ function ckFullReportPanel(focus) {
     focus._prepMsg = "";  // a fresh manual capture invalidates the last "prepare" caption
     if (ckState.reportFocus === focus && ckState.view === "submissions") ckRenderSubmissions();
   }));
-  s1.row.append(proveBtn, shotBtn);
+  // Attack-plan map — render a GRAPHICAL .png of the attack flow (actor → probe → observed vs control
+  // → confirmed) for this finding, saved into the POC download and embedded in the report.
+  const hasMap = focus.attackMap && focus.attackMap.data_url;
+  const mapBtn = cel("button", "ck-btn", hasMap ? "Re-render attack plan" : "🗺 Attack plan map");
+  mapBtn.type = "button";
+  mapBtn.title = "Render a graphical map of the attack GreyIQ used to confirm this finding — saved as a .png in the POC download and embedded in the report";
+  mapBtn.addEventListener("click", () => ckRenderAttackMap(focus, mapBtn, shotWrap));
+  s1.row.append(proveBtn, shotBtn, mapBtn);
   if (ckCanTestApiKeyAccess(focus)) {
     const keyBtn = cel("button", "ck-btn", focus.apiKeyAccessText ? "Re-test API key access" : "Test API key access");
     keyBtn.type = "button";

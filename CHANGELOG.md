@@ -2,6 +2,15 @@
 
 Notable changes to GreyIQ.
 
+## v0.92.0
+
+### Attack-plan map button on the full report
+- The "View full report" page now has an **Attack plan map** button that renders the graphical attack
+  map for any confirmed finding on demand — including a finding you opened from history — and shows it
+  inline with a Download button. Once rendered, the `.png` is embedded in the report and included in
+  the POC download alongside the screenshot. Built from the finding's own captured proof (no re-scan),
+  and it simply reports an error if the renderer isn't available.
+
 ## v0.91.0
 
 ### A graphical attack-plan map in every proof download
