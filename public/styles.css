@@ -3250,6 +3250,8 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-list li { padding: 0.6rem 0.8rem; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); font-size: 0.84rem; display: flex; justify-content: space-between; align-items: center; gap: 0.6rem; }
 .ck-list .ck-floc { flex: 1; }
 .ck-tag { font-size: 0.7rem; color: var(--muted); padding: 0.12rem 0.45rem; border: 1px solid var(--border); border-radius: 999px; white-space: nowrap; }
+.ck-tag-policy { color: var(--accent, #4f9dff); border-color: var(--accent, #4f9dff); font-weight: 600; }
+.ck-preset-bar { margin: 0.5rem 0 1rem; padding: 0.75rem; border: 1px dashed var(--border); border-radius: 8px; }
 
 /* Operator tab — the cockpit nav holds 8 views; keep an even 2-column grid
    (3 columns left a ragged trailing row of 2). */

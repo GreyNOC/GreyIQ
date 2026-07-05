@@ -2,6 +2,31 @@
 
 Notable changes to GreyIQ.
 
+## v0.97.0
+
+### NASA mode — hunt strictly within a program's Vulnerability Disclosure Policy
+- New **VDP policy profiles** bind a saved program to a published program's rules of engagement, so the
+  full engine runs but only inside that program's authorized scope and reporting guidelines. The first
+  profile is **NASA VDP** ("NASA mode"): its in-scope registered domains (nasa.gov, usgeo.gov, globe.gov,
+  nspires.nasaprs.com, nsc.nasa.gov), the endpoints it won't accept (e.g. `/wp-json/wp/v2/users`,
+  `xmlrpc.php`), the classes it rejects (non-sensitive clickjacking, missing-best-practice), **confirmed
+  findings only** (NASA rejects automated-scan output without a demonstration of exploitability), and
+  **no DoS / rate / spam** (time-based and deep probing are forced off for the program).
+- One click in Program setup — **"Set up NASA VDP (NASA mode)"** — creates the program pre-scoped and
+  policy-locked; the program row shows a **policy-locked** badge. A profile only ever *narrows* what is
+  probed and reported; it authorizes nothing the engine's own scope/SSRF gates don't already, and it
+  can never widen scope.
+- Findings the policy won't accept are **withheld transparently** (an excluded endpoint, a rejected
+  class, or anything without a captured proof of exploit under confirmed-only), and the count is shown
+  in the run log — never silently dropped. Endpoints: `GET /api/operator/vdp-profiles`,
+  `POST /api/operator/programs/preset`.
+- The policy is enforced at **every delivery surface**, not just the campaign summary: the on-demand
+  report builder (the "View full report" button on the live dashboard and in history) re-applies the
+  program's rules, so a withheld finding can't be turned into a submittable report. Manual single-target
+  runs against a policy-bound program apply its policy just like span runs do. Re-running the one-click
+  preset is **non-destructive** — it never re-widens a scope you narrowed (e.g. down to a NASA test
+  host); a profile can only ever narrow.
+
 ## v0.96.0
 
 ### Confirms sessions that stay valid after logout

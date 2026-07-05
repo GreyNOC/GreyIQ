@@ -5832,6 +5832,16 @@ function ckApplyActiveProgram(id) {
   ckUpdateSpanScopeToggle({ resetDefault: true });
 }
 
+// The VDP policy profile (e.g. "nasa") of the currently-picked program, or "" if none. Passed to the
+// on-demand report builder so a finding the program's policy withheld can't be reconstituted into a
+// submittable report — the server re-applies the same policy at that choke point.
+function ckActivePolicyProfile() {
+  const id = state.ckActiveProgramId || "";
+  if (!id) return "";
+  const prog = (ckProgramsCache || []).find((p) => p.id === id);
+  return (prog && prog.policy_profile) || "";
+}
+
 // "Span this program's whole scope" -- client-side ESTIMATE of the target list the
 // server's campaign.program_campaign_targets would derive (seed_targets, else eligible
 // structured_scope entries, wildcard-stripped). Approximate on purpose -- only used for
@@ -5942,6 +5952,11 @@ function ckProgramSetupRow(p) {
   const left = cel("div"); left.style.flex = "1";
   left.append(cel("span", "ck-ftitle", p.name || p.id));
   if (p.platform_handle) left.append(document.createTextNode(" "), cel("span", "ck-tag", `HackerOne: ${p.platform_handle}`));
+  if (p.policy_profile) {
+    const pol = cel("span", "ck-tag ck-tag-policy", p.policy_profile === "nasa" ? "NASA VDP · policy-locked" : `VDP: ${p.policy_profile} · policy-locked`);
+    pol.title = "This program is bound to a VDP policy: in-scope hosts only, excluded endpoints/classes suppressed, confirmed findings only, no DoS.";
+    left.append(document.createTextNode(" "), pol);
+  }
   if (p.oob_allowed) left.append(document.createTextNode(" "), cel("span", "ck-tag", "OOB allowed"));
   if (p.disclose_automation) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Discloses tool use"));
   const stats = p.h1_program_stats || {};
@@ -6215,6 +6230,9 @@ function ckProgramSetupForm() {
       },
       // Operator-supplied cross-tenant IDOR object-URL pairs (not secret, sent verbatim).
       idor_pairs: collectIdorPairs(),
+      // VDP policy binding (e.g. "nasa") — this form has no field for it, so carry the saved value
+      // through untouched on edit; it's only ever set by the one-click VDP preset (see ckRenderProgram).
+      policy_profile: editing ? (editing.policy_profile || "") : "",
       user_agent_suffix: uaSuffix.input.value,
       // This form owns the structured-scope table, so a save here should always re-derive
       // scope_text/in_scope_hosts/out_of_scope_hosts from whatever the table currently
@@ -6274,8 +6292,45 @@ async function ckRenderProgram() {
     host.append(list);
   }
 
+  host.append(ckPresetBar());
+
   host.append(cel("h3", "ck-section-title", ckProgEdit ? `Edit program — ${ckProgEdit.name || ckProgEdit.id}` : "Add a program"));
   host.append(ckProgramSetupForm());
+}
+
+// One-click VDP presets — create a program pre-bound to a published program's rules of engagement
+// (scope + excluded endpoints/classes + confirmed-only + no-DoS). "NASA mode" is the NASA VDP preset:
+// same engine, constrained to NASA's authorized scope and reporting guidelines. The preset AUTHORIZES
+// nothing the engine's own scope/SSRF gates don't already — it only NARROWS what is probed/reported.
+function ckPresetBar() {
+  const wrap = cel("div", "ck-preset-bar");
+  wrap.append(cel("h3", "ck-section-title", "Quick start from a VDP policy"));
+  wrap.append(cel("p", "ck-hint",
+    "One click creates a program locked to a published Vulnerability Disclosure Policy — its in-scope hosts, "
+    + "the endpoints/classes it won't accept, confirmed-findings-only, and no DoS. The full engine runs, but "
+    + "strictly within that program's authorized scope and reporting rules."));
+  const row = cel("div", "ck-import-row");
+  const nasaBtn = cel("button", "ck-btn ck-btn-primary", "Set up NASA VDP (NASA mode)"); nasaBtn.type = "button";
+  row.append(nasaBtn);
+  const note = cel("p", "ck-status");
+  wrap.append(row, note);
+  nasaBtn.addEventListener("click", async () => {
+    const label = nasaBtn.textContent; nasaBtn.disabled = true; nasaBtn.textContent = "Creating…";
+    note.className = "ck-status"; note.textContent = "";
+    try {
+      const res = await apiFetch("/api/operator/programs/preset", { method: "POST", body: JSON.stringify({ profile: "nasa" }) });
+      if (!res || res.ok === false) {
+        note.className = "ck-status is-error"; note.textContent = (res && res.error) || "Could not create the preset program.";
+        return;
+      }
+      note.className = "ck-status"; note.textContent = "NASA VDP program saved — scope, no-DoS, and confirmed-only are enforced for every hunt on it.";
+      await ckRefreshProgramsEverywhere();
+      void ckRenderProgram();
+    } catch (err) {
+      note.className = "ck-status is-error"; note.textContent = err.message || "Could not create the preset program.";
+    } finally { nasaBtn.disabled = false; nasaBtn.textContent = label; }
+  });
+  return wrap;
 }
 
 // --- Guided first-run wizard — drives the REAL cockpit (real ckSetView navigation, real
@@ -6924,6 +6979,7 @@ async function ckFullReportMarkdown(focus) {
       }
     } catch (_) { /* fall through */ }
   }
+  let withheldMsg = null;
   try {
     const res = await apiFetch("/api/bounty/finding/report", {
       method: "POST", timeoutMs: 30000,
@@ -6936,12 +6992,27 @@ async function ckFullReportMarkdown(focus) {
         // Carry the engine's captured request/response so the report shows the concrete headers
         // (e.g. CORS ACAO/ACAC) and builds the class-specific reproduction from the real evidence.
         proof_evidence: focus.proofEvidence || null,
+        // Re-assert the bound program's VDP policy at the report choke point (server withholds a
+        // finding the policy rejects rather than authoring a submittable report for it).
+        policy_profile: ckActivePolicyProfile(),
       }),
     });
     if (res && res.ok && res.package && res.package.vulnerability_information) {
       return { text: res.package.vulnerability_information, canonical: true, package: res.package };
     }
+    if (res && res.ok === false && res.withheld) {
+      // The program's VDP policy withholds this finding — surface it and do NOT fall through to the
+      // client-side draft, which would otherwise reconstitute the very report the policy forbids.
+      withheldMsg = res.error || "Withheld by this program's VDP policy.";
+    }
   } catch (_) { /* fall through */ }
+  if (withheldMsg) {
+    // Return a NOTICE, never a submittable report, and never the offline draft below — a withheld
+    // finding must not be reconstitutable via copy/download. The notice is what the operator sees.
+    return { text: `# Withheld by program policy\n\n_${withheldMsg}_\n\nThis finding is not reportable `
+      + `under the selected program's VDP policy, so no submittable report was generated.`,
+      canonical: false, withheld: true, package: null };
+  }
   return { text: ckBuildSubmissionDraft(focus), canonical: false, package: null };
 }
 
@@ -8150,9 +8221,13 @@ async function ckReportFromLedger(rec) {
         title: rec.title || "Security finding", severity: rec.severity || "info",
         class_name: rec.class_id || "", class_id: rec.class_id || "", location: rec.source_url || "",
         rule_id: rec.rule_id || "", target: rec.source_url || "", platform: ckState.platform || "hackerone",
+        // Honor a VDP policy bound to this record (or the picked program) so a policy-withheld finding
+        // can't be reconstituted from durable history either.
+        policy_profile: rec.policy_profile || ckActivePolicyProfile(),
       }),
     });
     if (res && res.ok && res.package) return res.package.vulnerability_information || "";
+    if (res && res.ok === false && res.withheld) return `# ${rec.title || "Finding"}\n\n_(${res.error})_`;
     return `# ${rec.title || "Finding"}\n\n_(Report could not be built: ${(res && res.error) || "unknown error"})_`;
   } catch (err) {
     return `# ${rec.title || "Finding"}\n\n_(Report could not be built: ${err.message || "engine unreachable"})_`;
@@ -9022,6 +9097,9 @@ async function ckRun() {
         body: JSON.stringify({
           target, scope: state.ckScope, authorized: true, program: state.ckProgram || null,
           program_id: spanning ? state.ckActiveProgramId : null,
+          // Bind the picked program to a single-target run too, so its VDP policy / scope / creds apply
+          // even off the span path (server looks this up by id; `program` may be only a handle or empty).
+          active_program_id: state.ckActiveProgramId || null,
           active: state.ckActive, time_based: state.ckTimeBased, live: state.ckLive, deep: state.ckDeep,
           attack_map: state.ckAttackMap,
           max_pages: Number(ck.maxPages?.value) || 12,
@@ -9702,6 +9780,9 @@ async function ckDrawerReport(f) {
         class_id: f.class_id || "", location: f.location || f.target || "", cwe: f.cwe || "", rule_id: f.rule || "",
         target: f.target || f.location || "", scope: ckCampaign.scope || "",
         platform: ckState.platform || "hackerone", proof,
+        // The live dashboard streams findings PRE-policy-filter; re-assert the bound program's VDP
+        // policy here so a withheld finding can't be turned into a submittable report from the drawer.
+        policy_profile: ckActivePolicyProfile(),
       }),
     });
   } catch (err) {
@@ -9709,6 +9790,7 @@ async function ckDrawerReport(f) {
     return;
   }
   if (res && res.ok && res.package) setState({ state: "done", markdown: res.package.vulnerability_information || "", filename: ckSlug(f.title || "finding") + ".md" });
+  else if (res && res.ok === false && res.withheld) setState({ state: "error", error: res.error || "Withheld by this program's VDP policy." });
   else setState({ state: "error", error: (res && res.error) || "Report could not be built." });
 }
 
