@@ -2,6 +2,16 @@
 
 Notable changes to GreyIQ.
 
+## v0.93.0
+
+### Confirms exposed database dumps and config backups
+- The engine now proves a served **backup / database-dump / config-backup** the same rigorous way it
+  already proves an exposed `.git`, `.env`, or `.aws/credentials`: it fetches the file and confirms
+  only when the response carries the file's unmistakable contents (a real SQL dump header, secret
+  key/value lines, or WordPress `DB_PASSWORD` definitions) **and** a non-existent control path does
+  not — so a page that merely mentions those strings never triggers it. New: `/backup.sql`,
+  `/dump.sql`, `/.env.bak`, `/.env.local`, and `/wp-config.php.bak`. GET-only, no false positives.
+
 ## v0.92.0
 
 ### Attack-plan map button on the full report

@@ -1814,6 +1814,19 @@ _EXPOSED_FILES: tuple[tuple[str, "re.Pattern[str]", str], ...] = (
     # bare registries (npmjs.org), port-qualified (Verdaccio :4873, Nexus :8081), and path-qualified
     # private registries (Artifactory/GitLab/Azure), which are the highest-value leaked-token case.
     ("/.npmrc", re.compile(r"(?im)^//[^\s]+?/:_authToken="), ".npmrc (npm registry auth token)"),
+    # A served SQL DUMP — a mysqldump/pg_dump header or line-anchored DDL/INSERT. A downloadable
+    # database dump is a full-data breach; the signature is anchored so prose about SQL can't match.
+    # (Kept to the two highest-yield names — each row is one root probe against the per-host budget.)
+    *((path, re.compile(r"(?im)^\s*-- (?:MySQL|MariaDB|PostgreSQL|SQL)[^\r\n]{0,40}[Dd]ump\b|"
+                        r"^\s*(?:DROP TABLE IF EXISTS|CREATE TABLE)\s|^\s*INSERT INTO\s+[`\"']?\w"),
+       f"{path} (database dump)") for path in ("/backup.sql", "/dump.sql")),
+    # A served .env BACKUP variant — same secrets shape as .env, at a name that dodges a bare-.env block.
+    *((path, re.compile(r"(?m)^[A-Z][A-Z0-9_]{2,}\s*=\S"), f"{path} (application secrets/config)")
+      for path in ("/.env.bak", "/.env.local")),
+    # A served WordPress wp-config.php BACKUP — raw PHP exposing the DB_PASSWORD/DB_USER define()s
+    # (the source is returned instead of executed because the .bak suffix isn't handled by PHP).
+    ("/wp-config.php.bak", re.compile(r"""(?im)^\s*define\s*\(\s*['"]DB_(?:PASSWORD|USER|HOST|NAME)['"]"""),
+     "wp-config.php.bak (WordPress DB credentials)"),
 )
 
 

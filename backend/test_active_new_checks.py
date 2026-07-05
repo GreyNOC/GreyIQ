@@ -251,6 +251,30 @@ class NewSignatureTableTests(unittest.TestCase):
             self.assertIsNotNone(f, line)
             self.assertEqual(f["_active_proof"]["status"], "confirmed")
 
+    def test_sql_dump_exposed_confirmed(self) -> None:
+        body = "-- MySQL dump 10.13  Distrib 8.0.32\n--\nDROP TABLE IF EXISTS `users`;\nCREATE TABLE `users` (...);\nINSERT INTO `users` VALUES (1,'a');\n"
+        f = av._check_sensitive_paths(_ServesOne("/backup.sql", body), "https://t/")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+
+    def test_env_backup_variant_exposed_confirmed(self) -> None:
+        f = av._check_sensitive_paths(_ServesOne("/.env.bak", "DB_PASSWORD=hunter2\nSTRIPE_KEY=sk_live_x\n"), "https://t/")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+
+    def test_wp_config_backup_exposed_confirmed(self) -> None:
+        body = "<?php\ndefine('DB_NAME', 'wp');\ndefine('DB_USER', 'root');\ndefine('DB_PASSWORD', 's3cr3t');\n"
+        f = av._check_sensitive_paths(_ServesOne("/wp-config.php.bak", body), "https://t/")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+
+    def test_backup_signatures_do_not_flag_prose(self) -> None:
+        # a docs/blog page that MENTIONS these strings must not false-positive (anchored signatures)
+        docs = _ServesOne("/backup.sql", "Our tutorial explains how to CREATE TABLE and INSERT INTO rows in SQL.")
+        self.assertIsNone(av._check_sensitive_paths(docs, "https://t/"))
+        env_docs = _ServesOne("/.env.bak", "Set your DB_PASSWORD environment variable before running.")
+        self.assertIsNone(av._check_sensitive_paths(env_docs, "https://t/"))
+
     def test_elasticsearch_cat_indices_exposed_confirmed(self) -> None:
         body = "health status index          uuid   pri rep docs.count\ngreen  open   logs-2024-01 aBcD   1   1   1200\n"
         f = av._check_debug_endpoints(_ServesOne("/_cat/indices?v", body), "https://t/")
