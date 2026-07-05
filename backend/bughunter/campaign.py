@@ -28,6 +28,7 @@ from urllib.parse import urlparse
 from bughunter import (
     account_login_service,
     active_verify_service,
+    attack_map,
     cve_service,
     fsutil,
     hunt_brain,
@@ -86,15 +87,31 @@ def _campaign_risk(consolidated: list[dict[str, Any]]) -> str:
     return "low" if consolidated else "clean"
 
 
-def _capture_proof_screenshots(items: list[dict[str, Any]], shot_dir: Path, target: str, scope: Any) -> int:
+def _capture_proof_screenshots(items: list[dict[str, Any]], shot_dir: Path, target: str, scope: Any,
+                               with_attack_map: bool = True) -> int:
     """Capture a scope-gated proof screenshot for each confirmed finding and record its path on the
-    finding (+ the plain-text request/response proof if any). Bounded by the caller, best-effort:
-    every step is wrapped so a missing Playwright / a capture error is a clean no-op, never a break.
-    Returns the number of screenshots captured. Reused for BOTH the every-confirmed pass and deep."""
+    finding (+ the plain-text request/response proof if any). When ``with_attack_map`` is on, also
+    render a GRAPHICAL attack-plan map (a .png of the attack flow) beside it in the POC folder. Bounded
+    by the caller, best-effort: every step is wrapped so a missing Playwright / a capture error is a
+    clean no-op, never a break. Returns the number of screenshots captured. Reused by the
+    every-confirmed pass and deep."""
     captured = 0
     for index, item in enumerate(items, 1):
         finding = item["finding"]
         stem = f"{index:02d}-{_safe_slug(str(finding.get('ref') or 'finding'))}"
+        # Attack-plan map — rendered FIRST and INDEPENDENTLY of the screenshot: it's built from the
+        # finding's own data (no network, no POC URL needed), so a finding whose screenshot can't be
+        # captured still gets its visual attack map. Best-effort + fail-open.
+        if with_attack_map:
+            try:
+                mplan = item.get("plan") if isinstance(item.get("plan"), dict) else {
+                    "proof_of_impact": (finding.get("_active_proof") if isinstance(finding.get("_active_proof"), dict)
+                                        else item.get("proof_of_impact")) or {}}
+                res = attack_map.render_attack_map(finding, mplan, shot_dir / f"{stem}-attack-map.png")
+                if res.get("ok"):
+                    finding["attack_map_path"] = res["path"]
+            except Exception:  # noqa: BLE001 - the map is enrichment; never break the campaign
+                pass
         ictx = {"target": item.get("source_url") or target, "scope": scope, "attack_plans": {}}
         try:
             poc = screenshot_service.poc_url_for_finding(finding, ictx)
@@ -185,6 +202,7 @@ def _run_campaign_body(
     excluded_hosts: tuple[str, ...] = (),
     admin_account_access: dict[str, Any] | None = None,
     idor_pairs: list[dict[str, Any]] | None = None,
+    include_attack_map: bool = True,
     progress_run_id: str | None = None,
     progress_unit: str | None = None,
 ) -> dict[str, Any]:
@@ -620,9 +638,14 @@ def _run_campaign_body(
     # which measurably speeds/raises triage acceptance. Scope-gated, degrades cleanly without
     # Playwright, bounded to 8 so a big campaign can't launch unbounded browsers.
     if effective_active and confirmed:
-        n = _capture_proof_screenshots(confirmed[:8], out_root / "screenshots", clean_target, scope)
+        n = _capture_proof_screenshots(confirmed[:8], out_root / "screenshots", clean_target, scope,
+                                       with_attack_map=include_attack_map)
         if n:
             _emit(f"captured {n} proof screenshot(s) for confirmed finding(s).")
+        if include_attack_map:
+            mapped = sum(1 for c in confirmed[:8] if c["finding"].get("attack_map_path"))
+            if mapped:
+                _emit(f"rendered {mapped} graphical attack-plan map(s) into the POC download.")
 
     # --- Replayable proof-of-exploit artifacts: a copy-paste `replay.sh` (each confirmed finding's
     # benign crafted request as curl) + a `findings.har` (importable into Burp/browser devtools),
@@ -854,6 +877,7 @@ def run_campaign_over_targets(
     excluded_hosts: tuple[str, ...] = (),
     admin_account_access: dict[str, Any] | None = None,
     idor_pairs: list[dict[str, Any]] | None = None,
+    include_attack_map: bool = True,
     progress_run_id: str | None = None,
     progress_unit: str | None = None,
 ) -> dict[str, Any]:
@@ -947,7 +971,7 @@ def run_campaign_over_targets(
                 account_access=account_access, user_agent_suffix=user_agent_suffix, live=live,
                 program=program, max_pages=max_pages, platform=platform, deep=deep,
                 disclose_automation=disclose_automation, on_progress=_target_emit, excluded_hosts=excluded_hosts,
-                admin_account_access=admin_account_access, idor_pairs=idor_pairs,
+                admin_account_access=admin_account_access, idor_pairs=idor_pairs, include_attack_map=include_attack_map,
                 progress_run_id=progress_run_id, progress_unit=unit,
             )
             if progress_unit is None:
@@ -1077,6 +1101,7 @@ def run_portfolio_campaign(
     platform: str = "hackerone",
     deep: bool = False,
     on_progress: Any = None,
+    include_attack_map: bool = True,
     progress_run_id: str | None = None,
     max_concurrent_programs: int = _PORTFOLIO_MAX_PROGRAMS,
 ) -> dict[str, Any]:
@@ -1161,7 +1186,7 @@ def run_portfolio_campaign(
                 platform=platform, deep=deep, disclose_automation=spec["disclose_automation"],
                 account_access=spec["account_access"], admin_account_access=spec.get("admin_account_access"),
                 idor_pairs=spec.get("idor_pairs"), user_agent_suffix=spec["user_agent_suffix"],
-                excluded_hosts=spec["excluded_hosts"], on_progress=_p_emit,
+                excluded_hosts=spec["excluded_hosts"], include_attack_map=include_attack_map, on_progress=_p_emit,
                 progress_run_id=progress_run_id, progress_unit=label,
             )
             progress.mark_target(progress_run_id, label, "done" if result.get("ok") else "error",

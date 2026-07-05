@@ -605,6 +605,7 @@ class CampaignRequest(BaseModel):
     live: bool = False
     max_pages: int = Field(default=12, ge=1, le=50)
     deep: bool = False  # aggressive: time-based SQLi + auto screenshot + research per confirmed lead
+    attack_map: bool = True  # render a graphical attack-plan map (.png) per confirmed finding into the POC download + report
     run_id: str = Field(default="", max_length=100)  # client-minted id for polling live progress
 
 
@@ -625,6 +626,7 @@ class PortfolioRequest(BaseModel):
     active: bool = False
     time_based: bool = False
     deep: bool = False           # GPU-brain deep AI write-ups + screenshots + research per confirmed lead
+    attack_map: bool = True      # render a graphical attack-plan map (.png) per confirmed finding
     live: bool = False
     max_pages: int = Field(default=12, ge=1, le=50)
     auth_cookie: str = Field(default="", max_length=8000)
@@ -1975,6 +1977,7 @@ class GreyIQRuntime:
             program=request.program,
             max_pages=request.max_pages,
             deep=request.deep,
+            include_attack_map=request.attack_map,
             disclose_automation=disclose_automation,
             excluded_hosts=excluded_hosts,
             on_progress=bounty_progress.sink(run_id) if run_id else None,
@@ -2025,6 +2028,7 @@ class GreyIQRuntime:
             program=program_label,
             max_pages=request.max_pages,
             deep=request.deep,
+            include_attack_map=request.attack_map,
             disclose_automation=disclose_automation,
             excluded_hosts=excluded_hosts,
             on_progress=bounty_progress.sink(run_id) if run_id else None,
@@ -2098,6 +2102,7 @@ class GreyIQRuntime:
             live=request.live,
             max_pages=request.max_pages,
             deep=request.deep,
+            include_attack_map=request.attack_map,
             on_progress=bounty_progress.sink(run_id) if run_id else None,
             progress_run_id=run_id or None,
         )
