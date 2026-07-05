@@ -342,6 +342,7 @@ from bughunter import learning as bounty_learning  # noqa: E402
 from bughunter import submission as bounty_submission  # noqa: E402
 from bughunter import report as bounty_report  # noqa: E402
 from bughunter import report_formats as bounty_formats  # noqa: E402
+from bughunter import attack_map as bounty_attack_map  # noqa: E402
 from bughunter import screenshot_service as bounty_screenshot  # noqa: E402
 from bughunter import target_ingest as bounty_ingest  # noqa: E402
 from bughunter import bundle as bounty_bundle  # noqa: E402
@@ -779,6 +780,26 @@ class ScreenshotRequest(BaseModel):
     matched_value: str = Field(default="", max_length=2000)   # evidence to highlight + annotate
     full_page: bool = False
     scope: str = Field(default="", max_length=4000)   # optional extra scope (the cockpit's current Scope box), unioned with the run + live program scope at capture time
+
+
+class AttackMapRequest(BaseModel):
+    # Render the GRAPHICAL attack-plan map (.png) for a finding on demand. run_id/ref locate the cached
+    # run (richest: the full attack plan + captured differential). Optional so a finding opened from
+    # history / an evicted run still renders from its OWN passed proof fields — no re-hunt. Built from
+    # already-captured data, no network; the PNG is returned as an inline data_url for the report page.
+    run_id: str = Field(default="", max_length=64)
+    ref: str = Field(default="", max_length=40)
+    title: str = Field(default="", max_length=255)
+    severity: str = Field(default="", max_length=16)
+    class_name: str = Field(default="", max_length=120)
+    location: str = Field(default="", max_length=4000)
+    actor: str = Field(default="", max_length=300)
+    observed_result: str = Field(default="", max_length=2000)
+    control_result: str = Field(default="", max_length=2000)
+    request_line: str = Field(default="", max_length=2000)
+    request_header: str = Field(default="", max_length=1000)
+    matched_value: str = Field(default="", max_length=2000)
+    impact: str = Field(default="", max_length=1000)
 
 
 class CredentialTestRequest(BaseModel):
@@ -2410,6 +2431,56 @@ class GreyIQRuntime:
             "highlighted": result.get("highlighted", False),
             "source_text": source_text,  # copy-pasteable request/response/source, for the POC zip / report
         }
+
+    def render_attack_plan_map(self, request: "AttackMapRequest") -> dict[str, Any]:
+        """Render the GRAPHICAL attack-plan map (.png) for a finding ON DEMAND and return it as an
+        inline data_url for the 'View full report' page (and record its path on the cached finding so
+        the report/submission embed it). Built entirely from already-captured data — NO network.
+        Playwright-lazy; degrades cleanly (ok:False) if Chromium is unavailable."""
+        import base64
+
+        ctx, finding, run = self._resolve_run_finding(request.run_id, request.ref)
+        # Richest source: the cached finding + its attack plan. Fallback: the fields the caller passed
+        # (a finding opened from history / an evicted run) so a map still renders with no re-hunt.
+        if finding is not None:
+            fnd = finding
+            plans = (ctx or {}).get("attack_plans")
+            plan = plans.get(request.ref) if isinstance(plans, dict) else None
+            plan = dict(plan) if isinstance(plan, dict) else {}
+            if not isinstance(plan.get("proof_of_impact"), dict) and isinstance(fnd.get("_active_proof"), dict):
+                plan["proof_of_impact"] = fnd["_active_proof"]   # active-pass findings carry the differential here
+        else:
+            if not (str(request.title or "").strip() or str(request.location or "").strip()):
+                return {"ok": False, "error": "Open this finding from a run or history entry so its attack plan can be mapped."}
+            fnd = {
+                "title": request.title, "severity": request.severity, "class_name": request.class_name,
+                "location": request.location,
+                "proof_evidence": {"request_line": request.request_line, "request_header": request.request_header,
+                                   "matched_value": request.matched_value},
+            }
+            plan = {"impact": request.impact, "proof_of_impact": {
+                "actor": request.actor, "observed_result": request.observed_result,
+                "control_result": request.control_result}}
+        safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
+        stem = f"{safe(request.run_id or 'adhoc')}-{safe(request.ref or fnd.get('title') or 'finding')}"
+        out_path = RUNTIME_DIR / "screenshots" / f"{stem}-attack-map.png"
+        res = bounty_attack_map.render_attack_map(fnd, plan, out_path)
+        if not res.get("ok"):
+            return {"ok": False, "error": res.get("error") or "Could not render the attack-plan map (Playwright/Chromium may be unavailable)."}
+        data_url = ""
+        try:
+            raw = Path(res["path"]).read_bytes()
+            if len(raw) <= 4_000_000:  # inline preview; skip if huge
+                data_url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+        except OSError:
+            pass
+        # Record on the cached finding so build_submission / the report embed the map by basename.
+        with self.lock:
+            if finding is not None:
+                finding["attack_map_path"] = res["path"]
+                if run is not None and request.ref:
+                    run.setdefault("attack_maps", {})[request.ref] = res["path"]
+        return {"ok": True, "path": res["path"], "data_url": data_url}
 
     def research_finding(self, request: "ResearchRequest") -> dict[str, Any]:
         """Research one lead with the CONFIGURED brain (Claude/ChatGPT/local) — or a
@@ -4252,6 +4323,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/screenshot":
             request = validate_payload(ScreenshotRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.capture_screenshot, request))
+            return
+        if method == "POST" and path == "/api/bounty/attack-map":
+            request = validate_payload(AttackMapRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.render_attack_plan_map, request))
             return
         if method == "POST" and path == "/api/bounty/credential-test":
             request = validate_payload(CredentialTestRequest, await read_json_body(receive))
