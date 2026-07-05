@@ -2,6 +2,20 @@
 
 Notable changes to GreyIQ.
 
+## v0.91.0
+
+### A graphical attack-plan map in every proof download
+- Confirmed findings now come with a **visual map of the attack** — a `.png` that lays out the exact
+  flow the engine used to prove the bug: the actor, the crafted request, the observed tell, the
+  negative control that rules out a false positive, and the confirmed impact. It's the picture that
+  goes with the text reproduction steps, and it lands right next to the proof screenshot in the POC
+  download and is embedded in the submission report.
+- It's an **option** (on by default) — a toggle on the hunt launch panel — so you can turn it off if
+  you don't want it.
+- Built entirely from the finding's own captured data (no extra requests), rendered by the same
+  bundled browser used for screenshots. Any secret in the proof text is redacted just like everywhere
+  else, and if the renderer isn't available the map is simply skipped — the hunt is never affected.
+
 ## v0.90.0
 
 ### Catches GraphQL schema leaks even when introspection is off
