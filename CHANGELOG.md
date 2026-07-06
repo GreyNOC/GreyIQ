@@ -2,6 +2,37 @@
 
 Notable changes to GreyIQ.
 
+## v1.1.0
+
+### Redesigned bug-bounty cockpit — sidebar + top-bar shell, Report Center as a data board
+- The Hunt cockpit is rebuilt around a persistent **left sidebar** (glowing GreyNOC-IQ globe brand,
+  single-column icon navigation, a collapsible **Hunt setup** panel that holds the launch form, and an
+  Operator footer) and a slim **top bar** (Program picker + run-type control on the left; engine status,
+  Guide me, Studio, theme, and an operator avatar on the right).
+- The **Report Center** is now a proper board: five stat cards (Report ready / Confirmed / Submitted /
+  Paid / Total findings), a filter toolbar (search + severity + proof + status + sort + **Saved views**),
+  and a paginated table — **Severity · Title · Target · Status · Proof · Last updated · Actions** — at 25
+  findings per page, with a per-row **Open report** / **Get report ready** action and a "…" overflow menu
+  (copy / download .md / re-ready).
+- New per-finding **Status** column (Confirmed / Candidate / Missing proof / Submitted / Paid) and a
+  **Last updated** timestamp; **Saved views** persist filter presets locally; the search box keeps focus
+  and keystrokes across a live refresh.
+- One consistent dark design across every view: unified stat cards, filled severity pills (LOW now reads
+  green), and the same card/table look everywhere. Responsive down to mobile. Design and layout only —
+  every hunt, campaign, filter, theme, drawer, and report action behaves exactly as before.
+
+## v1.0.0
+
+### Global Report Center + live event stream
+- A durable, app-wide **Report Center** over the cross-run finding ledger: every finding across every
+  program, each with a **Get report ready** action that assembles proof-of-concept, proof-of-impact, and
+  proof-of-evidence into a submission-ready report that stays synced and survives restarts.
+- An app-wide **live event stream** (a lightweight ~2s poll — no SSE, so the API token header and CSP
+  stay intact) that updates the cockpit as findings confirm or reports ready anywhere, with an
+  auto-reconnect banner + amber engine pill when the local engine is briefly unreachable.
+- Report assembly reports its own capped `proof_status`, so a forged confirm (observed result with no
+  control) honestly caps to *candidate* instead of inflating to *confirmed*.
+
 ## v0.99.0
 
 ### Strict secret classification — stop over-reporting public API keys

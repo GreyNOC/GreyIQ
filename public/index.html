@@ -390,46 +390,30 @@
     <!-- The default surface. The AI studio above is demoted behind "Studio".
          All dynamic content is built DOM-only in app.js (no innerHTML). -->
     <main class="cockpit" id="cockpit" aria-label="Bug bounty cockpit">
-      <header class="ck-topbar">
-        <div class="ck-brand">
+      <aside class="ck-sidebar" aria-label="Hunt navigation and setup">
+        <div class="ck-side-brand">
           <span class="ck-logo ck-logo-globe" aria-hidden="true">
-            <img src="./globe.svg" alt="" width="34" height="34">
+            <img src="./globe.svg" alt="" width="30" height="30">
           </span>
           <div>
-            <p class="ck-eyebrow">GreyNOC-IQ · Bug Bounty</p>
+            <p class="ck-eyebrow">GreyNOC-IQ</p>
             <h1>Hunt</h1>
           </div>
         </div>
-        <div class="ck-topbar-actions">
-          <span class="ck-service" id="ckService" title="Local engine status">connecting…</span>
-          <button class="ck-ghost" id="ckTheme" type="button" title="Switch theme">Dark</button>
-          <button class="ck-ghost" id="ckStudio" type="button" title="Open the AI studio (chat, coding brain, training)">Studio ↗</button>
-        </div>
-      </header>
 
-      <div class="ck-banner" id="ckBanner" role="status" aria-live="polite" hidden></div>
+        <nav class="ck-nav ck-nav-side" id="ckNav" aria-label="Cockpit views">
+          <button class="ck-nav-btn is-active" data-ck-view="program" type="button">Overview</button>
+          <button class="ck-nav-btn" data-ck-view="findings" type="button">Findings</button>
+          <button class="ck-nav-btn" data-ck-view="surface" type="button">Surface</button>
+          <button class="ck-nav-btn" data-ck-view="submissions" type="button">Submissions</button>
+          <button class="ck-nav-btn" data-ck-view="reports" type="button">Report Center</button>
+          <button class="ck-nav-btn" data-ck-view="idor" type="button">Access control</button>
+          <button class="ck-nav-btn" data-ck-view="learn" type="button">Learn</button>
+        </nav>
 
-      <div class="ck-body">
-        <aside class="ck-rail" aria-label="Hunt controls">
-          <nav class="ck-nav ck-nav-5" id="ckNav" aria-label="Cockpit views">
-            <button class="ck-nav-btn is-active" data-ck-view="program" type="button">Program</button>
-            <button class="ck-nav-btn" data-ck-view="campaign" type="button">Campaign</button>
-            <button class="ck-nav-btn" data-ck-view="findings" type="button">Findings</button>
-            <button class="ck-nav-btn" data-ck-view="surface" type="button">Surface</button>
-            <button class="ck-nav-btn" data-ck-view="submissions" type="button">Submissions</button>
-            <button class="ck-nav-btn" data-ck-view="reports" type="button">Report Center</button>
-            <button class="ck-nav-btn" data-ck-view="idor" type="button">Access control</button>
-            <button class="ck-nav-btn" data-ck-view="learn" type="button">Learn</button>
-            <button class="ck-nav-btn" data-ck-view="operator" type="button">Operator</button>
-          </nav>
-
+        <details class="ck-setup-fold" id="ckSetupFold" open>
+          <summary class="ck-setup-head"><span>Hunt setup</span></summary>
           <form class="ck-launch" id="ckLaunch">
-            <div class="ck-seg-group" role="group" aria-label="Run type">
-              <button type="button" class="ck-seg is-active" id="ckRunHunt" data-ck-runtype="hunt">Single hunt</button>
-              <button type="button" class="ck-seg" id="ckRunCampaign" data-ck-runtype="campaign">Full campaign</button>
-              <button type="button" class="ck-seg" id="ckRunPortfolio" data-ck-runtype="portfolio">Portfolio</button>
-            </div>
-
             <div data-ck-when="portfolio" hidden class="ck-portfolio-pick">
               <div class="ck-portfolio-head">
                 <span>Programs to hunt <strong id="ckPortfolioCount"></strong></span>
@@ -439,8 +423,6 @@
               <p class="ck-hint">Runs a full campaign on every selected program's <em>own saved scope</em> — several at once, bounded so it stays polite (per-host rate limits stay on). AI write-ups run on your selected device (GPU if set). Target/Scope above are ignored in this mode.</p>
             </div>
 
-            <label><span>Program <em>(optional — fills in Target/Scope below)</em></span>
-              <select id="ckActiveProgram"><option value="">— pick a saved program —</option></select></label>
             <label><span>Target</span>
               <input id="ckTarget" type="text" autocomplete="off" spellcheck="false" placeholder="https://example.com  ·  C:\path\to\repo"></label>
             <label><span>Scope / program notes</span>
@@ -489,21 +471,54 @@
           </form>
 
           <p class="ck-disclaimer">Authorized testing only. Active probes fire only against a host you name in Scope, after you tick the authorization box. The server enforces both — fail-closed.</p>
-        </aside>
+        </details>
 
-        <section class="ck-main">
-          <div class="ck-view" id="ckViewProgram"></div>
-          <div class="ck-view" id="ckViewCampaign" hidden></div>
-          <div class="ck-view" id="ckViewFindings" hidden></div>
-          <div class="ck-view" id="ckViewSurface" hidden></div>
-          <div class="ck-view" id="ckViewSubmissions" hidden></div>
-          <div class="ck-view" id="ckViewReports" hidden></div>
-          <div class="ck-view" id="ckViewIdor" hidden></div>
-          <div class="ck-view" id="ckViewLearn" hidden></div>
-          <div class="ck-view" id="ckViewOperator" hidden></div>
-        </section>
+        <div class="ck-side-foot">
+          <button class="ck-nav-btn ck-foot-btn" data-ck-view="operator" type="button">Operator</button>
+        </div>
+      </aside>
 
-        <aside class="ck-detail" id="ckDetail" hidden aria-label="Finding detail"></aside>
+      <div class="ck-shell-main">
+        <header class="ck-topbar">
+          <div class="ck-topbar-left">
+            <div class="ck-topbar-field">
+              <span class="ck-topbar-flabel">Program</span>
+              <select id="ckActiveProgram" aria-label="Active program"><option value="">— pick a program —</option></select>
+            </div>
+            <div class="ck-topbar-field">
+              <span class="ck-topbar-flabel">Campaign</span>
+              <div class="ck-seg-group" role="group" aria-label="Run type">
+                <button type="button" class="ck-seg is-active" id="ckRunHunt" data-ck-runtype="hunt">Single hunt</button>
+                <button type="button" class="ck-seg" id="ckRunCampaign" data-ck-runtype="campaign">Full campaign</button>
+                <button type="button" class="ck-seg" id="ckRunPortfolio" data-ck-runtype="portfolio">Portfolio</button>
+              </div>
+            </div>
+          </div>
+          <div class="ck-topbar-actions">
+            <span class="ck-service" id="ckService" title="Local engine status">connecting…</span>
+            <button class="ck-ghost" id="ckStudio" type="button" title="Open the AI studio (chat, coding brain, training)">Studio ↗</button>
+            <button class="ck-ghost ck-theme-btn" id="ckTheme" type="button" title="Switch theme">Dark</button>
+            <span class="ck-avatar" aria-hidden="true">GS</span>
+          </div>
+        </header>
+
+        <div class="ck-banner" id="ckBanner" role="status" aria-live="polite" hidden></div>
+
+        <div class="ck-body">
+          <section class="ck-main">
+            <div class="ck-view" id="ckViewProgram"></div>
+            <div class="ck-view" id="ckViewCampaign" hidden></div>
+            <div class="ck-view" id="ckViewFindings" hidden></div>
+            <div class="ck-view" id="ckViewSurface" hidden></div>
+            <div class="ck-view" id="ckViewSubmissions" hidden></div>
+            <div class="ck-view" id="ckViewReports" hidden></div>
+            <div class="ck-view" id="ckViewIdor" hidden></div>
+            <div class="ck-view" id="ckViewLearn" hidden></div>
+            <div class="ck-view" id="ckViewOperator" hidden></div>
+          </section>
+
+          <aside class="ck-detail" id="ckDetail" hidden aria-label="Finding detail"></aside>
+        </div>
       </div>
     </main>
 

@@ -2228,8 +2228,10 @@ function applyTheme() {
     els.themeToggle.setAttribute("aria-pressed", String(theme === "dark"));
     els.themeToggle.title = theme === "dark" ? "Switch to light theme" : "Switch to dark theme";
   }
+  // Cockpit theme control shows the CURRENT theme (mockup's "Dark ▾" dropdown look); the moon
+  // glyph + caret are CSS pseudo-elements so this textContent write can't clobber them.
   const ckTheme = document.querySelector("#ckTheme");
-  if (ckTheme) ckTheme.textContent = theme === "dark" ? "Light" : "Dark";
+  if (ckTheme) ckTheme.textContent = theme === "dark" ? "Dark" : "Light";
 }
 
 function toggleTheme() {
@@ -6510,7 +6512,7 @@ function ckRenderGuideButton() {
   if (document.querySelector("#ckGuideBtn")) return;
   const actions = document.querySelector(".ck-topbar-actions");
   if (!actions) return;
-  const btn = cel("button", "ck-ghost", "🧭 Guide me"); btn.type = "button"; btn.id = "ckGuideBtn";
+  const btn = cel("button", "ck-ghost ck-ghost-guide", "Guide me"); btn.type = "button"; btn.id = "ckGuideBtn";
   btn.title = "Replay the guided setup tour";
   btn.addEventListener("click", () => ckShowWizard(0));
   actions.prepend(btn);
@@ -8242,7 +8244,7 @@ async function ckEnsureHistory() {
 // An app-wide, live, durable hub over the SAME ledger the Submissions history reads: every finding
 // across every program, with a per-finding "Get report ready" that assembles POC/POI/POE and marks
 // it ready (synced everywhere, survives restart). Updates live via the global event stream.
-const ckReports = { ready: "all" };  // ready-state filter: all | readyable | ready
+const ckReports = { ready: "all", page: 1, pageSize: 25 };  // ready-state filter + client-side pagination
 
 function ckProofDots(rec) {
   const wrap = cel("span", "ck-proof-dots");
@@ -8313,7 +8315,7 @@ async function ckGetReportReady(rec, btn, status, li) {
   const parts = ["poc", "poi", "poe"].filter((k) => r[k]).map((k) => k.toUpperCase());
   // Rebuild the row (so the ready badge + dots + button label update) and carry the confirmation
   // onto the fresh row's status span — setting it on the old span would be discarded by the swap.
-  const fresh = ckReportRow(rec);
+  const fresh = ckReportTr(rec);
   const freshStatus = fresh.querySelector(".ck-status");
   if (freshStatus) {
     freshStatus.className = "ck-status is-ok";
@@ -8330,122 +8332,257 @@ async function ckGetReportReady(rec, btn, status, li) {
   }
 }
 
-function ckReportRow(rec) {
-  const li = cel("li");
-  li.style.flexWrap = "wrap";
-  const left = cel("div"); left.style.flex = "1";
-  const sev = String(rec.severity || "info").toLowerCase();
-  left.append(cel("span", `ck-sev sev-${sev}`, String(rec.severity || "info").toUpperCase()), document.createTextNode(" "));
-  left.append(cel("span", "ck-ftitle", rec.title || "Finding"));
-  if (rec.report_ready) left.append(document.createTextNode(" "), cel("span", "ck-ready-badge", "Report ready ✓"));
-  const meta = cel("div", "ck-cd-finding-meta");
-  if (rec.class_id) meta.append(cel("span", null, rec.class_id));
-  const rproof = ckEffectiveProof(rec, rec.proof_status);
-  if (rproof) meta.append(ckProofBadge(rproof));
-  meta.append(cel("span", "ck-tag", ckEffectiveStage(rec) || rec.stage || "discovered"));
-  if (rec.program) meta.append(cel("span", "ck-tag", rec.program));
-  if (Number(rec.bounty)) meta.append(cel("span", null, `$${rec.bounty}`));
-  if (rec.source_url) meta.append(cel("span", "ck-cd-finding-target", ckShortTarget(rec.source_url)));
-  meta.append(ckProofDots(rec));
-  left.append(meta);
-  li.append(left);
+// Persisted "Saved views" for the Report Center (self-contained localStorage, like ckStatusOverlay).
+const ckSavedViews = (() => {
+  try { return JSON.parse(localStorage.getItem("greyiq-rc-views") || "[]") || []; } catch (_) { return []; }
+})();
+function ckSaveSavedViews() { try { localStorage.setItem("greyiq-rc-views", JSON.stringify(ckSavedViews)); } catch (_) { /* private mode / quota */ } }
 
-  const acts = cel("div", "ck-actions"); acts.style.margin = "0";
-  const status = cel("span", "ck-status"); status.style.marginLeft = "0.4rem";
-  const readyBtn = cel("button", "ck-btn ck-btn-primary", rec.report_ready ? "Re-ready report" : "Get report ready");
-  readyBtn.type = "button";
-  readyBtn.title = "Assemble POC + POI + POE into a submission-ready report and keep it here";
-  readyBtn.addEventListener("click", () => ckGetReportReady(rec, readyBtn, status, li));
-  const viewBtn = cel("button", "ck-btn", "View full report");
-  viewBtn.type = "button";
-  viewBtn.addEventListener("click", () => ckViewFullReportHere(rec));
-  const copyBtn = cel("button", "ck-btn", "Copy");
-  copyBtn.type = "button";
-  copyBtn.addEventListener("click", async () => {
-    copyBtn.disabled = true; copyBtn.textContent = "…";
-    try { const md = await ckReportFromLedger(rec); const ok = await ckCopy(md); copyBtn.textContent = ok ? "Copied ✓" : "Failed"; }
-    finally { copyBtn.disabled = false; setTimeout(() => { copyBtn.textContent = "Copy"; }, 1600); }
+// Open popup menus (row kebab / Saved views) register their close() here so a full Report Center
+// rebuild (e.g. a live refresh) can tear them down cleanly instead of orphaning their document
+// click-listener when replaceChildren detaches the menu node.
+const ckOpenMenus = new Set();
+function ckCloseOpenMenus() { for (const c of [...ckOpenMenus]) { try { c(); } catch (_) { /* already gone */ } } }
+
+// A generic popup menu: wires `triggerEl` to toggle a menu built lazily by buildItems().
+// Returns a positioned wrapper span containing the trigger; used by the row kebab and Saved views.
+function ckAttachMenu(triggerEl, buildItems) {
+  triggerEl.setAttribute("aria-haspopup", "true");
+  const host = cel("span"); host.style.position = "relative"; host.style.display = "inline-flex";
+  let menu = null;
+  const onDoc = (e) => { if (menu && !host.contains(e.target)) close(); };
+  function close() { if (menu) { menu.remove(); menu = null; } document.removeEventListener("click", onDoc, true); ckOpenMenus.delete(close); triggerEl.setAttribute("aria-expanded", "false"); }
+  triggerEl.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (menu) { close(); return; }
+    menu = cel("div", "ck-kebab-menu");
+    for (const it of buildItems()) {
+      const b = cel("button", null, it.label); b.type = "button";
+      if (it.disabled) b.disabled = true;
+      b.addEventListener("click", (ev) => { ev.stopPropagation(); close(); if (it.onClick) it.onClick(); });
+      menu.append(b);
+    }
+    host.append(menu);
+    triggerEl.setAttribute("aria-expanded", "true");
+    document.addEventListener("click", onDoc, true);
+    ckOpenMenus.add(close);
   });
-  const dlBtn = cel("button", "ck-btn", "Download .md");
-  dlBtn.type = "button";
-  dlBtn.addEventListener("click", async () => {
-    dlBtn.disabled = true; dlBtn.textContent = "…";
-    try { const md = await ckReportFromLedger(rec); ckDownloadText(`${ckSlug(rec.title || "finding")}.md`, md); }
-    finally { dlBtn.disabled = false; dlBtn.textContent = "Download .md"; }
-  });
-  acts.append(readyBtn, viewBtn, copyBtn, dlBtn, status);
-  li.append(acts);
-  return li;
+  host.append(triggerEl);
+  return host;
 }
 
-function ckReportControlsBar() {
-  const opts = ckState.sub;
-  const wrap = cel("div", "ck-creds ck-sub-controls");
-  const head = cel("div", "ck-creds-head");
-  head.append(cel("strong", null, "Search · filter · sort"));
-  wrap.append(head);
-  const row = cel("div", "ck-sub-controls-row");
+function ckKebab(items) {
+  const btn = cel("button", "ck-kebab", "⋯"); btn.type = "button"; btn.title = "More actions"; btn.setAttribute("aria-label", "More actions");
+  return ckAttachMenu(btn, () => items);
+}
 
-  const searchLab = cel("label", "ck-sub-search");
-  searchLab.append(cel("span", null, "Search"));
-  const search = cel("input");
-  search.type = "search"; search.id = "ckRcSearch"; search.value = opts.query;
-  search.placeholder = "title, URL, class, CWE, program…"; search.autocomplete = "off";
-  search.addEventListener("input", () => {
-    const pos = search.selectionStart;
-    opts.query = search.value;
+// The single mockup "Status" column. A filed report's later stage (submitted/paid) wins; otherwise
+// it reflects proof state — Confirmed (green) vs Missing proof (amber), with Candidate in between.
+// A bare "reported" stage does NOT override proof: an auto-drafted report with no captured evidence
+// still reads "Missing proof", matching the mockup.
+function ckReportStatus(rec) {
+  const proof = ckEffectiveProof(rec, rec.proof_status);
+  const stage = ckEffectiveStage(rec) || rec.stage || "discovered";
+  if (stage === "paid") return { text: "Paid", cls: "is-confirmed" };
+  if (stage === "submitted") return { text: "Submitted", cls: "is-confirmed" };
+  if (proof === "confirmed") return { text: "Confirmed", cls: "is-confirmed" };
+  if (proof === "candidate") return { text: "Candidate", cls: "is-neutral" };
+  return { text: "Missing proof", cls: "is-missing" };
+}
+
+// Format an ISO updated_at into a { date, time } pair for the two-line "Last updated" cell.
+function ckFmtWhen(iso) {
+  if (!iso) return { d: "—", t: "" };
+  const dt = new Date(iso);
+  if (isNaN(dt.getTime())) return { d: String(iso).slice(0, 10), t: "" };
+  const d = dt.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  const t = dt.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  return { d, t };
+}
+
+// One stat card (icon tile + label + big number + caption) for the Report Center header strip.
+function ckRcCard(tone, icoClass, label, num, cap) {
+  const card = cel("div", "ck-rc-card");
+  const top = cel("div", "ck-rc-card-top");
+  top.append(cel("span", `ck-rc-icon ${tone} ${icoClass}`));
+  top.append(cel("span", "ck-rc-label", label));
+  card.append(top);
+  card.append(cel("div", "ck-rc-num", num));
+  card.append(cel("div", "ck-rc-cap", cap));
+  return card;
+}
+
+// One Report Center table row (<tr>). Kept swappable by ckGetReportReady the same way the old
+// <li> row was (it calls ckReportTr(rec) and row.replaceWith(fresh); the .ck-status span survives).
+function ckReportTr(rec) {
+  const tr = cel("tr");
+  const sev = String(rec.severity || "info").toLowerCase();
+
+  const tdSev = cel("td");
+  tdSev.append(cel("span", `ck-sevpill sev-${sev}`, String(rec.severity || "info").toUpperCase()));
+  tr.append(tdSev);
+
+  const tdTitle = cel("td");
+  const titleLine = cel("div", "ck-rc-title");
+  titleLine.append(document.createTextNode(rec.title || "Finding"));
+  if (rec.report_ready) titleLine.append(cel("span", "ck-ready-badge", "Report ready ✓"));
+  tdTitle.append(titleLine);
+  const subParts = [];
+  if (rec.class_id) subParts.push(rec.class_id);
+  if (rec.source_url) subParts.push(ckShortTarget(rec.source_url));
+  if (subParts.length) tdTitle.append(cel("div", "ck-rc-sub", subParts.join(" · ")));
+  tr.append(tdTitle);
+
+  const tdTarget = cel("td");
+  tdTarget.append(cel("span", "ck-rc-target", rec.source_url ? ckShortTarget(rec.source_url) : (rec.program || "—")));
+  tr.append(tdTarget);
+
+  const st = ckReportStatus(rec);
+  const tdStatus = cel("td");
+  tdStatus.append(cel("span", `ck-rc-status ${st.cls}`, st.text));
+  tr.append(tdStatus);
+
+  const tdProof = cel("td");
+  tdProof.append(ckProofDots(rec));
+  tr.append(tdProof);
+
+  const w = ckFmtWhen(rec.updated_at || rec.last_seen);
+  const tdWhen = cel("td");
+  const when = cel("div", "ck-rc-when", w.d);
+  if (w.t) when.append(cel("span", "t", w.t));
+  tdWhen.append(when);
+  tr.append(tdWhen);
+
+  const tdActions = cel("td");
+  const acts = cel("div", "ck-rc-actions");
+  const status = cel("span", "ck-status");
+  const primary = cel("button", `ck-btn ${rec.report_ready ? "ck-rc-open" : "ck-rc-getready"}`, rec.report_ready ? "Open report" : "Get report ready");
+  primary.type = "button";
+  if (rec.report_ready) {
+    primary.title = "Open the assembled full report";
+    primary.addEventListener("click", () => ckViewFullReportHere(rec));
+  } else {
+    primary.title = "Assemble POC + POI + POE into a submission-ready report and keep it here";
+    primary.addEventListener("click", () => ckGetReportReady(rec, primary, status, tr));
+  }
+  const menuItems = [{ label: "View full report", onClick: () => ckViewFullReportHere(rec) }];
+  if (rec.report_ready) menuItems.push({ label: "Re-ready report", onClick: () => ckGetReportReady(rec, primary, status, tr) });
+  menuItems.push({ label: "Copy report", onClick: async () => { try { const md = await ckReportFromLedger(rec); await ckCopy(md); } catch (_) { /* copy blocked */ } } });
+  menuItems.push({ label: "Download .md", onClick: async () => { try { const md = await ckReportFromLedger(rec); ckDownloadText(`${ckSlug(rec.title || "finding")}.md`, md); } catch (_) { /* build failed */ } } });
+  acts.append(primary, ckKebab(menuItems), status);
+  tdActions.append(acts);
+  tr.append(tdActions);
+  return tr;
+}
+
+function ckReportToolbar() {
+  const opts = ckState.sub;
+  const wrap = cel("div", "ck-rc-toolbar");
+
+  const search = cel("div", "ck-rc-search");
+  const input = cel("input");
+  input.type = "search"; input.id = "ckRcSearch"; input.value = opts.query;
+  input.placeholder = "Search findings (title, URL, class, CWE, program…)"; input.autocomplete = "off";
+  input.addEventListener("input", () => {
+    const pos = input.selectionStart;
+    opts.query = input.value; ckReports.page = 1;
     void ckRenderReportCenter();
     const again = document.getElementById("ckRcSearch");
     if (again) { again.focus(); try { again.setSelectionRange(pos, pos); } catch (_) { /* type=search quirk */ } }
   });
-  searchLab.append(search);
-  row.append(searchLab);
+  search.append(input);
+  wrap.append(search);
 
-  const mkSelect = (label, value, choices, onset) => {
-    const lab = cel("label");
-    lab.append(cel("span", null, label));
+  const mkSelect = (value, choices, onset) => {
     const sel = cel("select");
     for (const [val, text] of choices) {
       const opt = cel("option", null, text); opt.value = val;
       if (val === value) opt.selected = true;
       sel.append(opt);
     }
-    sel.addEventListener("change", () => { onset(sel.value); void ckRenderReportCenter(); });
-    lab.append(sel);
-    return lab;
+    sel.addEventListener("change", () => { onset(sel.value); ckReports.page = 1; void ckRenderReportCenter(); });
+    return sel;
   };
 
-  row.append(mkSelect("Ready", ckReports.ready, [
-    ["all", "All findings"], ["readyable", "Ready to assemble"], ["ready", "Report ready"],
-  ], (v) => { ckReports.ready = v; }));
-  row.append(mkSelect("Severity", opts.sev, [
+  wrap.append(mkSelect(opts.sev, [
     ["all", "All severities"], ["critical", "Critical"], ["high", "High"],
     ["medium", "Medium"], ["low", "Low"], ["info", "Info"],
   ], (v) => { opts.sev = v; }));
-  row.append(mkSelect("Proof", opts.proof, [
+  wrap.append(mkSelect(opts.proof, [
     ["all", "Any proof"], ["confirmed", "Confirmed"], ["candidate", "Candidate"], ["missing", "Unproven"],
   ], (v) => { opts.proof = v; }));
-  row.append(mkSelect("Sort", opts.sort, [
-    ["severity", "Severity"], ["title", "Title (A–Z)"], ["recent", "Most recent"],
+  wrap.append(mkSelect(ckReports.ready, [
+    ["all", "All statuses"], ["readyable", "Ready to assemble"], ["ready", "Report ready"],
+  ], (v) => { ckReports.ready = v; }));
+  wrap.append(mkSelect(opts.sort, [
+    ["severity", "Sort: Severity"], ["title", "Sort: Title (A–Z)"], ["recent", "Sort: Most recent"],
   ], (v) => { opts.sort = v; }));
 
-  const active = opts.query || opts.sev !== "all" || opts.proof !== "all" || opts.sort !== "severity" || ckReports.ready !== "all";
-  if (active) {
-    const clear = cel("button", "ck-btn", "Clear");
-    clear.type = "button";
-    clear.addEventListener("click", () => {
-      ckState.sub = { query: "", sev: "all", proof: "all", sort: "severity" };
-      ckReports.ready = "all"; void ckRenderReportCenter();
-    });
-    row.append(clear);
-  }
-  wrap.append(row);
+  const applyView = (v) => {
+    ckState.sub = { query: v.query || "", sev: v.sev || "all", proof: v.proof || "all", sort: v.sort || "severity" };
+    ckReports.ready = v.ready || "all"; ckReports.page = 1; void ckRenderReportCenter();
+  };
+  const savedBtn = cel("button", "ck-ghost ck-rc-saved", "Saved views"); savedBtn.type = "button";
+  const savedWrap = ckAttachMenu(savedBtn, () => {
+    const items = [];
+    ckSavedViews.forEach((v, i) => items.push({ label: `View: ${v.name}`, onClick: () => applyView(v) }));
+    items.push({ label: "＋ Save current view", onClick: () => {
+      ckSavedViews.push({ name: `View ${ckSavedViews.length + 1}`, query: opts.query, sev: opts.sev, proof: opts.proof, sort: opts.sort, ready: ckReports.ready });
+      ckSaveSavedViews();
+    } });
+    const active = opts.query || opts.sev !== "all" || opts.proof !== "all" || opts.sort !== "severity" || ckReports.ready !== "all";
+    items.push({ label: "✕ Clear filters", disabled: !active, onClick: () => applyView({}) });
+    return items;
+  });
+  wrap.append(savedWrap);
+
   return wrap;
+}
+
+// Windowed page-number list (1 … n-1 n) so the pager stays compact for large histories.
+function ckPageWindow(cur, pages) {
+  const out = [];
+  if (pages <= 7) { for (let i = 1; i <= pages; i++) out.push(i); return out; }
+  out.push(1);
+  if (cur > 3) out.push("…");
+  for (let i = Math.max(2, cur - 1); i <= Math.min(pages - 1, cur + 1); i++) out.push(i);
+  if (cur < pages - 2) out.push("…");
+  out.push(pages);
+  return out;
+}
+
+function ckReportPager(total, pages, start, shown) {
+  const pager = cel("div", "ck-rc-pager");
+  const from = total ? start + 1 : 0;
+  pager.append(cel("span", "ck-rc-pager-info",
+    `Showing ${from} to ${start + shown} of ${total} finding${total === 1 ? "" : "s"}`));
+  const ctl = cel("div", "ck-rc-pager-ctl");
+  const mkBtn = (label, page, disabled, active) => {
+    const b = cel("button", `ck-rc-pagebtn${active ? " is-active" : ""}`, label); b.type = "button";
+    if (disabled) b.disabled = true;
+    else b.addEventListener("click", () => { ckReports.page = page; void ckRenderReportCenter(); });
+    return b;
+  };
+  ctl.append(mkBtn("‹", ckReports.page - 1, ckReports.page <= 1, false));
+  for (const p of ckPageWindow(ckReports.page, pages)) {
+    if (p === "…") ctl.append(cel("span", "ck-rc-pager-info", "…"));
+    else ctl.append(mkBtn(String(p), p, false, p === ckReports.page));
+  }
+  ctl.append(mkBtn("›", ckReports.page + 1, ckReports.page >= pages, false));
+  pager.append(ctl);
+  return pager;
 }
 
 async function ckRenderReportCenter() {
   const host = ck.views.reports;
   if (!host) return;
+  // Preserve the search box's focus + caret across a full rebuild — including rebuilds triggered by
+  // a live report_ready/finding_confirmed event while the operator is mid-type (the rebuild replaces
+  // the #ckRcSearch node, so without this a live refresh would steal focus and drop keystrokes).
+  const _active = document.activeElement;
+  const rcSearchFocused = !!(_active && _active.id === "ckRcSearch");
+  const rcSearchCaret = rcSearchFocused && typeof _active.selectionStart === "number" ? _active.selectionStart : null;
+  ckCloseOpenMenus();  // any open kebab/Saved-views menu is about to be detached by the rebuild
   // Only paint a loading line on the FIRST load (no cache yet), so a live refresh doesn't flash.
   if (!ckState._history) host.replaceChildren(cel("p", "ck-hint", "Loading reports…"));
   const data = await ckEnsureHistory();
@@ -8455,25 +8592,26 @@ async function ckRenderReportCenter() {
 
   if (ckState.reportFocus) host.append(ckFullReportPanel(ckState.reportFocus));
 
-  host.append(cel("h2", "ck-section-title", "Report Center"));
-  host.append(cel("p", "ck-hint",
-    "Every finding across every program. Click “Get report ready” to assemble its proof of concept, "
-    + "proof of impact and proof of evidence into a submission-ready report — it stays here, synced, and "
-    + "survives restarts."));
+  const head = cel("div", "ck-rc-head");
+  head.append(cel("h2", null, "Report Center"));
+  head.append(cel("p", "ck-hint", "Turn findings into high-quality reports and track your progress."));
+  host.append(head);
 
   const fn = (data.funnel && data.funnel.portfolio) || data.funnel || {};
   const st = fn.stages || {};
-  const strip = cel("div", "ck-summary");
-  strip.append(ckPill("is-armed", "Report-ready", String(data.ready_total || fn.ready || 0)));
-  strip.append(ckPill("", "Confirmed", String(st.confirmed || 0)));
-  strip.append(ckPill("", "Submitted", String(st.submitted || 0)));
-  strip.append(ckPill("", "Paid", String(st.paid || 0)));
-  strip.append(ckPill("", "Total", String(fn.total || (data.findings || []).length)));
-  if (fn.bounty_total) strip.append(ckPill("", "Earned", `$${fn.bounty_total}`));
-  host.append(strip);
+  const cards = cel("div", "ck-rc-cards");
+  cards.append(ckRcCard("tone-ready", "ico-ready", "Report ready", String(data.ready_total || fn.ready || 0), "Findings ready to report"));
+  cards.append(ckRcCard("tone-ok", "ico-ok", "Confirmed", String(st.confirmed || 0), "Findings confirmed"));
+  cards.append(ckRcCard("tone-send", "ico-send", "Submitted", String(st.submitted || 0), "Reports submitted"));
+  cards.append(ckRcCard("tone-warn", "ico-paid", "Paid", String(st.paid || 0), fn.bounty_total ? `$${fn.bounty_total} earned` : "Reports paid"));
+  cards.append(ckRcCard("tone-neutral", "ico-total", "Total findings", String(fn.total || (data.findings || []).length), "Across all statuses"));
+  host.append(cards);
 
-  host.append(ckFormatBar());
-  host.append(ckReportControlsBar());
+  host.append(ckReportToolbar());
+  if (rcSearchFocused) {
+    const s = document.getElementById("ckRcSearch");
+    if (s) { s.focus(); if (rcSearchCaret != null) { try { s.setSelectionRange(rcSearchCaret, rcSearchCaret); } catch (_) { /* type=search quirk */ } } }
+  }
 
   const opts = ckState.sub;
   let recs = (data.findings || []).filter((r) => ckSubMatch(r, opts));
@@ -8481,16 +8619,34 @@ async function ckRenderReportCenter() {
   else if (ckReports.ready === "readyable") recs = recs.filter((r) => r.readyable && !r.report_ready);
   recs = ckSubSort(recs, opts.sort);
 
-  host.append(cel("h3", "ck-section-title", `${recs.length} report${recs.length === 1 ? "" : "s"}`));
   if (!recs.length) {
     host.append(cel("p", "ck-hint", (data.findings || []).length
       ? "No findings match your filter."
       : "No findings yet. Run a hunt — every finding lands here, and you can get its report ready for submission."));
     return;
   }
-  const ul = cel("ul", "ck-list");
-  for (const r of recs) ul.append(ckReportRow(r));
-  host.append(ul);
+
+  const total = recs.length;
+  const pages = Math.max(1, Math.ceil(total / ckReports.pageSize));
+  if (ckReports.page > pages) ckReports.page = pages;
+  if (ckReports.page < 1) ckReports.page = 1;
+  const start = (ckReports.page - 1) * ckReports.pageSize;
+  const pageRecs = recs.slice(start, start + ckReports.pageSize);
+
+  const tableWrap = cel("div", "ck-rc-table-wrap");
+  const table = cel("table", "ck-rc-table");
+  const thead = cel("thead");
+  const htr = cel("tr");
+  for (const h of ["Severity", "Title", "Target", "Status", "Proof", "Last updated", "Actions"]) htr.append(cel("th", null, h));
+  thead.append(htr);
+  table.append(thead);
+  const tbody = cel("tbody");
+  for (const r of pageRecs) tbody.append(ckReportTr(r));
+  table.append(tbody);
+  tableWrap.append(table);
+  host.append(tableWrap);
+
+  host.append(ckReportPager(total, pages, start, pageRecs.length));
 }
 
 // Live: when a finding confirms or a report is readied anywhere, refresh the Report Center (if
@@ -10253,7 +10409,10 @@ function bootCockpit() {
     if (e.key === "Escape" && ck.detail && !ck.detail.hidden) ckCloseDetail();
   });
   ck.segHunt?.addEventListener("click", () => ckSetRunType("hunt"));
-  ck.segCampaign?.addEventListener("click", () => ckSetRunType("campaign"));
+  // Selecting "Full campaign" jumps to the live campaign dashboard when one already exists — the
+  // redesign moved the run-type control to the top bar and dropped the standalone Campaign nav tab,
+  // so this is now the way to re-open a running/finished campaign board manually.
+  ck.segCampaign?.addEventListener("click", () => { ckSetRunType("campaign"); if (ckCampaign && ckCampaign.runId) ckSetView("campaign"); });
   ck.segPortfolio?.addEventListener("click", () => ckSetRunType("portfolio"));
   ck.portfolioAll?.addEventListener("click", () => {
     const boxes = ck.portfolioList ? [...ck.portfolioList.querySelectorAll("input[type=checkbox]:not(:disabled)")] : [];
