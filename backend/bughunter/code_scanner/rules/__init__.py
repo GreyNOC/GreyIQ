@@ -8,6 +8,7 @@ once. Adding a new pack is a single import + tuple append below.
 from __future__ import annotations
 
 from bughunter.code_scanner.rules.backdoor import RULES as BACKDOOR_RULES
+from bughunter.code_scanner.rules.access_control import RULES as ACCESS_CONTROL_RULES
 from bughunter.code_scanner.rules.base import RegexRule, Rule
 from bughunter.code_scanner.rules.ci_workflow import RULES as CI_RULES
 from bughunter.code_scanner.rules.cmd_inject import RULES as CMD_RULES
@@ -27,6 +28,7 @@ from bughunter.code_scanner.rules.chrome_extension import RULES as CHROME_EXT_RU
 
 ALL_RULES: tuple[Rule, ...] = (
     *SECRET_RULES,
+    *ACCESS_CONTROL_RULES,
     *EVAL_RULES,
     *CMD_RULES,
     *NETWORK_RULES,

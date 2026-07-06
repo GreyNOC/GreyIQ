@@ -31,14 +31,18 @@ from bughunter import credential_validation
 from bughunter import oob_service
 from bughunter import fsutil
 from bughunter import hunt_loop
+from bughunter import hunt_brain
 from bughunter import impact_model
 from bughunter import ledger
 from bughunter import next_steps as next_steps_lib
+from bughunter import recon
 from bughunter import report as report_lib
 from bughunter import secret_classification
+from bughunter import screenshot_service
 from bughunter import toolkit as toolkit_lib
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.live_scan_service import run_live_scan
+from bughunter.rate_limit import HostRateGovernor
 from bughunter.scan_service import run_code_scan
 from bughunter.scan_auth import AuthContext, build_auth
 from bughunter.web_scan_service import run_web_scan
@@ -121,7 +125,7 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
         "name": "Broken access control / IDOR",
         "cwe": "CWE-639 / CWE-284",
         "owasp": "A01:2021 Broken Access Control",
-        "categories": set(),
+        "categories": {"access_control"},
         "checklist": [
             "Enumerate object identifiers (ids, UUIDs, filenames) in requests.",
             "Replay a request as a second, lower-privileged account and swap the identifier.",
@@ -394,9 +398,10 @@ BOUNTY_PROFILES: dict[str, dict[str, Any]] = {
         "description": "Static scan of a repo or folder for injection sinks, eval/exec, hardcoded secrets, weak crypto, vulnerable deps, risky CI, and backdoor patterns.",
         "kinds": {"path", "git"},
         "scanners": ["code"],
-        "classes": ["rce", "secrets", "ssrf", "sqli", "supply-chain", "file-upload", "csrf", "ssti", "xxe", "nosqli", "jwt", "prototype-pollution"],
+        "classes": ["rce", "secrets", "access-control", "ssrf", "sqli", "supply-chain", "file-upload", "csrf", "ssti", "xxe", "nosqli", "jwt", "prototype-pollution"],
         "checklist": [
             "Grep for the framework's raw-query / template-render / deserialization APIs.",
+            "Trace object-id lookups and request-body model updates to ownership/tenant checks.",
             "Map untrusted input (request, env, file) to each flagged sink to confirm reachability.",
             "Trace package install hooks, CI permissions, and artifact download paths for build-time compromise.",
         ],
@@ -426,11 +431,14 @@ BOUNTY_PROFILES: dict[str, dict[str, Any]] = {
 
 BOUNTY_SYSTEM_PROMPT = (
     "You are GreyIQ BugHunter, a security analyst preparing an AUTHORIZED bug-bounty report. "
-    "You are given automated scan findings for an in-scope target. Your job is to prioritize them, "
-    "write clear reproduction / proof-of-concept steps suitable for a bounty submission, assess impact, "
-    "capture concrete proof of impact, and recommend a fix. Reproduction steps describe how to confirm the bug on the authorized target — "
-    "they are for the report. Do NOT provide mass-exploitation tooling, malware, ways to attack systems "
-    "you are not authorized to test, or techniques to evade detection. Stay strictly within the named scope. "
+    "You are given automated scan findings for an in-scope target. Your job is to prioritize them like "
+    "a platform triager, write clear reproduction / proof-of-concept steps suitable for a bounty submission, "
+    "assess impact, define the proof-of-impact artifact, and recommend the smallest server-side fix. "
+    "Reproduction steps describe how to confirm the bug on the authorized target; they are for a report, "
+    "not for broad exploitation. Distinguish confirmed evidence from hypotheses, prefer one root cause per "
+    "report, require observed-vs-control proof for any confirmed claim, and never invent responses, roles, "
+    "data, credentials, screenshots, or severity. Do NOT provide mass-exploitation tooling, malware, ways to "
+    "attack systems you are not authorized to test, or techniques to evade detection. Stay strictly within the named scope. "
     "Respond with a single JSON object and nothing else."
 )
 
@@ -1131,10 +1139,19 @@ def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], 
         {
             "ref": f.get("ref"),
             "severity": f.get("severity"),
+            "confidence": f.get("confidence"),
             "class": f.get("class_name"),
+            "rule_id": f.get("rule_id"),
+            "cwe": f.get("cwe"),
             "title": f.get("title"),
             "location": f.get("location"),
             "snippet": str(f.get("snippet") or "")[:200],
+            "evidence": {
+                k: str(v)[:300]
+                for k, v in (f.get("proof_evidence") or {}).items()
+                if k in {"request_line", "request_header", "response_status", "matched_value", "read_data"}
+            } if isinstance(f.get("proof_evidence"), dict) else {},
+            "remediation": str(f.get("remediation") or "")[:260],
         }
         for f in findings[:30]
     ]
@@ -1172,7 +1189,14 @@ def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], 
             "hypothesis, the exact in-scope request to try, and the tell that would confirm it. Ground every "
             "lead in a name you actually see above — never invent an endpoint, field, or a confirmed result.\n\n")
            if response_digest else "")
-        + "Return ONLY a JSON object:\n"
+        + "Bounty-quality rubric:\n"
+        "- Treat scanner output as candidate evidence unless the provided evidence already shows a real differential.\n"
+        "- Lead with the bug that has the clearest business impact and the lowest duplicate risk.\n"
+        "- For access-control/auth/API findings, require two-account or role-differential proof.\n"
+        "- For browser trust bugs (XSS/CORS/CSRF/redirect), explain the account/data/action impact, not just the header or reflection.\n"
+        "- For secrets, include liveness/blast-radius proof only when the evidence contains it; otherwise require one read-only issuer check.\n"
+        "- Prefer one root cause per report and mention chains only when they raise proven impact.\n\n"
+        "Return ONLY a JSON object:\n"
         '{"tldr": "one sentence, <=25 words — the single most important takeaway for a triager",\n'
         ' "report_title": "a specific, submission-ready report title for the highest-impact finding '
         '(name the bug class + the affected endpoint/parameter, e.g. \'Reflected XSS in /search via q\')",\n'
@@ -1379,6 +1403,222 @@ def _order_by_resolved_severity(display: list[dict[str, Any]], attack_plans: dic
     return remapped
 
 
+def _merge_unique_strings(existing: list[str] | None, additions: list[str] | tuple[str, ...] | set[str] | None,
+                          *, limit: int = 40) -> list[str]:
+    """Case-insensitive merge for recon/brain hints while preserving first-seen spelling."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in list(existing or []) + list(additions or []):
+        text = str(value or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _aggregate_active_meta(metas: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collapse per-endpoint active-verification metadata into the legacy single meta shape."""
+    if not metas:
+        return {}
+    verified = sorted({
+        str(cls)
+        for meta in metas
+        for cls in (meta.get("verified_classes") or [])
+        if str(cls or "").strip()
+    })
+    skipped = [
+        str(meta.get("skipped_reason") or "").strip()
+        for meta in metas
+        if str(meta.get("skipped_reason") or "").strip()
+    ]
+    first = metas[0]
+    return {
+        "in_scope": any(bool(meta.get("in_scope")) for meta in metas),
+        "host": str(first.get("host") or ""),
+        "requests_used": sum(int(meta.get("requests_used") or 0) for meta in metas),
+        "rate_limited": any(bool(meta.get("rate_limited")) for meta in metas),
+        "verified_classes": verified,
+        "skipped_reason": "; ".join(dict.fromkeys(skipped[:4])),
+        "targets_checked": len(metas),
+        "targets": [
+            {
+                "target": str(meta.get("target") or ""),
+                "host": str(meta.get("host") or ""),
+                "in_scope": bool(meta.get("in_scope")),
+                "requests_used": int(meta.get("requests_used") or 0),
+                "rate_limited": bool(meta.get("rate_limited")),
+                "verified_classes": list(meta.get("verified_classes") or []),
+                "skipped_reason": str(meta.get("skipped_reason") or ""),
+            }
+            for meta in metas
+        ],
+    }
+
+
+def _rank_active_targets(seed: str, urls: list[str] | tuple[str, ...] | set[str] | None, *, limit: int = 4) -> list[str]:
+    """Pick the most probe-worthy discovered URLs for a direct active hunt."""
+    candidates = _merge_unique_strings([seed], urls, limit=40)
+    hot_words = (
+        "api", "search", "query", "login", "logout", "oauth", "sso", "redirect", "callback",
+        "download", "file", "export", "import", "render", "preview", "webhook", "graphql",
+    )
+
+    def score(url: str) -> int:
+        parsed = urlparse(url)
+        haystack = f"{parsed.path}?{parsed.query}".lower()
+        value = 0
+        if parsed.query:
+            value += 6
+        value += sum(2 for word in hot_words if word in haystack)
+        if url.rstrip("/") == seed.rstrip("/"):
+            value -= 1
+        return value
+
+    ranked = sorted(enumerate(candidates), key=lambda item: (score(item[1]), -item[0]), reverse=True)
+    selected = [url for _, url in ranked[:limit]]
+    if not selected:
+        return [seed]
+    if seed not in selected and len(selected) < limit:
+        selected.append(seed)
+    return selected
+
+
+def _infer_active_target_priority(url: str, discovered_params: list[str] | None = None) -> list[str]:
+    """Use endpoint shape to spend the verifier's fixed request budget where it is likeliest to pay off."""
+    try:
+        parsed = urlparse(url)
+        query_names = {k.lower() for k, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+    except ValueError:
+        return []
+    path = (parsed.path or "").lower()
+    haystack = f"{path}?{parsed.query}".lower()
+    discovered = {str(p or "").strip().lower() for p in discovered_params or [] if str(p or "").strip()}
+    names = query_names | discovered
+    hints: list[str] = []
+    if any(word in haystack for word in ("search", "query", "filter", "render", "preview", "template")) or (
+        names & {"q", "query", "search", "s", "keyword", "message", "name", "comment"}
+    ):
+        hints.extend(["xss", "ssti", "sqli", "nosqli"])
+    if any(word in haystack for word in ("redirect", "callback", "return", "continue", "next", "oauth", "sso")) or any(
+        any(hint in name for hint in ("redirect", "return", "next", "dest", "continue", "callback", "url"))
+        for name in names
+    ):
+        hints.append("redirect")
+    if any(word in haystack for word in ("download", "file", "export", "import", "attachment", "template")) or (
+        names & {"file", "filename", "path", "page", "template", "doc", "download", "attachment"}
+    ):
+        hints.append("path-traversal")
+    if "graphql" in haystack:
+        hints.append("graphql")
+    if any(word in haystack for word in ("jwt", "token", "jwks", "oauth", "sso")):
+        hints.append("jwt")
+    return _merge_unique_strings(hints, [], limit=12)
+
+
+def _infer_active_xss_params(url: str) -> list[str]:
+    """Endpoint-shaped parameter priorities for reflected-XSS checks.
+
+    These are names only, fed into verify_active's priority channel. They prevent
+    broad recon/brain guesses from starving obvious aliases on routes like /search
+    while preserving _candidate_params' general ordering contract.
+    """
+    try:
+        path = (urlparse(url).path or "").lower()
+    except ValueError:
+        return []
+    hints: list[str] = []
+    for name in ("search", "query", "q", "keyword", "message", "comment", "name"):
+        if name in path:
+            hints.append(name)
+    return _merge_unique_strings(hints, [], limit=8)
+
+
+def _proof_capture_highlight(finding: dict[str, Any]) -> str:
+    pe = finding.get("proof_evidence")
+    if not isinstance(pe, dict):
+        return ""
+    for key in ("read_data", "matched_value", "response_header", "set_cookie"):
+        value = str(pe.get(key) or "").strip()
+        if value:
+            return value[:300]
+    return ""
+
+
+def _capture_direct_proof_artifacts(display: list[dict[str, Any]], attack_plans: dict[str, Any],
+                                    out_dir: Path, target: str, scope: str, *,
+                                    limit: int = 4) -> int:
+    """Best-effort direct-hunt proof production for confirmed URL findings.
+
+    Campaigns already attach proof screenshots. Direct hunts should too, otherwise a
+    confirmed finding can have text evidence but no visual/browser proof artifact. Every
+    capture is scope-gated inside screenshot_service and failure is recorded on the finding,
+    never raised.
+    """
+    captured = 0
+    shot_dir = out_dir / "proof-artifacts"
+    for finding in display:
+        if captured >= limit:
+            break
+        ref = str(finding.get("ref") or "").strip()
+        plan = attack_plans.get(ref) or {}
+        try:
+            detail = report_lib._proof_of_impact_detail(finding, plan)
+        except Exception:  # noqa: BLE001 - proof capture is enrichment, never report-breaking
+            continue
+        if detail.get("status") != "confirmed":
+            continue
+        if finding.get("screenshot_path") or finding.get("source_text"):
+            continue
+        poc = screenshot_service.poc_url_for_finding(finding, {"target": target, "scope": scope, "attack_plans": attack_plans})
+        if not poc:
+            continue
+        pe = finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {}
+        matched = _proof_capture_highlight(finding)
+        stem = _safe_slug(f"{ref}-{finding.get('rule_id') or finding.get('title') or 'proof'}", fallback=f"finding-{ref or 'proof'}")
+        try:
+            shot = screenshot_service.capture_screenshot(
+                poc,
+                shot_dir / f"{stem}.png",
+                scope=scope,
+                authorized=True,
+                annotate={
+                    "title": finding.get("title") or "",
+                    "location": finding.get("location") or finding.get("file_path") or "",
+                    "matched": matched,
+                    "request_line": pe.get("request_line") or "",
+                },
+                highlight=matched,
+            )
+        except Exception as exc:  # noqa: BLE001
+            finding["proof_capture"] = {"status": "skipped", "reason": f"{type(exc).__name__}: {exc}"[:300]}
+            continue
+        if shot.get("ok"):
+            finding["screenshot_path"] = shot.get("path") or ""
+            if shot.get("source_text_path"):
+                finding["source_text_path"] = shot.get("source_text_path")
+            if shot.get("source_text"):
+                finding["source_text"] = str(shot.get("source_text") or "")[:6000]
+            finding["proof_capture"] = {
+                "status": "captured",
+                "type": "browser-source-proof",
+                "url": shot.get("url") or poc,
+                "final_url": shot.get("final_url") or "",
+                "warning": shot.get("warning") or screenshot_service.REDACTION_WARNING,
+                "highlighted": bool(shot.get("highlighted")),
+            }
+            captured += 1
+        else:
+            reason = str(shot.get("error") or "proof capture skipped").strip()
+            finding["proof_capture"] = {"status": "skipped", "reason": reason[:300], "url": shot.get("url") or poc}
+    return captured
+
+
 def run_bounty_hunt(
     target: str,
     profile_id: str,
@@ -1466,6 +1706,63 @@ def run_bounty_hunt(
     if scan_errors and not scan_succeeded:
         return {"ok": False, "error": "Scan could not run — " + "; ".join(scan_errors), "scan_errors": scan_errors}
 
+    active_targets = [clean_target]
+    effective_extra_params = _merge_unique_strings(extra_params, [], limit=40)
+    effective_class_priority = _merge_unique_strings(class_priority, [], limit=20)
+    # Direct "Run Hunt" calls do not go through campaign.recon, so an active URL hunt would
+    # otherwise probe only the literal starting URL. Add a small, scope-gated recon pass here
+    # (campaign already supplies extra_params/class_priority, so it skips this branch) to mine
+    # real target parameter names/forms/tech hints and point the existing benign differential
+    # checks at better places. This never emits findings directly.
+    if (active or time_based) and authorized and kind == "url" and extra_params is None and class_priority is None:
+        try:
+            _emit("active recon: mapping forms, JS parameters, and API hints...")
+            active_settings = settings or active_verify_service.get_settings()
+            scope_gate = (
+                (lambda h: active_verify_service.host_in_active_scope(h, scope, active_settings))
+                if str(scope or "").strip()
+                else None
+            )
+            rec = recon.discover(
+                clean_target,
+                scope_in=scope_gate,
+                max_pages=6,
+                max_requests=18,
+                settings=active_settings,
+            )
+            active_targets = _rank_active_targets(clean_target, rec.get("urls") or [], limit=4)
+            params_before = len(effective_extra_params)
+            effective_extra_params = _merge_unique_strings(effective_extra_params, rec.get("params") or [], limit=40)
+            if len(effective_extra_params) > params_before:
+                _emit(f"active recon: +{len(effective_extra_params) - params_before} parameter name(s) from target surface")
+            hint_classes = [c for c in (rec.get("hints") or {}).keys() if str(c or "").strip()]
+            effective_class_priority = _merge_unique_strings(effective_class_priority, hint_classes, limit=20)
+
+            hb = hunt_brain.plan_hunt(
+                coder_cfg,
+                clean_target,
+                scope,
+                {
+                    "endpoints": active_targets,
+                    "params": effective_extra_params,
+                    "tech": rec.get("tech") or [],
+                    "forms": rec.get("forms") or [],
+                },
+            )
+            brain_params = hb.get("param_hypotheses") or []
+            before_brain = len(effective_extra_params)
+            effective_extra_params = _merge_unique_strings(effective_extra_params, brain_params, limit=40)
+            if len(effective_extra_params) > before_brain:
+                _emit(f"hunt-brain: +{len(effective_extra_params) - before_brain} target-specific parameter name(s)")
+            brain_classes: list[str] = []
+            for row in hb.get("probe_priority") or []:
+                brain_classes.extend([str(c) for c in (row.get("classes") or [])])
+            effective_class_priority = _merge_unique_strings(brain_classes, effective_class_priority, limit=20)
+            if len(active_targets) > 1:
+                _emit(f"active recon: checking {len(active_targets)} discovered in-scope endpoint(s)")
+        except Exception as exc:  # noqa: BLE001 - recon is a recall booster, never a hunt breaker
+            _emit(f"active recon skipped: {exc}")
+
     # Opt-in ACTIVE verification: double-gated (active + authorized + url), scope-bound,
     # rate-limited. It DISCOVERS and PROVES a provable subset (XSS/CORS/redirect/
     # clickjacking/host-header/SQLi-error/CRLF/open-bucket) with one benign request each,
@@ -1478,17 +1775,59 @@ def run_bounty_hunt(
         _emit(f"running active verification against {len(raw_findings)} candidate(s)"
               + (" (time-based probes enabled)…" if time_based else "…"))
         try:
-            # Opt-in AI-driven iterative loop (probe -> observe -> re-plan): a bounded SCHEDULER over the
-            # SAME verify_active, so every scope/SSRF/budget/confirm guardrail applies unchanged. Off by
-            # default; falls back to the single pass below whenever it isn't enabled.
+            active_settings = settings or active_verify_service.get_settings()
+            # Opt-in AI-driven iterative loop (probe -> observe -> re-plan): a bounded scheduler over
+            # the SAME verify_active, so every scope/SSRF/budget/confirm guardrail applies unchanged.
+            # It runs against the seed URL, but receives the recon surface + expanded params/class
+            # priorities so the loop can steer the existing prober without inventing scope.
             if hunt_loop.iterative_enabled(coder_cfg, settings):
+                loop_xss_params = _merge_unique_strings(
+                    xss_params,
+                    _infer_active_xss_params(clean_target),
+                    limit=20,
+                )
                 active_findings, active_meta = hunt_loop.run_iterative_verify(
                     clean_target, raw_findings, scope=scope, time_based=time_based, auth=auth_ctx,
-                    extra_params=extra_params, settings=settings, class_priority=class_priority,
-                    xss_params=xss_params, coder_cfg=coder_cfg,
-                    surface={"endpoints": [clean_target], "params": list(extra_params or [])}, on_progress=_emit)
+                    extra_params=effective_extra_params, settings=active_settings,
+                    class_priority=effective_class_priority,
+                    xss_params=loop_xss_params, coder_cfg=coder_cfg,
+                    surface={"endpoints": active_targets, "params": list(effective_extra_params or [])},
+                    on_progress=_emit)
             else:
-                active_findings, active_meta = active_verify_service.verify_active(clean_target, raw_findings, scope=scope, time_based=time_based, auth=auth_ctx, extra_params=extra_params, settings=settings, class_priority=class_priority, xss_params=xss_params)
+                active_findings = []
+                active_metas: list[dict[str, Any]] = []
+                active_governor = HostRateGovernor(
+                    capacity=active_settings.active_max_requests_per_host,
+                    min_interval_s=active_settings.active_min_interval_ms / 1000.0,
+                )
+                for active_target in active_targets:
+                    target_priority = _merge_unique_strings(
+                        _infer_active_target_priority(active_target, effective_extra_params),
+                        effective_class_priority,
+                        limit=20,
+                    )
+                    target_xss_params = _merge_unique_strings(
+                        xss_params,
+                        _infer_active_xss_params(active_target),
+                        limit=20,
+                    )
+                    target_findings, target_meta = active_verify_service.verify_active(
+                        active_target,
+                        raw_findings,
+                        scope=scope,
+                        time_based=time_based,
+                        auth=auth_ctx,
+                        extra_params=effective_extra_params,
+                        settings=active_settings,
+                        governor=active_governor,
+                        class_priority=target_priority,
+                        xss_params=target_xss_params,
+                    )
+                    target_meta = dict(target_meta)
+                    target_meta["target"] = active_target
+                    active_metas.append(target_meta)
+                    active_findings.extend(target_findings)
+                active_meta = _aggregate_active_meta(active_metas)
             if active_findings:
                 raw_findings = list(raw_findings) + active_findings
                 if "active" not in scanners_run:
@@ -1509,7 +1848,8 @@ def run_bounty_hunt(
             try:
                 _emit("running blind-SSRF OOB probe (collaborator configured)…")
                 ssrf = oob_service.confirm_blind_ssrf(clean_target, base=oob_base, secret=oob_secret,
-                                                      scope=scope, settings=settings, extra_params=extra_params,
+                                                      scope=scope, settings=settings,
+                                                      extra_params=effective_extra_params,
                                                       priority=ssrf_params)
                 if ssrf.get("ok") and ssrf.get("finding") and ssrf.get("status") in ("confirmed", "candidate"):
                     raw_findings = list(raw_findings) + [ssrf["finding"]]
@@ -1762,6 +2102,30 @@ def run_bounty_hunt(
     # top-severity finding and the report's table / ref numbers / triage all agree.
     attack_plans = _order_by_resolved_severity(display, attack_plans)
 
+    try:
+        out_dir = _resolve_output_dir(output_dir, default_reports_dir)
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not use the output folder: {exc}"}
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    # A short random suffix so two hunts on the SAME target/profile within the same
+    # second (a double-click on "Run Hunt", or a manual hunt racing a campaign's
+    # per-URL run_bounty_hunt call for the same URL -- each request runs on its own
+    # asyncio.to_thread worker) can never collide onto the same stem and silently
+    # clobber each other's report files.
+    unique = uuid4().hex[:8]
+    stem = f"bounty-{_safe_slug(profile_id)}-{_safe_slug(clean_target)}-{stamp}-{unique}"
+    proof_artifacts_captured = 0
+    if authorized and kind == "url":
+        proof_artifacts_captured = _capture_direct_proof_artifacts(
+            display,
+            attack_plans,
+            out_dir / stem,
+            clean_target,
+            scope,
+        )
+        if proof_artifacts_captured:
+            _emit(f"proof capture complete — {proof_artifacts_captured} artifact(s) attached")
+
     # Manual checklist = profile + selected-class + brain ideas.
     checklist = list(profile.get("checklist", []))
     if class_meta:
@@ -1805,6 +2169,7 @@ def run_bounty_hunt(
         "active_requested": bool(active and kind == "url"),
         "active_authorization": active_meta,
         "active_verified_classes": active_meta.get("verified_classes", []),
+        "proof_artifacts_captured": proof_artifacts_captured,
         "recommendation": "",
     }
 
@@ -1818,22 +2183,6 @@ def run_bounty_hunt(
     markdown = report_lib.build_markdown(ctx)
     json_doc = report_lib.build_json(ctx)
 
-    try:
-        out_dir = _resolve_output_dir(output_dir, default_reports_dir)
-    except OSError as exc:
-        return {"ok": False, "error": f"Could not use the output folder: {exc}"}
-    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    # A short random suffix so two hunts on the SAME target/profile within the same
-    # second (a double-click on "Run Hunt", or a manual hunt racing a campaign's
-    # per-URL run_bounty_hunt call for the same URL -- each request runs on its own
-    # asyncio.to_thread worker) can never collide onto the same stem and silently
-    # clobber each other's report files. A content hash of the target wouldn't help
-    # here (two calls for the identical target would hash identically); campaign.py's
-    # own out_root collision guard uses a target hash because IT only needs to
-    # disambiguate DIFFERENT targets whose slugs share a long common prefix -- this
-    # guards the stricter same-target-same-second case, so it must be unique per call.
-    unique = uuid4().hex[:8]
-    stem = f"bounty-{_safe_slug(profile_id)}-{_safe_slug(clean_target)}-{stamp}-{unique}"
     md_path = out_dir / f"{stem}.md"
     json_path = out_dir / f"{stem}.json"
     try:
@@ -1883,6 +2232,7 @@ def run_bounty_hunt(
         "coverage": ctx["coverage"],
         "active_verified_classes": ctx["active_verified_classes"],
         "active_authorization": ctx["active_authorization"],
+        "proof_artifacts_captured": proof_artifacts_captured,
         # Structured per-finding data so a GUI can render a findings board + proof
         # pane without re-parsing the markdown. These mirror the on-disk JSON sidecar
         # (already scope-filtered + redacted by _reportable_findings) — additive,
@@ -1892,6 +2242,7 @@ def run_bounty_hunt(
         "findings": json_doc["findings"],
         "attack_plans": json_doc["attack_plans"],
         "proof_of_impact": json_doc["proof_of_impact"],
+        "proof_of_exploitability": json_doc["proof_of_exploitability"],
         "cvss": json_doc["cvss"],
         "class_counts": json_doc["class_counts"],
         "submission_checklist": json_doc["submission_checklist"],

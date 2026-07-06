@@ -37,6 +37,7 @@ MAX_RECENT_TURNS = 6
 SOURCE_ID_BY_FILE = {
     "train.txt": "src_starter_knowledge",
     "greyiq_starter_knowledge.txt": "src_starter_knowledge",
+    "greyiq_bug_bounty_knowledge.txt": "src_bug_bounty",
     "greyiq_personal_choices.txt": "src_personal_choices",
     "greyiq_profile.txt": "src_personal_choices",
     "greyiq_preferred_examples.txt": "src_preferred_examples",
@@ -229,6 +230,7 @@ QUERY_INTENT_SERIOUS = "serious_task"
 QUERY_INTENT_CODING = "coding_task"
 QUERY_INTENT_PLANNING = "planning_task"
 QUERY_INTENT_WEB = "current_web_lookup"
+QUERY_INTENT_BUG_BOUNTY = "bug_bounty_hunt"
 
 CASUAL_INTENT_LABELS = frozenset(
     {
@@ -247,6 +249,7 @@ SERIOUS_INTENT_LABELS = frozenset(
         QUERY_INTENT_SERIOUS,
         QUERY_INTENT_CODING,
         QUERY_INTENT_PLANNING,
+        QUERY_INTENT_BUG_BOUNTY,
     }
 )
 DOCUMENT_INTENT_LABELS = frozenset({QUERY_INTENT_DOCUMENT})
@@ -364,6 +367,18 @@ SERIOUS_TASK_HINT_RE = re.compile(
     r"explain\s+(in\s+detail|how|why)|walk\s+me\s+through|deep\s*dive|"
     r"write\s+(a|an|me)\s+(report|essay|memo|spec|summary|document)|"
     r"draft\s+(a|an)?\s*(email|letter|message|response))\b",
+    re.IGNORECASE,
+)
+BUG_BOUNTY_HINT_RE = re.compile(
+    r"\b("
+    r"bug\s*bount(?:y|ies)|bounty\s*hunt|hackerone|bugcrowd|intigriti|yeswehack|"
+    r"vrp|vulnerability\s*disclosure|proof\s*of\s*impact|poc|repro(?:duction)?\s*steps?|"
+    r"idor|bola|bfla|xss|csrf|cors|ssrf|ssti|sqli|nosqli|xxe|jwt|graphql|"
+    r"open\s*redirect|path\s*traversal|lfi|rce|command\s*injection|request\s*smuggling|"
+    r"subdomain\s*takeover|race\s*condition|business\s*logic|mass\s*assignment|"
+    r"broken\s*access\s*control|account\s*takeover|ato|vulnerability\s*triage|"
+    r"security\s*report|bounty\s*report"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -2761,6 +2776,11 @@ class SolinEngine:
             )
         if label == QUERY_INTENT_CODING:
             return "I don't have enough to write that code yet — share the function signature, an example input/output, or the error you're seeing."
+        if label == QUERY_INTENT_BUG_BOUNTY:
+            return (
+                "For bug bounty, start with scope, asset type, auth state, and one concrete surface. "
+                "Prioritize high-impact classes (access control, auth, injection, SSRF, secrets), prove one root cause with a clean observed-vs-control artifact, then write the smallest reproducible report."
+            )
         if label == QUERY_INTENT_PLANNING:
             return "I need a bit more to plan this — what's the goal, the deadline, and the main constraints?"
         if label == QUERY_INTENT_WEB:
@@ -3136,7 +3156,17 @@ class SolinEngine:
                 return QueryIntent(label=QUERY_INTENT_WEB, use_retrieval=False)
             return QueryIntent(label=QUERY_INTENT_KNOWLEDGE, use_retrieval=True)
 
-        # 6) Coding / planning / serious task signals.
+        # 6) Bug-bounty and vulnerability-hunt requests should use the local
+        # bounty playbook instead of falling into generic coding/planning.
+        if BUG_BOUNTY_HINT_RE.search(lowered):
+            return QueryIntent(
+                label=QUERY_INTENT_BUG_BOUNTY,
+                use_retrieval=True,
+                wants_summary=wants_summary,
+                wants_code=wants_code,
+            )
+
+        # 7) Coding / planning / serious task signals.
         if CODING_HINT_RE.search(lowered) or wants_code:
             return QueryIntent(
                 label=QUERY_INTENT_CODING,
@@ -3152,20 +3182,20 @@ class SolinEngine:
                 wants_summary=wants_summary,
             )
 
-        # 7) Opinion questions stay casual unless they look technical/document-y.
+        # 8) Opinion questions stay casual unless they look technical/document-y.
         if CASUAL_OPINION_RE.search(lowered) and not (
             DOC_HINT_RE.search(lowered) or CODING_HINT_RE.search(lowered) or WEB_HINT_RE.search(lowered)
         ):
             return QueryIntent(label=QUERY_INTENT_CASUAL_OPINION, use_retrieval=False)
 
-        # 8) Short greeting-shaped utterances stay casual rather than being
+        # 9) Short greeting-shaped utterances stay casual rather than being
         #    treated as knowledge lookups.
         if token_count <= 4 and (GREETING_RE.search(lowered) or not lowered.endswith("?")):
             return QueryIntent(label=QUERY_INTENT_CASUAL_SMALLTALK, use_retrieval=False)
         if token_count <= 5 and GREETING_RE.search(lowered):
             return QueryIntent(label=QUERY_INTENT_CASUAL_GREETING, use_retrieval=False)
 
-        # 9) Default: factual knowledge lookup.
+        # 10) Default: factual knowledge lookup.
         return QueryIntent(
             label=QUERY_INTENT_KNOWLEDGE,
             use_retrieval=True,
@@ -3202,6 +3232,12 @@ class SolinEngine:
             return (
                 "be direct and technical; provide concrete code when useful; "
                 "briefly explain how to use it; surface assumptions; no casual filler"
+            )
+        if intent.label == QUERY_INTENT_BUG_BOUNTY:
+            return (
+                "answer like a careful authorized bug-bounty operator; prioritize scope, attack surface, "
+                "highest-impact classes, proof-of-impact artifacts, triage likelihood, and report quality; "
+                "separate confirmed facts from hypotheses; avoid mass exploitation or out-of-scope advice"
             )
         if intent.label == QUERY_INTENT_PLANNING:
             return (
@@ -3270,9 +3306,14 @@ class SolinEngine:
 
     def _prepare_retrieval_query(self, user_input: str, intent: QueryIntent) -> str:
         prepared = (normalize_intent_routing_text(user_input) or user_input).strip()
-        if intent.label in {QUERY_INTENT_DOCUMENT, QUERY_INTENT_KNOWLEDGE}:
+        if intent.label in {QUERY_INTENT_DOCUMENT, QUERY_INTENT_KNOWLEDGE, QUERY_INTENT_BUG_BOUNTY}:
             prepared = RETRIEVAL_FRAME_RE.sub(" ", prepared)
             prepared = re.sub(r"\s+", " ", prepared).strip(" ,.-")
+        if intent.label == QUERY_INTENT_BUG_BOUNTY:
+            prepared = (
+                f"{prepared} bug bounty authorized scope proof impact triage "
+                "reproduction steps high impact vulnerability report"
+            ).strip()
         return prepared or user_input.strip()
 
     def _is_broad_document_summary_query(self, user_input: str, intent: QueryIntent) -> bool:
@@ -3390,7 +3431,11 @@ class SolinEngine:
         min_score = float(settings["retrieval_threshold"])
         if intent.label == QUERY_INTENT_DOCUMENT:
             min_score = min(min_score, 0.2)
+        if intent.label == QUERY_INTENT_BUG_BOUNTY:
+            min_score = min(min_score, 0.24)
         limit = int(settings["retrieval_limit"])
+        if intent.label == QUERY_INTENT_BUG_BOUNTY:
+            limit = max(limit, 4)
         matches = self.knowledge_base.search(
             retrieval_query,
             limit=limit,
@@ -3398,7 +3443,10 @@ class SolinEngine:
             source_ids=source_ids,
         )
         if not matches and retrieval_query != user_input:
-            fallback_threshold = min(min_score, 0.18 if intent.label == QUERY_INTENT_DOCUMENT else 0.3)
+            fallback_threshold = min(
+                min_score,
+                0.18 if intent.label in {QUERY_INTENT_DOCUMENT, QUERY_INTENT_BUG_BOUNTY} else 0.3,
+            )
             matches = self.knowledge_base.search(
                 user_input,
                 limit=limit,
@@ -3647,7 +3695,7 @@ class SolinEngine:
                     "repetition_penalty": 1.1,
                 }
             )
-        elif intent.label in {QUERY_INTENT_SERIOUS, QUERY_INTENT_PLANNING}:
+        elif intent.label in {QUERY_INTENT_SERIOUS, QUERY_INTENT_PLANNING, QUERY_INTENT_BUG_BOUNTY}:
             settings.update(
                 {
                     "max_new_tokens": min(max(max_new_tokens, 128), 160),

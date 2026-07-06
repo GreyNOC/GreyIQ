@@ -9,7 +9,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -115,6 +115,7 @@ class WebScanRedactionTests(unittest.TestCase):
                 # (mirrors the on-disk sidecar; redacted) — not just counts + markdown.
                 self.assertIn("findings", report)
                 self.assertIn("proof_of_impact", report)
+                self.assertIn("proof_of_exploitability", report)
                 self.assertIn("cvss", report)
                 self.assertTrue(report["findings"])
                 self.assertNotIn(raw_key, json.dumps(report["findings"]))
@@ -133,6 +134,67 @@ class WebScanRedactionTests(unittest.TestCase):
             self.assertFalse(json_doc["proof_of_impact"]["F1"]["ready"])
             # ...and the report tells the operator exactly what to capture to prove impact.
             self.assertTrue(json_doc["proof_of_impact"]["F1"]["proof_obligation"])
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+            if previous_allow is None:
+                os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+            else:
+                os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = previous_allow
+
+
+class DirectActiveReconTests(unittest.TestCase):
+    def test_active_hunt_checks_discovered_linked_endpoint(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith("/search"):
+                    val = (parse_qs(urlparse(self.path).query, keep_blank_values=True).get("search") or [""])[0]
+                    body = f"<html><body>{val}</body></html>".encode()
+                else:
+                    body = b'<html><a href="/search">Search</a></html>'
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        previous_allow = os.environ.get("GREYIQ_SCAN_ALLOW_PRIVATE_URLS")
+        os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
+        try:
+            url = f"http://127.0.0.1:{server.server_port}/"
+            lines: list[str] = []
+            with tempfile.TemporaryDirectory() as tmp:
+                report = run_bounty_hunt(
+                    url,
+                    "web-app",
+                    None,
+                    tmp,
+                    "127.0.0.1",
+                    True,
+                    {},
+                    active=True,
+                    default_reports_dir=Path(tmp),
+                    seed_dir=BACKEND_DIR / "seed",
+                    runtime_dir=REPO_ROOT / "runtime",
+                    on_progress=lines.append,
+                )
+            self.assertTrue(report["ok"], report.get("error"))
+            rule_ids = {finding.get("rule_id") for finding in report["findings"]}
+            self.assertIn("active.reflected-xss", rule_ids)
+            xss_ref = next(finding.get("ref") for finding in report["findings"] if finding.get("rule_id") == "active.reflected-xss")
+            poe = report["proof_of_exploitability"][xss_ref]
+            self.assertEqual("confirmed", poe["status"])
+            self.assertTrue(poe["captured"])
+            self.assertIn("Captured exploit request/response", poe["text_artifact"])
+            self.assertGreaterEqual(report["active_authorization"].get("targets_checked", 0), 2)
+            self.assertTrue(any("active recon" in line for line in lines))
         finally:
             server.shutdown()
             thread.join(timeout=2)

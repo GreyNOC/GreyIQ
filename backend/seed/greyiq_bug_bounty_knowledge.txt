@@ -1,0 +1,74 @@
+GreyIQ Bug Bounty Knowledge
+
+Operating rule:
+Bug bounty work is authorized testing only. Stay inside the program scope, named hosts, allowed methods, allowed accounts, and rate limits. Treat every automated result as a lead until a clean proof artifact exists. A good answer separates confirmed evidence, likely hypotheses, and the next safe check.
+
+Bug bounty operator loop:
+1. Read the scope and exclusions first. Record allowed hosts, paths, asset types, test accounts, automation limits, rate limits, OOB/collaborator rules, and report eligibility.
+2. Map the surface before testing deeply: routes, forms, query params, JSON fields, JS bundle endpoints, API docs, mobile endpoints, auth flows, redirects, upload/import/render features, webhooks, GraphQL, and cloud storage references.
+3. Prioritize high-value classes: broken access control, auth/session flaws, injection/RCE/SSTI/SQLi/NoSQLi, SSRF, exposed live secrets, cloud exposure, request smuggling, and business logic. Low-value hardening is useful only if it chains to real impact.
+4. Prove one root cause at a time. Capture the exact request, the exact response, the role/account used, the negative control, and the before/after state.
+5. Write one report per root cause. Lead with impact, show the smallest reproduction, redact secrets, name the affected asset, include a concrete fix, and state limitations.
+
+Proof of impact standard:
+A bounty finding is strongest when it has an observed-vs-control artifact. Observed result means the unauthorized read, write, redirect, code execution marker, file read, cross-origin read, forged token acceptance, or state change actually happened. Control result means the same request with the expected role, object, input, origin, or invalid credential did not produce the effect. If either side is missing, call it candidate and name the exact artifact to capture next.
+
+Triage order:
+Critical/high first: RCE, command injection, SSTI to RCE, SQLi with data access, auth bypass, account takeover, cross-tenant access, live production secrets, cloud metadata credential reach, writable public storage, request smuggling with hijack/poisoning.
+Medium often needs a chain: reflected XSS without account impact, CORS without credentialed sensitive data, open redirect outside auth, missing headers, weak CSP, information disclosure without sensitive data.
+Low/info usually hardening unless it unlocks a chain: headers, version disclosure, verbose errors, weak cookie posture without an exploitable flow.
+
+Access control and IDOR:
+Find object identifiers in URLs, JSON bodies, GraphQL variables, file paths, invoice/order/user/team IDs, UUIDs, slugs, and exports. Use two accounts when allowed. First prove Account A can access its own object. Then replay as Account B with only the object id changed. A strong report shows Account B receives Account A data or performs Account A action. Include both account roles, both request/response pairs, the exact changed identifier, and the data class exposed. If only status codes differ without data/action impact, keep hunting.
+
+BFLA and admin function access:
+Map privileged actions such as admin user update, invite, role change, billing, export, impersonation, audit logs, feature flags, and internal tools. Replay the privileged request with a normal user token. Try method confusion only within scope. A strong proof shows the normal user performed or reached a function reserved for a higher role.
+
+Authentication and session:
+Prioritize password reset, OAuth/OIDC, SSO, magic links, invite acceptance, email change, MFA setup, logout, refresh tokens, remember-me tokens, and session fixation. Proof needs a server-side effect: token reuse, reset link accepted twice, login as another account, session still valid after logout, MFA bypass, or OAuth token/code leakage. Cookie flags alone are rarely enough without impact.
+
+XSS:
+Do not stop at reflection. Prove execution in the target origin. Note the context: HTML body, attribute, JavaScript string, template, markdown, PDF preview, email preview, upload filename, profile field, comment, or admin dashboard. A strong XSS report shows execution, affected users, CSP behavior, and impact such as authenticated action, session/token exposure, stored admin execution, or account takeover path. Self-XSS is usually weak unless it reaches another user or privileged view.
+
+SSRF:
+Look for URL/host inputs: webhook, import by URL, image fetch, avatar URL, PDF/render, link preview, metadata fetch, proxy, callback, feed, file converter, and cloud integrations. Start with a collaborator/OOB callback if allowed. Then prove server-side egress and, only in scope, internal reach or cloud metadata impact. A strong proof includes callback token, server IP/user-agent if available, target endpoint, control request, and the sensitive internal/cloud asset reached. Never scan internal ranges broadly.
+
+SQLi and NoSQLi:
+Start with parameters used for search, filter, sort, login, id lookup, report export, and admin grids. For SQLi, compare normal, quote, balanced quote, boolean true/false, and time-based probes when allowed. For NoSQLi, JSON operator injection usually matters most in login/filter endpoints. Strong proof shows changed result set, auth bypass, database error with reachable input, or timing differential with a control. Do not extract data beyond the minimum proof allowed by the program.
+
+SSTI and RCE:
+Look for template/render/email/PDF/theme/preview/name fields and stacks like Flask/Jinja, Django templates, Twig, Freemarker, Handlebars, ERB/EJS. First use benign arithmetic such as 7*7 and confirm server-side evaluation. For RCE or command injection, use benign markers like id/whoami or time-based sleep only when allowed. Strong proof shows command output or a timing differential with a matching control, not destructive action.
+
+File handling:
+Upload, import, avatar, attachment, archive extraction, document conversion, image processing, and preview workers are high-value surfaces. Test MIME/extension validation, direct object access, stored XSS in rendered files, parser bugs, path traversal in archive names, and public storage permissions. Strong proof shows unauthorized read/write, executable handling, sensitive file read, or stored execution.
+
+CORS, CSRF, and redirects:
+CORS is reportable when an untrusted Origin can read credentialed sensitive data. Capture Origin, Access-Control-Allow-Origin, Access-Control-Allow-Credentials, and the readable response data. CSRF is reportable when a cross-site request changes sensitive state without a token or SameSite protection; show before/after state. Open redirects are strongest inside auth, OAuth, reset, invite, or token-bearing flows; show token leakage or account-impact chain when possible.
+
+GraphQL:
+Check introspection, hidden queries/mutations, field-level authorization, object access by id, batching/alias rate-limit bypass, and query depth/complexity. The best bounty bug is usually BOLA/BFLA through a hidden query or mutation, not introspection alone. Capture query, variables, role, object owner, response, and negative control.
+
+Secrets:
+Classify the secret by provider and key type. Validate liveness with one benign read-only request to the credential issuer when allowed. Redact the value. Determine production vs staging, scopes, project/account, authorized domains, and blast radius. Check git history if source is available. A revoked/test key is usually not reportable unless the program accepts historical exposure.
+
+Cloud and takeover:
+For S3/GCS/Azure blobs, prove public list/read/write with the minimum safe request and a harmless marker only if writes are allowed. For subdomain takeover, prove the DNS points to an unclaimed service and claim only a benign marker page. For metadata exposure, prove credential reach only through an in-scope SSRF and stop at minimum evidence.
+
+Business logic:
+Model the intended workflow. Try skipping steps, replaying single-use actions, changing quantities/prices/coupons, race conditions, quota reset, refund/withdrawal duplication, role transitions, invite reuse, and idempotency gaps. Strong proof is a before/after state change that violates a business invariant.
+
+Report checklist:
+Title: bug class + endpoint/parameter/root cause.
+Summary: one or two sentences with impact first.
+Scope: target, program, account roles, and authorization notes.
+Reproduction: exact numbered steps, request method/path/headers/body, and only the minimum payload.
+Proof: observed result, control result, evidence excerpt or screenshot, and limitations.
+Impact: data/action affected, attacker capability, affected users/tenants, business risk, and why it is eligible.
+Remediation: server-side authorization, parameterization, allow-listing, secret rotation, token invalidation, storage policy, or workflow invariant enforcement.
+Attachments: raw HTTP, screenshot, redacted issuer response, collaborator token, or PoC HTML only when needed.
+
+When asked "what should I do next":
+If scope is unclear, answer: confirm scope and exclusions first.
+If there is no target surface yet, answer: map routes/forms/params/JS/API docs/auth flows first.
+If there are candidate findings, answer: confirm the highest-impact one with observed-vs-control proof.
+If there is a confirmed finding, answer: package one root-cause report with exact repro, proof, impact, and fix.

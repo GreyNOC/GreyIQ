@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -9,9 +10,10 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+from bughunter import bounty as bounty_lib  # noqa: E402
 from bughunter import next_steps as next_steps_lib  # noqa: E402
 from bughunter import report as report_lib  # noqa: E402
-from bughunter.bounty import list_profiles  # noqa: E402
+from bughunter.bounty import _capture_direct_proof_artifacts, list_profiles  # noqa: E402
 
 
 class BountyReportTests(unittest.TestCase):
@@ -219,6 +221,62 @@ class BountyReportTests(unittest.TestCase):
             self.assertNotIn("C:\\\\runtime", md)  # never leak the absolute capture path
             self.assertIn("NOT auto-redacted", md)
 
+    def test_direct_proof_capture_attaches_screenshot_and_source_text(self) -> None:
+        finding = {
+            "ref": "F1", "severity": "high", "confidence": "high", "category": "xss",
+            "class_id": "xss", "class_name": "Reflected XSS", "title": "Reflected XSS",
+            "location": "https://example.test/?q=1", "rule_id": "active.reflected-xss",
+            "proof_evidence": {
+                "request_line": "GET https://example.test/?q=<svg/onload=1>",
+                "response_status": "HTTP 200",
+                "matched_value": "<svg/onload=1>",
+                "read_data": "<body><svg/onload=1></body>",
+            },
+        }
+        plan = {"proof_of_impact": {
+            "status": "confirmed",
+            "observed_result": "payload reflected unescaped",
+            "control_result": "plain marker did not execute",
+            "evidence": "payload reflected unescaped",
+        }}
+
+        def fake_poc_url(_finding: dict, _ctx: dict) -> str:
+            return "https://example.test/?q=<svg/onload=1>"
+
+        def fake_capture(*_args: object, **_kwargs: object) -> dict:
+            return {
+                "ok": True,
+                "path": "C:\\tmp\\proof-source.png",
+                "source_text_path": "C:\\tmp\\proof-source.txt",
+                "source_text": "REQUEST\nGET https://example.test/?q=<svg/onload=1>\nRESPONSE\nHTTP 200",
+                "url": "https://example.test/?q=<svg/onload=1>",
+                "final_url": "https://example.test/?q=<svg/onload=1>",
+                "warning": "review before submit",
+                "highlighted": True,
+            }
+
+        old_poc = bounty_lib.screenshot_service.poc_url_for_finding
+        old_capture = bounty_lib.screenshot_service.capture_screenshot
+        try:
+            bounty_lib.screenshot_service.poc_url_for_finding = fake_poc_url
+            bounty_lib.screenshot_service.capture_screenshot = fake_capture
+            with tempfile.TemporaryDirectory() as tmp:
+                count = _capture_direct_proof_artifacts(
+                    [finding],
+                    {"F1": plan},
+                    Path(tmp),
+                    "https://example.test",
+                    "example.test",
+                )
+        finally:
+            bounty_lib.screenshot_service.poc_url_for_finding = old_poc
+            bounty_lib.screenshot_service.capture_screenshot = old_capture
+
+        self.assertEqual(count, 1)
+        self.assertEqual(finding["screenshot_path"], "C:\\tmp\\proof-source.png")
+        self.assertIn("REQUEST", finding["source_text"])
+        self.assertEqual(finding["proof_capture"]["status"], "captured")
+
     def test_passive_web_finding_gets_curl_repro_step(self) -> None:
         from bughunter.bounty import _deterministic_attack_plan
         finding = {
@@ -283,6 +341,8 @@ class BountyReportTests(unittest.TestCase):
             self.assertGreaterEqual(len(meta["checklist"]), 3, f"{cid} thin checklist")
         web = next(p for p in payload["profiles"] if p["id"] == "web-app")
         self.assertTrue({"ssti", "jwt", "graphql", "request-smuggling"} <= set(web["classes"]))
+        source = next(p for p in payload["profiles"] if p["id"] == "source-code")
+        self.assertIn("access-control", source["classes"])
 
     def test_class_value_floats_high_value_class_within_severity_band(self) -> None:
         ctx = {
