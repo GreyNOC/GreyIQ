@@ -336,7 +336,7 @@ from bughunter.web_scan_service import run_web_scan  # noqa: E402
 from bughunter.live_scan_service import run_live_scan  # noqa: E402
 from bughunter.triage import triage  # noqa: E402
 from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
-from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names, _deterministic_attack_plan, cwe_for_class  # noqa: E402
+from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names, _deterministic_attack_plan, cwe_for_class, build_replay_script as bounty_build_replay, build_findings_har as bounty_build_har  # noqa: E402
 from bughunter import campaign as bounty_campaign  # noqa: E402
 from bughunter import learning as bounty_learning  # noqa: E402
 from bughunter import submission as bounty_submission  # noqa: E402
@@ -618,6 +618,12 @@ class BountyProgressRequest(BaseModel):
     after: int = Field(default=0, ge=0)
 
 
+class BountyEventsRequest(BaseModel):
+    # App-wide event stream cursor (not scoped to a run): the UI polls this so any open tab
+    # reacts live to a finding confirmed / report readied / submission filed in another run.
+    after: int = Field(default=0, ge=0)
+
+
 class CampaignStopRequest(BaseModel):
     run_id: str = Field(min_length=1, max_length=100)
 
@@ -737,6 +743,18 @@ class FindingDismissRequest(BaseModel):
 class FindingRestoreRequest(BaseModel):
     # Undo a delete — the finding can surface again. Keyed by the dedup_key the delete returned.
     dedup_key: str = Field(default="", max_length=64)
+
+
+class ReportReadyRequest(FindingReportRequest):
+    # "Get report ready": assemble POC/POI/POE for ONE finding into a submission-ready report and
+    # mark it READY in the durable ledger so the Report Center can review it. Inherits every
+    # FindingReportRequest field (title/severity/class/proof/proof_evidence/screenshot_path/poc/
+    # policy_profile/…) so it flows straight through build_finding_report — the single honest choke
+    # point that server-recomputes proof_status. Adds only the durable-ledger coordinates.
+    dedup_key: str = Field(default="", max_length=64)  # the ledger record's key (a history finding carries it)
+    program: str | None = Field(default=None, max_length=200)  # its ledger bucket id
+    run_id: str = Field(default="", max_length=64)  # optional: a cached-run finding
+    ref: str = Field(default="", max_length=40)
 
 
 class AggregateReportRequest(BaseModel):
@@ -1678,6 +1696,12 @@ class GreyIQRuntime:
         # streamed findings + rolled-up stats); `events`/`count` remain the text log.
         return {"ok": True, **bounty_progress.tail(run_id, after), "snapshot": bounty_progress.snapshot(run_id)}
 
+    def bounty_events(self, after: int = 0) -> dict[str, Any]:
+        """The app-wide event stream — findings confirmed, reports readied, submissions filed —
+        so any open tab (Campaign, Findings, Report Center) reacts live to work happening in a
+        different run/program. Read-only, poll-based; the durable ledger is the system of record."""
+        return {"ok": True, **bounty_progress.global_tail(after)}
+
     def stop_campaign(self, run_id: str) -> dict[str, Any]:
         """Cooperatively cancel a running campaign: set a stop flag the campaign loops poll
         between targets/URLs, so it winds down and its blocking request returns the partial
@@ -1877,8 +1901,9 @@ class GreyIQRuntime:
         # UI can say "showing the most recent N" and point at the CSV export for everything.
         # `archived` is the history subcategory: HIGH/CRITICAL findings kept from deleted programs.
         total = int((funnel.get("portfolio") or {}).get("total") or len(records))
+        ready_total = int((funnel.get("portfolio") or {}).get("ready") or 0)
         return {"ok": True, "findings": records, "funnel": funnel, "archived": archived,
-                "truncated": len(records) < total, "total": total}
+                "truncated": len(records) < total, "total": total, "ready_total": ready_total}
 
     def dismiss_finding(self, request: "FindingDismissRequest") -> dict[str, Any]:
         """Delete a finding: record its stable dedup key in the ledger's suppression set so no
@@ -1998,12 +2023,15 @@ class GreyIQRuntime:
         # PRE-filter, so without this a finding the policy withheld could be reconstituted into a
         # submittable report here. Re-apply the SAME policy: refuse to author a report for a finding on
         # an excluded endpoint, of an always-rejected class, or (confirmed-only) that isn't confirmed.
+        # VDP-gate proof status: _has_captured_artifact is the confirm authority the policy filter
+        # uses (its historical input). It intentionally returns True on a captured active artifact
+        # incl. a bare observed "HTTP 200" — the RETURNED proof_status below is the honest, capped one.
+        proof_dict = request.proof.model_dump() if request.proof is not None else None
+        observed = str((request.proof.observed_result if request.proof is not None else "") or "")
+        gate_confirmed = bounty_report._has_captured_artifact(finding, proof_dict, observed)
         profile = bounty_vdp.get_profile(request.policy_profile) if request.policy_profile else None
         if profile:
-            proof_dict = request.proof.model_dump() if request.proof is not None else None
-            observed = str((request.proof.observed_result if request.proof is not None else "") or "")
-            is_confirmed = bounty_report._has_captured_artifact(finding, proof_dict, observed)
-            gate_item = {"proof_status": "confirmed" if is_confirmed else "candidate", "finding": finding}
+            gate_item = {"proof_status": "confirmed" if gate_confirmed else "candidate", "finding": finding}
             _kept, _dropped = bounty_vdp.filter_findings([gate_item], profile)
             if not _kept:
                 reason = (_dropped[0].get("reason") if _dropped else "not reportable under this program's policy")
@@ -2013,7 +2041,85 @@ class GreyIQRuntime:
         package = bounty_submission.build_submission(ctx, finding, platform)
         if package is None:
             return {"ok": False, "error": "This finding isn't reportable (e.g. an unconfirmed credential lead)."}
-        return {"ok": True, "package": package, "platform": platform}
+        # Return the report's OWN proof_status — build_submission reads the plan's proof_of_impact
+        # status, which the overlay above already capped to 'candidate' when there's no real
+        # observed-vs-control differential. This is the honest value a caller/badge must trust: a bare
+        # "HTTP 200" observation with no control can never read 'confirmed' here.
+        return {"ok": True, "package": package, "platform": platform,
+                "proof_status": str(package.get("proof_status") or "candidate")}
+
+    def get_report_ready(self, request: "ReportReadyRequest") -> dict[str, Any]:
+        """"Get report ready" for ONE finding: assemble its POC (attack-plan steps + PoC + a runnable
+        replay.sh + findings.har), POI (the observed-vs-control differential) and POE (the captured
+        request/response artifact + screenshot) into a submission-ready report, server-recompute
+        proof_status (a client can NEVER forge 'confirmed'), persist the ready state to the durable
+        ledger, and notify the app-wide stream so the Report Center updates live. Honest on absence:
+        a candidate finding with no differential stays 'candidate' and its POI/POE flags read false —
+        no fabricated proof."""
+        # 1) Assemble the report through the single honest choke point (caps forged confirms +
+        #    re-applies the program's VDP policy). Reuses build_finding_report wholesale.
+        report = self.build_finding_report(request)
+        if not report.get("ok"):
+            return report  # withheld by policy, or not reportable — surface as-is
+        package = report.get("package") or {}
+        platform = report.get("platform") or bounty_formats.normalize_platform(request.platform)
+        proof_status = str(report.get("proof_status") or "candidate")
+
+        # 2) POC / POI / POE presence — honest, server-computed (never asserted by the client).
+        location = str(request.location or request.target or "")
+        pe = {k: v for k, v in (request.proof_evidence.model_dump().items() if request.proof_evidence is not None else [])
+              if str(v or "").strip()}
+        has_poe = bool(pe) or bool(str(request.screenshot_path or "").strip())
+        # POI is real only with BOTH a positive observation and a negative control (the differential).
+        has_poi = bool(request.proof is not None
+                       and str(request.proof.observed_result or "").strip()
+                       and str(request.proof.control_result or "").strip())
+        # 3) Runnable POC artifacts from the captured evidence (empty when nothing reconstructable).
+        item = {"finding": {"ref": "R1", "title": str(request.title or ""), "location": location,
+                            "proof_evidence": pe},
+                "source_url": location, "proof_status": proof_status,
+                "proof_of_impact": (request.proof.model_dump() if request.proof is not None else {})}
+        replay, replay_n = bounty_build_replay([item])
+        har, har_n = bounty_build_har([item], version=VERSION)
+        # Every assembled report carries deterministic reproduction steps — that IS the proof of
+        # concept. replay.sh/findings.har are bonus runnable artifacts when captured evidence permits.
+        has_poc = True
+
+        # 4) Persist the ready state durably (orthogonal to the pipeline stage).
+        finding_for_key = {"class_id": str(request.class_id or ""), "rule_id": str(request.rule_id or ""),
+                           "location": location}
+        key = str(request.dedup_key or "").strip() or bounty_ledger.dedup_key(finding_for_key)
+        report_index = {"platform": platform, "filename": f"report-{key}.md", "proof_status": proof_status,
+                        "screenshot_path": str(request.screenshot_path or "")}
+        proof_flags = {"poc": has_poc, "poi": has_poi, "poe": has_poe}
+        marked = bounty_ledger.mark_report_ready(RUNTIME_DIR, request.program, request.target, key,
+                                                 report_index=report_index, proof_flags=proof_flags)
+        if not marked:
+            # Not in the durable ledger yet (readied straight from a fresh board run): record it, then
+            # mark. upsert keys into program_key(program, target) — a NEW bucket, so no duplicate risk.
+            try:
+                bounty_ledger.upsert_findings(RUNTIME_DIR, request.program, request.target, [{
+                    "finding": {"class_id": str(request.class_id or ""), "rule_id": str(request.rule_id or ""),
+                                "title": str(request.title or ""), "severity": str(request.severity or "info"),
+                                "location": location, "proof_evidence": pe,
+                                "screenshot_path": str(request.screenshot_path or "")},
+                    "source_url": location, "proof_status": proof_status,
+                    "proof_of_impact": (request.proof.model_dump() if request.proof is not None else {}),
+                }])
+                marked = bounty_ledger.mark_report_ready(RUNTIME_DIR, request.program, request.target, key,
+                                                         report_index=report_index, proof_flags=proof_flags)
+            except Exception:  # noqa: BLE001 - persistence must never 500 the assembly
+                marked = False
+
+        # 5) Notify the app-wide stream (best-effort) so any open Report Center refreshes live.
+        bounty_progress.global_log("report_ready", {
+            "dedup_key": key, "program": str(request.program or ""), "title": str(request.title or ""),
+            "severity": str(request.severity or ""), "proof_status": proof_status,
+            "poc": has_poc, "poi": has_poi, "poe": has_poe,
+        })
+        return {"ok": True, "package": package, "platform": platform, "proof_status": proof_status,
+                "ready": {"poc": has_poc, "poi": has_poi, "poe": has_poe}, "persisted": bool(marked),
+                "dedup_key": key, "replay": (replay if replay_n else ""), "har": (har if har_n else None)}
 
     def aggregate_report(self, request: "AggregateReportRequest") -> dict[str, Any]:
         """The special report: one engagement document across many findings — from a cached
@@ -4474,6 +4580,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             request = validate_payload(BountyProgressRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.bounty_progress, request.run_id, request.after))
             return
+        if method == "POST" and path == "/api/bounty/events":
+            request = validate_payload(BountyEventsRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.bounty_events, request.after))
+            return
         if method == "POST" and path == "/api/bounty/campaign/stop":
             request = validate_payload(CampaignStopRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.stop_campaign, request.run_id))
@@ -4489,6 +4599,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/finding/report":
             request = validate_payload(FindingReportRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.build_finding_report, request))
+            return
+        if method == "POST" and path == "/api/bounty/finding/report-ready":
+            request = validate_payload(ReportReadyRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.get_report_ready, request))
             return
         if method == "POST" and path == "/api/bounty/finding/dismiss":
             request = validate_payload(FindingDismissRequest, await read_json_body(receive))

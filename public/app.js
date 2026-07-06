@@ -648,6 +648,117 @@ function ensureServicePolling() {
   }, 5000);
 }
 
+// ===== App-wide live event stream (poll-based) =====
+// One global poller over POST /api/bounty/events feeds cross-run updates (a finding confirmed
+// in a campaign, a report readied, a submission filed) to any subscribed view via liveOn(),
+// AND doubles as the engine-reachability signal behind the reconnect banner. Poll-based by
+// design: EventSource can't carry the X-GreyIQ-Token header the API gate requires and the CSP
+// is connect-src 'self'; a ~2s poll is imperceptible for a local single-user app.
+const LIVE_BASE_MS = 2000;
+const LIVE_MAX_MS = 30000;
+const live = {
+  timer: null,
+  cursor: 0,
+  primed: false,          // first contact adopts the server cursor without replaying pre-existing events
+  status: "connecting",   // connecting | up | reconnecting
+  backoff: LIVE_BASE_MS,
+  failures: 0,
+  started: false,
+  handlers: new Map(),    // kind -> Set<fn>; the "*" kind receives every event
+};
+
+// Subscribe to a live event kind ("finding_confirmed" | "report_ready" | "submitted" | "*").
+// Returns an unsubscribe function.
+function liveOn(kind, fn) {
+  if (typeof fn !== "function") return () => {};
+  const set = live.handlers.get(kind) || new Set();
+  set.add(fn);
+  live.handlers.set(kind, set);
+  return () => { const s = live.handlers.get(kind); if (s) s.delete(fn); };
+}
+
+function liveDispatch(event) {
+  for (const kind of [event && event.kind, "*"]) {
+    const set = kind && live.handlers.get(kind);
+    if (!set) continue;
+    for (const fn of set) { try { fn(event); } catch (_) { /* a bad subscriber must not kill the stream */ } }
+  }
+}
+
+function ensureLiveBanner() {
+  const banner = document.querySelector("#ckBanner");
+  if (!banner || banner.dataset.built) return banner;
+  const msg = document.createElement("span");
+  msg.className = "ck-banner-msg";
+  msg.textContent = "Local engine unreachable — reconnecting…";
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.className = "ck-banner-retry";
+  retry.textContent = "Retry now";
+  retry.addEventListener("click", () => { void liveTick(); });
+  banner.append(msg, retry);
+  banner.dataset.built = "1";
+  return banner;
+}
+
+function liveRenderStatus() {
+  const reconnecting = live.status === "reconnecting";
+  const banner = ensureLiveBanner();
+  if (banner) banner.hidden = !reconnecting;
+  if (ck && ck.service) {
+    ck.service.classList.toggle("is-reconnecting", reconnecting);
+    if (reconnecting) ck.service.textContent = "reconnecting…";
+    else if (typeof ckSyncService === "function") ckSyncService();  // restore normal up/down text
+  }
+}
+
+function liveSetStatus(next) {
+  if (live.status === next) return;
+  live.status = next;
+  liveRenderStatus();
+}
+
+async function liveTick() {
+  if (live.timer) { clearTimeout(live.timer); live.timer = null; }
+  let ok = false;
+  try {
+    const res = await apiFetch("/api/bounty/events", {
+      method: "POST", timeoutMs: 6000,
+      body: JSON.stringify({ after: live.cursor }),
+    });
+    if (res && res.ok) {
+      ok = true;
+      if (!live.primed) {
+        live.primed = true;  // don't replay events that predate this session
+      } else if (Array.isArray(res.events)) {
+        for (const ev of res.events) liveDispatch(ev);
+      }
+      if (typeof res.count === "number") live.cursor = res.count;
+    }
+  } catch (_) {
+    ok = false;
+  }
+  if (ok) {
+    live.failures = 0;
+    live.backoff = LIVE_BASE_MS;
+    liveSetStatus("up");
+  } else {
+    live.failures += 1;
+    // Only raise the banner after two consecutive misses so one slow/dropped poll doesn't
+    // flash an alarming banner during normal operation.
+    if (live.failures >= 2) liveSetStatus("reconnecting");
+    live.backoff = Math.min(LIVE_MAX_MS, Math.round(live.backoff * 1.7));
+  }
+  live.timer = window.setTimeout(() => { void liveTick(); }, ok ? LIVE_BASE_MS : live.backoff);
+}
+
+function liveStart() {
+  if (live.started) return;
+  live.started = true;
+  ensureLiveBanner();
+  void liveTick();
+}
+
 function serializableBot(bot) {
   return {
     id: bot.id,
@@ -4336,6 +4447,7 @@ const ck = {
     findings: document.querySelector("#ckViewFindings"),
     surface: document.querySelector("#ckViewSurface"),
     submissions: document.querySelector("#ckViewSubmissions"),
+    reports: document.querySelector("#ckViewReports"),
     idor: document.querySelector("#ckViewIdor"),
     learn: document.querySelector("#ckViewLearn"),
     operator: document.querySelector("#ckViewOperator")
@@ -4412,6 +4524,7 @@ function ckSetView(view) {
   if (view === "learn") void ckRenderLearn();
   if (view === "surface") ckRenderSurface();
   if (view === "submissions") ckRenderSubmissions();
+  if (view === "reports") void ckRenderReportCenter();
   if (view === "idor") ckRenderIdor();
   if (view === "operator") void ckRenderOperator();
   // Operator events only poll while its tab is open.
@@ -5180,7 +5293,7 @@ async function ckRenderAttackMap(f, btn, wrap) {
       f.attackMap = { data_url: res.data_url, path: res.path || "" };
       btn.textContent = "Re-render attack plan";
       // Re-render the report panel so the map appears in the visual-evidence area + embeds in the report.
-      if (ckState.reportFocus === f && ckState.view === "submissions") { ckRenderSubmissions(); return; }
+      if (ckState.reportFocus === f && ckReportSurfaceActive()) { ckRerenderReportSurface(); return; }
       ckAppendScreenshot(wrap, res.data_url, `${f.title || f.ref}-attack-plan`, "Attack-plan map");
       wrap.append(cel("p", "ck-hint", `Saved locally${res.path ? ": " + res.path : ""}. Now embedded in this finding's report / POC download.`));
     } else {
@@ -6962,6 +7075,30 @@ function ckViewFullReport(f, extra) {
   if (panel && panel.scrollIntoView) panel.scrollIntoView({ block: "start" });
 }
 
+// The pinned full-report panel is shared by the Submissions hub AND the Report Center. Its async
+// handlers (markdown load, screenshot, prove, prepare, attack-map) must repaint whichever of those
+// two views currently hosts it — gating on "submissions" alone left the panel stuck (e.g. on
+// "Building the full report…") when opened from the Report Center. This is the "is the panel
+// visible right now" guard those handlers check before repainting.
+function ckReportSurfaceActive() {
+  return ckState.view === "submissions" || ckState.view === "reports";
+}
+function ckRerenderReportSurface() {
+  // Preserve the active view's search caret so an async repaint landing mid-typing doesn't drop a key.
+  const searchId = ckState.view === "reports" ? "ckRcSearch" : "ckSubSearch";
+  const el = document.activeElement;
+  const onSearch = el && el.id === searchId;
+  const caret = onSearch ? el.selectionStart : null;
+  const restore = () => {
+    if (!onSearch) return;
+    const again = document.getElementById(searchId);
+    if (again) { again.focus(); try { again.setSelectionRange(caret, caret); } catch (_) { /* type=search quirk */ } }
+  };
+  // ckRenderReportCenter is async (loads history); restore the caret after it settles.
+  if (ckState.view === "reports") void ckRenderReportCenter().then(restore);
+  else { ckRenderSubmissions(); restore(); }
+}
+
 // The canonical full report for a focused finding. Prefer the run package (build_submission)
 // when we have run+ref (board findings); otherwise the general finding→report builder
 // (campaign findings, ledger records); offline draft as the last resort.
@@ -7023,7 +7160,7 @@ function ckFullReportPanel(focus) {
   back.type = "button";
   back.title = "Close this report";
   back.style.marginLeft = "auto";
-  back.addEventListener("click", () => { ckState.reportFocus = null; ckRenderSubmissions(); });
+  back.addEventListener("click", () => { ckState.reportFocus = null; if (ckState.view === "reports") void ckRenderReportCenter(); else ckRenderSubmissions(); });
   head.append(back);
   wrap.append(head);
 
@@ -7132,7 +7269,7 @@ function ckFullReportPanel(focus) {
     // Persist on the focus so the shots survive a panel re-render, then repaint.
     focus.shots = shots;
     focus._prepMsg = "";  // a fresh manual capture invalidates the last "prepare" caption
-    if (ckState.reportFocus === focus && ckState.view === "submissions") ckRenderSubmissions();
+    if (ckState.reportFocus === focus && ckReportSurfaceActive()) ckRerenderReportSurface();
   }));
   // Attack-plan map — render a GRAPHICAL .png of the attack flow (actor → probe → observed vs control
   // → confirmed) for this finding, saved into the POC download and embedded in the report.
@@ -7156,7 +7293,7 @@ function ckFullReportPanel(focus) {
         m.apiKeyAccessJsonPath = focus.apiKeyAccessJsonPath;
       }
       focus._md = null;
-      if (ckState.reportFocus === focus && ckState.view === "submissions") ckRenderSubmissions();
+      if (ckState.reportFocus === focus && ckReportSurfaceActive()) ckRerenderReportSurface();
     });
     s1.row.append(keyBtn);
   }
@@ -7234,19 +7371,10 @@ function ckFullReportPanel(focus) {
         const pkg = await ckFullReportMarkdown(focus);
         focus._md = pkg.text;
         focus._mdLoading = false;
-        if (ckState.reportFocus === focus && ckState.view === "submissions") {
-          // Preserve the search box's focus/caret: this async re-render can land mid-typing
-          // (the fetch runs while the operator searches), and replaceChildren() would otherwise
-          // steal focus for one keystroke.
-          const active = document.activeElement;
-          const onSearch = active && active.id === "ckSubSearch";
-          const caret = onSearch ? active.selectionStart : null;
-          ckRenderSubmissions();
-          if (onSearch) {
-            const again = document.getElementById("ckSubSearch");
-            if (again) { again.focus(); try { again.setSelectionRange(caret, caret); } catch (_) { /* type=search */ } }
-          }
-        }
+        // Repaint whichever report surface (Submissions or Report Center) is hosting the panel, so
+        // "View full report" resolves instead of staying on "Building the full report…". The helper
+        // preserves the active view's search caret (this fetch can land while the operator types).
+        if (ckState.reportFocus === focus && ckReportSurfaceActive()) ckRerenderReportSurface();
       })();
     }
   }
@@ -7356,7 +7484,7 @@ async function ckPrepareFullReport(f, btn, statusEl, shotWrap) {
       : "Report built, but impact isn’t confirmed — Submit stays gated. Re-run “Create proof of impact” to confirm it.";
   } finally {
     btn.disabled = false; btn.textContent = old;
-    if (ckState.reportFocus === f && ckState.view === "submissions") ckRenderSubmissions();
+    if (ckState.reportFocus === f && ckReportSurfaceActive()) ckRerenderReportSurface();
   }
 }
 
@@ -8087,8 +8215,283 @@ async function ckLoadHistory(body) {
   try { res = await apiFetch("/api/bounty/findings", { method: "GET", timeoutMs: 15000 }); }
   catch (_) { body.replaceChildren(cel("p", "ck-hint", "Could not load history — the engine is unreachable.")); return; }
   if (!res || res.ok === false) { body.replaceChildren(cel("p", "ck-hint", "Could not load history.")); return; }
-  ckState._history = { findings: res.findings || [], funnel: res.funnel || null, truncated: Boolean(res.truncated), archived: res.archived || [] };
+  ckState._history = { findings: res.findings || [], funnel: res.funnel || null, truncated: Boolean(res.truncated), archived: res.archived || [], ready_total: res.ready_total || 0 };
   ckRenderHistory(body, ckState._history);
+}
+
+// Load (and cache) the durable finding/report history WITHOUT rendering — shared by the
+// Submissions history section and the Report Center so they read one authoritative ledger set.
+async function ckEnsureHistory() {
+  if (ckState._history) return ckState._history;
+  let res;
+  try { res = await apiFetch("/api/bounty/findings", { method: "GET", timeoutMs: 15000 }); }
+  catch (_) { return null; }
+  if (!res || res.ok === false) return null;
+  ckState._history = { findings: res.findings || [], funnel: res.funnel || null,
+    truncated: Boolean(res.truncated), archived: res.archived || [], ready_total: res.ready_total || 0 };
+  return ckState._history;
+}
+
+// ===== Report Center =====
+// An app-wide, live, durable hub over the SAME ledger the Submissions history reads: every finding
+// across every program, with a per-finding "Get report ready" that assembles POC/POI/POE and marks
+// it ready (synced everywhere, survives restart). Updates live via the global event stream.
+const ckReports = { ready: "all" };  // ready-state filter: all | readyable | ready
+
+function ckProofDots(rec) {
+  const wrap = cel("span", "ck-proof-dots");
+  const rp = rec.report_ready_proof || {};
+  const cap = rec.captured_proof || {};
+  const poi = cap.proof_of_impact || {};
+  // Once readied, show what the assembled report ACTUALLY carries; before that, show what's
+  // assemblable from the captured proof (steps are always assemblable, so POC is always on).
+  const on = {
+    poc: rec.report_ready ? !!rp.poc : true,
+    poi: rec.report_ready ? !!rp.poi : !!(poi.observed_result && poi.control_result),
+    poe: rec.report_ready ? !!rp.poe : !!(cap.proof_evidence || cap.credential_proof),
+  };
+  for (const [k, label, tip] of [
+    ["poc", "POC", "Proof of concept — reproduction steps + PoC"],
+    ["poi", "POI", "Proof of impact — observed-vs-control differential"],
+    ["poe", "POE", "Proof of evidence — captured request/response"],
+  ]) {
+    const dot = cel("span", `ck-pxx-dot ck-${k}-dot ${on[k] ? "is-on" : "is-off"}`, label);
+    dot.title = `${tip} · ${on[k] ? "present" : "not captured"}`;
+    wrap.append(dot);
+  }
+  return wrap;
+}
+
+async function ckViewFullReportHere(rec) {
+  // Like ckViewFullReport, but pins the report at the top of the Report Center (no navigation).
+  ckState.reportFocus = ckNormalizeForReport(rec);
+  await ckRenderReportCenter();
+  const panel = document.querySelector(".ck-fullreport");
+  if (panel && panel.scrollIntoView) panel.scrollIntoView({ block: "start" });
+}
+
+async function ckGetReportReady(rec, btn, status, li) {
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = "Assembling…";
+  status.className = "ck-status"; status.textContent = "";
+  let res;
+  try {
+    res = await apiFetch("/api/bounty/finding/report-ready", {
+      method: "POST", timeoutMs: 30000,
+      body: JSON.stringify({
+        title: rec.title || "Security finding", severity: rec.severity || "info",
+        class_name: rec.class_id || "", class_id: rec.class_id || "",
+        location: rec.source_url || "", rule_id: rec.rule_id || "",
+        target: rec.source_url || "", platform: ckState.platform || "hackerone",
+        policy_profile: rec.policy_profile || ckActivePolicyProfile(),
+        dedup_key: rec.dedup_key || "", program: rec.program || "",
+        ...ckCapturedProofFields(rec),
+      }),
+    });
+  } catch (err) {
+    btn.disabled = false; btn.textContent = old;
+    status.className = "ck-status is-error"; status.textContent = err.message || "Engine unreachable.";
+    return;
+  }
+  if (!res || res.ok === false) {
+    btn.disabled = false; btn.textContent = old;
+    status.className = "ck-status is-error";
+    status.textContent = (res && (res.error || (res.withheld ? `Withheld: ${res.reason || res.policy}` : ""))) || "Could not assemble the report.";
+    return;
+  }
+  // Reflect the readied state on the cached record so a re-render (or a live refresh) keeps it.
+  rec.report_ready = true;
+  rec.report_ready_proof = res.ready || {};
+  if (res.proof_status) rec.proof_status = res.proof_status;
+  const r = res.ready || {};
+  const parts = ["poc", "poi", "poe"].filter((k) => r[k]).map((k) => k.toUpperCase());
+  // Rebuild the row (so the ready badge + dots + button label update) and carry the confirmation
+  // onto the fresh row's status span — setting it on the old span would be discarded by the swap.
+  const fresh = ckReportRow(rec);
+  const freshStatus = fresh.querySelector(".ck-status");
+  if (freshStatus) {
+    freshStatus.className = "ck-status is-ok";
+    freshStatus.textContent = `Report ready · ${parts.join(" + ") || "steps only"} (${res.proof_status || "candidate"})`;
+  }
+  if (li.isConnected) {
+    li.replaceWith(fresh);
+  } else if (ckState.view === "reports") {
+    // A concurrent live refresh (finding_confirmed/report_ready) rebuilt the list and detached our
+    // row while the request was in flight, so replaceWith would silently no-op. Force a fresh reload
+    // so the now-persisted ready badge + dots surface (the transient status line is dropped).
+    ckState._history = null;
+    void ckRenderReportCenter();
+  }
+}
+
+function ckReportRow(rec) {
+  const li = cel("li");
+  li.style.flexWrap = "wrap";
+  const left = cel("div"); left.style.flex = "1";
+  const sev = String(rec.severity || "info").toLowerCase();
+  left.append(cel("span", `ck-sev sev-${sev}`, String(rec.severity || "info").toUpperCase()), document.createTextNode(" "));
+  left.append(cel("span", "ck-ftitle", rec.title || "Finding"));
+  if (rec.report_ready) left.append(document.createTextNode(" "), cel("span", "ck-ready-badge", "Report ready ✓"));
+  const meta = cel("div", "ck-cd-finding-meta");
+  if (rec.class_id) meta.append(cel("span", null, rec.class_id));
+  const rproof = ckEffectiveProof(rec, rec.proof_status);
+  if (rproof) meta.append(ckProofBadge(rproof));
+  meta.append(cel("span", "ck-tag", ckEffectiveStage(rec) || rec.stage || "discovered"));
+  if (rec.program) meta.append(cel("span", "ck-tag", rec.program));
+  if (Number(rec.bounty)) meta.append(cel("span", null, `$${rec.bounty}`));
+  if (rec.source_url) meta.append(cel("span", "ck-cd-finding-target", ckShortTarget(rec.source_url)));
+  meta.append(ckProofDots(rec));
+  left.append(meta);
+  li.append(left);
+
+  const acts = cel("div", "ck-actions"); acts.style.margin = "0";
+  const status = cel("span", "ck-status"); status.style.marginLeft = "0.4rem";
+  const readyBtn = cel("button", "ck-btn ck-btn-primary", rec.report_ready ? "Re-ready report" : "Get report ready");
+  readyBtn.type = "button";
+  readyBtn.title = "Assemble POC + POI + POE into a submission-ready report and keep it here";
+  readyBtn.addEventListener("click", () => ckGetReportReady(rec, readyBtn, status, li));
+  const viewBtn = cel("button", "ck-btn", "View full report");
+  viewBtn.type = "button";
+  viewBtn.addEventListener("click", () => ckViewFullReportHere(rec));
+  const copyBtn = cel("button", "ck-btn", "Copy");
+  copyBtn.type = "button";
+  copyBtn.addEventListener("click", async () => {
+    copyBtn.disabled = true; copyBtn.textContent = "…";
+    try { const md = await ckReportFromLedger(rec); const ok = await ckCopy(md); copyBtn.textContent = ok ? "Copied ✓" : "Failed"; }
+    finally { copyBtn.disabled = false; setTimeout(() => { copyBtn.textContent = "Copy"; }, 1600); }
+  });
+  const dlBtn = cel("button", "ck-btn", "Download .md");
+  dlBtn.type = "button";
+  dlBtn.addEventListener("click", async () => {
+    dlBtn.disabled = true; dlBtn.textContent = "…";
+    try { const md = await ckReportFromLedger(rec); ckDownloadText(`${ckSlug(rec.title || "finding")}.md`, md); }
+    finally { dlBtn.disabled = false; dlBtn.textContent = "Download .md"; }
+  });
+  acts.append(readyBtn, viewBtn, copyBtn, dlBtn, status);
+  li.append(acts);
+  return li;
+}
+
+function ckReportControlsBar() {
+  const opts = ckState.sub;
+  const wrap = cel("div", "ck-creds ck-sub-controls");
+  const head = cel("div", "ck-creds-head");
+  head.append(cel("strong", null, "Search · filter · sort"));
+  wrap.append(head);
+  const row = cel("div", "ck-sub-controls-row");
+
+  const searchLab = cel("label", "ck-sub-search");
+  searchLab.append(cel("span", null, "Search"));
+  const search = cel("input");
+  search.type = "search"; search.id = "ckRcSearch"; search.value = opts.query;
+  search.placeholder = "title, URL, class, CWE, program…"; search.autocomplete = "off";
+  search.addEventListener("input", () => {
+    const pos = search.selectionStart;
+    opts.query = search.value;
+    void ckRenderReportCenter();
+    const again = document.getElementById("ckRcSearch");
+    if (again) { again.focus(); try { again.setSelectionRange(pos, pos); } catch (_) { /* type=search quirk */ } }
+  });
+  searchLab.append(search);
+  row.append(searchLab);
+
+  const mkSelect = (label, value, choices, onset) => {
+    const lab = cel("label");
+    lab.append(cel("span", null, label));
+    const sel = cel("select");
+    for (const [val, text] of choices) {
+      const opt = cel("option", null, text); opt.value = val;
+      if (val === value) opt.selected = true;
+      sel.append(opt);
+    }
+    sel.addEventListener("change", () => { onset(sel.value); void ckRenderReportCenter(); });
+    lab.append(sel);
+    return lab;
+  };
+
+  row.append(mkSelect("Ready", ckReports.ready, [
+    ["all", "All findings"], ["readyable", "Ready to assemble"], ["ready", "Report ready"],
+  ], (v) => { ckReports.ready = v; }));
+  row.append(mkSelect("Severity", opts.sev, [
+    ["all", "All severities"], ["critical", "Critical"], ["high", "High"],
+    ["medium", "Medium"], ["low", "Low"], ["info", "Info"],
+  ], (v) => { opts.sev = v; }));
+  row.append(mkSelect("Proof", opts.proof, [
+    ["all", "Any proof"], ["confirmed", "Confirmed"], ["candidate", "Candidate"], ["missing", "Unproven"],
+  ], (v) => { opts.proof = v; }));
+  row.append(mkSelect("Sort", opts.sort, [
+    ["severity", "Severity"], ["title", "Title (A–Z)"], ["recent", "Most recent"],
+  ], (v) => { opts.sort = v; }));
+
+  const active = opts.query || opts.sev !== "all" || opts.proof !== "all" || opts.sort !== "severity" || ckReports.ready !== "all";
+  if (active) {
+    const clear = cel("button", "ck-btn", "Clear");
+    clear.type = "button";
+    clear.addEventListener("click", () => {
+      ckState.sub = { query: "", sev: "all", proof: "all", sort: "severity" };
+      ckReports.ready = "all"; void ckRenderReportCenter();
+    });
+    row.append(clear);
+  }
+  wrap.append(row);
+  return wrap;
+}
+
+async function ckRenderReportCenter() {
+  const host = ck.views.reports;
+  if (!host) return;
+  // Only paint a loading line on the FIRST load (no cache yet), so a live refresh doesn't flash.
+  if (!ckState._history) host.replaceChildren(cel("p", "ck-hint", "Loading reports…"));
+  const data = await ckEnsureHistory();
+  if (ckState.view !== "reports") return;  // user navigated away while awaiting
+  host.replaceChildren();
+  if (!data) { host.append(cel("p", "ck-hint", "Could not load reports — the engine is unreachable.")); return; }
+
+  if (ckState.reportFocus) host.append(ckFullReportPanel(ckState.reportFocus));
+
+  host.append(cel("h2", "ck-section-title", "Report Center"));
+  host.append(cel("p", "ck-hint",
+    "Every finding across every program. Click “Get report ready” to assemble its proof of concept, "
+    + "proof of impact and proof of evidence into a submission-ready report — it stays here, synced, and "
+    + "survives restarts."));
+
+  const fn = (data.funnel && data.funnel.portfolio) || data.funnel || {};
+  const st = fn.stages || {};
+  const strip = cel("div", "ck-summary");
+  strip.append(ckPill("is-armed", "Report-ready", String(data.ready_total || fn.ready || 0)));
+  strip.append(ckPill("", "Confirmed", String(st.confirmed || 0)));
+  strip.append(ckPill("", "Submitted", String(st.submitted || 0)));
+  strip.append(ckPill("", "Paid", String(st.paid || 0)));
+  strip.append(ckPill("", "Total", String(fn.total || (data.findings || []).length)));
+  if (fn.bounty_total) strip.append(ckPill("", "Earned", `$${fn.bounty_total}`));
+  host.append(strip);
+
+  host.append(ckFormatBar());
+  host.append(ckReportControlsBar());
+
+  const opts = ckState.sub;
+  let recs = (data.findings || []).filter((r) => ckSubMatch(r, opts));
+  if (ckReports.ready === "ready") recs = recs.filter((r) => r.report_ready);
+  else if (ckReports.ready === "readyable") recs = recs.filter((r) => r.readyable && !r.report_ready);
+  recs = ckSubSort(recs, opts.sort);
+
+  host.append(cel("h3", "ck-section-title", `${recs.length} report${recs.length === 1 ? "" : "s"}`));
+  if (!recs.length) {
+    host.append(cel("p", "ck-hint", (data.findings || []).length
+      ? "No findings match your filter."
+      : "No findings yet. Run a hunt — every finding lands here, and you can get its report ready for submission."));
+    return;
+  }
+  const ul = cel("ul", "ck-list");
+  for (const r of recs) ul.append(ckReportRow(r));
+  host.append(ul);
+}
+
+// Live: when a finding confirms or a report is readied anywhere, refresh the Report Center (if
+// open) and keep its nav badge current. Registered once at boot; rides the Slice-1 event stream.
+function ckSubscribeReportsLive() {
+  liveOn("report_ready", () => { ckState._history = null; if (ckState.view === "reports") void ckRenderReportCenter(); });
+  liveOn("finding_confirmed", () => { ckState._history = null; if (ckState.view === "reports") void ckRenderReportCenter(); });
 }
 
 function ckRenderHistory(body, data) {
@@ -8211,6 +8614,35 @@ function ckHistoryRow(rec) {
   return li;
 }
 
+// Thread a durable-history record's captured proof (POE = request/response artifact, POI =
+// observed-vs-control differential, screenshot) into a report/report-ready request. Without this
+// a report rebuilt from the ledger is a proof-less shell — the evidence the record persisted for
+// exactly this purpose is dropped. Shared by "Download report" and "Get report ready".
+function ckCapturedProofFields(rec) {
+  const cap = (rec && rec.captured_proof) || {};
+  const out = {};
+  const pe = cap.proof_evidence;
+  if (pe && typeof pe === "object") {
+    out.proof_evidence = {
+      request_line: pe.request_line || "", request_header: pe.request_header || "",
+      response_status: pe.response_status || "", response_header: pe.response_header || "",
+      set_cookie: pe.set_cookie || "", matched_value: pe.matched_value || "", read_data: pe.read_data || "",
+    };
+  }
+  const poi = cap.proof_of_impact;
+  if (poi && typeof poi === "object") {
+    out.proof = {
+      status: poi.status || "", method: poi.method || "",
+      observed_result: poi.observed_result || "", control_result: poi.control_result || "",
+      evidence: poi.evidence || "", affected_asset: poi.affected_asset || "", limitations: poi.limitations || "",
+    };
+  }
+  const cred = cap.credential_proof;
+  if (cred && typeof cred === "object" && cred.poc) out.poc = String(cred.poc);
+  if (cap.screenshot_path) out.screenshot_path = String(cap.screenshot_path);
+  return out;
+}
+
 async function ckReportFromLedger(rec) {
   try {
     const res = await apiFetch("/api/bounty/finding/report", {
@@ -8222,6 +8654,8 @@ async function ckReportFromLedger(rec) {
         // Honor a VDP policy bound to this record (or the picked program) so a policy-withheld finding
         // can't be reconstituted from durable history either.
         policy_profile: rec.policy_profile || ckActivePolicyProfile(),
+        // Carry the record's captured POE/POI/screenshot so the rebuilt report shows real evidence.
+        ...ckCapturedProofFields(rec),
       }),
     });
     if (res && res.ok && res.package) return res.package.vulnerability_information || "";
@@ -9807,6 +10241,7 @@ function bootCockpit() {
   // Seed aria-current on the initially-active nav button — the default view is set via the HTML
   // is-active class (not through ckSetView), so it would otherwise stay unset until the first click.
   ck.navButtons.find((b) => b.classList.contains("is-active"))?.setAttribute("aria-current", "page");
+  ckSubscribeReportsLive();  // Report Center refreshes live off the app-wide event stream
   // Escape closes the finding-detail aside (only reachable when it's open, i.e. hunt mode).
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && ck.detail && !ck.detail.hidden) ckCloseDetail();
@@ -9876,6 +10311,7 @@ async function boot() {
   render();
   setPanelMode(state.panelMode || "brain");
   bootCockpit();
+  liveStart();  // app-wide live event stream + reconnect banner
   renderTemplateBar();
   renderWorkbench();
   if (state.agentMode && state.agentWorkspace) {
