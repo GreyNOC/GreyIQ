@@ -432,6 +432,7 @@
             </div>
 
             <label><span>Target</span>
+              <select id="ckTargetPick" hidden aria-label="Target — pick from the program's scope"></select>
               <input id="ckTarget" type="text" autocomplete="off" spellcheck="false" placeholder="https://example.com  ·  C:\path\to\repo"></label>
             <label><span>Scope / program notes</span>
               <input id="ckScope" type="text" autocomplete="off" placeholder="acme — *.example.com in scope"></label>
@@ -487,6 +488,7 @@
           <button class="ck-nav-btn ck-foot-btn" data-ck-view="operator" type="button">Operator</button>
         </div>
       </aside>
+      <div class="ck-resizer" id="ckResizer" role="separator" aria-orientation="vertical" aria-label="Resize sidebar (drag, or arrow keys)" tabindex="0" title="Drag to resize"></div>
 
       <div class="ck-shell-main">
         <header class="ck-topbar">

@@ -2,6 +2,17 @@
 
 Notable changes to GreyIQ.
 
+## v1.3.0
+
+### Resizable sidebar + pick the target from a program's scope
+- The left **sidebar is now resizable** — drag the divider at its right edge (or focus it and use the
+  arrow keys; Shift for larger steps). The width is clamped to a sensible range, persists across
+  reloads, and collapses out of the way on the mobile stacked layout.
+- Once you pick a program, the **Target field becomes a dropdown of that program's in-scope targets**,
+  so you choose from scope instead of typing (e.g. a program scoped to `tiktok.com` lists it directly).
+  An **Other target…** option reveals the free-text input for anything off-list. The chosen scope target
+  is preserved across reloads, and every run/report still reads the same underlying value.
+
 ## v1.2.0
 
 ### Program-first launch flow
