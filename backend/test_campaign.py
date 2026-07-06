@@ -18,7 +18,9 @@ _VULN_SRC = (
     "import os\n"
     "def run(cmd):\n"
     "    os.system('ping ' + cmd)  # command injection\n"
-    "SECRET = 'AKIAIOSFODNN7EXAMPLE'\n"
+    # A realistic (non-"EXAMPLE") AWS access key so strict secret classification keeps it as a
+    # candidate secret rather than correctly filtering the AWS documentation placeholder.
+    "SECRET = 'AKIAZ9Q8R7W6T5Y4U3I2'\n"
 )
 
 

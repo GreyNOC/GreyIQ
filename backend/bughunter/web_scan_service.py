@@ -23,6 +23,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from bughunter import secret_classification
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.code_scanner.rules import SECRET_RULES
 from bughunter.rate_limit import HostRateGovernor
@@ -641,6 +642,11 @@ def run_web_scan(
             findings.extend(_probe_sensitive_paths(fetched["final_url"], governor, auth=auth))
         except Exception:  # noqa: BLE001 - probing is additive, never fatal
             pass
+    # Strict secret classification for the standalone web scan too: a page-source Google/Firebase key,
+    # OAuth client id, or analytics/CDN config is a PUBLIC client key by default — classified, downgraded
+    # to Info, and marked not-reportable, never a scary High from a page-source match. (The hunt path does
+    # this inside run_bounty_hunt; this covers the direct /api/bounty/web-scan route identically.)
+    secret_classification.apply_secret_classification(findings)
     findings.sort(key=lambda f: _SEVERITY_RANK.get(f["severity"], 0), reverse=True)
     risk, score = _risk(findings)
     return {

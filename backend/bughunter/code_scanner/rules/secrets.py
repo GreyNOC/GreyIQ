@@ -186,13 +186,20 @@ RULES = (
         unique=True,
     ),
     RegexRule(
+        # A Google/Firebase AIza key is a browser-embeddable PUBLIC client key by default — it is DESIGNED
+        # to ship in web/app source and to identify its project. Detecting one is NOT proof of a secret or
+        # a vulnerability, so this rule stays INFO; only strict classification (bughunter.secret_classification)
+        # may escalate it, and only with real proof of unauthorized access/impact (an open Firebase data
+        # store, or demonstrated unrestricted paid-API abuse). Never High from the pattern alone.
         rule_id="secret.google-api-key",
-        title="Google API key",
-        description="A Google Cloud API key (AIza...) is hardcoded.",
-        severity=Severity.HIGH,
+        title="Google/Firebase API key (public client key by default)",
+        description="A Google/Firebase API key (AIza...) appears in source. These are browser-safe public "
+                    "client keys by design — reportable only with proof of unauthorized access or impact.",
+        severity=Severity.INFO,
         confidence=Confidence.MEDIUM,
         category="secret",
-        remediation="Restrict or rotate the key in Google Cloud Console; keys with no referrer restriction are usable from anywhere.",
+        remediation="Confirm the key's HTTP-referrer / API / app restrictions. It is only a finding if it is "
+                    "unrestricted AND grants unauthorized access (e.g. an open Firebase data store or paid-API abuse).",
         pattern=r"\bAIza[0-9A-Za-z\-_]{35}\b",
         unique=True,
     ),

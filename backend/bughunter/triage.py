@@ -16,17 +16,51 @@ import urllib.request
 from typing import Any
 
 import coder
+from bughunter import secret_classification
 
 _TOP = 8
 _CITATION_WEIGHT = {"critical": 0.99, "high": 0.85, "medium": 0.6, "low": 0.4, "info": 0.2}
+
+_CLASS_NOTE = {
+    secret_classification.PUBLIC_CLIENT_KEY: "public client key — informational only, not a reportable secret without proof of impact",
+    secret_classification.CANDIDATE_UNVERIFIED: "unverified candidate — regex/source match without validation",
+    secret_classification.FALSE_POSITIVE: "false positive — issuer rejected it (dead/revoked) or a placeholder",
+}
+
+
+def _secret_class(finding: dict[str, Any]) -> str:
+    """The strict classification for an exposed-key finding — an already-stamped one, or computed on the
+    fly (the CLI code-scan path doesn't run the hunt's normalization). Empty for non-secret findings."""
+    cls = str(finding.get("secret_classification") or "")
+    if cls:
+        return cls
+    if secret_classification._is_secret_finding(finding):
+        try:
+            return secret_classification.classify_secret_finding(finding)
+        except Exception:  # noqa: BLE001 - triage must never break on a malformed finding
+            return ""
+    return ""
+
+
+def _display_severity(finding: dict[str, Any], cls: str) -> str:
+    """The severity to SHOW — capped by classification so an unverified/public API key never prints High.
+    For a non-secret finding the raw severity is returned UNCHANGED (preserving existing behaviour,
+    including the case-sensitive citation-weight lookup)."""
+    if cls and cls != secret_classification.CONFIRMED_SECRET:
+        sev = str(finding.get("severity") or "").lower()
+        return secret_classification.severity_for_classification(cls, sev or "info")
+    return str(finding.get("severity") or "")
 
 
 def _format_finding(index: int, finding: dict[str, Any]) -> str:
     location = finding.get("file_path", "")
     line = finding.get("line_start")
     where = f"{location}:{line}" if line else location
-    severity = (finding.get("severity") or "").upper()
+    cls = _secret_class(finding)
+    severity = _display_severity(finding, cls).upper()
     lines = [f"{index}. [{severity}] {finding.get('rule_id', '')} - {where}"]
+    if cls and cls != secret_classification.CONFIRMED_SECRET:
+        lines.append(f"   [{cls}] {_CLASS_NOTE.get(cls, cls)}")
     if finding.get("title"):
         lines.append(f"   {finding['title']}")
     if finding.get("snippet"):
@@ -68,10 +102,13 @@ def _citations(result: dict[str, Any], limit: int = 6) -> list[dict[str, Any]]:
     for finding in result.get("findings", [])[:limit]:
         location = finding.get("file_path", "")
         line = finding.get("line_start")
+        # Weight by the classification-adjusted severity so an unverified/public API key doesn't cite
+        # as strongly as a proven finding.
+        disp_sev = _display_severity(finding, _secret_class(finding))
         citations.append(
             {
                 "source": f"{location}:{line}" if line else location,
-                "score": _CITATION_WEIGHT.get(finding.get("severity"), 0.3),
+                "score": _CITATION_WEIGHT.get(disp_sev, 0.3),
                 "excerpt": f"{finding.get('title', '')} - {finding.get('snippet', '')}"[:200],
             }
         )
@@ -105,7 +142,19 @@ def remote_triage(result: dict[str, Any], remote_config: dict[str, Any] | None) 
         "You are GreyIQ BugHunter, a security triage assistant. Given these scan findings "
         "(JSON), produce a short prioritized triage: the single most important issue first, "
         "group duplicates, flag likely false positives, and give the most valuable fix. Be "
-        "concise and concrete.\n\nFindings JSON:\n"
+        "concise and concrete.\n\n"
+        "BE STRICT WITH SECRET / API-KEY FINDINGS — do NOT inflate their severity:\n"
+        "- A value appearing in page/app source is NOT proof of a vulnerability. A regex match is NOT "
+        "proof of a secret.\n"
+        "- Only a `confirmed_secret` (each finding carries a `secret_classification` field) — a real "
+        "privileged credential PROVEN usable, or a data store proven readable — may be Medium/High/"
+        "Critical. Respect that field; never upgrade an unverified/public one to confirmed.\n"
+        "- A Google/Firebase `AIza` browser key, OAuth client id, analytics id (GA/GTM), Firebase web "
+        "config, CDN/endpoint URL, or public app id is a `public_client_key` — INFORMATIONAL only, not "
+        "a reportable secret without proof of unauthorized access/impact.\n"
+        "- Group unverified/public API-key findings in a SEPARATE section from confirmed secrets, and "
+        "state plainly when a finding is NOT reportable yet (and what proof is missing).\n\n"
+        "Findings JSON:\n"
         + json.dumps(
             {
                 "scan_type": result.get("scan_type"),

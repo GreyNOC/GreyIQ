@@ -40,6 +40,7 @@ from bughunter import (
     recon,
     research,
     screenshot_service,
+    secret_classification,
     submission,
     vdp_policy,
     web_ingest,
@@ -444,7 +445,12 @@ def _run_campaign_body(
         if progress_unit is None:
             progress.mark_target(progress_run_id, url, "done")
 
-    # --- Secrets mined from served JS (recon-sourced) — classify + dedup + add. ---
+    # --- Secrets mined from served JS (recon-sourced) — STRICT-classify + dedup + add. ---
+    # These served-JS secrets are folded straight into the campaign report WITHOUT going through a
+    # per-URL run_bounty_hunt, so they must be classified here too — otherwise a public Google/Firebase
+    # key (or an OAuth/analytics id) keeps mine_js's raw High/Critical severity and inflates the campaign
+    # risk. apply_secret_classification downgrades unproven keys to Info/Low and scrubs the raw value.
+    secret_classification.apply_secret_classification(rec_js_secrets)
     for index, secret in enumerate(rec_js_secrets, 1):
         cid, cname, cwe, owasp = _classify(secret)
         finding = {**secret, "ref": f"JS{index}", "class_id": cid, "class_name": cname, "cwe": cwe, "owasp": owasp,
@@ -454,8 +460,11 @@ def _run_campaign_body(
         if key in seen_keys:
             continue
         seen_keys.add(key)
+        # A public client key / dead credential is informational, not a submittable candidate.
+        _sc = str(finding.get("secret_classification") or "")
+        pstatus = "missing" if _sc in (secret_classification.PUBLIC_CLIENT_KEY, secret_classification.FALSE_POSITIVE) else "candidate"
         consolidated.append({"finding": finding, "source_url": finding["location"], "source_report": "",
-                             "source_json": "", "proof_status": "candidate", "cvss": {}})
+                             "source_json": "", "proof_status": pstatus, "cvss": {}})
 
     # --- API-discovery candidates (GraphQL introspection): each carries its own inline plan. ---
     for finding in recon_api_findings:

@@ -17,8 +17,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from bughunter import secret_classification
 from bughunter import sensitive_data
-from bughunter.code_scanner.redaction import redact_text
+from bughunter.code_scanner.redaction import redact_secret, redact_text
 
 _SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 _SEVERITY_LABEL = {
@@ -99,11 +100,22 @@ def resolve_severity(finding: dict[str, Any], plan: dict[str, Any] | None = None
     routes through here, so the severity shown for a finding can never disagree across
     the different outputs the operator submits."""
     cvss = plan.get("cvss") if isinstance(plan, dict) else None
+    tier = ""
     if isinstance(cvss, dict):
         cvss_severity = str(cvss.get("base_severity") or "").strip().lower()
         if cvss_severity in _SEVERITY_ORDER:
-            return cvss_severity
-    return str(finding.get("severity") or "low").strip().lower()
+            tier = cvss_severity
+    if not tier:
+        tier = str(finding.get("severity") or "low").strip().lower()
+    # Strict-secret clamp (defense in depth): an exposed key/token that classification did NOT confirm
+    # can NEVER read Medium+, regardless of any plan/brain CVSS. The classification cap wins over CVSS —
+    # a page-source / regex match must not be dressed up as a High secret.
+    cls = str(finding.get("secret_classification") or "")
+    if cls and cls != secret_classification.CONFIRMED_SECRET:
+        capped = secret_classification.severity_for_classification(cls, tier)
+        if _SEVERITY_ORDER.get(capped, 0) < _SEVERITY_ORDER.get(tier, 0):
+            return capped
+    return tier
 
 
 def _sev_rank(finding: dict[str, Any], plan: dict[str, Any] | None = None) -> int:
@@ -125,11 +137,17 @@ def _jwt_replay_value(finding: dict[str, Any]) -> bool | None:
 
 
 def _reportable_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Drop unconfirmed JWT credential candidates before report rendering."""
+    """Drop findings that must never reach a report: unconfirmed JWT credential candidates, and
+    exposed-secret findings classified ``false_positive`` (a credential the issuer rejected as
+    dead/revoked, or a placeholder) — those are noise, not findings. Public-client keys and unverified
+    candidates are KEPT (already downgraded to Info/Low) so the report can show them clearly marked
+    'not reportable yet' / 'informational only' rather than silently hiding them."""
     out: list[dict[str, Any]] = []
     for finding in findings:
         rule_id = str(finding.get("rule_id") or "")
         if rule_id in _JWT_CREDENTIAL_RULE_IDS and _jwt_replay_value(finding) is not True:
+            continue
+        if str(finding.get("secret_classification") or "") == secret_classification.FALSE_POSITIVE:
             continue
         out.append(finding)
     return out
@@ -314,14 +332,24 @@ def _has_captured_artifact(finding: dict[str, Any], proof: Any, observed_result:
     ``status: confirmed`` with vague prose essentially never supplies a real differential.
     This keeps an explicit status from single-handedly flipping proof_status (and the
     auto-submit gate behind it) without backing evidence."""
+    # A secret / exposed-key finding that strict classification did NOT confirm can NEVER be a captured
+    # artifact — no synthesized issuer narrative, "HTTP 200" mention, or brain prose may promote a public
+    # client key or an unverified candidate to confirmed. This is the single authoritative guard.
+    _sc = str(finding.get("secret_classification") or "")
+    if _sc and _sc != secret_classification.CONFIRMED_SECRET:
+        return False
     if _jwt_replay_value(finding) is True:
         return True
     if finding.get("secret_hits"):
         return True
-    # A credential the engine actively validated as LIVE is a proven finding — a benign read to
-    # the credential's own issuer confirmed it authenticates (see _append_credential_proof).
+    # A credential the engine actively validated as LIVE is a proven finding — a benign read to the
+    # credential's own issuer confirmed it authenticates — BUT ONLY for a genuinely privileged secret.
+    # A live Google/Firebase BROWSER key (getProjectConfig 200) is the EXPECTED behaviour of a public
+    # client key, not an exploit; secret_classification.has_confirmed_secret_proof requires a
+    # validator-backed server token (or a captured active artifact / embedded secret), never a public
+    # key's shape — so a live public key never counts as a captured artifact here.
     cred = finding.get("_credential_proof")
-    if isinstance(cred, dict) and cred.get("live") is True:
+    if isinstance(cred, dict) and cred.get("live") is True and secret_classification.has_confirmed_secret_proof(finding):
         return True
     if isinstance(proof, dict) and str(proof.get("observed_result") or "").strip() and str(proof.get("control_result") or "").strip():
         return True
@@ -336,7 +364,7 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
     # as a confirmed proof of impact directly — the project/domains are impact, not secrets, and the
     # raw key itself lives only in the dedicated credential section, never here.
     cred = finding.get("_credential_proof")
-    if isinstance(cred, dict) and cred.get("live") is True:
+    if isinstance(cred, dict) and cred.get("live") is True and secret_classification.has_confirmed_secret_proof(finding):
         project = str(cred.get("project_id") or "").strip()
         domains = [str(d) for d in (cred.get("authorized_domains") or []) if str(d).strip()]
         principal = str(cred.get("principal") or "").strip()
@@ -736,13 +764,35 @@ def _append_credential_proof(out: list[str], finding: dict[str, Any]) -> None:
     for a secret finding that carried a raw ``secret_value`` and/or a ``_credential_proof``."""
     secret = str(finding.get("secret_value") or "").strip()
     proof = finding.get("_credential_proof") if isinstance(finding.get("_credential_proof"), dict) else {}
-    if not secret and not proof:
+    ev = finding.get("secret_evidence") if isinstance(finding.get("secret_evidence"), dict) else {}
+    if not secret and not proof and not ev:
         return
-    out.append("## Credential — exact location, key, and live validation\n")
+    cls = str(finding.get("secret_classification") or ev.get("secret_classification") or "")
+    confirmed = cls == secret_classification.CONFIRMED_SECRET
+    out.append("## Credential — classification, evidence, and validation\n")
     var = str(finding.get("variable_name") or "").strip()
     out.append(f"- **Exact location:** {_code(_location(finding))}" + (f" — variable {_code(var)}" if var else ""))
-    if secret:
-        out.append(f"- **Credential (actual value, NOT redacted):** {_code(secret)}")
+    # NEVER print the full key — always a safe prefix…suffix redaction, whatever the classification.
+    redacted = str(ev.get("redacted_secret") or (redact_secret(secret) if secret else "")).strip()
+    if redacted:
+        out.append(f"- **Credential (redacted — prefix…suffix, never the full key):** {_code(redacted)}")
+    # The strict-classification evidence block: the fields a triager needs to trust — or correctly
+    # discount — this finding, so an unproven key is never dressed up as an exploited secret.
+    if ev:
+        out.append(f"- **Classification:** {_code(cls or secret_classification.CANDIDATE_UNVERIFIED)} — {ev.get('impact_summary', '')}")
+        out.append(f"- **Evidence status:** {ev.get('evidence_status', 'unverified')} · "
+                   f"proof required: {'yes' if ev.get('proof_required') else 'no'} · "
+                   f"proof present: {'yes' if ev.get('proof_present') else 'no'} · "
+                   f"impact proven: {'yes' if ev.get('impact_proven') else 'no'}")
+        out.append(f"- **Reportability:** {ev.get('reportability', 'not_reportable_yet')} — {ev.get('not_reportable_note', '')}")
+        out.append(f"- **Validation method:** {ev.get('validation_method', '')}")
+        out.append(f"- **Request evidence:** {_code(str(ev.get('request_evidence', '')))}")
+        out.append(f"- **Response evidence:** {ev.get('response_evidence', '')}")
+        missing = ev.get("missing_proof") or []
+        if missing and not confirmed:
+            out.append("- **Missing proof — required before this is reportable:**")
+            for m in missing:
+                out.append(f"  - {m}")
     if proof and proof.get("checked"):
         live = proof.get("live")
         label = "**LIVE** (validated)" if live is True else "not live / revoked" if live is False else "inconclusive"
@@ -757,35 +807,36 @@ def _append_credential_proof(out: list[str], finding: dict[str, Any]) -> None:
         if str(proof.get("scopes") or "").strip():
             out.append(f"- **Granted scopes:** {_code(str(proof['scopes']))}")
         issuer = str(proof.get("endpoint") or "the credential's own issuer").strip()
-        # Explicit "pure evidence of sent and return code": the exact request that was made and the
-        # HTTP status it returned — the two facts a triager needs to trust the liveness verdict. The
-        # "no account data read" clause is added ONLY for validators that read none (OpenAI/Anthropic
-        # model catalog, Stripe non-existent resource); GitHub/Slack/Firebase read + show the account
-        # identity/project below, so claiming no-data-read there would contradict this very block.
         no_data = " No account data was read." if proof.get("no_data_read") else ""
         out.append(f"- **Request sent:** one benign, read-only request to the credential's own issuer "
                    f"(`{issuer}`) carrying only the found credential — never the target." + no_data)
         verdict = ("authenticated — the credential is LIVE" if live is True
                    else "rejected — not live / revoked" if live is False else "inconclusive")
         out.append(f"- **Return code:** HTTP {proof.get('http_status', '?')} ({verdict}).")
-        # Runnable PoC + the ACTUAL issuer response — the reproducible command a triager runs and the
-        # captured artifact proving the credential is live and what it reveals (not prose). The command
-        # carries the real value on purpose (this block is already flagged sensitive); response redacted.
-        poc = str(proof.get("poc") or "").strip()
-        if poc:
-            out.append("")
-            out.append("**Proof of concept — reproduce liveness (one benign, read-only GET to the issuer, never the target):**\n")
-            out.append("```bash")
-            out.append(poc)
+    # A runnable liveness PoC + issuer response ONLY for a CONFIRMED secret — and with the key redacted
+    # even there (the report must never carry a usable key). A public/unverified key gets an explicit
+    # not-reportable banner instead of a polished PoC that would make it read as exploited.
+    if confirmed and str(proof.get("poc") or "").strip():
+        out.append("")
+        out.append("**Proof of concept — reproduce liveness (one benign, read-only request to the issuer; key redacted):**\n")
+        out.append("```bash")
+        out.append(secret_classification.redact_value_in(str(proof.get("poc")), secret))
+        out.append("```")
+        excerpt = str(proof.get("response_excerpt") or "").strip()
+        if excerpt:
+            out.append("Issuer response — proof the key is live and what it grants (redacted):\n")
+            out.append("```json")
+            out.append(secret_classification.redact_value_in(excerpt, secret)[:900])
             out.append("```")
-            excerpt = str(proof.get("response_excerpt") or "").strip()
-            if excerpt:
-                out.append("Issuer response — proof the key is live and what it grants (redacted):\n")
-                out.append("```json")
-                out.append(redact_text(excerpt)[0][:900])
-                out.append("```")
+    elif not confirmed:
+        if cls == secret_classification.PUBLIC_CLIENT_KEY:
+            out.append("\n> **Informational only: public client key or unverified browser key.** A Google/Firebase "
+                       "browser key, OAuth client id, or analytics/CDN config is designed to be public — it is NOT a "
+                       "reportable secret without proof of unauthorized access or real security impact (see missing proof above).")
+        else:
+            out.append(f"\n> **{ev.get('not_reportable_note') or 'Not reportable yet: candidate secret without confirmed impact.'}**")
     out.append("")
-    if secret:
+    if secret and confirmed:
         out.append(f"> {_CREDENTIAL_WARNING}")
         out.append("")
 

@@ -2,7 +2,28 @@
 
 Notable changes to GreyIQ.
 
-## v0.98.0
+## v0.99.0
+
+### Strict secret classification — stop over-reporting public API keys
+- BugHunter no longer reports a **public frontend API key** (Google/Firebase `AIza…`, OAuth client id,
+  Google Analytics / GTM id, Firebase web config, CDN/endpoint URL) as a **confirmed secret** or
+  **High/Medium** severity without proof. A value appearing in page source is not a vulnerability, and a
+  regex match is not a secret. A live Firebase browser key (a `getProjectConfig` 200) is the *expected*
+  behaviour of a public key — not an exploit.
+- Every exposed-key finding is now classified as one of **confirmed_secret** (a real, privileged secret
+  proven usable — a validator-backed live server token, a committed private key / service-account JSON /
+  `.env`, or a proven-open Firebase data store), **public_client_key** (browser-safe, informational),
+  **candidate_unverified** (a regex match with no validation — not reportable yet), or **false_positive**
+  (dead/revoked or a placeholder, hidden). Only a confirmed_secret may be Medium+.
+- Findings carry structured **evidence fields** (classification, proof present/required, validation
+  method, request/response evidence, impact proven, reportability, redacted secret) and the report says
+  plainly when something is **"Informational only"** or **"Not reportable yet"** and exactly what proof
+  is missing (domain/API restriction, unauthorized access, Firebase rules, billing abuse).
+- Reports and the JSON output now **redact secrets everywhere** — the full key is never printed (only a
+  safe prefix…suffix), including in the credential PoC and the structured findings sidecar.
+- Applied on every surface: hunts, campaigns, the standalone web scan, the on-demand "View full report",
+  and both the remote triage prompt and the offline local summary. Genuinely validated server tokens and
+  real Firebase data-store exposure still confirm and keep their severity.
 
 ### Single hunt now runs on the live dashboard
 - A **single Hunt** now drives the same **live dashboard** a full campaign does — you can watch it work

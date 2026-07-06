@@ -63,6 +63,10 @@ def _result_to_dict(result: ScanResult) -> dict[str, Any]:
         ),
         reverse=True,
     )
+    finding_dicts = [
+        _finding_to_dict(f, redacted=f"{f.rule_id}@{f.file_path}:{f.line_start}" in result.redacted_findings)
+        for f in ordered[:_MAX_FINDINGS_RETURNED]
+    ]
     return {
         "ok": True,
         "scan_type": "code",
@@ -78,13 +82,7 @@ def _result_to_dict(result: ScanResult) -> dict[str, Any]:
         "finding_count": len(result.findings),
         "suppressed_count": result.suppressed_count,
         "git_metadata": result.git_metadata,
-        "findings": [
-            _finding_to_dict(
-                f,
-                redacted=f"{f.rule_id}@{f.file_path}:{f.line_start}" in result.redacted_findings,
-            )
-            for f in ordered[:_MAX_FINDINGS_RETURNED]
-        ],
+        "findings": finding_dicts,
         "findings_truncated": len(result.findings) > _MAX_FINDINGS_RETURNED,
     }
 

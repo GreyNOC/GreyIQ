@@ -355,6 +355,7 @@ from bughunter import stored_xss_service as bounty_stored_xss  # noqa: E402
 from bughunter import ledger as bounty_ledger  # noqa: E402
 from bughunter import portfolio as bounty_portfolio  # noqa: E402
 from bughunter import vdp_policy as bounty_vdp  # noqa: E402
+from bughunter import secret_classification as bounty_secret_class  # noqa: E402
 from bughunter import hackerone_import as bounty_h1_import  # noqa: E402
 from bughunter import hackerone_activity as bounty_h1_activity  # noqa: E402
 from bughunter import progress as bounty_progress  # noqa: E402
@@ -1939,6 +1940,12 @@ class GreyIQRuntime:
             pe = {k: v for k, v in request.proof_evidence.model_dump().items() if str(v or "").strip()}
             if pe:
                 finding["proof_evidence"] = pe
+        # STRICT SECRET CLASSIFICATION on the on-demand report path too — a ledger/dashboard finding for a
+        # Google/Firebase browser key (or any exposed key) is reconstructed here from client fields with no
+        # classification, so without this every strict-secret gate (severity clamp, confirm authority,
+        # reportability) no-ops and a public key re-inflates to High/Confirmed/reportable. Classify BEFORE
+        # the attack plan + submission so the whole render pipeline sees the correct class + severity.
+        bounty_secret_class.apply_secret_classification([finding])
         # Every report gets REAL reproduction steps: the engine's offline attack-plan builder
         # (class-aware steps + a benign curl repro for web findings + impact + CVSS estimate),
         # the same steps a full hunt would emit — so an on-demand report for a ledger/dashboard
@@ -2317,6 +2324,15 @@ class GreyIQRuntime:
         key = str(finding.get("secret_value") or "").strip()
         if not key:
             return {"ok": False, "error": "This cached finding does not include the raw API key needed for a live issuer check."}
+        # Strict secret classification redacts the raw key from the finding so it can't leak into any
+        # report/JSON surface — which means it is no longer available for an on-demand re-test here. The
+        # engine already validates credentials automatically DURING an authorized hunt (populating the
+        # credential's live/not-live proof), so re-testing from a redacted cache isn't needed; be honest
+        # rather than silently validating the redacted placeholder and reporting a false "not live".
+        if "[REDACTED_SECRET" in key or "…" in key or "..." in key:
+            return {"ok": False, "error": "The raw key is redacted for safety, so it can't be re-tested here. "
+                    "Run the hunt with authorization ticked — the engine validates the credential live "
+                    "automatically and shows whether it's live in the finding's report."}
         rule_id = str(finding.get("rule_id") or "")
         validators = {
             "secret.github-pat": bounty_credential_validation.validate_github_token,
@@ -4408,17 +4424,19 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             return
         if method == "POST" and path == "/api/scan/code":
             request = validate_payload(ScanCodeRequest, await read_json_body(receive))
-            await send_json(
-                send,
-                await asyncio.to_thread(
-                    run_code_scan,
-                    request.target,
-                    request.target_type,
-                    request.max_files,
-                    tuple(request.include_globs),
-                    tuple(request.exclude_globs),
-                ),
-            )
+
+            def _scan_and_classify() -> dict[str, Any]:
+                res = run_code_scan(request.target, request.target_type, request.max_files,
+                                    tuple(request.include_globs), tuple(request.exclude_globs))
+                # Strict secret classification + raw-value scrub before the result leaves for the browser:
+                # this standalone route returns finding secret_value un-redacted otherwise (run_code_scan is
+                # also used INTERNALLY by run_bounty_hunt, which classifies later and needs the raw value for
+                # AWS key pairing — so the scrub is applied HERE, at the API edge, not inside run_code_scan).
+                if isinstance(res, dict) and isinstance(res.get("findings"), list):
+                    bounty_secret_class.apply_secret_classification(res["findings"])
+                return res
+
+            await send_json(send, await asyncio.to_thread(_scan_and_classify))
             return
         if method == "POST" and path == "/api/scan/web":
             request = validate_payload(WebScanRequest, await read_json_body(receive))
