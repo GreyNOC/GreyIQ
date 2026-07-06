@@ -4542,15 +4542,19 @@ function ckSetView(view) {
 function ckSetRunType(type) {
   state.ckRunType = ["campaign", "portfolio"].includes(type) ? type : "hunt";
   saveState();
-  ck.segHunt?.classList.toggle("is-active", state.ckRunType === "hunt");
-  ck.segCampaign?.classList.toggle("is-active", state.ckRunType === "campaign");
-  ck.segPortfolio?.classList.toggle("is-active", state.ckRunType === "portfolio");
+  for (const [seg, type] of [[ck.segHunt, "hunt"], [ck.segCampaign, "campaign"], [ck.segPortfolio, "portfolio"]]) {
+    if (!seg) continue;
+    const on = state.ckRunType === type;
+    seg.classList.toggle("is-active", on);
+    seg.setAttribute("aria-pressed", String(on));  // selection conveyed to AT, not by color alone
+  }
   for (const node of document.querySelectorAll("[data-ck-when]")) {
     node.hidden = node.dataset.ckWhen !== state.ckRunType;
   }
   if (ck.run) ck.run.textContent = state.ckRunType === "campaign" ? "Run campaign" : (state.ckRunType === "portfolio" ? "Run portfolio hunt" : "Run hunt");
   ckUpdateSpanScopeToggle();
   if (state.ckRunType === "portfolio") ckRenderPortfolioPicker();
+  ckSyncSetupReveal();  // Portfolio always reveals the rest; hunt/campaign keep the program-first gate
 }
 
 // The Portfolio-mode program multi-select: a checkbox per saved program (marking which have
@@ -5116,6 +5120,14 @@ async function ckDeleteFinding(f, btn) {
   ckState.findings = ckState.findings.filter((x) =>
     !(x.ref === f.ref && x.className === f.className
       && (x.class_id || "") === (f.class_id || "") && (x.location || "") === (f.location || "")));
+  // Prune this finding's status-overlay entry so the persisted overlay can't grow unbounded — but ONLY
+  // when no surviving finding still maps to the same (coarse) key: ckFindingKey normalizes digits, so
+  // siblings like /api/users/1 and /api/users/2 alias to one key, and deleting one must not wipe the
+  // other's still-live status.
+  const ovKey = ckFindingKey(f);
+  if (ovKey && ckStatusOverlay[ovKey] && !ckState.findings.some((x) => ckFindingKey(x) === ovKey)) {
+    delete ckStatusOverlay[ovKey]; ckSaveStatusOverlay();
+  }
   ckCloseDetail();
   ckRenderFindings();
   ckBadgeCount("findings", ckState.findings.length);
@@ -5921,26 +5933,42 @@ function ckPopulateActiveProgramSelect() {
   if (!ck.activeProgram) return;
   const current = ck.activeProgram.value;
   ck.activeProgram.replaceChildren();
-  const none = cel("option", null, "— pick a saved program —"); none.value = "";
+  const none = cel("option", null, "— pick a program —"); none.value = "";
   ck.activeProgram.append(none);
   for (const p of ckProgramsCache) {
     const o = cel("option", null, p.name || p.id); o.value = p.id;
     ck.activeProgram.append(o);
   }
+  // Explicit escape hatch so the program-first flow still works with no saved programs — picking this
+  // reveals the rest of the setup for a hand-typed target and keeps program_id null on every run.
+  const oneoff = cel("option", null, "＋ One-off target (no saved program)"); oneoff.value = "__oneoff__";
+  ck.activeProgram.append(oneoff);
   const restore = state.ckActiveProgramId || current;
   if (restore && [...ck.activeProgram.options].some((o) => o.value === restore)) ck.activeProgram.value = restore;
+  else if (!state.ckActiveProgramId && state.ckOneOff) ck.activeProgram.value = "__oneoff__";  // restore a one-off session
   // Keep the Portfolio multi-select in sync with the same programs cache.
   if (state.ckRunType === "portfolio") ckRenderPortfolioPicker();
+  ckSyncSetupReveal();
+  ckUpdateTopProgram();
 }
 
 // Fills Target/Scope from a saved program — still hand-editable after. Only runs on an
 // explicit picker change, never silently on boot (that would clobber a hand-edited
 // Target/Scope with stale program data on every reload).
 function ckApplyActiveProgram(id) {
-  state.ckActiveProgramId = id;
+  // "One-off target" is a UI-only choice meaning "no saved program" — it maps to an empty active
+  // program id (so program_id stays null on every run/report call) while still advancing the flow.
+  const oneoff = id === "__oneoff__";
+  state.ckActiveProgramId = oneoff ? "" : id;
+  state.ckOneOff = oneoff;   // remember an explicit one-off choice so boot can re-select it
   saveState();
-  const prog = ckProgramsCache.find((p) => p.id === id);
-  if (!prog) { ckUpdateSpanScopeToggle({ resetDefault: true }); return; }
+  const prog = oneoff ? null : ckProgramsCache.find((p) => p.id === id);
+  if (!prog) {
+    ckUpdateSpanScopeToggle({ resetDefault: true });
+    ckSyncSetupReveal();
+    ckUpdateTopProgram();
+    return;
+  }
   if (ck.target && prog.seed_targets && prog.seed_targets.length) ck.target.value = prog.seed_targets[0];
   if (ck.scope && prog.scope_text) ck.scope.value = prog.scope_text;
   if (ck.program) ck.program.value = prog.platform_handle || "";
@@ -5949,6 +5977,35 @@ function ckApplyActiveProgram(id) {
   state.ckProgram = ck.program ? ck.program.value : state.ckProgram;
   saveState();
   ckUpdateSpanScopeToggle({ resetDefault: true });
+  ckSyncSetupReveal();
+  ckUpdateTopProgram();
+}
+
+// Program-first launch flow: the rest of the Hunt-setup form stays hidden until the operator picks a
+// program (or the explicit one-off option). A returning session that already had a target entered
+// stays open so nothing they were mid-editing disappears on reload.
+function ckSyncSetupReveal() {
+  const rest = document.getElementById("ckSetupRest");
+  if (!rest) return;
+  const v = ck.activeProgram ? ck.activeProgram.value : "";
+  // Portfolio mode selects programs in the multi-picker inside the rest, so it never gates on the
+  // single-program step — always reveal there. Otherwise proceed once a program/one-off/target exists.
+  const chosen = state.ckRunType === "portfolio"
+    || (!!v && v !== "")
+    || Boolean(((ck.target && ck.target.value) || state.ckTarget || "").trim());
+  rest.hidden = !chosen;
+  const lead = document.getElementById("ckProgramLead");
+  if (lead) lead.hidden = chosen;  // drop the prompt once they've moved past step 1
+}
+
+// Mirror the picked program's name into the read-only top-bar Program indicator.
+function ckUpdateTopProgram() {
+  const el = document.getElementById("ckTopProgram");
+  if (!el) return;
+  const id = state.ckActiveProgramId || "";
+  const prog = id ? (ckProgramsCache || []).find((p) => p.id === id) : null;
+  const v = ck.activeProgram ? ck.activeProgram.value : "";
+  el.textContent = prog ? (prog.name || prog.id) : (v === "__oneoff__" ? "One-off target" : "— none —");
 }
 
 // The VDP policy profile (e.g. "nasa") of the currently-picked program, or "" if none. Passed to the
@@ -8334,7 +8391,9 @@ async function ckGetReportReady(rec, btn, status, li) {
 
 // Persisted "Saved views" for the Report Center (self-contained localStorage, like ckStatusOverlay).
 const ckSavedViews = (() => {
-  try { return JSON.parse(localStorage.getItem("greyiq-rc-views") || "[]") || []; } catch (_) { return []; }
+  // Array.isArray guard: a well-formed non-array JSON value (e.g. "{}" from an out-of-band edit or an
+  // older/newer schema) is truthy and passes JSON.parse, and would crash the menu's .forEach/.push.
+  try { const v = JSON.parse(localStorage.getItem("greyiq-rc-views") || "[]"); return Array.isArray(v) ? v : []; } catch (_) { return []; }
 })();
 function ckSaveSavedViews() { try { localStorage.setItem("greyiq-rc-views", JSON.stringify(ckSavedViews)); } catch (_) { /* private mode / quota */ } }
 
@@ -8348,23 +8407,49 @@ function ckCloseOpenMenus() { for (const c of [...ckOpenMenus]) { try { c(); } c
 // Returns a positioned wrapper span containing the trigger; used by the row kebab and Saved views.
 function ckAttachMenu(triggerEl, buildItems) {
   triggerEl.setAttribute("aria-haspopup", "true");
+  triggerEl.setAttribute("aria-expanded", "false");  // collapsed state present from first render
   const host = cel("span"); host.style.position = "relative"; host.style.display = "inline-flex";
   let menu = null;
-  const onDoc = (e) => { if (menu && !host.contains(e.target)) close(); };
-  function close() { if (menu) { menu.remove(); menu = null; } document.removeEventListener("click", onDoc, true); ckOpenMenus.delete(close); triggerEl.setAttribute("aria-expanded", "false"); }
+  const onDoc = (e) => { if (menu && !host.contains(e.target) && !menu.contains(e.target)) close(); };
+  const onKey = (e) => { if (e.key === "Escape" && menu) { e.stopPropagation(); close(); try { triggerEl.focus(); } catch (_) {} } };
+  const onReflow = () => { if (menu) close(); };  // a fixed-positioned menu would detach on scroll/resize — close it
+  function close() {
+    if (menu) { menu.remove(); menu = null; }
+    document.removeEventListener("click", onDoc, true);
+    document.removeEventListener("keydown", onKey, true);
+    window.removeEventListener("scroll", onReflow, true);
+    window.removeEventListener("resize", onReflow);
+    ckOpenMenus.delete(close);
+    triggerEl.setAttribute("aria-expanded", "false");
+  }
+  // Position the open menu as position:fixed at the trigger, flipping upward when there isn't room
+  // below — otherwise it is clipped by the Report Center's scroll containers (.ck-main / the table
+  // wrap) on the bottom rows, or pushed off-screen.
+  function place() {
+    const r = triggerEl.getBoundingClientRect();
+    menu.style.position = "fixed"; menu.style.right = "auto";
+    const mh = menu.offsetHeight, mw = menu.offsetWidth;
+    const openUp = (window.innerHeight - r.bottom) < mh + 10 && r.top > mh + 10;
+    menu.style.top = (openUp ? r.top - mh - 4 : r.bottom + 4) + "px";
+    menu.style.left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8)) + "px";
+  }
   triggerEl.addEventListener("click", (e) => {
     e.stopPropagation();
     if (menu) { close(); return; }
-    menu = cel("div", "ck-kebab-menu");
+    menu = cel("div", "ck-kebab-menu"); menu.setAttribute("role", "menu");
     for (const it of buildItems()) {
-      const b = cel("button", null, it.label); b.type = "button";
+      const b = cel("button", null, it.label); b.type = "button"; b.setAttribute("role", "menuitem");
       if (it.disabled) b.disabled = true;
       b.addEventListener("click", (ev) => { ev.stopPropagation(); close(); if (it.onClick) it.onClick(); });
       menu.append(b);
     }
     host.append(menu);
+    place();
     triggerEl.setAttribute("aria-expanded", "true");
     document.addEventListener("click", onDoc, true);
+    document.addEventListener("keydown", onKey, true);
+    window.addEventListener("scroll", onReflow, true);
+    window.addEventListener("resize", onReflow);
     ckOpenMenus.add(close);
   });
   host.append(triggerEl);
@@ -10434,6 +10519,14 @@ function bootCockpit() {
     ckUpdatePortfolioCount();
   });
   ck.activeProgram?.addEventListener("change", () => ckApplyActiveProgram(ck.activeProgram.value));
+  // Persist a hand-typed target/scope as it's entered, so a one-off setup survives reload (and the
+  // program-first reveal stays open) instead of collapsing back to step 1 on next boot.
+  // Persist as typed. Only REVEAL on input (a non-empty target opens the rest) — never let a keystroke
+  // HIDE the rest while the user is editing inside it (clearing the field to retype would otherwise
+  // collapse #ckSetupRest and blur the focused input). Collapsing happens only on an explicit
+  // program-picker change via ckApplyActiveProgram.
+  ck.target?.addEventListener("input", () => { state.ckTarget = ck.target.value; saveState(); if (ck.target.value.trim()) ckSyncSetupReveal(); });
+  ck.scope?.addEventListener("input", () => { state.ckScope = ck.scope.value; saveState(); });
   ck.spanScope?.addEventListener("change", () => {
     state.ckSpanScope = Boolean(ck.spanScope.checked);
     saveState();
@@ -10457,6 +10550,8 @@ function bootCockpit() {
   if (ck.authHeaders) ck.authHeaders.value = state.ckAuthHeaders || "";
   if (ck.authFold && (state.ckAuthCookie || state.ckAuthHeaders)) ck.authFold.open = true;
   ckSetRunType(state.ckRunType || "hunt");
+  ckSyncSetupReveal();   // reveal the rest of setup immediately if a target was already restored
+  ckUpdateTopProgram();
   ckSyncService();
   void ckPopulateProfiles();
   void (async () => {

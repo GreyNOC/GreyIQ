@@ -2961,13 +2961,6 @@ body[data-app-mode="hunt"] .cockpit {
 }
 .ck-body.has-detail { grid-template-columns: minmax(0, 1fr) minmax(22rem, 30rem); }
 
-.ck-rail {
-  border-right: 1px solid var(--border);
-  padding: 0.9rem;
-  overflow-y: auto;
-  display: flex; flex-direction: column; gap: 0.9rem;
-  background: color-mix(in srgb, var(--surface) 50%, transparent);
-}
 /* ===== Redesign: left sidebar (brand + single-column icon nav + hunt-setup fold + footer) ===== */
 .ck-sidebar {
   grid-row: 1 / -1;
@@ -3028,6 +3021,23 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-setup-fold[open] .ck-setup-head::after { transform: rotate(90deg); }
 .ck-setup-fold .ck-launch { padding-top: 0.3rem; }
 .ck-setup-fold .ck-disclaimer { margin-top: 0.7rem; }
+
+/* --- Program-first launch flow --- */
+.ck-step-lab { display: flex; align-items: center; gap: 0.45rem; margin: 0.2rem 0 0.1rem;
+  font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.ck-step-n { display: inline-flex; align-items: center; justify-content: center; width: 1.2rem; height: 1.2rem;
+  flex: none; border-radius: 50%; font-size: 0.68rem; font-weight: 800;
+  background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--accent); }
+.ck-setup-step.ck-step-program { display: flex; flex-direction: column; gap: 0.3rem; }
+/* The Program step is the flow's entry point — give the select an accent ring so it reads as step 1. */
+.ck-step-program select { font: inherit; font-size: 0.9rem; color: var(--text);
+  background: var(--surface); border: 1px solid var(--accent); border-radius: 9px; padding: 0.55rem 0.6rem;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent); }
+.ck-step-program select:focus { outline: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent); }
+.ck-step-hint { margin-top: 0.05rem; }
+.ck-setup-rest { display: flex; flex-direction: column; gap: 0.6rem; }
+/* Read-only Program value mirrored into the top bar (the live picker lives in the sidebar). */
+.ck-topbar-value { font-size: 0.86rem; font-weight: 600; color: var(--text); padding: 0.12rem 0; white-space: nowrap; }
 
 /* Sidebar footer (Operator) */
 .ck-side-foot { margin-top: auto; padding-top: 0.6rem; border-top: 1px solid var(--border); }
@@ -3462,7 +3472,9 @@ body[data-app-mode="hunt"] .cockpit {
 }
 
 /* Data table */
-.ck-rc-table-wrap { border: 1px solid var(--border); border-radius: var(--radius-card); overflow: visible; background: var(--surface); }
+/* Own horizontal scroll so the 7-column table's right-hand columns (incl. Actions) aren't clipped
+   off-screen on narrow viewports. The row kebab is position:fixed, so it escapes this scroll box. */
+.ck-rc-table-wrap { border: 1px solid var(--border); border-radius: var(--radius-card); overflow-x: auto; overflow-y: visible; background: var(--surface); }
 .ck-rc-table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
 .ck-rc-table th {
   text-align: left; font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.06em;
@@ -3511,7 +3523,7 @@ body[data-app-mode="hunt"] .cockpit {
 }
 .ck-kebab:hover { border-color: var(--accent); color: var(--text); }
 .ck-kebab-menu {
-  position: absolute; top: calc(100% + 0.3rem); right: 0; z-index: 40;
+  position: fixed; z-index: 200;
   background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 0.3rem;
   display: flex; flex-direction: column; min-width: 9.5rem; box-shadow: 0 10px 28px rgba(0,0,0,0.4);
 }
@@ -3538,11 +3550,6 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-sev.sev-low { color: var(--ok); }
 .ck-preset-bar { margin: 0.5rem 0 1rem; padding: 0.75rem; border: 1px dashed var(--border); border-radius: 8px; }
 
-/* Operator tab — the cockpit nav is a 2-column grid. With an odd view count (9: … Report
-   Center, Access control, Learn, Operator), let the trailing button span both columns so the
-   last row reads as intentional rather than a ragged orphan. */
-.ck-nav-5 { grid-template-columns: repeat(2, 1fr); }
-.ck-nav-5 .ck-nav-btn:last-child:nth-child(odd) { grid-column: 1 / -1; }
 .ck-op-ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; margin: 0.4rem 0 1.2rem; }
 .ck-op-log { max-height: 14rem; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); padding: 0.5rem 0.7rem; margin-bottom: 1.2rem; }
 .ck-op-event { display: flex; gap: 0.6rem; font-size: 0.78rem; line-height: 1.6; font-family: var(--code-font); color: var(--text); }
