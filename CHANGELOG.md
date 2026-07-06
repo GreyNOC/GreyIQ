@@ -2,6 +2,28 @@
 
 Notable changes to GreyIQ.
 
+## v1.2.0
+
+### Program-first launch flow
+- The sidebar **Hunt setup** is now a guided, program-first flow: **Program** is step 1 (an accented
+  picker at the top), and the rest of the form (**Target & scope**, **Options**, Run) stays hidden until
+  you pick a saved program — which auto-fills target + scope — or choose the new **One-off target** option
+  to enter your own. The top bar shows a read-only Program indicator mirroring the choice.
+- A hand-typed one-off target now persists across reloads (the setup no longer collapses back to step 1),
+  and clearing the target to retype no longer yanks focus or hides the form.
+
+### QA/QC pass — reliability, layout, and accessibility fixes
+- **Report Center table** scrolls horizontally instead of clipping its right-hand columns (incl. the
+  Actions button + kebab) off-screen on narrow viewports.
+- The row **kebab menu** is now `position: fixed` and flips upward near the bottom of the list, so its
+  items are never clipped by the scroll container; it closes on Escape (returning focus) and on scroll,
+  and exposes `role="menu"`/`menuitem`.
+- **Accessibility:** the run-type control exposes its selection via `aria-pressed` (not colour alone);
+  popup triggers initialise `aria-expanded`.
+- **Robustness:** the Saved-views loader guards against a corrupt (non-array) localStorage value; the
+  per-finding status overlay is pruned on delete (bounded growth) without wiping a sibling finding's
+  status; removed dead `.ck-rail` / `.ck-nav-5` CSS left over from the pre-redesign cockpit.
+
 ## v1.1.0
 
 ### Redesigned bug-bounty cockpit — sidebar + top-bar shell, Report Center as a data board

@@ -414,6 +414,14 @@
         <details class="ck-setup-fold" id="ckSetupFold" open>
           <summary class="ck-setup-head"><span>Hunt setup</span></summary>
           <form class="ck-launch" id="ckLaunch">
+            <div class="ck-setup-step ck-step-program">
+              <span class="ck-step-lab"><span class="ck-step-n">1</span> Program</span>
+              <select id="ckActiveProgram" aria-label="Program"><option value="">— pick a program —</option></select>
+              <p class="ck-hint ck-step-hint" id="ckProgramLead">Pick a saved program to auto-fill target &amp; scope — or choose a one-off target to enter your own.</p>
+            </div>
+
+            <div id="ckSetupRest" class="ck-setup-rest" hidden>
+            <span class="ck-step-lab"><span class="ck-step-n">2</span> Target &amp; scope</span>
             <div data-ck-when="portfolio" hidden class="ck-portfolio-pick">
               <div class="ck-portfolio-head">
                 <span>Programs to hunt <strong id="ckPortfolioCount"></strong></span>
@@ -438,6 +446,7 @@
             </div>
             <p class="ck-hint" id="ckProfileHint" data-ck-when="hunt"></p>
 
+            <span class="ck-step-lab"><span class="ck-step-n">3</span> Options</span>
             <div class="ck-toggles">
               <label class="ck-switch" id="ckSpanScopeWrap" data-ck-when="campaign" hidden>
                 <input id="ckSpanScope" type="checkbox">
@@ -468,6 +477,7 @@
 
             <button class="ck-run" id="ckRun" type="submit">Run hunt</button>
             <p class="ck-status" id="ckStatus" aria-live="polite"></p>
+            </div>
           </form>
 
           <p class="ck-disclaimer">Authorized testing only. Active probes fire only against a host you name in Scope, after you tick the authorization box. The server enforces both — fail-closed.</p>
@@ -483,7 +493,7 @@
           <div class="ck-topbar-left">
             <div class="ck-topbar-field">
               <span class="ck-topbar-flabel">Program</span>
-              <select id="ckActiveProgram" aria-label="Active program"><option value="">— pick a program —</option></select>
+              <span class="ck-topbar-value" id="ckTopProgram" title="Chosen in the sidebar’s Hunt setup">— none —</span>
             </div>
             <div class="ck-topbar-field">
               <span class="ck-topbar-flabel">Campaign</span>
