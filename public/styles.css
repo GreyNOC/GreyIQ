@@ -2880,6 +2880,25 @@ body[data-app-mode="hunt"] .cockpit {
 }
 .ck-service.is-up { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
 .ck-service.is-down { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
+/* is-reconnecting wins over is-up/is-down (declared last) so a stale "ready" pill still reads amber. */
+.ck-service.is-reconnecting { color: var(--sun); border-color: color-mix(in srgb, var(--sun) 55%, var(--border)); }
+
+/* Engine-unreachable banner (auto-shown by the live client after repeated poll failures). */
+.ck-banner {
+  display: flex; align-items: center; justify-content: center; gap: 0.7rem;
+  padding: 0.45rem 1rem; font-size: 0.82rem;
+  color: color-mix(in srgb, var(--sun) 35%, var(--text));
+  background: color-mix(in srgb, var(--sun) 12%, var(--surface));
+  border-bottom: 1px solid color-mix(in srgb, var(--sun) 45%, var(--border));
+}
+.ck-banner[hidden] { display: none; }
+.ck-banner-msg { font-weight: 500; }
+.ck-banner-retry {
+  font: inherit; font-size: 0.78rem; cursor: pointer; color: var(--text);
+  background: transparent; border: 1px solid color-mix(in srgb, var(--sun) 55%, var(--border));
+  border-radius: 7px; padding: 0.2rem 0.6rem; transition: background 0.15s;
+}
+.ck-banner-retry:hover { background: color-mix(in srgb, var(--sun) 16%, transparent); }
 .ck-ghost {
   font: inherit; font-size: 0.8rem; cursor: pointer; color: var(--text);
   background: transparent; border: 1px solid var(--border); border-radius: 8px;
@@ -3250,12 +3269,30 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-list li { padding: 0.6rem 0.8rem; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); font-size: 0.84rem; display: flex; justify-content: space-between; align-items: center; gap: 0.6rem; }
 .ck-list .ck-floc { flex: 1; }
 .ck-tag { font-size: 0.7rem; color: var(--muted); padding: 0.12rem 0.45rem; border: 1px solid var(--border); border-radius: 999px; white-space: nowrap; }
+
+/* Report Center — "report ready" badge + POC/POI/POE presence dots. */
+.ck-ready-badge {
+  font-size: 0.68rem; font-weight: 700; letter-spacing: 0.02em; white-space: nowrap;
+  color: var(--ok, #12855a); padding: 0.1rem 0.45rem; border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--ok, #12855a) 50%, var(--border));
+  background: color-mix(in srgb, var(--ok, #12855a) 12%, transparent);
+}
+.ck-proof-dots { display: inline-flex; gap: 0.3rem; margin-left: 0.5rem; vertical-align: middle; }
+.ck-pxx-dot {
+  font-size: 0.6rem; font-weight: 700; letter-spacing: 0.03em; padding: 0.05rem 0.32rem;
+  border-radius: 4px; border: 1px solid var(--border); color: var(--muted);
+}
+.ck-pxx-dot.is-on { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.ck-pxx-dot.is-off { opacity: 0.5; text-decoration: line-through; }
 .ck-tag-policy { color: var(--accent, #4f9dff); border-color: var(--accent, #4f9dff); font-weight: 600; }
 .ck-preset-bar { margin: 0.5rem 0 1rem; padding: 0.75rem; border: 1px dashed var(--border); border-radius: 8px; }
 
-/* Operator tab — the cockpit nav holds 8 views; keep an even 2-column grid
-   (3 columns left a ragged trailing row of 2). */
+/* Operator tab — the cockpit nav is a 2-column grid. With an odd view count (9: … Report
+   Center, Access control, Learn, Operator), let the trailing button span both columns so the
+   last row reads as intentional rather than a ragged orphan. */
 .ck-nav-5 { grid-template-columns: repeat(2, 1fr); }
+.ck-nav-5 .ck-nav-btn:last-child:nth-child(odd) { grid-column: 1 / -1; }
 .ck-op-ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; margin: 0.4rem 0 1.2rem; }
 .ck-op-log { max-height: 14rem; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); padding: 0.5rem 0.7rem; margin-bottom: 1.2rem; }
 .ck-op-event { display: flex; gap: 0.6rem; font-size: 0.78rem; line-height: 1.6; font-family: var(--code-font); color: var(--text); }

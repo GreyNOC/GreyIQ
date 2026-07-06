@@ -301,6 +301,39 @@ def mark_reported(runtime_dir: str | Path, program: str | None, target: str, fin
     advance_stage(runtime_dir, program, target, dedup_key(finding), "reported")
 
 
+def mark_report_ready(runtime_dir: str | Path, program: str | None, target: str, key: str, *,
+                      report_index: dict[str, Any] | None = None,
+                      proof_flags: dict[str, Any] | None = None) -> bool:
+    """Flag a finding's report as ASSEMBLED — "ready to review/submit" in the Report Center.
+    Records ``report_ready``/``report_ready_at``, which of POC/POI/POE the assembled report
+    actually carries (``report_ready_proof``), and a small artifact index (platform/filename/
+    proof_status). Deliberately ORTHOGONAL to the pipeline ``stage`` (never advances/regresses it)
+    so "ready" is independent of report/submit state and can't perturb the funnel or the
+    anti-duplicate gate. Locates the record in the given program bucket, else searches the whole
+    portfolio (a history finding's bucket id may differ from ``program_key(program, target)``).
+    No-op returning False when the key isn't recorded (the caller upserts the finding first)."""
+    pid = program_key(program, target)
+    with _LOCK:
+        data = _load(runtime_dir)
+        # Non-mutating lookup (don't use _prog_bucket — it would create an empty bucket for a wrong pid).
+        rec = data.get("programs", {}).get(pid, {}).get("findings", {}).get(key)
+        if rec is None:
+            for bucket in data.get("programs", {}).values():
+                cand = (bucket.get("findings") or {}).get(key)
+                if cand is not None:
+                    rec = cand
+                    break
+        if rec is None:
+            return False
+        rec["report_ready"] = True
+        rec["report_ready_at"] = _now()
+        rec["report_ready_proof"] = {k: bool((proof_flags or {}).get(k)) for k in ("poc", "poi", "poe")}
+        rec["report_index"] = report_index if isinstance(report_index, dict) else {}
+        rec["updated_at"] = _now()
+        _save(runtime_dir, data)
+    return True
+
+
 # --- Deletion / suppression -------------------------------------------------------
 # A finding the operator DELETES is recorded here by its stable dedup key. Every future
 # hunt/campaign filters these out, and the durable history + funnel + CSV export hide
@@ -474,6 +507,7 @@ def funnel(runtime_dir: str | Path, program: str | None = None, target: str = ""
         counts = dict.fromkeys(STAGES, 0)
         bounty = 0.0
         total = 0
+        ready = 0
         for pid in pids:
             for key, rec in (data.get(pid, {}).get("findings", {}) or {}).items():
                 if key in dismissed or rec.get("dismissed"):
@@ -482,8 +516,10 @@ def funnel(runtime_dir: str | Path, program: str | None = None, target: str = ""
                 stage = rec.get("stage", "discovered")
                 if stage in counts:
                     counts[stage] += 1
+                if rec.get("report_ready"):
+                    ready += 1  # orthogonal to stage: how many have an assembled report in the Report Center
                 bounty += float(rec.get("bounty") or 0.0)
-        return {"total": total, "stages": counts, "bounty_total": round(bounty, 2)}
+        return {"total": total, "stages": counts, "bounty_total": round(bounty, 2), "ready": ready}
 
     if program or target:
         return {"program": keys[0], **_count(keys)}
@@ -540,9 +576,19 @@ def list_all(runtime_dir: str | Path, limit: int = _MAX_LIST_ALL) -> list[dict[s
         for key, rec in (bucket.get("findings") or {}).items():
             if key in dismissed or rec.get("dismissed"):
                 continue  # deleted — never surfaced in the durable history
-            out.append({**rec, "program": pid, "dedup_key": key})
+            out.append({**rec, "program": pid, "dedup_key": key, "readyable": _readyable(rec)})
     out.sort(key=lambda r: str(r.get("updated_at") or r.get("last_seen") or ""), reverse=True)
     return out[: max(1, limit)]
+
+
+def _readyable(rec: dict[str, Any]) -> bool:
+    """Whether a "Get report ready" action can produce a meaningful report for this record: it
+    carries captured proof (POE/POI) or its server-truth proof_status is at least a candidate.
+    (A bare 'missing' record with no captured evidence can still be reported, but there's nothing
+    to assemble beyond the deterministic steps — the UI de-emphasizes it.)"""
+    cap = rec.get("captured_proof") if isinstance(rec.get("captured_proof"), dict) else {}
+    return bool(cap.get("proof_evidence") or cap.get("proof_of_impact") or cap.get("credential_proof")) \
+        or str(rec.get("proof_status") or "").lower() in ("candidate", "confirmed")
 
 
 def to_csv_rows(runtime_dir: str | Path, program: str | None = None, target: str = "") -> list[dict[str, Any]]:

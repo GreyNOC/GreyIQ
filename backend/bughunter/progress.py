@@ -22,6 +22,16 @@ _runs: dict[str, dict[str, Any]] = {}
 _run_order: list[str] = []
 _stopped: set[str] = set()  # run_ids the operator asked to cancel (cooperative-cancellation flags)
 
+# --- App-wide (cross-run) event ring -------------------------------------------
+# A single global stream the UI polls at /api/bounty/events so ANY tab can react
+# live to work happening in another run/program (a finding confirmed in a campaign,
+# a report readied in the Report Center, a submission filed). This is the app-wide
+# counterpart to the per-run `events` log above; kept small since it's a notify
+# channel, not the system of record (the ledger is).
+_MAX_GLOBAL_EVENTS = 300
+_global_events: list[dict[str, Any]] = []
+_global_base_seq = 0  # how many events have been trimmed off the front (keeps 'after' cursors stable)
+
 
 def start_run(run_id: str) -> None:
     """Reset (or create) the buffer for run_id, evicting the oldest run past _MAX_RUNS."""
@@ -92,6 +102,44 @@ def tail(run_id: str, after: int = 0) -> dict[str, Any]:
         events = list(entry["events"])
     total = base + len(events)
     start_idx = max(0, after - base)
+    return {"events": events[start_idx:], "count": total}
+
+
+# --- App-wide event stream (cross-run notify channel) -----------------------------
+
+def global_log(kind: str, payload: dict[str, Any] | None = None) -> None:
+    """Append a cross-run event (``finding_confirmed`` | ``report_ready`` | ``submitted``)
+    to the single app-wide ring the UI polls. Mirrors ``log``'s ``base_seq`` bookkeeping so a
+    client's absolute ``after`` cursor never desyncs once the ring wraps. Must NOT be called
+    while ``_lock`` is already held (it takes the same lock)."""
+    global _global_base_seq
+    if not kind:
+        return
+    try:
+        with _lock:
+            _global_events.append({
+                "at": datetime.now(UTC).isoformat(),
+                "kind": str(kind)[:40],
+                "payload": payload if isinstance(payload, dict) else {},
+            })
+            overflow = len(_global_events) - _MAX_GLOBAL_EVENTS
+            if overflow > 0:
+                del _global_events[:overflow]
+                _global_base_seq += overflow
+    except Exception:  # noqa: BLE001 - a notify event must never break a hunt
+        pass
+
+
+def global_tail(after: int = 0) -> dict[str, Any]:
+    """Global events since the client's absolute cursor + the new absolute count (mirrors ``tail``)."""
+    with _lock:
+        base = _global_base_seq
+        events = list(_global_events)
+    total = base + len(events)
+    try:
+        start_idx = max(0, int(after) - base)
+    except (TypeError, ValueError):
+        start_idx = 0
     return {"events": events[start_idx:], "count": total}
 
 
@@ -174,6 +222,7 @@ def add_findings(run_id: str, target: str, findings: list[dict[str, Any]]) -> No
     """Append compact findings discovered for a work unit and roll their counts into it."""
     if not run_id:
         return
+    confirmed_events: list[dict[str, Any]] = []  # emitted to the app-wide stream AFTER the lock releases
     try:
         with _lock:
             entry = _runs.get(run_id)
@@ -210,6 +259,13 @@ def add_findings(run_id: str, target: str, findings: list[dict[str, Any]]) -> No
                 added += 1
                 if proof == "confirmed":
                     confirmed += 1
+                    confirmed_events.append({
+                        "run_id": str(run_id), "target": name, "ref": str(f.get("ref") or ""),
+                        "title": str(f.get("title") or "")[:160], "severity": sev,
+                        "cls": str(f.get("class_name") or f.get("class_id") or ""),
+                        "location": str(f.get("location") or f.get("source_url") or "")[:600],
+                        "class_id": str(f.get("class_id") or "")[:80],
+                    })
                 if _SEV_RANK.get(sev, 0) > _SEV_RANK.get(top, 0):
                     top = sev
             if rec is not None:
@@ -219,6 +275,9 @@ def add_findings(run_id: str, target: str, findings: list[dict[str, Any]]) -> No
                     rec["top_severity"] = top
     except Exception:  # noqa: BLE001
         pass
+    # Emit outside the lock — global_log takes the same (non-reentrant) _lock.
+    for ev in confirmed_events:
+        global_log("finding_confirmed", ev)
 
 
 def snapshot(run_id: str) -> dict[str, Any]:
