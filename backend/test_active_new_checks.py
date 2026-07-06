@@ -96,6 +96,32 @@ class PathTraversalTests(unittest.TestCase):
         self.assertIsNone(av._check_path_traversal(_LfiHttp(None), "https://t/download?file=a.pdf"))
 
 
+class DefaultAliasCoverageTests(unittest.TestCase):
+    class _SearchReflect:
+        auth = None
+
+        def fetch(self, url, *, method="GET", extra_headers=None):
+            val = (parse_qs(urlparse(url).query, keep_blank_values=True).get("search") or [""])[0]
+            return {
+                "status": 200,
+                "headers": {"content-type": "text/html"},
+                "cookies": [],
+                "body": f"<html>{val}</html>",
+                "location": None,
+                "final_url": url,
+            }
+
+    def test_xss_default_aliases_include_search_on_paramless_endpoint(self) -> None:
+        finding = av._check_reflected_xss(self._SearchReflect(), "https://app.example.com/search")
+        self.assertIsNotNone(finding)
+        self.assertIn("search", finding["title"])
+
+    def test_path_traversal_default_aliases_include_filename(self) -> None:
+        finding = av._check_path_traversal(_LfiHttp("filename"), "https://t/download")
+        self.assertIsNotNone(finding)
+        self.assertEqual(finding["rule_id"], "active.path-traversal")
+
+
 class _GqlHttp:
     def __init__(self, introspects: bool = True) -> None:
         self.introspects = introspects

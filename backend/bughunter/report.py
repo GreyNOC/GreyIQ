@@ -644,6 +644,9 @@ def _exploitability_artifact_text(finding: dict[str, Any], plan: dict[str, Any])
     request_response = _captured_request_response_text(finding, include_read_data=True)
     if request_response:
         chunks.append("Captured exploit request/response:\n" + request_response)
+    source_text = str(finding.get("source_text") or "").strip()
+    if source_text:
+        chunks.append("Captured browser/source proof sheet:\n" + redact_text(source_text[:2500])[0])
     observed: list[str] = []
     for key, label in (
         ("method", "Method"),
@@ -661,21 +664,86 @@ def _exploitability_artifact_text(finding: dict[str, Any], plan: dict[str, Any])
     return "\n\n".join(chunks).strip()[:4500]
 
 
+def _proof_of_exploit_capture_recipe(finding: dict[str, Any], plan: dict[str, Any],
+                                     poi: dict[str, Any]) -> str:
+    """Deterministic fallback for reports that do not yet have a live exploit artifact.
+
+    This is not marked "ready"; it is the exact authorized artifact the operator needs to
+    capture so every report still carries a useful proof-of-exploit section instead of a
+    dead "missing" block.
+    """
+    location = _location(finding) or "the affected location"
+    class_name = str(finding.get("class_name") or finding.get("category") or "the reported issue").strip()
+    rule_id = str(finding.get("rule_id") or "").strip()
+    obligation = str(poi.get("proof_obligation") or "").strip()
+    if not obligation:
+        obligation = (
+            "Capture the minimal authorized request/response pair that shows the issue working, "
+            "plus a negative control that shows the same effect does not happen for a safe input, "
+            "different role, invalid credential, or expected baseline."
+        )
+    steps = normalize_steps(plan.get("steps"))
+    replay_step = next((str(step).strip() for step in steps if str(step).strip()), "")
+    if not replay_step:
+        if str(location).startswith(("http://", "https://")):
+            replay_step = f"Replay a benign request to `{location}` and apply the smallest class-specific payload/control needed for {class_name}."
+        else:
+            replay_step = f"Trace `{location}` to the reachable input or endpoint, then replay the smallest authorized test for {class_name}."
+    expected = str(poi.get("observed_result") or poi.get("evidence") or "").strip()
+    if not expected:
+        expected = (
+            "the exploit signal described by the finding appears in the response, browser, account state, "
+            "issuer response, callback log, or source-controlled output"
+        )
+    control = str(poi.get("control_result") or "").strip()
+    if not control:
+        control = (
+            "repeat the same test with the safe baseline: a permitted object, escaped payload, invalid token, "
+            "non-attacker origin, unchanged identifier, or non-vulnerable input; capture that it does not produce the exploit signal"
+        )
+    lines = [
+        "Exploit proof capture recipe:",
+        f"1. Target: `{location}`" + (f" (rule `{rule_id}`)." if rule_id else "."),
+        f"2. Trigger: {replay_step}",
+        f"3. Capture required: {obligation}",
+        f"4. Expected exploit signal: {expected}",
+        f"5. Negative control: {control}",
+        "6. Attach the redacted request/response, terminal output, callback log, before/after state, or screenshot that shows the signal.",
+    ]
+    return redact_text("\n".join(lines))[0][:3000]
+
+
 def _proof_of_exploitability_detail(finding: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
     poi = _proof_of_impact_detail(finding, plan)
-    artifact_text = _exploitability_artifact_text(finding, plan)
+    captured_text = _exploitability_artifact_text(finding, plan)
+    recipe_text = "" if captured_text else _proof_of_exploit_capture_recipe(finding, plan, poi)
     screenshots = _screenshot_names(finding)
     status = "missing"
-    if artifact_text or screenshots:
+    if captured_text or screenshots:
         explicit = _explicit_proof_status(finding, plan, _proof_value(finding, plan))
         status = "confirmed" if str(poi.get("status")) == "confirmed" or (screenshots and explicit == "confirmed") else "candidate"
+    elif recipe_text:
+        status = "candidate"
+    artifact_text = captured_text or recipe_text
+    artifact_type = ""
+    if captured_text and screenshots:
+        artifact_type = "captured text and screenshot"
+    elif captured_text:
+        artifact_type = "captured text"
+    elif screenshots:
+        artifact_type = "screenshot"
+    elif recipe_text:
+        artifact_type = "exploit proof capture recipe"
     return {
         "status": status,
         "ready": status == "confirmed",
-        "artifact_type": "text and screenshot" if artifact_text and screenshots else "text" if artifact_text else "screenshot" if screenshots else "",
+        "artifact_type": artifact_type,
         "text_artifact": artifact_text,
         "screenshot_files": screenshots,
+        "source_text_file": str(finding.get("source_text_path") or "").replace("\\", "/").rsplit("/", 1)[-1],
         "proof_obligation": str(poi.get("proof_obligation") or "").strip(),
+        "captured": bool(captured_text or screenshots),
+        "capture": finding.get("proof_capture") if isinstance(finding.get("proof_capture"), dict) else {},
     }
 
 
@@ -696,9 +764,14 @@ def _append_proof_of_exploitability(out: list[str], finding: dict[str, Any], pla
     artifact_type = str(detail.get("artifact_type") or "").strip()
     if artifact_type:
         out.append(f"- **Exploit proof artifact:** {artifact_type}.")
+    if not detail.get("captured"):
+        out.append("- **Readiness:** Capture the artifact below before submission; this section is a proof recipe, not confirmed exploit evidence yet.")
     screenshots = detail.get("screenshot_files") or []
     if screenshots:
         out.append("- **Working exploit screenshot(s):** " + ", ".join(_code(str(name)) for name in screenshots))
+    source_text_file = str(detail.get("source_text_file") or "").strip()
+    if source_text_file:
+        out.append(f"- **Browser/source proof text:** {_code(source_text_file)}")
     text_artifact = str(detail.get("text_artifact") or "").strip()
     if text_artifact:
         fence = _fence(text_artifact)
@@ -1095,10 +1168,16 @@ def build_markdown(ctx: dict[str, Any]) -> str:
 
     # --- Authorization & scope ---
     out.append("## Authorization & scope\n")
+    active_ran = "active" in (ctx.get("scanners_run") or []) or bool((ctx.get("active_authorization") or {}).get("in_scope"))
+    verification_mode = (
+        "static/passive analysis plus opt-in active verification. Active checks are benign, scope-bound, and rate-limited"
+        if active_ran
+        else "static or passive; nothing was exploited against a live target"
+    )
     out.append(
         "> This report covers **authorized** security testing only — your own assets, an "
         "explicit engagement, an in-scope bug-bounty program, or a CTF. All checks below are "
-        "static or passive; nothing was exploited against a live target."
+        f"{verification_mode}."
     )
     scope = str(ctx.get("scope") or "").strip()
     out.append("")
@@ -1474,6 +1553,7 @@ def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
             "model": ctx.get("brain", {}).get("model", ""),
         },
         "scan_meta": ctx.get("scan_meta", {}),
+        "proof_artifacts_captured": int(ctx.get("proof_artifacts_captured") or 0),
     }
 
 

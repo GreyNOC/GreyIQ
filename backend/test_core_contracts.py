@@ -12,7 +12,13 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from solin_core import KnowledgeBase, ReplyDiagnostics, _format_core_contract  # noqa: E402
+from solin_core import (  # noqa: E402
+    KnowledgeBase,
+    QUERY_INTENT_BUG_BOUNTY,
+    ReplyDiagnostics,
+    SolinEngine,
+    _format_core_contract,
+)
 
 
 class CoreContractTests(unittest.TestCase):
@@ -118,6 +124,39 @@ class KnowledgeSourceFilterTests(unittest.TestCase):
             self.assertEqual(starter_matches, [])
             self.assertEqual(len(imported_matches), 1)
             self.assertEqual(imported_matches[0].source_id, "src_imported_docs")
+
+    def test_bug_bounty_seed_has_its_own_source_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "data"
+            data.mkdir()
+            (data / "greyiq_starter_knowledge.txt").write_text(
+                "Starter material covers general planning.",
+                encoding="utf-8",
+            )
+            (data / "greyiq_bug_bounty_knowledge.txt").write_text(
+                "IDOR proof of impact requires an observed-vs-control authorization differential.",
+                encoding="utf-8",
+            )
+
+            kb = KnowledgeBase(root)
+            matches = kb.search("IDOR proof impact authorization", source_ids=["src_bug_bounty"], min_score=0.1)
+
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0].source_id, "src_bug_bounty")
+
+
+class BugBountyIntentTests(unittest.TestCase):
+    def test_bug_bounty_questions_route_to_retrieval(self) -> None:
+        engine = SolinEngine.__new__(SolinEngine)
+        engine.internet_enabled = False
+
+        intent = engine._classify_intent("How should I prove an IDOR for bug bounty?")
+        query = engine._prepare_retrieval_query("How should I prove an IDOR for bug bounty?", intent)
+
+        self.assertEqual(intent.label, QUERY_INTENT_BUG_BOUNTY)
+        self.assertTrue(intent.use_retrieval)
+        self.assertIn("proof impact", query)
 
 
 if __name__ == "__main__":

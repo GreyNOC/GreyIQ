@@ -6,6 +6,7 @@ const API_TIMEOUT_MS = 45000;
 const COLORS = ["#0e7c7b", "#6c5ce7", "#c95542", "#d69b2d", "#31572c", "#8f3985"];
 const DEFAULT_SELECTED_TRAINING_SOURCES = [
   "src_starter_knowledge",
+  "src_bug_bounty",
   "src_personal_choices",
   "src_preferred_examples"
 ];
@@ -15,6 +16,11 @@ const TRAINING_SOURCES = [
     id: "src_starter_knowledge",
     name: "Starter Knowledge",
     description: "General knowledge and GreyIQ behavior seed."
+  },
+  {
+    id: "src_bug_bounty",
+    name: "Bug Bounty",
+    description: "Authorized hunt tactics, proof standards, and report-writing patterns."
   },
   {
     id: "src_personal_choices",

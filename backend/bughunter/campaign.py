@@ -126,6 +126,8 @@ def _capture_proof_screenshots(items: list[dict[str, Any]], shot_dir: Path, targ
             finding["screenshot_path"] = shot["path"]
             if shot.get("source_text_path"):  # plain-text request/response/source proof
                 finding["source_text_path"] = shot["source_text_path"]
+            if shot.get("source_text"):
+                finding["source_text"] = str(shot.get("source_text") or "")[:6000]
             captured += 1
     return captured
 

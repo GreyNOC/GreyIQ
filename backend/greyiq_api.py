@@ -401,12 +401,14 @@ SEED_FILES = (
 )
 SEED_DATA_FILES = (
     "greyiq_starter_knowledge.txt",
+    "greyiq_bug_bounty_knowledge.txt",
     # Native-text extract of the Manual_pdfs library, bundled so the local model
     # trains on it on first run (copied into RUNTIME_DIR/data by ensure_runtime).
     "greyiq_manual_pdfs.txt",
 )
 TRAINING_SOURCE_FILES = {
     "src_starter_knowledge": "greyiq_starter_knowledge.txt",
+    "src_bug_bounty": "greyiq_bug_bounty_knowledge.txt",
     "src_personal_choices": "greyiq_personal_choices.txt",
     "src_preferred_examples": "greyiq_preferred_examples.txt",
     "src_local_notes": "greyiq_local_notes.txt",
@@ -457,6 +459,7 @@ BUGHUNTER_CORE: dict[str, Any] = {
         "calling something critical.",
     ],
     "sourceIds": [
+        "src_bug_bounty",
         "src_starter_knowledge",
         "src_local_notes",
         "src_imported_docs",

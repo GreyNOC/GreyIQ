@@ -92,6 +92,52 @@ class PocPoiPlumbingTests(unittest.TestCase):
         self.assertEqual(doc["findings"][0]["proof_evidence"]["response_status"], "HTTP 200")
         self.assertIn("run?cmd=", doc["findings"][0]["proof_evidence"]["request_line"])
 
+    def test_json_sidecar_carries_exploit_capture_recipe_when_no_artifact_exists(self) -> None:
+        ctx = _ctx()
+        finding = dict(_FINDING)
+        finding.pop("proof_evidence", None)
+        finding["rule_id"] = "static.eval"
+        finding["location"] = "app.py:42"
+        plan = dict(_PLAN)
+        plan.pop("poc", None)
+        plan["proof_of_impact"] = {
+            "status": "missing",
+            "proof_obligation": "Capture a benign marker proving code execution without running a destructive payload.",
+        }
+        ctx["findings"] = [finding]
+        ctx["attack_plans"] = {"F1": plan}
+
+        doc = R.build_json(ctx)
+        poe = doc["proof_of_exploitability"]["F1"]
+
+        self.assertEqual(poe["status"], "candidate")
+        self.assertFalse(poe["ready"])
+        self.assertFalse(poe["captured"])
+        self.assertEqual(poe["artifact_type"], "exploit proof capture recipe")
+        self.assertIn("Exploit proof capture recipe", poe["text_artifact"])
+        self.assertIn("Capture a benign marker", poe["text_artifact"])
+
+        md = R.build_finding_markdown(ctx, finding)
+        self.assertIn("## Proof of exploitability", md)
+        self.assertIn("Exploit proof capture recipe", md)
+        self.assertNotIn("Missing - no exploit proof artifact", md)
+
+    def test_source_proof_sheet_becomes_captured_exploitability_artifact(self) -> None:
+        ctx = _ctx()
+        finding = dict(_FINDING)
+        finding.pop("proof_evidence", None)
+        finding["source_text"] = "GreyIQ proof sheet\nREQUEST\nGET https://example.test/run\nRESPONSE\nHTTP 200\nout: 222"
+        finding["source_text_path"] = "C:\\tmp\\proof-source.txt"
+        ctx["findings"] = [finding]
+
+        doc = R.build_json(ctx)
+        poe = doc["proof_of_exploitability"]["F1"]
+
+        self.assertEqual(poe["status"], "confirmed")
+        self.assertTrue(poe["captured"])
+        self.assertEqual(poe["source_text_file"], "proof-source.txt")
+        self.assertIn("Captured browser/source proof sheet", poe["text_artifact"])
+
     def test_poc_section_falls_back_to_captured_request_when_plan_has_no_poc(self) -> None:
         ctx = _ctx()
         ctx["attack_plans"]["F1"] = dict(_PLAN)

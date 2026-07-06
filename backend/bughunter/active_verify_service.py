@@ -79,7 +79,11 @@ from bughunter.web_scan_service import (
 # host-header proofs so nothing is ever actually sent to it.
 _MARKER_HOST = "greyiq-marker.example"
 _MARKER_ORIGIN = f"https://{_MARKER_HOST}"
-_REDIRECT_PARAMS = ("next", "returnurl", "return_url", "redirect", "redirect_uri", "redirecturl", "url", "continue", "dest", "destination", "returnto", "return_to")
+_REDIRECT_PARAMS = ("next", "redirect", "url", "returnurl", "return_url", "redirect_uri", "redirecturl", "continue", "callback", "dest", "destination", "returnto", "return_to")
+_XSS_PARAMS = ("q", "query", "search", "s", "keyword", "message", "name", "comment")
+_SSTI_PARAMS = ("q", "template", "tpl", "view", "theme", "preview", "name")
+_RCE_PARAMS = ("cmd", "command", "exec", "ping", "host", "ip", "domain", "query", "q")
+_PATH_PARAMS = ("file", "filename", "path", "page", "template", "doc", "download", "attachment")
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 # SQL-specific error signatures only — a generic stack trace is not SQL injection.
 _SQL_ERROR_RE = re.compile(
@@ -578,7 +582,7 @@ def _check_cors(http: _Http, url: str) -> dict[str, Any] | None:
 
 
 def _check_open_redirect(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
-    candidates = _redirect_candidates(url, extra_params, ("next", "redirect", "url"), 3)
+    candidates = _redirect_candidates(url, extra_params, _REDIRECT_PARAMS, 3)
     for param in candidates:
         try:
             probe = http.fetch(_with_query(url, {param: _MARKER_ORIGIN + "/"}))
@@ -783,7 +787,7 @@ def _context_excerpt(body: str, needle: str, pad: int = 140) -> str:
 
 def _check_reflected_xss(http: _Http, url: str, extra_params: list[str] | None = None,
                          priority: list[str] | None = None) -> dict[str, Any] | None:
-    params = _candidate_params(url, extra_params, ("q",), 3, priority=priority)
+    params = _candidate_params(url, extra_params, _XSS_PARAMS, 3, priority=priority)
     marker_payload = f"{_MARK}<svg/onload=1>"
     for param in params:
         try:
@@ -847,7 +851,7 @@ def _check_reflected_xss_context(http: _Http, url: str, extra_params: list[str] 
     reflect UNENCODED *and* the reflection physically sits inside a ``<script>`` element / a double-
     quoted attribute (verified from the surrounding syntax) — a real, browser-executable differential.
     Runs after the element-content check, so it only spends budget when that one didn't fire."""
-    params = _candidate_params(url, extra_params, ("q",), 2, priority=priority)
+    params = _candidate_params(url, extra_params, _XSS_PARAMS, 2, priority=priority)
     for param in params:
         try:
             control = http.fetch(_with_query(url, {param: _MARK}))
@@ -904,7 +908,7 @@ def _check_reflected_xss_context(http: _Http, url: str, extra_params: list[str] 
 
 
 def _check_ssti(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
-    params = _candidate_params(url, extra_params, ("q",), 3)
+    params = _candidate_params(url, extra_params, _SSTI_PARAMS, 3)
     # Probe the common template engines in ONE request — each 7*7 expression tagged with its OWN
     # adjacent marker so an evaluated 49 is unambiguous, attributable to the engine, and can't
     # coincide with page text. Covers Jinja/Twig, Freemarker/JSP-EL, ERB/EJS, Thymeleaf/Ruby.
@@ -948,7 +952,7 @@ def _check_rce_command_injection(http: _Http, url: str, extra_params: list[str] 
     control that is NOT substituted rules out a coincidental echo. GET-only; one marker per probe.
     This is the arithmetic-echo sibling of the SSTI check, for a shell context rather than a
     template engine — the safe way to prove RCE without executing a real payload."""
-    params = _candidate_params(url, extra_params, ("cmd", "exec", "ping", "host", "ip", "query", "q"), 3)
+    params = _candidate_params(url, extra_params, _RCE_PARAMS, 3)
     # BOTH substitution forms ($(...) and backticks) ride in ONE probe, each behind its own
     # marker — so this check costs exactly what SSTI does: one control + one probe per param.
     sig_dollar, sig_tick = f"{_MARK}D222", f"{_MARK}T222"
@@ -1160,7 +1164,7 @@ def _check_crlf(http: _Http, url: str, extra_params: list[str] | None = None) ->
     real response header equal to the marker AND a control without the CRLF does not —
     proving the value crossed into the header block. Benign marker header only; nothing
     that affects other users' traffic (contrast request smuggling)."""
-    candidates = _redirect_candidates(url, extra_params, ("next", "redirect", "url", "page"), 3)
+    candidates = _redirect_candidates(url, extra_params, _REDIRECT_PARAMS, 3)
     # RAW CR/LF — _with_query's urlencode encodes it ONCE to %0D%0A (pre-encoding here
     # would double-encode to %250D%250A and never inject a real newline).
     marker_value = f"\r\nX-Greyiq-Crlf:{_MARK}"
@@ -1251,7 +1255,7 @@ def _check_time_rce(http: _Http, url: str, settings: Any = None, extra_params: l
     time-based SQLi. A non-vulnerable app never actually sleeps, so it stays fast."""
     settings = settings or get_settings()
     parsed = urlparse(url)
-    params = _candidate_params(url, extra_params, ("cmd", "exec", "ping", "host", "ip", "query", "q"), 1)
+    params = _candidate_params(url, extra_params, _RCE_PARAMS, 1)
     if not params:
         return None  # need a URL or recon-discovered param; never invent injection points
     d = getattr(settings, "active_time_sqli_delay_seconds", _TIME_DELAY_S) or _TIME_DELAY_S
@@ -1827,7 +1831,7 @@ def _check_path_traversal(http: _Http, url: str, extra_params: list[str] | None 
     """Confirm a path traversal / local-file read on a file-ish parameter by reading ONE
     well-known, non-sensitive system file (/etc/passwd or win.ini) as proof and gating on its
     unmistakable signature PLUS a benign-value control — extracting nothing else."""
-    params = _candidate_params(url, extra_params, ("file", "path", "page", "template", "doc"), 2)
+    params = _candidate_params(url, extra_params, _PATH_PARAMS, 2)
     for param in params:
         # One control per param (not per payload) keeps the request budget in check.
         try:

@@ -79,9 +79,37 @@ class JwtWeakTests(unittest.TestCase):
         self.assertIn("jwt.short-hmac-secret", _hits('jwt.encode(payload, "secret123")', "python"))
 
 
+class AccessControlSourceTests(unittest.TestCase):
+    def test_django_request_id_lookup(self) -> None:
+        code = 'order = Order.objects.get(id=request.GET["id"])'
+        self.assertIn("py.django-object-by-request-id", _hits(code, "python", "views.py"))
+
+    def test_django_owner_scoped_lookup_is_not_flagged(self) -> None:
+        code = 'order = Order.objects.get(id=request.GET["id"], owner=request.user)'
+        self.assertNotIn("py.django-object-by-request-id", _hits(code, "python", "views.py"))
+
+    def test_express_request_id_lookup(self) -> None:
+        code = "const order = await Order.findOne({ _id: req.params.id });"
+        self.assertIn("js.mongoose-object-by-request-id", _hits(code, "javascript", "routes.js"))
+
+    def test_express_owner_scoped_lookup_is_not_flagged(self) -> None:
+        code = "const order = await Order.findOne({ _id: req.params.id, owner: req.user.id });"
+        self.assertNotIn("js.mongoose-object-by-request-id", _hits(code, "javascript", "routes.js"))
+
+    def test_request_body_mass_assignment(self) -> None:
+        self.assertIn(
+            "js.request-body-mass-assignment",
+            _hits("await User.updateOne({ _id: req.params.id }, req.body);", "javascript", "routes.js"),
+        )
+
+    def test_drf_all_fields_serializer(self) -> None:
+        self.assertIn("py.drf-modelserializer-all-fields", _hits('fields = "__all__"', "python", "serializers.py"))
+
+
 class ClassificationTests(unittest.TestCase):
     def test_new_categories_map_to_accurate_classes(self) -> None:
         cases = {
+            "access_control": "access-control",
             "deserialization": "rce",
             "open_redirect": "redirect",
             "ssti": "ssti",

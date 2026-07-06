@@ -20,6 +20,7 @@ DATA_FOLDER = "data"
 COMBINED_FILE = "combined_train.txt"
 SOURCE_TEXT_FILES = {
     "src_starter_knowledge": ["greyiq_starter_knowledge.txt"],
+    "src_bug_bounty": ["greyiq_bug_bounty_knowledge.txt"],
     "src_personal_choices": ["greyiq_personal_choices.txt", "greyiq_profile.txt"],
     "src_preferred_examples": ["greyiq_preferred_examples.txt"],
     "src_local_notes": ["greyiq_local_notes.txt"],
