@@ -1607,6 +1607,11 @@ class GreyIQRuntime:
         run_id = str(request.run_id or "").strip()
         if run_id:
             bounty_progress.start_run(run_id)
+            # A single hunt drives the SAME live dashboard the campaign uses: register it as one work
+            # unit (queued -> running -> done/error) so its status, streamed findings, and the rolled-up
+            # stat tiles render on the campaign dashboard, not only in the compact text log.
+            bounty_progress.set_targets(run_id, [request.target])
+            bounty_progress.mark_target(run_id, request.target, "running")
         result = run_bounty_hunt(
             request.target,
             request.profile,
@@ -1630,8 +1635,42 @@ class GreyIQRuntime:
             # OOB probe automatically (the token is the reproducible 'sheriff flag').
             oob_base=self._oob_config()[0], oob_secret=self._oob_config()[1],
         )
+        if run_id:
+            self._stream_hunt_to_dashboard(run_id, request.target, result)
         self._cache_bounty_run(result, target=request.target, scope=request.scope, program=None)
         return result
+
+    @staticmethod
+    def _stream_hunt_to_dashboard(run_id: str, target: str, result: dict[str, Any]) -> None:
+        """Roll a completed single hunt's findings into the live-dashboard snapshot (the same compact
+        shape the campaign streams per URL) and mark its work unit done/error — so a single hunt's
+        findings + status appear on the campaign dashboard exactly like a campaign target's do. The
+        activity log already streams live via the on_progress sink during the hunt. Never raises."""
+        try:
+            if not result.get("ok", True):
+                bounty_progress.mark_target(run_id, target, "error", error=str(result.get("error") or ""))
+                return
+            poi = result.get("proof_of_impact") or {}
+            compact: list[dict[str, Any]] = []
+            for f in result.get("findings") or []:
+                ref = str(f.get("ref") or "")
+                detail = poi.get(ref) or {}
+                compact.append({
+                    "ref": ref, "title": f.get("title"), "severity": f.get("severity"),
+                    "class_name": f.get("class_name") or f.get("class_id"),
+                    # Same proof-status derivation the campaign uses (proof_of_impact[ref].status).
+                    "proof_status": str(detail.get("status") or "missing"),
+                    "location": f.get("location") or target, "cwe": f.get("cwe"),
+                    "rule_id": f.get("rule_id"), "class_id": f.get("class_id"),
+                    # Carry the captured differential + request/response so the dashboard drawer's
+                    # "View full report" renders a confirmed single-hunt finding as CONFIRMED too.
+                    "proof_detail": detail, "proof_evidence": f.get("proof_evidence") or None,
+                })
+            if compact:
+                bounty_progress.add_findings(run_id, target, compact)
+            bounty_progress.mark_target(run_id, target, "done")
+        except Exception:  # noqa: BLE001 - progress must never break a hunt
+            pass
 
     def bounty_progress(self, run_id: str, after: int = 0) -> dict[str, Any]:
         # `snapshot` carries the structured campaign-dashboard state (per-target status +
