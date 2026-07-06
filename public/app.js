@@ -8518,6 +8518,19 @@ function ckReportToolbar() {
     ["severity", "Sort: Severity"], ["title", "Sort: Title (A–Z)"], ["recent", "Sort: Most recent"],
   ], (v) => { opts.sort = v; }));
 
+  // Report format for the row Copy / Download .md / Open report actions (they build via
+  // ckState.platform). The old ckFormatBar lived only in Submissions; expose the choice here so an
+  // operator working straight from the Report Center isn't silently locked to the HackerOne default.
+  const fmt = cel("select");
+  fmt.title = "Report format for Copy / Download .md / Open report";
+  for (const p of CK_PLATFORMS) {
+    const opt = cel("option", null, `Format: ${p.name}`); opt.value = p.id;
+    if (p.id === ckState.platform) opt.selected = true;
+    fmt.append(opt);
+  }
+  fmt.addEventListener("change", () => { ckState.platform = fmt.value || "hackerone"; });
+  wrap.append(fmt);
+
   const applyView = (v) => {
     ckState.sub = { query: v.query || "", sev: v.sev || "all", proof: v.proof || "all", sort: v.sort || "severity" };
     ckReports.ready = v.ready || "all"; ckReports.page = 1; void ckRenderReportCenter();
