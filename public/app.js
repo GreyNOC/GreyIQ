@@ -4432,6 +4432,8 @@ const ck = {
   spanScope: document.querySelector("#ckSpanScope"),
   spanScopeCount: document.querySelector("#ckSpanScopeCount"),
   target: document.querySelector("#ckTarget"),
+  targetPick: document.querySelector("#ckTargetPick"),
+  resizer: document.querySelector("#ckResizer"),
   scope: document.querySelector("#ckScope"),
   profile: document.querySelector("#ckProfile"),
   klass: document.querySelector("#ckClass"),
@@ -5948,6 +5950,9 @@ function ckPopulateActiveProgramSelect() {
   else if (!state.ckActiveProgramId && state.ckOneOff) ck.activeProgram.value = "__oneoff__";  // restore a one-off session
   // Keep the Portfolio multi-select in sync with the same programs cache.
   if (state.ckRunType === "portfolio") ckRenderPortfolioPicker();
+  // Rebuild the in-scope Target dropdown for the restored active program (preserving the restored target).
+  const activeProg = state.ckActiveProgramId ? ckProgramsCache.find((p) => p.id === state.ckActiveProgramId) : null;
+  ckSyncTargetControl(activeProg);
   ckSyncSetupReveal();
   ckUpdateTopProgram();
 }
@@ -5964,12 +5969,16 @@ function ckApplyActiveProgram(id) {
   saveState();
   const prog = oneoff ? null : ckProgramsCache.find((p) => p.id === id);
   if (!prog) {
+    ckSyncTargetControl(null);   // no program -> plain text Target input
     ckUpdateSpanScopeToggle({ resetDefault: true });
     ckSyncSetupReveal();
     ckUpdateTopProgram();
     return;
   }
-  if (ck.target && prog.seed_targets && prog.seed_targets.length) ck.target.value = prog.seed_targets[0];
+  // Target becomes a dropdown of the program's in-scope targets; default to the first (a seed if any).
+  const firstScope = (prog.seed_targets && prog.seed_targets[0]) || ckEstimateSpanTargets(prog)[0] || "";
+  if (ck.target) ck.target.value = firstScope;
+  ckSyncTargetControl(prog, firstScope);
   if (ck.scope && prog.scope_text) ck.scope.value = prog.scope_text;
   if (ck.program) ck.program.value = prog.platform_handle || "";
   state.ckTarget = ck.target ? ck.target.value : state.ckTarget;
@@ -5979,6 +5988,61 @@ function ckApplyActiveProgram(id) {
   ckUpdateSpanScopeToggle({ resetDefault: true });
   ckSyncSetupReveal();
   ckUpdateTopProgram();
+}
+
+// Once a program is chosen, present Target as a dropdown of its in-scope targets (so the operator picks
+// from scope instead of typing) plus an "Other…" escape to the free-text input. #ckTarget stays the
+// single source of truth — its .value is what every run/report reads; the select just writes into it.
+// `preferred` (optional) forces which target is selected; otherwise the input's current value is kept
+// if it's in scope, a hand-typed out-of-scope value falls to "Other", and an empty value picks the first.
+function ckSyncTargetControl(prog, preferred) {
+  const pick = ck.targetPick, input = ck.target;
+  if (!pick || !input) return;
+  const targets = prog ? ckEstimateSpanTargets(prog) : [];
+  if (!targets.length) { pick.hidden = true; input.hidden = false; return; }  // no scope list -> text input
+  pick.replaceChildren();
+  for (const t of targets) { const o = cel("option", null, t); o.value = t; pick.append(o); }
+  const other = cel("option", null, "✎ Other target…"); other.value = "__custom__"; pick.append(other);
+  const want = String(preferred != null ? preferred : (input.value || "")).trim();
+  if (want && targets.includes(want)) { pick.value = want; input.value = want; input.hidden = true; }
+  else if (want) { pick.value = "__custom__"; input.hidden = false; }   // a hand-typed target not in scope
+  else { pick.value = targets[0]; input.value = targets[0]; input.hidden = true; }
+  pick.hidden = false;
+}
+
+// Draggable divider that resizes the left sidebar: updates --ck-sidebar-w on the cockpit grid,
+// clamped to [MIN, MAX]px and persisted so the width survives reloads. Also arrow-key resizable.
+function ckWireSidebarResizer() {
+  const root = ck.root, handle = ck.resizer;
+  if (!root || !handle) return;
+  const KEY = "greyiq-sidebar-w", MIN = 176, MAX = 460;
+  const setW = (w, persist) => {
+    w = Math.max(MIN, Math.min(MAX, Math.round(w)));
+    root.style.setProperty("--ck-sidebar-w", w + "px");
+    if (persist) { try { localStorage.setItem(KEY, String(w)); } catch (_) { /* private mode / quota */ } }
+  };
+  try { const w = parseInt(localStorage.getItem(KEY), 10); if (w >= MIN && w <= MAX) root.style.setProperty("--ck-sidebar-w", w + "px"); } catch (_) {}
+  let dragging = false;
+  const onMove = (e) => { if (dragging) setW(e.clientX - root.getBoundingClientRect().left, false); };
+  const onUp = () => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove("ck-resizing"); handle.classList.remove("is-dragging");
+    const cur = parseInt(getComputedStyle(root).getPropertyValue("--ck-sidebar-w"), 10);
+    if (cur) { try { localStorage.setItem(KEY, String(cur)); } catch (_) { /* private mode / quota */ } }
+    window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp);
+  };
+  handle.addEventListener("pointerdown", (e) => {
+    e.preventDefault(); dragging = true;
+    document.body.classList.add("ck-resizing"); handle.classList.add("is-dragging");
+    window.addEventListener("pointermove", onMove); window.addEventListener("pointerup", onUp);
+  });
+  handle.addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    const cur = parseInt(getComputedStyle(root).getPropertyValue("--ck-sidebar-w"), 10) || 232;
+    setW(cur + (e.key === "ArrowRight" ? 1 : -1) * (e.shiftKey ? 32 : 12), true);
+  });
 }
 
 // Program-first launch flow: the rest of the Hunt-setup form stays hidden until the operator picks a
@@ -10527,6 +10591,14 @@ function bootCockpit() {
   // program-picker change via ckApplyActiveProgram.
   ck.target?.addEventListener("input", () => { state.ckTarget = ck.target.value; saveState(); if (ck.target.value.trim()) ckSyncSetupReveal(); });
   ck.scope?.addEventListener("input", () => { state.ckScope = ck.scope.value; saveState(); });
+  // Target scope-picker: pick an in-scope target, or "Other…" to reveal the free-text input.
+  ck.targetPick?.addEventListener("change", () => {
+    if (ck.targetPick.value === "__custom__") { ck.target.hidden = false; ck.target.value = ""; ck.target.focus(); }
+    else { ck.target.hidden = true; ck.target.value = ck.targetPick.value; }
+    state.ckTarget = ck.target.value; saveState();
+    ckSyncSetupReveal();
+  });
+  ckWireSidebarResizer();
   ck.spanScope?.addEventListener("change", () => {
     state.ckSpanScope = Boolean(ck.spanScope.checked);
     saveState();

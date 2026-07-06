@@ -2839,7 +2839,8 @@ body[data-theme="dark"] .panel-mode-btn.is-active {
 body[data-app-mode="hunt"] .app-shell { display: none; }
 body[data-app-mode="hunt"] .cockpit {
   display: grid;
-  grid-template-columns: 14.5rem minmax(0, 1fr);
+  grid-template-columns: var(--ck-sidebar-w, 14.5rem) minmax(0, 1fr);
+  position: relative;
   height: 100vh;
   min-height: 0;
   background:
@@ -2970,6 +2971,20 @@ body[data-app-mode="hunt"] .cockpit {
   border-right: 1px solid var(--border);
   overflow-y: auto; min-height: 0;
 }
+/* Draggable divider between the sidebar and the main column. Sits at the grid-column boundary
+   (left = the sidebar width variable) so it never scrolls away with the sidebar's content. */
+.ck-resizer {
+  position: absolute; top: 0; height: 100%; left: var(--ck-sidebar-w, 14.5rem);
+  width: 9px; margin-left: -5px; z-index: 25; cursor: col-resize; touch-action: none;
+  background: transparent; transition: background 0.12s;
+}
+.ck-resizer::after { content: ""; position: absolute; top: 0; bottom: 0; left: 4px; width: 1px; background: var(--border); }
+.ck-resizer:hover, .ck-resizer:focus-visible, .ck-resizer.is-dragging {
+  background: color-mix(in srgb, var(--accent) 22%, transparent); outline: none;
+}
+.ck-resizer:hover::after, .ck-resizer.is-dragging::after { background: var(--accent); width: 2px; left: 3.5px; }
+body.ck-resizing { cursor: col-resize; user-select: none; }
+
 .ck-side-brand { display: flex; align-items: center; gap: 0.55rem; padding: 0.15rem 0.4rem 0.7rem; }
 .ck-side-brand h1 { margin: 0; font-size: 1.02rem; letter-spacing: -0.01em; }
 .ck-side-brand .ck-eyebrow { font-size: 0.58rem; }
@@ -3611,7 +3626,10 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-wizard-acts { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.8rem; justify-content: flex-end; }
 
 @media (max-width: 1180px) {
-  body[data-app-mode="hunt"] .cockpit { grid-template-columns: 13rem minmax(0, 1fr); }
+  /* Keep the sidebar resizable here too — just default narrower (13rem) when the operator
+     hasn't set a width. The resizer's fallback is aligned so it stays on the column boundary. */
+  body[data-app-mode="hunt"] .cockpit { grid-template-columns: var(--ck-sidebar-w, 13rem) minmax(0, 1fr); }
+  .ck-resizer { left: var(--ck-sidebar-w, 13rem); }
 }
 @media (max-width: 1100px) {
   .ck-body.has-detail { grid-template-columns: minmax(0, 1fr) 0; }
@@ -3625,4 +3643,5 @@ body[data-app-mode="hunt"] .cockpit {
   .ck-sidebar { grid-row: auto; border-right: none; border-bottom: 1px solid var(--border); overflow: visible; }
   .ck-body, .ck-body.has-detail { display: block; overflow-y: auto; }
   .ck-main { overflow: visible; }
+  .ck-resizer { display: none; }  /* single-column stacked layout — nothing to resize */
 }
