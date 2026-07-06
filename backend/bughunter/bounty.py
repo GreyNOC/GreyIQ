@@ -35,6 +35,7 @@ from bughunter import impact_model
 from bughunter import ledger
 from bughunter import next_steps as next_steps_lib
 from bughunter import report as report_lib
+from bughunter import secret_classification
 from bughunter import toolkit as toolkit_lib
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.live_scan_service import run_live_scan
@@ -498,6 +499,12 @@ _ARTIFACT_CATEGORIES = {"secret", "secret_exposed", "disclosure"}
 def _deterministic_proof_status(finding: dict[str, Any]) -> str:
     category = str(finding.get("category") or "").lower()
     rule_id = str(finding.get("rule_id") or "").lower()
+    # An exposed key/token that strict classification found UNPROVEN is not a submittable candidate: a
+    # public client key (browser-safe by design) or a dead/false-positive reads as informational
+    # ("missing" — a lead, not a finding); only a genuinely unverified candidate stays "candidate".
+    cls = str(finding.get("secret_classification") or "")
+    if cls in (secret_classification.PUBLIC_CLIENT_KEY, secret_classification.FALSE_POSITIVE):
+        return "missing"
     if category in _ARTIFACT_CATEGORIES or rule_id.startswith(("secret.", "web.exposed.")) or "disclosure" in rule_id:
         return "candidate"
     return "missing"
@@ -989,11 +996,19 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
     if credential_artifacts:
         proof_of_impact.update(credential_artifacts)
         credential_proof = finding.get("_credential_proof") if isinstance(finding.get("_credential_proof"), dict) else {}
-        proof_of_impact["limitations"] = (
-            "Live credential validation is complete." if credential_proof.get("live") is True
-            else "Credential validation did not prove the key live; keep this as candidate until an in-scope success response proves impact."
-        )
-        if credential_proof.get("live") is True:
+        # For a NON-confirmed secret (a public client key or an unverified/inconclusive candidate), keep the
+        # validation PoC as a LEAD but strip the synthesized observed-vs-control differential: a live public
+        # key "accepted (HTTP 200)" is EXPECTED, not proof of impact, and leaving that differential in makes
+        # the report read as exploited (and _has_captured_artifact's HTTP-200 heuristic would confirm it).
+        if not secret_classification.has_confirmed_secret_proof(finding):
+            proof_of_impact["observed_result"] = ""
+            proof_of_impact["control_result"] = ""
+            proof_of_impact["limitations"] = (
+                "Not proven: a public/unverified key is not a confirmed secret. Capture the missing proof "
+                "(unauthorized access / open data store / paid-API abuse) before reporting."
+            )
+        else:
+            proof_of_impact["limitations"] = "Live credential validation is complete."
             proof_of_impact["proof_obligation"] = ""
         request = credential_artifacts.get("authenticated_read_request", "")
         response = credential_artifacts.get("authenticated_read_response", "")
@@ -1006,11 +1021,20 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
                 f"Blast radius:\n{blast or model['affected_asset']}\n\n"
                 "Use only one read-only issuer request. Do not perform writes, enumeration, prompt submission, or data extraction."
             )
+    cvss = impact_model.cvss_for_class(class_id)
+    # An UNPROVEN exposed secret (public client key / unverified candidate) must not carry the
+    # secrets-class High CVSS: resolve_severity lets a plan CVSS base_severity win over the finding's
+    # own (already-downgraded) severity, which would silently re-inflate it. Cap the CVSS base_severity
+    # to the classification's ceiling so a page-source / regex match can never read Medium+. A
+    # confirmed_secret keeps the real modelled CVSS.
+    _sc = str(finding.get("secret_classification") or "")
+    if class_id == "secrets" and _sc and _sc != secret_classification.CONFIRMED_SECRET and isinstance(cvss, dict):
+        cvss = {**cvss, "base_severity": secret_classification.severity_for_classification(_sc, "info"), "estimated": True}
     return {
         "steps": steps,
         "impact": impact_text,
         "proof_of_impact": proof_of_impact,
-        "cvss": impact_model.cvss_for_class(class_id),
+        "cvss": cvss,
         # Deterministic remediation floor — a per-rule remediation still wins in the
         # report via `finding.get('remediation') or plan.get('remediation')`.
         "remediation": impact_model.remediation_for_class(class_id),
@@ -1591,6 +1615,15 @@ def run_bounty_hunt(
                         _emit(f"firebase exposure probe error: {exc}")
         if exposure_findings:
             raw_findings = list(raw_findings) + exposure_findings
+
+    # Strict secret classification — an exposed key/token is only a real, reportable secret when there is
+    # PROOF it is usable (a validator-backed live token, or a captured artifact like an open Firebase data
+    # store). A Google/Firebase browser key, an OAuth client id, analytics/CDN config, or ANY regex /
+    # page-source match with no validation is a public-client / unverified candidate — classified,
+    # severity-capped to Info/Low, and marked not-reportable. Runs on EVERY path (authorized or not) BEFORE
+    # annotate/rank/report, so scoring can't inflate an unproven secret. The confirm authority
+    # (report._has_captured_artifact) stays the sole gate for confirmed_secret; this only ever narrows.
+    secret_classification.apply_secret_classification(raw_findings)
 
     # Annotate + rank.
     annotated: list[dict[str, Any]] = []

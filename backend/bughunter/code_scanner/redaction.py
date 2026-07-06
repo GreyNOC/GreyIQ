@@ -34,6 +34,12 @@ _SECRET_VALUE_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b"),
     re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{20,}\b"),
     re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b"),
+    # GitLab / npm / SendGrid / DigitalOcean tokens — all treated as real secrets elsewhere, so their
+    # raw value must be redacted out of a snippet the same as the AWS/GitHub/Stripe shapes above.
+    re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}\b"),
+    re.compile(r"\bnpm_[A-Za-z0-9]{36}\b"),
+    re.compile(r"\bSG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}\b"),
+    re.compile(r"\bdop_v1_[a-f0-9]{64}\b"),
     re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{16,}\b"),
 )
 
@@ -85,6 +91,19 @@ def _format_redacted(value: str) -> str:
     if len(value) >= 12:
         return f"{value[:4]}...{value[-4:]} [REDACTED_SECRET:sha256:{short}]"
     return f"[REDACTED_SECRET:sha256:{short}]"
+
+
+def redact_secret(value: str) -> str:
+    """Redact an EXACT secret value to a safe prefix…suffix placeholder — never the full key.
+
+    Unlike ``redact_text`` (which only redacts substrings matching a known vendor pattern), this
+    redacts the whole value you hand it, so a report can show that a credential exists and enough of
+    it to correlate ("AIzaSyAB…w3xyz") without ever printing the usable key. Deterministic: the same
+    value always yields the same placeholder."""
+    v = str(value or "").strip()
+    if not v:
+        return ""
+    return _format_redacted(v)
 
 
 def redact_text(text: str) -> tuple[str, bool]:

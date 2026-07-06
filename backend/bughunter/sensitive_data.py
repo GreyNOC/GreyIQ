@@ -31,7 +31,10 @@ _SENSITIVE_SECRET_LABELS = {
     "secret.github-pat": "a GitHub access token",
     "secret.slack-bot-token": "a Slack token",
     "secret.stripe-key": "a Stripe secret key",
-    "secret.google-api-key": "a Google API key",
+    # secret.google-api-key is deliberately NOT here: a Google/Firebase AIza key is a browser-safe
+    # PUBLIC client key by default (see bughunter.secret_classification). A public key appearing in a
+    # response body is not sensitive-data disclosure and must not raise a finding's severity — only a
+    # PROVEN-impact Firebase exposure (open data store) is a real finding, handled separately.
     "secret.anthropic-key": "an Anthropic API key",
     "secret.private-key-pem": "a private key (PEM)",
 }

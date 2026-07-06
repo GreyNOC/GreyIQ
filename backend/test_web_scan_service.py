@@ -125,12 +125,13 @@ class WebScanRedactionTests(unittest.TestCase):
             self.assertNotIn(raw_key, json.dumps(json_doc))
             self.assertIn("[REDACTED_SECRET", markdown)
             self.assertEqual("CWE-200", json_doc["findings"][0]["cwe"])
-            # An exposed secret IS a captured artifact, so the deterministic proof is
-            # a 'candidate' (exposure shown) — not 'missing' — but never 'ready'
-            # (a static scan hasn't proven the key is live/impactful).
-            self.assertEqual("candidate", json_doc["proof_of_impact"]["F1"]["status"])
+            # A Google/Firebase AIza key is a PUBLIC client key by default — strict classification
+            # downgrades it and marks it INFORMATIONAL, so the deterministic proof is 'missing'
+            # (a lead, not a candidate secret) and never 'ready'. It is NOT a captured artifact.
+            self.assertEqual("public_client_key", json_doc["findings"][0].get("secret_classification"))
+            self.assertEqual("missing", json_doc["proof_of_impact"]["F1"]["status"])
             self.assertFalse(json_doc["proof_of_impact"]["F1"]["ready"])
-            # ...and the report tells the operator exactly what to capture to prove it.
+            # ...and the report tells the operator exactly what to capture to prove impact.
             self.assertTrue(json_doc["proof_of_impact"]["F1"]["proof_obligation"])
         finally:
             server.shutdown()

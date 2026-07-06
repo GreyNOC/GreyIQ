@@ -363,40 +363,52 @@ class SecretCaptureTests(unittest.TestCase):
 
 
 class CredentialReportTests(unittest.TestCase):
-    def _render(self, proof):
+    def _render(self, proof, *, rule_id="secret.google-api-key", secret_value=_KEY,
+                title="Exposed credential", variable_name="apiKey"):
         finding = {
-            "ref": "F1", "title": "Google API key", "severity": "high", "class_id": "secrets",
-            "location": "src/firebase.js", "line_start": 12, "rule_id": "secret.google-api-key",
-            "cwe": "CWE-798", "description": "A Google Cloud API key is hardcoded.",
+            "ref": "F1", "title": title, "severity": "high", "class_id": "secrets",
+            "location": "src/firebase.js", "line_start": 12, "rule_id": rule_id,
+            "cwe": "CWE-798", "description": "A credential is hardcoded.",
             "snippet": 'const apiKey = "AIza...[REDACTED_SECRET:sha256:x]";',
-            "variable_name": "apiKey", "secret_value": _KEY, "_credential_proof": proof,
+            "variable_name": variable_name, "secret_value": secret_value, "_credential_proof": proof,
         }
+        # Classify exactly as a real hunt does, so the rendered block reflects the strict classification.
+        from bughunter import secret_classification as _sc
+        _sc.apply_secret_classification([finding])
         plan = _deterministic_attack_plan(finding, "secrets")
         ctx = {"tool": "g", "version": "t", "generated_at": "now", "target": "src/firebase.js",
                "scope": "", "attack_plans": {"F1": plan}}
         return RF.render_finding(ctx, finding, "hackerone")
 
-    def test_report_has_all_four_h1_requirements(self) -> None:
+    def test_live_firebase_browser_key_is_public_client_key_not_confirmed(self) -> None:
+        # A live Google/Firebase browser key (getProjectConfig 200) is EXPECTED — a public client key,
+        # NOT a confirmed secret. The report shows the location + project context but marks it
+        # informational, redacts the key, and never claims it is exploited.
         body = self._render({"checked": True, "live": True, "project_id": "acme-prod-42",
                              "authorized_domains": ["acme.com", "acme.firebaseapp.com"],
                              "detail": "LIVE — authenticates to Firebase project acme-prod-42", "http_status": 200})
-        self.assertIn("src/firebase.js:12", body)                 # exact location
+        self.assertIn("src/firebase.js:12", body)                 # exact location still shown
         self.assertIn("variable `apiKey`", body)                  # variable name
-        self.assertIn(_KEY, body)                                 # actual, un-redacted key
-        self.assertIn("LIVE", body)                               # validated live
-        self.assertIn("acme-prod-42", body)                       # specific project
-        self.assertIn("acme.firebaseapp.com", body)               # data/domains it grants
-        self.assertIn("UN-REDACTED", body)                        # review-before-sharing warning
+        self.assertNotIn(_KEY, body)                              # the FULL key is NEVER printed
+        self.assertIn("public_client_key", body)                  # classified as a public client key
+        self.assertIn("Informational only", body)                 # explicit not-a-secret banner
+        self.assertNotIn("UN-REDACTED", body)                     # no "share the real key" warning for a public key
+        self.assertNotRegex(body, r"(?i)status:\*\*\s*Confirmed")  # never confirmed from liveness alone
 
     def test_report_includes_runnable_poc_and_captured_response(self) -> None:
-        poc = f"curl -s 'https://www.googleapis.com/identitytoolkit/v3/relyingparty/getProjectConfig?key={_KEY}'"
-        body = self._render({"checked": True, "live": True, "project_id": "acme-prod-42",
-                             "authorized_domains": ["acme.com"], "detail": "LIVE", "http_status": 200,
-                             "poc": poc, "response_excerpt": '{"projectId":"acme-prod-42","authorizedDomains":["acme.com"]}'})
+        # A CONFIRMED secret (a validator-backed live server token) still gets a runnable PoC + captured
+        # issuer response — but the key is redacted even there (the report never carries a usable key).
+        gh = "ghp_" + "c" * 36
+        poc = f"curl -s -H 'Authorization: Bearer {gh}' https://api.github.com/user"
+        body = self._render({"checked": True, "live": True, "principal": "octocat", "scopes": "repo",
+                             "detail": "LIVE", "http_status": 200, "endpoint": "GitHub api.github.com/user",
+                             "poc": poc, "response_excerpt": '{"login":"octocat"}'},
+                            rule_id="secret.github-pat", secret_value=gh, variable_name="GITHUB_TOKEN")
         self.assertIn("Proof of concept", body)                       # a PoC section is present
-        self.assertIn(f"getProjectConfig?key={_KEY}", body)           # the runnable command, with the real key
+        self.assertIn("api.github.com/user", body)                    # the runnable command target
+        self.assertNotIn(gh, body)                                    # ...but the real token is redacted
         self.assertIn("Issuer response", body)                        # the captured artifact heading
-        self.assertIn("acme-prod-42", body)                           # the actual issuer response content
+        self.assertIn("octocat", body)                                # the actual issuer response content
 
     def _render_plan_proof(self, poi: dict) -> str:
         # A secret finding whose proof-of-impact is supplied directly (no _credential_proof branch),
@@ -449,25 +461,33 @@ class CredentialReportTests(unittest.TestCase):
         self.assertIn("Account / workspace", body)              # the account IS shown
         self.assertNotIn("No account data was read", body)      # so the contradictory claim is suppressed
 
-    def test_live_credential_reads_as_confirmed(self) -> None:
-        body = self._render({"checked": True, "live": True, "project_id": "p", "detail": "LIVE", "http_status": 200})
+    def test_live_validated_server_token_reads_as_confirmed(self) -> None:
+        # A validator-backed SERVER token the issuer authenticated as live IS a confirmed secret — this
+        # non-regression path must keep working (only the public-Firebase-key liveness is excluded).
+        gh = "ghp_" + "d" * 36
+        body = self._render({"checked": True, "live": True, "principal": "octocat", "detail": "LIVE",
+                             "http_status": 200, "endpoint": "GitHub api.github.com/user"},
+                            rule_id="secret.github-pat", secret_value=gh, variable_name="GITHUB_TOKEN")
         self.assertRegex(body, r"(?i)status:\*\*\s*Confirmed")
 
     def test_report_renders_github_token_account_scopes_and_confirmed(self) -> None:
+        gh = "ghp_" + "e" * 36
         body = self._render({"checked": True, "live": True, "principal": "octocat", "scopes": "repo, read:org",
                              "detail": "LIVE — GitHub account octocat", "http_status": 200,
                              "endpoint": "GitHub api.github.com/user",
-                             "poc": "curl -s -H 'Authorization: Bearer ghp_XXX' https://api.github.com/user",
-                             "response_excerpt": '{"login":"octocat"}'})
+                             "poc": f"curl -s -H 'Authorization: Bearer {gh}' https://api.github.com/user",
+                             "response_excerpt": '{"login":"octocat"}'},
+                            rule_id="secret.github-pat", secret_value=gh, variable_name="GITHUB_TOKEN")
         self.assertIn("octocat", body)                          # the account the token controls
         self.assertIn("repo, read:org", body)                  # granted scopes
         self.assertIn("api.github.com/user", body)             # runnable PoC + generic issuer wording
-        self.assertRegex(body, r"(?i)status:\*\*\s*Confirmed")  # a live token is a confirmed finding
+        self.assertRegex(body, r"(?i)status:\*\*\s*Confirmed")  # a live validated server token is confirmed
 
     def test_dead_credential_is_shown_but_not_confirmed(self) -> None:
         body = self._render({"checked": True, "live": False, "detail": "NOT live", "http_status": 400})
-        self.assertIn(_KEY, body)                                 # still shows the key + location
-        self.assertNotRegex(body, r"(?i)status:\*\*\s*Confirmed")  # but a dead key is not a confirmed finding
+        self.assertNotIn(_KEY, body)                              # the full key is never printed (redacted)
+        self.assertIn("src/firebase.js:12", body)                # but the location is still shown
+        self.assertNotRegex(body, r"(?i)status:\*\*\s*Confirmed")  # a dead key is not a confirmed finding
 
     def test_source_api_credential_plan_carries_redacted_read_proof(self) -> None:
         raw = "sk-proj-" + ("C" * 32)
