@@ -2,6 +2,16 @@
 
 Notable changes to GreyIQ.
 
+## v0.98.0
+
+### Single hunt now runs on the live dashboard
+- A **single Hunt** now drives the same **live dashboard** a full campaign does — you can watch it work
+  instead of staring at a compact text log. The target appears as a work unit (queued → running → done),
+  the activity log streams every step live, and its findings + severity tiles roll up on the dashboard,
+  with the same click-to-investigate drawer (re-verify, "View full report") a campaign target has.
+- Removed the old separate launch-rail progress log; both a single hunt and a campaign share one
+  dashboard, and the empty state now invites a single Hunt, a Full campaign, or a Portfolio hunt.
+
 ## v0.97.0
 
 ### NASA mode — hunt strictly within a program's Vulnerability Disclosure Policy

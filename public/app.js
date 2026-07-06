@@ -4347,8 +4347,6 @@ const ck = {
 let ckOpPoll = null;        // operator event-poll timer
 let ckOpEventCount = 0;     // events already rendered
 let ckOpEdit = null;        // the program being edited in the form (null = adding a new one)
-let ckLivePoll = null;      // scan/campaign live-progress poll timer
-let ckLiveEventCount = 0;   // live-progress lines already rendered
 
 const ckState = {
   result: null,          // last hunt/campaign response
@@ -9075,20 +9073,18 @@ async function ckRun() {
       : "Hunting — running scanners and proving findings…"
   );
   const progressRunId = crypto.randomUUID();
-  if (isCampaign) {
-    // A campaign opens its live dashboard (per-target status + streamed findings);
-    // a single hunt keeps the compact launch-rail activity log.
-    const dashLabel = spanning
-      ? ((ck.activeProgram?.selectedOptions?.[0]?.textContent || state.ckProgram || "Program").trim() + " — span scope")
-      : `Campaign · ${target}`;
-    // Capture the scope + program + authorization so the dashboard's on-demand re-verify
-    // can re-probe a finding within the SAME authorized scope this campaign ran under.
-    ckStartCampaignDashboard(progressRunId, dashLabel, {
-      scope: state.ckScope, programId: spanning ? state.ckActiveProgramId : null, authorized: true,
-    });
-  } else {
-    ckStartLiveLog(progressRunId);
-  }
+  // A full campaign AND a single hunt both open the live dashboard (per-target status + streamed
+  // findings + activity log), so the operator can watch a single hunt work exactly like a campaign.
+  const dashLabel = isCampaign
+    ? (spanning
+        ? ((ck.activeProgram?.selectedOptions?.[0]?.textContent || state.ckProgram || "Program").trim() + " — span scope")
+        : `Campaign · ${ckShortTarget(target)}`)
+    : `Hunt · ${ckShortTarget(target)}`;
+  // Capture the scope + program + authorization so the dashboard's on-demand re-verify can re-probe
+  // a finding within the SAME authorized scope this run used.
+  ckStartCampaignDashboard(progressRunId, dashLabel, {
+    scope: state.ckScope, programId: spanning ? state.ckActiveProgramId : null, authorized: true,
+  });
   try {
     let res;
     if (isCampaign) {
@@ -9138,53 +9134,17 @@ async function ckRun() {
       void ckNotify("GreyIQ — hunt complete", doneMsg);
     }
     ckRenderFindings();
-    // A campaign stays on its live dashboard (which shows the final summary); a single
-    // hunt jumps to the Findings board as before.
-    if (!isCampaign) ckSetView("findings");
-    else if (ckState.view === "campaign") ckRenderCampaign();
+    // Both a campaign and a single hunt stay on the live dashboard (which shows the final summary +
+    // findings, with a "View all findings →" jump to the board).
+    if (ckState.view === "campaign") ckRenderCampaign();
   } catch (err) {
     ckStatus(err.message || "The run failed.", true);
   } finally {
     ck.run.disabled = false;
-    if (isCampaign) {
-      void ckFinishCampaignDashboard();  // stop polling, mark done, final render
-    } else {
-      ckStopLiveLog();
-      void ckPollLiveLog(progressRunId); // catch any trailing line(s) emitted right before the response returned
-    }
+    void ckFinishCampaignDashboard();  // stop polling, mark done, final render
   }
 }
 
-function ckStartLiveLog(runId) {
-  const log = document.querySelector("#ckLiveLog");
-  if (!log) return;
-  ckStopLiveLog();
-  ckLiveEventCount = 0;
-  log.hidden = false;
-  log.replaceChildren(cel("p", "ck-hint", "Starting…"));
-  ckLivePoll = setInterval(() => { void ckPollLiveLog(runId); }, 1200);
-}
-
-function ckStopLiveLog() {
-  if (ckLivePoll) { clearInterval(ckLivePoll); ckLivePoll = null; }
-}
-
-async function ckPollLiveLog(runId) {
-  const log = document.querySelector("#ckLiveLog");
-  if (!log) return;
-  let res = null;
-  try { res = await apiFetch("/api/bounty/progress", { method: "POST", timeoutMs: 6000, body: JSON.stringify({ run_id: runId, after: ckLiveEventCount }) }); } catch (_) { return; }
-  if (!res || res.ok === false) return;
-  if (!(res.events || []).length) return;
-  if (log.firstElementChild && log.firstElementChild.textContent === "Starting…") log.replaceChildren();
-  for (const ev of res.events) {
-    const row = cel("div", "ck-op-event");
-    row.append(cel("span", "ck-op-time", (ev.at || "").slice(11, 19)), cel("span", null, ev.message || ""));
-    log.append(row);
-  }
-  ckLiveEventCount = res.count || (ckLiveEventCount + res.events.length);
-  log.scrollTop = log.scrollHeight;
-}
 
 function ckStatus(text, isError) {
   if (!ck.status) return;
@@ -9420,7 +9380,7 @@ function ckRenderCampaign() {
     globe.src = "./globe.svg"; globe.alt = ""; globe.width = 150; globe.height = 150;
     hero.append(globe);
     hero.append(cel("p", "ck-hint",
-      "No campaign is running. Start a Full campaign or a Portfolio hunt from the launch rail — pick a saved program (tick “span scope” for its whole scope) or select several programs to hunt at once — and every target's status and each finding appears here live."));
+      "Nothing is running. Start a single Hunt, a Full campaign, or a Portfolio hunt from the launch rail — every target's status and each finding appears here live as it works."));
     host.append(hero);
     return;
   }
