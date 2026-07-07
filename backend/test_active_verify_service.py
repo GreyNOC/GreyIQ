@@ -68,6 +68,31 @@ class _Stub:
         return {"status": status, "headers": headers, "cookies": [], "body": body, "truncated": False, "final_url": url, "location": location}
 
 
+class _AuthCorsStub:
+    """An AUTHENTICATED-scan stub (carries a truthy ``auth``) whose reflected-Origin endpoint
+    returns a caller-supplied body/status — so the CORS read-impact grader sees a real authenticated
+    response and can classify it. Reflects the attacker marker Origin with credentials and echoes a
+    benign control Origin (dynamic reflection), exactly like the confirmed-misconfig branch expects."""
+
+    def __init__(self, body: str, *, status: int = 200) -> None:
+        self.auth = object()  # non-None => fetch() would attach the operator's same-site session
+        self.body = body
+        self.status = status
+        self.methods: list[str] = []
+
+    def fetch(self, url: str, *, method: str = "GET", extra_headers=None) -> dict:
+        self.methods.append(method)
+        origin = {k.lower(): v for k, v in (extra_headers or {}).items()}.get("origin")
+        headers: dict[str, str] = {}
+        if origin == av._MARKER_ORIGIN:
+            headers["access-control-allow-origin"] = origin
+            headers["access-control-allow-credentials"] = "true"
+        elif origin:  # dynamically reflect the benign control origin (proves reflection is Origin-driven)
+            headers["access-control-allow-origin"] = origin
+        return {"status": self.status, "headers": headers, "cookies": [], "body": self.body,
+                "final_url": url, "location": None}
+
+
 class ActiveCheckTests(unittest.TestCase):
     URL = "https://app.example.com/?q=x&next=/home"
 
@@ -79,6 +104,41 @@ class ActiveCheckTests(unittest.TestCase):
     def test_cors_without_credentials_is_candidate_not_confirmed(self) -> None:
         f = av._check_cors(_Stub(cors_credentialed=False), self.URL)
         self.assertEqual(f["_active_proof"]["status"], "candidate")
+
+    def test_cors_unauthenticated_reflection_is_low_not_high(self) -> None:
+        # The classic overclaim: reflected attacker Origin + Allow-Credentials on an UNAUTHENTICATED
+        # scan (the stub carries no session). The misconfiguration is confirmed, but no authenticated
+        # body was read — severity must be Low and CVSS must never assert C:H.
+        f = av._check_cors(_Stub(), self.URL)
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertEqual(f["severity"], "low")
+        self.assertEqual(f["_active_cvss"]["base_severity"], "Low")
+        self.assertNotIn("/C:H", f["_active_cvss"]["vector"])  # Confidentiality:High absent (AC:H is fine)
+        self.assertIn("C:L", f["_active_cvss"]["vector"])
+        # The proof labels this as server-side header behaviour with unproven impact, not a cross-origin read.
+        self.assertIn("unproven", f["_active_proof"]["affected_asset"].lower())
+        self.assertIn("header behaviour", f["_active_proof"]["observed_result"].lower())
+
+    def test_cors_authenticated_sensitive_read_is_medium_and_names_data(self) -> None:
+        # An authenticated scan whose reflected-Origin endpoint returns a 2xx body containing a JWT +
+        # email: a live authenticated endpoint. Severity is MEDIUM (not High — the read is same-site /
+        # curl-equivalent, so browser exploitability is unproven), and the sensitive data is captured
+        # and NAMED from the raw body (before redaction).
+        jwt = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+               "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U")
+        f = av._check_cors(_AuthCorsStub(f'{{"email":"victim@acme.com","token":"{jwt}"}}'), self.URL)
+        self.assertEqual(f["severity"], "medium")
+        self.assertEqual(f["_active_cvss"]["base_severity"], "Medium")
+        self.assertNotIn("/C:H", f["_active_cvss"]["vector"])  # Confidentiality:High absent
+        self.assertIn("a JWT (session/bearer token)", f["proof_evidence"]["sensitive_data_labels"])
+        self.assertTrue(f["proof_evidence"]["read_data"])  # the body was captured for the PoC file
+
+    def test_cors_authenticated_404_is_low(self) -> None:
+        # Authenticated scan, but the reflected-Origin endpoint returns 404: header misconfiguration
+        # confirmed, but no sensitive read demonstrated -> Low.
+        f = av._check_cors(_AuthCorsStub("Not Found", status=404), self.URL)
+        self.assertEqual(f["severity"], "low")
+        self.assertEqual(f["_active_cvss"]["base_severity"], "Low")
 
     def test_reflected_xss_unescaped_confirms_with_control(self) -> None:
         f = av._check_reflected_xss(_Stub(), self.URL)

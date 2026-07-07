@@ -53,7 +53,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from bughunter import digest_builder
+from bughunter import digest_builder, impact_model, sensitive_data
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.rate_limit import HostRateGovernor
 from bughunter.registrable_domain import is_bare_public_suffix, registrable_domain
@@ -432,37 +432,126 @@ def _finding(rule_id: str, title: str, severity: str, category: str, class_hint:
 # Each returns a finding dict (confirmed/candidate) or None. Conservative: a
 # 'confirmed' status requires a positive observation AND a control differential.
 
-def _cors_enrich_read(http: _Http, probe: dict[str, Any], proof: dict[str, Any], ev: dict[str, str]) -> None:
-    """Turn a proven CORS *misconfiguration* into a proven cross-origin *read*.
+def _cors_cvss(tier: str) -> dict[str, Any]:
+    """A per-finding, evidence-based CVSS v3.1 block for a CORS misconfiguration, sized to
+    what the engine actually proved. NEVER C:H — the active layer only performs a SAME-SITE
+    (curl-equivalent) read, which does not prove a browser cross-origin read, so confidentiality
+    impact caps at Low. High (C:H) is reserved for a browser-hosted PoC that reads sensitive
+    victim data cross-origin — evidence this engine does not, by itself, produce.
 
-    When the scan is authenticated, ``fetch`` attaches the operator's SAME-SITE session to
-    the probe, so a 2xx response body IS the authenticated data an attacker origin can read
-    once ACAO reflects it with Allow-Credentials. Embed a redacted excerpt as ``read_data``
-    (the report renders it as the demonstrated cross-origin read) and note the read in the
-    observation — this is the concrete "reads sensitive authenticated data cross-origin"
-    a HackerOne triager rejects a header-only CORS report for lacking. No-op on an
-    unauthenticated scan / non-2xx / trivially-empty body (misconfig still reported)."""
-    if getattr(http, "auth", None) is None:
-        return
+      medium — arbitrary Origin reflected + Allow-Credentials:true CONFIRMED on an
+               authenticated endpoint that returned a real 2xx body (impact plausible, not
+               yet browser-proven).
+      low    — the misconfiguration is confirmed, but only on a non-authenticated / non-2xx
+               / empty response (404, 403, redirect, health check, static/public content),
+               so no sensitive cross-origin read is demonstrated."""
+    vector = (
+        "AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:N/A:N" if tier == "medium"
+        else "AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:N/A:N"
+    )
+    scored = impact_model.cvss_base_score(vector)
+    if tier == "medium":
+        why = ("Arbitrary-Origin reflection with Allow-Credentials:true is confirmed on an authenticated "
+               "endpoint (server-side header behaviour). Confidentiality impact is scored Low, not High, "
+               "because a browser cross-origin read of sensitive victim data has not yet been demonstrated — "
+               "capture a browser-hosted PoC to justify a higher score.")
+    else:
+        why = ("The CORS header misconfiguration is confirmed, but only on a non-sensitive response (non-2xx, "
+               "empty, or unauthenticated), so no cross-origin read of sensitive authenticated data is "
+               "demonstrated. Severity stays Low until impact is shown on an authenticated data endpoint.")
+    return {
+        "vector": vector,
+        "base_score": scored["score"],
+        "base_severity": scored["severity"],
+        "estimated": False,
+        "justification": why,
+    }
+
+
+def _cors_read_impact(http: _Http, probe: dict[str, Any], proof: dict[str, Any], ev: dict[str, str]) -> str:
+    """Grade the demonstrated impact of a proven CORS *misconfiguration* and, when possible,
+    capture the authenticated response body — WITHOUT overclaiming a browser cross-origin read.
+
+    Returns the evidence-based severity tier ('medium' or 'low'):
+
+      * The active layer's ``fetch`` attaches the operator's SAME-SITE session, so a 2xx body is
+        what the endpoint returns *to a same-site request* (curl-equivalent). That is NOT proof a
+        browser would send the victim's cookie cross-origin (SameSite) nor that an attacker page
+        actually read it — so this NEVER returns 'high'. High requires a browser-hosted PoC.
+      * 'medium' — authenticated scan + a real 2xx body: a live authenticated endpoint whose CORS
+        headers WOULD let an attacker origin read a response like this. The body is captured as
+        ``read_data`` and any sensitive data in it is NAMED (``sensitive_data_labels``), classified
+        on the RAW body before redaction so JWT/token/session material is not missed.
+      * 'low' — unauthenticated scan, non-2xx (404/403/redirect/health), or a trivially-empty body:
+        the header misconfiguration is confirmed but no sensitive cross-origin read is demonstrated.
+
+    The proof's observed_result / affected_asset are rewritten to say exactly this, so the report
+    can never read as "sensitive data theft confirmed" off a header-only or non-sensitive result."""
     try:
         status = int(probe.get("status") or 0)
     except (TypeError, ValueError):
-        return
-    if not (200 <= status < 300):
-        return
+        status = 0
     body = str(probe.get("body") or "")
-    if len(body.strip()) < 8:
-        return
+    authenticated = getattr(http, "auth", None) is not None
+    has_body = 200 <= status < 300 and len(body.strip()) >= 8
+
+    if not (authenticated and has_body):
+        # Confirmed header behaviour only — no authenticated body to demonstrate a read.
+        reason = (
+            f"the tested endpoint returned HTTP {status or '(no body)'}"
+            if not (200 <= status < 300) else
+            "the scan was unauthenticated, so no victim-specific body could be captured"
+            if not authenticated else
+            "the response body was empty/non-sensitive"
+        )
+        proof["observed_result"] = (
+            (proof.get("observed_result") or "").rstrip(". ")
+            + f"; {reason}, so a cross-origin read of sensitive authenticated data is NOT demonstrated "
+              "by this evidence — the confirmed result is the server-side CORS header behaviour only"
+        )
+        proof["affected_asset"] = (
+            "the server's CORS response-header policy (confirmed); sensitive-data impact is unproven "
+            "on this endpoint"
+        )
+        proof.setdefault("limitations", "")
+        proof["limitations"] = (
+            (proof["limitations"] + " " if proof["limitations"] else "")
+            + "Server-side header behaviour is confirmed (curl-level). A browser-hosted PoC on an "
+              "attacker origin that reads a sensitive authenticated response is required to prove "
+              "browser exploitability and sensitive impact."
+        ).strip()
+        return "low"
+
+    # Authenticated 2xx body captured: a live authenticated endpoint. Classify the RAW body
+    # (before _finding() redacts) so token/JWT/session material is named, not missed.
+    labels = sensitive_data.classify(body)
+    named = sensitive_data.summarize(body)
+    proof["actor"] = "an attacker-controlled web page loaded by a logged-in victim (browser PoC required to confirm)"
     proof["observed_result"] = (
         (proof.get("observed_result") or "").rstrip(". ")
-        + f"; a cross-origin GET carrying the victim's session then returned the authenticated "
-          f"response ({len(body)} bytes) that the reflected Access-Control-Allow-Origin + "
-          f"Allow-Credentials let the attacker origin READ"
+        + f"; requested WITH the operator's session (a same-site, curl-equivalent read), the endpoint "
+          f"returned a {len(body)}-byte authenticated body"
+        + (f" containing {named}" if named else "")
+        + ". The confirmed CORS headers WOULD let an attacker-controlled origin read a response like "
+          "this; a browser cross-origin read has not yet been proven"
     )
-    proof["affected_asset"] = "the authenticated response body an attacker origin reads cross-origin"
+    proof["affected_asset"] = (
+        "authenticated responses from this endpoint" + (f" (observed to include {named})" if named else "")
+    )
+    proof.setdefault("limitations", "")
+    proof["limitations"] = (
+        (proof["limitations"] + " " if proof["limitations"] else "")
+        + "The read shown was same-site (the tool's own session), which proves the endpoint returns this "
+          "data but NOT that a browser sends the victim's cookie cross-origin. Host the PoC on an attacker "
+          "origin and capture the response body it reads to confirm browser exploitability."
+    ).strip()
     # Store the RAW excerpt; _finding() redacts every proof_evidence value exactly once.
-    # (Redacting here too would nest the markers: "[REDACTED_SECRET:[REDACTED_SECRET:…".)
     ev["read_data"] = body[:1500]
+    if labels:
+        # Labels are generic English (never the secret itself) so they survive redaction and let the
+        # report name the sensitive data even when the redacted excerpt shows only [REDACTED_…] markers.
+        ev["sensitive_data_labels"] = "; ".join(labels)
+    return "medium"
 
 
 def _check_cors(http: _Http, url: str) -> dict[str, Any] | None:
@@ -498,9 +587,9 @@ def _check_cors(http: _Http, url: str) -> dict[str, Any] | None:
         )
         ev = {"request_line": f"GET {url}", "request_header": f"Origin: {_MARKER_ORIGIN}",
               "response_status": f"HTTP {probe['status']}", "matched_value": f"Access-Control-Allow-Origin: {acao}; Access-Control-Allow-Credentials: {acac}"}
-        _cors_enrich_read(http, probe, proof, ev)
-        return _finding("active.cors-reflection", "CORS reflects attacker Origin with credentials", "high",
-                        "cors", "cors", url, proof, ev)
+        tier = _cors_read_impact(http, probe, proof, ev)
+        return _finding("active.cors-reflection", "CORS reflects attacker Origin with credentials", tier,
+                        "cors", "cors", url, proof, ev, cvss=_cors_cvss(tier))
     if reflects_marker and not credentialed:
         proof = _proof("candidate", method="GET with attacker Origin",
                        observed_result=f"ACAO reflected {acao} but Allow-Credentials was not true",
@@ -527,8 +616,8 @@ def _check_cors(http: _Http, url: str) -> dict[str, Any] | None:
             )
             ev = {"request_line": f"GET {url}", "request_header": "Origin: null", "response_status": f"HTTP {null_probe['status']}",
                   "matched_value": "Access-Control-Allow-Origin: null; Access-Control-Allow-Credentials: true"}
-            _cors_enrich_read(http, null_probe, proof, ev)
-            return _finding("active.cors-reflection", "CORS trusts Origin: null with credentials", "high", "cors", "cors", url, proof, ev)
+            tier = _cors_read_impact(http, null_probe, proof, ev)
+            return _finding("active.cors-reflection", "CORS trusts Origin: null with credentials", tier, "cors", "cors", url, proof, ev, cvss=_cors_cvss(tier))
 
     # Variant 3 — attacker-controlled subdomain of the in-scope host reflected with
     # credentials (a takeover/XSS on any sibling subdomain then reads this API).
@@ -551,8 +640,8 @@ def _check_cors(http: _Http, url: str) -> dict[str, Any] | None:
                 )
                 ev = {"request_line": f"GET {url}", "request_header": f"Origin: {sub_origin}", "response_status": f"HTTP {sub_probe['status']}",
                       "matched_value": f"Access-Control-Allow-Origin: {sub_origin}; Access-Control-Allow-Credentials: true"}
-                _cors_enrich_read(http, sub_probe, proof, ev)
-                return _finding("active.cors-reflection", "CORS trusts arbitrary subdomain Origin with credentials", "high", "cors", "cors", url, proof, ev)
+                tier = _cors_read_impact(http, sub_probe, proof, ev)
+                return _finding("active.cors-reflection", "CORS trusts arbitrary subdomain Origin with credentials", tier, "cors", "cors", url, proof, ev, cvss=_cors_cvss(tier))
 
     # Variant 4 — naive substring/prefix trust: an ACL that checks `if TARGET in origin` (or a
     # `startswith` without a boundary) trusts `https://TARGET.attacker.example`. Send that shape;
@@ -576,8 +665,8 @@ def _check_cors(http: _Http, url: str) -> dict[str, Any] | None:
                 )
                 ev = {"request_line": f"GET {url}", "request_header": f"Origin: {substr_origin}", "response_status": f"HTTP {substr_probe['status']}",
                       "matched_value": f"Access-Control-Allow-Origin: {substr_origin}; Access-Control-Allow-Credentials: true"}
-                _cors_enrich_read(http, substr_probe, proof, ev)
-                return _finding("active.cors-reflection", "CORS trusts an origin that merely contains the host (substring/prefix trust)", "high", "cors", "cors", url, proof, ev)
+                tier = _cors_read_impact(http, substr_probe, proof, ev)
+                return _finding("active.cors-reflection", "CORS trusts an origin that merely contains the host (substring/prefix trust)", tier, "cors", "cors", url, proof, ev, cvss=_cors_cvss(tier))
     return None
 
 

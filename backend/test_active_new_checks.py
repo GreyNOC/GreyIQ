@@ -433,19 +433,24 @@ class _AuthedReflectCorsStub:
 
 class CorsAuthenticatedReadTests(unittest.TestCase):
     def test_authenticated_scan_captures_cross_origin_read(self) -> None:
-        # An authenticated scan turns a header-only misconfig into a proven cross-origin READ:
-        # read_data holds the response body and the observation states the attacker origin READ it.
+        # An authenticated scan CAPTURES the authenticated body (read_data) and NAMES the sensitive
+        # data — but the read is SAME-SITE (curl-equivalent), so severity is Medium (not High) and the
+        # observation is honest that a browser cross-origin read is not yet proven (no overclaimed theft).
         f = av._check_cors(_AuthedReflectCorsStub(), "https://api.example.com/user/me")
         self.assertIsNotNone(f)
-        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")   # the MISCONFIGURATION is confirmed
+        self.assertEqual(f["severity"], "medium")                     # not High — no browser PoC
+        self.assertNotIn("/C:H", f["_active_cvss"]["vector"])          # Confidentiality:High not asserted
         self.assertIn("read_data", f["proof_evidence"])
         self.assertIn("victim@example.com", f["proof_evidence"]["read_data"])
-        self.assertIn("READ", f["_active_proof"]["observed_result"])
+        self.assertIn("email address(es)", f["proof_evidence"]["sensitive_data_labels"])
+        self.assertIn("same-site", f["_active_proof"]["observed_result"])
+        self.assertIn("not yet been proven", f["_active_proof"]["observed_result"])
         # read_data is redacted exactly once — no nested "[REDACTED_SECRET:[REDACTED_SECRET" markers.
         self.assertNotIn("[REDACTED_SECRET:[REDACTED_SECRET", f["proof_evidence"]["read_data"])
 
     def test_unauthenticated_scan_reports_misconfig_without_read(self) -> None:
-        # No auth attribute -> _cors_enrich_read is a no-op: the misconfiguration is still
+        # No auth attribute -> _cors_read_impact grades Low: the misconfiguration is still
         # confirmed, but nothing is claimed to have been read (fail-closed on the read claim).
         class _Anon(_AuthedReflectCorsStub):
             auth = None
@@ -475,7 +480,7 @@ class CorsAuthenticatedReadTests(unittest.TestCase):
         body = RF.render_finding(ctx, finding, "hackerone")
         self.assertIn("curl -i -H 'Origin:", body)                     # concrete repro request
         self.assertIn("credentials: \"include\"", body)                # runnable credentialed PoC
-        self.assertIn("Demonstrated cross-origin read", body)          # the read is shown
+        self.assertIn("same-site read", body)                          # the captured read is shown honestly
         self.assertIn("victim@example.com", body)                      # the actual sensitive data
         self.assertRegex(body, r"(?m)^Access-Control-Allow-Credentials: true$")  # ACAC on its own line
 

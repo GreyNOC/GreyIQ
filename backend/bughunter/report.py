@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from bughunter import impact_model
 from bughunter import secret_classification
 from bughunter import sensitive_data
 from bughunter.code_scanner.redaction import redact_secret, redact_text
@@ -161,6 +162,142 @@ def severity_counts(findings: list[dict[str, Any]], attack_plans: dict[str, Any]
         if sev in counts:
             counts[sev] += 1
     return counts
+
+
+# ----------------------------- pre-export QA gate -----------------------------
+# Response statuses that, on their own, do NOT demonstrate sensitive-data exposure — a
+# reflected-Origin CORS header on one of these proves the header behaviour, not impact.
+_NON_SENSITIVE_STATUS = {"301", "302", "303", "307", "308", "204", "401", "403", "404", "410"}
+# Confidentiality-driven classes where a C:H / High claim MUST be backed by a captured
+# sensitive read. Injection/RCE/SQLi keep their modelled C:H (their impact isn't a data read).
+_CONFIDENTIALITY_CLASSES = {"cors", "disclosure"}
+
+
+def _response_status_code(finding: dict[str, Any]) -> str:
+    pe = finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {}
+    m = re.search(r"\b([1-5]\d{2})\b", str(pe.get("response_status") or ""))
+    return m.group(1) if m else ""
+
+
+def _sensitive_read_captured(finding: dict[str, Any]) -> bool:
+    """True only when the captured readable body actually NAMES high-confidence sensitive data —
+    either the labels the capturing check classified on the raw body, or (fallback) a re-scan of the
+    redacted excerpt. This is the single 'sensitive data was really read' signal the QA gate trusts."""
+    pe = finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {}
+    if str(pe.get("sensitive_data_labels") or "").strip():
+        return True
+    rd = str(pe.get("read_data") or "").strip()
+    return bool(rd and sensitive_data.summarize(rd))
+
+
+def _browser_poc_confirmed(finding: dict[str, Any]) -> bool:
+    """True only when a browser-hosted PoC on an ATTACKER origin actually read the cross-origin
+    response — the one evidence that lifts a credentialed-CORS misconfig to High. The active prover
+    reads same-site (curl-equivalent) and never sets this, so it is False unless an operator/dynamic
+    PoC explicitly records ``cross_origin_read_confirmed`` on the finding."""
+    return finding.get("cross_origin_read_confirmed") is True
+
+
+def _sub_metric(vector: str, key: str, value: str) -> str:
+    """Replace CVSS metric ``key`` with ``value``, boundary-anchored so ``C`` (Confidentiality) is
+    never matched inside ``AC`` (Attack Complexity) — a naive ``vector.replace("C:H","C:L")`` corrupts
+    ``AC:H`` into ``AC:L``. Leaves the vector unchanged when the metric is absent."""
+    return re.sub(rf"(^|/){re.escape(key)}:[A-Za-z]+", rf"\1{key}:{value}", vector)
+
+
+def _has_metric(vector: str, key: str, value: str) -> bool:
+    return re.search(rf"(^|/){re.escape(key)}:{re.escape(value)}(/|$)", vector) is not None
+
+
+def _set_cvss_vector(cvss: dict[str, Any], vector: str, note: str) -> None:
+    scored = impact_model.cvss_base_score(vector)
+    cvss["vector"] = vector
+    cvss["base_score"] = scored["score"]
+    cvss["base_severity"] = scored["severity"]
+    prior = str(cvss.get("justification") or "").rstrip(". ")
+    cvss["justification"] = (f"{prior}. " if prior else "") + note
+
+
+def qa_validate_report(findings: list[dict[str, Any]], attack_plans: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Final QA pass GreyIQ runs BEFORE it exports a report. It answers the evidence-vs-claim
+    questions a triager would ask and applies SAFE, downgrade-only corrections in place — a report can
+    only get MORE conservative here, never more severe. Returns::
+
+        {"ok": bool, "issues": [ {ref, severity, question, verdict, action, detail} , ... ]}
+
+    Enforced invariants (the claims that must be backed by real evidence):
+      * Claims sensitive-data exposure / C:H  → a sensitive read must be captured, else strip C:H.
+      * Claims High on a CORS finding          → a browser cross-origin PoC must exist, else cap Medium.
+      * Response was 404/403/204/redirect + no sensitive read → cap the demonstrated impact to Low.
+    Every correction is recorded as an issue so the change is auditable in the report + JSON."""
+    plans = attack_plans or {}
+    issues: list[dict[str, Any]] = []
+
+    def _record(finding, ref, question, verdict, action="", detail=""):
+        issues.append({"ref": ref, "severity": resolve_severity(finding, plans.get(ref)),
+                       "question": question, "verdict": verdict, "action": action, "detail": detail})
+
+    def _cap(finding, plan, target_tier, reason):
+        cur = resolve_severity(finding, plan)
+        if _SEVERITY_ORDER.get(target_tier, 0) >= _SEVERITY_ORDER.get(cur, 0):
+            return False  # already at/below the cap — nothing to downgrade
+        finding["severity"] = target_tier
+        cvss = plan.get("cvss") if isinstance(plan.get("cvss"), dict) else None
+        if cvss and isinstance(cvss.get("vector"), str):
+            # Rewrite to a vector whose computed severity matches the cap so score + word never disagree:
+            # drop C:H→C:L and Scope-Changed→Unchanged, then, if still above the cap, weaken AC.
+            vec = _sub_metric(_sub_metric(cvss["vector"], "C", "L"), "S", "U")
+            if _SEVERITY_ORDER.get(impact_model.cvss_base_score(vec)["severity"].lower(), 0) > _SEVERITY_ORDER.get(target_tier, 0):
+                vec = _sub_metric(vec, "AC", "H")
+            _set_cvss_vector(cvss, vec, f"QA cap to {target_tier.title()}: {reason}")
+        return True
+
+    for finding in findings:
+        ref = finding.get("ref")
+        plan = plans.get(ref) or {}
+        cls = str(finding.get("class_id") or "").lower()
+        detail = _proof_of_impact_detail(finding, plan)
+        status_code = _response_status_code(finding)
+        sensitive = _sensitive_read_captured(finding)
+        browser_poc = _browser_poc_confirmed(finding)
+
+        # Q1 — claims High/Critical on a CORS finding? Requires a browser cross-origin PoC.
+        if cls == "cors" and _SEVERITY_ORDER.get(resolve_severity(finding, plan), 0) >= _SEVERITY_ORDER["high"] and not browser_poc:
+            if _cap(finding, plan, "medium", "no browser cross-origin PoC read sensitive victim data; curl/same-site "
+                                              "evidence proves header behaviour only"):
+                _record(finding, ref, "Does the report claim High CORS severity?", "unsupported",
+                        "downgraded to Medium", "High CORS requires a browser-hosted PoC reading sensitive data cross-origin.")
+
+        # Q2 — response is 404/403/204/redirect and no sensitive read → cap demonstrated impact to Low.
+        if cls in _CONFIDENTIALITY_CLASSES and status_code in _NON_SENSITIVE_STATUS and not sensitive:
+            if _cap(finding, plan, "low", f"the tested endpoint returned HTTP {status_code} with no sensitive data in "
+                                          "the readable response"):
+                _record(finding, ref, "Does the response status show 404/403/204/redirect?", "yes",
+                        "capped demonstrated impact to Low",
+                        f"HTTP {status_code} with no sensitive read — misconfiguration confirmed, impact not demonstrated.")
+
+        # Q3 — claims sensitive-data exposure (C:H) with no sensitive read captured → strip C:H. Re-read
+        # the plan CVSS live (Q1/Q2 may already have rewritten it) so a stale vector can't re-inflate it.
+        cvss = plan.get("cvss") if isinstance(plan.get("cvss"), dict) else None
+        vector = str((cvss or {}).get("vector") or "")
+        if cls in _CONFIDENTIALITY_CLASSES and cvss and _has_metric(vector, "C", "H") and not sensitive:
+            _set_cvss_vector(cvss, _sub_metric(vector, "C", "L"),
+                             "QA: C:H removed — no sensitive authenticated data was captured in the readable response")
+            # Re-cap the finding severity to the recomputed CVSS tier so the two agree.
+            finding["severity"] = min(resolve_severity(finding, plan), cvss["base_severity"].lower(),
+                                      key=lambda t: _SEVERITY_ORDER.get(t, 0))
+            _record(finding, ref, "Does the report claim sensitive data exposure (C:H)?", "unsupported",
+                    "removed C:H from the CVSS vector", "No sensitive data was present in the captured readable response.")
+
+        # Q4 — curl-only evidence must be labelled server behaviour, not browser exploitability. The
+        # active prover already writes this into the proof, so here we only flag when a confirmed CORS
+        # finding lacks the browser-PoC note (informational; no downgrade beyond Q1).
+        if cls == "cors" and detail.get("status") == "confirmed" and not browser_poc:
+            _record(finding, ref, "Is CORS evidence curl-only (server behaviour)?", "yes", "",
+                    "Labelled as server-side header behaviour; cross-origin browser exploitability is not "
+                    "proven from curl/same-site evidence.")
+
+    return {"ok": not any(i.get("action") for i in issues), "issues": issues}
 
 
 def _md_escape_cell(text: str) -> str:
@@ -965,10 +1102,9 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
         out.append(body)
         out.append(fence)
         out.append("")
-    # The demonstrated cross-origin read: a request carrying the victim's authenticated
-    # session returned this body, which the reflected CORS headers let an attacker origin
-    # READ. This is the concrete "sensitive data exploited" a HackerOne triager demands —
-    # not just the header reflection. Already redacted by the capturing check.
+    # The captured readable body. For a disclosure the data IS returned to any reader; for CORS this
+    # is a SAME-SITE (curl-equivalent) capture that shows the endpoint returns this data — the browser
+    # cross-origin read stays PoC-gated (see the heading below). Already redacted by the capturing check.
     read_data = str(pe.get("read_data") or "").strip()
     if read_data:
         rd = read_data[:1500]
@@ -981,10 +1117,11 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
         if cls == "cors" or "cors" in rid:
             is_disclosure = True
             heading = (
-                "**Demonstrated cross-origin read** — a request carrying the victim's authenticated "
-                "session returned the response body below. Because the CORS headers above make this "
-                "response readable from an attacker-controlled origin, this is the sensitive data an "
-                "attacker page exfiltrates:"
+                "**Captured authenticated response (same-site read)** — requested with the tool's own "
+                "session, this endpoint returned the body below. The confirmed CORS headers above WOULD "
+                "let an attacker-controlled origin read a response like this, but the capture is same-site "
+                "(curl-equivalent); a browser-hosted PoC on an attacker origin is still required to prove "
+                "the cross-origin read and its sensitive impact:"
             )
         elif cls in _DISCLOSURE or any(t in rid for t in _DISCLOSURE_RID):
             is_disclosure = True
@@ -1005,15 +1142,30 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
         out.append(rd_fence)
         out.append(rd)
         out.append(rd_fence)
-        # Name the high-confidence sensitive data actually present in the disclosed body — the "so-what"
-        # that raises a data-disclosure finding's severity. Only for disclosure classes: for injection
-        # classes the body is the payload's own effect, not data exfiltrated to an attacker.
+        # Name the high-confidence sensitive data actually present in the captured body — the "so-what"
+        # that raises a data-disclosure finding's severity. Prefer the labels the capturing check
+        # classified on the RAW body (``sensitive_data_labels``): redaction rewrites JWT/token/session
+        # material to markers this classifier can no longer see, so re-summarizing the redacted excerpt
+        # (the fallback) silently under-reports. Only for disclosure classes: for injection classes the
+        # body is the payload's own effect, not data an attacker reads.
         if is_disclosure:
-            exposed = sensitive_data.summarize(rd)
+            exposed = str(pe.get("sensitive_data_labels") or "").strip() or sensitive_data.summarize(rd)
             if exposed:
                 out.append("")
-                out.append(f"**Sensitive data exposed:** the disclosed content includes {exposed} — "
-                           "directly usable by an attacker, which raises the real-world impact.")
+                if cls == "cors" or "cors" in rid:
+                    # Same-site capture — the data is PRESENT on the endpoint, but the cross-origin read
+                    # is still browser-PoC-gated, so do not assert it is already in an attacker's hands.
+                    out.append(f"**Sensitive data present in the captured response:** {exposed}. "
+                               "A browser-hosted PoC that reads this cross-origin would confirm an attacker "
+                               "can obtain it; until then this establishes the data at risk, not a completed theft.")
+                else:
+                    out.append(f"**Sensitive data exposed:** the disclosed content includes {exposed} — "
+                               "directly usable by an attacker, which raises the real-world impact.")
+                # Point at the separate redacted capture file bundled in the PoC download.
+                sd_path = str(finding.get("sensitive_data_path") or "").strip()
+                if sd_path:
+                    out.append(f"_Saved as a separate evidence file in the PoC download: "
+                               f"`evidence/sensitive-data/{sd_path.replace(chr(92), '/').rsplit('/', 1)[-1]}`._")
         out.append("")
 
 
@@ -1034,6 +1186,45 @@ def _append_cvss(out: list[str], plan: dict[str, Any]) -> None:
     justification = str(cvss.get("justification") or "").strip()
     if justification:
         out.append(f"- **Why this severity:** {justification}")
+
+
+def _append_qa(out: list[str], ctx: dict[str, Any]) -> None:
+    """Render the pre-export QA gate: the evidence-vs-claim checks and any downgrade-only
+    corrections GreyIQ applied. Shown so a triager can see the tool actively guards against
+    overclaiming — and why a severity may read lower than a raw header match would suggest."""
+    qa = ctx.get("qa") if isinstance(ctx.get("qa"), dict) else None
+    issues = (qa or {}).get("issues") or []
+    if not issues:
+        return
+    corrections = [i for i in issues
+                   if any(word in str(i.get("action") or "").lower() for word in ("downgrad", "cap", "removed"))]
+    out.append("## Pre-export QA (evidence vs claim)\n")
+    out.append(
+        "Before export, GreyIQ verifies that every severity and impact claim is backed by the captured "
+        "evidence and applies **conservative, downgrade-only** corrections. This is why a severity may read "
+        "lower than a bare header/status match would suggest — the tool refuses to assert impact it did not prove."
+    )
+    out.append("")
+    for i in issues:
+        ref = str(i.get("ref") or "-")
+        question = str(i.get("question") or "").strip()
+        verdict = str(i.get("verdict") or "").strip()
+        action = str(i.get("action") or "checked — no change needed").strip()
+        detail = str(i.get("detail") or "").strip()
+        line = f"- **{ref}** — {question}"
+        if verdict:
+            line += f" _({verdict})_"
+        line += f" → **{action}**."
+        if detail:
+            line += f" {detail}"
+        out.append(line)
+    out.append("")
+    if corrections:
+        out.append(f"_{len(corrections)} downgrade-only correction(s) applied. GreyIQ never raises a severity here — "
+                   "only lowers one to match the evidence._")
+    else:
+        out.append("_All claims matched the captured evidence; no severity corrections were required._")
+    out.append("")
 
 
 def _append_active_authorization(out: list[str], ctx: dict[str, Any]) -> None:
@@ -1245,6 +1436,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
             f"| {_location_cell(finding)} |"
         )
     out.append("")
+    _append_qa(out, ctx)
 
     # --- Per-finding detail ---
     out.append("## Finding details\n")
@@ -1554,6 +1746,9 @@ def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
         },
         "scan_meta": ctx.get("scan_meta", {}),
         "proof_artifacts_captured": int(ctx.get("proof_artifacts_captured") or 0),
+        # Pre-export QA gate result: the evidence-vs-claim checks + any downgrade-only corrections
+        # GreyIQ applied so a triager can audit why a severity reads the way it does.
+        "qa": ctx.get("qa") or {"ok": True, "issues": []},
     }
 
 

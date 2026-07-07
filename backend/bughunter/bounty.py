@@ -39,6 +39,7 @@ from bughunter import recon
 from bughunter import report as report_lib
 from bughunter import secret_classification
 from bughunter import screenshot_service
+from bughunter import sensitive_data
 from bughunter import toolkit as toolkit_lib
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.live_scan_service import run_live_scan
@@ -1619,6 +1620,70 @@ def _capture_direct_proof_artifacts(display: list[dict[str, Any]], attack_plans:
     return captured
 
 
+def _write_sensitive_data_files(display: list[dict[str, Any]], base_dir: Path) -> list[str]:
+    """Write a separate, REDACTED 'sensitive data captured' .txt for every finding whose captured
+    readable body actually contains high-confidence sensitive data (as named by ``sensitive_data``).
+
+    This is the dedicated "returned sensitive data saved to a separate file" artifact — it lands in
+    the POC download and is referenced on the report. It is only produced when the proof-of-exploit
+    engine genuinely found sensitive data (labels present), so a non-sensitive read never yields a
+    misleading file. Values are already redacted (the report's redact-before-write posture); the file
+    NAMES what was found and shows the redacted excerpt as proof without re-exposing the raw secret.
+    Sets ``sensitive_data_path`` on each finding and returns the paths written."""
+    paths: list[str] = []
+    out_dir = base_dir / "proof-artifacts"
+    for finding in display:
+        pe = finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {}
+        read_data = str(pe.get("read_data") or "").strip()
+        if not read_data:
+            continue
+        # Prefer the labels the capturing check classified on the RAW body; fall back to a re-scan of
+        # the redacted excerpt. No labels => the readable content is not high-confidence sensitive =>
+        # do NOT write a file that would imply otherwise.
+        labels = str(pe.get("sensitive_data_labels") or "").strip() or sensitive_data.summarize(read_data)
+        if not labels:
+            continue
+        ref = str(finding.get("ref") or "F").strip() or "F"
+        stem = _safe_slug(f"{ref}-{finding.get('rule_id') or finding.get('title') or 'sensitive'}", fallback=f"{ref}-sensitive")
+        path = out_dir / f"{stem}-sensitive-data.txt"
+        is_cors = str(finding.get("class_id") or "").lower() == "cors"
+        caveat = (
+            "For this CORS finding the capture is SAME-SITE (the tool's own session). It proves the "
+            "endpoint returns this data, NOT that a browser sends the victim's cookie cross-origin — "
+            "host a PoC on an attacker origin to confirm the cross-origin read."
+            if is_cors else
+            "This content was returned by the captured proof request, demonstrating the data is retrievable."
+        )
+        lines = [
+            "GreyIQ BugHunter — CAPTURED SENSITIVE DATA (REDACTED)",
+            "=" * 72,
+            f"Finding:   {ref} — {finding.get('title', '')}",
+            f"Location:  {finding.get('location') or finding.get('file_path') or ''}",
+            f"Class:     {finding.get('class_id') or finding.get('category') or ''}",
+            f"Response:  {pe.get('response_status') or '(status not recorded)'}",
+            "",
+            "Sensitive data classes identified in the readable response:",
+            f"    {labels}",
+            "",
+            "NOTE: the values in the excerpt below are REDACTED (prefix…suffix + sha256 tag). The labels",
+            "above name WHAT was present; the excerpt proves it was returned without re-exposing the raw",
+            f"secret. {caveat}",
+            "",
+            "Captured readable response excerpt (redacted, first 1500 bytes):",
+            "-" * 72,
+            read_data,
+            "-" * 72,
+            "",
+        ]
+        try:
+            fsutil.write_text_safe(path, "\n".join(lines))
+        except OSError:
+            continue
+        paths.append(str(path))
+        finding["sensitive_data_path"] = str(path)
+    return paths
+
+
 def run_bounty_hunt(
     target: str,
     profile_id: str,
@@ -2067,7 +2132,11 @@ def run_bounty_hunt(
     narrated = 0  # bound the per-confirmed-finding impact-narrative brain calls
     for finding in display:
         active_proof = finding.pop("_active_proof", None)
-        finding.pop("_active_cvss", None)
+        # A check MAY supply its own evidence-based CVSS (e.g. the CORS prover, which caps
+        # confidentiality at Low unless a browser cross-origin read of sensitive data is proven).
+        # That per-finding vector is authoritative over the static class vector on confirmation,
+        # so a confirmed-but-header-only CORS finding is never re-inflated to the class C:H.
+        active_cvss = finding.pop("_active_cvss", None)
         finding.pop("_active_class_hint", None)
         ref = finding.get("ref")
         if ref not in attack_plans:
@@ -2077,15 +2146,19 @@ def run_bounty_hunt(
             if isinstance(base_proof, dict) and not active_proof.get("proof_obligation"):
                 active_proof = {**active_proof, "proof_obligation": base_proof.get("proof_obligation", "")}
             attack_plans[ref]["proof_of_impact"] = active_proof
-        # A CONFIRMED finding uses the DETERMINISTIC class CVSS (confirmed=True), never an
-        # attacker-influenceable brain-supplied vector. This runs for EVERY confirmation route —
-        # not just active-prover findings, but also JWT-replay / secret_hits / live-credential,
-        # which reach 'confirmed' WITHOUT an _active_proof and previously kept the brain CVSS
-        # driving their submitted severity_rating. What changes on confirmation is confidence, not
-        # the vector; report.py's own evidence gate decides the status so the two never disagree.
+        # A CONFIRMED finding uses the check's own evidence-based CVSS when it supplied one, else the
+        # DETERMINISTIC class CVSS (confirmed=True) — never an attacker-influenceable brain-supplied
+        # vector. This runs for EVERY confirmation route — not just active-prover findings, but also
+        # JWT-replay / secret_hits / live-credential, which reach 'confirmed' WITHOUT an _active_proof
+        # and previously kept the brain CVSS driving their submitted severity_rating. What changes on
+        # confirmation is confidence, not the vector; report.py's own evidence gate decides the status
+        # so the two never disagree.
         detail = report_lib._proof_of_impact_detail(finding, attack_plans[ref])
         if detail["status"] == "confirmed":
-            attack_plans[ref]["cvss"] = impact_model.cvss_for_class(finding.get("class_id", ""), confirmed=True)
+            attack_plans[ref]["cvss"] = (
+                active_cvss if isinstance(active_cvss, dict) and active_cvss.get("vector")
+                else impact_model.cvss_for_class(finding.get("class_id", ""), confirmed=True)
+            )
             # Enrich the "so-what": ask the brain to write the impact/blast-radius statement from the
             # ALREADY-CAPTURED artifacts. It goes into a DESCRIPTIVE field only (impact_narrative) — it
             # cannot touch proof_status/CVSS (already frozen above) — is sanitized + fail-closed, and is
@@ -2097,7 +2170,16 @@ def run_bounty_hunt(
                 if narrative and isinstance(poi, dict):
                     poi["impact_narrative"] = narrative
 
-    # CVSS is now final (deterministic floor + brain + active confirmation). Re-order the
+    # Final pre-export QA gate: answer the evidence-vs-claim questions a triager would ask and
+    # apply SAFE, downgrade-only corrections (never upgrades) — e.g. cap a credentialed-CORS finding
+    # that only reflected on a 404 / captured no sensitive data, and strip a C:H claim with no
+    # sensitive read behind it. Runs AFTER confirmation/CVSS are final and BEFORE ordering, so the
+    # ref numbering and severity counts reflect the corrected severities.
+    qa = report_lib.qa_validate_report(display, attack_plans)
+    if qa.get("issues"):
+        _emit(f"pre-export QA: {len([i for i in qa['issues'] if i.get('action')])} correction(s) applied")
+
+    # CVSS is now final (deterministic floor + brain + active confirmation + QA gate). Re-order the
     # findings and re-number refs by that final resolved severity, so F1 is genuinely the
     # top-severity finding and the report's table / ref numbers / triage all agree.
     attack_plans = _order_by_resolved_severity(display, attack_plans)
@@ -2125,6 +2207,13 @@ def run_bounty_hunt(
         )
         if proof_artifacts_captured:
             _emit(f"proof capture complete — {proof_artifacts_captured} artifact(s) attached")
+
+    # Separate, redacted "sensitive data captured" .txt per finding that actually disclosed sensitive
+    # data — bundled in the POC download and referenced on the report (runs on any finding carrying a
+    # classified readable body, not just URL hunts).
+    sensitive_data_paths = _write_sensitive_data_files(display, out_dir / stem)
+    if sensitive_data_paths:
+        _emit(f"sensitive data captured — {len(sensitive_data_paths)} file(s) saved for the PoC bundle")
 
     # Manual checklist = profile + selected-class + brain ideas.
     checklist = list(profile.get("checklist", []))
@@ -2170,6 +2259,7 @@ def run_bounty_hunt(
         "active_authorization": active_meta,
         "active_verified_classes": active_meta.get("verified_classes", []),
         "proof_artifacts_captured": proof_artifacts_captured,
+        "qa": qa,
         "recommendation": "",
     }
 
@@ -2216,6 +2306,7 @@ def run_bounty_hunt(
         "report_path": str(md_path),
         "json_path": str(json_path),
         "per_finding_paths": per_finding_paths,
+        "sensitive_data_paths": sensitive_data_paths,
         "output_dir": str(out_dir),
         "target": clean_target,
         "profile": profile_id,

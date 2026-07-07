@@ -88,11 +88,14 @@ IMPACT_MODEL: dict[str, dict[str, str]] = {
         "cvss_vector": "AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:H/A:N",
     },
     "cors": {
-        "attacker_capability": "An attacker page reads authenticated responses cross-origin because the API reflects/trusts its Origin.",
-        "affected_asset": "authenticated API responses (profile, tokens, account data).",
-        "business_impact": "cross-origin theft of authenticated data leading to account compromise.",
-        "proof_obligation": "Capture the response showing `Access-Control-Allow-Origin: <attacker>` with `Allow-Credentials: true`, plus a PoC from an untrusted origin that actually READS sensitive authenticated data.",
-        "cvss_vector": "AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:N/A:N",
+        "attacker_capability": "An attacker-controlled page MAY read authenticated responses cross-origin because the API reflects/trusts its Origin with credentials — proven only if a browser PoC actually reads the response.",
+        "affected_asset": "authenticated responses served by any endpoint that reflects the attacker Origin with Allow-Credentials; the concrete data at risk depends on which endpoints share this policy.",
+        "business_impact": "cross-origin reading of authenticated responses by an attacker page — impact ranges from low (non-sensitive/public/404 responses) to high (sensitive per-user data), judged from what a browser PoC actually reads.",
+        "proof_obligation": "Capture the response showing `Access-Control-Allow-Origin: <attacker>` with `Allow-Credentials: true` (server-side header behaviour), THEN host a PoC on an attacker-controlled origin and capture the sensitive authenticated response body it reads with the victim's credentials. Curl proves the header behaviour only; a browser PoC proves exploitability and sensitive impact.",
+        # Low-ceiling ESTIMATE (C:L, Scope-Unchanged) for a static/candidate CORS lead. NOT C:H/S:C:
+        # a header misconfiguration alone does not prove a sensitive cross-origin read. The active
+        # prover overrides this per-finding with an evidence-based vector once it confirms the tier.
+        "cvss_vector": "AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:N/A:N",
     },
     "redirect": {
         "attacker_capability": "An attacker supplies a redirect parameter that sends users to an external site.",

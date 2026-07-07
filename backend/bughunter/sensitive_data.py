@@ -3,11 +3,15 @@ finding's impact reads "leaks a victim JWT + email" instead of "returned 800 byt
 exposed data is what lifts a CORS-read / IDOR / error-SQLi dump from Low to High in a triager's eyes.
 
 Detection reuses the HIGH-CONFIDENCE secret rules from ``code_scanner/rules/secrets.py`` VERBATIM
-(their exact patterns + their own precision gates — no new, looser regexes here) plus one anchored
-email match. DELIBERATELY EXCLUDED from this confident tier: credit-card/Luhn, phone numbers,
-national IDs, and ``password``-field-name heuristics — those over-claim and are advisory leads at
-best. Pure, no I/O, frozen-safe. Callers should pass an already-captured (and already-redacted)
-proof excerpt; this only classifies, it never fetches.
+(their exact patterns + their own precision gates — no new, looser regexes here), one anchored
+email match, plus KEY-ANCHORED authenticated-session material (CSRF/anti-forgery tokens, session
+identifiers, OAuth/bearer tokens) — the classes that make a cross-origin/IDOR-readable response body
+genuinely user-specific. DELIBERATELY EXCLUDED from this confident tier: credit-card/Luhn, phone
+numbers, national IDs, and ``password``-field-name heuristics — those over-claim and are advisory
+leads at best. Pure, no I/O, frozen-safe. IMPORTANT: pass the RAW captured body here, before
+``redact_text`` runs — redaction rewrites JWTs/tokens to ``[REDACTED_…]`` markers this classifier
+can no longer match, so classifying a redacted excerpt silently under-reports. The report keeps the
+resulting labels alongside the redacted excerpt. This only classifies, it never fetches.
 """
 
 from __future__ import annotations
@@ -50,6 +54,26 @@ _OPENAI_RE = re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_]{20,}\b")
 # An email address — high-signal PII in a disclosure, though not a "secret". Anchored with a plausible
 # TLD so it doesn't fire on every ``user@host`` fragment.
 _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,24}\b")
+# Authenticated-session material that makes a readable response body user-specific/sensitive — the
+# exact classes a CORS/IDOR read-impact hinges on (CSRF tokens, session ids, OAuth/bearer tokens).
+# Each pattern is KEY-ANCHORED: a well-known field name, a JSON/assignment delimiter, then a value
+# long enough to be a real token — so ordinary prose ("your session has expired") never false-matches.
+# These are high-signal, not vendor secrets, so they name authenticated-data exposure without the
+# false-positive risk of a bare-value regex.
+_KEYED_SESSION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("a CSRF/anti-forgery token", re.compile(
+        r"(?i)\b(?:csrf[_-]?token|csrfmiddlewaretoken|xsrf[_-]?token|authenticity_token|"
+        r"request(?:_)?verification_?token|anti[_-]?csrf[_-]?token)\b"
+        r"['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9._+/\-]{16,}")),
+    ("a session identifier", re.compile(
+        r"(?i)\b(?:session[_-]?id|sessionid|phpsessid|jsessionid|connect\.sid|asp\.net_sessionid|auth[_-]?session)\b"
+        r"['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9._%\-]{12,}")),
+    ("an OAuth access/refresh token", re.compile(
+        r"(?i)\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token)\b"
+        r"['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9._+/\-]{16,}")),
+    ("a bearer authorization token", re.compile(
+        r"(?i)\bauthorization\b['\"]?\s*[:=]\s*['\"]?bearer\s+[A-Za-z0-9._+/\-]{16,}")),
+]
 # Role/functional local-parts that are almost always the SITE'S OWN public contact address (footer
 # mailto:, support links) — not exfiltrated victim PII. Excluded so an email claim means real PII.
 _ROLE_LOCALPARTS = frozenset({
@@ -100,6 +124,11 @@ def classify(text: str) -> list[str]:
         add("a JWT (session/bearer token)")
     if _OPENAI_RE.search(text):  # body-strict OpenAI key (not the hyphen-loose shared rule)
         add("an OpenAI API key")
+    for label, pattern in _KEYED_SESSION_PATTERNS:  # CSRF / session-id / OAuth / bearer material
+        if len(labels) >= _MAX_LABELS:
+            return labels[:_MAX_LABELS]
+        if pattern.search(text):
+            add(label)
     if _has_nonrole_email(text):
         add("email address(es)")
     return labels[:_MAX_LABELS]

@@ -2,6 +2,29 @@
 
 Notable changes to GreyIQ.
 
+## v1.4.0
+
+### Evidence-based CORS severity + sensitive-data capture engine (anti-overclaim)
+- **CORS is no longer auto-High.** A reflected attacker `Origin` + `Access-Control-Allow-Credentials: true`
+  now confirms a **server-side header misconfiguration** but is graded by evidence: **Medium** only when an
+  authenticated endpoint returned a real 2xx body, **Low/Info** on a 404/403/204/redirect/unauthenticated/
+  empty response. **High** requires a browser-hosted PoC that reads sensitive victim data cross-origin
+  (`cross_origin_read_confirmed`) — the active prover reads same-site (curl-equivalent) and never claims it.
+- **CVSS never asserts `C:H` without proof.** The CORS class vector dropped from `S:C/C:H` (High) to a
+  `C:L` Low ceiling; the active prover attaches a per-finding evidence-based vector (Low/Medium) that is
+  honored on confirmation instead of the old static class vector.
+- **Sensitive-data capture engine.** `sensitive_data.classify` now also names CSRF/anti-forgery tokens,
+  session identifiers, and OAuth/bearer tokens (classified on the **raw** body before redaction). When a
+  captured readable body contains sensitive data it is saved, **redacted**, to a separate
+  `evidence/sensitive-data/<ref>-sensitive-data.txt` in the PoC download and named on the report.
+- **Honest wording.** Same-site captures are labelled "same-site (curl-equivalent) read; browser
+  cross-origin read not yet proven" instead of "Demonstrated cross-origin read / attacker page exfiltrates".
+- **Pre-export QA gate.** `report.qa_validate_report` runs before export and applies downgrade-only
+  corrections (cap unproven High CORS to Medium, cap 404/redirect-only to Low, strip `C:H` with no sensitive
+  read), surfaced in a new **"Pre-export QA (evidence vs claim)"** report section and the JSON `qa` block.
+- See [docs/cors-report-logic.md](docs/cors-report-logic.md) for the full decision tree, severity/confidence
+  rules, wording, QA checklist, and a rewritten honest 404-CORS example.
+
 ## v1.3.0
 
 ### Resizable sidebar + pick the target from a program's scope

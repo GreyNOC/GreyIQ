@@ -2370,6 +2370,8 @@ class GreyIQRuntime:
             "campaign_path": result.get("campaign_path", ""),
             "per_finding_paths": list(result.get("per_finding_paths") or []),
             "submission_paths": list(result.get("submission_paths") or []),
+            # Separate redacted "sensitive data captured" .txt artifacts, bundled under evidence/.
+            "sensitive_data_paths": list(result.get("sensitive_data_paths") or []),
         }
         with self.lock:
             self.bounty_runs[run_id] = {
@@ -3012,6 +3014,10 @@ class GreyIQRuntime:
                 specs.append((f"findings/{Path(p).name}", p))
             for p in art.get("submission_paths") or []:
                 specs.append((f"submissions/{Path(p).name}", p))
+            # The separate redacted sensitive-data captures (one .txt per finding that disclosed
+            # sensitive data), so a triager sees exactly what was returned alongside the report.
+            for p in art.get("sensitive_data_paths") or []:
+                specs.append((f"evidence/sensitive-data/{Path(p).name}", p))
             for entry in (run.get("screenshots") or {}).values():
                 for p in (entry if isinstance(entry, list) else [entry]):
                     if p:
