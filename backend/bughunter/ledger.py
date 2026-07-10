@@ -215,10 +215,6 @@ def record_submission(runtime_dir: str | Path, program: str | None, target: str,
     advance_stage(runtime_dir, program, target, key, "submitted", h1_report_id=report_id, report_url=url, submitted_at=_now())
 
 
-def record_paid(runtime_dir: str | Path, program: str | None, target: str, key: str, bounty: float, outcome: str = "accepted") -> None:
-    advance_stage(runtime_dir, program, target, key, "paid", bounty=float(bounty or 0.0), outcome=outcome)
-
-
 # HackerOne report states that will never change again — once a record is synced to one
 # of these, a later sync pass skips it (never re-polls a closed report).
 _H1_TERMINAL_STATES = {"resolved", "not-applicable", "informative", "duplicate", "spam"}
@@ -345,10 +341,6 @@ def mark_report_ready(runtime_dir: str | Path, program: str | None, target: str,
 def dismissed_keys(runtime_dir: str | Path) -> set[str]:
     """The set of deleted (suppressed) dedup keys — what the engine filters out."""
     return set((_load(runtime_dir).get("dismissed") or {}))
-
-
-def is_dismissed(runtime_dir: str | Path, finding: dict[str, Any]) -> bool:
-    return dedup_key(finding) in (_load(runtime_dir).get("dismissed") or {})
 
 
 def dismiss(
