@@ -17,6 +17,8 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+from bughunter import account_login_service  # noqa: E402
+from bughunter import bounty  # noqa: E402
 from bughunter import scan_auth as sa  # noqa: E402
 from bughunter import web_scan_service as ws  # noqa: E402
 from bughunter.scan_auth import AuthContext  # noqa: E402
@@ -165,6 +167,145 @@ class GuardedRedirectAuthTests(unittest.TestCase):
         new = handler.redirect_request(req, None, 302, "Found", {}, "https://api.example.com/v2")
         self.assertIsNotNone(new)
         self.assertTrue(new.has_header("Cookie"), "session may follow a same-site redirect")
+
+
+class SameRegistrableSiteTests(unittest.TestCase):
+    """The wider issuer boundary: a reused research-account session may reach any host on
+    the ISSUER's registrable domain (siblings included), and nothing off it."""
+
+    def test_same_registrable_domain_including_siblings(self) -> None:
+        self.assertTrue(sa.same_registrable_site("app.acme.com", "login.acme.com"))  # siblings, neither a subdomain
+        self.assertTrue(sa.same_registrable_site("acme.com", "login.acme.com"))       # apex, from a subdomain issuer
+        self.assertTrue(sa.same_registrable_site("a.b.acme.com", "acme.com"))
+        self.assertTrue(sa.same_registrable_site("acme.com", "acme.com"))
+        self.assertTrue(sa.same_registrable_site("APP.acme.com", "login.ACME.com"))   # case-insensitive
+
+    def test_refuses_across_registrable_boundary(self) -> None:
+        self.assertFalse(sa.same_registrable_site("acme-b.com", "acme-a.com"))
+        self.assertFalse(sa.same_registrable_site("evil-acme.com", "acme.com"))        # substring is not same-registrable
+        self.assertFalse(sa.same_registrable_site("acme.com.evil.test", "acme.com"))   # suffix-graft attack
+
+    def test_multi_label_etld_is_respected(self) -> None:
+        # foo.co.uk and bar.co.uk are DIFFERENT owners under the co.uk public suffix
+        self.assertTrue(sa.same_registrable_site("shop.foo.co.uk", "foo.co.uk"))
+        self.assertFalse(sa.same_registrable_site("bar.co.uk", "foo.co.uk"))
+
+    def test_shared_hosting_tenants_are_distinct(self) -> None:
+        # a session on one PaaS tenant must never be judged same-site with a sibling tenant
+        self.assertFalse(sa.same_registrable_site("a.herokuapp.com", "b.herokuapp.com"))
+        self.assertTrue(sa.same_registrable_site("myapp.herokuapp.com", "myapp.herokuapp.com"))
+
+    def test_empty_fails_closed(self) -> None:
+        self.assertFalse(sa.same_registrable_site("", "acme.com"))
+        self.assertFalse(sa.same_registrable_site("acme.com", ""))
+
+    def test_ip_requires_exact_match(self) -> None:
+        self.assertTrue(sa.same_registrable_site("203.0.113.5", "203.0.113.5"))
+        self.assertFalse(sa.same_registrable_site("203.0.113.6", "203.0.113.5"))
+        self.assertFalse(sa.same_registrable_site("app.example.com", "203.0.113.5"))
+
+
+class IssuerGateBuildAuthTests(unittest.TestCase):
+    """build_auth's issuer_host gate: credentials minted at one host are never re-bound to a
+    target on a different registrable domain (the reused-session leak)."""
+
+    def test_no_issuer_binds_to_target_as_before(self) -> None:
+        auth = sa.build_auth("https://app.example.com/", cookie="session=x")  # no issuer_host supplied
+        self.assertIsNotNone(auth)
+        self.assertEqual(auth.host, "app.example.com")
+        self.assertEqual(auth.headers["Cookie"], "session=x")
+
+    def test_same_registrable_issuer_attaches_and_binds_to_target(self) -> None:
+        auth = sa.build_auth("https://api.example.com/", cookie="session=x", issuer_host="login.example.com")
+        self.assertIsNotNone(auth)
+        self.assertEqual(auth.headers["Cookie"], "session=x")
+        # still bound to the TARGET host, so the per-request same_site redirect check is unchanged
+        self.assertEqual(auth.host, "api.example.com")
+
+    def test_off_registrable_issuer_withholds_everything(self) -> None:
+        self.assertIsNone(sa.build_auth("https://other-brand.com/", cookie="session=x", issuer_host="login.example.com"))
+        self.assertIsNone(sa.build_auth("https://app.other-brand.com/", headers=["Authorization: Bearer t"],
+                                        issuer_host="example.com"))
+
+    def test_shared_hosting_tenants_are_isolated(self) -> None:
+        self.assertIsNone(sa.build_auth("https://attacker.herokuapp.com/", cookie="s=1", issuer_host="victim.herokuapp.com"))
+        self.assertIsNotNone(sa.build_auth("https://victim.herokuapp.com/x", cookie="s=1", issuer_host="victim.herokuapp.com"))
+
+    def test_ip_issuer_requires_exact_match(self) -> None:
+        self.assertIsNotNone(sa.build_auth("http://203.0.113.5/", cookie="s=1", issuer_host="203.0.113.5"))
+        self.assertIsNone(sa.build_auth("http://203.0.113.6/", cookie="s=1", issuer_host="203.0.113.5"))
+
+    def test_idn_target_gate_compares_in_punycode(self) -> None:
+        # issuer given in unicode; the target arrives punycoded — the gate must still recognize them as
+        # the same registrable domain (and bind the session), not silently withhold it.
+        auth = sa.build_auth("https://api.xn--mnchen-3ya.de/", cookie="s=1", issuer_host="münchen.de")
+        self.assertIsNotNone(auth)
+        self.assertEqual(auth.host, "api.xn--mnchen-3ya.de")
+
+
+class SpanReuseIssuerGateTests(unittest.TestCase):
+    """End-to-end regression for the reported defect: a multi-target span logs into the research
+    account ONCE (at host L) and reuses that one session for every in-scope target. The login
+    cookie must reach L's own registrable domain but NEVER a target on a different one."""
+
+    def _session(self) -> dict:
+        # exactly what account_login_service.login returns for a program whose login lives on
+        # registrable domain acme-a.com (pasted-cookie path carries the login_url's host)
+        return account_login_service.login(
+            {"cookie": "session=SECRET-A", "login_url": "https://login.acme-a.com/signin"},
+            scope="acme-a.com")
+
+    def test_login_reports_the_issuing_host(self) -> None:
+        s = self._session()
+        self.assertTrue(s["ok"])
+        self.assertEqual(s["host"], "login.acme-a.com")
+
+    def test_cookie_reaches_same_registrable_domain_targets(self) -> None:
+        s = self._session()
+        for target in ("https://login.acme-a.com/", "https://app.acme-a.com/",
+                       "https://api.acme-a.com/dash", "https://acme-a.com/"):
+            auth = sa.build_auth(target, cookie=s["cookie"], issuer_host=s["host"])
+            self.assertIsNotNone(auth, target)
+            self.assertEqual(auth.headers["Cookie"], "session=SECRET-A")
+
+    def test_domain_A_cookie_is_never_sent_to_domain_B(self) -> None:
+        s = self._session()
+        for target in ("https://acme-b.com/", "https://app.acme-b.com/",
+                       "https://acme-a.com.evil.test/", "https://evil-acme-a.com/"):
+            self.assertIsNone(
+                sa.build_auth(target, cookie=s["cookie"], issuer_host=s["host"]),
+                f"domain-A login cookie must not bind to {target}")
+
+
+class RunBountyHuntIssuerWiringTests(unittest.TestCase):
+    """The exact call site named in the defect (bounty.run_bounty_hunt -> build_auth) must forward
+    the session's issuer_host, or the span gate above would be bypassed for the per-URL scan."""
+
+    def test_run_bounty_hunt_forwards_issuer_host_to_build_auth(self) -> None:
+        captured: dict = {}
+
+        class _Stop(Exception):
+            pass
+
+        def _spy(target_url, *, cookie="", headers=None, issuer_host=""):
+            captured["target_url"] = target_url
+            captured["cookie"] = cookie
+            captured["issuer_host"] = issuer_host
+            raise _Stop()  # build_auth is called before any scanner runs — abort early, no network
+
+        orig = bounty.build_auth
+        bounty.build_auth = _spy
+        try:
+            with self.assertRaises(_Stop):
+                bounty.run_bounty_hunt(
+                    "https://acme-b.com/", "web-app", None, None, "acme-b.com", True, None,
+                    default_reports_dir=Path("."),
+                    auth={"cookie": "session=SECRET-A", "issuer_host": "acme-a.com"},
+                )
+        finally:
+            bounty.build_auth = orig
+        self.assertEqual(captured["issuer_host"], "acme-a.com")
+        self.assertEqual(captured["cookie"], "session=SECRET-A")
 
 
 if __name__ == "__main__":

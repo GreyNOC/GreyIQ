@@ -1757,7 +1757,11 @@ def run_bounty_hunt(
     # the target + its subdomains and nothing else — for URL targets only.
     auth_ctx: AuthContext | None = None
     if kind == "url" and isinstance(auth, dict):
-        auth_ctx = build_auth(clean_target, cookie=auth.get("cookie", ""), headers=auth.get("headers") or [])
+        # issuer_host: when this session was minted at a research-account login and is being
+        # reused across a multi-target span, build_auth refuses to bind it to a target on a
+        # different registrable domain than the issuer (that target is hunted unauthenticated).
+        auth_ctx = build_auth(clean_target, cookie=auth.get("cookie", ""), headers=auth.get("headers") or [],
+                              issuer_host=str(auth.get("issuer_host") or ""))
 
     _emit(f"hunt: {clean_target} (profile={profile['name']})")
     _emit("running scanner(s)…")

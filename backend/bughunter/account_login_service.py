@@ -120,7 +120,10 @@ def _playwright_login(url: str, host: str, email: str, password: str, scope: str
     if not cookie_str:
         return {"ok": False, "cookie": "", "headers": [], "note": "login submitted but no session cookie was set — check the credentials, or paste a cookie."}
     note = "auto-login succeeded" if not still_login else "auto-login submitted (login form still present — verify the session)"
-    return {"ok": True, "cookie": cookie_str, "headers": [], "note": note}
+    # ``host`` is the ISSUING host — the (in-scope, sanitized) login URL host the cookies were
+    # collected for. Carried so a span reusing this session never replays it to a target on a
+    # different registrable domain than the one that issued it (scan_auth.build_auth gate).
+    return {"ok": True, "cookie": cookie_str, "headers": [], "host": host, "note": note}
 
 
 def login(account_access: dict[str, Any] | None, scope: str, settings: Any = None) -> dict[str, Any]:
@@ -134,7 +137,24 @@ def login(account_access: dict[str, Any] | None, scope: str, settings: Any = Non
     acc = account_access if isinstance(account_access, dict) else {}
     pasted = str(acc.get("cookie") or "").strip()
     if pasted:  # the direct path and the auto-login fallback
-        return {"ok": True, "cookie": pasted, "headers": [], "note": "using the operator-provided session cookie."}
+        # Best-effort ISSUING host so a pasted session reused across a multi-target span is
+        # gated to its own registrable domain (scan_auth.build_auth). The paste carries no
+        # host of its own, so take the configured login URL's host — but ONLY when it's IN
+        # SCOPE, exactly as the auto-login path guarantees: an in-scope login page is a real
+        # program host for this session, whereas an out-of-scope or third-party (SSO)
+        # login_url is NOT the cookie's issuer. Off-scope/absent leaves the issuer empty, so
+        # no cross-issuer gate applies and the paste binds to its target as before.
+        paste_host = ""
+        raw_login = str(acc.get("login_url") or "").strip()
+        if raw_login:
+            try:
+                cand = (urlparse(normalize_website_url(raw_login)).hostname or "").lower()
+            except (WebsiteFetchError, ValueError):
+                cand = (urlparse(raw_login).hostname or "").lower()
+            if cand and host_in_active_scope(cand, scope, settings):
+                paste_host = cand
+        return {"ok": True, "cookie": pasted, "headers": [], "host": paste_host,
+                "note": "using the operator-provided session cookie."}
     email = str(acc.get("email") or "").strip()
     password = str(acc.get("password") or "").strip()
     login_url = str(acc.get("login_url") or "").strip()

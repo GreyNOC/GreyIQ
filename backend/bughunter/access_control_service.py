@@ -116,8 +116,10 @@ def run_idor_check(
     except WebsiteFetchError as exc:
         return _err(f"target refused by the URL guard: {exc}")
 
-    auth_a = build_auth(sa, cookie=account_a.get("cookie", ""), headers=account_a.get("headers") or [])
-    auth_b = build_auth(sb, cookie=account_b.get("cookie", ""), headers=account_b.get("headers") or [])
+    auth_a = build_auth(sa, cookie=account_a.get("cookie", ""), headers=account_a.get("headers") or [],
+                        issuer_host=str(account_a.get("issuer_host") or ""))
+    auth_b = build_auth(sb, cookie=account_b.get("cookie", ""), headers=account_b.get("headers") or [],
+                        issuer_host=str(account_b.get("issuer_host") or ""))
     if auth_a is None or auth_b is None:
         return _err("IDOR testing needs TWO sessions — supply a cookie and/or auth headers for BOTH account A and account B.")
 
@@ -246,7 +248,8 @@ def run_idor_probe(
         su = _guard_url(nu, settings.allow_private_urls, settings.web_allowed_ports)
     except WebsiteFetchError as exc:
         return _err(f"target refused by the URL guard: {exc}")
-    auth = build_auth(su, cookie=account.get("cookie", ""), headers=account.get("headers") or [])
+    auth = build_auth(su, cookie=account.get("cookie", ""), headers=account.get("headers") or [],
+                      issuer_host=str(account.get("issuer_host") or ""))
     if auth is None:
         return _err("Provide your authenticated session (a cookie and/or auth headers) so the probe reads YOUR object.")
 
@@ -388,8 +391,10 @@ def run_bfla_check(
     except WebsiteFetchError as exc:
         return _err(f"target refused by the URL guard: {exc}")
 
-    auth_admin = build_auth(su, cookie=admin_account.get("cookie", ""), headers=admin_account.get("headers") or [])
-    auth_user = build_auth(su, cookie=user_account.get("cookie", ""), headers=user_account.get("headers") or [])
+    auth_admin = build_auth(su, cookie=admin_account.get("cookie", ""), headers=admin_account.get("headers") or [],
+                            issuer_host=str(admin_account.get("issuer_host") or ""))
+    auth_user = build_auth(su, cookie=user_account.get("cookie", ""), headers=user_account.get("headers") or [],
+                           issuer_host=str(user_account.get("issuer_host") or ""))
     if auth_admin is None or auth_user is None:
         return _err("BFLA testing needs TWO sessions — supply a cookie and/or auth headers for BOTH the high-privilege and the low-privilege account.")
 
@@ -677,7 +682,8 @@ def run_mass_assignment_check(
         su = _guard_url(nu, settings.allow_private_urls, settings.web_allowed_ports)
     except WebsiteFetchError as exc:
         return _err(f"target refused by the URL guard: {exc}")
-    auth = build_auth(su, cookie=account.get("cookie", ""), headers=account.get("headers") or [])
+    auth = build_auth(su, cookie=account.get("cookie", ""), headers=account.get("headers") or [],
+                      issuer_host=str(account.get("issuer_host") or ""))
     if auth is None:
         return _err("Mass-assignment testing needs your session -- supply a cookie and/or auth headers for the account that owns the object.")
 
@@ -847,7 +853,8 @@ def run_session_invalidation_check(
         slo = _guard_url(nlo, settings.allow_private_urls, settings.web_allowed_ports)
     except WebsiteFetchError as exc:
         return _err(f"target refused by the URL guard: {exc}")
-    auth = build_auth(sau, cookie=account.get("cookie", ""), headers=account.get("headers") or [])
+    auth = build_auth(sau, cookie=account.get("cookie", ""), headers=account.get("headers") or [],
+                      issuer_host=str(account.get("issuer_host") or ""))
     if auth is None:
         return _err("Session testing needs your session -- supply a cookie and/or auth headers for the account.")
 

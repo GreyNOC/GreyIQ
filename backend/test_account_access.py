@@ -12,7 +12,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 import greyiq_api  # noqa: E402
-from bughunter import account_login_service, portfolio, web_ingest, web_scan_service  # noqa: E402
+from bughunter import account_login_service, campaign, portfolio, web_ingest, web_scan_service  # noqa: E402
 
 
 class SchemaTests(unittest.TestCase):
@@ -57,6 +57,27 @@ class LoginServiceTests(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertEqual(out["cookie"], "sid=abc123")
 
+    def test_pasted_cookie_carries_issuing_host_from_login_url(self) -> None:
+        # a span reuses this session for every target; the issuing host is what gates the cookie
+        # to its own registrable domain downstream (scan_auth.build_auth)
+        out = account_login_service.login(
+            {"cookie": "sid=abc123", "login_url": "https://login.acme-a.com/signin"}, scope="acme-a.com")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["host"], "login.acme-a.com")
+
+    def test_pasted_cookie_without_login_url_has_no_issuing_host(self) -> None:
+        # unknown issuer => empty host => no cross-issuer gate (a single-target paste is unaffected)
+        out = account_login_service.login({"cookie": "sid=abc123"}, scope="app.example")
+        self.assertEqual(out.get("host", ""), "")
+
+    def test_pasted_cookie_with_out_of_scope_login_url_has_no_issuing_host(self) -> None:
+        # a third-party/SSO login_url (not in scope) is NOT the cookie's issuer — leaving the host
+        # empty means the pasted cookie is NOT wrongly withheld from its in-scope target
+        out = account_login_service.login(
+            {"cookie": "sid=abc123", "login_url": "https://login.okta-idp.com/app"}, scope="acme-a.com")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out.get("host", ""), "")
+
     def test_no_credentials_fails_closed(self) -> None:
         out = account_login_service.login({"email": "me@x.example"}, scope="app.example")  # no password/login_url
         self.assertFalse(out["ok"])
@@ -96,6 +117,32 @@ class LoginServiceTests(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertEqual(called, [])                           # scope gate stopped it
         self.assertIn("scope", out["note"].lower())
+
+
+class LoginAuthPlumbingTests(unittest.TestCase):
+    """campaign._login_auth is what a span calls ONCE; it must carry the login's issuing host into
+    the reused auth dict so every per-target build_auth can gate the cookie to the issuer's domain."""
+
+    def test_login_auth_propagates_issuer_host(self) -> None:
+        orig = campaign.account_login_service.login
+        campaign.account_login_service.login = lambda *a, **k: {
+            "ok": True, "cookie": "session=SECRET-A", "headers": [], "host": "login.acme-a.com", "note": "ok"}
+        try:
+            auth = campaign._login_auth({"email": "u@x", "password": "p", "login_url": "https://login.acme-a.com/"},
+                                        scope="acme-a.com", excluded_hosts=(), emit=None)
+        finally:
+            campaign.account_login_service.login = orig
+        self.assertEqual(auth["cookie"], "session=SECRET-A")
+        self.assertEqual(auth["issuer_host"], "login.acme-a.com")
+
+    def test_login_auth_none_when_login_fails_closed(self) -> None:
+        orig = campaign.account_login_service.login
+        campaign.account_login_service.login = lambda *a, **k: {"ok": False, "cookie": "", "note": "nope"}
+        try:
+            auth = campaign._login_auth({"email": "u@x"}, scope="acme-a.com", excluded_hosts=(), emit=None)
+        finally:
+            campaign.account_login_service.login = orig
+        self.assertIsNone(auth)
 
 
 class ApiRedactionTests(unittest.TestCase):

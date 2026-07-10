@@ -39,6 +39,7 @@ from bughunter import (
     ranking,
     recon,
     research,
+    scan_auth,
     screenshot_service,
     secret_classification,
     submission,
@@ -143,7 +144,11 @@ def _login_auth(account_access: dict[str, Any] | None, scope: str,
     if callable(emit):
         emit(f"account access: {session.get('note', '')}")
     if session.get("ok") and session.get("cookie"):
-        return {"cookie": session["cookie"], "headers": session.get("headers") or []}
+        # Carry the ISSUING host with the session. A span logs in ONCE and reuses this dict
+        # for every in-scope target; build_auth uses issuer_host to refuse to replay the
+        # cookie to a target on a different registrable domain than the login host.
+        return {"cookie": session["cookie"], "headers": session.get("headers") or [],
+                "issuer_host": session.get("host") or ""}
     return None
 
 
@@ -247,6 +252,16 @@ def _run_campaign_body(
                 on_progress(msg)
             except Exception:  # noqa: BLE001
                 pass
+
+    # A research-account session is minted ONCE per span and reused for every target. When a
+    # target is on a DIFFERENT registrable domain than the login host that issued it, build_auth
+    # withholds the session (never replays a token off its own issuer); surface that so a target
+    # hunted unauthenticated for this reason isn't misread as a missing/broken login.
+    if kind == "url" and isinstance(auth, dict) and str(auth.get("issuer_host") or ""):
+        tgt_host = urlparse(clean_target).hostname or ""
+        if tgt_host and not scan_auth.same_registrable_site(tgt_host, str(auth["issuer_host"])):
+            _emit(f"note: '{tgt_host}' is off the research login's domain ({auth['issuer_host']}) — "
+                  f"hunting it unauthenticated (that session is never replayed off its issuer).")
 
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     # A short hash of the FULL (untruncated) target, not just its slug, so two targets
