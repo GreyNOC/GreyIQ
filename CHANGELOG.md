@@ -2,6 +2,25 @@
 
 Notable changes to GreyIQ.
 
+## v1.5.0
+
+### Session issuer-binding (authenticated-scan hardening) + dead-code removal
+- **A reused research-account session is never replayed off its issuer.** A multi-target span logs
+  into the program's research account once (at host `L`) and reuses that session for every in-scope
+  target `T`. Because a session bound to `T` makes the same-site check `same_site(T, T)` trivially
+  true, `L`'s login cookie was being attached to in-scope targets on **other registrable domains**
+  that never issued it. The session now carries its **issuing host**, and `scan_auth.build_auth`
+  attaches it to a target only when the target shares the issuer's registrable domain
+  (`same_registrable_site` — registrable-domain wide, so a `login.acme.com` session still covers
+  sibling `app.acme.com`, but strict across a domain boundary and across shared-hosting suffixes
+  like `herokuapp.com`). Off the issuer's domain the target is hunted unauthenticated. Enforced at
+  `run_bounty_hunt` and the reused-session access-control probes (IDOR/BFLA/mass-assignment/session).
+  Impact was bounded (the operator's own session, in-scope hosts only), but it violated the stated
+  "tokens are never replayed off their own issuer" invariant.
+- **Dead-code removal (deletion-only).** Removed confirmed-unused backend code — `code_scanner/llm.py`
+  and `sarif.py`, the unused `ledger` helpers, and the retired `web_ingest.fetch_website_text` cluster —
+  each grep-verified dead with no importers or tests.
+
 ## v1.4.0
 
 ### Evidence-based CORS severity + sensitive-data capture engine (anti-overclaim)
