@@ -4,9 +4,7 @@ A static analyzer that finds backdoor patterns, hardcoded secrets,
 unsafe sinks (eval/exec/command injection), CI-workflow exfil shapes,
 and weak-crypto / known-vulnerable dependency primitives across a
 repository tree. No machine-learning model is bundled in the engine —
-all detection is regex- and AST-based. An optional bring-your-own-LLM
-adapter (``bughunter.code_scanner.llm``) lets users opt in to sending
-findings to their own API key for second-opinion review.
+all detection is regex- and AST-based.
 
 The public surface is intentionally narrow:
 

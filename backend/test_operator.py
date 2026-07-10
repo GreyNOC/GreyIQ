@@ -710,13 +710,13 @@ class DismissTests(unittest.TestCase):
 
         entry = ledger.dismiss(self.rt, finding=item["finding"], program="acme", target="https://x")
         self.assertEqual(entry["dedup_key"], item["dedup_key"])
-        self.assertTrue(ledger.is_dismissed(self.rt, item["finding"]))
+        self.assertIn(ledger.dedup_key(item["finding"]), ledger.dismissed_keys(self.rt))
         self.assertEqual(ledger.list_all(self.rt), [])            # gone from durable history
         self.assertEqual(ledger.funnel(self.rt, "acme")["total"], 0)  # and out of the funnel
         self.assertEqual(ledger.to_csv_rows(self.rt, "acme", "https://x"), [])  # and the export
 
         self.assertTrue(ledger.restore(self.rt, item["dedup_key"]))
-        self.assertFalse(ledger.is_dismissed(self.rt, item["finding"]))
+        self.assertNotIn(ledger.dedup_key(item["finding"]), ledger.dismissed_keys(self.rt))
         self.assertEqual(len(ledger.list_all(self.rt)), 1)        # reappears intact
 
     def test_delete_sticks_across_a_digit_change_in_the_location(self) -> None:
@@ -771,7 +771,8 @@ class DismissTests(unittest.TestCase):
         item = _item("C1", "xss", "r", "https://x/a", proof="confirmed")
         ledger.upsert_findings(self.rt, "acme", "https://x", [item])
         ledger.record_submission(self.rt, "acme", "https://x", item["dedup_key"], "R1", "u")
-        ledger.record_paid(self.rt, "acme", "https://x", item["dedup_key"], 500.0)
+        [rec] = ledger.submitted_records(self.rt)
+        ledger.record_h1_sync(self.rt, rec["pid"], rec["key"], state="resolved", resolved_with_reward=True, bounty=500.0)
         self.assertEqual(ledger.funnel(self.rt, "acme")["bounty_total"], 500.0)
 
         ledger.dismiss(self.rt, dedup_key_str=item["dedup_key"])
