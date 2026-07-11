@@ -1,22 +1,23 @@
 :root {
-  --bg: #f6f7f4;
+  /* GreyNOC minimalist — cool neutral greys, one barely-tinted steel signal. */
+  --bg: #eceff3;
   --surface: #ffffff;
-  --surface-2: #eef3ef;
-  --ink: #1d2430;
-  --muted: #69727d;
-  --line: #d9dfda;
-  --teal: #0e7c7b;
-  --teal-2: #bde4dc;
-  --coral: #c95542;
-  --violet: #6c5ce7;
-  --sun: #d69b2d;
-  --ok: #12855a;  /* success/confirmed green — AA-tuned on white/--surface-2 (light) */
-  --focus: #1f8a70;
-  /* Redesign tokens: sidebar surface (one notch off --bg), card radius, globe glow. */
-  --sidebar-bg: #eef1ee;
-  --radius-card: 12px;
+  --surface-2: #e7ebf0;
+  --ink: #161b22;
+  --muted: #58626e;
+  --line: #d6dce3;
+  --teal: #3a5560;   /* the signal: a desaturated cool steel (near-greyscale) */
+  --teal-2: #dde5e9; /* soft signal wash */
+  --coral: #bd3d2d;  /* semantic: down / critical */
+  --violet: #566373; /* neutralized to slate (monochrome) */
+  --sun: #a8701a;    /* semantic: warn */
+  --ok: #1f8a5b;     /* semantic: up / confirmed — AA-tuned on white/--surface-2 (light) */
+  --focus: #3a5560;
+  /* Redesign tokens: sidebar surface (one notch off --bg), card radius. */
+  --sidebar-bg: #e7ebf0;
+  --radius-card: 9px;
   --radius-pill: 999px;
-  --glow: rgba(46, 168, 255, 0.6);
+  --glow: transparent;  /* flat — no glows */
   /* Generic aliases (used by the workbench + new UI). They follow the base
      tokens above, so overriding the base tokens in dark mode re-themes
      everything that uses either name. */
@@ -45,22 +46,23 @@
 /* ---- Dark theme: override the base tokens so the whole app re-themes, then
    patch the few places that hardcode light colors. ---- */
 body[data-theme="dark"] {
-  --bg: #14171c;
-  --surface: #1b1f27;
-  --surface-2: #232a34;
-  --ink: #e7ecf3;
-  --muted: #97a2b2;
-  --line: #2c333f;
-  --teal: #2ea3a0;
-  --teal-2: #1f3b3a;
-  --coral: #e06a55;
-  --violet: #8a7bf0;
-  --sun: #e0ad4a;
-  --ok: #38c07f;  /* success/confirmed green — brighter for dark surfaces */
-  --focus: #3bb39c;
+  /* GreyNOC night watch — the NOC console (default theme). */
+  --bg: #0e1116;
+  --surface: #161a21;
+  --surface-2: #1c222b;
+  --ink: #e2e8ef;
+  --muted: #8a95a4;
+  --line: #262d38;
+  --teal: #8ea8ae;   /* the signal: cool light steel (near-greyscale) */
+  --teal-2: #1e262b; /* soft signal wash */
+  --coral: #db6250;  /* semantic: down / critical */
+  --violet: #7c8794; /* neutralized to slate (monochrome) */
+  --sun: #d8a441;    /* semantic: warn */
+  --ok: #34b877;     /* semantic: up / confirmed — brighter for dark surfaces */
+  --focus: #8ea8ae;
   /* Redesign tokens (redeclared: --sidebar-bg differs by theme; a var() would resolve light). */
-  --sidebar-bg: #12151b;
-  --glow: rgba(46, 168, 255, 0.6);
+  --sidebar-bg: #10141a;
+  --glow: transparent;  /* flat — no glows */
   /* Re-point the generic aliases at the dark base tokens. A var() inside a custom
      property is resolved where that property is DECLARED — so the :root aliases
      keep their light-resolved values and must be redeclared here, or workbench
@@ -83,26 +85,24 @@ body[data-theme="dark"] {
   --tok-key: #7ee787;
   --tok-func: #d2a8ff;
   color-scheme: dark;
-  background:
-    linear-gradient(180deg, rgba(46, 163, 160, 0.07), transparent 32rem),
-    var(--bg);
+  background: var(--bg);
 }
 
 body[data-theme="dark"] .bot-panel,
 body[data-theme="dark"] .training-panel {
-  background: rgba(27, 31, 39, 0.85);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
 }
 
 body[data-theme="dark"] .chat-header {
-  background: rgba(20, 23, 28, 0.85);
+  background: color-mix(in srgb, var(--bg) 86%, transparent);
 }
 
 body[data-theme="dark"] .composer {
-  background: rgba(27, 31, 39, 0.85);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
 }
 
 body[data-theme="dark"] .message.is-user {
-  border-color: rgba(46, 163, 160, 0.4);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
   background: var(--teal-2);
 }
 
@@ -118,9 +118,7 @@ body[data-theme="dark"] .segment.is-active {
 body {
   min-height: 100vh;
   margin: 0;
-  background:
-    linear-gradient(180deg, rgba(14, 124, 123, 0.08), transparent 32rem),
-    var(--bg);
+  background: var(--bg);
   color: var(--ink);
 }
 
@@ -342,7 +340,7 @@ button:focus-visible {
 }
 
 .bot-item.is-active {
-  border-color: rgba(14, 124, 123, 0.34);
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent);
   background: var(--surface-2);
 }
 
@@ -540,7 +538,7 @@ label {
 
 .starter-card:hover,
 .starter-card:focus-visible {
-  border-color: rgba(46, 163, 160, 0.5);
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
   background: var(--panel-2);
 }
 
@@ -578,7 +576,7 @@ label {
 
 .message.is-user {
   align-self: flex-end;
-  border-color: rgba(14, 124, 123, 0.22);
+  border-color: color-mix(in srgb, var(--accent) 22%, transparent);
   background: #eaf5f1;
 }
 
@@ -680,7 +678,7 @@ label {
 
 .rate-button.is-active.like,
 .rate-button.like:hover {
-  border-color: rgba(14, 124, 123, 0.35);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
   color: var(--teal);
 }
 
@@ -1145,7 +1143,7 @@ label {
   height: 0.58rem;
   border-radius: 50%;
   background: var(--teal);
-  box-shadow: 0 0 0 3px rgba(46, 163, 160, 0.16);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent);
 }
 
 .model-state-card[data-state="setup"] .model-dot {
@@ -1922,7 +1920,7 @@ label {
 }
 
 .tree-marker.is-changed {
-  border-color: rgba(46, 163, 160, 0.45);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
   color: var(--teal);
 }
 
@@ -2048,7 +2046,7 @@ button.workspace-tree-item:focus-visible {
 }
 
 .run-flow-step.is-done {
-  border-color: rgba(46, 163, 160, 0.42);
+  border-color: color-mix(in srgb, var(--accent) 42%, transparent);
 }
 
 .run-flow-step.is-warn,
@@ -2843,9 +2841,7 @@ body[data-app-mode="hunt"] .cockpit {
   position: relative;
   height: 100vh;
   min-height: 0;
-  background:
-    radial-gradient(1100px 460px at 78% -8%, rgba(46, 163, 160, 0.10), transparent 60%),
-    var(--bg);
+  background: var(--bg);
   color: var(--text);
 }
 .ck-shell-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
@@ -2875,14 +2871,14 @@ body[data-app-mode="hunt"] .cockpit {
 /* Avatar chip (decorative) */
 .ck-avatar {
   width: 1.9rem; height: 1.9rem; border-radius: 999px; display: inline-grid; place-items: center;
-  font-size: 0.7rem; font-weight: 700; color: #fff; flex: none;
-  background: linear-gradient(135deg, var(--accent), var(--violet));
+  font-size: 0.7rem; font-weight: 700; color: var(--muted); flex: none;
+  background: var(--surface-2); border: 1px solid var(--border);
 }
 /* Green status dot on the engine-ready pill */
 .ck-service.is-up::before {
   content: ""; display: inline-block; width: 0.45rem; height: 0.45rem; border-radius: 999px;
   background: var(--ok); margin-right: 0.4rem; vertical-align: middle;
-  box-shadow: 0 0 6px color-mix(in srgb, var(--ok) 55%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 20%, transparent);
 }
 /* "Guide me" camera glyph + theme moon/caret, both via pseudo-elements so textContent writes survive */
 .ck-ghost-guide::before {
@@ -2905,28 +2901,28 @@ body[data-app-mode="hunt"] .cockpit {
 
 /* --- GreyNOC globe brand mark --- */
 .ck-logo-globe { display: inline-flex; align-items: center; justify-content: center; background: none; border: 0; padding: 0; }
-.ck-logo-globe img { width: 34px; height: 34px; display: block; filter: drop-shadow(0 0 6px rgba(46, 168, 255, 0.6)); }
+.ck-logo-globe img { width: 34px; height: 34px; display: block; }
 .brand-row { display: flex; align-items: center; gap: 0.6rem; }
 .brand-row .icon-button { margin-left: auto; }
-.brand-globe { width: 30px; height: 30px; flex: none; filter: drop-shadow(0 0 6px rgba(46, 168, 255, 0.55)); }
+.brand-globe { width: 30px; height: 30px; flex: none; }
 
 /* Boot splash — the globe while the local engine spins up. */
 .ck-splash { position: fixed; inset: 0; z-index: 120; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.7rem;
-  background: radial-gradient(circle at 50% 42%, #0a1a2e 0%, #03070e 70%); transition: opacity 0.5s ease; }
+  background: #0e1116; transition: opacity 0.5s ease; }
 .ck-splash.is-hidden { opacity: 0; pointer-events: none; }
-.ck-splash-globe { width: min(46vw, 208px); height: auto; filter: drop-shadow(0 0 24px rgba(46, 168, 255, 0.55)); }
-.ck-splash-name { font-size: 1.6rem; font-weight: 800; letter-spacing: 0.16em; color: #eafbff; }
-.ck-splash-sub { font-size: 0.82rem; letter-spacing: 0.05em; color: #7fb6e6; }
+.ck-splash-globe { width: min(46vw, 208px); height: auto; }
+.ck-splash-name { font-size: 1.6rem; font-weight: 800; letter-spacing: 0.16em; color: #e2e8ef; }
+.ck-splash-sub { font-size: 0.82rem; letter-spacing: 0.05em; color: #8a95a4; }
 
 /* Campaign-dashboard idle hero. */
 .ck-cd-hero { display: flex; flex-direction: column; align-items: center; gap: 0.6rem; padding: 1.6rem 0 0.4rem; text-align: center; }
-.ck-cd-hero img { width: min(38vw, 150px); height: auto; opacity: 0.92; filter: drop-shadow(0 0 16px rgba(46, 168, 255, 0.4)); }
+.ck-cd-hero img { width: min(38vw, 150px); height: auto; opacity: 0.92; }
 .ck-topbar-actions { display: flex; align-items: center; gap: 0.5rem; }
 .ck-service {
   font-size: 0.74rem; color: var(--muted); padding: 0.2rem 0.55rem;
   border: 1px solid var(--border); border-radius: 999px; white-space: nowrap;
 }
-.ck-service.is-up { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.ck-service.is-up { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
 .ck-service.is-down { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
 /* is-reconnecting wins over is-up/is-down (declared last) so a stale "ready" pill still reads amber. */
 .ck-service.is-reconnecting { color: var(--sun); border-color: color-mix(in srgb, var(--sun) 55%, var(--border)); }
@@ -3201,7 +3197,7 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
 .ck-cd-progress-fill.is-done { background: var(--ok); }
 
 .ck-cd-tiles { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0.55rem; margin: 0.9rem 0; }
-.ck-cd-tile { border: 1px solid var(--border); border-radius: var(--radius-card); background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 60%, transparent), var(--surface)); padding: 0.75rem 0.6rem; text-align: center; }
+.ck-cd-tile { border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); padding: 0.75rem 0.6rem; text-align: center; }
 .ck-cd-tile.is-ok { border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
 .ck-cd-tile.is-hot { border-color: color-mix(in srgb, var(--coral) 45%, var(--border)); }
 .ck-cd-tile-value { font-size: 1.5rem; font-weight: 800; color: var(--text); line-height: 1.1; }
@@ -3348,7 +3344,7 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
 .ck-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .ck-stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); gap: 0.7rem; margin-bottom: 1rem; }
-.ck-stat { padding: 0.85rem 0.95rem; border: 1px solid var(--border); border-radius: var(--radius-card); background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 60%, transparent), var(--surface)); }
+.ck-stat { padding: 0.85rem 0.95rem; border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); }
 .ck-stat .n { font-size: 1.5rem; font-weight: 800; color: var(--text); }
 .ck-stat .l { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
 .ck-intel { margin: 0 0 1rem; padding-left: 1.1rem; font-size: 0.84rem; line-height: 1.55; color: var(--text); }
@@ -3431,7 +3427,7 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
 .ck-rc-card {
   display: flex; flex-direction: column; gap: 0.5rem;
   padding: 0.85rem 0.95rem; border: 1px solid var(--border); border-radius: var(--radius-card);
-  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 60%, transparent), var(--surface));
+  background: var(--surface);
 }
 .ck-rc-card-top { display: flex; align-items: center; gap: 0.55rem; }
 .ck-rc-icon { width: 2rem; height: 2rem; border-radius: 9px; display: grid; place-items: center; flex: none; }
