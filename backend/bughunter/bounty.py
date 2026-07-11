@@ -531,15 +531,17 @@ def _single_url_target(req_line: str) -> str:
     instead emit a multi-step / placeholder DESCRIPTION — e.g. mass-assignment
     ``PATCH {u}  (body: …)  then  GET {u}``, broken-session ``GET {u} (session) -> logout -> …``,
     stored-XSS ``POST {u} (field=<payload>) then GET {u}``, blind-XXE ``POST {u} (Content-Type: …)``,
-    GraphQL introspection ``GET {gql}?query={__schema...}``. A URL never carries raw whitespace, and
-    ``...`` is only ever a truncation placeholder — either one marks a description curl cannot run, so
-    it must yield no replay.sh curl / findings.har entry (which would be malformed) and must not count
-    as a runnable PoC artifact."""
+    GraphQL introspection ``GET {gql}?query={__schema...}``. A URL never carries raw whitespace, and a
+    lone ``...`` ellipsis is only ever a truncation placeholder — either one marks a description curl
+    cannot run, so it must yield no replay.sh curl / findings.har entry (which would be malformed) and
+    must not count as a runnable PoC artifact. A LONGER dot run is NOT a placeholder — a path-traversal
+    payload like ``....//....//etc/passwd`` is a genuine runnable URL and must still replay, so only an
+    isolated three-dot ellipsis is rejected."""
     _method, _sep, target = req_line.partition(" ")
     target = target.strip()
     if not target.startswith(("http://", "https://")):
         return ""
-    if any(ch.isspace() for ch in target) or "..." in target:
+    if any(ch.isspace() for ch in target) or re.search(r"(?<!\.)\.\.\.(?!\.)", target):
         return ""
     return target
 

@@ -61,21 +61,30 @@ class ReplayScriptTests(unittest.TestCase):
         ]
         sh, n = bounty.build_replay_script(items)
         self.assertEqual((sh, n), ("", 0))                       # none is a single runnable request
-        # A genuinely runnable single-URL line (even with an inline XSS payload) still replays.
+        # Genuinely runnable single-URL lines still replay: an inline XSS payload, AND a path-traversal
+        # payload whose '....' dot runs must NOT be mistaken for an ellipsis placeholder.
         ok = _item("F1", "reflected-xss", "GET https://h/q?x=<svg/onload=1>")
-        sh2, n2 = bounty.build_replay_script([ok] + items)
-        self.assertEqual(n2, 1)                                  # only F1, the multi-step ones stay excluded
+        lfi = _item("F2", "path-traversal", "GET https://h/f?p=....//....//....//etc/passwd")
+        sh2, n2 = bounty.build_replay_script([ok, lfi] + items)
+        self.assertEqual(n2, 2)                                  # F1 + F2, the multi-step ones stay excluded
         self.assertIn("curl -i 'https://h/q?x=<svg/onload=1>'", sh2)
+        self.assertIn("curl -i 'https://h/f?p=....//....//....//etc/passwd'", sh2)
 
     def test_single_url_target_predicate(self) -> None:
         # The shared gate _curl_from_evidence and build_findings_har both use.
         self.assertEqual(bounty._single_url_target("GET https://h/a?x=1"), "https://h/a?x=1")
         self.assertEqual(bounty._single_url_target("GET https://h/q?x=<svg/onload=1>"), "https://h/q?x=<svg/onload=1>")
         self.assertEqual(bounty._single_url_target("PATCH https://h/x  then  GET https://h/x"), "")   # whitespace
-        self.assertEqual(bounty._single_url_target("GET https://h/g?query={__schema...}"), "")        # '...' placeholder
+        self.assertEqual(bounty._single_url_target("GET https://h/g?query={__schema...}"), "")        # ellipsis placeholder
         self.assertEqual(bounty._single_url_target("GET HTTP://h/x"), "")                              # scheme case-sensitive
         self.assertEqual(bounty._single_url_target("GET /relative"), "")                              # not absolute
         self.assertEqual(bounty._single_url_target(""), "")
+        # A path-traversal payload uses LONGER dot runs ('....'), not a truncation ellipsis — it is a
+        # genuine single runnable URL and must NOT be rejected as a placeholder.
+        self.assertEqual(bounty._single_url_target("GET https://h/f?p=....//....//....//etc/passwd"),
+                         "https://h/f?p=....//....//....//etc/passwd")
+        self.assertEqual(bounty._single_url_target("GET https://h/f?p=../../../../etc/passwd"),
+                         "https://h/f?p=../../../../etc/passwd")
 
     def test_a_detected_secret_in_a_request_is_redacted(self) -> None:
         # belt-and-suspenders: if a crafted request line somehow carries a real token, redact it

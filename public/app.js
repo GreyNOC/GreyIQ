@@ -8371,17 +8371,19 @@ const ckReports = { ready: "all", page: 1, pageSize: 25 };  // ready-state filte
 // has_poc in get_report_ready. A replay.sh/findings.har is rebuildable only from a captured crafted
 // request line that is a single runnable request (see bounty._single_url_target / _curl_from_evidence):
 // an absolute-URL target — case-sensitive http/https like the server — with no whitespace and no
-// '...' placeholder (multi-step / description request_lines like 'PATCH {u} (body: …) then GET {u}'
-// or 'GET {gql}?query={__schema...}' are NOT runnable). A live-credential finding instead carries its
-// own runnable PoC. Auto-generated reproduction steps do NOT count. Kept in lockstep with the server
-// so the preview POC dot equals what "Get report ready" persists (no green→red flip on click).
+// isolated '...' truncation ellipsis (multi-step / description request_lines like
+// 'PATCH {u} (body: …) then GET {u}' or 'GET {gql}?query={__schema...}' are NOT runnable). A LONGER
+// dot run is fine — a path-traversal payload like '....//....//etc/passwd' is a real runnable URL. A
+// live-credential finding instead carries its own runnable PoC. Auto-generated reproduction steps do
+// NOT count. Kept in lockstep with the server so the preview POC dot equals what "Get report ready"
+// persists (no green→red flip on click).
 function ckHasRunnablePoc(cap) {
   cap = cap || {};
   const pe = cap.proof_evidence || {};
   const reqLine = String(pe.request_line || "").trim();
   const sp = reqLine.indexOf(" ");
   const target = sp >= 0 ? reqLine.slice(sp + 1).trim() : "";  // "GET https://…" → the URL
-  const runnable = /^https?:\/\//.test(target) && !/\s/.test(target) && !target.includes("...");
+  const runnable = /^https?:\/\//.test(target) && !/\s/.test(target) && !/(?<!\.)\.\.\.(?!\.)/.test(target);
   const cred = cap.credential_proof;
   return runnable || !!(cred && cred.poc);
 }
