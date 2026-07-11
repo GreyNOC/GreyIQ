@@ -525,15 +525,34 @@ def _hattr(value: str) -> str:
     return str(value or "").replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
 
 
+def _single_url_target(req_line: str) -> str:
+    """The one absolute-URL target of a crafted request line, or "" when the line is NOT a single
+    runnable request. A real crafted line is ``METHOD <one absolute URL>``; several engine producers
+    instead emit a multi-step / placeholder DESCRIPTION — e.g. mass-assignment
+    ``PATCH {u}  (body: …)  then  GET {u}``, broken-session ``GET {u} (session) -> logout -> …``,
+    stored-XSS ``POST {u} (field=<payload>) then GET {u}``, blind-XXE ``POST {u} (Content-Type: …)``,
+    GraphQL introspection ``GET {gql}?query={__schema...}``. A URL never carries raw whitespace, and
+    ``...`` is only ever a truncation placeholder — either one marks a description curl cannot run, so
+    it must yield no replay.sh curl / findings.har entry (which would be malformed) and must not count
+    as a runnable PoC artifact."""
+    _method, _sep, target = req_line.partition(" ")
+    target = target.strip()
+    if not target.startswith(("http://", "https://")):
+        return ""
+    if any(ch.isspace() for ch in target) or "..." in target:
+        return ""
+    return target
+
+
 def _curl_from_evidence(pe: dict[str, Any], url: str) -> tuple[str, str]:
     """Rebuild the EXACT crafted request GreyIQ used to confirm a finding as a copy-paste
     curl, from the captured ``proof_evidence``. Returns ``(curl, target_url)`` or ``("","")``
-    when no crafted request line was captured. Every active probe is an idempotent GET/HEAD/
-    OPTIONS, so the reproduction is benign to run as-is."""
+    when no single runnable crafted request line was captured. Every active probe is an idempotent
+    GET/HEAD/OPTIONS, so the reproduction is benign to run as-is."""
     req_line = str(pe.get("request_line") or "").strip()
-    method, _, target = req_line.partition(" ")
-    target = target.strip()
-    if not target.startswith(("http://", "https://")):
+    method, _sep, _rest = req_line.partition(" ")
+    target = _single_url_target(req_line)
+    if not target:
         return "", ""
     parts = ["curl -i"]
     m = method.strip().upper()
@@ -607,9 +626,9 @@ def build_findings_har(items: list[dict[str, Any]], version: str = "", generated
         finding = it.get("finding") if isinstance(it.get("finding"), dict) else {}
         pe = finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {}
         req_line = str(pe.get("request_line") or "").strip()
-        method, _sep, target = req_line.partition(" ")
-        target = target.strip()
-        if not target.startswith(("http://", "https://")):
+        method, _sep, _rest = req_line.partition(" ")
+        target = _single_url_target(req_line)
+        if not target:
             continue
         # Redact any detected secret riding in the crafted URL / header BEFORE it lands in the HAR — the
         # same guarantee build_replay_script gives (it redacts its whole output). A finding confirmed on

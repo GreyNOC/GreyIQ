@@ -2084,9 +2084,13 @@ class GreyIQRuntime:
                 "proof_of_impact": (request.proof.model_dump() if request.proof is not None else {})}
         replay, replay_n = bounty_build_replay([item])
         har, har_n = bounty_build_har([item], version=VERSION)
-        # Every assembled report carries deterministic reproduction steps — that IS the proof of
-        # concept. replay.sh/findings.har are bonus runnable artifacts when captured evidence permits.
-        has_poc = True
+        # POC readiness = a REAL runnable reproduction is present: a replay.sh/findings.har rebuilt
+        # from a captured crafted request line, or an operator/brain-supplied runnable PoC
+        # (request.poc). The assembled report ALWAYS carries deterministic reproduction steps, but
+        # those are auto-generated guidance — not proof the finding reproduces — so gating the flag
+        # on a captured or supplied artifact keeps POC honest and consistent with POI/POE (which
+        # likewise mean "real proof captured"), instead of reading true for every finding.
+        has_poc = bool(replay_n or har_n or str(request.poc or "").strip())
 
         # 4) Persist the ready state durably (orthogonal to the pipeline stage).
         finding_for_key = {"class_id": str(request.class_id or ""), "rule_id": str(request.rule_id or ""),

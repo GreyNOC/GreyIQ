@@ -8367,15 +8367,37 @@ async function ckEnsureHistory() {
 // it ready (synced everywhere, survives restart). Updates live via the global event stream.
 const ckReports = { ready: "all", page: 1, pageSize: 25 };  // ready-state filter + client-side pagination
 
+// Whether a REAL runnable PoC is derivable from a record's captured proof — mirrors the server's
+// has_poc in get_report_ready. A replay.sh/findings.har is rebuildable only from a captured crafted
+// request line that is a single runnable request (see bounty._single_url_target / _curl_from_evidence):
+// an absolute-URL target — case-sensitive http/https like the server — with no whitespace and no
+// '...' placeholder (multi-step / description request_lines like 'PATCH {u} (body: …) then GET {u}'
+// or 'GET {gql}?query={__schema...}' are NOT runnable). A live-credential finding instead carries its
+// own runnable PoC. Auto-generated reproduction steps do NOT count. Kept in lockstep with the server
+// so the preview POC dot equals what "Get report ready" persists (no green→red flip on click).
+function ckHasRunnablePoc(cap) {
+  cap = cap || {};
+  const pe = cap.proof_evidence || {};
+  const reqLine = String(pe.request_line || "").trim();
+  const sp = reqLine.indexOf(" ");
+  const target = sp >= 0 ? reqLine.slice(sp + 1).trim() : "";  // "GET https://…" → the URL
+  const runnable = /^https?:\/\//.test(target) && !/\s/.test(target) && !target.includes("...");
+  const cred = cap.credential_proof;
+  return runnable || !!(cred && cred.poc);
+}
+
 function ckProofDots(rec) {
   const wrap = cel("span", "ck-proof-dots");
   const rp = rec.report_ready_proof || {};
   const cap = rec.captured_proof || {};
   const poi = cap.proof_of_impact || {};
-  // Once readied, show what the assembled report ACTUALLY carries; before that, show what's
-  // assemblable from the captured proof (steps are always assemblable, so POC is always on).
+  // Once readied, show what the assembled report ACTUALLY carries; before that, PREVIEW what
+  // get_report_ready will compute from the captured proof. POC mirrors the server: a runnable
+  // reproduction (replay.sh/findings.har rebuilt from a captured crafted request line, or a
+  // supplied credential PoC), NOT the always-present auto-generated steps — so the dot doesn't
+  // flip green→red the moment the operator hits "Get report ready".
   const on = {
-    poc: rec.report_ready ? !!rp.poc : true,
+    poc: rec.report_ready ? !!rp.poc : ckHasRunnablePoc(cap),
     poi: rec.report_ready ? !!rp.poi : !!(poi.observed_result && poi.control_result),
     poe: rec.report_ready ? !!rp.poe : !!(cap.proof_evidence || cap.credential_proof),
   };

@@ -15,6 +15,7 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+import greyiq_api as api  # noqa: E402
 from bughunter import ledger  # noqa: E402
 
 
@@ -94,6 +95,83 @@ class ReportReadyLedgerTests(unittest.TestCase):
         ledger.upsert_findings(self.runtime, "acme", "https://example.com", [item])
         rec = ledger.list_all(self.runtime)[0]
         self.assertFalse(rec.get("readyable"))
+
+
+class ReportReadyRoutePocFlagTests(unittest.TestCase):
+    """The get_report_ready route's POC readiness flag must reflect whether a REAL runnable
+    reproduction exists — a replay.sh/findings.har rebuilt from a captured crafted request, or an
+    operator/brain-supplied PoC — NOT read true unconditionally. POI/POE already gate on captured
+    proof; POC now does too (the always-present auto-generated repro steps don't count)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_runtime_dir = api.RUNTIME_DIR
+        api.RUNTIME_DIR = Path(self._tmp.name)
+        self.rt = api.GreyIQRuntime.__new__(api.GreyIQRuntime)
+
+    def tearDown(self) -> None:
+        api.RUNTIME_DIR = self._orig_runtime_dir
+        self._tmp.cleanup()
+
+    def _ready(self, req: "api.ReportReadyRequest") -> dict:
+        out = api.GreyIQRuntime.get_report_ready(self.rt, req)
+        self.assertTrue(out.get("ok"), out)
+        return out
+
+    def test_poc_flag_false_without_a_runnable_artifact(self) -> None:
+        # Captured response evidence but NO crafted request line and no supplied PoC → nothing
+        # runnable to replay, so POC readiness is false even though the report still renders steps.
+        req = api.ReportReadyRequest(
+            class_id="cors", rule_id="web.cors-acao-reflect", title="CORS misconfiguration",
+            severity="high", location="https://example.com/api/me", target="https://example.com",
+            proof_evidence=api.ProofEvidenceInput(
+                response_header="Access-Control-Allow-Origin: https://evil.example",
+                response_status="200"))
+        out = self._ready(req)
+        self.assertFalse(out["ready"]["poc"])          # no runnable artifact, no supplied PoC
+        self.assertEqual(out.get("replay"), "")         # replay.sh could not be rebuilt
+        self.assertIsNone(out.get("har"))               # nor findings.har
+        self.assertTrue(out["ready"]["poe"])            # response evidence still lights POE
+
+    def test_poc_flag_true_with_a_rebuilt_replay_artifact(self) -> None:
+        # An absolute crafted request line lets replay.sh/findings.har be reconstructed → POC true.
+        req = api.ReportReadyRequest(
+            class_id="cors", rule_id="web.cors-acao-reflect", title="CORS misconfiguration",
+            severity="high", location="https://example.com/api/me", target="https://example.com",
+            proof_evidence=api.ProofEvidenceInput(
+                request_line="GET https://example.com/api/me",
+                response_header="Access-Control-Allow-Origin: https://evil.example",
+                response_status="200"))
+        out = self._ready(req)
+        self.assertTrue(out["ready"]["poc"])
+        self.assertTrue(out.get("replay"))              # the runnable artifact that earned the flag
+        self.assertIsNotNone(out.get("har"))
+
+    def test_poc_flag_false_for_a_multi_step_request_line(self) -> None:
+        # A mass-assignment/BFLA finding captures its request_line as a multi-step DESCRIPTION
+        # ("PATCH … then GET …"), which is not a single runnable request — so no replay.sh/har is
+        # rebuilt and POC readiness is false, not a malformed-artifact false positive.
+        req = api.ReportReadyRequest(
+            class_id="mass-assignment", rule_id="active.mass-assignment", title="Mass assignment",
+            severity="high", location="https://example.com/api/users/1", target="https://example.com",
+            proof_evidence=api.ProofEvidenceInput(
+                request_line='PATCH https://example.com/api/users/1  (body: {"is_admin": true})  then  GET https://example.com/api/users/1',
+                response_status="re-read reflects is_admin=true"))
+        out = self._ready(req)
+        self.assertFalse(out["ready"]["poc"])          # the multi-step description is not runnable
+        self.assertEqual(out.get("replay"), "")
+        self.assertIsNone(out.get("har"))
+
+    def test_poc_flag_true_with_a_supplied_poc(self) -> None:
+        # No crafted request line (nothing to replay), but the operator/brain supplied a runnable
+        # PoC — that IS a real POC artifact, so the flag is true without a rebuilt replay.sh.
+        req = api.ReportReadyRequest(
+            class_id="xss", rule_id="active.reflected-xss", title="Reflected XSS",
+            severity="high", location="https://example.com/q", target="https://example.com",
+            poc="<html><body><script>document.location='https://example.com/q?x=<svg/onload=1>'</script></body></html>")
+        out = self._ready(req)
+        self.assertTrue(out["ready"]["poc"])            # the supplied PoC counts
+        self.assertEqual(out.get("replay"), "")         # ...and it was NOT from a rebuilt artifact
 
 
 if __name__ == "__main__":
