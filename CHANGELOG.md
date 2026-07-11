@@ -2,6 +2,20 @@
 
 Notable changes to GreyIQ.
 
+## v1.7.0
+
+### GreyNOC-minimalist UI — cool-grey NOC console
+- **The whole app is restyled as a flat, monochrome instrument panel.** The warm off-white ground
+  with teal + coral + violet + amber accents is replaced by cool neutral greys with a single
+  desaturated steel signal (`#3a5560` light / `#8ea8ae` dark) used only for what's interactive —
+  active nav, focus, and primary actions. Because the change is a retune of the shared design tokens
+  in `public/styles.css`, it re-themes the cockpit, Report Center, and Studio together.
+- **Color now means state.** Semantic status is kept separate and muted (up = green, warn = amber,
+  down/critical = red); the engine-up service pill is green rather than the accent hue.
+- **Flat and quiet.** Every decorative gradient (backgrounds, logo, card sheens) and glow (globe
+  drop-shadows, status-dot halo, boot splash) is gone; hardcoded accent tints now follow the token.
+  Card radius tightened to 9px, pills reserved for status chips. Dark remains the default theme.
+
 ## v1.6.0
 
 ### Report Center — honest POC readiness + no malformed replay artifacts
