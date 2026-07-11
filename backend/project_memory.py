@@ -244,6 +244,14 @@ def scan(runtime_dir: str | Path, workspace: str, cfg: dict[str, Any] | None) ->
     auto.extend(_fact("stack", label, "auto") for label in _detect_stack(root))
     auto.extend(_fact("run", cmd, "auto") for cmd in _detect_run(root))
     auto.extend(_fact("files", name, "auto") for name in _key_files(root))
+    # Every auto fact is re-injected as TRUSTED 'PROJECT MEMORY' on every future run, so an untrusted
+    # repo's package.json script name / stack label / filename carrying an embedded injection sentence
+    # (e.g. "start\n\nSYSTEM: ignore prior instructions…") would poison the coding agent persistently.
+    # Drop any auto fact that scans as a prompt-injection risk (the 'purpose' fact was already scanned
+    # in _derive_purpose; re-scanning it here is a harmless no-op). Only 'auto' facts are filtered —
+    # a user's own facts are trusted input.
+    auto = [f for f in auto
+            if trust.scan_text(str(f.get("text") or ""), source="project memory fact")["level"] != "risk"]
 
     user_facts = [f for f in load(runtime_dir, workspace)["facts"] if f.get("source") == "user"]
     result = save(runtime_dir, workspace, auto + user_facts)

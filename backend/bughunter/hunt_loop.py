@@ -28,7 +28,7 @@ import coder
 import trust
 from bughunter import active_verify_service, hunt_brain
 from bughunter.brain_safety import sanitize_brain_field  # noqa: F401  (kept for symmetry / future prose)
-from bughunter.rate_limit import HostRateGovernor
+from bughunter.rate_limit import shared_governor
 from bughunter.settings import get_settings
 
 _PER_TURN_MIN = 4  # don't start a turn that can't afford a few probes
@@ -144,10 +144,11 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
     Returns the SAME (results, meta) shape as verify_active, so run_bounty_hunt can swap it in."""
     settings = settings or get_settings()
     max_iters = int(getattr(settings, "hunt_loop_max_iters", 3))
-    # ONE governor for the whole loop: its per-host bucket does not refill between turns, so the total
-    # per-host requests stay capped no matter how many turns run.
-    governor = HostRateGovernor(capacity=settings.active_max_requests_per_host,
-                                min_interval_s=settings.active_min_interval_ms / 1000.0)
+    # ONE process-wide governor: its per-host bucket is shared across turns AND across concurrent hunts
+    # on the same host, so the total per-host request rate stays capped no matter how many turns or
+    # parallel span/portfolio workers run.
+    governor = shared_governor(capacity=settings.active_max_requests_per_host,
+                               min_interval_s=settings.active_min_interval_ms / 1000.0)
 
     def _emit(msg: str) -> None:
         if callable(on_progress):
@@ -167,6 +168,7 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
     last_meta: dict[str, Any] = {"in_scope": True, "host": "", "requests_used": 0, "rate_limited": False, "verified_classes": []}
     surf = surface or {"endpoints": [target_url], "params": params_tried}
 
+    turn = -1  # so out_meta["loop_turns"] = turn + 1 is well-defined (0) even if max_iters <= 0
     for turn in range(max_iters):
         per_turn = min(requests_budget, budget_remaining)
         if per_turn < _PER_TURN_MIN and turn > 0:

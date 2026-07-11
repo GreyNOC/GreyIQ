@@ -83,6 +83,63 @@ class ReconScopeBleedTests(unittest.TestCase):
         self.assertEqual(result.get("js_secrets"), [])
 
 
+class _JsRedirectHandler(BaseHTTPRequestHandler):
+    """In-scope seed page references an in-scope `<script src>`, but that JS asset 302s to a public
+    OUT-OF-SCOPE host whose body carries a mineable param + secret. recon must re-gate the JS's
+    post-redirect final_url and never mine the OOS body."""
+    port = 0
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/":
+            body = b'<html><body><script src="/asset.js"></script></body></html>'
+            ctype = "text/html"
+        elif self.path == "/asset.js":  # in-scope asset that redirects OFF the seed host
+            self.send_response(302)
+            self.send_header("Location", f"http://evil.example.test:{self.port}/oos.js")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        else:  # the OOS host's JS body — must never be mined
+            body = b'var u = "/api/data?leaked_js_param=1"; var k = "AKIAIOSFODNN7EXAMPLE";'
+            ctype = "text/javascript"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args: object) -> None:
+        return
+
+
+class ReconServedJsScopeBleedTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._prev = os.environ.get("GREYIQ_SCAN_ALLOW_PRIVATE_URLS")
+        os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
+        self._orig_gai = socket.getaddrinfo
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _JsRedirectHandler)
+        _JsRedirectHandler.port = self.server.server_port
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        orig = self._orig_gai
+        port = self.server.server_port
+        socket.getaddrinfo = lambda host, p, *a, **k: orig("127.0.0.1", port, *a, **k)
+
+    def tearDown(self) -> None:
+        socket.getaddrinfo = self._orig_gai
+        self.server.shutdown()
+        if self._prev is None:
+            os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
+        else:
+            os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = self._prev
+
+    def test_served_js_redirecting_out_of_scope_is_not_mined(self) -> None:
+        seed = f"http://app.example.test:{self.server.server_port}/"
+        result = recon.discover(seed, scope_in=lambda h: False, settings=get_settings())
+        self.assertNotIn("leaked_js_param", result["params"])
+        self.assertEqual(result.get("js_secrets"), [])
+        self.assertGreaterEqual(result["dropped_out_of_scope"], 1)
+
+
 class ReconHtmlEntityTests(unittest.TestCase):
     """Regression: an href/src value in HTML encodes '&' as '&amp;'. Recon must DECODE it to
     the real URL, or the '&amp;' survives into the finding location + curl PoC (breaking a

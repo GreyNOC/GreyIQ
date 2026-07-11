@@ -157,7 +157,11 @@ def parse_csv(text: str) -> dict[str, Any]:
         return _err("csv", f"Could not parse CSV: {exc}")
     if not rows:
         return _finalize("csv", [], [])
-    column = _pick_column(rows[0])
+    # A single-column list has NO header column to pick: _pick_column's substring tier would match a
+    # hint inside the first value itself ("host" in "host1.example.com"), mis-flag row 0 as a header,
+    # and silently drop the first (often most important) target. Scan every cell instead — a genuine
+    # one-column header word (url/host/domain) isn't a valid target, so _normalize_one drops it anyway.
+    column = None if len(rows[0]) == 1 else _pick_column(rows[0])
     collected: list[str] = []
     if column is not None:
         for row in rows[1:]:            # skip the header row

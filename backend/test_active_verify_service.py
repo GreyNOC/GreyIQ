@@ -145,6 +145,29 @@ class ActiveCheckTests(unittest.TestCase):
         self.assertEqual(f["_active_proof"]["status"], "confirmed")
         self.assertEqual(f["_active_class_hint"], "xss")
 
+    def test_reflected_xss_in_rcdata_context_is_not_confirmed(self) -> None:
+        # The payload reflects UNESCAPED but inside <title> (RCDATA) — the browser treats it as text,
+        # so <svg/onload> never executes. Confirming it would be a false positive.
+        class TitleContextStub(_Stub):
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                r = super().fetch(url, method=method, extra_headers=extra_headers)
+                if "<html>echo " in r["body"]:
+                    inner = r["body"][len("<html>echo "):-len("</html>")]
+                    r["body"] = f"<html><head><title>Results for {inner}</title></head></html>"
+                return r
+        self.assertIsNone(av._check_reflected_xss(TitleContextStub(), self.URL))
+
+    def test_reflected_xss_in_html_comment_is_not_confirmed(self) -> None:
+        # Reflected unescaped but inside an HTML comment — inert, must not confirm.
+        class CommentContextStub(_Stub):
+            def fetch(self, url, *, method="GET", extra_headers=None):
+                r = super().fetch(url, method=method, extra_headers=extra_headers)
+                if "<html>echo " in r["body"]:
+                    inner = r["body"][len("<html>echo "):-len("</html>")]
+                    r["body"] = f"<html><!-- debug: {inner} --></html>"
+                return r
+        self.assertIsNone(av._check_reflected_xss(CommentContextStub(), self.URL))
+
     def test_open_redirect_confirms_and_is_not_followed(self) -> None:
         f = av._check_open_redirect(_Stub(), self.URL)
         self.assertEqual(f["rule_id"], "active.open-redirect")
@@ -1495,15 +1518,35 @@ class _JwtAuthHandler(BaseHTTPRequestHandler):
     real_token = ""
     vulnerable = True
     signature_checked = True
+    algnone_returns_anon = False  # verify signatures, but serve a PUBLIC 200 page for an alg:none token
 
     def do_GET(self) -> None:  # noqa: N802
         token = self._extract_token()
+        if type(self).algnone_returns_anon and self._is_alg_none(token):
+            # A signature-verifying server that decodes an alg:none token to "no valid claims" and
+            # serves its PUBLIC page with 200 (not 401) — the body is NOT the authenticated content.
+            body = b"public landing page: please sign in to view your account dashboard"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         ok = self._is_authenticated(token)
         body = b"authenticated" if ok else b"unauthorized"
         self.send_response(200 if ok else 401)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _is_alg_none(self, token: str) -> bool:
+        parts = token.split(".")
+        if len(parts) < 2 or not parts[0]:
+            return False
+        try:
+            header = json.loads(av._b64url_decode(parts[0]))
+        except Exception:  # noqa: BLE001
+            return False
+        return isinstance(header, dict) and str(header.get("alg", "")).lower() == "none"
 
     def _extract_token(self) -> str:
         authz = self.headers.get("Authorization") or ""
@@ -1546,6 +1589,7 @@ class JwtAlgNoneE2ETests(unittest.TestCase):
         _JwtAuthHandler.real_token = self.token
         _JwtAuthHandler.vulnerable = True
         _JwtAuthHandler.signature_checked = True
+        _JwtAuthHandler.algnone_returns_anon = False
 
     def tearDown(self) -> None:
         self.server.shutdown()
@@ -1588,6 +1632,15 @@ class JwtAlgNoneE2ETests(unittest.TestCase):
         http = self._http(None)
         self.assertIsNone(av._check_jwt_alg_none(http, url))
         self.assertEqual(http.sent, 0)
+
+    def test_signature_verified_but_algnone_returns_anonymous_body_is_not_flagged(self) -> None:
+        # FP guard (confirmation-oracle inflation): the server verifies signatures (corrupted-sig ->
+        # 401, passing the "server verifies" gate) but serves a PUBLIC 200 page for an alg:none token.
+        # Confirming on 2xx status alone would false-positive a CRITICAL; the body differential must
+        # reject it because the alg:none response is NOT the authenticated content.
+        _JwtAuthHandler.algnone_returns_anon = True
+        url = f"http://127.0.0.1:{self.port}/"
+        self.assertIsNone(av._check_jwt_alg_none(self._http(self._auth()), url))
 
     def test_wired_into_verify_active(self) -> None:
         # A generous governor/budget so the (many) checks ordered BEFORE the JWT

@@ -81,7 +81,7 @@ def parse_spec_body(body: str, is_yaml_hint: bool = False) -> Any:
     if not is_yaml_hint and (s.startswith("{") or s.startswith("[")):
         try:
             return json.loads(text)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             pass
     if _yaml is not None:
         try:
@@ -112,6 +112,25 @@ def _resolve_base(origin: str, server: str) -> str:
     return origin.rstrip("/")
 
 
+def _resolve_server_variables(url: str, variables: Any) -> str:
+    """Substitute OpenAPI ``servers[].variables`` defaults into a templated server URL
+    (``https://{host}/{basePath}`` -> the declared defaults). Any variable without a declared default
+    is replaced with a neutral ``1`` so the base never carries a literal ``{...}`` into an assembled
+    endpoint URL (which the host-only scope gate would pass and the prover would waste a request on)."""
+    if not isinstance(url, str) or "{" not in url:
+        return url
+    vars_map = variables if isinstance(variables, dict) else {}
+
+    def _sub(match: re.Match[str]) -> str:
+        name = match.group(0)[1:-1]  # strip the surrounding { } (the regex has no capture group)
+        spec = vars_map.get(name)
+        if isinstance(spec, dict) and spec.get("default") is not None:
+            return str(spec["default"])
+        return _TEMPLATE_PLACEHOLDER
+
+    return _TEMPLATE_PARAM_RE.sub(_sub, url)
+
+
 def parse_openapi(spec: Any, spec_url: str) -> dict[str, Any]:
     """Pure parse of an OpenAPI 3.x / Swagger 2.0 document. Returns
     ``{title, version, endpoints, params}`` — endpoints are absolute URLs for *concrete*
@@ -124,11 +143,14 @@ def parse_openapi(spec: Any, spec_url: str) -> dict[str, Any]:
         return {}
     origin = _origin(spec_url)
     base = ""
+    server_variables: Any = None
     servers = spec.get("servers")
     if isinstance(servers, list) and servers and isinstance(servers[0], dict):
         base = str(servers[0].get("url") or "")
+        server_variables = servers[0].get("variables")
     elif spec.get("basePath"):  # Swagger 2.0
         base = str(spec.get("basePath") or "")
+    base = _resolve_server_variables(base, server_variables)  # {version} -> its declared default
     base_url = _resolve_base(origin, base)
 
     endpoints: list[str] = []
@@ -163,6 +185,8 @@ def parse_openapi(spec: Any, spec_url: str) -> dict[str, Any]:
             else:
                 concrete = raw_path
             full = base_url.rstrip("/") + "/" + concrete.lstrip("/")
+            if "{" in full or "}" in full:
+                continue  # unresolved server-variable/template -> never hand a braced URL to the prover
             endpoints.append(full)
     # de-dupe, preserve order
     seen: set[str] = set()
@@ -342,6 +366,7 @@ def discover_api_surface(
             ui_url = origin + ui_path
             if not in_scope(ui_url):
                 continue
+            tried += 1  # count each fetched UI page against the combined spec-probe cap (guard above)
             r = fetch(ui_url)
             if not r or int(r.get("status") or 0) != 200:
                 continue
@@ -378,7 +403,7 @@ def discover_api_surface(
             continue
         try:
             data = json.loads(body)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             continue
         info = parse_graphql_introspection(data)
         if info:

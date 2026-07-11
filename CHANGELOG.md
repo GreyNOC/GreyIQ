@@ -2,6 +2,43 @@
 
 Notable changes to GreyIQ.
 
+## v1.8.0
+
+### Offline-brain distillation — Phase 0: hunt-trace training corpus
+- **Every URL hunt is now recorded** to an append-only `hunt_traces.jsonl` under the runtime dir: the recon
+  surface, the plan the brain produced from it, and what actually confirmed. This is the training corpus for
+  a future learned, fully-offline hunt ranker that sharpens `offline_hunt.py` from real confirmations
+  (see [docs/offline-hunt-brain-distillation.md](docs/offline-hunt-brain-distillation.md)).
+- Wired into **both** hunt paths — the campaign engine and the standalone `run_bounty_hunt` (guarded so a
+  campaign's per-URL sub-hunt never double-logs). New `hunt_trace.training_examples` lazily joins the ledger
+  by `dedup_key` to backfill each finding's final stage/bounty, so a bounty landing weeks later is reflected
+  without rewriting the log.
+- **Privacy-preserving and safe by construction:** every stored URL runs through `redact_text` (secret values
+  in `?token=`/`AKIA…`/`eyJ…` stripped; numeric/UUID path segments kept), fields are capped, the append is
+  torn-line-durable, and a trace write is fail-closed — it can never break a hunt. It sits behind the
+  unchanged plan-validation + prover gate, so it only ever records.
+- **Visible via `gn traces`** (and `--json`): hunts logged, programs, outcome rows, confirmed rows.
+
+### Whole-app QAQC hardening (precision + safety)
+- **Active-prover confirm oracles.** A reflected `<svg/onload>` inside RCDATA/raw-text/HTML-comment context is
+  now treated as inert (not a confirm-grade injection); the blind SQLi/RCE timing margin is clamped below a
+  timeout-reduced delay so a real blind injection isn't silently missed.
+- **JWT forgery is proven by a body differential** — a forged/`alg:none` token confirms a bypass only when it
+  unlocks the *same authenticated content* the real token returns (a bare 2xx public page is no longer a
+  false CRITICAL), plus an RS→HMAC algorithm-confusion control.
+- **Recon re-gates the post-redirect `final_url`** — an in-scope `<script src>` that 302s to a public
+  out-of-scope host is no longer mined (the fetch guard is SSRF-only, not scope).
+- **API discovery** resolves/skips braced server-variable/template URLs, so a `{version}` URL is never handed
+  to the prover.
+- **Credential validation** keeps a Firebase project *number* out of the slug `project_id`, and leaves AWS
+  `ASIA` temporary credentials inconclusive (no session token) rather than false-marking a live one dead.
+- **One process-wide host rate governor** (`rate_limit.shared_governor`) so concurrent span/portfolio hunts on
+  a host share a single token bucket — WAF/ban and avoid-DoS-policy safety.
+- **RecursionError hardening** against hostile deeply-nested JSON, and redaction↔classify parity for keyed
+  session/CSRF/OAuth/bearer values.
+- **Backend log rotation** — the desktop app's backend log rolls to a single `.1` backup past 5 MB instead of
+  growing unbounded.
+
 ## v1.7.0
 
 ### GreyNOC-minimalist UI — cool-grey NOC console

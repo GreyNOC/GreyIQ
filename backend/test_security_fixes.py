@@ -37,6 +37,48 @@ class RedactionTests(unittest.TestCase):
         self.assertNotIn("abcd1234efgh5678", out)
         self.assertNotIn("supersecretvalue99", out)
 
+    def test_opaque_bearer_token_redacted(self) -> None:
+        # An opaque (non-JWT, non-vendor) bearer token has no vendor shape, so only the key-anchored
+        # session-material patterns can strip it. A captured proof body carrying it must not leak.
+        raw = "8f3a2b1c9d0e4f5a6b7c8d9e0f1a2b3c"
+        out, redacted = redact_text(f"Authorization: Bearer {raw}")
+        self.assertTrue(redacted)
+        self.assertNotIn(raw, out)
+        self.assertIn("Bearer", out)  # keep the field visible for triage
+
+    def test_json_session_id_redacted(self) -> None:
+        # Lowercase session id in a JSON body: no vendor shape, no uppercase dotenv match.
+        raw = "a5f3c9d81b2e4470deadbeef"
+        out, redacted = redact_text(f'{{"session_id": "{raw}"}}')
+        self.assertTrue(redacted)
+        self.assertNotIn(raw, out)
+
+    def test_classified_session_material_is_always_redactable(self) -> None:
+        # INVARIANT: anything ``sensitive_data.classify`` NAMES as session/bearer material MUST also be
+        # stripped by ``redact_text``. Otherwise a raw session/bearer token leaks into a report whose
+        # header claims "already redacted" (the v1.4.0 capture-engine leak). This guards the two
+        # taxonomies against drifting: a new class added to the classifier without a matching redaction
+        # pattern fails this test.
+        from bughunter import sensitive_data  # noqa: PLC0415
+
+        samples = {
+            "a CSRF/anti-forgery token": ('{"csrfToken": "%s"}', "AbCd1234EfGh5678Ijkl"),
+            "a session identifier": ('{"session_id": "%s"}', "a5f3c9d81b2e4470deadbeef"),
+            "an OAuth access/refresh token": ('{"access_token": "%s"}', "opaqueTOKENvalue1234567890"),
+            "a bearer authorization token": ("Authorization: Bearer %s", "8f3a2b1c9d0e4f5a6b7c8d9e0f1a2b3c"),
+        }
+        classifier_labels = {label for label, _ in sensitive_data._KEYED_SESSION_PATTERNS}
+        self.assertEqual(
+            set(samples), classifier_labels,
+            "sensitive_data._KEYED_SESSION_PATTERNS changed: add a sample + a redact_text pattern for the new class",
+        )
+        for label, (template, raw) in samples.items():
+            text = template % raw
+            self.assertIn(label, sensitive_data.classify(text), f"classifier no longer names {label!r}")
+            out, redacted = redact_text(text)
+            self.assertTrue(redacted, f"redact_text did not touch {label!r}")
+            self.assertNotIn(raw, out, f"raw {label!r} value leaked through redact_text")
+
 
 class DenylistTests(unittest.TestCase):
     def test_separated_recursive_force_flags_blocked(self) -> None:

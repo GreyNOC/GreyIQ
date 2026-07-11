@@ -68,11 +68,15 @@ class ValidatorInterpretationTests(unittest.TestCase):
         self.assertIn("users/secret.json", storage["evidence"])   # concrete object name, not prose
         self.assertIn("private/", storage["detail"])
 
-    def test_live_but_restricted_still_live_and_extracts_project(self) -> None:
+    def test_live_but_restricted_still_live_and_extracts_project_number(self) -> None:
         self._mock(403, '{"error":{"message":"Identity Toolkit API has not been used in project 123456789012 before or it is disabled."}}')
         r = cv.validate_firebase_key(_KEY)
         self.assertIs(r["live"], True)
-        self.assertEqual(r["project_id"], "123456789012")
+        # The error names a project NUMBER, not a slug. It must land in project_number (informational),
+        # NOT project_id (a slug) — a numeric project_id yields a futile <number>.firebaseio.com probe
+        # and a misleading "Firebase project <number>" label.
+        self.assertEqual(r.get("project_number"), "123456789012")
+        self.assertEqual(r.get("project_id", ""), "")  # left empty so probe_firebase_exposure isn't called with a number
 
     def test_non_key_is_not_checked(self) -> None:
         r = cv.validate_firebase_key("not-a-google-key")
@@ -234,6 +238,16 @@ class TokenLivenessTests(unittest.TestCase):
         r = cv.validate_aws_key("not-an-akid", "short")
         self.assertFalse(r["checked"])                           # malformed pair -> never contacts AWS
         self.assertEqual(sent, [])
+
+    def test_aws_temporary_asia_key_is_inconclusive_not_dead(self) -> None:
+        # A temporary (ASIA) key needs its session token to validate; signing without it always 403s.
+        # We must NOT contact AWS and falsely mark a live temp credential dead/revoked -> leave it
+        # inconclusive (live None, unchecked) so classify doesn't downgrade the finding.
+        sent = []
+        cv._get_full = lambda url, extra_headers=None: (sent.append(url), (403, {}, ""))[1]
+        r = cv.validate_aws_key("ASIA" + "C" * 16, "y" * 40)
+        self.assertIsNone(r["live"])          # inconclusive, not False
+        self.assertEqual(sent, [])            # never signed / contacted AWS
 
     def test_gcp_service_account_live_and_ssrf_safe(self) -> None:
         from cryptography.hazmat.primitives import serialization

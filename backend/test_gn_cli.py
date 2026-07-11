@@ -68,8 +68,38 @@ class GnCliTests(unittest.TestCase):
 
     def test_cli_commands_match_dispatch_list(self) -> None:
         # run_frozen dispatches on these verbs; keep them aligned with the parser.
-        for verb in ("hunt", "campaign", "scan", "learn", "stats", "profiles", "classes", "tools", "version"):
+        for verb in ("hunt", "campaign", "scan", "learn", "stats", "traces", "profiles", "classes", "tools", "version"):
             self.assertIn(verb, gn_cli.CLI_COMMANDS)
+
+    def test_traces_command_reports_corpus(self) -> None:
+        import json
+
+        from bughunter import hunt_trace
+        with tempfile.TemporaryDirectory() as tmp:
+            original = gn_cli.RUNTIME_DIR
+            gn_cli.RUNTIME_DIR = Path(tmp)
+            try:
+                # Empty corpus: friendly nudge, exit 0.
+                code, out, _ = _run(["traces"])
+                self.assertEqual(code, 0)
+                self.assertIn("No hunt traces", out)
+                # Record one trace, then the corpus readout reflects it.
+                hunt_trace.record_trace(
+                    Path(tmp), program="demo", target="https://app.example.com/",
+                    surface={"endpoints": ["https://app.example.com/search"], "params": ["q"], "tech": ["flask"], "forms": []},
+                    plan={"provider": "offline", "probe_priority": [{"endpoint": "https://app.example.com/search", "classes": ["xss"]}]},
+                    outcomes=[{"endpoint": "https://app.example.com/search", "class": "xss", "proof_status": "confirmed", "dedup_key": "k1"}])
+                code, out, _ = _run(["traces"])
+                self.assertEqual(code, 0)
+                self.assertIn("1 hunt(s)", out)
+                self.assertIn("1 confirmed", out)
+                code, out, _ = _run(["traces", "--json"])
+                self.assertEqual(code, 0)
+                doc = json.loads(out)
+                self.assertEqual(doc["hunts"], 1)
+                self.assertEqual(doc["confirmed_rows"], 1)
+            finally:
+                gn_cli.RUNTIME_DIR = original
 
     def test_learn_and_stats_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

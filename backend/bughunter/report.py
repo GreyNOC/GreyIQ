@@ -962,9 +962,10 @@ def _append_screenshot(out: list[str], finding: dict[str, Any]) -> None:
         out.append("")
 
 
-_CREDENTIAL_WARNING = ("The credential above is shown UN-REDACTED so you can validate it and paste the "
-                       "real value into your report — treat this document as sensitive and share it only "
-                       "with the program you are reporting to.")
+_CREDENTIAL_WARNING = ("The credential above is shown REDACTED (prefix…suffix) — the raw key never appears in "
+                       "this report. Retrieve the full value from your own source finding / validation step "
+                       "before pasting it into a submission, and treat this document as sensitive, sharing it "
+                       "only with the program you are reporting to.")
 
 
 def _append_credential_proof(out: list[str], finding: dict[str, Any]) -> None:

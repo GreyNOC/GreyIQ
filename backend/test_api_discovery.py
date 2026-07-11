@@ -60,6 +60,31 @@ class ParseOpenApiTests(unittest.TestCase):
         self.assertEqual(api.parse_openapi({"hello": "world"}, "https://x/y"), {})
         self.assertEqual(api.parse_openapi("not a dict", "https://x/y"), {})
 
+    def test_server_variables_are_resolved_to_defaults(self) -> None:
+        # A path-position {version} server variable must be substituted with its declared default,
+        # not left as a literal brace in every assembled endpoint URL.
+        spec = {
+            "openapi": "3.0.1", "info": {"title": "V"},
+            "servers": [{"url": "https://api.example.com/{version}",
+                         "variables": {"version": {"default": "v2"}}}],
+            "paths": {"/items": {"get": {}}},
+        }
+        p = api.parse_openapi(spec, "https://api.example.com/openapi.json")
+        self.assertIn("https://api.example.com/v2/items", p["endpoints"])
+        self.assertFalse(any("{" in e or "}" in e for e in p["endpoints"]))
+
+    def test_unresolved_server_variable_does_not_leak_a_braced_url(self) -> None:
+        # A server variable with no declared default falls back to a neutral placeholder; no endpoint
+        # may ever carry a literal brace to the prover.
+        spec = {
+            "openapi": "3.0.1", "info": {"title": "V"},
+            "servers": [{"url": "https://api.example.com/{stage}"}],  # no variables/default declared
+            "paths": {"/items": {"get": {}}},
+        }
+        p = api.parse_openapi(spec, "https://api.example.com/openapi.json")
+        self.assertTrue(p["endpoints"])
+        self.assertFalse(any("{" in e or "}" in e for e in p["endpoints"]))
+
     def test_cross_origin_servers_url_is_resolved_verbatim(self) -> None:
         # parse_openapi is a PURE parser with no scope awareness -- an OpenAPI spec
         # served from one host can legitimately (or maliciously) declare servers[].url
@@ -71,6 +96,18 @@ class ParseOpenApiTests(unittest.TestCase):
                 "paths": {"/secrets": {"get": {}}}}
         p = api.parse_openapi(spec, "https://api.example.com/openapi.json")
         self.assertIn("https://internal-admin.other-host.example/secrets", p["endpoints"])
+
+
+class ParseSpecBodyTests(unittest.TestCase):
+    def test_deeply_nested_json_returns_none_not_recursionerror(self) -> None:
+        # json.loads raises RecursionError (a RuntimeError, NOT ValueError) on deeply nested brackets.
+        # parse_spec_body promises "never raises" — a hostile /openapi.json must degrade to None, not
+        # crash recon for the whole target.
+        hostile = "[" * 6000 + "]" * 6000
+        self.assertIsNone(api.parse_spec_body(hostile))
+
+    def test_valid_json_still_parses(self) -> None:
+        self.assertEqual(api.parse_spec_body('{"a": 1}'), {"a": 1})
 
 
 class GraphQLTests(unittest.TestCase):

@@ -36,6 +36,14 @@ class CsvTests(unittest.TestCase):
         self.assertEqual(r["count"], 2)
         self.assertEqual(r["hosts"], ["example.com", "x.example.net"])
 
+    def test_headerless_single_column_first_target_not_dropped_when_value_contains_hint(self) -> None:
+        # The first value CONTAINS a host-hint substring ("host" inside "host1.example.com"). Before the
+        # fix, _pick_column's substring tier mis-read row 0 as a header and silently dropped host1 --
+        # the first (often most important) target. A single-column list must scan every cell.
+        r = ti.ingest("host1.example.com\nhost2.example.com\n", "csv")
+        self.assertEqual(r["count"], 2)
+        self.assertEqual(r["hosts"], ["host1.example.com", "host2.example.com"])
+
     def test_junk_cells_dropped(self) -> None:
         # Header labels + bare words + n/a must NOT become targets; only the dotted host does.
         r = ti.ingest("label,note\nN/A,comment\nexample.com,todo\n", "csv")

@@ -71,3 +71,25 @@ class HostRateGovernor:
             now = time.monotonic()
             tokens = min(float(self.capacity), state["tokens"] + (now - state["last_refill"]) * self.refill_per_s)
             return int(tokens)
+
+
+# Process-wide governors, keyed by config, so the per-host politeness cap is truly PROCESS-WIDE (as
+# the module docstring promises) rather than per-hunt. Concurrent hunts — a span's parallel URL
+# workers, a portfolio's parallel programs — that each build their OWN governor multiply the effective
+# per-host budget by the worker count, risking WAF/IP bans and breaching an avoid_dos VDP policy.
+_shared_lock = threading.Lock()
+_shared_governors: dict[tuple[int, float, float], "HostRateGovernor"] = {}
+
+
+def shared_governor(capacity: int = 20, min_interval_s: float = 0.5, refill_per_s: float = 0.5) -> "HostRateGovernor":
+    """Return a PROCESS-WIDE HostRateGovernor for this config so every concurrent hunt hitting the same
+    registrable host draws from ONE token bucket. The governor already keys its buckets by host
+    internally, so a single instance spans every host. Keyed by config: a differently-tuned caller
+    gets its own shared instance; identical config -> the same instance. Thread-safe."""
+    key = (max(1, int(capacity)), max(0.0, float(min_interval_s)), max(0.0, float(refill_per_s)))
+    with _shared_lock:
+        gov = _shared_governors.get(key)
+        if gov is None:
+            gov = HostRateGovernor(*key)
+            _shared_governors[key] = gov
+        return gov

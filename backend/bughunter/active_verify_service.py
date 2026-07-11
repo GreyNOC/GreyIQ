@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import difflib
 import hashlib
 import hmac
 import json
@@ -893,6 +894,10 @@ def _check_reflected_xss(http: _Http, url: str, extra_params: list[str] | None =
         # reflection into application/json or text/plain is not browser-executable.
         # We INSPECT the string; nothing executes.
         if marker_payload in body and _MARK in ctrl_body and f"{_MARK}&lt;" not in body and html_context:
+            if _in_nonexecuting_context(body, body.find(marker_payload)):
+                # Reflected into RCDATA/raw-text (<title>, <textarea>, …) or an HTML comment — the
+                # <svg/onload> is inert text there, so this is not a confirm-grade injection.
+                continue
             proof = _proof(
                 "confirmed", method=f"GET with {param}={marker_payload}", affected_asset="victim sessions/cookies and any action the victim can take",
                 observed_result=f"the '{param}' parameter reflected the payload UNESCAPED into the response (the `<svg/onload>` markup was not HTML-encoded)",
@@ -906,6 +911,32 @@ def _check_reflected_xss(http: _Http, url: str, extra_params: list[str] | None =
                   "read_data": _context_excerpt(body, marker_payload)}
             return _finding("active.reflected-xss", f"Reflected XSS via '{param}' parameter", "high", "client_sink", "xss", url, proof, ev)
     return None
+
+
+# Elements whose content the browser parses as raw text / RCDATA, not markup — a reflected
+# ``<svg/onload>`` inside one of these (or inside an HTML comment) is inert text, never executed.
+_RAW_TEXT_ELEMENTS = ("script", "style", "title", "textarea", "xmp", "noscript", "noframes", "iframe")
+
+
+def _in_nonexecuting_context(body: str, idx: int) -> bool:
+    """True if position ``idx`` sits somewhere a reflected ``<svg/onload>`` does NOT execute as HTML:
+    inside an HTML comment, or inside a raw-text/RCDATA element (<script>, <style>, <title>,
+    <textarea>, <xmp>, <noscript>, <noframes>, <iframe>) whose content is treated as text. The
+    element-content reflected-XSS check must land in an EXECUTING context to be confirm-grade; a
+    reflection into <title>/<textarea>/a comment is a false confirm."""
+    if idx < 0:
+        return False
+    before = body[:idx].lower()
+    # HTML comment: the nearest '<!--' before idx has no closing '-->' between it and idx.
+    c_open = before.rfind("<!--")
+    if c_open >= 0 and before.rfind("-->") < c_open:
+        return True
+    # Raw-text / RCDATA element: the nearest opening such tag before idx is unclosed.
+    for tag in _RAW_TEXT_ELEMENTS:
+        open_i = before.rfind(f"<{tag}")
+        if open_i >= 0 and open_i > before.rfind(f"</{tag}"):
+            return True
+    return False
 
 
 def _in_script_context(body: str, idx: int) -> bool:
@@ -1303,6 +1334,10 @@ def _check_time_sqli(http: _Http, url: str, settings: Any = None, extra_params: 
     # Keep the injected delay strictly under the fetch timeout so a confirmed probe never
     # trips the timeout (which would read as an error, not a delay).
     d = min(float(d), max(1.0, float(settings.web_fetch_timeout_seconds) - 1.0))
+    # If a reduced fetch timeout clamped the delay below the confirm margin, the differential could
+    # NEVER pass and a real blind SQLi would be silently missed. Clamp the margin below the clamped
+    # delay (floor 1.0s so we never confirm on sub-second noise) so the check degrades gracefully.
+    margin = min(float(margin), max(1.0, d - 1.0))
     # MySQL/MariaDB SLEEP is the most common; a single fixed payload keeps requests bounded.
     d_str = str(int(d)) if float(d).is_integer() else f"{d:.1f}"  # SLEEP(4), not SLEEP(4.0)
     slow = f"' AND SLEEP({d_str})-- -"
@@ -1350,6 +1385,9 @@ def _check_time_rce(http: _Http, url: str, settings: Any = None, extra_params: l
     d = getattr(settings, "active_time_sqli_delay_seconds", _TIME_DELAY_S) or _TIME_DELAY_S
     margin = getattr(settings, "active_time_sqli_margin_seconds", _TIME_MARGIN_S) or _TIME_MARGIN_S
     d = min(float(d), max(1.0, float(settings.web_fetch_timeout_seconds) - 1.0))
+    # Clamp the margin below the (possibly timeout-reduced) delay so a real blind RCE isn't silently
+    # missed when the delay drops below the fixed margin (floor 1.0s to avoid sub-second-noise confirms).
+    margin = min(float(margin), max(1.0, d - 1.0))
     ds = str(int(d)) if float(d).is_integer() else f"{d:.1f}"
     # The common places a value lands in a shell: command separator, substitution (both forms),
     # and pipe. Each confirmed independently by its own two-trial timing differential.
@@ -1607,6 +1645,30 @@ def _forge_alg_none_variants(token: str) -> list[str]:
     return [f"{forged_header}.{parts[1]}.", f"{forged_header}.{parts[1]}"]
 
 
+# Body-similarity confirm gate for the JWT forgery checks. A forged token is only proof of a bypass
+# if the response it unlocks is the SAME authenticated content the REAL token returns — a bare 2xx
+# status can be an anonymous/public page that a signature-verifying server still serves for a no-auth
+# request (corrupted-sig rejected with 401, but alg:none decoded to "no claims" and served the public
+# page with 200). Confirming on status alone false-positives a CRITICAL there. Mirrors the
+# observed-vs-baseline discipline of run_bfla_check/run_idor_check (access_control_service._SAME);
+# kept self-contained here because access_control_service imports THIS module (avoid an import cycle).
+_JWT_BODY_SAME = 0.95
+_JWT_MIN_BODY = 8
+_JWT_BODY_CMP_CAP = 6000
+
+
+def _body_similar(a: str, b: str) -> float:
+    """difflib similarity in [0,1] over whitespace-normalized, length-capped bodies. Two empty bodies
+    are 1.0; one-empty-one-not is 0.0 (an empty forged response never matches a real authenticated one)."""
+    na = " ".join(str(a or "").split())[:_JWT_BODY_CMP_CAP]
+    nb = " ".join(str(b or "").split())[:_JWT_BODY_CMP_CAP]
+    if not na and not nb:
+        return 1.0
+    if not na or not nb:
+        return 0.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
 def _check_jwt_alg_none(http: _Http, url: str, discovered_token: str = "") -> dict[str, Any] | None:
     """Confirm the server accepts an UNSIGNED (alg:none) copy of a real session token as
     authenticated — one of the highest-signal, lowest-effort JWT bugs in real programs.
@@ -1641,6 +1703,9 @@ def _check_jwt_alg_none(http: _Http, url: str, discovered_token: str = "") -> di
         return None
     if not (200 <= int(baseline.get("status") or 0) < 300):
         return None  # can't establish what an "authenticated" response even looks like here
+    baseline_body = str(baseline.get("body") or "")
+    if len(" ".join(baseline_body.split())) < _JWT_MIN_BODY:
+        return None  # no substantive authenticated body to differentiate against -> can't prove a bypass
     parts = real_token.split(".")
     corrupted_sig = _corrupt_jwt_signature(parts[2])
     try:
@@ -1658,30 +1723,36 @@ def _check_jwt_alg_none(http: _Http, url: str, discovered_token: str = "") -> di
             probe = http.fetch(url, extra_headers={header_name: rebuild(forged)})
         except _ActiveError:
             continue
-        if 200 <= int(probe.get("status") or 0) < 300:
-            proof = _proof(
-                "confirmed", method=f"GET with a forged alg:none {header_name}",
-                affected_asset="every endpoint behind this authentication check",
-                observed_result=f"the unsigned (alg:none) token was accepted (HTTP {probe['status']}), matching the real-token baseline (HTTP {baseline['status']})",
-                control_result=f"a token with a corrupted signature (same algorithm) was rejected (HTTP {control['status']}) — the server does verify signatures normally",
-                evidence="alg:none acceptance confirmed via a real-token baseline plus a corrupted-signature negative control",
-            )
-            ev = {
-                "request_line": f"GET {url}",
-                "request_header": f"{header_name}: <forged alg:none token>",
-                "response_status": f"HTTP {probe['status']}",
-                "matched_value": "unsigned token accepted as authenticated",
-            }
-            # The authenticated response the forged token unlocked — the concrete data an attacker
-            # reads once signature verification is bypassed. Guarded so a trivially-empty body is
-            # not rendered; _finding() redacts it once.
-            auth_body = str(probe.get("body") or "")
-            if len(auth_body.strip()) >= 8:
-                ev["read_data"] = auth_body[:1200]
-            return _finding(
-                "active.jwt-alg-none", "JWT alg:none accepted (signature verification bypass)",
-                "critical", "jwt", "jwt", url, proof, ev,
-            )
+        if not (200 <= int(probe.get("status") or 0) < 300):
+            continue
+        auth_body = str(probe.get("body") or "")
+        sim = _body_similar(auth_body, baseline_body)
+        if sim < _JWT_BODY_SAME:
+            # 2xx but NOT the authenticated content — a signature-verifying server can still serve an
+            # anonymous/public page with 200 for a token it decoded to "no valid claims". Not a bypass.
+            continue
+        proof = _proof(
+            "confirmed", method=f"GET with a forged alg:none {header_name}",
+            affected_asset="every endpoint behind this authentication check",
+            observed_result=f"the unsigned (alg:none) token was accepted (HTTP {probe['status']}) and returned the SAME authenticated content as the real-token baseline ({sim:.0%} body match, HTTP {baseline['status']})",
+            control_result=f"a token with a corrupted signature (same algorithm) was rejected (HTTP {control['status']}) — the server does verify signatures normally",
+            evidence="alg:none acceptance confirmed via a real-token baseline (body-matched), plus a corrupted-signature negative control",
+        )
+        ev = {
+            "request_line": f"GET {url}",
+            "request_header": f"{header_name}: <forged alg:none token>",
+            "response_status": f"HTTP {probe['status']}",
+            "matched_value": "unsigned token accepted as authenticated",
+        }
+        # The authenticated response the forged token unlocked — the concrete data an attacker
+        # reads once signature verification is bypassed. Guarded so a trivially-empty body is
+        # not rendered; _finding() redacts it once.
+        if len(auth_body.strip()) >= 8:
+            ev["read_data"] = auth_body[:1200]
+        return _finding(
+            "active.jwt-alg-none", "JWT alg:none accepted (signature verification bypass)",
+            "critical", "jwt", "jwt", url, proof, ev,
+        )
     return None
 
 
@@ -1770,6 +1841,9 @@ def _check_jwt_alg_confusion(http: _Http, url: str, discovered_token: str = "") 
         return None
     if not (200 <= int(baseline.get("status") or 0) < 300):
         return None
+    baseline_body = str(baseline.get("body") or "")
+    if len(" ".join(baseline_body.split())) < _JWT_MIN_BODY:
+        return None  # no substantive authenticated body to differentiate against -> can't prove a bypass
     pems = _fetch_rsa_public_pems(http, url, kid=str(header.get("kid") or ""))
     if not pems:
         return None  # no public key reachable -> can't forge, nothing to prove
@@ -1796,27 +1870,33 @@ def _check_jwt_alg_confusion(http: _Http, url: str, discovered_token: str = "") 
             probe = http.fetch(url, extra_headers={header_name: rebuild(forged)})
         except _ActiveError:
             continue
-        if 200 <= int(probe.get("status") or 0) < 300:
-            proof = _proof(
-                "confirmed", method=f"GET with an RS256->HS256 confused token ({hs_alg}, HMAC-signed with the RSA public key)",
-                affected_asset="every endpoint behind this authentication check — a forged token grants any identity/role",
-                observed_result=f"a token re-signed as {hs_alg} using the target's own RSA public key was accepted (HTTP {probe['status']}), matching the real-token baseline (HTTP {baseline['status']})",
-                control_result=f"a token with a corrupted RS signature was rejected (HTTP {control['status']}) — the server does verify signatures, so accepting the public-key HMAC proves algorithm confusion",
-                evidence="RS256->HS256 confusion confirmed: forgery signed with the public JWKS key accepted, corrupted-signature control rejected",
-            )
-            ev = {
-                "request_line": f"GET {url}",
-                "request_header": f"{header_name}: <token forged as {hs_alg}, HMAC key = the RSA public key>",
-                "response_status": f"HTTP {probe['status']}",
-                "matched_value": f"{alg}->{hs_alg} algorithm-confusion forgery accepted as authenticated",
-            }
-            auth_body = str(probe.get("body") or "")
-            if len(auth_body.strip()) >= 8:
-                ev["read_data"] = auth_body[:1200]
-            return _finding(
-                "active.jwt-alg-confusion", "JWT RS256->HS256 algorithm confusion (token forgery via the public key)",
-                "critical", "jwt", "jwt", url, proof, ev,
-            )
+        if not (200 <= int(probe.get("status") or 0) < 300):
+            continue
+        auth_body = str(probe.get("body") or "")
+        sim = _body_similar(auth_body, baseline_body)
+        if sim < _JWT_BODY_SAME:
+            # 2xx but NOT the authenticated content — a signature-verifying server can still serve an
+            # anonymous/public page with 200 for a forged token it rejects. Not a proven forgery.
+            continue
+        proof = _proof(
+            "confirmed", method=f"GET with an RS256->HS256 confused token ({hs_alg}, HMAC-signed with the RSA public key)",
+            affected_asset="every endpoint behind this authentication check — a forged token grants any identity/role",
+            observed_result=f"a token re-signed as {hs_alg} using the target's own RSA public key was accepted (HTTP {probe['status']}) and returned the SAME authenticated content as the real-token baseline ({sim:.0%} body match, HTTP {baseline['status']})",
+            control_result=f"a token with a corrupted RS signature was rejected (HTTP {control['status']}) — the server does verify signatures, so accepting the public-key HMAC proves algorithm confusion",
+            evidence="RS256->HS256 confusion confirmed: forgery signed with the public JWKS key accepted (body-matched), corrupted-signature control rejected",
+        )
+        ev = {
+            "request_line": f"GET {url}",
+            "request_header": f"{header_name}: <token forged as {hs_alg}, HMAC key = the RSA public key>",
+            "response_status": f"HTTP {probe['status']}",
+            "matched_value": f"{alg}->{hs_alg} algorithm-confusion forgery accepted as authenticated",
+        }
+        if len(auth_body.strip()) >= 8:
+            ev["read_data"] = auth_body[:1200]
+        return _finding(
+            "active.jwt-alg-confusion", "JWT RS256->HS256 algorithm confusion (token forgery via the public key)",
+            "critical", "jwt", "jwt", url, proof, ev,
+        )
     return None
 
 

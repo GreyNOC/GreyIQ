@@ -234,6 +234,27 @@ class RunBountyHuntProgressTests(unittest.TestCase):
             self.assertTrue(Path(second["report_path"]).is_file())
 
 
+    def test_active_url_hunt_writes_a_hunt_trace(self) -> None:
+        # Phase 0 (bounty path): a direct ACTIVE URL hunt does its own recon+plan, so it appends one
+        # hunt_traces.jsonl line (surface + offline plan + reportable-finding outcomes). Exercises the
+        # standalone integration (guarded so a campaign's per-URL call — which passes extra_params —
+        # never reaches here) plus the fail-closed row-building and the reportable-findings iteration.
+        from bughunter import hunt_trace
+        url = f"http://127.0.0.1:{self.server.server_port}/"
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as rt:
+            report = run_bounty_hunt(
+                url, "web-app", None, tmp, "127.0.0.1", True, {}, active=True,
+                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed", runtime_dir=Path(rt))
+            self.assertTrue(report["ok"], report.get("error"))
+            traces = hunt_trace.load_traces(Path(rt))
+            self.assertEqual(len(traces), 1)
+            trace = traces[0]
+            self.assertEqual(trace["plan"]["provider"], "offline")  # coder_cfg={} -> offline plan
+            self.assertIn("127.0.0.1", trace["target"])
+            self.assertIn("endpoints", trace["surface"])
+            self.assertIsInstance(trace["outcomes"], list)
+
+
 class RunCampaignProgressChainTests(unittest.TestCase):
     def setUp(self) -> None:
         self._prev = os.environ.get("GREYIQ_SCAN_ALLOW_PRIVATE_URLS")

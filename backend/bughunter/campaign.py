@@ -32,6 +32,7 @@ from bughunter import (
     cve_service,
     fsutil,
     hunt_brain,
+    hunt_trace,
     ledger,
     learning,
     offline_hunt,
@@ -71,6 +72,14 @@ def _read_json(path: str) -> dict[str, Any]:
 
 def _proof_status(doc: dict[str, Any], ref: str) -> str:
     return str(((doc.get("proof_of_impact") or {}).get(ref) or {}).get("status") or "missing")
+
+
+_PROOF_RANK = {"confirmed": 2, "candidate": 1, "missing": 0}
+
+
+def _proof_rank(status: str) -> int:
+    """Proof strength ordering (confirmed > candidate > missing/unknown) for dedup-replacement."""
+    return _PROOF_RANK.get(str(status or "").strip().lower(), 0)
 
 
 def _severity_counts(findings: list[dict[str, Any]]) -> dict[str, int]:
@@ -291,6 +300,11 @@ def _run_campaign_body(
     # WHICH params those two checks try first; the checks still supply the payload and confirm.
     brain_ssrf_params: list[str] = []
     brain_xss_params: list[str] = []
+    # The recon SURFACE and the PLAN produced from it — captured for the hunt trace log
+    # (hunt_trace, the offline-brain distillation corpus). Stay None on a repo/path target
+    # or if the reasoning layer errored, so a trace is only written when both really exist.
+    hunt_trace_surface: dict[str, Any] | None = None
+    hunt_trace_plan: dict[str, Any] | None = None
     if kind == "url":
         _emit("recon: mapping the surface…")
         # Bind discovery to the SAME fail-closed scope gate the active prover uses, so
@@ -322,9 +336,11 @@ def _run_campaign_body(
         # only ever REPORTED if the deterministic prover independently confirms it (recall up,
         # precision unchanged). Best-effort + fail-closed: no brain / any error keeps current behaviour.
         try:
-            hb = hunt_brain.plan_hunt(coder_cfg, clean_target, scope,
-                                      {"endpoints": urls, "params": recon_params, "tech": recon_tech, "forms": recon_forms},
-                                      priors=priors)
+            surface_for_brain = {"endpoints": urls, "params": recon_params, "tech": recon_tech, "forms": recon_forms}
+            hb = hunt_brain.plan_hunt(coder_cfg, clean_target, scope, surface_for_brain, priors=priors)
+            # Capture the (surface, plan) input side for the trace log. recon_params is only ever
+            # REBOUND below (never mutated in place), so this reference stays the recon-only surface.
+            hunt_trace_surface, hunt_trace_plan = surface_for_brain, hb
             new_params = [p for p in (hb.get("param_hypotheses") or [])
                           if p.lower() not in {q.lower() for q in recon_params}]
             if new_params:
@@ -389,6 +405,7 @@ def _run_campaign_body(
     per_target: list[dict[str, Any]] = []
     consolidated: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
+    key_to_idx: dict[str, int] = {}  # dedup key -> index in `consolidated`, for confirmed-upgrade replacement
     # Register the discovered URLs as the dashboard's work units — but ONLY for a top-level
     # single-target campaign. In a program span the NAMED targets are the units (already
     # registered by the span); here we just stream that target's findings as URLs finish.
@@ -423,12 +440,9 @@ def _run_campaign_body(
             # Dedup across targets by class + rule + normalized location.
             norm_loc = re.sub(r"\d+", "N", str(finding.get("location") or ""))
             key = f"{finding.get('class_id')}|{finding.get('rule_id')}|{norm_loc}"
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
             ref = str(finding.get("ref") or "")
             proof_status = _proof_status(doc, ref)
-            consolidated.append({
+            item = {
                 "finding": finding,
                 "source_url": url,
                 "source_report": result.get("report_path", ""),
@@ -441,7 +455,19 @@ def _run_campaign_body(
                 # EMPTY differential and a report rebuilt from history after a restart/eviction loses the
                 # very proof that earned "confirmed". The differential lives in the run JSON's proof map.
                 "proof_of_impact": (doc.get("proof_of_impact") or {}).get(ref) or {},
-            })
+            }
+            if key in seen_keys:
+                # Same class/rule at the same normalized location was already recorded at an earlier URL.
+                # Normally skip the duplicate — but if THIS occurrence is confirmed while the retained one
+                # is weaker (candidate/missing), REPLACE it so a real, submittable confirmed finding isn't
+                # silently lost to a first-seen unconfirmed instance (confirmed > candidate > missing).
+                prev = key_to_idx.get(key)
+                if prev is not None and _proof_rank(proof_status) > _proof_rank(consolidated[prev].get("proof_status")):
+                    consolidated[prev] = item
+                continue
+            seen_keys.add(key)
+            key_to_idx[key] = len(consolidated)
+            consolidated.append(item)
             url_new.append({"ref": ref, "title": finding.get("title"), "severity": finding.get("severity"),
                             "class_name": finding.get("class_name") or finding.get("class_id"), "proof_status": proof_status,
                             # Carried for the dashboard's investigate drawer + on-demand re-verify/report:
@@ -737,6 +763,14 @@ def _run_campaign_body(
     # which were ALREADY reported in a prior run (so a re-run never re-files them). ---
     if rt is not None:
         ledger.upsert_findings(rt, program, clean_target, consolidated)
+        # Append this hunt to the trace log (offline-brain distillation corpus): the recon
+        # surface + the plan the brain produced + what actually confirmed. upsert_findings
+        # ran first so each consolidated item now carries its dedup_key (for the later ledger
+        # join in hunt_trace.training_examples). Best-effort + fail-closed inside record_trace.
+        if hunt_trace_surface is not None and hunt_trace_plan is not None:
+            hunt_trace.record_trace(rt, program=program, target=clean_target,
+                                    surface=hunt_trace_surface, plan=hunt_trace_plan,
+                                    consolidated=consolidated)
 
     # --- Submission packages (reportable findings; confirmed first; never re-package a
     # finding already reported in a prior run). ---
@@ -859,7 +893,9 @@ def _target_host_excluded(candidate: str, excluded_hosts: list[str]) -> bool:
     if not excluded_hosts:
         return False
     raw = str(candidate or "").strip()
-    host = (urlparse(raw).hostname if "://" in raw else raw).strip().lower().strip("[]")
+    # urlparse('http://').hostname is None for a scheme-only/malformed seed — coalesce to '' before
+    # .strip() so one bad seed is skipped, not allowed to crash the whole portfolio/span run.
+    host = ((urlparse(raw).hostname if "://" in raw else raw) or "").strip().lower().strip("[]")
     if not host:
         return False
     reg = registrable_domain(host)

@@ -2026,12 +2026,17 @@ class GreyIQRuntime:
         # PRE-filter, so without this a finding the policy withheld could be reconstituted into a
         # submittable report here. Re-apply the SAME policy: refuse to author a report for a finding on
         # an excluded endpoint, of an always-rejected class, or (confirmed-only) that isn't confirmed.
-        # VDP-gate proof status: _has_captured_artifact is the confirm authority the policy filter
-        # uses (its historical input). It intentionally returns True on a captured active artifact
-        # incl. a bare observed "HTTP 200" — the RETURNED proof_status below is the honest, capped one.
-        proof_dict = request.proof.model_dump() if request.proof is not None else None
-        observed = str((request.proof.observed_result if request.proof is not None else "") or "")
-        gate_confirmed = bounty_report._has_captured_artifact(finding, proof_dict, observed)
+        # VDP-gate proof status: the gate must see the SAME differential-capped status the report
+        # renders, NOT a fresh _has_captured_artifact() on the raw client observed_result. When the
+        # caller supplies proof, a bare "HTTP 200" with no control was already capped to 'candidate'
+        # above (has_differential); reusing that here stops a confirmed_only program's withhold gate
+        # from being bypassed by an uncontrolled client observation (authoring a report the policy
+        # requires withheld while the badge honestly reads 'candidate'). With no client proof, the
+        # engine's OWN cached artifact is the trustworthy signal, so keep _has_captured_artifact there.
+        if request.proof is not None:
+            gate_confirmed = (status == "confirmed")  # 'status' = the capped overlay status computed above
+        else:
+            gate_confirmed = bounty_report._has_captured_artifact(finding, None, "")
         profile = bounty_vdp.get_profile(request.policy_profile) if request.policy_profile else None
         if profile:
             gate_item = {"proof_status": "confirmed" if gate_confirmed else "candidate", "finding": finding}
@@ -2909,6 +2914,7 @@ class GreyIQRuntime:
             "title": finding["title"], "severity": finding["severity"],
         }
 
+    @_confirm_route
     def check_session_invalidation(self, request: "SessionInvalRequest") -> dict[str, Any]:
         """Confirm a SESSION STAYS VALID AFTER LOGOUT: log in, verify an authenticated endpoint, log out,
         then replay the SAME session and confirm it still authenticates (while an anonymous request is
@@ -2935,6 +2941,7 @@ class GreyIQRuntime:
             "title": finding["title"], "severity": finding["severity"],
         }
 
+    @_confirm_route
     def check_bfla(self, request: "BflaRequest") -> dict[str, Any]:
         """Confirm BFLA (broken function-level authorization) via a three-session differential
         (admin / low-priv user / anon). On a CONFIRMED bypass, cache it as a run so every
@@ -3256,6 +3263,7 @@ class GreyIQRuntime:
                 "platform": persisted["platform"], "report": persisted["report"], "marker": res.get("marker"),
                 "title": finding["title"], "severity": finding["severity"]}
 
+    @_confirm_route
     def check_stored_xss_beacon(self, request: "StoredXssBeaconRequest") -> dict[str, Any]:
         """Confirm stored XSS via an OOB collaborator beacon rendered in a browser — proves the injected
         markup EXECUTES on render (catches DOM/JS-rendered stored XSS a source fetch misses). Assisted by
@@ -4503,18 +4511,23 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
     method = str(scope.get("method") or "GET").upper()
     path = str(scope.get("path") or "/")
 
-    # Access-key gate runs before EVERYTHING else, including the unauthenticated index
-    # page and static-file fallback that embed/precede SESSION_TOKEN — a no-op when
-    # GREYIQ_ACCESS_KEY isn't set (the default local/Electron case).
-    if not _access_key_authorized(scope):
-        await send_unauthorized(send)
-        return
-
+    # A CORS preflight (OPTIONS) NEVER carries credentials per the Fetch spec, so it must be answered
+    # BEFORE the access-key gate. Otherwise a configured GREYIQ_ACCESS_KEY 401s every preflight and no
+    # preflighted cross-origin /api/* call from an allowlisted frontend can ever succeed. The actual
+    # credentialed request that the browser sends AFTER a successful preflight is still access-key gated
+    # below. The origin is still validated here, and OPTIONS returns only an empty CORS response.
     if method == "OPTIONS":
         if not _request_origin_allowed(scope):
             await send_json(send, {"error": "origin not allowed"}, 403)
             return
         await send_empty(send)
+        return
+
+    # Access-key gate runs before EVERYTHING else, including the unauthenticated index
+    # page and static-file fallback that embed/precede SESSION_TOKEN — a no-op when
+    # GREYIQ_ACCESS_KEY isn't set (the default local/Electron case).
+    if not _access_key_authorized(scope):
+        await send_unauthorized(send)
         return
 
     if not _request_origin_allowed(scope):

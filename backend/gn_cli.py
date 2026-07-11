@@ -45,7 +45,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 # These are the CLI verbs run_frozen.py recognizes to dispatch here.
-CLI_COMMANDS = ("hunt", "campaign", "scan", "learn", "stats", "operator", "profiles", "classes", "tools", "version", "gn")
+CLI_COMMANDS = ("hunt", "campaign", "scan", "learn", "stats", "traces", "operator", "profiles", "classes", "tools", "version", "gn")
 
 _SEV_COLOR = {"critical": "1;31", "high": "31", "medium": "33", "low": "36", "info": "2"}
 
@@ -233,6 +233,25 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(_c("  what pays here:", "32"))
         for note in intel:
             print(f"    - {note}")
+    return 0
+
+
+def _cmd_traces(args: argparse.Namespace) -> int:
+    from bughunter import hunt_trace
+
+    stats = hunt_trace.trace_stats(RUNTIME_DIR)
+    if args.json:
+        print(json.dumps(stats, indent=2, default=str))
+        return 0
+    if not stats["hunts"]:
+        print("No hunt traces recorded yet. Run a URL hunt or campaign; each one appends to the "
+              "offline-brain training corpus (hunt_traces.jsonl).")
+        return 0
+    print(_c("Hunt trace corpus (offline-brain distillation):", "1"))
+    print(f"  {stats['hunts']} hunt(s) across {stats['programs']} program(s)")
+    print(f"  {stats['outcome_rows']} outcome row(s), {_c(str(stats['confirmed_rows']) + ' confirmed', '32')}")
+    print("\nThis is the local training data for a learned offline hunt ranker (see "
+          "docs/offline-hunt-brain-distillation.md). Nothing here leaves your machine.")
     return 0
 
 
@@ -698,6 +717,10 @@ def build_parser() -> argparse.ArgumentParser:
     stats.add_argument("--target", default="", help="a target URL/host (derives the program)")
     stats.add_argument("--json", action="store_true")
     stats.set_defaults(func=_cmd_stats)
+
+    traces = sub.add_parser("traces", help="show the offline-brain training corpus (hunt_traces.jsonl) recorded from your hunts")
+    traces.add_argument("--json", action="store_true")
+    traces.set_defaults(func=_cmd_traces)
 
     op = sub.add_parser("operator", help="autonomous operator — run a portfolio of programs unattended")
     op.set_defaults(func=_cmd_operator, op_action=None)

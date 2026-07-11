@@ -332,6 +332,28 @@ class AccessKeyGateTests(unittest.TestCase):
             cap = _run_route("GET", "/", headers=headers)
             self.assertEqual(cap.status, 401, bad)
 
+    def test_options_preflight_succeeds_under_access_key_for_allowed_origin(self) -> None:
+        # A CORS preflight (OPTIONS) NEVER carries credentials (Fetch spec). With an access key set it
+        # must still return 204 for an allowlisted origin so the browser can then send the real
+        # credentialed request -- otherwise every preflighted cross-origin /api/* call 401s and the
+        # documented GREYIQ_ALLOWED_ORIGINS + access-key deployment is unusable.
+        g.GREYIQ_ACCESS_KEY = "supersecretkey"
+        orig = g.os.environ.get("GREYIQ_ALLOWED_ORIGINS")
+        g.os.environ["GREYIQ_ALLOWED_ORIGINS"] = "https://allowed.example"
+        try:
+            cap = _run_route("OPTIONS", "/api/bounty/scan",
+                             headers={"Host": "127.0.0.1:8791", "Origin": "https://allowed.example"})
+            self.assertEqual(cap.status, 204)  # preflight succeeds without Basic auth
+            # A disallowed origin's preflight is still refused -- OPTIONS bypasses the key, NOT the origin check.
+            cap2 = _run_route("OPTIONS", "/api/bounty/scan",
+                              headers={"Host": "127.0.0.1:8791", "Origin": "https://evil.example"})
+            self.assertEqual(cap2.status, 403)
+        finally:
+            if orig is None:
+                g.os.environ.pop("GREYIQ_ALLOWED_ORIGINS", None)
+            else:
+                g.os.environ["GREYIQ_ALLOWED_ORIGINS"] = orig
+
 
 if __name__ == "__main__":
     unittest.main()

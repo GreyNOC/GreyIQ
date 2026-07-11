@@ -306,7 +306,7 @@ def discover(
             continue
         try:
             doc = json.loads(fetched.get("body") or "")
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):  # deeply-nested hostile JSON must not crash recon
             continue
         if not isinstance(doc, dict):
             continue
@@ -434,6 +434,12 @@ def discover(
             js_done.add(js_url)
             jf = budgeted_fetch(js_url)
             if not jf:
+                continue
+            # RE-GATE the post-redirect final_url: an in-scope <script src> can 302 to a public OOS
+            # host (the fetch guard is SSRF-only, not scope). Mining that body would leak OOS params/
+            # secrets into the prover surface + report — every sibling path re-gates final_url likewise.
+            if not in_scope(jf.get("final_url") or js_url):
+                dropped_oos += 1
                 continue
             mined = mine_js(jf.get("body") or "", jf.get("final_url") or js_url, host_filter=host_ok)
             params.update(mined.get("params") or [])

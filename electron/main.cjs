@@ -219,9 +219,19 @@ async function startBackend() {
   };
 
   // Mirror backend output to a log file so failures are diagnosable even though
-  // a packaged GUI app has no attached console.
+  // a packaged GUI app has no attached console. Bound its growth: an append-only log with no cap
+  // inflates to hundreds of MB over months of launches / chatty engine sessions and can exhaust a
+  // small disk. Roll to a single .1 backup once it passes the cap, then keep appending to a fresh file.
+  const LOG_MAX_BYTES = 5 * 1024 * 1024;
   try {
-    logStream = fs.createWriteStream(backendLogPath(), { flags: 'a' });
+    const logPath = backendLogPath();
+    try {
+      if (fs.statSync(logPath).size > LOG_MAX_BYTES) {
+        try { fs.rmSync(`${logPath}.1`, { force: true }); } catch (_) { /* no prior backup */ }
+        try { fs.renameSync(logPath, `${logPath}.1`); } catch (_) { /* best-effort roll */ }
+      }
+    } catch (_) { /* no existing log yet */ }
+    logStream = fs.createWriteStream(logPath, { flags: 'a' });
     logStream.write(`\n===== GreyIQ backend start ${new Date().toISOString()} (${command.exe}) =====\n`);
   } catch (_) {
     logStream = null;

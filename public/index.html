@@ -461,8 +461,8 @@
                 <span>Dynamic browser pass <em>(Playwright)</em></span></label>
               <label class="ck-switch"><input id="ckDeep" type="checkbox">
                 <span>Deep auto-work <em>— (campaign) implies proof-of-impact + time-based SQLi, then auto-captures a screenshot and writes a researched dossier for each confirmed lead</em></span></label>
-              <label class="ck-switch"><input id="ckAttackMap" type="checkbox" checked>
-                <span>Attack-plan map <em>— render a graphical .png of the attack flow for each confirmed finding into the POC download &amp; submission report</em></span></label>
+              <label class="ck-switch" data-ck-when="campaign portfolio" hidden><input id="ckAttackMap" type="checkbox" checked>
+                <span>Attack-plan map <em>— render a graphical .png of the attack flow for each confirmed finding into the POC download &amp; submission report (campaign/portfolio runs)</em></span></label>
               <label class="ck-switch ck-auth"><input id="ckAuthorized" type="checkbox">
                 <span><strong>I'm authorized to test this target (in scope).</strong></span></label>
             </div>

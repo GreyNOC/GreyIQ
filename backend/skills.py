@@ -133,14 +133,21 @@ def _safe_desc(skill: "Skill") -> str:
     return desc
 
 
+def _safe_name(skill: "Skill") -> str:
+    name = str(skill.name or "")
+    if skill.source == "workspace":  # untrusted: collapse to one line + cap so the frontmatter NAME
+        name = re.sub(r"\s+", " ", name).strip()[:80]  # can't inject a newline+instruction into the prompt
+    return name
+
+
 def skills_prompt(selected: list[Skill], all_skills: list[Skill]) -> str:
     parts: list[str] = []
     if selected:
         parts.append("Relevant playbook(s) for this task — follow the steps in order:")
         for skill in selected:
-            parts.append(f"\n## Playbook: {skill.name}\n{_safe_body(skill)}")
+            parts.append(f"\n## Playbook: {_safe_name(skill)}\n{_safe_body(skill)}")
     others = [s for s in all_skills if s not in selected and s.description]
     if others:
-        index = "\n".join(f"- {s.name}: {_safe_desc(s)}" for s in others)
+        index = "\n".join(f"- {_safe_name(s)}: {_safe_desc(s)}" for s in others)
         parts.append("\nOther available playbooks (read/apply one if it fits better):\n" + index)
     return "\n".join(parts).strip()

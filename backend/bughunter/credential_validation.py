@@ -162,10 +162,13 @@ def validate_firebase_key(key: str) -> dict[str, Any]:
         return result
     if any(m in low for m in _LIVE_BUT_RESTRICTED):
         result.update(live=True)
-        # Try to surface a project number the error sometimes names ("project 123456789012").
+        # Try to surface a project NUMBER the error sometimes names ("project 123456789012"). Store it
+        # in a distinct field, NOT project_id: project_id is a SLUG (RTDB hosts key off the slug), so a
+        # numeric project number there yields a futile <number>.firebaseio.com probe and a misleading
+        # "Firebase project <number>" label. Leaving project_id empty also gates probe_firebase_exposure.
         m = re.search(r"project[^0-9]{0,12}(\d{6,})", low)
         if m:
-            result["project_id"] = m.group(1)
+            result["project_number"] = m.group(1)
         result["detail"] = (
             f"LIVE — the key is accepted (HTTP {status}) but the Identity Toolkit API is disabled/"
             "restricted for it. The credential is real; enumerate the other Google/Firebase APIs it "
@@ -628,6 +631,16 @@ def validate_aws_key(access_key_id: str, secret_access_key: str) -> dict[str, An
     result["no_data_read"] = True  # returns only the caller's OWN identity — no resource is ever read
     if not _AKID_RE.match(access_key_id) or len(secret_access_key) < 40:
         return result  # not a well-formed AWS pair -> unchecked (never sign junk)
+    if access_key_id.startswith("ASIA"):
+        # ASIA = a TEMPORARY credential; sts:GetCallerIdentity also requires its X-Amz-Security-Token
+        # (session token), which a leaked access-key-id + secret pair does not carry. Signing without it
+        # ALWAYS 403s, which would falsely mark a genuinely LIVE temp credential dead/revoked (and
+        # downgrade the finding). Leave it inconclusive (unchecked) rather than under-reporting; the
+        # paired secret access key is still reported separately.
+        result["detail"] = ("Temporary AWS credential (ASIA…): liveness needs the paired session token "
+                            "(X-Amz-Security-Token), which is not part of the leaked key pair, so liveness "
+                            "cannot be determined here — inconclusive, not dead.")
+        return result
     url = f"https://{_STS_HOST}/?{_STS_QUERY}"
     result["poc"] = ("# with the paired key configured (aws configure):\n"
                      "aws sts get-caller-identity")

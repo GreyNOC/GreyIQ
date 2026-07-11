@@ -109,6 +109,88 @@ class CampaignTests(unittest.TestCase):
         self.assertIn(ref, result["cvss"])              # CVSS surfaced for ranking/severity
         self.assertGreaterEqual(len(result["submission_paths"]), 1)  # a report package was written
 
+    def test_url_campaign_writes_hunt_trace(self) -> None:
+        # Phase 0 (offline-brain distillation corpus): a URL campaign appends exactly one
+        # hunt_traces.jsonl line carrying the recon surface, the (offline) plan produced from
+        # it, and the consolidated findings' confirm outcomes. recon / the per-URL hunt / the
+        # CVE fetch are stubbed so the test stays offline; the CVE pass injects one candidate
+        # finding so the trace has a non-empty outcome row.
+        from bughunter import cve_service as cve, hunt_trace
+
+        target = "https://app.example.com/"
+        comp = {"product": "jquery", "version": "1.8.0", "evidence": "/static/jquery-1.8.0.min.js"}
+        cve_finding = cve._build_finding(comp, cve.match_cves("jquery", "1.8.0"), target)
+        orig = (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves)
+        campaign.recon.discover = lambda t, **k: {
+            "urls": [t, t + "search?q=1"], "notes": [], "sources": {}, "js_secrets": [],
+            "tech": ["flask"], "params": ["q", "file"], "forms": [], "hints": {}}
+        campaign.run_bounty_hunt = lambda *a, **k: {"ok": True, "json_path": "", "report_path": ""}
+        campaign.cve_service.scan_known_cves = lambda t, **k: {
+            "ok": True, "host": "app.example.com", "target": target,
+            "components": [comp], "count": 1, "findings": [dict(cve_finding)]}
+        try:
+            result = campaign.run_campaign(
+                target, scope="app.example.com", authorized=True, coder_cfg={},
+                default_reports_dir=self.reports, runtime_dir=self.runtime, version="9.9.9", program="demo")
+        finally:
+            campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves = orig
+
+        self.assertTrue(result["ok"], result.get("error"))
+        traces = hunt_trace.load_traces(self.runtime)
+        self.assertEqual(len(traces), 1)
+        trace = traces[0]
+        self.assertEqual(trace["program"], "demo")
+        self.assertEqual(trace["target"], target)
+        # The recon surface was captured (params + tech), and the OFFLINE plan ran over it.
+        self.assertIn("q", trace["surface"]["params"])
+        self.assertIn("flask", trace["surface"]["tech"])
+        self.assertEqual(trace["plan"]["provider"], "offline")
+        # The injected CVE candidate flows through as an outcome row with its confirm status.
+        classes = {o["class"] for o in trace["outcomes"]}
+        self.assertIn(str(cve_finding.get("class_id")), classes)
+
+    def test_target_host_excluded_survives_scheme_only_seed(self) -> None:
+        # A malformed scheme-only seed makes urlparse(...).hostname None; the exclusion check must
+        # skip it, not crash the whole portfolio/span run with AttributeError on .strip().
+        for bad in ("http://", "https://", "//x", "ftp://:"):
+            self.assertFalse(campaign._target_host_excluded(bad, ["evil.example"]))
+        # A genuinely excluded host (and its subdomains) is still matched.
+        self.assertTrue(campaign._target_host_excluded("https://sub.evil.example/x", ["evil.example"]))
+
+    def test_later_confirmed_duplicate_replaces_earlier_candidate(self) -> None:
+        # Cross-URL consolidation: the SAME class/rule at the same digit-normalized location appears
+        # unconfirmed at an earlier URL and CONFIRMED at a later one. The confirmed, submittable
+        # instance must win — not be dropped by the first-seen unconfirmed key.
+        url_a, url_b = "https://app.example.com/", "https://app.example.com/p2"
+        find_a = {"ref": "F1", "title": "Reflected XSS", "severity": "high", "class_id": "xss",
+                  "class_name": "Reflected XSS", "rule_id": "active.reflected-xss",
+                  "location": "https://app.example.com/search?item=1", "cwe": "CWE-79"}
+        find_b = {**find_a, "location": "https://app.example.com/search?item=2"}  # same normalized location
+        docs = {
+            url_a: {"findings": [find_a], "proof_of_impact": {"F1": {"status": "candidate"}}, "cvss": {"F1": {}}},
+            url_b: {"findings": [find_b], "proof_of_impact":
+                    {"F1": {"status": "confirmed", "observed_result": "reflected raw", "control_result": "encoded"}},
+                    "cvss": {"F1": {}}},
+        }
+        orig = (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves,
+                campaign._read_json)
+        campaign.recon.discover = lambda t, **k: {"urls": [url_a, url_b], "notes": [], "sources": {},
+                                                  "js_secrets": [], "tech": [], "params": [], "forms": []}
+        campaign.run_bounty_hunt = lambda *a, **k: {"ok": True, "json_path": a[0], "report_path": ""}
+        campaign.cve_service.scan_known_cves = lambda t, **k: {"ok": True, "findings": []}
+        campaign._read_json = lambda p: docs.get(p, {})
+        try:
+            result = campaign.run_campaign(
+                "https://app.example.com/", scope="app.example.com", authorized=True, coder_cfg={},
+                default_reports_dir=self.reports, runtime_dir=self.runtime, version="9.9.9", program="demo")
+        finally:
+            (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves,
+             campaign._read_json) = orig
+        self.assertTrue(result["ok"], result.get("error"))
+        xss = [f for f in result["findings"] if f.get("rule_id") == "active.reflected-xss"]
+        self.assertEqual(len(xss), 1, "the duplicate should collapse to one finding")
+        self.assertEqual(result["proof_of_impact"][xss[0]["ref"]]["status"], "confirmed")
+
     def test_brain_selected_idor_candidates_run_the_dormant_prover(self) -> None:
         # The reasoning layer flags object-scoped endpoints; the campaign runs the (previously
         # never-autonomously-called) single-session IDOR prover on them WITH the operator's session,

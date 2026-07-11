@@ -75,6 +75,39 @@ _PEM_LONE_RE: Final = re.compile(
     r"-----BEGIN (?:RSA |EC |OPENSSH |PGP |DSA )?PRIVATE KEY( BLOCK)?-----[\s\S]*"
 )
 
+# Key-anchored authenticated-session material — session identifiers, CSRF/anti-forgery tokens,
+# OAuth access/refresh/id tokens, and opaque ``Authorization: Bearer`` values. These are the exact
+# classes ``bughunter.sensitive_data.classify`` NAMES as sensitive in a captured proof body, but the
+# vendor-secret patterns above only strip vendor-shaped keys and JWTs — an opaque bearer token or a
+# lowercase ``"session_id": "…"`` (common in JSON bodies) has no vendor shape and would otherwise be
+# rendered verbatim into a report/evidence file whose header claims it is "already redacted". Each
+# pattern captures ``(key + delimiter prefix, value)`` so only the value half is stamped, keeping the
+# field name visible for triage. The field-name alternations MIRROR
+# ``sensitive_data._KEYED_SESSION_PATTERNS`` — ``test_security_fixes`` asserts the two cannot drift so
+# that anything the classifier can name is guaranteed redactable. Linear-time (no nested quantifiers).
+_KEYED_SESSION_VALUE_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    # CSRF / anti-forgery tokens.
+    re.compile(
+        r"(?i)(\b(?:csrf[_-]?token|csrfmiddlewaretoken|xsrf[_-]?token|authenticity_token|"
+        r"request(?:_)?verification_?token|anti[_-]?csrf[_-]?token)\b['\"]?\s*[:=]\s*['\"]?)"
+        r"([A-Za-z0-9._+/\-]{16,})"
+    ),
+    # Session identifiers (cookie or JSON, any case; value charset allows %-encoding and dots).
+    re.compile(
+        r"(?i)(\b(?:session[_-]?id|sessionid|phpsessid|jsessionid|connect\.sid|asp\.net_sessionid|"
+        r"auth[_-]?session)\b['\"]?\s*[:=]\s*['\"]?)([A-Za-z0-9._%\-]{12,})"
+    ),
+    # OAuth access / refresh / id tokens.
+    re.compile(
+        r"(?i)(\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token)\b['\"]?\s*[:=]\s*['\"]?)"
+        r"([A-Za-z0-9._+/\-]{16,})"
+    ),
+    # Opaque (or JWT) bearer authorization value.
+    re.compile(
+        r"(?i)(\bauthorization\b['\"]?\s*[:=]\s*['\"]?bearer\s+)([A-Za-z0-9._+/\-]{16,})"
+    ),
+)
+
 
 def _short_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
@@ -150,6 +183,15 @@ def _redact_text(text: str) -> tuple[str, bool]:
     if count:
         redacted_any = True
         text = new_text
+
+    # Key-anchored session/bearer/OAuth/CSRF material — redact the value half, keep the field name.
+    for pattern in _KEYED_SESSION_VALUE_PATTERNS:
+        new_text, count = pattern.subn(
+            lambda m: f"{m.group(1)}{_format_redacted(m.group(2))}", text
+        )
+        if count:
+            redacted_any = True
+            text = new_text
 
     # Vendor-specific value patterns.
     for pattern in _SECRET_VALUE_PATTERNS:

@@ -32,6 +32,7 @@ from bughunter import oob_service
 from bughunter import fsutil
 from bughunter import hunt_loop
 from bughunter import hunt_brain
+from bughunter import hunt_trace
 from bughunter import impact_model
 from bughunter import ledger
 from bughunter import next_steps as next_steps_lib
@@ -43,7 +44,7 @@ from bughunter import sensitive_data
 from bughunter import toolkit as toolkit_lib
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.live_scan_service import run_live_scan
-from bughunter.rate_limit import HostRateGovernor
+from bughunter.rate_limit import HostRateGovernor, shared_governor
 from bughunter.scan_service import run_code_scan
 from bughunter.scan_auth import AuthContext, build_auth
 from bughunter.web_scan_service import run_web_scan
@@ -1059,7 +1060,25 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
     # confirmed_secret keeps the real modelled CVSS.
     _sc = str(finding.get("secret_classification") or "")
     if class_id == "secrets" and _sc and _sc != secret_classification.CONFIRMED_SECRET and isinstance(cvss, dict):
-        cvss = {**cvss, "base_severity": secret_classification.severity_for_classification(_sc, "info"), "estimated": True}
+        # Recompute the WHOLE vector to match the ceiling, not just base_severity — otherwise the report
+        # emits a self-contradictory 'C:H 8.6 info' (score/vector left High while severity reads Info).
+        # An unproven/public key has no demonstrated confidentiality impact, so drop C to N (info) / L
+        # (low), recompute the score from the downgraded vector, and rewrite the justification so score,
+        # vector, severity, and 'why' all agree.
+        ceiling = secret_classification.severity_for_classification(_sc, "info")
+        c_metric = "L" if str(ceiling).lower() == "low" else "N"
+        new_vector = "/".join(
+            (f"C:{c_metric}" if part.upper().startswith("C:") else part)
+            for part in str(cvss.get("vector") or "").split("/")
+        )
+        scored = impact_model.cvss_base_score(new_vector)
+        cvss = {
+            **cvss, "vector": new_vector, "base_score": scored["score"], "base_severity": ceiling,
+            "estimated": True,
+            "justification": ("Public or unverified key: no live access to the backing service was proven, "
+                              "so the CVSS confidentiality impact is capped. Validate the key against its own "
+                              "issuer to establish the real severity."),
+        }
     return {
         "steps": steps,
         "impact": impact_text,
@@ -1468,6 +1487,10 @@ def _aggregate_active_meta(metas: list[dict[str, Any]]) -> dict[str, Any]:
         "verified_classes": verified,
         "skipped_reason": "; ".join(dict.fromkeys(skipped[:4])),
         "targets_checked": len(metas),
+        # Carry a structural response digest through the aggregate (the FIRST target that produced one).
+        # Without this the default (non-loop) active path drops 'digest', so the shipped response-structure
+        # lead generator (IDOR/mass-assignment/JWT/business-logic) never runs off the aggregated meta.
+        "digest": next((m.get("digest") for m in metas if isinstance(m.get("digest"), dict) and m.get("digest")), {}),
         "targets": [
             {
                 "target": str(meta.get("target") or ""),
@@ -1799,6 +1822,12 @@ def run_bounty_hunt(
     active_targets = [clean_target]
     effective_extra_params = _merge_unique_strings(extra_params, [], limit=40)
     effective_class_priority = _merge_unique_strings(class_priority, [], limit=20)
+    # The recon SURFACE + the PLAN produced from it — captured for the hunt trace log
+    # (offline-brain distillation corpus) ONLY on a direct 'Run Hunt' that does its own recon
+    # (below). A campaign passes extra_params/class_priority, so that branch is skipped and the
+    # campaign layer logs the trace instead — no double-logging. Stay None => no trace written.
+    hunt_trace_surface: dict[str, Any] | None = None
+    hunt_trace_plan: dict[str, Any] | None = None
     # Direct "Run Hunt" calls do not go through campaign.recon, so an active URL hunt would
     # otherwise probe only the literal starting URL. Add a small, scope-gated recon pass here
     # (campaign already supplies extra_params/class_priority, so it skips this branch) to mine
@@ -1828,17 +1857,23 @@ def run_bounty_hunt(
             hint_classes = [c for c in (rec.get("hints") or {}).keys() if str(c or "").strip()]
             effective_class_priority = _merge_unique_strings(effective_class_priority, hint_classes, limit=20)
 
-            hb = hunt_brain.plan_hunt(
-                coder_cfg,
-                clean_target,
-                scope,
-                {
-                    "endpoints": active_targets,
-                    "params": effective_extra_params,
-                    "tech": rec.get("tech") or [],
-                    "forms": rec.get("forms") or [],
-                },
-            )
+            surface_for_brain = {
+                "endpoints": active_targets,
+                "params": effective_extra_params,
+                "tech": rec.get("tech") or [],
+                "forms": rec.get("forms") or [],
+            }
+            hb = hunt_brain.plan_hunt(coder_cfg, clean_target, scope, surface_for_brain)
+            # Capture the (surface, plan) input side for the trace log. effective_extra_params is
+            # REBOUND below (never mutated in place) when brain params merge, so this snapshot
+            # stays the recon-only surface. list() the endpoints/params to be doubly safe.
+            hunt_trace_surface = {
+                "endpoints": list(active_targets),
+                "params": list(effective_extra_params),
+                "tech": surface_for_brain["tech"],
+                "forms": surface_for_brain["forms"],
+            }
+            hunt_trace_plan = hb
             brain_params = hb.get("param_hypotheses") or []
             before_brain = len(effective_extra_params)
             effective_extra_params = _merge_unique_strings(effective_extra_params, brain_params, limit=40)
@@ -1886,7 +1921,9 @@ def run_bounty_hunt(
             else:
                 active_findings = []
                 active_metas: list[dict[str, Any]] = []
-                active_governor = HostRateGovernor(
+                # PROCESS-WIDE per-host governor: concurrent span/portfolio hunts on the same host share
+                # ONE token bucket, so the per-host cap is real, not multiplied by the worker count.
+                active_governor = shared_governor(
                     capacity=active_settings.active_max_requests_per_host,
                     min_interval_s=active_settings.active_min_interval_ms / 1000.0,
                 )
@@ -2298,6 +2335,43 @@ def run_bounty_hunt(
     markdown = report_lib.build_markdown(ctx)
     json_doc = report_lib.build_json(ctx)
 
+    # Append this DIRECT hunt to the trace log (offline-brain distillation corpus). Only when this
+    # run did its OWN recon+plan (hunt_trace_plan set): a campaign's per-URL call passes
+    # extra_params/class_priority, skips that branch, and is logged once at the campaign layer — so
+    # there is no double-logging. Outcomes reuse the report's canonical per-ref proof status
+    # (proof_of_impact[ref].status — the same field campaign._proof_status reads).
+    if runtime_dir is not None and hunt_trace_plan is not None:
+        # Fail-closed: guard the WHOLE block (row construction + dedup_key + record) so a trace can
+        # never break the hunt — record_trace is internally fail-closed, but the outcome-building here
+        # (incl. ledger.dedup_key) is not, and this runs after the report is built but before it's
+        # written, so an exception here would otherwise turn a completed hunt into an error.
+        try:
+            _poi = json_doc.get("proof_of_impact") if isinstance(json_doc, dict) else {}
+            _poi = _poi if isinstance(_poi, dict) else {}
+            # Iterate the REPORTABLE findings (json_doc["findings"] — the same list proof_of_impact is
+            # keyed from) rather than the pre-filter `display`. A finding dropped from the report then
+            # has no _poi entry and would be mislabeled proof_status='missing'; this also matches the
+            # campaign path's grain (it records only reportable, consolidated findings).
+            _report_findings = json_doc.get("findings") if isinstance(json_doc, dict) else []
+            _trace_outcomes: list[dict[str, Any]] = []
+            for _f in (_report_findings or []):
+                if not isinstance(_f, dict):
+                    continue
+                _ref = str(_f.get("ref") or "")
+                _trace_outcomes.append({
+                    "endpoint": str(_f.get("location") or _f.get("source_url") or clean_target),
+                    "class": str(_f.get("class_id") or ""),
+                    "rule_id": str(_f.get("rule_id") or ""),
+                    "proof_status": str((_poi.get(_ref) or {}).get("status") or "missing"),
+                    "severity": str(_f.get("severity") or ""),
+                    "dedup_key": ledger.dedup_key(_f) if _f.get("class_id") else "",
+                })
+            hunt_trace.record_trace(runtime_dir, program=None, target=clean_target,
+                                    surface=hunt_trace_surface, plan=hunt_trace_plan,
+                                    outcomes=_trace_outcomes)
+        except Exception:  # noqa: BLE001 - a trace write must never break a hunt
+            pass
+
     md_path = out_dir / f"{stem}.md"
     json_path = out_dir / f"{stem}.json"
     try:
@@ -2324,7 +2398,10 @@ def run_bounty_hunt(
             except OSError:
                 continue
 
-    counts = report_lib.severity_counts(display)
+    # Resolve counts WITH the attack plans, matching report.build_markdown/build_json — otherwise the
+    # API/GUI tally uses raw scanner severity while the saved report uses the plan-CVSS-resolved
+    # severity, so an active-confirmed finding (scanner 'medium' vs modelled 'high') is miscounted.
+    counts = report_lib.severity_counts(display, attack_plans)
     _emit(f"done — {len(display)} finding(s) ({risk} risk)")
     return {
         "ok": True,

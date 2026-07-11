@@ -4551,7 +4551,10 @@ function ckSetRunType(type) {
     seg.setAttribute("aria-pressed", String(on));  // selection conveyed to AT, not by color alone
   }
   for (const node of document.querySelectorAll("[data-ck-when]")) {
-    node.hidden = node.dataset.ckWhen !== state.ckRunType;
+    // data-ck-when may list one OR several space-separated run types (e.g. "campaign portfolio");
+    // the node is shown when the active run type is any of them.
+    const modes = node.dataset.ckWhen.split(/\s+/).filter(Boolean);
+    node.hidden = !modes.includes(state.ckRunType);
   }
   if (ck.run) ck.run.textContent = state.ckRunType === "campaign" ? "Run campaign" : (state.ckRunType === "portfolio" ? "Run portfolio hunt" : "Run hunt");
   ckUpdateSpanScopeToggle();
