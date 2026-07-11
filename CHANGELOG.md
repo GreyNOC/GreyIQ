@@ -2,6 +2,27 @@
 
 Notable changes to GreyIQ.
 
+## v1.6.0
+
+### Report Center — honest POC readiness + no malformed replay artifacts
+- **The "Get report ready" POC flag now reflects a real runnable reproduction.** It was hard-coded
+  true, so every finding's POC dot read green regardless of whether a runnable artifact existed —
+  unlike POI (observed-vs-control differential) and POE (captured request/response). `has_poc` now
+  means a `replay.sh`/`findings.har` was rebuilt from a captured crafted request, or an
+  operator/brain-supplied PoC is present. The report still always carries deterministic reproduction
+  steps; those are guidance, not proof, so they no longer light the flag on their own. The
+  not-yet-readied Report Center preview dot mirrors the same rule, so it never flips green→red the
+  moment you click "Get report ready".
+- **Stop emitting malformed `replay.sh` / `findings.har` for multi-step findings.** The artifact
+  builders accepted any `request_line` whose token after the method merely started with `http`, so
+  producers that emit a multi-step / placeholder *description* — mass-assignment/BFLA, broken-session,
+  blind-XXE, stored-XSS, GraphQL introspection — were turned into unrunnable curls (a URL argument
+  full of spaces and prose) and shipped into the campaign download bundle. A shared
+  `bounty._single_url_target()` gate now requires a single absolute-URL target (no whitespace, no
+  isolated `...` truncation ellipsis), so those produce no artifact. Genuinely runnable single-URL
+  lines — including path-traversal payloads whose `....` dot runs are real, and inline XSS payloads —
+  still replay.
+
 ## v1.5.0
 
 ### Session issuer-binding (authenticated-scan hardening) + dead-code removal
