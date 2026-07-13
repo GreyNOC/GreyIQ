@@ -2,6 +2,19 @@
 
 Notable changes to GreyIQ.
 
+## v1.8.4
+
+### Offline coder — learns from real runs (Phase 1, move 5)
+The Workbench now **distills** what the strong brains do into a corpus the offline coder can grow from:
+every **successful, verify-passing** agent run driven by a real brain (Claude/Ollama) is recorded to an
+append-only `edit_traces.jsonl` — the request intent, provider, selected skills, and the *structural
+shape* of the diff (which files, what operation, size deltas). It records **structure only** (never file
+content or a diff body), secret-redacted and fail-closed, and only real-brain verified runs (an offline
+run is already a template). This is the coding sibling of the shipped bug-hunt `hunt_trace`; a later
+mining step will cluster these shapes into new `seed/snippets/` templates so the offline path replays —
+offline, at low compute — edit patterns a strong brain performed online. See
+[docs/offline-coder-strategy.md](docs/offline-coder-strategy.md).
+
 ## v1.8.3
 
 ### Offline coder — retrieval-augmented, repo-specific scaffolds (Phase 1, move 3)

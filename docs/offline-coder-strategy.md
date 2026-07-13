@@ -46,6 +46,14 @@ function; a template library + `ast` + `py_compile` will.
 | **5** | `edit_trace.py` distillation: mine real Claude/Ollama runs into replayable skills/snippets | High, compounding | M |
 | **6** | Tokenizer: adopt existing `solin_bpe.py`, for **glue/routing only**, never codegen | Low (honest) | M |
 
+**Status:** moves **1, 2, 3, and move 5's logging half are SHIPPED** (v1.8.1–v1.8.4). Move 1 (honest
+short-circuit) + move 2 (`offline_coder.py` deterministic provider, wired into `run_agent`) + move 3
+(retrieval + `seed/snippets/`) are live; move 5's `edit_trace.py` corpus records every verified
+real-brain run (structure only, redacted). **Deferred:** move 4 (the verify→repair table — premature
+while ops are pre-vetted templates that always pass verify; do it when `wrap_ast`/`insert_anchor` ops
+can produce invalid code), move 5's **mining/promotion** step (cluster `edit_traces.jsonl` shapes →
+auto-propose `seed/snippets/` + skills, behind a review gate), and move 6 (BPE glue).
+
 ### 1 — Stop the char model from pretending (do first)
 Add a coding-intent guard in `greyiq_api.chat()` before `engine.generate_reply`: when no
 brain is configured and the message is coding intent, return immediately —

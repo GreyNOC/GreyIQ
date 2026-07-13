@@ -1511,10 +1511,12 @@ def run_agent(
     )
 
     # Inject matching skill playbooks so the model follows a vetted procedure.
+    selected_skills: list[str] = []  # captured for the edit-trace corpus (move 5)
     if settings.get("skills_enabled", True) and runtime_dir is not None and seed_dir is not None:
         try:
             available = skills_lib.load_skills(runtime_dir, seed_dir, root)
             chosen = skills_lib.select_skills(message, available)
+            selected_skills = [getattr(s, "name", "") for s in chosen if getattr(s, "name", "")]
             block = skills_lib.skills_prompt(chosen, available)
             if block:
                 system_prompt += "\n\n" + block
@@ -1599,6 +1601,20 @@ def run_agent(
     result["plan"] = plan
     result["snapshot"] = toolbox.snapshot_payload()
     result["flagged_reads"] = list(toolbox.flagged_reads)
+    # Distill a SUCCESSFUL real-brain run into the offline-coder corpus (edit_traces.jsonl): structure
+    # only (intent + diff shapes + skills), secret-redacted, fail-closed. Only real brains + verified
+    # runs are recorded (an offline run IS a template already). See docs/offline-coder-strategy.md (move 5).
+    try:
+        import edit_trace
+        edit_trace.record_trace(
+            runtime_dir, message=message, provider=str(result.get("provider") or ""),
+            model=str(result.get("model") or ""), workspace=str(workspace or ""),
+            changes=result.get("changes"), touched_files=result.get("touched_files"),
+            verified=bool(result.get("verified")), steps=int(result.get("steps") or 0),
+            skills=selected_skills,
+        )
+    except Exception:  # noqa: BLE001 - trace recording must never break a run
+        pass
     return result
 
 
