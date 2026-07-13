@@ -862,5 +862,96 @@ class ClassPriorityReorderTests(unittest.TestCase):
         self.assertEqual(av._apply_class_priority(original, ["nonexistent-class"]), original)  # no match -> unchanged order
 
 
+def _ws_expected_accept() -> tuple[str, str]:
+    """Recompute the deterministic handshake key + the RFC-6455 accept the detector expects,
+    mirroring _check_cswsh exactly so a stub can hand back a legitimate-looking 101."""
+    key = base64.b64encode(hashlib.sha256(av._MARKER_ORIGIN.encode()).digest()[:16]).decode()
+    accept = base64.b64encode(hashlib.sha1((key + av._WS_GUID).encode()).digest()).decode()
+    return key, accept
+
+
+class _CswshHttp:
+    """Records the handshake the check sends and replays a server response. `mode` picks the
+    server behaviour: a correct 101 handshake, a 101 with the wrong/absent accept token, or a
+    plain non-upgrade response. Also asserts the probe is benign (a GET, no body read)."""
+
+    def __init__(self, mode: str = "accept") -> None:
+        self.mode = mode
+        self.sent: list[dict] = []
+        self.read_body_flags: list[bool] = []
+
+    def fetch(self, url, *, method="GET", extra_headers=None, read_body=True):
+        self.sent.append(dict(extra_headers or {}))
+        self.read_body_flags.append(read_body)
+        _key, accept = _ws_expected_accept()
+        if self.mode == "accept":
+            return {"status": 101, "headers": {"sec-websocket-accept": accept}, "body": "", "location": None}
+        if self.mode == "wrong-accept":
+            return {"status": 101, "headers": {"sec-websocket-accept": "AAAA-not-derived-from-our-key="}, "body": "", "location": None}
+        if self.mode == "no-accept":
+            return {"status": 101, "headers": {}, "body": "", "location": None}
+        if self.mode == "not-101":
+            return {"status": 200, "headers": {"sec-websocket-accept": accept}, "body": "", "location": None}
+        raise AssertionError(f"unknown mode {self.mode}")
+
+
+class CswshHandshakeTests(unittest.TestCase):
+    """WebSocket CSWSH: confirmed ONLY on a real 101 handshake whose Sec-WebSocket-Accept is the
+    cryptographic derivative of the key WE sent (the offline negative control). Every other shape —
+    wrong accept, missing accept, a non-upgrade 200 — is fail-closed to None."""
+
+    def test_confirmed_on_correct_accept(self) -> None:
+        http = _CswshHttp("accept")
+        f = av._check_cswsh(http, "https://t/socket")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["rule_id"], "active.cswsh-origin")
+        self.assertEqual(f["_active_class_hint"], "websocket")
+        self.assertEqual(f["_active_proof"]["status"], "confirmed")
+        self.assertEqual(f["severity"], "low")
+        # benign + non-blocking: the handshake carried the marker Origin and no body was read.
+        self.assertEqual(http.sent[0].get("Origin"), av._MARKER_ORIGIN)
+        self.assertEqual(http.sent[0].get("Upgrade"), "websocket")
+        self.assertEqual(http.read_body_flags, [False])
+
+    def test_wrong_accept_is_not_confirmed(self) -> None:
+        self.assertIsNone(av._check_cswsh(_CswshHttp("wrong-accept"), "https://t/socket"))
+
+    def test_missing_accept_is_not_confirmed(self) -> None:
+        self.assertIsNone(av._check_cswsh(_CswshHttp("no-accept"), "https://t/socket"))
+
+    def test_non_101_is_not_confirmed(self) -> None:
+        self.assertIsNone(av._check_cswsh(_CswshHttp("not-101"), "https://t/socket"))
+
+    def test_transport_error_is_clean_none(self) -> None:
+        class _Dead(_CswshHttp):
+            def fetch(self, url, *, method="GET", extra_headers=None, read_body=True):
+                raise av._ActiveError("no route")
+        self.assertIsNone(av._check_cswsh(_Dead(), "https://t/socket"))
+
+    def test_websocket_class_is_registered(self) -> None:
+        from bughunter.bounty import VULN_CLASSES
+        self.assertIn("websocket", VULN_CLASSES)
+        self.assertTrue(VULN_CLASSES["websocket"]["cwe"].startswith("CWE-"))
+
+    def test_non_ws_path_is_skipped_without_a_request(self) -> None:
+        # An ordinary content path must NOT get a handshake probe — that's the budget-safety property
+        # that keeps the low-value CSWSH check from starving the confirmable checks (xss/rce/sqli).
+        http = _CswshHttp("accept")
+        self.assertIsNone(av._check_cswsh(http, "https://t/?q=x"))
+        self.assertEqual(http.sent, [])  # gate returned before any fetch
+
+    def test_landing_upgrade_signal_opens_the_gate(self) -> None:
+        # A non-WS-shaped path still gets probed when the landing response announced an upgrade
+        # (426 Upgrade Required or Upgrade: websocket), so WS endpoints at unconventional paths aren't missed.
+        http = _CswshHttp("accept")
+        landing = {"status": 426, "headers": {}}
+        f = av._check_cswsh(http, "https://t/api/v2/realtime", landing)
+        self.assertIsNotNone(f)
+        self.assertEqual(len(http.sent), 1)
+        http2 = _CswshHttp("accept")
+        f2 = av._check_cswsh(http2, "https://t/api/v2/realtime", {"status": 200, "headers": {"upgrade": "websocket"}})
+        self.assertIsNotNone(f2)
+
+
 if __name__ == "__main__":
     unittest.main()

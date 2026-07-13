@@ -97,6 +97,16 @@ IMPACT_MODEL: dict[str, dict[str, str]] = {
         # prover overrides this per-finding with an evidence-based vector once it confirms the tier.
         "cvss_vector": "AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:N/A:N",
     },
+    "websocket": {
+        "attacker_capability": "An attacker-controlled page MAY open a WebSocket to this endpoint on a victim's behalf because the handshake completes while carrying a cross-site Origin — proven only if a browser PoC on an attacker origin then reads authenticated socket data.",
+        "affected_asset": "any WebSocket channel whose handshake trusts a cross-site Origin and rides the victim's ambient session (cookies/credentials); the data at risk depends on what that socket streams.",
+        "business_impact": "cross-origin reading (or driving) of an authenticated real-time channel by an attacker page — impact ranges from low (public/non-sensitive feeds) to high (per-user data or privileged actions over the socket), judged from what a browser PoC actually reads.",
+        "proof_obligation": "Capture the handshake showing `101 Switching Protocols` with a `Sec-WebSocket-Accept` derived from the key sent under a cross-site `Origin` (server-side origin-trust behaviour), THEN host a PoC on an attacker-controlled origin and capture the authenticated frames a logged-in victim's socket serves cross-site. The handshake proves origin trust only; a browser PoC proves exploitability and sensitive impact.",
+        # Low-ceiling ESTIMATE for a handshake that merely accepts a cross-site Origin — like the CORS
+        # estimate, it does NOT presume a sensitive read. The active prover confirms the handshake with
+        # its own per-finding vector; a real data-read impact needs the browser PoC above.
+        "cvss_vector": "AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:N/A:N",
+    },
     "redirect": {
         "attacker_capability": "An attacker supplies a redirect parameter that sends users to an external site.",
         "affected_asset": "users following links, and any token passed through the redirect (OAuth code, reset token).",
@@ -280,6 +290,7 @@ _REMEDIATION: dict[str, str] = {
     "sqli": "Use parameterized queries / prepared statements for every query; never build SQL by string formatting. Apply least-privilege DB roles.",
     "csrf": "Require an unpredictable per-session anti-CSRF token (or SameSite=strict cookies) on every state-changing request and verify it server-side.",
     "cors": "Reflect Origin only from an explicit allowlist, never combine `Access-Control-Allow-Origin: *`/reflected with `Allow-Credentials: true`, and never trust `null`.",
+    "websocket": "Validate the `Origin` header on the WebSocket handshake against an explicit allowlist and reject cross-site origins; bind the socket to an unpredictable per-session CSRF token rather than ambient cookies alone.",
     "redirect": "Allowlist redirect targets (relative paths or a fixed host set); validate with a host/scheme check (e.g. url_has_allowed_host_and_scheme) and reject off-host URLs.",
     "file-upload": "Validate type by content (not extension), store outside the web root with non-executable permissions and random names, and serve via a controlled handler.",
     "business-logic": "Enforce the intended workflow and invariants server-side (ownership, quantity/price, state transitions); never trust client-asserted steps or amounts.",
@@ -313,6 +324,7 @@ _REFERENCES: dict[str, list[str]] = {
     "sqli": [f"{_CS}/SQL_Injection_Prevention_Cheat_Sheet.html", f"{_CWE}/89.html", "https://portswigger.net/web-security/sql-injection"],
     "csrf": [f"{_CS}/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html", f"{_CWE}/352.html"],
     "cors": [f"{_CS}/HTML5_Security_Cheat_Sheet.html", f"{_CWE}/284.html", f"{_CWE}/346.html", f"{_CWE}/942.html", "https://portswigger.net/web-security/cors"],
+    "websocket": [f"{_CWE}/284.html", f"{_CWE}/346.html", "https://portswigger.net/web-security/websockets/cross-site-websocket-hijacking", "https://owasp.org/www-community/attacks/Cross_Site_WebSocket_Hijacking_CSWSH"],
     "redirect": [f"{_CS}/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html", f"{_CWE}/601.html"],
     "file-upload": [f"{_CS}/File_Upload_Cheat_Sheet.html", f"{_CWE}/434.html"],
     "business-logic": ["https://owasp.org/www-community/vulnerabilities/Business_logic_vulnerability", f"{_CWE}/840.html"],
@@ -365,6 +377,7 @@ _BUGCROWD_VRT: dict[str, str] = {
     "csrf": "broken_authentication_and_session_management.cross_site_request_forgery_csrf",
     "redirect": "unvalidated_redirects_and_forwards.open_redirect",
     "cors": "server_security_misconfiguration.cors_misconfiguration",
+    "websocket": "",  # no clean Bugcrowd VRT leaf for CSWSH — report renders the honest placeholder
     "secrets": "sensitive_data_exposure.disclosure_of_secrets",
     "jwt": "broken_authentication_and_session_management.authentication_bypass",
     "file-upload": "unrestricted_file_upload",

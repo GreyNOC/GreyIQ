@@ -184,6 +184,21 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
             "Document the exact Origin, response headers, and data class exposed.",
         ],
     },
+    "websocket": {
+        "name": "WebSocket cross-site hijacking (CSWSH)",
+        # A WebSocket handshake that trusts a cross-site Origin is an origin-validation failure;
+        # HackerOne files this under CWE-284 (Improper Access Control), same picker bucket as CORS,
+        # with CWE-346 (Origin Validation Error) as the precise technical reference.
+        "cwe": "CWE-284",
+        "owasp": "A05:2021 Security Misconfiguration",
+        "categories": set(),
+        "checklist": [
+            "Identify WebSocket endpoints (ws:// / wss:// literals or new WebSocket(...) call targets).",
+            "Check whether the handshake completes (101) while carrying an attacker-controlled Origin.",
+            "If it does, host a browser PoC on an attacker origin and confirm a logged-in victim's socket "
+            "serves authenticated data cross-site.",
+        ],
+    },
     "redirect": {
         "name": "Open redirect / unsafe forwarding",
         "cwe": "CWE-601",

@@ -136,19 +136,27 @@ def _snippet(body: str, match: re.Match[str], ctx: int = 60) -> str:
     return re.sub(r"\s+", " ", body[start:end]).strip()[:200]
 
 
-def _consume(response: Any, settings: Any) -> dict[str, Any]:
+def _consume(response: Any, settings: Any, *, read_body: bool = True) -> dict[str, Any]:
     """Read status, headers, cookies, and a byte-capped body from a response
-    or an HTTPError (so error pages are still analyzed)."""
+    or an HTTPError (so error pages are still analyzed).
+
+    ``read_body=False`` returns status + headers WITHOUT reading the body — for a
+    ``101 Switching Protocols`` WebSocket handshake, the server may hold the connection
+    open after the headers, so reading the body would block until timeout. Only the
+    status + ``Sec-WebSocket-Accept`` header are needed there; the body is skipped."""
     headers = {key.lower(): value for key, value in response.headers.items()}
     cookies = response.headers.get_all("Set-Cookie") or []
-    raw = response.read(settings.web_fetch_max_bytes + 1)
-    truncated = len(raw) > settings.web_fetch_max_bytes
-    raw = raw[: settings.web_fetch_max_bytes]
-    charset = response.headers.get_content_charset() or "utf-8"
-    try:
-        body = raw.decode(charset, errors="replace")
-    except LookupError:
-        body = raw.decode("utf-8", errors="replace")
+    if read_body:
+        raw = response.read(settings.web_fetch_max_bytes + 1)
+        truncated = len(raw) > settings.web_fetch_max_bytes
+        raw = raw[: settings.web_fetch_max_bytes]
+        charset = response.headers.get_content_charset() or "utf-8"
+        try:
+            body = raw.decode(charset, errors="replace")
+        except LookupError:
+            body = raw.decode("utf-8", errors="replace")
+    else:
+        body, truncated = "", False
     status = getattr(response, "status", None) or getattr(response, "code", 0)
     return {
         "status": int(status or 0),

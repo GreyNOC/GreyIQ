@@ -80,6 +80,15 @@ from bughunter.web_scan_service import (
 # host-header proofs so nothing is ever actually sent to it.
 _MARKER_HOST = "greyiq-marker.example"
 _MARKER_ORIGIN = f"https://{_MARKER_HOST}"
+# RFC-6455 handshake magic GUID: the server appends it to our Sec-WebSocket-Key and SHA1s the result
+# into Sec-WebSocket-Accept — an offline-computable cryptographic negative control for the CSWSH check.
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+# Path segments that conventionally host a WebSocket endpoint. The CSWSH check ONLY spends a request on a
+# path whose segment matches one of these (or a landing response that announced an upgrade) — so it costs
+# nothing against ordinary pages and never preempts the high-value confirmable checks' request budget.
+_WS_PATH_HINTS = frozenset({"ws", "wss", "websocket", "websockets", "socket", "sockjs", "socket.io",
+                            "cable", "hub", "hubs", "signalr", "subscriptions", "graphql-ws", "mqtt",
+                            "stomp", "rtm"})
 _REDIRECT_PARAMS = ("next", "redirect", "url", "returnurl", "return_url", "redirect_uri", "redirecturl", "continue", "callback", "dest", "destination", "returnto", "return_to")
 _XSS_PARAMS = ("q", "query", "search", "s", "keyword", "message", "name", "comment")
 _SSTI_PARAMS = ("q", "template", "tpl", "view", "theme", "preview", "name")
@@ -330,7 +339,8 @@ class _Http:
         self.sent = 0
         self.opener = build_opener(_NoRedirect())
 
-    def fetch(self, url: str, *, method: str = "GET", extra_headers: dict[str, str] | None = None) -> dict[str, Any]:
+    def fetch(self, url: str, *, method: str = "GET", extra_headers: dict[str, str] | None = None,
+              read_body: bool = True) -> dict[str, Any]:
         method = method.upper()
         if method not in _SAFE_METHODS:  # belt-and-suspenders; callers never pass others
             raise _ActiveError(f"refused non-idempotent method {method}")
@@ -365,7 +375,7 @@ class _Http:
                 started = time.monotonic()
                 try:
                     with self.opener.open(request, timeout=self.settings.web_fetch_timeout_seconds) as resp:
-                        consumed = _consume(resp, self.settings)
+                        consumed = _consume(resp, self.settings, read_body=read_body)
                         consumed["final_url"] = resp.geturl()
                         consumed["location"] = resp.headers.get("Location") if resp.headers else None
                         consumed["elapsed"] = time.monotonic() - started
@@ -377,7 +387,7 @@ class _Http:
                     # path/debug probes, error-SQLi, alg:none control), so close it or every
                     # errored probe leaks an FD until GC.
                     try:
-                        consumed = _consume(exc, self.settings)
+                        consumed = _consume(exc, self.settings, read_body=read_body)
                         consumed["final_url"] = sanitized
                         consumed["location"] = exc.headers.get("Location") if exc.headers else None
                         consumed["elapsed"] = time.monotonic() - started
@@ -432,6 +442,73 @@ def _finding(rule_id: str, title: str, severity: str, category: str, class_hint:
 # ----------------------------- individual checks -----------------------------
 # Each returns a finding dict (confirmed/candidate) or None. Conservative: a
 # 'confirmed' status requires a positive observation AND a control differential.
+
+
+def _is_websocket_endpoint(url: str, landing: dict[str, Any] | None) -> bool:
+    """A cheap, no-request gate: is this URL plausibly a WebSocket endpoint? True when a path segment is a
+    conventional WS name (``/ws``, ``/socket.io``, ``/cable`` …) OR the already-fetched landing response
+    announced an upgrade (``426 Upgrade Required`` or an ``Upgrade: websocket`` header). Keeps the CSWSH
+    handshake off ordinary pages so it never wastes the request budget the confirmable checks depend on."""
+    segments = {s for s in (urlparse(url).path or "").lower().split("/") if s}
+    if segments & _WS_PATH_HINTS:
+        return True
+    if isinstance(landing, dict):
+        if int(landing.get("status") or 0) == 426:  # Upgrade Required — the server itself asks to switch
+            return True
+        if "websocket" in str((landing.get("headers") or {}).get("upgrade") or "").lower():
+            return True
+    return False
+
+
+def _check_cswsh(http: "_Http", url: str, landing: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """WebSocket cross-site hijacking (CSWSH): does the endpoint complete a WebSocket handshake that
+    carries an ATTACKER (cross-site) Origin? Only fires on a WebSocket-shaped endpoint (see
+    ``_is_websocket_endpoint``) so it costs nothing on ordinary pages. ONE benign RFC-6455 handshake — a
+    GET with the Upgrade / Sec-WebSocket-* headers and ``Origin: <reserved marker>`` — is sent; NO
+    WebSocket frame is ever transmitted and NO body is read (read_body=False, so a server holding the
+    socket open never blocks us). Confirmed ONLY when the server returns ``101 Switching Protocols`` AND a
+    ``Sec-WebSocket-Accept`` equal to base64(SHA1(the key WE sent + the RFC-6455 GUID)). That accept token
+    IS the cryptographic negative control (offline-computable, like the JWT weak-secret self-cert): it
+    proves a real WebSocket server processed OUR marker-Origin handshake — not an unconditional 101, a
+    proxy artifact, or a soft-404. Benign + scope/SSRF-gated by the shared http.fetch."""
+    if not _is_websocket_endpoint(url, landing):
+        return None
+    key = base64.b64encode(hashlib.sha256(_MARKER_ORIGIN.encode()).digest()[:16]).decode()  # deterministic 16-byte key
+    expected = base64.b64encode(hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+    handshake = {"Connection": "Upgrade", "Upgrade": "websocket", "Sec-WebSocket-Version": "13",
+                 "Sec-WebSocket-Key": key, "Origin": _MARKER_ORIGIN}
+    try:
+        r = http.fetch(url, extra_headers=handshake, read_body=False)
+    except (_RateLimited, _ActiveError, WebsiteFetchError):
+        return None
+    except Exception:  # noqa: BLE001 - an odd 101 / blocking handshake is a clean no-confirm, never a crash
+        return None
+    if int(r.get("status") or 0) != 101:
+        return None
+    accept = str((r.get("headers") or {}).get("sec-websocket-accept") or "").strip()
+    if not accept or accept != expected:
+        return None  # a 101 without OUR key's derived accept is a proxy/soft artifact, not a real handshake
+    proof = _proof(
+        "confirmed",
+        method=f"RFC-6455 WebSocket handshake with Origin: {_MARKER_ORIGIN} (no frame sent, no body read)",
+        affected_asset=f"the WebSocket endpoint at {url}",
+        observed_result=("server returned 101 Switching Protocols with a Sec-WebSocket-Accept derived from "
+                         "OUR key, while the handshake carried an attacker (cross-site) Origin"),
+        control_result=("the accept token equals base64(SHA1(our_key + RFC-6455 GUID)) — a real WebSocket "
+                        "server processed OUR marker-Origin handshake, not an unconditional / proxy 101 or soft-404"),
+        evidence=f"Sec-WebSocket-Accept: {accept}",
+        limitations=("Confirms the handshake accepts a cross-site Origin. Full impact depends on whether the "
+                     "socket then serves authenticated data to that origin — verify with a browser PoC hosted "
+                     "on an attacker origin against a logged-in victim session."),
+    )
+    return _finding(
+        "active.cswsh-origin", "WebSocket handshake accepts a cross-site Origin (possible CSWSH)",
+        "low", "cors", "websocket", url, proof,
+        {"request_line": f"GET {url}   (Upgrade: websocket; Origin: {_MARKER_ORIGIN})",
+         "response_status": "101 Switching Protocols",
+         "matched_value": f"Sec-WebSocket-Accept derived from the key we sent ({accept})"},
+        {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:N/A:N", "base_score": 3.1, "base_severity": "low", "estimated": True},
+    )
 
 def _cors_cvss(tier: str) -> dict[str, Any]:
     """A per-finding, evidence-based CVSS v3.1 block for a CORS misconfiguration, sized to
@@ -2420,6 +2497,10 @@ def verify_active(
         # Unauthenticated debug/management endpoints (Spring actuator heapdump/env, Jolokia JMX)
         # — critical secret-exfil / RCE, root-only, same signature + catch-all control gate.
         ("debug", lambda: _check_debug_endpoints(http, sanitized)),
+        # WebSocket cross-site hijacking (CSWSH) — low severity and path-gated (fires only on a
+        # WebSocket-shaped endpoint or one whose landing announced an upgrade), so it sits LATE and
+        # normally costs nothing: one benign RFC-6455 handshake with a cryptographic negative control.
+        ("websocket", lambda: _check_cswsh(http, sanitized, landing)),
         # Path traversal / LFI reads ONE well-known system file as proof (signature + control),
         # extracting nothing else; GET-only. Heaviest of the new checks, so it normally runs last
         # and only uses whatever request budget the earlier checks left. When time_based=True below,

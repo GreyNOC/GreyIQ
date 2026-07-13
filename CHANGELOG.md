@@ -2,6 +2,25 @@
 
 Notable changes to GreyIQ.
 
+## v1.8.7
+
+### Detection expansion — confirmed WebSocket cross-site hijacking (CSWSH)
+Completes the safe detection additions with a new **active-confirmed** check (still no
+exploitation/payloads/C2/evasion — the offensive core stays declined):
+- **WebSocket CSWSH detector** — for a WebSocket endpoint (surfaced by the v1.8.5 miner), the active
+  pass now sends **one benign RFC-6455 handshake** — a GET carrying the `Upgrade`/`Sec-WebSocket-*`
+  headers and a reserved attacker (cross-site) `Origin` marker. **No WebSocket frame is ever sent and
+  no body is read**, so a server holding the socket open never blocks the scan. It confirms *only* when
+  the server returns `101 Switching Protocols` **and** a `Sec-WebSocket-Accept` equal to
+  `base64(SHA1(the key we sent + the RFC-6455 GUID))` — that accept token is the offline-computable
+  **cryptographic negative control**, so an unconditional/proxy 101 or a soft-404 can't produce a false
+  positive. Reported as class `websocket` (CWE-284, low severity) with a browser-PoC follow-up
+  checklist and a full impact model. The check is **path-gated** — it only spends a request on a
+  WebSocket-shaped endpoint (`/ws`, `/socket.io`, `/cable`, …) or one whose landing response announced
+  an upgrade (`426`/`Upgrade: websocket`), and runs late in the active pass, so it never preempts the
+  request budget the high-value XSS/RCE/SQLi checks depend on. Registered in `bounty.VULN_CLASSES` and
+  `impact_model` (impact narrative, remediation, references).
+
 ## v1.8.6
 
 ### Detection expansion — GraphQL operation surfacing + opt-in CT recon
