@@ -1410,16 +1410,18 @@ def plan_task(message: str, cfg: dict[str, Any], root: Path, settings: dict[str,
     return _parse_plan(out.get("text", ""))
 
 
-def _run_offline(message: str, toolbox: "ToolBox", on_event: Any) -> dict[str, Any]:
+def _run_offline(message: str, toolbox: "ToolBox", on_event: Any, *,
+                 runtime_dir: str | Path | None = None, seed_dir: str | Path | None = None) -> dict[str, Any]:
     """Deterministic offline provider (no LLM): apply offline_coder's closed-set edit ops through the
     ToolBox — so every write is snapshotted/undoable and the workspace-lock + undo protections apply —
-    then verify. Handles scaffolds + mechanical edits; anything else returns an honest 'configure a
-    brain' result instead of dead-ending. See docs/offline-coder-strategy.md."""
+    then verify. Handles scaffolds + mechanical edits (retrieval-augmented from the repo surface +
+    seed/snippets); anything else returns an honest 'configure a brain' result instead of dead-ending.
+    See docs/offline-coder-strategy.md."""
     import offline_coder
 
     transcript: list[dict[str, Any]] = []
     try:
-        plan = offline_coder.plan_edits(message, toolbox.root)
+        plan = offline_coder.plan_edits(message, toolbox.root, seed_dir=seed_dir, runtime_dir=runtime_dir)
     except Exception as exc:  # noqa: BLE001 - the planner must never crash a run
         plan = {"ops": [], "needs_brain": True, "summary": f"Offline planner error: {exc}"}
 
@@ -1568,7 +1570,7 @@ def run_agent(
             # dead-ending or trying a disabled provider. It applies a bounded closed set of edit ops
             # through this toolbox and honestly defers anything it can't template to a configured
             # brain. See docs/offline-coder-strategy.md.
-            result = _run_offline(message, toolbox, on_event)
+            result = _run_offline(message, toolbox, on_event, runtime_dir=runtime_dir, seed_dir=seed_dir)
         elif provider == "anthropic":
             result = _run_anthropic(messages, system_prompt, cfg, settings, toolbox, on_event)
         elif provider in ("local", "openai"):

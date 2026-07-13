@@ -2,6 +2,23 @@
 
 Notable changes to GreyIQ.
 
+## v1.8.3
+
+### Offline coder — retrieval-augmented, repo-specific scaffolds (Phase 1, move 3)
+The deterministic offline coder now reads the repo to make its scaffolds fit the project instead of
+emitting a generic snippet:
+- **Framework-aware tests** — "add a test for `foo`" produces a **pytest** stub in a pytest repo
+  (detected from `conftest.py` / `pytest.ini` / the dependency manifests) and a **unittest** stub
+  otherwise; `repomap.search_repo` locates the target symbol so the stub's TODO points at the real file.
+- **Stack-gated templates** — "add a route `/path`" scaffolds a Flask route **only** in a Flask repo;
+  otherwise it honestly defers to a configured brain (and names the closest matching skill playbook).
+- **New scaffolds** — "add a dockerfile" and "set up a CI workflow" generate a `Dockerfile` and a
+  GitHub Actions workflow (with the test command matched to the repo's runner).
+- Templates live in a new bundled `seed/snippets/` library (`{{slot}}` markers filled from the request
+  + retrieval); a built-in fallback keeps it working in a stripped environment. Every generated file
+  still flows through the snapshotted, verify-gated toolbox. See
+  [docs/offline-coder-strategy.md](docs/offline-coder-strategy.md).
+
 ## v1.8.2
 
 ### Workbench agent — QA/QC hardening (the real Ollama/Claude code path)

@@ -1,0 +1,12 @@
+"""Auto-scaffolded Flask route for {{path}}. Register {{name}}_bp on your app/blueprint."""
+from __future__ import annotations
+
+from flask import Blueprint, jsonify
+
+{{name}}_bp = Blueprint("{{name}}", __name__)
+
+
+@{{name}}_bp.route("{{path}}", methods=["GET"])
+def {{name}}():
+    # TODO: implement {{path}}.
+    return jsonify({"ok": True})

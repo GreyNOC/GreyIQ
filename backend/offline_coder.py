@@ -3,16 +3,20 @@
 The coding analog of ``bughunter/offline_hunt.py``: a substring-rule planner over the repo that emits
 only a small CLOSED SET of edit operations (never free-form text a tiny model would botch). The agent
 applies each op through its existing ``ToolBox`` (so every write is snapshotted + undoable) and gates
-the result with ``verify``. Honest ceiling: **scaffolds and mechanical edits** — a new test stub, a
-new file from a template. Anything it can't confidently map returns ``needs_brain=True``: the offline
-coder never guesses business logic; a configured Local/Claude brain should handle those.
+the result with ``verify``. Honest ceiling: **scaffolds and mechanical edits** — a framework-aware
+test stub, a route/Dockerfile/CI file from a template. Anything it can't confidently map returns
+``needs_brain=True``: the offline coder never guesses business logic.
 
-This is the Phase-1 skeleton (strategy moves 1-2 — see ``docs/offline-coder-strategy.md``): the
-``new_file`` op, the ``add_test`` / ``create_file`` intents, and the plan contract. Retrieval (move 3,
-``repomap.search_repo`` + ``seed/snippets/``), the verify->repair loop (move 4), and distillation
-(move 5, ``edit_trace.py``) build on this same closed-set-of-ops contract.
+Retrieval (strategy move 3): the plan is made **repo-specific** by reading the repo surface — the
+dependency manifests decide pytest-vs-unittest and gate stack-specific templates (a Flask route is
+only offered in a Flask repo), and ``repomap.search_repo`` locates the target symbol so a test stub's
+TODO points at the real file. Templates come from ``seed/snippets/`` (``{{slot}}`` markers filled from
+the request + retrieval); a bundled fallback is used if the seed dir is unavailable.
 
-Pure / dependency-free: stdlib only, so it stays frozen-safe and runs anywhere the agent runs.
+See ``docs/offline-coder-strategy.md``. Phase-1 skeleton (moves 1-3); the verify->repair loop (move 4)
+and ``edit_trace.py`` distillation (move 5) build on this same closed-set-of-ops contract.
+
+Pure / dependency-free: stdlib + intra-repo imports only (repomap/skills are optional, best-effort).
 """
 
 from __future__ import annotations
@@ -23,34 +27,27 @@ from typing import Any
 
 _IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 
-# A parameterized template is the ONLY way the offline coder produces file content — never generation.
-_PY_TEST_TEMPLATE = '''\
-"""Auto-scaffolded test stub for {symbol}. Fill in real assertions."""
-from __future__ import annotations
-
-import unittest
-
-
-class Test{cls}(unittest.TestCase):
-    def test_{symbol}_placeholder(self) -> None:
-        # TODO: import and exercise {symbol}, then assert its real behavior.
-        self.assertTrue(True)
-
-
-if __name__ == "__main__":
-    unittest.main()
-'''
+# Bundled fallbacks — used ONLY when seed/snippets/ is unavailable, so the offline coder still works
+# in a stripped environment. The seed templates are the source of truth.
+_FALLBACK_UNITTEST = (
+    '"""Auto-scaffolded unittest test for {{symbol}}. Fill in real assertions."""\n'
+    "from __future__ import annotations\n\nimport unittest\n\n\n"
+    "class Test{{cls}}(unittest.TestCase):\n"
+    "    def test_{{symbol}}_placeholder(self) -> None:\n"
+    "        # TODO: import and exercise {{symbol}} ({{location}}), then assert its real behavior.\n"
+    "        self.assertTrue(True)\n\n\n"
+    'if __name__ == "__main__":\n    unittest.main()\n'
+)
 
 
 def _class_name(symbol: str) -> str:
-    """CamelCase a symbol for a test class name (add_user -> AddUser)."""
     parts = [p for p in re.split(r"[_\W]+", str(symbol or "").strip()) if p]
     return "".join(p[:1].upper() + p[1:] for p in parts) or "Thing"
 
 
 def _safe_rel(candidate: str) -> str:
-    """Normalize a user-named path and reject anything that escapes the workspace. ToolBox._resolve
-    re-checks containment; this is a friendly early gate so a bad path is a clean 'skip', not a raise."""
+    """Normalize a user-named path and reject anything that escapes the workspace (ToolBox._resolve
+    re-checks; this is a friendly early gate so a bad path is a clean 'skip', not a raise)."""
     rel = str(candidate or "").strip().strip("`\"'")
     if not rel or rel.startswith(("/", "\\")) or ":" in rel[:3]:
         return ""
@@ -59,30 +56,108 @@ def _safe_rel(candidate: str) -> str:
     return rel.replace("\\", "/")
 
 
-def _needs_brain(summary: str = "") -> dict[str, Any]:
-    return {
-        "ops": [],
-        "needs_brain": True,
-        "summary": summary or (
-            "The offline coder handles scaffolds and mechanical edits (e.g. \"add a test for "
-            "<function>\", \"create a file <path>\"). This task needs a configured brain — set up a "
-            "Local model (Ollama) or Claude in Settings, then re-run."
-        ),
-    }
+def _fill(template: str, slots: dict[str, str]) -> str:
+    """Substitute ``{{slot}}`` markers from ``slots`` (an unknown marker is left as-is)."""
+    return re.sub(r"\{\{\s*(\w+)\s*\}\}", lambda m: str(slots.get(m.group(1), m.group(0))), template)
 
 
-def plan_edits(message: str, root: str | Path) -> dict[str, Any]:
-    """Map a request to a CLOSED SET of deterministic edit ops.
+def _load_snippet(seed_dir: str | Path | None, name: str) -> str | None:
+    if not seed_dir:
+        return None
+    try:
+        p = Path(seed_dir) / "snippets" / name
+        return p.read_text(encoding="utf-8") if p.is_file() else None
+    except OSError:
+        return None
 
-    Returns ``{"ops": [{"kind","path","content"}], "needs_brain": bool, "summary": str}``. Each op is
-    one of the closed set (currently ``new_file``); the agent applies it through the ToolBox. Empty
-    ops + ``needs_brain=True`` means the request isn't a templated scaffold — defer to a real brain."""
+
+# --- Retrieval over the repo surface (what makes an edit repo-specific) ---
+
+_MANIFESTS = ("requirements.txt", "requirements-dev.txt", "pyproject.toml", "setup.py", "setup.cfg",
+              "Pipfile", "package.json")
+
+
+def _read_manifests(root: Path) -> str:
+    blobs: list[str] = []
+    for name in _MANIFESTS:
+        p = root / name
+        if p.is_file():
+            try:
+                blobs.append(p.read_text(encoding="utf-8", errors="replace").lower())
+            except OSError:
+                continue
+    return "\n".join(blobs)
+
+
+def _uses_pytest(root: Path, manifests: str) -> bool:
+    return ("pytest" in manifests or (root / "conftest.py").is_file()
+            or (root / "pytest.ini").is_file() or (root / "tox.ini").is_file())
+
+
+def _locate_symbol(root: Path, symbol: str) -> str:
+    """Best-effort: use repomap.search_repo to note which file defines ``symbol``, so a scaffold's
+    TODO points at the real code. Returns '' if repomap is unavailable or nothing matches."""
+    try:
+        import repomap
+        out = repomap.search_repo(root, f"def {symbol} class {symbol} {symbol}", max_results=1)
+    except Exception:  # noqa: BLE001 - retrieval is best-effort, never blocks a plan
+        return ""
+    m = re.search(r"([\w./\\-]+\.(?:py|js|ts|go|rs)):", str(out or ""))
+    return m.group(1) if m else ""
+
+
+def _guess_module(root: Path) -> str:
+    """A best-guess start module for a Dockerfile CMD: the first top-level package (dir with
+    __init__.py), else the repo folder name, else 'app'."""
+    try:
+        for child in sorted(root.iterdir()):
+            if child.is_dir() and (child / "__init__.py").is_file():
+                return child.name
+    except OSError:
+        pass
+    return re.sub(r"\W+", "_", root.name).strip("_") or "app"
+
+
+def _skill_hint(message: str, seed_dir: str | Path | None, runtime_dir: str | Path | None,
+                root: Path) -> str:
+    """The closest matching playbook name (via the SAME deterministic skills matcher the agent uses),
+    to make the 'needs a brain' message actionable. Best-effort."""
+    if not seed_dir or not runtime_dir:
+        return ""
+    try:
+        import skills as skills_lib
+        available = skills_lib.load_skills(Path(runtime_dir), Path(seed_dir), root)
+        chosen = skills_lib.select_skills(message, available, limit=1)
+        return chosen[0].name if chosen else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _needs_brain(summary: str = "", skill: str = "") -> dict[str, Any]:
+    base = summary or (
+        "The offline coder handles scaffolds and mechanical edits (e.g. \"add a test for <function>\", "
+        "\"add a flask route <path>\", \"add a dockerfile\", \"create a file <path>\"). This task needs "
+        "a configured brain — set up a Local model (Ollama) or Claude in Settings, then re-run."
+    )
+    if skill:
+        base += f" (The `{skill}` playbook covers this once a brain is enabled.)"
+    return {"ops": [], "needs_brain": True, "summary": base}
+
+
+def plan_edits(message: str, root: str | Path, *, seed_dir: str | Path | None = None,
+               runtime_dir: str | Path | None = None) -> dict[str, Any]:
+    """Map a request to a CLOSED SET of deterministic edit ops, made repo-specific by retrieval.
+
+    Returns ``{"ops": [{"kind","path","content"}], "needs_brain": bool, "summary": str}``. Empty ops +
+    ``needs_brain=True`` means the request isn't a templated scaffold — defer to a real brain."""
     text = str(message or "").strip()
     if not text:
         return _needs_brain()
+    root = Path(root)
     low = text.lower()
+    manifests = _read_manifests(root)
 
-    # Intent: "add/create/write a [unit] test [stub] for <symbol>" -> a unittest scaffold.
+    # Intent: "add/write a [unit] test [stub] for <symbol>" -> a framework-aware test scaffold.
     m = re.search(
         r"\b(?:add|create|write|generate|scaffold|make)\s+(?:a\s+|an\s+)?(?:unit\s+)?test(?:\s+stub)?\s+for\s+"
         r"(?:the\s+)?(?:function|method|class\s+)?[`'\"]?(" + _IDENT + r")",
@@ -90,13 +165,55 @@ def plan_edits(message: str, root: str | Path) -> dict[str, Any]:
     )
     if m:
         symbol = m.group(1)
+        use_pytest = _uses_pytest(root, manifests)
+        location = _locate_symbol(root, symbol) or "the target module"
+        slots = {"symbol": symbol, "cls": _class_name(symbol), "location": location}
+        tmpl = (_load_snippet(seed_dir, "pytest_case.py.tmpl") if use_pytest
+                else _load_snippet(seed_dir, "unittest_case.py.tmpl")) or _FALLBACK_UNITTEST
+        framework = "pytest" if use_pytest else "unittest"
         rel = f"test_{symbol}.py"
-        content = _PY_TEST_TEMPLATE.format(symbol=symbol, cls=_class_name(symbol))
         return {
-            "ops": [{"kind": "new_file", "path": rel, "content": content}],
+            "ops": [{"kind": "new_file", "path": rel, "content": _fill(tmpl, slots)}],
             "needs_brain": False,
-            "summary": f"Scaffolded a unittest stub `{rel}` for `{symbol}` — fill in the real assertions.",
+            "summary": f"Scaffolded a {framework} stub `{rel}` for `{symbol}` "
+                       f"({'found in ' + location if location != 'the target module' else 'fill in the target'}).",
         }
+
+    # Intent: "add a route/endpoint <path>" -> a Flask route, but ONLY in a Flask repo (retrieval-gated).
+    m = re.search(r"\b(?:add|create|make|new)\s+(?:a\s+|an\s+)?(?:route|endpoint)\s+([`'\"]?/\S*)", low)
+    if m:
+        path = m.group(1).strip("`'\"")
+        if "flask" not in manifests:
+            return _needs_brain(
+                "That looks like a web route, but this repo doesn't declare Flask (the only web "
+                "framework the offline coder templates today). Configure a brain to add it for your stack.",
+                skill=_skill_hint(text, seed_dir, runtime_dir, root))
+        name = re.sub(r"\W+", "_", path.strip("/")).strip("_") or "index"
+        slots = {"path": path, "name": name}
+        tmpl = _load_snippet(seed_dir, "flask_route.py.tmpl")
+        if tmpl:
+            return {"ops": [{"kind": "new_file", "path": f"{name}_route.py", "content": _fill(tmpl, slots)}],
+                    "needs_brain": False,
+                    "summary": f"Scaffolded a Flask route `{path}` in `{name}_route.py` — register {name}_bp on your app."}
+
+    # Intent: "add a dockerfile" -> a Python Dockerfile from the template.
+    if re.search(r"\b(?:add|create|make|write|generate)\b[^.?!]{0,30}\bdocker\s*file\b", low):
+        tmpl = _load_snippet(seed_dir, "dockerfile.tmpl")
+        if tmpl:
+            return {"ops": [{"kind": "new_file", "path": "Dockerfile",
+                             "content": _fill(tmpl, {"module": _guess_module(root)})}],
+                    "needs_brain": False,
+                    "summary": "Scaffolded a Dockerfile (adjust the base image + CMD for your app)."}
+
+    # Intent: "add a CI workflow / github action" -> a GitHub Actions workflow.
+    if re.search(r"\b(?:add|create|make|set\s*up)\b[^.?!]{0,40}\b(?:ci\s+(?:workflow|pipeline)|github\s+action|workflow)\b", low):
+        tmpl = _load_snippet(seed_dir, "github_workflow.yml.tmpl")
+        if tmpl:
+            test_cmd = "python -m pytest" if _uses_pytest(root, manifests) else "python -m unittest discover"
+            return {"ops": [{"kind": "new_file", "path": ".github/workflows/ci.yml",
+                             "content": _fill(tmpl, {"test_command": test_cmd})}],
+                    "needs_brain": False,
+                    "summary": "Scaffolded a GitHub Actions CI workflow at .github/workflows/ci.yml."}
 
     # Intent: "create/add/make a [new] file <path> [with <text>]" -> a new file (won't overwrite).
     m = re.search(r"\b(?:create|add|make|new)\s+(?:a\s+|an\s+)?(?:new\s+)?file\s+(\S+)", text, re.IGNORECASE)
@@ -105,10 +222,7 @@ def plan_edits(message: str, root: str | Path) -> dict[str, Any]:
         if rel:
             body = re.search(r"\bwith\s+(.+)$", text, re.IGNORECASE | re.DOTALL)
             content = (body.group(1).strip() + "\n") if body else ""
-            return {
-                "ops": [{"kind": "new_file", "path": rel, "content": content}],
-                "needs_brain": False,
-                "summary": f"Created `{rel}`.",
-            }
+            return {"ops": [{"kind": "new_file", "path": rel, "content": content}],
+                    "needs_brain": False, "summary": f"Created `{rel}`."}
 
-    return _needs_brain()
+    return _needs_brain(skill=_skill_hint(text, seed_dir, runtime_dir, root))

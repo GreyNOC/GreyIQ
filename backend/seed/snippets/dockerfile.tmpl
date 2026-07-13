@@ -1,0 +1,11 @@
+# Auto-scaffolded Dockerfile. Adjust the base image, install step, and start command for your app.
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+
+EXPOSE 8000
+# TODO: replace with your real entrypoint.
+CMD ["python", "-m", "{{module}}"]
