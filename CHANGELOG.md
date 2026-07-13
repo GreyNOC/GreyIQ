@@ -2,6 +2,19 @@
 
 Notable changes to GreyIQ.
 
+## v1.8.6
+
+### Detection expansion — GraphQL operation surfacing + opt-in CT recon
+Continuing the safe, benign-probe detection additions (still no exploitation/payloads/C2/evasion):
+- **GraphQL operations surfaced** — introspection already fetched every type's fields, but the parser
+  discarded them. It now names the actual **query and mutation operations** the schema exposes (e.g.
+  `users`, `adminReport`, `deleteUser`) in the finding's disclosed-schema evidence, and folds those
+  operation names into the probe surface as candidate leads — no extra request. Still candidate-grade.
+- **Certificate-transparency recon (opt-in)** — a new `recon_osint_enabled` setting
+  (`GREYIQ_RECON_OSINT`, **off by default**) seeds in-scope sibling hosts from the public CT logs
+  (crt.sh) that no link or JS exposed. crt.sh is queried, never the target, and every returned host is
+  scope-gated before it becomes a crawl target — so it only widens discovery *within* your scope.
+
 ## v1.8.5
 
 ### Detection expansion — WebSocket surface + more CVE fingerprints

@@ -340,6 +340,24 @@ def discover(
 
     # --- Bounded BFS crawl + served-JS mine + fingerprint. ---
     queue: list[tuple[str, int]] = [(sanitized, 0)]
+    # Passive OSINT (opt-in): seed in-scope sibling hosts from certificate transparency (crt.sh) — hosts
+    # no link/JS exposed. crt.sh is queried (never the target); every returned host is host_ok()-gated
+    # before it becomes a crawl target, so this can only widen discovery WITHIN scope. Best-effort.
+    if getattr(settings, "recon_osint_enabled", False):
+        try:
+            from bughunter import takeover_service
+            from bughunter.registrable_domain import registrable_domain
+            ct_added = 0
+            for ch in takeover_service.cert_transparency_subdomains(registrable_domain(host)):
+                root = f"https://{(ch or '').lower()}/"
+                if host_ok(ch) and root not in seen and len(discovered) < max_pages:
+                    seen.add(root); discovered.append(root); queue.append((root, 1))
+                    ct_added += 1
+            if ct_added:
+                sources["ct"] = ct_added
+                notes.append(f"{ct_added} in-scope host(s) added from certificate transparency (crt.sh OSINT).")
+        except Exception:  # noqa: BLE001 - OSINT is best-effort, never breaks recon
+            pass
     crawled = 0
     while queue and len(discovered) < max_pages and used["n"] < max_requests and crawled < max_pages:
         url, depth = queue.pop(0)

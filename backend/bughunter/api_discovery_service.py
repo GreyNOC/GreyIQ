@@ -215,11 +215,25 @@ def parse_graphql_introspection(data: Any) -> dict[str, Any] | None:
         return None
     types = [str(t.get("name")) for t in (schema.get("types") or [])
              if isinstance(t, dict) and t.get("name") and not str(t.get("name")).startswith("__")]
+    # The introspection query already fetched `fields{name}` for every type — surface the ROOT
+    # query/mutation operation names (the actual read/write API), which the caller can add to the
+    # probe surface. No extra request; this only reads what was already returned.
+    by_name = {str(t.get("name")): t for t in (schema.get("types") or []) if isinstance(t, dict) and t.get("name")}
+
+    def _field_names(type_name: str) -> list[str]:
+        entry = by_name.get(type_name) or {}
+        return [str(f.get("name")) for f in (entry.get("fields") or [])
+                if isinstance(f, dict) and f.get("name")][:60]
+
+    q_name = str((schema.get("queryType") or {}).get("name") or "")
+    m_name = str((schema.get("mutationType") or {}).get("name") or "")
     return {
-        "query_type": str((schema.get("queryType") or {}).get("name") or ""),
-        "mutation_type": str((schema.get("mutationType") or {}).get("name") or ""),
+        "query_type": q_name,
+        "mutation_type": m_name,
         "type_count": len(types),
         "types": types[:50],
+        "query_fields": _field_names(q_name),      # the read operations exposed
+        "mutation_fields": _field_names(m_name),   # the write operations exposed
     }
 
 
@@ -255,7 +269,9 @@ def _graphql_finding(gql_url: str, info: dict[str, Any]) -> dict[str, Any]:
             "read_data": (
                 f"queryType: {info.get('query_type') or '?'}\n"
                 f"mutationType: {info.get('mutation_type') or '—'}\n"
-                f"Types ({info.get('type_count', 0)} total, sample of {len(info.get('types') or [])}): "
+                + (f"Query operations: {', '.join(info.get('query_fields') or [])}\n" if info.get("query_fields") else "")
+                + (f"Mutation operations: {', '.join(info.get('mutation_fields') or [])}\n" if info.get("mutation_fields") else "")
+                + f"Types ({info.get('type_count', 0)} total, sample of {len(info.get('types') or [])}): "
                 + ", ".join(info.get("types") or [])
             ),
         },
@@ -422,7 +438,15 @@ def discover_api_surface(
         if info:
             out["graphql"] = {"url": url, **info}
             out["findings"].append(_graphql_finding(url, info))
+            # The disclosed query/mutation operation names are real parameter LEADS — add them to the
+            # surface so the active prover can probe them (candidate leads only; a name is CONFIRMED
+            # solely if a downstream benign differential fires, never here).
+            op_names = list(dict.fromkeys((info.get("query_fields") or []) + (info.get("mutation_fields") or [])))
+            for name in op_names:
+                if name and name not in out["params"]:
+                    out["params"].append(name)
+            ops_note = f", {len(op_names)} operation(s)" if op_names else ""
             out["notes"].append(
-                f"GraphQL introspection ENABLED at {path} ({info['type_count']} types) — candidate finding added.")
+                f"GraphQL introspection ENABLED at {path} ({info['type_count']} types{ops_note}) — candidate finding added.")
             break
     return out

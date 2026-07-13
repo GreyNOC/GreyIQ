@@ -88,6 +88,11 @@ class ScannerSettings:
     # max-iters AND the shared per-host governor + the single hunt's request budget (never expanded).
     hunt_loop_enabled: bool = False
     hunt_loop_max_iters: int = 3
+    # Passive OSINT recon enrichment (certificate-transparency subdomain seeding via crt.sh): OFF by
+    # default (opt-in) — it queries a THIRD-PARTY service (the public CT logs) with the target's apex,
+    # so the operator turns it on deliberately. Every CT-returned host is still scope-gated before it
+    # becomes a crawl target, so enabling it can only widen discovery WITHIN scope.
+    recon_osint_enabled: bool = False
     # Per-request exclusion filter (NOT sourced from env -- callers that resolve a
     # saved portfolio program build a settings override via dataclasses.replace() with
     # that program's out_of_scope_hosts). Checked first, and can only ever NARROW scope
@@ -109,4 +114,5 @@ def get_settings() -> ScannerSettings:
         active_time_sqli_margin_seconds=_float_env("GREYIQ_ACTIVE_TIME_SQLI_MARGIN_S", 3.0),
         hunt_loop_enabled=_bool_env("GREYIQ_HUNT_LOOP_ENABLED", False),
         hunt_loop_max_iters=max(1, min(_int_env("GREYIQ_HUNT_LOOP_MAX_ITERS", 3), 6)),
+        recon_osint_enabled=_bool_env("GREYIQ_RECON_OSINT", False),
     )

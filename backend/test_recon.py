@@ -112,6 +112,43 @@ class ReconGuardTests(unittest.TestCase):
         self.assertIn("https://example.com/admin", result["urls"])
         self.assertNotIn("http://[::1", " ".join(result["urls"]))
 
+    def test_certificate_transparency_seeds_only_inscope_hosts_when_opted_in(self) -> None:
+        import dataclasses
+        from bughunter import takeover_service
+        from bughunter.settings import get_settings
+        settings = dataclasses.replace(get_settings(), recon_osint_enabled=True)
+
+        def fake_fetch(url: str):
+            if url.endswith((".xml", "security.txt", "/robots.txt")) or "/.well-known/" in url:
+                return {"status": 404, "body": "", "headers": {}, "final_url": url}
+            return {"status": 200, "body": "<html></html>", "headers": {}, "final_url": url}
+
+        orig_fetch, orig_ct = recon._fetch_raw, takeover_service.cert_transparency_subdomains
+        recon._fetch_raw = fake_fetch
+        takeover_service.cert_transparency_subdomains = lambda apex, **k: ["api.example.com", "evil.test"]
+        try:
+            result = recon.discover("https://example.com/", scope_in=lambda h: h.endswith("example.com"),
+                                    settings=settings, max_pages=10)
+        finally:
+            recon._fetch_raw, takeover_service.cert_transparency_subdomains = orig_fetch, orig_ct
+        self.assertIn("https://api.example.com/", result["urls"])   # in-scope CT host seeded + crawled
+        self.assertNotIn("https://evil.test/", result["urls"])       # out-of-scope CT host dropped
+        self.assertEqual(result["sources"].get("ct"), 1)
+
+    def test_certificate_transparency_is_off_by_default(self) -> None:
+        from bughunter import takeover_service
+
+        def _boom(*a, **k):
+            raise AssertionError("crt.sh must NOT be queried unless recon_osint is opted in")
+
+        orig_fetch, orig_ct = recon._fetch_raw, takeover_service.cert_transparency_subdomains
+        recon._fetch_raw = lambda url: {"status": 200, "body": "<html></html>", "headers": {}, "final_url": url}
+        takeover_service.cert_transparency_subdomains = _boom
+        try:
+            recon.discover("https://example.com/", max_pages=5)  # default settings -> OSINT off
+        finally:
+            recon._fetch_raw, takeover_service.cert_transparency_subdomains = orig_fetch, orig_ct
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -129,6 +129,22 @@ class GraphQLTests(unittest.TestCase):
         self.assertEqual(f["_plan"]["proof_of_impact"]["status"], "candidate")
         self.assertEqual(f["_plan"]["cvss"]["base_severity"], "low")
 
+    def test_query_and_mutation_operations_surfaced(self) -> None:
+        # The introspection query already fetches fields{name}; the parser now surfaces the actual
+        # read/write operations (and the finding names them), without any extra request.
+        data = {"data": {"__schema": {
+            "queryType": {"name": "Query"}, "mutationType": {"name": "Mutation"},
+            "types": [
+                {"name": "Query", "kind": "OBJECT", "fields": [{"name": "users"}, {"name": "adminReport"}]},
+                {"name": "Mutation", "kind": "OBJECT", "fields": [{"name": "deleteUser"}]},
+                {"name": "User", "kind": "OBJECT", "fields": [{"name": "id"}]},
+            ]}}}
+        info = api.parse_graphql_introspection(data)
+        self.assertEqual(info["query_fields"], ["users", "adminReport"])
+        self.assertEqual(info["mutation_fields"], ["deleteUser"])
+        f = api._graphql_finding("https://api.example.com/graphql", info)
+        self.assertIn("adminReport", f["proof_evidence"]["read_data"])  # operations named in the evidence
+
 
 class DiscoverDriverTests(unittest.TestCase):
     def _fetch_map(self, mapping):
