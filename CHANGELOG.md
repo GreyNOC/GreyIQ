@@ -2,6 +2,18 @@
 
 Notable changes to GreyIQ.
 
+## v1.8.5
+
+### Detection expansion — WebSocket surface + more CVE fingerprints
+Inspired by external tooling but rebuilt GreyIQ-native and kept strictly to the safe, authorized,
+benign-probe model (no exploitation, payloads, C2, or evasion — those were deliberately excluded):
+- **WebSocket endpoint discovery** — the served-JS miner now extracts `ws://`/`wss://` endpoints
+  (explicit literals + `new WebSocket(...)` targets, relative ones resolved to the base host), each
+  scope-gated like every other discovered host. Surfaced as a real-time-surface inventory (an
+  endpoint's existence is not itself a finding).
+- **More component CVEs** — added Prism and Marked to the passive front-end fingerprint/CVE table, plus
+  jQuery CVE-2020-11022, so more outdated-dependency leads surface (candidate-grade, via `cve_service`).
+
 ## v1.8.4
 
 ### Offline coder — learns from real runs (Phase 1, move 5)

@@ -31,13 +31,18 @@ _CALL_URL_RE = re.compile(r"""(?:fetch|axios(?:\.\s*\w+)?|\.open)\s*\(\s*["'`]([
 _PARAM_RE = re.compile(r"""[?&]([A-Za-z_][A-Za-z0-9_]{0,39})=""")  # {0,39}: single-letter params (?q= ?s= ?p=) are real attack surface
 # Absolute hostnames (for same-apex asset discovery).
 _HOST_RE = re.compile(r"""https?://([A-Za-z0-9][A-Za-z0-9.\-]{1,250}\.[A-Za-z]{2,24})""")
+# WebSocket endpoints: explicit ws://wss:// string literals + `new WebSocket(target)` targets. A
+# WebSocket URL is real-time attack surface (auth, CSWSH, message injection) that an HTML crawl never
+# sees; captured as a scope-gated INVENTORY fact (existence is not itself a vulnerability).
+_WS_URL_RE = re.compile(r"""["'`](wss?://[A-Za-z0-9][A-Za-z0-9.\-:]{1,250}(?:/[^"'`\s]{0,200})?)["'`]""", re.I)
+_WS_CALL_RE = re.compile(r"""new\s+WebSocket\s*\(\s*["'`]([^"'`]{2,200})["'`]""", re.I)
 
 _ENDPOINT_HINTS = ("api", "graphql", "/v1", "/v2", "/v3", "rest", "/query", "/admin", "/internal")
 # Static assets a fetch()/axios() call may load but that are NOT injectable routes — excluded from
 # the hint-exempt call-target path so relaxing the hint gate doesn't add asset noise to the surface.
 _STATIC_EXT = (".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".woff", ".woff2",
                ".ttf", ".eot", ".map", ".mp4", ".webm", ".pdf", ".zip", ".woff2")
-_CAP_ENDPOINTS, _CAP_PARAMS, _CAP_HOSTS, _CAP_SECRETS = 80, 60, 40, 20
+_CAP_ENDPOINTS, _CAP_PARAMS, _CAP_HOSTS, _CAP_SECRETS, _CAP_WS = 80, 60, 40, 20, 30
 
 
 def _registrable_apex(host: str) -> str:
@@ -95,6 +100,28 @@ def mine_js(js_text: str, base_url: str, *, host_filter: Callable[[str], bool] |
 
     params = sorted({p for p in _PARAM_RE.findall(text)})[:_CAP_PARAMS]
 
+    # WebSocket endpoints — explicit ws(s):// literals + `new WebSocket(target)`, each scope-gated
+    # like the HTTP endpoints. A relative WebSocket target (new WebSocket('/live')) resolves against
+    # the base host with the matching secure scheme. Inventory only; never a finding here.
+    websockets: list[str] = []
+    seen_ws: set[str] = set()
+    _ws_scheme = "wss" if str(base_url).lower().startswith("https") else "ws"
+    for raw in _WS_URL_RE.findall(text) + _WS_CALL_RE.findall(text):
+        raw = (raw or "").strip()
+        if raw.lower().startswith(("ws://", "wss://")):
+            ws = raw
+        elif raw.startswith("/") and base_host:
+            ws = f"{_ws_scheme}://{base_host}{raw}"
+        else:
+            continue
+        host = (urlparse(ws).hostname or "").lower()
+        if not host or ws in seen_ws or not keep_host(host):
+            continue
+        seen_ws.add(ws)
+        websockets.append(ws)
+        if len(websockets) >= _CAP_WS:
+            break
+
     hosts: list[str] = []
     seen_h: set[str] = set()
     for h in _HOST_RE.findall(text):
@@ -127,4 +154,5 @@ def mine_js(js_text: str, base_url: str, *, host_filter: Callable[[str], bool] |
         if len(secret_findings) >= _CAP_SECRETS:
             break
 
-    return {"endpoints": endpoints, "params": params, "hosts": hosts, "secret_findings": secret_findings}
+    return {"endpoints": endpoints, "params": params, "hosts": hosts, "websockets": websockets,
+            "secret_findings": secret_findings}

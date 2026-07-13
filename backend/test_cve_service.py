@@ -73,6 +73,19 @@ class DetectComponentsTests(unittest.TestCase):
         self.assertEqual(comps.get("underscore"), "1.10.2")
         self.assertEqual(comps.get("mustache"), "2.1.0")
 
+    def test_prismjs_and_marked_detected(self) -> None:
+        body = ('<script src="/js/prism-1.25.0.min.js"></script>'
+                '<script src="/js/marked-4.0.0.min.js"></script>')
+        comps = {c["product"]: c["version"] for c in cve.detect_components(body)}
+        self.assertEqual(comps.get("prismjs"), "1.25.0")
+        self.assertEqual(comps.get("marked"), "4.0.0")
+
+    def test_prism_detected_from_banner(self) -> None:
+        # Prism is often served version-less under a CDN path; its "/* PrismJS 1.26.0" banner IDs it.
+        comps = {c["product"]: c["version"]
+                 for c in cve.detect_components("/* PrismJS 1.26.0\nhttps://prismjs.com/download.html */")}
+        self.assertEqual(comps.get("prismjs"), "1.26.0")
+
     def test_wordpress_from_meta_generator(self) -> None:
         body = '<head><meta name="generator" content="WordPress 5.8.1" /></head>'
         comps = {c["product"]: c["version"] for c in cve.detect_components(body)}
@@ -109,6 +122,13 @@ class MatchCvesTests(unittest.TestCase):
         scores = [c["base_score"] for c in cve.match_cves("lodash", "4.0.0")]
         self.assertEqual(scores, sorted(scores, reverse=True))
         self.assertGreaterEqual(scores[0], 9.0)  # CVE-2019-10744 critical heads the list
+
+    def test_new_products_and_jquery_cve(self) -> None:
+        self.assertIn("CVE-2022-23647", {c["cve"] for c in cve.match_cves("prismjs", "1.25.0")})
+        self.assertEqual(cve.match_cves("prismjs", "1.27.0"), [])          # fixed
+        self.assertIn("CVE-2022-21681", {c["cve"] for c in cve.match_cves("marked", "4.0.0")})
+        self.assertEqual(cve.match_cves("marked", "4.0.10"), [])           # fixed
+        self.assertIn("CVE-2020-11022", {c["cve"] for c in cve.match_cves("jquery", "3.4.1")})
 
 
 class FindingShapeTests(unittest.TestCase):

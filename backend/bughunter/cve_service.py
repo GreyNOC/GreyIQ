@@ -45,6 +45,9 @@ _KNOWN_CVES: dict[str, list[dict[str, Any]]] = {
         {"cve": "CVE-2020-11023", "fixed_in": "3.5.0", "cwe": "CWE-79", "severity": "medium", "base_score": 6.1,
          "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", "epss": 0.42, "kev": False,
          "summary": "HTML containing <option> elements passed to DOM methods executes — XSS (with CVE-2020-11022)."},
+        {"cve": "CVE-2020-11022", "fixed_in": "3.5.0", "cwe": "CWE-79", "severity": "medium", "base_score": 6.1,
+         "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", "epss": 0.42, "kev": False,
+         "summary": "HTML from .html()/.append() with crafted attributes executes — XSS (pairs with CVE-2020-11023)."},
     ],
     "bootstrap": [
         {"cve": "CVE-2018-14042", "fixed_in": "3.4.0", "cwe": "CWE-79", "severity": "medium", "base_score": 6.1,
@@ -137,12 +140,25 @@ _KNOWN_CVES: dict[str, list[dict[str, Any]]] = {
          "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N", "epss": 0.25, "kev": False,
          "summary": "Directory-traversal / information disclosure via the block editor in some configs."},
     ],
+    "prismjs": [
+        {"cve": "CVE-2022-23647", "fixed_in": "1.27.0", "cwe": "CWE-79", "severity": "medium", "base_score": 6.1,
+         "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", "epss": 0.20, "kev": False,
+         "summary": "DOM clobbering in the Prism autoloader / line-highlight plugins leads to XSS."},
+    ],
+    "marked": [
+        {"cve": "CVE-2022-21681", "fixed_in": "4.0.10", "cwe": "CWE-1333", "severity": "high", "base_score": 7.5,
+         "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H", "epss": 0.25, "kev": False,
+         "summary": "ReDoS in inline.reflinkSearch when rendering attacker-controlled markdown."},
+        {"cve": "CVE-2022-21680", "fixed_in": "4.0.10", "cwe": "CWE-1333", "severity": "high", "base_score": 7.5,
+         "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H", "epss": 0.25, "kev": False,
+         "summary": "ReDoS in block.def when rendering attacker-controlled markdown."},
+    ],
 }
 
 _LABELS = {"jquery": "jQuery", "bootstrap": "Bootstrap", "lodash": "Lodash", "moment": "Moment.js",
            "angularjs": "AngularJS", "handlebars": "Handlebars", "dompurify": "DOMPurify",
            "jquery-ui": "jQuery UI", "axios": "Axios", "underscore": "Underscore.js",
-           "mustache": "Mustache.js", "wordpress": "WordPress (core)"}
+           "mustache": "Mustache.js", "wordpress": "WordPress (core)", "prismjs": "Prism", "marked": "Marked"}
 
 # Version pulled from a script `src`/`href` filename. Anchored on a separator so `jquery-ui`
 # / `jquery-migrate` / `jquery.validate` do NOT register as jQuery core (their CVEs differ).
@@ -159,6 +175,8 @@ _SRC_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("axios", re.compile(r"(?:^|[/\\])axios[-.](\d+\.\d+\.\d+)(?:\.min)?\.js", re.I)),
     ("underscore", re.compile(r"(?:^|[/\\])underscore[-.](\d+\.\d+\.\d+)(?:\.min)?\.js", re.I)),
     ("mustache", re.compile(r"(?:^|[/\\])mustache[-.](\d+\.\d+\.\d+)(?:\.min)?\.js", re.I)),
+    ("prismjs", re.compile(r"(?:^|[/\\])prism[-.](\d+\.\d+\.\d+)(?:\.min)?\.js", re.I)),
+    ("marked", re.compile(r"(?:^|[/\\])marked[-.](\d+\.\d+\.\d+)(?:\.min)?\.js", re.I)),
 )
 
 # Version pulled from the library's own banner/comment in inline or fetched script bodies.
@@ -172,6 +190,9 @@ _BANNER_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("handlebars", re.compile(r"Handlebars(?:\.js)?\s+v?(\d+\.\d+\.\d+)", re.I)),
     ("dompurify", re.compile(r"DOMPurify[\s\S]{0,40}?VERSION\s*[:=]\s*['\"](\d+\.\d+\.\d+)", re.I)),
     ("underscore", re.compile(r"Underscore\.js\s+(\d+\.\d+\.\d+)", re.I)),
+    # Prism ships a leading "/* PrismJS 1.29.0" banner in its minified bundle — more reliable than
+    # the filename (Prism is often served as a version-less prism.min.js under a versioned CDN path).
+    ("prismjs", re.compile(r"PrismJS\s+(\d+\.\d+\.\d+)", re.I)),
 )
 
 # Version pulled from an HTML <meta name="generator"> tag (CMS / framework fingerprint).

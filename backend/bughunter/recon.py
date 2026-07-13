@@ -194,7 +194,8 @@ def discover(
         sanitized = _guard_url(normalize_website_url(seed_url), settings.allow_private_urls, settings.web_allowed_ports)
     except WebsiteFetchError as exc:
         return {"urls": [seed_url], "host": "", "sources": {}, "notes": [f"recon skipped: {exc}"],
-                "endpoints": [], "params": [], "js_secrets": [], "tech": [], "hints": {}, "dropped_out_of_scope": 0, "requests_used": 0}
+                "endpoints": [], "params": [], "js_secrets": [], "tech": [], "hints": {}, "websockets": [],
+                "dropped_out_of_scope": 0, "requests_used": 0}
     host = (urlparse(sanitized).hostname or "").lower()
     governor = governor or HostRateGovernor(
         capacity=max(settings.active_max_requests_per_host, max_pages + 6),
@@ -225,6 +226,7 @@ def discover(
     notes: list[str] = []
     params: set[str] = set()
     js_secrets: list[dict[str, Any]] = []
+    websockets: set[str] = set()  # ws:// endpoints mined from served JS (scope-gated surface inventory)
     tech: list[str] = []
     hints: dict[str, str] = {}
     forms_out: list[dict[str, Any]] = []  # structured in-scope forms (action/method/fields) for the reasoning layer
@@ -388,6 +390,7 @@ def discover(
         # in_scope-gated endpoints only (never hosts, never queued) — exactly like the served-JS branch.
         inline = mine_js(body, final, host_filter=host_ok)
         params.update(inline.get("params") or [])
+        websockets.update(inline.get("websockets") or [])
         js_secrets.extend(inline.get("secret_findings") or [])
         for ep in (inline.get("endpoints") or []):
             if ep not in seen and in_scope(ep) and len(discovered) < max_pages:
@@ -452,6 +455,7 @@ def discover(
                 continue
             mined = mine_js(jf.get("body") or "", jf.get("final_url") or js_url, host_filter=host_ok)
             params.update(mined.get("params") or [])
+            websockets.update(mined.get("websockets") or [])
             js_secrets.extend(mined.get("secret_findings") or [])
             # A mined host can be an in-scope SIBLING (api.example.com) that no HTML link exposes.
             # RE-GATE each with host_ok (mine_js's own filter is a looser same-apex match that ignores
@@ -496,11 +500,14 @@ def discover(
         notes.append(f"{len(js_secrets)} secret(s) found in served JS (redacted).")
     if params:
         notes.append(f"{len(params)} input parameter name(s) discovered (forms/JS/links) — probed by the active checks.")
+    if websockets:
+        notes.append(f"{len(websockets)} WebSocket endpoint(s) discovered in served JS (real-time surface).")
 
     return {
         "urls": discovered[:max_pages], "host": host, "sources": sources, "notes": notes,
         "endpoints": [u for u in discovered if u != sanitized][:max_pages],
         "params": sorted(params)[:60], "js_secrets": js_secrets, "tech": tech, "hints": hints,
+        "websockets": sorted(websockets)[:30],
         "forms": forms_out, "api_findings": api_findings,
         "dropped_out_of_scope": dropped_oos, "requests_used": used["n"],
     }

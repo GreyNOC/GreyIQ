@@ -46,6 +46,28 @@ class MineJsTests(unittest.TestCase):
             self.assertNotIn(secret, str(f))  # the raw key never leaks
 
 
+class WebSocketMiningTests(unittest.TestCase):
+    """Kittysploit-inspired protocol surface: WebSocket endpoints mined from served JS, scope-gated."""
+
+    JS = ("var a = new WebSocket('wss://app.acme.com/live');"
+          " var b = new WebSocket('/notifications');"
+          " var evil = 'ws://evil.test/x';"
+          " var abs = \"wss://cdn.acme.com/stream\";")
+
+    def test_websockets_mined_and_scope_gated(self) -> None:
+        m = recon_js.mine_js(self.JS, "https://app.acme.com/main.js", host_filter=lambda h: h.endswith("acme.com"))
+        ws = set(m["websockets"])
+        self.assertIn("wss://app.acme.com/live", ws)                 # explicit wss:// literal
+        self.assertIn("wss://app.acme.com/notifications", ws)        # relative WebSocket() -> resolved wss
+        self.assertIn("wss://cdn.acme.com/stream", ws)               # same-apex, in scope
+        self.assertNotIn("ws://evil.test/x", ws)                     # out-of-scope host dropped
+
+    def test_relative_scheme_matches_base(self) -> None:
+        m = recon_js.mine_js("var s = new WebSocket('/live');", "http://app.acme.com/main.js",
+                             host_filter=lambda h: True)
+        self.assertEqual(m["websockets"], ["ws://app.acme.com/live"])  # http base -> ws (not wss)
+
+
 class CallUrlRegexTests(unittest.TestCase):
     """_CALL_URL_RE (fetch/axios/.open call targets) had no dedicated coverage --
     only ever exercised incidentally through _ENDPOINT_RE-matching literals."""
