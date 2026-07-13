@@ -10,6 +10,7 @@ import hmac
 import json
 import mimetypes
 import os
+import re
 import secrets
 import shutil
 import sys
@@ -1164,9 +1165,31 @@ _H1_STATE_TO_LEARNING_OUTCOME = {
 }
 
 
+# Code-WRITING / -editing intent, for the offline honesty short-circuit (docs/offline-coder-strategy.md).
+# Deliberately NARROW: it must match "write me a function" / "fix this script" / "generate a test", but
+# NOT general code *discussion* ("what is an API?", "explain python") — TinyGPT can attempt prose on
+# those. A 0.8M char model cannot produce code, so when no brain is configured we say so honestly
+# instead of spending forward passes on output the quality gate would discard anyway.
+_CODEGEN_INTENT_RE = re.compile(
+    r"\b(write|create|generate|implement|build|add|make|fix|refactor|edit|modify|debug|scaffold)\b"
+    r"[^.?!]{0,60}\b(code|script|function|method|class|module|program|endpoint|route|component|"
+    r"unit\s*test|test|regex|sql|query|dockerfile|docker\s*file|ci|pipeline|workflow|snippet|"
+    r"\.py|\.js|\.ts|\.go|\.rs)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_codegen_request(message: str) -> bool:
+    return bool(_CODEGEN_INTENT_RE.search(str(message or "")))
+
+
 class GreyIQRuntime:
     def __init__(self) -> None:
         self.lock = threading.RLock()
+        # One agent run at a time per resolved workspace: concurrent runs race on the same files and
+        # clobber each other's single per-workspace rollback snapshot. Keyed by resolved path; the
+        # dict itself is guarded by self.lock, each value is held for a run's duration.
+        self._agent_workspace_locks: dict[str, threading.Lock] = {}
         self.engine: SolinEngine | None = None
         self.engine_error = ""
         self.training = TrainingState()
@@ -1429,7 +1452,28 @@ class GreyIQRuntime:
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "core_id": core_id, "ai_core": ai_core}
 
+    def _agent_workspace_lock(self, workspace: str) -> "threading.Lock":
+        """The per-resolved-workspace agent-run lock (created on first use), so only one agent run
+        touches a workspace at a time — concurrent runs race on files and clobber each other's
+        single rollback snapshot."""
+        key = str(Path(str(workspace or "")).expanduser().resolve())
+        with self.lock:
+            lk = self._agent_workspace_locks.get(key)
+            if lk is None:
+                lk = threading.Lock()
+                self._agent_workspace_locks[key] = lk
+            return lk
+
+    _AGENT_BUSY_MSG = ("An agent run is already in progress for this workspace. Wait for it to "
+                       "finish (or undo it) before starting another.")
+
     def run_agent(self, request: AgentRequest) -> dict[str, Any]:
+        ws_lock = self._agent_workspace_lock(request.workspace)
+        if not ws_lock.acquire(blocking=False):
+            return {"ok": False, "request_id": uuid4().hex, "message": self._AGENT_BUSY_MSG,
+                    "transcript": [], "steps": 0, "changes": [], "touched_files": [], "plan": [],
+                    "flagged_reads": [], "completed": False, "verified": False, "outstanding": [],
+                    "snapshot_available": False, "snapshot_count": 0}
         try:
             result = coding_agent.run_agent(
                 request.message,
@@ -1459,28 +1503,36 @@ class GreyIQRuntime:
                 "provider": result["provider"],
             }
         except coding_agent.AgentError as exc:
+            # A mid-run failure may have partially written files; persist the snapshot the run
+            # attached so the user can still undo those partial edits.
+            snap = self._persist_snapshot(request.workspace, getattr(exc, "agent_snapshot", None) or [])
             return {
                 "ok": False,
                 "request_id": uuid4().hex,
                 "message": str(exc),
                 "transcript": [],
                 "steps": 0,
-                "changes": [],
-                "touched_files": [],
+                "changes": getattr(exc, "agent_changes", []) or [],
+                "touched_files": getattr(exc, "agent_touched", []) or [],
                 "plan": [],
                 "flagged_reads": [],
                 "completed": False,
                 "verified": False,
                 "outstanding": [],
-                "snapshot_available": False,
-                "snapshot_count": 0,
+                "snapshot_available": snap["available"],
+                "snapshot_count": snap["count"],
             }
+        finally:
+            ws_lock.release()
 
     def start_agent_run(self, request: AgentRequest) -> dict[str, Any]:
         """Kick off an agent run in the background and return its request_id. The
         UI polls agent_run_events() for live tool-by-tool progress and, when the
         run finishes, the same result payload /api/agent would have returned."""
         request_id = uuid4().hex
+        ws_lock = self._agent_workspace_lock(request.workspace)
+        if not ws_lock.acquire(blocking=False):
+            return {"ok": False, "request_id": request_id, "error": self._AGENT_BUSY_MSG, "message": self._AGENT_BUSY_MSG}
         record: dict[str, Any] = {"events": [], "done": False, "result": None}
         with self.lock:
             # Bound memory: drop the oldest finished runs once a few have piled up.
@@ -1524,10 +1576,16 @@ class GreyIQRuntime:
                     "provider": result["provider"],
                 }
             except coding_agent.AgentError as exc:
-                payload = {"ok": False, "request_id": request_id, "message": str(exc)}
+                snap = self._persist_snapshot(request.workspace, getattr(exc, "agent_snapshot", None) or [])
+                payload = {"ok": False, "request_id": request_id, "message": str(exc),
+                           "snapshot_available": snap["available"], "snapshot_count": snap["count"]}
             except Exception as exc:  # noqa: BLE001 - surfaced to the UI, never crashes the server
                 self.log(f"Agent run failed: {exc}")
-                payload = {"ok": False, "request_id": request_id, "message": f"Agent error: {exc}"}
+                snap = self._persist_snapshot(request.workspace, getattr(exc, "agent_snapshot", None) or [])
+                payload = {"ok": False, "request_id": request_id, "message": f"Agent error: {exc}",
+                           "snapshot_available": snap["available"], "snapshot_count": snap["count"]}
+            finally:
+                ws_lock.release()  # free the workspace for the next run, success or failure
             with self.lock:
                 record["result"] = payload
                 record["done"] = True
@@ -1597,6 +1655,13 @@ class GreyIQRuntime:
                 return {"ok": False, "error": "Nothing to undo — no snapshot from a recent agent run."}
             data = json.loads(path.read_text(encoding="utf-8"))
             outcome = coding_agent.restore_snapshot(data.get("files") or [], request.workspace)
+            if outcome.get("errors"):
+                # Some files couldn't be restored (e.g. a lock / permission error). KEEP the snapshot
+                # so the user can retry after clearing the cause — deleting it here would strand those
+                # files with no way back.
+                return {"ok": False, "available": True,
+                        "error": "Some files could not be restored; the snapshot was kept so you can retry.",
+                        **outcome}
             try:
                 path.unlink()
             except OSError:
@@ -3700,6 +3765,26 @@ class GreyIQRuntime:
         coder_reply = self._coder_reply(request)
         if coder_reply is not None:
             return coder_reply
+        # No coding brain configured AND this is a code-WRITING request: the ~0.8M-param offline model
+        # cannot write code (64-char context, ~0% code in its corpus; its own quality gate discards
+        # code-shaped output). Be honest and point at the real path instead of generating a reply that
+        # gets thrown away — this also avoids the wasted CPU forward passes. See docs/offline-coder-strategy.md.
+        if _looks_like_codegen_request(request.message):
+            return {
+                "request_id": uuid4().hex,
+                "message": (
+                    "The offline model can't write or edit code. Configure a **Local model (Ollama)** or "
+                    "a **Claude brain** in Settings, then use the Workbench agent — it edits files in your "
+                    "workspace, runs verify, and can undo its changes. (The offline model is for chat and "
+                    "explanations, not code generation.)"
+                ),
+                "used_fallback": True,
+                "captured_for_training": False,
+                "model_name": "offline:no-codegen",
+                "device": "cpu",
+                "citations": [],
+                "ai_core": self.store.load(),
+            }
         try:
             engine = self.get_engine()
             engine.safety = OpenPolicy()

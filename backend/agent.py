@@ -668,8 +668,12 @@ class ToolBox:
         self._capture_created_dirs(target)
         target.parent.mkdir(parents=True, exist_ok=True)
         content = str(args.get("content", ""))
+        # Derive `existed` from the filesystem, NOT from read success: a file that EXISTS but can't
+        # be read (permissions/binary/IO error -> _safe_read returns None) must still be recorded as
+        # pre-existing, or a rollback would DELETE a file this run only overwrote.
+        existed = target.is_file()
         before = self._safe_read(target)
-        self._capture_original(target, before, existed=before is not None)
+        self._capture_original(target, before, existed=existed)
         target.write_text(content, encoding="utf-8")
         self._mark_touched(target)
         self._record_change(target, "write_file", before, content)
@@ -706,7 +710,14 @@ class ToolBox:
         rel = target.relative_to(self.root).as_posix()
         if rel in self.snapshot:
             return
-        self.snapshot[rel] = {"existed": bool(existed), "content": content if existed else ""}
+        # content_unavailable: the file pre-existed but its content couldn't be read at snapshot time
+        # (permissions/binary/IO error). Restore must then LEAVE it as-is — neither blank it with ""
+        # nor delete it — because we have no faithful original to write back.
+        self.snapshot[rel] = {
+            "existed": bool(existed),
+            "content": content if content is not None else "",
+            "content_unavailable": bool(existed and content is None),
+        }
 
     def snapshot_payload(self) -> list[dict[str, Any]]:
         """Full pre-run state of touched files (and the directories the run created),
@@ -798,7 +809,10 @@ class ToolBox:
         except subprocess.TimeoutExpired:
             raise ToolError(f"Command timed out after {self.command_timeout:.0f}s.") from None
         out = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
-        return f"exit={proc.returncode}\n{out.strip()}"
+        # Command output can echo attacker-controlled workspace/network content — hand it to the
+        # model behind the same untrusted-DATA boundary as read_file/grep so an injected directive
+        # in stdout/stderr can't be mistaken for an instruction.
+        return trust.wrap_for_model(f"exit={proc.returncode}\n{out.strip()}", path="(run_command output)")
 
     def _tool_net_probe(self, args: dict[str, Any]) -> str:
         """Read-only network diagnostics: dns / tcp / http / tls. Pure-Python (no
@@ -816,9 +830,9 @@ class ToolBox:
             raise ToolError("target must not be empty.")
         if action == "dns":
             host, _ = _split_host_port(target)
-            return self._net_dns(host)
+            return self._wrap_net(self._net_dns(host))
         if action == "http":
-            return self._net_http(target)
+            return self._wrap_net(self._net_http(target))
         # tcp / tls need a host and a port (from target or the port field).
         host, port = _split_host_port(target)
         if port is None:
@@ -835,8 +849,15 @@ class ToolBox:
         if not 1 <= port <= 65535:
             raise ToolError("port must be between 1 and 65535.")
         if action == "tcp":
-            return self._net_tcp(host, port)
-        return self._net_tls(host, port)
+            return self._wrap_net(self._net_tcp(host, port))
+        return self._wrap_net(self._net_tls(host, port))
+
+    @staticmethod
+    def _wrap_net(result: str) -> str:
+        """net_probe results carry probed-host content (HTTP headers/body, a TLS cert subject) that
+        an attacker controls — wrap them in the same untrusted-DATA boundary as every other tool
+        result so an injected directive in a response can't be mistaken for an instruction."""
+        return trust.wrap_for_model(result, path="(net_probe output)")
 
     def _net_dns(self, host: str) -> str:
         try:
@@ -1389,6 +1410,58 @@ def plan_task(message: str, cfg: dict[str, Any], root: Path, settings: dict[str,
     return _parse_plan(out.get("text", ""))
 
 
+def _run_offline(message: str, toolbox: "ToolBox", on_event: Any) -> dict[str, Any]:
+    """Deterministic offline provider (no LLM): apply offline_coder's closed-set edit ops through the
+    ToolBox — so every write is snapshotted/undoable and the workspace-lock + undo protections apply —
+    then verify. Handles scaffolds + mechanical edits; anything else returns an honest 'configure a
+    brain' result instead of dead-ending. See docs/offline-coder-strategy.md."""
+    import offline_coder
+
+    transcript: list[dict[str, Any]] = []
+    try:
+        plan = offline_coder.plan_edits(message, toolbox.root)
+    except Exception as exc:  # noqa: BLE001 - the planner must never crash a run
+        plan = {"ops": [], "needs_brain": True, "summary": f"Offline planner error: {exc}"}
+
+    if plan.get("needs_brain") or not plan.get("ops"):
+        return _finalize(str(plan.get("summary") or "This task needs a configured brain."),
+                         transcript, toolbox, "deterministic", "offline", completed=True)
+
+    for op in plan["ops"]:
+        rel = str(op.get("path") or "")
+        if op.get("kind") == "new_file":
+            try:
+                target = toolbox._resolve(rel)
+            except ToolError as exc:
+                entry = {"tool": "new_file", "input": {"path": rel}, "output": f"refused: {exc}", "is_error": True}
+            else:
+                if target.exists():
+                    # A "new_file" op never clobbers — that's a scaffold, not an overwrite.
+                    entry = {"tool": "new_file", "input": {"path": rel},
+                             "output": f"skipped: {rel} already exists (the offline coder never overwrites)",
+                             "is_error": True}
+                else:
+                    try:
+                        output = toolbox._tool_write_file({"path": rel, "content": op.get("content", "")})
+                        entry = {"tool": "write_file", "input": {"path": rel}, "output": output, "is_error": False}
+                    except ToolError as exc:
+                        entry = {"tool": "write_file", "input": {"path": rel}, "output": f"error: {exc}", "is_error": True}
+        else:
+            entry = {"tool": "unknown", "input": dict(op), "output": f"unsupported op: {op.get('kind')}", "is_error": True}
+        transcript.append(entry)
+        _emit(on_event, {"type": "step", "entry": entry})
+
+    # Verify what was written (py_compile / json / yaml / secret scan) — the SAME gate the LLM loops
+    # use, so an offline run never claims 'done' over broken files.
+    verify_out = toolbox._tool_verify({})
+    v_entry = {"tool": "verify", "input": {}, "output": verify_out, "is_error": "FAIL" in verify_out}
+    transcript.append(v_entry)
+    _emit(on_event, {"type": "step", "entry": v_entry})
+
+    return _finalize(str(plan.get("summary") or f"Applied {len(plan['ops'])} offline edit(s)."),
+                     transcript, toolbox, "deterministic", "offline", completed=True)
+
+
 def run_agent(
     message: str,
     history: list[dict[str, str]],
@@ -1451,7 +1524,10 @@ def run_agent(
     try:
         project_setup = devops_detect.build_project_setup_block(root)
         if project_setup:
-            system_prompt += "\n\n" + project_setup
+            # Repo-derived (it echoes package.json script names, Dockerfile lines, etc. — all
+            # attacker-controllable in a hostile workspace). Frame it as untrusted DATA, not trusted
+            # system text, so an injected script name can't act as an instruction to the agent.
+            system_prompt += "\n\n" + trust.wrap_for_model(project_setup, path="(project setup — repo-derived)")
     except Exception:  # noqa: BLE001 - best-effort, never block a run
         pass
 
@@ -1460,7 +1536,9 @@ def run_agent(
         try:
             repo_map = repomap.build_repo_map(root)
             if repo_map:
-                system_prompt += "\n\n" + repo_map
+                # Repo-derived file/structure listing — a hostile filename could carry an injected
+                # directive, so frame it as untrusted DATA rather than trusted system instruction.
+                system_prompt += "\n\n" + trust.wrap_for_model(repo_map, path="(repo map — repo-derived)")
         except Exception:  # noqa: BLE001 - best-effort, never block a run
             pass
 
@@ -1483,15 +1561,36 @@ def run_agent(
         )
         _emit(on_event, {"type": "plan", "plan": plan})
 
-    if provider == "anthropic":
-        result = _run_anthropic(messages, system_prompt, cfg, settings, toolbox, on_event)
-    elif provider in ("local", "openai"):
-        block = cfg["local"] if provider == "local" else cfg["openai"]
-        result = _run_tool_loop(messages, system_prompt, cfg, block, settings, toolbox, provider, on_event)
-    else:
-        raise AgentError(
-            "No coding brain is configured. Set up a brain (Local model or Claude) first — the agent needs one to think."
-        )
+    try:
+        if not coder.coder_enabled(coder_cfg):
+            # No LLM brain ENABLED (the common default is provider=local but enabled=False) -> the
+            # DETERMINISTIC offline coder (scaffolds + mechanical edits, verify-gated) instead of
+            # dead-ending or trying a disabled provider. It applies a bounded closed set of edit ops
+            # through this toolbox and honestly defers anything it can't template to a configured
+            # brain. See docs/offline-coder-strategy.md.
+            result = _run_offline(message, toolbox, on_event)
+        elif provider == "anthropic":
+            result = _run_anthropic(messages, system_prompt, cfg, settings, toolbox, on_event)
+        elif provider in ("local", "openai"):
+            block = cfg["local"] if provider == "local" else cfg["openai"]
+            result = _run_tool_loop(messages, system_prompt, cfg, block, settings, toolbox, provider, on_event)
+        else:
+            # No LLM brain configured -> the DETERMINISTIC offline coder (scaffolds + mechanical edits,
+            # verify-gated) instead of dead-ending. It applies a bounded, closed set of edit ops through
+            # this same toolbox and honestly defers anything it can't template to a configured brain.
+            result = _run_offline(message, toolbox, on_event)
+    except Exception as exc:
+        # A mid-run failure (API error, timeout, cancel) can leave files ALREADY partially written by
+        # earlier tool calls. Attach the rollback snapshot (+ change list) to the exception so the API
+        # layer can still persist it and offer one-click undo of the partial edits — otherwise the
+        # snapshot (built only at the success path below) is lost and the edits are unrecoverable.
+        try:
+            exc.agent_snapshot = toolbox.snapshot_payload()  # type: ignore[attr-defined]
+            exc.agent_changes = toolbox.change_payload()  # type: ignore[attr-defined]
+            exc.agent_touched = sorted(toolbox.touched)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - snapshot capture must never mask the original error
+            pass
+        raise
     # Attach change tracking (touched files + before/after) for the Workbench.
     result["changes"] = toolbox.change_payload()
     result["touched_files"] = sorted(toolbox.touched)
@@ -1818,6 +1917,10 @@ def restore_snapshot(files: list[dict[str, Any]], workspace: str) -> dict[str, A
                     deleted.append(rel + "/")
                 continue
             if entry.get("existed"):
+                if entry.get("content_unavailable"):
+                    # Pre-existed but its content wasn't captured — leave it untouched rather than
+                    # blanking it with "" (never destroy data we can't faithfully restore).
+                    continue
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(str(entry.get("content") or ""), encoding="utf-8")
                 restored.append(rel)

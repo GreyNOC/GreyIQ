@@ -2,6 +2,34 @@
 
 Notable changes to GreyIQ.
 
+## v1.8.2
+
+### Workbench agent — QA/QC hardening (the real Ollama/Claude code path)
+From an audit of the code-writing path, six defects fixed (each with a regression test):
+- **Prompt-injection surface closed** — repo-derived context (a hostile `package.json`'s script
+  names, the repo map) is now framed as untrusted **data** in the agent's system prompt, not as
+  trusted instructions.
+- **Undo survives a mid-run failure** — a run that fails partway now still attaches (and persists) its
+  rollback snapshot, so partial edits stay one-click undoable.
+- **Rollback never destroys data** — a pre-existing file whose content couldn't be captured is left
+  untouched (not deleted or blanked); `undo` keeps the snapshot when a restore hits an error so you
+  can retry.
+- **One agent run per workspace** — concurrent runs are rejected instead of racing on files and
+  clobbering each other's snapshot.
+- **All tool output is trust-wrapped** — `run_command` / `net_probe` results cross the same
+  untrusted-data boundary as file reads.
+
+### Offline coder — honest degradation instead of garbage (Phase 1)
+The tiny offline model **cannot** write code (64-character context, no code in its training data), so:
+- **Offline chat no longer fakes it** — a code-writing request with no brain configured now returns an
+  honest "configure a Local (Ollama) or Claude brain and use the Workbench agent" message instead of
+  emitting mangled output the quality gate would discard anyway.
+- **A new deterministic offline coder** (`offline_coder.py`) gives no-brain agent runs a real
+  fallback: it scaffolds test stubs and new files from templates through the agent's normal
+  (snapshotted, verify-gated) toolbox, and honestly defers novel logic to a configured brain — rather
+  than dead-ending. See [docs/offline-coder-strategy.md](docs/offline-coder-strategy.md) for the full
+  plan (retrieval, verify→repair, and distilling real Claude/Ollama runs into reusable templates).
+
 ## v1.8.1
 
 ### Whole-app QA/QC — 33 verified defect fixes
