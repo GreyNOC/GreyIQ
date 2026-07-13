@@ -15,6 +15,7 @@ from bughunter.code_scanner.model import ScanRequest, ScanResult, ScanTargetType
 from bughunter.code_scanner.redaction import redact_finding_snippets
 from bughunter.code_scanner.rules import ALL_RULES
 from bughunter.code_scanner.sources import resolve_source
+from bughunter.code_scanner.sources.git_local import LocalGitSource
 from bughunter.code_scanner.sources.local import LocalPathSource
 from bughunter.code_scanner.suppression import is_suppressed
 from bughunter.code_scanner.walker import detect_language, walk_collect
@@ -38,8 +39,14 @@ def scan_target(request: ScanRequest) -> ScanResult:
         # configured base path. The default empty string keeps the
         # behaviour the local CLI / Electron user expects; deployments
         # set CODE_SCAN_BASE_PATH to lock the API down.
+        #
+        # Gate on the resolved source type, not on target_type == PATH:
+        # a git_local target (LocalGitSource) also walks an arbitrary
+        # in-place host path, so it must be contained too. Remote git and
+        # archive sources extract into a private tempdir, so they are
+        # exempt (their root is never an operator-chosen host path).
         base = get_settings().code_scan_base_path
-        if base and request.target_type == ScanTargetType.PATH:
+        if base and isinstance(source, (LocalPathSource, LocalGitSource)):
             base_path = Path(base).expanduser().resolve()
             resolved_root = root.resolve()
             if not (

@@ -702,7 +702,10 @@ def _check_open_redirect(http: _Http, url: str, extra_params: list[str] | None =
             try:
                 control = http.fetch(_with_query(url, {param: "/greyiq-control"}))
             except _ActiveError:
-                control = {"location": ""}
+                # The negative control is what proves the redirect target is attacker-supplied
+                # (not a static redirect). If we could not observe it, an empty control must NOT
+                # count as a passing differential — skip this candidate rather than confirm.
+                continue
             ctrl_loc = (control.get("location") or "").strip()
             if _MARKER_HOST not in ctrl_loc:
                 proof = _proof(
@@ -830,7 +833,10 @@ def _check_host_header(http: _Http, url: str) -> dict[str, Any] | None:
     try:
         control = http.fetch(url)
     except _ActiveError:
-        control = {"location": "", "body": ""}
+        # The negative control (real Host) is the FP suppressor that proves the marker is
+        # header-driven and not already present under the real Host. Without observing it we
+        # cannot confirm — bail rather than treat an empty control as a passing differential.
+        return None
     if _MARKER_HOST in (control.get("location") or "") or _MARKER_HOST in (control.get("body") or ""):
         return None  # marker present without our header → not header-driven
     in_location = _MARKER_HOST in location
@@ -1633,7 +1639,10 @@ def _forge_alg_none_variants(token: str) -> list[str]:
         return []
     try:
         header_obj = json.loads(_b64url_decode(parts[0]))
-    except (ValueError, binascii.Error, UnicodeDecodeError, json.JSONDecodeError):
+    # RecursionError (a RuntimeError, NOT a ValueError subclass) is raised by json.loads on a
+    # crafted deeply-nested header from an untrusted target token — catch it so a malformed token
+    # is a clean skip, never a crash that aborts the whole active pass.
+    except (ValueError, binascii.Error, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return []
     if not isinstance(header_obj, dict) or str(header_obj.get("alg", "")).strip().lower() == "none":
         return []
@@ -1782,7 +1791,9 @@ def _fetch_rsa_public_pems(http: _Http, url: str, kid: str = "") -> list[bytes]:
             continue
         try:
             doc = json.loads(resp.get("body") or "")
-        except (ValueError, json.JSONDecodeError):
+        # RecursionError guards against a deeply-nested JWKS served by the target (json.loads raises
+        # RecursionError, not ValueError) — skip that key source rather than crashing the pass.
+        except (ValueError, json.JSONDecodeError, RecursionError):
             continue
         # An OpenID discovery doc points at the JWKS via jwks_uri — follow it ONCE, same-host only.
         if isinstance(doc, dict) and doc.get("jwks_uri") and "keys" not in doc:
@@ -1790,7 +1801,9 @@ def _fetch_rsa_public_pems(http: _Http, url: str, kid: str = "") -> list[bytes]:
                 jwks_uri = str(doc["jwks_uri"])
                 if (urlparse(jwks_uri).hostname or "").lower() == (parsed.hostname or "").lower():
                     doc = json.loads((http.fetch(jwks_uri).get("body") or ""))
-            except (_ActiveError, ValueError, json.JSONDecodeError):
+            # RecursionError: the followed jwks_uri may serve deeply-nested JSON — treat like any
+            # other parse failure instead of letting it abort the active pass.
+            except (_ActiveError, ValueError, json.JSONDecodeError, RecursionError):
                 continue
         for key in (doc.get("keys") if isinstance(doc, dict) else None) or []:
             if not isinstance(key, dict) or key.get("kty") != "RSA" or not key.get("n") or not key.get("e"):
@@ -1830,7 +1843,9 @@ def _check_jwt_alg_confusion(http: _Http, url: str, discovered_token: str = "") 
         return None
     try:
         header = json.loads(_b64url_decode(parts[0]))
-    except (ValueError, binascii.Error, UnicodeDecodeError, json.JSONDecodeError):
+    # RecursionError (not a ValueError subclass) from a crafted deeply-nested header must not crash
+    # the pass — a malformed token is simply not proof of alg confusion.
+    except (ValueError, binascii.Error, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return None
     alg = str(header.get("alg", "")).strip().upper() if isinstance(header, dict) else ""
     if alg not in _RS_TO_HS:
@@ -1923,7 +1938,9 @@ def _crack_jwt_hs_secret(token: str) -> tuple[str, str] | None:
     try:
         header = json.loads(_b64url_decode(parts[0]))
         real_sig = _b64url_decode(parts[2])
-    except (ValueError, binascii.Error, UnicodeDecodeError, json.JSONDecodeError):
+    # RecursionError from a crafted deeply-nested header must not crash the pass; a malformed
+    # token is simply un-crackable, not an error to propagate.
+    except (ValueError, binascii.Error, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return None
     alg = str(header.get("alg", "")).strip().upper() if isinstance(header, dict) else ""
     digest = _JWT_HS_DIGEST.get(alg)
@@ -2355,7 +2372,12 @@ def verify_active(
     # by the alg:none check when the operator supplied no JWT credential, so it can test the app's OWN
     # token for a signature-verification bypass. Extracted from a response already fetched (no request);
     # the check re-validates the token authenticates before proving anything, so a stray token is a no-op.
-    discovered_jwt = _extract_jwt_token(landing)
+    # This runs OUTSIDE the per-check try/except below, so belt-and-suspenders: a malformed landing
+    # body (e.g. a crafted token whose header blows the recursion limit) must never abort the pass.
+    try:
+        discovered_jwt = _extract_jwt_token(landing)
+    except Exception:  # noqa: BLE001 - a crafted landing body is a no-op, never a crash
+        discovered_jwt = ""
     # Order: header-only first (cheap), then the request-heavier probes. Each check
     # is wrapped so a budget exhaustion stops cleanly without raising.
     # Each check is tagged with the normalized vuln class it confirms, so the reasoning layer's

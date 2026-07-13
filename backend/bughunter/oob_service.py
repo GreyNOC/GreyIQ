@@ -84,13 +84,26 @@ def poll_collaborator(base: str, secret: str, token: str, *, timeout: float = 8.
         if exc.code == 401:
             return {"ok": False, "error": "collaborator poll unauthorized — check the OOB secret."}
         return {"ok": False, "error": f"collaborator poll HTTP {exc.code}"}
-    except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError) as exc:
+    except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError, RecursionError) as exc:
+        # RecursionError (a RuntimeError subclass, NOT a ValueError) is raised by json.loads on a
+        # deeply-nested body ('[' * 100000) that a proxy/LB/MITM on the public tunnel can serve —
+        # catch it here so a pathological body degrades to a graceful error, never aborts the sweep.
         return {"ok": False, "error": f"collaborator poll failed: {exc}"}
     # The collaborator's response may not be a JSON object (a misconfigured tunnel/proxy,
     # a load-balancer error page rendered as JSON, or a buggy collaborator could return an
     # array/string/number) — normalize to {} so a non-dict body never crashes the poll.
     data = data if isinstance(data, dict) else {}
-    return {"ok": True, "count": int(data.get("count") or 0), "hits": data.get("hits") or []}
+    # A dict body can still carry wrong-typed fields. Coerce defensively: a non-int-convertible
+    # count (e.g. "N/A", a list/dict) degrades to 0 instead of raising outside the try, and hits
+    # is reduced to a list of dict entries so a confirm site can require a genuine dict hit before
+    # treating count>0 as a proven callback (a non-list/empty hits must never false-confirm).
+    try:
+        count = int(data.get("count") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    raw_hits = data.get("hits")
+    hits = [h for h in raw_hits if isinstance(h, dict)] if isinstance(raw_hits, list) else []
+    return {"ok": True, "count": count, "hits": hits}
 
 
 def _build_ssrf_finding(target_url: str, param: str, token: str, base: str, hit: dict[str, Any], confirmed: bool = True) -> dict[str, Any]:
@@ -240,11 +253,12 @@ def confirm_blind_ssrf(
             if not res.get("ok"):
                 poll_errors.append(res.get("error", "poll failed"))
                 break  # transient poll failure for THIS param — move on, don't abort the sweep
-            if res.get("count"):
+            if res.get("count") and res.get("hits"):
                 # The token went 0 -> N only AFTER our probe, and it is unguessable, so the
-                # callback resulted from this probe. A known crawler/bot/link-preview UA is
-                # downgraded to a CANDIDATE (it may be a log-scanner / unfurler, not the
-                # target's own server-side fetch).
+                # callback resulted from this probe. Require a real dict hit (not just a
+                # positive count) so a malformed count>0/hits=[] body can't false-confirm.
+                # A known crawler/bot/link-preview UA is downgraded to a CANDIDATE (it may be
+                # a log-scanner / unfurler, not the target's own server-side fetch).
                 hit = (res.get("hits") or [{}])[0]
                 ua = (hit.get("headers") or {}).get("user-agent", "")
                 confirmed = not _is_crawler_ua(ua)
@@ -460,7 +474,9 @@ def confirm_blind_xxe(
             if not res.get("ok"):
                 poll_errors.append(res.get("error", "poll failed"))
                 break
-            if res.get("count"):
+            # Require a genuine dict hit, not just count>0, so a malformed collaborator body
+            # (count>0 with empty/non-list hits) can't fabricate a confirmed XXE finding.
+            if res.get("count") and res.get("hits"):
                 return _xxe_finding_from_hit(sanitized, token, base, (res.get("hits") or [{}])[0])
         return {"ok": True, "status": "no-callback", "token": token, "sent": True, "payloads": payloads,
                 "poll_errors": poll_errors,
@@ -476,7 +492,7 @@ def confirm_blind_xxe(
     res = poll_collaborator(base, secret, token, timeout=settings.web_fetch_timeout_seconds)
     if not res.get("ok"):
         return {"ok": False, "error": res.get("error", "collaborator poll failed")}
-    if res.get("count"):
+    if res.get("count") and res.get("hits"):  # a real dict hit is required, not just a count
         return _xxe_finding_from_hit(sanitized, token, base, (res.get("hits") or [{}])[0])
     return {"ok": True, "status": "no-callback", "token": token, "payloads": payloads,
             "reason": "no callback yet for this token — deliver the payload to an XML endpoint, then poll again."}

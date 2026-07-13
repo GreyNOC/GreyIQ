@@ -20,6 +20,7 @@ import dataclasses
 import hashlib
 import json
 import re
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ from bughunter import (
     progress,
     ranking,
     recon,
+    report,
     research,
     scan_auth,
     screenshot_service,
@@ -48,6 +50,7 @@ from bughunter import (
     web_ingest,
 )
 from bughunter.bounty import _classify, _infer_kind, _safe_slug, build_findings_har, build_replay_script, run_bounty_hunt
+from bughunter.rate_limit import shared_governor
 from bughunter.registrable_domain import registrable_domain
 from bughunter.settings import get_settings
 from bughunter.target_ingest import _normalize_one
@@ -97,6 +100,19 @@ def _campaign_risk(consolidated: list[dict[str, Any]]) -> str:
         if sev in present:
             return label
     return "low" if consolidated else "clean"
+
+
+def _resolved_severity_finding(item: dict[str, Any]) -> dict[str, Any]:
+    """A shallow copy of a consolidated item's finding whose ``severity`` has been resolved the
+    SAME way the per-target report resolves it — the modelled plan CVSS (impact_model) wins over
+    the raw scanner label. Feeding these into _severity_counts/_campaign_risk keeps the campaign
+    tally in agreement with each per-target report; reading finding['severity'] directly
+    under-reports an active-confirmed finding whose scanner label ('medium') sits below the
+    modelled tier ('high'), the exact miscount the per-target layer already guards (bounty.py)."""
+    finding = item.get("finding") or {}
+    cvss = item.get("cvss")
+    plan = {"cvss": cvss} if isinstance(cvss, dict) and cvss else None
+    return {**finding, "severity": report.resolve_severity(finding, plan)}
 
 
 def _capture_proof_screenshots(items: list[dict[str, Any]], shot_dir: Path, target: str, scope: Any,
@@ -224,6 +240,7 @@ def _run_campaign_body(
     policy_profile: str = "",
     progress_run_id: str | None = None,
     progress_unit: str | None = None,
+    submission_claim: tuple[set[str], "threading.Lock"] | None = None,
 ) -> dict[str, Any]:
     """Run a full campaign. Returns {ok, campaign_path, json_path, urls_scanned,
     finding_count, confirmed_count, submission_paths, ...} or {ok: False, error}.
@@ -311,7 +328,17 @@ def _run_campaign_body(
         # in-scope cross-host expansion (a wildcard program) is followed and ONLY
         # in-scope hosts are ever fetched -- excluded_hosts rides on campaign_settings.
         scope_gate = (lambda h: active_verify_service.host_in_active_scope(h, scope, campaign_settings)) if str(scope or "").strip() else None
-        rec = recon.discover(clean_target, max_pages=max_pages, scope_in=scope_gate)
+        # Draw passive recon from the PROCESS-WIDE per-host token bucket, so concurrent span/portfolio
+        # workers crawling the same host (a wildcard program whose targets recon-expand to a shared
+        # host/CDN) don't each build their own governor and multiply the per-host request rate/burst.
+        rec = recon.discover(
+            clean_target, max_pages=max_pages, scope_in=scope_gate,
+            governor=shared_governor(
+                capacity=campaign_settings.active_max_requests_per_host,
+                min_interval_s=campaign_settings.active_min_interval_ms / 1000.0,
+                pool="recon",  # a SEPARATE per-host bucket from the active prover — recon must not drain it
+            ),
+        )
         urls = rec.get("urls") or [clean_target]
         recon_notes = rec.get("notes") or []
         recon_sources = rec.get("sources") or {}
@@ -776,10 +803,25 @@ def _run_campaign_body(
     # finding already reported in a prior run). ---
     submission_paths: list[str] = []
     sub_dir = out_root / "submissions"
+    claimed_keys, claim_lock = submission_claim if submission_claim else (None, None)
     for rank_i, item in enumerate(consolidated, 1):
         if item.get("duplicate_of_prior"):
             continue  # already reported in a previous run — don't re-emit a package
         finding = item["finding"]
+        # Cross-target dedup within a CONCURRENT span/portfolio: two targets of a wildcard program
+        # can recon-expand to the same in-scope URL and surface the SAME finding (identical
+        # dedup_key). duplicate_of_prior is decided at upsert time but the ledger isn't advanced to
+        # 'reported' until below (after write_submission_package's disk I/O), so the per-ledger gate
+        # can't stop two concurrent workers from EACH packaging it. Atomically claim the dedup_key
+        # here so exactly one identical package is built across the span (no double-counted funnel,
+        # no duplicate-report/spam risk if the bundle is bulk-filed).
+        if claim_lock is not None:
+            key = str(item.get("dedup_key") or "")
+            if key:
+                with claim_lock:
+                    if key in claimed_keys:
+                        continue  # another concurrent target already packaged this exact finding
+                    claimed_keys.add(key)
         if item.get("plan") is not None:
             # Synthetic finding (e.g. known-CVE) carries its plan inline — build the minimal
             # ctx its submission needs instead of reading a per-target JSON sidecar it has none.
@@ -796,10 +838,16 @@ def _run_campaign_body(
         if package:
             item["submission_path"] = package["markdown_path"]
             submission_paths.append(package["markdown_path"])
-            if rt is not None:
-                ledger.mark_reported(rt, program, clean_target, finding)
-            # Log confirmed findings to the learning store so outcomes can be recorded.
+            # Only advance the ledger to 'reported' for a CONFIRMED package. A candidate/unconfirmed
+            # lead still gets its local package written above, but must NOT mark itself 'reported':
+            # otherwise a later --active run that CONFIRMS the same finding sees the prior stage
+            # (>= reported), is flagged duplicate_of_prior, and is skipped — its confirmed proof
+            # package (screenshot/replay/differential) is never built and the operator is told a
+            # payable bug was "already reported" when nothing was ever filed. (ledger.is_submitted's
+            # own docstring warns against gating re-packaging on >= reported for exactly this reason.)
             if rt is not None and item["proof_status"] == "confirmed":
+                ledger.mark_reported(rt, program, clean_target, finding)
+                # Log confirmed findings to the learning store so outcomes can be recorded.
                 learning.record_outcome(
                     rt, program=program, target=clean_target, class_id=str(finding.get("class_id") or "other"),
                     title=str(finding.get("title") or ""), status="submitted", severity=str(finding.get("severity") or ""),
@@ -868,8 +916,10 @@ def _run_campaign_body(
         "cvss": cvss_out,
         "attack_plans": plans_out,
         "surface": {"urls": urls, "sources": recon_sources, "notes": recon_notes, "tech": recon_tech},
-        "severity_counts": _severity_counts([item["finding"] for item in consolidated]),
-        "risk": _campaign_risk(consolidated),
+        # Resolve each finding's severity through its modelled cvss (matching the per-target
+        # report tally) before counting, so an active-confirmed finding isn't under-reported.
+        "severity_counts": _severity_counts([_resolved_severity_finding(item) for item in consolidated]),
+        "risk": _campaign_risk([{"finding": _resolved_severity_finding(item)} for item in consolidated]),
     }
 
 
@@ -999,6 +1049,12 @@ def run_campaign_over_targets(
     if auth is None and account_access:
         auth = _login_auth(account_access, scope, excluded_hosts, _emit)
 
+    # Shared submission claim: the span's targets run CONCURRENTLY (below), and two targets can
+    # surface the same finding (identical dedup_key). This process-local set + lock lets each
+    # inner run_campaign atomically claim a dedup_key before packaging, so exactly one identical
+    # submission package is produced across the span instead of a race-duplicated pair.
+    submission_claim: tuple[set[str], threading.Lock] = (set(), threading.Lock())
+
     # One wrapping folder for the whole span; each per-target run_campaign() call nests
     # its OWN campaign-<slug>-<stamp> folder inside it (run_campaign builds that path
     # itself from whatever default_reports_dir it's given) -- so the existing "download
@@ -1061,6 +1117,7 @@ def run_campaign_over_targets(
                 admin_account_access=admin_account_access, idor_pairs=idor_pairs, include_attack_map=include_attack_map,
                 policy_profile=policy_profile,
                 progress_run_id=progress_run_id, progress_unit=unit,
+                submission_claim=submission_claim,  # dedup identical findings across concurrent targets
             )
             if progress_unit is None:
                 if result.get("ok"):
@@ -1164,8 +1221,12 @@ def run_campaign_over_targets(
         "cvss": cvss_out,
         "attack_plans": plans_out,
         "surface": {"urls": surface_urls, "sources": surface_sources, "notes": surface_notes, "tech": surface_tech},
-        "severity_counts": _severity_counts(findings_out),
-        "risk": _campaign_risk([{"finding": f} for f in findings_out]),
+        # Resolve severity through each finding's modelled cvss (cvss_out shares the C-ref key)
+        # so the span tally matches each per-target report instead of the raw scanner label.
+        "severity_counts": _severity_counts(
+            [_resolved_severity_finding({"finding": f, "cvss": cvss_out.get(f.get("ref"), {})}) for f in findings_out]),
+        "risk": _campaign_risk(
+            [{"finding": _resolved_severity_finding({"finding": f, "cvss": cvss_out.get(f.get("ref"), {})})} for f in findings_out]),
     }
 
 
@@ -1356,7 +1417,12 @@ def run_portfolio_campaign(
         "finding_count": len(findings_out), "confirmed_count": confirmed_count, "submission_paths": submission_paths,
         "findings": findings_out, "proof_of_impact": proof_out, "cvss": cvss_out, "attack_plans": plans_out,
         "surface": {"urls": surface_urls, "sources": surface_sources, "notes": surface_notes, "tech": surface_tech},
-        "severity_counts": _severity_counts(findings_out), "risk": _campaign_risk([{"finding": f} for f in findings_out]),
+        # Resolve severity through each finding's modelled cvss (cvss_out shares the C-ref key),
+        # so the portfolio tally matches the per-program/per-target reports.
+        "severity_counts": _severity_counts(
+            [_resolved_severity_finding({"finding": f, "cvss": cvss_out.get(f.get("ref"), {})}) for f in findings_out]),
+        "risk": _campaign_risk(
+            [{"finding": _resolved_severity_finding({"finding": f, "cvss": cvss_out.get(f.get("ref"), {})})} for f in findings_out]),
     }
 
 

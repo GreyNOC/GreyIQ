@@ -40,7 +40,10 @@ _SECRET_VALUE_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"\bnpm_[A-Za-z0-9]{36}\b"),
     re.compile(r"\bSG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}\b"),
     re.compile(r"\bdop_v1_[a-f0-9]{64}\b"),
-    re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{16,}\b"),
+    # JWT by shape. Thresholds MIRROR ``sensitive_data._JWT_RE`` ({5,}/{5,}/{5,}) so every JWT the
+    # classifier NAMES is also strippable here — a stricter {8,}/{8,}/{16,} let a short-signature or
+    # compact-payload JWT be named "a JWT" yet left verbatim in an "already redacted" excerpt.
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{5,}\.eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\b"),
 )
 
 # Generic password-style assignment: keyword = "value". For these we
@@ -108,7 +111,6 @@ _KEYED_SESSION_VALUE_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     ),
 )
 
-
 def _short_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
@@ -167,7 +169,33 @@ def _redact_text(text: str) -> tuple[str, bool]:
         redacted_any = True
         text = new_text
 
-    # Generic password assignment — redact the value half.
+    # Key-anchored session/bearer/OAuth/CSRF material — redact the value half, keep the field name.
+    # MUST run BEFORE the generic-password pass: its value charset includes '.', so it strips a whole
+    # dotted JWT in an ``access_token``/``session_id`` field. The generic-password pass's value charset
+    # EXCLUDES '.', so if it ran first it would match only the JWT header (up to the first dot), break
+    # the ``eyJ.eyJ.`` structure, and leave the payload+signature verbatim where neither the keyed nor
+    # the JWT-shape pass could re-match — leaking a recoverable token into an "already redacted" excerpt.
+    for pattern in _KEYED_SESSION_VALUE_PATTERNS:
+        new_text, count = pattern.subn(
+            lambda m: f"{m.group(1)}{_format_redacted(m.group(2))}", text
+        )
+        if count:
+            redacted_any = True
+            text = new_text
+
+    # Vendor-specific value patterns (incl. the JWT shape) — also BEFORE generic-password so a bare
+    # JWT in a non-keyword field is stripped by structure before the dot-truncating pass can chew it.
+    for pattern in _SECRET_VALUE_PATTERNS:
+        def _replace(match: re.Match[str]) -> str:
+            return _format_redacted(match.group(0))
+
+        new_text, count = pattern.subn(_replace, text)
+        if count:
+            redacted_any = True
+            text = new_text
+
+    # Generic password assignment — redact the value half. Runs after the structured passes above so a
+    # dotted token in a password/token field was already fully stripped by shape.
     def _replace_password(match: re.Match[str]) -> str:
         prefix, value = match.group(1), match.group(2)
         return f"{prefix}{_format_redacted(value)}"
@@ -183,25 +211,6 @@ def _redact_text(text: str) -> tuple[str, bool]:
     if count:
         redacted_any = True
         text = new_text
-
-    # Key-anchored session/bearer/OAuth/CSRF material — redact the value half, keep the field name.
-    for pattern in _KEYED_SESSION_VALUE_PATTERNS:
-        new_text, count = pattern.subn(
-            lambda m: f"{m.group(1)}{_format_redacted(m.group(2))}", text
-        )
-        if count:
-            redacted_any = True
-            text = new_text
-
-    # Vendor-specific value patterns.
-    for pattern in _SECRET_VALUE_PATTERNS:
-        def _replace(match: re.Match[str]) -> str:
-            return _format_redacted(match.group(0))
-
-        new_text, count = pattern.subn(_replace, text)
-        if count:
-            redacted_any = True
-            text = new_text
 
     return text, redacted_any
 

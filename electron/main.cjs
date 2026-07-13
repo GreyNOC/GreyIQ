@@ -61,6 +61,8 @@ let backendExited = false;
 let startupError = '';
 let quitting = false;
 let logStream = null;
+let logBytes = 0;  // bytes written to the current backend.log since it was (re)opened; drives mid-session rolling
+const LOG_MAX_BYTES = 5 * 1024 * 1024;
 
 function backendLogPath() {
   try {
@@ -189,11 +191,31 @@ async function waitForBackend(port) {
   return false;
 }
 
+// Roll the live log mid-session once it crosses the cap. The spawn-time roll only
+// fires once per launch, so a long-lived, chatty session would otherwise append to
+// backend.log without bound (hundreds of MB). Mirror the spawn-time roll here.
+function rollBackendLog() {
+  const logPath = backendLogPath();
+  if (!logPath) return;
+  try {
+    if (logStream) { try { logStream.end(); } catch (_) { /* ignore */ } }
+    try { fs.rmSync(`${logPath}.1`, { force: true }); } catch (_) { /* no prior backup */ }
+    try { fs.renameSync(logPath, `${logPath}.1`); } catch (_) { /* best-effort roll */ }
+    logStream = fs.createWriteStream(logPath, { flags: 'a' });
+    logBytes = 0;
+  } catch (_) {
+    logStream = null;
+  }
+}
+
 function teeBackendOutput(chunk) {
   process.stdout.write(`[GreyIQ] ${chunk}`);
   if (logStream) {
     try {
       logStream.write(chunk);
+      // chunk is a Buffer on stdio pipes, so .length is the byte count.
+      logBytes += chunk.length;
+      if (logBytes > LOG_MAX_BYTES) rollBackendLog();
     } catch (_) {
       // Logging is best-effort; never let it crash startup.
     }
@@ -222,7 +244,6 @@ async function startBackend() {
   // a packaged GUI app has no attached console. Bound its growth: an append-only log with no cap
   // inflates to hundreds of MB over months of launches / chatty engine sessions and can exhaust a
   // small disk. Roll to a single .1 backup once it passes the cap, then keep appending to a fresh file.
-  const LOG_MAX_BYTES = 5 * 1024 * 1024;
   try {
     const logPath = backendLogPath();
     try {
@@ -232,7 +253,12 @@ async function startBackend() {
       }
     } catch (_) { /* no existing log yet */ }
     logStream = fs.createWriteStream(logPath, { flags: 'a' });
-    logStream.write(`\n===== GreyIQ backend start ${new Date().toISOString()} (${command.exe}) =====\n`);
+    // Seed the running byte counter with the size already on disk (flags:'a' appends),
+    // so mid-session rolling accounts for pre-existing content, not just this session's writes.
+    try { logBytes = fs.statSync(logPath).size; } catch (_) { logBytes = 0; }
+    const startBanner = `\n===== GreyIQ backend start ${new Date().toISOString()} (${command.exe}) =====\n`;
+    logStream.write(startBanner);
+    logBytes += Buffer.byteLength(startBanner);
   } catch (_) {
     logStream = null;
   }

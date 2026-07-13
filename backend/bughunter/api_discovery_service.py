@@ -90,10 +90,13 @@ def parse_spec_body(body: str, is_yaml_hint: bool = False) -> Any:
                 return loaded
         except Exception:  # pragma: no cover - malformed YAML
             return None
-    # last resort: a JSON body that didn't start with {/[ (rare) but is still valid JSON
+    # last resort: a JSON body that didn't start with {/[ (rare) but is still valid JSON.
+    # RecursionError (deeply-nested hostile JSON) is a RuntimeError, not a ValueError, so it
+    # must be caught explicitly here too — matching the first-block guard above — otherwise a
+    # stripped build (_yaml is None) re-raises it and breaks the "never raises" contract.
     try:
         return json.loads(text)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return None
 
 
@@ -302,6 +305,11 @@ def _ingest_spec(spec_url: str, r: dict[str, Any], in_scope: Callable[[str], boo
     with its scope-gated endpoints + params. Returns True when a spec was ingested."""
     body = r.get("body") or ""
     final = r.get("final_url") or spec_url
+    # Re-gate on the POST-redirect final_url: an in-scope spec URL can 302 to a public OOS host
+    # (the injected fetch's redirect guard is SSRF-only, not scope-aware). Without this, the OOS
+    # spec's attacker-chosen param names (out["params"]) would leak into the prover's surface.
+    if not in_scope(final):
+        return False
     is_yaml = final.split("?", 1)[0].lower().endswith((".yaml", ".yml"))
     spec = parse_spec_body(body, is_yaml_hint=is_yaml)
     if not isinstance(spec, dict):
@@ -397,6 +405,11 @@ def discover_api_surface(
             continue
         r = fetch(f"{url}?query={enc}")
         if not r or int(r.get("status") or 0) != 200:
+            continue
+        # Re-gate on the post-redirect final_url before crediting introspection to `url`: an
+        # in-scope /graphql can 302 to a public OOS host whose schema would otherwise be reported
+        # as enabled on the in-scope target (a false finding on the wrong host).
+        if not in_scope(r.get("final_url") or url):
             continue
         body = r.get("body") or ""
         if not _looks_like_json(body):

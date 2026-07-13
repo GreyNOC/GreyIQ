@@ -58,7 +58,13 @@ class HostRateGovernor:
             state["next_send"] = send_at + self.min_interval_s
             wait = send_at - now
         if wait > 0:
-            time.sleep(min(wait, self.min_interval_s))
+            # Sleep the FULL reserved remainder, not min(wait, min_interval_s):
+            # capping at one interval let concurrent callers holding far-future
+            # slots (2..N intervals out) all wake after a single interval and fire
+            # together, collapsing the per-host floor into a per-thread one and
+            # bursting N requests at one host per tick. The token bucket already
+            # bounds total volume, so honoring the full wait is safe.
+            time.sleep(wait)
         return True
 
     def remaining(self, host: str) -> int:
@@ -81,15 +87,24 @@ _shared_lock = threading.Lock()
 _shared_governors: dict[tuple[int, float, float], "HostRateGovernor"] = {}
 
 
-def shared_governor(capacity: int = 20, min_interval_s: float = 0.5, refill_per_s: float = 0.5) -> "HostRateGovernor":
+def shared_governor(capacity: int = 20, min_interval_s: float = 0.5, refill_per_s: float = 0.5,
+                    pool: str = "") -> "HostRateGovernor":
     """Return a PROCESS-WIDE HostRateGovernor for this config so every concurrent hunt hitting the same
     registrable host draws from ONE token bucket. The governor already keys its buckets by host
     internally, so a single instance spans every host. Keyed by config: a differently-tuned caller
-    gets its own shared instance; identical config -> the same instance. Thread-safe."""
-    key = (max(1, int(capacity)), max(0.0, float(min_interval_s)), max(0.0, float(refill_per_s)))
+    gets its own shared instance; identical config -> the same instance. Thread-safe.
+
+    ``pool`` namespaces the bucket: two callers with the SAME config but a DIFFERENT pool get
+    SEPARATE process-wide governors. This keeps the passive-recon crawl (pool='recon') from draining
+    the SAME per-host token bucket the active prover uses (pool=''): the recon and active layers are
+    sized independently, so sharing one bucket lets a crawl starve the active pass of every token
+    (no probes fire, no findings). Recon workers still share ONE 'recon' bucket per host across
+    concurrent span/portfolio targets, which is the multi-worker rate-multiplication this guards."""
+    cfg = (max(1, int(capacity)), max(0.0, float(min_interval_s)), max(0.0, float(refill_per_s)))
+    key = (str(pool), *cfg)
     with _shared_lock:
         gov = _shared_governors.get(key)
         if gov is None:
-            gov = HostRateGovernor(*key)
+            gov = HostRateGovernor(*cfg)
             _shared_governors[key] = gov
         return gov

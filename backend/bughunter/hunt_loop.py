@@ -51,8 +51,11 @@ def iterative_enabled(coder_cfg: dict[str, Any] | None, settings: Any = None) ->
 
 
 def _dedup_key(finding: dict[str, Any]) -> str:
+    # verify_active/_finding tags the class on `_active_class_hint` (and `category`),
+    # never `class_id` — read the real keys so the class component isn't always None.
+    cls = finding.get("_active_class_hint") or finding.get("category") or ""
     loc = re.sub(r"\d+", "N", str(finding.get("location") or finding.get("file_path") or ""))
-    return f"{finding.get('class_id')}|{finding.get('rule_id')}|{loc}"
+    return f"{cls}|{finding.get('rule_id')}|{loc}"
 
 
 def _observations_digest(findings: list[dict[str, Any]], meta: dict[str, Any]) -> str:
@@ -62,7 +65,10 @@ def _observations_digest(findings: list[dict[str, Any]], meta: dict[str, Any]) -
     for f in findings[:12]:
         proof = f.get("_active_proof") if isinstance(f.get("_active_proof"), dict) else {}
         rows.append({
-            "class": str(f.get("class_id") or f.get("class_name") or ""),
+            # verify_active/_finding never sets class_id/class_name — the class lives
+            # on `_active_class_hint` (or `category`). Read those so the brain actually
+            # sees which class was confirmed instead of a blank string every row.
+            "class": str(f.get("_active_class_hint") or f.get("category") or ""),
             "status": str(proof.get("status") or "candidate"),
             "observed": str(proof.get("observed_result") or "")[:200],
         })

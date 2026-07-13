@@ -104,6 +104,13 @@ def _extract_links(body: str, base_url: str) -> list[str]:
             continue
         if absolute.lower().endswith(_SKIP_EXT):
             continue
+        # A client-side framework template (e.g. href="/user/{{id}}/profile") urljoins to a
+        # literal-brace URL — urljoin does NOT percent-encode braces — that is a guaranteed junk
+        # route: fetching it burns a per-campaign request-budget slot and surfaces a template URL
+        # to the active prover + report. parse_openapi refuses to hand a braced URL to the prover
+        # for exactly this reason (api_discovery_service.py); mirror that guard here.
+        if "{" in absolute or "}" in absolute:
+            continue
         if absolute.startswith(("http://", "https://")):
             out.append(absolute)
     return out
@@ -316,6 +323,8 @@ def discover(
                 continue
             ep = _clean(val)
             if ep in seen or len(discovered) >= max_pages:
+                continue
+            if "{" in ep or "}" in ep:  # a templated endpoint (e.g. https://host/{tenant}/authorize) is not a real URL
                 continue
             if not in_scope(ep):  # a federated endpoint on an external IdP host — drop it
                 dropped_oos += 1

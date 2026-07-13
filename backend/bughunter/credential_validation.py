@@ -619,12 +619,24 @@ def _sigv4_headers(access_key_id: str, secret_access_key: str, amzdate: str, dat
     return {"X-Amz-Date": amzdate, "Authorization": authorization}
 
 
+# STS <Code> values that genuinely prove the key pair is invalid/inactive (=> dead). A 403/401 with
+# ANY OTHER code (or none) — notably RequestTimeTooSkewed (host clock drift) or Throttling — does NOT
+# prove the key is dead: the signature was accepted, only the timestamp/rate was rejected. Mark those
+# inconclusive rather than under-report a genuinely live (possibly admin) key.
+_AWS_DEAD_CODES = frozenset({
+    "SignatureDoesNotMatch", "InvalidClientTokenId", "InvalidAccessKeyId", "AccessDenied",
+    "UnrecognizedClientException", "InvalidSignatureException", "ExpiredToken",
+    "TokenRefreshRequired", "InvalidToken",
+})
+
+
 def validate_aws_key(access_key_id: str, secret_access_key: str) -> dict[str, Any]:
     """Validate a leaked AWS access key + secret via SigV4-signed ``sts:GetCallerIdentity`` — ONE
     benign, read-only GET to the key's OWN issuer (AWS STS, never the target). A 200 returns the
-    caller's ARN/account (the key is live and identified); a 403 (SignatureDoesNotMatch /
-    InvalidClientTokenId) means the pair is invalid/inactive. NO resource is read — GetCallerIdentity
-    returns only the caller's own identity."""
+    caller's ARN/account (the key is live and identified); a 403 with a genuine invalid-credential
+    <Code> (SignatureDoesNotMatch / InvalidClientTokenId / …) means the pair is invalid/inactive,
+    while a 403 from clock skew (RequestTimeTooSkewed) or throttling is inconclusive, not dead. NO
+    resource is read — GetCallerIdentity returns only the caller's own identity."""
     access_key_id = str(access_key_id or "").strip()
     secret_access_key = str(secret_access_key or "").strip()
     result = _credential_result("AWS sts:GetCallerIdentity")
@@ -662,9 +674,20 @@ def validate_aws_key(access_key_id: str, secret_access_key: str) -> dict[str, An
         return result
     err = (re.search(r"<Code>([^<]+)</Code>", body) or [None, ""])[1]
     if status in (403, 401):
-        result.update(live=False)
         result["response_excerpt"] = f"error={err}" if err else body[:150]
-        result["detail"] = f"NOT live — AWS STS rejected the key (HTTP {status}{f'; {err}' if err else ''})."
+        if err in _AWS_DEAD_CODES:
+            result.update(live=False)
+            result["detail"] = f"NOT live — AWS STS rejected the key (HTTP {status}; {err})."
+            return result
+        # 403/401 with a non-credential code (e.g. RequestTimeTooSkewed from a skewed host clock on a
+        # VM/container/CI runner/frozen .exe, or Throttling) does NOT prove the key is dead — the
+        # signature verified, only the timestamp/rate failed. Same guard as the ASIA path above:
+        # prefer inconclusive over marking a genuinely LIVE (possibly admin) key dead.
+        result["detail"] = (
+            f"Inconclusive — AWS STS returned HTTP {status}{f'; {err}' if err else ''}, which does not "
+            "prove the key is invalid (e.g. RequestTimeTooSkewed from host clock drift, or Throttling). "
+            "Check the host clock and re-validate manually within scope."
+        )
         return result
     result["detail"] = f"Inconclusive (HTTP {status or 'no response'}) — validate manually within scope."
     return result

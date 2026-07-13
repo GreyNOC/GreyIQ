@@ -2123,15 +2123,23 @@ class GreyIQRuntime:
             except Exception:  # noqa: BLE001 - persistence must never 500 the assembly
                 marked = False
 
-        # 5) Notify the app-wide stream (best-effort) so any open Report Center refreshes live.
-        bounty_progress.global_log("report_ready", {
-            "dedup_key": key, "program": str(request.program or ""), "title": str(request.title or ""),
-            "severity": str(request.severity or ""), "proof_status": proof_status,
-            "poc": has_poc, "poi": has_poi, "poe": has_poe,
-        })
-        return {"ok": True, "package": package, "platform": platform, "proof_status": proof_status,
-                "ready": {"poc": has_poc, "poi": has_poi, "poe": has_poe}, "persisted": bool(marked),
-                "dedup_key": key, "replay": (replay if replay_n else ""), "har": (har if har_n else None)}
+        # 5) Notify the app-wide stream (best-effort) so any open Report Center refreshes live --
+        #    but ONLY when the ready state was durably persisted. Firing report_ready (or returning
+        #    ok:True) on a failed write badges the finding "Report ready" in the UI, then silently
+        #    drops it on the next reload/restart when the ledger has no flag. Be honest: no persist,
+        #    no "ready" signal, and surface ok=False so the client doesn't badge a non-persisted row.
+        if marked:
+            bounty_progress.global_log("report_ready", {
+                "dedup_key": key, "program": str(request.program or ""), "title": str(request.title or ""),
+                "severity": str(request.severity or ""), "proof_status": proof_status,
+                "poc": has_poc, "poi": has_poi, "poe": has_poe,
+            })
+        result = {"ok": bool(marked), "package": package, "platform": platform, "proof_status": proof_status,
+                  "ready": {"poc": has_poc, "poi": has_poi, "poe": has_poe}, "persisted": bool(marked),
+                  "dedup_key": key, "replay": (replay if replay_n else ""), "har": (har if har_n else None)}
+        if not marked:
+            result["error"] = "Could not persist the report-ready state to the durable ledger — not marked ready."
+        return result
 
     def aggregate_report(self, request: "AggregateReportRequest") -> dict[str, Any]:
         """The special report: one engagement document across many findings — from a cached
@@ -4329,11 +4337,14 @@ async def read_json_body(receive: Any) -> dict[str, Any]:
         return {}
     try:
         payload = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
         # A body containing invalid UTF-8 bytes raises UnicodeDecodeError here, which is
         # a ValueError but NOT a json.JSONDecodeError -- it must be caught too, or it
         # escapes as an unhandled exception and the client sees a generic 500 instead of
-        # the intended 400 "bad request".
+        # the intended 400 "bad request". A deeply-nested body (e.g. b'['*60000) makes
+        # json.loads raise RecursionError, which is NOT a ValueError subclass -- catch it
+        # too so malformed-but-nested JSON also maps to the deliberate 400 rather than a
+        # 500 + server-log traceback spam.
         raise HTTPError(400, f"Invalid JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise HTTPError(422, "JSON body must be an object.")
@@ -4390,6 +4401,33 @@ def _same_origin(scope: dict[str, Any] | None) -> str:
     fwd = _header(scope, "x-forwarded-proto").split(",")[0].strip().lower()
     scheme = fwd if fwd in ("http", "https") else str((scope or {}).get("scheme") or "http").lower()
     return f"{scheme}://{host}"
+
+
+def _host_header_allowed(scope: dict[str, Any] | None) -> bool:
+    """Reject a request whose Host header names a host that is neither loopback nor an
+    operator-configured origin. This closes DNS rebinding against the loopback deployment:
+    _same_origin() derives the trusted same-origin string verbatim from the client-controlled
+    Host header, so an attacker who rebinds evil.com -> 127.0.0.1 would otherwise have the
+    rebound page pass the same-origin check, read the SESSION_TOKEN-bearing index, and drive
+    /api/*. A configured GREYIQ_ACCESS_KEY already authenticates EVERY request via Basic Auth,
+    so beyond-loopback proxy/domain deployments (which may not set GREYIQ_ALLOWED_ORIGINS) are
+    left untouched -- the rebinding hole only exists for the keyless loopback default."""
+    host = _header(scope, "host").strip().lower()
+    if not host:
+        # A missing Host header cannot come from the rebinding browser attack (browsers always
+        # send one); don't reject legitimate non-browser local callers that omit it.
+        return True
+    try:
+        # urlparse handles host:port and bracketed IPv6 ([::1]:8766) uniformly.
+        hostname = (urlparse(f"//{host}").hostname or "").lower()
+    except ValueError:
+        return False
+    if not hostname or hostname in _LOOPBACK_HOSTS:
+        return True
+    if GREYIQ_ACCESS_KEY:
+        return True
+    allowed_hosts = {h for h in (urlparse(o).hostname for o in _configured_origins()) if h}
+    return hostname in allowed_hosts
 
 
 def _request_origin_allowed(scope: dict[str, Any] | None = None) -> bool:
@@ -4510,6 +4548,13 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
     _CURRENT_SCOPE.set(scope)
     method = str(scope.get("method") or "GET").upper()
     path = str(scope.get("path") or "/")
+
+    # Host-header allowlist runs before ANYTHING is served (index/token/static/API), closing
+    # DNS rebinding for the loopback deployment: a rebound Host: evil.com is neither loopback
+    # nor a configured origin, so it is refused before _same_origin can trust it verbatim.
+    if not _host_header_allowed(scope):
+        await send_json(send, {"error": "host not allowed"}, 403)
+        return
 
     # A CORS preflight (OPTIONS) NEVER carries credentials per the Fetch spec, so it must be answered
     # BEFORE the access-key gate. Otherwise a configured GREYIQ_ACCESS_KEY 401s every preflight and no
@@ -4953,10 +4998,14 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             return
 
         relative_path = unquote(path.lstrip("/")) or "index.html"
-        file_path = (PUBLIC_DIR / relative_path).resolve()
         try:
+            # .resolve() itself raises ValueError('embedded null byte') / OSError on a
+            # trivially malformed path (e.g. GET /%00 -> relative_path "\x00"), so it must
+            # live INSIDE the guard alongside the traversal check -- otherwise it escapes to
+            # the generic 500 handler with a logged traceback instead of the intended 404.
+            file_path = (PUBLIC_DIR / relative_path).resolve()
             file_path.relative_to(PUBLIC_DIR.resolve())
-        except ValueError:
+        except (ValueError, OSError):
             await send_json(send, {"error": "not found"}, 404)
             return
         if file_path.exists() and file_path.is_file():

@@ -2,6 +2,35 @@
 
 Notable changes to GreyIQ.
 
+## v1.8.1
+
+### Whole-app QA/QC — 33 verified defect fixes
+A multi-agent QA/QC audit of the v1.8.0 codebase surfaced 35 adversarially-verified defects in
+GreyIQ's own code; this release fixes 33, each with a regression test. (Two low-severity findings —
+`redact_text` has no email pattern — were assessed as intended: a captured non-role email is the
+proof-of-impact a CORS/sensitive-data finding must show, and secrets in it are still redacted.)
+
+- **Auto-submit throttle honored** — `max_submits_per_day = 0` now actually pauses filing (was
+  silently coerced to 3).
+- **No dropped confirmations** — a passive *candidate* lead no longer marks itself "reported", so a
+  later `--active` run's confirmed, payable finding is packaged instead of skipped as "already
+  reported"; concurrent span targets can't double-package the same finding.
+- **Crash hardening** — a crafted JWT/JWKS or deeply-nested JSON from a target can no longer
+  `RecursionError`-crash the active pass, recon, the ledger, the OOB poller, or the API (now a clean
+  400/skip).
+- **Scope integrity** — GraphQL and OpenAPI discovery re-gate the post-redirect `final_url` (no false
+  finding / leaked params from a rebound out-of-scope host).
+- **Credential accuracy** — a live AWS key hitting STS clock-skew/throttling is reported inconclusive,
+  not "dead".
+- **Honest severity** — the pre-export QA "downgrade-only" cap now actually lowers the exported
+  severity (no over-claim), and re-keys its audit refs after renumbering.
+- **DNS-rebinding closed** — a Host-header allowlist blocks a rebound origin from stealing the
+  loopback session token and driving `/api/*`.
+- **Rate-limit correctness** — the per-host spacing no longer collapses under concurrent callers, and
+  passive recon draws from a **separate** per-host token pool so a crawl can't starve the active prover.
+- **Redaction** — JWTs are fully redacted (no longer truncated at the first dot); the hunt-trace log
+  redacts its target field; plus smaller report/scanner/desktop/UI correctness fixes.
+
 ## v1.8.0
 
 ### Offline-brain distillation — Phase 0: hunt-trace training corpus

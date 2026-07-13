@@ -23,6 +23,10 @@ from bughunter import sensitive_data
 from bughunter.code_scanner.redaction import redact_secret, redact_text
 
 _SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+# Upper bound of each CVSS v3.1 severity band. Used to stamp a representative base_score when the QA
+# gate must force a finding's tier DOWN directly (no conforming vector could be produced) so the
+# score and the capped word never disagree.
+_CVSS_TIER_CEIL = {"critical": 10.0, "high": 8.9, "medium": 6.9, "low": 3.9, "info": 0.0, "none": 0.0}
 _SEVERITY_LABEL = {
     "critical": "Critical",
     "high": "High",
@@ -234,22 +238,42 @@ def qa_validate_report(findings: list[dict[str, Any]], attack_plans: dict[str, A
     issues: list[dict[str, Any]] = []
 
     def _record(finding, ref, question, verdict, action="", detail=""):
+        # Stash the finding OBJECT under a private key: the caller (bounty._order_by_resolved_severity)
+        # re-sorts findings and reassigns finding["ref"]=F1..N IN PLACE AFTER this QA pass runs — and a
+        # QA downgrade is the very thing that moves a finding in that sort — so the frozen ``ref`` string
+        # here goes stale precisely for the findings the QA section discusses. ``_resync_qa_refs`` reads
+        # this object's CURRENT ref at render time (and strips the key) so the audit trail names the
+        # right finding. See the report.py:237 QAQC finding.
         issues.append({"ref": ref, "severity": resolve_severity(finding, plans.get(ref)),
-                       "question": question, "verdict": verdict, "action": action, "detail": detail})
+                       "question": question, "verdict": verdict, "action": action, "detail": detail,
+                       "_finding": finding})
 
     def _cap(finding, plan, target_tier, reason):
         cur = resolve_severity(finding, plan)
-        if _SEVERITY_ORDER.get(target_tier, 0) >= _SEVERITY_ORDER.get(cur, 0):
+        target_rank = _SEVERITY_ORDER.get(target_tier, 0)
+        if target_rank >= _SEVERITY_ORDER.get(cur, 0):
             return False  # already at/below the cap — nothing to downgrade
         finding["severity"] = target_tier
         cvss = plan.get("cvss") if isinstance(plan.get("cvss"), dict) else None
         if cvss and isinstance(cvss.get("vector"), str):
             # Rewrite to a vector whose computed severity matches the cap so score + word never disagree:
-            # drop C:H→C:L and Scope-Changed→Unchanged, then, if still above the cap, weaken AC.
+            # drop C:H→C:L and Scope-Changed→Unchanged, then, while STILL above the cap, weaken the
+            # remaining leverage metrics one at a time. A single C+AC weaken can leave a residual High
+            # (e.g. a brain-supplied vector carrying I:H/A:H), which resolve_severity — trusting the
+            # recomputed base_severity — would then re-inflate above the tier the QA section records.
             vec = _sub_metric(_sub_metric(cvss["vector"], "C", "L"), "S", "U")
-            if _SEVERITY_ORDER.get(impact_model.cvss_base_score(vec)["severity"].lower(), 0) > _SEVERITY_ORDER.get(target_tier, 0):
-                vec = _sub_metric(vec, "AC", "H")
+            for key, low in (("AC", "H"), ("I", "L"), ("A", "L")):
+                if _SEVERITY_ORDER.get(impact_model.cvss_base_score(vec)["severity"].lower(), 0) <= target_rank:
+                    break
+                vec = _sub_metric(vec, key, low)
             _set_cvss_vector(cvss, vec, f"QA cap to {target_tier.title()}: {reason}")
+        # Final guard: if there was no usable vector, or the weakened vector STILL computes above the
+        # cap, stamp the tier directly. resolve_severity trusts cvss.base_severity when it is a
+        # recognized tier, so a residual-High base_severity would silently re-inflate the finding above
+        # the downgrade the QA section reports — never record a downgrade resolve_severity won't honor.
+        if cvss and _SEVERITY_ORDER.get(str(cvss.get("base_severity") or "").strip().lower(), 0) > target_rank:
+            cvss["base_severity"] = _SEVERITY_LABEL.get(target_tier, target_tier.title())
+            cvss["base_score"] = _CVSS_TIER_CEIL.get(target_tier, 0.0)
         return True
 
     for finding in findings:
@@ -1189,10 +1213,27 @@ def _append_cvss(out: list[str], plan: dict[str, Any]) -> None:
         out.append(f"- **Why this severity:** {justification}")
 
 
+def _resync_qa_refs(qa: Any) -> None:
+    """Re-point each QA issue's ``ref`` at its finding's CURRENT ref, then drop the private ``_finding``
+    carrier so it never reaches the JSON sidecar. qa_validate_report freezes the ref at QA time, but
+    the findings are re-sorted and re-numbered (bounty._order_by_resolved_severity) AFTERWARD, so the
+    frozen ref would otherwise misattribute a downgrade to the wrong finding in the rendered QA section.
+    Idempotent: once ``_finding`` is stripped, subsequent calls are no-ops."""
+    if not isinstance(qa, dict):
+        return
+    for issue in qa.get("issues") or []:
+        if not isinstance(issue, dict):
+            continue
+        finding = issue.pop("_finding", None)
+        if isinstance(finding, dict) and finding.get("ref"):
+            issue["ref"] = finding.get("ref")
+
+
 def _append_qa(out: list[str], ctx: dict[str, Any]) -> None:
     """Render the pre-export QA gate: the evidence-vs-claim checks and any downgrade-only
     corrections GreyIQ applied. Shown so a triager can see the tool actively guards against
     overclaiming — and why a severity may read lower than a raw header match would suggest."""
+    _resync_qa_refs(ctx.get("qa"))
     qa = ctx.get("qa") if isinstance(ctx.get("qa"), dict) else None
     issues = (qa or {}).get("issues") or []
     if not issues:
@@ -1686,6 +1727,7 @@ def _default_summary(counts: dict[str, int], total: int) -> str:
 
 def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
     """Machine-readable sidecar mirroring the report."""
+    _resync_qa_refs(ctx.get("qa"))  # correct QA refs after renumber + strip the private _finding carrier
     findings = _reportable_findings(ctx.get("findings", []))
     attack_plans = ctx.get("attack_plans", {}) or {}
     return {

@@ -232,7 +232,7 @@ def record_trace(
             "v": _SCHEMA_VERSION,
             "ts": now or _now(),
             "program": program_key(program, target)[:_MAX_PROGRAM],
-            "target": str(target or "")[:600],
+            "target": _redact_url(target),  # a full target URL can carry a secret (?access_token=, magic-link) — redact like every other URL in the record
             "surface": _compact_surface(surface),
             "plan": _compact_plan(plan),
             "outcomes": rows,

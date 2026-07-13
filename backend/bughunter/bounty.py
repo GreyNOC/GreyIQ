@@ -1361,7 +1361,11 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
     try:
         obj = json.loads(text[start : end + 1])
         return obj if isinstance(obj, dict) else None
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        # The brain text is untrusted (it can reflect a prompt-injection from scanned target
+        # content). Deeply-nested JSON makes json.loads raise RecursionError (a RuntimeError, NOT
+        # a ValueError/JSONDecodeError), which would escape _ask_brain and break run_bounty_hunt's
+        # documented "never raises to the API" contract. Degrade to the deterministic report instead.
         return None
 
 
@@ -1848,6 +1852,14 @@ def run_bounty_hunt(
                 max_pages=6,
                 max_requests=18,
                 settings=active_settings,
+                # Draw passive recon from the PROCESS-WIDE per-host bucket (same config the active
+                # layer uses below), so concurrent span/portfolio workers crawling the same host
+                # don't each build their own governor and multiply the per-host request rate.
+                governor=shared_governor(
+                    capacity=active_settings.active_max_requests_per_host,
+                    min_interval_s=active_settings.active_min_interval_ms / 1000.0,
+                    pool="recon",  # a SEPARATE per-host bucket from the active prover — recon must not drain it
+                ),
             )
             active_targets = _rank_active_targets(clean_target, rec.get("urls") or [], limit=4)
             params_before = len(effective_extra_params)

@@ -46,7 +46,9 @@ def _load(runtime_dir: str | Path) -> dict[str, Any]:
     try:
         data = json.loads(_store_path(runtime_dir).read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {"programs": {}}
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, RecursionError):
+        # RecursionError: a hand-edited/corrupt store with deeply-nested JSON makes
+        # json.loads blow the recursion limit; degrade to empty like any other bad load.
         return {"programs": {}}
 
 
@@ -66,6 +68,16 @@ def _save(runtime_dir: str | Path, data: dict[str, Any]) -> None:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Tolerant float() for a stored value from this hand-editable JSON store (matches
+    learning._safe_float). A corrupt/hand-edited bounty like '1,000' or a list/dict must
+    degrade to the default instead of raising and 500-ing the whole money dashboard."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _normalized_location(finding: dict[str, Any]) -> str:
@@ -438,7 +450,12 @@ def archive_and_purge_program(runtime_dir: str | Path, program_id: str,
                 severity = str(rec.get("severity") or "").strip().lower()
                 keep = severity in ("high", "critical") and key not in dismissed and not rec.get("dismissed")
                 if keep:
-                    archive[key] = {**rec, "program": pid, "archived_from": pid, "archived_at": _now()}
+                    # Key the archive by a per-record composite (pid:dedup_key), NOT the bare
+                    # dedup_key: the SAME finding can live under both the saved-program bucket and a
+                    # program=None domain bucket (both swept here), and two different programs can
+                    # share a class/rule/location. A bare-key archive[key]= would let the second
+                    # bucket's (possibly stale/bounty-less) record silently overwrite the richer one.
+                    archive[f"{pid}:{key}"] = {**rec, "program": pid, "archived_from": pid, "archived_at": _now()}
                     n_arch += 1
                 else:
                     n_purge += 1
@@ -456,7 +473,15 @@ def list_archived(runtime_dir: str | Path, limit: int | None = None) -> list[dic
     store = _load(runtime_dir)
     archive = store.get("archived") or {}
     dismissed = store.get("dismissed") or {}
-    out = [{**rec, "dedup_key": key} for key, rec in archive.items() if key not in dismissed]
+    # The archive dict key is now a pid:dedup_key composite (see archive_and_purge_program), so
+    # recover the bare dedup_key from the stored record (falling back to the dict key for any
+    # legacy bare-keyed entry) for both the dismissed filter and the returned dedup_key.
+    out = []
+    for akey, rec in archive.items():
+        dk = str(rec.get("dedup_key") or akey)
+        if dk in dismissed:
+            continue
+        out.append({**rec, "dedup_key": dk})
     out.sort(key=lambda r: str(r.get("archived_at") or r.get("updated_at") or ""), reverse=True)
     return out[: max(1, limit or _MAX_LIST_ALL)]
 
@@ -510,7 +535,7 @@ def funnel(runtime_dir: str | Path, program: str | None = None, target: str = ""
                     counts[stage] += 1
                 if rec.get("report_ready"):
                     ready += 1  # orthogonal to stage: how many have an assembled report in the Report Center
-                bounty += float(rec.get("bounty") or 0.0)
+                bounty += _safe_float(rec.get("bounty"), 0.0)  # tolerate a hand-edited/corrupt bounty rather than 500 the whole funnel
         return {"total": total, "stages": counts, "bounty_total": round(bounty, 2), "ready": ready}
 
     if program or target:

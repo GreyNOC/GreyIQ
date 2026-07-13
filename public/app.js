@@ -8020,7 +8020,11 @@ function ckBuildPocSummary(focus) {
 // the target URL is embedded as a JSON string literal so it can't break out of the script.
 function ckBuildPocHtml(focus) {
   const esc = escapeHtml;
-  const j = (s) => JSON.stringify(String(s == null ? "" : s));
+  // JSON string for embedding inside an inline <script>. JSON.stringify neutralizes JS string
+  // delimiters but NOT the literal "</script>" sequence, so a target-derived URL containing
+  // "</script>" would close the script tag early and inject markup that runs when the researcher
+  // opens poc.html. Escape "</" to "<\/" (identical JS string, inert to the HTML tokenizer).
+  const j = (s) => JSON.stringify(String(s == null ? "" : s)).replace(/<\//g, "<\\/");
   const cls = String(focus.class_id || "").toLowerCase();
   const url = String(focus.location || focus.target || "");
   const plan = focus.plan || {};
@@ -8404,7 +8408,9 @@ function ckProofDots(rec) {
   const on = {
     poc: rec.report_ready ? !!rp.poc : ckHasRunnablePoc(cap),
     poi: rec.report_ready ? !!rp.poi : !!(poi.observed_result && poi.control_result),
-    poe: rec.report_ready ? !!rp.poe : !!(cap.proof_evidence || cap.credential_proof),
+    // Mirror the server's has_poe = bool(proof_evidence) OR bool(screenshot_path): a screenshot-only
+    // finding must preview POE ON, else the dot flips OFF→ON the moment "Get report ready" is clicked.
+    poe: rec.report_ready ? !!rp.poe : !!(cap.proof_evidence || cap.credential_proof || cap.screenshot_path),
   };
   for (const [k, label, tip] of [
     ["poc", "POC", "Proof of concept — reproduction steps + PoC"],
@@ -9947,7 +9953,7 @@ function ckStatus(text, isError) {
 // without losing an in-flight/finished result); `dom` caches the built scaffold so polls
 // UPDATE it in place instead of rebuilding (which was resetting the findings scroll to top).
 const ckCampaign = {
-  runId: "", poll: null, snapshot: null, events: [], eventCount: 0, done: false,
+  runId: "", poll: null, polling: false, snapshot: null, events: [], eventCount: 0, done: false,
   stopRequested: false, label: "", startedAt: 0,
   scope: "", programId: null, authorized: false,
   sortBy: "severity", filterSev: "all", selectedKey: "", reverify: {}, report: {}, reverifyVersion: 0,
@@ -9958,7 +9964,7 @@ function ckStartCampaignDashboard(runId, label, opts = {}) {
   if (ckCampaign.poll) { clearInterval(ckCampaign.poll); ckCampaign.poll = null; }
   Object.assign(ckCampaign, {
     runId, label: label || "Campaign", snapshot: null, events: [], eventCount: 0, done: false,
-    stopRequested: false, startedAt: Date.now(),
+    polling: false, stopRequested: false, startedAt: Date.now(),
     scope: opts.scope || "", programId: opts.programId || null, authorized: Boolean(opts.authorized),
     selectedKey: "", reverify: {}, report: {}, reverifyVersion: 0, dom: null,
   });
@@ -9980,16 +9986,25 @@ async function ckStopCampaign() {
 
 async function ckPollCampaign() {
   if (!ckCampaign.runId) return;
-  let res = null;
-  try { res = await apiFetch("/api/bounty/progress", { method: "POST", timeoutMs: 6000, body: JSON.stringify({ run_id: ckCampaign.runId, after: ckCampaign.eventCount }) }); } catch (_) { return; }
-  if (!res || res.ok === false) return;
-  if ((res.events || []).length) {
-    ckCampaign.events.push(...res.events);
-    if (ckCampaign.events.length > 400) ckCampaign.events = ckCampaign.events.slice(-400);
-    ckCampaign.eventCount = res.count || (ckCampaign.eventCount + res.events.length);
+  // In-flight guard: a heavy campaign can take >1.2s to answer /api/bounty/progress, so the
+  // 1200ms interval could fire again before the prior poll returns. Both would carry the same
+  // `after` cursor and push the same events, duplicating activity-log lines. Skip re-entrant polls.
+  if (ckCampaign.polling) return;
+  ckCampaign.polling = true;
+  try {
+    let res = null;
+    try { res = await apiFetch("/api/bounty/progress", { method: "POST", timeoutMs: 6000, body: JSON.stringify({ run_id: ckCampaign.runId, after: ckCampaign.eventCount }) }); } catch (_) { return; }
+    if (!res || res.ok === false) return;
+    if ((res.events || []).length) {
+      ckCampaign.events.push(...res.events);
+      if (ckCampaign.events.length > 400) ckCampaign.events = ckCampaign.events.slice(-400);
+      ckCampaign.eventCount = res.count || (ckCampaign.eventCount + res.events.length);
+    }
+    if (res.snapshot) ckCampaign.snapshot = res.snapshot;
+    if (ckState.view === "campaign") ckRenderCampaign();
+  } finally {
+    ckCampaign.polling = false;
   }
-  if (res.snapshot) ckCampaign.snapshot = res.snapshot;
-  if (ckState.view === "campaign") ckRenderCampaign();
 }
 
 async function ckFinishCampaignDashboard() {
