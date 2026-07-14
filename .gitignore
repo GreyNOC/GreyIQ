@@ -16,6 +16,8 @@ build/*
 !build/installer.nsh
 !build/requirements-build.txt
 !build/build-portable.ps1
+!build/icon.ico
+!build/icon.png
 *.log
 .env
 .env.*
