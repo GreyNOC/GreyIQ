@@ -2,6 +2,23 @@
 
 Notable changes to GreyIQ.
 
+## v1.8.8
+
+### Desktop app + installer branded with the GreyNOC orb icon
+The Windows portable/NSIS installer and the Linux AppImage previously shipped the stock Electron
+icon — electron-builder found no icon in its build resources (`build/`) and the app window set none.
+This release wires the **GreyNOC orb** everywhere a desktop build surfaces an icon (packaging/branding
+only — no behavior changes):
+- **Windows** — `build/icon.ico` (7 embedded sizes, 16→256px) becomes the portable exe, the
+  `Setup.exe` installer, the uninstaller, the installed app exe, and the Start Menu + Desktop shortcut
+  icons (nsis `installerIcon` / `uninstallerIcon` / `installerHeaderIcon`).
+- **Linux** — `build/icon.png` (512×512) becomes the AppImage icon.
+- **Runtime window** — `BrowserWindow` now sets a platform-aware `icon` (`electron/icon.{ico,png}`,
+  bundled via the existing `electron/**/*` files glob), so the window, taskbar/dock, and `electron .`
+  dev runs all show the orb. On packaged Windows the taskbar uses the exe's embedded icon.
+- **Tooling** — `.gitignore` allow-lists `build/icon.{ico,png}` past the `build/*` rule;
+  `.gitattributes` marks `*.ico` / `*.png` binary so EOL normalization can't corrupt them.
+
 ## v1.8.7
 
 ### Detection expansion — confirmed WebSocket cross-site hijacking (CSWSH)
