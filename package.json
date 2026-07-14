@@ -44,6 +44,7 @@
       }
     ],
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         "portable",
         "nsis"
@@ -58,9 +59,13 @@
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
       "include": "build/installer.nsh",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
       "artifactName": "GreyIQ-Setup-${version}.exe"
     },
     "linux": {
+      "icon": "build/icon.png",
       "target": [
         "AppImage"
       ],

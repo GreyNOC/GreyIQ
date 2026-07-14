@@ -3,3 +3,6 @@
 gn text eol=lf
 *.sh text eol=lf
 build/build-portable.ps1 text eol=crlf
+# App icons are binary — never apply text/EOL normalization.
+*.ico binary
+*.png binary
