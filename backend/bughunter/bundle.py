@@ -137,6 +137,99 @@ def _write_manifest(
     zf.writestr(_MANIFEST_SHA256, "\n".join(checksum_lines) + ("\n" if checksum_lines else ""))
 
 
+_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "none": 5}
+# Human descriptions for the standard artifacts a bundle can contain, keyed by the file's
+# basename or top-level folder. Only the ones actually present are listed in the INDEX.
+_ARTIFACT_GUIDE: tuple[tuple[str, str], ...] = (
+    ("CAMPAIGN.md", "The engagement report — every finding in one document (start here)."),
+    ("report.md", "The finding report (start here)."),
+    ("report.json", "The report as structured JSON (machine-readable sidecar)."),
+    ("INDEX.md", "This file — a map of the whole bundle."),
+    ("replay.sh", "Runnable script: re-issues each confirmed finding's benign request as curl "
+                  "(in scope, with your own authorization). Read the comments for the observed-vs-control differential."),
+    ("findings.har", "HAR 1.2 log of the confirming requests — import into Burp / browser devtools."),
+    ("EVIDENCE-MANIFEST.json", "Chain-of-custody: SHA-256 of every artifact, with tool/version/time."),
+    ("MANIFEST.sha256", "Standard checksum file — verify with `sha256sum -c MANIFEST.sha256`."),
+    ("submissions/", "Per-finding, per-platform submission packages (the report shaped for each program's form)."),
+    ("screenshots/", "Proof screenshots and graphical attack-plan maps (image evidence — NOT auto-redacted)."),
+    ("evidence/", "Captured request/response transcripts, sensitive-data captures, and credential-test artifacts (redacted)."),
+    ("research/", "Deep-research dossiers for confirmed leads."),
+)
+
+
+def build_index(meta: dict[str, Any] | None, present: set[str] | None = None) -> str:
+    """Render the triager-facing ``INDEX.md`` — the "start here" map of a bundle.
+
+    ``meta`` may carry ``tool``, ``version``, ``generated_at``, ``target``, ``scope``, and
+    ``findings`` (a list of ``{ref, title, severity, proof_status}``). ``present`` is the set
+    of top-level file basenames / folder names actually in the bundle, so the guide only lists
+    artifacts that exist. Pure — no I/O; the caller writes the returned text as an artifact so
+    it is fingerprinted into the chain of custody like any other file.
+    """
+    meta = meta or {}
+    present = present or set()
+    tool = str(meta.get("tool") or "GreyIQ BugHunter")
+    version = str(meta.get("version") or "")
+    generated = str(meta.get("generated_at") or "").strip()
+    target = str(meta.get("target") or "").strip()
+    scope = str(meta.get("scope") or "").strip()
+    findings = [f for f in (meta.get("findings") or []) if isinstance(f, dict)]
+
+    out: list[str] = []
+    title = f"# Evidence bundle — {target}" if target else "# Evidence bundle"
+    out.append(title)
+    stamp = f"{tool}{(' v' + version) if version else ''}"
+    line = f"Produced by {stamp}"
+    if generated:
+        line += f" · generated {generated}"
+    out.append(f"\n{line}.")
+    if scope:
+        out.append(f"\nScope: `{scope}`")
+    out.append(
+        "\nThis archive is the complete, self-contained evidence for the finding(s) below — "
+        "reports, machine-replayable reproductions, captured proof, and a cryptographic chain "
+        "of custody. It is designed to be attached to a bug-bounty submission as-is.")
+
+    if findings:
+        out.append("\n## Findings\n")
+        out.append("| Ref | Severity | Proof | Title |")
+        out.append("|---|---|---|---|")
+        for f in sorted(findings, key=lambda x: _SEVERITY_ORDER.get(str(x.get("severity") or "").lower(), 9)):
+            ref = str(f.get("ref") or "").replace("|", "\\|")
+            sev = str(f.get("severity") or "").title()
+            proof = str(f.get("proof_status") or "").replace("_", " ")
+            titl = str(f.get("title") or "").replace("|", "\\|").replace("\n", " ")[:100]
+            out.append(f"| {ref} | {sev} | {proof} | {titl} |")
+
+    guide = [(name, desc) for name, desc in _ARTIFACT_GUIDE
+             if (name.rstrip("/") in present or name in present)]
+    if guide:
+        out.append("\n## What's in this bundle\n")
+        for name, desc in guide:
+            out.append(f"- **`{name}`** — {desc}")
+
+    out.append("\n## Verify integrity (chain of custody)\n")
+    out.append("Every artifact is SHA-256 fingerprinted in `MANIFEST.sha256`. From this folder, run:\n")
+    out.append("```\nsha256sum -c MANIFEST.sha256        # macOS: shasum -a 256 -c MANIFEST.sha256\n```")
+    out.append("\nA matching digest proves every proof artifact is byte-for-byte unaltered since capture.")
+
+    if "replay.sh" in present or "findings.har" in present:
+        out.append("\n## Reproduce\n")
+        if "replay.sh" in present:
+            out.append("- `bash replay.sh` — re-issues each confirmed finding's benign request. "
+                       "Every GreyIQ active probe is an idempotent GET/HEAD/OPTIONS; run ONLY in scope, "
+                       "with your own authorization. Each request is annotated with what the negative "
+                       "control showed, so you can reproduce the differential the report claims.")
+        if "findings.har" in present:
+            out.append("- Import `findings.har` into Burp or your browser devtools to inspect/re-issue the requests.")
+
+    out.append("\n## Notes\n")
+    out.append("- Screenshots are image evidence and are **not** auto-redacted — the manifest proves they "
+               "are unaltered, not that they are safe to share. Review before publishing.")
+    out.append("- All testing was performed against an in-scope, authorized target.")
+    return "\n".join(out) + "\n"
+
+
 def _finish(out_zip: Path, state: dict[str, int], skipped: list[str]) -> dict[str, Any]:
     if state["count"] == 0:
         try:

@@ -40,7 +40,8 @@ class ReplayScriptTests(unittest.TestCase):
         self.assertTrue(sh.startswith("#!/usr/bin/env bash"))
         self.assertIn("curl -i -H 'Origin: https://evil.example' 'https://t/q?x=<svg/onload=1>'", sh)
         self.assertIn("curl -i https://t/admin/users", sh)
-        self.assertIn("observed: the payload reflected UNENCODED", sh)  # the differential rides as a comment
+        self.assertIn("observed (this request):   the payload reflected UNENCODED", sh)  # positive obs as comment
+        self.assertIn("negative control (baseline): control differed", sh)  # v2: the control differential rides too
         self.assertNotIn("<low-priv session>", sh)               # placeholder auth header is NOT emitted as -H
 
     def test_no_confirmed_requests_is_empty(self) -> None:

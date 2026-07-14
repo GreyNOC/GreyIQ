@@ -202,15 +202,45 @@ _TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "edit_file",
-        "description": "Replace an exact, unique substring in a file. Fails if old_string is missing or not unique.",
+        "description": ("Replace an exact substring in a file. By default old_string must be unique "
+                        "(fails if missing or matched more than once); pass replace_all=true to replace "
+                        "every occurrence instead."),
         "parameters": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
                 "old_string": {"type": "string"},
                 "new_string": {"type": "string"},
+                "replace_all": {"type": "boolean", "description": "Replace all occurrences instead of requiring uniqueness."},
             },
             "required": ["path", "old_string", "new_string"],
+        },
+    },
+    {
+        "name": "multi_edit",
+        "description": ("Apply several find/replace edits to ONE file atomically, in order. Each edit is "
+                        "{old_string, new_string, replace_all?}; a non-replace_all edit must match exactly "
+                        "once in the file's current (post-prior-edits) state. If ANY edit fails, NOTHING is "
+                        "written — the file is left untouched. Prefer this over multiple edit_file calls when "
+                        "changing several places in the same file."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                            "replace_all": {"type": "boolean"},
+                        },
+                        "required": ["old_string", "new_string"],
+                    },
+                },
+            },
+            "required": ["path", "edits"],
         },
     },
     {
@@ -679,26 +709,63 @@ class ToolBox:
         self._record_change(target, "write_file", before, content)
         return f"Wrote {len(content)} chars to {target.relative_to(self.root).as_posix()}"
 
+    @staticmethod
+    def _apply_one_edit(text: str, old: str, new: str, replace_all: bool) -> str:
+        """Apply one find/replace to ``text`` and return the result, or raise ToolError.
+        ``replace_all`` replaces every occurrence (>=1 required); otherwise the match must be
+        unique. Pure — the caller decides when to persist, which is what makes multi_edit atomic."""
+        if not old:
+            raise ToolError("old_string must not be empty.")
+        count = text.count(old)
+        if count == 0:
+            raise ToolError("old_string was not found in the file.")
+        if replace_all:
+            return text.replace(old, new)
+        if count > 1:
+            raise ToolError(f"old_string is not unique ({count} matches); include more context or pass replace_all=true.")
+        return text.replace(old, new, 1)
+
     def _tool_edit_file(self, args: dict[str, Any]) -> str:
         target = self._resolve(args["path"])
         if not target.is_file():
             raise ToolError(f"Not a file: {args['path']}")
         old = str(args.get("old_string", ""))
         new = str(args.get("new_string", ""))
-        if not old:
-            raise ToolError("old_string must not be empty.")
         text = target.read_text(encoding="utf-8", errors="replace")
-        count = text.count(old)
-        if count == 0:
-            raise ToolError("old_string was not found in the file.")
-        if count > 1:
-            raise ToolError(f"old_string is not unique ({count} matches); include more context.")
+        new_text = self._apply_one_edit(text, old, new, bool(args.get("replace_all", False)))
         self._capture_original(target, text, existed=True)
-        new_text = text.replace(old, new, 1)
         target.write_text(new_text, encoding="utf-8")
         self._mark_touched(target)
         self._record_change(target, "edit_file", text, new_text)
         return f"Edited {target.relative_to(self.root).as_posix()}"
+
+    def _tool_multi_edit(self, args: dict[str, Any]) -> str:
+        """Apply several edits to one file atomically: all succeed and the file is written once,
+        or the first failure aborts the whole batch with the file untouched."""
+        target = self._resolve(args["path"])
+        if not target.is_file():
+            raise ToolError(f"Not a file: {args['path']}")
+        edits = args.get("edits")
+        if not isinstance(edits, list) or not edits:
+            raise ToolError("edits must be a non-empty list of {old_string, new_string} objects.")
+        original = target.read_text(encoding="utf-8", errors="replace")
+        text = original
+        for i, edit in enumerate(edits, 1):
+            if not isinstance(edit, dict):
+                raise ToolError(f"edit #{i} must be an object with old_string/new_string.")
+            try:
+                text = self._apply_one_edit(text, str(edit.get("old_string", "")), str(edit.get("new_string", "")),
+                                            bool(edit.get("replace_all", False)))
+            except ToolError as exc:
+                # All-or-nothing: nothing has been written yet, so just report which edit failed.
+                raise ToolError(f"edit #{i} failed: {exc} (no changes written)") from None
+        if text == original:
+            return f"No change: the {len(edits)} edit(s) left {target.relative_to(self.root).as_posix()} identical."
+        self._capture_original(target, original, existed=True)
+        target.write_text(text, encoding="utf-8")
+        self._mark_touched(target)
+        self._record_change(target, "multi_edit", original, text)
+        return f"Applied {len(edits)} edit(s) to {target.relative_to(self.root).as_posix()}"
 
     def change_payload(self) -> list[dict[str, Any]]:
         """The before/after change list for the Workbench Changes panel."""

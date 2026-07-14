@@ -3641,3 +3641,19 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
   .ck-main { overflow: visible; }
   .ck-resizer { display: none; }  /* single-column stacked layout — nothing to resize */
 }
+
+/* v2 submission preflight panel — required-field checklist, asset picker, duplicate warnings. */
+.ck-preflight { margin-top: 0.6rem; display: flex; flex-direction: column; gap: 0.5rem; }
+.ck-preflight:empty { display: none; }
+.ck-preflight-head { display: flex; align-items: center; gap: 0.6rem; }
+.ck-pill.ok { background: color-mix(in srgb, var(--ok) 16%, transparent); border-color: color-mix(in srgb, var(--ok) 55%, var(--border)); }
+.ck-pill.warn { background: color-mix(in srgb, var(--sun) 16%, transparent); border-color: color-mix(in srgb, var(--sun) 55%, var(--border)); }
+.ck-check { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.2rem; font-size: 0.82rem; }
+.ck-check li { font-variant-numeric: tabular-nums; }
+.ck-check li.is-ok { color: var(--ok); }
+.ck-check li.is-missing { color: var(--danger); }
+.ck-field { display: flex; flex-direction: column; gap: 0.25rem; }
+.ck-field-label { font-size: 0.78rem; color: var(--muted); }
+.ck-input { padding: 0.4rem 0.55rem; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-2); color: var(--text); font: inherit; }
+.ck-dupes { border: 1px solid color-mix(in srgb, var(--sun) 45%, var(--border)); background: color-mix(in srgb, var(--sun) 8%, transparent); border-radius: 8px; padding: 0.55rem 0.7rem; display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.82rem; }
+.ck-dupe-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.3rem; }

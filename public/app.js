@@ -5514,13 +5514,27 @@ async function ckSubmitFinding(f, btn, statusEl) {
   btn.textContent = "Submitting…";
   try {
     const res = await apiFetch("/api/bounty/submit", {
-      method: "POST", timeoutMs: 60000,
-      body: JSON.stringify({ run_id: f.runId || ckState.runId, ref: f.ref, confirm: true, platform: "hackerone" })
+      method: "POST", timeoutMs: 90000,
+      body: JSON.stringify({ run_id: f.runId || ckState.runId, ref: f.ref, confirm: true, platform: "hackerone",
+        // v2: route to the operator-picked in-scope asset (from the preflight panel) and upload
+        // the captured evidence as report attachments.
+        structured_scope_id: f._scopeId || "", include_attachments: true })
     });
     if (res.ok) {
       ckState.triage[f.ref] = "submitted";
       btn.replaceWith(ckReportLink(res.url, res.report_id));
-      if (statusEl) statusEl.textContent = "";
+      if (statusEl) {
+        // Surface what actually rode along: routed weakness/asset + how many attachments landed.
+        const bits = [];
+        const routed = res.routed || {};
+        if (routed.weakness_id) bits.push("weakness set");
+        if (routed.structured_scope_id) bits.push("asset routed");
+        const att = res.attachments || {};
+        if ((att.uploaded || []).length) bits.push(`${att.uploaded.length} attachment(s) uploaded`);
+        if ((att.failed || []).length) bits.push(`${att.failed.length} attachment(s) failed — they're in the bundle`);
+        statusEl.textContent = bits.length ? `Filed · ${bits.join(" · ")}.` : "";
+        statusEl.classList.remove("is-error");
+      }
       // Reflect the submitted stage across every view (dashboard, board, history) + persist it.
       ckMarkStatus(f, { stage: "submitted" });
     } else {
@@ -5530,6 +5544,90 @@ async function ckSubmitFinding(f, btn, statusEl) {
   } catch (err) {
     btn.disabled = false; btn.textContent = "Submit to HackerOne";
     if (statusEl) { statusEl.textContent = err.message || "Submit failed."; statusEl.classList.add("is-error"); }
+  }
+}
+
+// v2 submission preflight panel: calls /api/bounty/finding/preflight and renders the
+// required-field checklist for the target platform, an in-scope asset picker (persisting the
+// choice on focus._scopeId, threaded into the submit), probable-duplicate warnings, and the
+// attachment count. Advisory throughout — it informs the submit, never blocks it client-side
+// (the server gate remains authoritative).
+async function ckPreflightSubmission(f, panel, btn) {
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "Checking…";
+  panel.replaceChildren();
+  try {
+    const res = await apiFetch("/api/bounty/finding/preflight", {
+      method: "POST", timeoutMs: 30000,
+      body: JSON.stringify({ run_id: f.runId || ckState.runId, ref: f.ref, platform: ckState.platform || "hackerone" })
+    });
+    if (!res || res.ok === false) {
+      panel.append(cel("p", "ck-status is-error", (res && res.error) || "Preflight failed."));
+      return;
+    }
+    const pf = res.preflight || {};
+    const head = cel("div", "ck-preflight-head");
+    head.append(cel("strong", null, `Preflight — ${pf.platform_name || res.platform}`));
+    head.append(cel("span", pf.ready ? "ck-pill ok" : "ck-pill warn", pf.ready ? "Ready to submit" : "Needs attention"));
+    panel.append(head);
+
+    // Required-field checklist.
+    const list = cel("ul", "ck-check");
+    for (const item of (pf.checklist || [])) {
+      const li = cel("li", item.present ? "is-ok" : "is-missing");
+      li.textContent = `${item.present ? "✓" : "✗"} ${item.label}`;
+      list.append(li);
+    }
+    panel.append(list);
+    for (const w of (pf.warnings || [])) panel.append(cel("p", "ck-hint", "⚠ " + w));
+
+    // In-scope asset picker (structured_scope_id) — routes the H1 submission.
+    if ((res.assets || []).length) {
+      const wrap = cel("label", "ck-field");
+      wrap.append(cel("span", "ck-field-label", "In-scope asset (routes the report)"));
+      const sel = cel("select", "ck-input");
+      const none = cel("option", null, "Auto-match by host"); none.value = ""; sel.append(none);
+      for (const a of res.assets) {
+        const opt = cel("option", null, `${a.identifier}${a.asset_type ? " (" + a.asset_type + ")" : ""}`);
+        opt.value = a.id;
+        if (a.id && a.id === (res.matched_scope_id || "")) opt.selected = true;
+        sel.append(opt);
+      }
+      f._scopeId = res.matched_scope_id || "";
+      sel.addEventListener("change", () => { f._scopeId = sel.value; });
+      wrap.append(sel);
+      panel.append(wrap);
+    } else if (res.matched_scope_id) {
+      f._scopeId = res.matched_scope_id;
+    }
+
+    // Attachment count.
+    if (typeof res.attachment_count === "number") {
+      panel.append(cel("p", "ck-hint", `${res.attachment_count} evidence file(s) will be attached to the report.`));
+    }
+
+    // Probable-duplicate warnings — the #1 rejection reason, caught before filing.
+    if ((res.duplicates || []).length) {
+      const dupWrap = cel("div", "ck-dupes");
+      dupWrap.append(cel("strong", null, `⚠ ${res.duplicates.length} possible duplicate(s) already disclosed:`));
+      for (const d of res.duplicates) {
+        const row = cel("div", "ck-dupe-row");
+        if (d.url) {
+          const a = cel("a", "ck-link", d.title || d.url);
+          a.href = d.url; a.target = "_blank"; a.rel = "noopener noreferrer";
+          row.append(a);
+        } else {
+          row.append(cel("span", null, d.title || "(untitled)"));
+        }
+        row.append(cel("span", "ck-floc", ` — ${Math.round((d.score || 0) * 100)}% match · ${d.reason || ""}`));
+        dupWrap.append(row);
+      }
+      panel.append(dupWrap);
+    }
+  } catch (err) {
+    panel.append(cel("p", "ck-status is-error", err.message || "Preflight failed."));
+  } finally {
+    btn.disabled = false; btn.textContent = label;
   }
 }
 
@@ -7480,8 +7578,17 @@ function ckFullReportPanel(focus) {
     submitBtn.disabled = !can;
     submitBtn.title = can ? "File this confirmed finding to your HackerOne program" : "Blocked — see the reason next to this button";
     submitBtn.addEventListener("click", () => ckSubmitFinding(focus, submitBtn, statusEl));
-    s3.row.append(submitBtn);
+    // v2 preflight: the paste-and-submit readiness check — required-field checklist for the
+    // chosen platform, the in-scope asset picker, a probable-duplicate warning, and how many
+    // evidence files will be attached. Renders into a panel below the actions.
+    const preflightPanel = cel("div", "ck-preflight");
+    const preBtn = cel("button", "ck-btn", "Submission preflight");
+    preBtn.type = "button";
+    preBtn.title = "Check required fields, pick the in-scope asset, and scan for probable duplicates before filing";
+    preBtn.addEventListener("click", () => ckPreflightSubmission(focus, preflightPanel, preBtn));
+    s3.row.append(submitBtn, preBtn);
     if (!can) s3.row.append(cel("p", "ck-gate-note", ckSubmitGateReason(focus)));
+    s3.el.append(preflightPanel);
   }
   actions.append(s3.el);
 

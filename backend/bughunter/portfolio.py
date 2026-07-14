@@ -118,6 +118,9 @@ def _clean_scope_entry(entry: Any) -> dict[str, Any] | None:
         return None
     return {
         "identifier": identifier[:500],
+        # The HackerOne structured_scope id (from import), so a filed report can be routed
+        # to this exact in-scope asset. Preserved verbatim; '' for CSV/hand-entered rows.
+        "id": str(entry.get("id") or "").strip()[:64],
         "asset_type": str(entry.get("asset_type") or "").strip()[:60],
         "eligible_for_submission": bool(entry.get("eligible_for_submission", True)),
         "eligible_for_bounty": bool(entry.get("eligible_for_bounty", False)),

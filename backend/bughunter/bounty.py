@@ -613,10 +613,17 @@ def build_replay_script(items: list[dict[str, Any]]) -> tuple[str, int]:
         n += 1
         ref = str(finding.get("ref") or f"F{n}")
         title = str(finding.get("title") or "").replace("\n", " ")[:120]
-        obs = str(_poi_of(it).get("observed_result") or "").replace("\n", " ").strip()[:200]
+        poi = _poi_of(it)
+        obs = str(poi.get("observed_result") or "").replace("\n", " ").strip()[:240]
+        ctrl = str(poi.get("control_result") or "").replace("\n", " ").strip()[:240]
         body.append(f"# [{ref}] {title}")
         if obs:
-            body.append(f"#   observed: {obs}")
+            body.append(f"#   observed (this request):   {obs}")
+        # The negative control is what the baseline request showed — the differential between
+        # the two is the proof. Carried as a comment so a triager reproduces the differential,
+        # not just the positive request.
+        if ctrl:
+            body.append(f"#   negative control (baseline): {ctrl}")
         body.append(curl)
         body.append("")
     if n == 0:

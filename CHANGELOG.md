@@ -2,6 +2,63 @@
 
 Notable changes to GreyIQ.
 
+## v2.0.0 — the submission-ready release
+
+A major version focused on the last mile: taking a confirmed finding **straight to HackerOne
+(or any service)** and shipping a **POC bundle that contains every bit of evidence** — plus
+matching leaps in the coding agent and the hunt's confirmation honesty. Everything below is
+additive; the anti-overclaim honesty invariants (downgrade-only QA gate, captured-artifact
+gating of "confirmed", VDP-policy withholding, and the unbypassable submit gate) are unchanged.
+
+### Report straight to HackerOne — routed, field-perfect, one submit
+The HackerOne API submit used to send five flat text attributes; a filed report landed with no
+machine-readable weakness, no asset selected, and no evidence attached. It now files a **routed**
+report behind the exact same hard gate (explicit confirm + server-recomputed
+`proof_status == "confirmed"` + perms-store creds):
+- **CWE → HackerOne weakness_id** — matched against the program's own enabled weakness list
+  (`hackerone_import.fetch_weaknesses`, matched by `taxonomy.match_weakness_id`; no fragile
+  hardcoded ids). The report lands weakness-set and routable.
+- **In-scope asset routing** — the finding's host is matched to the program's imported
+  `structured_scope_id` (now captured on import + persisted), so the H1 form's required Asset
+  field is filled. An operator can override it from the new **asset picker**.
+- **Evidence rides along** — proof screenshots, the attack-plan map, the request/response
+  transcripts, `replay.sh`, and `findings.har` are uploaded as report **attachments**
+  (best-effort and honestly reported — an upload failure never fails the submit; the files stay
+  in the downloadable bundle).
+- **Submission preflight** (`/api/bounty/finding/preflight`) — a per-platform required-field
+  checklist (H1: asset+weakness; Bugcrowd: VRT+priority; Intigriti/YWH: endpoint+CVSS), a
+  **probable-duplicate scan** against the program's disclosed reports (duplicate is the #1
+  rejection reason), and the attachment count — all before you file.
+- **CWE → Bugcrowd VRT** — a curated `taxonomy.cwe_to_vrt` map auto-fills the Bugcrowd
+  submission's Bug-Type field instead of the old "(map to the closest VRT category)" placeholder.
+
+### POC bundle — every bit of evidence, navigable and reproducible
+- **`INDEX.md`** — a triager-facing "start here" map in every bundle: the finding table, what
+  each artifact is, how to verify the chain of custody, and how to reproduce. Fingerprinted into
+  the SHA-256 manifest like every other artifact.
+- **Single-hunt parity** — a single finding's "Download bundle" now also ships the
+  machine-replayable `replay.sh` + `findings.har` (previously campaign-only).
+- **Runnable negative control** — `replay.sh` now annotates each request with the
+  observed-vs-control differential, so a triager reproduces the *differential the report claims*,
+  not just the positive request.
+
+### Coding agent — robust multi-site edits
+- **`multi_edit`** — apply several find/replace edits to one file atomically (all succeed and the
+  file is written once, or the batch aborts with the file untouched), routed through the same
+  snapshot/rollback machinery as every write.
+- **`edit_file` `replace_all`** — replace every occurrence instead of requiring a unique match,
+  retiring the top real-task failure mode of brittle single edits.
+
+### Hunt — reproduction-stability
+- **Stability re-verify** — the operator-triggered re-verify can now re-run the same scope-gated,
+  budget-bounded, benign probe up to 3× and report how consistently each finding re-confirms
+  (`stability: {passes, of, stable}`). A flaky WAF/timing false-positive won't confirm every pass.
+
+### Deferred to a later 2.x (documented, not shipped)
+Multi-platform *direct* submit transport (only HackerOne has a researcher create-report API),
+autonomous mass-assignment/two-account-IDOR proving in the campaign loop (write-bearing — needs
+live-target verification before it runs unattended), and agent `ask_user` suspend/resume.
+
 ## v1.8.8
 
 ### Desktop app + installer branded with the GreyNOC orb icon

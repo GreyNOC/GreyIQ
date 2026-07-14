@@ -20,6 +20,7 @@ from typing import Any
 
 from bughunter import report as R
 from bughunter import submission_writer
+from bughunter import taxonomy
 
 
 def _ai_summary(ctx: dict[str, Any], finding: dict[str, Any], plan: dict[str, Any], platform: str) -> str | None:
@@ -114,7 +115,13 @@ def _meta_table(out: list[str], ctx: dict[str, Any], finding: dict[str, Any], pl
     owasp = str(finding.get("owasp") or "")
     vrt = str(finding.get("vrt") or "").strip()
     if platform == "bugcrowd":
-        out.append(f"| **Bug type (VRT)** | {R._code(vrt) if vrt else '(map to the closest VRT category)'} |")
+        # Prefer any VRT the finding carries, else derive a best-effort estimate from the
+        # CWE so the Bugcrowd form's required Bug-Type field isn't left as a placeholder.
+        vrt_est = vrt or (taxonomy.cwe_to_vrt(cwe) or "")
+        if vrt_est:
+            out.append(f"| **Bug type (VRT, est.)** | {R._code(vrt_est)} |")
+        else:
+            out.append("| **Bug type (VRT)** | (map to the closest VRT category) |")
         if cwe:
             out.append(f"| **CWE** | {R._linkify_cwe(cwe)} |")
     elif platform == "yeswehack":

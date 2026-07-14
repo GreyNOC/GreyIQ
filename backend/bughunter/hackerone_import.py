@@ -98,12 +98,17 @@ def _fetch_json(url: str, *, api_username: str, api_token: str, timeout: float) 
             time.sleep(_RETRY_BACKOFF_S * attempt)
 
 
-def _clean_entry(attrs: dict[str, Any]) -> dict[str, Any] | None:
+def _clean_entry(attrs: dict[str, Any], scope_id: str = "") -> dict[str, Any] | None:
     identifier = str(attrs.get("asset_identifier") or "").strip()
     if not identifier:
         return None
     return {
         "identifier": identifier,
+        # The HackerOne structured_scope id (JSON:API row-level ``id``, not an attribute).
+        # Carried through import + program storage so submit_finding can route a filed
+        # report to the exact in-scope asset (structured_scope_id) instead of leaving the
+        # H1 form's required Asset field empty. '' when the API omits it.
+        "id": str(scope_id or "").strip(),
         "asset_type": str(attrs.get("asset_type") or ""),
         "eligible_for_submission": bool(attrs.get("eligible_for_submission", True)),
         "eligible_for_bounty": bool(attrs.get("eligible_for_bounty", False)),
@@ -163,6 +168,66 @@ def verify_credentials(
         return {"ok": False, "error": f"Could not reach HackerOne: {exc}"}
     who = f" as {api_username}" if api_username else ""
     return {"ok": True, "message": f"HackerOne accepted these credentials{who}."}
+
+
+def fetch_weaknesses(
+    handle: str,
+    api_username: str,
+    api_token: str,
+    *,
+    fetch: Callable[..., Any] | None = None,
+    timeout: float = 20.0,
+    max_entries: int = 400,
+) -> dict[str, Any]:
+    """Fetch a program's enabled HackerOne weakness list (for CWE -> weakness_id routing).
+
+    ``GET /v1/hackers/programs/{handle}/weaknesses`` — each entry carries a numeric ``id``
+    (the ``weakness_id`` a report submission routes on) and ``attributes.external_id`` like
+    "cwe-79". ``taxonomy.match_weakness_id`` matches the finding's CWE against this list.
+
+    Read-only, host-pinned, operator/submit-triggered, and best-effort: any failure returns
+    ``{"ok": False, "error": ...}`` and the caller simply omits weakness_id (pre-v2 behavior).
+    Never raises. Returns ``{"ok", "handle", "weaknesses": [{"id", "external_id", "name"}], "error"?}``.
+    """
+    handle = str(handle or "").strip()
+    if not handle:
+        return {"ok": False, "error": "A HackerOne program handle is required."}
+    if not (api_username and api_token):
+        return {"ok": False, "error": "Save your HackerOne API username + token first."}
+    fetch = fetch or _fetch_json
+    safe_handle = urllib.parse.quote(handle, safe="")
+    entries: list[dict[str, Any]] = []
+    url: str | None = f"{_API_BASE}/programs/{safe_handle}/weaknesses"
+    pages = 0
+    try:
+        while url and pages < _MAX_PAGES and len(entries) < max_entries:
+            page = fetch(url, api_username=api_username, api_token=api_token, timeout=timeout)
+            pages += 1
+            if not isinstance(page, dict):
+                break
+            for row in page.get("data") or []:
+                attrs = (row or {}).get("attributes") or {}
+                raw_id = str((row or {}).get("id") or "").strip()
+                if not raw_id:
+                    continue
+                entries.append({
+                    "id": raw_id,
+                    "external_id": str(attrs.get("external_id") or "").strip(),
+                    "name": str(attrs.get("name") or "").strip(),
+                })
+                if len(entries) >= max_entries:
+                    break
+            next_url = ((page.get("links") or {}).get("next")) or None
+            if next_url is not None and not _is_hackerone_url(next_url):
+                next_url = None
+            url = next_url
+    except urllib.error.HTTPError as exc:
+        if not entries:
+            return {"ok": False, "error": _error_for(exc)}
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
+        if not entries:
+            return {"ok": False, "error": f"Could not reach HackerOne: {exc}"}
+    return {"ok": True, "handle": handle, "weaknesses": entries}
 
 
 def fetch_structured_scope(
@@ -235,7 +300,7 @@ def fetch_structured_scope(
             if not isinstance(page, dict):
                 break
             for row in page.get("data") or []:
-                cleaned = _clean_entry((row or {}).get("attributes") or {})
+                cleaned = _clean_entry((row or {}).get("attributes") or {}, str((row or {}).get("id") or ""))
                 if cleaned:
                     entries.append(cleaned)
                 if len(entries) >= max_entries:

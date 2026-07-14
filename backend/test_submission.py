@@ -239,7 +239,12 @@ class SubmitToHackeroneNetworkTests(unittest.TestCase):
             result = submission.submit_to_hackerone(
                 self._pkg(), team_handle="acme", api_username="bob", api_token="s3cret", confirm=True, timeout=7.0,
             )
-        self.assertEqual(result, {"ok": True, "report_id": "12345", "url": "https://hackerone.com/reports/12345"})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["report_id"], "12345")
+        self.assertEqual(result["url"], "https://hackerone.com/reports/12345")
+        # v2: the routed-fields summary rides along; None when no weakness/asset was resolved.
+        self.assertEqual(result["routed"], {"weakness_id": None, "structured_scope_id": None})
+        self.assertNotIn("attachments", result)  # no attachments passed -> no upload attempted
         self.assertEqual(captured["timeout"], 7.0)
 
         request = captured["request"]
@@ -275,7 +280,9 @@ class SubmitToHackeroneNetworkTests(unittest.TestCase):
             result = submission.submit_to_hackerone(
                 self._pkg(), team_handle="acme", api_username="bob", api_token="s3cret", confirm=True,
             )
-        self.assertEqual(result, {"ok": True, "report_id": "", "url": ""})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["report_id"], "")
+        self.assertEqual(result["url"], "")
 
     def test_http_error_decodes_body_and_status_into_message(self) -> None:
         def fake_urlopen(request, timeout=None):

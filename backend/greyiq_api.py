@@ -359,6 +359,8 @@ from bughunter import vdp_policy as bounty_vdp  # noqa: E402
 from bughunter import secret_classification as bounty_secret_class  # noqa: E402
 from bughunter import hackerone_import as bounty_h1_import  # noqa: E402
 from bughunter import hackerone_activity as bounty_h1_activity  # noqa: E402
+from bughunter import taxonomy as bounty_taxonomy  # noqa: E402
+from bughunter import fsutil as bounty_fsutil  # noqa: E402
 from bughunter import progress as bounty_progress  # noqa: E402
 from bughunter.operator import OperatorLoop  # noqa: E402
 from bughunter import toolkit as toolkit_lib  # noqa: E402
@@ -659,6 +661,10 @@ class ReverifyRequest(BaseModel):
     time_based: bool = False  # opt-in: allow the (executing) time-based blind-SQLi probe
     auth_cookie: str = Field(default="", max_length=8000)
     auth_headers: list[str] = Field(default_factory=list, max_length=20)
+    # v2 reproduction-stability: re-run the same scope-gated probe this many times and report
+    # how consistently each finding confirmed (a flaky WAF/timing false-positive won't confirm
+    # every pass). 1 = the classic single probe. Capped server-side so it can't fan out.
+    stability_passes: int = Field(default=1, ge=1, le=3)
 
 
 class ProveRequest(BaseModel):
@@ -791,6 +797,17 @@ class SubmitRequest(BaseModel):
     ref: str = Field(min_length=1, max_length=40)
     confirm: bool = False
     platform: str = Field(default="hackerone", max_length=20)
+    # Optional operator override from the asset picker; when empty the server matches the
+    # finding's host against the program's structured scope automatically.
+    structured_scope_id: str = Field(default="", max_length=64)
+    include_attachments: bool = True
+
+
+class PreflightRequest(BaseModel):
+    run_id: str = Field(min_length=1, max_length=64)
+    ref: str = Field(min_length=1, max_length=40)
+    platform: str = Field(default="hackerone", max_length=20)
+    check_duplicates: bool = True
 
 
 class ScreenshotRequest(BaseModel):
@@ -1791,6 +1808,7 @@ class GreyIQRuntime:
             return {"ok": False, "error": "This finding has no URL to re-verify."}
         scope, settings, _excluded = self._active_scope_for(request.scope, request.program_id)
         auth = bounty_scan_auth.build_auth(url, cookie=request.auth_cookie, headers=request.auth_headers)
+        passes = max(1, min(int(request.stability_passes or 1), 3))
         results, meta = bounty_active_verify.verify_active(
             url, [], scope=scope, settings=settings, time_based=request.time_based,
             auth=auth, requests_budget=16,
@@ -1799,11 +1817,39 @@ class GreyIQRuntime:
             return {"ok": False, "in_scope": False, "host": meta.get("host", ""),
                     "error": meta.get("skipped_reason") or "That target is not named in the current scope, so it can't be re-verified."}
         compact = [self._compact_active(r) for r in results]
+        requests_used = int(meta.get("requests_used", 0))
+        rate_limited = bool(meta.get("rate_limited"))
+        # Reproduction-stability: re-run the SAME benign, scope-gated, budget-bounded probe up to
+        # `passes-1` more times and count how often each finding re-confirmed. A finding that
+        # confirms every pass is reproducibly real; one that flips is flagged as possibly flaky.
+        # Keyed by (rule_id|title) so a finding is tracked across passes; best-effort — a failed
+        # extra pass never fails the whole re-verify.
+        if passes > 1 and compact:
+            def _key(item: dict[str, Any]) -> str:
+                return f"{item.get('rule_id', '')}|{item.get('title', '')}"
+            confirmed_counts = {_key(c): (1 if c["status"] == "confirmed" else 0) for c in compact}
+            for _ in range(passes - 1):
+                try:
+                    more, more_meta = bounty_active_verify.verify_active(
+                        url, [], scope=scope, settings=settings, time_based=request.time_based,
+                        auth=auth, requests_budget=16)
+                except Exception:  # noqa: BLE001 - a flaky extra pass must not fail the base re-verify
+                    break
+                requests_used += int(more_meta.get("requests_used", 0))
+                rate_limited = rate_limited or bool(more_meta.get("rate_limited"))
+                seen = {f"{r.get('rule_id','')}|{r.get('title','')}"
+                        for r in (self._compact_active(x) for x in more) if r["status"] == "confirmed"}
+                for k in confirmed_counts:
+                    if k in seen:
+                        confirmed_counts[k] += 1
+            for c in compact:
+                hits = confirmed_counts.get(_key(c), 0)
+                c["stability"] = {"passes": hits, "of": passes, "stable": hits == passes and c["status"] == "confirmed"}
         confirmed = sum(1 for c in compact if c["status"] == "confirmed")
         return {
             "ok": True, "host": meta.get("host", ""), "in_scope": True,
-            "requests_used": meta.get("requests_used", 0), "rate_limited": bool(meta.get("rate_limited")),
-            "findings": compact, "confirmed": confirmed,
+            "requests_used": requests_used, "rate_limited": rate_limited,
+            "stability_passes": passes, "findings": compact, "confirmed": confirmed,
         }
 
     # --- Shared active-probe helpers (used by reverify + prove) --------------------
@@ -3069,11 +3115,40 @@ class GreyIQRuntime:
             "title": finding["title"], "severity": finding["severity"],
         }
 
+    def _run_replay_items(self, run: dict[str, Any]) -> list[dict[str, Any]]:
+        """Rebuild the replay/HAR item list ({finding, proof_status, proof_of_impact}) from a
+        cached run's findings + attack plans — the shape bounty_build_replay/har consume."""
+        ctx = run.get("ctx") or {}
+        plans = ctx.get("attack_plans") or {}
+        items: list[dict[str, Any]] = []
+        for ref, finding in (run.get("findings") or {}).items():
+            if not isinstance(finding, dict):
+                continue
+            plan = plans.get(ref) if isinstance(plans.get(ref), dict) else {}
+            poi = plan.get("proof_of_impact") if isinstance(plan.get("proof_of_impact"), dict) else {}
+            status = str(poi.get("status") or finding.get("proof_status") or "")
+            items.append({"finding": finding, "source_url": finding.get("location", ""),
+                          "proof_status": status, "proof_of_impact": poi, "plan": plan})
+        return items
+
+    def _run_findings_summary(self, run: dict[str, Any]) -> list[dict[str, Any]]:
+        """A compact per-finding summary (ref/title/severity/proof_status) for the bundle INDEX."""
+        summary: list[dict[str, Any]] = []
+        for item in self._run_replay_items(run):
+            f = item["finding"]
+            summary.append({"ref": str(f.get("ref") or ""), "title": str(f.get("title") or ""),
+                            "severity": str(f.get("severity") or ""),
+                            "proof_status": item["proof_status"] or "candidate"})
+        return summary
+
     def export_bundle(self, request: "BundleRequest") -> dict[str, Any]:
         """Zip the whole engagement (reports, per-platform packages, evidence,
-        screenshots, research dossiers, JSON) for download. A campaign's self-contained
-        folder is zipped whole; a single hunt's artifacts are gathered by file list. The
-        .zip is returned inline (base64) under a size cap, else by path. Local only."""
+        screenshots, research dossiers, JSON, replay.sh/findings.har, and a triager-facing
+        INDEX.md) for download. A campaign's self-contained folder is zipped whole; a single
+        hunt's artifacts are gathered by file list. V2: a single hunt now also gets the
+        machine-replayable replay.sh + findings.har (previously campaign-only) and every
+        bundle carries an INDEX.md "start here" map. The .zip is returned inline (base64)
+        under a size cap, else by path. Local only."""
         import base64
 
         with self.lock:
@@ -3081,14 +3156,31 @@ class GreyIQRuntime:
         if not run:
             return {"ok": False, "error": "This run is no longer cached — re-run the hunt to rebuild the bundle."}
         art = run.get("artifacts") or {}
+        ctx = run.get("ctx") or {}
         safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "_" for c in str(s))[:60]  # noqa: E731
         out_zip = RUNTIME_DIR / "bundles" / f"engagement-{safe(request.run_id)}.zip"
         # Stamp the run's identity + generation time into the evidence-integrity manifest so
         # the chain of custody names the exact tool/version and when the evidence was bundled.
-        bundle_meta = {"tool": "GreyIQ BugHunter", "version": VERSION,
-                       "generated_at": str(run.get("generated_at") or art.get("generated_at") or "")}
+        # The findings summary + target/scope feed the INDEX.md the triager reads first.
+        bundle_meta: dict[str, Any] = {
+            "tool": "GreyIQ BugHunter", "version": VERSION,
+            "generated_at": str(run.get("generated_at") or art.get("generated_at") or ""),
+            "target": str(run.get("target") or ctx.get("target") or ""),
+            "scope": str(ctx.get("scope") or ""),
+            "findings": self._run_findings_summary(run),
+        }
         if art.get("is_campaign") and art.get("output_dir") and Path(art["output_dir"]).is_dir():
-            res = bounty_bundle.bundle_directory(art["output_dir"], out_zip, meta=bundle_meta)
+            out_dir = Path(art["output_dir"])
+            # Write the INDEX into the campaign folder (idempotent) so the folder is self-
+            # documenting whether opened directly or via the .zip. present = what's actually
+            # there + the manifest files bundle_directory will add.
+            try:
+                present = {p.name for p in out_dir.iterdir()}
+                present |= {"INDEX.md", "EVIDENCE-MANIFEST.json", "MANIFEST.sha256"}
+                bounty_fsutil.write_text_safe(out_dir / "INDEX.md", bounty_bundle.build_index(bundle_meta, present))
+            except OSError:
+                pass
+            res = bounty_bundle.bundle_directory(out_dir, out_zip, meta=bundle_meta)
         else:
             specs: list[tuple[str, str]] = []
             for key in ("report_path", "json_path"):
@@ -3119,6 +3211,26 @@ class GreyIQRuntime:
                 for p in (entry if isinstance(entry, list) else [entry]):
                     if p:
                         specs.append((f"evidence/{Path(p).name}", p))
+            # V2 parity: a single hunt now also ships the machine-replayable reproduction
+            # artifacts + the INDEX, staged to disk (bundle_files reads from disk).
+            stage = RUNTIME_DIR / "bundles" / f"stage-{safe(request.run_id)}"
+            try:
+                stage.mkdir(parents=True, exist_ok=True)
+                items = self._run_replay_items(run)
+                replay, replay_n = bounty_build_replay(items)
+                if replay_n:
+                    bounty_fsutil.write_text_safe(stage / "replay.sh", replay)
+                    specs.append(("replay.sh", str(stage / "replay.sh")))
+                har, har_n = bounty_build_har(items, version=VERSION, generated_at=bundle_meta["generated_at"])
+                if har_n:
+                    bounty_fsutil.write_text_safe(stage / "findings.har", json.dumps(har, indent=2))
+                    specs.append(("findings.har", str(stage / "findings.har")))
+                present = {arc.split("/", 1)[0] for arc, _ in specs}
+                present |= {"INDEX.md", "EVIDENCE-MANIFEST.json", "MANIFEST.sha256"}
+                bounty_fsutil.write_text_safe(stage / "INDEX.md", bounty_bundle.build_index(bundle_meta, present))
+                specs.append(("INDEX.md", str(stage / "INDEX.md")))
+            except OSError:
+                pass
             res = bounty_bundle.bundle_files(specs, out_zip, meta=bundle_meta)
         if not res.get("ok"):
             return res
@@ -3136,12 +3248,99 @@ class GreyIQRuntime:
             "download_b64": download_b64, "inline": bool(download_b64),
         }
 
+    def _hackerone_weakness_id(self, handle: str, cwe: Any) -> int | None:
+        """Match a finding's CWE against the program's enabled HackerOne weakness list so a
+        filed report lands weakness-set (routable) rather than untriaged. The list is fetched
+        once per handle per process and cached. Fail-closed: any failure -> None (the report
+        still files, just without a structured weakness — the pre-v2 behavior)."""
+        number = bounty_taxonomy.cwe_number(cwe)
+        if not (handle and number):
+            return None
+        cache = getattr(self, "_h1_weakness_cache", None)
+        if cache is None:
+            cache = {}
+            self._h1_weakness_cache = cache
+        if handle not in cache:
+            _, username, token = self._hackerone_creds()
+            res = bounty_h1_import.fetch_weaknesses(handle, username, token)
+            cache[handle] = res.get("weaknesses") if res.get("ok") else []
+        return bounty_taxonomy.match_weakness_id(cache.get(handle) or [], cwe)
+
+    def _match_structured_scope_id(self, run: dict[str, Any] | None, finding: dict[str, Any],
+                                   override: str = "") -> str:
+        """Resolve the HackerOne structured_scope_id for a finding's host so a filed report is
+        routed to the exact in-scope asset (the H1 form's required Asset field). An explicit
+        operator override (asset picker) wins; otherwise match the finding's host against the
+        program's imported structured scope (exact host, then registrable-domain/wildcard).
+        Returns '' when nothing matches (report files un-routed, as before)."""
+        if str(override or "").strip():
+            return str(override).strip()
+        program_id = str((run or {}).get("program") or "").strip()
+        if not program_id:
+            return ""
+        program = bounty_portfolio.get_program(RUNTIME_DIR, program_id)
+        if not program:
+            return ""
+        host = (urlparse(str(finding.get("location") or (run or {}).get("target") or "")).hostname or "").lower()
+        if not host:
+            return ""
+        best = ""
+        for entry in program.get("structured_scope") or []:
+            sid = str(entry.get("id") or "").strip()
+            if not sid or not entry.get("eligible_for_submission", True):
+                continue
+            ident = str(entry.get("identifier") or "").strip().lower().lstrip("*.")
+            if not ident:
+                continue
+            if ident == host:
+                return sid  # exact host match wins outright
+            if not best and (host == ident or host.endswith("." + ident)):
+                best = sid  # wildcard / parent-domain match, kept only if no exact match appears
+        return best
+
+    def _submission_attachment_paths(self, run: dict[str, Any], finding: dict[str, Any]) -> list[str]:
+        """Gather the captured evidence files for a finding to upload as report attachments:
+        proof screenshots + attack-plan map (they render inline), the plain-text request/
+        response + credential + sensitive-data transcripts, and the machine-replayable
+        replay.sh / findings.har. Deduped by basename, existing files only, bounded."""
+        candidates: list[str] = []
+        for key in ("screenshot_path", "attack_map_path"):
+            if finding.get(key):
+                candidates.append(str(finding[key]))
+        for coll in ("screenshots", "source_texts", "credential_artifacts"):
+            for entry in (run.get(coll) or {}).values():
+                for p in (entry if isinstance(entry, list) else [entry]):
+                    if p:
+                        candidates.append(str(p))
+        art = (run or {}).get("artifacts") or {}
+        for p in art.get("sensitive_data_paths") or []:
+            candidates.append(str(p))
+        out_dir = art.get("output_dir")
+        if out_dir:
+            for name in ("replay.sh", "findings.har", "INDEX.md"):
+                fp = Path(out_dir) / name
+                if fp.is_file():
+                    candidates.append(str(fp))
+        seen: set[str] = set()
+        resolved: list[str] = []
+        for p in candidates:
+            pp = Path(p)
+            if pp.name in seen or not pp.is_file():
+                continue
+            seen.add(pp.name)
+            resolved.append(str(pp))
+        return resolved[:12]
+
     def submit_finding(self, request: "SubmitRequest") -> dict[str, Any]:
         """File one CONFIRMED finding to HackerOne via the hard-gated submit. The gate
         lives in submission.submit_to_hackerone and is unbypassable: proof_status is
         recomputed server-side from the cached ctx, so a forged confirm can't push a
         non-confirmed finding. Creds come from the perms-restricted secrets store, never
-        the request body. The ONLY path here that touches the network."""
+        the request body. The ONLY path here that touches the network.
+
+        V2: the report is routed (weakness_id from the CWE, structured_scope_id from the
+        finding's host) and the captured evidence rides along as attachments — attachment
+        upload is best-effort and cannot fail the submit."""
         if bounty_formats.normalize_platform(request.platform) != "hackerone":
             return {"ok": False, "error": "Only the HackerOne API submit is wired. Export the package (Copy report / Download .md) and file it on the other platforms."}
         # Resolve the finding + run BEFORE the network call and hold a LOCAL reference. The 16-entry
@@ -3154,9 +3353,14 @@ class GreyIQRuntime:
             return pkg_result
         package = pkg_result["package"]
         handle, username, token = self._hackerone_creds()
+        weakness_id = self._hackerone_weakness_id(handle, package.get("cwe"))
+        scope_id = self._match_structured_scope_id(run, finding or {}, request.structured_scope_id)
+        attachments = (self._submission_attachment_paths(run or {}, finding or {})
+                       if request.include_attachments and finding is not None else None)
         try:
             outcome = bounty_submission.submit_to_hackerone(
                 package, team_handle=handle, api_username=username, api_token=token, confirm=request.confirm,
+                weakness_id=weakness_id, structured_scope_id=scope_id, attachments=attachments,
             )
         except bounty_submission.SubmissionError as exc:
             return {"ok": False, "error": str(exc)}
@@ -3185,6 +3389,50 @@ class GreyIQRuntime:
             bounty_ledger.record_submission(RUNTIME_DIR, program, target, dedup_key,
                                             str(outcome.get("report_id", "")), str(outcome.get("url", "")))
         return {"ok": True, **outcome}
+
+    def preflight_submission(self, request: "PreflightRequest") -> dict[str, Any]:
+        """Per-platform submission readiness — the paste-and-submit gate the cockpit shows
+        before a submit. Returns: the required-field checklist for THIS platform, the
+        program's in-scope assets (for the picker) + the auto-matched structured_scope_id,
+        a probable-duplicate check against the program's disclosed HackerOne reports, and
+        how many evidence files would be attached. Read-only — no submit happens here."""
+        ctx, finding, run = self._resolve_run_finding(request.run_id, request.ref)
+        if ctx is None:
+            return {"ok": False, "error": "This run is no longer cached — re-run the hunt to rebuild it."}
+        if finding is None:
+            return {"ok": False, "error": "Unknown finding for this run."}
+        platform = bounty_formats.normalize_platform(request.platform)
+        package = bounty_submission.build_submission(ctx, finding, platform)
+        if package is None:
+            return {"ok": False, "error": "This finding is not reportable (the report rules drop it, e.g. an unconfirmed credential lead)."}
+        pf = bounty_submission.preflight(package, platform)
+
+        assets: list[dict[str, str]] = []
+        program_id = str((run or {}).get("program") or "").strip()
+        if program_id:
+            program = bounty_portfolio.get_program(RUNTIME_DIR, program_id)
+            for entry in (program or {}).get("structured_scope") or []:
+                if entry.get("eligible_for_submission", True) and str(entry.get("id") or "").strip():
+                    assets.append({"id": str(entry.get("id")), "identifier": str(entry.get("identifier") or ""),
+                                   "asset_type": str(entry.get("asset_type") or "")})
+        matched_scope_id = self._match_structured_scope_id(run, finding, "")
+
+        duplicates: list[dict[str, Any]] = []
+        if request.check_duplicates and platform == "hackerone":
+            handle, uname, token = self._hackerone_creds()
+            if handle and token:
+                try:
+                    hz = bounty_h1_activity.fetch_hacktivity(handle, uname, token, limit=50)
+                    if hz.get("ok"):
+                        duplicates = bounty_h1_activity.find_probable_duplicates(
+                            str(finding.get("title") or ""), package.get("cwe", ""), hz.get("items") or [])
+                except Exception:  # noqa: BLE001 - duplicate check is advisory; never break preflight
+                    duplicates = []
+        return {
+            "ok": True, "platform": platform, "preflight": pf, "assets": assets,
+            "matched_scope_id": matched_scope_id, "duplicates": duplicates,
+            "attachment_count": len(self._submission_attachment_paths(run or {}, finding or {})),
+        }
 
     def hackerone_creds_status(self) -> dict[str, Any]:
         """Creds presence for the UI — NEVER returns the API token."""
@@ -4880,6 +5128,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/submit":
             request = validate_payload(SubmitRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.submit_finding, request))
+            return
+        if method == "POST" and path == "/api/bounty/finding/preflight":
+            request = validate_payload(PreflightRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.preflight_submission, request))
             return
         if method == "GET" and path == "/api/bounty/hackerone/creds":
             await send_json(send, await asyncio.to_thread(runtime.hackerone_creds_status))

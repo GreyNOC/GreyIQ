@@ -24,9 +24,12 @@ Best-effort / never raises to the caller: every network/parse failure returns
 
 from __future__ import annotations
 
+import re
 import urllib.error
 import urllib.parse
 from typing import Any, Callable
+
+from bughunter import taxonomy
 
 from bughunter.hackerone_import import _API_BASE, _fetch_json
 
@@ -97,7 +100,10 @@ def fetch_hacktivity(
     items: list[dict[str, Any]] = []
     for row in page.get("data") or []:
         attrs = (row or {}).get("attributes") or {}
+        rid = str((row or {}).get("id") or "").strip()
         items.append({
+            "id": rid,
+            "url": f"https://hackerone.com/reports/{rid}" if rid.isdigit() else "",
             "title": str(attrs.get("title") or ""),
             "severity_rating": str(attrs.get("severity_rating") or ""),
             "cwe": str(attrs.get("cwe") or ""),
@@ -107,6 +113,71 @@ def fetch_hacktivity(
             "program_handle": handle,  # already filtered server-side to this program
         })
     return {"ok": True, "handle": handle, "items": items}
+
+
+# ---------------------------------------------------------------------------
+# Pre-submit duplicate detection (against a program's disclosed reports)
+# ---------------------------------------------------------------------------
+# Duplicate is the #1 bug-bounty rejection reason. fetch_hacktivity already pulls a
+# program's disclosed reports; this compares a pending finding against them so the
+# operator gets a "this looks like #12345" warning BEFORE filing. Deterministic /
+# offline — pure string + CWE overlap, no network, no model.
+_DUP_STOPWORDS = frozenset({
+    "the", "a", "an", "in", "on", "at", "of", "to", "and", "or", "for", "with", "via",
+    "is", "are", "was", "by", "from", "vulnerability", "issue", "bug", "security",
+})
+
+
+def _dup_tokens(text: str) -> set[str]:
+    words = re.findall(r"[a-z0-9]+", str(text or "").lower())
+    return {w for w in words if len(w) > 2 and w not in _DUP_STOPWORDS}
+
+
+def find_probable_duplicates(
+    title: str, cwe: str, items: list[dict[str, Any]], *, threshold: float = 0.4, limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Score a pending finding's (title, cwe) against disclosed reports; return the most
+    similar above ``threshold``, most-similar first.
+
+    Score = Jaccard token overlap of titles, boosted when the CWE matches. Pure, total,
+    never raises — an empty/garbage input just yields []. This is an advisory signal, never
+    a gate: it warns, it does not block a submit.
+    """
+    my_tokens = _dup_tokens(title)
+    my_cwe = taxonomy.cwe_number(cwe) if title or cwe else ""
+    if not my_tokens:
+        return []
+    scored: list[dict[str, Any]] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        their_tokens = _dup_tokens(item.get("title"))
+        if not their_tokens:
+            continue
+        overlap = my_tokens & their_tokens
+        union = my_tokens | their_tokens
+        jaccard = len(overlap) / len(union) if union else 0.0
+        cwe_match = bool(my_cwe) and taxonomy.cwe_number(item.get("cwe")) == my_cwe
+        score = min(1.0, jaccard + (0.25 if cwe_match else 0.0))
+        if score < threshold:
+            continue
+        reasons = []
+        if cwe_match:
+            reasons.append(f"same CWE ({my_cwe})")
+        if overlap:
+            reasons.append("shared terms: " + ", ".join(sorted(overlap)[:6]))
+        scored.append({
+            "title": str(item.get("title") or ""),
+            "url": str(item.get("url") or ""),
+            "id": str(item.get("id") or ""),
+            "cwe": str(item.get("cwe") or ""),
+            "severity_rating": str(item.get("severity_rating") or ""),
+            "disclosed_at": str(item.get("disclosed_at") or ""),
+            "score": round(score, 3),
+            "reason": "; ".join(reasons) or "similar title",
+        })
+    scored.sort(key=lambda row: row["score"], reverse=True)
+    return scored[:limit]
 
 
 def fetch_my_reports(

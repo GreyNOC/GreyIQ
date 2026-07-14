@@ -2,29 +2,44 @@
 
 Turns a confirmed/reportable finding into a submission-ready package: the
 human-readable, self-contained Markdown (reused from report.py) plus the
-structured fields a platform wants — title, severity rating, CWE, impact, and the
-vulnerability_information body. Default behavior is EXPORT (write files); pushing
-to the HackerOne API is a separate, hard-gated, opt-in action.
+structured fields a platform wants — title, severity rating, CWE/weakness, Bugcrowd
+VRT, CVSS vector, the target asset, and the vulnerability_information body. Default
+behavior is EXPORT (write files); pushing to the HackerOne API is a separate,
+hard-gated, opt-in action.
 
-Pure / frozen-safe for the export path. The optional API submit is the only thing
-that touches the network, and only when the caller passes real credentials and an
-explicit confirmation for a CONFIRMED finding.
+V2 additions:
+  * ``preflight`` — a per-platform required-field validator, so an operator sees
+    exactly what THIS program's form still needs (H1: asset+weakness; Bugcrowd:
+    VRT+priority; …) before submitting, instead of discovering empty required fields
+    on paste.
+  * ``submit_to_hackerone`` now files a *routed* report — the in-scope asset
+    (structured_scope_id), the HackerOne weakness id (matched from the finding's CWE),
+    and the CVSS vector ride along, and the captured evidence is uploaded as report
+    attachments — all behind the same unbypassable hard gate.
+
+Pure / frozen-safe for the export path. The optional API submit + attachment upload
+are the only things that touch the network, and only when the caller passes real
+credentials and an explicit confirmation for a CONFIRMED finding.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import mimetypes
 import re
 import shutil
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any
 
 from bughunter import fsutil
 from bughunter import report as report_lib
 from bughunter import report_formats
+from bughunter import taxonomy
 
 # H1 severity_rating vocabulary.
 _H1_SEVERITY = {"critical": "critical", "high": "high", "medium": "medium", "low": "low", "info": "none", "none": "none"}
@@ -55,7 +70,13 @@ def build_submission(ctx: dict[str, Any], finding: dict[str, Any], platform: str
     proof = report_lib._proof_of_impact_detail(finding, plan)
     impact = str(plan.get("impact") or finding.get("impact") or proof.get("affected_asset") or "").strip()
     sev = report_lib.resolve_severity(finding, plan).title()
-    title = f"[{sev}] {finding.get('title', 'Security finding')} at {finding.get('location') or ctx.get('target', '')}"
+    location = str(finding.get("location") or "").strip()
+    title = f"[{sev}] {finding.get('title', 'Security finding')} at {location or ctx.get('target', '')}"
+    # Bugcrowd VRT: prefer any explicit value the finding already carries, else derive it
+    # deterministically from the CWE (best-effort estimate) so a Bugcrowd submission no
+    # longer lands on the literal "(map to the closest VRT category)" placeholder.
+    vrt = str(finding.get("vrt") or "").strip() or (taxonomy.cwe_to_vrt(finding.get("cwe")) or "")
+    cvss = plan.get("cvss") if isinstance(plan.get("cvss"), dict) else {}
     return {
         "ref": finding.get("ref", ""),
         "title": title[:255],
@@ -67,11 +88,76 @@ def build_submission(ctx: dict[str, Any], finding: dict[str, Any], platform: str
         "platform_severity": report_formats.platform_severity(platform, finding, plan),
         "cwe": str(finding.get("cwe") or ""),
         "weakness": _cwe_number(finding),
-        "vrt": str(finding.get("vrt") or ""),  # Bugcrowd VRT category (est.), '' if unmapped
+        "vrt": vrt,  # Bugcrowd VRT category (est.), '' if the CWE is unmapped
+        "cvss_vector": str(cvss.get("vector") or "").strip(),
+        "cvss_score": cvss.get("base_score"),
+        # The concrete affected asset/endpoint — used to route an H1 submission to its
+        # structured_scope entry and to preflight the platforms that require an endpoint.
+        "location": location,
         "proof_status": str(proof.get("status") or "missing"),
         "vulnerability_information": body,
         "impact": impact,
         "target": ctx.get("target", ""),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Per-platform submission preflight (required-field readiness)
+# ---------------------------------------------------------------------------
+# What each destination program's submission form actually REQUIRES, so preflight can
+# report "missing for THIS program" instead of a generic completeness score. Each entry:
+# a package-field key -> the human label shown when it's absent.
+_PLATFORM_REQUIRED: dict[str, list[tuple[str, str]]] = {
+    "hackerone": [("title", "Title"), ("vulnerability_information", "Report body"),
+                  ("severity_rating", "Severity"), ("weakness", "Weakness (CWE)"),
+                  ("location", "Affected asset / endpoint")],
+    "bugcrowd": [("title", "Title"), ("vulnerability_information", "Description"),
+                 ("platform_severity", "Priority (P1–P5)"), ("vrt", "Bug type (VRT)")],
+    "intigriti": [("title", "Title"), ("vulnerability_information", "Description"),
+                  ("location", "Endpoint / domain"), ("cvss_vector", "CVSS vector")],
+    "yeswehack": [("title", "Title"), ("vulnerability_information", "Description"),
+                  ("weakness", "Bug type (CWE)"), ("cvss_vector", "CVSS vector")],
+}
+
+
+def preflight(package: dict[str, Any], platform: str | None = None) -> dict[str, Any]:
+    """Validate a submission package against the destination platform's required fields.
+
+    Returns ``{"ok", "platform", "platform_name", "ready", "missing": [labels],
+    "warnings": [str], "checklist": [{"label", "present"}]}``. ``ready`` is True only when
+    every required field is present AND the finding is proof-confirmed. Pure/no-network —
+    this is the paste-and-submit readiness gate the UI shows before a submit.
+    """
+    platform = report_formats.normalize_platform(platform or package.get("platform"))
+    required = _PLATFORM_REQUIRED.get(platform, _PLATFORM_REQUIRED["hackerone"])
+    checklist: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for key, label in required:
+        present = bool(str(package.get(key) or "").strip())
+        checklist.append({"label": label, "present": present})
+        if not present:
+            missing.append(label)
+
+    warnings: list[str] = []
+    proof_status = str(package.get("proof_status") or "missing")
+    proof_ok = proof_status == "confirmed"
+    checklist.append({"label": "Proof captured (confirmed)", "present": proof_ok})
+    if not proof_ok:
+        warnings.append(
+            f"Proof status is '{proof_status}', not 'confirmed' — capture the observed-vs-control "
+            "differential (run with --active) before submitting to a live program."
+        )
+    if not str(package.get("cvss_vector") or "").strip():
+        warnings.append("No CVSS vector — most programs accept the report without one, but it speeds triage.")
+
+    return {
+        "ok": True,
+        "platform": platform,
+        "platform_name": report_formats.platform_name(platform),
+        "ready": not missing and proof_ok,
+        "missing": missing,
+        "warnings": warnings,
+        "checklist": checklist,
     }
 
 
@@ -112,6 +198,98 @@ class SubmissionError(RuntimeError):
     """A HackerOne submit could not proceed (gate failed or API error)."""
 
 
+_H1_API = "https://api.hackerone.com/v1"
+# Cap each uploaded attachment so a stray large artifact can't stall a submit; the
+# evidence bundle stays available locally regardless of what uploads.
+_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+_MAX_ATTACHMENTS = 12
+
+
+def _basic_auth(api_username: str, api_token: str) -> str:
+    return "Basic " + base64.b64encode(f"{api_username}:{api_token}".encode()).decode()
+
+
+def _multipart_encode(field_name: str, filename: str, data: bytes, content_type: str) -> tuple[bytes, str]:
+    """Build a minimal RFC 2388 multipart/form-data body (stdlib only). Returns
+    (body_bytes, content_type_header)."""
+    boundary = "----GreyIQ" + uuid.uuid4().hex
+    disp = f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"'
+    body = b"".join([
+        f"--{boundary}\r\n".encode(),
+        f"{disp}\r\n".encode(),
+        f"Content-Type: {content_type}\r\n\r\n".encode(),
+        data,
+        f"\r\n--{boundary}--\r\n".encode(),
+    ])
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def upload_hackerone_attachments(
+    report_id: str,
+    attachments: list[str | Path],
+    *,
+    api_username: str,
+    api_token: str,
+    timeout: float = 60.0,
+    _urlopen: Any = None,
+) -> dict[str, Any]:
+    """Best-effort upload of evidence files to a just-created HackerOne report.
+
+    Never raises and never blocks the submit: a filed report must stand even if an
+    attachment upload fails (the operator still has the complete local evidence bundle).
+    Returns ``{"uploaded": [names], "failed": [{"name", "error"}]}``. Each file is posted
+    as multipart/form-data to ``/reports/{id}/attachments``; oversized/unreadable files are
+    skipped. Bounded to _MAX_ATTACHMENTS so a big engagement can't fan out unbounded POSTs.
+    """
+    urlopen = _urlopen or urllib.request.urlopen
+    uploaded: list[str] = []
+    failed: list[dict[str, str]] = []
+    if not report_id:
+        return {"uploaded": uploaded, "failed": failed}
+    seen: set[str] = set()
+    for spec in attachments or []:
+        if len(uploaded) + len(failed) >= _MAX_ATTACHMENTS:
+            break
+        path = Path(str(spec))
+        name = path.name
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        try:
+            if not path.is_file():
+                continue
+            size = path.stat().st_size
+            if size == 0 or size > _MAX_ATTACHMENT_BYTES:
+                failed.append({"name": name, "error": "too large" if size else "empty"})
+                continue
+            data = path.read_bytes()
+        except OSError as exc:
+            failed.append({"name": name, "error": str(exc)})
+            continue
+        content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        body, ct_header = _multipart_encode("file", name, data, content_type)
+        req = urllib.request.Request(
+            f"{_H1_API}/reports/{urllib.parse.quote(str(report_id), safe='')}/attachments",
+            data=body, method="POST",
+            headers={"Authorization": _basic_auth(api_username, api_token),
+                     "Content-Type": ct_header, "Accept": "application/json"},
+        )
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                resp.read()
+            uploaded.append(name)
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", "ignore")[:200]
+            except Exception:  # noqa: BLE001
+                pass
+            failed.append({"name": name, "error": f"HTTP {exc.code}: {detail or exc.reason}"})
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            failed.append({"name": name, "error": str(exc)})
+    return {"uploaded": uploaded, "failed": failed}
+
+
 def submit_to_hackerone(
     package: dict[str, Any],
     *,
@@ -119,12 +297,24 @@ def submit_to_hackerone(
     api_username: str,
     api_token: str,
     confirm: bool,
+    weakness_id: int | None = None,
+    structured_scope_id: str | None = None,
+    attachments: list[str | Path] | None = None,
     timeout: float = 30.0,
+    _urlopen: Any = None,
 ) -> dict[str, Any]:
     """POST one package to the HackerOne API. HARD-GATED: requires an explicit
     confirm, real credentials, a team handle, and a CONFIRMED proof status — this
     must never fire on an unproven lead. Returns the API response summary or raises
-    SubmissionError. Network is only touched here."""
+    SubmissionError. Network is only touched here.
+
+    V2: the report is *routed* — ``weakness_id`` (matched from the finding's CWE against
+    the program's enabled weakness list) and ``structured_scope_id`` (the in-scope asset)
+    are added to the payload when known, so the report lands weakness-set and asset-routed
+    rather than in the triage backlog. When ``attachments`` are supplied, the captured
+    evidence is uploaded to the created report — best-effort, reported under ``attachments``,
+    and NEVER able to fail the submit itself.
+    """
     if not confirm:
         raise SubmissionError("refused: pass an explicit confirmation to submit to a live program.")
     if package.get("proof_status") != "confirmed":
@@ -134,27 +324,33 @@ def submit_to_hackerone(
         )
     if not (team_handle and api_username and api_token):
         raise SubmissionError("refused: team handle + HACKERONE_API_USERNAME + HACKERONE_API_TOKEN are required.")
-    payload = {
-        "data": {
-            "type": "report",
-            "attributes": {
-                "team_handle": team_handle,
-                "title": package["title"],
-                "vulnerability_information": package["vulnerability_information"],
-                "impact": package.get("impact") or "See the report.",
-                "severity_rating": package.get("severity_rating", "low"),
-            },
-        }
+    urlopen = _urlopen or urllib.request.urlopen
+    attributes: dict[str, Any] = {
+        "team_handle": team_handle,
+        "title": package["title"],
+        "vulnerability_information": package["vulnerability_information"],
+        "impact": package.get("impact") or "See the report.",
+        "severity_rating": package.get("severity_rating", "low"),
     }
-    auth = base64.b64encode(f"{api_username}:{api_token}".encode()).decode()
+    # Only add the routing attributes when they resolved — an unknown weakness/asset must
+    # not send a null and risk the create call rejecting an otherwise-valid report.
+    if weakness_id is not None:
+        try:
+            attributes["weakness_id"] = int(weakness_id)
+        except (TypeError, ValueError):
+            pass
+    if structured_scope_id:
+        attributes["structured_scope_id"] = str(structured_scope_id)
+    payload = {"data": {"type": "report", "attributes": attributes}}
     request = urllib.request.Request(
-        "https://api.hackerone.com/v1/reports",
+        f"{_H1_API}/reports",
         data=json.dumps(payload).encode("utf-8"),
         method="POST",
-        headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json", "Accept": "application/json"},
+        headers={"Authorization": _basic_auth(api_username, api_token),
+                 "Content-Type": "application/json", "Accept": "application/json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as resp:
+        with urlopen(request, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "ignore")[:500] if hasattr(exc, "read") else ""
@@ -162,4 +358,13 @@ def submit_to_hackerone(
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise SubmissionError(f"HackerOne submit failed: {exc}") from exc
     report_id = str(((data.get("data") or {}).get("id")) or "")
-    return {"ok": True, "report_id": report_id, "url": f"https://hackerone.com/reports/{report_id}" if report_id else ""}
+    result: dict[str, Any] = {
+        "ok": True, "report_id": report_id,
+        "url": f"https://hackerone.com/reports/{report_id}" if report_id else "",
+        "routed": {"weakness_id": attributes.get("weakness_id"),
+                   "structured_scope_id": attributes.get("structured_scope_id")},
+    }
+    if attachments and report_id:
+        result["attachments"] = upload_hackerone_attachments(
+            report_id, list(attachments), api_username=api_username, api_token=api_token, _urlopen=urlopen)
+    return result
