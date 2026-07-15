@@ -2,6 +2,48 @@
 
 Notable changes to GreyIQ.
 
+## v2.2.0 - veteran hunt intelligence and professional cockpit
+
+This release strengthens GreyIQ's complete finding lifecycle: deciding what to test, discovering
+hidden attack surface, validating proof without overclaiming, packaging triager-ready evidence,
+and operating the hunt through a focused professional workflow. Existing authorization, scope,
+budget, VDP-policy, and submit gates remain enforced.
+
+### Veteran hunt planning and source-map recon
+- A deterministic offline planner ranks differential checks per endpoint from observed routes,
+  parameters, forms, APIs, authentication signals, and stack semantics, so constrained request
+  budgets reach likely high-impact classes without requiring an LLM.
+- Ordered class priorities remain an actual ranking; duplicate-class checks and the safety-tuned
+  unranked tail keep stable ordering.
+- Recon inspects explicitly referenced, in-scope external source maps for hidden endpoints,
+  parameters, sibling hosts, and redacted secrets, with pre/post-redirect scope gates and hard
+  request, map, source-file, and content limits.
+
+### Submission-proof QA/QC hardening
+- Findings reach **Confirmed** only through an engine-trusted validator or a captured
+  positive-vs-control differential. HTTP-looking notes and generic screenshots cannot overstate
+  proof of impact or exploitability.
+- Proof obligations are redacted with the other proof fields, preventing credentials echoed by a
+  model or operator note from leaking into exported reports.
+- Per-finding packages copy every referenced screenshot, preserve colliding basenames, omit broken
+  links after failed copies, and namespace same-named evidence in engagement ZIPs.
+- Test discovery is restricted to GreyIQ's backend suite so cached repositories and packaged
+  dependencies cannot pollute local QA runs.
+
+### Professional cockpit workflow
+- The launch rail follows a clear Target/Scope -> Strategy -> Authorize/Launch flow with a dedicated
+  scroll region, readiness guidance, and a clear non-overlapping launch action.
+- Single-hunt, campaign, and portfolio modes show only relevant controls; portfolio runs cannot
+  expose or reuse a single target's shared session credentials.
+- Navigation, run modes, sortable findings, finding rows, and empty-state handoffs publish keyboard
+  and assistive-technology semantics.
+- The cockpit scales to phone widths: navigation compacts, structured scope rows stack, wide tables
+  scroll within their panels, and page-level horizontal overflow is prevented.
+
+### Maintenance
+- Local HTTP fixtures now close their listener sockets deterministically, eliminating the remaining
+  `ResourceWarning` noise from the QA suite.
+
 ## v2.1.0 — program repository hunts
 
 A program's scope is rarely just its running app — bounty programs increasingly publish their

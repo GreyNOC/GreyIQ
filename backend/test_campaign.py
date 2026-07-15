@@ -471,6 +471,39 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(result["proof_of_impact"][ref]["status"], "candidate")
         self.assertIn(ref, result["attack_plans"])  # inline plan threaded through
 
+    def test_url_campaign_passes_deterministic_priority_to_active_engine(self) -> None:
+        # A small per-URL request budget must reach the endpoint's most relevant class even when
+        # no optional LLM is configured. Lock the recon -> planner -> active-engine wiring.
+        target = "https://app.example.com/api/download?file=report.pdf"
+        captured: dict = {}
+        orig = (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves)
+        campaign.recon.discover = lambda t, **k: {
+            "urls": [t], "notes": [], "sources": {}, "js_secrets": [], "tech": [],
+            "params": ["file"], "forms": [], "hints": {}, "api_findings": [],
+        }
+
+        def fake_hunt(*args, **kwargs):
+            captured.update(kwargs)
+            return {"ok": True, "json_path": "", "report_path": ""}
+
+        campaign.run_bounty_hunt = fake_hunt
+        campaign.cve_service.scan_known_cves = lambda t, **k: {
+            "ok": True, "host": "app.example.com", "target": t,
+            "components": [], "count": 0, "findings": [],
+        }
+        try:
+            result = campaign.run_campaign(
+                target, scope="app.example.com", authorized=True, coder_cfg={},
+                default_reports_dir=self.reports, runtime_dir=self.runtime, version="9.9.9",
+                program="demo", active=True,
+            )
+        finally:
+            campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves = orig
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(captured["class_priority"][0], "path-traversal")
+        self.assertIn("crlf", captured["class_priority"])
+
     def test_static_findings_are_not_auto_recorded_as_submitted(self) -> None:
         # Source-code findings are candidates (no active proof) -> nothing logged
         # to the learning store, so we never pollute program memory with leads.

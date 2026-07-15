@@ -15,6 +15,7 @@ only ever fetches in-scope targets.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Callable
 from urllib.parse import urljoin, urlparse
@@ -43,6 +44,13 @@ _ENDPOINT_HINTS = ("api", "graphql", "/v1", "/v2", "/v3", "rest", "/query", "/ad
 _STATIC_EXT = (".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".woff", ".woff2",
                ".ttf", ".eot", ".map", ".mp4", ".webm", ".pdf", ".zip", ".woff2")
 _CAP_ENDPOINTS, _CAP_PARAMS, _CAP_HOSTS, _CAP_SECRETS, _CAP_WS = 80, 60, 40, 20, 30
+_CAP_SOURCE_MAP_URLS = 4
+_CAP_SOURCE_FILES = 100
+_CAP_SOURCE_CONTENT_CHARS = 1_000_000
+_SOURCE_MAP_RE = re.compile(
+    r"(?://[#@]\s*sourceMappingURL\s*=\s*([^\s]+)|/\*[#@]\s*sourceMappingURL\s*=\s*([^\s*]+))",
+    re.IGNORECASE,
+)
 
 
 def _registrable_apex(host: str) -> str:
@@ -156,3 +164,84 @@ def mine_js(js_text: str, base_url: str, *, host_filter: Callable[[str], bool] |
 
     return {"endpoints": endpoints, "params": params, "hosts": hosts, "websockets": websockets,
             "secret_findings": secret_findings}
+
+
+def source_map_urls(js_text: str, base_url: str) -> list[str]:
+    """Extract bounded external ``sourceMappingURL`` references from a served JS body.
+
+    Inline ``data:`` maps are intentionally skipped: decoding attacker-controlled base64 would
+    add memory/CPU risk and no request-visible exposure. The caller still applies its own scope
+    gate before any returned URL is fetched.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in _SOURCE_MAP_RE.finditer(str(js_text or "")):
+        raw = str(match.group(1) or match.group(2) or "").strip().strip("\"';")
+        if not raw or raw.lower().startswith("data:"):
+            continue
+        try:
+            absolute = urljoin(base_url, raw).split("#", 1)[0]
+            parsed = urlparse(absolute)
+        except (TypeError, ValueError):
+            continue
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or absolute in seen:
+            continue
+        seen.add(absolute)
+        out.append(absolute)
+        if len(out) >= _CAP_SOURCE_MAP_URLS:
+            break
+    return out
+
+
+def mine_source_map(
+    map_text: str,
+    map_url: str,
+    *,
+    host_filter: Callable[[str], bool] | None = None,
+) -> dict[str, Any]:
+    """Mine embedded ``sourcesContent`` from one external source map, with hard size caps.
+
+    This function is pure and treats the map as untrusted data. It never follows ``sources`` paths
+    or fetches missing source files; only code the server actually exposed inside the map is mined.
+    """
+    empty = {
+        "endpoints": [], "params": [], "hosts": [], "secret_findings": [],
+        "source_count": 0, "embedded_chars": 0,
+    }
+    try:
+        document = json.loads(str(map_text or ""))
+    except (TypeError, ValueError):
+        return empty
+    if not isinstance(document, dict):
+        return empty
+    contents = document.get("sourcesContent")
+    if not isinstance(contents, list):
+        return empty
+
+    kept: list[str] = []
+    total = 0
+    for content in contents[:_CAP_SOURCE_FILES]:
+        if not isinstance(content, str) or not content:
+            continue
+        remaining = _CAP_SOURCE_CONTENT_CHARS - total
+        if remaining <= 0:
+            break
+        piece = content[:remaining]
+        kept.append(piece)
+        total += len(piece)
+    if not kept:
+        return empty
+
+    parsed_map = urlparse(map_url)
+    origin = f"{parsed_map.scheme}://{parsed_map.netloc}/" if parsed_map.scheme and parsed_map.netloc else map_url
+    mined = mine_js("\n".join(kept), origin, host_filter=host_filter)
+    # A source-map secret is a distinct exposure from a minified-bundle secret. Preserve the same
+    # redaction contract while making the evidence location/title honest for report QA/QC.
+    for finding in mined.get("secret_findings") or []:
+        finding["title"] = str(finding.get("title") or "Secret in served JS").replace(
+            "Secret in served JS", "Secret in served source map", 1
+        )
+        finding["file_path"] = map_url
+        finding["remediation"] = "Remove production source maps or omit sensitive source content, then rotate the exposed secret."
+    mined.update({"source_count": len(kept), "embedded_chars": total})
+    return mined

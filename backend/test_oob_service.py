@@ -337,6 +337,7 @@ class PollCollaboratorRealResponseTests(unittest.TestCase):
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         return server.server_port
 

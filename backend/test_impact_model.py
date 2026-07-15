@@ -128,7 +128,12 @@ class DeterministicProofTests(unittest.TestCase):
         f = {"ref": "F1", "class_id": "access-control", "rule_id": "x"}
         prose = {"proof_of_impact": {"evidence": "an attacker could read another user account; admin data returned"}}
         self.assertEqual(report_lib._proof_of_impact_detail(f, prose)["status"], "candidate")
-        artifact = {"proof_of_impact": {"observed_result": "HTTP 200 returned the order owned by account A"}}
+        observation_only = {"proof_of_impact": {"observed_result": "HTTP 200 returned the order owned by account A"}}
+        self.assertEqual(report_lib._proof_of_impact_detail(f, observation_only)["status"], "candidate")
+        artifact = {"proof_of_impact": {
+            "observed_result": "HTTP 200 returned the order owned by account A",
+            "control_result": "the same request as account B returned HTTP 403",
+        }}
         self.assertEqual(report_lib._proof_of_impact_detail(f, artifact)["status"], "confirmed")
         # An explicit 'confirmed' status WITH a real observed_result/control_result
         # differential (what every active-prover check actually produces) stays confirmed.
@@ -164,6 +169,19 @@ class DeterministicProofTests(unittest.TestCase):
         for cid in impact_model.IMPACT_MODEL:
             plan = _deterministic_attack_plan({"ref": "F1", "class_id": cid, "rule_id": "x"}, cid)
             self.assertTrue(plan["proof_of_impact"]["proof_obligation"].strip(), cid)
+
+    def test_operator_or_model_proof_obligation_is_redacted(self) -> None:
+        raw = "AKIAIOSFODNN7EXAMPLE"
+        detail = report_lib._proof_of_impact_detail(
+            {"ref": "F1", "class_id": "secrets", "rule_id": "x"},
+            {"proof_of_impact": {
+                "status": "candidate",
+                "evidence": "credential-shaped value exposed in source",
+                "proof_obligation": f"Validate {raw} with the issuer",
+            }},
+        )
+        self.assertNotIn(raw, detail["proof_obligation"])
+        self.assertIn("REDACTED", detail["proof_obligation"])
 
 
 if __name__ == "__main__":

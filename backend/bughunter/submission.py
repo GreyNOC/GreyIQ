@@ -165,8 +165,62 @@ def write_submission_package(ctx: dict[str, Any], finding: dict[str, Any], out_d
                              platform: str = "hackerone") -> dict[str, Any] | None:
     """Write a finding's submission .md + .json to out_dir. Returns the package
     (with paths) or None if the finding isn't reportable / write failed."""
-    package = build_submission(ctx, finding, platform)
-    if package is None:
+    # Preflight reportability before touching disk. Screenshot paths are normalized below
+    # only for the on-disk package; the caller's finding remains unchanged.
+    if build_submission(ctx, finding, platform) is None:
+        return None
+    package_finding = dict(finding)
+    raw_shots = finding.get("screenshot_paths")
+    if not isinstance(raw_shots, list) or not raw_shots:
+        single = str(finding.get("screenshot_path") or "").strip()
+        raw_shots = [single] if single else []
+
+    # Copy every referenced screenshot and give basename collisions a deterministic,
+    # package-specific name. The report is rendered only from successful copies, which
+    # prevents stale/broken image links and prevents one finding's proof from silently
+    # replacing another finding's screenshot in a shared submissions folder.
+    copied_shots: list[str] = []
+    newly_created: list[Path] = []
+    seen_sources: set[Path] = set()
+    if raw_shots:
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        for index, shot in enumerate(raw_shots, 1):
+            src = Path(str(shot or "").strip())
+            try:
+                resolved_src = src.resolve()
+                if not src.is_file() or resolved_src in seen_sources:
+                    continue
+                seen_sources.add(resolved_src)
+                dest = out_dir / src.name
+                if dest.exists() and resolved_src != dest.resolve():
+                    suffix = src.suffix or ".png"
+                    dest = out_dir / f"{stem}-proof-{index:02d}{suffix}"
+                    serial = 2
+                    while dest.exists() and resolved_src != dest.resolve():
+                        dest = out_dir / f"{stem}-proof-{index:02d}-{serial}{suffix}"
+                        serial += 1
+                if resolved_src != dest.resolve():
+                    shutil.copyfile(src, dest)
+                    newly_created.append(dest)
+                copied_shots.append(str(dest))
+            except OSError:
+                continue
+
+    package_finding.pop("screenshot_path", None)
+    package_finding.pop("screenshot_paths", None)
+    if copied_shots:
+        package_finding["screenshot_path"] = copied_shots[0]
+        package_finding["screenshot_paths"] = copied_shots
+    package = build_submission(ctx, package_finding, platform)
+    if package is None:  # defensive: the screenshot-only rewrite cannot change reportability
+        for path in newly_created:
+            try:
+                path.unlink()
+            except OSError:
+                pass
         return None
     md_path = out_dir / f"{stem}.md"
     json_path = out_dir / f"{stem}.json"
@@ -174,14 +228,15 @@ def write_submission_package(ctx: dict[str, Any], finding: dict[str, Any], out_d
         fsutil.write_text_safe(md_path, package["vulnerability_information"])
         fsutil.write_text_safe(json_path, json.dumps(package, indent=2, default=str))
     except OSError:
+        for path in newly_created:
+            try:
+                path.unlink()
+            except OSError:
+                pass
         return None
-    # Co-locate the proof screenshot (if any) with the .md so its embedded
-    # ![](basename) reference resolves wherever the package folder is opened. The
-    # report embeds by basename, so keep the same name. Best-effort: a copy failure
-    # must not drop the package.
-    # Co-locate the proof screenshot AND the graphical attack-plan map (each optional) with the .md so
-    # their embedded ![](basename) references resolve wherever the package folder is opened.
-    for artifact in (finding.get("screenshot_path"), finding.get("attack_map_path")):
+    # Co-locate the graphical attack-plan map with the report. Screenshots were already
+    # copied and collision-safe-normalized above before rendering the package.
+    for artifact in (finding.get("attack_map_path"),):
         p = str(artifact or "").strip()
         if not p:
             continue
@@ -191,7 +246,8 @@ def write_submission_package(ctx: dict[str, Any], finding: dict[str, Any], out_d
                 shutil.copyfile(src, out_dir / src.name)
         except OSError:
             pass
-    return {**package, "markdown_path": str(md_path), "json_path": str(json_path)}
+    return {**package, "markdown_path": str(md_path), "json_path": str(json_path),
+            "screenshot_paths": copied_shots}
 
 
 class SubmissionError(RuntimeError):

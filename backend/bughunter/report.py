@@ -475,10 +475,11 @@ def _proof_text_is_concrete(text: str) -> bool:
     return bool(_CONCRETE_IMPACT_RE.search(cleaned))
 
 
-_HTTP_RESULT_RE = re.compile(r"\bHTTP\s*[1-5]\d{2}\b|\b(?:returned|response|status)\b[^.]{0,40}\b[1-5]\d{2}\b", re.IGNORECASE)
-
-
-def _has_captured_artifact(finding: dict[str, Any], proof: Any, observed_result: str) -> bool:
+def _has_captured_artifact(
+    finding: dict[str, Any],
+    proof: Any,
+    _observed_result: str = "",
+) -> bool:
     """True only when there is a REAL captured artifact proving IMPACT — never from
     narrative prose alone, and never from a bare explicit status. NOTE: the passive web
     ``proof_evidence`` (request line + 'header absent' + response status) is deliberately
@@ -492,7 +493,11 @@ def _has_captured_artifact(finding: dict[str, Any], proof: Any, observed_result:
     brain (possibly hallucinating, or echoing scanned-page prompt-injection) writing a bare
     ``status: confirmed`` with vague prose essentially never supplies a real differential.
     This keeps an explicit status from single-handedly flipping proof_status (and the
-    auto-submit gate behind it) without backing evidence."""
+    auto-submit gate behind it) without backing evidence.
+
+    ``_observed_result`` remains as an ignored compatibility argument for callers from
+    the v2.1 report API. Narrative text -- even an HTTP-looking string -- is not a
+    captured artifact and must never satisfy this gate by itself."""
     # A secret / exposed-key finding that strict classification did NOT confirm can NEVER be a captured
     # artifact — no synthesized issuer narrative, "HTTP 200" mention, or brain prose may promote a public
     # client key or an unverified candidate to confirmed. This is the single authoritative guard.
@@ -513,8 +518,6 @@ def _has_captured_artifact(finding: dict[str, Any], proof: Any, observed_result:
     if isinstance(cred, dict) and cred.get("live") is True and secret_classification.has_confirmed_secret_proof(finding):
         return True
     if isinstance(proof, dict) and str(proof.get("observed_result") or "").strip() and str(proof.get("control_result") or "").strip():
-        return True
-    if observed_result and _HTTP_RESULT_RE.search(observed_result):
         return True
     return False
 
@@ -633,6 +636,7 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
         "blast_radius",
         "impact_narrative",
         "limitations",
+        "proof_obligation",
     ):
         if detail[_k]:
             detail[_k] = redact_text(str(detail[_k]))[0]
@@ -642,7 +646,7 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
     # affected_asset/actor fields never drive promotion — only true proof fields do.)
     combined = f"{detail['evidence']} {detail['observed_result']}".strip()
     explicit_status = _explicit_proof_status(finding, plan, proof)
-    artifact = _has_captured_artifact(finding, proof, str(detail["observed_result"]))
+    artifact = _has_captured_artifact(finding, proof)
     if explicit_status == "confirmed":
         # An explicit 'confirmed' — from the active prover, an attack plan, or the brain —
         # is honored ONLY when a real captured artifact backs it. Brain/plan prose alone
@@ -881,8 +885,10 @@ def _proof_of_exploitability_detail(finding: dict[str, Any], plan: dict[str, Any
     screenshots = _screenshot_names(finding)
     status = "missing"
     if captured_text or screenshots:
-        explicit = _explicit_proof_status(finding, plan, _proof_value(finding, plan))
-        status = "confirmed" if str(poi.get("status")) == "confirmed" or (screenshots and explicit == "confirmed") else "candidate"
+        # A screenshot can support an already-confirmed exploit, but it cannot turn a
+        # client/model assertion into confirmation by itself. Keep proof of impact and
+        # proof of exploitability on the same evidence gate.
+        status = "confirmed" if str(poi.get("status")) == "confirmed" else "candidate"
     elif recipe_text:
         status = "candidate"
     artifact_text = captured_text or recipe_text

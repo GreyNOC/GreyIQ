@@ -4445,10 +4445,12 @@ const ck = {
   deep: document.querySelector("#ckDeep"),
   attackMap: document.querySelector("#ckAttackMap"),
   live: document.querySelector("#ckLive"),
+  optionsFold: document.querySelector("#ckOptionsFold"),
   authFold: document.querySelector("#ckAuthFold"),
   authCookie: document.querySelector("#ckAuthCookie"),
   authHeaders: document.querySelector("#ckAuthHeaders"),
   authorized: document.querySelector("#ckAuthorized"),
+  readiness: document.querySelector("#ckLaunchReadiness"),
   run: document.querySelector("#ckRun"),
   status: document.querySelector("#ckStatus"),
   views: {
@@ -4557,9 +4559,11 @@ function ckSyncService() {
   ck.service.textContent = up ? "engine ready" : "engine offline";
   ck.service.classList.toggle("is-up", up);
   ck.service.classList.toggle("is-down", !up);
+  ckUpdateLaunchReadiness();
 }
 
 function ckSetView(view) {
+  if (!ck.views[view]) return;
   ckState.view = view;
   for (const btn of ck.navButtons) {
     const active = btn.dataset.ckView === view;
@@ -4601,6 +4605,59 @@ function ckSetRunType(type) {
   ckUpdateSpanScopeToggle();
   if (state.ckRunType === "portfolio") ckRenderPortfolioPicker();
   ckSyncSetupReveal();  // Portfolio always reveals the rest; hunt/campaign keep the program-first gate
+  ckUpdateVerificationSummary();
+  ckUpdateLaunchReadiness();
+}
+
+function ckUpdateVerificationSummary() {
+  const label = ck.optionsFold?.querySelector("summary span");
+  const detail = ck.optionsFold?.querySelector("summary small");
+  if (!label || !detail) return;
+  const enabled = [];
+  if (ck.active?.checked) enabled.push("proof probes");
+  if (ck.timeBased?.checked) enabled.push("deep SQLi");
+  if (ck.live?.checked) enabled.push("browser pass");
+  if (state.ckRunType !== "hunt" && ck.deep?.checked) enabled.push("auto-work");
+  label.textContent = enabled.length ? "Custom verification" : "Passive by default";
+  detail.textContent = enabled.length ? enabled.join(" · ") : "expand for proof probes";
+}
+
+function ckUpdateLaunchReadiness() {
+  if (!ck.readiness) return;
+  const isPortfolio = state.ckRunType === "portfolio";
+  const isCampaign = state.ckRunType === "campaign";
+  const spanning = isCampaign && Boolean(ck.spanScope?.checked) && !ck.spanScopeWrap?.hidden && Boolean(state.ckActiveProgramId);
+  const portfolioCount = ck.portfolioList ? ck.portfolioList.querySelectorAll("input[type=checkbox]:checked").length : 0;
+  const target = (ck.target?.value || "").trim();
+  const scope = (ck.scope?.value || "").trim();
+  const authorized = Boolean(ck.authorized?.checked);
+  const proofEnabled = Boolean(ck.active?.checked || ck.timeBased?.checked || (state.ckRunType !== "hunt" && ck.deep?.checked));
+  const networkTarget = /^https?:\/\//i.test(target) && !ckIsCloneableGitUrl(target);
+  let text = "";
+  let ready = false;
+
+  if (!service.available) text = "Engine offline · start the local service before launching.";
+  else if (isPortfolio && !portfolioCount) text = "Select at least one saved program.";
+  else if (!isPortfolio && !spanning && !target) {
+    text = ck.activeProgram?.value === "__oneoff__"
+      ? "Enter the authorized target to continue."
+      : "Choose a program or add a one-off target.";
+  }
+  else if (!authorized) text = "Confirm authorization to unlock this run.";
+  else {
+    ready = true;
+    if (proofEnabled && networkTarget && !scope) {
+      ready = false;
+      text = "Add authorized scope before enabling network proof probes.";
+    } else {
+      const mode = isPortfolio ? "portfolio" : (isCampaign ? "campaign" : "single hunt");
+      const depth = proofEnabled ? "proof-enabled" : "passive-first";
+      text = `Ready · ${mode} · ${depth}.`;
+    }
+  }
+  ck.readiness.textContent = text;
+  ck.readiness.classList.toggle("is-ready", ready);
+  ck.readiness.classList.toggle("is-blocked", !ready);
 }
 
 // The Portfolio-mode program multi-select: a checkbox per saved program (marking which have
@@ -4616,6 +4673,7 @@ function ckRenderPortfolioPicker() {
       ? "No saved programs yet — add one in the Program tab (import scope, add seed targets, or opt in a source repository)."
       : "Engine unreachable — can't load your programs."));
     if (ck.portfolioCount) ck.portfolioCount.textContent = "";
+    ckUpdateLaunchReadiness();
     return;
   }
   for (const p of progs) {
@@ -4639,6 +4697,7 @@ function ckUpdatePortfolioCount() {
   if (!ck.portfolioCount) return;
   const n = ck.portfolioList ? ck.portfolioList.querySelectorAll("input[type=checkbox]:checked").length : 0;
   ck.portfolioCount.textContent = n ? `(${n} selected)` : "";
+  ckUpdateLaunchReadiness();
 }
 
 async function ckPopulateProfiles() {
@@ -4830,6 +4889,21 @@ function ckRenderFindings() {
     svg.append(p);
     empty.append(svg, cel("h2", null, "Run a hunt to begin"), cel("p", null,
       "Enter an authorized target and scope on the left, then run a single hunt or a full campaign. Findings land here with a proof-status column; click any row for the captured proof and a submission draft."));
+    const actions = cel("div", "ck-actions");
+    const hunt = cel("button", "ck-btn primary", "Configure a hunt"); hunt.type = "button";
+    hunt.addEventListener("click", () => {
+      ckSetRunType("hunt");
+      document.querySelector("#ckSetupFold")?.setAttribute("open", "");
+      ck.activeProgram?.focus();
+    });
+    const campaign = cel("button", "ck-btn", "Configure a campaign"); campaign.type = "button";
+    campaign.addEventListener("click", () => {
+      ckSetRunType("campaign");
+      document.querySelector("#ckSetupFold")?.setAttribute("open", "");
+      ck.activeProgram?.focus();
+    });
+    actions.append(hunt, campaign);
+    empty.append(actions);
     host.append(empty);
     return;
   }
@@ -4900,26 +4974,25 @@ function ckRenderFindings() {
   const thead = cel("thead");
   const htr = cel("tr");
   for (const [label, sortKey] of [["Sev", "severity"], ["Class", null], ["Proof", "proof"], ["Finding", null], ["Where", null], ["CVSS", "cvss"]]) {
-    const th = cel("th", null, label);
+    const th = cel("th");
     if (sortKey) {
       const isCurrent = ckState.sort.key === sortKey;
       // dir=-1 sorts DESCENDING (the default on first click — critical/high first); the
       // glyph must match the conventional meaning (▼ descending, ▲ ascending), not invert it.
-      const arrow = cel("span", "ck-sort", isCurrent ? (ckState.sort.dir < 0 ? " ▼" : " ▲") : " ⇅");
-      th.append(arrow);
-      // Keyboard-operable sortable header: focusable, Enter/Space toggles, aria-sort exposes state.
-      th.tabIndex = 0;
+      const sortButton = cel("button", "ck-sort-btn", label);
+      sortButton.type = "button";
+      const arrow = cel("span", "ck-sort", isCurrent ? (ckState.sort.dir < 0 ? "▼" : "▲") : "⇅");
+      arrow.setAttribute("aria-hidden", "true");
+      sortButton.append(arrow);
       th.setAttribute("aria-sort", isCurrent ? (ckState.sort.dir < 0 ? "descending" : "ascending") : "none");
       const doSort = () => {
         if (ckState.sort.key === sortKey) ckState.sort.dir *= -1;
         else ckState.sort = { key: sortKey, dir: -1 };
         ckRenderFindings();
       };
-      th.addEventListener("click", doSort);
-      th.addEventListener("keydown", (ev) => {
-        if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); doSort(); }
-      });
-    } else { th.style.cursor = "default"; }
+      sortButton.addEventListener("click", doSort);
+      th.append(sortButton);
+    } else th.append(document.createTextNode(label));
     htr.append(th);
   }
   thead.append(htr);
@@ -4953,7 +5026,9 @@ function ckRenderFindings() {
     tbody.append(tr);
   }
   table.append(tbody);
-  host.append(table);
+  const tableWrap = cel("div", "ck-table-wrap");
+  tableWrap.append(table);
+  host.append(tableWrap);
 
   function td(child) { const cell = cel("td"); cell.append(child); return cell; }
 }
@@ -5829,6 +5904,14 @@ function ckRenderSurface() {
   const s = ckState.surface;
   if (!s || !(s.urls || []).length) {
     host.append(cel("p", "ck-hint", "Run a full campaign to map the target's surface (discovered URLs, robots/sitemap/security.txt sources)."));
+    const configure = cel("button", "ck-btn primary", "Configure a full campaign");
+    configure.type = "button";
+    configure.addEventListener("click", () => {
+      ckSetRunType("campaign");
+      document.querySelector("#ckSetupFold")?.setAttribute("open", "");
+      ck.activeProgram?.focus();
+    });
+    host.append(configure);
     return;
   }
   host.append(cel("h2", "ck-section-title", `Surface — ${s.urls.length} in-scope URL(s)`));
@@ -5995,10 +6078,10 @@ const CK_WALKTHROUGHS = {
 function ckWalkthrough(key) {
   const spec = CK_WALKTHROUGHS[key];
   if (!spec) return cel("span");  // unknown key — render nothing (defensive)
-  const storeKey = "greyiq.walkthrough." + key;
+  const storeKey = "greyiq.walkthrough.v2." + key;
   const box = cel("details", "ck-walkthrough");
   const stored = localStorage.getItem(storeKey);
-  box.open = stored === null ? (spec.defaultOpen !== false) : stored !== "0";  // honour the user's choice once set
+  box.open = stored === null ? spec.defaultOpen === true : stored === "1";  // collapsed unless a walkthrough explicitly opts in
   box.addEventListener("toggle", () => {
     try { localStorage.setItem(storeKey, box.open ? "1" : "0"); } catch (_) {}
   });
@@ -6206,6 +6289,7 @@ function ckSyncSetupReveal() {
   rest.hidden = !chosen;
   const lead = document.getElementById("ckProgramLead");
   if (lead) lead.hidden = chosen;  // drop the prompt once they've moved past step 1
+  ckUpdateLaunchReadiness();
 }
 
 // Mirror the picked program's name into the read-only top-bar Program indicator.
@@ -6269,9 +6353,12 @@ function ckUpdateAuthorizedLabel() {
   const label = ck.authorized.closest("label")?.querySelector("strong");
   if (!label) return;
   const spanning = state.ckRunType === "campaign" && ck.spanScope && !ck.spanScopeWrap?.hidden && ck.spanScope.checked;
-  label.textContent = spanning
-    ? "I'm authorized to test every in-scope asset in this program (in scope)."
-    : "I'm authorized to test this target (in scope).";
+  label.textContent = state.ckRunType === "portfolio"
+    ? "Confirm authorization for every selected program scope."
+    : spanning
+      ? "Confirm authorization for every in-scope program asset."
+      : "Confirm authorization and scope.";
+  ckUpdateLaunchReadiness();
 }
 
 function ckScopeRowEl(entry) {
@@ -10012,10 +10099,7 @@ async function ckRunPortfolio() {
   state.ckDeep = Boolean(ck.deep?.checked);
   state.ckAttackMap = ck.attackMap ? Boolean(ck.attackMap.checked) : true;  // graphical attack-plan map (default on)
   state.ckLive = Boolean(ck.live?.checked);
-  state.ckAuthCookie = (ck.authCookie?.value || "").trim();
-  state.ckAuthHeaders = (ck.authHeaders?.value || "");
   saveState();
-  const authHeaderLines = state.ckAuthHeaders.split("\n").map((s) => s.trim()).filter(Boolean);
   ck.run.disabled = true;
   ckStatus(`Portfolio hunt running — campaigns across ${ids.length} program(s), several at once (this can take a while)…`);
   const progressRunId = crypto.randomUUID();
@@ -10030,7 +10114,7 @@ async function ckRunPortfolio() {
       body: JSON.stringify({
         program_ids: ids, authorized: true, active: state.ckActive, time_based: state.ckTimeBased,
         deep: state.ckDeep, attack_map: state.ckAttackMap, live: state.ckLive, max_pages: Number(ck.maxPages?.value) || 12,
-        auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines, run_id: progressRunId,
+        run_id: progressRunId,
       }),
     });
     if (res.ok === false) { ckStatus(res.error || "The portfolio hunt could not complete.", true); return; }
@@ -10415,6 +10499,20 @@ function ckRenderCampaign() {
     hero.append(globe);
     hero.append(cel("p", "ck-hint",
       "Nothing is running. Start a single Hunt, a Full campaign, or a Portfolio hunt from the launch rail — every target's status and each finding appears here live as it works."));
+    const actions = cel("div", "ck-actions");
+    const campaign = cel("button", "ck-btn primary", "Configure full campaign"); campaign.type = "button";
+    campaign.addEventListener("click", () => {
+      ckSetRunType("campaign");
+      document.querySelector("#ckSetupFold")?.setAttribute("open", "");
+      ck.activeProgram?.focus();
+    });
+    const portfolio = cel("button", "ck-btn", "Configure portfolio"); portfolio.type = "button";
+    portfolio.addEventListener("click", () => {
+      ckSetRunType("portfolio");
+      document.querySelector("#ckSetupFold")?.setAttribute("open", "");
+    });
+    actions.append(campaign, portfolio);
+    hero.append(actions);
     host.append(hero);
     return;
   }
@@ -10865,14 +10963,42 @@ function bootCockpit() {
   // HIDE the rest while the user is editing inside it (clearing the field to retype would otherwise
   // collapse #ckSetupRest and blur the focused input). Collapsing happens only on an explicit
   // program-picker change via ckApplyActiveProgram.
-  ck.target?.addEventListener("input", () => { state.ckTarget = ck.target.value; saveState(); if (ck.target.value.trim()) ckSyncSetupReveal(); });
-  ck.scope?.addEventListener("input", () => { state.ckScope = ck.scope.value; saveState(); });
+  ck.target?.addEventListener("input", () => { state.ckTarget = ck.target.value; saveState(); if (ck.target.value.trim()) ckSyncSetupReveal(); ckUpdateLaunchReadiness(); });
+  ck.scope?.addEventListener("input", () => { state.ckScope = ck.scope.value; saveState(); ckUpdateLaunchReadiness(); });
+  ck.authorized?.addEventListener("change", ckUpdateLaunchReadiness);
+  ck.active?.addEventListener("change", () => {
+    if (!ck.active.checked) {
+      if (ck.timeBased) ck.timeBased.checked = false;
+      if (ck.deep) ck.deep.checked = false;
+    }
+    ckUpdateVerificationSummary();
+    ckUpdateLaunchReadiness();
+  });
+  ck.timeBased?.addEventListener("change", () => {
+    if (ck.timeBased.checked && ck.active) ck.active.checked = true;
+    if (!ck.timeBased.checked && ck.deep) ck.deep.checked = false;
+    ckUpdateVerificationSummary();
+    ckUpdateLaunchReadiness();
+  });
+  ck.deep?.addEventListener("change", () => {
+    if (ck.deep.checked) {
+      if (ck.active) ck.active.checked = true;
+      if (ck.timeBased) ck.timeBased.checked = true;
+    }
+    ckUpdateVerificationSummary();
+    ckUpdateLaunchReadiness();
+  });
+  ck.live?.addEventListener("change", () => {
+    ckUpdateVerificationSummary();
+    ckUpdateLaunchReadiness();
+  });
   // Target scope-picker: pick an in-scope target, or "Other…" to reveal the free-text input.
   ck.targetPick?.addEventListener("change", () => {
     if (ck.targetPick.value === "__custom__") { ck.target.hidden = false; ck.target.value = ""; ck.target.focus(); }
     else { ck.target.hidden = true; ck.target.value = ck.targetPick.value; }
     state.ckTarget = ck.target.value; saveState();
     ckSyncSetupReveal();
+    ckUpdateLaunchReadiness();
   });
   ckWireSidebarResizer();
   ck.spanScope?.addEventListener("change", () => {
@@ -10882,8 +11008,10 @@ function bootCockpit() {
   });
   ck.profile?.addEventListener("change", () => { state.bountyProfile = ck.profile.value; saveState(); ckUpdateProfileHint(); });
   ck.launch?.addEventListener("submit", (e) => { e.preventDefault(); void ckRun(); });
-  // Drop the (collapsed-by-default) hunt walkthrough at the top of the launch form.
-  if (ck.launch) ck.launch.prepend(ckWalkthrough("hunt"));
+  // Keep optional guidance below configuration so it never delays program/target entry.
+  const setupRest = document.querySelector("#ckSetupRest");
+  const launchActions = setupRest?.querySelector(".ck-launch-actions");
+  if (setupRest && launchActions) setupRest.insertBefore(ckWalkthrough("hunt"), launchActions);
   // Restore persisted form values.
   if (ck.target) ck.target.value = state.ckTarget || "";
   if (ck.scope) ck.scope.value = state.ckScope || "";
@@ -10896,11 +11024,18 @@ function bootCockpit() {
   if (ck.spanScope) ck.spanScope.checked = Boolean(state.ckSpanScope);
   if (ck.authCookie) ck.authCookie.value = state.ckAuthCookie || "";
   if (ck.authHeaders) ck.authHeaders.value = state.ckAuthHeaders || "";
+  if (ck.deep?.checked) {
+    if (ck.timeBased) ck.timeBased.checked = true;
+    if (ck.active) ck.active.checked = true;
+  } else if (ck.timeBased?.checked && ck.active) ck.active.checked = true;
+  if (ck.optionsFold && (ck.active?.checked || ck.timeBased?.checked || ck.deep?.checked || ck.live?.checked)) ck.optionsFold.open = true;
   if (ck.authFold && (state.ckAuthCookie || state.ckAuthHeaders)) ck.authFold.open = true;
   ckSetRunType(state.ckRunType || "hunt");
   ckSyncSetupReveal();   // reveal the rest of setup immediately if a target was already restored
   ckUpdateTopProgram();
   ckSyncService();
+  ckUpdateVerificationSummary();
+  ckUpdateLaunchReadiness();
   void ckPopulateProfiles();
   void (async () => {
     await ckFetchCreds();

@@ -93,6 +93,8 @@ class WriteSubmissionPackageScreenshotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             written = submission.write_submission_package(ctx, finding, Path(tmp), "sub-01-xss")
         self.assertIsNotNone(written)  # missing screenshot must not drop the whole package
+        assert written is not None
+        self.assertNotIn("Screenshot evidence", written["vulnerability_information"])
 
     def test_screenshot_already_at_destination_is_not_recopied(self) -> None:
         # src.resolve() == (out_dir / src.name).resolve() -- the in-place guard must
@@ -123,14 +125,10 @@ class WriteSubmissionPackageScreenshotTests(unittest.TestCase):
                 written = submission.write_submission_package(ctx, finding, out_dir, "sub-01-xss")
         self.assertIsNotNone(written)
         self.assertFalse((out_dir / "01-f1.png").exists())
+        assert written is not None
+        self.assertNotIn("Screenshot evidence", written["vulnerability_information"])
 
-    def test_basename_collision_silently_overwrites_the_existing_file(self) -> None:
-        # PINS current (not necessarily desirable) behavior: write_submission_package
-        # copies by basename, so a second finding whose screenshot happens to share a
-        # basename with an already-copied screenshot (e.g. a stale file left over from a
-        # prior run reusing the same out_dir/stem numbering) silently clobbers it --
-        # no collision detection, no error, no rename. Documented here so a future change
-        # can't silently make this worse (or better) without a test noticing.
+    def test_basename_collision_preserves_both_findings_evidence(self) -> None:
         ctx1, finding1 = _ctx_and_finding(ref="F1")
         ctx2, finding2 = _ctx_and_finding(ref="F2")
         with tempfile.TemporaryDirectory() as tmp:
@@ -149,10 +147,35 @@ class WriteSubmissionPackageScreenshotTests(unittest.TestCase):
             src2.parent.mkdir()
             src2.write_bytes(b"finding-two-proof")
             finding2["screenshot_path"] = str(src2)
-            submission.write_submission_package(ctx2, finding2, out_dir, "sub-02-xss")
+            written2 = submission.write_submission_package(ctx2, finding2, out_dir, "sub-02-xss")
 
-            # finding 1's embedded screenshot now silently shows finding 2's proof.
-            self.assertEqual((out_dir / "01-shot.png").read_bytes(), b"finding-two-proof")
+            self.assertEqual((out_dir / "01-shot.png").read_bytes(), b"finding-one-proof")
+            renamed = out_dir / "sub-02-xss-proof-01.png"
+            self.assertEqual(renamed.read_bytes(), b"finding-two-proof")
+            assert written2 is not None
+            self.assertIn("(sub-02-xss-proof-01.png)", written2["vulnerability_information"])
+
+    def test_all_screenshot_paths_are_copied_and_embedded(self) -> None:
+        ctx, finding = _ctx_and_finding()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src = tmp_path / "src"
+            src.mkdir()
+            first, second = src / "evidence.png", src / "response.png"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            finding["screenshot_path"] = str(first)
+            finding["screenshot_paths"] = [str(first), str(second)]
+            out_dir = tmp_path / "out"
+            written = submission.write_submission_package(ctx, finding, out_dir, "sub-01-xss")
+
+            self.assertIsNotNone(written)
+            assert written is not None
+            self.assertEqual((out_dir / "evidence.png").read_bytes(), b"first")
+            self.assertEqual((out_dir / "response.png").read_bytes(), b"second")
+            body = written["vulnerability_information"]
+            self.assertIn("(evidence.png)", body)
+            self.assertIn("(response.png)", body)
 
     def test_non_reportable_finding_returns_none_without_touching_disk(self) -> None:
         ctx, finding = _ctx_and_finding()

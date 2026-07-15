@@ -2,6 +2,7 @@
 each proven to stay strictly within scope (the paramount constraint) via a stubbed fetcher."""
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -10,8 +11,8 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from bughunter import recon  # noqa: E402
-from bughunter.recon_js import mine_js  # noqa: E402
+from bughunter import recon, recon_js  # noqa: E402
+from bughunter.recon_js import mine_js, mine_source_map, source_map_urls  # noqa: E402
 
 
 def _resp(body: str, final: str, ctype: str = "text/html") -> dict:
@@ -98,6 +99,127 @@ class MineJsHintExemptionTests(unittest.TestCase):
         self.assertNotIn("https://app.acme.com/api/v1/report.pdf", m["endpoints"])  # asset dropped
         self.assertNotIn("https://app.acme.com/api/assets/logo.png", m["endpoints"])
         self.assertIn("https://app.acme.com/api/v1/orders", m["endpoints"])  # a real route survives
+
+
+class SourceMapReconTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._orig_fetch = recon._safe_fetch
+        self.addCleanup(lambda: setattr(recon, "_safe_fetch", self._orig_fetch))
+
+    def test_source_mapping_urls_are_resolved_deduped_and_inline_maps_skipped(self) -> None:
+        js = """
+        //# sourceMappingURL=app.js.map
+        /*# sourceMappingURL=../maps/vendor.map */
+        //# sourceMappingURL=data:application/json;base64,AAAA
+        //# sourceMappingURL=app.js.map
+        """
+        self.assertEqual(source_map_urls(js, "https://app.example.com/static/app.js"), [
+            "https://app.example.com/static/app.js.map",
+            "https://app.example.com/maps/vendor.map",
+        ])
+
+    def test_pure_source_map_miner_recovers_only_embedded_surface(self) -> None:
+        body = json.dumps({
+            "version": 3,
+            "sources": ["webpack:///src/export.ts", "https://not-fetched.example/source.ts"],
+            "sourcesContent": ['fetch("/api/private/export?file="); const q="?returnUrl=";', None],
+        })
+        mined = mine_source_map(body, "https://app.example.com/static/app.js.map",
+                                host_filter=lambda h: h == "app.example.com")
+        self.assertIn("https://app.example.com/api/private/export?file=", mined["endpoints"])
+        self.assertIn("file", mined["params"])
+        self.assertIn("returnUrl", mined["params"])
+        self.assertEqual(mined["source_count"], 1)
+        self.assertNotIn("not-fetched.example", " ".join(mined["endpoints"]))
+
+    def test_discovery_mines_explicit_in_scope_source_map(self) -> None:
+        map_body = json.dumps({
+            "version": 3, "sources": ["src/export.ts"],
+            "sourcesContent": ['export const run = () => fetch("/api/private/export?file=")'],
+        })
+        pages = {
+            "https://example.com/": _resp('<script src="/static/app.js"></script>', "https://example.com/"),
+            "https://example.com/static/app.js": _resp(
+                "minified();\n//# sourceMappingURL=app.js.map", "https://example.com/static/app.js", "application/javascript"),
+            "https://example.com/static/app.js.map": _resp(
+                map_body, "https://example.com/static/app.js.map", "application/json"),
+        }
+        recon._safe_fetch = lambda url, s, g: pages.get(url) or {
+            "status": 404, "final_url": url, "headers": {}, "cookies": [], "body": "",
+        }
+        result = recon.discover("https://example.com/", scope_in=lambda h: h == "example.com",
+                                max_pages=50, max_requests=40)
+        self.assertIn("https://example.com/api/private/export?file=", result["urls"])
+        self.assertIn("file", result["params"])
+        self.assertEqual(result["sources"].get("source-map"), 1)
+        self.assertEqual(result["sources"].get("source-map-endpoint"), 1)
+        self.assertEqual(result["source_maps"][0]["source_count"], 1)
+
+    def test_out_of_scope_map_is_never_fetched(self) -> None:
+        fetched_urls: list[str] = []
+
+        def fake_fetch(url, settings, governor):
+            fetched_urls.append(url)
+            if url == "https://example.com/":
+                return _resp('<script src="/app.js"></script>', url)
+            if url == "https://example.com/app.js":
+                return _resp("//# sourceMappingURL=https://evil.example/app.js.map", url, "application/javascript")
+            return {"status": 404, "final_url": url, "headers": {}, "cookies": [], "body": ""}
+
+        recon._safe_fetch = fake_fetch
+        result = recon.discover("https://example.com/", scope_in=lambda h: h == "example.com",
+                                max_pages=20, max_requests=40)
+        self.assertNotIn("https://evil.example/app.js.map", fetched_urls)
+        self.assertGreaterEqual(result["dropped_out_of_scope"], 1)
+
+    def test_script_and_source_map_redirects_are_regated_before_mining(self) -> None:
+        map_doc = json.dumps({"version": 3, "sourcesContent": ['fetch("/api/should-not-leak")']})
+        pages = {
+            "https://example.com/": _resp(
+                '<script src="/redirected.js"></script><script src="/mapped.js"></script>', "https://example.com/"),
+            "https://example.com/redirected.js": _resp(
+                'fetch("/api/from-oos-script")', "https://evil.example/redirected.js", "application/javascript"),
+            "https://example.com/mapped.js": _resp(
+                "//# sourceMappingURL=mapped.js.map", "https://example.com/mapped.js", "application/javascript"),
+            "https://example.com/mapped.js.map": _resp(
+                map_doc, "https://evil.example/mapped.js.map", "application/json"),
+        }
+        recon._safe_fetch = lambda url, s, g: pages.get(url) or {
+            "status": 404, "final_url": url, "headers": {}, "cookies": [], "body": "",
+        }
+        result = recon.discover("https://example.com/", scope_in=lambda h: h == "example.com",
+                                max_pages=30, max_requests=40)
+        joined = " ".join(result["urls"])
+        self.assertNotIn("from-oos-script", joined)
+        self.assertNotIn("should-not-leak", joined)
+        self.assertGreaterEqual(result["dropped_out_of_scope"], 2)
+
+    def test_malformed_source_map_is_bounded_and_nonfatal(self) -> None:
+        mined = mine_source_map("{ definitely not JSON", "https://app.example.com/app.js.map")
+        self.assertEqual(mined["endpoints"], [])
+        self.assertEqual(mined["source_count"], 0)
+
+    def test_source_map_content_and_reference_counts_are_hard_capped(self) -> None:
+        refs = "\n".join(f"//# sourceMappingURL=bundle-{i}.map" for i in range(20))
+        self.assertEqual(
+            len(source_map_urls(refs, "https://app.example.com/app.js")),
+            recon_js._CAP_SOURCE_MAP_URLS,
+        )
+        body = json.dumps({"sourcesContent": ["x" * (recon_js._CAP_SOURCE_CONTENT_CHARS + 50)] * 3})
+        mined = mine_source_map(body, "https://app.example.com/app.js.map")
+        self.assertEqual(mined["embedded_chars"], recon_js._CAP_SOURCE_CONTENT_CHARS)
+        self.assertEqual(mined["source_count"], 1)
+
+    def test_source_map_secret_is_redacted_and_attributed_to_the_map(self) -> None:
+        raw_secret = "AKIAIOSFODNN7EXAMPLE"
+        body = json.dumps({"sourcesContent": [f'const aws_access_key_id = "{raw_secret}";']})
+        mined = mine_source_map(body, "https://app.example.com/app.js.map")
+        self.assertEqual(len(mined["secret_findings"]), 1)
+        finding = mined["secret_findings"][0]
+        self.assertIn("served source map", finding["title"])
+        self.assertEqual(finding["file_path"], "https://app.example.com/app.js.map")
+        self.assertNotIn(raw_secret, finding["snippet"])
+        self.assertTrue(finding["redacted"])
 
 
 if __name__ == "__main__":

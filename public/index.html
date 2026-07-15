@@ -402,7 +402,7 @@
         </div>
 
         <nav class="ck-nav ck-nav-side" id="ckNav" aria-label="Cockpit views">
-          <button class="ck-nav-btn is-active" data-ck-view="program" type="button">Overview</button>
+          <button class="ck-nav-btn is-active" data-ck-view="program" type="button" aria-current="page">Overview</button>
           <button class="ck-nav-btn" data-ck-view="findings" type="button">Findings</button>
           <button class="ck-nav-btn" data-ck-view="surface" type="button">Surface</button>
           <button class="ck-nav-btn" data-ck-view="submissions" type="button">Submissions</button>
@@ -414,40 +414,45 @@
         <details class="ck-setup-fold" id="ckSetupFold" open>
           <summary class="ck-setup-head"><span>Hunt setup</span></summary>
           <form class="ck-launch" id="ckLaunch">
-            <div class="ck-setup-step ck-step-program">
+            <div class="ck-setup-step ck-step-program" data-ck-when="hunt campaign">
               <span class="ck-step-lab"><span class="ck-step-n">1</span> Program</span>
               <select id="ckActiveProgram" aria-label="Program"><option value="">— pick a program —</option></select>
               <p class="ck-hint ck-step-hint" id="ckProgramLead">Pick a saved program to auto-fill target &amp; scope — or choose a one-off target to enter your own.</p>
             </div>
 
             <div id="ckSetupRest" class="ck-setup-rest" hidden>
-            <span class="ck-step-lab"><span class="ck-step-n">2</span> Target &amp; scope</span>
+            <span class="ck-step-lab" data-ck-when="hunt campaign"><span class="ck-step-n">2</span> Target &amp; scope</span>
             <div data-ck-when="portfolio" hidden class="ck-portfolio-pick">
               <div class="ck-portfolio-head">
                 <span>Programs to hunt <strong id="ckPortfolioCount"></strong></span>
                 <button type="button" class="ck-btn" id="ckPortfolioAll">Select all</button>
               </div>
               <div id="ckPortfolioPrograms" class="ck-portfolio-list"></div>
-              <p class="ck-hint">Runs a full campaign on every selected program's <em>own saved scope</em> — several at once, bounded so it stays polite (per-host rate limits stay on). AI write-ups run on your selected device (GPU if set). Target/Scope above are ignored in this mode.</p>
+              <p class="ck-hint">Each selected program uses its own saved scope and research account. Runs stay bounded by the same per-host limits.</p>
             </div>
 
+            <div class="ck-target-fields" data-ck-when="hunt campaign">
             <label><span>Target</span>
               <select id="ckTargetPick" hidden aria-label="Target — pick from the program's scope"></select>
               <input id="ckTarget" type="text" autocomplete="off" spellcheck="false" placeholder="https://example.com  ·  https://github.com/org/repo  ·  C:\path\to\repo"></label>
             <label><span>Scope / program notes</span>
               <input id="ckScope" type="text" autocomplete="off" placeholder="acme — *.example.com in scope"></label>
+            </div>
 
             <div class="ck-grid2">
               <label data-ck-when="hunt"><span>Profile</span><select id="ckProfile"></select></label>
               <label data-ck-when="hunt"><span>Focus class</span><select id="ckClass"></select></label>
               <label data-ck-when="campaign" hidden><span>Program handle</span>
                 <input id="ckProgram" type="text" autocomplete="off" placeholder="default: target domain"></label>
-              <label data-ck-when="campaign" hidden><span>Recon depth (pages)</span>
+              <label data-ck-when="campaign portfolio" hidden><span>Recon depth (pages)</span>
                 <input id="ckMaxPages" type="number" min="1" max="50" value="12"></label>
             </div>
             <p class="ck-hint" id="ckProfileHint" data-ck-when="hunt"></p>
 
-            <span class="ck-step-lab"><span class="ck-step-n">3</span> Options</span>
+            <span class="ck-step-lab" data-ck-when="hunt campaign"><span class="ck-step-n">3</span> Verification &amp; depth</span>
+            <span class="ck-step-lab" data-ck-when="portfolio" hidden><span class="ck-step-n">2</span> Verification &amp; depth</span>
+            <details class="ck-options-fold" id="ckOptionsFold">
+              <summary><span>Passive by default</span><small>expand for proof probes</small></summary>
             <div class="ck-toggles">
               <label class="ck-switch" id="ckSpanScopeWrap" data-ck-when="campaign" hidden>
                 <input id="ckSpanScope" type="checkbox">
@@ -459,15 +464,14 @@
                 <span>Deep SQLi probe <em>— opt-in time-based blind SQLi (sends a bounded SLEEP; in-scope only, implies proof-of-impact)</em></span></label>
               <label class="ck-switch"><input id="ckLive" type="checkbox">
                 <span>Dynamic browser pass <em>(Playwright)</em></span></label>
-              <label class="ck-switch"><input id="ckDeep" type="checkbox">
+              <label class="ck-switch" data-ck-when="campaign portfolio" hidden><input id="ckDeep" type="checkbox">
                 <span>Deep auto-work <em>— (campaign) implies proof-of-impact + time-based SQLi, then auto-captures a screenshot and writes a researched dossier for each confirmed lead</em></span></label>
               <label class="ck-switch" data-ck-when="campaign portfolio" hidden><input id="ckAttackMap" type="checkbox" checked>
                 <span>Attack-plan map <em>— render a graphical .png of the attack flow for each confirmed finding into the POC download &amp; submission report (campaign/portfolio runs)</em></span></label>
-              <label class="ck-switch ck-auth"><input id="ckAuthorized" type="checkbox">
-                <span><strong>I'm authorized to test this target (in scope).</strong></span></label>
             </div>
+            </details>
 
-            <details class="ck-auth-fold" id="ckAuthFold">
+            <details class="ck-auth-fold" id="ckAuthFold" data-ck-when="hunt campaign">
               <summary>Scan behind a login <span class="ck-auth-hint">optional</span></summary>
               <label><span>Session cookie</span>
                 <input id="ckAuthCookie" type="text" autocomplete="off" spellcheck="false" placeholder="session=…; csrf=…"></label>
@@ -476,8 +480,15 @@
               <p class="ck-hint">Sent only to the target host and its subdomains — never to a third-party host, even on a redirect.</p>
             </details>
 
+            <section class="ck-launch-actions" aria-label="Authorize and launch">
+            <span class="ck-step-lab" data-ck-when="hunt campaign"><span class="ck-step-n">4</span> Authorize &amp; launch</span>
+            <span class="ck-step-lab" data-ck-when="portfolio" hidden><span class="ck-step-n">3</span> Authorize &amp; launch</span>
+            <label class="ck-switch ck-auth"><input id="ckAuthorized" type="checkbox">
+              <span><strong>Confirm authorization and scope.</strong></span></label>
+            <p class="ck-launch-readiness" id="ckLaunchReadiness" aria-live="polite">Choose a program or one-off target to begin.</p>
             <button class="ck-run" id="ckRun" type="submit">Run hunt</button>
             <p class="ck-status" id="ckStatus" aria-live="polite"></p>
+            </section>
             </div>
           </form>
 
@@ -500,9 +511,9 @@
             <div class="ck-topbar-field">
               <span class="ck-topbar-flabel">Campaign</span>
               <div class="ck-seg-group" role="group" aria-label="Run type">
-                <button type="button" class="ck-seg is-active" id="ckRunHunt" data-ck-runtype="hunt">Single hunt</button>
-                <button type="button" class="ck-seg" id="ckRunCampaign" data-ck-runtype="campaign">Full campaign</button>
-                <button type="button" class="ck-seg" id="ckRunPortfolio" data-ck-runtype="portfolio">Portfolio</button>
+                <button type="button" class="ck-seg is-active" id="ckRunHunt" data-ck-runtype="hunt" aria-pressed="true">Single hunt</button>
+                <button type="button" class="ck-seg" id="ckRunCampaign" data-ck-runtype="campaign" aria-pressed="false">Full campaign</button>
+                <button type="button" class="ck-seg" id="ckRunPortfolio" data-ck-runtype="portfolio" aria-pressed="false">Portfolio</button>
               </div>
             </div>
           </div>

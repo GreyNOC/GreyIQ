@@ -190,6 +190,25 @@ class SubmissionApiTests(unittest.TestCase):
             self.rt._cache_bounty_run(r, target="https://t", scope="t", program=None)
         self.assertLessEqual(len(self.rt.bounty_runs), 16)
 
+    def test_bundle_keeps_same_basename_evidence_from_multiple_findings(self) -> None:
+        run = self.rt.bounty_runs[self.run_id]
+        first = Path(self._tmp.name) / "one" / "proof.png"
+        second = Path(self._tmp.name) / "two" / "proof.png"
+        first.parent.mkdir()
+        second.parent.mkdir()
+        first.write_bytes(b"first-proof")
+        second.write_bytes(b"second-proof")
+        run["screenshots"] = {"F1": [str(first)], "F2": [str(second)]}
+
+        bundle = self.rt.export_bundle(g.BundleRequest(run_id=self.run_id))
+        self.assertTrue(bundle["ok"], bundle)
+        with zipfile.ZipFile(bundle["path"]) as zf:
+            names = set(zf.namelist())
+            self.assertIn("screenshots/F1-01-proof.png", names)
+            self.assertIn("screenshots/F2-01-proof.png", names)
+            self.assertEqual(zf.read("screenshots/F1-01-proof.png"), b"first-proof")
+            self.assertEqual(zf.read("screenshots/F2-01-proof.png"), b"second-proof")
+
 
 if __name__ == "__main__":
     unittest.main()

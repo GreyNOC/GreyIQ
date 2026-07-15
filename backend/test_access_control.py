@@ -464,6 +464,7 @@ class MassAssignmentTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.server.shutdown()
+        self.server.server_close()
         if self._prev is None:
             _os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
         else:
@@ -600,6 +601,7 @@ class SessionInvalidationTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.server.shutdown()
+        self.server.server_close()
         if self._prev is None:
             _os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
         else:

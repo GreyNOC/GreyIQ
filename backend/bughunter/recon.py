@@ -26,7 +26,7 @@ from urllib.parse import parse_qsl, urldefrag, urljoin, urlparse
 from bughunter import api_discovery_service
 from bughunter.fingerprint import fingerprint
 from bughunter.rate_limit import HostRateGovernor
-from bughunter.recon_js import mine_js
+from bughunter.recon_js import mine_js, mine_source_map, source_map_urls
 from bughunter.settings import get_settings
 from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
 from bughunter.web_scan_service import _fetch_raw, _guard_url
@@ -62,6 +62,7 @@ _OIDC_ENDPOINT_KEYS = ("authorization_endpoint", "token_endpoint", "userinfo_end
 _SKIP_EXT = (".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".woff", ".woff2",
              ".ttf", ".eot", ".pdf", ".zip", ".mp4", ".webm", ".mp3", ".map")
 _MAX_JS = 8  # served-JS bundles mined per campaign (bounded)
+_MAX_SOURCE_MAPS = 6     # explicit, external sourceMappingURL files mined per campaign (bounded)
 _MAX_SITEMAPS = 6         # child/robots-declared sitemap files fetched per campaign (bounded)
 _MAX_SITEMAP_DEPTH = 2    # sitemap-index recursion depth cap
 
@@ -187,15 +188,15 @@ def discover(
     governor: HostRateGovernor | None = None,
 ) -> dict[str, Any]:
     """Map the seed's surface (bounded). Returns {urls, host, sources, notes,
-    endpoints, params, js_secrets, tech, hints, dropped_out_of_scope, requests_used}.
+    endpoints, params, js_secrets, source_maps, tech, hints, dropped_out_of_scope, requests_used}.
     ``scope_in(host) -> bool`` gates which hosts may be fetched (default: same-origin)."""
     settings = settings or get_settings()
     try:
         sanitized = _guard_url(normalize_website_url(seed_url), settings.allow_private_urls, settings.web_allowed_ports)
     except WebsiteFetchError as exc:
         return {"urls": [seed_url], "host": "", "sources": {}, "notes": [f"recon skipped: {exc}"],
-                "endpoints": [], "params": [], "js_secrets": [], "tech": [], "hints": {}, "websockets": [],
-                "dropped_out_of_scope": 0, "requests_used": 0}
+                "endpoints": [], "params": [], "js_secrets": [], "source_maps": [], "tech": [],
+                "hints": {}, "websockets": [], "dropped_out_of_scope": 0, "requests_used": 0}
     host = (urlparse(sanitized).hostname or "").lower()
     governor = governor or HostRateGovernor(
         capacity=max(settings.active_max_requests_per_host, max_pages + 6),
@@ -232,6 +233,8 @@ def discover(
     forms_out: list[dict[str, Any]] = []  # structured in-scope forms (action/method/fields) for the reasoning layer
     dropped_oos = 0
     js_done: set[str] = set()
+    source_map_done: set[str] = set()
+    source_maps_out: list[dict[str, Any]] = []
 
     # --- Passive recon: robots + security.txt seed extra paths; sitemaps handled by the recursive
     # worklist below (which follows sitemap-index children + robots-declared Sitemap: files). ---
@@ -463,15 +466,16 @@ def discover(
                 continue
             js_done.add(js_url)
             jf = budgeted_fetch(js_url)
-            if not jf:
+            if not jf or jf.get("status", 0) >= 400:
                 continue
-            # RE-GATE the post-redirect final_url: an in-scope <script src> can 302 to a public OOS
-            # host (the fetch guard is SSRF-only, not scope). Mining that body would leak OOS params/
-            # secrets into the prover surface + report — every sibling path re-gates final_url likewise.
-            if not in_scope(jf.get("final_url") or js_url):
+            js_final = jf.get("final_url") or js_url
+            # The script URL was scope-gated before fetch, but it can redirect. Never inspect or
+            # mine a body that lands out of scope (same post-redirect invariant as HTML/sitemaps).
+            if not in_scope(js_final):
                 dropped_oos += 1
                 continue
-            mined = mine_js(jf.get("body") or "", jf.get("final_url") or js_url, host_filter=host_ok)
+            js_body = jf.get("body") or ""
+            mined = mine_js(js_body, js_final, host_filter=host_ok)
             params.update(mined.get("params") or [])
             websockets.update(mined.get("websockets") or [])
             js_secrets.extend(mined.get("secret_findings") or [])
@@ -489,6 +493,48 @@ def discover(
                     seen.add(ep); discovered.append(ep)
                     sources["js-endpoint"] = sources.get("js-endpoint", 0) + 1
                     queue.append((ep, depth + 1))  # actually CRAWL it (its body/sublinks/forms/JS), not just inventory
+
+            # A production source map can expose the application's unminified route table and
+            # parameter names even when the bundle hides them. Fetch ONLY an explicit external
+            # sourceMappingURL from an already-served, in-scope script. Both the requested URL and
+            # post-redirect final URL are scope-gated; inline data maps and missing sources are not
+            # decoded/followed. Shared request budget + hard file/content caps bound the work.
+            for map_url in source_map_urls(js_body, js_final):
+                if map_url in source_map_done or len(source_map_done) >= _MAX_SOURCE_MAPS or used["n"] >= max_requests:
+                    continue
+                if not in_scope(map_url):
+                    dropped_oos += 1
+                    continue
+                source_map_done.add(map_url)
+                mf = budgeted_fetch(map_url)
+                if not mf or mf.get("status", 0) >= 400:
+                    continue
+                map_final = mf.get("final_url") or map_url
+                if not in_scope(map_final):
+                    dropped_oos += 1
+                    continue
+                mapped = mine_source_map(mf.get("body") or "", map_final, host_filter=host_ok)
+                if not int(mapped.get("source_count") or 0):
+                    continue  # malformed/no-embedded-source maps were fetched but not claimed as mined
+                source_maps_out.append({
+                    "url": map_final,
+                    "source_count": int(mapped.get("source_count") or 0),
+                    "embedded_chars": int(mapped.get("embedded_chars") or 0),
+                })
+                sources["source-map"] = sources.get("source-map", 0) + 1
+                params.update(mapped.get("params") or [])
+                js_secrets.extend(mapped.get("secret_findings") or [])
+                for mh in (mapped.get("hosts") or []):
+                    root = f"https://{(mh or '').lower()}/"
+                    if host_ok(mh) and root not in seen and len(discovered) < max_pages:
+                        seen.add(root); discovered.append(root)
+                        sources["source-map-host"] = sources.get("source-map-host", 0) + 1
+                        queue.append((root, depth + 1))
+                for ep in (mapped.get("endpoints") or []):
+                    if ep not in seen and in_scope(ep) and len(discovered) < max_pages:
+                        seen.add(ep); discovered.append(ep)
+                        sources["source-map-endpoint"] = sources.get("source-map-endpoint", 0) + 1
+                        queue.append((ep, depth + 1))
 
     # --- API surface discovery: OpenAPI/Swagger spec + GraphQL introspection (GET-only,
     # scope-gated, budget-shared). Expands the prover's surface with the spec's endpoints +
@@ -514,8 +560,11 @@ def discover(
         notes.append(f"recon request budget ({max_requests}) reached — surface may be partial.")
     if dropped_oos:
         notes.append(f"{dropped_oos} discovered link(s) skipped as out-of-scope.")
+    if source_maps_out:
+        source_files = sum(int(m.get("source_count") or 0) for m in source_maps_out)
+        notes.append(f"{len(source_maps_out)} served source map(s) mined ({source_files} embedded source file(s)).")
     if js_secrets:
-        notes.append(f"{len(js_secrets)} secret(s) found in served JS (redacted).")
+        notes.append(f"{len(js_secrets)} secret(s) found in client-served code/source maps (redacted).")
     if params:
         notes.append(f"{len(params)} input parameter name(s) discovered (forms/JS/links) — probed by the active checks.")
     if websockets:
@@ -524,8 +573,8 @@ def discover(
     return {
         "urls": discovered[:max_pages], "host": host, "sources": sources, "notes": notes,
         "endpoints": [u for u in discovered if u != sanitized][:max_pages],
-        "params": sorted(params)[:60], "js_secrets": js_secrets, "tech": tech, "hints": hints,
-        "websockets": sorted(websockets)[:30],
+        "params": sorted(params)[:60], "js_secrets": js_secrets, "source_maps": source_maps_out,
+        "tech": tech, "hints": hints, "websockets": sorted(websockets)[:30],
         "forms": forms_out, "api_findings": api_findings,
         "dropped_out_of_scope": dropped_oos, "requests_used": used["n"],
     }
