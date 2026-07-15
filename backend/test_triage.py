@@ -137,6 +137,7 @@ class RemoteTriageRealCallTests(unittest.TestCase):
     def _serve(self) -> int:
         server = ThreadingHTTPServer(("127.0.0.1", 0), _ChatCompletionsHandler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         return server.server_port
 
@@ -174,6 +175,7 @@ class TriageComposeTests(unittest.TestCase):
     def test_remote_success_is_appended_to_local_summary(self) -> None:
         server = ThreadingHTTPServer(("127.0.0.1", 0), _ChatCompletionsHandler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         cfg = {"remote_enabled": True, "remote_url": f"http://127.0.0.1:{server.server_port}", "remote_model": "m", "remote_timeout_s": 5.0}
         out = T.triage({"ok": True, "findings": [_finding()], "finding_count": 1}, cfg)

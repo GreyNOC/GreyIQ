@@ -116,6 +116,7 @@ class GuardedRedirectBounceTests(unittest.TestCase):
         _RedirectChainHandler.chain = chain
         server = ThreadingHTTPServer(("127.0.0.1", 0), _RedirectChainHandler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         return server
 

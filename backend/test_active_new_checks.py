@@ -843,10 +843,10 @@ class ClassPriorityReorderTests(unittest.TestCase):
         return [("clickjacking", 1), ("csrf", 2), ("jwt", 3), ("cors", 4), ("redirect", 5),
                 ("xss", 6), ("rce", 7), ("sqli", 8), ("path-traversal", 9)]
 
-    def test_priority_promotes_and_preserves_order(self) -> None:
+    def test_priority_honours_rank_and_preserves_unranked_order(self) -> None:
         out = av._apply_class_priority(self._checks(), ["path-traversal", "rce"])
-        # prioritised classes move to the front; within each partition the default order is kept
-        self.assertEqual([c for c, _ in out][:2], ["rce", "path-traversal"])  # rce(7) before traversal(9): default order preserved
+        # The caller's ranking controls budget order; the unranked tail keeps default order.
+        self.assertEqual([c for c, _ in out][:2], ["path-traversal", "rce"])
         self.assertEqual([c for c, _ in out][2:], ["clickjacking", "csrf", "jwt", "cors", "redirect", "xss", "sqli"])
 
     def test_reorder_never_adds_or_drops_a_check(self) -> None:

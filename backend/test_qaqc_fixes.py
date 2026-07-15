@@ -19,6 +19,8 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+from bughunter import report as report_lib  # noqa: E402
+
 
 class BrainIngestionShapeTests(unittest.TestCase):
     """_ask_brain must degrade to the deterministic report, never raise, on a valid-JSON
@@ -106,6 +108,16 @@ class ForgedConfirmedProofTests(unittest.TestCase):
         self.assertEqual(self._status("", obs, ""), "candidate")           # the bypass
         self.assertEqual(self._status("confirmed", obs, ""), "candidate")   # the original guard
         self.assertEqual(self._status("", obs, "account A id returned 403"), "confirmed")  # real differential
+
+    def test_screenshot_cannot_confirm_exploitability_without_impact_differential(self) -> None:
+        finding = {"ref": "F1", "class_id": "idor", "screenshot_path": "/tmp/generic-page.png"}
+        plan = {"proof_of_impact": {
+            "status": "confirmed",
+            "observed_result": "HTTP 200 returned",
+            "control_result": "",
+        }}
+        self.assertEqual(report_lib._proof_of_impact_detail(finding, plan)["status"], "candidate")
+        self.assertEqual(report_lib._proof_of_exploitability_detail(finding, plan)["status"], "candidate")
 
 
 class SsrfPrivateRangeTests(unittest.TestCase):

@@ -3196,23 +3196,23 @@ class GreyIQRuntime:
             # sensitive data), so a triager sees exactly what was returned alongside the report.
             for p in art.get("sensitive_data_paths") or []:
                 specs.append((f"evidence/sensitive-data/{Path(p).name}", p))
-            for entry in (run.get("screenshots") or {}).values():
-                for p in (entry if isinstance(entry, list) else [entry]):
+            for ref, entry in (run.get("screenshots") or {}).items():
+                for index, p in enumerate((entry if isinstance(entry, list) else [entry]), 1):
                     if p:
-                        specs.append((f"screenshots/{Path(p).name}", p))
-            for entry in (run.get("research_paths") or {}).values():
-                for p in (entry if isinstance(entry, list) else [entry]):
+                        specs.append((f"screenshots/{safe(ref)}-{index:02d}-{Path(p).name}", p))
+            for ref, entry in (run.get("research_paths") or {}).items():
+                for index, p in enumerate((entry if isinstance(entry, list) else [entry]), 1):
                     if p:
-                        specs.append((f"research/{Path(p).name}", p))
+                        specs.append((f"research/{safe(ref)}-{index:02d}-{Path(p).name}", p))
             # The plain-text request/response/source proof (.txt) captured per finding.
-            for entry in (run.get("source_texts") or {}).values():
-                for p in (entry if isinstance(entry, list) else [entry]):
+            for ref, entry in (run.get("source_texts") or {}).items():
+                for index, p in enumerate((entry if isinstance(entry, list) else [entry]), 1):
                     if p:
-                        specs.append((f"evidence/{Path(p).name}", p))
-            for entry in (run.get("credential_artifacts") or {}).values():
-                for p in (entry if isinstance(entry, list) else [entry]):
+                        specs.append((f"evidence/{safe(ref)}-source-{index:02d}-{Path(p).name}", p))
+            for ref, entry in (run.get("credential_artifacts") or {}).items():
+                for index, p in enumerate((entry if isinstance(entry, list) else [entry]), 1):
                     if p:
-                        specs.append((f"evidence/{Path(p).name}", p))
+                        specs.append((f"evidence/{safe(ref)}-credential-{index:02d}-{Path(p).name}", p))
             # V2 parity: a single hunt now also ships the machine-replayable reproduction
             # artifacts + the INDEX, staged to disk (bundle_files reads from disk).
             stage = RUNTIME_DIR / "bundles" / f"stage-{safe(request.run_id)}"

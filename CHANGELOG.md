@@ -793,6 +793,23 @@ proof-of-impact a CORS/sensitive-data finding must show, and secrets in it are s
 - OpenAI/ChatGPT requests now omit custom `temperature` for newer hosted models that only accept the provider default, fixing HTTP 400 errors like `Unsupported value: 'temperature' does not support 0.2 with this model`.
 - The OpenAI-compatible retry path now also strips `temperature` once when a gateway reports it unsupported, while local OpenAI-compatible servers keep the configured temperature.
 
+### Submission-proof QA/QC hardening
+- A finding now reaches **Confirmed** only through an engine-trusted validator or a captured positive-vs-control differential; an HTTP-looking model/operator observation or a generic screenshot can no longer overstate proof of impact or exploitability.
+- Proof obligations are redacted like every other proof field, closing a path where a model/operator note could echo a credential into an exported report.
+- Per-finding packages now copy every referenced screenshot, preserve both artifacts when basenames collide, omit broken image links after a failed copy, and namespace same-named evidence in engagement ZIPs.
+- `pytest` discovery is scoped to GreyIQ's backend suite, so cached scanned repositories and packaged dependencies under `runtime/` / `release/` no longer pollute local QA runs.
+
+### Veteran hunt-planning and source-map recon
+- A deterministic, offline hunt planner now ranks the existing differential checks per endpoint from observed route, parameter, form, API, authentication, and stack semantics, so tight request budgets reach likely high-impact classes without requiring an LLM.
+- Ordered class priorities are now honored as an actual ranking instead of being collapsed to a set; duplicate-class checks and the unranked safety-tuned tail retain stable order.
+- Recon now mines explicitly referenced, in-scope external source maps for hidden endpoints, parameters, sibling hosts, and redacted secrets, with pre/post-redirect scope gates and hard request, map, source-file, and content caps.
+
+### Professional cockpit workflow
+- The hunt rail now follows a three-step Target/Scope → Strategy → Authorize/Launch flow with a dedicated scroll area and a persistent, non-overlapping launch action.
+- Single hunt, full campaign, and portfolio modes reveal only the controls they actually use; portfolio runs no longer expose or reuse a single target's shared session credentials.
+- Navigation, run-mode state, sortable findings, clickable finding rows, and empty-state handoffs now expose keyboard and assistive-technology semantics.
+- The cockpit now scales cleanly to phone widths: navigation compacts, structured scope rows stack, wide findings tables scroll inside their panel, and page-level horizontal overflow is prevented.
+
 ## v0.78.1
 
 ### Proof artifacts, bigger findings, and ChatGPT API compatibility

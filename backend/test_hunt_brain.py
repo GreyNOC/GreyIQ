@@ -149,5 +149,62 @@ class HuntBrainTests(unittest.TestCase):
         self.assertIn("https://app.example.com/login", block)
 
 
+class DeterministicVeteranPlannerTests(unittest.TestCase):
+    def _classes(self, endpoint: str, *, tech=None, forms=None) -> list[str]:
+        plan = hunt_brain.heuristic_plan({"endpoints": [endpoint], "tech": tech or [], "forms": forms or []})
+        self.assertTrue(plan["used"])
+        self.assertEqual(plan["probe_priority"][0]["endpoint"], endpoint)
+        return plan["probe_priority"][0]["classes"]
+
+    def test_file_download_spends_budget_on_traversal_first(self) -> None:
+        classes = self._classes("https://app.example.com/api/download?file=report.pdf")
+        self.assertEqual(classes[0], "path-traversal")
+        self.assertIn("crlf", classes)
+
+    def test_command_and_template_routes_get_high_impact_priority(self) -> None:
+        self.assertEqual(self._classes("https://app.example.com/api/ping?host=example.com")[0], "rce")
+        self.assertEqual(self._classes("https://app.example.com/render?template=invoice")[0], "ssti")
+
+    def test_search_api_ranks_injection_and_cross_origin_checks(self) -> None:
+        classes = self._classes("https://app.example.com/api/search?q=boots", tech=["Node/Express"])
+        self.assertEqual(classes[0], "nosqli")
+        self.assertIn("sqli", classes)
+        self.assertIn("xss", classes)
+        self.assertIn("cors", classes)
+
+    def test_auth_callback_ranks_redirect_jwt_and_host_header(self) -> None:
+        classes = self._classes("https://app.example.com/oauth/callback?returnUrl=%2Fhome")
+        self.assertEqual(classes[0], "redirect")
+        self.assertIn("jwt", classes)
+        self.assertIn("host-header", classes)
+
+    def test_graphql_semantics_promote_the_self_gated_graphql_check(self) -> None:
+        classes = self._classes("https://app.example.com/graphql")
+        self.assertEqual(classes[0], "graphql")
+        self.assertIn("cors", classes)
+
+    def test_post_state_change_form_promotes_csrf_without_inventing_surface(self) -> None:
+        endpoint = "https://app.example.com/account/delete"
+        classes = self._classes(endpoint, forms=[{"action": endpoint, "method": "POST", "params": ["accountId"]}])
+        self.assertIn("csrf", classes)
+        plan = hunt_brain.heuristic_plan({"endpoints": [endpoint], "forms": []})
+        self.assertTrue(all(row["endpoint"] == endpoint for row in plan["probe_priority"]))
+        self.assertEqual(plan["param_hypotheses"], [])
+
+    def test_generic_and_malformed_surfaces_fail_quietly(self) -> None:
+        self.assertFalse(hunt_brain.heuristic_plan({"endpoints": ["https://app.example.com/"]})["used"])
+        self.assertFalse(hunt_brain.heuristic_plan({"endpoints": 7, "forms": "bad", "tech": True})["used"])
+        self.assertFalse(hunt_brain.heuristic_plan({"endpoints": ["not-a-url", None]})["used"])
+
+    def test_rows_and_classes_are_hard_capped_and_deterministic(self) -> None:
+        endpoints = [f"https://app.example.com/api/download/{i}?file=x" for i in range(100)]
+        surface = {"endpoints": endpoints, "tech": [], "forms": []}
+        first = hunt_brain.heuristic_plan(surface)
+        second = hunt_brain.heuristic_plan(surface)
+        self.assertEqual(first, second)
+        self.assertLessEqual(len(first["probe_priority"]), hunt_brain._MAX_PRIORITY_ROWS)
+        self.assertTrue(all(len(row["classes"]) <= 6 for row in first["probe_priority"]))
+
+
 if __name__ == "__main__":
     unittest.main()

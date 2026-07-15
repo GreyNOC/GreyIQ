@@ -414,15 +414,23 @@ def _proof(status: str, **fields: Any) -> dict[str, Any]:
 
 
 def _apply_class_priority(checks: list[tuple[str, Any]], class_priority: list[str] | None) -> list[tuple[str, Any]]:
-    """Stable-partition class-tagged ``(class_key, thunk)`` checks so the reasoning layer's
-    prioritised classes run FIRST, preserving the tuned default order within each partition. Pure:
-    never adds, removes, or mutates a check — only reorders. Empty/None priority => unchanged."""
+    """Apply the caller's ordered class ranking, preserving default order within each rank.
+
+    Pure: never adds, removes, or mutates a check — only reorders. Empty/None/unknown priority
+    leaves the tuned default order unchanged.
+    """
     if not class_priority:
         return checks
-    wanted = {str(c).strip().lower() for c in class_priority if str(c or "").strip()}
-    if not wanted:
+    rank: dict[str, int] = {}
+    for raw in class_priority:
+        key = str(raw or "").strip().lower()
+        if key and key not in rank:
+            rank[key] = len(rank)
+    if not rank or not any(class_key in rank for class_key, _ in checks):
         return checks
-    return sorted(checks, key=lambda ck: 0 if ck[0] in wanted else 1)  # sorted() is stable
+    # The input is an ordered ranking, not a membership set. ``sorted`` is stable, so checks
+    # sharing one class and the entire unranked tail retain their tuned default order.
+    return sorted(checks, key=lambda ck: rank.get(ck[0], len(rank)))
 
 
 def _finding(rule_id: str, title: str, severity: str, category: str, class_hint: str, url: str,

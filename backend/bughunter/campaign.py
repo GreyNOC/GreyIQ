@@ -357,6 +357,19 @@ def _run_campaign_body(
         # graphql). Their class_ids steer the active check order alongside the brain's per-endpoint picks.
         hint_classes = [c for c in (rec.get("hints") or {}).keys() if c]
 
+        # Always-available veteran baseline: rank existing check classes from observed endpoint,
+        # parameter, form, and stack semantics. This is deterministic/offline and only reorders
+        # checks, so installations without a configured model still spend small request budgets
+        # on the classes most suited to each route.
+        hunt_surface = {"endpoints": urls, "params": recon_params, "tech": recon_tech, "forms": recon_forms}
+        hp = hunt_brain.heuristic_plan(hunt_surface)
+        for row in (hp.get("probe_priority") or []):
+            ep, classes = row.get("endpoint"), row.get("classes") or []
+            if ep and classes:
+                hunt_priority[ep] = list(classes)
+        if hunt_priority:
+            _emit(f"hunt-planner: prioritised probe classes on {len(hunt_priority)} endpoint(s) from observed semantics")
+
         # Reasoning layer: let the configured brain read the mapped surface and propose
         # target-specific parameter NAMES the heuristics miss (e.g. returnUrl/callback on a login,
         # tpl on a renderer, file/path on a download). These are unioned into recon_params and thus
@@ -364,7 +377,7 @@ def _run_campaign_body(
         # only ever REPORTED if the deterministic prover independently confirms it (recall up,
         # precision unchanged). Best-effort + fail-closed: no brain / any error keeps current behaviour.
         try:
-            surface_for_brain = {"endpoints": urls, "params": recon_params, "tech": recon_tech, "forms": recon_forms}
+            surface_for_brain = hunt_surface
             hb = hunt_brain.plan_hunt(coder_cfg, clean_target, scope, surface_for_brain, priors=priors)
             # Capture the (surface, plan) input side for the trace log. recon_params is only ever
             # REBOUND below (never mutated in place), so this reference stays the recon-only surface.
@@ -380,9 +393,11 @@ def _run_campaign_body(
             for row in (hb.get("probe_priority") or []):
                 ep, classes = row.get("endpoint"), row.get("classes") or []
                 if ep and classes:
-                    hunt_priority[ep] = classes
-            if hunt_priority:
-                _emit(f"hunt-brain: prioritised probe classes on {len(hunt_priority)} endpoint(s)")
+                    # The optional model is target-specific refinement, so its ranking precedes
+                    # the offline baseline while retaining every deterministic suggestion.
+                    hunt_priority[ep] = list(dict.fromkeys(list(classes) + (hunt_priority.get(ep) or [])))
+            if hb.get("probe_priority"):
+                _emit(f"hunt-brain: refined probe priorities on {len(hb.get('probe_priority') or [])} endpoint(s)")
             idor_candidates = [e for e in (hb.get("idor_candidates") or []) if e in set(urls)]
             privileged_endpoints = [e for e in (hb.get("privileged_endpoints") or []) if e in set(urls)]
             brain_ssrf_params = list(hb.get("ssrf_params") or [])

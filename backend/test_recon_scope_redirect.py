@@ -67,6 +67,7 @@ class ReconScopeBleedTests(unittest.TestCase):
     def tearDown(self) -> None:
         socket.getaddrinfo = self._orig_gai
         self.server.shutdown()
+        self.server.server_close()
         if self._prev is None:
             os.environ.pop("GREYIQ_SCAN_ALLOW_PRIVATE_URLS", None)
         else:

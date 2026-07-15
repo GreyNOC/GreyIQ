@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 import coder
 import trust
@@ -57,6 +57,46 @@ _MAX_PRIORITY_ROWS = 20
 _MAX_ENDPOINTS_IN_PROMPT = 40
 _MAX_KNOWN_PARAMS_IN_PROMPT = 60
 _MAX_FORMS_IN_PROMPT = 15
+
+# High-signal endpoint-purpose vocabulary. This is deliberately narrower than a wordlist
+# fuzzer: it only REORDERS existing checks, and every result still needs the active prover's
+# observed/control differential before it can become a confirmed finding.
+_FILE_SIGNALS = frozenset({
+    "file", "filename", "filepath", "path", "download", "export", "attachment", "document",
+    "doc", "include", "folder", "directory", "archive", "backup", "log", "read",
+})
+_COMMAND_SIGNALS = frozenset({
+    "cmd", "command", "exec", "execute", "shell", "ping", "host", "hostname", "ip", "convert",
+    "converter", "resize", "image", "import", "compile", "diagnostic", "traceroute", "lookup",
+})
+_TEMPLATE_SIGNALS = frozenset({
+    "template", "tpl", "render", "renderer", "preview", "theme", "view", "layout", "invoice",
+    "email", "mail", "format", "generate",
+})
+_REDIRECT_SIGNALS = frozenset({
+    "redirect", "redirecturi", "return", "returnurl", "next", "continue", "destination", "dest",
+    "callback", "callbackurl", "goto", "forward", "relaystate", "target", "url",
+})
+_SQL_SIGNALS = frozenset({
+    "id", "uid", "userid", "accountid", "orderid", "productid", "itemid", "search", "query", "q",
+    "filter", "sort", "where", "report", "lookup", "list", "record", "category", "page",
+})
+_NOSQL_SIGNALS = frozenset({
+    "filter", "query", "where", "selector", "criteria", "search", "username", "user", "password",
+    "login", "email", "json", "match",
+})
+_XSS_SIGNALS = frozenset({
+    "q", "query", "search", "term", "keyword", "message", "comment", "feedback", "name", "title",
+    "description", "content", "html", "text", "error", "notice",
+})
+_AUTH_SIGNALS = frozenset({
+    "auth", "login", "logout", "signin", "signout", "oauth", "oidc", "sso", "callback", "token",
+    "session", "password", "reset", "invite", "register", "verify",
+})
+_STATE_CHANGE_SIGNALS = frozenset({
+    "create", "update", "delete", "remove", "change", "transfer", "checkout", "purchase", "admin",
+    "settings", "profile", "password", "invite", "upload",
+})
 
 HUNT_BRAIN_SYSTEM_PROMPT = (
     "You are an elite web-application penetration tester assisting an AUTHORIZED bug-bounty hunt. "
@@ -86,6 +126,134 @@ def _norm_class(value: str) -> str:
         "lfi": "path-traversal", "local-file-inclusion": "path-traversal", "sql-injection": "sqli",
         "no-sqli": "nosqli", "nosql-injection": "nosqli", "template-injection": "ssti",
     }.get(v, v)
+
+
+def _signal_words(value: str) -> set[str]:
+    """Tokenize paths/parameter names, including camelCase, without interpreting values."""
+    split_camel = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(value or ""))
+    return {w.lower() for w in re.findall(r"[A-Za-z0-9]+", split_camel) if w}
+
+
+def heuristic_plan(surface: dict[str, Any]) -> dict[str, Any]:
+    """Build a bounded, offline probe-priority plan from observed endpoint semantics.
+
+    This is the always-available veteran baseline for installations with no configured LLM. It
+    cannot add endpoints, parameter names, payloads, requests, or findings. It ranks only existing
+    active-check classes for verbatim recon endpoints; deterministic proof gates remain unchanged.
+    """
+    empty = {
+        "used": False, "provider": "deterministic", "model": "veteran-heuristics-v1",
+        "param_hypotheses": [], "probe_priority": [], "notes": "",
+    }
+    if not isinstance(surface, dict):
+        return empty
+    raw_endpoints = surface.get("endpoints") or []
+    if not isinstance(raw_endpoints, (list, tuple)):
+        return empty
+    endpoints = list(dict.fromkeys(
+        str(u).strip() for u in raw_endpoints if isinstance(u, str) and str(u).strip()
+    ))[:_MAX_ENDPOINTS_IN_PROMPT]
+    forms_by_action: dict[str, dict[str, Any]] = {}
+    raw_forms = surface.get("forms") or []
+    raw_forms = raw_forms if isinstance(raw_forms, (list, tuple)) else []
+    for form in raw_forms[:30]:
+        if not isinstance(form, dict):
+            continue
+        action = str(form.get("action") or "").strip()
+        if action in endpoints:
+            forms_by_action[action] = form
+    raw_tech = surface.get("tech") or []
+    raw_tech = raw_tech if isinstance(raw_tech, (list, tuple)) else []
+    tech_text = " ".join(str(t).lower() for t in raw_tech[:20])
+
+    rows: list[dict[str, Any]] = []
+    for endpoint in endpoints:
+        try:
+            parsed = urlparse(endpoint)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                continue
+            query_params = [name for name, _ in parse_qsl(parsed.query, keep_blank_values=True)]
+        except (TypeError, ValueError):
+            continue
+        form = forms_by_action.get(endpoint) or {}
+        raw_form_params = form.get("params") or []
+        raw_form_params = raw_form_params if isinstance(raw_form_params, (list, tuple)) else []
+        form_params = [str(p) for p in raw_form_params if isinstance(p, (str, int))]
+        path_words = _signal_words(parsed.path)
+        param_words: set[str] = set()
+        for name in query_params + form_params:
+            param_words.update(_signal_words(name))
+            # Camel/snake tokenization turns returnUrl into {return,url}; retain a compact form too.
+            compact = re.sub(r"[^a-z0-9]", "", str(name).lower())
+            if compact:
+                param_words.add(compact)
+        words = path_words | param_words
+        path_low = parsed.path.lower()
+        scores: dict[str, int] = {}
+        reasons: dict[str, str] = {}
+
+        def add(class_key: str, score: int, reason: str) -> None:
+            if score > scores.get(class_key, -1):
+                scores[class_key], reasons[class_key] = score, reason
+
+        file_hits = words & _FILE_SIGNALS
+        command_hits = words & _COMMAND_SIGNALS
+        template_hits = words & _TEMPLATE_SIGNALS
+        redirect_hits = words & _REDIRECT_SIGNALS
+        sql_hits = words & _SQL_SIGNALS
+        nosql_hits = words & _NOSQL_SIGNALS
+        xss_hits = words & _XSS_SIGNALS
+        auth_hits = words & _AUTH_SIGNALS
+
+        if command_hits:
+            add("rce", 120, f"command-like endpoint/parameter: {sorted(command_hits)[0]}")
+        if file_hits:
+            add("path-traversal", 118, f"file-like endpoint/parameter: {sorted(file_hits)[0]}")
+            add("crlf", 62, "file/download response may build headers from input")
+        if template_hits:
+            add("ssti", 112, f"render/template semantic: {sorted(template_hits)[0]}")
+            add("xss", 68, "rendered user-controlled content")
+        if redirect_hits or auth_hits & {"oauth", "oidc", "sso", "callback", "logout"}:
+            signal = sorted(redirect_hits or auth_hits)[0]
+            add("redirect", 104, f"navigation/auth semantic: {signal}")
+            add("crlf", 64, "navigation response may construct a Location header")
+        if sql_hits:
+            add("sqli", 92, f"record/search selector: {sorted(sql_hits)[0]}")
+        if nosql_hits and any(t in tech_text for t in ("mongo", "mongoose", "node", "express")):
+            add("nosqli", 96, "JSON selector/login semantics on a Node/NoSQL-shaped stack")
+        elif nosql_hits and ("/api/" in path_low or "graphql" in path_low):
+            add("nosqli", 78, "structured API selector/login input")
+        if xss_hits:
+            add("xss", 86, f"likely reflected/displayed input: {sorted(xss_hits)[0]}")
+        if "graphql" in path_words or "graphql" in tech_text:
+            add("graphql", 115, "GraphQL endpoint/technology observed")
+            add("cors", 76, "cross-origin API data surface")
+            add("nosqli", 72, "structured GraphQL input surface")
+        elif "/api/" in path_low or path_low.startswith("/api") or "rest" in path_words:
+            add("cors", 74, "API/data endpoint")
+        if auth_hits:
+            add("jwt", 84, f"authentication/token semantic: {sorted(auth_hits)[0]}")
+            if auth_hits & {"reset", "invite", "oauth", "oidc", "callback", "verify"}:
+                add("host-header", 82, "absolute-link/auth callback surface")
+        if any(w in path_words for w in ("debug", "actuator", "jolokia", "management", "heapdump")):
+            add("debug", 125, "debug/management endpoint semantic")
+        method = str(form.get("method") or "GET").upper()
+        if method not in {"GET", "HEAD", "OPTIONS"} and words & _STATE_CHANGE_SIGNALS:
+            add("csrf", 80, f"state-changing {method} form")
+
+        if not scores:
+            continue
+        ordered = sorted(scores, key=lambda c: (-scores[c], c))[:6]
+        why = "; ".join(reasons[c] for c in ordered[:2])[:160]
+        rows.append({"endpoint": endpoint, "classes": ordered, "why": why,
+                     "score": scores[ordered[0]], "source": "deterministic-veteran-heuristics"})
+        if len(rows) >= _MAX_PRIORITY_ROWS:
+            break
+    return {
+        "used": bool(rows), "provider": "deterministic", "model": "veteran-heuristics-v1",
+        "param_hypotheses": [], "probe_priority": rows,
+        "notes": f"Prioritised {len(rows)} endpoint(s) from observed route/parameter semantics." if rows else "",
+    }
 
 
 def _build_surface_context(target: str, surface: dict[str, Any]) -> str:

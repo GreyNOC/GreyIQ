@@ -140,6 +140,7 @@ class PostFormSameSiteTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.server.shutdown()
+        self.server.server_close()
 
     def test_session_attached_when_post_host_is_same_site_as_auth(self) -> None:
         from bughunter.scan_auth import build_auth
