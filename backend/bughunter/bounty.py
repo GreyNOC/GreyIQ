@@ -43,6 +43,7 @@ from bughunter import screenshot_service
 from bughunter import sensitive_data
 from bughunter import toolkit as toolkit_lib
 from bughunter.code_scanner.redaction import redact_text
+from bughunter.code_scanner.sources.git_remote import is_supported_remote_git_url
 from bughunter.live_scan_service import run_live_scan
 from bughunter.rate_limit import HostRateGovernor, shared_governor
 from bughunter.scan_service import run_code_scan
@@ -481,6 +482,11 @@ def list_profiles() -> dict[str, Any]:
 def _infer_kind(target: str) -> str:
     raw = target.strip()
     lowered = raw.lower()
+    # Detect a cloneable HTTPS repository BEFORE the generic http(s) branch. The old
+    # ordering classified every real forge URL as a web page, making ``git_remote``
+    # unreachable for the links bounty programs publish.
+    if is_supported_remote_git_url(raw):
+        return "git"
     if lowered.startswith(("http://", "https://")):
         return "url"
     if lowered.endswith(".git") or "github.com/" in lowered or "gitlab.com/" in lowered or lowered.startswith(("git@", "ssh://")):
@@ -1167,7 +1173,7 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
             scores.append(float(result.get("score") or 0.0))
             meta[scanner] = {
                 key: result.get(key)
-                for key in ("files_scanned", "status", "final_url", "finding_count", "elapsed_seconds")
+                for key in ("files_scanned", "status", "final_url", "finding_count", "elapsed_seconds", "git_metadata")
                 if result.get(key) is not None
             }
         else:
@@ -1834,7 +1840,9 @@ def run_bounty_hunt(
                               issuer_host=str(auth.get("issuer_host") or ""))
 
     _emit(f"hunt: {clean_target} (profile={profile['name']})")
-    _emit("running scanner(s)…")
+    if kind == "git":
+        _emit("cloning authorized repository (shallow, single branch)…")
+    _emit("running adversarial source scan…" if kind in {"git", "path"} else "running scanner(s)…")
     raw_findings, scanners_run, scan_meta, risk, score = _run_scanners(profile, kind, clean_target, max_files, run_live, auth_ctx)
     _emit(f"scan complete — {', '.join(scanners_run) or 'no'} scanner(s) ran, {len(raw_findings)} raw finding(s), risk={risk}")
     # Surface scanner failures instead of letting a failed scan read as a clean

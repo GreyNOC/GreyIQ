@@ -100,6 +100,7 @@ default.
 
 See [docs/USER_GUIDE.md](docs/USER_GUIDE.md) for the full Hunt-cockpit walkthrough —
 Program setup (including pulling real scope from HackerOne's API or a CSV/paste import),
+opt-in shallow cloning/adversarial scanning of program-provided public source repositories,
 per-program SSRF/OOB setup, running a hunt, and reports & submission. The cockpit also opens
 a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the top bar).
 
@@ -139,8 +140,9 @@ refuses catastrophic commands (`rm -rf`, disk formats, pipe-to-shell, power cont
 privilege escalation, …).
 
 Local code scans can be restricted to one folder with
-`GREYIQ_CODE_SCAN_BASE_PATH`. Remote repository scans require HTTPS URLs from
-the built-in host allowlist. Web/live scans refuse private/loopback hosts unless
+`GREYIQ_CODE_SCAN_BASE_PATH`. Remote repository scans require public HTTPS repository-root
+URLs from the built-in forge allowlist; GreyIQ shallow-clones them into a temporary directory
+and removes it after the scan. Web/live scans refuse private/loopback hosts unless
 `GREYIQ_SCAN_ALLOW_PRIVATE_URLS=1`.
 
 ## How Training Works

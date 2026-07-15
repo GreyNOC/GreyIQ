@@ -17,6 +17,34 @@ from bughunter.bounty import _capture_direct_proof_artifacts, list_profiles  # n
 
 
 class BountyReportTests(unittest.TestCase):
+    def test_https_repository_roots_are_git_targets_before_generic_urls(self) -> None:
+        self.assertEqual(bounty_lib._infer_kind("https://github.com/acme/widget"), "git")
+        self.assertEqual(bounty_lib._infer_kind("https://gitlab.com/acme/platform/widget.git"), "git")
+
+    def test_forge_pages_remain_web_targets(self) -> None:
+        self.assertEqual(bounty_lib._infer_kind("https://github.com/acme/widget/issues/12"), "url")
+        self.assertEqual(bounty_lib._infer_kind("https://github.com/acme/widget/blob/main/app.py"), "url")
+
+    def test_full_sweep_routes_https_repository_to_remote_clone_scanner(self) -> None:
+        calls = []
+        original = bounty_lib.run_code_scan
+        bounty_lib.run_code_scan = lambda target, target_type, max_files=5000: (
+            calls.append((target, target_type, max_files))
+            or {"ok": True, "findings": [], "risk": "low", "score": 0,
+                "files_scanned": 4, "finding_count": 0, "git_metadata": {"clone_depth": "1"}}
+        )
+        try:
+            target = "https://github.com/acme/widget"
+            kind = bounty_lib._infer_kind(target)
+            _findings, scanners, meta, _risk, _score = bounty_lib._run_scanners(
+                bounty_lib.BOUNTY_PROFILES["full-sweep"], kind, target, 123, False,
+            )
+        finally:
+            bounty_lib.run_code_scan = original
+        self.assertEqual(calls, [(target, "git_remote", 123)])
+        self.assertEqual(scanners, ["code"])
+        self.assertEqual(meta["code"]["git_metadata"]["clone_depth"], "1")
+
     def test_markdown_adds_bounty_submission_sections(self) -> None:
         ctx = {
             "tool": "GreyIQ BugHunter",

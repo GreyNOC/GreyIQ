@@ -24,7 +24,8 @@ and scope live. One saved program feeds three things: the launch rail's **Progra
 you set up SSRF/OOB testing — the Access-control tab's collaborator panel.
 
 A program record has: a name, an optional HackerOne team handle, a **structured scope**
-table (one row per in-scope/out-of-scope asset), an `oob_allowed` flag, and free-text notes.
+table (one row per in-scope/out-of-scope asset), optional program-provided source repository
+links, an `oob_allowed` flag, and free-text notes.
 
 ### Getting scope in — three ways
 
@@ -61,6 +62,13 @@ plain list of hosts.
 required field. Everything else (asset type, bounty eligibility, severity cap, instructions)
 is optional metadata.
 
+**Add a program-provided source repository.** Paste each public HTTPS repository-root link
+into **Program-provided source repositories**, then explicitly enable **Clone and adversarially
+scan**. HackerOne/CSV imports that contain supported GitHub, GitLab, Bitbucket, Codeberg, or
+SourceHut repository roots are detected and copied into this review list, but cloning remains
+off until you opt in. Issue, pull-request, blob, and tree pages are not accepted as repositories.
+Private-repository credentials are intentionally not accepted in repository URLs.
+
 ### Review before you hunt
 
 Whichever way scope arrived, review the table before saving:
@@ -71,6 +79,11 @@ Whichever way scope arrived, review the table before saving:
   active — this is the same fail-closed gate the launch rail and Operator already use, just
   applied one level up: an empty structured scope can't silently become "active everywhere."
 - Click **Save program**.
+- For a source-code hunt, click **Hunt repository** on the saved program or pick the repository
+  from the launch rail's Target suggestions. GreyIQ makes a depth-1, single-branch temporary
+  clone, scans the whole eligible code tree with the adversarial static rule set, sends the
+  resulting leads through the configured hunt brain for red-team reproduction/impact planning,
+  performs the normal authorized credential-validation and reporting stages, then removes the clone.
 
 ### HackerOne credentials
 
@@ -114,7 +127,8 @@ Three ways to actually run the engine, all reading the same Target/Scope from th
 rail (which the Program picker can autofill):
 
 - **Single hunt** — one target, one profile (Web app / API / Source-code / Secrets / Full
-  sweep), optional vuln-class focus. The fastest way to check one asset. Start here.
+  sweep), optional vuln-class focus. A supported public repository URL is automatically routed
+  to the remote-clone source scanner. The fastest way to check one asset. Start here.
 - **Full campaign** — recon-crawls the target first (robots/sitemap/security.txt,
   same-origin links, served-JS mining), then hunts every discovered URL, dedupes and ranks
   findings, and (in **Deep** mode) auto-captures a screenshot + writes a research dossier
