@@ -2,6 +2,12 @@
 
 Notable changes to GreyIQ.
 
+## v2.2.1 - release packaging correction
+
+- Reissues the unchanged, fully validated v2.2.0 code as correctly versioned v2.2.1 Windows
+  artifacts after GitHub's immutable-release policy prevented correction of asset filename casing.
+- No hunt-engine, proof, reporting, submission, or cockpit behavior changed from v2.2.0.
+
 ## v2.2.0 - veteran hunt intelligence and professional cockpit
 
 This release strengthens GreyIQ's complete finding lifecycle: deciding what to test, discovering
