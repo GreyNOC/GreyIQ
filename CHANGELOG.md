@@ -2,6 +2,37 @@
 
 Notable changes to GreyIQ.
 
+## v2.1.0 — program repository hunts
+
+A program's scope is rarely just its running app — bounty programs increasingly publish their
+**source** too. This release lets a hunt cover that source alongside the live surface, as an
+explicit, bounded, safe-by-default opt-in. Everything below is additive; the anti-overclaim
+honesty invariants and the unbypassable submit gate are unchanged.
+
+### Opt-in source-code hunts on a program's public repositories
+- **Per-program opt-in** — a program can now carry `repository_urls` (public HTTPS repository
+  roots) plus a `clone_repositories` flag that **defaults off**. Nothing is cloned until an
+  operator explicitly turns it on and selects the repositories in the Program tab.
+- **Repository-root only, strictly validated** — `is_supported_remote_git_url` accepts only a
+  forge-allowlisted, public HTTPS **repository root**. Issue / pull-request / blob / tree / commit
+  and other in-repository forge *pages* are rejected as non-clone targets, as are URLs carrying
+  embedded credentials, a query, or a fragment. GitLab nested-group and sourcehut (`~user`)
+  shapes are handled explicitly.
+- **Additive to the existing scope, still bounded** — opted-in repositories join `seed_targets`
+  (which still take precedence over derived web assets) so a program can hunt its **app and its
+  source in the same span / portfolio / operator cycle**. Fan-out stays bounded
+  (`_MAX_REPOSITORIES = 25`); a repository root imported as a structured-scope asset is never
+  fetched as a web page — it is hunted only through the explicit opt-in.
+- **Correct scanner routing** — target-kind inference now detects a cloneable repository *before*
+  the generic http(s) branch (the old ordering classified every forge URL as a web page, leaving
+  the remote-git scanner unreachable), and the hunt log honestly narrates the shallow single-branch
+  clone and the adversarial source scan. `git_metadata` now rides along in scanner results.
+- **Docs** — README security notes and the User Guide describe the opt-in shallow-clone-into-temp,
+  scan, and remove-after flow, and the forge repository-root URL requirement.
+
+### Maintenance
+- Dev toolchain: bumped `electron` 43.0.0 → 43.1.0 (dev dependency; #145).
+
 ## v2.0.0 — the submission-ready release
 
 A major version focused on the last mile: taking a confirmed finding **straight to HackerOne
