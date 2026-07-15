@@ -599,6 +599,24 @@ class ProgramCampaignTargetsTests(unittest.TestCase):
         }
         self.assertEqual(campaign.program_campaign_targets(program), ["https://a.example.com", "https://b.example.com"])
 
+    def test_opted_in_repository_is_additive_to_web_seed_targets(self) -> None:
+        program = {
+            "seed_targets": ["https://app.example.com"],
+            "clone_repositories": True,
+            "repository_urls": ["https://github.com/acme/widget"],
+        }
+        self.assertEqual(campaign.program_campaign_targets(program), [
+            "https://app.example.com", "https://github.com/acme/widget",
+        ])
+
+    def test_repository_in_structured_scope_requires_clone_opt_in(self) -> None:
+        scoped = {"structured_scope": [{
+            "identifier": "https://github.com/acme/widget", "eligible_for_submission": True,
+        }]}
+        self.assertEqual(campaign.program_campaign_targets(scoped), [])
+        scoped["clone_repositories"] = True
+        self.assertEqual(campaign.program_campaign_targets(scoped), ["https://github.com/acme/widget"])
+
     def test_falls_back_to_structured_scope_when_no_seed_targets(self) -> None:
         program = {"structured_scope": [
             {"identifier": "a.example.com", "eligible_for_submission": True},

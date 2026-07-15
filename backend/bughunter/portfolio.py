@@ -27,10 +27,12 @@ from typing import Any
 from uuid import uuid4
 
 from bughunter.learning import program_key
+from bughunter.code_scanner.sources.git_remote import is_supported_remote_git_url
 
 _STORE_NAME = "portfolio.json"
 _LOCK = threading.Lock()  # serialize read-modify-write (os.replace is atomic but not RMW-safe)
 _MAX_SCOPE_ENTRIES = 500  # bound a program's structured scope (an imported program is a convenience, never an unbounded loader)
+_MAX_REPOSITORIES = 25    # each repository becomes a full source campaign; keep program fan-out bounded
 
 # Field defaults — every automation flag defaults to the SAFE/off value.
 _DEFAULTS: dict[str, Any] = {
@@ -41,6 +43,8 @@ _DEFAULTS: dict[str, Any] = {
     "in_scope_hosts": [],
     "out_of_scope_hosts": [],
     "seed_targets": [],            # URLs/hosts to hunt (each within scope)
+    "repository_urls": [],         # public HTTPS repository roots explicitly selected for source-code hunting
+    "clone_repositories": False,   # explicit opt-in: shallow-clone + adversarially scan repository_urls
     "structured_scope": [],        # [{identifier, asset_type, eligible_for_submission, eligible_for_bounty, instruction, max_severity}], from HackerOne API/CSV import or hand entry
     "oob_allowed": False,          # operator-confirmed: this program's policy permits out-of-band/collaborator testing
     "disclose_automation": False,  # operator-confirmed: this program's terms require disclosing automated-tool assistance in submitted reports
@@ -127,6 +131,25 @@ def _clean_scope_entry(entry: Any) -> dict[str, Any] | None:
         "instruction": str(entry.get("instruction") or "")[:2000],
         "max_severity": str(entry.get("max_severity") or "").strip()[:20],
     }
+
+
+def _clean_repository_urls(value: Any) -> list[str]:
+    """Keep only bounded, deduplicated public repository-root URLs the remote
+    scanner can actually clone. Invalid forge pages (issues/blob/tree) and private
+    credential-bearing URLs are dropped here, before they can become hunt targets."""
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        url = str(item or "").strip().rstrip("/")[:2000]
+        key = url.lower()
+        if url and key not in seen and is_supported_remote_git_url(url):
+            seen.add(key)
+            out.append(url)
+        if len(out) >= _MAX_REPOSITORIES:
+            break
+    return out
 
 
 _H1_STATS_BOOL_FIELDS = ("offers_bounties", "open_scope", "fast_payments", "gold_standard_safe_harbor", "allows_bounty_splitting")
@@ -232,6 +255,17 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     out["structured_scope"] = [
         e for e in (_clean_scope_entry(x) for x in (out.get("structured_scope") or [])) if e
     ][:_MAX_SCOPE_ENTRIES]
+    out["clone_repositories"] = bool(out.get("clone_repositories"))
+    out["repository_urls"] = _clean_repository_urls(out.get("repository_urls"))
+    # A fetched/imported program can already carry repository roots in structured
+    # scope. Once the operator opts in, use those links automatically when no
+    # narrower repository selection was saved.
+    if out["clone_repositories"] and not out["repository_urls"]:
+        out["repository_urls"] = _clean_repository_urls([
+            entry.get("identifier")
+            for entry in out["structured_scope"]
+            if entry.get("eligible_for_submission", True)
+        ])
     out["oob_allowed"] = bool(out.get("oob_allowed"))
     out["disclose_automation"] = bool(out.get("disclose_automation"))
     out["h1_program_stats"] = _clean_h1_program_stats(out.get("h1_program_stats"))
@@ -255,6 +289,10 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
             out["in_scope_hosts"] = in_ids
         if not out.get("out_of_scope_hosts"):
             out["out_of_scope_hosts"] = out_ids
+    # A manually entered source repository is itself the saved authorization scope.
+    # This keeps repository-only programs usable without inventing a live web host.
+    if out["clone_repositories"] and out["repository_urls"] and not str(out.get("scope_text") or "").strip():
+        out["scope_text"] = "\n".join(out["repository_urls"])
     # Fail-closed coupling: active/live/deep/auto_submit require a non-empty scope.
     if not str(out.get("scope_text") or "").strip():
         out["active"] = False
@@ -299,10 +337,10 @@ def upsert_program(runtime_dir: str | Path, record: dict[str, Any]) -> dict[str,
     the SAME id (one program = one memory).
 
     ``record["resync_scope"]`` (not a stored field — read here, never persisted) is an
-    explicit signal from a caller that owns the structured-scope table (the Program-setup
-    UI) that scope_text/in_scope_hosts/out_of_scope_hosts should be RE-derived from
-    whatever structured_scope this call carries, even if a scope_text already exists from
-    a prior save. Without it, ``_normalize``'s derivation only ever fires once (when
+    explicit signal from a caller that owns the structured/repository scope controls (the
+    Program-setup UI) that scope_text/in_scope_hosts/out_of_scope_hosts should be RE-derived
+    from whatever structured/repository scope this call carries, even if scope_text already
+    exists from a prior save. Without it, ``_normalize``'s derivation only ever fires once (when
     scope_text starts out empty) -- a later edit that changes structured_scope would
     otherwise leave the stale, previously-derived scope_text in place forever, since a
     caller that doesn't expose a scope_text field of its own has no other way to ask for
@@ -317,10 +355,20 @@ def upsert_program(runtime_dir: str | Path, record: dict[str, Any]) -> dict[str,
         programs = data.setdefault("programs", {})
         existing = programs.get(pid, {})
         merge_source = {**existing, **record, "id": pid}
-        if record.get("resync_scope") and merge_source.get("structured_scope"):
-            merge_source["scope_text"] = ""
-            merge_source["in_scope_hosts"] = []
-            merge_source["out_of_scope_hosts"] = []
+        if record.get("resync_scope"):
+            should_clear_scope = bool(merge_source.get("structured_scope"))
+            # The Program form also owns repository-only scope. If the existing scope
+            # was auto-derived from its old repository selection, clear it before
+            # normalizing so changing/removing that selection cannot leave a stale repo
+            # URL behind. A hand-typed Operator scope is preserved.
+            if not should_clear_scope and ("repository_urls" in record or "clone_repositories" in record):
+                old_repository_scope = "\n".join(_clean_repository_urls(existing.get("repository_urls")))
+                current_scope = str(existing.get("scope_text") or "").strip()
+                should_clear_scope = not current_scope or current_scope == old_repository_scope.strip()
+            if should_clear_scope:
+                merge_source["scope_text"] = ""
+                merge_source["in_scope_hosts"] = []
+                merge_source["out_of_scope_hosts"] = []
         merged = _normalize(merge_source)
         merged["name"] = name or existing.get("name") or pid
         merged["created_at"] = existing.get("created_at") or _now()

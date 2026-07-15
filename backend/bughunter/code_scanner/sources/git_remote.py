@@ -30,6 +30,45 @@ _HOST_ALLOWLIST = frozenset(
 )
 _URL_RE = re.compile(r"^https://[^\s]+$", re.IGNORECASE)
 
+# Forge paths that identify a page *inside* a repository rather than the repository
+# itself. Passing one of these to ``git clone`` produces a confusing transport error;
+# reject it as a non-repository link before any subprocess is started.
+_NON_REPOSITORY_SEGMENTS = frozenset({
+    "blob", "commit", "commits", "compare", "issues", "merge_requests", "pull",
+    "pulls", "releases", "src", "tree", "wiki", "-",
+})
+
+
+def is_supported_remote_git_url(url: str) -> bool:
+    """Return whether *url* is a public HTTPS repository root GreyIQ can clone.
+
+    This is deliberately stricter than "URL hosted on a forge": issue, pull-request,
+    blob, and tree pages are web targets, not clone targets. GitLab permits nested
+    groups, while the other supported forges use a two-component owner/repository
+    shape.
+    """
+    raw = str(url or "").strip()
+    if not _URL_RE.match(raw):
+        return False
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return False
+    if (parsed.scheme.lower() != "https" or parsed.username or parsed.password
+            or parsed.query or parsed.fragment):
+        return False
+    host = (parsed.hostname or "").lower()
+    if host not in _HOST_ALLOWLIST:
+        return False
+    parts = [part for part in parsed.path.split("/") if part]
+    if any(part.lower() in _NON_REPOSITORY_SEGMENTS for part in parts[2:]):
+        return False
+    if host == "gitlab.com":
+        return len(parts) >= 2 and "-" not in parts
+    if host == "git.sr.ht":
+        return len(parts) == 2 and parts[0].startswith("~")
+    return len(parts) == 2
+
 
 def _validate_url(url: str) -> str:
     url = url.strip()
@@ -47,6 +86,8 @@ def _validate_url(url: str) -> str:
     # Drop userinfo to avoid sneaking creds into the URL.
     if parsed.username or parsed.password:
         raise ValueError("Embedded credentials in URLs are not supported.")
+    if not is_supported_remote_git_url(url):
+        raise ValueError("Remote git URL must point to a repository root, not a forge page inside a repository.")
     return url
 
 

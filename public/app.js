@@ -4503,6 +4503,47 @@ function cel(tag, className, text) {
   return node;
 }
 
+// Client-side mirror of the backend's public-forge repository-root check. This
+// drives only hints/autofill; the server validates every URL again before saving
+// or cloning it.
+function ckIsCloneableGitUrl(value) {
+  try {
+    const url = new URL(String(value || "").trim());
+    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return false;
+    const host = url.hostname.toLowerCase();
+    const allowed = new Set(["github.com", "gitlab.com", "bitbucket.org", "codeberg.org", "git.sr.ht"]);
+    if (!allowed.has(host)) return false;
+    const parts = url.pathname.split("/").filter(Boolean);
+    const inside = new Set(["blob", "commit", "commits", "compare", "issues", "merge_requests", "pull", "pulls", "releases", "src", "tree", "wiki", "-"]);
+    if (parts.slice(2).some((part) => inside.has(part.toLowerCase()))) return false;
+    if (host === "gitlab.com") return parts.length >= 2 && !parts.includes("-");
+    if (host === "git.sr.ht") return parts.length === 2 && parts[0].startsWith("~");
+    return parts.length === 2;
+  } catch (_) { return false; }
+}
+
+function ckParseRepositoryUrls(value) {
+  return [...new Set(String(value || "").split(/[\s,]+/)
+    .map((item) => item.trim().replace(/\/$/, ""))
+    .filter((item) => item && ckIsCloneableGitUrl(item)))].slice(0, 25);
+}
+
+function ckRepositoryUrlsFromScope(entries) {
+  return [...new Set((entries || [])
+    .filter((entry) => entry && entry.eligible_for_submission !== false)
+    .map((entry) => String(entry.identifier || "").trim().replace(/\/$/, ""))
+    .filter(ckIsCloneableGitUrl))].slice(0, 25);
+}
+
+function ckProgramTargetsFor(prog) {
+  if (!prog) return [];
+  const seeds = (prog.seed_targets || []).map((item) => String(item || "").trim()).filter(Boolean);
+  const repos = prog.clone_repositories
+    ? (prog.repository_urls || []).map((item) => String(item || "").trim()).filter(ckIsCloneableGitUrl)
+    : [];
+  return [...new Set([...seeds, ...repos])];
+}
+
 function setAppMode(mode) {
   state.appMode = mode === "studio" ? "studio" : "hunt";
   document.body.dataset.appMode = state.appMode;
@@ -4572,13 +4613,13 @@ function ckRenderPortfolioPicker() {
   const progs = ckProgramsCache || [];
   if (!progs.length) {
     host.append(cel("p", "ck-hint", ckProgramsReachable
-      ? "No saved programs yet — add one in the Program tab (import a HackerOne scope or add seed targets)."
+      ? "No saved programs yet — add one in the Program tab (import scope, add seed targets, or opt in a source repository)."
       : "Engine unreachable — can't load your programs."));
     if (ck.portfolioCount) ck.portfolioCount.textContent = "";
     return;
   }
   for (const p of progs) {
-    const n = (p.seed_targets || []).length || (p.structured_scope || []).filter((s) => s && s.eligible_for_submission !== false).length;
+    const n = ckEstimateSpanTargets(p).length;
     const row = cel("label", "ck-portfolio-row");
     const cb = document.createElement("input");
     cb.type = "checkbox"; cb.value = p.id; cb.checked = prev.has(p.id);
@@ -4612,6 +4653,7 @@ async function ckPopulateProfiles() {
     const o = cel("option", null, p.name);
     o.value = p.id;
     o.dataset.desc = p.description || "";
+    o.dataset.kinds = (p.kinds || []).join(",");
     ck.profile.append(o);
   }
   if (profiles.some((p) => p.id === state.bountyProfile)) ck.profile.value = state.bountyProfile;
@@ -5826,10 +5868,12 @@ const CK_WALKTHROUGHS = {
         ["Fetch from HackerOne. ", "Enter the program's HackerOne team handle and click Fetch — pulls the program's structured scope via HackerOne's own API, using the API username/token you already saved in Submissions. Many programs restrict this to invited researchers, so a 403/404 here is common, not a bug."],
         ["Import a CSV or paste. ", "No API access? Export or copy the program's scope table from its HackerOne page and paste/upload it — GreyIQ recognizes the real column names (identifier, asset type, eligible for submission/bounty, instruction, max severity) and keeps every column."],
         ["Or just type it. ", "Add scope rows by hand with “+ Add scope row” — an identifier is the only required field."],
+        ["Program source repository. ", "Paste a public HTTPS repository-root link supplied by the program. Imported GitHub/GitLab/Bitbucket/Codeberg/SourceHut roots are detected for review; cloning stays off until you explicitly enable clone + scan."],
       ] },
       { h4: "Review before you hunt", list: [
         "Untick “In scope” on any row you don't want probed — it becomes an exclusion, never an expansion.",
         "A program with no in-scope rows (and no hand-typed Scope) can never go active — the same fail-closed gate the launch rail and Operator use.",
+        "Repository hunts use a shallow temporary clone, the full adversarial source scanner, hunt-brain red-team triage, and the same report pipeline. Forge issue/blob/tree/pull pages and embedded credentials are rejected.",
       ] },
       { h4: "Then", ordered: true, list: [
         ["Save the program. ", "It appears in the launch rail's Program picker and the Operator tab."],
@@ -5888,7 +5932,7 @@ const CK_WALKTHROUGHS = {
     sections: [
       { h4: "Set the target", list: [
         "Program (optional) — pick a program you set up in the Program tab and it fills in Target/Scope below; still hand-editable after.",
-        "Target — the authorized URL (or local repo path) to hunt.",
+        "Target — the authorized URL, supported public repository root, or local repo path to hunt. Repository roots are cloned temporarily and routed to the source-code scanner.",
         "Scope — name the host(s) you're allowed to probe; this is the fail-closed gate for every active check (an unnamed host stays passive-only).",
         "Profile / Focus class — bias the hunt toward a program's payouts or a single bug class (single hunt only).",
         ["Hunt this program's entire scope (Full campaign only). ", "Appears once you pick a program with more than one derivable target — runs one full campaign per in-scope target (from seed targets, or every eligible row in the program's structured scope) and merges them into one findings board, instead of just the single Target box."],
@@ -5914,6 +5958,7 @@ const CK_WALKTHROUGHS = {
       { h4: "Add a program", list: [
         "Name + Scope — the hosts/wildcards you're authorized to test (the fail-closed gate; active and deep modes need a non-empty scope).",
         "Seed targets — the URLs/hosts to hunt each cycle (each within scope).",
+        "Program source repositories — optional public repository roots; enable clone + scan to include them in each scheduled cycle alongside web targets.",
         "Cadence + daily cap — how often it re-runs, and the most it may auto-submit per day.",
         "HackerOne handle — required only if you want auto-submit.",
       ] },
@@ -6190,12 +6235,13 @@ function ckActivePolicyProfile() {
 // actually runs, so an estimate mismatch here can never widen what gets hunted.
 function ckEstimateSpanTargets(prog) {
   if (!prog) return [];
-  const seeds = (prog.seed_targets || []).map((t) => String(t || "").trim()).filter(Boolean);
+  const seeds = ckProgramTargetsFor(prog);
   if (seeds.length) return [...new Set(seeds)];
   const out = [];
   const seen = new Set();
   for (const entry of prog.structured_scope || []) {
     if (!entry || entry.eligible_for_submission === false) continue;
+    if (ckIsCloneableGitUrl(entry.identifier)) continue; // repository scope requires the explicit clone opt-in
     const id = String(entry.identifier || "").trim().replace(/^\*\.?/, "").toLowerCase();
     if (id && id.includes(".") && !seen.has(id)) { seen.add(id); out.push(id); }
   }
@@ -6300,6 +6346,8 @@ function ckProgramSetupRow(p) {
   }
   if (p.oob_allowed) left.append(document.createTextNode(" "), cel("span", "ck-tag", "OOB allowed"));
   if (p.disclose_automation) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Discloses tool use"));
+  const repositories = p.clone_repositories ? (p.repository_urls || []).filter(ckIsCloneableGitUrl) : [];
+  if (repositories.length) left.append(document.createTextNode(" "), cel("span", "ck-tag", `${repositories.length} source repo${repositories.length === 1 ? "" : "s"} · clone + scan`));
   const stats = p.h1_program_stats || {};
   if (stats.offers_bounties) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Offers bounties"));
   if (stats.fast_payments) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Fast payments"));
@@ -6336,6 +6384,27 @@ function ckProgramSetupRow(p) {
     if (ck.activeProgram) ck.activeProgram.value = p.id;
     ckSetView("idor");
   });
+  if (repositories.length) {
+    const huntRepo = cel("button", "ck-btn ck-btn-primary", "Hunt repository"); huntRepo.type = "button";
+    huntRepo.title = "Load this program's first opted-in repository as a source-code hunt target";
+    huntRepo.addEventListener("click", () => {
+      ckApplyActiveProgram(p.id);
+      if (ck.activeProgram) ck.activeProgram.value = p.id;
+      if (ck.target) ck.target.value = repositories[0];
+      ckSyncTargetControl(p, repositories[0]);
+      if (ck.profile && [...ck.profile.options].some((option) => option.value === "source-code")) {
+        ck.profile.value = "source-code";
+        state.bountyProfile = "source-code";
+        ckUpdateProfileHint();
+      }
+      ckSetRunType("hunt");
+      state.ckTarget = repositories[0];
+      saveState();
+      ck.launch?.scrollIntoView({ behavior: "smooth", block: "start" });
+      ck.run?.focus();
+    });
+    acts.append(huntRepo);
+  }
   const del = cel("button", "ck-btn", "Delete"); del.type = "button";
   del.addEventListener("click", async () => {
     if (await ckDeleteProgram(p.id, p.name)) void ckRenderProgram();
@@ -6409,6 +6478,24 @@ function ckProgramSetupForm() {
   const scopeTable = ckScopeTable(editing ? (editing.structured_scope || []) : []);
   form.append(scopeTable);
 
+  const existingRepositoryUrls = editing
+    ? ((editing.repository_urls || []).length
+        ? editing.repository_urls
+        : ckRepositoryUrlsFromScope(editing.structured_scope || []))
+    : [];
+  const repoWrap = cel("div", "ck-subsection");
+  repoWrap.append(cel("h4", "ck-subhead", "Program-provided source repositories"));
+  repoWrap.append(cel("p", "ck-hint",
+    "Add public HTTPS repository-root links supplied by the bounty program (GitHub, GitLab, Bitbucket, Codeberg, or SourceHut). "
+    + "When clone + scan is enabled, a hunt shallow-clones each selected repo, runs the full adversarial static rule set, "
+    + "passes the leads through the hunt brain for red-team attack planning, validates eligible credentials, and writes the normal reports."));
+  const repoUrls = ckTextareaField("Repository URLs (one per line; repository roots only)", "");
+  repoUrls.input.value = existingRepositoryUrls.join("\n");
+  repoUrls.input.rows = 3;
+  repoUrls.input.placeholder = "https://github.com/program/repository";
+  repoWrap.append(repoUrls.wrap);
+  form.append(repoWrap);
+
   fetchBtn.addEventListener("click", async () => {
     const h = handle.input.value.trim();
     if (!h) { fetchNote.className = "ck-status is-error"; fetchNote.textContent = "Enter a HackerOne team handle first."; return; }
@@ -6435,6 +6522,13 @@ function ckProgramSetupForm() {
         scopeTable.ckReplace(merged);
         if (truncated) mergeNote = ` Capped at ${CK_MAX_SCOPE_ENTRIES} scope entries — some existing rows were dropped.`;
       }
+      const fetchedRepositories = ckRepositoryUrlsFromScope(entries);
+      if (fetchedRepositories.length) {
+        repoUrls.input.value = [...new Set([
+          ...ckParseRepositoryUrls(repoUrls.input.value), ...fetchedRepositories,
+        ])].slice(0, 25).join("\n");
+        mergeNote += ` Found ${fetchedRepositories.length} public source repositor${fetchedRepositories.length === 1 ? "y" : "ies"}; review the list and enable clone + scan below to hunt it.`;
+      }
       fetchNote.className = "ck-status";
       fetchNote.textContent = `Fetched ${entries.length} scope entr${entries.length === 1 ? "y" : "ies"} for "${res.program_name}".`
         + ((res.warnings || []).length ? " " + res.warnings.join(" ") : "") + mergeNote;
@@ -6456,6 +6550,8 @@ function ckProgramSetupForm() {
   form.append(importNote);
 
   const toggles = cel("div", "ck-toggles");
+  const cloneRepositories = ckToggle("Clone and adversarially scan the selected program repositories during program hunts", editing ? Boolean(editing.clone_repositories) : false);
+  toggles.append(cloneRepositories.wrap);
   const oobAllowed = ckToggle("This program's policy allows out-of-band / collaborator testing (SSRF, blind XXE)", editing ? Boolean(editing.oob_allowed) : false);
   toggles.append(oobAllowed.wrap);
   const discloseAutomation = ckToggle("This program's terms require disclosing automated-tool assistance — add a disclosure line to submitted reports", editing ? Boolean(editing.disclose_automation) : false);
@@ -6544,11 +6640,19 @@ function ckProgramSetupForm() {
     e.preventDefault();
     const structuredScope = scopeTable.ckCollect();
     if (!name.input.value.trim()) { saveNote.className = "ck-status is-error"; saveNote.textContent = "Program name is required."; return; }
+    const repositoryUrls = ckParseRepositoryUrls(repoUrls.input.value);
+    if (cloneRepositories.input.checked && repoUrls.input.value.trim() && !repositoryUrls.length) {
+      saveNote.className = "ck-status is-error";
+      saveNote.textContent = "Add a supported public HTTPS repository-root URL (not an issue, blob, tree, or pull-request page).";
+      return;
+    }
     const payload = {
       name: name.input.value.trim(),
       platform: handle.input.value.trim() ? "hackerone" : "manual",
       platform_handle: handle.input.value.trim(),
       structured_scope: structuredScope,
+      repository_urls: repositoryUrls,
+      clone_repositories: cloneRepositories.input.checked,
       oob_allowed: oobAllowed.input.checked,
       disclose_automation: discloseAutomation.input.checked,
       h1_program_stats: fetchedProgramStats,
@@ -6575,11 +6679,10 @@ function ckProgramSetupForm() {
       // through untouched on edit; it's only ever set by the one-click VDP preset (see ckRenderProgram).
       policy_profile: editing ? (editing.policy_profile || "") : "",
       user_agent_suffix: uaSuffix.input.value,
-      // This form owns the structured-scope table, so a save here should always re-derive
-      // scope_text/in_scope_hosts/out_of_scope_hosts from whatever the table currently
-      // holds — never echo back a stale value from before this edit. The server no-ops
-      // this when structured_scope is empty, so it can't blank out a scope set some other
-      // way (e.g. hand-typed via the Operator tab).
+      // This form owns the structured-scope table and repository selection, so a save here
+      // should always re-derive scope_text/in_scope_hosts/out_of_scope_hosts from whatever
+      // the form currently holds — never echo back a stale value from before this edit.
+      // The server recognizes and preserves scope text hand-typed in the Operator tab.
       resync_scope: true,
     };
     if (editing) {
@@ -9654,7 +9757,7 @@ function ckProgramRow(prog, funnel) {
   if (prog.auto_submit) left.append(document.createTextNode(" "), cel("span", "ck-tag", "auto-submit"));
   if (!prog.enabled) left.append(document.createTextNode(" "), cel("span", "ck-tag", "disabled"));
   const fp = (funnel && funnel.programs && funnel.programs[prog.id]) || null;
-  const meta = `${prog.scope_text || "(no scope)"} · ${(prog.seed_targets || []).length} target(s)` + (fp ? ` · ${fp.stages.submitted || 0} submitted · $${fp.bounty_total || 0}` : "");
+  const meta = `${prog.scope_text || "(no scope)"} · ${ckEstimateSpanTargets(prog).length} target(s)` + (fp ? ` · ${fp.stages.submitted || 0} submitted · $${fp.bounty_total || 0}` : "");
   left.append(cel("div", "ck-floc", meta));
   li.append(left);
 
@@ -9696,18 +9799,23 @@ function ckProgramForm() {
   const name = ckField("Program name", "text", editing ? (editing.name || "") : "");
   const scope = ckField("Scope (hosts/wildcards — the active gate)", "text", editing ? (editing.scope_text || "") : "");
   const targets = ckField("Seed targets (comma/space separated URLs)", "text", editing ? (editing.seed_targets || []).join(", ") : "");
+  const repositories = ckTextareaField("Program source repositories (public HTTPS roots, one per line)", "");
+  repositories.input.value = editing ? (editing.repository_urls || []).join("\n") : "";
+  repositories.input.rows = 3;
+  repositories.input.placeholder = "https://github.com/program/repository";
   const handle = ckField("HackerOne team handle (for auto-submit)", "text", editing ? (editing.platform_handle || "") : "");
   const interval = ckField("Re-run every (minutes)", "number", editing ? String(editing.interval_minutes || 1440) : "1440");
   const cap = ckField("Max auto-submits / day", "number", editing ? String(editing.max_submits_per_day ?? 3) : "3");
-  form.append(name.wrap, scope.wrap, targets.wrap, handle.wrap, interval.wrap, cap.wrap);
+  form.append(name.wrap, scope.wrap, targets.wrap, repositories.wrap, handle.wrap, interval.wrap, cap.wrap);
   form.append(ckTargetImport(targets, scope));
 
   const toggles = cel("div", "ck-toggles");
+  const cloneRepositories = ckToggle("Clone + adversarially scan program repositories", editing ? !!editing.clone_repositories : false);
   const active = ckToggle("Capture proof of impact (active)", editing ? !!editing.active : true);
   const live = ckToggle("Dynamic Playwright pass", editing ? !!editing.live : false);
   const deep = ckToggle("Deep auto-work (time-based SQLi + screenshot + research per confirmed lead)", editing ? !!editing.deep : false);
   const auto = ckToggle("Auto-submit confirmed findings (per-program opt-in)", editing ? !!editing.auto_submit : false);
-  toggles.append(active.wrap, live.wrap, deep.wrap, auto.wrap);
+  toggles.append(cloneRepositories.wrap, active.wrap, live.wrap, deep.wrap, auto.wrap);
   form.append(toggles);
 
   const submit = cel("button", "ck-btn primary", editing ? "Update program" : "Save program");
@@ -9724,8 +9832,15 @@ function ckProgramForm() {
     e.preventDefault();
     if (!name.input.value.trim() || !scope.input.value.trim()) { note.textContent = "Name and scope are required."; note.classList.add("is-error"); return; }
     const seeds = targets.input.value.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+    const repositoryUrls = ckParseRepositoryUrls(repositories.input.value);
+    if (cloneRepositories.input.checked && repositories.input.value.trim() && !repositoryUrls.length) {
+      note.textContent = "Add a supported public HTTPS repository-root URL.";
+      note.classList.add("is-error");
+      return;
+    }
     const payload = {
       name: name.input.value.trim(), scope_text: scope.input.value.trim(), seed_targets: seeds,
+      repository_urls: repositoryUrls, clone_repositories: cloneRepositories.input.checked,
       platform: handle.input.value.trim() ? "hackerone" : "manual", platform_handle: handle.input.value.trim(),
       active: active.input.checked, live: live.input.checked, deep: deep.input.checked, auto_submit: auto.input.checked,
       interval_minutes: Number(interval.input.value) || 1440, max_submits_per_day: Number(cap.input.value) || 3
@@ -9948,6 +10063,7 @@ async function ckRun() {
   const isCampaign = state.ckRunType === "campaign";
   const spanning = isCampaign && Boolean(ck.spanScope?.checked) && !ck.spanScopeWrap?.hidden && Boolean(state.ckActiveProgramId);
   const target = (ck.target?.value || "").trim();
+  const repositoryHunt = !spanning && ckIsCloneableGitUrl(target);
   if (!spanning && !target) { ckStatus("Enter a target URL or folder/repo path.", true); return; }
   if (!ck.authorized?.checked) { ckStatus("Confirm you are authorized to test " + (spanning ? "this program's scope" : "this target") + " (tick the box).", true); return; }
   if (!(service.available || (await refreshServiceStatus({ silent: true })))) { ckStatus("Local GreyIQ engine is not running.", true); return; }
@@ -9961,12 +10077,23 @@ async function ckRun() {
   state.ckLive = Boolean(ck.live?.checked);
   state.ckAuthCookie = (ck.authCookie?.value || "").trim();
   state.ckAuthHeaders = (ck.authHeaders?.value || "");
+  // A repository root must use a profile that accepts Git targets. If the selected
+  // profile is web-only, switch to the full source audit automatically; profiles
+  // such as Full sweep and Secrets already accept Git and are preserved.
+  if (!isCampaign && repositoryHunt && ck.profile) {
+    const selectedKinds = String(ck.profile.selectedOptions[0]?.dataset.kinds || "").split(",").filter(Boolean);
+    if (!selectedKinds.includes("git") && [...ck.profile.options].some((option) => option.value === "source-code")) {
+      ck.profile.value = "source-code";
+      ckUpdateProfileHint();
+    }
+  }
   state.bountyProfile = ck.profile?.value || state.bountyProfile;
   saveState();
   const authHeaderLines = state.ckAuthHeaders.split("\n").map((s) => s.trim()).filter(Boolean);
   ck.run.disabled = true;
   ckStatus(
     spanning ? "Campaign running — hunting every target in this program's scope (this can take a while for a large program)…"
+      : repositoryHunt ? "Repository hunt running — shallow-cloning the authorized repo, adversarially scanning the codebase, then running hunt-brain red-team triage and reports…"
       : isCampaign ? "Campaign running — mapping the surface, hunting each URL (this can take a few minutes)…"
       : "Hunting — running scanners and proving findings…"
   );

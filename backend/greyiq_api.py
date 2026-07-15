@@ -996,6 +996,8 @@ class ProgramUpsertRequest(BaseModel):
     in_scope_hosts: list[str] = Field(default_factory=list)
     out_of_scope_hosts: list[str] = Field(default_factory=list)
     seed_targets: list[str] = Field(default_factory=list)
+    repository_urls: list[str] = Field(default_factory=list, max_length=25)
+    clone_repositories: bool = False
     structured_scope: list[dict[str, Any]] = Field(default_factory=list, max_length=500)
     oob_allowed: bool = False
     disclose_automation: bool = False  # this program's terms require disclosing automated-tool assistance in submitted reports
@@ -1006,7 +1008,7 @@ class ProgramUpsertRequest(BaseModel):
     idor_pairs: list[dict[str, Any]] = Field(default_factory=list, max_length=50)  # operator-supplied cross-tenant IDOR test pairs [{url_a, url_b, label}] — object URLs only, no secrets (portfolio._clean_idor_pairs bounds/dedups/caps)
     policy_profile: str = Field(default="", max_length=40)  # OPTIONAL VDP profile id (e.g. "nasa") binding this program to a program's rules of engagement (scope + excluded endpoints/classes + confirmed-only + no-DoS); validated in portfolio._normalize against bughunter.vdp_policy
     user_agent_suffix: str = Field(default="", max_length=120)    # a mandatory UA tag some programs require appended to every in-scope request
-    resync_scope: bool = False  # re-derive scope_text/hosts from structured_scope even if scope_text is already set (see portfolio.upsert_program)
+    resync_scope: bool = False  # re-derive scope_text/hosts from Program-form structured/repository scope even if scope_text is already set
     active: bool = False
     live: bool = False
     deep: bool = False
@@ -2355,7 +2357,7 @@ class GreyIQRuntime:
             return {"ok": False, "error": "Program not found — it may have been deleted."}
         targets = bounty_campaign.program_campaign_targets(program)
         if not targets:
-            return {"ok": False, "error": "This program has no huntable targets — add seed targets, or import/build its structured scope, in the Program tab."}
+            return {"ok": False, "error": "This program has no huntable targets — add seed targets, opt in a source repository, or import/build its structured scope in the Program tab."}
         scope = str(program.get("scope_text") or "").strip() or request.scope
         program_label = str(program.get("name") or program.get("id") or request.program_id)
         disclose_automation = bool(program.get("disclose_automation"))
@@ -2437,7 +2439,7 @@ class GreyIQRuntime:
                 "user_agent_suffix": str(program.get("user_agent_suffix") or ""),
             })
         if not specs:
-            return {"ok": False, "error": "None of the selected programs have huntable targets — add seed targets or import/build a structured scope in the Program tab."
+            return {"ok": False, "error": "None of the selected programs have huntable targets — add seed targets, opt in a source repository, or import/build a structured scope in the Program tab."
                                           + (f" (skipped: {', '.join(skipped[:8])})" if skipped else "")}
         result = bounty_campaign.run_portfolio_campaign(
             specs,

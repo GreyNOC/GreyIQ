@@ -61,9 +61,9 @@ def run_program_cycle(
     ``submit_fn(run_id, ref) -> {ok, report_id, url} | {ok: False, error}`` is the
     runtime's hard-gated submit; None => review-only (never submits)."""
     pid = program["id"]
-    # Prefers hand-typed seed_targets; falls back to deriving one target per eligible
-    # structured_scope entry (a HackerOne API/CSV-imported program) so a program built
-    # purely from an imported scope table still gets hunted, not silently skipped.
+    # Uses hand-typed seed_targets plus opted-in source repositories; falls back to
+    # deriving one target per eligible structured_scope entry so an imported program
+    # still gets hunted, not silently skipped.
     targets = campaign.program_campaign_targets(program)
     summary = {"program": pid, "targets_run": 0, "findings": 0, "confirmed": 0, "submitted": 0, "errors": []}
     auto = bool(submit_fn) and bool(program.get("auto_submit"))

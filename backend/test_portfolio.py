@@ -42,6 +42,8 @@ class BackwardCompatTests(TempRuntimeMixin, unittest.TestCase):
         self.assertFalse(programs[0]["disclose_automation"])
         self.assertEqual(programs[0]["h1_program_stats"], {})
         self.assertEqual(programs[0]["notes"], "")
+        self.assertEqual(programs[0]["repository_urls"], [])
+        self.assertFalse(programs[0]["clone_repositories"])
         self.assertTrue(programs[0]["active"])   # untouched by the new derivation path
 
     def test_upsert_without_new_fields_unchanged_behavior(self) -> None:
@@ -51,6 +53,29 @@ class BackwardCompatTests(TempRuntimeMixin, unittest.TestCase):
 
 
 class StructuredScopeDerivationTests(TempRuntimeMixin, unittest.TestCase):
+    def test_repository_clone_opt_in_extracts_supported_structured_scope_links(self) -> None:
+        prog = pf.upsert_program(self.runtime_dir, {
+            "name": "Source Program",
+            "clone_repositories": True,
+            "structured_scope": [
+                {"identifier": "https://github.com/acme/widget", "eligible_for_submission": True},
+                {"identifier": "https://github.com/acme/widget/issues/1", "eligible_for_submission": True},
+            ],
+        })
+        self.assertEqual(prog["repository_urls"], ["https://github.com/acme/widget"])
+        self.assertIn("https://github.com/acme/widget", prog["scope_text"])
+
+    def test_repository_urls_are_bounded_deduped_and_root_validated(self) -> None:
+        urls = ["https://github.com/acme/widget", "https://github.com/acme/widget/"]
+        urls += ["https://github.com/acme/widget/blob/main/app.py", "https://evil.example/acme/widget"]
+        urls += [f"https://github.com/acme/repo-{i}" for i in range(pf._MAX_REPOSITORIES + 5)]
+        prog = pf.upsert_program(self.runtime_dir, {
+            "name": "Source Program", "clone_repositories": True, "repository_urls": urls,
+        })
+        self.assertEqual(prog["repository_urls"][0], "https://github.com/acme/widget")
+        self.assertEqual(len(prog["repository_urls"]), pf._MAX_REPOSITORIES)
+        self.assertNotIn("https://github.com/acme/widget/blob/main/app.py", prog["repository_urls"])
+
     def test_derives_scope_text_and_hosts_when_scope_text_empty(self) -> None:
         prog = pf.upsert_program(self.runtime_dir, {
             "name": "Acme",
@@ -139,6 +164,33 @@ class EditPathDerivationTests(TempRuntimeMixin, unittest.TestCase):
         first = pf.upsert_program(self.runtime_dir, {"name": "Acme", "scope_text": "hand-typed.acme.com"})
         second = pf.upsert_program(self.runtime_dir, {"id": first["id"], "name": "Acme", "resync_scope": True})
         self.assertEqual(second["scope_text"], "hand-typed.acme.com")
+
+    def test_resync_can_replace_and_remove_auto_derived_repository_scope(self) -> None:
+        first = pf.upsert_program(self.runtime_dir, {
+            "name": "Source", "clone_repositories": True,
+            "repository_urls": ["https://github.com/acme/one"], "resync_scope": True,
+        })
+        second = pf.upsert_program(self.runtime_dir, {
+            "id": first["id"], "name": "Source", "clone_repositories": True,
+            "repository_urls": ["https://github.com/acme/two"], "resync_scope": True,
+        })
+        self.assertEqual(second["scope_text"], "https://github.com/acme/two")
+        third = pf.upsert_program(self.runtime_dir, {
+            "id": first["id"], "name": "Source", "clone_repositories": False,
+            "repository_urls": [], "resync_scope": True,
+        })
+        self.assertEqual(third["scope_text"], "")
+
+    def test_repository_resync_preserves_a_hand_typed_scope(self) -> None:
+        first = pf.upsert_program(self.runtime_dir, {
+            "name": "Mixed", "scope_text": "app.acme.test",
+            "clone_repositories": True, "repository_urls": ["https://github.com/acme/one"],
+        })
+        second = pf.upsert_program(self.runtime_dir, {
+            "id": first["id"], "name": "Mixed", "clone_repositories": False,
+            "repository_urls": [], "resync_scope": True,
+        })
+        self.assertEqual(second["scope_text"], "app.acme.test")
 
     def test_omitted_fields_preserve_existing_value_not_reset_to_default(self) -> None:
         # Mirrors what greyiq_api.RuntimeApi.upsert_program's exclude_unset now guarantees:

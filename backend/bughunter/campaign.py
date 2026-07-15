@@ -54,6 +54,7 @@ from bughunter.rate_limit import shared_governor
 from bughunter.registrable_domain import registrable_domain
 from bughunter.settings import get_settings
 from bughunter.target_ingest import _normalize_one
+from bughunter.code_scanner.sources.git_remote import is_supported_remote_git_url
 
 _SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 _MAX_PROGRAM_TARGETS = 25  # a "span the whole program" campaign is N full campaigns -- bound it
@@ -960,10 +961,11 @@ def _target_host_excluded(candidate: str, excluded_hosts: list[str]) -> bool:
 
 def program_campaign_targets(program: dict[str, Any], max_targets: int = _MAX_PROGRAM_TARGETS) -> list[str]:
     """The list of concrete URLs a "hunt this program's whole scope" campaign should
-    run. Prefers ``seed_targets`` (an operator's own hand-curated hunt list) when
-    present; otherwise derives one representative, deduped target per ELIGIBLE
-    ``structured_scope`` entry (a HackerOne API/CSV-imported program), so a program
-    built purely from an imported scope table still has something to hunt. Bounded —
+    run. Uses ``seed_targets`` (an operator's own hand-curated hunt list) plus any
+    explicitly opted-in ``repository_urls``; otherwise derives one representative,
+    deduped target per ELIGIBLE ``structured_scope`` entry (a HackerOne API/CSV-imported
+    program), so a program built purely from an imported scope table still has something
+    to hunt. Bounded —
     this feeds directly into a real active-probing pipeline, never an unbounded fan-out.
     A host in the program's own out_of_scope_hosts is filtered out here too — it must
     never become the literal target of a hunt just because it was hand-typed as a seed
@@ -971,14 +973,35 @@ def program_campaign_targets(program: dict[str, Any], max_targets: int = _MAX_PR
     excluded_hosts = [str(h) for h in (program.get("out_of_scope_hosts") or [])]
     seeds = [str(t).strip() for t in (program.get("seed_targets") or []) if str(t or "").strip()]
     seeds = [t for t in seeds if not _target_host_excluded(t, excluded_hosts)]
-    if seeds:
-        return list(dict.fromkeys(seeds))[:max_targets]
+    repositories = []
+    if program.get("clone_repositories"):
+        configured_repositories = list(program.get("repository_urls") or [])
+        if not configured_repositories:
+            configured_repositories = [
+                entry.get("identifier") for entry in (program.get("structured_scope") or [])
+                if isinstance(entry, dict) and entry.get("eligible_for_submission", True)
+            ]
+        repositories = [
+            str(t).strip().rstrip("/") for t in configured_repositories
+            if is_supported_remote_git_url(str(t or "").strip())
+        ]
+    # Seed targets still take precedence over derived web assets, but explicitly
+    # opted-in repositories are additive: a program can hunt its app and source in
+    # the same span/portfolio/operator cycle.
+    explicit = list(dict.fromkeys(seeds + repositories))
+    if explicit:
+        return explicit[:max_targets]
     out: list[str] = []
     seen: set[str] = set()
     for entry in program.get("structured_scope") or []:
         if not isinstance(entry, dict) or not entry.get("eligible_for_submission", True):
             continue
-        url = _representative_host(str(entry.get("identifier") or ""))
+        identifier = str(entry.get("identifier") or "").strip()
+        # A forge repository is never fetched as a web page. It is included only
+        # through the explicit clone_repositories opt-in above.
+        if is_supported_remote_git_url(identifier):
+            continue
+        url = _representative_host(identifier)
         if url and url not in seen and not _target_host_excluded(url, excluded_hosts):
             seen.add(url)
             out.append(url)
@@ -1286,7 +1309,7 @@ def run_portfolio_campaign(
                       "policy_profile": str(p.get("policy_profile") or ""),
                       "user_agent_suffix": str(p.get("user_agent_suffix") or "")})
     if not clean:
-        return {"ok": False, "error": "No huntable programs — each needs seed targets or an imported/built structured scope."}
+        return {"ok": False, "error": "No huntable programs — each needs seed targets, an opted-in source repository, or an imported/built structured scope."}
 
     def _emit(msg: str) -> None:
         if callable(on_progress):
