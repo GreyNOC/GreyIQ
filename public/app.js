@@ -4638,7 +4638,11 @@ function ckUpdateLaunchReadiness() {
 
   if (!service.available) text = "Engine offline · start the local service before launching.";
   else if (isPortfolio && !portfolioCount) text = "Select at least one saved program.";
-  else if (!isPortfolio && !spanning && !target) text = "Choose a program or add a one-off target.";
+  else if (!isPortfolio && !spanning && !target) {
+    text = ck.activeProgram?.value === "__oneoff__"
+      ? "Enter the authorized target to continue."
+      : "Choose a program or add a one-off target.";
+  }
   else if (!authorized) text = "Confirm authorization to unlock this run.";
   else {
     ready = true;

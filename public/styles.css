@@ -3113,12 +3113,10 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
 .ck-auth-fold label { margin-bottom: 0.5rem; }
 .ck-auth-fold textarea { font: inherit; font-size: 0.78rem; resize: vertical; }
 .ck-launch-actions {
-  position: sticky; bottom: -0.3rem; z-index: 5;
   display: flex; flex-direction: column; gap: 0.4rem;
   margin: 0 -0.15rem -0.3rem; padding: 0.55rem 0.15rem 0.3rem;
   border-top: 1px solid var(--border);
   background: color-mix(in srgb, var(--sidebar-bg) 95%, var(--surface));
-  box-shadow: 0 -10px 24px color-mix(in srgb, var(--bg) 45%, transparent);
 }
 .ck-launch-actions .ck-step-lab { margin-top: 0; }
 .ck-launch-actions .ck-auth { align-items: center; }
@@ -3678,7 +3676,7 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
   .ck-topbar-actions .ck-ghost { padding: 0.3rem 0.42rem; font-size: 0.68rem; }
   .ck-body, .ck-body.has-detail { display: block; overflow-y: auto; overflow-x: hidden; }
   .ck-main { overflow: visible; padding: 0.9rem; }
-  .ck-launch-actions { position: static; margin-bottom: 0; box-shadow: none; }
+  .ck-launch-actions { margin-bottom: 0; }
   .ck-scope-head { display: none; }
   .ck-scope-row { grid-template-columns: minmax(0, 1fr); padding: 0.65rem; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); }
   .ck-scope-rm { justify-self: start; }

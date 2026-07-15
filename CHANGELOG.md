@@ -2,6 +2,48 @@
 
 Notable changes to GreyIQ.
 
+## v2.2.0 - veteran hunt intelligence and professional cockpit
+
+This release strengthens GreyIQ's complete finding lifecycle: deciding what to test, discovering
+hidden attack surface, validating proof without overclaiming, packaging triager-ready evidence,
+and operating the hunt through a focused professional workflow. Existing authorization, scope,
+budget, VDP-policy, and submit gates remain enforced.
+
+### Veteran hunt planning and source-map recon
+- A deterministic offline planner ranks differential checks per endpoint from observed routes,
+  parameters, forms, APIs, authentication signals, and stack semantics, so constrained request
+  budgets reach likely high-impact classes without requiring an LLM.
+- Ordered class priorities remain an actual ranking; duplicate-class checks and the safety-tuned
+  unranked tail keep stable ordering.
+- Recon inspects explicitly referenced, in-scope external source maps for hidden endpoints,
+  parameters, sibling hosts, and redacted secrets, with pre/post-redirect scope gates and hard
+  request, map, source-file, and content limits.
+
+### Submission-proof QA/QC hardening
+- Findings reach **Confirmed** only through an engine-trusted validator or a captured
+  positive-vs-control differential. HTTP-looking notes and generic screenshots cannot overstate
+  proof of impact or exploitability.
+- Proof obligations are redacted with the other proof fields, preventing credentials echoed by a
+  model or operator note from leaking into exported reports.
+- Per-finding packages copy every referenced screenshot, preserve colliding basenames, omit broken
+  links after failed copies, and namespace same-named evidence in engagement ZIPs.
+- Test discovery is restricted to GreyIQ's backend suite so cached repositories and packaged
+  dependencies cannot pollute local QA runs.
+
+### Professional cockpit workflow
+- The launch rail follows a clear Target/Scope -> Strategy -> Authorize/Launch flow with a dedicated
+  scroll region, readiness guidance, and a clear non-overlapping launch action.
+- Single-hunt, campaign, and portfolio modes show only relevant controls; portfolio runs cannot
+  expose or reuse a single target's shared session credentials.
+- Navigation, run modes, sortable findings, finding rows, and empty-state handoffs publish keyboard
+  and assistive-technology semantics.
+- The cockpit scales to phone widths: navigation compacts, structured scope rows stack, wide tables
+  scroll within their panels, and page-level horizontal overflow is prevented.
+
+### Maintenance
+- Local HTTP fixtures now close their listener sockets deterministically, eliminating the remaining
+  `ResourceWarning` noise from the QA suite.
+
 ## v2.1.0 — program repository hunts
 
 A program's scope is rarely just its running app — bounty programs increasingly publish their
@@ -792,23 +834,6 @@ proof-of-impact a CORS/sensitive-data finding must show, and secrets in it are s
 ### OpenAI hosted model compatibility
 - OpenAI/ChatGPT requests now omit custom `temperature` for newer hosted models that only accept the provider default, fixing HTTP 400 errors like `Unsupported value: 'temperature' does not support 0.2 with this model`.
 - The OpenAI-compatible retry path now also strips `temperature` once when a gateway reports it unsupported, while local OpenAI-compatible servers keep the configured temperature.
-
-### Submission-proof QA/QC hardening
-- A finding now reaches **Confirmed** only through an engine-trusted validator or a captured positive-vs-control differential; an HTTP-looking model/operator observation or a generic screenshot can no longer overstate proof of impact or exploitability.
-- Proof obligations are redacted like every other proof field, closing a path where a model/operator note could echo a credential into an exported report.
-- Per-finding packages now copy every referenced screenshot, preserve both artifacts when basenames collide, omit broken image links after a failed copy, and namespace same-named evidence in engagement ZIPs.
-- `pytest` discovery is scoped to GreyIQ's backend suite, so cached scanned repositories and packaged dependencies under `runtime/` / `release/` no longer pollute local QA runs.
-
-### Veteran hunt-planning and source-map recon
-- A deterministic, offline hunt planner now ranks the existing differential checks per endpoint from observed route, parameter, form, API, authentication, and stack semantics, so tight request budgets reach likely high-impact classes without requiring an LLM.
-- Ordered class priorities are now honored as an actual ranking instead of being collapsed to a set; duplicate-class checks and the unranked safety-tuned tail retain stable order.
-- Recon now mines explicitly referenced, in-scope external source maps for hidden endpoints, parameters, sibling hosts, and redacted secrets, with pre/post-redirect scope gates and hard request, map, source-file, and content caps.
-
-### Professional cockpit workflow
-- The hunt rail now follows a three-step Target/Scope → Strategy → Authorize/Launch flow with a dedicated scroll area and a persistent, non-overlapping launch action.
-- Single hunt, full campaign, and portfolio modes reveal only the controls they actually use; portfolio runs no longer expose or reuse a single target's shared session credentials.
-- Navigation, run-mode state, sortable findings, clickable finding rows, and empty-state handoffs now expose keyboard and assistive-technology semantics.
-- The cockpit now scales cleanly to phone widths: navigation compacts, structured scope rows stack, wide findings tables scroll inside their panel, and page-level horizontal overflow is prevented.
 
 ## v0.78.1
 

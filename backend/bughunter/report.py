@@ -475,7 +475,11 @@ def _proof_text_is_concrete(text: str) -> bool:
     return bool(_CONCRETE_IMPACT_RE.search(cleaned))
 
 
-def _has_captured_artifact(finding: dict[str, Any], proof: Any) -> bool:
+def _has_captured_artifact(
+    finding: dict[str, Any],
+    proof: Any,
+    _observed_result: str = "",
+) -> bool:
     """True only when there is a REAL captured artifact proving IMPACT — never from
     narrative prose alone, and never from a bare explicit status. NOTE: the passive web
     ``proof_evidence`` (request line + 'header absent' + response status) is deliberately
@@ -489,7 +493,11 @@ def _has_captured_artifact(finding: dict[str, Any], proof: Any) -> bool:
     brain (possibly hallucinating, or echoing scanned-page prompt-injection) writing a bare
     ``status: confirmed`` with vague prose essentially never supplies a real differential.
     This keeps an explicit status from single-handedly flipping proof_status (and the
-    auto-submit gate behind it) without backing evidence."""
+    auto-submit gate behind it) without backing evidence.
+
+    ``_observed_result`` remains as an ignored compatibility argument for callers from
+    the v2.1 report API. Narrative text -- even an HTTP-looking string -- is not a
+    captured artifact and must never satisfy this gate by itself."""
     # A secret / exposed-key finding that strict classification did NOT confirm can NEVER be a captured
     # artifact — no synthesized issuer narrative, "HTTP 200" mention, or brain prose may promote a public
     # client key or an unverified candidate to confirmed. This is the single authoritative guard.
