@@ -91,6 +91,84 @@ def _validate_url(url: str) -> str:
     return url
 
 
+def _categorize_git_error(stderr: str) -> tuple[str, str]:
+    """Map raw git transport stderr to a (status, operator-facing message) pair.
+
+    The message is deliberately actionable and NEVER echoes the local temp path git
+    prints (``Cloning into 'C:\\...\\gn-scan-xxxx\\repo'``) or other plumbing. GitHub (and
+    most forges) return "not found" for BOTH a missing repo and a private one — to avoid
+    leaking existence — so those collapse to one honest message.
+    """
+    low = (stderr or "").lower()
+    if any(s in low for s in ("not found", "repository does not exist", "does not appear to be a git")):
+        return ("not_found", "Repository not found. Check the URL for typos, or confirm the repo is "
+                             "public — GreyIQ only clones public repositories, and a private repo reads "
+                             "as not-found here.")
+    if any(s in low for s in ("authentication failed", "could not read username", "could not read password",
+                              "terminal prompts disabled", "invalid username or password", "permission denied")):
+        return ("private", "This repository requires authentication, so it looks private. GreyIQ only "
+                          "clones public repositories.")
+    if any(s in low for s in ("could not resolve host", "failed to connect", "unable to access",
+                              "connection timed out", "network is unreachable", "temporary failure")):
+        return ("unreachable", "Couldn't reach the forge to read the repository. Check your network "
+                             "connection and try again.")
+    # Unknown git failure: surface only the first non-"Cloning into" line, never the temp path.
+    detail = ""
+    for line in (stderr or "").splitlines():
+        line = line.strip()
+        if line and not line.lower().startswith("cloning into"):
+            detail = line[:160]
+            break
+    return ("error", "Couldn't read the repository" + (f" — {detail}" if detail else "") + ".")
+
+
+def preflight(url: str, *, timeout: float = 12.0) -> dict[str, object]:
+    """Cheaply verify a public repo root is reachable and cloneable WITHOUT cloning it.
+
+    Uses ``git ls-remote`` (the same smart-HTTP transport a clone uses, so it tests the real
+    thing) against the already-allowlisted forge host. Returns
+    ``{"ok": bool, "status": str, "message": str, "default_branch": str}`` — status is one of
+    ``ok`` / ``not_found`` / ``private`` / ``unreachable`` / ``invalid`` / ``no_git`` / ``timeout`` /
+    ``error``. Never raises; every failure is a categorized, operator-facing message.
+    """
+    raw = str(url or "").strip().rstrip("/")
+    if not is_supported_remote_git_url(raw):
+        return {"ok": False, "status": "invalid",
+                "message": "Enter a public HTTPS repository-root URL from a supported forge (GitHub, "
+                           "GitLab, Bitbucket, Codeberg, or SourceHut) — not an issue, blob, tree, or "
+                           "pull-request page.",
+                "default_branch": ""}
+    if shutil.which("git") is None:
+        return {"ok": False, "status": "no_git",
+                "message": "git isn't installed on this machine, so GreyIQ can't check or clone "
+                           "repositories. Install git and try again.",
+                "default_branch": ""}
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "echo"}
+    try:
+        proc = subprocess.run(
+            ["git", "ls-remote", "--symref", raw, "HEAD"],
+            capture_output=True, timeout=timeout, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "status": "timeout",
+                "message": "The forge took too long to respond. Check your connection and try again.",
+                "default_branch": ""}
+    except (OSError, ValueError):
+        return {"ok": False, "status": "error",
+                "message": "Couldn't run the repository check. Try again.", "default_branch": ""}
+    if proc.returncode == 0:
+        default_branch = ""
+        for line in proc.stdout.decode("utf-8", "replace").splitlines():
+            if line.startswith("ref:") and "\tHEAD" in line:
+                default_branch = line[4:].split("\t", 1)[0].strip().removeprefix("refs/heads/")
+                break
+        return {"ok": True, "status": "ok",
+                "message": "Reachable public repository — ready to clone and scan.",
+                "default_branch": default_branch or "HEAD"}
+    status, message = _categorize_git_error(proc.stderr.decode("utf-8", "replace"))
+    return {"ok": False, "status": status, "message": message, "default_branch": ""}
+
+
 class RemoteGitSource(ScanSource):
     def __init__(self, target: str) -> None:
         super().__init__(target)
@@ -133,8 +211,8 @@ class RemoteGitSource(ScanSource):
         except subprocess.CalledProcessError as error:
             self._tempdir.cleanup()
             self._tempdir = None
-            stderr = (error.stderr or b"").decode("utf-8", errors="replace")[:240]
-            raise RuntimeError(f"git clone failed: {stderr}") from error
+            _status, message = _categorize_git_error((error.stderr or b"").decode("utf-8", errors="replace"))
+            raise RuntimeError(message) from error
 
         self.git_metadata = {
             "remote_url": url,

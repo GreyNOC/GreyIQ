@@ -117,6 +117,11 @@ _PLATFORM_REQUIRED: dict[str, list[tuple[str, str]]] = {
                   ("location", "Endpoint / domain"), ("cvss_vector", "CVSS vector")],
     "yeswehack": [("title", "Title"), ("vulnerability_information", "Description"),
                   ("weakness", "Bug type (CWE)"), ("cvss_vector", "CVSS vector")],
+    # HackenProof's form is Title / Target / Vulnerability category / Severity / Vulnerability
+    # details / Validation steps — it has NO CWE field (it uses a Vulnerability category), so
+    # readiness must NOT demand a CWE the platform doesn't collect.
+    "hackenproof": [("title", "Title"), ("vulnerability_information", "Vulnerability details"),
+                    ("platform_severity", "Severity"), ("location", "Target")],
 }
 
 

@@ -37,8 +37,8 @@ _MAX_REPOSITORIES = 25    # each repository becomes a full source campaign; keep
 # Field defaults — every automation flag defaults to the SAFE/off value.
 _DEFAULTS: dict[str, Any] = {
     "name": "",
-    "platform": "manual",          # 'hackerone' | 'manual'
-    "platform_handle": "",         # HackerOne team handle (for auto-submit)
+    "platform": "manual",          # 'hackerone' | 'hackenproof' | 'manual' — report-format + display tag. Only 'hackerone' (with a handle) can auto-submit; the others are export-only.
+    "platform_handle": "",         # HackerOne team handle (for auto-submit) / HackenProof program slug (hackenproof.com/programs/{slug})
     "scope_text": "",              # free-text, passed verbatim to run_campaign(scope=)
     "in_scope_hosts": [],
     "out_of_scope_hosts": [],

@@ -2,6 +2,30 @@
 
 Notable changes to GreyIQ.
 
+## v2.4.0 - gentle Program setup, repository preflight, HackenProof platform
+
+### Program setup redesigned into a gentle, one-step-at-a-time flow
+- The Program tab now rests as a calm list with a single **New program** button, and opens a
+  guided **Start → Identify → Scope & save** wizard (pick how you start: repo link, HackerOne,
+  or manual). The scattered repo-link bar, VDP-preset bar, and always-on giant form are gone;
+  advanced fields (out-of-band, research accounts, IDOR pairs) are tucked under one disclosure.
+
+### Repository preflight — no more doomed hunts
+- A repository target is now checked for reachability **before** a hunt commits to it, via
+  `git ls-remote` against the allowlisted forge (`POST /api/repos/preflight`). A typo'd, private,
+  or missing repo is caught up front with an actionable message instead of failing deep in the
+  clone. Clone failures no longer leak the local temp path or raw git plumbing to the UI. The
+  launch-time check is best-effort: only a definitive negative (bad URL, not found, private)
+  blocks a hunt — a transient/slow forge never refuses a run the operator asked for.
+
+### HackenProof report-format platform (export-only)
+- Adds **HackenProof** as a fifth submission format (web3: exchanges, protocols, smart contracts):
+  its four-band Critical–Low severity and Target + Vulnerability category framing, an AI summary
+  voice, a program platform selector, and a readiness checklist matching HackenProof's own form
+  (no CWE requirement). HackenProof publishes no researcher API for scope/submission/metrics, so
+  like YesWeHack/Bugcrowd/Intigriti it is export-only — GreyIQ formats the report and you submit
+  it on the platform's dashboard.
+
 ## v2.3.0 - repository-link program onboarding
 
 - Adds **Start from a repo link** to the Program tab: one or more validated public forge

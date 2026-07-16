@@ -113,7 +113,11 @@ a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the
   per-finding files) is written to a folder you choose. **Authorized testing only** —
   a hunt won't run unless you confirm the target is in scope.
 - Bounty reports now add triage, class mix, chain leads, submission-readiness checks,
-  retest guidance, and platform-friendly one-file-per-finding exports. URL targets can
+  retest guidance, and platform-friendly one-file-per-finding exports. Reports reshape for
+  HackerOne, YesWeHack, Bugcrowd, Intigriti, and **HackenProof** (web3: exchanges, protocols,
+  smart contracts) — pick the format in Submissions. HackerOne is the only live-API submit;
+  the rest, HackenProof included, are export-only (HackenProof has no researcher API — you
+  submit on its dashboard). URL targets can
   opt into the live browser pass, and focus classes also cover CSRF, CORS, open
   redirect, unsafe file upload, business logic, and supply-chain/dependency risk.
 - **Agent security test** — red-teams GreyIQ's own agent in a throwaway sandbox

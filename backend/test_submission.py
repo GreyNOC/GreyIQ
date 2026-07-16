@@ -372,5 +372,36 @@ class SubmitToHackeroneNetworkTests(unittest.TestCase):
         self.assertIn("HackerOne submit failed", str(cm.exception))
 
 
+class PreflightPlatformTests(unittest.TestCase):
+    """Per-platform readiness must demand only the fields THAT platform collects."""
+
+    def _pkg(self, **overrides: object) -> dict:
+        pkg = {
+            "title": "Reflected XSS", "vulnerability_information": "steps and details...",
+            "platform_severity": "High", "location": "https://app.example.com/?q=",
+            "proof_status": "confirmed", "weakness": "",  # no CWE resolved
+        }
+        pkg.update(overrides)
+        return pkg
+
+    def test_hackenproof_does_not_require_a_cwe(self) -> None:
+        # HackerOne's checklist demands a CWE; HackenProof has no CWE field, so the SAME
+        # CWE-less package is "not ready" on HackerOne but ready on HackenProof.
+        h1 = submission.preflight(self._pkg(), "hackerone")
+        self.assertIn("Weakness (CWE)", h1["missing"])
+        self.assertFalse(h1["ready"])
+        hp = submission.preflight(self._pkg(), "hackenproof")
+        self.assertNotIn("Weakness (CWE)", hp["missing"])
+        self.assertEqual(hp["missing"], [])            # Title/details/Severity/Target all present
+        self.assertTrue(hp["ready"])
+        self.assertEqual(hp["platform"], "hackenproof")
+
+    def test_hackenproof_flags_its_own_required_fields_when_absent(self) -> None:
+        hp = submission.preflight(self._pkg(location="", platform_severity=""), "hackenproof")
+        self.assertIn("Target", hp["missing"])
+        self.assertIn("Severity", hp["missing"])
+        self.assertFalse(hp["ready"])
+
+
 if __name__ == "__main__":
     unittest.main()

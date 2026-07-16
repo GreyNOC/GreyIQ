@@ -370,6 +370,7 @@ from bughunter import active_verify_service as bounty_active_verify  # noqa: E40
 from bughunter import scan_auth as bounty_scan_auth  # noqa: E402
 from bughunter import credential_validation as bounty_credential_validation  # noqa: E402
 from bughunter.code_scanner.redaction import redact_text  # noqa: E402
+from bughunter.code_scanner.sources import git_remote as bounty_git_remote  # noqa: E402
 from bughunter.settings import get_settings as _bounty_get_settings  # noqa: E402
 
 
@@ -1023,6 +1024,10 @@ class ProgramUpsertRequest(BaseModel):
 class ProgramFromRepoRequest(BaseModel):
     repository_urls: list[str] = Field(default_factory=list, max_length=25)
     enrich: bool = False
+
+
+class RepoPreflightRequest(BaseModel):
+    url: str = Field(default="", max_length=2000)
 
 
 _REPO_DRAFT_PROVENANCE = (
@@ -3877,6 +3882,16 @@ class GreyIQRuntime:
             "candidate_hosts": list(enrichment.get("candidate_hosts") or []),
         }
 
+    def preflight_repository(self, request: "RepoPreflightRequest") -> dict[str, Any]:
+        """Check a repository root is reachable + cloneable BEFORE a hunt commits to it.
+
+        Delegates to git_remote.preflight (a single `git ls-remote` against the already
+        forge-allowlisted host — the same transport a clone uses, but without downloading a
+        tree). This is the read that catches a typo'd/private/non-existent repo up front with
+        an actionable message, instead of letting the clone fail deep in the scan with raw git
+        plumbing. Read-only, on this explicit operator call — never background."""
+        return bounty_git_remote.preflight(str(request.url or "").strip())
+
     def import_hackerone_scope(self, request: "HackerOneImportRequest") -> dict[str, Any]:
         """Preview a program's scope pulled from the HackerOne API — a documented read
         to a fixed non-target host, only on this explicit, operator-clicked call
@@ -5329,6 +5344,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/programs/from-repo":
             request = validate_payload(ProgramFromRepoRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.program_from_repo, request))
+            return
+        if method == "POST" and path == "/api/repos/preflight":
+            request = validate_payload(RepoPreflightRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.preflight_repository, request))
             return
         if method == "POST" and path == "/api/hackerone/import-scope":
             request = validate_payload(HackerOneImportRequest, await read_json_body(receive))

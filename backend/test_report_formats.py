@@ -60,12 +60,13 @@ def _ctx_finding():
 
 
 class PlatformRegistryTests(unittest.TestCase):
-    def test_four_platforms_hackerone_first(self) -> None:
+    def test_five_platforms_hackerone_first(self) -> None:
         ids = [p["id"] for p in rf.list_platforms()]
-        self.assertEqual(ids, ["hackerone", "yeswehack", "bugcrowd", "intigriti"])
+        self.assertEqual(ids, ["hackerone", "yeswehack", "bugcrowd", "intigriti", "hackenproof"])
 
     def test_normalize_platform_falls_back(self) -> None:
         self.assertEqual(rf.normalize_platform("YesWeHack"), "yeswehack")
+        self.assertEqual(rf.normalize_platform("HackenProof"), "hackenproof")
         self.assertEqual(rf.normalize_platform("nope"), "hackerone")
         self.assertEqual(rf.normalize_platform(None), "hackerone")
         self.assertEqual(rf.normalize_platform(""), "hackerone")
@@ -77,16 +78,25 @@ class PlatformRegistryTests(unittest.TestCase):
         self.assertEqual(rf.platform_severity("bugcrowd", finding, plan), "P2 (Severe)")
         self.assertEqual(rf.platform_severity("yeswehack", finding, plan), "High")
         self.assertEqual(rf.platform_severity("intigriti", finding, plan), "High")
-        # info maps to the floor of each scale.
+        self.assertEqual(rf.platform_severity("hackenproof", finding, plan), "High")
+        # info maps to the floor of each scale — HackenProof has no Informational band, so Low.
         info = {"severity": "info"}
         self.assertEqual(rf.platform_severity("hackerone", info, {}), "none")
         self.assertIn("P5", rf.platform_severity("bugcrowd", info, {}))
+        self.assertEqual(rf.platform_severity("hackenproof", info, {}), "Low")
+        self.assertEqual(rf.platform_severity("hackenproof", {"severity": "critical"}, {}), "Critical")
+        # HackenProof defines no "None"/"Informational" band — none must map to a real band (Low),
+        # never emit an invented "None" label into a submission report.
+        for sev in ("none", "info"):
+            self.assertEqual(rf.platform_severity("hackenproof", {"severity": sev}, {}), "Low")
+        self.assertNotIn("None", {rf.platform_severity("hackenproof", {"severity": s}, {})
+                                  for s in ("critical", "high", "medium", "low", "info", "none")})
 
 
 class RenderTests(unittest.TestCase):
     def test_every_platform_renders_and_includes_gathered_evidence(self) -> None:
         ctx, finding = _ctx_finding()
-        for p in ("hackerone", "yeswehack", "bugcrowd", "intigriti"):
+        for p in ("hackerone", "yeswehack", "bugcrowd", "intigriti", "hackenproof"):
             md = rf.render_finding(ctx, finding, p)
             self.assertTrue(md.strip(), f"{p} produced empty output")
             self.assertIn(rf.platform_name(p), md)                      # platform banner
@@ -110,6 +120,11 @@ class RenderTests(unittest.TestCase):
         self.assertIn("Recommended fix", intig)
         h1 = rf.render_finding(ctx, finding, "hackerone")
         self.assertIn("Weakness (CWE)", h1)
+        hp = rf.render_finding(ctx, finding, "hackenproof")
+        self.assertIn("Vulnerability category", hp)                 # HackenProof's leading field
+        self.assertIn("Cross-site scripting (XSS)", hp)             # ...carries the finding's class name
+        self.assertIn("HackenProof submission", hp)                 # platform banner
+        self.assertIn("severity **High**", hp)                      # HackenProof Critical..Low vocab
 
     def test_unknown_platform_renders_as_hackerone(self) -> None:
         ctx, finding = _ctx_finding()
@@ -127,7 +142,7 @@ class RenderTests(unittest.TestCase):
         # Submitted content must never name the tool/bot unless the operator has
         # explicitly opted in for this program (H1-terms disclosure requirement).
         ctx, finding = _ctx_finding()
-        for p in ("hackerone", "yeswehack", "bugcrowd", "intigriti"):
+        for p in ("hackerone", "yeswehack", "bugcrowd", "intigriti", "hackenproof"):
             md = rf.render_finding(ctx, finding, p)
             self.assertNotIn("GreyIQ", md, f"{p} still self-identifies the tool")
             self.assertNotIn("BugHunter", md, f"{p} still self-identifies the tool")
