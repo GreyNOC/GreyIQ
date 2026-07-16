@@ -359,6 +359,7 @@ from bughunter import vdp_policy as bounty_vdp  # noqa: E402
 from bughunter import secret_classification as bounty_secret_class  # noqa: E402
 from bughunter import hackerone_import as bounty_h1_import  # noqa: E402
 from bughunter import hackerone_activity as bounty_h1_activity  # noqa: E402
+from bughunter import forge_metadata as bounty_forge_metadata  # noqa: E402
 from bughunter import taxonomy as bounty_taxonomy  # noqa: E402
 from bughunter import fsutil as bounty_fsutil  # noqa: E402
 from bughunter import progress as bounty_progress  # noqa: E402
@@ -1019,10 +1020,61 @@ class ProgramUpsertRequest(BaseModel):
     enabled: bool = True
 
 
+class ProgramFromRepoRequest(BaseModel):
+    repository_urls: list[str] = Field(default_factory=list, max_length=25)
+    enrich: bool = False
+
+
+_REPO_DRAFT_PROVENANCE = (
+    "Draft created from repo link(s); scope is source-only until web hosts are confirmed."
+)
+
+
+def _repo_owner_slug(repository_url: str) -> str:
+    parsed = urlparse(repository_url)
+    parts = [part for part in parsed.path.split("/") if part]
+    return (parts[0].lstrip("~") if parts else "").strip()
+
+
+def _program_name_from_repositories(repository_urls: list[str]) -> str:
+    """Titleize unique owner slugs in input order; the first repo supplies the name."""
+    owners: list[str] = []
+    seen: set[str] = set()
+    for repository_url in repository_urls:
+        slug = _repo_owner_slug(repository_url)
+        display = re.sub(r"[-_.]+", " ", slug).strip().title()
+        key = display.lower()
+        if display and key not in seen:
+            seen.add(key)
+            owners.append(display)
+    return " + ".join(owners)[:200] or "Repository Program"
+
+
+def _repo_description_note(repository_url: str, description: str) -> str:
+    parsed = urlparse(repository_url)
+    label = parsed.path.strip("/") or (parsed.hostname or "repository")
+    return f"Forge description ({label}): {description}"
+
+
+def _merge_note_lines(existing_notes: str, additions: list[str]) -> str:
+    lines = [line for line in str(existing_notes or "").splitlines() if line.strip()]
+    known = {line.strip() for line in lines}
+    for addition in additions:
+        clean = str(addition or "").strip()
+        if clean and clean not in known:
+            known.add(clean)
+            lines.append(clean)
+    return "\n".join(lines)[:4000]
+
+
 def _program_for_read(program: dict[str, Any]) -> dict[str, Any]:
     """Redact the research-account secrets before a program leaves the API: the UI never receives the
     stored password or session cookie in plaintext — only booleans saying whether each is set. Email,
     login/register URL, and notes are returned so the operator can see and edit them."""
+    # repo_draft_pending is a storage invariant, not operator-editable data. The
+    # empty scope already tells the UI this generated draft still needs review.
+    program = {key: value for key, value in program.items() if key != "repo_draft_pending"}
+
     def _redact(acc: Any) -> dict[str, Any] | None:
         if not (isinstance(acc, dict) and acc):
             return None
@@ -3714,9 +3766,103 @@ class GreyIQRuntime:
         saved = bounty_portfolio.upsert_program(RUNTIME_DIR, preset)
         return {"ok": True, "created": created, "program": _program_for_read(saved)}
 
+    def program_from_repo(self, request: "ProgramFromRepoRequest") -> dict[str, Any]:
+        """Create a passive review draft from public forge repository roots.
+
+        Tier 1 is entirely local. Tier 2 runs only for ``enrich=True`` and delegates
+        to the fixed-host, one-GET-per-repository forge metadata reader. Metadata may
+        add bounded description text to notes, but candidate web hosts are returned
+        separately and never written into any scope field.
+
+        Repeating the action is idempotent and non-destructive: repository roots are
+        unioned into the same owner-derived program, while established scope, runtime
+        flags, credentials, and operator choices remain untouched.
+        """
+        repository_urls = bounty_portfolio._clean_repository_urls(request.repository_urls)
+        if not repository_urls:
+            return {
+                "ok": False,
+                "error": (
+                    "Add at least one public HTTPS repository-root URL from a supported forge "
+                    "(GitHub, GitLab, Bitbucket, Codeberg, or SourceHut). Forge pages such as "
+                    "issues, blobs, trees, and pull requests, non-allowlisted hosts, and "
+                    "credential-bearing URLs are not accepted."
+                ),
+            }
+
+        name = _program_name_from_repositories(repository_urls)
+        expected_id = bounty_learning.program_key(name, "")
+        existing = next(
+            (program for program in bounty_portfolio.list_programs(RUNTIME_DIR)
+             if str(program.get("id") or "") == expected_id),
+            None,
+        )
+
+        enrichment: dict[str, Any] = {"descriptions": [], "candidate_hosts": []}
+        if request.enrich:
+            # No background path calls this method; this branch is reached only from
+            # the explicit opt-in payload sent by the repo onboarding button.
+            try:
+                fetched_enrichment = bounty_forge_metadata.enrich_repositories(repository_urls, timeout=10.0)
+                if isinstance(fetched_enrichment, dict):
+                    enrichment = fetched_enrichment
+            except Exception:  # noqa: BLE001 - optional enrichment must never block the local draft
+                pass
+        description_notes = [
+            _repo_description_note(item.get("repository_url", ""), item.get("description", ""))
+            for item in (enrichment.get("descriptions") or [])
+            if isinstance(item, dict) and item.get("repository_url") and item.get("description")
+        ]
+
+        if existing:
+            # Omit every unrelated field so portfolio.upsert_program's merge preserves
+            # the operator's established settings and secrets. The explicit repo-link
+            # action only adds validated repositories, enables their clone selection,
+            # and appends provenance/description notes once.
+            record: dict[str, Any] = {
+                "id": existing["id"],
+                "name": existing.get("name") or name,
+                "repository_urls": bounty_portfolio._clean_repository_urls(
+                    list(existing.get("repository_urls") or []) + repository_urls
+                ),
+                "clone_repositories": True,
+                "notes": _merge_note_lines(
+                    str(existing.get("notes") or ""),
+                    [_REPO_DRAFT_PROVENANCE, *description_notes],
+                ),
+            }
+        else:
+            record = {
+                "name": name,
+                "platform": "manual",
+                "platform_handle": "",
+                "repository_urls": repository_urls,
+                "clone_repositories": True,
+                # Persisted internal marker: prevents the normal repository-only scope
+                # derivation until the operator reviews and Saves the existing form.
+                "repo_draft_pending": True,
+                "active": False,
+                "live": False,
+                "deep": False,
+                "auto_submit": False,
+                "enabled": False,
+                "structured_scope": [],
+                "scope_text": "",
+                "in_scope_hosts": [],
+                "out_of_scope_hosts": [],
+                "seed_targets": [],
+                "notes": _merge_note_lines("", [_REPO_DRAFT_PROVENANCE, *description_notes]),
+            }
+        saved = bounty_portfolio.upsert_program(RUNTIME_DIR, record)
+        return {
+            "ok": True,
+            "program": _program_for_read(saved),
+            "candidate_hosts": list(enrichment.get("candidate_hosts") or []),
+        }
+
     def import_hackerone_scope(self, request: "HackerOneImportRequest") -> dict[str, Any]:
-        """Preview a program's scope pulled from the HackerOne API — the ONLY read here
-        that reaches a non-target host, and only on this explicit, operator-clicked call
+        """Preview a program's scope pulled from the HackerOne API — a documented read
+        to a fixed non-target host, only on this explicit, operator-clicked call
         (never automatic/background). Returns a PREVIEW; nothing is saved until the
         operator submits the Program form. Reuses the same creds already stored for
         submission — no new secret."""
@@ -5162,6 +5308,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/operator/programs/preset":
             request = validate_payload(VdpPresetRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.create_program_from_preset, request))
+            return
+        if method == "POST" and path == "/api/programs/from-repo":
+            request = validate_payload(ProgramFromRepoRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.program_from_repo, request))
             return
         if method == "POST" and path == "/api/hackerone/import-scope":
             request = validate_payload(HackerOneImportRequest, await read_json_body(receive))

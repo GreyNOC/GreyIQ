@@ -45,6 +45,11 @@ _DEFAULTS: dict[str, Any] = {
     "seed_targets": [],            # URLs/hosts to hunt (each within scope)
     "repository_urls": [],         # public HTTPS repository roots explicitly selected for source-code hunting
     "clone_repositories": False,   # explicit opt-in: shallow-clone + adversarially scan repository_urls
+    # Internal review marker for /api/programs/from-repo. While true, the repo URL is
+    # selected but has not yet passed through the existing Program form's Save action,
+    # so it must not become scope merely because _normalize runs on a read. The form's
+    # resync_scope write clears this marker and the normal source-only derivation resumes.
+    "repo_draft_pending": False,
     "structured_scope": [],        # [{identifier, asset_type, eligible_for_submission, eligible_for_bounty, instruction, max_severity}], from HackerOne API/CSV import or hand entry
     "oob_allowed": False,          # operator-confirmed: this program's policy permits out-of-band/collaborator testing
     "disclose_automation": False,  # operator-confirmed: this program's terms require disclosing automated-tool assistance in submitted reports
@@ -256,6 +261,7 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
         e for e in (_clean_scope_entry(x) for x in (out.get("structured_scope") or [])) if e
     ][:_MAX_SCOPE_ENTRIES]
     out["clone_repositories"] = bool(out.get("clone_repositories"))
+    out["repo_draft_pending"] = bool(out.get("repo_draft_pending"))
     out["repository_urls"] = _clean_repository_urls(out.get("repository_urls"))
     # A fetched/imported program can already carry repository roots in structured
     # scope. Once the operator opts in, use those links automatically when no
@@ -291,7 +297,8 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
             out["out_of_scope_hosts"] = out_ids
     # A manually entered source repository is itself the saved authorization scope.
     # This keeps repository-only programs usable without inventing a live web host.
-    if out["clone_repositories"] and out["repository_urls"] and not str(out.get("scope_text") or "").strip():
+    if (out["clone_repositories"] and out["repository_urls"]
+            and not out["repo_draft_pending"] and not str(out.get("scope_text") or "").strip()):
         out["scope_text"] = "\n".join(out["repository_urls"])
     # Fail-closed coupling: active/live/deep/auto_submit require a non-empty scope.
     if not str(out.get("scope_text") or "").strip():
@@ -356,6 +363,10 @@ def upsert_program(runtime_dir: str | Path, record: dict[str, Any]) -> dict[str,
         existing = programs.get(pid, {})
         merge_source = {**existing, **record, "id": pid}
         if record.get("resync_scope"):
+            # A Save from the full Program form is the explicit review action that
+            # finalizes a repo-link draft. Once cleared, _normalize may derive the
+            # repository-only source scope exactly as it did before this onboarding path.
+            merge_source["repo_draft_pending"] = False
             should_clear_scope = bool(merge_source.get("structured_scope"))
             # The Program form also owns repository-only scope. If the existing scope
             # was auto-derived from its old repository selection, clear it before

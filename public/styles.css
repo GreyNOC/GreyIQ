@@ -3589,6 +3589,18 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
 /* LOW severity reads green (mockup) in the findings table too */
 .ck-sev.sev-low { color: var(--ok); }
 .ck-preset-bar { margin: 0.5rem 0 1rem; padding: 0.75rem; border: 1px dashed var(--border); border-radius: 8px; }
+.ck-repo-start {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0.45rem 0.75rem;
+  align-items: end; margin: 0.7rem 0 1rem; padding: 0.75rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  border-radius: 10px; background: color-mix(in srgb, var(--accent) 4%, var(--surface));
+}
+.ck-repo-start > .ck-section-title,
+.ck-repo-start > .ck-hint,
+.ck-repo-start > .ck-status { grid-column: 1 / -1; margin: 0; }
+.ck-repo-start-input { display: flex; flex-direction: column; gap: 0.25rem; min-width: 0; font-size: 0.76rem; color: var(--muted); }
+.ck-repo-start-controls { display: flex; flex-direction: column; align-items: flex-start; gap: 0.45rem; padding-bottom: 0.05rem; }
+.ck-repo-start-controls .ck-switch { white-space: nowrap; }
 
 .ck-op-ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; margin: 0.4rem 0 1.2rem; }
 .ck-op-log { max-height: 14rem; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); padding: 0.5rem 0.7rem; margin-bottom: 1.2rem; }
@@ -3678,6 +3690,8 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
   .ck-main { overflow: visible; padding: 0.9rem; }
   .ck-launch-actions { margin-bottom: 0; }
   .ck-scope-head { display: none; }
+  .ck-repo-start { grid-template-columns: minmax(0, 1fr); }
+  .ck-repo-start-controls { align-items: stretch; }
   .ck-scope-row { grid-template-columns: minmax(0, 1fr); padding: 0.65rem; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); }
   .ck-scope-rm { justify-self: start; }
   .ck-resizer { display: none; }  /* single-column stacked layout — nothing to resize */

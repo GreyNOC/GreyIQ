@@ -2,6 +2,20 @@
 
 Notable changes to GreyIQ.
 
+## v2.3.0 - repository-link program onboarding
+
+- Adds **Start from a repo link** to the Program tab: one or more validated public forge
+  repository roots create an inactive, autonomous-operator-disabled draft in the existing
+  review form, with cloning selected but repository scope deferred until the first Save.
+- Adds optional, explicit **Enrich from forge (read-only)** metadata for GitHub and GitLab:
+  one unauthenticated GET per repository, bounded and non-redirecting. Descriptions enrich
+  Notes; homepage/web domains are returned only as unticked suggestions and never authorize scope.
+- Keeps repeat creation idempotent and non-destructive by merging repository roots and notes
+  without resetting established program scope, credentials, or operator settings.
+- Documents the fixed forge API egress allowlist and adds regression coverage for invalid
+  forge pages/credentials, zero-network Tier 1, candidate-host isolation, route dispatch,
+  first-Save finalization, and frontend review-only affordances.
+
 ## v2.2.1 - release packaging correction
 
 - Reissues the unchanged, fully validated v2.2.0 code as correctly versioned v2.2.1 Windows

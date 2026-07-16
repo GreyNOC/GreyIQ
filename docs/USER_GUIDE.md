@@ -27,16 +27,32 @@ A program record has: a name, an optional HackerOne team handle, a **structured 
 table (one row per in-scope/out-of-scope asset), optional program-provided source repository
 links, an `oob_allowed` flag, and free-text notes.
 
-### Getting scope in — three ways
+### Getting a program and scope in — four ways
+
+**Start from a repository link.** At the top of the Program tab, paste one or more public
+HTTPS repository-root links and click **Create draft program →**. GreyIQ validates the same
+GitHub, GitLab, Bitbucket, Codeberg, and SourceHut roots accepted by the source scanner,
+derives a program name from the repository owner, and opens the existing review form with
+**Clone and adversarially scan** already selected. The new record is inactive, disabled for
+autonomous scheduling, and has no web scope until you review and save it. Issue, blob, tree,
+pull-request, credential-bearing, and non-allowlisted URLs are rejected.
+
+The optional **Enrich from forge (read-only)** checkbox is off by default. On the explicit
+create click, it makes at most one unauthenticated GET per repository to GitHub's public API
+(`api.github.com`) or GitLab's public API (`gitlab.com`); other forges are skipped. A returned
+description is added to Notes. Homepage/web domains appear only as **unticked** suggested
+scope rows with a reminder to confirm authorization. They are never written into the draft's
+scope by the backend and never become in-scope unless you deliberately tick **In scope** and
+save. Failures are best-effort and do not prevent the local draft from being created.
 
 **Fetch from HackerOne (API).** If you have a HackerOne API username + token saved (see
 [HackerOne credentials](#hackerone-credentials) below), enter the program's team handle and
 click **Fetch scope from HackerOne**. GreyIQ calls HackerOne's own hacker API —
 `GET /v1/hackers/programs/{handle}` for the program's name/policy, then
 `GET /v1/hackers/programs/{handle}/structured_scopes` (paginated) for every scope entry —
-using HTTP Basic auth with the same credentials you already entered. This is the **only**
-call in the whole engine that reaches a host other than your target, and it only fires on
-this explicit click — never automatically or in the background.
+using HTTP Basic auth with the same credentials you already entered. This is one of the
+small, documented set of calls that can reach a host other than your target, and it only
+fires on this explicit click — never automatically or in the background.
 
 Many programs restrict structured-scope visibility to invited or paid researchers, so a
 403/404 here is common and is *not* a bug — GreyIQ tells you plainly and points at the CSV
@@ -75,6 +91,9 @@ Whichever way scope arrived, review the table before saving:
 
 - Untick **In scope** on any row you don't want probed. This is an **exclusion filter
   only** — unticking a row never expands what GreyIQ is allowed to touch; it only narrows it.
+- Forge-enriched host suggestions start unticked. Check the program's published policy and
+  confirm you are authorized to test a host before ticking **In scope**; the suggestion alone
+  grants no authorization.
 - A program with **no** in-scope rows (and no hand-typed Scope text) can never be marked
   active — this is the same fail-closed gate the launch rail and Operator already use, just
   applied one level up: an empty structured scope can't silently become "active everywhere."
@@ -180,7 +199,9 @@ Confirmed (and reportable candidate) findings appear in the **Submissions** tab:
   bounded non-GET request, always explicitly opted into per-call.
 - **Egress is deliberately narrow.** Everything talks to your authorized target, except:
   the HackerOne report submission (`api.hackerone.com`, write, hard-gated, manual), the
-  HackerOne scope import described above (`api.hackerone.com`, read-only, manual), an
+  HackerOne scope import described above (`api.hackerone.com`, read-only, manual), optional
+  repo-draft enrichment (`api.github.com` or `gitlab.com`, unauthenticated read-only, one GET
+  per repository, explicit click only), an
   optional certificate-transparency lookup for subdomain seeding (`crt.sh`, read-only), and
   polling your own OOB collaborator server (a host you configured). Nothing else leaves the
   machine.

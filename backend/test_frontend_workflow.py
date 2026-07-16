@@ -54,6 +54,26 @@ class CockpitWorkflowContractTests(unittest.TestCase):
         self.assertIn(".ck-scope-row { grid-template-columns: minmax(0, 1fr)", CSS)
         self.assertIn("@media (prefers-reduced-motion: reduce)", CSS)
 
+    def test_repo_link_onboarding_stays_review_only_and_fail_closed(self) -> None:
+        flow = JS.split("function ckRepoStartBar()", 1)[1].split(
+            "function ckProgramSetupRow", 1
+        )[0]
+        suggestions = JS.split("function ckProgramWithCandidateHosts", 1)[1].split(
+            "function ckRepoStartBar", 1
+        )[0]
+
+        self.assertIn('apiFetch("/api/programs/from-repo"', flow)
+        self.assertIn("ckParseRepositoryUrls(input.value).length === 0", flow)
+        self.assertIn('input.addEventListener("input", sync)', flow)
+        self.assertIn("enrich: enrich.input.checked", flow)
+        self.assertIn("ckProgEdit = ckProgramWithCandidateHosts", flow)
+        self.assertIn('document.querySelector(".ck-prog-setup-form")', flow)
+        self.assertIn("eligible_for_submission: false", suggestions)
+        self.assertIn("confirm you're authorized to test this host", suggestions)
+        self.assertIn("leaving a row unticked never authorizes it", JS)
+        self.assertIn('repositories.length && String(p.scope_text || "").trim()', JS)
+        self.assertIn(".ck-repo-start", CSS)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5948,6 +5948,7 @@ const CK_WALKTHROUGHS = {
     intro: "Set up the program you're authorized to test ONCE here, then reuse it everywhere: the launch rail's Program picker fills in Target/Scope, and the same list backs the Operator's autonomous scheduling. This is step one of Program → Hunt → Reports.",
     sections: [
       { h4: "Get the scope in", list: [
+        ["Start from a repo link. ", "Paste one or more supported public forge repository roots above to create an inactive source-only draft in this same review form. Optional forge enrichment is read-only; any homepage hosts return unticked and need your authorization confirmation."],
         ["Fetch from HackerOne. ", "Enter the program's HackerOne team handle and click Fetch — pulls the program's structured scope via HackerOne's own API, using the API username/token you already saved in Submissions. Many programs restrict this to invited researchers, so a 403/404 here is common, not a bug."],
         ["Import a CSV or paste. ", "No API access? Export or copy the program's scope table from its HackerOne page and paste/upload it — GreyIQ recognizes the real column names (identifier, asset type, eligible for submission/bounty, instruction, max severity) and keeps every column."],
         ["Or just type it. ", "Add scope rows by hand with “+ Add scope row” — an identifier is the only required field."],
@@ -5964,7 +5965,7 @@ const CK_WALKTHROUGHS = {
         ["Set up SSRF/OOB testing (optional). ", "Confirm the program's policy allows out-of-band testing, then jump straight to the Access-control tab's collaborator panel with scope pre-filled."],
       ] },
     ],
-    safety: "Only the HackerOne API fetch reaches a non-target host (api.hackerone.com, read-only, only on this explicit click). CSV/paste import is local parsing — nothing is added to scope, and nothing is probed, until you click Save.",
+    safety: "Fixed-host egress is explicit: HackerOne import uses api.hackerone.com; optional repo enrichment makes one read-only GET per repository to api.github.com or gitlab.com. CSV/paste and default repo-draft creation are local — nothing is probed, and suggested web hosts stay out of scope until you confirm and Save.",
   },
   "ssrf-setup": {
     summary: "Program-specific SSRF/OOB setup — walkthrough",
@@ -6107,6 +6108,7 @@ function ckWalkthrough(key) {
 // Operator tab's autonomous scheduling — both read/write the same /api/operator/programs
 // list, so a program created in either tab shows up in both. -----------------------------
 let ckProgEdit = null;   // the program being edited here (null = adding a new one)
+let ckRepoStartStatus = null;  // survives the success re-render so the explicit action has visible feedback
 let ckProgramsCache = []; // last-fetched program list, shared with the launch-rail picker
 
 let ckProgramsReachable = true;  // false after the last fetch FAILED (engine down) — so an
@@ -6421,6 +6423,111 @@ function ckScopeTable(initialRows) {
   return wrap;
 }
 
+function ckProgramWithCandidateHosts(program, candidateHosts) {
+  const rows = Array.isArray(program.structured_scope) ? program.structured_scope.map((row) => ({ ...row })) : [];
+  const seen = new Set(rows.map((row) => String(row.identifier || "").trim().toLowerCase()).filter(Boolean));
+  const suggested = [];
+  for (const rawHost of (candidateHosts || [])) {
+    const host = String(rawHost || "").trim().toLowerCase();
+    if (!host || /[\s/@]/.test(host) || seen.has(host)) continue;
+    seen.add(host);
+    suggested.push(host);
+    rows.push({
+      identifier: host,
+      asset_type: "URL",
+      eligible_for_submission: false,
+      eligible_for_bounty: false,
+      max_severity: "",
+      instruction: "Suggested by forge metadata — confirm you're authorized to test this host before ticking In scope.",
+    });
+  }
+  return { ...program, structured_scope: rows, _ckCandidateHosts: suggested };
+}
+
+function ckRepoStartBar() {
+  const wrap = cel("section", "ck-repo-start");
+  wrap.append(cel("h3", "ck-section-title", "Start from a repo link"));
+  wrap.append(cel("p", "ck-hint",
+    "Paste public repository roots to create an inactive, source-only draft. No web host is added to scope, and no hunt starts."));
+
+  const label = cel("label", "ck-repo-start-input");
+  label.append(cel("span", null, "Repository URLs (one per line)"));
+  const input = cel("textarea", "ck-import-ta");
+  input.rows = 3;
+  input.placeholder = "https://github.com/program/repository";
+  input.setAttribute("aria-label", "Repository URLs, one per line");
+  label.append(input);
+
+  const controls = cel("div", "ck-repo-start-controls");
+  const enrich = ckToggle("Enrich from forge (read-only)", false);
+  const create = cel("button", "ck-btn primary", "Create draft program →");
+  create.type = "button";
+  create.disabled = true;
+  controls.append(enrich.wrap, create);
+  const note = cel("p", `ck-status${ckRepoStartStatus?.error ? " is-error" : ""}`,
+    ckRepoStartStatus?.text || "");
+  note.setAttribute("role", "status");
+  note.setAttribute("aria-live", "polite");
+
+  const sync = () => {
+    create.disabled = ckParseRepositoryUrls(input.value).length === 0;
+    if (ckRepoStartStatus) {
+      ckRepoStartStatus = null;
+      note.className = "ck-status";
+      note.textContent = "";
+    }
+  };
+  input.addEventListener("input", sync);
+
+  create.addEventListener("click", async () => {
+    const repositoryUrls = ckParseRepositoryUrls(input.value);
+    if (!repositoryUrls.length) {
+      note.className = "ck-status is-error";
+      note.textContent = "Add a supported public HTTPS repository-root URL (not an issue, blob, tree, or pull-request page).";
+      return;
+    }
+    const originalLabel = create.textContent;
+    create.disabled = true;
+    create.textContent = enrich.input.checked ? "Creating + enriching…" : "Creating…";
+    note.className = "ck-status";
+    note.textContent = "";
+    try {
+      const result = await apiFetch("/api/programs/from-repo", {
+        method: "POST",
+        timeoutMs: 30000,
+        body: JSON.stringify({ repository_urls: repositoryUrls, enrich: enrich.input.checked }),
+      });
+      if (!result || result.ok === false || !result.program) {
+        note.className = "ck-status is-error";
+        note.textContent = (result && result.error) || "Could not create the draft program.";
+        return;
+      }
+      const candidates = Array.isArray(result.candidate_hosts) ? result.candidate_hosts : [];
+      ckProgEdit = ckProgramWithCandidateHosts(result.program, candidates);
+      const suggestedCount = ckProgEdit._ckCandidateHosts.length;
+      ckRepoStartStatus = {
+        error: false,
+        text: suggestedCount
+          ? `Draft created for “${result.program.name}”. ${suggestedCount} forge host suggestion${suggestedCount === 1 ? " is" : "s are"} unticked — confirm you're authorized before adding any to scope, then Save.`
+          : `Draft created for “${result.program.name}”. Review the source-only setup and Save; no web host was added to scope.`,
+      };
+      await ckRefreshProgramsEverywhere();
+      await ckRenderProgram();
+      const form = document.querySelector(".ck-prog-setup-form");
+      if (form) form.scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (err) {
+      note.className = "ck-status is-error";
+      note.textContent = err.message || "Could not create the draft program.";
+    } finally {
+      create.textContent = originalLabel;
+      create.disabled = ckParseRepositoryUrls(input.value).length === 0;
+    }
+  });
+
+  wrap.append(label, controls, note);
+  return wrap;
+}
+
 function ckProgramSetupRow(p) {
   const li = cel("li"); li.style.flexWrap = "wrap";
   const left = cel("div"); left.style.flex = "1";
@@ -6471,7 +6578,7 @@ function ckProgramSetupRow(p) {
     if (ck.activeProgram) ck.activeProgram.value = p.id;
     ckSetView("idor");
   });
-  if (repositories.length) {
+  if (repositories.length && String(p.scope_text || "").trim()) {
     const huntRepo = cel("button", "ck-btn ck-btn-primary", "Hunt repository"); huntRepo.type = "button";
     huntRepo.title = "Load this program's first opted-in repository as a source-code hunt target";
     huntRepo.addEventListener("click", () => {
@@ -6562,6 +6669,10 @@ function ckProgramSetupForm() {
   });
 
   form.append(cel("h4", null, "Structured scope"));
+  if (editing && Array.isArray(editing._ckCandidateHosts) && editing._ckCandidateHosts.length) {
+    form.append(cel("p", "ck-status ck-candidate-scope-note",
+      "Forge metadata suggested the unticked host rows below. Confirm you're authorized to test each host before ticking In scope; leaving a row unticked never authorizes it."));
+  }
   const scopeTable = ckScopeTable(editing ? (editing.structured_scope || []) : []);
   form.append(scopeTable);
 
@@ -6807,6 +6918,7 @@ async function ckRenderProgram() {
   host.append(cel("p", "ck-hint",
     "Set up the program you're authorized to test: its scope, and (optionally) its HackerOne handle. This feeds the Program picker on the launch rail and the Operator's autonomous scheduling — one program, everywhere."));
   host.append(ckWalkthrough("program"));
+  host.append(ckRepoStartBar());
 
   host.append(cel("h3", "ck-section-title", `Programs (${programs.length})`));
   if (!programs.length && !ckProgramsReachable) {
@@ -6871,7 +6983,7 @@ function ckPresetBar() {
 const CK_WIZARD_STEPS = [
   { title: "Welcome to GreyIQ", body: "Authorized testing only — your own assets, an authorized engagement, or a bug-bounty program you're enrolled in. Every active probe is scope-bound and fails closed: a host you don't name in Scope is never touched. This tour walks Program → Hunt → Reports." },
   { title: "Optional: connect a coding brain", body: "GreyIQ's scanners, proofs, and reports all work fully offline with no model. To get sharper reproduction steps, richer write-ups, and the chat/agent features, connect a brain — the built-in local model (a one-time ~1 GB download), or your own Claude or OpenAI API key. Set it in the Studio (chat) side under model settings; you can do this any time." },
-  { title: "1. Add your first program", body: "Give it a name (and its HackerOne handle if it has one). Then pull in real scope: “Fetch scope from HackerOne” (uses the API creds you save in Submissions), or import/paste a CSV, or add rows by hand.", view: "program" },
+  { title: "1. Add your first program", body: "Start with a public repo link to get an inactive source-only draft, or give the program a name and pull in real scope from HackerOne, CSV/paste, or hand-entered rows. Forge-suggested web hosts stay unticked until you confirm authorization.", view: "program" },
   { title: "2. Review the scope", body: "Check the structured-scope table — untick “In scope” on anything you don't want probed (that's an exclusion, never an expansion). Click Save program when it looks right.", view: "program" },
   { title: "3. SSRF/OOB setup (optional)", body: "If the program's policy allows out-of-band/collaborator testing, tick that on its form, then use “Set up SSRF/OOB →” on the program row to land here with scope pre-filled. Skip this step if you don't need it.", view: "idor" },
   { title: "4. Run your first hunt", body: "Back in the launch rail: pick your program (fills in Target/Scope), tick “I'm authorized to test this target”, and click Run hunt. Start with a Single hunt before a full campaign.", view: "program", focusSelector: "#ckActiveProgram" },

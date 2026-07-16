@@ -99,7 +99,8 @@ default.
 ## BugHunter
 
 See [docs/USER_GUIDE.md](docs/USER_GUIDE.md) for the full Hunt-cockpit walkthrough —
-Program setup (including pulling real scope from HackerOne's API or a CSV/paste import),
+Program setup (including starting an inactive draft from only a public forge repository link,
+or pulling real scope from HackerOne's API or a CSV/paste import),
 opt-in shallow cloning/adversarial scanning of program-provided public source repositories,
 per-program SSRF/OOB setup, running a hunt, and reports & submission. The cockpit also opens
 a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the top bar).
@@ -144,6 +145,13 @@ Local code scans can be restricted to one folder with
 URLs from the built-in forge allowlist; GreyIQ shallow-clones them into a temporary directory
 and removes it after the scan. Web/live scans refuse private/loopback hosts unless
 `GREYIQ_SCAN_ALLOW_PRIVATE_URLS=1`.
+
+Fixed third-party egress is narrow and documented. HackerOne import/submission uses
+`api.hackerone.com` only on its corresponding operator action. The optional **Enrich from
+forge (read-only)** action uses one unauthenticated GET per selected repository to
+`api.github.com` (GitHub) or `gitlab.com` (GitLab); it has a hard timeout, never runs in the
+background, and only returns homepage/web domains as **unticked** scope suggestions. Enrichment
+never authorizes or probes those hosts. Other supported forges are not queried for metadata.
 
 ## How Training Works
 
