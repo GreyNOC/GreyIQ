@@ -1036,13 +1036,23 @@ def _repo_owner_slug(repository_url: str) -> str:
     return (parts[0].lstrip("~") if parts else "").strip()
 
 
+def _display_token(token: str) -> str:
+    """Titlecase a plain lowercase word, but leave acronyms (OWASP) and handles that
+    already carry internal capitals (GitLab, NodeGoat) untouched, so ``str.title`` can't
+    mangle them into 'Owasp'/'Gitlab'."""
+    if not token or token.isupper() or token != token.lower():
+        return token
+    return token.capitalize()
+
+
 def _program_name_from_repositories(repository_urls: list[str]) -> str:
-    """Titleize unique owner slugs in input order; the first repo supplies the name."""
+    """Derive a display name from unique owner slugs in input order; the first repo supplies
+    the name. Plain words are Titlecased while acronyms/mixed-case handles are preserved."""
     owners: list[str] = []
     seen: set[str] = set()
     for repository_url in repository_urls:
         slug = _repo_owner_slug(repository_url)
-        display = re.sub(r"[-_.]+", " ", slug).strip().title()
+        display = " ".join(_display_token(w) for w in re.split(r"[-_.]+", slug) if w).strip()
         key = display.lower()
         if display and key not in seen:
             seen.add(key)
@@ -3791,6 +3801,13 @@ class GreyIQRuntime:
             }
 
         name = _program_name_from_repositories(repository_urls)
+        # Idempotency key: a repeat click for the same owner resolves to the same program id
+        # (bounty_learning.program_key(name, "") matches how upsert_program derives the id for
+        # this empty-scope/empty-seed record). In the rare case a differently-created program
+        # already occupies that id (same owner-derived name, id also seeded from name alone),
+        # the merge branch below only ADDS validated repositories, sets clone_repositories, and
+        # appends provenance notes — it never rewrites that program's scope, flags, or secrets,
+        # so the collision stays non-destructive.
         expected_id = bounty_learning.program_key(name, "")
         existing = next(
             (program for program in bounty_portfolio.list_programs(RUNTIME_DIR)

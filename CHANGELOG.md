@@ -15,6 +15,9 @@ Notable changes to GreyIQ.
 - Documents the fixed forge API egress allowlist and adds regression coverage for invalid
   forge pages/credentials, zero-network Tier 1, candidate-host isolation, route dispatch,
   first-Save finalization, and frontend review-only affordances.
+- Preserves acronym/mixed-case owner handles in the derived program name (OWASP/GitLab are
+  kept verbatim instead of being flattened to "Owasp"/"Gitlab"), and documents the
+  non-destructive idempotency-key collision behavior inline.
 
 ## v2.2.1 - release packaging correction
 
