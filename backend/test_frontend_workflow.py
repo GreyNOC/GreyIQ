@@ -82,11 +82,17 @@ class CockpitWorkflowContractTests(unittest.TestCase):
         self.assertIn('apiFetch("/api/repos/preflight"', run)
         self.assertIn('["invalid", "not_found", "private"].includes(pf.status)', run)
 
-    def test_hackenproof_is_a_selectable_platform(self) -> None:
-        # Report-format mirror + Program-form platform selector both offer HackenProof, and the
-        # saved platform tag comes from the selector (not the old handle-implies-HackerOne rule).
-        self.assertIn('id: "hackenproof", name: "HackenProof"', JS)
-        self.assertIn('["hackenproof", "HackenProof"]', JS)
+    def test_every_platform_is_selectable_in_the_program_flow(self) -> None:
+        # The report-format mirror lists all five platforms, and the Program-form platform
+        # selector is built FROM that mirror (+ a manual catch-all) so it can't drift — every
+        # supported platform, HackenProof included, is selectable. The saved tag comes from the
+        # selector (not the old handle-implies-HackerOne rule), and any of the five is preserved.
+        for pid, name in (("hackerone", "HackerOne"), ("yeswehack", "YesWeHack"),
+                          ("bugcrowd", "Bugcrowd"), ("intigriti", "Intigriti"),
+                          ("hackenproof", "HackenProof")):
+            self.assertIn(f'id: "{pid}", name: "{name}"', JS)
+        self.assertIn("CK_PLATFORMS.map((p) => [p.id, p.name])", JS)   # data-driven selector
+        self.assertIn("validPlatforms.has(initialPlatform)", JS)       # preserves any valid tag
         self.assertIn("platform: platSelect.value", JS)
         # The Operator tab's compact editor has no platform picker, so on edit it must PRESERVE the
         # existing platform tag (set in the Program tab) rather than re-derive it from the handle
@@ -105,8 +111,15 @@ class CockpitWorkflowContractTests(unittest.TestCase):
         for card in ("From a repo link", "From HackerOne", "Manually"):
             self.assertIn(card, JS)
         self.assertIn('cel("details", "ck-advanced")', JS)
-        for cls in (".ck-wiz-rail", ".ck-choice", ".ck-preflight", ".ck-advanced"):
+        # Flow classes use their own namespace so they can't collide with pre-existing components:
+        # the wizard container is .ck-progwiz (NOT .ck-wizard, which the guided tour owns as a
+        # fixed overlay), the repo preflight is .ck-rpf (NOT .ck-preflight, the submission panel),
+        # and the empty state is .ck-prog-empty (NOT .ck-empty, a full-page empty state).
+        for cls in (".ck-wiz-rail", ".ck-choice", ".ck-rpf", ".ck-advanced", ".ck-progwiz", ".ck-prog-empty"):
             self.assertIn(cls, CSS)
+        wizard_fn = JS.split("function ckProgramWizard()", 1)[1].split("function ckWizardStart", 1)[0]
+        self.assertIn('cel("div", "ck-progwiz")', wizard_fn)
+        self.assertNotIn('"ck-wizard"', wizard_fn)   # must not reuse the tour's fixed-overlay class
 
 
 if __name__ == "__main__":

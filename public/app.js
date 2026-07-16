@@ -6542,12 +6542,17 @@ function ckProgramSetupForm(prefill) {
   const platWrap = cel("label");
   platWrap.append(cel("span", null, "Platform"));
   const platSelect = cel("select");
-  for (const [pid, pname] of [["hackerone", "HackerOne"], ["hackenproof", "HackenProof"], ["manual", "Other / manual"]]) {
+  // Every supported report-format platform (HackerOne, YesWeHack, Bugcrowd, Intigriti,
+  // HackenProof) plus a catch-all — sourced from CK_PLATFORMS so this list can't drift from
+  // the backend registry. HackerOne can auto-submit via its API; the rest are export-only.
+  const platformOptions = [...CK_PLATFORMS.map((p) => [p.id, p.name]), ["manual", "Other / manual"]];
+  for (const [pid, pname] of platformOptions) {
     const o = cel("option", null, pname); o.value = pid; platSelect.append(o);
   }
+  const validPlatforms = new Set(platformOptions.map(([pid]) => pid));
   const initialPlatform = editing ? (editing.platform || "manual")
     : ((seed && seed.platform) || (seed && seed.platform_handle ? "hackerone" : "manual"));
-  platSelect.value = ["hackerone", "hackenproof"].includes(initialPlatform) ? initialPlatform : "manual";
+  platSelect.value = validPlatforms.has(initialPlatform) ? initialPlatform : "manual";
   platWrap.append(platSelect);
   const handle = ckField("HackerOne team handle", "text", editing ? (editing.platform_handle || "") : (seed && seed.platform_handle) || "");
   const syncHandleLabel = () => {
@@ -6892,8 +6897,8 @@ async function ckRenderProgram() {
     retry.addEventListener("click", () => void ckRenderProgram());
     host.append(retry);
   } else if (!programs.length) {
-    const empty = cel("div", "ck-empty");
-    empty.append(cel("p", "ck-empty-title", "No programs yet"));
+    const empty = cel("div", "ck-prog-empty");
+    empty.append(cel("p", "ck-prog-empty-title", "No programs yet"));
     empty.append(cel("p", "ck-hint", "Start your first one — paste a repo link, pull a HackerOne scope, or add it by hand. It takes about a minute."));
     const go = cel("button", "ck-btn primary", "Start a program"); go.type = "button";
     go.addEventListener("click", () => { ckFlow = { view: "wizard", step: 0, choice: null, prefill: null }; void ckRenderProgram(); });
@@ -6935,8 +6940,8 @@ function ckWizardRail(step) {
 }
 
 function ckProgramWizard() {
-  const wrap = cel("div", "ck-wizard");
-  const top = cel("div", "ck-wizard-top");
+  const wrap = cel("div", "ck-progwiz");
+  const top = cel("div", "ck-progwiz-top");
   const cancel = cel("button", "ck-textlink", "✕ Cancel"); cancel.type = "button";
   cancel.addEventListener("click", () => { ckProgReset(); void ckRenderProgram(); });
   top.append(cancel);
@@ -7009,7 +7014,7 @@ function ckWizardIdentifyRepo(nav) {
   const enrich = ckToggle("Enrich from forge (read-only) — pull the description and suggest homepage hosts", false);
   box.append(enrich.wrap);
   const checkBtn = cel("button", "ck-btn", "Check repository"); checkBtn.type = "button";
-  const verdict = cel("div", "ck-preflight");
+  const verdict = cel("div", "ck-rpf");
   box.append(checkBtn, verdict);
 
   const cont = cel("button", "ck-btn primary", "Continue →"); cont.type = "button"; cont.disabled = true;
@@ -7018,7 +7023,7 @@ function ckWizardIdentifyRepo(nav) {
   const runCheck = async () => {
     const urls = ckParseRepositoryUrls(ta.input.value);
     if (!urls.length) {
-      verdict.className = "ck-preflight"; verdict.replaceChildren(cel("div", "ck-preflight-row is-error",
+      verdict.className = "ck-rpf"; verdict.replaceChildren(cel("div", "ck-rpf-row is-error",
         "Add a supported public HTTPS repository-root URL (not an issue, blob, tree, or pull-request page)."));
       cont.disabled = true; return;
     }
@@ -7034,10 +7039,10 @@ function ckWizardIdentifyRepo(nav) {
     okUrls = results.filter((r) => r.ok).map((r) => r.url);
     verdict.replaceChildren();
     for (const r of results) {
-      const row = cel("div", "ck-preflight-row " + (r.ok ? "is-ok" : "is-error"));
-      row.append(cel("span", "ck-pf-ic", r.ok ? "✓" : "✕"));
-      const txt = cel("div", "ck-pf-text");
-      txt.append(cel("div", "ck-pf-url", ckShortTarget(r.url)), cel("div", "ck-pf-msg", r.message || (r.ok ? "Reachable." : "Not reachable.")));
+      const row = cel("div", "ck-rpf-row " + (r.ok ? "is-ok" : "is-error"));
+      row.append(cel("span", "ck-rpf-ic", r.ok ? "✓" : "✕"));
+      const txt = cel("div", "ck-rpf-text");
+      txt.append(cel("div", "ck-rpf-url", ckShortTarget(r.url)), cel("div", "ck-rpf-msg", r.message || (r.ok ? "Reachable." : "Not reachable.")));
       row.append(txt);
       verdict.append(row);
     }
@@ -7052,7 +7057,7 @@ function ckWizardIdentifyRepo(nav) {
     try {
       const res = await apiFetch("/api/programs/from-repo", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ repository_urls: okUrls, enrich: enrich.input.checked }) });
       if (!res || res.ok === false || !res.program) {
-        verdict.replaceChildren(cel("div", "ck-preflight-row is-error", (res && res.error) || "Could not create the draft."));
+        verdict.replaceChildren(cel("div", "ck-rpf-row is-error", (res && res.error) || "Could not create the draft."));
         cont.disabled = false; cont.textContent = "Continue →"; return;
       }
       const candidates = Array.isArray(res.candidate_hosts) ? res.candidate_hosts : [];
@@ -7061,7 +7066,7 @@ function ckWizardIdentifyRepo(nav) {
       ckFlow.view = "form";
       void ckRenderProgram();
     } catch (err) {
-      verdict.replaceChildren(cel("div", "ck-preflight-row is-error", err.message || "Could not create the draft."));
+      verdict.replaceChildren(cel("div", "ck-rpf-row is-error", err.message || "Could not create the draft."));
       cont.disabled = false; cont.textContent = "Continue →";
     }
   });

@@ -2,6 +2,19 @@
 
 Notable changes to GreyIQ.
 
+## v2.4.1 - fix new-program wizard, all platforms selectable
+
+- **Fix the new-program wizard rendering.** The v2.4.0 wizard reused CSS class names already
+  owned by other components, so it inherited a `position: fixed` overlay and floated over the
+  Hunt-setup sidebar instead of rendering in the main column. Three class-name collisions are
+  now namespaced: the wizard container (`.ck-wizard` → `.ck-progwiz`, which the guided tour
+  owns as a fixed overlay), the empty state (`.ck-empty` → `.ck-prog-empty`), and the repo
+  preflight verdict (`.ck-preflight` → `.ck-rpf`, distinct from the submission-readiness panel).
+- **Every report-format platform is selectable in the flow.** The program platform selector is
+  now built from the platform registry (HackerOne, YesWeHack, Bugcrowd, Intigriti, HackenProof,
+  plus Other/manual) instead of a hardcoded subset, and it preserves whichever platform an
+  existing program is tagged with.
+
 ## v2.4.0 - gentle Program setup, repository preflight, HackenProof platform
 
 ### Program setup redesigned into a gentle, one-step-at-a-time flow
