@@ -2,6 +2,65 @@
 
 Notable changes to GreyIQ.
 
+## v2.5.0 - whole-app QAQC: platform-aware reporting, cockpit & Workbench polish
+
+A whole-app quality pass driven by a fan-out UX audit: 23 verified, user-facing defects
+found and fixed across the bug-bounty cockpit, program setup, security panels, and the AI
+Studio Workbench, plus the report/export flow made platform-aware end to end. Every fix is
+locked in by a static frontend contract test.
+
+### Report format now follows the program's platform (was silently HackerOne)
+- Picking a saved program sets the export format from its platform, and a reload re-derives it
+  from the restored program — so a Bugcrowd/YesWeHack/Intigriti/HackenProof program no longer
+  silently exports a **HackerOne-shaped** report. A one-off run falls back to the HackerOne
+  generic framing.
+- **Export-only platforms get an export call-to-action, not a dead button.** For any non-HackerOne
+  format (which has no researcher submit API here), the full-report and submission-row "Submit to
+  HackerOne" control is replaced by "export above, then file on {platform}'s dashboard" — the
+  action that actually works. HackerOne remains the only live-API submit.
+- The findings-detail pane now shows which platform format its Copy/Download produce, so a report
+  can't be handed to the wrong program by surprise.
+- The submit gate reason references the **Submissions tab's** credentials bar (it was shared with
+  the Report Center, where "the credentials bar below" pointed at nothing).
+
+### Cockpit navigation, board, and tour
+- The nav tab is now labelled **Program** to match the page heading, guide, and tour (was
+  "Overview", the lone outlier a new user couldn't find).
+- The live board is titled by run kind — **Hunt / Campaign / Portfolio dashboard** — so a plain
+  single hunt isn't mislabelled "Campaign dashboard", with a note that a single hunt streams its
+  findings when it completes.
+- The **Single hunt** segment re-opens its live board when a run exists, mirroring Full campaign —
+  no more one-way trip away from a running single hunt.
+- The **Set up SSRF/OOB →** shortcut scrolls straight to (and focuses) the OOB panel instead of
+  dropping you at the top of a six-form page.
+- The guided tour's step titles no longer carry numbers that fought the "Step N of 8" counter, and
+  the coding-brain step names the actual **Studio ↗** button instead of a phantom "Studio side".
+- The Findings board's empty state points to the Report Center (findings are in-memory per session
+  but durable in the ledger), so an empty board doesn't read as data loss.
+- The new-program **HackerOne scope import** pre-checks for saved API credentials and offers a
+  one-click jump to save them, instead of dead-ending on a fetch that can't work.
+
+### Program setup and security panels
+- Program **Save/Update** now checks the server result: a validation rejection is reported instead
+  of a false "Saved." (both the Program-tab and Operator-tab editors).
+- The two program editors now cross-link — scheduling/activation/auto-submit live on the Operator
+  tab; structured scope/platform/account-access/IDOR/OOB live on the Program tab.
+- The Pentest/OSINT **toolkit** and **bounty-profile** panels explain themselves when the local
+  service is down (was a blank void), and a hunt won't POST an empty profile.
+- The portfolio **Select all** toggle keeps an honest label (flips to "Deselect all" when
+  everything is selected).
+- Switching to a **one-off target** clears the previously-picked program's target, so a "fresh"
+  one-off run can't silently reuse the prior program's host.
+
+### AI Studio Workbench
+- Enter is ignored while an IME candidate is composing (CJK), so confirming a candidate no longer
+  sends a half-composed message.
+- The workspace file tree skips redundant re-renders (a signature cache) — the ~600 ms poll during
+  a streaming agent run no longer churns the DOM or steals focus from a browsed node — and the file
+  search is debounced.
+- Opening a file restores tree focus for keyboard/AT users, and the file-tree filter is session-only
+  (a persisted filter no longer came back with an empty search box after reload).
+
 ## v2.4.1 - fix new-program wizard, all platforms selectable
 
 - **Fix the new-program wizard rendering.** The v2.4.0 wizard reused CSS class names already

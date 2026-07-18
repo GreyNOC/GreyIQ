@@ -6,6 +6,7 @@ still exercised separately during visual QA.
 """
 
 from pathlib import Path
+import re
 import unittest
 
 
@@ -120,6 +121,132 @@ class CockpitWorkflowContractTests(unittest.TestCase):
         wizard_fn = JS.split("function ckProgramWizard()", 1)[1].split("function ckWizardStart", 1)[0]
         self.assertIn('cel("div", "ck-progwiz")', wizard_fn)
         self.assertNotIn('"ck-wizard"', wizard_fn)   # must not reuse the tour's fixed-overlay class
+
+
+class CockpitQaqcV25ContractTests(unittest.TestCase):
+    """Static regression contracts for the v2.5 whole-app QAQC pass.
+
+    Locks in the 23 verified UX defects fixed in that pass so a later refactor can't
+    silently regress them (the same static-grep pattern the rest of this module uses)."""
+
+    def _fn(self, name: str) -> str:
+        """Source of a top-level `[async] function name(` up to the next top-level function."""
+        m = re.search(r"(?:async\s+)?function\s+" + re.escape(name) + r"\s*\(", JS)
+        self.assertIsNotNone(m, f"function {name} not found in app.js")
+        tail = JS[m.end():]
+        nxt = re.search(r"\n(?:async\s+)?function\s+\w+\s*\(", tail)
+        return tail[: nxt.start()] if nxt else tail
+
+    # --- Platform-aware submit/export (was hardcoded to HackerOne everywhere) ---
+    def test_export_only_platforms_get_an_export_cta_not_a_dead_submit(self) -> None:
+        self.assertIn("function ckIsLiveSubmit(", JS)
+        self.assertIn("function ckPlatformName(", JS)
+        self.assertIn("function ckSyncPlatformToProgram(", JS)
+        # Stage 3 branches to an export CTA for non-live (export-only) formats.
+        self.assertIn("!ckIsLiveSubmit(ckState.platform)", JS)
+        self.assertIn("is export-only.", JS)
+
+    def test_report_format_follows_the_active_program_platform(self) -> None:
+        apply = self._fn("ckApplyActiveProgram")
+        self.assertIn("ckSyncPlatformToProgram(prog)", apply)   # a picked program sets the format
+        self.assertIn("ckSyncPlatformToProgram(null)", apply)   # one-off -> HackerOne generic
+        # The reload/restore path re-derives the format from the restored program.
+        populate = self._fn("ckPopulateActiveProgramSelect")
+        self.assertIn("ckSyncPlatformToProgram(activeProg)", populate)
+
+    def test_findings_detail_shows_which_platform_format_it_exports(self) -> None:
+        self.assertIn("ck-export-fmt", JS)
+
+    # --- Gate reason no longer points at a "credentials bar below" that isn't on every surface ---
+    def test_submit_gate_reason_names_the_submissions_tab(self) -> None:
+        self.assertNotIn("credentials bar below", JS)
+        gate = self._fn("ckSubmitGateReason")
+        self.assertIn("Submissions tab", gate)
+
+    # --- The live board is titled by run kind; a single hunt is not "Campaign dashboard" ---
+    def test_board_title_tracks_run_kind(self) -> None:
+        self.assertIn("function ckBoardTitle()", JS)
+        self.assertIn('cel("h2", "ck-section-title", ckBoardTitle())', JS)
+        self.assertIn('"Live dashboard"', JS)                      # neutral empty-state title
+        self.assertIn('kind: isCampaign ? "campaign" : "hunt"', JS)
+        self.assertIn('kind: "portfolio"', JS)
+
+    # --- A single hunt can be re-opened from its segment, like a campaign ---
+    def test_single_hunt_segment_reopens_the_live_board(self) -> None:
+        self.assertIn(
+            'ck.segHunt?.addEventListener("click", () => { ckSetRunType("hunt"); '
+            'if (ckCampaign && ckCampaign.runId) ckSetView("campaign"); });',
+            JS,
+        )
+
+    # --- The SSRF/OOB shortcut scrolls to the OOB panel it names ---
+    def test_oob_shortcut_scrolls_to_the_oob_panel(self) -> None:
+        self.assertIn('wrap.id = "ckOobPanel"', JS)
+        self.assertIn('querySelector("#ckOobPanel")', JS)
+
+    # --- The Findings board points to the Report Center instead of reading as data loss ---
+    def test_findings_empty_state_points_to_report_center(self) -> None:
+        self.assertIn("Open Report Center", JS)
+
+    # --- The HackerOne scope-import wizard pre-checks credentials with a jump ---
+    def test_hackerone_scope_wizard_prechecks_creds(self) -> None:
+        h1 = self._fn("ckWizardIdentifyH1")
+        self.assertIn("ck-wiz-crednote", h1)
+        self.assertIn("Save HackerOne credentials", h1)
+
+    # --- Program save reports a server-side rejection instead of a false "Saved." ---
+    def test_program_save_checks_the_result(self) -> None:
+        self.assertEqual(JS.count("Could not save that program."), 2)   # both editors
+
+    # --- Offline populate helpers explain the empty panel instead of a blank void ---
+    def test_populate_helpers_explain_service_down(self) -> None:
+        self.assertIn("Toolkit unavailable", self._fn("loadToolkit"))
+        self.assertIn("load hunt profiles", self._fn("loadBountyProfiles"))
+
+    # --- The portfolio Select-all toggle keeps an honest label ---
+    def test_select_all_label_toggles(self) -> None:
+        count = self._fn("ckUpdatePortfolioCount")
+        self.assertIn('allOn ? "Deselect all" : "Select all"', count)
+
+    # --- A fresh one-off run doesn't inherit the previous program's target ---
+    def test_oneoff_clears_prior_program_target(self) -> None:
+        apply = self._fn("ckApplyActiveProgram")
+        self.assertIn("if (oneoff) {", apply)
+        self.assertIn('state.ckTarget = "";', apply)
+
+    # --- The two program editors cross-reference each other ---
+    def test_program_editors_cross_link(self) -> None:
+        self.assertIn(".ck-crosslink", CSS)
+        self.assertIn("set on the Operator tab.", JS)          # gentle form -> operator
+        self.assertIn("edited in the Program tab", JS)         # operator form -> program
+
+    # --- Tour: the step counter and titles agree, and the Studio button is named ---
+    def test_tour_titles_have_no_conflicting_numbering(self) -> None:
+        self.assertNotIn('title: "1. Add your first program"', JS)
+        self.assertIn('title: "Add your first program"', JS)
+        self.assertIn("Open the AI studio with the", JS)       # names the Studio button
+
+    # --- Workbench: IME guard, debounced+cached tree, session-only filter, focus restore ---
+    def test_workbench_input_and_tree_hardening(self) -> None:
+        self.assertIn("event.isComposing || event.keyCode === 229", JS)   # IME-safe Enter
+        self.assertIn("_workspaceSearchTimer", JS)                        # search debounce
+        self.assertIn("_treeRenderSig", JS)                              # redundant-render cache
+        self.assertIn("_treeRenderEntries === entries", JS)
+        self.assertIn("workbenchSearch: _search", JS)                    # excluded from persistence
+        self.assertIn("hadTreeFocus", JS)                                # focus restore on open
+
+    # --- The new QAQC nodes are themed (no unstyled classes shipped) ---
+    def test_qaqc_style_classes_exist(self) -> None:
+        for cls in (".ck-export-note", ".ck-export-fmt", ".ck-status.is-warn",
+                    ".ck-crosslink", ".ck-wiz-crednote"):
+            self.assertIn(cls, CSS)
+
+    # --- The nav label matches the heading/guide/tour ("Program", not "Overview") ---
+    def test_program_nav_label_matches_everywhere_else(self) -> None:
+        self.assertNotIn(">Overview<", HTML)
+        self.assertIn(
+            'data-ck-view="program" type="button" aria-current="page">Program<', HTML
+        )
 
 
 if __name__ == "__main__":
