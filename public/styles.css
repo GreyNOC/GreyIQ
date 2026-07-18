@@ -3133,6 +3133,7 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
 .ck-run:disabled { opacity: 0.55; cursor: progress; }
 .ck-status { margin: 0; font-size: 0.78rem; color: var(--muted); line-height: 1.45; }
 .ck-status.is-error { color: var(--danger); }
+.ck-status.is-warn { color: var(--sun); }
 .ck-disclaimer { margin: auto 0 0; font-size: 0.7rem; color: var(--muted); line-height: 1.5; padding-top: 0.6rem; border-top: 1px solid var(--border); }
 
 .ck-main { min-width: 0; overflow-y: auto; overflow-x: hidden; padding: 1.1rem 1.3rem; }
@@ -3419,6 +3420,12 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
 .ck-stage-label { padding-top: 0.5rem; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
 .ck-stage-row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
 .ck-gate-note { flex-basis: 100%; margin: 0.1rem 0 0; font-size: 0.75rem; line-height: 1.45; color: var(--sun); }
+/* Export-only platform CTA (non-HackerOne formats have no live submit) + inline export-format tag. */
+.ck-export-note { flex-basis: 100%; margin: 0.1rem 0 0; font-size: 0.75rem; line-height: 1.45; color: var(--sun); }
+.ck-export-fmt {
+  align-self: center; font-size: 0.66rem; color: var(--muted); white-space: nowrap;
+  padding: 0.12rem 0.45rem; border: 1px dashed var(--border); border-radius: 999px;
+}
 @media (max-width: 560px) {
   .ck-stage { grid-template-columns: 1fr; gap: 0.3rem; }
   .ck-stage-label { padding-top: 0; }
@@ -3671,6 +3678,13 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
 .ck-prog-setup-form .ck-scope-table,
 .ck-prog-setup-form .ck-hacktivity-panel,
 .ck-prog-setup-form h4 { grid-column: 1 / -1; margin: 0; }
+/* Cross-links between the two program editors + the wizard's creds-missing nudge. */
+.ck-crosslink {
+  border-left: 2px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  padding-left: 0.55rem; margin: 0.15rem 0 0.3rem; line-height: 1.45;
+}
+.ck-prog-form .ck-crosslink, .ck-prog-setup-form .ck-crosslink { grid-column: 1 / -1; }
+.ck-wiz-crednote { display: flex; flex-direction: column; align-items: flex-start; gap: 0.4rem; margin: 0.3rem 0; }
 .ck-scope-table { display: flex; flex-direction: column; gap: 0.4rem; }
 .ck-hacktivity-panel { display: flex; flex-direction: column; gap: 0.4rem; margin-top: 0.3rem; }
 .ck-report-link-group { display: inline-flex; align-items: center; gap: 0.4rem; }

@@ -401,6 +401,7 @@ function loadState() {
     workbenchActiveFile: "",
     workbenchSearch: "",
     workbenchTree: [],
+    workbenchTreeTruncated: false,
     workbenchHeight: null,
     workbenchDocked: false,
     workbenchWrap: false,
@@ -493,6 +494,10 @@ function saveState() {
   // quota and it is cheap to refetch. Theme and workbench UI prefs do persist.
   const {
     workbenchTree: _tree,
+    // The file-tree filter is session-only: persisting it left the tree filtered
+    // after a reload while the (unpersisted) search box came back empty, so the
+    // user saw a partial file list with no visible reason. Reset it each session.
+    workbenchSearch: _search,
     lastAgentTranscript: _transcript,
     lastAgentChanges: _changes,
     lastAgentPlan: _plan,
@@ -1774,6 +1779,11 @@ els.composer.addEventListener("submit", async (event) => {
 });
 
 els.promptInput.addEventListener("keydown", (event) => {
+  // Ignore Enter while an IME candidate is composing (CJK etc.); pressing Enter
+  // there confirms the candidate rather than submitting the message.
+  if (event.isComposing || event.keyCode === 229) {
+    return;
+  }
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
     els.composer.requestSubmit();
@@ -2579,6 +2589,7 @@ async function refreshWorkspaceTree() {
   if (!els.workspaceTree) return;
   if (!state.agentWorkspace) {
     state.workbenchTree = [];
+    state.workbenchTreeTruncated = false;
     renderWorkspaceTree([]);
     return;
   }
@@ -2599,7 +2610,8 @@ async function refreshWorkspaceTree() {
       return;
     }
     state.workbenchTree = Array.isArray(res.entries) ? res.entries : [];
-    renderWorkspaceTree(state.workbenchTree, Boolean(res.truncated));
+    state.workbenchTreeTruncated = Boolean(res.truncated);
+    renderWorkspaceTree(state.workbenchTree);
   } catch (error) {
     els.workspaceTree.replaceChildren(makeHint(error.message || "Could not list the workspace.", true));
   }
@@ -2647,10 +2659,28 @@ function makeTreeButton(entry, depth, isDir, fullPath) {
   return node;
 }
 
-function renderWorkspaceTree(entries, truncated = false) {
+// Signature of the last-rendered tree. Redundant re-renders (e.g. the ~600ms poll
+// during a streaming agent run, which calls renderWorkbench→renderWorkspaceTree
+// even though the tree data hasn't changed) skip the full replaceChildren() below —
+// which otherwise churned the DOM every tick and stole focus from a browsed node.
+let _treeRenderEntries = null;
+let _treeRenderSig = null;
+
+function renderWorkspaceTree(entries, truncated = state.workbenchTreeTruncated) {
   if (!els.workspaceTree) return;
   const list = Array.isArray(entries) ? entries : [];
   const search = (state.workbenchSearch || "").trim().toLowerCase();
+  const sig = [
+    list.length,
+    search,
+    state.workbenchActiveFile,
+    Boolean(truncated),
+    Boolean(state.agentWorkspace),
+    [...expandedDirs].sort().join("|")
+  ].join(" ");
+  if (_treeRenderEntries === entries && _treeRenderSig === sig) return;
+  _treeRenderEntries = entries;
+  _treeRenderSig = sig;
   els.workspaceTree.replaceChildren();
 
   if (!list.length) {
@@ -2710,10 +2740,18 @@ function renderWorkspaceTree(entries, truncated = false) {
 }
 
 async function openWorkspaceFile(path) {
+  const hadTreeFocus = els.workspaceTree?.contains(document.activeElement);
   state.workbenchActiveFile = path;
   setWorkbenchTab("preview");
   saveState();
   renderWorkspaceTree(state.workbenchTree);
+  // The re-render wiped the focused node; restore focus to the now-active file so a
+  // keyboard/AT user keeps their place in the tree (mirrors the dir-expand handler).
+  if (hadTreeFocus) {
+    [...els.workspaceTree.querySelectorAll(".workspace-tree-item")]
+      .find((el) => el.title === path)
+      ?.focus();
+  }
   if (!els.filePreviewPanel) return;
   els.filePreviewPanel.dataset.loadedPath = "";
   els.filePreviewPanel.replaceChildren(makeHint(`Loading ${path}…`));
@@ -3663,9 +3701,13 @@ els.workspaceRefresh?.addEventListener("click", () => {
   void refreshWorkspaceTree();
 });
 
+let _workspaceSearchTimer = null;
 els.workspaceSearch?.addEventListener("input", (event) => {
   state.workbenchSearch = event.target.value || "";
-  renderWorkspaceTree(state.workbenchTree);
+  // Debounce the re-render: each keystroke otherwise re-filters and rebuilds the
+  // whole flat file list synchronously, which visibly lags on a large workspace.
+  clearTimeout(_workspaceSearchTimer);
+  _workspaceSearchTimer = setTimeout(() => renderWorkspaceTree(state.workbenchTree), 140);
 });
 
 // Tab keyboard navigation (WAI-ARIA tabs pattern).
@@ -3893,14 +3935,24 @@ let bountyProfilesData = [];
 
 async function loadBountyProfiles() {
   if (!els.bountyProfile) return;
-  if (!(service.available || (await refreshServiceStatus({ silent: true })))) return;
+  // On service-down these selects would stay blank with no explanation; leave a note
+  // so the empty panel explains itself (the status poll re-calls this once it's up).
+  const profileNote = (msg) => { if (els.bountyProfileHint) els.bountyProfileHint.textContent = msg; };
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    profileNote("Start the local GreyIQ service to load hunt profiles.");
+    return;
+  }
   let info;
   try {
     info = await apiFetch("/api/bounty/types", { timeoutMs: 6000 });
   } catch (_) {
+    profileNote("Could not load hunt profiles — is the local service running?");
     return;
   }
-  if (!info || info.ok === false) return;
+  if (!info || info.ok === false) {
+    profileNote((info && info.error) || "Could not load hunt profiles right now.");
+    return;
+  }
   bountyProfilesData = Array.isArray(info.profiles) ? info.profiles : [];
   els.bountyProfile.replaceChildren();
   for (const profile of bountyProfilesData) {
@@ -3980,6 +4032,15 @@ els.bountyForm?.addEventListener("submit", async (event) => {
   if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
     els.bountyStatus.textContent = "Local GreyIQ service is not running.";
     return;
+  }
+  // The profile <select> is empty if it never populated (service was down when the panel
+  // opened). Re-populate now that the service is up, and refuse rather than POST profile:"".
+  if (!els.bountyProfile.value) {
+    await loadBountyProfiles();
+    if (!els.bountyProfile.value) {
+      els.bountyStatus.textContent = "Pick a hunt profile (reopen the panel if the list is empty).";
+      return;
+    }
   }
   state.bountyProfile = els.bountyProfile.value;
   state.bountyClass = els.bountyClass.value;
@@ -4341,9 +4402,14 @@ async function loadToolkit() {
   try {
     data = await apiFetch("/api/toolkit", { timeoutMs: 6000 });
   } catch (_) {
-    return; // local service not up yet; the panel stays empty
+    // Local service not up yet — explain the empty panel instead of a blank void.
+    if (els.toolkitStatus) els.toolkitStatus.textContent = "Toolkit unavailable — start the local GreyIQ service to load it.";
+    return;
   }
-  if (!data || data.ok === false) return;
+  if (!data || data.ok === false) {
+    if (els.toolkitStatus) els.toolkitStatus.textContent = (data && data.error) || "Toolkit unavailable right now.";
+    return;
+  }
   toolkitData = {
     tools: Array.isArray(data.tools) ? data.tools : [],
     categories: Array.isArray(data.categories) ? data.categories : [],
@@ -4496,6 +4562,26 @@ const CK_PLATFORMS = [
   { id: "intigriti", name: "Intigriti" },
   { id: "hackenproof", name: "HackenProof" }
 ];
+
+// Display name for a report-format id (falls back gracefully for "manual"/unknown).
+function ckPlatformName(id) {
+  return (CK_PLATFORMS.find((p) => p.id === id) || {}).name || "the selected platform";
+}
+// HackerOne is the only platform with a live researcher submit API here; every other format
+// is export-only (file it on that platform's own dashboard).
+function ckIsLiveSubmit(id) {
+  return (id || "hackerone") === "hackerone";
+}
+// The export format follows the active program's platform. A program tagged Bugcrowd/
+// YesWeHack/Intigriti/HackenProof exports that format; "manual"/unknown falls back to the
+// HackerOne generic framing the others narrow from. Keeps the format from silently defaulting
+// to HackerOne for a non-HackerOne program (and re-deriving it on reload).
+function ckSyncPlatformToProgram(prog) {
+  const plat = prog && prog.platform && CK_PLATFORMS.some((p) => p.id === prog.platform)
+    ? prog.platform : "hackerone";
+  ckState.platform = plat;
+  return plat;
+}
 
 const CK_SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
 
@@ -4698,6 +4784,13 @@ function ckUpdatePortfolioCount() {
   if (!ck.portfolioCount) return;
   const n = ck.portfolioList ? ck.portfolioList.querySelectorAll("input[type=checkbox]:checked").length : 0;
   ck.portfolioCount.textContent = n ? `(${n} selected)` : "";
+  // Keep the toggle's label honest — a second click deselects, so it must say so once
+  // everything selectable is already on (matches the handler's own allOn test).
+  if (ck.portfolioAll) {
+    const boxes = ck.portfolioList ? [...ck.portfolioList.querySelectorAll("input[type=checkbox]:not(:disabled)")] : [];
+    const allOn = boxes.length && boxes.every((c) => c.checked);
+    ck.portfolioAll.textContent = allOn ? "Deselect all" : "Select all";
+  }
   ckUpdateLaunchReadiness();
 }
 
@@ -4903,8 +4996,14 @@ function ckRenderFindings() {
       document.querySelector("#ckSetupFold")?.setAttribute("open", "");
       ck.activeProgram?.focus();
     });
-    actions.append(hunt, campaign);
+    // This board is in-memory only and clears on reload, but the server ledger keeps every
+    // finding — point there so an empty board doesn't read as lost data.
+    const reports = cel("button", "ck-btn", "Open Report Center"); reports.type = "button";
+    reports.title = "Findings from past runs are saved here";
+    reports.addEventListener("click", () => ckSetView("reports"));
+    actions.append(hunt, campaign, reports);
     empty.append(actions);
+    empty.append(cel("p", "ck-hint", "Findings from earlier runs are saved in the Report Center — this board only shows the current session's run."));
     host.append(empty);
     return;
   }
@@ -5165,6 +5264,11 @@ function ckRenderDetail(f) {
     } finally { dlBtn.disabled = false; dlBtn.textContent = "Download .md"; }
   });
   actions.append(dlBtn);
+  // Show which platform format the Copy/Download above produce — this pane has no format
+  // selector, so without it the operator could hand a HackerOne-shaped report to another program.
+  const fmtTag = cel("span", "ck-export-fmt", `${ckPlatformName(ckState.platform)} format`);
+  fmtTag.title = "Copy submission report / Download .md produce a report shaped for this platform. Change the format in the Submissions tab.";
+  actions.append(fmtTag);
 
   // Capture a proof screenshot of this finding's PoC URL (opt-in, Playwright-backed,
   // scope-gated). The image is NOT auto-redacted — review before submitting.
@@ -6191,6 +6295,9 @@ function ckPopulateActiveProgramSelect() {
   if (state.ckRunType === "portfolio") ckRenderPortfolioPicker();
   // Rebuild the in-scope Target dropdown for the restored active program (preserving the restored target).
   const activeProg = state.ckActiveProgramId ? ckProgramsCache.find((p) => p.id === state.ckActiveProgramId) : null;
+  // Re-derive the export format from the restored program so a reload of a Bugcrowd/YesWeHack/…
+  // program doesn't silently fall back to the HackerOne format default.
+  ckSyncPlatformToProgram(activeProg);
   ckSyncTargetControl(activeProg);
   ckSyncSetupReveal();
   ckUpdateTopProgram();
@@ -6208,6 +6315,15 @@ function ckApplyActiveProgram(id) {
   saveState();
   const prog = oneoff ? null : ckProgramsCache.find((p) => p.id === id);
   if (!prog) {
+    if (oneoff) {
+      // A fresh one-off run must not inherit the previously-picked program's target:
+      // clear it so the revealed text input starts empty and ckSyncSetupReveal doesn't
+      // treat a stale host as an already-chosen target.
+      if (ck.target) ck.target.value = "";
+      state.ckTarget = "";
+      saveState();
+    }
+    ckSyncPlatformToProgram(null);   // one-off/no program -> HackerOne generic format
     ckSyncTargetControl(null);   // no program -> plain text Target input
     ckUpdateSpanScopeToggle({ resetDefault: true });
     ckSyncSetupReveal();
@@ -6220,6 +6336,7 @@ function ckApplyActiveProgram(id) {
   ckSyncTargetControl(prog, firstScope);
   if (ck.scope && prog.scope_text) ck.scope.value = prog.scope_text;
   if (ck.program) ck.program.value = prog.platform_handle || "";
+  ckSyncPlatformToProgram(prog);   // export format tracks this program's platform
   state.ckTarget = ck.target ? ck.target.value : state.ckTarget;
   state.ckScope = ck.scope ? ck.scope.value : state.ckScope;
   state.ckProgram = ck.program ? ck.program.value : state.ckProgram;
@@ -6498,6 +6615,15 @@ function ckProgramSetupRow(p) {
     ckApplyActiveProgram(p.id);
     if (ck.activeProgram) ck.activeProgram.value = p.id;
     ckSetView("idor");
+    // The Access-control tab stacks the OOB panel below several other forms; scroll straight to
+    // it (and focus its first field) so the shortcut lands where it promised, not at the top.
+    setTimeout(() => {
+      const panel = document.querySelector("#ckOobPanel");
+      if (panel) {
+        panel.scrollIntoView({ behavior: "smooth", block: "start" });
+        panel.querySelector("input")?.focus();
+      }
+    }, 60);
   });
   if (repositories.length && String(p.scope_text || "").trim()) {
     const huntRepo = cel("button", "ck-btn ck-btn-primary", "Hunt repository"); huntRepo.type = "button";
@@ -6783,6 +6909,12 @@ function ckProgramSetupForm(prefill) {
     .map((r) => (typeof r._ckGet === "function" ? r._ckGet() : null))
     .filter((p) => p && p.url_a && p.url_b);
 
+  // Cross-link: this gentle form owns identity, structured scope, and account access; a saved
+  // program's run schedule, activation, and auto-submit live on the Operator tab. Say so, since
+  // neither editor is complete on its own.
+  form.append(cel("p", "ck-hint ck-crosslink",
+    "Scheduling, activation (active/paused), and auto-submit for a saved program are set on the Operator tab."));
+
   const submit = cel("button", "ck-btn primary", editing ? "Update program" : "Save program");
   submit.type = "submit";
   form.append(submit);
@@ -6850,7 +6982,15 @@ function ckProgramSetupForm(prefill) {
     }
     submit.disabled = true;  // no double upsert on a slow save
     try {
-      await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify(payload) });
+      // The endpoint returns { ok:false, error } with HTTP 200 on a validation reject
+      // (apiFetch only throws on HTTP errors), so an unchecked result would report
+      // "Saved." for a program the server never stored — a silent data-loss illusion.
+      const res = await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify(payload) });
+      if (res && res.ok === false) {
+        saveNote.textContent = res.error || "Could not save that program.";
+        saveNote.classList.add("is-error");
+        return;
+      }
       ckProgReset();
       saveNote.classList.remove("is-error"); saveNote.textContent = "Saved.";
       await ckRefreshProgramsEverywhere();
@@ -7078,6 +7218,28 @@ function ckWizardIdentifyH1(nav) {
   const box = cel("div");
   box.append(cel("h3", "ck-wiz-title", "Pull scope from HackerOne"));
   box.append(cel("p", "ck-hint", "Enter the program’s team handle. We call HackerOne’s API with the credentials you saved in Submissions. Many programs restrict this to invited researchers — a 403/404 is common, not a bug; you can still continue and add scope by hand."));
+  // Pull-scope needs saved HackerOne API creds. Pre-check them so a brand-new user (the tour
+  // reaches Program before Submissions) isn't dead-ended on a fetch that can't work, with no
+  // pointer to where the creds live. Refreshed once the creds status is known.
+  const credNote = cel("div", "ck-wiz-crednote");
+  box.append(credNote);
+  const paintCredNote = () => {
+    credNote.replaceChildren();
+    if (ckState.h1 && ckState.h1.has_token) return;  // creds present — nothing to warn about
+    credNote.append(cel("p", "ck-status is-warn",
+      "No HackerOne API credentials saved yet — the fetch below needs them. Save them first, or continue and add scope by hand."));
+    const go = cel("button", "ck-btn", "Save HackerOne credentials →"); go.type = "button";
+    go.addEventListener("click", () => {
+      ckSetView("submissions");
+      setTimeout(() => {
+        const bar = ck.views.submissions?.querySelector(".ck-creds");
+        if (bar) { bar.scrollIntoView({ behavior: "smooth", block: "start" }); bar.querySelector("input")?.focus(); }
+      }, 60);
+    });
+    credNote.append(go);
+  };
+  paintCredNote();
+  void ckFetchCreds().then(paintCredNote);
   const handle = ckField("HackerOne team handle", "text", "");
   box.append(handle.wrap);
   const fetchBtn = cel("button", "ck-btn", "Fetch scope"); fetchBtn.type = "button";
@@ -7140,13 +7302,13 @@ function ckWizardIdentifyManual(nav) {
 // button. Persisted dismissal is local-only (localStorage), not a server call. ------------
 const CK_WIZARD_STEPS = [
   { title: "Welcome to GreyIQ", body: "Authorized testing only — your own assets, an authorized engagement, or a bug-bounty program you're enrolled in. Every active probe is scope-bound and fails closed: a host you don't name in Scope is never touched. This tour walks Program → Hunt → Reports." },
-  { title: "Optional: connect a coding brain", body: "GreyIQ's scanners, proofs, and reports all work fully offline with no model. To get sharper reproduction steps, richer write-ups, and the chat/agent features, connect a brain — the built-in local model (a one-time ~1 GB download), or your own Claude or OpenAI API key. Set it in the Studio (chat) side under model settings; you can do this any time." },
-  { title: "1. Add your first program", body: "Start with a public repo link to get an inactive source-only draft, or give the program a name and pull in real scope from HackerOne, CSV/paste, or hand-entered rows. Forge-suggested web hosts stay unticked until you confirm authorization.", view: "program" },
-  { title: "2. Review the scope", body: "Check the structured-scope table — untick “In scope” on anything you don't want probed (that's an exclusion, never an expansion). Click Save program when it looks right.", view: "program" },
-  { title: "3. SSRF/OOB setup (optional)", body: "If the program's policy allows out-of-band/collaborator testing, tick that on its form, then use “Set up SSRF/OOB →” on the program row to land here with scope pre-filled. Skip this step if you don't need it.", view: "idor" },
-  { title: "4. Run your first hunt", body: "Back in the launch rail: pick your program (fills in Target/Scope), tick “I'm authorized to test this target”, and click Run hunt. Start with a Single hunt before a full campaign.", view: "program", focusSelector: "#ckActiveProgram" },
-  { title: "5. Read the results", body: "Findings land here with a proof-status column — Confirmed means GreyIQ actually proved it with a benign probe, not just flagged a pattern. Click any row for the evidence.", view: "findings" },
-  { title: "6. Generate a report", body: "Confirmed findings show up in Submissions — copy the Markdown, download it, or (once you've saved HackerOne API creds) submit it directly. Nothing is ever auto-filed without you arming it.", view: "submissions" },
+  { title: "Optional: connect a coding brain", body: "GreyIQ's scanners, proofs, and reports all work fully offline with no model. To get sharper reproduction steps, richer write-ups, and the chat/agent features, connect a brain — the built-in local model (a one-time ~1 GB download), or your own Claude or OpenAI API key. Open the AI studio with the “Studio ↗” button in the top bar, then set the model in its Coding brain panel; you can do this any time." },
+  { title: "Add your first program", body: "Start with a public repo link to get an inactive source-only draft, or give the program a name and pull in real scope from HackerOne, CSV/paste, or hand-entered rows. Forge-suggested web hosts stay unticked until you confirm authorization.", view: "program" },
+  { title: "Review the scope", body: "Check the structured-scope table — untick “In scope” on anything you don't want probed (that's an exclusion, never an expansion). Click Save program when it looks right.", view: "program" },
+  { title: "SSRF/OOB setup (optional)", body: "If the program's policy allows out-of-band/collaborator testing, tick that on its form, then use “Set up SSRF/OOB →” on the program row to land here with scope pre-filled. Skip this step if you don't need it.", view: "idor" },
+  { title: "Run your first hunt", body: "Back in the launch rail: pick your program (fills in Target/Scope), tick “I'm authorized to test this target”, and click Run hunt. Start with a Single hunt before a full campaign.", view: "program", focusSelector: "#ckActiveProgram" },
+  { title: "Read the results", body: "Findings land here with a proof-status column — Confirmed means GreyIQ actually proved it with a benign probe, not just flagged a pattern. Click any row for the evidence.", view: "findings" },
+  { title: "Generate a report", body: "Confirmed findings show up in Submissions — copy the Markdown, download it, or (once you've saved HackerOne API creds) submit it directly. Nothing is ever auto-filed without you arming it.", view: "submissions" },
 ];
 
 function ckDismissWizard() {
@@ -7563,6 +7725,7 @@ function ckSessionInvalForm() {
 // write-only (only its presence is returned).
 function ckOobPanel() {
   const wrap = cel("div");
+  wrap.id = "ckOobPanel";  // scroll target for the "Set up SSRF/OOB →" program-row shortcut
   wrap.append(cel("h2", "ck-section-title", "Out-of-band (OOB) — blind SSRF"));
   wrap.append(cel("p", "ck-hint", "Confirm blind bugs with your own collaborator: the probe injects a unique callback URL and polls the collaborator for a hit. Configure your collaborator (e.g. your phone's tunnel), then auto-confirm blind SSRF, or mint a URL to paste into a manual XXE / blind-XSS payload."));
 
@@ -8031,6 +8194,23 @@ function ckFullReportPanel(focus) {
   const s3 = stage("3 · Submit");
   if (ckEffectiveStage(focus) === "submitted") {
     s3.row.append(ckReportLink("", ""));
+  } else if (!ckIsLiveSubmit(ckState.platform)) {
+    // Export-only platform (Bugcrowd/YesWeHack/Intigriti/HackenProof have no researcher submit
+    // API here): the terminal step is exporting above, then filing on that platform's dashboard.
+    // Show that as the call-to-action instead of a HackerOne submit button that can never work.
+    const name = ckPlatformName(ckState.platform);
+    const note = cel("p", "ck-gate-note");
+    note.append(cel("strong", null, `${name} is export-only. `),
+      document.createTextNode(`Use Copy report / Download .md above, then submit on ${name}'s dashboard.`));
+    // The preflight readiness check (required fields for the chosen format, duplicate scan) still
+    // helps before you export, so keep it available.
+    const preflightPanel = cel("div", "ck-preflight");
+    const preBtn = cel("button", "ck-btn", "Submission preflight");
+    preBtn.type = "button";
+    preBtn.title = "Check required fields for this format, pick the in-scope asset, and scan for probable duplicates before exporting";
+    preBtn.addEventListener("click", () => ckPreflightSubmission(focus, preflightPanel, preBtn));
+    s3.row.append(preBtn, note);
+    s3.el.append(preflightPanel);
   } else {
     const submitBtn = cel("button", "ck-btn primary", "Submit to HackerOne");
     submitBtn.type = "button";
@@ -8099,10 +8279,12 @@ function ckReadinessNote(f) {
 function ckSubmitGateReason(f) {
   if (ckEffectiveProof(f) !== "confirmed")
     return "Blocked — impact isn’t confirmed. Run “Prepare full report” or “Create proof of impact” first; only a Confirmed finding can be filed.";
+  // Reference the Submissions tab by name, not "below": this gate note is shared with the
+  // Report Center full-report panel, which has no credentials bar on the page.
   if (!(ckState.h1 && ckState.h1.has_token))
-    return "Blocked — add your HackerOne API token in the credentials bar below.";
+    return "Blocked — add your HackerOne API token in the Submissions tab’s credentials bar.";
   if (!(ckState.h1 && ckState.h1.team_handle))
-    return "Blocked — set your HackerOne team handle in the credentials bar below.";
+    return "Blocked — set your HackerOne team handle in the Submissions tab’s credentials bar.";
   if (!f.ref)
     return "Blocked — open this finding from the Findings board after the campaign to file it.";
   return "Blocked.";
@@ -8378,6 +8560,10 @@ function ckSubmissionRow(f) {
 
   if (submitted) {
     acts.append(ckReportLink("", ""));
+  } else if (!ckIsLiveSubmit(ckState.platform)) {
+    // Export-only format: no live submit here — file it on that platform's dashboard.
+    const tag = cel("span", "ck-export-note", `${ckPlatformName(ckState.platform)} — export above, then file on their dashboard`);
+    acts.append(tag);
   } else {
     const submitBtn = cel("button", "ck-btn primary", "Submit to HackerOne");
     submitBtn.type = "button";
@@ -10153,6 +10339,11 @@ function ckProgramRow(prog, funnel) {
 function ckProgramForm() {
   const editing = ckOpEdit;  // a program object when editing, else null (adding new)
   const form = cel("form", "ck-prog-form");
+  // Cross-link: the gentle Program-tab setup form owns the structured-scope table, platform picker,
+  // account access, IDOR pairs, and the OOB flag. This Operator editor owns scheduling + automation
+  // (below) and a plain-text scope gate — point operators to the other form so they don't miss half.
+  form.append(cel("p", "ck-hint ck-crosslink",
+    "Structured scope, platform, account access, IDOR pairs, and OOB are edited in the Program tab’s setup form. This editor owns the run schedule and automation toggles below; the scope field here is a plain-text gate."));
   const name = ckField("Program name", "text", editing ? (editing.name || "") : "");
   const scope = ckField("Scope (hosts/wildcards — the active gate)", "text", editing ? (editing.scope_text || "") : "");
   const targets = ckField("Seed targets (comma/space separated URLs)", "text", editing ? (editing.seed_targets || []).join(", ") : "");
@@ -10217,7 +10408,14 @@ function ckProgramForm() {
     const submitBtn = e.submitter;  // the Save button that fired this submit
     if (submitBtn) submitBtn.disabled = true;  // no double upsert on a slow save
     try {
-      await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify(payload) });
+      // Same guard as the Program-tab form: a { ok:false } body comes back HTTP 200,
+      // so report the server's rejection instead of a false "Saved."
+      const res = await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify(payload) });
+      if (res && res.ok === false) {
+        note.textContent = res.error || "Could not save that program.";
+        note.classList.add("is-error");
+        return;
+      }
       ckOpEdit = null;
       note.classList.remove("is-error"); note.textContent = "Saved.";
       await ckRefreshProgramsEverywhere();
@@ -10382,7 +10580,7 @@ async function ckRunPortfolio() {
   // can gate a finding's host correctly regardless of which program it came from.
   const unionScope = (ckProgramsCache || []).filter((p) => ids.includes(p.id))
     .map((p) => String(p.scope_text || "").trim()).filter(Boolean).join("\n");
-  ckStartCampaignDashboard(progressRunId, `Portfolio · ${ids.length} program(s)`, { scope: unionScope, programId: null, authorized: true });
+  ckStartCampaignDashboard(progressRunId, `Portfolio · ${ids.length} program(s)`, { scope: unionScope, programId: null, authorized: true, kind: "portfolio" });
   try {
     const res = await apiFetch("/api/bounty/portfolio", {
       method: "POST", timeoutMs: 3600000,
@@ -10486,6 +10684,7 @@ async function ckRun() {
   // a finding within the SAME authorized scope this run used.
   ckStartCampaignDashboard(progressRunId, dashLabel, {
     scope: state.ckScope, programId: spanning ? state.ckActiveProgramId : null, authorized: true,
+    kind: isCampaign ? "campaign" : "hunt",
   });
   try {
     let res;
@@ -10565,16 +10764,24 @@ function ckStatus(text, isError) {
 // UPDATE it in place instead of rebuilding (which was resetting the findings scroll to top).
 const ckCampaign = {
   runId: "", poll: null, polling: false, snapshot: null, events: [], eventCount: 0, done: false,
-  stopRequested: false, label: "", startedAt: 0,
+  stopRequested: false, label: "", startedAt: 0, kind: "campaign",
   scope: "", programId: null, authorized: false,
   sortBy: "severity", filterSev: "all", selectedKey: "", reverify: {}, report: {}, reverifyVersion: 0,
   dom: null,
 };
 
+// The live board is shared by single hunts, campaigns, and portfolio runs — title it by the
+// run kind so a plain single hunt isn't mislabeled "Campaign dashboard".
+function ckBoardTitle() {
+  return ckCampaign.kind === "hunt" ? "Hunt dashboard"
+    : ckCampaign.kind === "portfolio" ? "Portfolio dashboard"
+    : "Campaign dashboard";
+}
+
 function ckStartCampaignDashboard(runId, label, opts = {}) {
   if (ckCampaign.poll) { clearInterval(ckCampaign.poll); ckCampaign.poll = null; }
   Object.assign(ckCampaign, {
-    runId, label: label || "Campaign", snapshot: null, events: [], eventCount: 0, done: false,
+    runId, label: label || "Campaign", kind: opts.kind || "campaign", snapshot: null, events: [], eventCount: 0, done: false,
     polling: false, stopRequested: false, startedAt: Date.now(),
     scope: opts.scope || "", programId: opts.programId || null, authorized: Boolean(opts.authorized),
     selectedKey: "", reverify: {}, report: {}, reverifyVersion: 0, dom: null,
@@ -10706,7 +10913,12 @@ function ckCdFindingRow(f, selectedKey) {
 // view — which was resetting the findings list's scroll to the top on every poll.
 function ckBuildCampaignScaffold(host) {
   host.replaceChildren();
-  host.append(cel("h2", "ck-section-title", "Campaign dashboard"));
+  host.append(cel("h2", "ck-section-title", ckBoardTitle()));
+  // A single hunt runs as one unit — the backend streams its findings only when the scan
+  // completes, so set that expectation instead of leaving the board at "0 findings" silently.
+  if (ckCampaign.kind === "hunt") {
+    host.append(cel("p", "ck-hint", "Single hunt runs as one unit — findings appear here when it completes."));
+  }
 
   const head = cel("div", "ck-cd-head");
   const label = cel("div", "ck-cd-label", ckCampaign.label);
@@ -10785,7 +10997,7 @@ function ckRenderCampaign() {
   if (!ckCampaign.runId) {
     ckCampaign.dom = null;
     host.replaceChildren();
-    host.append(cel("h2", "ck-section-title", "Campaign dashboard"));
+    host.append(cel("h2", "ck-section-title", "Live dashboard"));
     const hero = cel("div", "ck-cd-hero");
     const globe = document.createElement("img");
     globe.src = "./globe.svg"; globe.alt = ""; globe.width = 150; globe.height = 150;
@@ -11237,7 +11449,10 @@ function bootCockpit() {
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && ck.detail && !ck.detail.hidden) ckCloseDetail();
   });
-  ck.segHunt?.addEventListener("click", () => ckSetRunType("hunt"));
+  // Single hunts open the same live board as campaigns (shared ckCampaign.runId), so selecting
+  // "Single hunt" must also re-open that board when a run exists — otherwise an operator who
+  // navigated away mid-single-hunt has no way back to watch it.
+  ck.segHunt?.addEventListener("click", () => { ckSetRunType("hunt"); if (ckCampaign && ckCampaign.runId) ckSetView("campaign"); });
   // Selecting "Full campaign" jumps to the live campaign dashboard when one already exists — the
   // redesign moved the run-type control to the top bar and dropped the standalone Campaign nav tab,
   // so this is now the way to re-open a running/finished campaign board manually.
