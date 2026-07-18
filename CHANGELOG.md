@@ -2,42 +2,18 @@
 
 Notable changes to GreyIQ.
 
-## v2.4.1 - fix new-program wizard, all platforms selectable
+## Unreleased - coding-brain and hunt-engine QA/QC
 
-- **Fix the new-program wizard rendering.** The v2.4.0 wizard reused CSS class names already
-  owned by other components, so it inherited a `position: fixed` overlay and floated over the
-  Hunt-setup sidebar instead of rendering in the main column. Three class-name collisions are
-  now namespaced: the wizard container (`.ck-wizard` → `.ck-progwiz`, which the guided tour
-  owns as a fixed overlay), the empty state (`.ck-empty` → `.ck-prog-empty`), and the repo
-  preflight verdict (`.ck-preflight` → `.ck-rpf`, distinct from the submission-readiness panel).
-- **Every report-format platform is selectable in the flow.** The program platform selector is
-  now built from the platform registry (HackerOne, YesWeHack, Bugcrowd, Intigriti, HackenProof,
-  plus Other/manual) instead of a hardcoded subset, and it preserves whichever platform an
-  existing program is tagged with.
-
-## v2.4.0 - gentle Program setup, repository preflight, HackenProof platform
-
-### Program setup redesigned into a gentle, one-step-at-a-time flow
-- The Program tab now rests as a calm list with a single **New program** button, and opens a
-  guided **Start → Identify → Scope & save** wizard (pick how you start: repo link, HackerOne,
-  or manual). The scattered repo-link bar, VDP-preset bar, and always-on giant form are gone;
-  advanced fields (out-of-band, research accounts, IDOR pairs) are tucked under one disclosure.
-
-### Repository preflight — no more doomed hunts
-- A repository target is now checked for reachability **before** a hunt commits to it, via
-  `git ls-remote` against the allowlisted forge (`POST /api/repos/preflight`). A typo'd, private,
-  or missing repo is caught up front with an actionable message instead of failing deep in the
-  clone. Clone failures no longer leak the local temp path or raw git plumbing to the UI. The
-  launch-time check is best-effort: only a definitive negative (bad URL, not found, private)
-  blocks a hunt — a transient/slow forge never refuses a run the operator asked for.
-
-### HackenProof report-format platform (export-only)
-- Adds **HackenProof** as a fifth submission format (web3: exchanges, protocols, smart contracts):
-  its four-band Critical–Low severity and Target + Vulnerability category framing, an AI summary
-  voice, a program platform selector, and a readiness checklist matching HackenProof's own form
-  (no CWE requirement). HackenProof publishes no researcher API for scope/submission/metrics, so
-  like YesWeHack/Bugcrowd/Intigriti it is export-only — GreyIQ formats the report and you submit
-  it on the platform's dashboard.
+- OpenAI-compatible coding-brain and agent requests now adapt through multiple
+  sequential parameter incompatibilities (token-limit spelling and temperature)
+  with bounded loop protection, so routed gateways no longer fail after fixing
+  only the first rejected field.
+- Direct active hunts retain per-endpoint veteran/brain priorities instead of
+  flattening every route into one global budget order, and now apply stored
+  learned priors on the standalone path as campaigns already did.
+- Offline hunt plans use deterministic cold-start ordering, treat unseen learned
+  classes as neutral rather than zero, and skip malformed model class rows without
+  discarding later valid guidance.
 
 ## v2.3.0 - repository-link program onboarding
 

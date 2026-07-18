@@ -123,6 +123,19 @@ class HuntBrainTests(unittest.TestCase):
             self.assertEqual(plan["param_hypotheses"], [])   # no crash, empty plan
             self.assertEqual(plan["probe_priority"], [])
 
+    def test_malformed_row_classes_do_not_discard_later_valid_rows(self) -> None:
+        self._brain_returns(
+            '{"param_hypotheses": [], "probe_priority": ['
+            '{"endpoint": "https://app.example.com/login", "classes": 7},'
+            '{"endpoint": "https://app.example.com/download", "classes": ["path-traversal"]}'
+            ']}'
+        )
+        plan = hunt_brain.plan_hunt({}, "https://app.example.com/", "app.example.com", SURFACE)
+        self.assertEqual(
+            plan["probe_priority"],
+            [{"endpoint": "https://app.example.com/download", "classes": ["path-traversal"], "why": ""}],
+        )
+
     def test_param_hypotheses_are_capped(self) -> None:
         many = ", ".join(f'"p{i}"' for i in range(100))
         self._brain_returns(f'{{"param_hypotheses": [{many}], "probe_priority": []}}')

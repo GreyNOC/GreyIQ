@@ -396,8 +396,10 @@ def _validate_plan(parsed: Any, surface: dict[str, Any]) -> tuple[list[str], lis
         # introduce a URL. If it didn't copy one verbatim, drop the row (scope is recon's decision).
         if endpoint not in allowed_endpoints:
             continue
+        raw_classes = row.get("classes")
+        raw_classes = raw_classes if isinstance(raw_classes, list) else []
         classes = []
-        for c in (row.get("classes") or []):
+        for c in raw_classes:
             norm = _norm_class(c)
             if norm in {"redirect", "rce", "path-traversal", "nosqli"} or norm in ACTIVE_CLASSES:
                 if norm not in classes:

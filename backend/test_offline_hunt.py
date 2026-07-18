@@ -65,6 +65,26 @@ class OfflinePlanTests(unittest.TestCase):
         self.assertIn("path-traversal", search["classes"])
         self.assertEqual(search2["classes"][0], "path-traversal")   # boosted to the front
 
+    def test_noisy_prior_falls_below_unseen_neutral_classes(self) -> None:
+        # learned_priors are multipliers around neutral=1.0. A known-noisy 0.5
+        # class must be deprioritized below unseen classes, not accidentally
+        # promoted because unseen was treated as zero.
+        endpoint = "https://t.example/search?q=x"
+        plan = offline_hunt.offline_plan(
+            {"endpoints": [endpoint], "params": [], "tech": []},
+            priors={"xss": 0.5},
+        )
+        classes = plan["probe_priority"][0]["classes"]
+        self.assertLess(classes.index("sqli"), classes.index("xss"))
+
+    def test_cold_start_plan_order_is_explicit_and_deterministic(self) -> None:
+        surface = {"endpoints": ["https://t.example/thing"], "params": [], "tech": ["PHP", "WordPress"]}
+        first = offline_hunt.offline_plan(surface)
+        second = offline_hunt.offline_plan(surface)
+        self.assertEqual(first, second)
+        self.assertEqual(first["param_hypotheses"][:4], ["url", "redirect", "next", "callback"])
+        self.assertEqual(first["probe_priority"][0]["classes"][:3], ["rce", "sqli", "xss"])
+
     def test_tech_stack_boosts_ssti(self) -> None:
         p = offline_hunt.offline_plan(_SURFACE)                     # Flask/Jinja -> ssti in the surface
         self.assertTrue(any("ssti" in r["classes"] for r in p["probe_priority"]))
