@@ -133,6 +133,64 @@ class OpenAiChatParamTests(unittest.TestCase):
         self.assertEqual(captured[0]["temperature"], 0.2)
         self.assertNotIn("temperature", captured[1])
 
+    def test_gateway_can_reject_token_field_then_temperature(self) -> None:
+        """One routed endpoint can need both compatibility adjustments in sequence."""
+        captured: list[dict] = []
+
+        def fake_urlopen(request, timeout=0):  # noqa: ANN001
+            captured.append(json.loads(request.data.decode("utf-8")))
+            if len(captured) == 1:
+                detail = b'{"error":{"message":"Unsupported parameter: max_tokens"}}'
+                raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(detail))
+            if len(captured) == 2:
+                detail = b'{"error":{"message":"Unsupported value: temperature"}}'
+                raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(detail))
+            return _Response()
+
+        with mock.patch("coder.urllib.request.urlopen", side_effect=fake_urlopen):
+            out = coder._generate_openai_compatible(
+                [{"role": "user", "content": "hi"}],
+                "system",
+                {"base_url": "https://gateway.example/v1", "model": "routed-chat", "api_key": "sk-test"},
+                222,
+                0.2,
+                5.0,
+                "openai",
+            )
+
+        self.assertEqual(out["text"], "ok")
+        self.assertIn("max_tokens", captured[0])
+        self.assertIn("temperature", captured[0])
+        self.assertIn("max_completion_tokens", captured[1])
+        self.assertIn("temperature", captured[1])
+        self.assertIn("max_completion_tokens", captured[2])
+        self.assertNotIn("temperature", captured[2])
+
+    def test_gateway_token_field_swap_loop_is_bounded(self) -> None:
+        captured: list[dict] = []
+
+        def fake_urlopen(request, timeout=0):  # noqa: ANN001
+            sent = json.loads(request.data.decode("utf-8"))
+            captured.append(sent)
+            field = "max_completion_tokens" if "max_completion_tokens" in sent else "max_tokens"
+            detail = json.dumps({"error": {"message": f"Unsupported parameter: {field}"}}).encode()
+            raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(detail))
+
+        with mock.patch("coder.urllib.request.urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(coder.CoderError) as raised:
+                coder._generate_openai_compatible(
+                    [{"role": "user", "content": "hi"}],
+                    "system",
+                    {"base_url": "https://gateway.example/v1", "model": "routed-chat", "api_key": "sk-test"},
+                    222,
+                    0.2,
+                    5.0,
+                    "openai",
+                )
+
+        self.assertEqual(len(captured), 2)
+        self.assertIn("max_completion_tokens", str(raised.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

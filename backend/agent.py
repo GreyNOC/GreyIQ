@@ -1901,20 +1901,10 @@ def _run_tool_loop(
                 return resp.read()
 
         try:
-            body = json.loads(coder.with_retries(lambda: _open(payload)).decode("utf-8"))
+            body = json.loads(coder.request_chat_completion_with_compat(_open, payload).decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "ignore")[:400] if hasattr(exc, "read") else ""
-            retry_payload = coder.retry_payload_for_chat_completion_compat(payload, detail)
-            if retry_payload:
-                try:
-                    body = json.loads(coder.with_retries(lambda: _open(retry_payload)).decode("utf-8"))
-                except urllib.error.HTTPError as retry_exc:
-                    retry_detail = retry_exc.read().decode("utf-8", "ignore")[:400] if hasattr(retry_exc, "read") else ""
-                    raise AgentError(f"{label} HTTP {retry_exc.code}: {retry_detail or retry_exc.reason}") from retry_exc
-                except Exception as retry_exc:  # noqa: BLE001
-                    raise AgentError(f"{label} request failed: {retry_exc}") from retry_exc
-            else:
-                raise AgentError(f"{label} HTTP {exc.code}: {detail or exc.reason}") from exc
+            detail = coder.chat_completion_error_detail(exc)
+            raise AgentError(f"{label} HTTP {exc.code}: {detail or exc.reason}") from exc
         except urllib.error.URLError as exc:
             raise AgentError(f"Could not reach {label} ({exc.reason}). Is it running?") from exc
         except Exception as exc:  # noqa: BLE001

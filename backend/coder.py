@@ -187,6 +187,59 @@ def retry_payload_for_chat_completion_compat(payload: dict[str, Any], detail: st
     )
 
 
+def chat_completion_error_detail(exc: urllib.error.HTTPError, limit: int = 400) -> str:
+    """Return a bounded HTTP error body, including one already consumed by the
+    compatibility adapter.
+
+    ``HTTPError.read()`` is destructive. The adapter must inspect a 400 response
+    to decide whether to change the request, so preserve that detail on the
+    exception before re-raising it for the provider-specific error message.
+    """
+    saved = getattr(exc, "greyiq_detail", None)
+    if saved is not None:
+        return str(saved)[:limit]
+    try:
+        detail = exc.read().decode("utf-8", "ignore") if hasattr(exc, "read") else ""
+    except Exception:  # noqa: BLE001 - error reporting must not mask the HTTP failure
+        detail = ""
+    return detail[:limit]
+
+
+def request_chat_completion_with_compat(
+    open_payload,
+    payload: dict[str, Any],
+    *,
+    max_adjustments: int = 2,
+) -> bytes:
+    """Send one chat-completions request with bounded parameter adaptation.
+
+    Gateways frequently proxy several model families behind one URL. A request
+    can therefore be rejected first for ``max_tokens`` and then, after that is
+    corrected, for ``temperature``. Adapt one incompatibility at a time while
+    preventing field-swap loops; transient retry/backoff remains the job of
+    :func:`with_retries` for each concrete payload.
+    """
+    current = dict(payload)
+    seen = {json.dumps(current, sort_keys=True, default=str)}
+    adjustments = 0
+    while True:
+        try:
+            return with_retries(lambda: open_payload(current))
+        except urllib.error.HTTPError as exc:
+            detail = chat_completion_error_detail(exc)
+            retry = retry_payload_for_chat_completion_compat(current, detail)
+            fingerprint = json.dumps(retry, sort_keys=True, default=str) if retry is not None else ""
+            if retry is None or adjustments >= max_adjustments or fingerprint in seen:
+                try:
+                    exc.greyiq_detail = detail
+                except Exception:  # noqa: BLE001 - preserve the original HTTPError
+                    pass
+                raise
+            seen.add(fingerprint)
+            current = retry
+            adjustments += 1
+
+
 def coder_config(raw: dict[str, Any] | None) -> dict[str, Any]:
     """Merge stored config over the defaults (provider sub-dicts merged one level deep)."""
     merged = json.loads(json.dumps(CODER_DEFAULTS))  # deep copy of defaults
@@ -550,20 +603,10 @@ def _generate_openai_compatible(
             return response.read()
 
     try:
-        body = json.loads(with_retries(lambda: _open(payload)).decode("utf-8"))
+        body = json.loads(request_chat_completion_with_compat(_open, payload).decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "ignore")[:400] if hasattr(exc, "read") else ""
-        retry_payload = retry_payload_for_chat_completion_compat(payload, detail)
-        if retry_payload:
-            try:
-                body = json.loads(with_retries(lambda: _open(retry_payload)).decode("utf-8"))
-            except urllib.error.HTTPError as retry_exc:
-                retry_detail = retry_exc.read().decode("utf-8", "ignore")[:400] if hasattr(retry_exc, "read") else ""
-                raise CoderError(f"{label} HTTP {retry_exc.code}: {retry_detail or retry_exc.reason}") from retry_exc
-            except Exception as retry_exc:  # noqa: BLE001
-                raise CoderError(f"{label} request failed: {retry_exc}") from retry_exc
-        else:
-            raise CoderError(f"{label} HTTP {exc.code}: {detail or exc.reason}") from exc
+        detail = chat_completion_error_detail(exc)
+        raise CoderError(f"{label} HTTP {exc.code}: {detail or exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise CoderError(
             f"Could not reach {label} at {base_url} ({exc.reason}). "

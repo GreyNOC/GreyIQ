@@ -51,6 +51,12 @@ _PRIV_PATH_HINTS = ("/admin", "/internal", "/manage", "/moderat", "/staff", "/su
                     "/promote", "/grant", "/role", "/permission", "/impersonat", "/billing", "/payout")
 _ACTIVE_CLASSES = ("xss", "sqli", "redirect", "ssti", "rce", "crlf", "path-traversal", "cors", "nosqli", "host-header")
 _CAP = 24
+# Ordered deliberately: plans are persisted as training traces, so the cold-start
+# corpus must not change merely because Python chose a different set hash order.
+_SUGGEST = (
+    "url", "redirect", "next", "callback", "file", "path", "id", "q", "search", "template",
+    "image_url", "webhook", "return", "dest", "user_id", "order_id", "cmd", "page",
+)
 
 
 def _hit(name: str, hints: tuple[str, ...]) -> bool:
@@ -128,7 +134,17 @@ def _reorder_by_priors(classes: list[str], priors: dict[str, float] | None) -> l
     learning signal. Ties keep the knowledge order."""
     if not priors:
         return classes
-    return sorted(classes, key=lambda c: -float(priors.get(c, 0.0)))
+
+    def weight(class_id: str) -> float:
+        # learned_priors are multipliers around a neutral 1.0. Treating an unseen
+        # class as 0.0 accidentally promoted a known-noisy 0.5 class above every
+        # unseen class. Corrupt persisted values also degrade to neutral.
+        try:
+            return float(priors.get(class_id, 1.0))
+        except (TypeError, ValueError):
+            return 1.0
+
+    return sorted(classes, key=lambda c: -weight(c))
 
 
 def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None) -> dict[str, Any]:
@@ -137,7 +153,7 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
     endpoints = [str(u).strip() for u in (surface.get("endpoints") or []) if str(u or "").strip()]
     recon_params = {str(p).strip().lower() for p in (surface.get("params") or []) if str(p or "").strip()}
     tech = " ".join(str(t) for t in (surface.get("tech") or [])).lower()
-    tech_boost = tuple({c for key, cs in _TECH_CLASS.items() if key in tech for c in cs})
+    tech_boost = tuple(dict.fromkeys(c for key, cs in _TECH_CLASS.items() if key in tech for c in cs))
 
     ssrf_params: list[str] = []
     xss_params: list[str] = []
@@ -149,9 +165,6 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
 
     # A curated set of high-yield param names to TRY even when recon didn't surface them — the offline
     # analogue of the LLM proposing param_hypotheses. Only NEW names (not already discovered) are added.
-    _SUGGEST = {"url", "redirect", "next", "callback", "file", "path", "id", "q", "search", "template",
-                "image_url", "webhook", "return", "dest", "user_id", "order_id", "cmd", "page"}
-
     for url in endpoints[:60]:
         names = _endpoint_params(url) or []
         alln = names + sorted(recon_params)
