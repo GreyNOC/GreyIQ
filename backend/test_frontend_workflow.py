@@ -54,25 +54,72 @@ class CockpitWorkflowContractTests(unittest.TestCase):
         self.assertIn(".ck-scope-row { grid-template-columns: minmax(0, 1fr)", CSS)
         self.assertIn("@media (prefers-reduced-motion: reduce)", CSS)
 
-    def test_repo_link_onboarding_stays_review_only_and_fail_closed(self) -> None:
-        flow = JS.split("function ckRepoStartBar()", 1)[1].split(
-            "function ckProgramSetupRow", 1
+    def test_repo_onboarding_preflights_and_stays_review_only(self) -> None:
+        flow = JS.split("function ckWizardIdentifyRepo(", 1)[1].split(
+            "function ckWizardIdentifyH1", 1
         )[0]
         suggestions = JS.split("function ckProgramWithCandidateHosts", 1)[1].split(
-            "function ckRepoStartBar", 1
+            "function ckProgramSetupRow", 1
         )[0]
 
+        # Preflight runs BEFORE any draft is created, so a typo'd/private/missing repo is caught
+        # up front with an actionable message instead of failing deep in a clone mid-hunt.
+        self.assertIn('apiFetch("/api/repos/preflight"', flow)
         self.assertIn('apiFetch("/api/programs/from-repo"', flow)
-        self.assertIn("ckParseRepositoryUrls(input.value).length === 0", flow)
-        self.assertIn('input.addEventListener("input", sync)', flow)
+        self.assertLess(flow.index("/api/repos/preflight"), flow.index("/api/programs/from-repo"))
         self.assertIn("enrich: enrich.input.checked", flow)
         self.assertIn("ckProgEdit = ckProgramWithCandidateHosts", flow)
-        self.assertIn('document.querySelector(".ck-prog-setup-form")', flow)
+        # Candidate hosts arrive unticked and never authorize scope on their own.
         self.assertIn("eligible_for_submission: false", suggestions)
         self.assertIn("confirm you're authorized to test this host", suggestions)
         self.assertIn("leaving a row unticked never authorizes it", JS)
         self.assertIn('repositories.length && String(p.scope_text || "").trim()', JS)
-        self.assertIn(".ck-repo-start", CSS)
+        # A repository hunt is also preflighted at launch, so a bad repo typed straight into the
+        # rail can't fire a doomed run either — but ONLY a definitive negative blocks it. A
+        # transient/indeterminate preflight (timeout, unreachable) must never refuse a hunt the
+        # operator asked for (the real 120s clone is the authoritative attempt).
+        run = JS.split("async function ckRun()", 1)[1]
+        self.assertIn('apiFetch("/api/repos/preflight"', run)
+        self.assertIn('["invalid", "not_found", "private"].includes(pf.status)', run)
+
+    def test_every_platform_is_selectable_in_the_program_flow(self) -> None:
+        # The report-format mirror lists all five platforms, and the Program-form platform
+        # selector is built FROM that mirror (+ a manual catch-all) so it can't drift — every
+        # supported platform, HackenProof included, is selectable. The saved tag comes from the
+        # selector (not the old handle-implies-HackerOne rule), and any of the five is preserved.
+        for pid, name in (("hackerone", "HackerOne"), ("yeswehack", "YesWeHack"),
+                          ("bugcrowd", "Bugcrowd"), ("intigriti", "Intigriti"),
+                          ("hackenproof", "HackenProof")):
+            self.assertIn(f'id: "{pid}", name: "{name}"', JS)
+        self.assertIn("CK_PLATFORMS.map((p) => [p.id, p.name])", JS)   # data-driven selector
+        self.assertIn("validPlatforms.has(initialPlatform)", JS)       # preserves any valid tag
+        self.assertIn("platform: platSelect.value", JS)
+        # The Operator tab's compact editor has no platform picker, so on edit it must PRESERVE the
+        # existing platform tag (set in the Program tab) rather than re-derive it from the handle
+        # and clobber e.g. a HackenProof program back to HackerOne.
+        op = JS.split("function ckProgramForm()", 1)[1].split("function ", 1)[0]
+        self.assertIn("editing ? (editing.platform ||", op)
+
+    def test_program_setup_is_a_gentle_stepped_flow(self) -> None:
+        # One thing at a time: a calm list with a single New program button opens a guided
+        # Start -> Identify -> Scope&save wizard, and advanced fields are tucked behind a disclosure.
+        for fn in ("function ckWizardStart", "function ckWizardIdentify(",
+                   "function ckWizardIdentifyRepo(", "function ckProgramWizard(", "function ckProgReset("):
+            self.assertIn(fn, JS)
+        self.assertIn('view: "wizard"', JS)
+        self.assertIn("How do you want to start?", JS)
+        for card in ("From a repo link", "From HackerOne", "Manually"):
+            self.assertIn(card, JS)
+        self.assertIn('cel("details", "ck-advanced")', JS)
+        # Flow classes use their own namespace so they can't collide with pre-existing components:
+        # the wizard container is .ck-progwiz (NOT .ck-wizard, which the guided tour owns as a
+        # fixed overlay), the repo preflight is .ck-rpf (NOT .ck-preflight, the submission panel),
+        # and the empty state is .ck-prog-empty (NOT .ck-empty, a full-page empty state).
+        for cls in (".ck-wiz-rail", ".ck-choice", ".ck-rpf", ".ck-advanced", ".ck-progwiz", ".ck-prog-empty"):
+            self.assertIn(cls, CSS)
+        wizard_fn = JS.split("function ckProgramWizard()", 1)[1].split("function ckWizardStart", 1)[0]
+        self.assertIn('cel("div", "ck-progwiz")', wizard_fn)
+        self.assertNotIn('"ck-wizard"', wizard_fn)   # must not reuse the tour's fixed-overlay class
 
 
 if __name__ == "__main__":

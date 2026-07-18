@@ -4493,7 +4493,8 @@ const CK_PLATFORMS = [
   { id: "hackerone", name: "HackerOne" },
   { id: "yeswehack", name: "YesWeHack" },
   { id: "bugcrowd", name: "Bugcrowd" },
-  { id: "intigriti", name: "Intigriti" }
+  { id: "intigriti", name: "Intigriti" },
+  { id: "hackenproof", name: "HackenProof" }
 ];
 
 const CK_SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
@@ -6108,8 +6109,15 @@ function ckWalkthrough(key) {
 // Operator tab's autonomous scheduling — both read/write the same /api/operator/programs
 // list, so a program created in either tab shows up in both. -----------------------------
 let ckProgEdit = null;   // the program being edited here (null = adding a new one)
-let ckRepoStartStatus = null;  // survives the success re-render so the explicit action has visible feedback
 let ckProgramsCache = []; // last-fetched program list, shared with the launch-rail picker
+
+// The Program tab is a gentle, one-thing-at-a-time flow instead of a wall of controls.
+// ckFlow.view drives what the tab shows: "list" (calm resting state — your programs + one
+// New program button), "wizard" (guided Start → Identify steps for a new program), or "form"
+// (the full add/edit form, reached from the wizard or a program's Edit button). choice is the
+// wizard's picked path (repo/hackerone/manual); prefill seeds an add-mode form from Identify.
+let ckFlow = { view: "list", step: 0, choice: null, prefill: null };
+function ckProgReset() { ckProgEdit = null; ckFlow = { view: "list", step: 0, choice: null, prefill: null }; }
 
 let ckProgramsReachable = true;  // false after the last fetch FAILED (engine down) — so an
                                  // empty list is never mislabeled "no programs yet".
@@ -6444,90 +6452,6 @@ function ckProgramWithCandidateHosts(program, candidateHosts) {
   return { ...program, structured_scope: rows, _ckCandidateHosts: suggested };
 }
 
-function ckRepoStartBar() {
-  const wrap = cel("section", "ck-repo-start");
-  wrap.append(cel("h3", "ck-section-title", "Start from a repo link"));
-  wrap.append(cel("p", "ck-hint",
-    "Paste public repository roots to create an inactive, source-only draft. No web host is added to scope, and no hunt starts."));
-
-  const label = cel("label", "ck-repo-start-input");
-  label.append(cel("span", null, "Repository URLs (one per line)"));
-  const input = cel("textarea", "ck-import-ta");
-  input.rows = 3;
-  input.placeholder = "https://github.com/program/repository";
-  input.setAttribute("aria-label", "Repository URLs, one per line");
-  label.append(input);
-
-  const controls = cel("div", "ck-repo-start-controls");
-  const enrich = ckToggle("Enrich from forge (read-only)", false);
-  const create = cel("button", "ck-btn primary", "Create draft program →");
-  create.type = "button";
-  create.disabled = true;
-  controls.append(enrich.wrap, create);
-  const note = cel("p", `ck-status${ckRepoStartStatus?.error ? " is-error" : ""}`,
-    ckRepoStartStatus?.text || "");
-  note.setAttribute("role", "status");
-  note.setAttribute("aria-live", "polite");
-
-  const sync = () => {
-    create.disabled = ckParseRepositoryUrls(input.value).length === 0;
-    if (ckRepoStartStatus) {
-      ckRepoStartStatus = null;
-      note.className = "ck-status";
-      note.textContent = "";
-    }
-  };
-  input.addEventListener("input", sync);
-
-  create.addEventListener("click", async () => {
-    const repositoryUrls = ckParseRepositoryUrls(input.value);
-    if (!repositoryUrls.length) {
-      note.className = "ck-status is-error";
-      note.textContent = "Add a supported public HTTPS repository-root URL (not an issue, blob, tree, or pull-request page).";
-      return;
-    }
-    const originalLabel = create.textContent;
-    create.disabled = true;
-    create.textContent = enrich.input.checked ? "Creating + enriching…" : "Creating…";
-    note.className = "ck-status";
-    note.textContent = "";
-    try {
-      const result = await apiFetch("/api/programs/from-repo", {
-        method: "POST",
-        timeoutMs: 30000,
-        body: JSON.stringify({ repository_urls: repositoryUrls, enrich: enrich.input.checked }),
-      });
-      if (!result || result.ok === false || !result.program) {
-        note.className = "ck-status is-error";
-        note.textContent = (result && result.error) || "Could not create the draft program.";
-        return;
-      }
-      const candidates = Array.isArray(result.candidate_hosts) ? result.candidate_hosts : [];
-      ckProgEdit = ckProgramWithCandidateHosts(result.program, candidates);
-      const suggestedCount = ckProgEdit._ckCandidateHosts.length;
-      ckRepoStartStatus = {
-        error: false,
-        text: suggestedCount
-          ? `Draft created for “${result.program.name}”. ${suggestedCount} forge host suggestion${suggestedCount === 1 ? " is" : "s are"} unticked — confirm you're authorized before adding any to scope, then Save.`
-          : `Draft created for “${result.program.name}”. Review the source-only setup and Save; no web host was added to scope.`,
-      };
-      await ckRefreshProgramsEverywhere();
-      await ckRenderProgram();
-      const form = document.querySelector(".ck-prog-setup-form");
-      if (form) form.scrollIntoView({ behavior: "smooth", block: "start" });
-    } catch (err) {
-      note.className = "ck-status is-error";
-      note.textContent = err.message || "Could not create the draft program.";
-    } finally {
-      create.textContent = originalLabel;
-      create.disabled = ckParseRepositoryUrls(input.value).length === 0;
-    }
-  });
-
-  wrap.append(label, controls, note);
-  return wrap;
-}
-
 function ckProgramSetupRow(p) {
   const li = cel("li"); li.style.flexWrap = "wrap";
   const left = cel("div"); left.style.flex = "1";
@@ -6559,11 +6483,8 @@ function ckProgramSetupRow(p) {
   const edit = cel("button", "ck-btn", "Edit"); edit.type = "button";
   edit.addEventListener("click", () => {
     ckProgEdit = p;
+    ckFlow = { view: "form", step: 0, choice: null, prefill: null };
     void ckRenderProgram();
-    setTimeout(() => {
-      const f = document.querySelector(".ck-prog-setup-form");
-      if (f) { f.scrollIntoView({ behavior: "smooth", block: "center" }); const inp = f.querySelector("input"); if (inp) inp.focus(); }
-    }, 60);
   });
   const ssrf = cel("button", "ck-btn", "Set up SSRF/OOB →"); ssrf.type = "button";
   ssrf.title = "Jump to the Access-control tab's OOB panel with this program's scope pre-filled";
@@ -6608,17 +6529,46 @@ function ckProgramSetupRow(p) {
   return li;
 }
 
-function ckProgramSetupForm() {
+function ckProgramSetupForm(prefill) {
   const editing = ckProgEdit;
+  // A prefill seeds a NEW program (add mode) from the wizard's Identify step — e.g. a name typed
+  // manually or scope fetched from HackerOne. It never applies when editing an existing program.
+  const seed = (!editing && prefill && typeof prefill === "object") ? prefill : null;
   const form = cel("form", "ck-prog-setup-form");
-  const name = ckField("Program name", "text", editing ? (editing.name || "") : "");
-  const handle = ckField("HackerOne team handle", "text", editing ? (editing.platform_handle || "") : "");
-  form.append(name.wrap, handle.wrap);
+  const name = ckField("Program name", "text", editing ? (editing.name || "") : (seed && seed.name) || "");
+  // Platform tag: picks the report format and display. Only HackerOne (with a handle) can
+  // auto-submit over its API; HackenProof and the rest are export-only — GreyIQ formats the
+  // report for that platform's form and you submit it on the platform's dashboard.
+  const platWrap = cel("label");
+  platWrap.append(cel("span", null, "Platform"));
+  const platSelect = cel("select");
+  // Every supported report-format platform (HackerOne, YesWeHack, Bugcrowd, Intigriti,
+  // HackenProof) plus a catch-all — sourced from CK_PLATFORMS so this list can't drift from
+  // the backend registry. HackerOne can auto-submit via its API; the rest are export-only.
+  const platformOptions = [...CK_PLATFORMS.map((p) => [p.id, p.name]), ["manual", "Other / manual"]];
+  for (const [pid, pname] of platformOptions) {
+    const o = cel("option", null, pname); o.value = pid; platSelect.append(o);
+  }
+  const validPlatforms = new Set(platformOptions.map(([pid]) => pid));
+  const initialPlatform = editing ? (editing.platform || "manual")
+    : ((seed && seed.platform) || (seed && seed.platform_handle ? "hackerone" : "manual"));
+  platSelect.value = validPlatforms.has(initialPlatform) ? initialPlatform : "manual";
+  platWrap.append(platSelect);
+  const handle = ckField("HackerOne team handle", "text", editing ? (editing.platform_handle || "") : (seed && seed.platform_handle) || "");
+  const syncHandleLabel = () => {
+    const lab = handle.wrap.querySelector("span");
+    if (!lab) return;
+    lab.textContent = platSelect.value === "hackenproof" ? "HackenProof program slug (hackenproof.com/programs/…)"
+      : platSelect.value === "hackerone" ? "HackerOne team handle" : "Program handle (optional)";
+  };
+  platSelect.addEventListener("change", syncHandleLabel);
+  syncHandleLabel();
+  form.append(name.wrap, platWrap, handle.wrap);
 
   // Program-level signals fetched alongside the scope (offers_bounties, fast_payments,
   // etc.) — carried here so a Save persists them even though the form has no dedicated
   // fields for them; re-fetching overwrites this with fresher data.
-  let fetchedProgramStats = editing ? (editing.h1_program_stats || {}) : {};
+  let fetchedProgramStats = editing ? (editing.h1_program_stats || {}) : ((seed && seed.h1_program_stats) || {});
 
   const fetchBar = cel("div", "ck-import-row");
   const fetchBtn = cel("button", "ck-btn", "Fetch scope from HackerOne"); fetchBtn.type = "button";
@@ -6673,14 +6623,14 @@ function ckProgramSetupForm() {
     form.append(cel("p", "ck-status ck-candidate-scope-note",
       "Forge metadata suggested the unticked host rows below. Confirm you're authorized to test each host before ticking In scope; leaving a row unticked never authorizes it."));
   }
-  const scopeTable = ckScopeTable(editing ? (editing.structured_scope || []) : []);
+  const scopeTable = ckScopeTable(editing ? (editing.structured_scope || []) : ((seed && seed.structured_scope) || []));
   form.append(scopeTable);
 
   const existingRepositoryUrls = editing
     ? ((editing.repository_urls || []).length
         ? editing.repository_urls
         : ckRepositoryUrlsFromScope(editing.structured_scope || []))
-    : [];
+    : ((seed && seed.repository_urls) || []);
   const repoWrap = cel("div", "ck-subsection");
   repoWrap.append(cel("h4", "ck-subhead", "Program-provided source repositories"));
   repoWrap.append(cel("p", "ck-hint",
@@ -6748,18 +6698,25 @@ function ckProgramSetupForm() {
   form.append(importNote);
 
   const toggles = cel("div", "ck-toggles");
-  const cloneRepositories = ckToggle("Clone and adversarially scan the selected program repositories during program hunts", editing ? Boolean(editing.clone_repositories) : false);
+  const cloneRepositories = ckToggle("Clone and adversarially scan the selected program repositories during program hunts", editing ? Boolean(editing.clone_repositories) : (seed ? Boolean(seed.clone_repositories) : false));
   toggles.append(cloneRepositories.wrap);
-  const oobAllowed = ckToggle("This program's policy allows out-of-band / collaborator testing (SSRF, blind XXE)", editing ? Boolean(editing.oob_allowed) : false);
-  toggles.append(oobAllowed.wrap);
-  const discloseAutomation = ckToggle("This program's terms require disclosing automated-tool assistance — add a disclosure line to submitted reports", editing ? Boolean(editing.disclose_automation) : false);
-  toggles.append(discloseAutomation.wrap);
   form.append(toggles);
 
   const notes = ckTextareaField("Notes (policy excerpt, reward table, anything worth remembering)", "");
   notes.input.value = editing ? (editing.notes || "") : "";
   notes.input.rows = 3;
   form.append(notes.wrap);
+
+  // Everything below is optional power-user setup — tucked under one disclosure so the common
+  // path (name → scope → repos → save) stays short and gentle. Empty is fine for most programs.
+  const advanced = cel("details", "ck-advanced");
+  advanced.append(cel("summary", "ck-advanced-summary", "Advanced (optional) — out-of-band, research accounts, IDOR pairs"));
+  const advToggles = cel("div", "ck-toggles");
+  const oobAllowed = ckToggle("This program's policy allows out-of-band / collaborator testing (SSRF, blind XXE)", editing ? Boolean(editing.oob_allowed) : false);
+  advToggles.append(oobAllowed.wrap);
+  const discloseAutomation = ckToggle("This program's terms require disclosing automated-tool assistance — add a disclosure line to submitted reports", editing ? Boolean(editing.disclose_automation) : false);
+  advToggles.append(discloseAutomation.wrap);
+  advanced.append(advToggles);
 
   // --- Hunting requirements: research-account access + a program-mandated user-agent tag ---
   const acc = (editing && editing.account_access) || {};
@@ -6776,7 +6733,7 @@ function ckProgramSetupForm() {
   accCookie.input.rows = 2;
   const uaSuffix = ckField('Required user-agent suffix (appended to every request, e.g. " -BugBounty-acme-31337 ")', "text", (editing && editing.user_agent_suffix) || "");
   accWrap.append(accEmail.wrap, accPassword.wrap, accLoginUrl.wrap, accRegisterUrl.wrap, accCookie.wrap, uaSuffix.wrap);
-  form.append(accWrap);
+  advanced.append(accWrap);
 
   // --- Optional SECOND, higher-privilege research account: unlocks the autonomous dual-account
   // BFLA check (does the low-privilege account above reach an admin-only function?). Same storage,
@@ -6793,7 +6750,7 @@ function ckProgramSetupForm() {
   if (adm.cookie_set) admCookie.input.placeholder = "•••• saved session cookie — leave blank to keep";
   admCookie.input.rows = 2;
   admWrap.append(admEmail.wrap, admPassword.wrap, admLoginUrl.wrap, admCookie.wrap);
-  form.append(admWrap);
+  advanced.append(admWrap);
 
   // --- Optional cross-tenant IDOR test pairs. The operator explicitly supplies object URLs their two
   // accounts own; the engine checks whether the SECOND account can read the FIRST account's object.
@@ -6819,7 +6776,8 @@ function ckProgramSetupForm() {
   const addPairBtn = cel("button", "ck-btn", "+ Add IDOR pair"); addPairBtn.type = "button";
   addPairBtn.addEventListener("click", () => addIdorRow());
   idorWrap.append(addPairBtn);
-  form.append(idorWrap);
+  advanced.append(idorWrap);
+  form.append(advanced);
   // Collect only complete pairs (both URLs present); the server bounds/dedups/caps them again.
   const collectIdorPairs = () => Array.from(idorBody.children)
     .map((r) => (typeof r._ckGet === "function" ? r._ckGet() : null))
@@ -6828,9 +6786,9 @@ function ckProgramSetupForm() {
   const submit = cel("button", "ck-btn primary", editing ? "Update program" : "Save program");
   submit.type = "submit";
   form.append(submit);
-  if (editing) {
+  {
     const cancel = cel("button", "ck-btn", "Cancel"); cancel.type = "button";
-    cancel.addEventListener("click", () => { ckProgEdit = null; void ckRenderProgram(); });
+    cancel.addEventListener("click", () => { ckProgReset(); void ckRenderProgram(); });
     form.append(cancel);
   }
   const saveNote = cel("p", "ck-status");
@@ -6846,7 +6804,7 @@ function ckProgramSetupForm() {
     }
     const payload = {
       name: name.input.value.trim(),
-      platform: handle.input.value.trim() ? "hackerone" : "manual",
+      platform: platSelect.value,
       platform_handle: handle.input.value.trim(),
       structured_scope: structuredScope,
       repository_urls: repositoryUrls,
@@ -6893,7 +6851,7 @@ function ckProgramSetupForm() {
     submit.disabled = true;  // no double upsert on a slow save
     try {
       await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify(payload) });
-      ckProgEdit = null;
+      ckProgReset();
       saveNote.classList.remove("is-error"); saveNote.textContent = "Saved.";
       await ckRefreshProgramsEverywhere();
       void ckRenderProgram();
@@ -6914,13 +6872,24 @@ async function ckRenderProgram() {
   ckPopulateActiveProgramSelect();
 
   host.replaceChildren();
-  host.append(cel("h2", "ck-section-title", "Program setup"));
-  host.append(cel("p", "ck-hint",
-    "Set up the program you're authorized to test: its scope, and (optionally) its HackerOne handle. This feeds the Program picker on the launch rail and the Operator's autonomous scheduling — one program, everywhere."));
-  host.append(ckWalkthrough("program"));
-  host.append(ckRepoStartBar());
 
-  host.append(cel("h3", "ck-section-title", `Programs (${programs.length})`));
+  // One focused surface at a time. The full add/edit form and the guided wizard each take over
+  // the tab so nothing competes for attention; the calm program list is the default resting state.
+  if (ckFlow.view === "form") { host.append(ckProgramFormPanel()); return; }
+  if (ckFlow.view === "wizard") { host.append(ckProgramWizard()); return; }
+
+  host.append(cel("h2", "ck-section-title", "Programs"));
+  host.append(cel("p", "ck-hint",
+    "Set up the programs you're authorized to test, once. Each one feeds the launch rail's Program picker and the Operator's scheduling."));
+  host.append(ckWalkthrough("program"));
+
+  const topbar = cel("div", "ck-prog-topbar");
+  const addBtn = cel("button", "ck-btn primary ck-new-program", "＋ New program"); addBtn.type = "button";
+  addBtn.addEventListener("click", () => { ckFlow = { view: "wizard", step: 0, choice: null, prefill: null }; void ckRenderProgram(); });
+  topbar.append(addBtn);
+  if (programs.length) topbar.append(cel("span", "ck-prog-count", `${programs.length} saved`));
+  host.append(topbar);
+
   if (!programs.length && !ckProgramsReachable) {
     host.append(cel("p", "ck-status is-error", "Couldn't reach the local engine — your programs weren't loaded. This does NOT mean they're gone; retry once the engine is back."));
     const retry = cel("button", "ck-btn", "Retry");
@@ -6928,53 +6897,242 @@ async function ckRenderProgram() {
     retry.addEventListener("click", () => void ckRenderProgram());
     host.append(retry);
   } else if (!programs.length) {
-    host.append(cel("p", "ck-hint", "No programs yet — add one below, or fetch/import a scope to get started."));
+    const empty = cel("div", "ck-prog-empty");
+    empty.append(cel("p", "ck-prog-empty-title", "No programs yet"));
+    empty.append(cel("p", "ck-hint", "Start your first one — paste a repo link, pull a HackerOne scope, or add it by hand. It takes about a minute."));
+    const go = cel("button", "ck-btn primary", "Start a program"); go.type = "button";
+    go.addEventListener("click", () => { ckFlow = { view: "wizard", step: 0, choice: null, prefill: null }; void ckRenderProgram(); });
+    empty.append(go);
+    host.append(empty);
   } else {
     const list = cel("ul", "ck-list");
     for (const p of programs) list.append(ckProgramSetupRow(p));
     host.append(list);
   }
+}
 
-  host.append(ckPresetBar());
+// The full add/edit form on its own screen with a gentle way back. ckProgEdit set => Edit; a
+// wizard prefill (manual/HackerOne path) => a seeded new program; neither => a blank new program.
+function ckProgramFormPanel() {
+  const wrap = cel("div", "ck-focus");
+  const head = cel("div", "ck-focus-head");
+  const back = cel("button", "ck-textlink", "← Back to programs"); back.type = "button";
+  back.addEventListener("click", () => { ckProgReset(); void ckRenderProgram(); });
+  head.append(back);
+  wrap.append(head);
+  if (ckFlow.choice) wrap.append(ckWizardRail(2));   // continuity when arriving from the wizard
+  wrap.append(cel("h2", "ck-section-title", ckProgEdit ? `Edit — ${ckProgEdit.name || ckProgEdit.id}` : "New program — scope & save"));
+  wrap.append(cel("p", "ck-hint", ckProgEdit
+    ? "Adjust scope and settings, then save."
+    : "Review what we'll test, untick anything out of scope, then save. Advanced setup is tucked away below."));
+  wrap.append(ckProgramSetupForm(ckFlow.prefill));
+  return wrap;
+}
 
-  host.append(cel("h3", "ck-section-title", ckProgEdit ? `Edit program — ${ckProgEdit.name || ckProgEdit.id}` : "Add a program"));
-  host.append(ckProgramSetupForm());
+function ckWizardRail(step) {
+  const rail = cel("div", "ck-wiz-rail");
+  ["Start", "Identify", "Scope & save"].forEach((label, i) => {
+    const seg = cel("div", "ck-wiz-seg" + (i === step ? " is-current" : "") + (i < step ? " is-done" : ""));
+    seg.append(cel("span", "ck-wiz-bar"), cel("span", "ck-wiz-lab", label));
+    rail.append(seg);
+  });
+  return rail;
+}
+
+function ckProgramWizard() {
+  const wrap = cel("div", "ck-progwiz");
+  const top = cel("div", "ck-progwiz-top");
+  const cancel = cel("button", "ck-textlink", "✕ Cancel"); cancel.type = "button";
+  cancel.addEventListener("click", () => { ckProgReset(); void ckRenderProgram(); });
+  top.append(cancel);
+  wrap.append(top);
+  wrap.append(ckWizardRail(ckFlow.step));
+  wrap.append(ckFlow.step === 0 ? ckWizardStart() : ckWizardIdentify());
+  return wrap;
+}
+
+function ckWizardStart() {
+  const box = cel("div", "ck-wiz-body");
+  box.append(cel("h3", "ck-wiz-title", "How do you want to start?"));
+  box.append(cel("p", "ck-hint", "Pick one. You can add the rest later — nothing is locked in."));
+  const grid = cel("div", "ck-choice-grid");
+  const mk = (choice, icon, title, desc) => {
+    const c = cel("button", "ck-choice"); c.type = "button";
+    c.append(cel("span", "ck-choice-ic", icon));
+    const t = cel("div", "ck-choice-text");
+    t.append(cel("div", "ck-choice-t", title), cel("div", "ck-choice-d", desc));
+    c.append(t);
+    c.addEventListener("click", () => { ckFlow.choice = choice; ckFlow.step = 1; void ckRenderProgram(); });
+    return c;
+  };
+  grid.append(
+    mk("repo", "🔗", "From a repo link", "Paste a public repo. We check it, then set up a source-only draft you can hunt right away."),
+    mk("hackerone", "🎯", "From HackerOne", "Enter a program handle to pull real scope from the API, or paste its scope table."),
+    mk("manual", "✎", "Manually", "Name it and add scope yourself — full control."),
+  );
+  box.append(grid);
+
+  const vdp = cel("button", "ck-textlink ck-wiz-alt", "or start from a VDP policy (NASA) →"); vdp.type = "button";
+  const vdpNote = cel("p", "ck-status");
+  vdp.addEventListener("click", async () => {
+    vdp.disabled = true; vdpNote.className = "ck-status"; vdpNote.textContent = "Creating NASA VDP program…";
+    try {
+      const res = await apiFetch("/api/operator/programs/preset", { method: "POST", body: JSON.stringify({ profile: "nasa" }) });
+      if (!res || res.ok === false) { vdpNote.className = "ck-status is-error"; vdpNote.textContent = (res && res.error) || "Could not create the preset."; vdp.disabled = false; return; }
+      await ckRefreshProgramsEverywhere();
+      ckProgEdit = res.program || null;
+      ckFlow = { view: ckProgEdit ? "form" : "list", step: 0, choice: ckProgEdit ? "vdp" : null, prefill: null };
+      void ckRenderProgram();
+    } catch (err) { vdpNote.className = "ck-status is-error"; vdpNote.textContent = err.message || "Could not create the preset."; vdp.disabled = false; }
+  });
+  box.append(vdp, vdpNote);
+  return box;
+}
+
+function ckWizardIdentify() {
+  const box = cel("div", "ck-wiz-body");
+  const nav = cel("div", "ck-wiz-nav");
+  const back = cel("button", "ck-btn", "← Back"); back.type = "button";
+  back.addEventListener("click", () => { ckFlow.step = 0; void ckRenderProgram(); });
+  if (ckFlow.choice === "repo") box.append(ckWizardIdentifyRepo(nav));
+  else if (ckFlow.choice === "hackerone") box.append(ckWizardIdentifyH1(nav));
+  else box.append(ckWizardIdentifyManual(nav));
+  nav.prepend(back);
+  box.append(nav);
+  return box;
+}
+
+// The repo path — the one that used to fail deep in a hunt. Preflight runs BEFORE anything is
+// created, so a typo'd/private/missing repo is caught here with an actionable message.
+function ckWizardIdentifyRepo(nav) {
+  const box = cel("div");
+  box.append(cel("h3", "ck-wiz-title", "Add the repository"));
+  box.append(cel("p", "ck-hint", "We check the repo is reachable before you commit to a hunt, so a typo can’t waste a run."));
+  const ta = ckTextareaField("Repository URL(s) — one per line, repository roots only", "");
+  ta.input.rows = 3; ta.input.placeholder = "https://github.com/program/repository";
+  box.append(ta.wrap);
+  const enrich = ckToggle("Enrich from forge (read-only) — pull the description and suggest homepage hosts", false);
+  box.append(enrich.wrap);
+  const checkBtn = cel("button", "ck-btn", "Check repository"); checkBtn.type = "button";
+  const verdict = cel("div", "ck-rpf");
+  box.append(checkBtn, verdict);
+
+  const cont = cel("button", "ck-btn primary", "Continue →"); cont.type = "button"; cont.disabled = true;
+  let okUrls = [];
+
+  const runCheck = async () => {
+    const urls = ckParseRepositoryUrls(ta.input.value);
+    if (!urls.length) {
+      verdict.className = "ck-rpf"; verdict.replaceChildren(cel("div", "ck-rpf-row is-error",
+        "Add a supported public HTTPS repository-root URL (not an issue, blob, tree, or pull-request page)."));
+      cont.disabled = true; return;
+    }
+    checkBtn.disabled = true; checkBtn.textContent = "Checking…";
+    const results = [];
+    for (const u of urls) {
+      try {
+        const r = await apiFetch("/api/repos/preflight", { method: "POST", timeoutMs: 20000, body: JSON.stringify({ url: u }) });
+        results.push(Object.assign({ url: u }, r || {}));
+      } catch (err) { results.push({ url: u, ok: false, message: err.message || "Check failed." }); }
+    }
+    checkBtn.disabled = false; checkBtn.textContent = "Re-check";
+    okUrls = results.filter((r) => r.ok).map((r) => r.url);
+    verdict.replaceChildren();
+    for (const r of results) {
+      const row = cel("div", "ck-rpf-row " + (r.ok ? "is-ok" : "is-error"));
+      row.append(cel("span", "ck-rpf-ic", r.ok ? "✓" : "✕"));
+      const txt = cel("div", "ck-rpf-text");
+      txt.append(cel("div", "ck-rpf-url", ckShortTarget(r.url)), cel("div", "ck-rpf-msg", r.message || (r.ok ? "Reachable." : "Not reachable.")));
+      row.append(txt);
+      verdict.append(row);
+    }
+    cont.disabled = okUrls.length === 0;
+  };
+  checkBtn.addEventListener("click", () => void runCheck());
+  ta.input.addEventListener("input", () => { cont.disabled = true; verdict.replaceChildren(); checkBtn.textContent = "Check repository"; });
+
+  cont.addEventListener("click", async () => {
+    if (!okUrls.length) return;
+    cont.disabled = true; cont.textContent = enrich.input.checked ? "Creating + enriching…" : "Creating…";
+    try {
+      const res = await apiFetch("/api/programs/from-repo", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ repository_urls: okUrls, enrich: enrich.input.checked }) });
+      if (!res || res.ok === false || !res.program) {
+        verdict.replaceChildren(cel("div", "ck-rpf-row is-error", (res && res.error) || "Could not create the draft."));
+        cont.disabled = false; cont.textContent = "Continue →"; return;
+      }
+      const candidates = Array.isArray(res.candidate_hosts) ? res.candidate_hosts : [];
+      await ckRefreshProgramsEverywhere();
+      ckProgEdit = ckProgramWithCandidateHosts(res.program, candidates);
+      ckFlow.view = "form";
+      void ckRenderProgram();
+    } catch (err) {
+      verdict.replaceChildren(cel("div", "ck-rpf-row is-error", err.message || "Could not create the draft."));
+      cont.disabled = false; cont.textContent = "Continue →";
+    }
+  });
+  nav.append(cont);
+  return box;
+}
+
+function ckWizardIdentifyH1(nav) {
+  const box = cel("div");
+  box.append(cel("h3", "ck-wiz-title", "Pull scope from HackerOne"));
+  box.append(cel("p", "ck-hint", "Enter the program’s team handle. We call HackerOne’s API with the credentials you saved in Submissions. Many programs restrict this to invited researchers — a 403/404 is common, not a bug; you can still continue and add scope by hand."));
+  const handle = ckField("HackerOne team handle", "text", "");
+  box.append(handle.wrap);
+  const fetchBtn = cel("button", "ck-btn", "Fetch scope"); fetchBtn.type = "button";
+  const note = cel("p", "ck-status");
+  box.append(fetchBtn, note);
+  const cont = cel("button", "ck-btn primary", "Continue →"); cont.type = "button"; cont.disabled = true;
+  let fetched = null;
+
+  fetchBtn.addEventListener("click", async () => {
+    const h = handle.input.value.trim();
+    if (!h) { note.className = "ck-status is-error"; note.textContent = "Enter a HackerOne team handle first."; return; }
+    fetchBtn.disabled = true; fetchBtn.textContent = "Fetching…"; note.className = "ck-status"; note.textContent = "";
+    try {
+      const res = await apiFetch("/api/hackerone/import-scope", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ handle: h }) });
+      if (!res || res.ok === false) {
+        note.className = "ck-status is-error"; note.textContent = (res && res.error) || "Could not fetch scope. You can still continue and add scope by hand.";
+        fetched = { name: h, platform_handle: h }; cont.disabled = false; cont.textContent = "Continue anyway →"; return;
+      }
+      const entries = res.structured_scope || [];
+      fetched = { name: res.program_name || h, platform_handle: h, structured_scope: entries,
+        repository_urls: ckRepositoryUrlsFromScope(entries), h1_program_stats: res.program_stats || {} };
+      note.className = "ck-status"; note.textContent = `Fetched ${entries.length} scope entr${entries.length === 1 ? "y" : "ies"} for "${fetched.name}". Review and save on the next step.`;
+      cont.disabled = false; cont.textContent = "Continue →";
+    } catch (err) { note.className = "ck-status is-error"; note.textContent = err.message || "Fetch failed."; }
+    finally { fetchBtn.disabled = false; if (fetchBtn.textContent === "Fetching…") fetchBtn.textContent = "Fetch scope"; }
+  });
+  cont.addEventListener("click", () => {
+    if (!fetched) fetched = { name: handle.input.value.trim() || "New program", platform_handle: handle.input.value.trim() };
+    ckProgEdit = null; ckFlow.prefill = fetched; ckFlow.view = "form"; void ckRenderProgram();
+  });
+  nav.append(cont);
+  return box;
+}
+
+function ckWizardIdentifyManual(nav) {
+  const box = cel("div");
+  box.append(cel("h3", "ck-wiz-title", "Name your program"));
+  box.append(cel("p", "ck-hint", "Give it a name. You’ll set scope on the next step — the hosts you’re authorized to test, and optionally a repo."));
+  const name = ckField("Program name", "text", "");
+  box.append(name.wrap);
+  const cont = cel("button", "ck-btn primary", "Continue →"); cont.type = "button";
+  cont.addEventListener("click", () => {
+    const n = name.input.value.trim();
+    if (!n) { name.input.focus(); return; }
+    ckProgEdit = null; ckFlow.prefill = { name: n }; ckFlow.view = "form"; void ckRenderProgram();
+  });
+  name.input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); cont.click(); } });
+  nav.append(cont);
+  return box;
 }
 
 // One-click VDP presets — create a program pre-bound to a published program's rules of engagement
 // (scope + excluded endpoints/classes + confirmed-only + no-DoS). "NASA mode" is the NASA VDP preset:
-// same engine, constrained to NASA's authorized scope and reporting guidelines. The preset AUTHORIZES
-// nothing the engine's own scope/SSRF gates don't already — it only NARROWS what is probed/reported.
-function ckPresetBar() {
-  const wrap = cel("div", "ck-preset-bar");
-  wrap.append(cel("h3", "ck-section-title", "Quick start from a VDP policy"));
-  wrap.append(cel("p", "ck-hint",
-    "One click creates a program locked to a published Vulnerability Disclosure Policy — its in-scope hosts, "
-    + "the endpoints/classes it won't accept, confirmed-findings-only, and no DoS. The full engine runs, but "
-    + "strictly within that program's authorized scope and reporting rules."));
-  const row = cel("div", "ck-import-row");
-  const nasaBtn = cel("button", "ck-btn ck-btn-primary", "Set up NASA VDP (NASA mode)"); nasaBtn.type = "button";
-  row.append(nasaBtn);
-  const note = cel("p", "ck-status");
-  wrap.append(row, note);
-  nasaBtn.addEventListener("click", async () => {
-    const label = nasaBtn.textContent; nasaBtn.disabled = true; nasaBtn.textContent = "Creating…";
-    note.className = "ck-status"; note.textContent = "";
-    try {
-      const res = await apiFetch("/api/operator/programs/preset", { method: "POST", body: JSON.stringify({ profile: "nasa" }) });
-      if (!res || res.ok === false) {
-        note.className = "ck-status is-error"; note.textContent = (res && res.error) || "Could not create the preset program.";
-        return;
-      }
-      note.className = "ck-status"; note.textContent = "NASA VDP program saved — scope, no-DoS, and confirmed-only are enforced for every hunt on it.";
-      await ckRefreshProgramsEverywhere();
-      void ckRenderProgram();
-    } catch (err) {
-      note.className = "ck-status is-error"; note.textContent = err.message || "Could not create the preset program.";
-    } finally { nasaBtn.disabled = false; nasaBtn.textContent = label; }
-  });
-  return wrap;
-}
+// The VDP quick-start (NASA mode) is now offered as a link in the new-program wizard's Start
+// step (ckWizardStart), which posts to the same /api/operator/programs/preset endpoint.
 
 // --- Guided first-run wizard — drives the REAL cockpit (real ckSetView navigation, real
 // controls), it doesn't simulate a separate flow. Auto-shown once on a clean install (no
@@ -10002,7 +10160,7 @@ function ckProgramForm() {
   repositories.input.value = editing ? (editing.repository_urls || []).join("\n") : "";
   repositories.input.rows = 3;
   repositories.input.placeholder = "https://github.com/program/repository";
-  const handle = ckField("HackerOne team handle (for auto-submit)", "text", editing ? (editing.platform_handle || "") : "");
+  const handle = ckField("Program handle — HackerOne team handle (auto-submit) or HackenProof slug", "text", editing ? (editing.platform_handle || "") : "");
   const interval = ckField("Re-run every (minutes)", "number", editing ? String(editing.interval_minutes || 1440) : "1440");
   const cap = ckField("Max auto-submits / day", "number", editing ? String(editing.max_submits_per_day ?? 3) : "3");
   form.append(name.wrap, scope.wrap, targets.wrap, repositories.wrap, handle.wrap, interval.wrap, cap.wrap);
@@ -10040,7 +10198,12 @@ function ckProgramForm() {
     const payload = {
       name: name.input.value.trim(), scope_text: scope.input.value.trim(), seed_targets: seeds,
       repository_urls: repositoryUrls, clone_repositories: cloneRepositories.input.checked,
-      platform: handle.input.value.trim() ? "hackerone" : "manual", platform_handle: handle.input.value.trim(),
+      // Preserve an existing platform tag (e.g. HackenProof, set in the Program tab) instead of
+      // re-deriving it from the handle — this compact Operator editor has no platform picker, and
+      // clobbering it back to "hackerone" would mis-tag the program and change its report format.
+      platform: editing ? (editing.platform || (handle.input.value.trim() ? "hackerone" : "manual"))
+                        : (handle.input.value.trim() ? "hackerone" : "manual"),
+      platform_handle: handle.input.value.trim(),
       active: active.input.checked, live: live.input.checked, deep: deep.input.checked, auto_submit: auto.input.checked,
       interval_minutes: Number(interval.input.value) || 1440, max_submits_per_day: Number(cap.input.value) || 3
     };
@@ -10286,6 +10449,24 @@ async function ckRun() {
   state.bountyProfile = ck.profile?.value || state.bountyProfile;
   saveState();
   const authHeaderLines = state.ckAuthHeaders.split("\n").map((s) => s.trim()).filter(Boolean);
+  // Preflight a repository target BEFORE committing to a hunt: catch a typo'd/private/missing
+  // repo here with an actionable message, instead of failing deep in the clone mid-run. Best-effort
+  // — a preflight that can't run (engine hiccup) never blocks a hunt the operator asked for.
+  if (repositoryHunt) {
+    ck.run.disabled = true;
+    ckStatus("Checking the repository is reachable…");
+    try {
+      const pf = await apiFetch("/api/repos/preflight", { method: "POST", timeoutMs: 20000, body: JSON.stringify({ url: target }) });
+      // Only a DEFINITIVE "can't clone this" verdict blocks the launch (bad URL shape, not found,
+      // private). Indeterminate/transient outcomes (timeout, unreachable, no git, error) are
+      // best-effort: the real depth-1 clone (120s) is the authoritative attempt and its own
+      // preflight budget is only 12s — so never refuse a hunt the operator asked for over one.
+      if (pf && pf.ok === false && ["invalid", "not_found", "private"].includes(pf.status)) {
+        ckStatus(pf.message || "That repository isn't reachable.", true); ck.run.disabled = false; return;
+      }
+    } catch (_) { /* preflight unavailable — fall through and let the hunt try */ }
+    ck.run.disabled = false;
+  }
   ck.run.disabled = true;
   ckStatus(
     spanning ? "Campaign running — hunting every target in this program's scope (this can take a while for a large program)…"

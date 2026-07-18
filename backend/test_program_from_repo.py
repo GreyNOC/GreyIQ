@@ -64,6 +64,15 @@ class ProgramFromRepoTests(unittest.TestCase):
         self.assertEqual(stored["scope_text"], "")
         self.assertTrue(stored["repo_draft_pending"])
 
+    def test_owner_names_preserve_acronyms_and_mixed_case(self) -> None:
+        # Plain words are Titlecased; acronyms and mixed-case handles are kept verbatim
+        # (was mangled by str.title: OWASP -> "Owasp", GitLab -> "Gitlab").
+        self.assertEqual(self.create(["https://github.com/OWASP/NodeGoat"])["program"]["name"], "OWASP")
+        self.assertEqual(self.create(["https://github.com/GitLab/app"])["program"]["name"], "GitLab")
+        self.assertEqual(self.create(["https://github.com/acme-corp/api"])["program"]["name"], "Acme Corp")
+        multi = self.create(["https://github.com/OWASP/a", "https://gitlab.com/PortSwigger/b"])["program"]
+        self.assertEqual(multi["name"], "OWASP + PortSwigger")
+
     def test_first_program_form_save_finalizes_only_the_repository_scope(self) -> None:
         draft = self.create(["https://github.com/acme/webapp"])["program"]
         saved = self.runtime.upsert_program(api.ProgramUpsertRequest(

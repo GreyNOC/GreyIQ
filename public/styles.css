@@ -3588,19 +3588,65 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
 
 /* LOW severity reads green (mockup) in the findings table too */
 .ck-sev.sev-low { color: var(--ok); }
-.ck-preset-bar { margin: 0.5rem 0 1rem; padding: 0.75rem; border: 1px dashed var(--border); border-radius: 8px; }
-.ck-repo-start {
-  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0.45rem 0.75rem;
-  align-items: end; margin: 0.7rem 0 1rem; padding: 0.75rem;
-  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
-  border-radius: 10px; background: color-mix(in srgb, var(--accent) 4%, var(--surface));
-}
-.ck-repo-start > .ck-section-title,
-.ck-repo-start > .ck-hint,
-.ck-repo-start > .ck-status { grid-column: 1 / -1; margin: 0; }
-.ck-repo-start-input { display: flex; flex-direction: column; gap: 0.25rem; min-width: 0; font-size: 0.76rem; color: var(--muted); }
-.ck-repo-start-controls { display: flex; flex-direction: column; align-items: flex-start; gap: 0.45rem; padding-bottom: 0.05rem; }
-.ck-repo-start-controls .ck-switch { white-space: nowrap; }
+
+/* --- Gentle Program setup flow: calm resting state, guided wizard, focused form --- */
+.ck-prog-topbar { display: flex; align-items: center; gap: 0.6rem; margin: 0.6rem 0 0.9rem; }
+.ck-new-program { font-size: 0.85rem; padding: 0.5rem 0.9rem; }
+.ck-prog-count { font-size: 0.74rem; color: var(--muted); font-family: var(--code-font); }
+.ck-textlink { background: none; border: none; padding: 0; color: var(--accent); font-size: 0.8rem; cursor: pointer; }
+.ck-textlink:hover { text-decoration: underline; }
+.ck-textlink:disabled { color: var(--muted); cursor: default; text-decoration: none; }
+
+.ck-prog-empty { border: 1px dashed var(--border); border-radius: var(--radius-card); padding: 1.4rem 1.2rem; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 0.5rem; }
+.ck-prog-empty-title { font-size: 0.95rem; color: var(--text); margin: 0; }
+
+.ck-focus { max-width: 46rem; }
+.ck-focus-head { margin-bottom: 0.6rem; }
+
+/* Progress rail */
+.ck-wiz-rail { display: flex; gap: 0.5rem; margin: 0.8rem 0 1.3rem; }
+.ck-wiz-seg { flex: 1; display: flex; flex-direction: column; gap: 0.4rem; }
+.ck-wiz-bar { height: 3px; border-radius: 2px; background: var(--border); }
+.ck-wiz-seg.is-current .ck-wiz-bar, .ck-wiz-seg.is-done .ck-wiz-bar { background: var(--accent); }
+.ck-wiz-lab { font-size: 0.7rem; font-family: var(--code-font); color: var(--muted); letter-spacing: 0.02em; }
+.ck-wiz-seg.is-current .ck-wiz-lab { color: var(--text); }
+
+.ck-progwiz { max-width: 46rem; }
+.ck-progwiz-top { margin-bottom: 0.2rem; }
+.ck-wiz-body { }
+.ck-wiz-title { font-size: 1rem; margin: 0 0 0.2rem; color: var(--text); }
+.ck-wiz-nav { display: flex; align-items: center; gap: 0.6rem; margin-top: 1.2rem; }
+.ck-wiz-nav .primary { margin-left: auto; }
+.ck-wiz-alt { display: inline-block; margin-top: 1rem; }
+
+/* Start chooser cards */
+.ck-choice-grid { display: flex; flex-direction: column; gap: 0.6rem; margin: 0.9rem 0 0.4rem; }
+.ck-choice { display: flex; gap: 0.8rem; align-items: flex-start; text-align: left; width: 100%;
+  padding: 0.85rem 1rem; border: 1px solid var(--border); border-radius: var(--radius-card);
+  background: var(--surface-2); cursor: pointer; transition: border-color 0.12s, background 0.12s; }
+.ck-choice:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 5%, var(--surface-2)); }
+.ck-choice-ic { font-size: 1.25rem; line-height: 1.4; flex: none; }
+.ck-choice-t { font-size: 0.88rem; font-weight: 500; color: var(--text); }
+.ck-choice-d { font-size: 0.78rem; color: var(--muted); line-height: 1.5; margin-top: 0.1rem; }
+
+/* Preflight verdict rows */
+.ck-rpf { margin-top: 0.7rem; display: flex; flex-direction: column; gap: 0.4rem; }
+.ck-rpf-row { display: flex; gap: 0.55rem; align-items: flex-start; font-size: 0.8rem; line-height: 1.5;
+  padding: 0.55rem 0.7rem; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); }
+.ck-rpf-row.is-ok { border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); background: color-mix(in srgb, var(--ok) 8%, var(--surface-2)); }
+.ck-rpf-row.is-error { border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); background: color-mix(in srgb, var(--danger) 7%, var(--surface-2)); }
+.ck-rpf-ic { flex: none; font-weight: 600; }
+.ck-rpf-row.is-ok .ck-rpf-ic { color: var(--ok); }
+.ck-rpf-row.is-error .ck-rpf-ic { color: var(--danger); }
+.ck-rpf-url { font-family: var(--code-font); font-size: 0.76rem; color: var(--text); word-break: break-all; }
+.ck-rpf-msg { color: var(--muted); margin-top: 0.1rem; }
+
+/* Advanced disclosure inside the form */
+.ck-advanced { margin: 0.6rem 0; border: 1px solid var(--border); border-radius: 8px; padding: 0 0.7rem; }
+.ck-advanced[open] { padding-bottom: 0.7rem; }
+.ck-advanced-summary { cursor: pointer; padding: 0.6rem 0; font-size: 0.82rem; color: var(--muted); }
+.ck-advanced-summary:hover { color: var(--text); }
+.ck-advanced .ck-subsection { margin-top: 0.6rem; }
 
 .ck-op-ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; margin: 0.4rem 0 1.2rem; }
 .ck-op-log { max-height: 14rem; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); padding: 0.5rem 0.7rem; margin-bottom: 1.2rem; }
@@ -3690,8 +3736,8 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
   .ck-main { overflow: visible; padding: 0.9rem; }
   .ck-launch-actions { margin-bottom: 0; }
   .ck-scope-head { display: none; }
-  .ck-repo-start { grid-template-columns: minmax(0, 1fr); }
-  .ck-repo-start-controls { align-items: stretch; }
+  .ck-choice-grid { gap: 0.5rem; }
+  .ck-wiz-lab { font-size: 0.64rem; }
   .ck-scope-row { grid-template-columns: minmax(0, 1fr); padding: 0.65rem; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); }
   .ck-scope-rm { justify-self: start; }
   .ck-resizer { display: none; }  /* single-column stacked layout — nothing to resize */

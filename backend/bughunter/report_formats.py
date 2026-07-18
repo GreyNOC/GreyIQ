@@ -38,8 +38,8 @@ def _ai_summary(ctx: dict[str, Any], finding: dict[str, Any], plan: dict[str, An
             cache[platform] = ""
     return cache.get(platform) or None
 
-# Ordered so the UI lists HackerOne first, then YesWeHack, then the next two most
-# popular crowdsourced platforms.
+# Ordered so the UI lists HackerOne first, then YesWeHack and the next two crowdsourced
+# platforms, then HackenProof (web3-focused: exchanges, protocols, smart contracts).
 PLATFORMS: tuple[dict[str, str], ...] = (
     {"id": "hackerone", "name": "HackerOne",
      "blurb": "Weakness (CWE) + severity rating; Summary / Steps / Supporting material / Impact."},
@@ -49,6 +49,8 @@ PLATFORMS: tuple[dict[str, str], ...] = (
      "blurb": "VRT-led + P1–P5 priority; Description / Steps / PoC / Impact / Remediation."},
     {"id": "intigriti", "name": "Intigriti",
      "blurb": "Type (OWASP/CWE) + CVSS; Description / Endpoint / PoC / Impact / Recommended fix."},
+    {"id": "hackenproof", "name": "HackenProof",
+     "blurb": "Target + Vulnerability category + Critical–Low severity (web/mobile + smart contracts); Description / Validation steps / PoC / Impact."},
 )
 _PLATFORM_IDS = {p["id"] for p in PLATFORMS}
 DEFAULT_PLATFORM = "hackerone"
@@ -79,12 +81,19 @@ _BUGCROWD_PRIORITY = {"critical": "P1 (Critical)", "high": "P2 (Severe)", "mediu
                       "low": "P4 (Low)", "info": "P5 (Informational)", "none": "P5 (Informational)"}
 _TITLE_SEVERITY = {"critical": "Critical", "high": "High", "medium": "Medium", "low": "Low",
                    "info": "Informational", "none": "Informational"}
+# HackenProof classifies web/mobile and smart-contract findings on a four-band Critical..Low
+# scale (docs.hackenproof.com/bug-bounty/vulnerability-classification) — it defines no
+# "Informational" or "None" band. An internal info/none therefore maps to Low, the nearest
+# real band HackenProof recognizes, rather than emitting a band the platform doesn't define.
+_HACKENPROOF_SEVERITY = {"critical": "Critical", "high": "High", "medium": "Medium", "low": "Low",
+                         "info": "Low", "none": "Low"}
 # Per-platform section headings that differ from the neutral defaults.
 _PROFILES: dict[str, dict[str, str]] = {
     "hackerone": {"evidence": "Supporting material / evidence", "remediation": "Remediation"},
     "yeswehack": {"evidence": "Proof / evidence", "remediation": "Suggested remediation"},
     "bugcrowd": {"evidence": "Proof / evidence", "remediation": "Remediation"},
     "intigriti": {"evidence": "Proof / evidence", "remediation": "Recommended fix"},
+    "hackenproof": {"evidence": "Proof / evidence", "remediation": "Remediation"},
 }
 
 
@@ -102,6 +111,8 @@ def platform_severity(platform: str, finding: dict[str, Any], plan: dict[str, An
         return _H1_SEVERITY.get(sev, "low")
     if platform == "bugcrowd":
         return _BUGCROWD_PRIORITY.get(sev, "P4 (Low)")
+    if platform == "hackenproof":
+        return _HACKENPROOF_SEVERITY.get(sev, "Low")
     return _TITLE_SEVERITY.get(sev, "Low")  # yeswehack / intigriti
 
 
@@ -134,6 +145,15 @@ def _meta_table(out: list[str], ctx: dict[str, Any], finding: dict[str, Any], pl
             out.append(f"| **Type (OWASP)** | {R._linkify_owasp(owasp)} |")
         if cwe:
             out.append(f"| **CWE** | {R._linkify_cwe(cwe)} |")
+    elif platform == "hackenproof":
+        # HackenProof's report form leads with Target (the Asset/endpoint row above) +
+        # Vulnerability category + Severity; CVSS (appended below) is the fallback score.
+        if finding.get("class_name"):
+            out.append(f"| **Vulnerability category** | {finding['class_name']} |")
+        if cwe:
+            out.append(f"| **CWE** | {R._linkify_cwe(cwe)} |")
+        if owasp:
+            out.append(f"| **OWASP** | {R._linkify_owasp(owasp)} |")
     else:  # hackerone
         if cwe:
             out.append(f"| **Weakness (CWE)** | {R._linkify_cwe(cwe)} |")

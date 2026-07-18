@@ -27,6 +27,7 @@ _PLATFORM_VOICE = {
     "hackerone": "HackerOne: lead with the weakness (CWE) and the concrete security impact; terse and factual.",
     "bugcrowd": "Bugcrowd: lead with the VRT category and priority; state the technical issue then its impact.",
     "intigriti": "Intigriti: concise technical description then the business impact.",
+    "hackenproof": "HackenProof: lead with the vulnerability category and the affected target; state the technical issue then its concrete impact (funds/data/access for web3 and app targets). Terse and factual.",
     "generic": "A concise, professional vulnerability summary: what the issue is, where, and its impact.",
 }
 

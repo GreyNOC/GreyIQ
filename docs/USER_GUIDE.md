@@ -180,12 +180,17 @@ screenshot.
 Confirmed (and reportable candidate) findings appear in the **Submissions** tab:
 
 - **Copy report** / **Download .md** — a self-contained, submission-ready Markdown package,
-  reshaped per platform (HackerOne, YesWeHack, Bugcrowd, Intigriti — pick the format at the
-  top of the tab).
+  reshaped per platform (HackerOne, YesWeHack, Bugcrowd, Intigriti, **HackenProof** — pick the
+  format at the top of the tab). HackenProof's format leads with Target + Vulnerability category
+  and uses its four-band Critical–Low severity (web/mobile and smart-contract classes).
 - **Submit to HackerOne** — the one place GreyIQ pushes a report over the network on your
   behalf. It's hard-gated: only enabled once proof status is Confirmed *and* your HackerOne
   creds are saved, requires an explicit confirmation dialog, and the server independently
   re-checks the confirmed status (a forged client request can't push an unproven finding).
+  Every other platform — including HackenProof — is **export-only**: HackenProof publishes no
+  researcher API for scope, submission, or metrics (its programmatic surface is a triage-side
+  MCP server, not a hunter API), so GreyIQ formats the report and you submit it on the
+  platform's own dashboard.
 - **Download everything (.zip)** — the whole engagement folder (reports, JSON sidecars,
   screenshots, per-finding packages) as one archive.
 
