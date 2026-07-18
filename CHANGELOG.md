@@ -61,6 +61,16 @@ locked in by a static frontend contract test.
 - Opening a file restores tree focus for keyboard/AT users, and the file-tree filter is session-only
   (a persisted filter no longer came back with an empty search box after reload).
 
+### Coding brain and hunt engine (QA/QC)
+- OpenAI-compatible coding-brain and agent requests now adapt through multiple sequential parameter
+  incompatibilities (token-limit spelling and temperature) with bounded loop protection, so routed
+  gateways no longer fail after fixing only the first rejected field.
+- Direct active hunts retain per-endpoint veteran/brain priorities instead of flattening every route
+  into one global budget order, and now apply stored learned priors on the standalone path as
+  campaigns already did.
+- Offline hunt plans use deterministic cold-start ordering, treat unseen learned classes as neutral
+  rather than zero, and skip malformed model class rows without discarding later valid guidance.
+
 ## v2.4.1 - fix new-program wizard, all platforms selectable
 
 - **Fix the new-program wizard rendering.** The v2.4.0 wizard reused CSS class names already
