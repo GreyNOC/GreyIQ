@@ -35,6 +35,7 @@ from bughunter import hunt_brain
 from bughunter import hunt_trace
 from bughunter import impact_model
 from bughunter import ledger
+from bughunter import learning
 from bughunter import next_steps as next_steps_lib
 from bughunter import recon
 from bughunter import report as report_lib
@@ -1495,6 +1496,34 @@ def _merge_unique_strings(existing: list[str] | None, additions: list[str] | tup
     return out
 
 
+def _plan_priorities_by_endpoint(plan: dict[str, Any] | None) -> dict[str, list[str]]:
+    """Index a validated hunt plan without flattening endpoint-specific rankings."""
+    indexed: dict[str, list[str]] = {}
+    rows = plan.get("probe_priority") if isinstance(plan, dict) else []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        endpoint = str(row.get("endpoint") or "").strip()
+        raw_classes = row.get("classes")
+        if not endpoint or not isinstance(raw_classes, list):
+            continue
+        classes = _merge_unique_strings([], raw_classes, limit=20)
+        if classes:
+            indexed[endpoint] = _merge_unique_strings(indexed.get(endpoint), classes, limit=20)
+    return indexed
+
+
+def _merge_endpoint_priorities(
+    baseline: dict[str, list[str]],
+    refinement: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    """Put target-specific refinement first while retaining baseline suggestions."""
+    out = {endpoint: list(classes) for endpoint, classes in baseline.items()}
+    for endpoint, classes in refinement.items():
+        out[endpoint] = _merge_unique_strings(classes, out.get(endpoint), limit=20)
+    return out
+
+
 def _aggregate_active_meta(metas: list[dict[str, Any]]) -> dict[str, Any]:
     """Collapse per-endpoint active-verification metadata into the legacy single meta shape."""
     if not metas:
@@ -1596,6 +1625,25 @@ def _infer_active_target_priority(url: str, discovered_params: list[str] | None 
     if any(word in haystack for word in ("jwt", "token", "jwks", "oauth", "sso")):
         hints.append("jwt")
     return _merge_unique_strings(hints, [], limit=12)
+
+
+def _priority_for_active_target(
+    url: str,
+    endpoint_priorities: dict[str, list[str]] | None,
+    global_priority: list[str] | None,
+) -> list[str]:
+    """Compose one endpoint's budget order without leaking another route's plan.
+
+    Host-global recon parameter names are still *probed* on every route, but must
+    not steer every route's fixed class budget. URL-local params plus the veteran
+    plan's form-aware row provide the endpoint-specific inference instead.
+    """
+    inferred_and_global = _merge_unique_strings(
+        _infer_active_target_priority(url), global_priority, limit=20
+    )
+    return _merge_unique_strings(
+        (endpoint_priorities or {}).get(url), inferred_and_global, limit=20
+    )
 
 
 def _infer_active_xss_params(url: str) -> list[str]:
@@ -1856,6 +1904,7 @@ def run_bounty_hunt(
     active_targets = [clean_target]
     effective_extra_params = _merge_unique_strings(extra_params, [], limit=40)
     effective_class_priority = _merge_unique_strings(class_priority, [], limit=20)
+    endpoint_class_priorities: dict[str, list[str]] = {}
     # The recon SURFACE + the PLAN produced from it — captured for the hunt trace log
     # (offline-brain distillation corpus) ONLY on a direct 'Run Hunt' that does its own recon
     # (below). A campaign passes extra_params/class_priority, so that branch is skipped and the
@@ -1905,7 +1954,19 @@ def run_bounty_hunt(
                 "tech": rec.get("tech") or [],
                 "forms": rec.get("forms") or [],
             }
-            hb = hunt_brain.plan_hunt(coder_cfg, clean_target, scope, surface_for_brain)
+            # The always-available veteran planner is endpoint-specific. Preserve
+            # that mapping; flattening every row into one global list lets a
+            # download route's traversal priority consume a login route's budget.
+            hp = hunt_brain.heuristic_plan(surface_for_brain)
+            endpoint_class_priorities = _plan_priorities_by_endpoint(hp)
+            if endpoint_class_priorities:
+                _emit(
+                    f"hunt-planner: prioritised probe classes on "
+                    f"{len(endpoint_class_priorities)} endpoint(s) from observed semantics"
+                )
+
+            priors = learning.learned_priors(runtime_dir, None, clean_target) if runtime_dir is not None else None
+            hb = hunt_brain.plan_hunt(coder_cfg, clean_target, scope, surface_for_brain, priors=priors)
             # Capture the (surface, plan) input side for the trace log. effective_extra_params is
             # REBOUND below (never mutated in place) when brain params merge, so this snapshot
             # stays the recon-only surface. list() the endpoints/params to be doubly safe.
@@ -1921,10 +1982,9 @@ def run_bounty_hunt(
             effective_extra_params = _merge_unique_strings(effective_extra_params, brain_params, limit=40)
             if len(effective_extra_params) > before_brain:
                 _emit(f"hunt-brain: +{len(effective_extra_params) - before_brain} target-specific parameter name(s)")
-            brain_classes: list[str] = []
-            for row in hb.get("probe_priority") or []:
-                brain_classes.extend([str(c) for c in (row.get("classes") or [])])
-            effective_class_priority = _merge_unique_strings(brain_classes, effective_class_priority, limit=20)
+            endpoint_class_priorities = _merge_endpoint_priorities(
+                endpoint_class_priorities, _plan_priorities_by_endpoint(hb)
+            )
             if len(active_targets) > 1:
                 _emit(f"active recon: checking {len(active_targets)} discovered in-scope endpoint(s)")
         except Exception as exc:  # noqa: BLE001 - recon is a recall booster, never a hunt breaker
@@ -1956,7 +2016,9 @@ def run_bounty_hunt(
                 active_findings, active_meta = hunt_loop.run_iterative_verify(
                     clean_target, raw_findings, scope=scope, time_based=time_based, auth=auth_ctx,
                     extra_params=effective_extra_params, settings=active_settings,
-                    class_priority=effective_class_priority,
+                    class_priority=_priority_for_active_target(
+                        clean_target, endpoint_class_priorities, effective_class_priority,
+                    ),
                     xss_params=loop_xss_params, coder_cfg=coder_cfg,
                     surface={"endpoints": active_targets, "params": list(effective_extra_params or [])},
                     on_progress=_emit)
@@ -1970,10 +2032,8 @@ def run_bounty_hunt(
                     min_interval_s=active_settings.active_min_interval_ms / 1000.0,
                 )
                 for active_target in active_targets:
-                    target_priority = _merge_unique_strings(
-                        _infer_active_target_priority(active_target, effective_extra_params),
-                        effective_class_priority,
-                        limit=20,
+                    target_priority = _priority_for_active_target(
+                        active_target, endpoint_class_priorities, effective_class_priority,
                     )
                     target_xss_params = _merge_unique_strings(
                         xss_params,
