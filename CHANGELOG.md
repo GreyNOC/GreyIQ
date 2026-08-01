@@ -2,7 +2,7 @@
 
 Notable changes to GreyIQ.
 
-## v2.6.0 - the offline brains: comprehensive hunt / code / chat / RF agents with no brain configured
+## v2.7.0 - the offline brains: comprehensive hunt / code / chat / RF agents with no brain configured
 
 GreyIQ's no-brain path is what the shipped build actually runs — `greyiq-backend.spec` hard-excludes
 PyTorch, so TinyGPT is not importable in a release install. This release makes that path a real
@@ -86,6 +86,53 @@ See `docs/offline-brains.md`.
 Suite: **1814 → 2263 tests**, green. 21 defects found by a 5-dimension adversarial review, 17
 confirmed by independent verifiers and all fixed, each with a regression test proven to fail without
 its fix.
+
+## v2.6.0 - TACNOC launcher, shared brain techniques
+
+Merges the `GreyNOC/AddTACNOC` line onto the v2.5.0 release. That branch was cut before
+the v2.5.0 whole-app QAQC pass and self-labelled 2.5.2; this release carries both, so the
+version moves to 2.6.0 rather than reusing a number from a line that never shipped.
+
+### TACNOC
+- The cockpit topbar gains a **TACNOC** action that opens the companion TACNOC
+  (GreyNOC Belcher) intercepting-proxy workbench in its own hardened Electron process,
+  keeping TACNOC's contextBridge and secret-store boundary intact.
+- Discovery runs entirely in the main process: an explicit `GREYIQ_TACNOC_PATH` override,
+  then bundled/installed/development layouts. No renderer-controlled path or command-line
+  argument crosses IPC.
+- Browser-only mode says so plainly instead of failing silently.
+- `docs/tacnoc-integration.md` records the accepted design for making TACNOC a *baked-in*
+  feature — headless project export for evidence plus a control channel where GreyIQ
+  serves and TACNOC dials out — along with the at-rest crypto split that constrains it,
+  and what was rejected and why. The launcher in this release is the first step, not the
+  destination.
+
+### Shared brain techniques
+- New `backend/brain_techniques.py`: technique retrieval and outcome learning shared by the
+  code and hunt brains. Stores are local, append-only JSONL, bounded, and secret-redacted;
+  learning is best-effort and can never break a run.
+- Reasoning stays separate from authority — a technique can suggest a procedure but cannot
+  expand scope, manufacture proof, or execute a network action. Hunt suggestions still pass
+  the scope-gated differential prover; code changes still pass the workspace sandbox and
+  verification gate.
+- Seed techniques: `adaptive-attack-chains` (evidence-gated chaining that learns from both
+  confirmations and clean controls) and `frontier-code-workflow` (plan → evidence → change
+  → verify → reflect).
+
+### Security and hygiene
+- **Removed a TACNOC engagement project from version control.**
+  `Tiffanys-Co.gnbproj/{belcher.db,ca.pem,secrets.enc.json}` had been committed; that
+  directory holds a project CA private key and data-encryption key, and its database stores
+  host/URL/method metadata in cleartext. It is untracked and `*.gnbproj/` / `*.tacnocproj/`
+  are now ignored. The commit that added it was never pushed, so the material never left
+  the build machine — treat that project's CA as burned and regenerate it regardless.
+- New `backend/test_electron_security.py` and `backend/test_tacnoc_launcher.py` lock the
+  launcher's IPC contract: command selection stays in the main process, the renderer never
+  supplies an executable or arguments, and the child is spawned with `stdio: 'ignore'`.
+- `public/app.js` no longer contains a raw NUL byte (it had been written as a literal
+  control character in a `.join()` delimiter instead of `\u0000`). Runtime behaviour is
+  byte-identical, but `grep`/`ripgrep` classified the whole 11.6k-line file as binary and
+  silently skipped it — every content search over the main frontend file returned nothing.
 
 ## v2.5.0 - whole-app QAQC: platform-aware reporting, cockpit & Workbench polish
 

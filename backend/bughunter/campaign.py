@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import brain_techniques
+
 from bughunter import (
     account_login_service,
     active_verify_service,
@@ -269,7 +271,9 @@ def _run_campaign_body(
     campaign_settings = dataclasses.replace(get_settings(), excluded_hosts=tuple(excluded_hosts or ()))
 
     rt = runtime_dir
-    priors = learning.learned_priors(rt, program, clean_target) if rt is not None else {}
+    payout_priors = learning.learned_priors(rt, program, clean_target) if rt is not None else {}
+    chain_priors = brain_techniques.learned_hunt_priors(rt, program, clean_target) if rt is not None else {}
+    priors = brain_techniques.combine_priors(payout_priors, chain_priors)
     intel = learning.program_intelligence(rt, program, clean_target) if rt is not None else []
     prog_key = learning.program_key(program, clean_target)
 
@@ -362,6 +366,15 @@ def _run_campaign_body(
         # checks, so installations without a configured model still spend small request budgets
         # on the classes most suited to each route.
         hunt_surface = {"endpoints": urls, "params": recon_params, "tech": recon_tech, "forms": recon_forms}
+        hunt_techniques: list[brain_techniques.Technique] = []
+        technique_context = ""
+        try:
+            catalog = brain_techniques.load_techniques(rt or default_reports_dir, seed_dir or default_reports_dir)
+            hunt_task = " ".join([clean_target, *map(str, recon_tech), *map(str, recon_params[:30])])
+            hunt_techniques = brain_techniques.select_techniques(hunt_task, catalog, domain="hunt")
+            technique_context = brain_techniques.prompt_block(hunt_techniques, heading="Hunt techniques")
+        except Exception:  # noqa: BLE001 - Markdown guidance is advisory
+            pass
         hp = hunt_brain.heuristic_plan(hunt_surface)
         for row in (hp.get("probe_priority") or []):
             ep, classes = row.get("endpoint"), row.get("classes") or []
@@ -380,12 +393,27 @@ def _run_campaign_body(
             surface_for_brain = hunt_surface
             # seed_dir/runtime_dir locate the OPTIONAL learned offline ranker's weight file. With no
             # file present the planner is byte-identical to the hand-tuned rules, so this is safe to
-            # pass unconditionally.
-            hb = hunt_brain.plan_hunt(coder_cfg, clean_target, scope, surface_for_brain, priors=priors,
-                                      seed_dir=seed_dir, runtime_dir=rt)
+            # pass unconditionally. technique_context feeds the operator technique playbooks to a
+            # REASONING brain; the two are independent (offline ranker vs LLM prompt) and compose.
+            hb = hunt_brain.plan_hunt(
+                coder_cfg, clean_target, scope, surface_for_brain, priors=priors,
+                seed_dir=seed_dir, runtime_dir=rt,
+                technique_context=technique_context,
+            )
+            hb = brain_techniques.enrich_hunt_plan(hb, surface_for_brain, hunt_techniques, priors)
             # Capture the (surface, plan) input side for the trace log. recon_params is only ever
             # REBOUND below (never mutated in place), so this reference stays the recon-only surface.
             hunt_trace_surface, hunt_trace_plan = surface_for_brain, hb
+            chains = hb.get("attack_chains") or []
+            if chains:
+                _emit(f"hunt-brain: generated {len(chains)} evidence-gated attack chain(s)")
+                for chain in chains[:6]:
+                    progress.global_log("brain_dialog", {
+                        "domain": "hunt", "stage": "plan", "run_id": progress_run_id or "",
+                        "message": f"Planned {', '.join(chain.get('classes') or [])} chain; POE required",
+                        "chain_id": chain.get("id"), "classes": chain.get("classes") or [],
+                        "endpoint": chain.get("endpoint") or "",
+                    })
             new_params = [p for p in (hb.get("param_hypotheses") or [])
                           if p.lower() not in {q.lower() for q in recon_params}]
             if new_params:
@@ -818,6 +846,22 @@ def _run_campaign_body(
             hunt_trace.record_trace(rt, program=program, target=clean_target,
                                     surface=hunt_trace_surface, plan=hunt_trace_plan,
                                     consolidated=consolidated)
+
+    # Publish a local, redacted POE decision into the in-product operations stream. This is
+    # dialogue for the running app, never an external submission or production-side mutation.
+    if hunt_trace_plan is not None:
+        try:
+            chain_result = brain_techniques.chain_outcome_summary(hunt_trace_plan, consolidated)
+            target_label = urlparse(clean_target).hostname or _safe_slug(clean_target)
+            progress.global_log("poe_dialog", {
+                "domain": "hunt", "stage": "outcome", "run_id": progress_run_id or "",
+                "message": (f"POE decision: {chain_result['confirmed']} of {chain_result['planned']} "
+                            "planned chains produced independently confirmed evidence"),
+                "confirmed": chain_result["confirmed"], "planned": chain_result["planned"],
+                "target": target_label,
+            })
+        except Exception:  # noqa: BLE001 - live dialogue must never break a completed hunt
+            pass
 
     # --- Submission packages (reportable findings; confirmed first; never re-package a
     # finding already reported in a prior run). ---

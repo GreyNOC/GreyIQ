@@ -164,6 +164,13 @@ const els = {
   brainModelStatus: document.querySelector("#brainModelStatus"),
   brainDownload: document.querySelector("#brainDownload"),
   brainModelList: document.querySelector("#brainModelList"),
+  brainOpsRefresh: document.querySelector("#brainOpsRefresh"),
+  brainTechniqueList: document.querySelector("#brainTechniqueList"),
+  brainLiveFeed: document.querySelector("#brainLiveFeed"),
+  brainCodeTechniqueCount: document.querySelector("#brainCodeTechniqueCount"),
+  brainHuntTechniqueCount: document.querySelector("#brainHuntTechniqueCount"),
+  brainCodeSuccessCount: document.querySelector("#brainCodeSuccessCount"),
+  brainHuntConfirmCount: document.querySelector("#brainHuntConfirmCount"),
   agentToggle: document.querySelector("#agentToggle"),
   agentWorkspace: document.querySelector("#agentWorkspace"),
   agentWsPath: document.querySelector("#agentWsPath"),
@@ -625,6 +632,7 @@ async function refreshServiceStatus({ silent = false } = {}) {
     // If the backend only just became reachable, fill any Security-panel selectors
     // that bailed empty at boot (the lazy poll is how a late backend gets noticed).
     if (state.panelMode === "security") ensureSecurityData();
+    if (state.panelMode === "ops") void loadBrainOpsStatus({ force: true });
     if (!silent) {
       render();
     } else {
@@ -769,6 +777,125 @@ function liveStart() {
   ensureLiveBanner();
   void liveTick();
 }
+
+const brainOpsState = { loaded: false, loading: false, events: [] };
+
+function brainMetric(element, value) {
+  if (element) element.textContent = String(value ?? 0);
+}
+
+function renderBrainTechniques(snapshot) {
+  const data = snapshot?.techniques || {};
+  const learning = snapshot?.learning || {};
+  brainMetric(els.brainCodeTechniqueCount, data.code);
+  brainMetric(els.brainHuntTechniqueCount, data.hunt);
+  brainMetric(els.brainCodeSuccessCount, learning.code_successes);
+  brainMetric(els.brainHuntConfirmCount, learning.confirmed);
+  if (!els.brainTechniqueList) return;
+  els.brainTechniqueList.replaceChildren();
+  const items = Array.isArray(data.items) ? data.items : [];
+  const visible = [
+    ...items.filter((item) => item.domain === "code").slice(0, 4),
+    ...items.filter((item) => item.domain === "hunt").slice(0, 4),
+  ];
+  if (!visible.length) {
+    const empty = document.createElement("p");
+    empty.className = "ops-empty";
+    empty.textContent = "No Markdown techniques are available yet.";
+    els.brainTechniqueList.append(empty);
+    return;
+  }
+  for (const technique of visible) {
+    const card = document.createElement("article");
+    card.className = "brain-technique";
+    const header = document.createElement("div");
+    const badge = document.createElement("span");
+    badge.className = `brain-domain is-${technique.domain === "hunt" ? "hunt" : "code"}`;
+    badge.textContent = technique.domain === "hunt" ? "HUNT" : "CODE";
+    const name = document.createElement("strong");
+    name.textContent = String(technique.name || "Untitled technique");
+    header.append(badge, name);
+    const description = document.createElement("p");
+    description.textContent = String(technique.description || "Local Markdown procedure");
+    const source = document.createElement("small");
+    source.textContent = `${technique.source || "local"} Markdown`;
+    card.append(header, description, source);
+    els.brainTechniqueList.append(card);
+  }
+}
+
+async function loadBrainOpsStatus({ force = false } = {}) {
+  if (brainOpsState.loading || (brainOpsState.loaded && !force)) return;
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    if (els.brainTechniqueList) els.brainTechniqueList.textContent = "Local engine unavailable.";
+    return;
+  }
+  brainOpsState.loading = true;
+  if (els.brainOpsRefresh) els.brainOpsRefresh.disabled = true;
+  try {
+    const snapshot = await apiFetch("/api/brain/status", { timeoutMs: 8000 });
+    renderBrainTechniques(snapshot);
+    brainOpsState.loaded = true;
+  } catch (error) {
+    if (els.brainTechniqueList) els.brainTechniqueList.textContent = error.message || "Could not load brain status.";
+  } finally {
+    brainOpsState.loading = false;
+    if (els.brainOpsRefresh) els.brainOpsRefresh.disabled = false;
+  }
+}
+
+function renderBrainLiveFeed() {
+  if (!els.brainLiveFeed) return;
+  els.brainLiveFeed.replaceChildren();
+  if (!brainOpsState.events.length) {
+    const empty = document.createElement("p");
+    empty.className = "ops-empty";
+    empty.textContent = "Chain plans, code steps, and proof decisions will appear here.";
+    els.brainLiveFeed.append(empty);
+    return;
+  }
+  for (const event of brainOpsState.events.slice(-30)) {
+    const row = document.createElement("article");
+    row.className = `brain-live-row is-${event.domain}`;
+    const meta = document.createElement("div");
+    const domain = document.createElement("span");
+    domain.textContent = String(event.domain || "brain").toUpperCase();
+    const stage = document.createElement("span");
+    stage.textContent = String(event.stage || "event");
+    const time = document.createElement("time");
+    time.dateTime = event.at || "";
+    const parsed = new Date(event.at || Date.now());
+    time.textContent = Number.isNaN(parsed.getTime()) ? "now" : parsed.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    meta.append(domain, stage, time);
+    const message = document.createElement("p");
+    message.textContent = event.message;
+    row.append(meta, message);
+    els.brainLiveFeed.append(row);
+  }
+  els.brainLiveFeed.scrollTop = els.brainLiveFeed.scrollHeight;
+}
+
+function appendBrainLive(event) {
+  const payload = event?.payload || {};
+  let message = String(payload.message || "");
+  if (!message && event?.kind === "finding_confirmed") {
+    message = `POE confirmed: ${payload.title || payload.class_name || "reproducible finding"}`;
+  }
+  if (!message) return;
+  brainOpsState.events.push({
+    at: event.at || new Date().toISOString(),
+    domain: String(payload.domain || (event.kind === "finding_confirmed" ? "hunt" : "brain")),
+    stage: String(payload.stage || (event.kind === "finding_confirmed" ? "poe" : event.kind || "event")),
+    message: message.slice(0, 500),
+  });
+  if (brainOpsState.events.length > 40) brainOpsState.events.splice(0, brainOpsState.events.length - 40);
+  renderBrainLiveFeed();
+}
+
+liveOn("brain_dialog", appendBrainLive);
+liveOn("poe_dialog", appendBrainLive);
+liveOn("finding_confirmed", appendBrainLive);
+els.brainOpsRefresh?.addEventListener("click", () => { void loadBrainOpsStatus({ force: true }); });
 
 function serializableBot(bot) {
   return {
@@ -2241,7 +2368,12 @@ function applyTheme() {
   // Cockpit theme control shows the CURRENT theme (mockup's "Dark ▾" dropdown look); the moon
   // glyph + caret are CSS pseudo-elements so this textContent write can't clobber them.
   const ckTheme = document.querySelector("#ckTheme");
-  if (ckTheme) ckTheme.textContent = theme === "dark" ? "Dark" : "Light";
+  if (ckTheme) {
+    ckTheme.textContent = theme === "dark" ? "Dark" : "Light";
+    ckTheme.setAttribute("aria-label", "Dark mode");
+    ckTheme.setAttribute("aria-pressed", String(theme === "dark"));
+    ckTheme.title = theme === "dark" ? "Switch to light theme" : "Switch to dark theme";
+  }
 }
 
 function toggleTheme() {
@@ -2257,9 +2389,10 @@ els.themeToggle?.addEventListener("click", toggleTheme);
 // One surface at a time. Each mode owns a slice of the old "everything" panel, so
 // the user picks an intent and only its controls show. Mirrors the WAI-ARIA tabs
 // pattern (the workbench tablist uses the same approach).
-const PANEL_MODES = ["brain", "train", "security"];
+const PANEL_MODES = ["brain", "ops", "train", "security"];
 const PANEL_MODE_LABELS = {
   brain: { eyebrow: "Setup", title: "Coding Brain" },
+  ops: { eyebrow: "Live system", title: "Brain Operations" },
   train: { eyebrow: "Local model", title: "Training" },
   security: { eyebrow: "Offense", title: "Security" }
 };
@@ -2286,6 +2419,7 @@ function setPanelMode(mode, focusTab = false) {
   // and they're still empty — otherwise a backend that comes up after boot leaves
   // the dropdowns blank with no retry.
   if (mode === "security") ensureSecurityData();
+  if (mode === "ops") void loadBrainOpsStatus();
 }
 
 // Populate the Security panel's selectors if they haven't loaded yet. Idempotent
@@ -2677,7 +2811,7 @@ function renderWorkspaceTree(entries, truncated = state.workbenchTreeTruncated) 
     Boolean(truncated),
     Boolean(state.agentWorkspace),
     [...expandedDirs].sort().join("|")
-  ].join(" ");
+  ].join("\u0000");
   if (_treeRenderEntries === entries && _treeRenderSig === sig) return;
   _treeRenderEntries = entries;
   _treeRenderSig = sig;
@@ -4482,7 +4616,9 @@ const ck = {
   root: document.querySelector("#cockpit"),
   service: document.querySelector("#ckService"),
   theme: document.querySelector("#ckTheme"),
+  tacnoc: document.querySelector("#ckTacnoc"),
   studio: document.querySelector("#ckStudio"),
+  quickLaunch: document.querySelector("#ckQuickLaunch"),
   huntReturn: document.querySelector("#huntReturn"),
   nav: document.querySelector("#ckNav"),
   navButtons: [...document.querySelectorAll(".ck-nav-btn")],
@@ -4640,6 +4776,37 @@ function setAppMode(mode) {
   if (state.appMode === "hunt") ckSyncService();
 }
 
+async function ckLaunchTacnoc() {
+  if (!ck.tacnoc) return;
+  const launch = window.greyiqDesktop && window.greyiqDesktop.launchTacnoc;
+  if (typeof launch !== "function") {
+    window.alert("TACNOC can be opened from the GreyIQ desktop app. Browser-only mode cannot launch desktop applications.");
+    return;
+  }
+
+  const originalText = ck.tacnoc.textContent;
+  ck.tacnoc.disabled = true;
+  ck.tacnoc.setAttribute("aria-busy", "true");
+  ck.tacnoc.textContent = "Opening TACNOC…";
+  try {
+    const result = await launch();
+    if (!result || result.ok === false) {
+      window.alert((result && result.error) || "TACNOC could not be opened.");
+      return;
+    }
+    ck.tacnoc.textContent = "TACNOC opened";
+    setTimeout(() => {
+      if (ck.tacnoc) ck.tacnoc.textContent = originalText;
+    }, 1800);
+  } catch (err) {
+    window.alert((err && err.message) || "TACNOC could not be opened.");
+  } finally {
+    ck.tacnoc.disabled = false;
+    ck.tacnoc.removeAttribute("aria-busy");
+    if (ck.tacnoc.textContent === "Opening TACNOC…") ck.tacnoc.textContent = originalText;
+  }
+}
+
 function ckSyncService() {
   if (!ck.service) return;
   const up = Boolean(service.available);
@@ -4705,7 +4872,7 @@ function ckUpdateVerificationSummary() {
   if (ck.timeBased?.checked) enabled.push("deep SQLi");
   if (ck.live?.checked) enabled.push("browser pass");
   if (state.ckRunType !== "hunt" && ck.deep?.checked) enabled.push("auto-work");
-  label.textContent = enabled.length ? "Custom verification" : "Passive by default";
+  label.textContent = enabled.length ? "Custom verification" : "Passive scan";
   detail.textContent = enabled.length ? enabled.join(" · ") : "expand for proof probes";
 }
 
@@ -4730,21 +4897,50 @@ function ckUpdateLaunchReadiness() {
       ? "Enter the authorized target to continue."
       : "Choose a program or add a one-off target.";
   }
+  else if (proofEnabled && networkTarget && !scope) text = "Add authorized scope before using proof probes.";
   else if (!authorized) text = "Confirm authorization to unlock this run.";
   else {
     ready = true;
-    if (proofEnabled && networkTarget && !scope) {
-      ready = false;
-      text = "Add authorized scope before enabling network proof probes.";
-    } else {
-      const mode = isPortfolio ? "portfolio" : (isCampaign ? "campaign" : "single hunt");
-      const depth = proofEnabled ? "proof-enabled" : "passive-first";
-      text = `Ready · ${mode} · ${depth}.`;
-    }
+    const mode = isPortfolio ? "portfolio" : (isCampaign ? "campaign" : "single hunt");
+    const depth = proofEnabled ? "proof-enabled" : "passive-first";
+    text = `Ready · ${mode} · ${depth}.`;
   }
   ck.readiness.textContent = text;
   ck.readiness.classList.toggle("is-ready", ready);
   ck.readiness.classList.toggle("is-blocked", !ready);
+  ck.run?.classList.toggle("is-ready", ready);
+  if (ck.run) ck.run.title = ready ? "Launch this authorized run" : text;
+  if (ck.quickLaunch) {
+    ck.quickLaunch.textContent = ready ? "Review run" : "New run";
+    ck.quickLaunch.classList.toggle("is-ready", ready);
+    ck.quickLaunch.title = ready ? "Review the ready-to-launch run" : text;
+  }
+}
+
+// A single, predictable entry point into the launch flow. It opens the New run panel and
+// focuses the first unfinished requirement instead of making the operator hunt through fields.
+function ckFocusLaunchStep() {
+  const fold = document.querySelector("#ckSetupFold");
+  if (fold) fold.open = true;
+  const isPortfolio = state.ckRunType === "portfolio";
+  const portfolioCount = ck.portfolioList
+    ? ck.portfolioList.querySelectorAll("input[type=checkbox]:checked").length
+    : 0;
+  const target = (ck.target?.value || "").trim();
+  const scope = (ck.scope?.value || "").trim();
+  const proofEnabled = Boolean(ck.active?.checked || ck.timeBased?.checked || (state.ckRunType !== "hunt" && ck.deep?.checked));
+  const networkTarget = /^https?:\/\//i.test(target) && !ckIsCloneableGitUrl(target);
+  let next = null;
+  if (isPortfolio && !portfolioCount) next = ck.portfolioList;
+  else if (!isPortfolio && !ck.activeProgram?.value) next = ck.activeProgram;
+  else if (!isPortfolio && !target) next = ck.targetPick && !ck.targetPick.hidden ? ck.targetPick : ck.target;
+  else if (proofEnabled && networkTarget && !scope) next = ck.scope;
+  else if (!ck.authorized?.checked) next = ck.authorized;
+  else next = ck.run;
+  if (!next) return;
+  const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+  next.scrollIntoView?.({ behavior: reduced ? "auto" : "smooth", block: "center" });
+  setTimeout(() => next.focus?.(), reduced ? 0 : 180);
 }
 
 // The Portfolio-mode program multi-select: a checkbox per saved program (marking which have
@@ -6050,7 +6246,7 @@ function ckTextareaField(label, placeholder) {
 const CK_WALKTHROUGHS = {
   "program": {
     summary: "Program setup — walkthrough",
-    intro: "Set up the program you're authorized to test ONCE here, then reuse it everywhere: the launch rail's Program picker fills in Target/Scope, and the same list backs the Operator's autonomous scheduling. This is step one of Program → Hunt → Reports.",
+    intro: "Set up an authorized program once, then reuse it everywhere: New run loads its Target/Scope, and the same list backs Automation scheduling. This is step one of Program → Run → Findings → Report.",
     sections: [
       { h4: "Get the scope in", list: [
         ["Start from a repo link. ", "Paste one or more supported public forge repository roots above to create an inactive source-only draft in this same review form. Optional forge enrichment is read-only; any homepage hosts return unticked and need your authorization confirmation."],
@@ -6065,8 +6261,8 @@ const CK_WALKTHROUGHS = {
         "Repository hunts use a shallow temporary clone, the full adversarial source scanner, hunt-brain red-team triage, and the same report pipeline. Forge issue/blob/tree/pull pages and embedded credentials are rejected.",
       ] },
       { h4: "Then", ordered: true, list: [
-        ["Save the program. ", "It appears in the launch rail's Program picker and the Operator tab."],
-        ["Pick it before you hunt. ", "Selecting it in the launch rail fills in Target/Scope — still hand-editable after."],
+        ["Save the program. ", "It appears in New run and Automation."],
+        ["Pick it before you hunt. ", "Selecting it in New run fills Target/Scope — still hand-editable after."],
         ["Set up SSRF/OOB testing (optional). ", "Confirm the program's policy allows out-of-band testing, then jump straight to the Access-control tab's collaborator panel with scope pre-filled."],
       ] },
     ],
@@ -6371,7 +6567,7 @@ function ckSyncTargetControl(prog, preferred) {
 function ckWireSidebarResizer() {
   const root = ck.root, handle = ck.resizer;
   if (!root || !handle) return;
-  const KEY = "greyiq-sidebar-w", MIN = 176, MAX = 460;
+  const KEY = "greyiq-sidebar-w", MIN = 248, MAX = 440;
   const setW = (w, persist) => {
     w = Math.max(MIN, Math.min(MAX, Math.round(w)));
     root.style.setProperty("--ck-sidebar-w", w + "px");
@@ -6396,7 +6592,7 @@ function ckWireSidebarResizer() {
   handle.addEventListener("keydown", (e) => {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
     e.preventDefault();
-    const cur = parseInt(getComputedStyle(root).getPropertyValue("--ck-sidebar-w"), 10) || 232;
+    const cur = parseInt(getComputedStyle(root).getPropertyValue("--ck-sidebar-w"), 10) || 280;
     setW(cur + (e.key === "ArrowRight" ? 1 : -1) * (e.shiftKey ? 32 : 12), true);
   });
 }
@@ -6481,10 +6677,10 @@ function ckUpdateAuthorizedLabel() {
   if (!label) return;
   const spanning = state.ckRunType === "campaign" && ck.spanScope && !ck.spanScopeWrap?.hidden && ck.spanScope.checked;
   label.textContent = state.ckRunType === "portfolio"
-    ? "Confirm authorization for every selected program scope."
+    ? "I confirm every selected program scope is authorized."
     : spanning
-      ? "Confirm authorization for every in-scope program asset."
-      : "Confirm authorization and scope.";
+      ? "I confirm every in-scope program asset is authorized."
+      : "I confirm this run is authorized and in scope.";
   ckUpdateLaunchReadiness();
 }
 
@@ -6985,15 +7181,26 @@ function ckProgramSetupForm(prefill) {
       // The endpoint returns { ok:false, error } with HTTP 200 on a validation reject
       // (apiFetch only throws on HTTP errors), so an unchecked result would report
       // "Saved." for a program the server never stored — a silent data-loss illusion.
-      const res = await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify(payload) });
-      if (res && res.ok === false) {
-        saveNote.textContent = res.error || "Could not save that program.";
+      const saved = await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify(payload) });
+      if (saved && saved.ok === false) {
+        saveNote.textContent = saved.error || "Could not save that program.";
         saveNote.classList.add("is-error");
         return;
       }
+      const savedProgram = saved && saved.program;
+      const created = !editing;
       ckProgReset();
       saveNote.classList.remove("is-error"); saveNote.textContent = "Saved.";
       await ckRefreshProgramsEverywhere();
+      // A new program should flow straight into its first run. Select it, hydrate Target/Scope,
+      // open the launch panel, and focus the first remaining requirement (usually authorization).
+      if (created && savedProgram?.id && ck.activeProgram) {
+        ck.activeProgram.value = savedProgram.id;
+        ckApplyActiveProgram(savedProgram.id);
+        document.querySelector("#ckSetupFold")?.setAttribute("open", "");
+        ckStatus("Program saved · review the loaded target and scope, then confirm authorization.");
+        setTimeout(() => ckFocusLaunchStep(), 80);
+      }
       void ckRenderProgram();
     } catch (err) { saveNote.textContent = err.message || "Could not save."; saveNote.classList.add("is-error"); }
     finally { submit.disabled = false; }
@@ -7020,7 +7227,7 @@ async function ckRenderProgram() {
 
   host.append(cel("h2", "ck-section-title", "Programs"));
   host.append(cel("p", "ck-hint",
-    "Set up the programs you're authorized to test, once. Each one feeds the launch rail's Program picker and the Operator's scheduling."));
+    "Save authorized programs once. New run loads their approved scope; Automation reuses the same records for scheduling."));
   host.append(ckWalkthrough("program"));
 
   const topbar = cel("div", "ck-prog-topbar");
@@ -10268,7 +10475,7 @@ async function ckOperatorStop() {
   // A failed Stop must NOT be silent — an operator that thinks it stopped (but is still
   // auto-submitting) is the worst outcome here.
   try { await apiFetch("/api/operator/stop", { method: "POST", body: JSON.stringify({}) }); }
-  catch (err) { window.alert((err.message || "Could not reach the engine") + "\n\nThe operator may still be running — reopen the Operator tab to check its status."); }
+  catch (err) { window.alert((err.message || "Could not reach the engine") + "\n\nAutomation may still be running — reopen Automation to check its status."); }
   finally { ckOperatorBusy = false; setTimeout(() => void ckRenderOperator(), 400); }
 }
 
@@ -11003,7 +11210,7 @@ function ckRenderCampaign() {
     globe.src = "./globe.svg"; globe.alt = ""; globe.width = 150; globe.height = 150;
     hero.append(globe);
     hero.append(cel("p", "ck-hint",
-      "Nothing is running. Start a single Hunt, a Full campaign, or a Portfolio hunt from the launch rail — every target's status and each finding appears here live as it works."));
+      "Nothing is running. Start a Single hunt, Full campaign, or Portfolio from New run — every target status and finding appears here live."));
     const actions = cel("div", "ck-actions");
     const campaign = cel("button", "ck-btn primary", "Configure full campaign"); campaign.type = "button";
     campaign.addEventListener("click", () => {
@@ -11435,11 +11642,13 @@ function bootCockpit() {
     setAppMode("studio");
     els.promptInput?.focus();
   });
+  ck.tacnoc?.addEventListener("click", () => void ckLaunchTacnoc());
   ck.huntReturn?.addEventListener("click", () => {
     setAppMode("hunt");
     (ck.navButtons.find((b) => b.classList.contains("is-active")) || ck.navButtons[0])?.focus();
   });
   ck.theme?.addEventListener("click", () => toggleTheme());
+  ck.quickLaunch?.addEventListener("click", () => ckFocusLaunchStep());
   for (const btn of ck.navButtons) btn.addEventListener("click", () => ckSetView(btn.dataset.ckView));
   // Seed aria-current on the initially-active nav button — the default view is set via the HTML
   // is-active class (not through ckSetView), so it would otherwise stay unset until the first click.

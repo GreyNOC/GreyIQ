@@ -39,6 +39,7 @@ import offline_repair
 import project_memory
 import repomap
 import skills as skills_lib
+import brain_techniques
 import trust
 from bughunter.web_ingest import WebsiteFetchError, guarded_dns_scope, resolve_and_pin
 
@@ -1813,6 +1814,23 @@ def run_agent(
         except Exception:  # noqa: BLE001 - skills are best-effort, never block a run
             pass
 
+        # Shared technique retrieval also understands operator Markdown under Hunting/.
+        # Workspace notes are trust-wrapped before entering the system prompt.
+        try:
+            catalog = brain_techniques.load_techniques(runtime_dir, seed_dir, root)
+            technique_items = brain_techniques.select_techniques(message, catalog, domain="code")
+            known = {name.casefold() for name in selected_skills}
+            novel = [item for item in technique_items if item.name.casefold() not in known]
+            selected_skills.extend(item.name for item in novel)
+            block = brain_techniques.prompt_block(novel, heading="Coding techniques")
+            if block:
+                system_prompt += "\n\n" + block
+            learned = brain_techniques.learned_code_guidance(runtime_dir, selected_skills)
+            if learned:
+                system_prompt += "\n\n" + learned
+        except Exception:  # noqa: BLE001 - technique retrieval/learning is advisory
+            pass
+
     # Add deterministic deployment context before the repo map so server setup
     # tasks start with concrete project facts, not guesses.
     try:
@@ -1892,6 +1910,15 @@ def run_agent(
             exc.agent_touched = sorted(toolbox.touched)  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001 - snapshot capture must never mask the original error
             pass
+        # Failed and incomplete procedures are useful local learning signal too. Store only
+        # redacted intent and structural metadata, never code, diffs, or command output.
+        try:
+            brain_techniques.record_code_outcome(
+                runtime_dir, message=message, provider=provider, model=str(cfg.get("model") or ""),
+                completed=False, verified=False, skills=selected_skills, plan=plan, transcript=[],
+            )
+        except Exception:  # noqa: BLE001 - learning must never mask the agent error
+            pass
         raise
     # Attach change tracking (touched files + before/after) for the Workbench.
     result["changes"] = toolbox.change_payload()
@@ -1913,6 +1940,14 @@ def run_agent(
         )
     except Exception:  # noqa: BLE001 - trace recording must never break a run
         pass
+    # This outcome log includes verified, incomplete, and offline runs. Future procedure
+    # selection can therefore learn from both successful and unsuccessful workflows.
+    brain_techniques.record_code_outcome(
+        runtime_dir, message=message, provider=str(result.get("provider") or ""),
+        model=str(result.get("model") or ""), completed=bool(result.get("completed")),
+        verified=bool(result.get("verified")), skills=selected_skills, plan=plan,
+        transcript=result.get("transcript") if isinstance(result.get("transcript"), list) else [],
+    )
     return result
 
 

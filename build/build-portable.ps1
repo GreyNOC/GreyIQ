@@ -101,7 +101,7 @@ Write-Step "Installing Python build dependencies (CPU torch + requirements + PyI
 & $Py -m pip install --upgrade pip; Assert-LastExit "pip upgrade"
 # CPU-only torch keeps the bundle under GitHub's 2 GiB per-asset cap; the app only
 # uses torch for the small TinyGPT model (brain GPU accel comes via Ollama).
-& $Py -m pip install "torch>=2.2,<2.8" --index-url https://download.pytorch.org/whl/cpu
+& $Py -m pip install "torch>=2.13,<3.0" --index-url https://download.pytorch.org/whl/cpu
 Assert-LastExit "CPU torch install"
 & $Py -m pip install -r requirements.txt; Assert-LastExit "requirements.txt install"
 & $Py -m pip install -r build/requirements-build.txt; Assert-LastExit "build requirements install"

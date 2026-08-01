@@ -1,9 +1,9 @@
-torch>=2.2,<2.8
+torch>=2.13,<3.0
 numpy>=1.26,<3.0
 anthropic>=0.49,<1.0
 uvicorn>=0.34,<0.35
 pydantic>=2.10,<3.0
-pypdf>=5.0,<6.0
+pypdf>=6.14.2,<7.0
 pdf2image>=1.17,<1.18
 pytesseract>=0.3.10,<0.4.0
 Pillow>=10.0,<13.0
@@ -19,4 +19,4 @@ playwright>=1.49,<2.0
 # RSA (RS256) signing to mint the short-lived JWT that proves a leaked GCP service-account key is
 # live — one benign token-exchange to Google's OWN issuer (credential_validation.validate_gcp_service_account).
 # AWS key liveness uses stdlib hmac (SigV4), no dep. The frozen build bundles it (see build spec collect_all).
-cryptography>=42.0,<46.0
+cryptography>=49.0,<50.0

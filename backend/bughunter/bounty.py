@@ -24,6 +24,7 @@ from urllib.parse import parse_qsl, urlparse
 from uuid import uuid4
 
 import coder
+import brain_techniques
 from bughunter import active_verify_service
 from bughunter import brain_narrative
 from bughunter import brain_safety
@@ -1965,12 +1966,29 @@ def run_bounty_hunt(
                     f"{len(endpoint_class_priorities)} endpoint(s) from observed semantics"
                 )
 
-            priors = learning.learned_priors(runtime_dir, None, clean_target) if runtime_dir is not None else None
+            payout_priors = learning.learned_priors(runtime_dir, None, clean_target) if runtime_dir is not None else {}
+            chain_priors = brain_techniques.learned_hunt_priors(runtime_dir, None, clean_target) if runtime_dir is not None else {}
+            priors = brain_techniques.combine_priors(payout_priors, chain_priors)
+            hunt_techniques: list[brain_techniques.Technique] = []
+            technique_context = ""
+            if runtime_dir is not None and seed_dir is not None:
+                try:
+                    catalog = brain_techniques.load_techniques(runtime_dir, seed_dir)
+                    hunt_task = " ".join([clean_target, *map(str, surface_for_brain.get("tech") or [])])
+                    hunt_techniques = brain_techniques.select_techniques(hunt_task, catalog, domain="hunt")
+                    technique_context = brain_techniques.prompt_block(hunt_techniques, heading="Hunt techniques")
+                except Exception:  # noqa: BLE001 - Markdown guidance is advisory
+                    pass
             # seed_dir/runtime_dir locate the OPTIONAL learned offline ranker's weight file. With no
             # file present the planner is byte-identical to the hand-tuned rules, so this is safe to
-            # pass unconditionally.
-            hb = hunt_brain.plan_hunt(coder_cfg, clean_target, scope, surface_for_brain, priors=priors,
-                                      seed_dir=seed_dir, runtime_dir=runtime_dir)
+            # pass unconditionally. technique_context feeds the operator technique playbooks to a
+            # REASONING brain; the two are independent (offline ranker vs LLM prompt) and compose.
+            hb = hunt_brain.plan_hunt(
+                coder_cfg, clean_target, scope, surface_for_brain, priors=priors,
+                seed_dir=seed_dir, runtime_dir=runtime_dir,
+                technique_context=technique_context,
+            )
+            hb = brain_techniques.enrich_hunt_plan(hb, surface_for_brain, hunt_techniques, priors)
             # Capture the (surface, plan) input side for the trace log. effective_extra_params is
             # REBOUND below (never mutated in place) when brain params merge, so this snapshot
             # stays the recon-only surface. list() the endpoints/params to be doubly safe.

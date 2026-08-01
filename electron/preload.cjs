@@ -11,4 +11,7 @@ contextBridge.exposeInMainWorld('greyiqDesktop', {
   // Provision (download on first use) + start the on-demand Ollama runtime when the
   // user selects the local model. Resolves { ok, runtime } or { ok: false, error }.
   ensureOllama: () => ipcRenderer.invoke('greyiq:ensure-ollama'),
+  // Launch the companion TACNOC desktop application through the main process's
+  // fixed-path discovery. The renderer never supplies an executable or arguments.
+  launchTacnoc: () => ipcRenderer.invoke('greyiq:launch-tacnoc'),
 });

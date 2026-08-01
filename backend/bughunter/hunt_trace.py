@@ -138,10 +138,24 @@ def _compact_plan(plan: dict[str, Any] | None) -> dict[str, Any]:
         classes = _clip_strs(row.get("classes"), 10)
         if endpoint and classes:
             priority.append({"endpoint": endpoint, "classes": classes})
+    chains: list[dict[str, Any]] = []
+    for row in (p.get("attack_chains") or [])[:12]:
+        if not isinstance(row, dict):
+            continue
+        endpoint = _redact_url(row.get("endpoint"))
+        classes = _clip_strs(row.get("classes"), 6)
+        if endpoint and classes:
+            chains.append({
+                "id": str(row.get("id") or "")[:40],
+                "endpoint": endpoint, "classes": classes,
+                "techniques": _clip_strs(row.get("techniques"), 6),
+            })
     return {
         "provider": str(p.get("provider") or "")[:40],
         "model": str(p.get("model") or "")[:120],
         "used": bool(p.get("used")),
+        "techniques": _clip_strs(p.get("techniques"), 12),
+        "attack_chains": chains,
         "param_hypotheses": _clip_strs(p.get("param_hypotheses"), _MAX_PLAN_LIST),  # NAMES only
         "probe_priority": priority,
         "idor_candidates": _clip_urls(p.get("idor_candidates"), _MAX_PLAN_LIST),  # URLs — redact

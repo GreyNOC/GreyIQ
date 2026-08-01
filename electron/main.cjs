@@ -52,6 +52,145 @@ function ensureExecutable(filePath) {
   }
 }
 
+function existingFile(filePath) {
+  if (!filePath) return false;
+  try {
+    return fs.statSync(filePath).isFile();
+  } catch (_) {
+    return false;
+  }
+}
+
+function newestMatchingFile(dirPath, pattern) {
+  try {
+    return fs.readdirSync(dirPath)
+      .filter((name) => pattern.test(name))
+      .map((name) => path.join(dirPath, name))
+      .filter(existingFile)
+      .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0] || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+// TACNOC remains its own sandboxed Electron application and engine. GreyIQ only
+// discovers and starts that trusted companion; no renderer-controlled path or
+// command-line argument crosses IPC. An explicit environment override supports
+// custom installs, while the remaining candidates cover bundled, installed, and
+// local-development layouts.
+function tacnocCommandFrom(candidate) {
+  if (!candidate) return null;
+  const target = path.resolve(candidate);
+  if (existingFile(target)) return { exe: target, args: [], cwd: path.dirname(target) };
+
+  try {
+    if (!fs.statSync(target).isDirectory()) return null;
+  } catch (_) {
+    return null;
+  }
+
+  if (process.platform === 'darwin' && target.toLowerCase().endsWith('.app')) {
+    return { exe: '/usr/bin/open', args: [target], cwd: path.dirname(target) };
+  }
+
+  const packaged = process.platform === 'win32'
+    ? [
+        path.join(target, 'TACNOC.exe'),
+        path.join(target, 'dist', 'win-unpacked', 'TACNOC.exe'),
+      ]
+    : [
+        path.join(target, 'TACNOC'),
+        path.join(target, 'dist', 'TACNOC'),
+      ];
+  for (const executable of packaged) {
+    if (existingFile(executable)) return { exe: executable, args: [], cwd: path.dirname(executable) };
+  }
+
+  const artifact = process.platform === 'win32'
+    ? newestMatchingFile(path.join(target, 'dist'), /^TACNOC-.*-Portable-.*\.exe$/i)
+    : newestMatchingFile(path.join(target, 'dist'), /^TACNOC-.*\.AppImage$/i);
+  if (artifact) return { exe: artifact, args: [], cwd: path.dirname(artifact) };
+
+  // A built development checkout can run through its own Electron binary. Requiring
+  // both the compiled main entry and package identity avoids treating an arbitrary
+  // directory as an Electron application.
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(target, 'package.json'), 'utf8'));
+    const electron = process.platform === 'win32'
+      ? path.join(target, 'node_modules', 'electron', 'dist', 'electron.exe')
+      : path.join(target, 'node_modules', 'electron', 'dist', 'electron');
+    if (pkg.name === 'greynoc-tacnoc'
+        && existingFile(path.join(target, 'out', 'main', 'index.js'))
+        && existingFile(electron)) {
+      return { exe: electron, args: [target], cwd: target };
+    }
+  } catch (_) {
+    // Not a TACNOC source checkout.
+  }
+  return null;
+}
+
+function resolveTacnocCommand() {
+  const candidates = [];
+  if (process.env.GREYIQ_TACNOC_PATH) candidates.push(process.env.GREYIQ_TACNOC_PATH);
+  if (app.isPackaged) candidates.push(path.join(process.resourcesPath, 'tacnoc'));
+
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA || '';
+    if (localAppData) {
+      candidates.push(path.join(localAppData, 'Programs', 'TACNOC', 'TACNOC.exe'));
+      candidates.push(path.join(localAppData, 'Programs', 'greynoc-tacnoc', 'TACNOC.exe'));
+    }
+    candidates.push(path.join(path.dirname(process.execPath), 'TACNOC.exe'));
+  } else if (process.platform === 'darwin') {
+    candidates.push('/Applications/TACNOC.app');
+  } else {
+    candidates.push('/opt/TACNOC/TACNOC');
+    candidates.push('/usr/local/bin/tacnoc');
+  }
+
+  // GreyNOC's normal local-development checkout name. app.getPath('desktop') is
+  // user-relative, so this works without hard-coding an account name or drive.
+  candidates.push(path.join(app.getPath('desktop'), 'GreyNOC Belcher'));
+
+  for (const candidate of [...new Set(candidates.filter(Boolean))]) {
+    const command = tacnocCommandFrom(candidate);
+    if (command) return command;
+  }
+  return null;
+}
+
+function launchTacnoc() {
+  const command = resolveTacnocCommand();
+  if (!command) {
+    return Promise.resolve({
+      ok: false,
+      error: 'TACNOC was not found. Install TACNOC or set GREYIQ_TACNOC_PATH to its executable or project folder.',
+    });
+  }
+  if (process.platform !== 'win32' && command.exe !== '/usr/bin/open') ensureExecutable(command.exe);
+
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(command.exe, command.args, {
+        cwd: command.cwd,
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: false,
+      });
+    } catch (err) {
+      resolve({ ok: false, error: `TACNOC could not be opened: ${err.message}` });
+      return;
+    }
+    child.once('error', (err) => resolve({ ok: false, error: `TACNOC could not be opened: ${err.message}` }));
+    child.once('spawn', () => {
+      child.unref();
+      resolve({ ok: true });
+    });
+  });
+}
+
 let mainWindow = null;
 let backendProcess = null;
 let ollamaProcess = null;
@@ -300,33 +439,62 @@ async function startBackend() {
   }
 }
 
+function escapeSystemPageHtml(value) {
+  return String(value == null ? '' : value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+const SYSTEM_PAGE_HEAD = `
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:">
+  <meta name="color-scheme" content="dark">
+`;
+
 function loadingHtml() {
   return `data:text/html;charset=utf-8,${encodeURIComponent(`
-    <body style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#f6f7f4;color:#1d2430">
+    <!doctype html>${SYSTEM_PAGE_HEAD}
+    <body style="font-family:'IBM Plex Sans',system-ui,-apple-system,Segoe UI,sans-serif;margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#0a0e14;color:#edf1f6">
       <div style="text-align:center;max-width:440px;padding:24px">
-        <div style="width:42px;height:42px;border:4px solid #d6dad0;border-top-color:#3b7a57;border-radius:50%;margin:0 auto 22px;animation:spin 1s linear infinite"></div>
-        <h1 style="font-size:20px;font-weight:500;margin:0 0 10px">Starting GreyIQ…</h1>
-        <p style="color:#5f6b5a;font-size:14px;line-height:1.65;margin:0">The bug-bounty engine is starting. The first launch unpacks the app once (later launches are much faster). This window opens automatically when it's ready.</p>
+        <div style="font:600 11px 'Cascadia Mono',Consolas,monospace;letter-spacing:.12em;text-transform:uppercase;color:#7e8b9c;margin-bottom:18px">GreyNOC / Operations</div>
+        <div style="width:36px;height:36px;border:3px solid #1e2633;border-top-color:#5b8cff;border-radius:50%;margin:0 auto 22px;animation:spin 1s linear infinite"></div>
+        <h1 style="font-size:20px;font-weight:700;margin:0 0 10px">Starting GreyIQ…</h1>
+        <p style="color:#a8b3c2;font-size:14px;line-height:1.65;margin:0">The local engine is starting. First launch setup takes longer; later launches are faster. This window opens automatically when it is ready.</p>
       </div>
       <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
     </body>`)}`;
 }
 
 function errorHtml() {
+  const detail = escapeSystemPageHtml(startupError || 'Unknown startup error.');
+  const logPath = escapeSystemPageHtml(backendLogPath());
   return `data:text/html;charset=utf-8,${encodeURIComponent(`
-    <body style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:32px;background:#f6f7f4;color:#1d2430">
-      <h1 style="font-size:20px;font-weight:500">GreyIQ backend did not start</h1>
-      <p style="color:#5f6b5a;line-height:1.6">${startupError || 'Unknown startup error.'}</p>
-      <p style="color:#5f6b5a;line-height:1.6">The first launch is the slowest. Try closing and reopening GreyIQ — the engine unpacks once and starts faster afterwards. A log is at:<br><code>${backendLogPath()}</code></p>
+    <!doctype html>${SYSTEM_PAGE_HEAD}
+    <body style="font-family:'IBM Plex Sans',system-ui,-apple-system,Segoe UI,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:#0a0e14;color:#edf1f6">
+      <main style="width:min(620px,calc(100% - 48px));padding:28px;border:1px solid #1e2633;border-radius:6px;background:#10151d">
+        <div style="font:600 11px 'Cascadia Mono',Consolas,monospace;letter-spacing:.12em;text-transform:uppercase;color:#f0506e">Engine unavailable</div>
+        <h1 style="font-size:20px;font-weight:700;margin:10px 0">GreyIQ did not start</h1>
+        <p style="color:#a8b3c2;line-height:1.6">${detail}</p>
+        <p style="color:#a8b3c2;line-height:1.6">Close and reopen GreyIQ. If the problem continues, review the local log:<br><code style="color:#7aa2ff">${logPath}</code></p>
+      </main>
     </body>`)}`;
 }
 
 function backendStoppedHtml(code, signal) {
+  const exitDetail = escapeSystemPageHtml(`code=${code} signal=${signal}`);
+  const logPath = escapeSystemPageHtml(backendLogPath());
   return `data:text/html;charset=utf-8,${encodeURIComponent(`
-    <body style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:32px;background:#f6f7f4;color:#1d2430">
-      <h1 style="font-size:20px;font-weight:500">GreyIQ engine stopped</h1>
-      <p style="color:#5f6b5a;line-height:1.6">The local bug-bounty engine exited unexpectedly (code=${code} signal=${signal}), so the app can no longer reach it. Your saved programs, scopes, and reports are on disk and are safe.</p>
-      <p style="color:#5f6b5a;line-height:1.6">Close and reopen GreyIQ to continue. A log is at:<br><code>${backendLogPath()}</code></p>
+    <!doctype html>${SYSTEM_PAGE_HEAD}
+    <body style="font-family:'IBM Plex Sans',system-ui,-apple-system,Segoe UI,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:#0a0e14;color:#edf1f6">
+      <main style="width:min(620px,calc(100% - 48px));padding:28px;border:1px solid #1e2633;border-radius:6px;background:#10151d">
+        <div style="font:600 11px 'Cascadia Mono',Consolas,monospace;letter-spacing:.12em;text-transform:uppercase;color:#f0506e">Engine stopped</div>
+        <h1 style="font-size:20px;font-weight:700;margin:10px 0">GreyIQ lost its local engine</h1>
+        <p style="color:#a8b3c2;line-height:1.6">The engine exited unexpectedly (${exitDetail}). Your saved programs, scopes, and reports remain safe on disk.</p>
+        <p style="color:#a8b3c2;line-height:1.6">Close and reopen GreyIQ to continue. Local log:<br><code style="color:#7aa2ff">${logPath}</code></p>
+      </main>
     </body>`)}`;
 }
 
@@ -342,7 +510,7 @@ function createWindow() {
     minWidth: 980,
     minHeight: 680,
     title: APP_NAME,
-    backgroundColor: '#f6f7f4',
+    backgroundColor: '#0a0e14',
     // GreyNOC orb app icon for the window, taskbar/dock, and dev runs. On packaged
     // Windows the taskbar uses the icon embedded in the exe (build/icon.ico via
     // electron-builder); setting it here also covers `electron .` dev runs and Linux,
@@ -656,6 +824,10 @@ function registerIpcHandlers() {
     const accelerated = vendor === 'nvidia' || (vendor === 'amd' && activeOllamaRuntime === 'rocm');
     return { vendor, runtime: activeOllamaRuntime, accelerated };
   });
+
+  // Open the companion TACNOC app in its own hardened Electron process. Keeping
+  // the engines separate preserves TACNOC's contextBridge and secret-store boundary.
+  ipcMain.handle('greyiq:launch-tacnoc', async () => launchTacnoc());
 }
 
 async function boot() {
