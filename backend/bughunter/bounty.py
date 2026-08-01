@@ -1966,7 +1966,11 @@ def run_bounty_hunt(
                 )
 
             priors = learning.learned_priors(runtime_dir, None, clean_target) if runtime_dir is not None else None
-            hb = hunt_brain.plan_hunt(coder_cfg, clean_target, scope, surface_for_brain, priors=priors)
+            # seed_dir/runtime_dir locate the OPTIONAL learned offline ranker's weight file. With no
+            # file present the planner is byte-identical to the hand-tuned rules, so this is safe to
+            # pass unconditionally.
+            hb = hunt_brain.plan_hunt(coder_cfg, clean_target, scope, surface_for_brain, priors=priors,
+                                      seed_dir=seed_dir, runtime_dir=runtime_dir)
             # Capture the (surface, plan) input side for the trace log. effective_extra_params is
             # REBOUND below (never mutated in place) when brain params merge, so this snapshot
             # stays the recon-only surface. list() the endpoints/params to be doubly safe.

@@ -12,6 +12,23 @@ the impact/proof model, the active verifier), so it runs anywhere the scanners
 run — including a phone — without the ML stack. The frozen backend exe dispatches
 here when given a subcommand (see run_frozen.py), so the shipped binary is also
 the CLI.
+
+Two structural rules make that dual-purpose binary safe to extend:
+
+  * A verb owned by another module registers ITSELF through ``_VERB_PLUGINS``
+    (see :func:`_register_plugin_verbs`) instead of being hand-wired here, so
+    adding a command touches exactly one file — the module that implements it.
+  * ``CLI_COMMANDS`` is DERIVED from :func:`build_parser`, never hand-listed.
+    The hand-listed tuple had silently drifted: ``platforms``, ``bundle``,
+    ``takeover``, ``cve``, ``idor``, ``bfla`` and ``idor-probe`` were all
+    registered on the parser but missing from it, so ``run_frozen.py``'s
+    dispatch test failed and the shipped exe booted the API SERVER instead of
+    running those commands. Deriving the set makes that drift unrepresentable.
+
+Both rules cost a parser build at import time, which is only cheap because every
+``_cmd_*`` imports its engine INSIDE the function body (see ``_cmd_traces`` /
+``_cmd_scan``). Registration must stay import-light or ``test_boot_no_torch.py``
+and CLI startup latency both regress — that convention binds plugins too.
 """
 
 from __future__ import annotations
@@ -44,8 +61,18 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError, OSError):
         pass
 
-# These are the CLI verbs run_frozen.py recognizes to dispatch here.
-CLI_COMMANDS = ("hunt", "campaign", "scan", "learn", "stats", "traces", "operator", "profiles", "classes", "tools", "version", "gn")
+# Verbs run_frozen.py dispatches on that have NO subparser of their own. "gn" is the bare
+# alias prefix (`greyiq-backend.exe gn hunt ...`), stripped by main() before parsing.
+_ALWAYS_DISPATCH: tuple[str, ...] = ("gn",)
+
+# Modules that own their own `gn` verb. Each exposes `register_cli(sub) -> None`, which calls
+# sub.add_parser(...) + set_defaults(func=...). Imported LAZILY by build_parser() and
+# fail-closed: a module that does not exist yet (or fails to import, or raises while
+# registering) is simply skipped, so the CLI always builds. A plugin MUST keep its module
+# import light — it runs on every `import gn_cli`, and pulling torch/pandas in at
+# registration time would break test_boot_no_torch.py and CLI startup. Import the engine
+# inside the command function, exactly like the _cmd_* handlers below.
+_VERB_PLUGINS: tuple[str, ...] = ("bughunter.hunt_train", "bughunter.wardrive.cli", "edit_mine")
 
 _SEV_COLOR = {"critical": "1;31", "high": "31", "medium": "33", "low": "36", "info": "2"}
 
@@ -653,6 +680,31 @@ def _cmd_version(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _register_plugin_verbs(sub: argparse._SubParsersAction) -> None:
+    """Let each module in ``_VERB_PLUGINS`` add its own subcommand.
+
+    Deliberately total: a plugin that is absent (the module ships in a later release),
+    unimportable (a broken optional dependency), or that raises inside ``register_cli``
+    is SKIPPED, never propagated. build_parser() is on the import path of both the CLI
+    and run_frozen.py's dispatch test, so a single bad optional module must never be
+    able to stop `gn` from parsing `gn hunt` — losing one verb is recoverable, a CLI
+    that cannot build is not.
+    """
+    import importlib
+
+    for mod_name in _VERB_PLUGINS:
+        try:
+            register = getattr(importlib.import_module(mod_name), "register_cli", None)
+        except Exception:  # noqa: BLE001 - a missing/broken plugin must never break the CLI
+            continue
+        if not callable(register):
+            continue
+        try:
+            register(sub)
+        except Exception:  # noqa: BLE001 - same contract: a bad registration costs one verb, not the CLI
+            continue
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gn",
@@ -830,7 +882,30 @@ def build_parser() -> argparse.ArgumentParser:
     version = sub.add_parser("version", help="print the version")
     version.set_defaults(func=_cmd_version)
 
+    _register_plugin_verbs(sub)  # LAST: plugin verbs are additive and must not shadow a core verb
+    # Record the registered verb set on the parser so CLI_COMMANDS can be derived from it
+    # rather than hand-maintained (see the module docstring for the drift this fixes).
+    parser.set_defaults(_verbs=tuple(sorted(sub.choices)))
     return parser
+
+
+def cli_commands() -> tuple[str, ...]:
+    """The verbs run_frozen.py dispatches to this CLI, derived from build_parser().
+
+    Fail-closed to the empty set on any parser failure: dispatch must never depend on a
+    plugin. An empty result degrades the frozen exe to API-server mode (its behaviour
+    before a CLI existed) rather than crashing the binary at startup.
+    """
+    try:
+        verbs = tuple(build_parser().get_default("_verbs") or ())
+    except Exception:  # noqa: BLE001 - dispatch must never depend on a plugin
+        verbs = ()
+    return tuple(sorted(set(verbs) | set(_ALWAYS_DISPATCH)))
+
+
+# Module-level for run_frozen.py, which reads `gn_cli.CLI_COMMANDS` at dispatch time.
+# Must stay defined AFTER build_parser() so the derivation can run at import.
+CLI_COMMANDS: tuple[str, ...] = cli_commands()
 
 
 def main(argv: list[str] | None = None) -> int:

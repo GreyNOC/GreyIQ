@@ -1,0 +1,56 @@
+{
+  "engagement": "{{engagement}}",
+  "created_utc": "{{date}}",
+  "platform": "undetermined - name the bug bounty platform, or 'direct' for a private engagement",
+  "authorization": {
+    "signed_scope_on_file": false,
+    "reference": "undetermined - link or ticket for the signed scope document",
+    "window_start_utc": "undetermined - ISO-8601",
+    "window_end_utc": "undetermined - ISO-8601",
+    "note": "GreyNOC rules of engagement: NO activity until signed_scope_on_file is true and the window is open."
+  },
+  "in_scope": {
+    "domains": [],
+    "ip_ranges": [],
+    "web_apps": [],
+    "api_hosts": [],
+    "mobile_apps": [],
+    "source_repos": []
+  },
+  "out_of_scope": {
+    "domains": [],
+    "ip_ranges": [],
+    "paths": [],
+    "classes": [
+      "denial of service / volumetric testing",
+      "social engineering and physical access",
+      "third-party SaaS the program does not own"
+    ]
+  },
+  "rules_of_engagement": {
+    "least_impact": true,
+    "prefer_read_only": true,
+    "no_data_exfiltration_beyond_minimal_proof": true,
+    "max_requests_per_minute": 60,
+    "request_budget": 5000,
+    "self_scoped_tenancy": "two tenants you own - never another customer's data",
+    "canary_marker": "GNBB-CANARY-<uuid4>",
+    "stop_conditions": [
+      "production impact observed",
+      "third-party or another tenant's data reached",
+      "scope ambiguity",
+      "program asks you to stop"
+    ]
+  },
+  "evidence": {
+    "reproducible_or_it_did_not_happen": true,
+    "minimal_proof_only": true,
+    "redact_captured_secrets_in_reports": true,
+    "artifacts": ["replay.sh", "findings.har", "INDEX.md"]
+  },
+  "contacts": {
+    "program_security": "undetermined",
+    "escalation": "undetermined"
+  },
+  "notes": "Fill every 'undetermined' before the first request. Do not guess a value to make the file look complete."
+}

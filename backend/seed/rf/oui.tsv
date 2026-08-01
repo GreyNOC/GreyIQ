@@ -1,0 +1,134 @@
+# GreyIQ wardrive — curated IEEE MA-L (OUI) subset.
+#
+# vintage: 2026-07  |  provenance: hand-curated from the public IEEE MA-L registry
+# scope: DELIBERATELY NOT the full ~35k-row registry. Only prefixes that can CHANGE A
+#   VERDICT during rogue-AP / evil-twin triage are carried:
+#     enterprise-ap  — vendors whose kit is normally part of a managed WLAN
+#     consumer-ap    — retail / ISP CPE, i.e. "someone plugged in their own router"
+#     soc-devboard   — SoC and dev-board makers; a BEACONING AP on one of these prefixes
+#                      in a corporate RF environment is inherently worth a look
+#     mobile         — handset/laptop radios, so a client looks like a client
+#     network-gear   — switching/routing silicon that also ships radios
+#
+# HONESTY CONTRACT: a BSSID that is ABSENT from this table means "not in GreyIQ's
+# curated subset", NOT "unknown vendor" and NEVER "suspicious". oui.vendor_for()
+# returns None for it and the report prints the table's vintage next to every
+# unknown-vendor verdict so table age is attributable rather than presented as fact.
+# The zero-byte, always-correct signal that needs no table at all is the
+# locally-administered bit (model.is_locally_administered) — a soft-AP / hostapd /
+# phone-hotspot signature that works on every address, in or out of this file.
+#
+# format: <oui-hex-no-separators>\t<vendor>\t<class>
+000b85	Cisco Systems	enterprise-ap
+001aa1	Cisco Systems	enterprise-ap
+002497	Cisco Systems	enterprise-ap
+0026cb	Cisco Systems	enterprise-ap
+5897bd	Cisco Systems	enterprise-ap
+70df2f	Cisco Systems	enterprise-ap
+00180a	Cisco Meraki	enterprise-ap
+881544	Cisco Meraki	enterprise-ap
+e0553d	Cisco Meraki	enterprise-ap
+6cf37f	Aruba Networks	enterprise-ap
+24dec6	Aruba Networks	enterprise-ap
+94b40f	Aruba Networks	enterprise-ap
+d8c7c8	Aruba Networks	enterprise-ap
+9c1c12	Aruba Networks	enterprise-ap
+000496	Extreme Networks	enterprise-ap
+c0c520	Ruckus Wireless	enterprise-ap
+2ce6cc	Ruckus Wireless	enterprise-ap
+94b34f	Ruckus Wireless	enterprise-ap
+2c6bf5	Juniper Networks	enterprise-ap
+7819f7	Juniper Networks	enterprise-ap
+24a43c	Ubiquiti Networks	enterprise-ap
+44d9e7	Ubiquiti Networks	enterprise-ap
+788a20	Ubiquiti Networks	enterprise-ap
+7483c2	Ubiquiti Networks	enterprise-ap
+e063da	Ubiquiti Networks	enterprise-ap
+dc9fdb	Ubiquiti Networks	enterprise-ap
+f09fc2	Ubiquiti Networks	enterprise-ap
+0418d6	Ubiquiti Networks	enterprise-ap
+687251	Ubiquiti Networks	enterprise-ap
+b4fbe4	Ubiquiti Networks	enterprise-ap
+fcecda	Ubiquiti Networks	enterprise-ap
+00146c	NETGEAR	consumer-ap
+204e7f	NETGEAR	consumer-ap
+9c3dcf	NETGEAR	consumer-ap
+30469a	NETGEAR	consumer-ap
+c03f0e	NETGEAR	consumer-ap
+dcef09	NETGEAR	consumer-ap
+b03956	NETGEAR	consumer-ap
+14cc20	TP-Link Technologies	consumer-ap
+50c7bf	TP-Link Technologies	consumer-ap
+a0f3c1	TP-Link Technologies	consumer-ap
+c46e1f	TP-Link Technologies	consumer-ap
+ec086b	TP-Link Technologies	consumer-ap
+f4f26d	TP-Link Technologies	consumer-ap
+30b5c2	TP-Link Technologies	consumer-ap
+98dac4	TP-Link Technologies	consumer-ap
+ac84c6	TP-Link Technologies	consumer-ap
+b0be76	TP-Link Technologies	consumer-ap
+e8de27	TP-Link Technologies	consumer-ap
+001b11	D-Link	consumer-ap
+1c7ee5	D-Link	consumer-ap
+14d64d	D-Link	consumer-ap
+78542e	D-Link	consumer-ap
+c8be19	D-Link	consumer-ap
+9094e4	D-Link	consumer-ap
+08606e	ASUSTek Computer	consumer-ap
+2c56dc	ASUSTek Computer	consumer-ap
+305a3a	ASUSTek Computer	consumer-ap
+50465d	ASUSTek Computer	consumer-ap
+ac9e17	ASUSTek Computer	consumer-ap
+bcee7b	ASUSTek Computer	consumer-ap
+d850e6	ASUSTek Computer	consumer-ap
+0014bf	Cisco-Linksys	consumer-ap
+00226b	Cisco-Linksys	consumer-ap
+48f8b3	Cisco-Linksys	consumer-ap
+20aa4b	Cisco-Linksys	consumer-ap
+c0c1c0	Cisco-Linksys	consumer-ap
+149182	Belkin International	consumer-ap
+94103e	Belkin International	consumer-ap
+b4750e	Belkin International	consumer-ap
+ec1a59	Belkin International	consumer-ap
+240ac4	Espressif Inc.	soc-devboard
+30aea4	Espressif Inc.	soc-devboard
+246f28	Espressif Inc.	soc-devboard
+7c9ebd	Espressif Inc.	soc-devboard
+8caab5	Espressif Inc.	soc-devboard
+a4cf12	Espressif Inc.	soc-devboard
+b4e62d	Espressif Inc.	soc-devboard
+cc50e3	Espressif Inc.	soc-devboard
+84f3eb	Espressif Inc.	soc-devboard
+5ccf7f	Espressif Inc.	soc-devboard
+18fe34	Espressif Inc.	soc-devboard
+b827eb	Raspberry Pi Foundation	soc-devboard
+dca632	Raspberry Pi Trading	soc-devboard
+e45f01	Raspberry Pi Trading	soc-devboard
+28cdc1	Raspberry Pi Trading	soc-devboard
+d83add	Raspberry Pi Trading	soc-devboard
+2ccf67	Raspberry Pi Trading	soc-devboard
+000c43	Ralink Technology	soc-devboard
+00e04c	Realtek Semiconductor	soc-devboard
+001ec2	Apple	mobile
+28cfe9	Apple	mobile
+406c8f	Apple	mobile
+acbc32	Apple	mobile
+d023db	Apple	mobile
+f0dbe2	Apple	mobile
+001599	Samsung Electronics	mobile
+001d25	Samsung Electronics	mobile
+301966	Samsung Electronics	mobile
+5c0a5b	Samsung Electronics	mobile
+781fdb	Samsung Electronics	mobile
+cc07ab	Samsung Electronics	mobile
+0024d7	Intel Corporate	mobile
+340286	Intel Corporate	mobile
+7c5cf8	Intel Corporate	mobile
+a08869	Intel Corporate	mobile
+e4a471	Intel Corporate	mobile
+000c29	VMware	network-gear
+005056	VMware	network-gear
+080027	Oracle VirtualBox	network-gear
+4ccc6a	MikroTik	network-gear
+648d9e	MikroTik	network-gear
+dc2c6e	MikroTik	network-gear

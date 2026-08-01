@@ -1,0 +1,27 @@
+// Auto-scaffolded Express middleware `{{name}}`.
+// Mount it BEFORE your routes: `app.use(require('./{{name}}_middleware').{{name}});`
+// and mount the error handler LAST: `app.use(require('./{{name}}_middleware').errorHandler);`
+// ESM project? swap require/module.exports for import/export.
+const crypto = require('node:crypto');
+
+function {{name}}(req, res, next) {
+  // A per-request id makes a log line traceable back to one caller.
+  const requestId = req.headers['x-request-id'] || crypto.randomUUID();
+  req.requestId = requestId;
+  res.setHeader('X-Request-Id', requestId);
+  // TODO: put the real cross-cutting concern here (authz, rate limit, audit).
+  next();
+}
+
+// Four-arg signature — Express only treats it as an error handler with all four.
+function errorHandler(err, req, res, next) {
+  if (res.headersSent) {
+    next(err);
+    return;
+  }
+  // Log `err` server-side; return a generic body so stack traces and internals
+  // never reach the caller.
+  res.status(500).json({ error: 'internal error', requestId: req.requestId });
+}
+
+module.exports = { {{name}}, errorHandler };

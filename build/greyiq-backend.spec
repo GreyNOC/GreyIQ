@@ -29,6 +29,10 @@ for _root, _dirs, _files in os.walk(_SEED_SRC):
     _rel = os.path.relpath(_root, _SEED_SRC)
     _dest = "seed" if _rel == os.curdir else os.path.join("seed", _rel)
     for _fn in _files:
+        # HARD CONSTRAINT: no bundled model/weight/data file may use the ".pt" extension.
+        # This skip is unconditional, so a ".pt" under seed/ is dropped SILENTLY and the
+        # feature that reads it degrades in the shipped app while working perfectly in
+        # dev. Ship learned weights as ".json" (or any non-.pt extension) instead.
         if _fn.lower().endswith(".pt"):
             continue
         datas.append((os.path.join(_root, _fn), _dest))
@@ -53,6 +57,17 @@ hiddenimports = [
     "gn_cli",  # run_frozen imports it at function level (CLI dispatch) — force-include
     "yaml",    # api_discovery_service parses YAML OpenAPI specs; import is guarded, force-include so it's bundled
 ]
+
+# Optional offline modules added by later work. Each is imported at FUNCTION level (guarded
+# by try/except), so PyInstaller's static analysis cannot see it and would leave it out of
+# the bundle — the feature would then work in dev and silently degrade in the shipped exe.
+# Force-include each ONLY if it exists, so this spec stays valid at every point in the
+# rollout (before the module lands, after it lands, and if it is later dropped).
+# NOTE: new modules under backend/bughunter/ (including the wardrive package) need NO entry
+# here — collect_submodules("bughunter") below already sweeps that whole package.
+for _opt in ("edit_ops", "offline_repair", "edit_mine", "solin_domain"):
+    if os.path.isfile(os.path.join(BACKEND, _opt + ".py")):
+        hiddenimports.append(_opt)
 
 # The ASGI stack + clients load a lot dynamically; pull everything in. numpy stays
 # (document_ingest's pandas path uses it). anthropic is the Claude coding-brain client.

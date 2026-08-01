@@ -1,0 +1,26 @@
+"""Auto-scaffolded FastAPI router for {{path}}.
+
+Register it on the app with ``app.include_router({{name}}_router)``. The handler is a
+placeholder: validate every input with a Pydantic model before you trust it, and keep the
+response shape explicit so the OpenAPI schema stays honest.
+"""
+from __future__ import annotations
+
+from fastapi import APIRouter, HTTPException
+
+{{name}}_router = APIRouter(tags=["{{name}}"])
+
+
+@{{name}}_router.get("{{path}}")
+async def {{name}}() -> dict[str, object]:
+    # TODO: implement {{path}}. Replace the static payload with the real read,
+    # and raise HTTPException(404) rather than returning an empty success.
+    return {"ok": True, "path": "{{path}}"}
+
+
+@{{name}}_router.post("{{path}}")
+async def create_{{name}}(payload: dict[str, object]) -> dict[str, object]:
+    # TODO: replace `dict` with a Pydantic model so FastAPI validates the body for you.
+    if not payload:
+        raise HTTPException(status_code=422, detail="empty payload")
+    return {"ok": True, "created": True}

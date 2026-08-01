@@ -1,0 +1,52 @@
+<#
+.SYNOPSIS
+    {{synopsis}}
+
+.DESCRIPTION
+    Auto-scaffolded PowerShell script. The executable body opens with Set-StrictMode and
+    $ErrorActionPreference = 'Stop' so an unset variable or a failed cmdlet aborts the run
+    instead of silently continuing with a $null — the default PowerShell behaviour is the
+    single biggest source of "the script said it worked" incidents.
+
+    (param() has to be the first statement in the file, so it sits above them; nothing
+    executable runs before strict mode is on.)
+
+.EXAMPLE
+    ./{{name}}.ps1 -Path C:/work/repo -WhatIf
+#>
+[CmdletBinding(SupportsShouldProcess = $true)]
+param(
+    [Parameter()]
+    [string]$Path = (Get-Location).Path
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function Write-Step {
+    param([Parameter(Mandatory = $true)][string]$Message)
+    Write-Host "[{{name}}] $Message"
+}
+
+function Invoke-{{cls}} {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param([Parameter(Mandatory = $true)][string]$Target)
+
+    if (-not (Test-Path -LiteralPath $Target)) {
+        throw "Target not found: $Target"
+    }
+
+    if ($PSCmdlet.ShouldProcess($Target, '{{synopsis}}')) {
+        # TODO: the real work goes here.
+        Write-Step "Processed $Target"
+    }
+}
+
+try {
+    Invoke-{{cls}} -Target $Path
+    Write-Step 'Done.'
+}
+catch {
+    Write-Error $_
+    exit 1
+}

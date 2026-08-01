@@ -378,7 +378,11 @@ def _run_campaign_body(
         # precision unchanged). Best-effort + fail-closed: no brain / any error keeps current behaviour.
         try:
             surface_for_brain = hunt_surface
-            hb = hunt_brain.plan_hunt(coder_cfg, clean_target, scope, surface_for_brain, priors=priors)
+            # seed_dir/runtime_dir locate the OPTIONAL learned offline ranker's weight file. With no
+            # file present the planner is byte-identical to the hand-tuned rules, so this is safe to
+            # pass unconditionally.
+            hb = hunt_brain.plan_hunt(coder_cfg, clean_target, scope, surface_for_brain, priors=priors,
+                                      seed_dir=seed_dir, runtime_dir=rt)
             # Capture the (surface, plan) input side for the trace log. recon_params is only ever
             # REBOUND below (never mutated in place), so this reference stays the recon-only surface.
             hunt_trace_surface, hunt_trace_plan = surface_for_brain, hb

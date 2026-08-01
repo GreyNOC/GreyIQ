@@ -1,0 +1,37 @@
+# Auto-scaffolded systemd unit for {{name}}.
+# Install as /etc/systemd/system/{{name}}.service, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now {{name}}
+# The hardening block below is the point of using systemd at all: the service runs as a
+# dedicated non-root user with a read-only view of the filesystem except its own workdir.
+[Unit]
+Description={{description}}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{user}}
+Group={{user}}
+WorkingDirectory={{workdir}}
+# The leading '-' means "do not fail to start if the file is missing".
+EnvironmentFile=-{{workdir}}/.env
+ExecStart={{exec_start}}
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths={{workdir}}
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{name}}
+
+[Install]
+WantedBy=multi-user.target

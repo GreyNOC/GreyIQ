@@ -27,6 +27,17 @@ Env vars:
   jittery targets.
 - GREYIQ_ACTIVE_TIME_SQLI_MARGIN_S : how much slower (seconds) BOTH trial probes must be vs
   the fast controls before the probe is confirmed (default 3; keep well under the delay).
+- GREYIQ_OFFLINE_RANKER : "0" to force the hand-tuned hunt rules even when a learned
+  ranker weight file is present (default on).
+- GREYIQ_HUNT_LOOP_OFFLINE : "1" to opt into the offline (brain-free) iterative re-plan
+  pass (default off).
+- GREYIQ_OFFLINE_REPAIR : "0" to disable the offline coder's deterministic verify->repair
+  loop (default on).
+- GREYIQ_OFFLINE_REPAIR_ROUNDS : repair attempts per failed edit, clamped to 0..3
+  (default 2).
+
+See ``ScannerSettings`` for why each offline flag defaults the way it does — the short
+version is that none of them can widen scope or authorize a request.
 """
 
 from __future__ import annotations
@@ -93,6 +104,30 @@ class ScannerSettings:
     # so the operator turns it on deliberately. Every CT-returned host is still scope-gated before it
     # becomes a crawl target, so enabling it can only widen discovery WITHIN scope.
     recon_osint_enabled: bool = False
+    # --- Offline-brain feature flags (GREYIQ_OFFLINE_*) --------------------------------
+    # These gate the LEARNED/offline layers that sit on top of the deterministic engines.
+    # None of them can widen scope or authorize a request: a hunt plan is a targeting HINT
+    # and the deterministic prover still owns every confirmation, so the worst case of a
+    # bad flag is worse ORDERING, never an unauthorized probe. They exist as kill switches
+    # because a learned component can degrade in ways a rule cannot.
+    #
+    # GREYIQ_OFFLINE_RANKER — the learned offline hunt ranker. ON by default because it is
+    # already fail-closed at the module level (an absent/corrupt weight file falls back to
+    # the hand-tuned rules), so the switch is for an operator who wants the rules even when
+    # a model IS present — e.g. reproducing an older run.
+    offline_ranker_enabled: bool = True
+    # GREYIQ_HUNT_LOOP_OFFLINE — iterative re-plan driven by the OFFLINE planner (no brain
+    # round-trip). OFF by default, mirroring hunt_loop_enabled above: extra passes cost
+    # requests against the operator's per-host budget, so the operator opts in.
+    hunt_loop_offline_enabled: bool = False
+    # GREYIQ_OFFLINE_REPAIR — the deterministic verify->repair loop for the offline coder.
+    # ON by default: it only re-runs the SAME verifier on the coder's own output through
+    # ToolBox, so it can turn a failed edit into a passing one but never widens write reach.
+    offline_repair_enabled: bool = True
+    # GREYIQ_OFFLINE_REPAIR_ROUNDS — how many repair attempts. CLAMPED to 0..3 in
+    # get_settings(): each round is a full verify pass, so a hostile or fat-fingered env
+    # value must not be able to spin the loop unbounded.
+    offline_repair_rounds: int = 2
     # Per-request exclusion filter (NOT sourced from env -- callers that resolve a
     # saved portfolio program build a settings override via dataclasses.replace() with
     # that program's out_of_scope_hosts). Checked first, and can only ever NARROW scope
@@ -115,4 +150,10 @@ def get_settings() -> ScannerSettings:
         hunt_loop_enabled=_bool_env("GREYIQ_HUNT_LOOP_ENABLED", False),
         hunt_loop_max_iters=max(1, min(_int_env("GREYIQ_HUNT_LOOP_MAX_ITERS", 3), 6)),
         recon_osint_enabled=_bool_env("GREYIQ_RECON_OSINT", False),
+        offline_ranker_enabled=_bool_env("GREYIQ_OFFLINE_RANKER", True),
+        hunt_loop_offline_enabled=_bool_env("GREYIQ_HUNT_LOOP_OFFLINE", False),
+        offline_repair_enabled=_bool_env("GREYIQ_OFFLINE_REPAIR", True),
+        # Clamp, don't reject: an out-of-range value is a typo, not a reason to refuse to
+        # start. 0 means "verify only, never repair"; 3 is the ceiling on verify passes.
+        offline_repair_rounds=max(0, min(3, _int_env("GREYIQ_OFFLINE_REPAIR_ROUNDS", 2))),
     )

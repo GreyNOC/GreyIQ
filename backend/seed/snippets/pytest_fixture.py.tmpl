@@ -1,0 +1,20 @@
+"""Auto-scaffolded pytest fixture `{{name}}`.
+
+Yield-style so teardown runs even when the test fails. Build the resource under a tmp_path
+(or a tempfile) rather than a fixed path — a fixture that writes into the repo makes the
+suite order-dependent and leaks state between runs.
+"""
+from __future__ import annotations
+
+from collections.abc import Iterator
+
+import pytest
+
+
+@pytest.fixture()
+def {{name}}(tmp_path) -> Iterator[dict[str, object]]:
+    # TODO: build the real resource for {{name}} here (client, temp db, fake server).
+    resource: dict[str, object] = {"root": tmp_path}
+    yield resource
+    # TODO: release whatever was acquired above. This runs even if the test raised.
+    resource.clear()

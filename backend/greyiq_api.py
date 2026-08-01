@@ -336,7 +336,19 @@ from bughunter.scan_service import run_code_scan  # noqa: E402
 from bughunter.web_scan_service import run_web_scan  # noqa: E402
 from bughunter.live_scan_service import run_live_scan  # noqa: E402
 from bughunter.triage import triage  # noqa: E402
-from bughunter.chat_commands import detect_scan_command, run_scan  # noqa: E402
+from bughunter.chat_commands import (  # noqa: E402
+    detect_scan_command,
+    detect_wardrive_command,
+    run_scan,
+    run_wardrive,
+    _looks_like_url,
+    _looks_like_path,
+)
+# The curated offline domain brain. Stdlib-only and torch-free BY DESIGN (see its module
+# docstring): the shipped build excludes torch, so this is the only thing between a frozen
+# install and fallback_reply()'s single canned sentence. Safe to import at boot — it pulls
+# nothing heavier than re/difflib/math/pathlib.
+import solin_domain  # noqa: E402
 from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names, _deterministic_attack_plan, cwe_for_class, build_replay_script as bounty_build_replay, build_findings_har as bounty_build_har  # noqa: E402
 from bughunter import campaign as bounty_campaign  # noqa: E402
 from bughunter import learning as bounty_learning  # noqa: E402
@@ -1267,6 +1279,26 @@ _CODEGEN_INTENT_RE = re.compile(
 
 def _looks_like_codegen_request(message: str) -> bool:
     return bool(_CODEGEN_INTENT_RE.search(str(message or "")))
+
+
+def _names_concrete_target(message: str) -> bool:
+    """True when the message points at a REAL host or file path the operator wants tested.
+
+    Checked word by word, never over the whole message: ``_looks_like_path`` matches ANY
+    string containing a slash, so handing it a sentence ("read/write access") would report
+    a target that isn't there. When this is true the offline answer must open by admitting
+    it has never seen that target — quoting a playbook at someone who named a host reads
+    like analysis of that host otherwise."""
+    for token in str(message or "").split():
+        candidate = token.strip("\"'`(),;:!?[]<>").rstrip(".")
+        if len(candidate) < 4:
+            continue
+        try:
+            if _looks_like_url(candidate) or (_looks_like_path(candidate) and "." in candidate):
+                return True
+        except Exception:  # noqa: BLE001 - a target heuristic must never break a chat turn
+            return False
+    return False
 
 
 class GreyIQRuntime:
@@ -4184,7 +4216,201 @@ class GreyIQRuntime:
             },
         }
 
+    def _maybe_wardrive_reply(self, request: ChatRequest) -> dict[str, Any] | None:
+        """``wardrive -y <path>`` typed in chat — read-only RF survey analysis.
+
+        Sits beside ``_maybe_scan_reply`` so the offline surface covers hunt / code /
+        knowledge / RF from one place. ``detect_wardrive_command`` returns None for anything
+        ambiguous, so a message that merely says the word "wardrive" is ordinary chat.
+
+        The unauthorized case is answered, not silently dropped: ``run_wardrive`` reads
+        nothing without the explicit ``-y`` flag and returns a refusal that says what the
+        flag asserts and how to re-send. Treating the chat message itself as authorization
+        would make the flag meaningless."""
+        command = detect_wardrive_command(request.message)
+        if command is None:
+            return None
+        target, authorized = command
+        result = run_wardrive(target, authorized)
+        ok = bool(result.get("ok"))
+        if ok:
+            message = result.get("summary") or "The survey parsed but produced no assessment text."
+        else:
+            message = f"**Wardrive — {result.get('target') or 'survey'}**\n\n{result.get('error') or 'failed'}"
+        return {
+            "request_id": uuid4().hex,
+            "message": message,
+            "used_fallback": not ok,
+            "captured_for_training": False,
+            "model_name": "bughunter:wardrive",
+            "device": "scanner",
+            "citations": [],
+            "ai_core": self.store.load(),
+            "scan": {
+                key: result.get(key)
+                for key in (
+                    "ok", "scan_type", "risk", "finding_count", "undetermined_count",
+                    "target", "authorized",
+                )
+            },
+        }
+
+    def _domain_brain_payload(
+        self,
+        message: str,
+        *,
+        strategy: str,
+        confidence: float,
+        citations: list[dict[str, Any]],
+        intent: str,
+    ) -> dict[str, Any]:
+        """The 8-key chat dict its siblings return, plus the diagnostics block.
+
+        ``friendly_branding`` is deliberately NOT applied: it rewrites "GreyNOC"/"Solin"
+        inside the text, and this text is a VERBATIM quote of a bundled card. Silently
+        editing a quote would break the one guarantee that makes this path safe to put in
+        front of a security answer (test_solin_domain asserts the excerpt survives intact).
+        The packs are authored GreyIQ-branded, so there is nothing for it to fix anyway."""
+        return {
+            "request_id": uuid4().hex,
+            "message": message,
+            "used_fallback": False,
+            "captured_for_training": False,
+            "confidence": confidence,
+            "diagnostics": {
+                "used_fallback": False,
+                "captured_for_training": False,
+                "intent": intent,
+                "mode": "offline",
+                "strategy": strategy,
+                "confidence": confidence,
+                "retrieval_count": len(citations),
+                "memory_count": 0,
+                "note_count": 0,
+                "citation_count": len(citations),
+                "engine_ready": False,
+                "device": "cpu",
+            },
+            "model_name": "offline:domain-brain",
+            "device": "cpu",
+            "citations": citations,
+            "ai_core": self.store.load(),
+        }
+
+    def _domain_brain_reply(
+        self,
+        request: ChatRequest,
+        min_score: float = solin_domain.MIN_SCORE,
+    ) -> dict[str, Any] | None:
+        """Answer from the bundled playbooks / vuln-class table, or return None.
+
+        This runs BEFORE ``get_engine()`` because it is torch-free and the engine is not:
+        in the shipped build torch is excluded, ``get_engine()`` raises, and chat degrades
+        to ``fallback_reply()``'s single content-free sentence. Returning None is a total
+        no-op — the caller proceeds down exactly the path it took before this existed.
+
+        Nothing here generates text. Every branch either quotes a card verbatim, renders
+        ``VULN_CLASSES`` fields, or lists tool names from the catalog — see
+        ``solin_domain``'s module docstring for why that is the whole safety argument."""
+        message = str(request.message or "")
+        try:
+            body = ""
+            strategy = ""
+            domain = ""
+            confidence = 0.0
+            citations: list[dict[str, Any]] = []
+            wants_tools = solin_domain.looks_like_tool_request(message)
+            class_id = solin_domain.detect_class_query(message)
+
+            if class_id:
+                # "what is SSRF" — answer straight out of the class table so chat and the
+                # report writer can never disagree about a CWE or a checklist step.
+                body = solin_domain.explain_class(class_id)
+                if body:
+                    strategy = "class_explainer"
+                    domain = "webapp"
+                    confidence = 0.72
+                    citations = [{
+                        "source": f"bughunter.bounty.VULN_CLASSES['{class_id}']",
+                        "source_id": "src_vuln_classes",
+                        "score": 1.0,
+                        "excerpt": body[:400],
+                    }]
+            if not body and wants_tools:
+                classes = solin_domain.classes_mentioned(message)
+                tools = solin_domain.format_tools(
+                    solin_domain.recommend_tools(classes, SEED_DIR, RUNTIME_DIR)
+                )
+                if tools:
+                    body = (
+                        "Tools in GreyIQ's bundled reference catalog that help TEST "
+                        f"{', '.join(classes)} (names and links only — no payloads, and "
+                        "every one of them is for authorized testing inside scope):\n\n"
+                        f"{tools}"
+                    )
+                    strategy = "toolkit_recommend"
+                    domain = "bounty"
+                    confidence = 0.6
+                    citations = [{
+                        "source": "toolkit/catalog.json",
+                        "source_id": "src_toolkit",
+                        "score": 1.0,
+                        "excerpt": tools[:400],
+                    }]
+            if not body:
+                pack = solin_domain.load_pack(SEED_DIR, RUNTIME_DIR)
+                scored = solin_domain.match_cards_scored(
+                    message, pack, limit=3, min_score=min_score
+                )
+                if scored:
+                    cards = [card for card, _score in scored]
+                    domain = cards[0].domain
+                    body = solin_domain.compose_answer(message, cards, domain)
+                    if body:
+                        strategy = "domain_pack"
+                        confidence = round(min(max(scored[0][1], 0.2), 0.75), 3)
+                        citations = [
+                            {
+                                "source": card.source_path,
+                                "source_id": "src_domain_pack",
+                                "score": round(float(score), 3),
+                                "excerpt": solin_domain.verbatim_excerpt(card, message)[:400],
+                            }
+                            for card, score in scored
+                        ]
+            if not body or not strategy:
+                return None
+
+            # The honest capability gate: the operator named a host/path, and the offline
+            # brain has never seen it. Say so BEFORE the playbook, not after.
+            if _names_concrete_target(message):
+                body = f"{solin_domain.capability_statement(domain)}\n\n{body}"
+                strategy = "offline_capability"
+                confidence = min(confidence, 0.5)
+
+            return self._domain_brain_payload(
+                body,
+                strategy=strategy,
+                confidence=confidence,
+                citations=citations,
+                intent=domain or "offline_domain",
+            )
+        except Exception:  # noqa: BLE001 - additive feature: any failure here must fall through to the unchanged pipeline, never break a chat turn
+            self.log(f"Domain brain skipped: {traceback.format_exc(limit=3)}")
+            return None
+
     def chat(self, request: ChatRequest) -> dict[str, Any]:
+        # Read-only RF survey analysis of an export the operator already captured. Runs
+        # beside the scanners (and before every brain) so the offline surface reaches the
+        # wardrive engine too; returns None for anything that is not the command.
+        #
+        # STRICTLY BEFORE _maybe_scan_reply, because the wardrive trigger is the more
+        # specific one: "scan wardrive -y ./capture" also satisfies detect_scan_command
+        # (unknown subtype -> the rest looks like a path -> CODE scan), so the opposite order
+        # silently hands an RF survey to the source-code scanner.
+        wardrive_reply = self._maybe_wardrive_reply(request)
+        if wardrive_reply is not None:
+            return wardrive_reply
         scan_reply = self._maybe_scan_reply(request)
         if scan_reply is not None:
             return scan_reply
@@ -4213,6 +4439,14 @@ class GreyIQRuntime:
                 "citations": [],
                 "ai_core": self.store.load(),
             }
+        # The curated offline domain brain answers from bundled playbooks/knowledge packs with
+        # real citations. It runs BEFORE the TinyGPT engine because it is torch-free: the shipped
+        # build excludes torch, so get_engine() raises there and chat would otherwise degrade to
+        # fallback_reply()'s content-free placeholder. Returns None (and changes nothing) when no
+        # curated card matches above threshold. See solin_domain's module docstring.
+        domain_reply = self._domain_brain_reply(request)
+        if domain_reply is not None:
+            return domain_reply
         try:
             engine = self.get_engine()
             engine.safety = OpenPolicy()
@@ -4257,6 +4491,23 @@ class GreyIQRuntime:
         except Exception as exc:
             self.engine_error = f"{exc}"
             self.log(traceback.format_exc())
+            # Last resort before the canned platitude. On a torch-less machine (every shipped
+            # install) get_engine() raises EVERY turn, so this handler is the normal path, not
+            # an edge case — try the curated pack once more with a RELAXED threshold. The
+            # pre-router's bar exists to protect a working engine's answer; there is no
+            # engine answer here, so a weaker-but-real card beats the canned platitude.
+            #
+            # The threshold is solin_domain's own evidence-tuned constant, NOT a multiplier
+            # applied here: `MIN_SCORE * 0.75` used to land BELOW the scorer's off-domain
+            # noise floor, which made this handler answer "what is the capital of France"
+            # with a bug-bounty playbook. The bar and the evidence that sets it now live in
+            # one place, and test_solin_domain asserts the off-domain fixture stays out AT
+            # THIS THRESHOLD.
+            domain_reply = self._domain_brain_reply(
+                request, min_score=solin_domain.MIN_SCORE_RELAXED
+            )
+            if domain_reply is not None:
+                return domain_reply
             return {
                 "request_id": uuid4().hex,
                 "message": fallback_reply(request.message),
@@ -4479,6 +4730,18 @@ def ensure_runtime() -> None:
             dst_playbook = dst_bounty / playbook.name
             if not dst_playbook.exists():
                 shutil.copy2(playbook, dst_playbook)
+    # Offline domain packs: same never-clobber .md copy as the bounty playbooks (NOT
+    # SEED_DATA_FILES, which is a flat tuple of data/*.txt names). solin_domain.load_pack
+    # reads the runtime copy first so a user's edits win, and falls back to the bundled
+    # seed copy when a file is missing — so a failed copy costs nothing.
+    seed_domain = SEED_DIR / "domain"
+    if seed_domain.is_dir():
+        dst_domain = RUNTIME_DIR / "domain"
+        dst_domain.mkdir(parents=True, exist_ok=True)
+        for pack_file in seed_domain.glob("*.md"):
+            dst_pack = dst_domain / pack_file.name
+            if not dst_pack.exists():
+                shutil.copy2(pack_file, dst_pack)
     train_path = RUNTIME_DIR / "train.txt"
     if not train_path.exists():
         train_path.write_text(default_training_text(), encoding="utf-8")

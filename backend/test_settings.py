@@ -22,6 +22,9 @@ _ENV_KEYS = (
     "GREYIQ_WEB_FETCH_TIMEOUT", "GREYIQ_WEB_FETCH_MAX_BYTES", "GREYIQ_ACTIVE_MAX_REQUESTS_PER_HOST",
     "GREYIQ_ACTIVE_MIN_INTERVAL_MS", "GREYIQ_ACTIVE_SCAN_ALLOWLIST",
     "GREYIQ_ACTIVE_TIME_SQLI_DELAY_S", "GREYIQ_ACTIVE_TIME_SQLI_MARGIN_S",
+    "GREYIQ_HUNT_LOOP_ENABLED", "GREYIQ_HUNT_LOOP_MAX_ITERS", "GREYIQ_RECON_OSINT",
+    "GREYIQ_OFFLINE_RANKER", "GREYIQ_HUNT_LOOP_OFFLINE",
+    "GREYIQ_OFFLINE_REPAIR", "GREYIQ_OFFLINE_REPAIR_ROUNDS",
 )
 
 
@@ -159,6 +162,45 @@ class GetSettingsIntegrationTests(_EnvIsolated):
         self.assertEqual(s.active_scan_allowlist, ("trusted.example",))
         self.assertEqual(s.active_time_sqli_delay_seconds, 2.0)
         self.assertEqual(s.active_time_sqli_margin_seconds, 1.0)
+
+
+class OfflineFeatureFlagTests(_EnvIsolated):
+    """The offline-brain kill switches. Each one gates a LEARNED layer sitting on top of a
+    deterministic engine, so the defaults matter: an operator who never sets an env var must
+    get the behaviour the release was tested with, and every switch must be reachable."""
+
+    def test_defaults_with_no_env(self) -> None:
+        s = S.get_settings()
+        # The two fail-closed-at-the-module-level layers ship ON...
+        self.assertTrue(s.offline_ranker_enabled)
+        self.assertTrue(s.offline_repair_enabled)
+        self.assertEqual(s.offline_repair_rounds, 2)
+        # ...and the one that spends extra requests against the per-host budget is opt-in.
+        self.assertFalse(s.hunt_loop_offline_enabled)
+
+    def test_ranker_kill_switch(self) -> None:
+        os.environ["GREYIQ_OFFLINE_RANKER"] = "0"
+        self.assertFalse(S.get_settings().offline_ranker_enabled)
+        os.environ["GREYIQ_OFFLINE_RANKER"] = "1"
+        self.assertTrue(S.get_settings().offline_ranker_enabled)
+
+    def test_repair_kill_switch(self) -> None:
+        os.environ["GREYIQ_OFFLINE_REPAIR"] = "false"
+        self.assertFalse(S.get_settings().offline_repair_enabled)
+
+    def test_offline_hunt_loop_opt_in(self) -> None:
+        os.environ["GREYIQ_HUNT_LOOP_OFFLINE"] = "1"
+        self.assertTrue(S.get_settings().hunt_loop_offline_enabled)
+
+    def test_repair_rounds_are_clamped_to_0_3(self) -> None:
+        # A hostile or fat-fingered value must not be able to spin the verify->repair loop.
+        for raw, expected in (("99", 3), ("4", 3), ("3", 3), ("1", 1), ("0", 0), ("-1", 0), ("-999", 0)):
+            os.environ["GREYIQ_OFFLINE_REPAIR_ROUNDS"] = raw
+            self.assertEqual(S.get_settings().offline_repair_rounds, expected, raw)
+
+    def test_repair_rounds_malformed_falls_back_to_default(self) -> None:
+        os.environ["GREYIQ_OFFLINE_REPAIR_ROUNDS"] = "two"
+        self.assertEqual(S.get_settings().offline_repair_rounds, 2)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ differential.
 """
 from __future__ import annotations
 
+import ast
 import base64
 import dataclasses
 import email.message
@@ -32,7 +33,8 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from bughunter import active_verify_service as av  # noqa: E402
-from bughunter import web_ingest  # noqa: E402
+from bughunter import hunt_brain, offline_hunt, web_ingest  # noqa: E402
+from bughunter.prover_classes import CLASS_ALIASES, PROVER_CLASSES  # noqa: E402
 from bughunter.rate_limit import HostRateGovernor  # noqa: E402
 from bughunter.settings import get_settings  # noqa: E402
 
@@ -637,6 +639,67 @@ class WithOperatorTests(unittest.TestCase):
         self.assertEqual(parsed.scheme, "https")
         self.assertEqual(parsed.hostname, "app.example.com")
         self.assertEqual(parsed.path, "/search")
+
+
+class ProverClassVocabularyTests(unittest.TestCase):
+    """The mechanical anti-drift guard between the prover and the hunt planners.
+
+    Every check in verify_active's `checks` list is tagged with the vuln class it confirms, and
+    prover_classes.PROVER_CLASSES is the vocabulary the planners (hunt_brain / offline_hunt) are
+    allowed to propose. Those two used to be hand-synced hardcoded lists that drifted -- the prover
+    grew jwt/graphql/debug/websocket/sensitive/cloud-exposure/csrf/clickjacking checks while the
+    planners still knew 10 names, so the offline hunt could never steer budget toward eight classes
+    the engine had proved for months.
+
+    This test re-derives the REAL tags from this module's own SOURCE with stdlib `ast` (no import
+    side effects, no network, no need to actually run verify_active) and asserts set equality. A new
+    check carrying a novel tag fails the suite until PROVER_CLASSES is updated -- which is the whole
+    point: the drift can no longer be silent."""
+
+    def _tags_from_source(self) -> set[str]:
+        source = (BACKEND_DIR / "bughunter" / "active_verify_service.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        found: list[set[str]] = []
+        for node in ast.walk(tree):
+            # `checks: list[tuple[str, Callable[...]]] = [ ("clickjacking", lambda: ...), ... ]`
+            if not isinstance(node, ast.AnnAssign) or not isinstance(node.target, ast.Name):
+                continue
+            if node.target.id != "checks" or not isinstance(node.value, ast.List):
+                continue
+            tags: set[str] = set()
+            for element in node.value.elts:
+                self.assertIsInstance(element, ast.Tuple, "every check must be a (class, callable) tuple")
+                head = element.elts[0]
+                self.assertIsInstance(head, ast.Constant, "a check's class tag must be a literal string")
+                self.assertIsInstance(head.value, str)
+                tags.add(head.value)
+            found.append(tags)
+        self.assertEqual(len(found), 1, "expected exactly one annotated `checks` list to parse")
+        return found[0]
+
+    def test_every_prover_check_tag_is_in_the_shared_vocabulary(self) -> None:
+        tags = self._tags_from_source()
+        self.assertTrue(tags, "parsed zero check tags -- the ast anchor has moved, fix this test")
+        self.assertEqual(tags, set(PROVER_CLASSES))
+
+    def test_the_planners_cannot_propose_a_class_the_prover_cannot_confirm(self) -> None:
+        # offline_hunt gates its rule suggestions on this set; hunt_brain gates the LLM's on it.
+        self.assertLessEqual(set(offline_hunt._ACTIVE_CLASSES), set(PROVER_CLASSES))
+        self.assertTrue(set(hunt_brain.ACTIVE_CLASSES) >= set(PROVER_CLASSES))
+        # every alias must fold onto a real prover class -- an alias can never widen the vocabulary
+        for alias, canonical in CLASS_ALIASES.items():
+            self.assertIn(canonical, PROVER_CLASSES, f"alias {alias!r} points outside the prover")
+            self.assertNotIn(alias, PROVER_CLASSES, f"alias {alias!r} shadows a canonical tag")
+
+    def test_class_priority_stays_reorder_only_for_the_wider_vocabulary(self) -> None:
+        # The mechanical reason a wider planner vocabulary cannot damage precision: promoting a class
+        # only REORDERS the tuned check list; it never adds, drops, or mutates a check.
+        checks = [(cls, object()) for cls in ("clickjacking", "csrf", "jwt", "xss", "sqli")]
+        promoted = av._apply_class_priority(checks, ["jwt", "csrf"])
+        self.assertEqual([c for c, _ in promoted], ["jwt", "csrf", "clickjacking", "xss", "sqli"])
+        self.assertEqual(sorted(id(fn) for _, fn in promoted), sorted(id(fn) for _, fn in checks))
+        # an unknown/never-provable rank is ignored rather than injecting a check
+        self.assertEqual(av._apply_class_priority(checks, ["xxe", "idor"]), checks)
 
 
 class NormLenTests(unittest.TestCase):
