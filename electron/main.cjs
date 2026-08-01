@@ -52,6 +52,145 @@ function ensureExecutable(filePath) {
   }
 }
 
+function existingFile(filePath) {
+  if (!filePath) return false;
+  try {
+    return fs.statSync(filePath).isFile();
+  } catch (_) {
+    return false;
+  }
+}
+
+function newestMatchingFile(dirPath, pattern) {
+  try {
+    return fs.readdirSync(dirPath)
+      .filter((name) => pattern.test(name))
+      .map((name) => path.join(dirPath, name))
+      .filter(existingFile)
+      .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0] || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+// TACNOC remains its own sandboxed Electron application and engine. GreyIQ only
+// discovers and starts that trusted companion; no renderer-controlled path or
+// command-line argument crosses IPC. An explicit environment override supports
+// custom installs, while the remaining candidates cover bundled, installed, and
+// local-development layouts.
+function tacnocCommandFrom(candidate) {
+  if (!candidate) return null;
+  const target = path.resolve(candidate);
+  if (existingFile(target)) return { exe: target, args: [], cwd: path.dirname(target) };
+
+  try {
+    if (!fs.statSync(target).isDirectory()) return null;
+  } catch (_) {
+    return null;
+  }
+
+  if (process.platform === 'darwin' && target.toLowerCase().endsWith('.app')) {
+    return { exe: '/usr/bin/open', args: [target], cwd: path.dirname(target) };
+  }
+
+  const packaged = process.platform === 'win32'
+    ? [
+        path.join(target, 'TACNOC.exe'),
+        path.join(target, 'dist', 'win-unpacked', 'TACNOC.exe'),
+      ]
+    : [
+        path.join(target, 'TACNOC'),
+        path.join(target, 'dist', 'TACNOC'),
+      ];
+  for (const executable of packaged) {
+    if (existingFile(executable)) return { exe: executable, args: [], cwd: path.dirname(executable) };
+  }
+
+  const artifact = process.platform === 'win32'
+    ? newestMatchingFile(path.join(target, 'dist'), /^TACNOC-.*-Portable-.*\.exe$/i)
+    : newestMatchingFile(path.join(target, 'dist'), /^TACNOC-.*\.AppImage$/i);
+  if (artifact) return { exe: artifact, args: [], cwd: path.dirname(artifact) };
+
+  // A built development checkout can run through its own Electron binary. Requiring
+  // both the compiled main entry and package identity avoids treating an arbitrary
+  // directory as an Electron application.
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(target, 'package.json'), 'utf8'));
+    const electron = process.platform === 'win32'
+      ? path.join(target, 'node_modules', 'electron', 'dist', 'electron.exe')
+      : path.join(target, 'node_modules', 'electron', 'dist', 'electron');
+    if (pkg.name === 'greynoc-tacnoc'
+        && existingFile(path.join(target, 'out', 'main', 'index.js'))
+        && existingFile(electron)) {
+      return { exe: electron, args: [target], cwd: target };
+    }
+  } catch (_) {
+    // Not a TACNOC source checkout.
+  }
+  return null;
+}
+
+function resolveTacnocCommand() {
+  const candidates = [];
+  if (process.env.GREYIQ_TACNOC_PATH) candidates.push(process.env.GREYIQ_TACNOC_PATH);
+  if (app.isPackaged) candidates.push(path.join(process.resourcesPath, 'tacnoc'));
+
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA || '';
+    if (localAppData) {
+      candidates.push(path.join(localAppData, 'Programs', 'TACNOC', 'TACNOC.exe'));
+      candidates.push(path.join(localAppData, 'Programs', 'greynoc-tacnoc', 'TACNOC.exe'));
+    }
+    candidates.push(path.join(path.dirname(process.execPath), 'TACNOC.exe'));
+  } else if (process.platform === 'darwin') {
+    candidates.push('/Applications/TACNOC.app');
+  } else {
+    candidates.push('/opt/TACNOC/TACNOC');
+    candidates.push('/usr/local/bin/tacnoc');
+  }
+
+  // GreyNOC's normal local-development checkout name. app.getPath('desktop') is
+  // user-relative, so this works without hard-coding an account name or drive.
+  candidates.push(path.join(app.getPath('desktop'), 'GreyNOC Belcher'));
+
+  for (const candidate of [...new Set(candidates.filter(Boolean))]) {
+    const command = tacnocCommandFrom(candidate);
+    if (command) return command;
+  }
+  return null;
+}
+
+function launchTacnoc() {
+  const command = resolveTacnocCommand();
+  if (!command) {
+    return Promise.resolve({
+      ok: false,
+      error: 'TACNOC was not found. Install TACNOC or set GREYIQ_TACNOC_PATH to its executable or project folder.',
+    });
+  }
+  if (process.platform !== 'win32' && command.exe !== '/usr/bin/open') ensureExecutable(command.exe);
+
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(command.exe, command.args, {
+        cwd: command.cwd,
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: false,
+      });
+    } catch (err) {
+      resolve({ ok: false, error: `TACNOC could not be opened: ${err.message}` });
+      return;
+    }
+    child.once('error', (err) => resolve({ ok: false, error: `TACNOC could not be opened: ${err.message}` }));
+    child.once('spawn', () => {
+      child.unref();
+      resolve({ ok: true });
+    });
+  });
+}
+
 let mainWindow = null;
 let backendProcess = null;
 let ollamaProcess = null;
@@ -656,6 +795,10 @@ function registerIpcHandlers() {
     const accelerated = vendor === 'nvidia' || (vendor === 'amd' && activeOllamaRuntime === 'rocm');
     return { vendor, runtime: activeOllamaRuntime, accelerated };
   });
+
+  // Open the companion TACNOC app in its own hardened Electron process. Keeping
+  // the engines separate preserves TACNOC's contextBridge and secret-store boundary.
+  ipcMain.handle('greyiq:launch-tacnoc', async () => launchTacnoc());
 }
 
 async function boot() {

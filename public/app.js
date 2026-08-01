@@ -4416,6 +4416,7 @@ const ck = {
   root: document.querySelector("#cockpit"),
   service: document.querySelector("#ckService"),
   theme: document.querySelector("#ckTheme"),
+  tacnoc: document.querySelector("#ckTacnoc"),
   studio: document.querySelector("#ckStudio"),
   huntReturn: document.querySelector("#huntReturn"),
   nav: document.querySelector("#ckNav"),
@@ -4552,6 +4553,37 @@ function setAppMode(mode) {
   document.body.dataset.appMode = state.appMode;
   saveState();
   if (state.appMode === "hunt") ckSyncService();
+}
+
+async function ckLaunchTacnoc() {
+  if (!ck.tacnoc) return;
+  const launch = window.greyiqDesktop && window.greyiqDesktop.launchTacnoc;
+  if (typeof launch !== "function") {
+    window.alert("TACNOC can be opened from the GreyIQ desktop app. Browser-only mode cannot launch desktop applications.");
+    return;
+  }
+
+  const originalText = ck.tacnoc.textContent;
+  ck.tacnoc.disabled = true;
+  ck.tacnoc.setAttribute("aria-busy", "true");
+  ck.tacnoc.textContent = "Opening TACNOC…";
+  try {
+    const result = await launch();
+    if (!result || result.ok === false) {
+      window.alert((result && result.error) || "TACNOC could not be opened.");
+      return;
+    }
+    ck.tacnoc.textContent = "TACNOC opened";
+    setTimeout(() => {
+      if (ck.tacnoc) ck.tacnoc.textContent = originalText;
+    }, 1800);
+  } catch (err) {
+    window.alert((err && err.message) || "TACNOC could not be opened.");
+  } finally {
+    ck.tacnoc.disabled = false;
+    ck.tacnoc.removeAttribute("aria-busy");
+    if (ck.tacnoc.textContent === "Opening TACNOC…") ck.tacnoc.textContent = originalText;
+  }
 }
 
 function ckSyncService() {
@@ -11223,6 +11255,7 @@ function bootCockpit() {
     setAppMode("studio");
     els.promptInput?.focus();
   });
+  ck.tacnoc?.addEventListener("click", () => void ckLaunchTacnoc());
   ck.huntReturn?.addEventListener("click", () => {
     setAppMode("hunt");
     (ck.navButtons.find((b) => b.classList.contains("is-active")) || ck.navButtons[0])?.focus();

@@ -37,6 +37,12 @@ npm install
 npm run desktop
 ```
 
+The desktop cockpit includes a **TACNOC** option beside **AI Studio**. It opens
+the companion TACNOC application in its own sandboxed desktop process. GreyIQ
+detects standard TACNOC installs and the normal `GreyNOC Belcher` development
+checkout on the current user's Desktop; set `GREYIQ_TACNOC_PATH` to a TACNOC
+executable or project directory for any other layout.
+
 ## Check
 
 ```powershell
