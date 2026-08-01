@@ -20,7 +20,7 @@
     "check": "npm run check:js && npm run check:python && npm run check:devops"
   },
   "devDependencies": {
-    "electron": "^43.1.1",
+    "electron": "^43.2.0",
     "electron-builder": "^26.15.3"
   },
   "engines": {
