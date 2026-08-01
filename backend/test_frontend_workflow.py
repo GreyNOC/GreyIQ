@@ -1,6 +1,6 @@
 """Static workflow contracts for the bug-bounty cockpit.
 
-These checks protect the launch rail's progressive disclosure and safety boundaries
+These checks protect the New run panel's progressive disclosure and safety boundaries
 without requiring a browser in the normal backend test run. Responsive geometry is
 still exercised separately during visual QA.
 """
@@ -34,6 +34,33 @@ class CockpitWorkflowContractTests(unittest.TestCase):
         self.assertIn('th.setAttribute("aria-sort"', JS)
         self.assertIn('tr.addEventListener("keydown"', JS)
         self.assertIn('ev.key === "Enter" || ev.key === " "', JS)
+
+    def test_new_run_focuses_the_first_unfinished_requirement(self) -> None:
+        self.assertIn('id="ckQuickLaunch"', HTML)
+        self.assertIn('id="ckSetupFold" open', HTML)
+        flow = JS.split("function ckFocusLaunchStep()", 1)[1].split(
+            "// The Portfolio-mode program multi-select", 1
+        )[0]
+        for requirement in (
+            "ck.portfolioList",
+            "ck.activeProgram",
+            "ck.target",
+            "ck.scope",
+            "ck.authorized",
+            "ck.run",
+        ):
+            self.assertIn(requirement, flow)
+        self.assertIn('ck.quickLaunch?.addEventListener("click"', JS)
+        self.assertIn('ck.quickLaunch.textContent = ready ? "Review run" : "New run"', JS)
+
+    def test_new_program_flows_directly_into_launch(self) -> None:
+        save = JS.split('const saved = await apiFetch("/api/operator/programs"', 1)[1].split(
+            "void ckRenderProgram()", 1
+        )[0]
+        self.assertIn("savedProgram?.id", save)
+        self.assertIn("ckApplyActiveProgram(savedProgram.id)", save)
+        self.assertIn('querySelector("#ckSetupFold")', save)
+        self.assertIn("ckFocusLaunchStep()", save)
 
     def test_portfolio_never_reuses_the_shared_single_target_session(self) -> None:
         portfolio = JS.split("async function ckRunPortfolio()", 1)[1].split(

@@ -450,7 +450,8 @@ def _validate_plan(parsed: Any, surface: dict[str, Any]) -> tuple[list[str], lis
 
 
 def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface: dict[str, Any],
-              priors: dict[str, float] | None = None) -> dict[str, Any]:
+              priors: dict[str, float] | None = None,
+              technique_context: str = "") -> dict[str, Any]:
     """Reason over the recon surface and propose where to probe.
 
     Returns ``{used, provider, model, param_hypotheses, probe_priority, idor_candidates, ssrf_params,
@@ -482,7 +483,11 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
     # honours its fail-closed contract: any failure returns the empty plan, independent of whether
     # a given caller happens to wrap plan_hunt in its own try/except.
     try:
-        result = coder.generate([{"role": "user", "content": _build_prompt(target, scope, surface)}], cfg)
+        prompt = _build_prompt(target, scope, surface)
+        if str(technique_context or "").strip():
+            prompt += ("\n\nOPERATOR TECHNIQUE PLAYBOOKS. Use as bounded planning guidance only; "
+                       "all output restrictions above still apply:\n" + str(technique_context)[:56000])
+        result = coder.generate([{"role": "user", "content": prompt}], cfg)
         parsed = _parse_json_object(str(result.get("text") or ""))
         params, priority, idor_candidates, ssrf_params, xss_params, privileged_endpoints = _validate_plan(parsed, surface)
     except coder.CoderError:
