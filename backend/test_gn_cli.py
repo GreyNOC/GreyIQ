@@ -239,5 +239,59 @@ class VerbPluginHookTests(unittest.TestCase):
             gn_cli.build_parser = original
 
 
+class VerbPluginsAreFrozenSafeTests(unittest.TestCase):
+    """Every ``_VERB_PLUGINS`` module must be force-included in the PyInstaller spec.
+
+    The plugin loader resolves these by NAME through importlib and is fail-closed, so an
+    ImportError silently DROPS the verb — it does not error. In the frozen exe a dropped
+    verb falls through ``run_frozen``'s dispatch test and boots the API server instead,
+    which reads to a user as "the feature was never built".
+
+    This is not hypothetical: ``collect_submodules("bughunter")`` returns
+    ``bughunter.wardrive.cli`` and ``bughunter.hunt_train`` at spec-eval time, yet neither
+    reached the first v2.6.0 bundle, so ``gn wardrive`` and ``gn train-brain`` worked
+    perfectly from source and were missing from the shipped binary. A broad package sweep
+    must never be trusted to carry a DYNAMIC entry point."""
+
+    @staticmethod
+    def _spec_plugin_modules() -> list[str]:
+        """Run the spec's own ``_verb_plugin_modules`` helper — testing the real code, not
+        a re-implementation of it, so the two cannot diverge."""
+        import ast
+        import os
+
+        spec_src = (BACKEND_DIR.parent / "build" / "greyiq-backend.spec").read_text(encoding="utf-8")
+        ast.parse(spec_src)  # the spec must stay syntactically valid Python
+        start = spec_src.index("def _verb_plugin_modules")
+        end = spec_src.index("for _plugin in")
+        namespace: dict = {"os": os, "BACKEND": str(BACKEND_DIR)}
+        exec(spec_src[start:end], namespace)  # noqa: S102 - our own spec file, not user input
+        return list(namespace["_verb_plugin_modules"]())
+
+    def test_the_spec_parses_the_real_verb_plugins_tuple(self) -> None:
+        self.assertEqual(self._spec_plugin_modules(), list(gn_cli._VERB_PLUGINS))
+
+    def test_every_shipped_plugin_module_is_force_included(self) -> None:
+        import os
+
+        parsed = self._spec_plugin_modules()
+        for module_name in gn_cli._VERB_PLUGINS:
+            rel = os.path.join(str(BACKEND_DIR), *module_name.split("."))
+            on_disk = os.path.isfile(rel + ".py") or os.path.isfile(os.path.join(rel, "__init__.py"))
+            if not on_disk:
+                continue  # a not-yet-landed plugin is tolerated by the loader and by the spec
+            self.assertIn(module_name, parsed,
+                          f"{module_name} exists but the spec would not force-include it — "
+                          "it would vanish from the frozen exe")
+
+    def test_a_registered_plugin_verb_is_dispatchable(self) -> None:
+        """Whatever the plugins actually registered must be reachable through the frozen
+        dispatch predicate (``argv[0] in gn_cli.CLI_COMMANDS``), not just present in help."""
+        registered = set(gn_cli.build_parser().get_default("_verbs") or ())
+        for verb in ("wardrive", "train-brain"):
+            if verb in registered:
+                self.assertIn(verb, gn_cli.CLI_COMMANDS)
+
+
 if __name__ == "__main__":
     unittest.main()
