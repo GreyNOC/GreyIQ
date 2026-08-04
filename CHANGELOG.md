@@ -2,6 +2,50 @@
 
 Notable changes to GreyIQ.
 
+## v2.7.0 - per-brain reasoning, structured output, and an identity on the wire
+
+### Brains
+- **Per-brain reasoning profiles** (`backend/brain_profiles.py`). Every brain previously shared one
+  model, one effort level and one token budget, so the hunt planner - which decides where an entire
+  engagement points its probe budget - reasoned exactly as hard as the one-line impact narrator that
+  runs once per finding. Profiles give `xhigh` to the hunt planner, the strategy dossier and the
+  Workbench agent, and a deliberately cheap budget to the per-finding narrator. A profile is a
+  DEFAULT, not an override: an explicit operator setting always wins, and any historical shipped
+  default counts as "unset" so an upgraded install is never left pairing raised effort with the old
+  ceiling.
+- **Structured outputs.** The four JSON brains no longer scrape their reply out of model prose with
+  three divergent parsers - a caller sets a JSON schema and the reply is constrained to match. The
+  hunt planner's vulnerability-class enum is derived from `ACTIVE_CLASSES`, so the schema cannot
+  drift from what the differential prover can actually confirm. This is a SHAPE guarantee only:
+  every validator and the `brain_safety` sanitizer still own the untrusted content, and
+  non-Anthropic providers keep the prose-scraping fallback unchanged.
+- **Prompt caching** on the system prompt. The hunt planner alone re-sends up to 56k characters of
+  technique playbooks per run; that prefix is now a cache breakpoint.
+- Default model is now `claude-opus-5`, and `max_tokens` moves 8192 -> 16000 because that ceiling
+  covers thinking as well as the reply.
+- **A truncated or refused turn now raises instead of returning a partial string.** Returning a
+  half-written attack plan or a clipped JSON object as a success was the worst available outcome.
+- The **Workbench agent** had no effort or thinking configuration at all - the most agentic brain in
+  the product ran on bare API defaults. It now matches the rest.
+- The **strategy/research dossier had no system prompt**, so deep target research was being done by
+  a model still told it was a coding assistant.
+- The 400 fallback is now a ladder that drops one capability per rejection, so a model that rejects
+  caching no longer also loses adaptive thinking. Effort is sent independently of thinking.
+
+### Identity on the wire
+- The default User-Agent read `GreyNOC-Slop-Detection/0.1` - a **different GreyNOC product** - so
+  every in-scope request was misattributed. It is now derived from the single `_version` source, as
+  is the web-scan UA that had drifted to `/0.1`.
+- **All four headless-browser contexts that reach a target now send it.** They sent Chromium's own
+  UA, so proof screenshots, the stored-XSS render, the live scan and the research-account login
+  carried no researcher identity and no program marker. The local SVG rasterizer is deliberately
+  excluded - it aborts every request and never touches the network.
+- **A global researcher marker** (e.g. `h1-greynoc`) now rides every in-scope request, with a
+  settings field, plus a per-run tag on the hunt form. `campaign.run_campaign` was previously the
+  only setter in the entire product, so an ad-hoc hunt, a re-verify or a prover run identified
+  nobody. Both fragments are control-character stripped and length-capped; the per-program suffix
+  keeps its verbatim-append contract.
+
 ## v2.6.1 - honest brain failures, CVE-2026-69247
 
 ### Security
