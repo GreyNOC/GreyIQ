@@ -1828,6 +1828,12 @@ def _run_anthropic(
                     raise AgentError(f"Claude request failed: {retry_exc}") from retry_exc
             else:
                 raise AgentError(f"Claude rejected the request: {getattr(exc, 'message', exc)}") from exc
+        except anthropic.AuthenticationError as exc:
+            # Same actionable wording the chat path uses (coder._generate_anthropic); without this
+            # a bad or expired key surfaced here as a raw SDK 401 repr.
+            raise AgentError("Claude rejected the API key (authentication failed).") from exc
+        except anthropic.APIStatusError as exc:
+            raise AgentError(f"Claude API error {exc.status_code}: {getattr(exc, 'message', exc)}") from exc
         except Exception as exc:  # noqa: BLE001
             raise AgentError(f"Claude request failed: {exc}") from exc
 

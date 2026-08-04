@@ -1201,7 +1201,7 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
 def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], vuln_class: dict[str, Any] | None, scope: str, findings: list[dict[str, Any]], playbook: str, recommended_tools: list[dict[str, Any]] | None = None, response_digest: dict[str, Any] | None = None) -> dict[str, Any]:
     """Best-effort LLM enrichment. Returns a brain dict; on any failure the
     caller falls back to the deterministic report."""
-    brain: dict[str, Any] = {"used": False, "provider": "", "model": "", "tldr": "", "report_title": "", "summary": "", "notes": "", "attack_plans": {}, "manual_tests": [], "next_steps": []}
+    brain: dict[str, Any] = {"used": False, "provider": "", "model": "", "tldr": "", "report_title": "", "summary": "", "notes": "", "attack_plans": {}, "manual_tests": [], "next_steps": [], "error": ""}
     if not coder.coder_enabled(coder_cfg):
         return brain
     cfg = dict(coder.coder_config(coder_cfg))
@@ -1293,7 +1293,10 @@ def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], 
     )
     try:
         result = coder.generate([{"role": "user", "content": prompt}], cfg)
-    except coder.CoderError:
+    except coder.CoderError as exc:
+        # Record WHY it failed. A rejected API key, a timeout, or a 429 is not the same thing as
+        # "no brain configured", and the operator has to be able to tell the two apart.
+        brain["error"] = str(exc)
         return brain
     brain["used"] = True
     brain["provider"] = result.get("provider", "")
@@ -2282,7 +2285,12 @@ def run_bounty_hunt(
     _emit(f"asking the coding brain to write reproduction steps + attack plans for {len(display)} finding(s)…")
     brain = _ask_brain(coder_cfg or {}, clean_target, profile, class_obj, scope, display, playbook, recommended_tools,
                        response_digest=active_meta.get("digest") if isinstance(active_meta.get("digest"), dict) else None)
-    _emit("brain enrichment complete" if brain.get("used") else "brain enrichment skipped (no brain configured)")
+    if brain.get("used"):
+        _emit("brain enrichment complete")
+    elif brain.get("error"):
+        _emit(f"brain enrichment FAILED (report is deterministic-only): {brain['error']}")
+    else:
+        _emit("brain enrichment skipped (no brain configured)")
     for ref, plan in brain.get("attack_plans", {}).items():
         if ref in attack_plans and (plan.get("steps") or plan.get("poc")):
             base = attack_plans[ref]
