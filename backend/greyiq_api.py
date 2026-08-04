@@ -256,6 +256,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 import agent as coding_agent  # noqa: E402
+import brain_techniques  # noqa: E402
 import coder  # noqa: E402
 import project_memory  # noqa: E402
 import workspace as workspace_fs  # noqa: E402
@@ -1448,6 +1449,11 @@ class GreyIQRuntime:
     def coder_status(self) -> dict[str, Any]:
         return coder.public_config(self._coder_config())
 
+    def brain_status(self, workspace: str | None = None) -> dict[str, Any]:
+        """Public metadata only: technique names/counts, aggregate outcomes, and guardrails."""
+        root = workspace or str(PROJECT_ROOT)
+        return brain_techniques.status_snapshot(RUNTIME_DIR, SEED_DIR, root)
+
     def coder_test(self) -> dict[str, Any]:
         try:
             result = coder.generate(
@@ -1630,6 +1636,21 @@ class GreyIQRuntime:
         def on_event(event: dict[str, Any]) -> None:
             with self.lock:
                 record["events"].append(event)
+            event_type = str(event.get("type") or "")
+            message = ""
+            if event_type == "plan":
+                plan = [str(step)[:120] for step in (event.get("plan") or [])[:6]]
+                message = f"Code brain planned {len(plan)} verified workflow step(s)"
+            elif event_type == "step" and isinstance(event.get("entry"), dict):
+                entry = event["entry"]
+                tool = str(entry.get("tool") or "agent step")[:60]
+                status = "needs adaptation" if entry.get("is_error") else "completed"
+                message = f"{tool}: {status}"
+            if message:
+                bounty_progress.global_log("brain_dialog", {
+                    "domain": "code", "stage": event_type, "run_id": request_id,
+                    "message": message,
+                })
 
         def worker() -> None:
             try:
@@ -1672,6 +1693,12 @@ class GreyIQRuntime:
                            "snapshot_available": snap["available"], "snapshot_count": snap["count"]}
             finally:
                 ws_lock.release()  # free the workspace for the next run, success or failure
+            passed = bool(payload.get("ok") and payload.get("completed") and payload.get("verified"))
+            outcome = "completed and verified" if passed else "ended without verified completion"
+            bounty_progress.global_log("brain_dialog", {
+                "domain": "code", "stage": "outcome", "run_id": request_id,
+                "message": f"Code workflow {outcome}; the local procedure memory was updated",
+            })
             with self.lock:
                 record["result"] = payload
                 record["done"] = True
@@ -5107,6 +5134,9 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             return
         if method == "GET" and path == "/api/status":
             await send_json(send, await asyncio.to_thread(runtime.status))
+            return
+        if method == "GET" and path == "/api/brain/status":
+            await send_json(send, await asyncio.to_thread(runtime.brain_status))
             return
         if method == "POST" and path == "/api/chat":
             request = validate_payload(ChatRequest, await read_json_body(receive))

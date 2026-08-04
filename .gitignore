@@ -24,3 +24,9 @@ build/*
 !.env.example
 
 backend/shots/
+
+# TACNOC engagement projects. These carry captured traffic plus a project CA
+# private key and data-encryption key (secrets.enc.json), so they must never be
+# committed — not even sealed, since the metadata columns are cleartext.
+*.gnbproj/
+*.tacnocproj/

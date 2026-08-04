@@ -13,14 +13,14 @@
     <div class="ck-splash" id="ckSplash">
       <img class="ck-splash-globe" src="./globe.svg" alt="">
       <div class="ck-splash-name">GreyIQ</div>
-      <div class="ck-splash-sub">GreyNOC · starting the engine…</div>
+      <div class="ck-splash-sub">GreyNOC Operations · initializing local engine…</div>
     </div>
     <main class="app-shell">
       <aside class="bot-panel" aria-label="Bot roster and persona">
         <header class="brand-row">
           <img class="brand-globe" src="./globe.svg" alt="" width="30" height="30">
           <div>
-            <p class="eyebrow">GreyNOC-IQ</p>
+            <p class="eyebrow">GreyNOC / Operations</p>
             <h1>GreyIQ</h1>
           </div>
           <button class="icon-button" id="newBotButton" type="button" title="New bot" aria-label="New bot">
@@ -127,6 +127,7 @@
 
         <div class="panel-modes" role="tablist" aria-label="Tool mode">
           <button type="button" role="tab" id="pmode-brain" class="panel-mode-btn is-active" data-panel-mode="brain" aria-selected="true" aria-controls="panelBrain">Brain</button>
+          <button type="button" role="tab" id="pmode-ops" class="panel-mode-btn" data-panel-mode="ops" aria-selected="false" tabindex="-1" aria-controls="panelOps">Ops</button>
           <button type="button" role="tab" id="pmode-train" class="panel-mode-btn" data-panel-mode="train" aria-selected="false" tabindex="-1" aria-controls="panelTrain">Train</button>
           <button type="button" role="tab" id="pmode-security" class="panel-mode-btn" data-panel-mode="security" aria-selected="false" tabindex="-1" aria-controls="panelSecurity">Security</button>
         </div>
@@ -168,6 +169,40 @@
             <p class="folder-status" id="brainStatus" aria-live="polite"></p>
             <p class="folder-status" id="brainAccel"></p>
           </form>
+        </div>
+
+        <div class="panel-mode brain-ops" id="panelOps" data-mode="ops" role="tabpanel" aria-labelledby="pmode-ops" tabindex="0" hidden>
+          <div class="ops-kicker"><span class="ops-live-dot" aria-hidden="true"></span><span>Local operations stream</span></div>
+          <h3>Independent brains, shared evidence</h3>
+          <p class="mode-intro">Code and hunt procedures retrieve local Markdown, generate bounded chains, and adapt from verified outcomes. Authority and POE gates stay deterministic.</p>
+
+          <section class="brain-metrics" aria-label="Brain capability status">
+            <div><span>Code techniques</span><strong id="brainCodeTechniqueCount">?</strong></div>
+            <div><span>Hunt techniques</span><strong id="brainHuntTechniqueCount">?</strong></div>
+            <div><span>Verified code runs</span><strong id="brainCodeSuccessCount">?</strong></div>
+            <div><span>Confirmed outcomes</span><strong id="brainHuntConfirmCount">?</strong></div>
+          </section>
+
+          <div class="ops-section-heading">
+            <div><span class="eyebrow">Technique library</span><strong>Active playbooks</strong></div>
+            <button class="text-button" type="button" id="brainOpsRefresh">Refresh</button>
+          </div>
+          <section class="brain-technique-list" id="brainTechniqueList" aria-live="polite">
+            <p class="ops-empty">Waiting for the local engine?</p>
+          </section>
+
+          <div class="ops-section-heading">
+            <div><span class="eyebrow">POE live</span><strong>Brain dialogue</strong></div>
+            <span class="ops-local-badge">local only</span>
+          </div>
+          <section class="brain-live-feed" id="brainLiveFeed" role="log" aria-live="polite" aria-relevant="additions">
+            <p class="ops-empty">Chain plans, code steps, and proof decisions will appear here.</p>
+          </section>
+
+          <div class="ops-guardrail" id="brainGuardrail">
+            <strong>Production boundary</strong>
+            <span>Live dialogue is rendered inside GreyIQ. Nothing is auto-submitted or sent to an external production target.</span>
+          </div>
         </div>
 
         <!-- TRAIN: teach the local TinyGPT fallback -->
@@ -396,28 +431,28 @@
             <img src="./globe.svg" alt="" width="30" height="30">
           </span>
           <div>
-            <p class="ck-eyebrow">GreyNOC-IQ</p>
-            <h1>Hunt</h1>
+            <p class="ck-eyebrow">GreyNOC / Operations</p>
+            <h1>GreyIQ</h1>
           </div>
         </div>
 
         <nav class="ck-nav ck-nav-side" id="ckNav" aria-label="Cockpit views">
-          <button class="ck-nav-btn is-active" data-ck-view="program" type="button" aria-current="page">Overview</button>
+          <button class="ck-nav-btn is-active" data-ck-view="program" type="button" aria-current="page">Program</button>
           <button class="ck-nav-btn" data-ck-view="findings" type="button">Findings</button>
           <button class="ck-nav-btn" data-ck-view="surface" type="button">Surface</button>
           <button class="ck-nav-btn" data-ck-view="submissions" type="button">Submissions</button>
-          <button class="ck-nav-btn" data-ck-view="reports" type="button">Report Center</button>
-          <button class="ck-nav-btn" data-ck-view="idor" type="button">Access control</button>
-          <button class="ck-nav-btn" data-ck-view="learn" type="button">Learn</button>
+          <button class="ck-nav-btn" data-ck-view="reports" type="button">Reports</button>
+          <button class="ck-nav-btn" data-ck-view="idor" type="button">Access tests</button>
+          <button class="ck-nav-btn" data-ck-view="learn" type="button">Intel &amp; metrics</button>
         </nav>
 
         <details class="ck-setup-fold" id="ckSetupFold" open>
-          <summary class="ck-setup-head"><span>Hunt setup</span></summary>
+          <summary class="ck-setup-head"><span>New run</span><span class="ck-setup-safe">Passive first</span></summary>
           <form class="ck-launch" id="ckLaunch">
             <div class="ck-setup-step ck-step-program" data-ck-when="hunt campaign">
               <span class="ck-step-lab"><span class="ck-step-n">1</span> Program</span>
               <select id="ckActiveProgram" aria-label="Program"><option value="">— pick a program —</option></select>
-              <p class="ck-hint ck-step-hint" id="ckProgramLead">Pick a saved program to auto-fill target &amp; scope — or choose a one-off target to enter your own.</p>
+              <p class="ck-hint ck-step-hint" id="ckProgramLead">Choose a saved program to load its approved scope, or start a one-off run.</p>
             </div>
 
             <div id="ckSetupRest" class="ck-setup-rest" hidden>
@@ -432,10 +467,10 @@
             </div>
 
             <div class="ck-target-fields" data-ck-when="hunt campaign">
-            <label><span>Target</span>
+            <label><span>Asset or repository</span>
               <select id="ckTargetPick" hidden aria-label="Target — pick from the program's scope"></select>
-              <input id="ckTarget" type="text" autocomplete="off" spellcheck="false" placeholder="https://example.com  ·  https://github.com/org/repo  ·  C:\path\to\repo"></label>
-            <label><span>Scope / program notes</span>
+              <input id="ckTarget" type="text" autocomplete="off" spellcheck="false" aria-label="Asset or repository" placeholder="https://example.com  ·  https://github.com/org/repo  ·  C:\path\to\repo"></label>
+            <label><span>Authorized scope</span>
               <input id="ckScope" type="text" autocomplete="off" placeholder="acme — *.example.com in scope"></label>
             </div>
 
@@ -452,7 +487,7 @@
             <span class="ck-step-lab" data-ck-when="hunt campaign"><span class="ck-step-n">3</span> Verification &amp; depth</span>
             <span class="ck-step-lab" data-ck-when="portfolio" hidden><span class="ck-step-n">2</span> Verification &amp; depth</span>
             <details class="ck-options-fold" id="ckOptionsFold">
-              <summary><span>Passive by default</span><small>expand for proof probes</small></summary>
+              <summary><span>Passive scan</span><small>optional proof probes</small></summary>
             <div class="ck-toggles">
               <label class="ck-switch" id="ckSpanScopeWrap" data-ck-when="campaign" hidden>
                 <input id="ckSpanScope" type="checkbox">
@@ -472,7 +507,7 @@
             </details>
 
             <details class="ck-auth-fold" id="ckAuthFold" data-ck-when="hunt campaign">
-              <summary>Scan behind a login <span class="ck-auth-hint">optional</span></summary>
+              <summary>Authenticated scan <span class="ck-auth-hint">optional</span></summary>
               <label><span>Session cookie</span>
                 <input id="ckAuthCookie" type="text" autocomplete="off" spellcheck="false" placeholder="session=…; csrf=…"></label>
               <label><span>Extra headers <em>(one per line, Name: value)</em></span>
@@ -484,7 +519,7 @@
             <span class="ck-step-lab" data-ck-when="hunt campaign"><span class="ck-step-n">4</span> Authorize &amp; launch</span>
             <span class="ck-step-lab" data-ck-when="portfolio" hidden><span class="ck-step-n">3</span> Authorize &amp; launch</span>
             <label class="ck-switch ck-auth"><input id="ckAuthorized" type="checkbox">
-              <span><strong>Confirm authorization and scope.</strong></span></label>
+              <span><strong>I confirm this run is authorized and in scope.</strong></span></label>
             <p class="ck-launch-readiness" id="ckLaunchReadiness" aria-live="polite">Choose a program or one-off target to begin.</p>
             <button class="ck-run" id="ckRun" type="submit">Run hunt</button>
             <p class="ck-status" id="ckStatus" aria-live="polite"></p>
@@ -496,7 +531,7 @@
         </details>
 
         <div class="ck-side-foot">
-          <button class="ck-nav-btn ck-foot-btn" data-ck-view="operator" type="button">Operator</button>
+          <button class="ck-nav-btn ck-foot-btn" data-ck-view="operator" type="button">Automation</button>
         </div>
       </aside>
       <div class="ck-resizer" id="ckResizer" role="separator" aria-orientation="vertical" aria-label="Resize sidebar (drag, or arrow keys)" tabindex="0" title="Drag to resize"></div>
@@ -506,10 +541,10 @@
           <div class="ck-topbar-left">
             <div class="ck-topbar-field">
               <span class="ck-topbar-flabel">Program</span>
-              <span class="ck-topbar-value" id="ckTopProgram" title="Chosen in the sidebar’s Hunt setup">— none —</span>
+              <span class="ck-topbar-value" id="ckTopProgram" title="Chosen in the New run panel">— none —</span>
             </div>
             <div class="ck-topbar-field">
-              <span class="ck-topbar-flabel">Campaign</span>
+              <span class="ck-topbar-flabel">Run mode</span>
               <div class="ck-seg-group" role="group" aria-label="Run type">
                 <button type="button" class="ck-seg is-active" id="ckRunHunt" data-ck-runtype="hunt" aria-pressed="true">Single hunt</button>
                 <button type="button" class="ck-seg" id="ckRunCampaign" data-ck-runtype="campaign" aria-pressed="false">Full campaign</button>
@@ -518,6 +553,7 @@
             </div>
           </div>
           <div class="ck-topbar-actions">
+            <button class="ck-ghost ck-quick-launch" id="ckQuickLaunch" type="button" title="Open the New run panel">New run</button>
             <span class="ck-service" id="ckService" title="Local engine status">connecting…</span>
             <button class="ck-ghost" id="ckTacnoc" type="button" title="Open TACNOC in its own secure desktop window">TACNOC</button>
             <button class="ck-ghost" id="ckStudio" type="button" title="Open the AI studio (chat, coding brain, training)">Studio ↗</button>
