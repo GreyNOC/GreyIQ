@@ -24,6 +24,7 @@ from urllib.parse import parse_qsl, urlparse
 from uuid import uuid4
 
 import coder
+import brain_profiles
 import brain_techniques
 from bughunter import active_verify_service
 from bughunter import brain_narrative
@@ -44,6 +45,7 @@ from bughunter import secret_classification
 from bughunter import screenshot_service
 from bughunter import sensitive_data
 from bughunter import toolkit as toolkit_lib
+from bughunter import web_ingest
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.code_scanner.sources.git_remote import is_supported_remote_git_url
 from bughunter.live_scan_service import run_live_scan
@@ -1198,6 +1200,78 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
     return raw, ran, meta, overall_risk, overall_score
 
 
+# Structured-output schema for the reporter brain's reply. Anthropic-only: coder.generate passes it
+# as a response format so the model is CONSTRAINED to emit matching JSON; every other provider
+# ignores it and keeps the prose-scraping fallback (_parse_json_object below), which is why that
+# path must stay.
+#
+# Two things this schema is NOT:
+#   * It is not a trust boundary. It constrains SHAPE, never CONTENT — the reply can still carry a
+#     secret echoed from a scanned snippet or a prompt-injection reflected from the target's own
+#     page, so every field still goes through brain_safety.sanitize_brain_field and the per-field
+#     caps in _ask_brain. Those remain the real enforcement.
+#   * It is not the length limiter. Structured outputs reject minLength/maxLength/pattern/minimum,
+#     so word/length caps live in the prompt text and the post-parse caps in code.
+#
+# Note the shape mismatch this schema deliberately describes: the model emits ``attack_plans`` as a
+# LIST of plans (each carrying its own ``ref``); _ask_brain folds that list into a dict keyed by ref.
+# The schema must match what the MODEL emits, not what the code stores.
+_REPORT_PROOF_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "status", "method", "actor", "affected_asset", "observed_result",
+        "control_result", "evidence", "limitations", "proof_obligation",
+    ],
+    "properties": {
+        # 'confirmed' ONLY for a real captured artifact from an authorized test. The brain is an
+        # enricher, never an authority: observed_result/control_result are dropped on parse, so a
+        # 'confirmed' here can never by itself flip a finding's proof state.
+        "status": {"type": "string", "enum": ["confirmed", "candidate", "missing"]},
+        "method": {"type": "string", "description": "The authorized test used."},
+        "actor": {"type": "string", "description": "Role/account used."},
+        "affected_asset": {"type": "string", "description": "Data or action affected."},
+        "observed_result": {"type": "string", "description": "Exact response/state proving impact."},
+        "control_result": {"type": "string", "description": "Expected/negative-control result."},
+        "evidence": {"type": "string", "description": "Safe, concise, redacted proof."},
+        "limitations": {"type": "string", "description": "What is not yet proven."},
+        "proof_obligation": {"type": "string", "description": "The exact artifact to capture to PROVE impact."},
+    },
+}
+
+_REPORT_PLAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["ref", "steps", "poc", "impact", "cvss_vector", "proof_of_impact"],
+    "properties": {
+        "ref": {"type": "string", "description": "The finding ref this plan is for, e.g. 'F1'."},
+        "steps": {"type": "array", "items": {"type": "string"}, "description": "Reproduction steps, most important first."},
+        "poc": {"type": "string", "description": "Short PoC outline — no exploit code or payloads."},
+        "impact": {"type": "string"},
+        "cvss_vector": {"type": "string", "description": "CVSS v3.1 base vector, e.g. 'CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N'."},
+        "proof_of_impact": _REPORT_PROOF_SCHEMA,
+    },
+}
+
+_REPORT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "tldr", "report_title", "executive_summary", "attack_plans",
+        "manual_tests", "next_steps", "notes",
+    ],
+    "properties": {
+        "tldr": {"type": "string", "description": "One sentence, 25 words or fewer — the most important takeaway for a triager."},
+        "report_title": {"type": "string", "description": "Submission-ready title for the highest-impact finding: bug class + affected endpoint/parameter."},
+        "executive_summary": {"type": "string", "description": "2-4 sentences, most important issue first."},
+        "attack_plans": {"type": "array", "items": _REPORT_PLAN_SCHEMA},
+        "manual_tests": {"type": "array", "items": {"type": "string"}, "description": "Leads the scanner cannot confirm, to try by hand in scope."},
+        "next_steps": {"type": "array", "items": {"type": "string"}, "description": "Target-specific imperative actions, most valuable first."},
+        "notes": {"type": "string", "description": "Optional extra analysis; empty string when there is none."},
+    },
+}
+
+
 def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], vuln_class: dict[str, Any] | None, scope: str, findings: list[dict[str, Any]], playbook: str, recommended_tools: list[dict[str, Any]] | None = None, response_digest: dict[str, Any] | None = None) -> dict[str, Any]:
     """Best-effort LLM enrichment. Returns a brain dict; on any failure the
     caller falls back to the deterministic report."""
@@ -1206,6 +1280,13 @@ def _ask_brain(coder_cfg: dict[str, Any], target: str, profile: dict[str, Any], 
         return brain
     cfg = dict(coder.coder_config(coder_cfg))
     cfg["system_prompt"] = BOUNTY_SYSTEM_PROMPT
+    # The reporter brain writes the delivered artifact (reproduction steps, attack plans, the
+    # triager-facing narrative), so it gets real reasoning headroom — unless the operator set their
+    # own effort/max_tokens, which always wins (brain_profiles.apply only fills shipped defaults).
+    brain_profiles.apply(cfg, "report")
+    # Constrain the reply to the JSON contract spelled out in the prompt below. Anthropic-only; the
+    # prose-scraping fallback stays for every other provider and for a malformed reply.
+    cfg["response_schema"] = _REPORT_SCHEMA
     compact = [
         {
             "ref": f.get("ref"),
@@ -1813,6 +1894,44 @@ def _write_sensitive_data_files(display: list[dict[str, Any]], base_dir: Path) -
 
 
 def run_bounty_hunt(
+    target: str,
+    profile_id: str,
+    vuln_class: str | None,
+    output_dir: str | None,
+    scope: str,
+    authorized: bool,
+    coder_cfg: dict[str, Any] | None,
+    *,
+    user_agent_suffix: str = "",
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Run one hunt, first honoring the program's HUNTING REQUIREMENT for a user-agent tag.
+
+    ``user_agent_suffix`` is the marker a bug-bounty program can REQUIRE on every request it
+    receives so its triage team can identify authorized researcher traffic. It is set for the whole
+    hunt in THIS thread (a contextvar) so it rides on recon, the scan, and the active prover alike,
+    and is always restored — mirroring ``campaign.run_campaign``, which does the same around a
+    campaign. Until now only campaigns tagged their traffic, so a SINGLE hunt sent no program marker
+    at all.
+
+    Everything else forwards verbatim to the hunt body. One deliberate difference from
+    ``run_campaign``: an EMPTY suffix leaves the contextvar ALONE rather than clearing it. A
+    campaign sets the program's tag once and then calls this function per URL without passing it
+    down, so unconditionally setting "" here would strip the tag from essentially every request a
+    campaign makes."""
+    ua_token = web_ingest.set_ua_suffix(user_agent_suffix) if str(user_agent_suffix or "").strip() else None
+    try:
+        return _run_bounty_hunt_body(
+            target, profile_id, vuln_class, output_dir, scope, authorized, coder_cfg, **kwargs
+        )
+    finally:
+        # try/finally so a raise or an early return can never leak one program's tag into the next
+        # hunt running in this thread.
+        if ua_token is not None:
+            web_ingest.reset_ua_suffix(ua_token)
+
+
+def _run_bounty_hunt_body(
     target: str,
     profile_id: str,
     vuln_class: str | None,

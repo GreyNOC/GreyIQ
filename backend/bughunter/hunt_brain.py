@@ -35,6 +35,7 @@ import re
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
+import brain_profiles
 import coder
 import trust
 from bughunter import offline_hunt
@@ -340,6 +341,51 @@ def _build_prompt(target: str, scope: str, surface: dict[str, Any]) -> str:
     )
 
 
+# The vuln-class vocabulary the planner is allowed to name, derived from ACTIVE_CLASSES so the schema
+# can NEVER drift from what the differential prover can actually confirm. Sorted for determinism (a
+# stable schema is a cache-friendly schema, and a stable diff). `_norm_class` still folds the aliases
+# (open-redirect -> redirect, lfi -> path-traversal, ...) after parsing.
+_PLAN_CLASS_ENUM: list[str] = sorted(ACTIVE_CLASSES)
+
+# Structured-output contract for the planner reply — the EXACT shape `_build_prompt` asks for. On
+# Anthropic this constrains the model to emit matching JSON, which removes the "model wrote prose /
+# fenced markdown / a trailing apology" failure mode entirely. It is a SHAPE guarantee only: every
+# value is still attacker-influenced (recon text is reflected into the prompt), so `_parse_json_object`
+# and `_validate_plan` remain the enforcement — the caps, the param-name regex, and the verbatim
+# in-scope endpoint check are what actually keep the brain inside its box. Other providers ignore
+# `response_schema` and keep the prose-scraping fallback.
+#
+# NOTE: strict schemas reject minLength/maxLength/minimum/maximum/pattern — the length caps live in
+# the prompt as guidance and in `_validate_plan` as enforcement, never here.
+PLAN_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["param_hypotheses", "probe_priority", "idor_candidates", "ssrf_params",
+                 "xss_params", "privileged_endpoints", "notes"],
+    "properties": {
+        "param_hypotheses": {"type": "array", "items": {"type": "string"}},
+        "probe_priority": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["endpoint", "classes", "why"],
+                "properties": {
+                    "endpoint": {"type": "string"},
+                    "classes": {"type": "array", "items": {"type": "string", "enum": _PLAN_CLASS_ENUM}},
+                    "why": {"type": "string"},
+                },
+            },
+        },
+        "idor_candidates": {"type": "array", "items": {"type": "string"}},
+        "ssrf_params": {"type": "array", "items": {"type": "string"}},
+        "xss_params": {"type": "array", "items": {"type": "string"}},
+        "privileged_endpoints": {"type": "array", "items": {"type": "string"}},
+        "notes": {"type": "string"},
+    },
+}
+
+
 def _validate_names(raw: Any, cap: int = 12) -> list[str]:
     """Validate a model-supplied list of PARAMETER NAMES: names only (rejects URLs/payloads/values via
     _PARAM_NAME_RE), deduped, capped. A name can never carry a payload — the deterministic check does."""
@@ -478,6 +524,10 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
         return plan
     cfg = dict(coder.coder_config(coder_cfg))
     cfg["system_prompt"] = HUNT_BRAIN_SYSTEM_PROMPT
+    # Where an entire engagement points its probe budget is the highest-leverage single call in the
+    # product, so it gets the deepest profile (unless the operator configured their own).
+    brain_profiles.apply(cfg, "hunt_plan")
+    cfg["response_schema"] = PLAN_RESPONSE_SCHEMA
     # The WHOLE brain interaction — the network call, JSON parsing, AND validation of the
     # model's (untrusted, possibly hijacked) output — is inside one guard so the module itself
     # honours its fail-closed contract: any failure returns the empty plan, independent of whether
