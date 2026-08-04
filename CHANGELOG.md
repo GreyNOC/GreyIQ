@@ -2,6 +2,36 @@
 
 Notable changes to GreyIQ.
 
+## v2.6.1 - honest brain failures, CVE-2026-69247
+
+### Security
+- `cryptography` moves to 50.x for **CVE-2026-69247**. The previous `<50.0` ceiling pinned the
+  build to vulnerable 49.0.0 and failed the CI `pip-audit` gate on every run. `cryptography` is a
+  bundled release dependency (RSA/RS256 signing that proves a leaked GCP service-account key is
+  live), so the vulnerable copy was shipping inside the portable exe and the installer, not just
+  failing CI. Verified: the hazmat primitives in use are unchanged, `test_credential_validation`
+  53 passed, full suite identical on 50.0.0, `pip-audit -r requirements.txt` clean.
+
+### Fixed
+- A configured-but-failing Claude brain is no longer misreported as an absent one. The hunt's
+  report enrichment returned the same "unused" result for both "nothing configured" and "Claude
+  rejected the API key", so an auth failure, timeout, or 429 was announced to the operator as
+  *"brain enrichment skipped (no brain configured)"* - pointing at the wrong problem. `_ask_brain`
+  now records why it failed and the progress line distinguishes the two cases. The reason reaches
+  only the live progress stream: `report.build_json` builds its brain block from an explicit
+  allowlist, so it cannot enter a delivered report.
+- The Workbench agent loop caught `anthropic.AuthenticationError` in its generic handler, so a
+  rejected or expired key surfaced as a raw SDK 401 repr. It now raises the same actionable
+  "Claude rejected the API key (authentication failed)" message the chat path already used, and
+  gives `APIStatusError` the same treatment.
+
+### Tests
+- First coverage for the Anthropic provider path, which previously had none: the request shape
+  (adaptive thinking plus `output_config.effort`, the 400-retry that drops them for older models,
+  and that `temperature`/`top_p`/`top_k` are never sent - those return 400 on Opus 4.7+), the
+  API-key round-trip including preserve-on-blank-resave and redaction to `has_api_key`, and the
+  failure-reporting split. Suite 1877 -> 1893 passed.
+
 ## v2.6.0 - TACNOC launcher, shared brain techniques
 
 Merges the `GreyNOC/AddTACNOC` line onto the v2.5.0 release. That branch was cut before
