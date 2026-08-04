@@ -2,8 +2,9 @@
 
 Notable changes to GreyIQ.
 
-## Unreleased - investigation cortex
+## v2.8.0 - investigation cortex, removable brain keys
 
+### Investigation cortex
 - Added a deterministic, evidence-grounded investigation cortex shared by the coding
   agent, hunt planner/loop, and bounty reports. It calibrates confidence from typed
   artifacts, ranks proof-gathering hypotheses, flags contradictory evidence, and
@@ -19,6 +20,79 @@ Notable changes to GreyIQ.
 - New contract tests cover false confirmation from prose, non-differential controls,
   public-key severity inflation, chain correlation, report serialization, and coding-
   agent credential isolation.
+- **The cortex no longer decides what counts as confirmation.** Pre-release adversarial
+  review found it re-deriving the confirm rule instead of using the engine's authority, and
+  the two had drifted: a passive web `proof_evidence` (request line + response status,
+  which every header/cookie/disclosure finding carries) counted as a confirming artifact
+  here but is deliberately refused by `report._has_captured_artifact`, because it proves a
+  GET happened, not impact. A configured brain — or prompt-injected text echoed through one
+  — could pair a claimed `status: confirmed` with one passive GET and make the delivered
+  report print "confirmed / report-ready / 90-of-100" for a Low missing-header finding whose
+  canonical proof status in the same report still read `candidate`. That is exactly the
+  fabrication the gate exists to prevent. `investigator.has_confirming_artifact` now
+  delegates to the single authority; an unbacked claim raises a blocking
+  `confirmation-without-artifact` contradiction instead of a confirmation, and without an
+  accepted artifact calibrated confidence is capped below the `supported` band (a
+  missing-header finding scored 86/100 and read "supported" on the strength of a GET).
+- Liveness alone no longer validates a credential: a live Google/Firebase **public client
+  key** answering its own issuer is that key's expected behaviour, and was scoring an
+  Informational finding at 98/100. It now requires the same strict classification the
+  report gate requires, and a public key claimed as confirmed raises the classification
+  conflict — which previously keyed off a severity the classifier forces down to info/low,
+  so it could never fire on the mainline path.
+- A malformed authority in a finding's location (`https://host]/x`, `http://[foo]/x`) raised
+  out of `urlparse` at report-writing time and would have discarded a **completed** hunt's
+  report; scope extraction now fails closed. A non-finite `score` from a model reply no
+  longer empties the probe queue, and a synthesized hypothesis ref can no longer collide
+  with an explicit one.
+- The read-only claim for `investigate_code` is now asserted against the filesystem — a full
+  run must leave the workspace byte-identical — and workspace escape is tested directly,
+  replacing assertions that only read the tool's own description back.
+- The graph is built from the same filtered finding set as the report body and JSON sidecar,
+  so the ranked hypothesis queue can no longer cite an `F<n>` that was dropped as a
+  false-positive secret or an unconfirmed JWT candidate and appears nowhere else.
+- An iterative hunt returns two graphs — the loop's provisional snapshot and the
+  authoritative one built at report time — so both now carry `stage` and `authoritative`
+  markers instead of being indistinguishable in the same API response.
+- A second adversarial pass over that fix found the confirm gate closed but the fix carrying
+  its own costs, now also fixed. Unproven confidence is **rescaled** into the lead range
+  rather than clipped at its ceiling: clipping gave every unproven lead the identical score,
+  which flattened the ranked hypothesis queue into input order and ranked a missing header
+  level with a captured stack trace — in the one situation ("nothing is confirmed yet, what
+  do I chase?") the queue exists to answer.
+- The chain layer honours the same rule as the node layer. A chain of pure leads was averaging
+  its nodes and adding a same-scope bonus to land at `supported / 59`, above the ceiling none
+  of its nodes could reach; it is now `candidate` and capped. A malformed URL no longer
+  collapses to its scheme in scope extraction, which had handed unrelated findings a shared
+  bogus "scope" and with it that bonus.
+- Confirmation is read from the **same** proof carrier the gate is applied to, in the report's
+  own precedence order, so a bare `confirmed` on one carrier cannot borrow a differential
+  sitting on another. The cortex also reads the report's full proof vocabulary
+  (`verified`/`proven`/`reproduced`), which it previously ignored — the mirror of the same
+  drift, in the under-reporting direction.
+
+### A stored brain API key can finally be removed
+- A blank `api_key` in an update means "keep the stored one" — the UI never receives the
+  key back, so without that rule saving any other brain setting would wipe it. That
+  overload left **no way to express deletion**: the delete branch of the secrets store was
+  unreachable for coder providers, so removing a key meant hand-editing
+  `runtime/secrets.json`.
+- An explicit `clear_api_key` sentinel in the provider block is that path. It is a command,
+  not a setting (never stored), it is scoped to the provider that asked, and it **outranks
+  an `api_key` sent alongside it** so a contradictory update fails safe — visibly no key
+  beats silently keeping one the operator asked to delete. False-ish string flags
+  (`"false"`, `"0"`, `"off"`) are read as "no", so a stringified flag cannot delete a key
+  by accident.
+- The brain panel grows a **Clear saved key** control, shown only once a key is actually
+  stored and confirmed before it fires. Clearing refreshes just the key state, so it does
+  not snap the provider dropdown back or discard unsaved field edits.
+
+### Frontend assets stay grep-visible
+- A single raw control byte makes ripgrep and grep classify a file as binary and skip it
+  silently. `public/app.js` had picked up a raw NUL as a cache-key separator, which blinded
+  every content search and grep-driven audit over the 11.8k-line frontend — git itself had
+  the blob marked `-text`. A regression test now asserts `app.js`, `index.html` and
+  `styles.css` carry no raw control bytes beyond tab/LF/CR and decode as UTF-8.
 
 ## v2.7.0 - per-brain reasoning, structured output, and an identity on the wire
 

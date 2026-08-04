@@ -11,8 +11,27 @@ layer. Its purpose is to answer four analyst questions consistently:
 ## Core invariant
 
 Reasoning is not authority. Models, scanner rules, route semantics, and learned priors
-may propose hypotheses. Only typed captured artifacts can support confirmation. Free-text
-claims, including text marked `confirmed`, do not count as evidence.
+may propose hypotheses. Free-text claims, including text marked `confirmed`, do not count
+as evidence.
+
+**The cortex does not decide what counts as confirmation.** `report._has_captured_artifact`
+is the engine's single confirm authority, and `investigator.has_confirming_artifact`
+delegates to it rather than re-deriving the rule. This is load-bearing: the two DID drift
+once. The cortex treated a passive web `proof_evidence` (a request line plus a response
+status — which every header, cookie and disclosure finding carries) as a confirming typed
+artifact, while the canonical gate deliberately refuses it because it proves a GET
+happened, not impact. A configured brain — or prompt-injected text echoed through one —
+could then pair a claimed `status: confirmed` with one passive GET and have the delivered
+report print "confirmed / report-ready" for a missing-header finding whose canonical proof
+status was still `candidate`. Delegating is what keeps that closed.
+
+Two consequences follow, and both are tested:
+
+- A claimed confirmation the gate does not accept raises a blocking
+  `confirmation-without-artifact` contradiction. The claim is surfaced to the operator, not
+  silently rewritten into a weaker status.
+- Without an artifact the gate accepts, calibrated confidence is capped below the
+  `supported` band. Evidence that a request was made is a lead, never support.
 
 The cortex therefore does not execute probes, change scope, create findings, set CVSS,
 or bypass submission gates. Existing workspace, scope, SSRF, rate, authorization, and
@@ -34,6 +53,12 @@ proof controls remain authoritative.
 Typed evidence currently includes captured request/response pairs, response bodies,
 matched values, observed/control differentials, OOB callbacks, live credential
 validation, and screenshots. A source snippet earns only a small static-evidence weight.
+
+Being a typed artifact is not the same as being a confirming one — a captured
+request/response pair is inventoried and shown, but only the confirm authority above
+decides whether anything confirms. Live credential validation is listed only for a
+credential strict classification actually confirmed: a live public client key answering
+its own issuer is the expected behaviour of that key, not proof of impact.
 
 ## Coding integration
 

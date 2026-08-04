@@ -43,10 +43,33 @@ class AgentInvestigateToolTests(unittest.TestCase):
         self.assertIn("app.py:7", output)
         self.assertNotIn(secret, output)
 
-    def test_tool_is_registered_and_read_only(self) -> None:
+    def test_tool_is_registered(self) -> None:
         definition = next(item for item in agent._TOOLS if item["name"] == "investigate_code")
         self.assertIn("never modifies", definition["description"])
+
+    def test_running_the_tool_leaves_the_workspace_byte_identical(self) -> None:
+        """The read-only claim, asserted against the filesystem rather than the tool's own
+        description: a full run over a real workspace must not add, drop or alter a byte."""
+        root = Path(self.tmp.name)
+        (root / "unsafe.py").write_text(
+            "import os\n\ndef run(user_input):\n    return os.system(user_input)\n", encoding="utf-8"
+        )
+        (root / "notes.md").write_text("# notes\n", encoding="utf-8")
+        before = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+        output, is_error = self.box.run("investigate_code", {"path": ".", "max_files": 20})
+        self.assertFalse(is_error, output)
+
+        after = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+        self.assertEqual(before, after)
         self.assertEqual(self.box.touched, set())
+        self.assertFalse(getattr(self.box, "changes", None))
+
+    def test_the_tool_cannot_read_outside_the_workspace(self) -> None:
+        for escape in ("../", "../../../../../../etc/passwd", "..\\..\\Windows\\win.ini", "/etc/passwd"):
+            with self.subTest(path=escape):
+                output, is_error = self.box.run("investigate_code", {"path": escape, "max_files": 5})
+                self.assertTrue(is_error, f"{escape!r} was not refused: {output}")
 
     def test_real_scanner_finds_sink_but_keeps_it_candidate(self) -> None:
         Path(self.tmp.name, "unsafe.py").write_text(

@@ -2583,8 +2583,13 @@ def _run_bounty_hunt_body(
         "endpoints": list(active_targets) if kind == "url" else [],
         "params": list(effective_extra_params) if kind == "url" else [],
     }
+    # Built from the SAME filtered set the report body and JSON findings use. Ranking the raw
+    # display list let the hypothesis queue name an F<n> that _reportable_findings had dropped
+    # (a false-positive secret, an unconfirmed JWT candidate), so the brief cited a finding that
+    # appeared nowhere else in the report.
     ctx["investigation"] = investigator.build_investigation(
-        display, attack_plans, surface=investigation_surface, scan_meta=active_meta,
+        report_lib._reportable_findings(display), attack_plans,
+        surface=investigation_surface, scan_meta=active_meta,
     )
 
     _emit("writing report…")

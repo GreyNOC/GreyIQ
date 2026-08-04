@@ -60,6 +60,160 @@ class InvestigationCortexTests(unittest.TestCase):
         self.assertFalse(item["report_ready"])
         self.assertEqual(graph["contradictions"][0]["code"], "confirmation-without-artifact")
 
+    # The regression that shipped: the check above only covered a claim with ZERO artifacts.
+    # Every passive web finding carries request_line + response_status, which the cortex counted
+    # as a typed artifact while the canonical confirm gate deliberately refuses it -- so one
+    # passive GET plus brain prose printed "confirmed / report-ready" for a missing header.
+    PASSIVE_HEADER_FINDING = {
+        "ref": "F1", "rule_id": "web.missing-header.x-frame-options",
+        "title": "Missing X-Frame-Options", "severity": "low", "confidence": "high",
+        "location": "https://app.example/",
+        "proof_evidence": {"request_line": "GET https://app.example/", "response_status": "HTTP 200"},
+    }
+
+    def test_prose_confirmation_over_a_passive_request_is_blocked(self) -> None:
+        plans = {"F1": {"proof_of_impact": {
+            "status": "confirmed", "observed_result": "", "control_result": "",
+            "summary": "Clickjacking confirmed on the login page.",
+        }}}
+        graph = investigator.build_investigation([dict(self.PASSIVE_HEADER_FINDING)], plans)
+        item = graph["hypotheses"][0]
+        self.assertTrue(item["artifacts"])  # it DOES have a typed artifact...
+        self.assertNotEqual(item["status"], "confirmed")  # ...which still cannot confirm it
+        self.assertFalse(item["report_ready"])
+        self.assertEqual(item["decision"], "resolve-contradiction")
+        self.assertEqual(graph["metrics"]["confirmed"], 0)
+        self.assertEqual(graph["metrics"]["report_ready"], 0)
+        self.assertTrue(any(row["code"] == "confirmation-without-artifact" for row in graph["contradictions"]))
+
+    def test_a_passive_request_alone_cannot_reach_the_supported_band(self) -> None:
+        """Proving a GET happened is a lead. It used to score 86/100 and read "supported"."""
+        graph = investigator.build_investigation([dict(self.PASSIVE_HEADER_FINDING)])
+        item = graph["hypotheses"][0]
+        self.assertEqual(item["status"], "candidate")
+        self.assertLess(item["confidence_score"], investigator._SUPPORTED_THRESHOLD)
+        self.assertEqual(graph["metrics"]["supported"], 0)
+
+    def test_a_live_public_client_key_is_not_a_validated_credential(self) -> None:
+        """A live Google/Firebase browser key answering its own issuer is expected behaviour.
+        The canonical gate refuses it, so the cortex must not weight it as validation."""
+        graph = investigator.build_investigation([{
+            "ref": "F1", "rule_id": "secret.google_api_key", "class_id": "secrets",
+            "title": "Google API key", "severity": "info", "confidence": "high",
+            "secret_classification": "public_client_key", "_credential_proof": {"live": True},
+        }])
+        item = graph["hypotheses"][0]
+        self.assertNotIn("live-credential-validation", item["artifacts"])
+        self.assertNotEqual(item["status"], "confirmed")
+        self.assertLess(item["confidence_score"], investigator._SUPPORTED_THRESHOLD)
+
+    def test_a_public_client_key_claimed_confirmed_raises_the_conflict(self) -> None:
+        """Classification forces these classes to info/low, so a severity test never fires on
+        the mainline path -- the claimed confirmation is the reachable conflict."""
+        graph = investigator.build_investigation(
+            [{
+                "ref": "F1", "rule_id": "secret.google_api_key", "class_id": "secrets",
+                "title": "Google API key", "severity": "info", "confidence": "high",
+                "secret_classification": "public_client_key", "_credential_proof": {"live": True},
+            }],
+            {"F1": {"proof_of_impact": {"status": "confirmed"}}},
+        )
+        self.assertTrue(any(row["code"] == "secret-severity-conflict" for row in graph["contradictions"]))
+        self.assertFalse(graph["hypotheses"][0]["report_ready"])
+
+    def test_a_malformed_location_does_not_abort_the_report(self) -> None:
+        """urlparse raises on a bad authority; this runs at report-writing time on a finished
+        hunt, so an escape here would discard the whole run.
+
+        The two findings MUST be of chainable classes: _location_scope is only reached from the
+        chain builder, so a fixture of two same-class findings passes with the guard removed.
+        """
+        for location in ("https://app.example]/x", "http://[foo]/x", "https://[app.example/x"):
+            with self.subTest(location=location):
+                graph = investigator.build_investigation([
+                    {"ref": "F1", "class_id": "disclosure", "title": "Directory listing",
+                     "severity": "low", "confidence": "high", "location": location},
+                    {"ref": "F2", "class_id": "access-control", "title": "Sequential object id",
+                     "severity": "medium", "confidence": "high", "location": location},
+                ])
+                self.assertEqual(len(graph["hypotheses"]), 2)
+
+    def test_a_chain_of_unproven_leads_stays_a_projection(self) -> None:
+        """Averaging node confidence and adding the same-scope bonus must not lift a chain into
+        a band none of its nodes earned -- two capped leads used to average out to 59."""
+        graph = investigator.build_investigation([
+            {"ref": "F1", "class_id": "disclosure", "title": "Directory listing",
+             "severity": "low", "confidence": "high", "location": "https://app.example/files"},
+            {"ref": "F2", "class_id": "access-control", "title": "Sequential object id",
+             "severity": "medium", "confidence": "high", "location": "https://app.example/api/1"},
+        ])
+        self.assertTrue(graph["attack_chains"])
+        for chain in graph["attack_chains"]:
+            self.assertEqual(chain["status"], "candidate")
+            self.assertLessEqual(chain["confidence_score"], investigator._UNPROVEN_CONFIDENCE_CEILING)
+
+    def test_leads_stay_rankable_against_each_other(self) -> None:
+        """The ranked queue is the cortex's deliverable precisely when nothing is confirmed yet.
+        Clipping every unproven lead to the ceiling collapsed the order into input order."""
+        graph = investigator.build_investigation([
+            {"ref": "F1", "class_id": "disclosure", "title": "Directory listing", "severity": "medium",
+             "confidence": "high", "location": "https://app.example/files/",
+             "proof_evidence": {"request_line": "GET https://app.example/files/", "response_status": "HTTP 200",
+                                "response_body": "index of /files\nbackup.sql\ncustomers.csv"}},
+            {"ref": "F2", "class_id": "headers", "title": "Missing Referrer-Policy", "severity": "low",
+             "confidence": "high", "location": "https://app.example/"},
+            {"ref": "F3", "class_id": "sqli", "title": "String-built query", "severity": "high",
+             "confidence": "low", "file_path": "app.py", "snippet": "q = 'SELECT ' + v"},
+        ])
+        scores = {item["ref"]: item["confidence_score"] for item in graph["hypotheses"]}
+        self.assertGreater(scores["F1"], scores["F2"], f"captured body must outrank a bare GET: {scores}")
+        self.assertGreater(scores["F2"], scores["F3"], f"a captured GET must outrank a static match: {scores}")
+        for ref, score in scores.items():
+            self.assertLess(score, investigator._SUPPORTED_THRESHOLD, ref)
+
+    def test_a_confirmed_claim_on_one_carrier_cannot_borrow_another_carriers_proof(self) -> None:
+        """The gate must be applied to the SAME proof the status is read from. Evaluating it
+        across every carrier is more permissive than the report: a bare `confirmed` on
+        `_active_proof` would borrow the differential sitting on the plan's proof."""
+        finding = {"ref": "F1", "class_id": "sqli", "severity": "high", "confidence": "high",
+                   "_active_proof": {"status": "confirmed", "observed_result": "something"}}
+        plans = {"F1": {"proof_of_impact": {
+            "status": "candidate", "observed_result": "o", "control_result": "c"}}}
+        item = investigator.build_investigation([finding], plans)["hypotheses"][0]
+        self.assertNotEqual(item["status"], "confirmed")
+        self.assertFalse(item["report_ready"])
+
+    def test_the_report_proof_vocabulary_is_honoured(self) -> None:
+        """A prover writing "verified" beside a real differential rendered Confirmed in the
+        report but only "supported" in the brief -- the mirror image of the drift above."""
+        for word in ("verified", "proven", "reproduced"):
+            with self.subTest(status=word):
+                graph = investigator.build_investigation(
+                    [{"ref": "F1", "class_id": "sqli", "title": "SQLi", "severity": "high",
+                      "confidence": "high", "location": "https://app.example/api"}],
+                    {"F1": {"proof_of_impact": {
+                        "status": word,
+                        "observed_result": "true condition returned 17 rows",
+                        "control_result": "false condition returned 0 rows",
+                    }}},
+                )
+                item = graph["hypotheses"][0]
+                self.assertEqual(item["status"], "confirmed")
+                self.assertTrue(item["report_ready"])
+
+    def test_a_synthesized_ref_never_collides_with_an_explicit_one(self) -> None:
+        graph = investigator.build_investigation([{"ref": "H2", "title": "a"}, {"title": "b"}, {"title": "c"}])
+        refs = [item["ref"] for item in graph["hypotheses"]]
+        self.assertEqual(len(set(refs)), len(refs))
+
+    def test_a_non_finite_score_does_not_empty_the_probe_queue(self) -> None:
+        """json.loads accepts a bare Infinity from a model reply; int() then raises OverflowError."""
+        rows = investigator.build_probe_hypotheses({"probe_priority": [
+            {"endpoint": "/a", "classes": ["idor"], "score": float("inf")},
+            {"endpoint": "/b", "classes": ["xss"], "score": 90},
+        ]})
+        self.assertEqual({row["endpoint"] for row in rows}, {"/a", "/b"})
+
     def test_identical_control_is_not_a_differential(self) -> None:
         finding = {"ref": "F1", "class_id": "xss", "severity": "medium", "confidence": "high"}
         plans = {"F1": {"proof_of_impact": {

@@ -92,6 +92,24 @@ def _dedup_key(finding: dict[str, Any]) -> str:
     return f"{cls}|{finding.get('rule_id')}|{loc}"
 
 
+def _loop_snapshot(
+    findings: list[dict[str, Any]], surface: dict[str, Any], meta: dict[str, Any]
+) -> dict[str, Any]:
+    """The loop's own investigation snapshot, explicitly labelled as such.
+
+    A hunt carries TWO graphs: this one, and the authoritative graph bounty builds at report
+    time. They are not interchangeable — this is computed before secret classification, before
+    attack plans and before the QA gate, so its ranking and confidence are provisional. Both
+    delegate confirmation to the same authority, so neither can claim a bug the other denies,
+    but a consumer reading the wrong one gets stale ranking. The marker is how they are told
+    apart in an API response that carries both.
+    """
+    graph = investigator.build_investigation(findings, surface=surface, scan_meta=meta)
+    graph["stage"] = "hunt-loop-snapshot"
+    graph["authoritative"] = False
+    return graph
+
+
 def _observations_digest(findings: list[dict[str, Any]], meta: dict[str, Any]) -> str:
     """A compact, redacted, trust-wrapped summary of one turn for the brain to react to — verified
     classes + each finding's class/status and a short observed excerpt. NEVER the raw finding dicts."""
@@ -228,7 +246,7 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
         # Turn 0 not in scope / guard-refused: return immediately (nothing to iterate on).
         if not meta.get("in_scope", True) and turn == 0:
             meta = dict(meta)
-            meta["investigation"] = investigator.build_investigation(results, surface=surf, scan_meta=meta)
+            meta["investigation"] = _loop_snapshot(results, surf, meta)
             return results, meta
         if meta.get("rate_limited") or budget_remaining < _PER_TURN_MIN:
             break
@@ -248,5 +266,5 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
     out_meta["verified_classes"] = sorted(verified)
     out_meta["loop_turns"] = turn + 1
     final_results = list(merged.values())
-    out_meta["investigation"] = investigator.build_investigation(final_results, surface=surf, scan_meta=out_meta)
+    out_meta["investigation"] = _loop_snapshot(final_results, surf, out_meta)
     return final_results, out_meta
