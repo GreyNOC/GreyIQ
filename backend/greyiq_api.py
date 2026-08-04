@@ -256,6 +256,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 import agent as coding_agent  # noqa: E402
+import brain_profiles  # noqa: E402
 import brain_techniques  # noqa: E402
 import coder  # noqa: E402
 import project_memory  # noqa: E402
@@ -370,6 +371,7 @@ from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E4
 from bughunter import active_verify_service as bounty_active_verify  # noqa: E402
 from bughunter import scan_auth as bounty_scan_auth  # noqa: E402
 from bughunter import credential_validation as bounty_credential_validation  # noqa: E402
+from bughunter import web_ingest as bounty_web_ingest  # noqa: E402
 from bughunter.code_scanner.redaction import redact_text  # noqa: E402
 from bughunter.code_scanner.sources import git_remote as bounty_git_remote  # noqa: E402
 from bughunter.settings import get_settings as _bounty_get_settings  # noqa: E402
@@ -601,6 +603,10 @@ class BountyScanRequest(BaseModel):
     auth_headers: list[str] = Field(default_factory=list, max_length=20)
     per_finding: bool = False
     max_files: int = Field(default=5000, ge=1, le=100_000)
+    # A per-run UA tag, for hunting a program that requires one WITHOUT saving it to the portfolio
+    # (an ad-hoc/one-off target). Appended verbatim after the global researcher marker; sanitized in
+    # web_ingest.set_ua_suffix, so the cap here is a bound, not the injection defense.
+    user_agent_suffix: str = Field(default="", max_length=120)
     run_id: str = Field(default="", max_length=100)  # client-minted id for polling live progress
 
 
@@ -619,6 +625,10 @@ class CampaignRequest(BaseModel):
     max_pages: int = Field(default=12, ge=1, le=50)
     deep: bool = False  # aggressive: time-based SQLi + auto screenshot + research per confirmed lead
     attack_map: bool = True  # render a graphical attack-plan map (.png) per confirmed finding into the POC download + report
+    # Per-run UA tag (see BountyScanRequest). Overrides the saved program's user_agent_suffix when
+    # set, so the operator can satisfy a policy change without re-saving the program; empty (the
+    # default) keeps the program's stored tag, which is the normal path.
+    user_agent_suffix: str = Field(default="", max_length=120)
     run_id: str = Field(default="", max_length=100)  # client-minted id for polling live progress
 
 
@@ -1300,6 +1310,9 @@ class GreyIQRuntime:
         ensure_runtime()
         self._rewrite_core_defaults()
         self._ensure_bughunter_core()
+        # The operator's researcher UA marker is install-wide, so it must be live BEFORE the first
+        # request goes out — not only after a settings save. Loaded once here from the saved config.
+        self._sync_ua_marker()
 
     def _rewrite_core_defaults(self) -> None:
         state = self.store.load()
@@ -1432,8 +1445,32 @@ class GreyIQRuntime:
         config = config if isinstance(config, dict) else {}
         return _merge_coder_secrets(config)
 
+    def _sync_ua_marker(self) -> str:
+        """Load the operator's saved researcher UA marker into the scan stack's global marker.
+
+        The marker lives in the same runtime config ``/api/coder`` already round-trips (one settings
+        form, one save, one file) rather than in ``bughunter.settings``, which is env-var-only and
+        therefore cannot be edited from the UI. It is deliberately NOT a secret: it is a public
+        attribution token a program reads in its access logs, so it stays in the plaintext config
+        alongside the model name, not in the secrets store.
+
+        Never raises: an unreadable/absent config just means "no marker", which is the shipped
+        behavior, so a settings problem can never stop the engine from starting."""
+        try:
+            marker = str((self._coder_config() or {}).get("researcher_ua_marker") or "")
+        except Exception:  # noqa: BLE001 - a bad config must not break startup
+            marker = ""
+        return bounty_web_ingest.set_ua_marker(marker)
+
     def save_coder_config(self, update: dict[str, Any]) -> dict[str, Any]:
         runtime_path = RUNTIME_DIR / "solin_runtime_config.json"
+        update = dict(update or {})
+        # Sanitize the researcher marker at the WRITE boundary with the same rules the scan stack
+        # applies, so a control character can never reach the stored file (defense in depth:
+        # set_ua_marker sanitizes again on read, and neither layer is load-bearing alone).
+        if "researcher_ua_marker" in update:
+            update["researcher_ua_marker"] = bounty_web_ingest.sanitize_ua_fragment(
+                update["researcher_ua_marker"]).strip()
         # Serialize the read-modify-write against set_device and concurrent saves so
         # an interleaved write can't drop the device_preference or another field.
         with self.lock:
@@ -1444,6 +1481,8 @@ class GreyIQRuntime:
             # the main config stays key-free.
             payload["coder"] = _split_coder_secrets(coder.merge_update(payload.get("coder"), update))
             write_json(runtime_path, payload)
+        # Apply the saved marker immediately — the operator expects the next hunt to carry it.
+        self._sync_ua_marker()
         return coder.public_config(self._coder_config())
 
     def coder_status(self) -> dict[str, Any]:
@@ -1830,6 +1869,10 @@ class GreyIQRuntime:
             auth={"cookie": request.auth_cookie, "headers": request.auth_headers},
             max_files=request.max_files,
             per_finding=request.per_finding,
+            # A one-off hunt has no saved program to carry a required UA tag, so the operator supplies
+            # it per run. Carried verbatim (the program dictates its own spacing) and sanitized by
+            # web_ingest.set_ua_suffix inside the hunt.
+            user_agent_suffix=request.user_agent_suffix,
             on_progress=bounty_progress.sink(run_id) if run_id else None,
             # When a collaborator is configured, an active+authorized URL hunt also runs the blind-SSRF
             # OOB probe automatically (the token is the reproducible 'sheriff flag').
@@ -2402,7 +2445,13 @@ class GreyIQRuntime:
         admin_account_access = program_obj.get("admin_account_access") if program_obj else None
         idor_pairs = program_obj.get("idor_pairs") if program_obj else None
         policy_profile = str(program_obj.get("policy_profile") or "") if program_obj else ""
-        user_agent_suffix = str(program_obj.get("user_agent_suffix") or "") if program_obj else ""
+        # An explicit per-run tag wins over the saved program's (the operator typed it for THIS run);
+        # otherwise the program's stored requirement stands, exactly as before. The value is carried
+        # VERBATIM (only the emptiness test is trimmed) — a program dictates its own spacing, which is
+        # why portfolio._clean_ua_suffix keeps spaces too.
+        run_ua_suffix = str(request.user_agent_suffix or "")
+        user_agent_suffix = (run_ua_suffix if run_ua_suffix.strip()
+                             else (str(program_obj.get("user_agent_suffix") or "") if program_obj else ""))
         # An explicit cookie/header in the request wins; otherwise pass auth=None so the program's
         # stored research-account credentials (account_access) drive an auto-login in run_campaign.
         req_auth = ({"cookie": request.auth_cookie, "headers": request.auth_headers}
@@ -2475,7 +2524,11 @@ class GreyIQRuntime:
             admin_account_access=program.get("admin_account_access"),
             idor_pairs=program.get("idor_pairs"),
             policy_profile=str(program.get("policy_profile") or ""),
-            user_agent_suffix=str(program.get("user_agent_suffix") or ""),
+            # Same precedence as the single-target path: a per-run tag the operator typed for THIS
+            # span wins; otherwise the program's saved requirement. Carried verbatim.
+            user_agent_suffix=(str(request.user_agent_suffix or "")
+                               if str(request.user_agent_suffix or "").strip()
+                               else str(program.get("user_agent_suffix") or "")),
             live=request.live,
             program=program_label,
             max_pages=request.max_pages,
@@ -4160,6 +4213,10 @@ class GreyIQRuntime:
         # style, and stored preferences are layered on top.
         cfg = dict(cfg)
         cfg["system_prompt"] = self._coder_system_prompt(request, cfg)
+        # Chat is interactive: responsiveness matters as much as depth, so it gets its own reasoning
+        # profile instead of inheriting whatever the deepest brain needed. Only fills values the
+        # operator left at the shipped defaults — an explicit setting still wins.
+        brain_profiles.apply(cfg, "chat")
         try:
             result = coder.generate(messages, cfg)
         except coder.CoderError as exc:

@@ -157,6 +157,7 @@ const els = {
   brainModel: document.querySelector("#brainModel"),
   brainBaseUrl: document.querySelector("#brainBaseUrl"),
   brainApiKey: document.querySelector("#brainApiKey"),
+  brainUaMarker: document.querySelector("#brainUaMarker"),
   brainTest: document.querySelector("#brainTest"),
   brainSave: document.querySelector("#brainSave"),
   brainStatus: document.querySelector("#brainStatus"),
@@ -435,7 +436,8 @@ function loadState() {
     ckAttackMap: true,
     ckLive: false,
     ckAuthCookie: "",
-    ckAuthHeaders: ""
+    ckAuthHeaders: "",
+    ckUaSuffix: ""
   };
 
   try {
@@ -2142,6 +2144,9 @@ function renderBrainForm() {
   const provider = coderConfig && coderConfig.enabled && coderConfig.provider ? coderConfig.provider : "off";
   els.brainProvider.value = ["off", "local", "anthropic", "openai"].includes(provider) ? provider : "off";
   applyBrainFields(els.brainProvider.value, true);
+  // The researcher UA marker is install-wide, not per provider, so it lives outside
+  // applyBrainFields' provider-gated rows and stays visible even with the brain off.
+  if (els.brainUaMarker) els.brainUaMarker.value = (coderConfig && coderConfig.researcher_ua_marker) || "";
 }
 
 function buildBrainBlock(provider) {
@@ -2177,6 +2182,9 @@ els.brainForm?.addEventListener("submit", async (event) => {
   const update = provider === "off"
     ? { enabled: false }
     : { enabled: true, provider, [provider]: buildBrainBlock(provider) };
+  // Saved on BOTH branches: the marker attributes scan traffic, which the hunt engine sends whether
+  // or not a coding brain is configured, so turning the brain off must not skip saving it.
+  if (els.brainUaMarker) update.researcher_ua_marker = els.brainUaMarker.value.trim();
   els.brainSave.disabled = true;
   els.brainStatus.textContent = "Saving…";
   try {
@@ -4651,6 +4659,7 @@ const ck = {
   authFold: document.querySelector("#ckAuthFold"),
   authCookie: document.querySelector("#ckAuthCookie"),
   authHeaders: document.querySelector("#ckAuthHeaders"),
+  uaSuffix: document.querySelector("#ckUaSuffix"),
   authorized: document.querySelector("#ckAuthorized"),
   readiness: document.querySelector("#ckLaunchReadiness"),
   run: document.querySelector("#ckRun"),
@@ -10841,6 +10850,9 @@ async function ckRun() {
   state.ckLive = Boolean(ck.live?.checked);
   state.ckAuthCookie = (ck.authCookie?.value || "").trim();
   state.ckAuthHeaders = (ck.authHeaders?.value || "");
+  // NOT trimmed: a program dictates the exact tag including its own leading/trailing spaces, and the
+  // backend appends it verbatim — trimming here would silently send a different UA than required.
+  state.ckUaSuffix = (ck.uaSuffix?.value || "");
   // A repository root must use a profile that accepts Git targets. If the selected
   // profile is web-only, switch to the full source audit automatically; profiles
   // such as Full sweep and Secrets already accept Git and are preserved.
@@ -10907,7 +10919,8 @@ async function ckRun() {
           active: state.ckActive, time_based: state.ckTimeBased, live: state.ckLive, deep: state.ckDeep,
           attack_map: state.ckAttackMap,
           max_pages: Number(ck.maxPages?.value) || 12,
-          auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines, run_id: progressRunId
+          auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines,
+          user_agent_suffix: state.ckUaSuffix, run_id: progressRunId
         })
       });
     } else {
@@ -10916,7 +10929,8 @@ async function ckRun() {
         body: JSON.stringify({
           target, profile: state.bountyProfile, vuln_class: (ck.klass?.value || null) || null,
           scope: state.ckScope, authorized: true, active: state.ckActive, time_based: state.ckTimeBased, run_live: state.ckLive,
-          auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines, run_id: progressRunId
+          auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines,
+          user_agent_suffix: state.ckUaSuffix, run_id: progressRunId
         })
       });
     }
@@ -11741,12 +11755,13 @@ function bootCockpit() {
   if (ck.spanScope) ck.spanScope.checked = Boolean(state.ckSpanScope);
   if (ck.authCookie) ck.authCookie.value = state.ckAuthCookie || "";
   if (ck.authHeaders) ck.authHeaders.value = state.ckAuthHeaders || "";
+  if (ck.uaSuffix) ck.uaSuffix.value = state.ckUaSuffix || "";
   if (ck.deep?.checked) {
     if (ck.timeBased) ck.timeBased.checked = true;
     if (ck.active) ck.active.checked = true;
   } else if (ck.timeBased?.checked && ck.active) ck.active.checked = true;
   if (ck.optionsFold && (ck.active?.checked || ck.timeBased?.checked || ck.deep?.checked || ck.live?.checked)) ck.optionsFold.open = true;
-  if (ck.authFold && (state.ckAuthCookie || state.ckAuthHeaders)) ck.authFold.open = true;
+  if (ck.authFold && (state.ckAuthCookie || state.ckAuthHeaders || state.ckUaSuffix)) ck.authFold.open = true;
   ckSetRunType(state.ckRunType || "hunt");
   ckSyncSetupReveal();   // reveal the rest of setup immediately if a target was already restored
   ckUpdateTopProgram();

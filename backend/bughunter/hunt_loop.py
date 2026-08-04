@@ -24,6 +24,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import brain_profiles
 import coder
 import trust
 from bughunter import active_verify_service, hunt_brain
@@ -41,6 +42,39 @@ _REACT_SYSTEM = (
     "URLs — only names + class priorities; the prober supplies payloads and independently confirms. "
     "Respond with JSON only."
 )
+
+# Structured-output contract for ONE re-plan turn — the EXACT shape `_build_react_prompt` asks for.
+# It is the planner's shape MINUS the one-shot-only selections (idor/ssrf/privileged, which the loop
+# never reads) PLUS `done`, the loop's stop signal (read at `_react_plan` below). The class enum is
+# `hunt_brain`'s, so both brains speak the same vocabulary as the prover. `why` is absent on purpose:
+# the react prompt does not ask for it, and `_validate_plan` treats it as optional.
+#
+# SHAPE ONLY — `hunt_brain._validate_plan` still owns the content (names-only regex, verbatim in-scope
+# endpoints, caps), and a non-Anthropic provider ignores this and keeps the prose-scraping path.
+REACT_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["param_hypotheses", "probe_priority", "xss_params", "done", "notes"],
+    "properties": {
+        "param_hypotheses": {"type": "array", "items": {"type": "string"}},
+        "probe_priority": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["endpoint", "classes"],
+                "properties": {
+                    "endpoint": {"type": "string"},
+                    "classes": {"type": "array",
+                                "items": {"type": "string", "enum": hunt_brain._PLAN_CLASS_ENUM}},
+                },
+            },
+        },
+        "xss_params": {"type": "array", "items": {"type": "string"}},
+        "done": {"type": "boolean"},
+        "notes": {"type": "string"},
+    },
+}
 
 
 def iterative_enabled(coder_cfg: dict[str, Any] | None, settings: Any = None) -> bool:
@@ -126,6 +160,9 @@ def _react_plan(coder_cfg: dict[str, Any] | None, target: str, scope: str, surfa
         return empty
     cfg = dict(coder.coder_config(coder_cfg))
     cfg["system_prompt"] = _REACT_SYSTEM
+    # One turn inside a bounded loop, so it is profiled cheaper than the one-shot planner.
+    brain_profiles.apply(cfg, "hunt_react")
+    cfg["response_schema"] = REACT_RESPONSE_SCHEMA
     try:
         result = coder.generate([{"role": "user", "content":
             _build_react_prompt(target, scope, surface, observations, params_tried, budget_remaining)}], cfg)

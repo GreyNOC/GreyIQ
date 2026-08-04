@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import brain_profiles
 import coder
 from bughunter import brain_safety
 
@@ -62,6 +63,10 @@ def narrate_impact(coder_cfg: dict[str, Any] | None, finding: dict[str, Any], pl
     wrapped = brain_safety.wrap_untrusted_for_brain(json.dumps(facts, default=str), path="captured proof artifacts")
     cfg = dict(coder.coder_config(coder_cfg))
     cfg["system_prompt"] = _SYSTEM
+    # Hot path: one call per CONFIRMED finding for a 1-3 sentence clause off already-captured facts.
+    # The 'narrate' profile is deliberately the cheapest one in the table — do not raise it.
+    brain_profiles.apply(cfg, "narrate")
+    # No response_schema: the reply is plain prose, and a schema would only force it into JSON.
     try:
         result = coder.generate([{"role": "user", "content":
             "CONFIRMED finding. Write the impact/blast-radius statement from ONLY these captured "

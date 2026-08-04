@@ -12,6 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urlunparse
 from urllib.request import Request
 
+from _version import VERSION as _APP_VERSION
 from bughunter.settings import get_settings
 
 MAX_URL_LENGTH: Final = 2048
@@ -24,14 +25,49 @@ MAX_URL_LENGTH: Final = 2048
 # builds its UA via ``current_user_agent()`` so the tag rides on recon, the web scan, and the active
 # prover alike. Off-target requests (credential issuers, CT logs, the HackerOne API) don't use it.
 _UA_SUFFIX_VAR: contextvars.ContextVar[str] = contextvars.ContextVar("greyiq_ua_suffix", default="")
-_DEFAULT_UA: Final = "GreyNOC-Slop-Detection/0.1"
+
+# --- Global operator (researcher) marker ---
+# The per-program suffix above only exists while a saved program's hunt is running, and
+# ``campaign.run_campaign`` is its ONLY setter — so an ad-hoc hunt, a re-verify, a screenshot, or a
+# prover run launched outside a program carried no researcher identity at all. Most platforms ask a
+# researcher to make their traffic attributable at all times ("include your handle in the UA"), so
+# this is an install-wide marker (e.g. "h1-greynoc") that rides EVERY in-scope request, program or
+# not. It is a plain module global rather than a contextvar on purpose: a contextvar ``.set`` on the
+# main thread is invisible to the worker threads campaigns/hunts run in, so a startup-loaded default
+# would silently never reach the fetchers. A str rebind is atomic under the GIL, and the value is
+# operator-supplied config, never scan-derived.
+_UA_MARKER: str = ""
+
+# How many characters of an operator-supplied UA fragment survive. Shared by the program suffix and
+# the global marker so neither can be used to smuggle a long/odd header value.
+_UA_FRAGMENT_MAX: Final = 120
+
+# The product+version GreyIQ identifies itself as. This is the string a program's triage team sees in
+# their logs, so it is the app's signature on authorized traffic and must be accurate: until v2.7.0 it
+# read "GreyNOC-Slop-Detection/0.1", which is a DIFFERENT GreyNOC tool entirely, so every in-scope
+# request was misattributed. Derived from the single version source (``_version``, the same string
+# stamped into delivered reports) so a release can never ship a stale marker again.
+GREYIQ_UA: Final = f"GreyIQ-BugHunter/{_APP_VERSION} (+authorized-scan)"
+_DEFAULT_UA: Final = GREYIQ_UA
+
+
+def sanitize_ua_fragment(value: Any) -> str:
+    """Strip control characters from an operator-supplied UA fragment and cap its length.
+
+    Printable ASCII plus the space survives; everything else (CR, LF, tab, NUL, and any
+    non-ASCII byte) is dropped, so a fragment can never inject a header. This is the single
+    definition shared by the per-program suffix and the global researcher marker — they must
+    not be able to drift apart, because either one alone would reopen header injection."""
+    return "".join(c for c in str(value or "") if c == " " or 0x20 < ord(c) < 0x7f)[:_UA_FRAGMENT_MAX]
 
 
 def set_ua_suffix(suffix: str) -> contextvars.Token:
     """Set the current program's required UA suffix for this context/thread; returns a restore token.
-    Control chars are dropped so the suffix can never inject a CR/LF into the header."""
-    clean = "".join(c for c in str(suffix or "") if c == " " or 0x20 < ord(c) < 0x7f)[:120]
-    return _UA_SUFFIX_VAR.set(clean)
+    Control chars are dropped so the suffix can never inject a CR/LF into the header.
+
+    Appended VERBATIM (no separator is inserted): a program dictates the exact tag, including its
+    own leading/trailing spacing, so GreyIQ must not reshape it."""
+    return _UA_SUFFIX_VAR.set(sanitize_ua_fragment(suffix))
 
 
 def reset_ua_suffix(token: contextvars.Token) -> None:
@@ -41,10 +77,32 @@ def reset_ua_suffix(token: contextvars.Token) -> None:
         _UA_SUFFIX_VAR.set("")
 
 
+def set_ua_marker(marker: str) -> str:
+    """Set (or clear, with "") the install-wide researcher marker; returns the stored value.
+
+    Unlike the program suffix this is process-global and thread-wide by design — it identifies the
+    OPERATOR, not a program, so it must survive into every worker thread a hunt spawns. Sanitized
+    with the same rules as the suffix, then trimmed: the operator types a handle, not spacing, and
+    ``current_user_agent`` supplies the single separating space."""
+    global _UA_MARKER
+    _UA_MARKER = sanitize_ua_fragment(marker).strip()
+    return _UA_MARKER
+
+
+def current_ua_marker() -> str:
+    """The install-wide researcher marker currently in effect ("" when unset)."""
+    return _UA_MARKER
+
+
 def current_user_agent(base: str = _DEFAULT_UA) -> str:
-    """The base UA with the active program's required suffix appended (or just the base)."""
+    """The UA sent on in-scope requests: base + global researcher marker + program suffix.
+
+    The marker is space-separated (it is a token GreyIQ owns the formatting of); the program suffix
+    is appended verbatim (the program owns its formatting). With neither set this is just ``base``."""
+    marker = _UA_MARKER
     suffix = _UA_SUFFIX_VAR.get()
-    return f"{base}{suffix}" if suffix else base
+    agent = f"{base} {marker}" if marker else base
+    return f"{agent}{suffix}" if suffix else agent
 ALLOWED_PORTS: Final = {80, 443}
 CONTROL_OR_SPACE_RE: Final = re.compile(r"[\x00-\x20\x7f]")
 # A bounded retry for CONNECTION-LEVEL transient failures only (reset TCP, a DNS

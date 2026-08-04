@@ -281,8 +281,14 @@ class _FakeBrowser:
     def __init__(self, context: _FakeContext) -> None:
         self.context = context
         self.closed = False
+        self.context_kwargs: dict = {}
 
-    def new_context(self, ignore_https_errors=None) -> _FakeContext:
+    def new_context(self, **kwargs) -> _FakeContext:
+        # **kwargs, not a fixed signature: this double stands in for Playwright's real
+        # browser.new_context, so it must not reject options the product legitimately passes.
+        # It previously accepted only ignore_https_errors, so adding the User-Agent turned every
+        # driven test into a TypeError the service reported as ok=False.
+        self.context_kwargs = dict(kwargs)
         return self.context
 
     def close(self) -> None:
@@ -292,9 +298,12 @@ class _FakeBrowser:
 class _FakeChromium:
     def __init__(self, context: _FakeContext) -> None:
         self.context = context
+        self.browsers: list[_FakeBrowser] = []
 
     def launch(self, headless=None) -> _FakeBrowser:
-        return _FakeBrowser(self.context)
+        browser = _FakeBrowser(self.context)
+        self.browsers.append(browser)  # kept so a test can inspect the context options used
+        return browser
 
 
 class _FakePlaywrightCM:
@@ -308,9 +317,12 @@ class _FakePlaywrightCM:
         return False
 
 
-def _fake_playwright_modules(context: _FakeContext) -> dict[str, types.ModuleType]:
+def _fake_playwright_modules(context: _FakeContext, cms: list | None = None) -> dict[str, types.ModuleType]:
     def sync_playwright() -> _FakePlaywrightCM:
-        return _FakePlaywrightCM(context)
+        cm = _FakePlaywrightCM(context)
+        if cms is not None:
+            cms.append(cm)
+        return cm
 
     sync_api_mod = types.ModuleType("playwright.sync_api")
     sync_api_mod.sync_playwright = sync_playwright  # type: ignore[attr-defined]
@@ -328,6 +340,27 @@ class RunLiveScanDrivenTests(unittest.TestCase):
         with mock.patch.object(LS, "get_settings", return_value=ScannerSettings()):
             with mock.patch.dict(sys.modules, modules):
                 return LS.run_live_scan(url, wait_seconds=0.0)
+
+    def test_the_browser_is_attributable_to_greyiq_and_the_program(self) -> None:
+        # The browser half of a hunt must identify itself exactly like the HTTP half. Without an
+        # explicit user_agent Playwright sends headless Chromium's own UA and the program's mandatory
+        # researcher marker is silently dropped from this traffic.
+        from bughunter import web_ingest
+
+        cms: list = []
+        ctx = _FakeContext()
+        token = web_ingest.set_ua_suffix(" -BugBounty-acme-31337 ")
+        try:
+            with mock.patch.object(LS, "get_settings", return_value=ScannerSettings()):
+                with mock.patch.dict(sys.modules, _fake_playwright_modules(ctx, cms)):
+                    LS.run_live_scan("https://example.com/", wait_seconds=0.0)
+        finally:
+            web_ingest.reset_ua_suffix(token)
+
+        kwargs = cms[0].chromium.browsers[0].context_kwargs
+        self.assertIn("user_agent", kwargs)
+        self.assertIn("GreyIQ", kwargs["user_agent"])
+        self.assertIn("-BugBounty-acme-31337", kwargs["user_agent"])
 
     def test_clean_run_no_findings(self) -> None:
         result = self._run(_FakeContext())
