@@ -2,6 +2,24 @@
 
 Notable changes to GreyIQ.
 
+## Unreleased - investigation cortex
+
+- Added a deterministic, evidence-grounded investigation cortex shared by the coding
+  agent, hunt planner/loop, and bounty reports. It calibrates confidence from typed
+  artifacts, ranks proof-gathering hypotheses, flags contradictory evidence, and
+  correlates bounded attack-chain leads without allowing model prose to confirm a bug.
+- Agent mode gains the read-only `investigate_code` tool. It runs the existing static
+  scanner within the workspace, returns ranked root-cause leads and next proof
+  obligations, and explicitly strips raw credential values before results can reach a
+  configured remote model.
+- Hunt plans now carry an explicit evidence-required hypothesis queue, and iterative
+  hunts return a final investigation snapshot alongside their request-budget metadata.
+- Markdown reports gain an Investigation intelligence decision brief; JSON sidecars and
+  the hunt API return the same complete machine-readable graph.
+- New contract tests cover false confirmation from prose, non-differential controls,
+  public-key severity inflation, chain correlation, report serialization, and coding-
+  agent credential isolation.
+
 ## v2.7.0 - per-brain reasoning, structured output, and an identity on the wire
 
 ### Brains
@@ -75,7 +93,6 @@ Notable changes to GreyIQ.
   and that `temperature`/`top_p`/`top_k` are never sent - those return 400 on Opus 4.7+), the
   API-key round-trip including preserve-on-blank-resave and redaction to `has_api_key`, and the
   failure-reporting split. Suite 1877 -> 1893 passed.
-
 ## v2.6.0 - TACNOC launcher, shared brain techniques
 
 Merges the `GreyNOC/AddTACNOC` line onto the v2.5.0 release. That branch was cut before

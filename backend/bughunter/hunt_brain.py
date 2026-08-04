@@ -38,7 +38,7 @@ from urllib.parse import parse_qsl, urlparse
 import brain_profiles
 import coder
 import trust
-from bughunter import offline_hunt
+from bughunter import investigator, offline_hunt
 
 # The vuln classes the active prover (active_verify_service) can actually CONFIRM with a benign
 # differential. The brain's class suggestions are filtered to this set — a suggestion the prover
@@ -116,7 +116,17 @@ _MAX_IDOR_CANDIDATES = 6  # bound the brain-selected object-scoped endpoints han
 
 def _empty_plan() -> dict[str, Any]:
     return {"used": False, "provider": "", "model": "", "param_hypotheses": [], "probe_priority": [],
-            "idor_candidates": [], "ssrf_params": [], "xss_params": [], "privileged_endpoints": [], "notes": ""}
+            "idor_candidates": [], "ssrf_params": [], "xss_params": [], "privileged_endpoints": [],
+            "hypotheses": [], "notes": ""}
+
+
+def _with_hypotheses(plan: dict[str, Any]) -> dict[str, Any]:
+    """Attach the explicit proof-seeking queue without ever breaking planning."""
+    try:
+        plan["hypotheses"] = investigator.build_probe_hypotheses(plan)
+    except Exception:  # noqa: BLE001 - advisory intelligence must fail closed
+        plan["hypotheses"] = []
+    return plan
 
 
 def _norm_class(value: str) -> str:
@@ -144,7 +154,7 @@ def heuristic_plan(surface: dict[str, Any]) -> dict[str, Any]:
     """
     empty = {
         "used": False, "provider": "deterministic", "model": "veteran-heuristics-v1",
-        "param_hypotheses": [], "probe_priority": [], "notes": "",
+        "param_hypotheses": [], "probe_priority": [], "hypotheses": [], "notes": "",
     }
     if not isinstance(surface, dict):
         return empty
@@ -250,11 +260,11 @@ def heuristic_plan(surface: dict[str, Any]) -> dict[str, Any]:
                      "score": scores[ordered[0]], "source": "deterministic-veteran-heuristics"})
         if len(rows) >= _MAX_PRIORITY_ROWS:
             break
-    return {
+    return _with_hypotheses({
         "used": bool(rows), "provider": "deterministic", "model": "veteran-heuristics-v1",
         "param_hypotheses": [], "probe_priority": rows,
         "notes": f"Prioritised {len(rows)} endpoint(s) from observed route/parameter semantics." if rows else "",
-    }
+    })
 
 
 def _build_surface_context(target: str, surface: dict[str, Any]) -> str:
@@ -500,8 +510,8 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
               technique_context: str = "") -> dict[str, Any]:
     """Reason over the recon surface and propose where to probe.
 
-    Returns ``{used, provider, model, param_hypotheses, probe_priority, idor_candidates, ssrf_params,
-    xss_params, notes}``. With a brain configured, the LLM produces the plan; with NO brain configured
+    Returns ``{used, provider, model, param_hypotheses, probe_priority, hypotheses,
+    idor_candidates, ssrf_params, xss_params, notes}``. With a brain configured, the LLM produces the plan; with NO brain configured
     the OFFLINE knowledge-rule engine (offline_hunt, sharpened by learned ``priors``) produces the same
     shape — so an offline hunt is steered too, no longer flying blind. All outputs (names + verbatim
     in-scope endpoints + class orderings) pass through _validate_plan either way; a name can't carry a
@@ -518,10 +528,10 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
                          "notes": str(raw.get("notes") or "")})
         except Exception:  # noqa: BLE001 - the offline planner must never break a hunt
             pass
-        return plan
+        return _with_hypotheses(plan)
     target = str(target or "").strip()
     if not target:
-        return plan
+        return _with_hypotheses(plan)
     cfg = dict(coder.coder_config(coder_cfg))
     cfg["system_prompt"] = HUNT_BRAIN_SYSTEM_PROMPT
     # Where an entire engagement points its probe budget is the highest-leverage single call in the
@@ -541,16 +551,16 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
         parsed = _parse_json_object(str(result.get("text") or ""))
         params, priority, idor_candidates, ssrf_params, xss_params, privileged_endpoints = _validate_plan(parsed, surface)
     except coder.CoderError:
-        return plan
+        return _with_hypotheses(plan)
     except Exception:  # noqa: BLE001 - the reasoning layer must never break a hunt
-        return plan
+        return _with_hypotheses(plan)
     plan.update({
         "used": True, "provider": str(result.get("provider") or ""), "model": str(result.get("model") or ""),
         "param_hypotheses": params, "probe_priority": priority, "idor_candidates": idor_candidates,
         "ssrf_params": ssrf_params, "xss_params": xss_params, "privileged_endpoints": privileged_endpoints,
         "notes": str((parsed or {}).get("notes") or "").strip()[:300] if isinstance(parsed, dict) else "",
     })
-    return plan
+    return _with_hypotheses(plan)
 
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:

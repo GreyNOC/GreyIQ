@@ -36,6 +36,7 @@ from bughunter import hunt_loop
 from bughunter import hunt_brain
 from bughunter import hunt_trace
 from bughunter import impact_model
+from bughunter import investigator
 from bughunter import ledger
 from bughunter import learning
 from bughunter import next_steps as next_steps_lib
@@ -2576,6 +2577,15 @@ def _run_bounty_hunt_body(
     # it reflects exactly what ran.
     ctx["next_steps"] = next_steps_lib.build_next_steps(ctx, brain.get("next_steps"))
     ctx["coverage"] = next_steps_lib.coverage_summary(ctx)
+    # One evidence-grounded reasoning graph now drives the handoff from hunting to reporting.
+    # It is deterministic and advisory: only the existing proof engine can make a node confirmed.
+    investigation_surface = hunt_trace_surface or {
+        "endpoints": list(active_targets) if kind == "url" else [],
+        "params": list(effective_extra_params) if kind == "url" else [],
+    }
+    ctx["investigation"] = investigator.build_investigation(
+        display, attack_plans, surface=investigation_surface, scan_meta=active_meta,
+    )
 
     _emit("writing report…")
     markdown = report_lib.build_markdown(ctx)
@@ -2669,6 +2679,7 @@ def _run_bounty_hunt_body(
         "brain_model": f"{brain.get('provider')}:{brain.get('model')}" if brain.get("used") else "",
         "next_steps": ctx["next_steps"],
         "coverage": ctx["coverage"],
+        "investigation": json_doc["investigation"],
         "active_verified_classes": ctx["active_verified_classes"],
         "active_authorization": ctx["active_authorization"],
         "proof_artifacts_captured": proof_artifacts_captured,

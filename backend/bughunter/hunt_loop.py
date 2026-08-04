@@ -27,7 +27,7 @@ from typing import Any
 import brain_profiles
 import coder
 import trust
-from bughunter import active_verify_service, hunt_brain
+from bughunter import active_verify_service, hunt_brain, investigator
 from bughunter.brain_safety import sanitize_brain_field  # noqa: F401  (kept for symmetry / future prose)
 from bughunter.rate_limit import shared_governor
 from bughunter.settings import get_settings
@@ -227,6 +227,8 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
         budget_remaining -= int(meta.get("requests_used") or 0)
         # Turn 0 not in scope / guard-refused: return immediately (nothing to iterate on).
         if not meta.get("in_scope", True) and turn == 0:
+            meta = dict(meta)
+            meta["investigation"] = investigator.build_investigation(results, surface=surf, scan_meta=meta)
             return results, meta
         if meta.get("rate_limited") or budget_remaining < _PER_TURN_MIN:
             break
@@ -245,4 +247,6 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
     out_meta = dict(last_meta)
     out_meta["verified_classes"] = sorted(verified)
     out_meta["loop_turns"] = turn + 1
-    return list(merged.values()), out_meta
+    final_results = list(merged.values())
+    out_meta["investigation"] = investigator.build_investigation(final_results, surface=surf, scan_meta=out_meta)
+    return final_results, out_meta
