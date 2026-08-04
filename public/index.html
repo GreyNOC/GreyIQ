@@ -157,6 +157,10 @@
               <span>API key</span>
               <input id="brainApiKey" name="brainApiKey" type="password" autocomplete="off" placeholder="paste API key">
             </label>
+            <div class="folder-actions" id="brainKeyActions" hidden>
+              <span class="folder-status">A key is saved on this machine.</span>
+              <button class="text-button danger" type="button" id="brainClearKey">Clear saved key</button>
+            </div>
             <div class="folder-actions" id="brainModelRow" hidden>
               <span class="folder-status" id="brainModelStatus">checking model…</span>
               <button class="text-button" type="button" id="brainDownload">Download model</button>

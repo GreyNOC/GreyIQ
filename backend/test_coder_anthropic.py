@@ -5,11 +5,19 @@ These lock the wire contract the coding brain depends on. Claude Opus 4.7 and la
 request must carry adaptive thinking + ``output_config.effort`` and no sampling params at all. The
 stored API key must also never reach a network call empty, and an auth failure has to surface as a
 readable CoderError rather than a raw SDK exception.
+
+Key lifecycle: the UI never receives a stored key back, so a blank ``api_key`` in an update
+deliberately means "keep the stored one" — otherwise saving any other brain setting would wipe it.
+That overload left no way to *remove* a key (the delete branch of ``_store_secret`` was unreachable
+for coder providers, so hand-editing runtime/secrets.json was the only way out). Both halves are
+pinned below: blank still means keep, and the explicit ``clear_api_key`` sentinel really deletes.
 """
 from __future__ import annotations
 
 import copy
+import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -19,6 +27,11 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 import coder  # noqa: E402
+import greyiq_api as g  # noqa: E402
+
+ROOT = BACKEND_DIR.parent
+HTML = (ROOT / "public" / "index.html").read_text(encoding="utf-8")
+JS = (ROOT / "public" / "app.js").read_text(encoding="utf-8")
 
 
 class _APIStatusError(Exception):
@@ -245,7 +258,8 @@ class AnthropicProviderTests(unittest.TestCase):
 
 
 class KeyHandlingTests(unittest.TestCase):
-    """The stored key must never reach the UI, and saving other settings must not wipe it."""
+    """The stored key must never reach the UI, saving other settings must not wipe it, and an
+    explicit clear must actually remove it."""
 
     def test_public_config_strips_the_key_and_reports_presence(self) -> None:
         safe = coder.public_config({"provider": "anthropic", "anthropic": {"api_key": "sk-ant-secret"}})
@@ -259,10 +273,173 @@ class KeyHandlingTests(unittest.TestCase):
         self.assertEqual(merged["anthropic"]["api_key"], "sk-ant-keep")
         self.assertEqual(merged["anthropic"]["effort"], "max")
 
+    def test_whitespace_only_key_also_preserves_the_stored_key(self) -> None:
+        merged = coder.merge_update({"anthropic": {"api_key": "sk-ant-keep"}}, {"anthropic": {"api_key": "   "}})
+        self.assertEqual(merged["anthropic"]["api_key"], "sk-ant-keep")
+
     def test_a_real_key_in_an_update_replaces_the_stored_key(self) -> None:
         stored = {"provider": "anthropic", "anthropic": {"api_key": "sk-ant-old"}}
         merged = coder.merge_update(stored, {"anthropic": {"api_key": "sk-ant-new"}})
         self.assertEqual(merged["anthropic"]["api_key"], "sk-ant-new")
+
+    def test_clear_flag_empties_the_key_and_is_never_stored(self) -> None:
+        merged = coder.merge_update(
+            {"anthropic": {"api_key": "sk-ant-keep", "model": "claude-opus-5"}},
+            {"anthropic": {"clear_api_key": True}},
+        )
+        self.assertEqual(merged["anthropic"]["api_key"], "")
+        self.assertNotIn("clear_api_key", merged["anthropic"])  # a command, not a setting
+        self.assertEqual(merged["anthropic"]["model"], "claude-opus-5")  # nothing else disturbed
+
+    def test_clear_outranks_a_key_sent_in_the_same_update(self) -> None:
+        """A contradictory update fails safe: visibly no key beats silently keeping one."""
+        for block in ({"clear_api_key": True, "api_key": "sk-new"}, {"api_key": "sk-new", "clear_api_key": True}):
+            with self.subTest(order=list(block)):
+                merged = coder.merge_update({"anthropic": {"api_key": "sk-old"}}, {"anthropic": dict(block)})
+                self.assertEqual(merged["anthropic"]["api_key"], "")
+
+    def test_falsey_clear_flags_leave_the_key_alone(self) -> None:
+        for flag in (False, None, "", "false", "False", "0", "no", "off"):
+            with self.subTest(flag=flag):
+                merged = coder.merge_update(
+                    {"anthropic": {"api_key": "sk-ant-keep"}},
+                    {"anthropic": {"clear_api_key": flag, "api_key": ""}},
+                )
+                self.assertEqual(merged["anthropic"]["api_key"], "sk-ant-keep")
+                self.assertNotIn("clear_api_key", merged["anthropic"])
+
+    def test_clear_is_scoped_to_the_provider_that_asked(self) -> None:
+        merged = coder.merge_update(
+            {"anthropic": {"api_key": "sk-ant"}, "openai": {"api_key": "sk-oai"}},
+            {"anthropic": {"clear_api_key": True}},
+        )
+        self.assertEqual(merged["anthropic"]["api_key"], "")
+        self.assertEqual(merged["openai"]["api_key"], "sk-oai")
+
+    def test_clear_requests_names_only_the_explicit_providers(self) -> None:
+        update = {
+            "enabled": True,
+            "provider": "anthropic",
+            "anthropic": {"clear_api_key": True},
+            "openai": {"api_key": ""},          # blank is "keep", not a clear request
+            "local": {"api_key": "sk-local"},
+        }
+        self.assertEqual(coder.api_key_clear_requests(update), {"anthropic"})
+
+    def test_clear_requests_tolerates_empty_and_missing_updates(self) -> None:
+        self.assertEqual(coder.api_key_clear_requests(None), set())
+        self.assertEqual(coder.api_key_clear_requests({}), set())
+        self.assertEqual(coder.api_key_clear_requests({"enabled": True, "provider": "off"}), set())
+
+
+class SecretStoreClearTests(unittest.TestCase):
+    """End-to-end through the API runtime: does the key actually leave secrets.json?"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_runtime_dir = g.RUNTIME_DIR
+        self._orig_secrets = g.SECRETS_PATH
+        g.RUNTIME_DIR = Path(self._tmp.name)
+        g.SECRETS_PATH = Path(self._tmp.name) / "secrets.json"
+
+    def tearDown(self) -> None:
+        g.RUNTIME_DIR = self._orig_runtime_dir
+        g.SECRETS_PATH = self._orig_secrets
+        self._tmp.cleanup()
+
+    def _runtime_config_text(self) -> str:
+        path = g.RUNTIME_DIR / "solin_runtime_config.json"
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def _save_anthropic_key(self, key: str = "sk-ant-SECRET") -> dict:
+        return g.runtime.save_coder_config(
+            {"enabled": True, "provider": "anthropic", "anthropic": {"model": "claude-opus-5", "api_key": key}}
+        )
+
+    def test_saving_a_key_puts_it_in_the_secrets_store_only(self) -> None:
+        public = self._save_anthropic_key()
+        self.assertTrue(public["anthropic"]["has_api_key"])
+        self.assertEqual(g._load_secrets()["anthropic"], "sk-ant-SECRET")
+        self.assertNotIn("sk-ant-SECRET", self._runtime_config_text())
+
+    def test_blank_key_on_a_later_save_preserves_the_stored_key(self) -> None:
+        self._save_anthropic_key()
+        public = g.runtime.save_coder_config(
+            {"enabled": True, "provider": "anthropic", "anthropic": {"model": "claude-sonnet-5", "api_key": ""}}
+        )
+        self.assertTrue(public["anthropic"]["has_api_key"])
+        self.assertEqual(public["anthropic"]["model"], "claude-sonnet-5")
+        self.assertEqual(g._load_secrets()["anthropic"], "sk-ant-SECRET")
+
+    def test_clear_removes_the_entry_from_the_secrets_store(self) -> None:
+        self._save_anthropic_key()
+        public = g.runtime.save_coder_config({"anthropic": {"clear_api_key": True}})
+        self.assertFalse(public["anthropic"]["has_api_key"])
+        self.assertNotIn("anthropic", g._load_secrets())
+        self.assertNotIn("sk-ant-SECRET", g.SECRETS_PATH.read_text(encoding="utf-8"))
+        self.assertNotIn("sk-ant-SECRET", self._runtime_config_text())
+
+    def test_clear_does_not_disturb_the_selected_brain_or_other_fields(self) -> None:
+        self._save_anthropic_key()
+        public = g.runtime.save_coder_config({"anthropic": {"clear_api_key": True}})
+        self.assertTrue(public["enabled"])
+        self.assertEqual(public["provider"], "anthropic")
+        self.assertEqual(public["anthropic"]["model"], "claude-opus-5")
+        self.assertNotIn("clear_api_key", public["anthropic"])
+        self.assertNotIn("clear_api_key", json.loads(self._runtime_config_text())["coder"]["anthropic"])
+
+    def test_clear_leaves_other_providers_keys_in_place(self) -> None:
+        self._save_anthropic_key()
+        g.runtime.save_coder_config({"enabled": True, "provider": "openai", "openai": {"api_key": "sk-oai-SECRET"}})
+        public = g.runtime.save_coder_config({"anthropic": {"clear_api_key": True}})
+        self.assertFalse(public["anthropic"]["has_api_key"])
+        self.assertTrue(public["openai"]["has_api_key"])
+        self.assertEqual(g._load_secrets()["openai"], "sk-oai-SECRET")
+
+    def test_clearing_a_provider_with_no_stored_key_is_a_no_op(self) -> None:
+        public = g.runtime.save_coder_config({"openai": {"clear_api_key": True}})
+        self.assertFalse(public["openai"]["has_api_key"])
+        self.assertEqual(g._load_secrets(), {})
+
+    def test_a_cleared_key_stays_gone_across_a_later_blank_save(self) -> None:
+        """The regression that matters: "keep" must not resurrect what "clear" removed."""
+        self._save_anthropic_key()
+        g.runtime.save_coder_config({"anthropic": {"clear_api_key": True}})
+        public = g.runtime.save_coder_config(
+            {"enabled": True, "provider": "anthropic", "anthropic": {"api_key": ""}}
+        )
+        self.assertFalse(public["anthropic"]["has_api_key"])
+        self.assertNotIn("anthropic", g._load_secrets())
+
+    def test_a_new_key_can_be_saved_after_a_clear(self) -> None:
+        self._save_anthropic_key()
+        g.runtime.save_coder_config({"anthropic": {"clear_api_key": True}})
+        public = self._save_anthropic_key("sk-ant-REPLACEMENT")
+        self.assertTrue(public["anthropic"]["has_api_key"])
+        self.assertEqual(g._load_secrets()["anthropic"], "sk-ant-REPLACEMENT")
+
+
+class ClearKeyUiContractTests(unittest.TestCase):
+    """The clear path has to be reachable: a button wired to the sentinel, shown only when a key
+    is actually stored."""
+
+    def test_the_brain_panel_has_a_clear_saved_key_control(self) -> None:
+        self.assertIn('id="brainKeyActions"', HTML)
+        self.assertIn('id="brainClearKey"', HTML)
+        self.assertIn("Clear saved key", HTML)
+
+    def test_the_control_is_hidden_until_a_key_is_stored(self) -> None:
+        self.assertIn('<div class="folder-actions" id="brainKeyActions" hidden>', HTML)
+        self.assertIn('els.brainKeyActions.hidden = !(fields.includes("api_key") && block.has_api_key)', JS)
+
+    def test_the_button_posts_the_clear_sentinel_for_the_selected_provider(self) -> None:
+        self.assertIn('els.brainClearKey?.addEventListener("click"', JS)
+        self.assertIn("{ [provider]: { clear_api_key: true } }", JS)
+        self.assertIn("window.confirm(`Remove the saved ${label} API key", JS)
+
+    def test_a_normal_save_still_sends_a_blank_key_as_keep(self) -> None:
+        self.assertIn("block.api_key = els.brainApiKey.value; // blank = keep saved", JS)
+        self.assertIn('block.has_api_key ? "saved — leave blank to keep" : "paste API key"', JS)
 
 
 if __name__ == "__main__":

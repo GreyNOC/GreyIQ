@@ -12,7 +12,9 @@ Providers (OpenAI-compatible ones share a client; Claude uses its official SDK):
   - "off"/"none": disabled — the caller falls back to the local TinyGPT engine.
 
 Secrets (API keys) live in the runtime config and are never echoed back to the UI
-(see `public_config`).
+(see `public_config`). Because the UI never receives a key back, a blank api_key in
+an update means "keep the stored one"; deleting a key needs the explicit
+`clear_api_key` sentinel (see `merge_update` / `api_key_clear_requests`).
 """
 from __future__ import annotations
 
@@ -278,19 +280,60 @@ def public_config(raw: dict[str, Any] | None) -> dict[str, Any]:
     return safe
 
 
+# Sentinel a client sends inside a provider block to delete the stored API key.
+# A blank api_key deliberately means "keep what's stored" (the UI never receives the
+# key back, so re-saving any other field would otherwise wipe it) -- which leaves no
+# way to express deletion. This flag is that explicit, unambiguous path.
+CLEAR_API_KEY_FIELD = "clear_api_key"
+
+# Strings a JSON client may send for "no". Without this, `bool("false")` is True and a
+# stringified flag would silently delete a key.
+_FALSE_FLAGS = frozenset({"", "0", "false", "no", "off", "null", "none"})
+
+
+def _flag(value: Any) -> bool:
+    """Truthiness for a JSON flag, with the usual false-ish strings read as False."""
+    if isinstance(value, str):
+        return value.strip().lower() not in _FALSE_FLAGS
+    return bool(value)
+
+
+def api_key_clear_requests(update: dict[str, Any] | None) -> set[str]:
+    """Provider names in a UI update that explicitly ask for the stored API key to be
+    deleted. A blank api_key is NOT a clear request — it means "keep what's stored".
+
+    The secrets store lives outside this module (backend/greyiq_api.py), so the caller
+    pairs this with :func:`merge_update` to delete the key there as well.
+    """
+    return {
+        str(key)
+        for key, value in (update or {}).items()
+        if isinstance(value, dict) and _flag(value.get(CLEAR_API_KEY_FIELD))
+    }
+
+
 def merge_update(existing: dict[str, Any] | None, update: dict[str, Any]) -> dict[str, Any]:
     """Apply a partial update from the UI onto the stored config.
 
     An empty-string api_key in the update is treated as "leave unchanged" so the
     UI (which never receives keys) can save other fields without wiping the key.
+    To actually remove a key the update sets ``clear_api_key: true`` in the provider
+    block; that wins over any api_key sent alongside it, so a contradictory update
+    fails safe (visibly no key) rather than silently keeping a key the operator
+    asked to delete. The flag is a command, not a setting — it is never stored.
     """
     cfg = coder_config(existing)
     for key, value in (update or {}).items():
         if isinstance(value, dict) and isinstance(cfg.get(key), dict):
+            clearing = _flag(value.get(CLEAR_API_KEY_FIELD))
             for sub_key, sub_value in value.items():
-                if sub_key == "api_key" and not str(sub_value or "").strip():
-                    continue  # don't overwrite a stored key with a blank
+                if sub_key == CLEAR_API_KEY_FIELD:
+                    continue  # a command, not a stored field
+                if sub_key == "api_key" and (clearing or not str(sub_value or "").strip()):
+                    continue  # blank = keep the stored key; an explicit clear outranks it
                 cfg[key][sub_key] = sub_value
+            if clearing:
+                cfg[key]["api_key"] = ""
         else:
             cfg[key] = value
     return cfg

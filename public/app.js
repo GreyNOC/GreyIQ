@@ -158,6 +158,8 @@ const els = {
   brainBaseUrl: document.querySelector("#brainBaseUrl"),
   brainApiKey: document.querySelector("#brainApiKey"),
   brainUaMarker: document.querySelector("#brainUaMarker"),
+  brainKeyActions: document.querySelector("#brainKeyActions"),
+  brainClearKey: document.querySelector("#brainClearKey"),
   brainTest: document.querySelector("#brainTest"),
   brainSave: document.querySelector("#brainSave"),
   brainStatus: document.querySelector("#brainStatus"),
@@ -2130,12 +2132,17 @@ function applyBrainFields(provider, repopulate) {
       void refreshModelStatus();
     }
   }
+  const block = brainBlockFor(provider);
+  if (els.brainKeyActions) {
+    // "Clear saved key" only means anything once a key is actually stored.
+    els.brainKeyActions.hidden = !(fields.includes("api_key") && block.has_api_key);
+  }
+  // Derived from the stored state, so it stays right after a save or a clear too.
+  els.brainApiKey.placeholder = block.has_api_key ? "saved — leave blank to keep" : "paste API key";
   if (repopulate) {
-    const block = brainBlockFor(provider);
     els.brainModel.value = block.model || "";
     els.brainBaseUrl.value = block.base_url || "";
     els.brainApiKey.value = "";
-    els.brainApiKey.placeholder = block.has_api_key ? "saved — leave blank to keep" : "paste API key";
   }
 }
 
@@ -2170,6 +2177,40 @@ async function loadCoderConfig() {
 
 els.brainProvider?.addEventListener("change", () => {
   applyBrainFields(els.brainProvider.value, true);
+});
+
+const BRAIN_LABELS = { local: "local model", anthropic: "Claude", openai: "OpenAI" };
+
+// Deleting a stored key needs its own explicit request: a blank api_key means "keep
+// the saved one" (the UI is never sent the key back), so a normal save can't express
+// removal. `clear_api_key` is the sentinel the backend maps onto the delete path.
+els.brainClearKey?.addEventListener("click", async () => {
+  const provider = els.brainProvider.value;
+  if (!(BRAIN_FIELDS[provider] || []).includes("api_key")) return;
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.brainStatus.textContent = "Local GreyIQ service is not running.";
+    return;
+  }
+  const label = BRAIN_LABELS[provider] || provider;
+  if (!window.confirm(`Remove the saved ${label} API key from this machine?\n\nThis brain can't reach the provider until you paste a new one.`)) return;
+  els.brainClearKey.disabled = true;
+  els.brainStatus.textContent = "Clearing the saved key…";
+  try {
+    coderConfig = await apiFetch("/api/coder", {
+      method: "POST",
+      timeoutMs: 10000,
+      body: JSON.stringify({ config: { [provider]: { clear_api_key: true } } })
+    });
+    // Refresh only the key state: stay on the provider being edited (renderBrainForm
+    // would snap the dropdown back to the saved one) and keep any unsaved field edits.
+    applyBrainFields(provider, false);
+    renderAgentBar();
+    els.brainStatus.textContent = `Saved ${label} API key removed.`;
+  } catch (error) {
+    els.brainStatus.textContent = error.message || "Could not clear the saved key.";
+  } finally {
+    els.brainClearKey.disabled = false;
+  }
 });
 
 els.brainForm?.addEventListener("submit", async (event) => {

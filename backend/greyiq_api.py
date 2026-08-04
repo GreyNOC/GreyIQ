@@ -17,6 +17,7 @@ import sys
 import threading
 import traceback
 from collections import OrderedDict
+from collections.abc import Iterable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -194,11 +195,23 @@ def _merge_coder_secrets(config: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def _split_coder_secrets(config: dict[str, Any]) -> dict[str, Any]:
+def _split_coder_secrets(config: dict[str, Any], clear: Iterable[str] = ()) -> dict[str, Any]:
     """Move any API keys out of a coder config into the secrets store, leaving the
-    main config key-free."""
+    main config key-free.
+
+    ``clear`` names providers whose stored key the update explicitly asked to delete
+    (coder.api_key_clear_requests). A blank api_key can't express that on its own: it
+    means "keep the stored key", so without this the delete branch of _store_secret is
+    unreachable for coder providers and a key could only be removed by hand-editing
+    secrets.json."""
+    to_clear = {str(name) for name in clear}
     for provider in _SECRET_PROVIDERS:
         block = config.get(provider)
+        if provider in to_clear:
+            _store_secret(provider, "")  # delete branch: drops the entry from secrets.json
+            if isinstance(block, dict):
+                block["api_key"] = ""
+            continue
         if isinstance(block, dict) and block.get("api_key"):
             _store_secret(provider, str(block["api_key"]))
             block["api_key"] = ""
@@ -1478,8 +1491,12 @@ class GreyIQRuntime:
             if not isinstance(payload, dict):
                 payload = {}
             # Merge the UI update, then split API keys out into the secrets store so
-            # the main config stays key-free.
-            payload["coder"] = _split_coder_secrets(coder.merge_update(payload.get("coder"), update))
+            # the main config stays key-free. An explicit clear_api_key in the update
+            # also deletes the stored key (a blank api_key only means "keep it").
+            payload["coder"] = _split_coder_secrets(
+                coder.merge_update(payload.get("coder"), update),
+                clear=coder.api_key_clear_requests(update),
+            )
             write_json(runtime_path, payload)
         # Apply the saved marker immediately — the operator expects the next hunt to carry it.
         self._sync_ua_marker()
