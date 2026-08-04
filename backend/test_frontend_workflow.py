@@ -276,5 +276,45 @@ class CockpitQaqcV25ContractTests(unittest.TestCase):
         )
 
 
+class FrontendAssetsAreGrepableTextTests(unittest.TestCase):
+    """The shipped frontend assets must stay plain text.
+
+    A single raw control byte (a NUL, historically) makes ripgrep/grep classify
+    the file as binary and silently skip it, which blinds every content search
+    and every grep-driven QAQC audit over the 11.6k-line frontend. Control
+    characters belong in source as escapes (``\\u0000``), never as raw bytes.
+    """
+
+    ASSETS = ("public/app.js", "public/index.html", "public/styles.css")
+    ALLOWED = {0x09, 0x0A, 0x0D}  # tab, newline, carriage return
+
+    def test_no_raw_control_characters_in_shipped_assets(self) -> None:
+        for rel in self.ASSETS:
+            path = ROOT / rel
+            raw = path.read_bytes()
+            with self.subTest(asset=rel):
+                self.assertEqual(
+                    raw.count(b"\x00"),
+                    0,
+                    f"{rel} contains a raw NUL byte; grep/ripgrep will treat it as "
+                    f"binary and skip it. Write it as the escape \\u0000 instead.",
+                )
+                bad = sorted(
+                    {b for b in raw if b < 0x20 and b not in self.ALLOWED}
+                    | {b for b in raw if b == 0x7F}
+                )
+                self.assertEqual(
+                    bad,
+                    [],
+                    f"{rel} contains raw control bytes "
+                    f"{[hex(b) for b in bad]}; only tab/LF/CR are allowed.",
+                )
+
+    def test_assets_decode_as_utf8(self) -> None:
+        for rel in self.ASSETS:
+            with self.subTest(asset=rel):
+                (ROOT / rel).read_bytes().decode("utf-8")
+
+
 if __name__ == "__main__":
     unittest.main()
