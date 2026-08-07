@@ -328,6 +328,24 @@ def _md_escape_cell(text: str) -> str:
     return str(text).replace("|", "\\|").replace("\n", " ").strip()
 
 
+def _safe_display_int(value: Any) -> int:
+    """Tolerant integer coercion for advisory report metadata."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _safe_display_number(value: Any) -> int | float:
+    try:
+        number = float(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if number != number or abs(number) > 1_000_000:  # NaN / infinity / absurd advisory values
+        return 0
+    return int(number) if number.is_integer() else round(number, 1)
+
+
 def _fence(text: str) -> str:
     """A code-fence longer than any backtick run in ``text`` so embedded
     triple-backticks (from scanned target content or LLM output) can't break out."""
@@ -1444,6 +1462,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
     out.append("")
 
     _append_bounty_triage(out, ctx, counts)
+    _append_investigation(out, ctx)
     _append_next_steps(out, ctx)
 
     # --- Methodology ---
@@ -1602,6 +1621,87 @@ def _append_bounty_triage(out: list[str], ctx: dict[str, Any], counts: dict[str,
     for item in _SUBMISSION_CHECKLIST:
         out.append(f"- [ ] {item}")
     out.append("")
+
+
+def _append_investigation(out: list[str], ctx: dict[str, Any]) -> None:
+    """Render the shared evidence graph as an analyst decision brief.
+
+    This section intentionally reports proof state and gaps, never raw credentials or
+    model-authored evidence.  It is omitted for legacy/custom contexts that have not
+    run the investigation cortex.
+    """
+    investigation = ctx.get("investigation")
+    if not isinstance(investigation, dict):
+        return
+    metrics = investigation.get("metrics") if isinstance(investigation.get("metrics"), dict) else {}
+    hypotheses = investigation.get("hypotheses") if isinstance(investigation.get("hypotheses"), list) else []
+    chains = investigation.get("attack_chains") if isinstance(investigation.get("attack_chains"), list) else []
+    contradictions = investigation.get("contradictions") if isinstance(investigation.get("contradictions"), list) else []
+
+    out.append("## Investigation intelligence\n")
+    out.append(
+        "This evidence-grounded decision layer correlates scanner leads and captured proof. "
+        "It cannot promote model prose or a heuristic match to confirmed status."
+    )
+    out.append("")
+    out.append(f"- **Verdict:** {_md_escape_cell(investigation.get('verdict') or 'unknown')}")
+    out.append(
+        "- **Evidence state:** "
+        f"{_safe_display_int(metrics.get('confirmed'))} confirmed; "
+        f"{_safe_display_int(metrics.get('supported'))} supported; "
+        f"{_safe_display_int(metrics.get('report_ready'))} report-ready; "
+        f"{_safe_display_int(metrics.get('contradictions'))} contradiction(s)."
+    )
+    out.append(
+        f"- **Correlation:** {_safe_display_int(metrics.get('attack_chains'))} chain lead(s); "
+        f"average calibrated confidence {_safe_display_number(metrics.get('average_confidence'))}/100."
+    )
+    out.append("")
+
+    if hypotheses:
+        out.append("### Ranked hypothesis queue\n")
+        out.append("| Rank | Ref | State | Confidence | Decision | Next proof |")
+        out.append("|---:|---|---|---:|---|---|")
+        for item in hypotheses[:12]:
+            if not isinstance(item, dict):
+                continue
+            out.append(
+                f"| {_safe_display_int(item.get('rank'))} "
+                f"| {_md_escape_cell(item.get('ref') or '')} "
+                f"| {_md_escape_cell(item.get('status') or '')} "
+                f"| {_safe_display_int(item.get('confidence_score'))}/100 "
+                f"| {_md_escape_cell(item.get('decision') or '')} "
+                f"| {_md_escape_cell(item.get('next_action') or '')} |"
+            )
+        if len(hypotheses) > 12:
+            out.append(f"\n_Only the top 12 of {len(hypotheses)} hypotheses are shown; the JSON sidecar contains the full bounded queue._")
+        out.append("")
+
+    if chains:
+        out.append("### Correlated attack-chain leads\n")
+        for chain in chains[:8]:
+            if not isinstance(chain, dict):
+                continue
+            raw_refs = chain.get("refs")
+            refs = ", ".join(str(ref) for ref in raw_refs[:6]) if isinstance(raw_refs, list) else ""
+            out.append(
+                f"- **{_md_escape_cell(chain.get('id') or '')} · {_md_escape_cell(chain.get('title') or 'Chain lead')}** "
+                f"({_md_escape_cell(chain.get('status') or 'candidate')}, {_safe_display_int(chain.get('confidence_score'))}/100; "
+                f"refs: {_md_escape_cell(refs)}). {_md_escape_cell(chain.get('why') or '')} "
+                f"**Validate next:** {_md_escape_cell(chain.get('next_action') or '')}"
+            )
+        out.append("")
+
+    if contradictions:
+        out.append("### Contradictions requiring analyst resolution\n")
+        for issue in contradictions[:12]:
+            if not isinstance(issue, dict):
+                continue
+            out.append(
+                f"- **{_md_escape_cell(issue.get('ref') or '?')} · {_md_escape_cell(issue.get('code') or 'evidence-conflict')}:** "
+                f"{_md_escape_cell(issue.get('message') or '')}"
+            )
+        out.append("")
 
 
 def _append_next_steps(out: list[str], ctx: dict[str, Any]) -> None:
@@ -1783,6 +1883,13 @@ def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
         },
         "next_steps": ctx.get("next_steps", []),
         "coverage": ctx.get("coverage", {}),
+        # Shared code/hunt/report evidence graph: calibrated hypotheses, proof gaps,
+        # contradictions, and correlated chain leads. It is advisory and never a
+        # substitute for the canonical proof_of_impact fields above.
+        "investigation": ctx.get("investigation") or {
+            "algorithm": "", "verdict": "not-run", "metrics": {},
+            "hypotheses": [], "attack_chains": [], "contradictions": [],
+        },
         "manual_checklist": ctx.get("manual_checklist", []),
         "submission_checklist": list(_SUBMISSION_CHECKLIST),
         "retest_checklist": list(_RETEST_CHECKLIST),

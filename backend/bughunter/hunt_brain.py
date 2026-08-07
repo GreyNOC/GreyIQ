@@ -35,9 +35,10 @@ import re
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
+import brain_profiles
 import coder
 import trust
-from bughunter import offline_hunt
+from bughunter import investigator, offline_hunt
 
 # The vuln classes the active prover (active_verify_service) can actually CONFIRM with a benign
 # differential. The brain's class suggestions are filtered to this set — a suggestion the prover
@@ -115,7 +116,17 @@ _MAX_IDOR_CANDIDATES = 6  # bound the brain-selected object-scoped endpoints han
 
 def _empty_plan() -> dict[str, Any]:
     return {"used": False, "provider": "", "model": "", "param_hypotheses": [], "probe_priority": [],
-            "idor_candidates": [], "ssrf_params": [], "xss_params": [], "privileged_endpoints": [], "notes": ""}
+            "idor_candidates": [], "ssrf_params": [], "xss_params": [], "privileged_endpoints": [],
+            "hypotheses": [], "notes": ""}
+
+
+def _with_hypotheses(plan: dict[str, Any]) -> dict[str, Any]:
+    """Attach the explicit proof-seeking queue without ever breaking planning."""
+    try:
+        plan["hypotheses"] = investigator.build_probe_hypotheses(plan)
+    except Exception:  # noqa: BLE001 - advisory intelligence must fail closed
+        plan["hypotheses"] = []
+    return plan
 
 
 def _norm_class(value: str) -> str:
@@ -143,7 +154,7 @@ def heuristic_plan(surface: dict[str, Any]) -> dict[str, Any]:
     """
     empty = {
         "used": False, "provider": "deterministic", "model": "veteran-heuristics-v1",
-        "param_hypotheses": [], "probe_priority": [], "notes": "",
+        "param_hypotheses": [], "probe_priority": [], "hypotheses": [], "notes": "",
     }
     if not isinstance(surface, dict):
         return empty
@@ -249,11 +260,11 @@ def heuristic_plan(surface: dict[str, Any]) -> dict[str, Any]:
                      "score": scores[ordered[0]], "source": "deterministic-veteran-heuristics"})
         if len(rows) >= _MAX_PRIORITY_ROWS:
             break
-    return {
+    return _with_hypotheses({
         "used": bool(rows), "provider": "deterministic", "model": "veteran-heuristics-v1",
         "param_hypotheses": [], "probe_priority": rows,
         "notes": f"Prioritised {len(rows)} endpoint(s) from observed route/parameter semantics." if rows else "",
-    }
+    })
 
 
 def _build_surface_context(target: str, surface: dict[str, Any]) -> str:
@@ -338,6 +349,51 @@ def _build_prompt(target: str, scope: str, surface: dict[str, Any]) -> str:
         "the discovered list — never invent a host, URL, or path. Prefer quality over quantity; omit "
         "anything you are unsure about."
     )
+
+
+# The vuln-class vocabulary the planner is allowed to name, derived from ACTIVE_CLASSES so the schema
+# can NEVER drift from what the differential prover can actually confirm. Sorted for determinism (a
+# stable schema is a cache-friendly schema, and a stable diff). `_norm_class` still folds the aliases
+# (open-redirect -> redirect, lfi -> path-traversal, ...) after parsing.
+_PLAN_CLASS_ENUM: list[str] = sorted(ACTIVE_CLASSES)
+
+# Structured-output contract for the planner reply — the EXACT shape `_build_prompt` asks for. On
+# Anthropic this constrains the model to emit matching JSON, which removes the "model wrote prose /
+# fenced markdown / a trailing apology" failure mode entirely. It is a SHAPE guarantee only: every
+# value is still attacker-influenced (recon text is reflected into the prompt), so `_parse_json_object`
+# and `_validate_plan` remain the enforcement — the caps, the param-name regex, and the verbatim
+# in-scope endpoint check are what actually keep the brain inside its box. Other providers ignore
+# `response_schema` and keep the prose-scraping fallback.
+#
+# NOTE: strict schemas reject minLength/maxLength/minimum/maximum/pattern — the length caps live in
+# the prompt as guidance and in `_validate_plan` as enforcement, never here.
+PLAN_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["param_hypotheses", "probe_priority", "idor_candidates", "ssrf_params",
+                 "xss_params", "privileged_endpoints", "notes"],
+    "properties": {
+        "param_hypotheses": {"type": "array", "items": {"type": "string"}},
+        "probe_priority": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["endpoint", "classes", "why"],
+                "properties": {
+                    "endpoint": {"type": "string"},
+                    "classes": {"type": "array", "items": {"type": "string", "enum": _PLAN_CLASS_ENUM}},
+                    "why": {"type": "string"},
+                },
+            },
+        },
+        "idor_candidates": {"type": "array", "items": {"type": "string"}},
+        "ssrf_params": {"type": "array", "items": {"type": "string"}},
+        "xss_params": {"type": "array", "items": {"type": "string"}},
+        "privileged_endpoints": {"type": "array", "items": {"type": "string"}},
+        "notes": {"type": "string"},
+    },
+}
 
 
 def _validate_names(raw: Any, cap: int = 12) -> list[str]:
@@ -454,8 +510,8 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
               technique_context: str = "") -> dict[str, Any]:
     """Reason over the recon surface and propose where to probe.
 
-    Returns ``{used, provider, model, param_hypotheses, probe_priority, idor_candidates, ssrf_params,
-    xss_params, notes}``. With a brain configured, the LLM produces the plan; with NO brain configured
+    Returns ``{used, provider, model, param_hypotheses, probe_priority, hypotheses,
+    idor_candidates, ssrf_params, xss_params, notes}``. With a brain configured, the LLM produces the plan; with NO brain configured
     the OFFLINE knowledge-rule engine (offline_hunt, sharpened by learned ``priors``) produces the same
     shape — so an offline hunt is steered too, no longer flying blind. All outputs (names + verbatim
     in-scope endpoints + class orderings) pass through _validate_plan either way; a name can't carry a
@@ -472,12 +528,16 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
                          "notes": str(raw.get("notes") or "")})
         except Exception:  # noqa: BLE001 - the offline planner must never break a hunt
             pass
-        return plan
+        return _with_hypotheses(plan)
     target = str(target or "").strip()
     if not target:
-        return plan
+        return _with_hypotheses(plan)
     cfg = dict(coder.coder_config(coder_cfg))
     cfg["system_prompt"] = HUNT_BRAIN_SYSTEM_PROMPT
+    # Where an entire engagement points its probe budget is the highest-leverage single call in the
+    # product, so it gets the deepest profile (unless the operator configured their own).
+    brain_profiles.apply(cfg, "hunt_plan")
+    cfg["response_schema"] = PLAN_RESPONSE_SCHEMA
     # The WHOLE brain interaction — the network call, JSON parsing, AND validation of the
     # model's (untrusted, possibly hijacked) output — is inside one guard so the module itself
     # honours its fail-closed contract: any failure returns the empty plan, independent of whether
@@ -491,16 +551,16 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
         parsed = _parse_json_object(str(result.get("text") or ""))
         params, priority, idor_candidates, ssrf_params, xss_params, privileged_endpoints = _validate_plan(parsed, surface)
     except coder.CoderError:
-        return plan
+        return _with_hypotheses(plan)
     except Exception:  # noqa: BLE001 - the reasoning layer must never break a hunt
-        return plan
+        return _with_hypotheses(plan)
     plan.update({
         "used": True, "provider": str(result.get("provider") or ""), "model": str(result.get("model") or ""),
         "param_hypotheses": params, "probe_priority": priority, "idor_candidates": idor_candidates,
         "ssrf_params": ssrf_params, "xss_params": xss_params, "privileged_endpoints": privileged_endpoints,
         "notes": str((parsed or {}).get("notes") or "").strip()[:300] if isinstance(parsed, dict) else "",
     })
-    return plan
+    return _with_hypotheses(plan)
 
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:

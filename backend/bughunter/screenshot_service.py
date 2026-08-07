@@ -28,7 +28,7 @@ from urllib.parse import urlparse
 from bughunter.active_verify_service import host_in_active_scope
 from bughunter.playwright_env import ensure_bundled_browsers_path
 from bughunter.settings import get_settings
-from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
+from bughunter.web_ingest import WebsiteFetchError, current_user_agent, normalize_website_url
 from bughunter.web_scan_service import _guard_url, playwright_request_allowed
 
 _VIEWPORT = {"width": 1280, "height": 900}
@@ -256,7 +256,13 @@ def capture_screenshot(
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
-            context = browser.new_context(ignore_https_errors=True, viewport=_VIEWPORT)
+            # Identify the browser half of a hunt the same way the HTTP half does. Without an explicit
+            # user_agent Playwright sends headless Chromium's own UA, so screenshot/PoC traffic arrived
+            # unattributed and WITHOUT the program's mandatory marker — a rules-of-engagement problem
+            # for any program that requires researcher traffic be identifiable.
+            context = browser.new_context(
+                ignore_https_errors=True, viewport=_VIEWPORT, user_agent=current_user_agent()
+            )
             context.route("**/*", _guard_route)
             page = context.new_page()
             resp = page.goto(sanitized, wait_until="load", timeout=wait_ms + 15000)

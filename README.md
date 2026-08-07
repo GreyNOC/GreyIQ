@@ -67,6 +67,10 @@ In the **Coding brain** panel (training column) pick a provider:
 - **OpenAI-compatible** — any `/v1/chat/completions` endpoint.
 
 The brain answers chat, drives Agent mode, and writes the analysis in BugHunter reports.
+For security and root-cause work, Agent mode can call a shared evidence-grounded
+investigator that scans code read-only, ranks hypotheses, names the proof still needed,
+and detects contradictions before proposing a fix. Raw credential values are never
+included in the brief sent to a configured model.
 
 ## Agent mode & the Workbench
 
@@ -118,8 +122,12 @@ a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the
   reproduction steps + attack plans, and a Markdown report (+ JSON sidecar, optional
   per-finding files) is written to a folder you choose. **Authorized testing only** —
   a hunt won't run unless you confirm the target is in scope.
-- Bounty reports now add triage, class mix, chain leads, submission-readiness checks,
-  retest guidance, and platform-friendly one-file-per-finding exports. Reports reshape for
+- Bounty reports now add triage, class mix, submission-readiness checks, and an
+  **Investigation intelligence** brief: calibrated confidence, typed evidence state,
+  explicit proof gaps, contradiction detection, a ranked hypothesis queue, and
+  correlated attack-chain leads. The same graph is available in the JSON sidecar and
+  hunt API. Reports also include retest guidance and platform-friendly one-file-per-finding
+  exports. Reports reshape for
   HackerOne, YesWeHack, Bugcrowd, Intigriti, and **HackenProof** (web3: exchanges, protocols,
   smart contracts) — pick the format in Submissions. HackerOne is the only live-API submit;
   the rest, HackenProof included, are export-only (HackenProof has no researcher API — you

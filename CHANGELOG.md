@@ -2,6 +2,97 @@
 
 Notable changes to GreyIQ.
 
+## Unreleased - investigation cortex
+
+- Added a deterministic, evidence-grounded investigation cortex shared by the coding
+  agent, hunt planner/loop, and bounty reports. It calibrates confidence from typed
+  artifacts, ranks proof-gathering hypotheses, flags contradictory evidence, and
+  correlates bounded attack-chain leads without allowing model prose to confirm a bug.
+- Agent mode gains the read-only `investigate_code` tool. It runs the existing static
+  scanner within the workspace, returns ranked root-cause leads and next proof
+  obligations, and explicitly strips raw credential values before results can reach a
+  configured remote model.
+- Hunt plans now carry an explicit evidence-required hypothesis queue, and iterative
+  hunts return a final investigation snapshot alongside their request-budget metadata.
+- Markdown reports gain an Investigation intelligence decision brief; JSON sidecars and
+  the hunt API return the same complete machine-readable graph.
+- New contract tests cover false confirmation from prose, non-differential controls,
+  public-key severity inflation, chain correlation, report serialization, and coding-
+  agent credential isolation.
+
+## v2.7.0 - per-brain reasoning, structured output, and an identity on the wire
+
+### Brains
+- **Per-brain reasoning profiles** (`backend/brain_profiles.py`). Every brain previously shared one
+  model, one effort level and one token budget, so the hunt planner - which decides where an entire
+  engagement points its probe budget - reasoned exactly as hard as the one-line impact narrator that
+  runs once per finding. Profiles give `xhigh` to the hunt planner, the strategy dossier and the
+  Workbench agent, and a deliberately cheap budget to the per-finding narrator. A profile is a
+  DEFAULT, not an override: an explicit operator setting always wins, and any historical shipped
+  default counts as "unset" so an upgraded install is never left pairing raised effort with the old
+  ceiling.
+- **Structured outputs.** The four JSON brains no longer scrape their reply out of model prose with
+  three divergent parsers - a caller sets a JSON schema and the reply is constrained to match. The
+  hunt planner's vulnerability-class enum is derived from `ACTIVE_CLASSES`, so the schema cannot
+  drift from what the differential prover can actually confirm. This is a SHAPE guarantee only:
+  every validator and the `brain_safety` sanitizer still own the untrusted content, and
+  non-Anthropic providers keep the prose-scraping fallback unchanged.
+- **Prompt caching** on the system prompt. The hunt planner alone re-sends up to 56k characters of
+  technique playbooks per run; that prefix is now a cache breakpoint.
+- Default model is now `claude-opus-5`, and `max_tokens` moves 8192 -> 16000 because that ceiling
+  covers thinking as well as the reply.
+- **A truncated or refused turn now raises instead of returning a partial string.** Returning a
+  half-written attack plan or a clipped JSON object as a success was the worst available outcome.
+- The **Workbench agent** had no effort or thinking configuration at all - the most agentic brain in
+  the product ran on bare API defaults. It now matches the rest.
+- The **strategy/research dossier had no system prompt**, so deep target research was being done by
+  a model still told it was a coding assistant.
+- The 400 fallback is now a ladder that drops one capability per rejection, so a model that rejects
+  caching no longer also loses adaptive thinking. Effort is sent independently of thinking.
+
+### Identity on the wire
+- The default User-Agent read `GreyNOC-Slop-Detection/0.1` - a **different GreyNOC product** - so
+  every in-scope request was misattributed. It is now derived from the single `_version` source, as
+  is the web-scan UA that had drifted to `/0.1`.
+- **All four headless-browser contexts that reach a target now send it.** They sent Chromium's own
+  UA, so proof screenshots, the stored-XSS render, the live scan and the research-account login
+  carried no researcher identity and no program marker. The local SVG rasterizer is deliberately
+  excluded - it aborts every request and never touches the network.
+- **A global researcher marker** (e.g. `h1-greynoc`) now rides every in-scope request, with a
+  settings field, plus a per-run tag on the hunt form. `campaign.run_campaign` was previously the
+  only setter in the entire product, so an ad-hoc hunt, a re-verify or a prover run identified
+  nobody. Both fragments are control-character stripped and length-capped; the per-program suffix
+  keeps its verbatim-append contract.
+
+## v2.6.1 - honest brain failures, CVE-2026-69247
+
+### Security
+- `cryptography` moves to 50.x for **CVE-2026-69247**. The previous `<50.0` ceiling pinned the
+  build to vulnerable 49.0.0 and failed the CI `pip-audit` gate on every run. `cryptography` is a
+  bundled release dependency (RSA/RS256 signing that proves a leaked GCP service-account key is
+  live), so the vulnerable copy was shipping inside the portable exe and the installer, not just
+  failing CI. Verified: the hazmat primitives in use are unchanged, `test_credential_validation`
+  53 passed, full suite identical on 50.0.0, `pip-audit -r requirements.txt` clean.
+
+### Fixed
+- A configured-but-failing Claude brain is no longer misreported as an absent one. The hunt's
+  report enrichment returned the same "unused" result for both "nothing configured" and "Claude
+  rejected the API key", so an auth failure, timeout, or 429 was announced to the operator as
+  *"brain enrichment skipped (no brain configured)"* - pointing at the wrong problem. `_ask_brain`
+  now records why it failed and the progress line distinguishes the two cases. The reason reaches
+  only the live progress stream: `report.build_json` builds its brain block from an explicit
+  allowlist, so it cannot enter a delivered report.
+- The Workbench agent loop caught `anthropic.AuthenticationError` in its generic handler, so a
+  rejected or expired key surfaced as a raw SDK 401 repr. It now raises the same actionable
+  "Claude rejected the API key (authentication failed)" message the chat path already used, and
+  gives `APIStatusError` the same treatment.
+
+### Tests
+- First coverage for the Anthropic provider path, which previously had none: the request shape
+  (adaptive thinking plus `output_config.effort`, the 400-retry that drops them for older models,
+  and that `temperature`/`top_p`/`top_k` are never sent - those return 400 on Opus 4.7+), the
+  API-key round-trip including preserve-on-blank-resave and redaction to `has_api_key`, and the
+  failure-reporting split. Suite 1877 -> 1893 passed.
 ## v2.6.0 - TACNOC launcher, shared brain techniques
 
 Merges the `GreyNOC/AddTACNOC` line onto the v2.5.0 release. That branch was cut before

@@ -310,7 +310,11 @@ def _render_beacon(url: str, *, cookie: str, headers: list[str] | None, scope: s
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
-            context = browser.new_context(ignore_https_errors=True)
+            # Carry the app signature + the program's mandatory marker (see screenshot_service). This
+            # path renders the stored payload back, so its traffic is in-scope and must be attributable.
+            context = browser.new_context(
+                ignore_https_errors=True, user_agent=current_user_agent(_USER_AGENT)
+            )
             context.route("**/*", _guard_route)
             page = context.new_page()
             page.goto(url, wait_until="load", timeout=wait_ms + 15000)

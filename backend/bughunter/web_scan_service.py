@@ -30,6 +30,7 @@ from bughunter.rate_limit import HostRateGovernor
 from bughunter.scan_auth import AuthContext, auth_headers_for, same_site
 from bughunter.settings import get_settings
 from bughunter.web_ingest import (
+    GREYIQ_UA,
     WebsiteFetchError,
     _ascii_hostname,
     _host_is_private,
@@ -37,7 +38,9 @@ from bughunter.web_ingest import (
     normalize_website_url,
 )
 
-_USER_AGENT = "GreyIQ-BugHunter/0.1 (+authorized-scan)"
+# One source of truth for the app's signature on authorized traffic (web_ingest.GREYIQ_UA, derived
+# from _version). This previously hardcoded "/0.1" and had drifted six minor versions behind the app.
+_USER_AGENT = GREYIQ_UA
 _MAX_FINDINGS_RETURNED = 300
 
 # The per-program required-UA machinery lives in web_ingest (the lowest-level fetcher, imported here);

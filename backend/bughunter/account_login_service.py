@@ -26,7 +26,7 @@ from urllib.parse import urlparse
 from bughunter.active_verify_service import host_in_active_scope
 from bughunter.playwright_env import ensure_bundled_browsers_path
 from bughunter.settings import get_settings
-from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
+from bughunter.web_ingest import WebsiteFetchError, current_user_agent, normalize_website_url
 from bughunter.web_scan_service import _guard_url, playwright_request_allowed
 
 # Candidate selectors for the username/email field, most-specific first. The password field is always
@@ -88,7 +88,8 @@ def _playwright_login(url: str, host: str, email: str, password: str, scope: str
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
-            context = browser.new_context(ignore_https_errors=True)
+            # Carry the app signature + the program's mandatory marker (see screenshot_service).
+            context = browser.new_context(ignore_https_errors=True, user_agent=current_user_agent())
             context.route("**/*", _guard_route)
             page = context.new_page()
             try:

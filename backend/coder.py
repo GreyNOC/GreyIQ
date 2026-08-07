@@ -61,15 +61,22 @@ DEFAULT_SYSTEM_PROMPT = (
     "If you are unsure, say so instead of guessing."
 )
 
-# Default Claude model for the coding brain. Opus 4.8 is the most capable model;
-# adaptive thinking + high effort is the recommended setup for coding/agentic work.
-DEFAULT_ANTHROPIC_MODEL = "claude-opus-4-8"
+# Default Claude model for the coding brain. Opus 5 is the current Opus tier and a drop-in for the
+# request shape we send (adaptive thinking + output_config.effort, no sampling params) at the same
+# price as 4.8. Adaptive thinking + a per-brain effort (see brain_profiles) is the recommended setup.
+# NOTE: on Opus 5 thinking is ON by default, and max_tokens is a shared ceiling over thinking AND the
+# response — which is why _generate_anthropic now inspects stop_reason instead of trusting the text.
+DEFAULT_ANTHROPIC_MODEL = "claude-opus-5"
 
 CODER_DEFAULTS: dict[str, Any] = {
     "enabled": False,
     "provider": "local",
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
-    "max_tokens": 8192,
+    # On current models this ceiling covers THINKING as well as the reply, and Opus 5 thinks by
+    # default — 8192 (the pre-v2.7.0 value) was small enough that a deep turn could spend the budget
+    # reasoning and return a clipped answer. 16000 is the largest value that stays comfortably inside
+    # the SDK's non-streaming timeout guard. Per-brain overrides live in brain_profiles.
+    "max_tokens": 16000,
     "temperature": 0.2,
     "timeout_s": 120.0,
     "history_turns": 12,
@@ -306,7 +313,10 @@ def generate(messages: list[dict[str, str]], raw_config: dict[str, Any] | None) 
     if provider in _PROVIDERS_OFF:
         raise CoderError("The coding brain is turned off.")
     if provider == "anthropic":
-        return _generate_anthropic(messages, system_prompt, cfg["anthropic"], max_tokens, timeout)
+        # response_schema is Anthropic-only: it constrains the reply to valid JSON. Other providers
+        # keep the prose-scraping path, so a caller can always fall back to _parse_json_object.
+        schema = cfg.get("response_schema") if isinstance(cfg.get("response_schema"), dict) else None
+        return _generate_anthropic(messages, system_prompt, cfg["anthropic"], max_tokens, timeout, schema)
     if provider == "local":
         return _generate_ollama(messages, system_prompt, cfg["local"], max_tokens, temperature, timeout)
     if provider == "openai":
@@ -507,6 +517,7 @@ def _generate_anthropic(
     block: dict[str, Any],
     max_tokens: int,
     timeout: float,
+    schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     model = str(block.get("model") or DEFAULT_ANTHROPIC_MODEL)
     api_key = str(block.get("api_key") or "").strip()
@@ -520,44 +531,87 @@ def _generate_anthropic(
     # max_retries lets the SDK back off and retry transient 429/5xx/connection
     # errors itself, so a single blip doesn't kill the request.
     client = anthropic.Anthropic(api_key=api_key, timeout=timeout, max_retries=_MAX_RETRIES)
+    # Prompt caching: the system prompt is a large, stable prefix re-sent on every call of a given
+    # brain (the hunt planner alone appends up to 56k chars of technique playbooks per run). Marking
+    # it as an ephemeral cache breakpoint makes repeat calls read that prefix at ~0.1x input price
+    # instead of re-paying it. agent.py has done this since v0.9; the chat/hunt/report path had not.
     base_kwargs: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
-        "system": system_prompt,
+        "system": [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
         "messages": [{"role": m["role"], "content": m["content"]} for m in messages],
     }
-    # Adaptive thinking + effort is the recommended coding setup on Opus 4.8 / 4.7
-    # / Sonnet 4.6. Passed via extra_body so it works regardless of installed SDK
-    # version; older models reject these, so retry without them on a 400.
+    # Adaptive thinking + effort is the recommended setup on Opus 5 / 4.8 / 4.7 / Sonnet.
+    # Passed via extra_body so the request shape does not depend on the installed SDK version;
+    # older models reject these, so we degrade progressively on a 400 rather than all-at-once.
+    # effort is sent INDEPENDENTLY of thinking. They are separate controls, and bundling them meant
+    # a brain with thinking off also silently lost its effort level — landing on the API default
+    # rather than the cheap setting that was chosen deliberately.
     use_thinking = bool(block.get("thinking", True))
-    extra_body: dict[str, Any] = {}
+    extra_body: dict[str, Any] = {"output_config": {"effort": str(block.get("effort") or "high")}}
     if use_thinking:
-        extra_body = {
-            "thinking": {"type": "adaptive"},
-            "output_config": {"effort": str(block.get("effort") or "high")},
-        }
+        extra_body["thinking"] = {"type": "adaptive"}
+    # Structured output: when a caller supplies a JSON schema the model is CONSTRAINED to emit
+    # matching JSON, instead of us scraping the first {...} out of prose. Shape only — the content is
+    # still untrusted and still passes the caller's validator and brain_safety sanitizer.
+    if isinstance(schema, dict) and schema:
+        extra_body.setdefault("output_config", {})
+        extra_body["output_config"]["format"] = {"type": "json_schema", "schema": schema}
 
-    try:
-        response = client.messages.create(**base_kwargs, extra_body=extra_body or None)
-    except anthropic.BadRequestError as exc:
-        message = str(getattr(exc, "message", exc)).lower()
-        if use_thinking and ("effort" in message or "thinking" in message or "output_config" in message):
-            try:
-                response = client.messages.create(**base_kwargs)
-            except Exception as retry_exc:  # noqa: BLE001 - surfaced to user
-                raise CoderError(f"Claude request failed: {retry_exc}") from retry_exc
-        else:
+    # Capability ladder: drop ONE unsupported capability per 400 and try again, rather than throwing
+    # everything away at the first rejection. An older model can reject caching, then the schema, then
+    # adaptive thinking — a single-shot retry would surface the second rejection as a hard failure and
+    # a bundled retry would discard capabilities the model actually supports. Each rung is
+    # independent, so a cache rejection never costs us thinking and vice versa.
+    attempt_system: Any = base_kwargs["system"]
+    attempt_extra: dict[str, Any] = {k: (dict(v) if isinstance(v, dict) else v) for k, v in extra_body.items()}
+    response = None
+    for _ in range(len(("cache", "schema", "thinking")) + 1):
+        try:
+            response = client.messages.create(
+                **{**base_kwargs, "system": attempt_system}, extra_body=attempt_extra or None
+            )
+            break
+        except anthropic.BadRequestError as exc:
+            message = str(getattr(exc, "message", exc)).lower()
+            output_config = attempt_extra.get("output_config") or {}
+            if "cache" in message and isinstance(attempt_system, list):
+                attempt_system = system_prompt          # rung 1: plain system prompt, keep the rest
+                continue
+            if "format" in output_config and ("schema" in message or "format" in message):
+                output_config.pop("format", None)       # rung 2: unconstrained output, keep thinking
+                continue
+            if attempt_extra and ("effort" in message or "thinking" in message or "output_config" in message):
+                attempt_extra = {}                      # rung 3: bare request
+                continue
             raise CoderError(f"Claude rejected the request: {getattr(exc, 'message', exc)}") from exc
-    except anthropic.AuthenticationError as exc:
-        raise CoderError("Claude rejected the API key (authentication failed).") from exc
-    except anthropic.APIStatusError as exc:
-        raise CoderError(f"Claude API error {exc.status_code}: {getattr(exc, 'message', exc)}") from exc
-    except Exception as exc:  # noqa: BLE001 - network/SDK errors surfaced to user
-        raise CoderError(f"Claude request failed: {exc}") from exc
+        except anthropic.AuthenticationError as exc:
+            raise CoderError("Claude rejected the API key (authentication failed).") from exc
+        except anthropic.APIStatusError as exc:
+            raise CoderError(f"Claude API error {exc.status_code}: {getattr(exc, 'message', exc)}") from exc
+        except Exception as exc:  # noqa: BLE001 - network/SDK errors surfaced to user
+            raise CoderError(f"Claude request failed: {exc}") from exc
+    if response is None:  # every rung rejected: report it rather than dereference None
+        raise CoderError("Claude rejected the request even without thinking, caching, or a schema.")
+
+    # Why stop_reason is checked BEFORE the text: on current models max_tokens is a shared ceiling
+    # over thinking AND the response, so a deep-reasoning turn can spend the budget thinking and come
+    # back with a truncated answer. Returning that as a success is the worst outcome — a half-written
+    # attack plan or a clipped JSON object reads as real output. Fail loudly and name the fix instead.
+    stop_reason = str(getattr(response, "stop_reason", "") or "")
+    if stop_reason == "refusal":
+        raise CoderError("Claude declined this request (safety refusal); nothing was returned.")
 
     text = "".join(
         getattr(block_, "text", "") for block_ in response.content if getattr(block_, "type", "") == "text"
     ).strip()
+
+    if stop_reason == "max_tokens":
+        raise CoderError(
+            f"Claude hit the {max_tokens}-token output ceiling before finishing "
+            "(on current models that budget covers thinking as well as the reply), so the answer was "
+            "cut off. Raise max_tokens in the coding-brain settings, or lower the effort level."
+        )
     if not text:
         raise CoderError("Claude returned an empty response.")
     return {"text": text, "model": getattr(response, "model", model), "provider": "anthropic"}

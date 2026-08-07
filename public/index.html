@@ -162,6 +162,11 @@
               <button class="text-button" type="button" id="brainDownload">Download model</button>
             </div>
             <div class="model-list" id="brainModelList" hidden></div>
+            <label>
+              <span>Researcher UA marker</span>
+              <input id="brainUaMarker" name="brainUaMarker" type="text" autocomplete="off" spellcheck="false" maxlength="120" placeholder="e.g. h1-greynoc">
+            </label>
+            <p class="folder-status">Appended to the User-Agent of every in-scope request GreyIQ sends, so a program can attribute the traffic to you in its access logs. Use the handle on your platform profile. A program's own required tag is added after this one.</p>
             <div class="folder-actions">
               <button class="text-button" type="button" id="brainTest">Test</button>
               <button class="text-button" type="submit" id="brainSave">Save brain</button>
@@ -513,6 +518,9 @@
               <label><span>Extra headers <em>(one per line, Name: value)</em></span>
                 <textarea id="ckAuthHeaders" rows="2" autocomplete="off" spellcheck="false" placeholder="Authorization: Bearer …"></textarea></label>
               <p class="ck-hint">Sent only to the target host and its subdomains — never to a third-party host, even on a redirect.</p>
+              <label><span>Required UA tag <em>(this run)</em></span>
+                <input id="ckUaSuffix" type="text" autocomplete="off" spellcheck="false" maxlength="120" placeholder=" -BugBounty-acme-31337 "></label>
+              <p class="ck-hint">A tag some programs require on the User-Agent of every request. Appended <strong>verbatim</strong> after your researcher marker — include the program's own spacing. Leave blank to use the saved program's tag.</p>
             </details>
 
             <section class="ck-launch-actions" aria-label="Authorize and launch">

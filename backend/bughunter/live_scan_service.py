@@ -23,7 +23,7 @@ from typing import Any
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.playwright_env import ensure_bundled_browsers_path
 from bughunter.settings import get_settings
-from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
+from bughunter.web_ingest import WebsiteFetchError, current_user_agent, normalize_website_url
 from bughunter.web_scan_service import _guard_url, playwright_request_allowed
 
 # Bound runtime capture so a noisy/hostile page can't grow these lists without
@@ -183,7 +183,8 @@ def run_live_scan(url: str, wait_seconds: float = 6.0, max_findings: int = 300) 
 
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
-            context = browser.new_context(ignore_https_errors=True)
+            # Carry the app signature + the program's mandatory marker (see screenshot_service).
+            context = browser.new_context(ignore_https_errors=True, user_agent=current_user_agent())
             context.route("**/*", _guard_route)
             page = context.new_page()
             page.on("console", on_console)
