@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from urllib.parse import urlparse
 
 from bughunter import secret_classification
 
@@ -82,45 +81,6 @@ _RULE_CLASS_HINTS: tuple[tuple[str, str], ...] = (
     ("deserialize", "deserialization"), ("upload", "file-upload"), ("disclosure", "disclosure"),
     ("network", "network"), ("crypto", "crypto"), ("header", "headers"),
     ("supply", "supply-chain"), ("dependency", "supply-chain"), ("ci", "supply-chain"),
-)
-
-_CHAIN_RECIPES: tuple[dict[str, Any], ...] = (
-    {"classes": {"disclosure", "access-control"}, "title": "Disclosure-assisted object authorization bypass",
-     "why": "Leaked identifiers or hidden paths can make an access-control lead reproducible.",
-     "projected_impact": "Unauthorized access to another user's data or object.",
-     "validation": "Use only identifiers already disclosed, compare two authorized test roles, and capture the response differential."},
-    {"classes": {"secrets", "auth"}, "title": "Credential exposure into authentication compromise",
-     "why": "A usable privileged credential can turn an authentication weakness into account or environment access.",
-     "projected_impact": "Account, service, or environment compromise, bounded by the credential's proven scope.",
-     "validation": "Validate the credential with a least-privileged issuer call, then prove the auth boundary separately; never place the raw secret in the report."},
-    {"classes": {"redirect", "auth"}, "title": "Authentication-flow redirect chain",
-     "why": "An off-origin redirect in login, OAuth, invitation, or reset flows may expose tokens or trusted navigation.",
-     "projected_impact": "Token disclosure, trusted phishing, or authentication workflow abuse.",
-     "validation": "Walk the affected auth flow end to end and capture whether sensitive state reaches the off-origin destination."},
-    {"classes": {"cors", "auth"}, "title": "Credentialed cross-origin data read",
-     "why": "CORS becomes materially exploitable when an attacker origin can read authenticated data.",
-     "projected_impact": "Cross-origin theft of victim-accessible data.",
-     "validation": "Run a browser PoC against an authenticated test account and capture the readable sensitive response plus a disallowed-origin control."},
-    {"classes": {"xss", "auth"}, "title": "Browser execution into authenticated action",
-     "why": "Script execution can become higher impact when it reaches victim session data or privileged actions.",
-     "projected_impact": "Victim-session data access or authenticated state change.",
-     "validation": "Use a harmless marker in a test account and capture the exact authenticated action or data read; do not infer impact from an alert box."},
-    {"classes": {"ssrf", "cloud-exposure"}, "title": "Server-side request pivot into cloud control plane",
-     "why": "A confirmed server-side fetch may reach cloud-only services when network controls permit it.",
-     "projected_impact": "Internal service access or cloud credential exposure.",
-     "validation": "Use an engagement-approved callback or metadata-safe control and capture a target-bound response differential."},
-    {"classes": {"xxe", "ssrf"}, "title": "XML parser to server-side network pivot",
-     "why": "External entity resolution can act as a server-side request primitive.",
-     "projected_impact": "Internal network access or bounded file disclosure.",
-     "validation": "Capture a unique authorized callback for each primitive and a parser configuration control."},
-    {"classes": {"prototype-pollution", "xss"}, "title": "Prototype pollution gadget chain",
-     "why": "Pollution requires a reachable gadget to become a concrete browser vulnerability.",
-     "projected_impact": "Browser code execution in the affected application context.",
-     "validation": "Prove the polluted property reaches a specific sink and capture execution plus a clean-object control."},
-    {"classes": {"access-control", "graphql"}, "title": "GraphQL object/field authorization bypass",
-     "why": "Hidden GraphQL operations can expose the same object boundary missed by REST authorization.",
-     "projected_impact": "Unauthorized object or sensitive field access.",
-     "validation": "Replay the same query across two test roles and capture object- and field-level response differences."},
 )
 
 
@@ -352,69 +312,114 @@ def _evidence_score(
     return max(0, min(99, int(score)))
 
 
-def _location_scope(location: str) -> str:
-    # urlparse RAISES on a malformed authority ("https://example.com]/x", "http://[foo]/x",
-    # anything whose netloc fails NFKC normalization). This runs at report-writing time on a
-    # finished hunt, so an escape here would discard a completed run's whole report. Advisory
-    # intelligence fails closed: an unparseable location just contributes no scope.
-    try:
-        parsed = urlparse(location)
-    except ValueError:
-        parsed = None
-    if parsed is not None and parsed.hostname:
-        return parsed.hostname.lower()
-    # Drop any scheme before falling back, or every malformed URL collapses to the scheme
-    # itself ("https:") -- one bogus shared "scope" that hands unrelated findings the
-    # same-scope chain bonus.
-    normalized = re.sub(r"^[a-z][a-z0-9+.-]*:", "", location.strip(), flags=re.IGNORECASE)
-    normalized = normalized.replace("\\", "/").strip("/")
-    return normalized.split("/", 1)[0].lower() if normalized else ""
+# The chain layer's status vocabulary is the attacker's ("did every step actually happen?");
+# the cortex's is the evidence layer's. Map rather than let two vocabularies leak into one
+# report: a chain whose every step is backed by an accepted artifact IS confirmed, a chain
+# with at least one such step is supported, and a chain of pure leads stays a candidate.
+_CHAIN_STATE_TO_CORTEX = {"proven": "confirmed", "partial": "supported", "projected": "candidate"}
 
 
-def _build_chains(hypotheses: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_class: dict[str, list[dict[str, Any]]] = {}
-    for item in hypotheses:
-        by_class.setdefault(item["class_id"], []).append(item)
-    for rows in by_class.values():
-        rows.sort(key=lambda row: (row["priority_score"], row["confidence_score"]), reverse=True)
+def _build_chains(
+    hypotheses: list[dict[str, Any]],
+    findings: list[dict[str, Any]],
+    plans: dict[str, Any],
+    signals: list[dict[str, Any]] | None,
+    surface: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Correlate findings into ORDERED, multi-step attack chains.
+
+    Returns ``(chains, probes)`` — chains that cite at least one real finding, and
+    signal-only chains routed to the planner as untested probe leads.
+
+    Delegates to ``attack_chain``, which models attacker capabilities rather than matching
+    class pairs. The old recipe table could only ever say "these two classes co-occur"; it
+    could not order the steps, state what the attacker holds between them, or use a
+    sub-finding clue (a session cookie readable by script) that is not a finding at all.
+
+    Imported locally: ``attack_chain`` imports this module for the confirm gate and the
+    class vocabulary, so a module-level import here would be circular.
+    """
+    from bughunter import attack_chain as chain_engine
+
+    result = chain_engine.build_attack_chains(
+        findings, plans, signals=signals, surface=surface,
+    )
+    by_ref = {item["ref"]: item for item in hypotheses}
 
     chains: list[dict[str, Any]] = []
-    for recipe in _CHAIN_RECIPES:
-        required = sorted(recipe["classes"])
-        if not all(by_class.get(class_id) for class_id in required):
+    probes: list[dict[str, Any]] = []
+    for chain in result.get("chains") or []:
+        refs = [ref for ref in chain.get("refs") or [] if ref in by_ref]
+        # A chain must cite hypotheses that survived into THIS graph. The engine works from the
+        # same filtered finding set, but a ref that is not in the queue would render a
+        # cross-reference to a finding the report never prints.
+        #
+        # A chain citing NO finding at all is a chain built purely from signals — "there is an
+        # is_admin field on this form, so mass assignment might work". That is a genuinely
+        # useful thing to go TEST, and a fabrication to put in a report: nothing in it has been
+        # observed to be broken. So it is routed to the probe queue for the planner instead of
+        # being printed as a chain, and it is the reason the report's chain list can be shorter
+        # than the engine's.
+        if not refs:
+            probes.append({
+                "id": chain.get("id") or "", "title": chain.get("title") or "",
+                "hypothesis": chain.get("narrative") or "",
+                "impact": chain.get("impact_label") or "",
+                "next_action": chain.get("next_action") or "",
+                "signals": [s.get("signal") for s in (chain.get("steps") or [])
+                            if isinstance(s, dict) and s.get("signal")],
+                "status": "untested",
+            })
             continue
-        nodes = [by_class[class_id][0] for class_id in required]
-        refs = [node["ref"] for node in nodes]
-        if len(set(refs)) != len(refs):
-            continue
-        confidence = round(sum(node["confidence_score"] for node in nodes) / len(nodes))
-        scopes = {_location_scope(node.get("location", "")) for node in nodes} - {""}
-        if len(scopes) == 1:
-            confidence = min(99, confidence + 5)
-        statuses = {node["status"] for node in nodes}
-        if statuses == {"confirmed"}:
-            status = "confirmed"
-        elif "contradicted" in statuses:
+        classes = sorted({by_ref[ref]["class_id"] for ref in refs})
+        status = _CHAIN_STATE_TO_CORTEX.get(chain.get("status", ""), "candidate")
+        confidence = int(chain.get("confidence_score") or 0)
+        # A chain can never read stronger than the findings it rests on. The two layers
+        # answer different questions — the chain layer asks "did every STEP capture an
+        # artifact?", the cortex asks "is this FINDING's evidence sound?" — and a finding can
+        # satisfy the first while failing the second (a real differential paired with a
+        # claimed status the cortex flagged, say). Without this clamp the report printed a
+        # chain as "confirmed / 82-of-100" whose only cited finding rendered two sections
+        # earlier as a mere candidate, which is exactly the overstatement the cortex exists
+        # to prevent — just moved up a layer.
+        cited = [by_ref[ref]["status"] for ref in refs]
+        if "contradicted" in cited:
             status = "blocked"
-        elif "confirmed" in statuses:
+        elif status == "confirmed" and not all(s == "confirmed" for s in cited):
             status = "supported"
-        else:
-            # Every node is a lead, so the chain is a PROJECTION. Calling it "supported" and
-            # letting the mean plus the same-scope bonus carry it past the unproven ceiling
-            # (two 54s became 59) re-created above the node layer exactly the overstatement the
-            # node layer refuses.
-            status = "candidate"
+        if status in {"blocked", "candidate", "supported"}:
             confidence = min(confidence, _UNPROVEN_CONFIDENCE_CEILING)
+        if status == "blocked":
+            # A contradiction outranks any step evidence: resolving it comes before reporting.
+            confidence = min(confidence, 24)
         chains.append({
-            "id": "", "title": recipe["title"], "refs": refs, "classes": required,
-            "status": status, "confidence_score": confidence, "why": recipe["why"],
-            "projected_impact": recipe["projected_impact"], "next_action": recipe["validation"],
+            "id": chain.get("id") or "", "title": chain.get("title") or "Attack chain",
+            "refs": refs, "classes": classes, "status": status,
+            "confidence_score": confidence,
+            "why": chain.get("narrative") or "",
+            "projected_impact": chain.get("impact_label") or "",
+            # A blocked chain must not carry "package this as one report" as its next action,
+            # which is what the engine writes for a chain whose every step captured something.
+            "next_action": (
+                "Resolve the blocking evidence contradiction on the cited finding before "
+                "treating this chain as reportable."
+                if status == "blocked" else chain.get("next_action") or ""
+            ),
+            # The ordered ladder — what makes this a chain and not a pair.
+            "entry": chain.get("entry_label") or "",
+            "chain_state": chain.get("status") or "projected",
+            "steps": chain.get("steps") or [],
+            "step_count": chain.get("step_count") or 0,
+            "proven_steps": chain.get("proven_steps") or 0,
+            "blocking_step": chain.get("blocking_step") or 0,
         })
     chains.sort(key=lambda row: (row["status"] == "confirmed", row["confidence_score"]), reverse=True)
     chains = chains[:_MAX_CHAINS]
     for index, chain in enumerate(chains, 1):
         chain["id"] = f"C{index}"
-    return chains
+    for index, probe in enumerate(probes[:_MAX_CHAINS], 1):
+        probe["id"] = f"CP{index}"
+    return chains, probes[:_MAX_CHAINS]
 
 
 def build_investigation(
@@ -423,8 +428,15 @@ def build_investigation(
     *,
     surface: dict[str, Any] | None = None,
     scan_meta: dict[str, Any] | None = None,
+    signals: list[dict[str, Any]] | None = None,
+    response_digest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a bounded evidence graph and ranked decision queue.
+
+    ``signals`` carries sub-finding escalation clues (a session cookie readable by script,
+    a role-like field name, a captured out-of-band callback). They are never evidence and
+    can never confirm anything; they exist so the chain layer can order real findings into
+    an attack. When omitted, they are derived from ``response_digest`` and ``surface``.
 
     Malformed inputs degrade to an empty investigation.  The function is pure and
     does not mutate findings or plans.
@@ -435,6 +447,12 @@ def build_investigation(
     contradictions: list[dict[str, Any]] = []
 
     seen_refs: set[str] = set()
+    # Findings carrying the ref this graph RESOLVED for them. The chain layer keys its steps
+    # by ref, so it has to see the same identity the queue does — a finding with no explicit
+    # ref is "H3" here, and letting the chain layer synthesize its own name for it would make
+    # every chain over such a finding cite a ref that appears nowhere in the report. Shallow
+    # copies keep this function's no-mutation contract.
+    identified: list[dict[str, Any]] = []
     for index, raw in enumerate(raw_findings[:_MAX_HYPOTHESES], 1):
         if not isinstance(raw, dict):
             continue
@@ -444,6 +462,7 @@ def build_investigation(
         while ref in seen_refs:
             ref = f"{ref}-{index}"
         seen_refs.add(ref)
+        identified.append({**raw, "ref": ref})
         plan = _dict(plans.get(ref))
         class_id = normalize_class(raw)
         severity = _severity(raw, plan)
@@ -503,7 +522,18 @@ def build_investigation(
             "report_ready": report_ready,
         })
 
-    chains = _build_chains(hypotheses)
+    from bughunter import attack_chain as chain_engine
+
+    # MERGE rather than replace. Passing ``signals`` means "here are clues you cannot derive
+    # yourself" (what a scanner saw in a Set-Cookie header), not "these are the only clues" —
+    # treating them as a replacement silently dropped every surface- and digest-derived clue
+    # the moment a caller supplied one, which is the easiest possible way to lose half the
+    # chain graph without any error. collect_signals dedupes on (kind, subject).
+    signals = chain_engine.collect_signals(
+        findings=identified, response_digest=response_digest, surface=surface,
+        extra=signals if isinstance(signals, list) else None,
+    )
+    chains, chain_probes = _build_chains(hypotheses, identified, plans, signals, surface)
     chain_refs = {ref for chain in chains for ref in chain["refs"]}
     for item in hypotheses:
         if item["ref"] in chain_refs:
@@ -540,10 +570,14 @@ def build_investigation(
         "metrics": {
             "hypotheses": len(hypotheses), "confirmed": confirmed, "supported": supported,
             "report_ready": ready, "contradictions": len(contradictions),
-            "attack_chains": len(chains), "average_confidence": avg,
+            "attack_chains": len(chains), "chain_probes": len(chain_probes),
+            "average_confidence": avg,
         },
         "hypotheses": hypotheses,
         "attack_chains": chains,
+        # Signal-only chains: what to go TEST, not what was found. Kept separate from
+        # attack_chains precisely so nothing unobserved can be read as a result.
+        "chain_probes": chain_probes,
         "contradictions": contradictions,
         "coverage": {
             "endpoints_observed": len(surface_obj.get("endpoints") or []) if isinstance(surface_obj.get("endpoints"), list) else 0,

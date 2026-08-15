@@ -110,7 +110,38 @@ def _loop_snapshot(
     return graph
 
 
-def _observations_digest(findings: list[dict[str, Any]], meta: dict[str, Any]) -> str:
+def _chain_focus(findings: list[dict[str, Any]], surface: dict[str, Any],
+                 meta: dict[str, Any]) -> list[dict[str, Any]]:
+    """The open chains worth spending the remaining budget on, best first.
+
+    Deterministic and derived only from what has already been captured — it reorders the
+    loop's attention, it never adds a probe or claims a result. Fail-open: steering is an
+    optimization, so any error here just means an unsteered turn.
+    """
+    try:
+        graph = investigator.build_investigation(
+            findings, surface=surface, scan_meta=meta,
+            response_digest=meta.get("digest") if isinstance(meta.get("digest"), dict) else None,
+        )
+        focus: list[dict[str, Any]] = []
+        for chain in (graph.get("attack_chains") or [])[:3]:
+            blocking = next((s for s in (chain.get("steps") or [])
+                             if isinstance(s, dict) and not s.get("proven")), None)
+            if blocking is None:
+                continue  # already fully backed — nothing for this loop to chase
+            focus.append({
+                "chain": chain.get("title", ""),
+                "reaches": chain.get("projected_impact", ""),
+                "blocked_on": blocking.get("title", ""),
+                "needed": blocking.get("next_action", ""),
+            })
+        return focus
+    except Exception:  # noqa: BLE001 - steering is advisory; never break the loop
+        return []
+
+
+def _observations_digest(findings: list[dict[str, Any]], meta: dict[str, Any],
+                         chain_focus: list[dict[str, Any]] | None = None) -> str:
     """A compact, redacted, trust-wrapped summary of one turn for the brain to react to — verified
     classes + each finding's class/status and a short observed excerpt. NEVER the raw finding dicts."""
     rows: list[dict[str, Any]] = []
@@ -132,6 +163,10 @@ def _observations_digest(findings: list[dict[str, Any]], meta: dict[str, Any]) -
         # structure the brain reasons over instead of a blind param nudge. Extracted, redacted, no
         # values; it steers WHICH scope-gated classes/params to try next, never introduces a probe.
         "response_structure": meta.get("digest") if isinstance(meta.get("digest"), dict) else {},
+        # Which attack chains are one captured artifact away from real impact. Derived from
+        # our own confirmed evidence (never from model prose), so it is a priority hint, not
+        # a claim: the brain should aim the next turn at closing one of these.
+        "open_attack_chains": chain_focus or [],
         "requests_used": int(meta.get("requests_used") or 0),
     }
     return trust.wrap_for_model(str(blob), path="captured probe results")
@@ -155,7 +190,12 @@ def _build_react_prompt(target: str, scope: str, surface: dict[str, Any], observ
         "include names like a param you haven't tried -> add those NAMES to param_hypotheses; reflective-"
         "looking fields (search/q/name/message) -> xss_params; a present JWT or cookie-flag gap is context "
         "worth steering toward header/token classes. Propose param NAMES drawn from the structure, not "
-        "guesses. Respond with ONLY this JSON:\n"
+        "guesses.\n"
+        "PRIORITISE CLOSING A CHAIN: each observation carries `open_attack_chains` — chains already "
+        "part-proven that are blocked on ONE more captured artifact. Turning a part-proven chain into a "
+        "complete one is worth far more than finding another unrelated low. If a chain is blocked on a "
+        "class you can still probe here, put that class first in probe_priority.\n"
+        "Respond with ONLY this JSON:\n"
         "{\n"
         '  "param_hypotheses": ["NEW parameter NAMES to try next — names only, never a URL/value/payload"],\n'
         '  "probe_priority": [{"endpoint": "' + target + '", "classes": ["xss"|"sqli"|"redirect"|"ssti"|'
@@ -250,7 +290,12 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
             return results, meta
         if meta.get("rate_limited") or budget_remaining < _PER_TURN_MIN:
             break
-        observations.append(_observations_digest(results, meta))
+        # Chain-aware steering: the loop knows which chain is one step from real impact, so
+        # the next turn chases THAT class instead of whatever class looks locally interesting.
+        # A confirmed XSS with a token-theft step still open is worth more budget than a fresh
+        # unrelated lead, and only the chain layer knows that.
+        observations.append(_observations_digest(
+            results, meta, chain_focus=_chain_focus(list(merged.values()), surf, meta)))
         plan = _react_plan(coder_cfg, target_url, scope, surf, observations, params_tried, budget_remaining)
         new_params = [p for p in plan["param_hypotheses"] if p.lower() not in {q.lower() for q in params_tried}]
         new_priority = [r.get("classes") for r in plan["probe_priority"] if r.get("endpoint") == target_url and r.get("classes")]

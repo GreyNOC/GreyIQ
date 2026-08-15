@@ -926,12 +926,23 @@ class ToolBox:
             )
             lines.append(f"   Decision: {item['decision']}. Next evidence: {item['next_action']}")
         if graph["attack_chains"]:
-            lines.extend(["", "CORRELATED CHAIN LEADS:"])
+            lines.extend(["", "ATTACK CHAINS (ordered; a step is proven only when a captured artifact backs it):"])
             for chain in graph["attack_chains"][:6]:
                 lines.append(
                     f"- {chain['id']} [{chain['confidence_score']}%] {chain['title']} "
-                    f"({', '.join(chain['refs'])}). Next: {chain['next_action']}"
+                    f"({chain['proven_steps']}/{chain['step_count']} proven; {', '.join(chain['refs'])})"
                 )
+                for step in (chain.get("steps") or [])[:6]:
+                    evidence = step.get("evidence_ref") or step.get("signal") or "follows from the previous step"
+                    lines.append(
+                        f"    {step['n']}. [{step['state']}] {step['title']} ({evidence}) "
+                        f"-> {'; '.join(step.get('grants') or [])}"
+                    )
+                lines.append(f"    Next: {chain['next_action']}")
+        if graph.get("chain_probes"):
+            lines.extend(["", "CHAIN LEADS WORTH TESTING (structure only — nothing observed broken yet):"])
+            for probe in graph["chain_probes"][:4]:
+                lines.append(f"- {probe['id']} {probe['title']}: {probe['next_action']}")
         if graph["contradictions"]:
             lines.extend(["", "CONTRADICTIONS TO RESOLVE BEFORE REPORTING:"])
             for issue in graph["contradictions"][:10]:

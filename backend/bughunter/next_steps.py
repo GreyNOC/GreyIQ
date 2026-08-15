@@ -140,6 +140,15 @@ def _proof_already_confirmed(finding: dict[str, Any], plan: dict[str, Any] | Non
     return credential.get("live") is True
 
 
+def _safe_int(value: Any) -> int:
+    """Chain counters arrive from a JSON graph that a model reply can influence upstream, so
+    a non-numeric value must degrade to 0 rather than raise inside plan construction."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def chain_actions(findings: list[dict[str, Any]]) -> list[str]:
     """Do-this chain notes for the class combinations present in the findings."""
     present = {str(f.get("class_id") or f.get("category") or "").lower() for f in findings}
@@ -297,8 +306,59 @@ def build_next_steps(ctx: dict[str, Any], brain_next_steps: list[str] | None = N
             add("Hunt by hand", "hunt", "Analyst lead", text)
 
     # --- Phase 4 · Chain & escalate ---
-    for note in chain_actions(findings):
-        add("Chain & escalate", "chain", "Chain related findings for higher impact", note)
+    # Prefer the real chain engine: it names THIS hunt's chain, which step is blocking it,
+    # and the exact artifact that would close it. The static class-pair notes below are the
+    # fallback for contexts that never ran the cortex (legacy/custom callers), where the
+    # generic advice is still better than nothing.
+    investigation = ctx.get("investigation") if isinstance(ctx.get("investigation"), dict) else {}
+    chains = investigation.get("attack_chains") if isinstance(investigation.get("attack_chains"), list) else []
+    emitted_chain_step = False
+    for chain in chains[:6]:
+        if not isinstance(chain, dict):
+            continue
+        # NOT `steps` — that is this function's plan accumulator, which `add()` closes over by
+        # name. Rebinding it here made every later add() append into the LAST chain's step list
+        # inside ctx["investigation"], so the returned plan silently lost Phases 1-3 and the
+        # report rendered the injected dicts as blank rows in the chain's own step table.
+        chain_steps = chain.get("steps") if isinstance(chain.get("steps"), list) else []
+        blocking = next((s for s in chain_steps if isinstance(s, dict) and not s.get("proven")), None)
+        proven = _safe_int(chain.get("proven_steps"))
+        total = _safe_int(chain.get("step_count")) or len(chain_steps)
+        if str(chain.get("status") or "").lower() == "blocked":
+            # A chain resting on a contradicted finding must never be described as submittable,
+            # whatever its step states say — resolving the contradiction comes first.
+            detail = (
+                f"{chain.get('title')} — a finding this chain cites has a blocking evidence "
+                f"contradiction. Resolve that first; do not package this chain until it clears."
+            )
+        elif blocking is None:
+            detail = (
+                f"{chain.get('title')} — every step is backed by a captured artifact. "
+                f"Package the whole chain as ONE report: the chain, not the individual steps, is the impact."
+            )
+        else:
+            detail = (
+                f"{chain.get('title')} ({proven} of {total} step(s) proven). "
+                f"Blocking step {blocking.get('n')}: {blocking.get('title')}. "
+                f"{blocking.get('next_action') or ''}"
+            ).strip()
+        add("Chain & escalate", "chain",
+            f"Close chain {chain.get('id')} → {chain.get('projected_impact') or 'higher impact'}",
+            detail, ref=", ".join(str(r) for r in (chain.get("refs") or [])[:4]))
+        emitted_chain_step = True
+
+    for probe in (investigation.get("chain_probes") or [])[:3]:
+        if not isinstance(probe, dict):
+            continue
+        add("Chain & escalate", "chain", f"Test chain lead {probe.get('id')}",
+            f"{probe.get('hypothesis') or ''} {probe.get('next_action') or ''}".strip())
+
+    # Gated on real CHAINS only. Keying it on "did we emit anything" let a single speculative
+    # signal-only probe suppress all the class-pair advice, so a hunt with two chainable
+    # findings and one stray form field lost the note telling the operator to combine them.
+    if not emitted_chain_step:
+        for note in chain_actions(findings):
+            add("Chain & escalate", "chain", "Chain related findings for higher impact", note)
 
     # --- Phase 5 · Expand coverage ---
     expansion = _EXPANSION_BY_PROFILE.get(profile_id) or _EXPANSION_BY_PROFILE["full-sweep"]

@@ -5,6 +5,7 @@ H1 rating on the SAME finding (both route through report.resolve_severity), so a
 whose raw scanner label disagrees with its plan's CVSS base_severity is ranked, grouped,
 and counted by the CVSS-resolved severity everywhere — not just in the report.
 """
+
 from __future__ import annotations
 
 import sys
@@ -85,6 +86,74 @@ class SeverityResolutionTests(unittest.TestCase):
         self.assertIn("issuer success response", confirm_step["detail"])
         self.assertIn("blast radius", confirm_step["detail"])
         self.assertNotIn("Capture the exact request/response", confirm_step["detail"])
+
+
+class ChainPhaseTests(unittest.TestCase):
+    """The chain phase reads ctx["investigation"], which makes its wiring easy to break
+    silently — and it was: the plan used to be built before that key existed."""
+
+    def _ctx(self, **over: object) -> dict:
+        finding = _finding("F1", "high", class_id="xss")
+        ctx = {"findings": [finding], "attack_plans": {}, "scanners_run": ["web"], "kind": "url",
+               "investigation": {"attack_chains": [{
+                   "id": "C1", "title": "Unauthenticated attacker -> account takeover",
+                   "refs": ["F1"], "status": "supported", "projected_impact": "Account takeover",
+                   "step_count": 3, "proven_steps": 1, "next_action": "close it",
+                   "steps": [
+                       {"n": 1, "title": "XSS executes", "proven": True, "next_action": ""},
+                       {"n": 2, "title": "Read session cookie", "proven": False,
+                        "next_action": "Read document.cookie in a test account."},
+                   ]}], "chain_probes": []}}
+        ctx.update(over)
+        return ctx
+
+    def test_plan_is_not_corrupted_by_the_chain_phase(self) -> None:
+        """The loop must not rebind the plan accumulator: doing so appended every later step
+        into the chain's own step list and dropped Phases 1-3 from the returned plan."""
+        ctx = self._ctx()
+        chain = ctx["investigation"]["attack_chains"][0]
+        steps = next_steps.build_next_steps(ctx)
+
+        self.assertIsNot(steps, chain["steps"], "returned the chain's step list, not the plan")
+        self.assertEqual(len(chain["steps"]), 2, "the chain's own steps were mutated")
+        self.assertTrue(any(s["phase"] == "Confirm findings" for s in steps),
+                        "earlier phases were silently discarded")
+        self.assertTrue(all(isinstance(s.get("phase"), str) and s.get("action") for s in steps))
+
+    def test_chain_step_names_the_blocking_step(self) -> None:
+        steps = next_steps.build_next_steps(self._ctx())
+        chain_step = next(s for s in steps if s["phase"] == "Chain & escalate")
+        self.assertIn("C1", chain_step["action"])
+        self.assertIn("Blocking step 2", chain_step["detail"])
+        self.assertIn("document.cookie", chain_step["detail"])
+
+    def test_blocked_chain_is_not_described_as_submittable(self) -> None:
+        ctx = self._ctx()
+        chain = ctx["investigation"]["attack_chains"][0]
+        chain["status"] = "blocked"
+        chain["steps"] = [{"n": 1, "title": "step", "proven": True, "next_action": ""}]
+        chain_step = next(s for s in next_steps.build_next_steps(ctx)
+                          if s["phase"] == "Chain & escalate")
+        detail = chain_step["detail"].lower()
+        self.assertIn("contradiction", detail)
+        self.assertIn("do not package", detail)
+        # The fully-proven wording ("Package the whole chain as ONE report") must not appear:
+        # every step here IS proven, which is exactly how the blocked case used to reach it.
+        self.assertNotIn("package the whole chain", detail)
+
+    def test_a_speculative_probe_does_not_suppress_class_pair_advice(self) -> None:
+        """A signal-only probe is not a chain; it must not silence the generic advice that
+        two chainable findings should be combined."""
+        ctx = {"findings": [_finding("F1", "medium", class_id="disclosure"),
+                            _finding("F2", "high", class_id="access-control")],
+               "attack_plans": {}, "scanners_run": ["web"], "kind": "url",
+               "investigation": {"attack_chains": [], "chain_probes": [
+                   {"id": "CP1", "title": "mass assignment", "hypothesis": "an is_admin field",
+                    "next_action": "submit it and watch the echo"}]}}
+        chain_steps = [s for s in next_steps.build_next_steps(ctx) if s["phase"] == "Chain & escalate"]
+        self.assertTrue(any("CP1" in s["action"] for s in chain_steps))
+        self.assertTrue(any("leaked ids" in s["detail"].lower() for s in chain_steps),
+                        f"class-pair advice was suppressed: {[s['detail'][:60] for s in chain_steps]}")
 
 
 if __name__ == "__main__":

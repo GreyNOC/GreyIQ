@@ -4,8 +4,10 @@ Safely fetches a single URL, reusing the hardened SSRF/URL guard from
 ``web_ingest`` but keeping the *raw* HTML and response headers (the readable
 extractor strips scripts and headers, which is exactly where web security
 signal lives). It then runs passive checks: missing/weak security headers,
-software-version disclosure, insecure cookies, mixed content, secrets leaked
-in inline scripts, dangerous client-side sinks, and error/stack disclosure.
+software-version disclosure, mixed content, secrets leaked in inline scripts,
+dangerous client-side sinks, and error/stack disclosure. Session-cookie flag
+gaps are NOT findings here — they are emitted as ``attack_chain`` escalation
+signals (see ``docs/attack-chains.md``).
 
 PASSIVE means: one GET, no auth, no fuzzing, no state-changing requests. Point
 it only at sites you own or are explicitly authorized to test. Private,
@@ -23,7 +25,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from bughunter import secret_classification
+from bughunter import attack_chain, secret_classification
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.code_scanner.rules import SECRET_RULES
 from bughunter.rate_limit import HostRateGovernor
@@ -313,7 +315,6 @@ def _fetch_raw(url: str, *, auth: AuthContext | None = None) -> dict[str, Any]:
 
 def _analyze(fetched: dict[str, Any]) -> list[dict[str, Any]]:
     headers = fetched["headers"]
-    cookies = fetched["cookies"]
     body = fetched["body"]
     final_url = fetched["final_url"]
     is_https = final_url.lower().startswith("https://")
@@ -371,38 +372,19 @@ def _analyze(fetched: dict[str, Any]) -> list[dict[str, Any]]:
                 )
             )
 
-    # 3. Insecure cookies.
-    for cookie in cookies:
-        lowered = cookie.lower()
-        name = cookie.split("=", 1)[0].strip()
-        if is_https and "secure" not in lowered:
-            findings.append(
-                _finding(
-                    "web.cookie-insecure",
-                    f"Cookie '{name}' missing the Secure flag",
-                    "medium",
-                    "high",
-                    "cookies",
-                    final_url,
-                    snippet=cookie[:120],
-                    remediation="Set Secure so the cookie is only sent over HTTPS.",
-                    proof_evidence={**base_proof, "set_cookie": cookie[:200]},
-                )
-            )
-        if "httponly" not in lowered:
-            findings.append(
-                _finding(
-                    "web.cookie-no-httponly",
-                    f"Cookie '{name}' missing the HttpOnly flag",
-                    "low",
-                    "high",
-                    "cookies",
-                    final_url,
-                    snippet=cookie[:120],
-                    remediation="Set HttpOnly so client-side JavaScript cannot read the cookie.",
-                    proof_evidence={**base_proof, "set_cookie": cookie[:200]},
-                )
-            )
+    # 3. Cookie flags are NOT findings. See ``attack_chain.cookie_signals``.
+    #
+    # A missing HttpOnly/SameSite/Secure flag describes no attacker capability on its own —
+    # there is nothing to reproduce and nothing to impact. Reported standalone it is the
+    # single largest source of auto-closed "informational" noise in a bounty queue, and it
+    # crowds out the findings that matter. What the flag actually changes is the SEVERITY OF
+    # SOMETHING ELSE: no HttpOnly is the difference between "XSS pops an alert" and "XSS takes
+    # the account"; no SameSite is what makes a CSRF request arrive with the session attached;
+    # no Secure only matters to a network-adjacent attacker with a reachable plaintext endpoint.
+    #
+    # So the flags are emitted as escalation SIGNALS and consumed by the attack-chain engine,
+    # which reports them as the escalation step of a real chain — attached to the finding they
+    # escalate, with that finding's proof — or not at all.
 
     # 4. Mixed content on an HTTPS page.
     if is_https:
@@ -660,11 +642,20 @@ def run_web_scan(
     secret_classification.apply_secret_classification(findings)
     findings.sort(key=lambda f: _SEVERITY_RANK.get(f["severity"], 0), reverse=True)
     risk, score = _risk(findings)
+    # Sub-finding escalation clues (session-cookie flag gaps and friends). These are NOT
+    # findings and deliberately do not affect risk/score — they exist so the attack-chain
+    # engine can turn "XSS executes" into "XSS takes the account". Fail-open: a signal
+    # error must never sink a scan that already succeeded.
+    try:
+        signals = attack_chain.cookie_signals(fetched.get("cookies"), fetched["final_url"])
+    except Exception:  # noqa: BLE001 - advisory enrichment only
+        signals = []
     return {
         "ok": True,
         "scan_type": "web",
         "target": target,
         "final_url": fetched["final_url"],
+        "signals": signals,
         "status": fetched["status"],
         "risk": risk,
         "score": score,

@@ -2,6 +2,71 @@
 
 Notable changes to GreyIQ.
 
+## v2.9.0 - attack-chain engine, cookie findings demoted
+
+### Attack-chain engine
+- New `bughunter/attack_chain.py`: a forward-chaining **capability planner** that links
+  findings and sub-finding clues into **ordered, multi-step attack chains**. It models what an
+  attacker *holds* at each point (`exec.browser-script`, `read.session-token`,
+  `identity.admin`, `net.internal`…), which technique each clue enables, and what that step
+  grants — so the report answers "what can an attacker do with everything we found", not just
+  "what is broken here". Every recorded path is reduced to its **minimal witness**, so a chain
+  never lists a finding the attack does not actually use.
+- This replaces the cortex's static class-pair recipe table, which could only say "these two
+  classes co-occur" — it could not order the steps, state what the attacker holds between
+  them, or use a clue that is not a finding at all.
+- The engine **cannot confirm anything**. A step is `proven` only when the single confirm
+  authority (`report._has_captured_artifact`, via `investigator.has_confirming_artifact`)
+  already accepted that finding's evidence; a chain is `proven` only when *every* step is;
+  confidence is the **weakest link**, never a mean (averaging is how a proven step carries an
+  unproven one); and a not-fully-proven chain stays capped below the supported band so a long
+  speculative chain can never out-rank a short captured one.
+- A chain citing **no** finding is not a result — it is routed to `chain_probes` and rendered
+  as "chain leads worth testing", keeping unobserved structure out of the findings narrative.
+- Reports gain an **Attack chains** section: per chain, the attacker's starting position, the
+  ordered step ladder (step, evidence, proven/projected, what it grants), and the one action
+  that would close it. Guided next steps now name the blocking step of each open chain.
+
+### Cookie flags are no longer findings
+- **`web.cookie-insecure` and `web.cookie-no-httponly` are gone.** A missing
+  `HttpOnly`/`Secure`/`SameSite` flag describes no attacker capability on its own — there is
+  nothing to reproduce and nothing to impact — and it is the single largest source of
+  auto-closed informational noise in a bounty queue.
+- What a flag actually changes is the severity of *something else*, so the flags are now
+  emitted as escalation **signals** and consumed by the chain engine: no `HttpOnly` is the
+  step that turns a confirmed XSS into account takeover; no `SameSite` is what makes a CSRF
+  request arrive with the session attached; a `Domain`-scoped (non-`__Host-`) session cookie
+  is what makes a confirmed subdomain takeover reach the session. They reach the report only
+  as a numbered step of a chain a real finding anchors, carrying that finding's proof and an
+  explicit note that the flag alone is not a vulnerability. Only signals a chain actually
+  consumed are surfaced.
+- Net effect on a boring HTTPS site with sloppy cookie flags and nothing else broken: **no
+  output at all**. With a confirmed XSS on the same site: one account-takeover chain in which
+  the missing `HttpOnly` is step 2.
+- A network-adjacent attacker is deliberately **not** a chain entry point. Making it one meant
+  "session cookie without `Secure`" composed into an account-takeover chain by itself on every
+  HTTPS site — the same unconditional cookie noise wearing a chain as a disguise. A network
+  position must now be earned from observed evidence (mixed content, or a reachable
+  plaintext endpoint).
+- Signals carry cookie **names and flag facts only**, never a cookie value.
+
+### The engines now chain together
+- **Campaigns and portfolios build cross-target chains.** Per-target hunts each chained within
+  one host; the roll-up runs the cortex over the pooled, re-keyed findings, so a chain whose
+  steps live on different hosts becomes visible for the first time — a claimable subdomain on
+  one host plus a parent-domain session cookie on another is an account takeover neither
+  single-target hunt can see. `SPAN.md`/`PORTFOLIO.md` print only the genuinely cross-host
+  chains, since same-host ones are already in that target's own report. Per-target proof
+  verdicts are re-attached before the graph is built, or every finding a hunt confirmed would
+  re-enter the roll-up as an unproven lead.
+- **The iterative hunt loop is chain-aware**: each turn is told which chains are one captured
+  artifact away from real impact, and aims the remaining request budget at closing one rather
+  than at whatever class looks locally interesting.
+- The coding agent's `investigate_code` brief renders the same ordered ladder.
+- Passing `signals` to `build_investigation` now **merges** with surface- and digest-derived
+  clues instead of replacing them; treating them as a replacement silently dropped half the
+  chain graph the moment a caller supplied one.
+
 ## v2.8.0 - investigation cortex, removable brain keys
 
 ### Investigation cortex

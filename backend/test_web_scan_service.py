@@ -17,6 +17,7 @@ REPO_ROOT = BACKEND_DIR.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+from bughunter import attack_chain  # noqa: E402
 from bughunter.bounty import run_bounty_hunt  # noqa: E402
 from bughunter.web_ingest import WebsiteFetchError  # noqa: E402
 from bughunter.web_scan_service import _analyze, _guard_url, run_web_scan  # noqa: E402
@@ -41,24 +42,47 @@ class GuardUrlIpv6Tests(unittest.TestCase):
         self.assertEqual(urlparse(out).port, 443)
 
 
-class WebProofEvidenceTests(unittest.TestCase):
-    def test_cookie_finding_carries_redacted_proof_evidence(self) -> None:
-        token = "sk-" + ("A" * 40)
-        fetched = {
-            "headers": {},
-            "cookies": [f"session={token}; Path=/"],
-            "body": "<html></html>",
-            "final_url": "https://example.test/",
-            "status": 200,
-        }
-        findings = _analyze(fetched)
-        cookie = next(f for f in findings if f["rule_id"] == "web.cookie-no-httponly")
-        proof = cookie.get("proof_evidence") or {}
-        self.assertEqual(proof.get("request_line"), "GET https://example.test/")
-        self.assertEqual(proof.get("response_status"), "HTTP 200")
-        # The Set-Cookie is carried as proof — but its token is redacted.
-        self.assertIn("set_cookie", proof)
-        self.assertNotIn(token, json.dumps(cookie))
+class CookieDemotionTests(unittest.TestCase):
+    """Cookie flags are escalation signals for the attack-chain engine, never findings.
+
+    A flag gap describes no attacker capability on its own, so reporting it standalone is
+    pure queue noise. It earns a place in the report only as a step of a real chain.
+    """
+
+    FETCHED = {
+        "headers": {},
+        "cookies": ["session=" + ("A" * 40) + "; Path=/", "theme=dark; Path=/"],
+        "body": "<html></html>",
+        "final_url": "https://example.test/",
+        "status": 200,
+    }
+
+    def test_no_cookie_flag_finding_is_emitted(self) -> None:
+        findings = _analyze(dict(self.FETCHED))
+        rule_ids = {f["rule_id"] for f in findings}
+        self.assertNotIn("web.cookie-no-httponly", rule_ids)
+        self.assertNotIn("web.cookie-insecure", rule_ids)
+        # Nothing may sneak back in under a different id or the old category.
+        self.assertFalse([f for f in findings if "cookie" in f["rule_id"].lower()])
+        self.assertFalse([f for f in findings if f.get("category") == "cookies"])
+
+    def test_flag_gap_becomes_a_chain_signal_instead(self) -> None:
+        signals = attack_chain.cookie_signals(self.FETCHED["cookies"], self.FETCHED["final_url"])
+        kinds = {s["kind"] for s in signals}
+        self.assertIn("cookie.session-no-httponly", kinds)
+        self.assertIn("cookie.session-no-samesite", kinds)
+        self.assertTrue(all(s["escalation_only"] for s in signals))
+
+    def test_only_session_looking_cookies_produce_signals(self) -> None:
+        # A preference cookie without HttpOnly is not a clue about anything.
+        signals = attack_chain.cookie_signals(["theme=dark; Path=/"], "https://example.test/")
+        self.assertEqual(signals, [])
+
+    def test_signal_never_carries_the_cookie_value(self) -> None:
+        token = "sk-" + ("B" * 40)
+        signals = attack_chain.cookie_signals([f"session={token}; Path=/"], "https://example.test/")
+        self.assertTrue(signals)
+        self.assertNotIn(token, json.dumps(signals))
 
 
 class WebScanRedactionTests(unittest.TestCase):

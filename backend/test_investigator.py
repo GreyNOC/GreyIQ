@@ -241,11 +241,77 @@ class InvestigationCortexTests(unittest.TestCase):
              "title": "Object authorization lead", "location": "https://app.example/api/orders/1"},
         ]
         graph = investigator.build_investigation(findings)
-        self.assertEqual(graph["metrics"]["attack_chains"], 1)
-        chain = graph["attack_chains"][0]
-        self.assertEqual(set(chain["refs"]), {"F1", "F2"})
-        self.assertIn("object", chain["title"].lower())
+        self.assertTrue(graph["attack_chains"])
         self.assertTrue(all(item["chain_candidate"] for item in graph["hypotheses"]))
+
+        # The two-step chain: the disclosure is what makes the authorization lead reachable
+        # WITHOUT an account, so it must be step 1 and the object read step 2.
+        chained = next(c for c in graph["attack_chains"] if set(c["refs"]) == {"F1", "F2"})
+        self.assertEqual([s["evidence_ref"] for s in chained["steps"]], ["F1", "F2"])
+        self.assertEqual([s["n"] for s in chained["steps"]], [1, 2])
+        self.assertIn("unauthenticated", chained["entry"].lower())
+        self.assertIn("another tenant", chained["projected_impact"].lower())
+
+    def test_chain_reports_the_same_impact_once_per_distinct_attack(self) -> None:
+        """The same object read is reachable two ways here — unauthenticated via the
+        disclosure, or directly with an account. Those are different attacks with different
+        prerequisites, so both are worth reporting; neither may be listed twice."""
+        graph = investigator.build_investigation([
+            {"ref": "F1", "class_id": "disclosure", "severity": "medium", "confidence": "high",
+             "title": "Leaked object ids", "location": "https://app.example/api/debug"},
+            {"ref": "F2", "class_id": "access-control", "severity": "high", "confidence": "medium",
+             "title": "Object authorization lead", "location": "https://app.example/api/orders/1"},
+        ])
+        signatures = [tuple(s["technique_id"] for s in c["steps"]) for c in graph["attack_chains"]]
+        self.assertEqual(len(signatures), len(set(signatures)), f"duplicate chains: {signatures}")
+        entries = {c["entry"] for c in graph["attack_chains"]}
+        self.assertGreater(len(entries), 1, "the two routes have different attacker prerequisites")
+
+    def test_signal_only_chain_is_routed_to_probes_not_reported(self) -> None:
+        """Nothing was observed broken, so it is a test plan. Deleting this routing prints an
+        account-takeover chain citing no finding at all."""
+        graph = investigator.build_investigation(
+            [], surface={"forms": [{"action": "https://a.test/u", "method": "POST",
+                                    "params": ["email", "is_admin"]}]})
+        self.assertEqual(graph["attack_chains"], [])
+        self.assertTrue(graph["chain_probes"])
+        self.assertTrue(all(p["status"] == "untested" for p in graph["chain_probes"]))
+        self.assertEqual(graph["metrics"]["chain_probes"], len(graph["chain_probes"]))
+
+    def test_chain_never_reads_stronger_than_the_findings_it_cites(self) -> None:
+        """The chain layer asks "did every step capture an artifact?", the cortex asks "is this
+        finding's evidence sound?". A finding can pass the first and fail the second, and the
+        chain must not then render as confirmed above a hypothesis queue that says candidate."""
+        graph = investigator.build_investigation([{
+            "ref": "F1", "class_id": "sqli", "title": "SQL injection", "severity": "high",
+            "confidence": "high", "location": "https://app.example/r",
+            # A real differential (so the chain layer proves the step) paired with a claimed
+            # status the cortex will not accept as confirmation.
+            "proof_of_impact": {"status": "candidate", "observed_result": "true/false differential",
+                                "control_result": "baseline response"},
+        }])
+        hypothesis = graph["hypotheses"][0]
+        for chain in graph["attack_chains"]:
+            if "F1" not in chain["refs"]:
+                continue
+            if hypothesis["status"] != "confirmed":
+                self.assertNotEqual(chain["status"], "confirmed",
+                                    f"chain outran its finding: {chain['status']} vs {hypothesis['status']}")
+                self.assertLessEqual(chain["confidence_score"],
+                                     investigator._UNPROVEN_CONFIDENCE_CEILING)
+
+    def test_a_blocked_chain_is_never_described_as_submittable(self) -> None:
+        graph = investigator.build_investigation([{
+            "ref": "F1", "rule_id": "secret.google-api-key", "category": "secret",
+            "title": "Browser API key", "severity": "high", "confidence": "high",
+            "secret_classification": "public_client_key", "file_path": "public/app.js",
+            "proof_of_impact": {"status": "confirmed", "observed_result": "live", "control_result": "dead"},
+        }])
+        self.assertEqual(graph["hypotheses"][0]["status"], "contradicted")
+        for chain in graph["attack_chains"]:
+            if "F1" in chain["refs"]:
+                self.assertEqual(chain["status"], "blocked")
+                self.assertNotIn("package", chain["next_action"].lower())
 
     def test_probe_plan_becomes_explicit_evidence_queue(self) -> None:
         plan = {"probe_priority": [{

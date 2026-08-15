@@ -36,7 +36,7 @@ class BountyReportTests(unittest.TestCase):
         try:
             target = "https://github.com/acme/widget"
             kind = bounty_lib._infer_kind(target)
-            _findings, scanners, meta, _risk, _score = bounty_lib._run_scanners(
+            _findings, scanners, meta, _risk, _score, _signals = bounty_lib._run_scanners(
                 bounty_lib.BOUNTY_PROFILES["full-sweep"], kind, target, 123, False,
             )
         finally:

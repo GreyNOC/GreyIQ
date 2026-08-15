@@ -325,7 +325,15 @@ def qa_validate_report(findings: list[dict[str, Any]], attack_plans: dict[str, A
 
 
 def _md_escape_cell(text: str) -> str:
-    return str(text).replace("|", "\\|").replace("\n", " ").strip()
+    """Neutralize a value for a markdown TABLE CELL.
+
+    Escaping only ``|`` and ``\\n`` left a bare carriage return intact, and every renderer
+    treats a lone CR as a line break — so a target-derived string (a JSON key, a cookie name,
+    a finding title) carrying ``\\r`` ended the table row early and let whatever followed be
+    parsed as markdown at document level, including a heading. Strip the whole C0 range plus
+    DEL rather than enumerate the breaking characters."""
+    cleaned = re.sub(r"[\x00-\x1f\x7f]", " ", str(text))
+    return cleaned.replace("|", "\\|").strip()
 
 
 def _safe_display_int(value: Any) -> int:
@@ -440,6 +448,9 @@ def _checkbox(done: bool, text: str) -> str:
     return f"- [{'x' if done else ' '}] {text}"
 
 
+# The chain engine bounds its own step count; this bounds what the MARKDOWN prints per chain
+# so one long chain can't dominate the report body (the JSON sidecar keeps every step).
+_MAX_CHAIN_STEPS = 8
 _CONFIRMED_PROOF_STATUSES = {"confirmed", "verified", "proven", "reproduced"}
 _CANDIDATE_PROOF_STATUSES = {"candidate", "unverified", "partial", "needs_confirmation", "needs-confirmation"}
 _GENERIC_PROOF_RE = re.compile(
@@ -1552,6 +1563,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
         if plan.get("impact") or finding.get("impact"):
             out.append(f"**Impact:** {plan.get('impact') or finding.get('impact')}")
             out.append("")
+        _append_chain_role(out, ctx, ref)
         _append_proof_of_impact(out, finding, plan, heading="**Proof of impact:**")
         _append_proof_of_exploitability(out, finding, plan, heading="**Proof of exploitability:**")
         _append_screenshot(out, finding)
@@ -1623,6 +1635,36 @@ def _append_bounty_triage(out: list[str], ctx: dict[str, Any], counts: dict[str,
     out.append("")
 
 
+def _append_chain_role(out: list[str], ctx: dict[str, Any], ref: str) -> None:
+    """Name the chains this finding is a step of, right where the finding is read.
+
+    This is the other half of demoting cookie flags: the flag stops being its own Low, and
+    the finding it escalates gains the line saying what it now reaches. A triager reading a
+    reflected XSS in isolation prices it as an XSS; the same finding labelled "step 1 of a
+    chain to account takeover" is priced as what it actually is.
+    """
+    investigation = ctx.get("investigation") if isinstance(ctx.get("investigation"), dict) else {}
+    chains = investigation.get("attack_chains") if isinstance(investigation.get("attack_chains"), list) else []
+    lines: list[str] = []
+    for chain in chains:
+        if not isinstance(chain, dict):
+            continue
+        for step in chain.get("steps") or []:
+            if not isinstance(step, dict) or str(step.get("evidence_ref") or "") != str(ref):
+                continue
+            lines.append(
+                f"- Step {_safe_display_int(step.get('n'))} of **{_md_escape_cell(chain.get('id') or '')} · "
+                f"{_md_escape_cell(chain.get('title') or '')}** "
+                f"({_md_escape_cell(chain.get('status') or '')}) — reaching "
+                f"{_md_escape_cell(chain.get('projected_impact') or 'higher impact')}."
+            )
+    if not lines:
+        return
+    out.append("**Chain role:**\n")
+    out.extend(dict.fromkeys(lines))
+    out.append("")
+
+
 def _append_investigation(out: list[str], ctx: dict[str, Any]) -> None:
     """Render the shared evidence graph as an analyst decision brief.
 
@@ -1678,17 +1720,83 @@ def _append_investigation(out: list[str], ctx: dict[str, Any]) -> None:
         out.append("")
 
     if chains:
-        out.append("### Correlated attack-chain leads\n")
+        out.append("### Attack chains\n")
+        out.append(
+            "Each chain is an ORDERED path from an attacker's starting position to a concrete "
+            "impact. A step marked *proven* is backed by a captured artifact the confirm gate "
+            "accepted; a step marked *projected* is the next thing to prove, and the chain is "
+            "worth only as much as its weakest step."
+        )
+        out.append("")
         for chain in chains[:8]:
             if not isinstance(chain, dict):
                 continue
             raw_refs = chain.get("refs")
             refs = ", ".join(str(ref) for ref in raw_refs[:6]) if isinstance(raw_refs, list) else ""
+            steps = chain.get("steps") if isinstance(chain.get("steps"), list) else []
             out.append(
-                f"- **{_md_escape_cell(chain.get('id') or '')} · {_md_escape_cell(chain.get('title') or 'Chain lead')}** "
-                f"({_md_escape_cell(chain.get('status') or 'candidate')}, {_safe_display_int(chain.get('confidence_score'))}/100; "
-                f"refs: {_md_escape_cell(refs)}). {_md_escape_cell(chain.get('why') or '')} "
-                f"**Validate next:** {_md_escape_cell(chain.get('next_action') or '')}"
+                f"#### {_md_escape_cell(chain.get('id') or '')} · {_md_escape_cell(chain.get('title') or 'Attack chain')}\n"
+            )
+            out.append(
+                f"- **State:** {_md_escape_cell(chain.get('status') or 'candidate')} "
+                f"({_safe_display_int(chain.get('proven_steps'))} of {_safe_display_int(chain.get('step_count'))} "
+                f"step(s) proven); calibrated confidence {_safe_display_int(chain.get('confidence_score'))}/100."
+            )
+            out.append(f"- **Starting position:** {_md_escape_cell(chain.get('entry') or 'unknown')}")
+            out.append(f"- **Projected impact:** {_md_escape_cell(chain.get('projected_impact') or 'unknown')}")
+            if refs:
+                out.append(f"- **Findings used:** {_md_escape_cell(refs)}")
+            out.append("")
+            if steps:
+                out.append("| # | Step | Evidence | State | What it gives the attacker |")
+                out.append("|---:|---|---|---|---|")
+                for step in steps[:_MAX_CHAIN_STEPS]:
+                    if not isinstance(step, dict):
+                        continue
+                    # A step is carried by a finding (cite its ref), by a sub-finding signal
+                    # (name the observation — the whole point of the demotion is that the reader
+                    # sees "no HttpOnly" doing a job rather than sitting in a list), or by
+                    # neither, when it is a pure consequence of what the attacker already holds.
+                    signal_text = str(step.get("signal_why") or step.get("signal") or "")
+                    evidence = (
+                        str(step.get("evidence_ref") or "")
+                        or (f"signal: {signal_text}" if signal_text else "follows from the previous step")
+                    )
+                    grants = step.get("grants") if isinstance(step.get("grants"), list) else []
+                    out.append(
+                        f"| {_safe_display_int(step.get('n'))} "
+                        f"| {_md_escape_cell(step.get('title') or '')} "
+                        f"| {_md_escape_cell(evidence)} "
+                        f"| {_md_escape_cell(step.get('state') or '')} "
+                        f"| {_md_escape_cell('; '.join(str(g) for g in grants[:3]))} |"
+                    )
+                if len(steps) > _MAX_CHAIN_STEPS:
+                    out.append(f"\n_{len(steps) - _MAX_CHAIN_STEPS} further step(s) are in the JSON sidecar._")
+                out.append("")
+            notes = [str(step.get("note")) for step in steps
+                     if isinstance(step, dict) and str(step.get("note") or "").strip()]
+            for note in dict.fromkeys(notes):
+                out.append(f"> {_md_escape_cell(note)}")
+            if notes:
+                out.append("")
+            out.append(f"**Close the chain next:** {_md_escape_cell(chain.get('next_action') or '')}")
+            out.append("")
+
+    probes = investigation.get("chain_probes") if isinstance(investigation.get("chain_probes"), list) else []
+    if probes:
+        out.append("### Chain leads worth testing\n")
+        out.append(
+            "Built from observed structure alone — no finding backs these yet, so they are "
+            "test plans, not results."
+        )
+        out.append("")
+        for probe in probes[:6]:
+            if not isinstance(probe, dict):
+                continue
+            out.append(
+                f"- **{_md_escape_cell(probe.get('id') or '')} · {_md_escape_cell(probe.get('title') or '')}** "
+                f"— {_md_escape_cell(probe.get('hypothesis') or '')} "
+                f"**Test:** {_md_escape_cell(probe.get('next_action') or '')}"
             )
         out.append("")
 
@@ -1888,7 +1996,7 @@ def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
         # substitute for the canonical proof_of_impact fields above.
         "investigation": ctx.get("investigation") or {
             "algorithm": "", "verdict": "not-run", "metrics": {},
-            "hypotheses": [], "attack_chains": [], "contradictions": [],
+            "hypotheses": [], "attack_chains": [], "chain_probes": [], "contradictions": [],
         },
         "manual_checklist": ctx.get("manual_checklist", []),
         "submission_checklist": list(_SUBMISSION_CHECKLIST),
@@ -1987,6 +2095,9 @@ def build_finding_markdown(ctx: dict[str, Any], finding: dict[str, Any]) -> str:
     impact = plan.get("impact") or finding.get("impact")
     if impact:
         out.append(f"## Impact\n\n{impact}\n")
+    # A per-finding submission file is read on its own, so the chain context has to travel
+    # with it — otherwise the standalone package prices the finding lower than the report does.
+    _append_chain_role(out, ctx, str(finding.get("ref") or ""))
     _append_proof_of_impact(out, finding, plan, heading="## Proof of impact\n")
     _append_proof_of_exploitability(out, finding, plan, heading="## Proof of exploitability\n")
     _append_screenshot(out, finding)

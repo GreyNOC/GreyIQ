@@ -142,7 +142,7 @@ class SharedGovernorThreadingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             with contextlib.ExitStack() as stack:
                 stack.enter_context(mock.patch.object(
-                    bounty, "_run_scanners", lambda *a, **k: ([], ["web"], {"web": {"ok": True}}, "low", 0)))
+                    bounty, "_run_scanners", lambda *a, **k: ([], ["web"], {"web": {"ok": True}}, "low", 0, [])))
                 stack.enter_context(mock.patch.object(bounty.recon, "discover", _rec))
                 with self.assertRaises(_Stop):
                     bounty.run_bounty_hunt(

@@ -27,6 +27,7 @@ import coder
 import brain_profiles
 import brain_techniques
 from bughunter import active_verify_service
+from bughunter import attack_chain
 from bughunter import brain_narrative
 from bughunter import brain_safety
 from bughunter import credential_validation
@@ -1151,14 +1152,15 @@ def _resolve_output_dir(output_dir: str | None, default_reports_dir: Path) -> Pa
     return target
 
 
-def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: int, run_live: bool, auth: AuthContext | None = None) -> tuple[list[dict[str, Any]], list[str], dict[str, Any], str, float]:
+def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: int, run_live: bool, auth: AuthContext | None = None) -> tuple[list[dict[str, Any]], list[str], dict[str, Any], str, float, list[dict[str, Any]]]:
     """Run the profile's scanners for the inferred target kind. Returns
-    (raw_findings, scanners_run, scan_meta, risk, score)."""
+    (raw_findings, scanners_run, scan_meta, risk, score, chain_signals)."""
     scanners = profile["scanners"]
     if "auto" in scanners:
         scanners = ["code"] if kind in {"path", "git"} else ["web"]
 
     raw: list[dict[str, Any]] = []
+    signals: list[dict[str, Any]] = []
     ran: list[str] = []
     meta: dict[str, Any] = {}
     risks: list[str] = []
@@ -1174,6 +1176,10 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
         ran.append(scanner)
         if result.get("ok"):
             raw.extend(result.get("findings", []))
+            # Sub-finding escalation clues (session-cookie flag gaps). Carried alongside the
+            # findings, never mixed into them: they are inputs to the chain engine, not results.
+            if isinstance(result.get("signals"), list):
+                signals.extend(result["signals"])
             risks.append(str(result.get("risk", "low")))
             scores.append(float(result.get("score") or 0.0))
             meta[scanner] = {
@@ -1198,7 +1204,7 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
     rank = {"high": 3, "critical": 4, "moderate": 2, "low": 1, "clean": 0}
     overall_risk = max(risks, key=lambda r: rank.get(r, 0)) if risks else "low"
     overall_score = round(max(scores), 3) if scores else 0.0
-    return raw, ran, meta, overall_risk, overall_score
+    return raw, ran, meta, overall_risk, overall_score, signals
 
 
 # Structured-output schema for the reporter brain's reply. Anthropic-only: coder.generate passes it
@@ -2015,7 +2021,7 @@ def _run_bounty_hunt_body(
     if kind == "git":
         _emit("cloning authorized repository (shallow, single branch)…")
     _emit("running adversarial source scan…" if kind in {"git", "path"} else "running scanner(s)…")
-    raw_findings, scanners_run, scan_meta, risk, score = _run_scanners(profile, kind, clean_target, max_files, run_live, auth_ctx)
+    raw_findings, scanners_run, scan_meta, risk, score, chain_signals = _run_scanners(profile, kind, clean_target, max_files, run_live, auth_ctx)
     _emit(f"scan complete — {', '.join(scanners_run) or 'no'} scanner(s) ran, {len(raw_findings)} raw finding(s), risk={risk}")
     # Surface scanner failures instead of letting a failed scan read as a clean
     # target (the worst failure mode for a bug-finding tool). If every scanner
@@ -2572,17 +2578,22 @@ def _run_bounty_hunt_body(
         "recommendation": "",
     }
 
-    # Guided next steps: a deterministic, ordered operator action plan (brain leads
-    # folded in), plus a coverage/gaps summary. Built from the finished context so
-    # it reflects exactly what ran.
-    ctx["next_steps"] = next_steps_lib.build_next_steps(ctx, brain.get("next_steps"))
-    ctx["coverage"] = next_steps_lib.coverage_summary(ctx)
     # One evidence-grounded reasoning graph now drives the handoff from hunting to reporting.
     # It is deterministic and advisory: only the existing proof engine can make a node confirmed.
     investigation_surface = hunt_trace_surface or {
         "endpoints": list(active_targets) if kind == "url" else [],
         "params": list(effective_extra_params) if kind == "url" else [],
     }
+    # Scanner-emitted clues (session-cookie flag gaps) plus everything derivable from the
+    # recon surface and the captured response shape. Collected here rather than inside the
+    # cortex so the chain layer sees the WHOLE hunt's clues — a cookie flag observed by the
+    # web scanner and a role-like field seen in the response digest reach it together.
+    ctx["chain_signals"] = attack_chain.collect_signals(
+        findings=report_lib._reportable_findings(display),
+        response_digest=active_meta.get("digest") if isinstance(active_meta.get("digest"), dict) else None,
+        surface=investigation_surface,
+        extra=chain_signals,
+    )
     # Built from the SAME filtered set the report body and JSON findings use. Ranking the raw
     # display list let the hypothesis queue name an F<n> that _reportable_findings had dropped
     # (a false-positive secret, an unconfirmed JWT candidate), so the brief cited a finding that
@@ -2590,7 +2601,17 @@ def _run_bounty_hunt_body(
     ctx["investigation"] = investigator.build_investigation(
         report_lib._reportable_findings(display), attack_plans,
         surface=investigation_surface, scan_meta=active_meta,
+        signals=ctx["chain_signals"],
     )
+
+    # Guided next steps: a deterministic, ordered operator action plan (brain leads folded in),
+    # plus a coverage/gaps summary. Built from the finished context so it reflects exactly what
+    # ran — which means AFTER the investigation, because its "Chain & escalate" phase is built
+    # from ctx["investigation"]. Building the plan first left that key absent on every hunt, so
+    # the chain-driven phase silently never fired and every run fell back to the generic
+    # class-pair advice.
+    ctx["next_steps"] = next_steps_lib.build_next_steps(ctx, brain.get("next_steps"))
+    ctx["coverage"] = next_steps_lib.coverage_summary(ctx)
 
     _emit("writing report…")
     markdown = report_lib.build_markdown(ctx)
@@ -2685,6 +2706,10 @@ def _run_bounty_hunt_body(
         "next_steps": ctx["next_steps"],
         "coverage": ctx["coverage"],
         "investigation": json_doc["investigation"],
+        # Sub-finding escalation clues. Returned so a CAMPAIGN can chain across targets — a
+        # session cookie scoped to the parent domain here and a claimable subdomain there is
+        # a chain no single-target hunt can see, because neither host holds both halves.
+        "chain_signals": ctx["chain_signals"],
         "active_verified_classes": ctx["active_verified_classes"],
         "active_authorization": ctx["active_authorization"],
         "proof_artifacts_captured": proof_artifacts_captured,

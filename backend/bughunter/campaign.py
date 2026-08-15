@@ -36,6 +36,7 @@ from bughunter import (
     fsutil,
     hunt_brain,
     hunt_trace,
+    investigator,
     ledger,
     learning,
     offline_hunt,
@@ -95,6 +96,53 @@ def _severity_counts(findings: list[dict[str, Any]]) -> dict[str, int]:
         if sev in counts:
             counts[sev] += 1
     return counts
+
+
+def _span_investigation(
+    findings: list[dict[str, Any]],
+    plans: dict[str, Any],
+    proof: dict[str, Any],
+    signals: list[dict[str, Any]],
+    surface_urls: list[str],
+    surface_tech: list[str],
+) -> dict[str, Any]:
+    """The cross-target evidence graph for a whole span/portfolio.
+
+    Per-target hunts each chained within one host. This runs the same cortex over the POOLED,
+    re-keyed (C1, C2…) findings, so a chain whose steps live on different hosts becomes
+    visible for the first time.
+
+    The per-target proof verdicts are re-attached first: the confirm gate reads a finding's own
+    evidence, and the span's re-keying moves the canonical status into ``proof_out`` — without
+    this, every finding a per-target hunt CONFIRMED would re-enter the graph as an unproven
+    lead and the span would silently under-report its own strongest chains.
+
+    Fail-open: a span that hunted successfully must never fail because its summary graph did.
+    """
+    try:
+        merged: list[dict[str, Any]] = []
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            ref = str(finding.get("ref") or "")
+            verdict = proof.get(ref) if isinstance(proof.get(ref), dict) else {}
+            merged.append({**finding, "proof_of_impact": {**verdict}} if verdict else dict(finding))
+        return investigator.build_investigation(
+            merged, plans if isinstance(plans, dict) else {},
+            surface={"endpoints": list(surface_urls)[:400], "tech": list(surface_tech)[:60]},
+            signals=signals,
+        )
+    except Exception:  # noqa: BLE001 - the span graph is advisory; never sink a finished span
+        return {}
+
+
+def _chain_locations(findings: list[dict[str, Any]]) -> dict[str, str]:
+    """ref -> location, for the roll-up's cross-host test. A compact map rather than the whole
+    finding list: this lands in span.json/portfolio.json, which are navigation indexes."""
+    return {
+        str(f.get("ref") or ""): str(f.get("location") or f.get("file_path") or "")
+        for f in findings if isinstance(f, dict) and f.get("ref")
+    }
 
 
 def _campaign_risk(consolidated: list[dict[str, Any]]) -> str:
@@ -308,6 +356,10 @@ def _run_campaign_body(
     rec_js_secrets: list[dict[str, Any]] = []
     recon_tech: list[str] = []
     recon_params: list[str] = []
+    # Every hunted URL's sub-finding escalation clues, pooled for the span/portfolio layers
+    # above. Without this the campaign swallowed them and cross-target chaining could never
+    # fire — span_signals stayed permanently empty however many targets ran.
+    campaign_signals: list[dict[str, Any]] = []
     recon_api_findings: list[dict[str, Any]] = []
     # Per-endpoint vuln-class priorities from the reasoning layer — {url: [classes]} — used to steer
     # each URL's active pass toward the classes most likely to hit there (empty = default order).
@@ -504,6 +556,8 @@ def _run_campaign_body(
             if progress_unit is None:
                 progress.mark_target(progress_run_id, url, "error", error=str(result.get("error") or ""))
             continue
+        if isinstance(result.get("chain_signals"), list):
+            campaign_signals.extend(result["chain_signals"])
         doc = _read_json(result.get("json_path", ""))
         url_new: list[dict[str, Any]] = []  # findings first-seen at THIS url, for the live dashboard
         for finding in doc.get("findings") or []:
@@ -975,6 +1029,7 @@ def _run_campaign_body(
         "cvss": cvss_out,
         "attack_plans": plans_out,
         "surface": {"urls": urls, "sources": recon_sources, "notes": recon_notes, "tech": recon_tech},
+        "chain_signals": campaign_signals,
         # Resolve each finding's severity through its modelled cvss (matching the per-target
         # report tally) before counting, so an active-confirmed finding isn't under-reported.
         "severity_counts": _severity_counts([_resolved_severity_finding(item) for item in consolidated]),
@@ -1158,6 +1213,9 @@ def run_campaign_over_targets(
     surface_notes: list[str] = []
     surface_tech: list[str] = []
     surface_sources: dict[str, int] = {}
+    # Every target's sub-finding clues, pooled. Chaining across targets is the only way to
+    # see an attack whose halves live on different hosts.
+    span_signals: list[dict[str, Any]] = []
     errors: list[str] = []
     ref_counter = 0
     ok_count = 0
@@ -1256,6 +1314,8 @@ def run_campaign_over_targets(
             if old_ref in plans:
                 plans_out[new_ref] = plans[old_ref]
         submission_paths.extend(result.get("submission_paths") or [])
+        if isinstance(result.get("chain_signals"), list):
+            span_signals.extend(result["chain_signals"])
         surf = result.get("surface") or {}
         surface_urls.extend(surf.get("urls") or [])
         surface_notes.extend(surf.get("notes") or [])
@@ -1271,11 +1331,19 @@ def run_campaign_over_targets(
         errors.insert(0, f"Capped to the first {max_targets} of {len(clean_targets)} in-scope targets.")
 
     confirmed_count = len([f for f in findings_out if (proof_out.get(f["ref"], {}) or {}).get("status") == "confirmed"])
+    # CROSS-TARGET chaining. Each per-target hunt already chained within its own host; only
+    # here do findings from different hosts sit in one graph, which is where the chains that
+    # matter most in a wide scope live (a claimable subdomain on one host plus a
+    # parent-domain session cookie on another is an account takeover neither hunt can see).
+    span_investigation = _span_investigation(findings_out, plans_out, proof_out, span_signals,
+                                             surface_urls, surface_tech)
     span_ctx = {
         "program": program or "", "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
         "version": version, "scope": scope, "targets_total": len(clean_targets), "targets_hunted": ok_count,
         "per_target": per_target, "errors": errors, "finding_count": len(findings_out), "confirmed_count": confirmed_count,
         "submission_count": len(submission_paths),
+        "investigation": span_investigation,
+        "chain_locations": _chain_locations(findings_out),
     }
     span_md_path = span_root / "SPAN.md"
     span_json_path = span_root / "span.json"
@@ -1302,6 +1370,8 @@ def run_campaign_over_targets(
         "cvss": cvss_out,
         "attack_plans": plans_out,
         "surface": {"urls": surface_urls, "sources": surface_sources, "notes": surface_notes, "tech": surface_tech},
+        "investigation": span_investigation,
+        "chain_signals": span_signals,
         # Resolve severity through each finding's modelled cvss (cvss_out shares the C-ref key)
         # so the span tally matches each per-target report instead of the raw scanner label.
         "severity_counts": _severity_counts(
@@ -1393,6 +1463,7 @@ def run_portfolio_campaign(
     surface_notes: list[str] = []
     surface_tech: list[str] = []
     surface_sources: dict[str, int] = {}
+    span_signals: list[dict[str, Any]] = []
     errors: list[str] = []
     ref_counter = 0
     ok_count = 0
@@ -1467,6 +1538,8 @@ def run_portfolio_campaign(
             if old_ref in plans:
                 plans_out[new_ref] = plans[old_ref]
         submission_paths.extend(result.get("submission_paths") or [])
+        if isinstance(result.get("chain_signals"), list):
+            span_signals.extend(result["chain_signals"])
         surf = result.get("surface") or {}
         surface_urls.extend(surf.get("urls") or [])
         surface_notes.extend(surf.get("notes") or [])
@@ -1480,10 +1553,14 @@ def run_portfolio_campaign(
         return {"ok": False, "error": "Every program in the portfolio failed: " + "; ".join(errors[:5])}
 
     confirmed_count = len([f for f in findings_out if (proof_out.get(f["ref"], {}) or {}).get("status") == "confirmed"])
+    port_investigation = _span_investigation(findings_out, plans_out, proof_out, span_signals,
+                                             surface_urls, surface_tech)
     port_ctx = {
         "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"), "version": version,
         "programs_total": len(clean), "programs_hunted": ok_count, "per_program": per_program, "errors": errors,
         "finding_count": len(findings_out), "confirmed_count": confirmed_count, "submission_count": len(submission_paths),
+        "investigation": port_investigation,
+        "chain_locations": _chain_locations(findings_out),
     }
     port_md_path = portfolio_root / "PORTFOLIO.md"
     port_json_path = portfolio_root / "portfolio.json"
@@ -1498,6 +1575,8 @@ def run_portfolio_campaign(
         "finding_count": len(findings_out), "confirmed_count": confirmed_count, "submission_paths": submission_paths,
         "findings": findings_out, "proof_of_impact": proof_out, "cvss": cvss_out, "attack_plans": plans_out,
         "surface": {"urls": surface_urls, "sources": surface_sources, "notes": surface_notes, "tech": surface_tech},
+        "investigation": port_investigation,
+        "chain_signals": span_signals,
         # Resolve severity through each finding's modelled cvss (cvss_out shares the C-ref key),
         # so the portfolio tally matches the per-program/per-target reports.
         "severity_counts": _severity_counts(
@@ -1524,6 +1603,7 @@ def _render_portfolio_markdown(ctx: dict[str, Any]) -> str:
         for note in ctx["errors"]:
             out.append(f"- {note}")
         out.append("")
+    _append_cross_target_chains(out, ctx)
     out.append("## Programs\n")
     for t in ctx["per_program"]:
         if t.get("ok"):
@@ -1534,6 +1614,47 @@ def _render_portfolio_markdown(ctx: dict[str, Any]) -> str:
     out.append("---")
     out.append("_GreyIQ Portfolio Hunt — many programs, one run. Each program's full CAMPAIGN.md/SPAN.md is under this folder._")
     return "\n".join(out)
+
+
+def _append_cross_target_chains(out: list[str], ctx: dict[str, Any]) -> None:
+    """Render the chains the roll-up can see that no single target could.
+
+    Only chains whose findings actually span more than one host are printed here — a chain
+    confined to one target is already in that target's own report, and repeating it in the
+    index is noise that buries the genuinely new, cross-host ones.
+    """
+    investigation = ctx.get("investigation") if isinstance(ctx.get("investigation"), dict) else {}
+    chains = investigation.get("attack_chains") if isinstance(investigation.get("attack_chains"), list) else []
+    locations = ctx.get("chain_locations") if isinstance(ctx.get("chain_locations"), dict) else {}
+
+    def _hosts(chain: dict[str, Any]) -> set[str]:
+        hosts: set[str] = set()
+        for ref in chain.get("refs") or []:
+            try:
+                host = urlparse(str(locations.get(str(ref)) or "")).hostname
+            except ValueError:
+                host = None  # a malformed authority contributes no host, never an exception
+            if host:
+                hosts.add(host.lower())
+        return hosts
+
+    cross = [c for c in chains if isinstance(c, dict) and len(_hosts(c)) > 1]
+    if not cross:
+        return
+    out.append("## Cross-target attack chains\n")
+    out.append(
+        "These chains link findings on DIFFERENT hosts, so no single target's report can show "
+        "them. Each is an ordered path; a step is *proven* only when a captured artifact backs it."
+    )
+    out.append("")
+    for chain in cross[:6]:
+        refs = ", ".join(str(r) for r in (chain.get("refs") or [])[:6])
+        out.append(
+            f"- **{chain.get('id')} · {chain.get('title')}** ({chain.get('status')}, "
+            f"{chain.get('proven_steps')}/{chain.get('step_count')} step(s) proven; refs: {refs}) — "
+            f"{chain.get('why') or ''} **Close it next:** {chain.get('next_action') or ''}"
+        )
+    out.append("")
 
 
 def _render_span_markdown(ctx: dict[str, Any]) -> str:
@@ -1557,6 +1678,7 @@ def _render_span_markdown(ctx: dict[str, Any]) -> str:
         for note in ctx["errors"]:
             out.append(f"- {note}")
         out.append("")
+    _append_cross_target_chains(out, ctx)
     out.append("## Targets\n")
     out.append("Each target ran its own full campaign — open its `CAMPAIGN.md` for the complete detail "
                "(surface map, per-finding evidence, ready-to-submit packages). This index only rolls them up.\n")

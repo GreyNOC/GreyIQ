@@ -43,8 +43,12 @@ proof controls remain authoritative.
 
 - `hypotheses`: normalized class, severity, calibrated confidence, evidence artifacts,
   gaps, next proof obligation, decision, and report-readiness state;
-- `attack_chains`: concrete finding references joined through a curated class recipe,
-  with projected impact clearly separated from proven impact;
+- `attack_chains`: ordered, multi-step attack paths built by the attack-chain engine
+  (`bughunter/attack_chain.py`), with projected impact clearly separated from proven
+  impact — see [attack-chains.md](attack-chains.md);
+- `chain_probes`: chains built from observed structure alone, citing no finding. They are
+  test plans for the planner, kept out of `attack_chains` so nothing unobserved can be read
+  as a result;
 - `contradictions`: blocking evidence conflicts such as confirmation without an artifact,
   identical observed/control results, rejected verdicts, or an inflated public-client key;
 - `coverage`: observed endpoints/parameters, verified classes, and request use;
