@@ -1,0 +1,238 @@
+"""Bounded HTTP traffic client for an authorized lab or in-scope endpoint.
+
+The client is intentionally transport-only: responses are recorded as data and are never executed.
+TLS verification is always enabled for HTTPS; use --ca-cert to trust a private CA.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Sequence
+
+DEFAULT_USER_AGENT = "GreyIQ-Authorized-HTTP/1.0"
+MAX_REQUESTS = 100
+MAX_REQUEST_BYTES = 2 * 1024 * 1024
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep every request on the operator-supplied URL."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+def bounded_int(value: str, *, minimum: int, maximum: int) -> int:
+    number = int(value)
+    if not minimum <= number <= maximum:
+        raise argparse.ArgumentTypeError(f"must be between {minimum} and {maximum}")
+    return number
+
+
+def bounded_float(value: str, *, minimum: float, maximum: float) -> float:
+    number = float(value)
+    if not minimum <= number <= maximum:
+        raise argparse.ArgumentTypeError(f"must be between {minimum} and {maximum}")
+    return number
+
+
+def validate_url(value: str) -> str:
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise argparse.ArgumentTypeError("URL must be absolute http:// or https://")
+    if parsed.username is not None or parsed.password is not None:
+        raise argparse.ArgumentTypeError("put credentials in an explicit header, not the URL")
+    if "\\" in value or any(ch in value for ch in "\r\n"):
+        raise argparse.ArgumentTypeError("URL contains an unsafe character")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("URL has an invalid port") from exc
+    return value
+
+
+def parse_header(value: str) -> tuple[str, str]:
+    if ":" not in value or any(ch in value for ch in "\r\n"):
+        raise argparse.ArgumentTypeError("header must be NAME: VALUE on one line")
+    name, header_value = (part.strip() for part in value.split(":", 1))
+    if not name or not header_value:
+        raise argparse.ArgumentTypeError("header name and value cannot be empty")
+    if name.casefold() in {"host", "content-length", "user-agent"}:
+        raise argparse.ArgumentTypeError(
+            f"set {name} through the URL, request body, or --user-agent option"
+        )
+    return name, header_value
+
+
+def read_body(args: argparse.Namespace) -> bytes | None:
+    if args.data is not None:
+        body = args.data.encode("utf-8")
+    elif args.data_file is not None:
+        body = Path(args.data_file).read_bytes()
+    else:
+        return None
+    if len(body) > MAX_REQUEST_BYTES:
+        raise ValueError(f"request body exceeds {MAX_REQUEST_BYTES} bytes")
+    return body
+
+
+def make_context(args: argparse.Namespace) -> ssl.SSLContext:
+    context = ssl.create_default_context(cafile=args.ca_cert or None)
+    if args.client_key and not args.client_cert:
+        raise ValueError("--client-key requires --client-cert")
+    if args.client_cert:
+        context.load_cert_chain(certfile=args.client_cert, keyfile=args.client_key or None)
+    return context
+
+
+def make_opener(context: ssl.SSLContext) -> urllib.request.OpenerDirector:
+    # Do not inherit proxy behavior from ambient environment variables; reproducibility requires
+    # every network hop to be explicit. Redirects are also returned to the caller instead of followed.
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=context),
+        NoRedirectHandler(),
+    )
+
+
+def response_result(
+    response, *, attempt: int, elapsed_ms: int, expected: set[int], print_body: bool
+) -> dict[str, object]:  # noqa: ANN001
+    payload = response.read(MAX_RESPONSE_BYTES + 1)
+    truncated = len(payload) > MAX_RESPONSE_BYTES
+    if truncated:
+        payload = payload[:MAX_RESPONSE_BYTES]
+    status = int(response.status)
+    result: dict[str, object] = {
+        "attempt": attempt,
+        "ok": status in expected if expected else 200 <= status < 400,
+        "status": status,
+        "elapsed_ms": elapsed_ms,
+        "response_bytes": len(payload),
+        "response_sha256": hashlib.sha256(payload).hexdigest(),
+        "truncated": truncated,
+    }
+    if print_body:
+        result["body"] = payload.decode("utf-8", errors="replace")
+    return result
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--url", required=True, type=validate_url)
+    parser.add_argument(
+        "--method",
+        choices=("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"),
+        default="GET",
+    )
+    body = parser.add_mutually_exclusive_group()
+    body.add_argument("--data", help="UTF-8 request body")
+    body.add_argument("--data-file", help=f"request body file (max {MAX_REQUEST_BYTES} bytes)")
+    parser.add_argument("--header", action="append", default=[], type=parse_header, metavar="NAME: VALUE")
+    parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
+    parser.add_argument("--ca-cert", help="PEM CA certificate/bundle used to verify the server")
+    parser.add_argument("--client-cert", help="PEM client certificate or combined certificate/key")
+    parser.add_argument("--client-key", help="PEM client private key, if stored separately")
+    parser.add_argument(
+        "--timeout",
+        type=lambda value: bounded_float(value, minimum=0.1, maximum=120.0),
+        default=10.0,
+    )
+    parser.add_argument(
+        "--count",
+        type=lambda value: bounded_int(value, minimum=1, maximum=MAX_REQUESTS),
+        default=1,
+    )
+    parser.add_argument(
+        "--interval",
+        type=lambda value: bounded_float(value, minimum=0.0, maximum=60.0),
+        default=0.0,
+        help="seconds between requests (finite --count only)",
+    )
+    parser.add_argument("--expect-status", action="append", type=int, default=[], metavar="CODE")
+    parser.add_argument("--print-body", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="print the request plan without networking")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        body = read_body(args)
+        context = make_context(args)
+    except (OSError, ValueError, ssl.SSLError) as exc:
+        parser.error(str(exc))
+
+    headers = {name: value for name, value in args.header}
+    headers["User-Agent"] = args.user_agent
+    body_sha256 = hashlib.sha256(body).hexdigest() if body is not None else None
+    if args.dry_run:
+        print(
+            json.dumps(
+                {
+                    "url": args.url,
+                    "method": args.method,
+                    "headers": headers,
+                    "body_bytes": len(body or b""),
+                    "body_sha256": body_sha256,
+                    "ca_cert": args.ca_cert,
+                    "client_cert": args.client_cert,
+                    "count": args.count,
+                    "interval": args.interval,
+                    "timeout": args.timeout,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    opener = make_opener(context)
+    expected = set(args.expect_status)
+    failed = False
+    for attempt in range(1, args.count + 1):
+        request = urllib.request.Request(args.url, data=body, headers=headers, method=args.method)
+        started = time.monotonic()
+        try:
+            with opener.open(request, timeout=args.timeout) as response:
+                result = response_result(
+                    response,
+                    attempt=attempt,
+                    elapsed_ms=round((time.monotonic() - started) * 1000),
+                    expected=expected,
+                    print_body=args.print_body,
+                )
+        except urllib.error.HTTPError as response:
+            with response:
+                result = response_result(
+                    response,
+                    attempt=attempt,
+                    elapsed_ms=round((time.monotonic() - started) * 1000),
+                    expected=expected,
+                    print_body=args.print_body,
+                )
+        except (OSError, urllib.error.URLError) as exc:
+            result = {
+                "attempt": attempt,
+                "ok": False,
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+                "error": type(exc).__name__,
+                "message": str(exc),
+            }
+        print(json.dumps(result, sort_keys=True))
+        failed = failed or not bool(result["ok"])
+        if attempt < args.count and args.interval:
+            time.sleep(args.interval)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

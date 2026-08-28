@@ -4,6 +4,18 @@ Notable changes to GreyIQ.
 
 ## Unreleased - investigation cortex
 
+- Added a local-first `gn osint` campaign engine. It queries two certificate-transparency
+  indexes and two independent DNS-over-HTTPS resolvers, retains timestamped source provenance
+  for every claim, labels single-source and historical observations honestly, and writes a
+  Markdown evidence brief plus a machine-readable JSON ledger.
+- `gn osint <domain> --hunt --scope <scope> -y` hands only two-resolver, public-DNS-verified
+  hosts to the existing bounded multi-target BugHunter campaign. OSINT never grants scope;
+  authorization and the normal per-request scope checks remain mandatory. `gn campaign
+  --osint` also exposes the existing opt-in CT recon expansion directly from the local CLI.
+- The offline Workbench coder can scaffold a local authorized HTTP/C2 traffic simulator. It is
+  deliberately transport-only: finite request count, bounded bodies/timeouts, attributable User-
+  Agent, strict TLS with private-CA/mTLS options, no redirects, and no command polling, response
+  execution, persistence, evasion, or TLS-disable switch.
 - Added a deterministic, evidence-grounded investigation cortex shared by the coding
   agent, hunt planner/loop, and bounty reports. It calibrates confidence from typed
   artifacts, ranks proof-gathering hypotheses, flags contradictory evidence, and

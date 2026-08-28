@@ -3,8 +3,10 @@ Policy and applied to the hunt so GreyIQ operates strictly within that program's
 reporting guidelines. A profile pins the in-scope hosts, the endpoints/classes the program will NOT
 accept, and whether only exploitability-demonstrated (confirmed) findings may be reported.
 
-First profile: **NASA VDP** (https://bugcrowd.com/engagements/nasa-vdp). Applying it makes "NASA mode":
-same engine, constrained to the NASA program's scope + reporting rules.
+Entity-specific restriction profiles in this build are limited to U.S. federal entities. The first
+profile is **NASA VDP** (https://bugcrowd.com/engagements/nasa-vdp). Applying it makes "NASA mode":
+same engine, constrained to the NASA program's scope + reporting rules. A profile is selected by its
+explicit ID; a domain name alone never activates one.
 
 Pure/leaf module (stdlib only). The engine's own scope + SSRF gates still apply independently — a
 profile only NARROWS what is probed/reported, it can never widen scope or authorize anything.
@@ -17,6 +19,7 @@ from typing import Any
 # --- NASA VDP -------------------------------------------------------------------------------------
 _NASA: dict[str, Any] = {
     "id": "nasa",
+    "entity_class": "us-federal",
     "name": "NASA VDP",
     "program_name": "NASA VDP",
     # The only registered domains in scope (subdomains included by the engine's scope matcher).

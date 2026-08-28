@@ -232,6 +232,7 @@ def _run_campaign_body(
     live: bool = False,
     program: str | None = None,
     max_pages: int = 12,
+    osint: bool = False,
     platform: str = "hackerone",
     deep: bool = False,
     on_progress: Any = None,
@@ -268,7 +269,12 @@ def _run_campaign_body(
     # settings object every scope check downstream already takes, so recon's discovery
     # gate and run_bounty_hunt's own active-verification pass both honor it without
     # each needing their own separate exclusion parameter.
-    campaign_settings = dataclasses.replace(get_settings(), excluded_hosts=tuple(excluded_hosts or ()))
+    base_settings = get_settings()
+    campaign_settings = dataclasses.replace(
+        base_settings,
+        excluded_hosts=tuple(excluded_hosts or ()),
+        recon_osint_enabled=bool(osint or base_settings.recon_osint_enabled),
+    )
 
     rt = runtime_dir
     payout_priors = learning.learned_priors(rt, program, clean_target) if rt is not None else {}
@@ -1086,6 +1092,7 @@ def run_campaign_over_targets(
     live: bool = False,
     program: str | None = None,
     max_pages: int = 12,
+    osint: bool = False,
     platform: str = "hackerone",
     deep: bool = False,
     on_progress: Any = None,
@@ -1193,7 +1200,7 @@ def run_campaign_over_targets(
                 default_reports_dir=span_root, seed_dir=seed_dir, runtime_dir=runtime_dir,
                 version=version, active=active, time_based=time_based, auth=auth,
                 account_access=account_access, user_agent_suffix=user_agent_suffix, live=live,
-                program=program, max_pages=max_pages, platform=platform, deep=deep,
+                program=program, max_pages=max_pages, osint=osint, platform=platform, deep=deep,
                 disclose_automation=disclose_automation, on_progress=_target_emit, excluded_hosts=excluded_hosts,
                 admin_account_access=admin_account_access, idor_pairs=idor_pairs, include_attack_map=include_attack_map,
                 policy_profile=policy_profile,

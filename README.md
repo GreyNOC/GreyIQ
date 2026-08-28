@@ -104,7 +104,9 @@ binding, avoids secrets, and updates `DEPLOY.md` when deployment behavior change
 Verification is stronger for scripts and configs: Python, JSON, JavaScript, PM2
 ecosystem files, shell scripts, YAML files, and `.env.example` secret-shaped values are
 checked where the local command settings allow it. Command execution remains off by
-default.
+default. The offline coder can also scaffold a bounded authorized HTTP/C2 traffic simulator
+for a local lab; it sends finite attributed requests and treats every response as data, never
+as commands to execute.
 
 ## BugHunter
 
@@ -116,6 +118,11 @@ per-program SSRF/OOB setup, running a hunt, and reports & submission. The cockpi
 a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the top bar).
 
 - **Scan** from chat: `scan code <path|repo>`, `scan web <url>`, `scan live <url>`.
+- **OSINT campaigns from the local CLI**: `gn osint example.com` correlates two public
+  certificate-transparency indexes with Google and Cloudflare DNS, keeps claim-level source
+  provenance, and writes `OSINT.md` + `osint.json`. Add `--hunt --scope "*.example.com" -y`
+  to pass only independently DNS-verified public hosts into the normal BugHunter campaign;
+  OSINT discovery never grants authorization.
 - **Bug-bounty hunt** (training panel): pick a profile (Web app / API / Source-code /
   Secrets / Full sweep) and an optional vuln-class focus (XSS, SQLi, SSRF, IDOR/access
   control, auth, RCE, secrets). GreyIQ runs the right scanner, the brain writes
