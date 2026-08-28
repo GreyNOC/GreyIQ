@@ -344,6 +344,7 @@ def _run_campaign_body(
         # host/CDN) don't each build their own governor and multiply the per-host request rate/burst.
         rec = recon.discover(
             clean_target, max_pages=max_pages, scope_in=scope_gate,
+            settings=campaign_settings,
             governor=shared_governor(
                 capacity=campaign_settings.active_max_requests_per_host,
                 min_interval_s=campaign_settings.active_min_interval_ms / 1000.0,

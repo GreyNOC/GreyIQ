@@ -97,6 +97,23 @@ class GnCliTests(unittest.TestCase):
         self.assertIn("DNS-verified", out)
         run.assert_called_once()
 
+    def test_osint_hunt_filters_verified_hosts_through_explicit_scope(self) -> None:
+        payload = {
+            "status": "complete", "domain": "example.com", "apex": "example.com",
+            "report_path": "OSINT.md", "summary": {},
+            "hunt_targets": ["https://api.example.com/", "https://admin.example.com/"],
+        }
+        hunt_payload = {"ok": True}
+        with mock.patch("bughunter.osint.run_campaign", return_value=payload), \
+             mock.patch("bughunter.campaign.run_campaign_over_targets", return_value=hunt_payload) as hunt:
+            code, _, err = _run([
+                "osint", "example.com", "--hunt", "--scope", "api.example.com", "-y", "--json",
+            ])
+
+        self.assertEqual(code, 0)
+        self.assertNotIn("gn:", err)
+        self.assertEqual(hunt.call_args.args[0], ["https://api.example.com/"])
+
     def test_traces_command_reports_corpus(self) -> None:
         import json
 

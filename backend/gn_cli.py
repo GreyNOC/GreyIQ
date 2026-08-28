@@ -23,6 +23,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 # --- Resolve seed/runtime dirs exactly like greyiq_api (frozen vs dev). ---
 if getattr(sys, "frozen", False):
@@ -214,6 +215,19 @@ def _cmd_osint(args: argparse.Namespace) -> int:
             return _err(
                 "no hosts met the two-resolver DNS verification gate; review the OSINT report "
                 f"at {result.get('report_path', '')}"
+            )
+        from bughunter.active_verify_service import host_in_active_scope
+        from bughunter.settings import get_settings
+
+        scope_settings = get_settings()
+        targets = [
+            target for target in targets
+            if host_in_active_scope(urlparse(str(target)).hostname or "", args.scope, scope_settings)
+        ]
+        if not targets:
+            return _err(
+                "no DNS-verified OSINT hosts are within the explicit --scope; "
+                "OSINT discovery never expands authorization."
             )
         from bughunter.campaign import run_campaign_over_targets
 

@@ -100,6 +100,30 @@ class PlanEditsTests(unittest.TestCase):
         self.assertEqual(rendered["method"], "POST")
         self.assertEqual(rendered["body_bytes"], len('{"status":"ok"}'))
 
+    def test_generated_http_client_rejects_oversize_file_before_opening_it(self) -> None:
+        plan = offline_coder.plan_edits("write an HTTP client script to send traffic", ".")
+        namespace: dict[str, object] = {"__name__": "generated_client"}
+        exec(compile(plan["ops"][0]["content"], "generated_client.py", "exec"), namespace)
+        opened: list[bool] = []
+        maximum = namespace["MAX_REQUEST_BYTES"]
+
+        class OversizePath:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+            def stat(self):
+                return mock.Mock(st_size=maximum + 1)
+
+            def open(self, mode: str):
+                opened.append(True)
+                raise AssertionError("oversize body file must not be opened")
+
+        namespace["Path"] = OversizePath
+        args = mock.Mock(data=None, data_file="oversize.bin")
+        with self.assertRaisesRegex(ValueError, "request body exceeds"):
+            namespace["read_body"](args)  # type: ignore[operator]
+        self.assertEqual(opened, [])
+
     def test_generated_http_client_sends_attributed_traffic(self) -> None:
         seen: dict[str, object] = {}
 

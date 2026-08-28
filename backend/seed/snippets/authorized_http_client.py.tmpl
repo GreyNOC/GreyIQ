@@ -76,7 +76,13 @@ def read_body(args: argparse.Namespace) -> bytes | None:
     if args.data is not None:
         body = args.data.encode("utf-8")
     elif args.data_file is not None:
-        body = Path(args.data_file).read_bytes()
+        path = Path(args.data_file)
+        if path.stat().st_size > MAX_REQUEST_BYTES:
+            raise ValueError(f"request body exceeds {MAX_REQUEST_BYTES} bytes")
+        # Keep the read bounded too: the file could grow after stat() or report an
+        # unreliable size on a virtual filesystem.
+        with path.open("rb") as stream:
+            body = stream.read(MAX_REQUEST_BYTES + 1)
     else:
         return None
     if len(body) > MAX_REQUEST_BYTES:
