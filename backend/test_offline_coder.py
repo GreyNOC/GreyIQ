@@ -1,9 +1,14 @@
 """Tests for the deterministic offline code provider (offline-coder strategy, moves 1-2)."""
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -46,6 +51,125 @@ class PlanEditsTests(unittest.TestCase):
         self.assertEqual(plan["ops"], [])
         self.assertIn("configured brain", plan["summary"])
 
+    def test_c2_traffic_request_maps_to_bounded_http_client(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            plan = offline_coder.plan_edits(
+                "build a C2 traffic simulator script with a user agent and CA cert",
+                td,
+            )
+        self.assertFalse(plan["needs_brain"])
+        op = plan["ops"][0]
+        self.assertEqual(op["path"], "authorized_http_client.py")
+        compile(op["content"], op["path"], "exec")
+        self.assertIn("--user-agent", op["content"])
+        self.assertIn("--ca-cert", op["content"])
+        self.assertIn("--client-cert", op["content"])
+        self.assertIn("--count", op["content"])
+        self.assertNotIn("CERT_NONE", op["content"])
+        self.assertNotIn("subprocess", op["content"])
+        self.assertIn("never executes remote commands", plan["summary"])
+
+    def test_http_client_honors_safe_requested_filename(self) -> None:
+        plan = offline_coder.plan_edits(
+            "create an HTTP traffic sender named tools/lab_sender.py",
+            ".",
+        )
+        self.assertFalse(plan["needs_brain"])
+        self.assertEqual(plan["ops"][0]["path"], "tools/lab_sender.py")
+
+    def test_generated_http_client_dry_run_is_reproducible(self) -> None:
+        plan = offline_coder.plan_edits("write an HTTP client script to send traffic", ".")
+        namespace: dict[str, object] = {"__name__": "generated_client"}
+        exec(compile(plan["ops"][0]["content"], "generated_client.py", "exec"), namespace)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            exit_code = namespace["main"](  # type: ignore[operator]
+                [
+                    "--url", "https://lab.example.test/checkin",
+                    "--method", "POST",
+                    "--data", '{"status":"ok"}',
+                    "--user-agent", "Authorized-Test/7",
+                    "--count", "2",
+                    "--dry-run",
+                ]
+            )
+        rendered = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(rendered["headers"]["User-Agent"], "Authorized-Test/7")
+        self.assertEqual(rendered["count"], 2)
+        self.assertEqual(rendered["method"], "POST")
+        self.assertEqual(rendered["body_bytes"], len('{"status":"ok"}'))
+
+    def test_generated_http_client_rejects_oversize_file_before_opening_it(self) -> None:
+        plan = offline_coder.plan_edits("write an HTTP client script to send traffic", ".")
+        namespace: dict[str, object] = {"__name__": "generated_client"}
+        exec(compile(plan["ops"][0]["content"], "generated_client.py", "exec"), namespace)
+        opened: list[bool] = []
+        maximum = namespace["MAX_REQUEST_BYTES"]
+
+        class OversizePath:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+            def stat(self):
+                return mock.Mock(st_size=maximum + 1)
+
+            def open(self, mode: str):
+                opened.append(True)
+                raise AssertionError("oversize body file must not be opened")
+
+        namespace["Path"] = OversizePath
+        args = mock.Mock(data=None, data_file="oversize.bin")
+        with self.assertRaisesRegex(ValueError, "request body exceeds"):
+            namespace["read_body"](args)  # type: ignore[operator]
+        self.assertEqual(opened, [])
+
+    def test_generated_http_client_sends_attributed_traffic(self) -> None:
+        seen: dict[str, object] = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+                length = int(self.headers.get("Content-Length", "0"))
+                seen["user_agent"] = self.headers.get("User-Agent")
+                seen["body"] = self.rfile.read(length)
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"accepted":true}')
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                return
+
+        plan = offline_coder.plan_edits("create a network traffic client script", ".")
+        namespace: dict[str, object] = {"__name__": "generated_client"}
+        exec(compile(plan["ops"][0]["content"], "generated_client.py", "exec"), namespace)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output):
+                exit_code = namespace["main"](  # type: ignore[operator]
+                    [
+                        "--url", f"http://127.0.0.1:{server.server_port}/checkin",
+                        "--method", "POST",
+                        "--data", "hello lab",
+                        "--user-agent", "Authorized-Lab/1",
+                        "--expect-status", "201",
+                    ]
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2)
+
+        rendered = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(rendered["ok"])
+        self.assertEqual(rendered["status"], 201)
+        self.assertEqual(seen["user_agent"], "Authorized-Lab/1")
+        self.assertEqual(seen["body"], b"hello lab")
+
 
 class RunOfflineIntegrationTests(unittest.TestCase):
     """The no-brain agent path now runs the deterministic offline coder instead of dead-ending."""
@@ -67,6 +191,22 @@ class RunOfflineIntegrationTests(unittest.TestCase):
             self.assertEqual((Path(ws) / "test_foo.py").read_text(encoding="utf-8"), "PRECIOUS = 1\n",
                              "the offline coder must NOT clobber an existing file")
             self.assertEqual(result["provider"], "offline")
+
+    def test_no_brain_run_scaffolds_and_verifies_http_client(self) -> None:
+        with tempfile.TemporaryDirectory() as ws:
+            with mock.patch.object(agent, "plan_task", return_value=[]):
+                result = agent.run_agent(
+                    "build a C2 traffic simulator script with custom useragent and CA certs",
+                    [],
+                    ws,
+                    {},
+                )
+            written = Path(ws) / "authorized_http_client.py"
+            self.assertTrue(written.is_file())
+            self.assertIn("--ca-cert", written.read_text(encoding="utf-8"))
+            self.assertEqual(result["provider"], "offline")
+            self.assertTrue(result["verified"])
+            self.assertTrue(result["completed"])
 
     def test_unmappable_task_returns_honest_message(self) -> None:
         with tempfile.TemporaryDirectory() as ws:

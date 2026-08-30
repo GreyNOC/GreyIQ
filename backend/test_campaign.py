@@ -52,6 +52,31 @@ class CampaignTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("authorized", result["error"].lower())
 
+    def test_osint_opt_in_settings_reach_recon(self) -> None:
+        target = "https://app.example.com/"
+        captured: dict = {}
+
+        def fake_discover(value, **kwargs):
+            captured.update(kwargs)
+            return {"urls": [value], "notes": [], "sources": {}, "js_secrets": [],
+                    "tech": [], "params": [], "forms": []}
+
+        orig = (campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves)
+        campaign.recon.discover = fake_discover
+        campaign.run_bounty_hunt = lambda *a, **k: {"ok": True, "json_path": "", "report_path": ""}
+        campaign.cve_service.scan_known_cves = lambda *a, **k: {"ok": True, "findings": []}
+        try:
+            result = campaign.run_campaign(
+                target, scope="app.example.com", authorized=True, coder_cfg={},
+                default_reports_dir=self.reports, runtime_dir=self.runtime,
+                version="9.9.9", program="demo", osint=True,
+            )
+        finally:
+            campaign.recon.discover, campaign.run_bounty_hunt, campaign.cve_service.scan_known_cves = orig
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertTrue(captured["settings"].recon_osint_enabled)
+
     def test_local_source_campaign(self) -> None:
         result = self._run()
         self.assertTrue(result["ok"], result.get("error"))

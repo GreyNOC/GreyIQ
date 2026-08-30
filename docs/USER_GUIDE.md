@@ -163,6 +163,37 @@ on benign, in-scope-only active probes that can mark a finding **Confirmed** ins
 flagged; it (and every other active/opt-in mode — deep SQLi, live browser pass, deep
 auto-work) still only ever fires against a host actually named in Scope.
 
+### Passive OSINT campaigns (local CLI)
+
+The shipped `gn` command can build a domain evidence ledger before you spend any request
+budget on the target:
+
+```text
+gn osint example.com
+gn osint example.com --json
+gn osint example.com --hunt --scope "*.example.com" --active -y
+gn campaign https://example.com --scope "*.example.com" --osint -y
+```
+
+`gn osint` queries public indexes, not the investigated website: crt.sh + Cert Spotter for
+certificate history, then Google + Cloudflare DNS-over-HTTPS for current resolution. Every
+claim carries its provider IDs and retrieval time. Exact agreement from two independent
+providers is **verified**; one-source DNS facts stay **observed**; CT-only hostnames stay
+**historical**. The report and complete JSON ledger land under `runtime/osint/` by default.
+
+`--hunt` is a deliberate handoff, not automatic authorization. It requires explicit Scope and
+`-y`, includes only hosts independently present in current public DNS, withholds private or
+reserved answers, and then routes the targets through the same bounded campaign and per-request
+scope checks described above. Use `--max-hosts` to control the DNS-validation budget (25 by
+default, hard-capped at 100). `gn campaign --osint` is the lighter alternative: it opts the
+existing recon crawl into crt.sh seeding while retaining the normal page and request caps.
+
+The OSINT input checks are format and boundary checks, not organization filtering: commercial,
+nonprofit, and non-U.S. domains are accepted. Entity-specific policy restrictions are limited to
+explicitly selected U.S. federal VDP profiles (currently NASA); a `.gov` domain or organization name
+does not silently activate a profile. Authorization, scope, private-address, rate, and evidence gates
+remain universal because they prevent false attribution and out-of-scope traffic.
+
 ## 4. Reading results
 
 The **Findings** board shows every finding with a proof-status pill:
@@ -207,7 +238,9 @@ Confirmed (and reportable candidate) findings appear in the **Submissions** tab:
   HackerOne scope import described above (`api.hackerone.com`, read-only, manual), optional
   repo-draft enrichment (`api.github.com` or `gitlab.com`, unauthenticated read-only, one GET
   per repository, explicit click only), an
-  optional certificate-transparency lookup for subdomain seeding (`crt.sh`, read-only), and
+  optional certificate-transparency lookup for subdomain seeding (`crt.sh`, read-only), the
+  explicit local OSINT command (`crt.sh`, Cert Spotter, Google DNS, and Cloudflare DNS;
+  read-only public-index queries), and
   polling your own OOB collaborator server (a host you configured). Nothing else leaves the
   machine.
 - **Nothing auto-submits without you arming it.** The Operator's auto-submit is

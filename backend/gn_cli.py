@@ -5,6 +5,8 @@ Short, scriptable commands over the same engine the desktop app uses:
     gn hunt https://example.com -s "acme — *.example.com" --active -y
     gn hunt ./path/to/repo -p source-code -y
     gn scan https://example.com
+    gn osint example.com
+    gn osint example.com --hunt -s "*.example.com" -y
     gn profiles | gn classes | gn tools xss ssrf
 
 Torch-free and frozen-safe: it imports only the bughunter engine (the scanners,
@@ -21,6 +23,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 # --- Resolve seed/runtime dirs exactly like greyiq_api (frozen vs dev). ---
 if getattr(sys, "frozen", False):
@@ -45,7 +48,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 # These are the CLI verbs run_frozen.py recognizes to dispatch here.
-CLI_COMMANDS = ("hunt", "campaign", "scan", "learn", "stats", "traces", "operator", "profiles", "classes", "tools", "version", "gn")
+CLI_COMMANDS = ("hunt", "campaign", "osint", "scan", "learn", "stats", "traces", "operator", "profiles", "classes", "tools", "version", "gn")
 
 _SEV_COLOR = {"critical": "1;31", "high": "31", "medium": "33", "low": "36", "info": "2"}
 
@@ -167,6 +170,7 @@ def _cmd_campaign(args: argparse.Namespace) -> int:
         live=args.live,
         program=args.program,
         max_pages=args.max_pages,
+        osint=getattr(args, "osint", False),
         platform=getattr(args, "platform", "hackerone") or "hackerone",
         deep=getattr(args, "deep", False),
         on_progress=(lambda m: print(_c(f"  - {m}", "2"))) if not args.json else None,
@@ -185,6 +189,92 @@ def _cmd_campaign(args: argparse.Namespace) -> int:
     if result.get("confirmed_count"):
         print(_c("Confirmed findings are submission-ready under submissions/. Record outcomes with `gn learn`.", "32"))
     return 0
+
+
+def _cmd_osint(args: argparse.Namespace) -> int:
+    """Run passive evidence collection; optionally hand DNS-verified hosts to BugHunter."""
+    from bughunter import osint as osint_engine
+
+    if args.hunt and not args.authorize:
+        return _err("--hunt opens live targets — pass -y/--authorize to confirm you are authorized and in scope.")
+    if args.hunt and not str(args.scope or "").strip():
+        return _err("--hunt requires explicit --scope; OSINT discovery never grants authorization.")
+    if args.active and not args.hunt:
+        return _err("--active is valid only with --hunt.")
+
+    result = osint_engine.run_campaign(
+        args.target,
+        output_dir=args.out or (RUNTIME_DIR / "osint"),
+        max_hosts=args.max_hosts,
+        timeout=args.timeout,
+    )
+    hunt_result: dict | None = None
+    if args.hunt:
+        targets = list(result.get("hunt_targets") or [])
+        if not targets:
+            return _err(
+                "no hosts met the two-resolver DNS verification gate; review the OSINT report "
+                f"at {result.get('report_path', '')}"
+            )
+        from bughunter.active_verify_service import host_in_active_scope
+        from bughunter.settings import get_settings
+
+        scope_settings = get_settings()
+        targets = [
+            target for target in targets
+            if host_in_active_scope(urlparse(str(target)).hostname or "", args.scope, scope_settings)
+        ]
+        if not targets:
+            return _err(
+                "no DNS-verified OSINT hosts are within the explicit --scope; "
+                "OSINT discovery never expands authorization."
+            )
+        from bughunter.campaign import run_campaign_over_targets
+
+        hunt_result = run_campaign_over_targets(
+            targets,
+            scope=args.scope,
+            authorized=True,
+            coder_cfg=_load_coder_config(args.brain),
+            default_reports_dir=RUNTIME_DIR / "reports",
+            seed_dir=SEED_DIR,
+            runtime_dir=RUNTIME_DIR,
+            version=VERSION,
+            active=args.active,
+            live=args.live,
+            program=args.program or result.get("apex"),
+            max_pages=args.max_pages,
+            platform=args.platform,
+            on_progress=(lambda m: print(_c(f"  - {m}", "2"))) if not args.json else None,
+        )
+        if not hunt_result.get("ok"):
+            return _err(hunt_result.get("error", "the verified-host hunt could not run."))
+
+    if args.json:
+        payload = dict(result)
+        if hunt_result is not None:
+            payload["hunt"] = hunt_result
+        print(json.dumps(payload, indent=2, default=str))
+        return 1 if result.get("status") == "failed" else 0
+
+    summary = result.get("summary") or {}
+    state = str(result.get("status") or "unknown").upper()
+    print(f"\n{_c('GreyIQ OSINT', '1')} — {result.get('domain', '')}  [{state}]")
+    print(
+        f"Assets: {summary.get('assets_total', 0)} observed   "
+        f"{_c(str(summary.get('hunt_eligible', 0)) + ' DNS-verified', '32')}   "
+        f"Claims: {summary.get('claims_verified', 0)} verified / {summary.get('claims_observed', 0)} observed"
+    )
+    print(f"Evidence report: {result.get('report_path', '')}  (+ JSON sidecar)")
+    if hunt_result is not None:
+        print(
+            f"Bug Hunt: {hunt_result.get('targets_hunted', 0)} target(s), "
+            f"{hunt_result.get('finding_count', 0)} finding(s), "
+            f"{hunt_result.get('confirmed_count', 0)} confirmed — {hunt_result.get('campaign_path', '')}"
+        )
+    elif summary.get("hunt_eligible"):
+        print("Next: add `--hunt --scope <program-scope> -y` to campaign against verified hosts only.")
+    return 1 if result.get("status") == "failed" else 0
 
 
 def _cmd_learn(args: argparse.Namespace) -> int:
@@ -692,6 +782,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="extra auth header (repeatable), e.g. --header 'Authorization: Bearer ...'; sent same-site only")
     camp.add_argument("--live", action="store_true", help="dynamic Playwright pass per URL")
     camp.add_argument("--brain", action="store_true", help="use the configured LLM brain to enrich")
+    camp.add_argument("--osint", action="store_true",
+                      help="opt in to passive certificate-transparency seeding before recon (third-party lookup)")
     camp.add_argument("--max-pages", type=int, default=12, help="recon discovery cap (default 12)")
     camp.add_argument("--platform", default="hackerone",
                       help="report format for the submission packages: hackerone | yeswehack | bugcrowd | intigriti (see `gn platforms`)")
@@ -700,6 +792,28 @@ def build_parser() -> argparse.ArgumentParser:
     camp.add_argument("-y", "--authorize", action="store_true", help="confirm you are AUTHORIZED + in scope (required)")
     camp.add_argument("--json", action="store_true")
     camp.set_defaults(func=_cmd_campaign)
+
+    osint = sub.add_parser("osint", help="passive multi-source domain research with evidence provenance")
+    osint.add_argument("target", help="public domain or absolute URL")
+    osint.add_argument("--max-hosts", type=int, default=25,
+                       help="maximum CT candidates to validate through both DNS providers (1-100; default 25)")
+    osint.add_argument("--timeout", type=float, default=10.0, help="per-provider timeout in seconds (default 10)")
+    osint.add_argument("-o", "--out", default=None, help="evidence output root (default: runtime/osint)")
+    osint.add_argument("--hunt", action="store_true",
+                       help="hand only two-resolver DNS-verified hosts to a BugHunter campaign")
+    osint.add_argument("-s", "--scope", default="",
+                       help="explicit program scope required with --hunt; OSINT never grants scope")
+    osint.add_argument("--program", default=None, help="program handle for the optional BugHunter campaign")
+    osint.add_argument("--active", action="store_true", help="capture proof of impact during --hunt")
+    osint.add_argument("--live", action="store_true", help="dynamic Playwright pass during --hunt")
+    osint.add_argument("--brain", action="store_true", help="use the configured brain during --hunt only")
+    osint.add_argument("--max-pages", type=int, default=12, help="per-host recon cap during --hunt")
+    osint.add_argument("--platform", default="hackerone",
+                       help="submission export format for --hunt (default: hackerone)")
+    osint.add_argument("-y", "--authorize", action="store_true",
+                       help="confirm authorization for --hunt (not required for passive OSINT)")
+    osint.add_argument("--json", action="store_true", help="print the machine-readable campaign result")
+    osint.set_defaults(func=_cmd_osint)
 
     learn = sub.add_parser("learn", help="record a finding's bounty outcome (teaches the engine)")
     learn.add_argument("-c", "--class", dest="vuln_class", required=True, help="vuln class id (see `gn classes`)")

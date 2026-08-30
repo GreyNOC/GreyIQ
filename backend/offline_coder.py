@@ -4,7 +4,8 @@ The coding analog of ``bughunter/offline_hunt.py``: a substring-rule planner ove
 only a small CLOSED SET of edit operations (never free-form text a tiny model would botch). The agent
 applies each op through its existing ``ToolBox`` (so every write is snapshotted + undoable) and gates
 the result with ``verify``. Honest ceiling: **scaffolds and mechanical edits** — a framework-aware
-test stub, a route/Dockerfile/CI file from a template. Anything it can't confidently map returns
+test stub, a route/Dockerfile/CI file, or a bounded authorized HTTP traffic client from a template.
+Anything it can't confidently map returns
 ``needs_brain=True``: the offline coder never guesses business logic.
 
 Retrieval (strategy move 3): the plan is made **repo-specific** by reading the repo surface — the
@@ -62,13 +63,21 @@ def _fill(template: str, slots: dict[str, str]) -> str:
 
 
 def _load_snippet(seed_dir: str | Path | None, name: str) -> str | None:
-    if not seed_dir:
-        return None
-    try:
-        p = Path(seed_dir) / "snippets" / name
-        return p.read_text(encoding="utf-8") if p.is_file() else None
-    except OSError:
-        return None
+    # Production passes the extracted seed directory explicitly. Falling back to the source-tree
+    # seed keeps deterministic scaffolds available to direct/offline callers without copying large
+    # templates into this module. Frozen/stripped builds simply return None as before.
+    candidates = [Path(seed_dir)] if seed_dir else []
+    bundled = Path(__file__).resolve().parent / "seed"
+    if bundled not in candidates:
+        candidates.append(bundled)
+    for base in candidates:
+        try:
+            p = base / "snippets" / name
+            if p.is_file():
+                return p.read_text(encoding="utf-8")
+        except OSError:
+            continue
+    return None
 
 
 # --- Retrieval over the repo surface (what makes an edit repo-specific) ---
@@ -136,7 +145,8 @@ def _skill_hint(message: str, seed_dir: str | Path | None, runtime_dir: str | Pa
 def _needs_brain(summary: str = "", skill: str = "") -> dict[str, Any]:
     base = summary or (
         "The offline coder handles scaffolds and mechanical edits (e.g. \"add a test for <function>\", "
-        "\"add a flask route <path>\", \"add a dockerfile\", \"create a file <path>\"). This task needs "
+        "\"add a flask route <path>\", \"add a dockerfile\", \"build an HTTP traffic client\", "
+        "\"create a file <path>\"). This task needs "
         "a configured brain — set up a Local model (Ollama) or Claude in Settings, then re-run."
     )
     if skill:
@@ -214,6 +224,43 @@ def plan_edits(message: str, root: str | Path, *, seed_dir: str | Path | None = 
                              "content": _fill(tmpl, {"test_command": test_cmd})}],
                     "needs_brain": False,
                     "summary": "Scaffolded a GitHub Actions CI workflow at .github/workflows/ci.yml."}
+
+    # Intent: an HTTP/C2 *traffic simulator* -> a bounded, non-tasking client. This deliberately
+    # stops at curl-equivalent transport: it can send finite HTTP requests with an attributable
+    # User-Agent, a private CA bundle, and an optional mTLS identity, but it never polls for or
+    # executes commands, persists, evades, or disables certificate verification.
+    traffic_client = bool(
+        re.search(
+            r"\b(?:create|add|write|generate|scaffold|make|build)\b[^.?!]{0,100}"
+            r"\b(?:c2|command(?:\s+and|\s*&\s*)\s+control|https?|network|traffic)\b"
+            r"[^.?!]{0,100}\b(?:client|script|sender|request|traffic|simulat\w*)\b",
+            low,
+        )
+        or re.search(
+            r"\b(?:create|add|write|generate|scaffold|make|build)\b[^.?!]{0,100}"
+            r"\b(?:client|script|sender|simulat\w*)\b[^.?!]{0,100}"
+            r"\b(?:send|generate)\s+(?:https?\s+|network\s+)?traffic\b",
+            low,
+        )
+    )
+    if traffic_client:
+        named = re.search(
+            r"\b(?:as|called|named)\s+[`'\"]?([A-Za-z0-9_.\-/]+\.py)\b",
+            text,
+            re.IGNORECASE,
+        )
+        rel = _safe_rel(named.group(1)) if named else "authorized_http_client.py"
+        tmpl = _load_snippet(seed_dir, "authorized_http_client.py.tmpl")
+        if rel and tmpl:
+            return {
+                "ops": [{"kind": "new_file", "path": rel, "content": tmpl}],
+                "needs_brain": False,
+                "summary": (
+                    f"Scaffolded `{rel}`, a bounded authorized HTTP traffic client with explicit "
+                    "User-Agent, CA-bundle, optional mTLS, timeout, and finite-count options. "
+                    "It treats responses as data and never executes remote commands."
+                ),
+            }
 
     # Intent: "create/add/make a [new] file <path> [with <text>]" -> a new file (won't overwrite).
     m = re.search(r"\b(?:create|add|make|new)\s+(?:a\s+|an\s+)?(?:new\s+)?file\s+(\S+)", text, re.IGNORECASE)
