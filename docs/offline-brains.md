@@ -15,10 +15,15 @@ This document is the map of what answers you in that state, and the rules every 
 | Coding | `offline_coder.py` + `edit_ops.py` + `offline_repair.py` | `agent._run_offline` |
 | RF / wardriving | `bughunter/wardrive/` | `gn wardrive`, `wardrive -y <path>` in chat |
 
-`GreyIQRuntime.chat()` is the router. In order: scan commands → wardrive command → a configured
+`GreyIQRuntime.chat()` is the router. In order: **wardrive command → scan commands** → a configured
 coding brain → the codegen honesty short-circuit → the domain brain → TinyGPT (dev only) → and, if
 the engine raised (which is *always* the case in a frozen install), one last domain-brain attempt
 before the canned fallback.
+
+The first two are ordered deliberately and must not be swapped: the wardrive trigger is the more
+specific one, and `scan wardrive -y ./capture` also satisfies `detect_scan_command` (unknown
+subtype, remainder looks like a path → a CODE scan). Putting scan first hands an RF survey to the
+source-code scanner. See the comment above `_maybe_wardrive_reply` in `greyiq_api.py`.
 
 ## The rules
 

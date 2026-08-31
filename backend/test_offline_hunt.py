@@ -261,9 +261,11 @@ class _StubRanker:
 
     def __init__(self, reply=None, boom: bool = False) -> None:
         self.reply, self.boom, self.calls = reply, boom, []
+        self.forms: list = []
 
-    def rank_endpoint_classes(self, url, names, recon, tech, candidates, priors):
+    def rank_endpoint_classes(self, url, names, recon, tech, candidates, priors, *, form=None):
         self.calls.append((url, list(names), list(recon), tech, list(candidates), priors))
+        self.forms.append(form)
         if self.boom:
             raise RuntimeError("corrupt weights")
         return self.reply if self.reply is not None else list(reversed(candidates))
@@ -314,6 +316,24 @@ class RankerSeamTests(unittest.TestCase):
         self.assertEqual(tech, "flask")
         self.assertEqual(priors, {"xss": 2.0})
         self.assertLessEqual(set(candidates), set(PROVER_CLASSES))
+        self.assertIsNone(model.forms[0])               # no form for this endpoint
+
+    def test_a_form_crosses_the_seam_value_free(self) -> None:
+        """The model needs form:* features (hunt_train fits on them) but must never be handed a
+        field VALUE -- only the method and the field names hunt_features actually reads."""
+        model = _StubRanker()
+        url = "https://t.example/api/search?q=x"
+        offline_hunt.offline_plan(
+            {"endpoints": [url], "params": [], "tech": [],
+             "forms": [{"action": url, "method": "POST",
+                        "params": ["email", "token"],
+                        "values": {"email": "victim@example.com"},
+                        "csrf": "s3cr3t"}]},
+            model=model)
+        self.assertEqual(model.forms[0], {"method": "POST", "params": ["email", "token"]})
+        blob = repr(model.forms[0])
+        self.assertNotIn("victim@example.com", blob)
+        self.assertNotIn("s3cr3t", blob)
 
     def test_a_model_cannot_reach_anything_but_the_class_ordering(self) -> None:
         # endpoint selection, param hypotheses, IDOR/privileged picks are all rule-owned.

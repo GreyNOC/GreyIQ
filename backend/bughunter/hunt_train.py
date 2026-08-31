@@ -203,6 +203,8 @@ def _collect(runtime_dir: str | Path) -> list[dict[str, Any]]:
                 "query_names": names,
                 "recon_params": recon,
                 "tech": tech,
+                # Carried so _evaluate can score the SAME vector production builds.
+                "form": forms.get(endpoint),
                 "rule_ids": rule_ids.get((endpoint, class_id), []),
                 "paid": bool(paid),
             })
@@ -396,7 +398,8 @@ def _evaluate(model: Any, rows: list[dict[str, Any]]) -> dict[str, Any]:
         # called explicitly so the baseline is literally the shipped rules function.
         rules = offline_hunt._reorder_by_priors(candidates, None)
         learned = model.rank_endpoint_classes(
-            ctx["endpoint"], ctx["query_names"], ctx["recon_params"], ctx["tech"], candidates, None)
+            ctx["endpoint"], ctx["query_names"], ctx["recon_params"], ctx["tech"], candidates, None,
+            form=ctx.get("form"))
         rules_scores.append(_recall_at_k(rules, relevant))
         model_scores.append(_recall_at_k(learned, relevant))
 
