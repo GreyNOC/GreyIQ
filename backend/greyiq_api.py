@@ -4259,7 +4259,11 @@ class GreyIQRuntime:
 
     def _coder_reply(self, request: ChatRequest) -> dict[str, Any] | None:
         raw = self._coder_config()
-        if not coder.coder_enabled(raw):
+        # Chat needs a free-form reasoning provider. The deterministic providers are valid
+        # Workbench engines, but ``generate`` intentionally rejects them; treating them as a
+        # chat brain would turn every ordinary message into an error instead of allowing the
+        # offline domain/TinyGPT fallbacks below to answer it.
+        if not coder.reasoning_brain_enabled(raw):
             return None
         cfg = coder.coder_config(raw)
         messages = self._build_coder_messages(request, int(cfg.get("history_turns") or 12))

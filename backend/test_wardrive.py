@@ -1502,6 +1502,22 @@ class CliTests(unittest.TestCase):
             self.assertEqual(sorted(payload["source_formats"]), ["airodump-csv", "kismet-netxml"])
             self.assertTrue(payload["survey"]["aps"])
 
+    def test_json_with_report_keeps_stdout_machine_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "walk.csv"
+            path.write_text(AIRODUMP_CSV, encoding="utf-8")
+            out = Path(tmp) / "rf.md"
+            args = self._parser().parse_args(
+                ["wardrive", str(path), "-y", "--json", "--out", str(out)])
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = args.func(args)
+            self.assertEqual(code, 0)
+            self.assertTrue(json.loads(stdout.getvalue())["ok"])
+            self.assertTrue(out.exists())
+            self.assertIn(f"report: {out}", stderr.getvalue())
+            self.assertNotIn("report:", stdout.getvalue())
+
     def test_report_and_min_severity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "walk.csv"
