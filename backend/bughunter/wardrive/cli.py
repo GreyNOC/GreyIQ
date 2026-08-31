@@ -108,7 +108,9 @@ def _cmd_wardrive(args: argparse.Namespace) -> int:
             written = report.write_rf_report(out, result, ctx=ctx)
         except OSError as exc:
             return err(f"could not write the report to {out}: {exc}")
-        print(f"report: {written}")
+        # Keep stdout as one valid JSON document for machine consumers. The report status is
+        # still useful to an operator, but it belongs on stderr when --json is active.
+        print(f"report: {written}", file=sys.stderr if getattr(args, "json", False) else sys.stdout)
     return 0
 
 
