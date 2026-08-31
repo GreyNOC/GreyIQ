@@ -2,7 +2,7 @@
 
 Notable changes to GreyIQ.
 
-## v3.0.0 - chain-engine QAQC, observation provenance, surface-drift engine
+## v3.0.1 - chain-engine QAQC, observation provenance, surface-drift engine
 
 A whole-subsystem audit of the attack-chain engine (71 adversarial agents; 49 defects confirmed
 after refutation, 10 claims refuted and dropped) plus a new engine that gives the hunt a memory.
@@ -157,6 +157,25 @@ each cycle starts blind. So GreyIQ could not notice the highest-signal event in 
   cross-site sending — as protection.
 - Test suite 2017 → 2100+, including contract tests for four documented invariants that were pinned
   so loosely that deleting the guard they describe left the suite green.
+
+### Merged from main — OSINT harness, and a dependency CVE cleared
+
+This release also carries the work that landed on `main` while the audit ran:
+
+- Added a local-first `gn osint` campaign engine. It queries two certificate-transparency
+  indexes and two independent DNS-over-HTTPS resolvers, retains timestamped source provenance
+  for every claim, labels single-source and historical observations honestly, and writes a
+  Markdown evidence brief plus a machine-readable JSON ledger.
+- `gn osint <domain> --hunt --scope <scope> -y` hands only two-resolver, public-DNS-verified
+  hosts to the existing bounded multi-target BugHunter campaign. OSINT never grants scope;
+  authorization and the normal per-request scope checks remain mandatory. `gn campaign
+  --osint` also exposes the existing opt-in CT recon expansion directly from the local CLI.
+- The offline Workbench coder can scaffold a local authorized HTTP/C2 traffic simulator. It is
+  deliberately transport-only: finite request count, bounded bodies/timeouts, attributable User-
+  Agent, strict TLS with private-CA/mTLS options, no redirects, and no command polling, response
+  execution, persistence, evasion, or TLS-disable switch.
+- `cryptography` moves to `>=50.0,<51.0`, clearing **CVE-2026-69247** — the previous
+  `<50.0` upper bound was itself what blocked the fix. Electron moves 43.2.0 -> 43.4.1.
 
 ## v2.9.0 - attack-chain engine, cookie findings demoted
 

@@ -19,6 +19,4 @@ playwright>=1.49,<2.0
 # RSA (RS256) signing to mint the short-lived JWT that proves a leaked GCP service-account key is
 # live — one benign token-exchange to Google's OWN issuer (credential_validation.validate_gcp_service_account).
 # AWS key liveness uses stdlib hmac (SigV4), no dep. The frozen build bundles it (see build spec collect_all).
-# 50.0.0 is the fix for CVE-2026-69247; the previous <50.0 ceiling pinned us to vulnerable
-# 49.0.0 and failed the CI pip-audit gate.
 cryptography>=50.0,<51.0

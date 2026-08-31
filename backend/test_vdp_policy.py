@@ -15,6 +15,9 @@ def test_get_profile_is_case_insensitive_and_none_for_unknown():
     assert vdp_policy.get_profile("") is None
     assert vdp_policy.get_profile(None) is None
     assert vdp_policy.get_profile("does-not-exist") is None
+    # Restrictions are explicit U.S.-federal profiles; a hostname never auto-selects one.
+    assert vdp_policy.get_profile("nasa.gov") is None
+    assert {p.get("entity_class") for p in vdp_policy.PROFILES.values()} == {"us-federal"}
 
 
 def test_nasa_program_preset_carries_scope_and_binding():

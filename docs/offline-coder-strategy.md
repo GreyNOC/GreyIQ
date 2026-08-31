@@ -54,6 +54,14 @@ while ops are pre-vetted templates that always pass verify; do it when `wrap_ast
 can produce invalid code), move 5's **mining/promotion** step (cluster `edit_traces.jsonl` shapes →
 auto-propose `seed/snippets/` + skills, behind a review gate), and move 6 (BPE glue).
 
+The closed template set also includes an authorized HTTP traffic client for requests such as
+"build a C2 traffic simulator script" or "create an HTTP traffic sender." It is deliberately a
+transport test harness, not an implant: finite `--count`, bounded bodies/timeouts, no redirect
+following, no task polling or response execution, no persistence/evasion, and no TLS-disable switch.
+It exposes explicit `--user-agent`, `--ca-cert`, `--client-cert`, and `--client-key` options so private
+PKI and mTLS tests remain reproducible. `--dry-run` prints a stable JSON request plan without sending
+traffic.
+
 ### 1 — Stop the char model from pretending (do first)
 Add a coding-intent guard in `greyiq_api.chat()` before `engine.generate_reply`: when no
 brain is configured and the message is coding intent, return immediately —

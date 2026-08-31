@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -68,8 +69,50 @@ class GnCliTests(unittest.TestCase):
 
     def test_cli_commands_match_dispatch_list(self) -> None:
         # run_frozen dispatches on these verbs; keep them aligned with the parser.
-        for verb in ("hunt", "campaign", "scan", "learn", "stats", "traces", "profiles", "classes", "tools", "version"):
+        for verb in ("hunt", "campaign", "osint", "scan", "learn", "stats", "traces", "profiles", "classes", "tools", "version"):
             self.assertIn(verb, gn_cli.CLI_COMMANDS)
+
+    def test_osint_hunt_requires_authorization_and_scope_before_lookup(self) -> None:
+        with mock.patch("bughunter.osint.run_campaign") as run:
+            code, _, err = _run(["osint", "example.com", "--hunt"])
+            self.assertEqual(code, 2)
+            self.assertIn("authorize", err.lower())
+            run.assert_not_called()
+
+            code, _, err = _run(["osint", "example.com", "--hunt", "-y"])
+            self.assertEqual(code, 2)
+            self.assertIn("scope", err.lower())
+            run.assert_not_called()
+
+    def test_osint_cli_prints_passive_campaign_summary(self) -> None:
+        payload = {
+            "status": "complete", "domain": "example.com", "report_path": "OSINT.md",
+            "summary": {"assets_total": 2, "hunt_eligible": 1, "claims_verified": 3, "claims_observed": 2},
+        }
+        with mock.patch("bughunter.osint.run_campaign", return_value=payload) as run:
+            code, out, err = _run(["osint", "example.com"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("gn:", err)
+        self.assertIn("GreyIQ OSINT", out)
+        self.assertIn("DNS-verified", out)
+        run.assert_called_once()
+
+    def test_osint_hunt_filters_verified_hosts_through_explicit_scope(self) -> None:
+        payload = {
+            "status": "complete", "domain": "example.com", "apex": "example.com",
+            "report_path": "OSINT.md", "summary": {},
+            "hunt_targets": ["https://api.example.com/", "https://admin.example.com/"],
+        }
+        hunt_payload = {"ok": True}
+        with mock.patch("bughunter.osint.run_campaign", return_value=payload), \
+             mock.patch("bughunter.campaign.run_campaign_over_targets", return_value=hunt_payload) as hunt:
+            code, _, err = _run([
+                "osint", "example.com", "--hunt", "--scope", "api.example.com", "-y", "--json",
+            ])
+
+        self.assertEqual(code, 0)
+        self.assertNotIn("gn:", err)
+        self.assertEqual(hunt.call_args.args[0], ["https://api.example.com/"])
 
     def test_traces_command_reports_corpus(self) -> None:
         import json
@@ -126,6 +169,19 @@ class GnCliTests(unittest.TestCase):
         code, _, err = _run(["campaign", str(BACKEND_DIR / "bughunter")])
         self.assertEqual(code, 2)
         self.assertIn("authorize", err.lower())
+
+    def test_campaign_osint_flag_reaches_engine(self) -> None:
+        payload = {
+            "ok": True, "program": "demo", "urls_scanned": 0, "urls_discovered": 0,
+            "finding_count": 0, "confirmed_count": 0, "submission_paths": [],
+        }
+        with mock.patch("bughunter.campaign.run_campaign", return_value=payload) as run:
+            code, _, err = _run(["campaign", "https://example.com", "--osint", "-y", "--json"])
+        # Other browser tests can finalize an un-awaited Playwright future while stderr is redirected
+        # here on Windows; the CLI contract is its exit code + engine call, not ambient GC warnings.
+        self.assertEqual(code, 0)
+        self.assertNotIn("gn:", err)
+        self.assertTrue(run.call_args.kwargs["osint"])
 
     def test_operator_cli_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
