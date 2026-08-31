@@ -5,7 +5,13 @@ emit the structured guidance the hunt needs, so the OFFLINE path (no Claude/Olla
 get an EMPTY plan — it hunted blind. ``offline_plan`` fills that: it produces the SAME plan shape
 ``hunt_brain.plan_hunt`` does (param_hypotheses / probe_priority / ssrf_params / xss_params /
 idor_candidates), derived from curated bug-bounty KNOWLEDGE RULES over the recon surface and SHARPENED
-by what the program has actually confirmed before (``learning.learned_priors``). No model, no network.
+by what the program has actually confirmed before (``learning.learned_priors``). No LLM, no network.
+
+An OPTIONAL learned ranker (``hunt_model``, loaded from a local weight file) may be passed in to
+reorder the rule-proposed classes on each endpoint. It is a strict permutation seam — see ``_rank``
+— so an absent, stale, or corrupt model degrades to exactly the hand-tuned rule ordering, and the
+class VOCABULARY itself is pinned to ``prover_classes.PROVER_CLASSES``: the offline brain can never
+propose a class the deterministic prover has no check for.
 
 SAFETY: identical to the LLM brain's contract — it only ever emits parameter NAMES, verbatim in-scope
 endpoint selections, and class orderings. Every one is re-validated by hunt_brain._validate_plan and
@@ -18,6 +24,8 @@ from __future__ import annotations
 import re
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
+
+from bughunter.prover_classes import PROVER_CLASSES
 
 # param-name substring -> the vuln class it most likely feeds. Ordered by specificity in _classify.
 _SSRF_HINTS = ("url", "uri", "dest", "target", "callback", "webhook", "image", "avatar", "photo", "feed",
@@ -49,8 +57,38 @@ _UUID_SEG_RE = re.compile(r"/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-
 _PRIV_PATH_HINTS = ("/admin", "/internal", "/manage", "/moderat", "/staff", "/superuser", "/root/",
                     "/console", "/dashboard/admin", "/settings", "/config", "/audit", "/approve",
                     "/promote", "/grant", "/role", "/permission", "/impersonat", "/billing", "/payout")
-_ACTIVE_CLASSES = ("xss", "sqli", "redirect", "ssti", "rce", "crlf", "path-traversal", "cors", "nosqli", "host-header")
+# Membership gate for ``add()`` below — a rule may only propose a class the deterministic prover can
+# actually CONFIRM. This used to be a hand-maintained 10-tuple that drifted behind the prover's real
+# 18 tags, which silently made jwt/graphql/debug/websocket/sensitive/cloud-exposure/csrf/clickjacking
+# unreachable from the offline path. Deriving it mechanically closes that hole and keeps it closed.
+# Membership only: this set has NO bearing on ordering (the cue order in _classes_for_endpoint does).
+_ACTIVE_CLASSES = PROVER_CLASSES
+# param-name substrings that mark a bearer/session token worth a JWT signature-bypass probe.
+_JWT_HINTS = ("token", "jwt", "bearer", "id_token", "access_token", "refresh", "assertion", "session")
 _CAP = 24
+# probe_priority is HARD-CAPPED (the prover spends its request budget walking this list in order), so
+# the cap is a zero-sum contest between endpoints — a fact the widened class vocabulary made load-
+# bearing. Endpoints that previously produced ZERO classes were skipped entirely and consumed no
+# slot; now they qualify, and in raw discovery order a run of low-signal endpoints (ten /ws/* rooms
+# scoring only ``websocket``) could occupy the whole cap and evict already-planned high-signal ones
+# (fifteen /download?file= path-traversal candidates). Added recall must never cost existing recall,
+# so the cap now keeps the HIGHEST-SIGNAL endpoints instead of the first ones encountered.
+_MAX_PRIORITY = 20
+# Per-class signal weight: what a probe-budget slot spent on this class is worth, as severity x how
+# directly a recon cue evidences it. Injection classes with a concrete injectable parameter rank
+# above path-shape "this looks like an X surface" cues, which rank above header/config observations.
+# Values are ordinal only — nothing reads them as a probability, and no output claims a likelihood.
+# Completeness against PROVER_CLASSES is asserted by test_offline_hunt so a newly provable class
+# cannot silently inherit the neutral default.
+_CLASS_SIGNAL: dict[str, int] = {
+    "rce": 100, "sqli": 92, "ssti": 90, "path-traversal": 88, "nosqli": 84,
+    "sensitive": 80, "debug": 78, "xss": 70, "redirect": 66, "jwt": 64,
+    "graphql": 60, "cloud-exposure": 56, "crlf": 50, "host-header": 48,
+    "csrf": 44, "cors": 40, "websocket": 34, "clickjacking": 20,
+}
+# An unweighted class is treated as MID signal — never silently buried, never silently promoted.
+# Guessing high or low here would be asserting a ranking we cannot observe.
+_DEFAULT_CLASS_SIGNAL = 50
 # Ordered deliberately: plans are persisted as training traces, so the cold-start
 # corpus must not change merely because Python chose a different set hash order.
 _SUGGEST = (
@@ -126,6 +164,31 @@ def _classes_for_endpoint(url: str, names: list[str], tech_boost: tuple[str, ...
         if _hit(n, _SSRF_HINTS): add("redirect")  # ssrf isn't a verify_active class; its url-params also feed redirect
     for c in tech_boost:
         add(c)
+    # Prover classes the rules could not reach before (the vocabulary was capped at 10 while the
+    # prover grew to 18). Appended LAST, after every pre-existing cue, so the first six entries of any
+    # endpoint that already produced six are byte-identical to before this change — plans are
+    # persisted as training traces (see _SUGGEST's note), so a reordering here would silently
+    # invalidate the cold-start corpus. Only endpoints that previously produced FEWER than six
+    # classes gain anything.
+    #
+    # Per-endpoint that is pure gain; PLAN-wide it is not, because probe_priority is capped. An
+    # endpoint that used to produce ZERO classes was skipped and consumed no slot, and now competes
+    # for one. That is why the cap is applied to a SIGNAL-RANKED list (_priority_sort_key) rather
+    # than to discovery order — see _MAX_PRIORITY.
+    if "graphql" in path:
+        add("graphql")
+    if any(k in path for k in ("/actuator", "/jolokia", "heapdump", "/debug", "/trace", "/env", "/metrics")):
+        add("debug")
+    if any(k in path for k in ("/ws", "/socket.io", "/cable", "/websocket")):
+        add("websocket")
+    if any(k in path for k in ("/token", "/oauth", "/jwt", "/session", "/refresh", "/login")) or any(_hit(n, _JWT_HINTS) for n in names):
+        add("jwt")
+    if any(k in path for k in ("/.git", "/.env", "/backup", "/.svn", "/dump", "/.well-known")):
+        add("sensitive")
+    if any(k in path for k in ("/upload", "/s3", "/blob", "/bucket", "/storage", "/cdn", "/media")):
+        add("cloud-exposure")
+    if any(k in path for k in ("/account", "/profile", "/password", "/email", "/delete", "/transfer", "/invite")):
+        add("csrf")
     return classes[:6]
 
 
@@ -147,9 +210,62 @@ def _reorder_by_priors(classes: list[str], priors: dict[str, float] | None) -> l
     return sorted(classes, key=lambda c: -weight(c))
 
 
-def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None) -> dict[str, Any]:
+def _rank(candidates: list[str], priors: dict[str, float] | None, model: Any | None,
+          url: str, names: list[str], recon: list[str], tech: str) -> list[str]:
+    """Order the candidate classes for ONE endpoint — the single seam a learned ranker may occupy.
+
+    The model may only PERMUTE ``candidates``. A returned value that is not a permutation of exactly
+    what the rules proposed is DISCARDED and the deterministic prior ordering is used instead, so a
+    corrupt, stale, or hostile weight file can never add, drop, or invent a class — the worst it can
+    do is order the same allowlisted classes badly, which costs a little request budget and nothing
+    else (the prover still owns every confirmation). ``model=None`` is exactly today's behaviour.
+
+    The narrow ``rank_endpoint_classes`` call keeps ALL feature extraction inside the model module,
+    which is what lets this file stay on its ``re``/``typing``/``urllib.parse`` import set.
+    """
+    if model is None:
+        return _reorder_by_priors(candidates, priors)
+    try:
+        ranked = list(model.rank_endpoint_classes(url, names, recon, tech, list(candidates), priors))
+    except Exception:  # noqa: BLE001 - a corrupt model must never break the offline plan
+        return _reorder_by_priors(candidates, priors)
+    if sorted(ranked) != sorted(candidates):  # not a permutation -> the model invented/dropped a class
+        return _reorder_by_priors(candidates, priors)
+    return ranked
+
+
+def _priority_sort_key(row: dict[str, Any], index: int) -> tuple[int, int, int]:
+    """Rank ONE probe_priority row for the hard cap: strongest class, then breadth, then discovery.
+
+    The key is deliberately PERMUTATION-INVARIANT in the row's class list (``max`` and ``len`` both
+    are), so neither the learned ranker nor the learned priors — which may only reorder classes
+    WITHIN an endpoint (see ``_rank``) — can change WHICH endpoints survive the cap. Endpoint
+    selection stays rule-owned, exactly as the ranker seam's contract promises.
+
+    ``index`` (the endpoint's discovery position) is the final tie-break, which makes the ordering
+    TOTAL and STABLE: two runs over the same surface produce byte-identical plans. That matters
+    beyond aesthetics — plans are persisted verbatim as training traces, and a non-total order would
+    let a set/dict hash reshuffle the cold-start corpus between runs.
+    """
+    classes = row.get("classes") or []
+    strongest = max((_CLASS_SIGNAL.get(c, _DEFAULT_CLASS_SIGNAL) for c in classes), default=0)
+    return (-strongest, -len(classes), index)
+
+
+def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None, *,
+                 model: Any | None = None) -> dict[str, Any]:
     """Produce a hunt plan (same shape as hunt_brain.plan_hunt) from knowledge rules + learned priors.
-    ``surface`` = {endpoints, params, tech, forms}; ``priors`` = learning.learned_priors (class->weight)."""
+    ``surface`` = {endpoints, params, tech, forms}; ``priors`` = learning.learned_priors (class->weight).
+
+    ``probe_priority`` is returned STRONGEST-ENDPOINT-FIRST and capped at ``_MAX_PRIORITY``: the
+    prover walks it in order, so the cap must keep the highest-signal endpoints rather than the
+    first ones recon happened to discover.
+
+    ``model`` is an OPTIONAL learned ranker (hunt_model). It is keyword-only and defaults to None so
+    every existing caller keeps byte-identical behaviour; when supplied it may only permute the rule-
+    proposed class candidates per endpoint (see ``_rank``) — it cannot reach param_hypotheses,
+    idor_candidates, privileged_endpoints, or the endpoint selection itself (the cap's sort key is
+    permutation-invariant, so it cannot decide which endpoints survive either)."""
     endpoints = [str(u).strip() for u in (surface.get("endpoints") or []) if str(u or "").strip()]
     recon_params = {str(p).strip().lower() for p in (surface.get("params") or []) if str(p or "").strip()}
     tech = " ".join(str(t) for t in (surface.get("tech") or [])).lower()
@@ -168,7 +284,8 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
     for url in endpoints[:60]:
         names = _endpoint_params(url) or []
         alln = names + sorted(recon_params)
-        classes = _reorder_by_priors(_classes_for_endpoint(url, alln, tech_boost), priors)
+        candidates = _classes_for_endpoint(url, alln, tech_boost)
+        classes = _rank(candidates, priors, model, url, names, sorted(recon_params), tech)
         if classes and url not in seen_pri:
             seen_pri.add(url)
             priority.append({"endpoint": url, "classes": classes})
@@ -190,14 +307,25 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
         if n.lower() not in recon_params and n not in param_hypotheses:
             param_hypotheses.append(n)
 
+    # Rank BEFORE truncating so the cap keeps the highest-signal endpoints rather than the first
+    # ones discovered — see _MAX_PRIORITY. Ordering is total (discovery index breaks every tie), so
+    # the plan stays byte-reproducible for the persisted training corpus.
+    ranked_priority = [priority[i] for i in
+                       sorted(range(len(priority)), key=lambda i: _priority_sort_key(priority[i], i))]
+
     return {
         "used": bool(endpoints), "provider": "offline", "model": "greyiq-offline-hunt",
         "param_hypotheses": param_hypotheses[:_CAP],
-        "probe_priority": priority[:20],
+        "probe_priority": ranked_priority[:_MAX_PRIORITY],
         "ssrf_params": ssrf_params[:12],
         "xss_params": xss_params[:12],
         "idor_candidates": idor_candidates[:6],
         "privileged_endpoints": privileged_endpoints[:6],
+        # ``notes`` is persisted verbatim in the hunt trace, so the training corpus records WHICH
+        # brain produced each plan. A model with no readable version tag is reported as
+        # "undetermined" rather than guessed — an unlabelled corpus row is worse than an honest one.
         "notes": (f"offline knowledge-rule plan over {len(endpoints)} endpoint(s)"
-                  + (" (sharpened by learned priors)" if priors else "")),
+                  + (" (sharpened by learned priors)" if priors else "")
+                  + (f" +ranker {str(getattr(model, 'version_tag', '') or 'undetermined')[:40]}"
+                     if model is not None else "")),
     }

@@ -1,0 +1,34 @@
+# Auto-scaffolded Pester v5 test file for {{target}}.
+# Run it with: Invoke-Pester -Path ./{{name}}.Tests.ps1
+#
+# The first It is a real assertion, not a placeholder: it parses the script with PowerShell's
+# own parser, which catches the syntax errors that only surface at run time otherwise.
+
+#Requires -Modules Pester
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+BeforeAll {
+    $script:TargetPath = Join-Path $PSScriptRoot '{{target}}'
+}
+
+Describe '{{name}}' {
+
+    It 'the target script exists' {
+        Test-Path -LiteralPath $script:TargetPath | Should -BeTrue
+    }
+
+    It 'the target script parses without errors' {
+        $errors = $null
+        [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:TargetPath, [ref]$null, [ref]$errors) | Out-Null
+        $errors | Should -BeNullOrEmpty
+    }
+
+    It 'TODO: asserts the real behaviour' {
+        # TODO: dot-source or invoke the target and assert what it actually does.
+        # This placeholder passes on purpose so the file is runnable; it proves nothing.
+        Set-ItResult -Skipped -Because 'scaffold - fill in a real assertion'
+    }
+}

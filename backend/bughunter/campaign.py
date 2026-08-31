@@ -450,8 +450,13 @@ def _run_campaign_body(
         # precision unchanged). Best-effort + fail-closed: no brain / any error keeps current behaviour.
         try:
             surface_for_brain = hunt_surface
+            # seed_dir/runtime_dir locate the OPTIONAL learned offline ranker's weight file. With no
+            # file present the planner is byte-identical to the hand-tuned rules, so this is safe to
+            # pass unconditionally. technique_context feeds the operator technique playbooks to a
+            # REASONING brain; the two are independent (offline ranker vs LLM prompt) and compose.
             hb = hunt_brain.plan_hunt(
                 coder_cfg, clean_target, scope, surface_for_brain, priors=priors,
+                seed_dir=seed_dir, runtime_dir=rt,
                 technique_context=technique_context,
             )
             hb = brain_techniques.enrich_hunt_plan(hb, surface_for_brain, hunt_techniques, priors)

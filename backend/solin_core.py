@@ -52,6 +52,31 @@ GENERATED_KNOWLEDGE_FILES = {
     "greyiq_selected_sources.txt",
 }
 
+# Retrieval trust multiplier by SOURCE FILE NAME, applied to the search score before the
+# min_score cut. Rationale: greyiq_manual_pdfs.txt is ~6.27 MB of native-text PDF extract
+# (sensor fusion, category theory, English-language textbooks) sitting in the SAME lexical
+# index as 9.4 KB of actual bug-bounty knowledge — roughly 99.8% of the corpus by bytes and
+# overwhelmingly off-domain. The hardcoded "practice makes perfect" / "ch\d+.indd" junk
+# filters downstream in _compress_context are the smoking gun that it was already winning
+# retrievals it should not. Down-weighting it (and lifting the curated corpus) fixes the
+# RANKING without removing anything: every chunk is still indexed, still citable, and still
+# reachable through exactly the same source_ids filter as before — a deliberate choice over
+# re-keying its source id, which would have silently dropped it out of every existing core's
+# saved sourceIds with no UI to add it back.
+_SOURCE_TRUST_BY_FILE: dict[str, float] = {
+    "greyiq_bug_bounty_knowledge.txt": 1.25,
+    "greyiq_manual_pdfs.txt": 0.70,
+}
+
+
+def _source_trust(source_name: str) -> float:
+    """Trust multiplier for a chunk's source file (1.0 = unchanged, the default for
+    everything not explicitly listed)."""
+    try:
+        return _SOURCE_TRUST_BY_FILE.get(Path(str(source_name)).name, 1.0)
+    except Exception:  # noqa: BLE001 - a weird source name must never break retrieval
+        return 1.0
+
 
 class _OpenPolicyResult:
     allowed = True
@@ -2007,6 +2032,11 @@ class KnowledgeBase:
                 semantic_similarity=semantic_similarity,
                 single_term_penalty=single_term_penalty,
             )
+            # De-poison the ranking BEFORE the min_score cut: a lexical hit inside the 6 MB
+            # off-domain PDF blob must not outrank the curated bug-bounty corpus (see
+            # _SOURCE_TRUST_BY_FILE). Clamped back into 0..1 so downstream confidence math,
+            # which assumes a normalized score, is unaffected.
+            score = max(0.0, min(1.0, score * _source_trust(str(chunk.get("source", "")))))
 
             if score >= min_score:
                 excerpt = _best_excerpt_window(

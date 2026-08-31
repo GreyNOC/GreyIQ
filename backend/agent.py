@@ -35,6 +35,8 @@ from urllib.parse import urlparse
 import brain_profiles
 import coder
 import devops_detect
+import edit_ops
+import offline_repair
 import project_memory
 import repomap
 import skills as skills_lib
@@ -350,6 +352,30 @@ class ToolError(Exception):
 _JS_SUFFIXES = {".js", ".cjs", ".mjs"}
 _YAML_SUFFIXES = {".yml", ".yaml"}
 _ECOSYSTEM_NAMES = {"ecosystem.config.js", "ecosystem.config.cjs", "ecosystem.config.mjs"}
+_TOML_SUFFIXES = {".toml"}
+# INI-shaped configuration verify can structurally parse with stdlib configparser. `.service` /
+# `.socket` / `.timer` are systemd units — deployment work edits them constantly and they went
+# entirely unverified before.
+_INI_SUFFIXES = {".ini", ".cfg", ".conf", ".service", ".socket", ".timer"}
+_INI_SECTION_RE = re.compile(r"^\s*\[[^\]]+\]\s*$", re.MULTILINE)
+# The full Dockerfile instruction set (plus the `# syntax=` parser directive, handled as a comment).
+# A generated Dockerfile's realistic failure is an invented or typo'd instruction, which is
+# decidable from the keyword alone — no Docker daemon, no third-party parser.
+_DOCKERFILE_DIRECTIVES = frozenset({
+    "ADD", "ARG", "CMD", "COPY", "ENTRYPOINT", "ENV", "EXPOSE", "FROM", "HEALTHCHECK", "LABEL",
+    "MAINTAINER", "ONBUILD", "RUN", "SHELL", "STOPSIGNAL", "USER", "VOLUME", "WORKDIR",
+})
+
+
+def _is_dockerfile(path: Path) -> bool:
+    """True for `Dockerfile`, `Dockerfile.prod`, `api.Dockerfile`, `containerfile` — the naming
+    conventions people actually use, matched case-insensitively."""
+    name = path.name.lower()
+    return (
+        name in ("dockerfile", "containerfile")
+        or name.startswith(("dockerfile.", "containerfile."))
+        or name.endswith((".dockerfile", ".containerfile"))
+    )
 _SECRET_KEY_RE = re.compile(
     r"(?:secret|password|passwd|token|api[_-]?key|private[_-]?key|access[_-]?key|client[_-]?secret)",
     re.IGNORECASE,
@@ -1328,6 +1354,102 @@ class ToolBox:
             lines.append(f"FAIL {rel}: YAML parse failed: {exc}")
             return False
 
+    @staticmethod
+    def _check_toml_parse(rel: str, path: Path, lines: list[str]) -> bool:
+        """pyproject.toml / *.toml. Stdlib since 3.11, so this needs no dependency and no shell —
+        which matters because a pyproject edit is one of the most common mechanical changes and
+        went entirely UNVERIFIED before this check existed."""
+        try:
+            import tomllib
+        except ImportError:  # pragma: no cover - only on <3.11
+            lines.append(f"SKIP {rel}: tomllib is unavailable; TOML parse skipped")
+            return False
+        try:
+            tomllib.loads(path.read_text(encoding="utf-8", errors="replace"))
+            lines.append(f"OK   {rel} (TOML parse)")
+            return True
+        except Exception as exc:  # noqa: BLE001 - tomllib raises TOMLDecodeError/ValueError/UnicodeError
+            lines.append(f"FAIL {rel}: TOML parse failed: {exc}")
+            return False
+
+    @staticmethod
+    def _check_ini_parse(rel: str, path: Path, lines: list[str]) -> bool:
+        """INI-shaped config: .ini/.cfg plus systemd unit files (.service/.socket/.timer) and the
+        INI-shaped .conf files deployment work edits. ``strict=False`` + ``allow_no_value=True``
+        because systemd legitimately repeats keys and uses bare flags — the check is for STRUCTURE
+        (a section header, no orphan lines), not for a Python-flavoured dialect.
+
+        ``.conf`` is ambiguous: nginx/Apache use a brace grammar that is NOT INI, so a bare .conf
+        is checked only when it actually opens with a ``[section]`` header. Anything else emits a
+        SKIP — an unverifiable file must read as UNVERIFIED, never as broken."""
+        import configparser
+
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if path.suffix.lower() == ".conf" and not _INI_SECTION_RE.search(text):
+            lines.append(f"SKIP {rel}: not INI-shaped (no [section] header); config parse skipped")
+            return False
+        parser = configparser.ConfigParser(strict=False, allow_no_value=True, interpolation=None)
+        try:
+            parser.read_string(text, source=rel)
+            lines.append(f"OK   {rel} (config parse)")
+            return True
+        except (configparser.Error, UnicodeError, ValueError) as exc:
+            lines.append(f"FAIL {rel}: config parse failed: {exc}")
+            return False
+
+    @staticmethod
+    def _check_dockerfile(rel: str, path: Path, lines: list[str]) -> bool:
+        """Directive whitelist per non-comment, non-continuation line. There is no stdlib
+        Dockerfile parser, but the failure that actually happens on a generated Dockerfile is a
+        typo'd or invented instruction, and that is decidable from the keyword alone."""
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            lines.append(f"FAIL {rel}: could not read Dockerfile: {exc}")
+            return False
+        continued = False
+        for lineno, raw in enumerate(text.splitlines(), 1):
+            stripped = raw.strip()
+            was_continued, continued = continued, stripped.endswith("\\")
+            if was_continued or not stripped or stripped.startswith("#"):
+                continue
+            directive = stripped.split(None, 1)[0].upper()
+            if directive not in _DOCKERFILE_DIRECTIVES:
+                lines.append(f"FAIL {rel}: unknown Dockerfile directive '{directive}' on line {lineno}")
+                return False
+        lines.append(f"OK   {rel} (Dockerfile directives)")
+        return True
+
+    def _check_powershell_syntax(self, rel: str, path: Path, lines: list[str]) -> bool:
+        """`.ps1` via PowerShell's own parser. Command-gated exactly like node/bash: it spawns a
+        process, so with commands disabled (or PowerShell absent — this runs on Linux/macOS too)
+        it emits a SKIP line, never a FAIL. An unavailable checker means UNVERIFIED, not broken."""
+        if not self.allow_commands:
+            lines.append(f"SKIP {rel}: PowerShell syntax check requires commands enabled")
+            return False
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        if not shell:
+            lines.append(f"SKIP {rel}: PowerShell is not available")
+            return False
+        # The path is embedded as a PowerShell SINGLE-QUOTED literal (no expansion, `'` escaped by
+        # doubling) rather than passed as a trailing argv entry: `-Command` appends extra arguments
+        # to the command STRING and never populates `$args`, so an `$args[0]` form silently parses
+        # nothing and reports every script as broken.
+        literal = str(path).replace("'", "''")
+        script = (
+            "$errors = $null; "
+            "[void][System.Management.Automation.Language.Parser]::ParseFile("
+            f"'{literal}', [ref]$null, [ref]$errors); "
+            "if ($errors.Count -gt 0) { $errors | ForEach-Object { $_.Message }; exit 1 }"
+        )
+        ok, output = self._run_verify_process([shell, "-NoProfile", "-NonInteractive", "-Command", script])
+        if ok:
+            lines.append(f"OK   {rel} (PowerShell parse)")
+            return True
+        detail = f": {output}" if output else ""
+        lines.append(f"FAIL {rel}: PowerShell parse failed{detail}")
+        return False
+
     def _tool_verify(self, args: dict[str, Any]) -> str:
         lines: list[str] = []
         failed = False
@@ -1368,6 +1490,22 @@ class ToolBox:
                             failed = True
                 elif suffix == ".sh":
                     self._check_shell_syntax(rel, path, lines)
+                    if lines[-1].startswith("FAIL"):
+                        failed = True
+                elif suffix in _TOML_SUFFIXES:
+                    self._check_toml_parse(rel, path, lines)
+                    if lines[-1].startswith("FAIL"):
+                        failed = True
+                elif suffix in _INI_SUFFIXES:
+                    self._check_ini_parse(rel, path, lines)
+                    if lines[-1].startswith("FAIL"):
+                        failed = True
+                elif suffix == ".ps1":
+                    self._check_powershell_syntax(rel, path, lines)
+                    if lines[-1].startswith("FAIL"):
+                        failed = True
+                elif _is_dockerfile(path):
+                    self._check_dockerfile(rel, path, lines)
                     if lines[-1].startswith("FAIL"):
                         failed = True
                 else:
@@ -1471,16 +1609,23 @@ def _auto_verify(
     return None
 
 
-def _outstanding_work(toolbox: "ToolBox", completed: bool) -> list[str]:
+def _outstanding_work(toolbox: "ToolBox", completed: bool, *, incomplete_reason: str = "") -> list[str]:
     """What still needs attention after a run — the basis for an honest completion
-    status. Empty list means a clean finish."""
+    status. Empty list means a clean finish.
+
+    ``incomplete_reason`` overrides the default step-limit sentence. The deterministic
+    offline path does not have a step limit — it stops because verify never came clean —
+    so it supplies its own reason rather than inheriting a wrong one."""
     items: list[str] = []
     if toolbox.touched and not toolbox.verified_ok:
         files = ", ".join(sorted(toolbox.touched)[:8])
         more = f" (+{len(toolbox.touched) - 8} more)" if len(toolbox.touched) > 8 else ""
         items.append(f"Changed files are not verified-clean: {files}{more}. Run verify and fix any failures.")
     if not completed:
-        items.append("The run hit the step limit before signalling completion — re-run to continue from here.")
+        items.append(
+            incomplete_reason
+            or "The run hit the step limit before signalling completion — re-run to continue from here."
+        )
     return items
 
 
@@ -1492,14 +1637,16 @@ def _finalize(
     provider: str,
     *,
     completed: bool,
+    incomplete_reason: str = "",
 ) -> dict[str, Any]:
     """Build the standard agent result with an honest completion status.
 
     ``completed`` is True only when the model finished on its own (it stopped
     calling tools), False when the loop hit the step cap. ``verified`` reflects
     whether the last verify passed (or there was nothing to verify), so a caller
-    never reads "done" when changes are still broken."""
-    outstanding = _outstanding_work(toolbox, completed)
+    never reads "done" when changes are still broken. ``incomplete_reason`` lets a
+    caller that failed for a DIFFERENT reason than the step cap say so."""
+    outstanding = _outstanding_work(toolbox, completed, incomplete_reason=incomplete_reason)
     clean = completed and not outstanding
     return {
         "text": text,
@@ -1623,13 +1770,86 @@ def plan_task(message: str, cfg: dict[str, Any], root: Path, settings: dict[str,
     return _parse_plan(out.get("text", ""))
 
 
+def _offline_repair_rounds() -> int:
+    """How many deterministic repair rounds the offline coder may attempt. Sourced from the
+    scanner settings (``GREYIQ_OFFLINE_REPAIR`` / ``GREYIQ_OFFLINE_REPAIR_ROUNDS``, already clamped
+    to 0..3 there) so the operator has a real kill switch. Any failure to read them means ZERO
+    rounds — the fail-closed direction is 'verify only, never repair'."""
+    try:
+        from bughunter.settings import get_settings
+
+        settings = get_settings()
+        return int(settings.offline_repair_rounds) if bool(settings.offline_repair_enabled) else 0
+    except Exception:  # noqa: BLE001 - settings must never decide whether a run happens, only how far it goes
+        return 0
+
+
+def _apply_offline_op(toolbox: "ToolBox", op: dict[str, Any]) -> dict[str, Any]:
+    """Apply ONE planner op and return a transcript row. Every write goes through the ToolBox, so
+    snapshot/undo/workspace-confinement/change-payload and the ``verified_ok`` reset are inherited
+    rather than re-implemented — this function owns no write path of its own.
+
+    An unknown op kind is an ``is_error`` row, never an exception: ``offline_coder`` (WS5) and this
+    applier evolve independently against the frozen op schema documented in ``edit_ops``, and a
+    schema skew must degrade to 'that op was refused', not to a crashed run."""
+    rel = str(op.get("path") or "")
+    kind = str(op.get("kind") or "")
+
+    if kind == "new_file":
+        try:
+            target = toolbox._resolve(rel)
+        except ToolError as exc:
+            return {"tool": "new_file", "input": {"path": rel}, "output": f"refused: {exc}", "is_error": True}
+        if target.exists():
+            # A "new_file" op never clobbers — that's a scaffold, not an overwrite.
+            return {"tool": "new_file", "input": {"path": rel},
+                    "output": f"skipped: {rel} already exists (the offline coder never overwrites)",
+                    "is_error": True}
+        try:
+            output = toolbox._tool_write_file({"path": rel, "content": op.get("content", "")})
+        except ToolError as exc:
+            return {"tool": "write_file", "input": {"path": rel}, "output": f"error: {exc}", "is_error": True}
+        return {"tool": "write_file", "input": {"path": rel}, "output": output, "is_error": False}
+
+    if kind == "edit_op":
+        op_name = str(op.get("op") or "")
+        try:
+            target = toolbox._resolve(rel)
+            current = target.read_text(encoding="utf-8", errors="replace")
+        except (ToolError, OSError) as exc:
+            return {"tool": "edit_op", "input": {"path": rel, "op": op_name},
+                    "output": f"refused: {exc}", "is_error": True}
+        # AST validation happens HERE, before any write: edit_ops returns a pair only when the
+        # resulting source already re-parsed and provably kept every existing statement. An op that
+        # cannot be validated leaves the file untouched — we never write and hope verify catches it.
+        result = edit_ops.realize(
+            current, op_name, dict(op.get("args") or {}),
+            suffix=target.suffix.lower(), allow_commands=toolbox.allow_commands,
+        )
+        if not result.ok:
+            return {"tool": "edit_op", "input": {"path": rel, "op": op_name},
+                    "output": f"refused: {result.reason}", "is_error": True}
+        try:
+            output = toolbox._tool_edit_file(
+                {"path": rel, "old_string": result.old_string, "new_string": result.new_string}
+            )
+        except ToolError as exc:
+            return {"tool": "edit_file", "input": {"path": rel, "op": op_name},
+                    "output": f"error: {exc}", "is_error": True}
+        return {"tool": "edit_file", "input": {"path": rel, "op": op_name}, "output": output, "is_error": False}
+
+    return {"tool": "unknown", "input": dict(op), "output": f"unsupported op: {kind or '(missing kind)'}",
+            "is_error": True}
+
+
 def _run_offline(message: str, toolbox: "ToolBox", on_event: Any, *,
                  runtime_dir: str | Path | None = None, seed_dir: str | Path | None = None) -> dict[str, Any]:
     """Deterministic offline provider (no LLM): apply offline_coder's closed-set edit ops through the
     ToolBox — so every write is snapshotted/undoable and the workspace-lock + undo protections apply —
-    then verify. Handles scaffolds + mechanical edits (retrieval-augmented from the repo surface +
-    seed/snippets); anything else returns an honest 'configure a brain' result instead of dead-ending.
-    See docs/offline-coder-strategy.md."""
+    then verify, deterministically repair, and roll back if it still will not come clean. Handles
+    scaffolds + mechanical edits (retrieval-augmented from the repo surface + seed/snippets); anything
+    else returns an honest 'configure a brain' result instead of dead-ending.
+    See docs/offline-coder-strategy.md (moves 2-4)."""
     import offline_coder
 
     transcript: list[dict[str, Any]] = []
@@ -1642,38 +1862,41 @@ def _run_offline(message: str, toolbox: "ToolBox", on_event: Any, *,
         return _finalize(str(plan.get("summary") or "This task needs a configured brain."),
                          transcript, toolbox, "deterministic", "offline", completed=True)
 
-    for op in plan["ops"]:
-        rel = str(op.get("path") or "")
-        if op.get("kind") == "new_file":
-            try:
-                target = toolbox._resolve(rel)
-            except ToolError as exc:
-                entry = {"tool": "new_file", "input": {"path": rel}, "output": f"refused: {exc}", "is_error": True}
-            else:
-                if target.exists():
-                    # A "new_file" op never clobbers — that's a scaffold, not an overwrite.
-                    entry = {"tool": "new_file", "input": {"path": rel},
-                             "output": f"skipped: {rel} already exists (the offline coder never overwrites)",
-                             "is_error": True}
-                else:
-                    try:
-                        output = toolbox._tool_write_file({"path": rel, "content": op.get("content", "")})
-                        entry = {"tool": "write_file", "input": {"path": rel}, "output": output, "is_error": False}
-                    except ToolError as exc:
-                        entry = {"tool": "write_file", "input": {"path": rel}, "output": f"error: {exc}", "is_error": True}
-        else:
-            entry = {"tool": "unknown", "input": dict(op), "output": f"unsupported op: {op.get('kind')}", "is_error": True}
+    ops = list(plan["ops"])
+    for op in ops:
+        entry = _apply_offline_op(toolbox, op if isinstance(op, dict) else {})
         transcript.append(entry)
         _emit(on_event, {"type": "step", "entry": entry})
 
-    # Verify what was written (py_compile / json / yaml / secret scan) — the SAME gate the LLM loops
-    # use, so an offline run never claims 'done' over broken files.
-    verify_out = toolbox._tool_verify({})
-    v_entry = {"tool": "verify", "input": {}, "output": verify_out, "is_error": "FAIL" in verify_out}
-    transcript.append(v_entry)
-    _emit(on_event, {"type": "step", "entry": v_entry})
+    # Verify what was written (py_compile / json / yaml / toml / config / secret scan / tests) — the
+    # SAME gate the LLM loops use, through ToolBox.run so the ToolError _tool_verify RAISES on
+    # failure becomes an honest (report, True) tuple instead of escaping run_agent as an exception.
+    verified, report, entries = offline_repair.repair_loop(
+        toolbox, ops, on_event, root=toolbox.root, seed_dir=seed_dir,
+        max_rounds=_offline_repair_rounds(),
+    )
+    transcript.extend(entries)
 
-    return _finalize(str(plan.get("summary") or f"Applied {len(plan['ops'])} offline edit(s)."),
+    if not verified:
+        # Nothing partially-good ships. Put every touched file back to its pre-run bytes and say
+        # which file and which check refused — a deterministic coder that cannot prove its change
+        # has no business leaving it on disk. verified_ok is forced False FIRST: a repair round may
+        # have ended on a passing verify (having reverted the very op that was asked for), and the
+        # restore below is a raw snapshot write that ToolBox's own reset never sees.
+        toolbox.verified_ok = False
+        restored = offline_repair.restore_all(toolbox)
+        if restored:
+            entry = {"tool": "rollback", "input": {}, "output": "\n".join(restored), "is_error": True}
+            transcript.append(entry)
+            _emit(on_event, {"type": "step", "entry": entry})
+        return _finalize(
+            offline_repair.failure_summary(report, restored), transcript, toolbox,
+            "deterministic", "offline", completed=False,
+            incomplete_reason="Verify never came clean, so every change was rolled back — "
+                              "configure a Local model (Ollama) or Claude brain and re-run.",
+        )
+
+    return _finalize(str(plan.get("summary") or f"Applied {len(ops)} offline edit(s)."),
                      transcript, toolbox, "deterministic", "offline", completed=True)
 
 
@@ -1817,11 +2040,19 @@ def run_agent(
         elif provider in ("local", "openai"):
             block = cfg["local"] if provider == "local" else cfg["openai"]
             result = _run_tool_loop(messages, system_prompt, cfg, block, settings, toolbox, provider, on_event)
+        elif provider in coder.PROVIDERS_DETERMINISTIC:
+            # The operator EXPLICITLY selected the deterministic coder (enabled=True,
+            # provider='offline'). Without this branch it fell through to the generic else below
+            # and — worse — did so without runtime_dir/seed_dir, silently disabling seed/snippets
+            # retrieval and the skill hint, so an explicit choice behaved worse than the default.
+            result = _run_offline(message, toolbox, on_event, runtime_dir=runtime_dir, seed_dir=seed_dir)
         else:
             # No LLM brain configured -> the DETERMINISTIC offline coder (scaffolds + mechanical edits,
             # verify-gated) instead of dead-ending. It applies a bounded, closed set of edit ops through
             # this same toolbox and honestly defers anything it can't template to a configured brain.
-            result = _run_offline(message, toolbox, on_event)
+            # runtime_dir/seed_dir are passed HERE TOO: without them plan_edits loses the seed template
+            # library and falls back to the bundled scaffold, which looked like a template bug.
+            result = _run_offline(message, toolbox, on_event, runtime_dir=runtime_dir, seed_dir=seed_dir)
     except Exception as exc:
         # A mid-run failure (API error, timeout, cancel) can leave files ALREADY partially written by
         # earlier tool calls. Attach the rollback snapshot (+ change list) to the exception so the API

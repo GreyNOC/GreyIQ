@@ -12,6 +12,7 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+import solin_core  # noqa: E402
 from solin_core import (  # noqa: E402
     KnowledgeBase,
     QUERY_INTENT_BUG_BOUNTY,
@@ -144,6 +145,57 @@ class KnowledgeSourceFilterTests(unittest.TestCase):
 
             self.assertEqual(len(matches), 1)
             self.assertEqual(matches[0].source_id, "src_bug_bounty")
+
+
+class SourceTrustTests(unittest.TestCase):
+    """The manual-PDF extract is ~99.8% of the corpus by bytes and overwhelmingly
+    off-domain; retrieval must not let a lexical hit inside it outrank the curated
+    bug-bounty corpus."""
+
+    def _corpus(self, root: Path) -> None:
+        data = root / "data"
+        data.mkdir()
+        # Deliberately near-identical wording so ONLY the source trust separates them.
+        sentence = "IDOR proof of impact requires an observed-vs-control authorization differential."
+        (data / "greyiq_bug_bounty_knowledge.txt").write_text(sentence, encoding="utf-8")
+        (data / "greyiq_manual_pdfs.txt").write_text(sentence, encoding="utf-8")
+
+    def test_curated_corpus_outranks_the_manual_pdf_blob(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._corpus(root)
+            matches = KnowledgeBase(root).search(
+                "IDOR proof impact authorization differential", min_score=0.05, limit=5
+            )
+            self.assertTrue(matches)
+            by_source = {match.source: match.score for match in matches}
+            self.assertIn("greyiq_bug_bounty_knowledge.txt", by_source)
+            self.assertIn("greyiq_manual_pdfs.txt", by_source)
+            self.assertEqual(matches[0].source, "greyiq_bug_bounty_knowledge.txt")
+            self.assertGreater(
+                by_source["greyiq_bug_bounty_knowledge.txt"],
+                by_source["greyiq_manual_pdfs.txt"],
+            )
+
+    def test_manual_pdfs_stay_indexed_citable_and_filterable(self) -> None:
+        """The down-weight is a RANKING change, never a removal: the chunk is still
+        indexed, still returned, and still carries the same source id it had before,
+        so an existing core's saved sourceIds keep reaching it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._corpus(root)
+            matches = KnowledgeBase(root).search(
+                "IDOR proof impact authorization differential",
+                source_ids=["src_imported_docs"],
+                min_score=0.05,
+            )
+            self.assertEqual([match.source for match in matches], ["greyiq_manual_pdfs.txt"])
+            self.assertEqual(matches[0].source_id, "src_imported_docs")
+
+    def test_unlisted_sources_are_unaffected(self) -> None:
+        self.assertEqual(solin_core._source_trust("greyiq_local_notes.txt"), 1.0)
+        self.assertEqual(solin_core._source_trust(""), 1.0)
+        self.assertLess(solin_core._source_trust("greyiq_manual_pdfs.txt"), 1.0)
 
 
 class BugBountyIntentTests(unittest.TestCase):

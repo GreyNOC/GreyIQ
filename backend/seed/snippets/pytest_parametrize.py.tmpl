@@ -1,0 +1,23 @@
+"""Auto-scaffolded parametrized pytest cases for {{symbol}} ({{location}}).
+
+One row per behavior, each with an explicit `id` so a failure names the case instead of
+`test_x[1]`. Add the boundary and hostile rows (empty, oversized, wrong type) — a table that
+only holds happy-path rows proves nothing.
+"""
+from __future__ import annotations
+
+import pytest
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        pytest.param("", "", id="empty"),
+        pytest.param("x", "x", id="single"),
+        pytest.param("  x  ", "x", id="surrounding-whitespace"),
+    ],
+)
+def test_{{symbol}}_cases(given: str, expected: str) -> None:
+    # TODO: call {{symbol}}(given) and assert against `expected`.
+    # The identity assertion below only proves the table wiring works — replace it.
+    assert given.strip() == expected

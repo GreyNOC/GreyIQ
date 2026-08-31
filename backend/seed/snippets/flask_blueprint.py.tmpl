@@ -1,0 +1,32 @@
+"""Auto-scaffolded Flask blueprint `{{name}}_bp` (url_prefix {{path}}).
+
+Register it once at app-creation time: ``app.register_blueprint({{name}}_bp)``. Keeping the
+error handler on the blueprint means a failure inside these routes returns JSON, not Flask's
+debug traceback page — never ship a traceback to a caller.
+"""
+from __future__ import annotations
+
+from flask import Blueprint, jsonify, request
+
+{{name}}_bp = Blueprint("{{name}}", __name__, url_prefix="{{path}}")
+
+
+@{{name}}_bp.get("/")
+def list_{{name}}():
+    # TODO: implement the collection read for {{path}}.
+    return jsonify({"ok": True, "items": []})
+
+
+@{{name}}_bp.post("/")
+def create_{{name}}():
+    payload = request.get_json(silent=True) or {}
+    # TODO: validate `payload` against a schema before you touch it.
+    if not payload:
+        return jsonify({"error": "empty payload"}), 422
+    return jsonify({"ok": True, "created": True}), 201
+
+
+@{{name}}_bp.errorhandler(Exception)
+def _handle_error(exc: Exception):
+    # Log `exc` server-side; return a generic message so internals never leak to the caller.
+    return jsonify({"error": "internal error"}), 500

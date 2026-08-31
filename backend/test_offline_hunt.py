@@ -12,6 +12,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from bughunter import hunt_brain, offline_hunt  # noqa: E402
+from bughunter.prover_classes import PROVER_CLASSES  # noqa: E402
 
 _SURFACE = {"endpoints": ["https://t/search?q=x", "https://t/order/1042", "https://t/download?file=a.pdf",
                           "https://t/api/me", "https://t/redirect?url=x", "https://t/users/9f8e7d6c-1234-4321-8888-abcdef012345",
@@ -100,6 +101,242 @@ class OfflinePlanTests(unittest.TestCase):
             self.assertNotIn(" ", n)
             self.assertNotIn("<", n)
             self.assertNotIn("/", n)
+
+
+class ProverVocabularyTests(unittest.TestCase):
+    """The offline brain's class vocabulary is now DERIVED from the prover's own check tags rather
+    than hand-listed, closing the recall hole where 8 provable classes were unreachable offline."""
+
+    def test_offline_classes_are_a_subset_of_what_the_prover_can_confirm(self) -> None:
+        # The invariant that makes a wider vocabulary safe: the brain can never propose a class the
+        # deterministic prover has no check for, so a suggestion is always actionable-or-ignored.
+        self.assertLessEqual(set(offline_hunt._ACTIVE_CLASSES), set(PROVER_CLASSES))
+
+    def test_the_eight_previously_unreachable_classes_are_now_proposable(self) -> None:
+        # Before this change _ACTIVE_CLASSES held 10 names and these were silently undroppable-
+        # because-unproposable. Pin them so a future narrowing of the set fails loudly.
+        for cls in ("jwt", "graphql", "debug", "websocket", "sensitive", "cloud-exposure",
+                    "csrf", "clickjacking"):
+            self.assertIn(cls, offline_hunt._ACTIVE_CLASSES)
+
+
+class NewCueCoverageTests(unittest.TestCase):
+    """The cue block appended LAST in _classes_for_endpoint. It may only ADD classes to endpoints
+    that had spare room in the 6-class cap; it must never displace a pre-existing class."""
+
+    def _classes(self, endpoint: str, **surface) -> list[str]:
+        plan = offline_hunt.offline_plan({"endpoints": [endpoint], "params": [], "tech": [], **surface})
+        self.assertTrue(plan["probe_priority"], f"{endpoint} produced no classes at all")
+        self.assertEqual(plan["probe_priority"][0]["endpoint"], endpoint)
+        return plan["probe_priority"][0]["classes"]
+
+    def test_graphql_path_proposes_the_graphql_check(self) -> None:
+        classes = self._classes("https://t.example/graphql")
+        self.assertIn("graphql", classes)
+        self.assertEqual(classes[0], "cors")   # the pre-existing /api cue still owns slot 0
+
+    def test_actuator_path_proposes_the_debug_check(self) -> None:
+        self.assertIn("debug", self._classes("https://t.example/actuator/env"))
+        self.assertIn("debug", self._classes("https://t.example/admin/jolokia/list"))
+
+    def test_websocket_path_proposes_the_cswsh_check(self) -> None:
+        self.assertIn("websocket", self._classes("https://t.example/ws/chat"))
+        self.assertIn("websocket", self._classes("https://t.example/socket.io/"))
+
+    def test_token_param_and_auth_path_propose_the_jwt_checks(self) -> None:
+        self.assertIn("jwt", self._classes("https://t.example/v1/me?access_token=abc"))
+        self.assertIn("jwt", self._classes("https://t.example/oauth/authorize"))
+
+    def test_exposed_file_upload_and_state_change_cues(self) -> None:
+        self.assertIn("sensitive", self._classes("https://t.example/.git/config"))
+        self.assertIn("cloud-exposure", self._classes("https://t.example/upload"))
+        self.assertIn("csrf", self._classes("https://t.example/account/delete"))
+
+    def test_new_cues_never_displace_a_pre_existing_class(self) -> None:
+        # A saturated endpoint (6 classes from the OLD cues alone) must be byte-identical: the new
+        # adds land past the classes[:6] cap. This is what keeps the cold-start training corpus valid.
+        saturated = "https://t.example/api/search?q=x&file=y&template=z&cmd=w&id=1"
+        self.assertEqual(self._classes(saturated, tech=["Flask"]),
+                         ["xss", "sqli", "cors", "path-traversal", "ssti", "rce"])
+
+    def test_class_count_is_still_hard_capped_at_six(self) -> None:
+        # every new cue fires at once + the old cues + a tech boost -> still 6, never more
+        greedy = "https://t.example/graphql/actuator/ws/oauth/.git/upload/account?file=a&q=b&cmd=c&token=d"
+        self.assertEqual(len(self._classes(greedy, tech=["Flask", "PHP"])), 6)
+
+
+class ColdStartBaselineTests(unittest.TestCase):
+    """Plans are persisted verbatim as training traces, so their exact values are the contract --
+    NOT a subset check. These pin the byte-level baseline the corpus is keyed to."""
+
+    def test_cold_start_plan_order_v2_is_explicit_and_deterministic(self) -> None:
+        # Two intended behaviour changes, recorded explicitly so each is a reviewed decision rather
+        # than silent corpus drift:
+        #   1. an endpoint that previously produced ZERO classes was omitted from probe_priority
+        #      entirely; /actuator/env matched no old cue and was absent, and now appears;
+        #   2. probe_priority is now ordered STRONGEST-SIGNAL-FIRST (_priority_sort_key) instead of
+        #      by discovery order, because the list is hard-capped and the prover walks it in order.
+        #      /search?q=x leads on sqli(92); /actuator/env follows on debug(78); /graphql last on
+        #      cors(40)+graphql(60) -> max 60.
+        surface = {"endpoints": ["https://t.example/actuator/env", "https://t.example/graphql",
+                                 "https://t.example/search?q=x"], "params": [], "tech": []}
+        first = offline_hunt.offline_plan(surface)
+        self.assertEqual(first, offline_hunt.offline_plan(surface))   # still deterministic
+        self.assertEqual(first["probe_priority"], [
+            {"endpoint": "https://t.example/search?q=x", "classes": ["xss", "sqli"]},
+            {"endpoint": "https://t.example/actuator/env", "classes": ["debug"]},
+            {"endpoint": "https://t.example/graphql", "classes": ["cors", "graphql"]},
+        ])
+        # param_hypotheses are cue-independent and must be UNCHANGED by this workstream
+        self.assertEqual(first["param_hypotheses"][:4], ["url", "redirect", "next", "callback"])
+        self.assertEqual(first["notes"], "offline knowledge-rule plan over 3 endpoint(s)")
+
+    def test_model_none_is_byte_identical_to_the_rules_only_plan(self) -> None:
+        # model=None is the default and MUST mean "exactly today's behaviour".
+        self.assertEqual(offline_hunt.offline_plan(_SURFACE), offline_hunt.offline_plan(_SURFACE, model=None))
+
+
+class PriorityCapRankingTests(unittest.TestCase):
+    """probe_priority is HARD-CAPPED and the prover walks it in order, so the cap is a zero-sum
+    contest between endpoints. Widening the class vocabulary made endpoints that used to produce ZERO
+    classes eligible, and in discovery order a run of low-signal ones evicted already-planned
+    high-signal ones off the end of the cap. ADDED RECALL MUST NEVER COST EXISTING RECALL."""
+
+    # The reviewed failure surface: ten /ws/* rooms (the widened vocabulary's `websocket` cue is the
+    # ONLY class they score) discovered BEFORE fifteen /download?file= path-traversal candidates.
+    _WS = [f"https://t/ws/chan{i}" for i in range(10)]
+    _DOWNLOADS = [f"https://t/download{i}?file=a" for i in range(15)]
+
+    @staticmethod
+    def _endpoints(surface: dict) -> list[str]:
+        return [r["endpoint"] for r in offline_hunt.offline_plan(surface)["probe_priority"]]
+
+    def test_low_signal_endpoints_never_evict_an_already_planned_endpoint(self) -> None:
+        # The regression itself: planning the SAME high-signal endpoints alongside newly-eligible
+        # low-signal ones must not drop any of them. Before the fix the ten websocket-only rooms took
+        # the first ten slots and download10..download14 fell off the 20-row cap.
+        before = self._endpoints({"endpoints": self._DOWNLOADS})
+        after = self._endpoints({"endpoints": self._WS + self._DOWNLOADS})
+        self.assertEqual(len(before), 15)
+        self.assertEqual([e for e in before if e not in after], [], "an already-planned endpoint was evicted")
+        self.assertEqual(after[:15], before)          # and they still lead the plan, in order
+
+    def test_the_cap_keeps_the_highest_signal_endpoints(self) -> None:
+        after = self._endpoints({"endpoints": self._WS + self._DOWNLOADS})
+        self.assertEqual(len(after), offline_hunt._MAX_PRIORITY)
+        # what survives past the 15 traversal candidates is the strongest 5 of the websocket rooms,
+        # in discovery order — the cap truncates the WEAKEST tail, not an arbitrary one.
+        self.assertEqual(after[15:], self._WS[:5])
+
+    def test_ordering_is_non_increasing_in_signal_and_total(self) -> None:
+        plan = offline_hunt.offline_plan({"endpoints": self._WS + self._DOWNLOADS})
+        keys = [offline_hunt._priority_sort_key(r, i) for i, r in enumerate(plan["probe_priority"])]
+        self.assertEqual(keys, sorted(keys, key=lambda k: k[:2]))   # strongest first
+        # total + stable: the same surface must produce a byte-identical plan (persisted as a trace)
+        self.assertEqual(plan, offline_hunt.offline_plan({"endpoints": self._WS + self._DOWNLOADS}))
+
+    def test_endpoint_selection_is_not_reachable_by_priors_or_a_ranker(self) -> None:
+        # The sort key is permutation-invariant in a row's class list, so the two seams that may
+        # reorder classes WITHIN an endpoint cannot decide WHICH endpoints survive the cap.
+        surface = {"endpoints": self._WS + self._DOWNLOADS, "params": [], "tech": []}
+        rules = [r["endpoint"] for r in offline_hunt.offline_plan(surface)["probe_priority"]]
+        with_priors = [r["endpoint"] for r in
+                       offline_hunt.offline_plan(surface, {"websocket": 9.0, "path-traversal": 0.1})["probe_priority"]]
+        with_model = [r["endpoint"] for r in
+                      offline_hunt.offline_plan(surface, model=_StubRanker())["probe_priority"]]
+        self.assertEqual(with_priors, rules)
+        self.assertEqual(with_model, rules)
+
+    def test_the_signal_table_covers_every_provable_class(self) -> None:
+        # Drift guard: a class the prover learns to confirm must be weighted deliberately, not left
+        # to inherit the neutral default by accident.
+        self.assertEqual(set(offline_hunt._CLASS_SIGNAL), set(PROVER_CLASSES))
+        self.assertTrue(all(isinstance(v, int) for v in offline_hunt._CLASS_SIGNAL.values()))
+
+
+class _StubRanker:
+    """A learned ranker stand-in. Records its inputs so the narrow call contract can be asserted."""
+
+    version_tag = "stub-v1"
+
+    def __init__(self, reply=None, boom: bool = False) -> None:
+        self.reply, self.boom, self.calls = reply, boom, []
+
+    def rank_endpoint_classes(self, url, names, recon, tech, candidates, priors):
+        self.calls.append((url, list(names), list(recon), tech, list(candidates), priors))
+        if self.boom:
+            raise RuntimeError("corrupt weights")
+        return self.reply if self.reply is not None else list(reversed(candidates))
+
+
+class RankerSeamTests(unittest.TestCase):
+    """The learned ranker may only PERMUTE the rule-proposed candidates. Anything else is discarded
+    and the deterministic prior ordering is used, so a corrupt/hostile weight file can shift budget
+    at worst -- never add, drop, or invent a vuln class."""
+
+    _SIMPLE = {"endpoints": ["https://t.example/api/search?q=x"], "params": [], "tech": []}
+
+    def _classes(self, model, surface=None, priors=None) -> list[str]:
+        plan = offline_hunt.offline_plan(surface or self._SIMPLE, priors, model=model)
+        return plan["probe_priority"][0]["classes"]
+
+    def test_rules_ordering_without_a_model(self) -> None:
+        self.assertEqual(self._classes(None), ["xss", "sqli", "cors"])
+
+    def test_a_valid_permutation_is_honoured(self) -> None:
+        self.assertEqual(self._classes(_StubRanker(["cors", "xss", "sqli"])), ["cors", "xss", "sqli"])
+
+    def test_an_invented_class_is_discarded_entirely(self) -> None:
+        # a class the rules did not propose (and that the prover may not even confirm) must not leak
+        for reply in (["xss", "sqli", "cors", "xxe"],      # added one
+                      ["xss", "sqli"],                     # dropped one
+                      ["xxe", "idor", "ssrf"],             # wholesale substitution
+                      ["xss", "xss", "sqli"]):             # duplicated to smuggle a drop
+            self.assertEqual(self._classes(_StubRanker(reply)), ["xss", "sqli", "cors"], reply)
+
+    def test_a_raising_model_falls_back_to_the_rules(self) -> None:
+        self.assertEqual(self._classes(_StubRanker(boom=True)), ["xss", "sqli", "cors"])
+
+    def test_a_garbage_return_type_falls_back_to_the_rules(self) -> None:
+        for reply in (None, 7, "xss"):
+            model = _StubRanker()
+            model.rank_endpoint_classes = lambda *a, _r=reply, **k: _r
+            self.assertEqual(self._classes(model), ["xss", "sqli", "cors"], reply)
+
+    def test_the_model_sees_only_the_narrow_feature_tuple(self) -> None:
+        model = _StubRanker()
+        offline_hunt.offline_plan({"endpoints": ["https://t.example/api/search?q=x"],
+                                   "params": ["file"], "tech": ["Flask"]}, {"xss": 2.0}, model=model)
+        url, names, recon, tech, candidates, priors = model.calls[0]
+        self.assertEqual(url, "https://t.example/api/search?q=x")
+        self.assertEqual(names, ["q"])                 # the endpoint's OWN query names
+        self.assertEqual(recon, ["file"])              # recon-wide params, sorted for determinism
+        self.assertEqual(tech, "flask")
+        self.assertEqual(priors, {"xss": 2.0})
+        self.assertLessEqual(set(candidates), set(PROVER_CLASSES))
+
+    def test_a_model_cannot_reach_anything_but_the_class_ordering(self) -> None:
+        # endpoint selection, param hypotheses, IDOR/privileged picks are all rule-owned.
+        rules = offline_hunt.offline_plan(_SURFACE)
+        ranked = offline_hunt.offline_plan(_SURFACE, model=_StubRanker())
+        for key in ("param_hypotheses", "ssrf_params", "xss_params", "idor_candidates",
+                    "privileged_endpoints", "used", "provider", "model"):
+            self.assertEqual(ranked[key], rules[key], key)
+        self.assertEqual([r["endpoint"] for r in ranked["probe_priority"]],
+                         [r["endpoint"] for r in rules["probe_priority"]])
+        self.assertTrue(any(r["classes"] != s["classes"]
+                            for r, s in zip(ranked["probe_priority"], rules["probe_priority"])))
+
+    def test_notes_record_which_brain_produced_the_plan(self) -> None:
+        # notes is persisted in the hunt trace, so the corpus must say whether a ranker ran.
+        self.assertNotIn("+ranker", offline_hunt.offline_plan(_SURFACE)["notes"])
+        self.assertIn("+ranker stub-v1", offline_hunt.offline_plan(_SURFACE, model=_StubRanker())["notes"])
+
+    def test_an_unlabelled_model_is_reported_undetermined_never_guessed(self) -> None:
+        class _NoTag:
+            def rank_endpoint_classes(self, *a, **k):
+                return list(a[4])
+        self.assertIn("+ranker undetermined", offline_hunt.offline_plan(_SURFACE, model=_NoTag())["notes"])
 
 
 class PlanHuntOfflineFallbackTests(unittest.TestCase):

@@ -56,6 +56,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from bughunter import digest_builder, impact_model, sensitive_data
 from bughunter.code_scanner.redaction import redact_text
+from bughunter.prover_classes import PROVER_CLASSES
 from bughunter.rate_limit import HostRateGovernor
 from bughunter.registrable_domain import is_bare_public_suffix, registrable_domain
 from bughunter.scan_auth import AuthContext, auth_headers_for
@@ -411,6 +412,13 @@ def _proof(status: str, **fields: Any) -> dict[str, Any]:
     }
     base.update({k: _redact(v) if isinstance(v, str) else v for k, v in fields.items()})
     return base
+
+
+# The vocabulary a caller's ``class_priority`` ranking may name, re-exported so a caller holding only
+# this module can validate its tags without also importing the planner. It is NOT consulted at
+# runtime: the ``checks`` list inside verify_active IS the definition, unknown ranks are simply
+# ignored by _apply_class_priority below, and test_active_verify_service asserts the two agree.
+ACTIVE_PROVER_CLASSES: frozenset[str] = PROVER_CLASSES
 
 
 def _apply_class_priority(checks: list[tuple[str, Any]], class_priority: list[str] | None) -> list[tuple[str, Any]]:
@@ -2476,6 +2484,10 @@ def verify_active(
     # is wrapped so a budget exhaustion stops cleanly without raising.
     # Each check is tagged with the normalized vuln class it confirms, so the reasoning layer's
     # per-endpoint priorities can promote the classes most likely to hit on THIS target (see below).
+    # EVERY tag below MUST be a member of prover_classes.PROVER_CLASSES — that frozenset is the
+    # vocabulary the hunt planners (hunt_brain / offline_hunt) are allowed to propose, and a tag they
+    # cannot name is a class the hunt can never steer budget toward. test_active_verify_service
+    # re-derives this list with `ast` and fails the suite if a new check introduces an unlisted tag.
     checks: list[tuple[str, Callable[[], dict[str, Any] | None]]] = [
         ("clickjacking", lambda: _check_clickjacking(http, sanitized, landing)),
         ("csrf", lambda: _check_csrf(landing, sanitized)),

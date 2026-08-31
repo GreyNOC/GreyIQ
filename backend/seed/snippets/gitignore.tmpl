@@ -1,0 +1,46 @@
+# Auto-scaffolded .gitignore.
+# The secrets block is first for a reason: everything else here costs disk, that block costs
+# an incident. A credential committed once is in the history forever — .gitignore prevents,
+# it does not remediate.
+
+# --- Secrets and local state ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+*.kdbx
+secrets.json
+runtime/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# --- Node ---
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Build output ---
+dist/
+build/
+release/
+coverage/
+*.log
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

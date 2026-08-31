@@ -29,6 +29,10 @@ for _root, _dirs, _files in os.walk(_SEED_SRC):
     _rel = os.path.relpath(_root, _SEED_SRC)
     _dest = "seed" if _rel == os.curdir else os.path.join("seed", _rel)
     for _fn in _files:
+        # HARD CONSTRAINT: no bundled model/weight/data file may use the ".pt" extension.
+        # This skip is unconditional, so a ".pt" under seed/ is dropped SILENTLY and the
+        # feature that reads it degrades in the shipped app while working perfectly in
+        # dev. Ship learned weights as ".json" (or any non-.pt extension) instead.
         if _fn.lower().endswith(".pt"):
             continue
         datas.append((os.path.join(_root, _fn), _dest))
@@ -53,6 +57,68 @@ hiddenimports = [
     "gn_cli",  # run_frozen imports it at function level (CLI dispatch) — force-include
     "yaml",    # api_discovery_service parses YAML OpenAPI specs; import is guarded, force-include so it's bundled
 ]
+
+# Optional offline modules added by later work. Each is imported at FUNCTION level (guarded
+# by try/except), so PyInstaller's static analysis cannot see it and would leave it out of
+# the bundle — the feature would then work in dev and silently degrade in the shipped exe.
+# Force-include each ONLY if it exists, so this spec stays valid at every point in the
+# rollout (before the module lands, after it lands, and if it is later dropped).
+for _opt in ("edit_ops", "offline_repair", "edit_mine", "solin_domain"):
+    if os.path.isfile(os.path.join(BACKEND, _opt + ".py")):
+        hiddenimports.append(_opt)
+
+# --- gn CLI verb plugins -----------------------------------------------------------
+# Every module in gn_cli._VERB_PLUGINS is loaded by NAME through importlib at
+# parser-build time, and the loader is fail-closed: an ImportError silently DROPS that
+# verb. A dropped verb does not error — `greyiq-backend.exe wardrive ...` simply falls
+# through run_frozen's dispatch test and boots the API server instead, which reads as
+# "the feature was never built".
+#
+# This bit us for real: `collect_submodules("bughunter")` below returns
+# bughunter.wardrive.cli and bughunter.hunt_train at spec-eval time, yet neither reached
+# the v2.6.0 bundle, so both new verbs vanished from the shipped exe while working
+# perfectly from source. Never rely on a broad package sweep to carry a DYNAMIC entry
+# point — name it.
+#
+# The list is PARSED from gn_cli.py's own `_VERB_PLUGINS` tuple (stdlib ast, no import,
+# so the spec stays side-effect free) rather than duplicated here, because a hand-copied
+# second list is exactly the drift that made CLI_COMMANDS wrong for seven verbs.
+def _verb_plugin_modules():
+    import ast
+
+    try:
+        with open(os.path.join(BACKEND, "gn_cli.py"), encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+    except (OSError, SyntaxError):
+        return []
+    for node in ast.walk(tree):
+        # `_VERB_PLUGINS: tuple[str, ...] = (...)` is an AnnAssign, NOT an Assign — handle
+        # both, or a type annotation silently turns this whole guard back into a no-op.
+        if isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        elif isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        else:
+            continue
+        if not any(getattr(t, "id", "") == "_VERB_PLUGINS" for t in targets):
+            continue
+        if node.value is None:
+            return []
+        try:
+            names = ast.literal_eval(node.value)
+        except (ValueError, SyntaxError):
+            return []
+        return [str(n) for n in names if isinstance(n, str)]
+    return []
+
+
+for _plugin in _verb_plugin_modules():
+    # Only if the module actually exists on disk — the tuple deliberately names modules
+    # that may not have landed yet (the loader tolerates that, and so must this).
+    _rel = os.path.join(BACKEND, *_plugin.split("."))
+    if os.path.isfile(_rel + ".py") or os.path.isfile(os.path.join(_rel, "__init__.py")):
+        hiddenimports.append(_plugin)
+        print(f"[greyiq-backend.spec] force-including gn verb plugin: {_plugin}")
 
 # The ASGI stack + clients load a lot dynamically; pull everything in. numpy stays
 # (document_ingest's pandas path uses it). anthropic is the Claude coding-brain client.
