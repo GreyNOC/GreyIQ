@@ -2,6 +2,134 @@
 
 Notable changes to GreyIQ.
 
+## v4.0.0 - the Burp-style redesign, and the subsystem that never shipped
+
+Two pieces of work were orphaned by the same collision on 2026-08-01, when the remote TACNOC
+v2.6.0 release landed in the middle of a session. The session stashed its in-progress redesign to
+merge cleanly, renumbered its own release v2.6.0 -> v2.7.0 to resolve the version clash, and ended
+before finishing either. `main` then shipped a *different* v2.7.0, so the clash repeated silently.
+Five releases went out without either piece. This release lands both.
+
+### The visual redesign
+
+Rebuilt on Burp Suite Professional: neutral charcoal greys carry the interface and ONE saturated
+orange carries every interactive or selected signal. **Dark is the default** (#1c1f23 window,
+#26292d panels, #ff6633); light is the option, and darkens the accent to #bf4508 so text on it
+still clears AA. Semantic status (ok / warn / danger) stays separate from the accent so a
+"running" state can never be misread as "healthy".
+
+- **Square edges everywhere** - all 169 `border-radius` sites are 0, pills and status dots
+  included. The `--radius-*` tokens remain (at 0) so a stray reference still resolves square.
+- **Flat** - no gradients, no glows, no blurred drop shadows, no frosted translucency. Every
+  surface that carried a shadow already had a 1px border, which is what separates it now. Focus
+  becomes a crisp 2px accent ring.
+- **One design, whole product** - the standalone PoC page that ships to platforms and the
+  attack-plan map PNG inside the submission bundle wear the same palette. The map stays
+  document-light, because a triager reads it as a document.
+- **Contrast was measured in the running app, not assumed.** A new `--on-accent` token carries the
+  ink for any saturated fill, because no single value works in both themes: white on #ff6633 is
+  2.8:1, and charcoal ink on the light accent is ~4.0:1. Fixed along the way: dark `--coral` was
+  failing both as a chip fill and as panel text; "Delete this bot" was danger-red *on* the orange
+  button it inherits from (1.31:1); and a dark-theme override was beating the accent fill on
+  background only, leaving dark ink on a dark wash at 1.13:1. Both themes, both app modes and all
+  eight cockpit views now report zero contrast failures and zero non-zero radii.
+
+### The offline brains, recovered
+
+86 files and ~18k lines that five releases never saw. GreyIQ's no-brain path is what the shipped
+build actually runs - `greyiq-backend.spec` hard-excludes PyTorch, so TinyGPT is not importable in
+a release install. This makes that path a real agent across every domain we work in: hunting, red
+team, wardriving, coding, and web apps. See `docs/offline-brains.md`.
+
+#### Offline chat answers from curated playbooks instead of a canned sentence
+- **The shipped app's offline chat was one hardcoded platitude.** With torch absent, `get_engine()`
+  raised, `chat()` fell into its exception handler, and every message returned `fallback_reply` —
+  the same sentence, forever. New **`solin_domain.py`** is a torch-free, stdlib-only extractive
+  answerer over curated packs (`seed/domain/{bounty,webapp,redteam,wardrive,coding}.md`, 73 cards),
+  routed **before** the engine and retried in the exception handler.
+- It **quotes, never generates**: replies are a contiguous slice of a pack file plus a fixed opener
+  and a `Source:` line. A test asserts the excerpt is a verbatim substring of its card — the
+  mechanical guarantee that a 0.8M-parameter char model is not writing security advice.
+- `webapp.md` is generated from `bughunter.bounty.VULN_CLASSES`, so chat and reports cannot drift.
+- Bare class names (`SSRF`, `idor`, `prototype pollution`) reach the class explainer; tool questions
+  reach the bundled catalog; greetings and off-domain questions fall through untouched.
+
+#### Wardriving / RF survey analysis (new)
+- **`gn wardrive <export>` and `wardrive -y <path>` in chat** — read-only posture assessment and
+  rogue-AP triage over surveys you already captured: airodump-ng CSV, WiGLE CSV, Kismet netxml,
+  Kismet CSV (alias-mapped), and Windows `netsh wlan show networks mode=bssid`. Four formats
+  normalize onto one vocabulary and merge by BSSID.
+- Findings for WEP/WPA1-TKIP/open networks, evil-twin and rogue-AP candidates, WPS, PMF, hidden and
+  default SSIDs, probe-request (PNL) exposure, non-randomized client MACs, and channel congestion.
+- **No transmission, ever** — no monitor-mode control, no handshake capture, no cracking, not even
+  in remediation text. Enforced by a source-scan test over the package's own imports. `-y/--authorize`
+  is required on both surfaces; a chat message is never authorization on its own.
+- **"Undetermined" is a first-class answer.** Capability facts carry provenance and are discarded if
+  the observing format cannot see them, so an airodump-only survey yields **zero** WPS and **zero**
+  PMF findings and says why — rendered above the findings so it can never read as a clean bill of
+  health. Merge order can never change a verdict, and a finding cites the export that observed the
+  fact, not the merge survivor.
+
+#### The offline hunt brain
+- **Class vocabulary 10 → 18**, derived from the prover's own check list via new
+  `bughunter/prover_classes.py`. `jwt`, `graphql`, `debug`, `websocket`, `sensitive`,
+  `cloud-exposure`, `csrf`, and `clickjacking` were structurally unreachable from the no-brain path;
+  a test parses the prover's source with `ast` so the two can never drift again.
+- **Learned ranker (distillation Phases 1–3)** — `hunt_features.py`, `hunt_model.py`, and
+  `gn train-brain` train a pure-stdlib logistic ranker on your own `hunt_traces.jsonl`, and promote
+  it **only if it beats the hand-tuned rules on a held-out split**. GreyIQ ships no pre-trained
+  weights; `gn train-brain --show` states how many more rows are needed. The ranker may only
+  *permute* an endpoint's existing candidates — a non-permutation is discarded.
+- **The probe-priority cap no longer evicts high-signal endpoints.** The 20-row cap now ranks by
+  class signal before truncating instead of keeping the first 20 discovered.
+- **The deterministic offline re-plan loop** (`GREYIQ_HUNT_LOOP_OFFLINE`, opt-in) refines a plan from
+  observed structure — JSON keys, form fields, error family, JWT shape, cookie flags — with no LLM.
+
+#### The offline coder
+- **It can now edit existing code**, not only create files: AST-validated ops (`add_import`,
+  anchored insert, function wrap) in new `edit_ops.py`, applied through the agent's `ToolBox` so
+  every write stays snapshotted and undoable. A Python result that does not re-parse leaves the file
+  untouched. New `offline_repair.py` adds a bounded deterministic verify→repair loop.
+- **28 new templates** for the stack we actually use — FastAPI, Flask, Express, pytest/unittest,
+  Docker, docker-compose, GitHub Actions, CodeQL, Dependabot, pre-commit, nginx, systemd, PM2,
+  Makefile, PowerShell/Pester — plus hunt-scope, detection-rule, and finding-report scaffolds.
+  The regex if-chain became a declarative recipe registry.
+- A test now iterates **every** recipe and asserts it fires on a phrasing from its own advertised
+  label (9/36 were failing, including every framework route recipe and every dotted config filename).
+
+#### Fixes
+- **Seven `gn` verbs never ran in the shipped exe.** `platforms`, `bundle`, `takeover`, `cve`,
+  `idor`, `bfla`, and `idor-probe` were registered in the parser but missing from the hand-maintained
+  `CLI_COMMANDS` tuple, so `run_frozen.py` booted the API server instead of running them.
+  `CLI_COMMANDS` is now derived from the parser and cannot drift.
+- **Selecting the deterministic coder silently blinded the hunt.** `offline`/`deterministic` are real
+  coder providers, so `coder_enabled()` was True for them — but they have no chat completion, so
+  every LLM-prompt gate took the LLM branch into a guaranteed error and lost its offline fallback.
+  New `coder.reasoning_brain_enabled()` draws the distinction; `hunt_brain.plan_hunt` returned an
+  empty plan and `hunt_loop` started then died at turn 0.
+- Offline chat no longer answers off-domain questions with a security playbook (an out-of-vocabulary
+  token was scored *below* ordinary filler, inverting coverage; thresholds retuned against a
+  measured 64-question fixture rather than by feel).
+- A UTF-8 BOM no longer drops an entire airodump capture; a junction cycle no longer aborts a survey;
+  one corrupt template no longer disables the whole offline coder; and the RF report no longer tells
+  operators their English Windows is "localized" or points them at a runtime OUI override that was
+  never wired up.
+
+### Reconciling five releases of drift
+
+The recovered branch forked before v2.7.0, so the merge was combines rather than picks: `hunt_loop`
+keeps main's chain-aware steering *and* the branch's structural offline re-plan; `gn_cli` takes the
+derived `CLI_COMMANDS`; `offline_coder` takes the recipe registry with main's bounded authorized
+HTTP traffic client ported into it as a row. `_load_snippet` now states which seed wins - an
+explicit `seed_dir` is authoritative, so a corrupt template disables that recipe instead of being
+silently healed from the source tree and offered by a build that cannot render it.
+`seed/domain/webapp.md` is generated from `bughunter.bounty.VULN_CLASSES` and was regenerated: v3.0.0
+added `path-traversal`, and the drift guard caught it.
+
+- electron 43.4.1 -> 44.0.0.
+
+Suite: **2580 tests**, 3 skipped, green.
+
 ## v3.0.1 - chain-engine QAQC, observation provenance, surface-drift engine
 
 A whole-subsystem audit of the attack-chain engine (71 adversarial agents; 49 defects confirmed
