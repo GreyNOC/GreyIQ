@@ -4,6 +4,27 @@ const DIMENSIONS = 384;
 const MAX_MEMORY_ITEMS = 32;
 const API_TIMEOUT_MS = 45000;
 const COLORS = ["#ff6633", "#8ec7d8", "#4bb377", "#d9a441", "#9aa1a8", "#c98a6b"];
+
+// The readable ink for text sitting ON a bot colour. Bot colours are persisted, so pre-v4
+// bots keep the old dark palette and a single hardcoded ink would fail on one era or the
+// other. Unparseable/absent -> white, which is what the pre-v4 avatars used.
+function inkOn(color) {
+  const m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(String(color || "").trim());
+  if (!m) return "#ffffff";
+  let hex = m[1];
+  if (hex.length === 3) hex = hex[0] + hex[0] + hex[1] + hex[1] + hex[2] + hex[2];
+  const lin = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+  const L = 0.2126 * lin(parseInt(hex.slice(0, 2), 16))
+          + 0.7152 * lin(parseInt(hex.slice(2, 4), 16))
+          + 0.0722 * lin(parseInt(hex.slice(4, 6), 16));
+  // Compare the REAL inks, not idealised black/white: the dark ink is #1c1f23 (relative
+  // luminance 0.0144), not 0. Using 0 overstates it and picks dark for mid-tone colours
+  // where white actually wins (the old #c95542 red: 3.83 dark vs 4.25 white).
+  const DARK_L = 0.0144;
+  const vsDark = (L + 0.05) / (DARK_L + 0.05);
+  const vsWhite = 1.05 / (L + 0.05);
+  return vsDark >= vsWhite ? "#1c1f23" : "#ffffff";
+}
 const DEFAULT_SELECTED_TRAINING_SOURCES = [
   "src_starter_knowledge",
   "src_bug_bounty",
@@ -1468,6 +1489,7 @@ function renderBots() {
     const avatar = document.createElement("span");
     avatar.className = "bot-avatar";
     avatar.style.background = String(bot.color || "");
+    avatar.style.color = inkOn(bot.color);
     avatar.textContent = initials(bot.name);
     const meta = document.createElement("span");
     const strong = document.createElement("strong");
@@ -1581,6 +1603,7 @@ function renderEditor() {
   els.activeBotName.textContent = bot.name;
   els.activeBotMark.textContent = initials(bot.name);
   els.activeBotMark.style.background = bot.color;
+  els.activeBotMark.style.color = inkOn(bot.color);
   els.swatchRow.replaceChildren();
 
   for (const color of COLORS) {
@@ -9098,7 +9121,7 @@ function ckBuildPocHtml(focus) {
     "code,pre{font-family:ui-monospace,Consolas,monospace}pre{white-space:pre-wrap;word-break:break-word;background:#26292d;border:1px solid #3a3f45;border-radius:0;padding:10px}",
     ".warn{background:#3a2318;color:#ffb08a;padding:10px 16px;border-bottom:2px solid #ff6633;font-size:13px}",
     ".btn{display:inline-block;background:#ff6633;color:#1c1f23;border:0;border-radius:0;padding:9px 14px;font:inherit;font-weight:600;cursor:pointer;text-decoration:none}",
-    ".out{margin-top:10px;min-height:2em}.note{color:#9aa1a8;margin:0 0 10px}.sev{background:#e05252;color:#1c1f23;border-radius:0;padding:1px 7px;font-weight:700;font-size:12px}",
+    ".out{margin-top:10px;min-height:2em}.note{color:#9aa1a8;margin:0 0 10px}.sev{background:#ef6b6b;color:#1c1f23;border-radius:0;padding:1px 7px;font-weight:700;font-size:12px}",
     "figure{margin:0 0 12px}figcaption{color:#9aa1a8;font-size:12px;margin-bottom:4px}img{max-width:100%;border:1px solid #3a3f45;border-radius:0}",
     "footer{padding:14px 16px;color:#9aa1a8;font-size:12px}</style></head><body>",
     '<div class="warn">⚠ Authorized security testing only — run this against a target you are permitted to test. Nothing executes until you click Run.</div>',

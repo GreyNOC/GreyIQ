@@ -32,7 +32,11 @@
   --on-accent: #ffffff;
   --sidebar-bg: #e4e6e8;
   /* Square by contract. These stay as tokens rather than being deleted so that any stray
-     `border-radius: 0;
+     reference to one still resolves square, and so a future rounded variant is a one-line
+     change instead of another 168-site sweep. (Deliberately worded without a literal radius
+     declaration in it: a bulk rewrite of those declarations once matched this very comment and
+     ran past its terminator, silently swallowing the three tokens below.) */
+  --radius-card: 0;
   --radius-pill: 0;
   --radius: 0;
   --glow: transparent;  /* flat - no glows */
@@ -77,8 +81,10 @@ body[data-theme="dark"] {
   --line: #3a3f45;
   --teal: #ff6633;   /* legacy alias for the accent */
   --teal-2: #3a2318; /* soft signal wash - a burnt-orange tint of the panel, never a blue */
-  --coral: #ef6b6b;  /* semantic: down / critical - lifted from #e05252 to clear AA both as
-                        filled-chip background (with --on-accent ink) and as text on a panel */
+  --coral: #ef6b6b;  /* semantic: down / critical - lifted from #e05252 so it clears AA as a
+                        filled chip background under --on-accent ink (5.56) and as text on
+                        --surface (5.05). On the lighter --surface-2 it is 4.06, so use it as
+                        a fill there rather than as body text. */
   --violet: #9aa1a8; /* neutralized to grey - the accent is the only hue */
   --sun: #d9a441;    /* semantic: warn */
   --ok: #4bb377;     /* semantic: up / confirmed */
@@ -372,9 +378,10 @@ button:focus-visible {
   height: 2.35rem;
   border-radius: 0;
   background: var(--teal);
-  /* Literal, not var(--on-accent): the inline background is a fixed JS palette entry that does
-     not change with the theme, so its ink must not either. Every COLORS row clears AA here. */
-  color: #1c1f23;
+  /* Fallback only. app.js sets this inline per bot via inkOn(bot.color), because bot colours
+     are PERSISTED: a pre-v4 bot still carries the old dark palette, on which a fixed dark ink
+     renders initials at ~2:1. Theme-independent by design -- the background is not themed. */
+  color: #ffffff;
   font-size: 0.82rem;
   font-weight: 800;
 }
@@ -3289,7 +3296,7 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
 .ck-cd-sevpill { flex: none; min-width: 2.6rem; text-align: center; font-size: 0.62rem; font-weight: 800; text-transform: uppercase; padding: 0.16rem 0.32rem; border-radius: 0; background: var(--surface-2); color: var(--muted); }
 .ck-cd-sevpill.sev-critical { color: var(--on-accent); background: var(--coral); }
 .ck-cd-sevpill.sev-high { color: var(--on-accent); background: color-mix(in srgb, var(--coral) 78%, var(--sun)); }
-.ck-cd-sevpill.sev-medium { color: var(--ink); background: var(--sun); }
+.ck-cd-sevpill.sev-medium { color: var(--on-accent); background: var(--sun); }
 .ck-cd-sevpill.sev-low { color: var(--on-accent); background: var(--ok); }
 .ck-cd-finding-main { min-width: 0; flex: 1; }
 .ck-cd-finding-title { font-size: 0.8rem; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -3573,7 +3580,7 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
 }
 .ck-sevpill.sev-critical { color: var(--on-accent); background: var(--coral); }
 .ck-sevpill.sev-high     { color: var(--on-accent); background: var(--coral); }
-.ck-sevpill.sev-medium   { color: #17202b; background: var(--sun); }
+.ck-sevpill.sev-medium   { color: var(--on-accent); background: var(--sun); }
 .ck-sevpill.sev-low      { color: var(--on-accent); background: var(--ok); }
 .ck-sevpill.sev-info     { color: var(--text); background: var(--surface-2); }
 
@@ -4035,7 +4042,8 @@ body[data-app-mode="hunt"] .cockpit {
 }
 
 .ck-run:not(.is-ready) {
-  background: color-mix(in srgb, var(--accent) 72%, var(--surface));
+  background: transparent;
+  color: var(--accent);
 }
 
 .ck-run:focus-visible,
