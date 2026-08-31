@@ -108,7 +108,10 @@ def _cmd_wardrive(args: argparse.Namespace) -> int:
             written = report.write_rf_report(out, result, ctx=ctx)
         except OSError as exc:
             return err(f"could not write the report to {out}: {exc}")
-        print(f"report: {written}")
+        # --json advertises a machine-readable document on stdout, so the status line must not
+        # land there: `gn wardrive --json --out r.md | jq` would fail on the trailing "report: ..."
+        # text. Human mode keeps it on stdout where the operator reads it.
+        print(f"report: {written}", file=sys.stderr if getattr(args, "json", False) else sys.stdout)
     return 0
 
 

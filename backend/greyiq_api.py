@@ -4259,7 +4259,12 @@ class GreyIQRuntime:
 
     def _coder_reply(self, request: ChatRequest) -> dict[str, Any] | None:
         raw = self._coder_config()
-        if not coder.coder_enabled(raw):
+        # reasoning_brain_enabled, NOT coder_enabled: the deterministic (offline) providers are a
+        # real coding capability, so coder_enabled answers True for them — but they have no chat
+        # completion at all and generate() raises CoderError by design. Gating chat on the broader
+        # predicate made every message, even a non-coding question, return that refusal and shadow
+        # the curated domain brain and the TinyGPT fallback below. See coder.reasoning_brain_enabled.
+        if not coder.reasoning_brain_enabled(raw):
             return None
         cfg = coder.coder_config(raw)
         messages = self._build_coder_messages(request, int(cfg.get("history_turns") or 12))

@@ -1502,6 +1502,44 @@ class CliTests(unittest.TestCase):
             self.assertEqual(sorted(payload["source_formats"]), ["airodump-csv", "kismet-netxml"])
             self.assertTrue(payload["survey"]["aps"])
 
+    def test_json_with_out_keeps_stdout_parseable(self) -> None:
+        """`--json --out r.md` must still emit ONE parseable document on stdout.
+
+        The report status line used to be printed to stdout unconditionally, right after the
+        JSON, so `gn wardrive --json --out r.md | jq` failed on trailing text. The existing
+        --json smoke test passed no --out, so it never exercised this combination.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "walk.csv"
+            path.write_text(AIRODUMP_CSV, encoding="utf-8")
+            out = Path(tmp) / "rf.md"
+            args = self._parser().parse_args(
+                ["wardrive", str(path), "-y", "--json", "--out", str(out)])
+            buf, errbuf = io.StringIO(), io.StringIO()
+            with redirect_stdout(buf), redirect_stderr(errbuf):
+                code = args.func(args)
+            self.assertEqual(code, 0)
+            self.assertTrue(out.exists())
+            # stdout parses as JSON on its own - no trailing status text.
+            payload = json.loads(buf.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertNotIn("report:", buf.getvalue())
+            # ...and the status is not lost, just moved to stderr.
+            self.assertIn("report:", errbuf.getvalue())
+            self.assertIn(str(out), errbuf.getvalue())
+
+    def test_human_mode_keeps_the_report_line_on_stdout(self) -> None:
+        """The stderr routing is --json-only: an operator reading the terminal still sees it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "walk.csv"
+            path.write_text(AIRODUMP_CSV, encoding="utf-8")
+            out = Path(tmp) / "rf.md"
+            args = self._parser().parse_args(["wardrive", str(path), "-y", "--out", str(out)])
+            buf, errbuf = io.StringIO(), io.StringIO()
+            with redirect_stdout(buf), redirect_stderr(errbuf):
+                self.assertEqual(args.func(args), 0)
+            self.assertIn("report:", buf.getvalue())
+
     def test_report_and_min_severity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "walk.csv"
