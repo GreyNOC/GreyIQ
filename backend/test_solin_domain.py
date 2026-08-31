@@ -591,6 +591,19 @@ class ApiRouterTests(unittest.TestCase):
         for message in ("hi", "thanks", "what is the capital of France"):
             self.assertIsNone(self._reply(message), message)
 
+    def test_deterministic_coder_does_not_intercept_chat(self) -> None:
+        """Workbench-only providers must leave chat to the offline fallback pipeline."""
+        from unittest import mock  # noqa: PLC0415
+
+        request = self.api.ChatRequest(message="what is SSRF")
+        for provider in ("offline", "deterministic"):
+            with self.subTest(provider=provider), \
+                 mock.patch.object(self.runtime, "_coder_config",
+                                   return_value={"enabled": True, "provider": provider}), \
+                 mock.patch.object(self.api.coder, "generate") as generate:
+                self.assertIsNone(self.runtime._coder_reply(request))
+                generate.assert_not_called()
+
     def test_off_domain_questions_fall_through_on_both_router_paths(self) -> None:
         """End-to-end cover for the reported defect, at BOTH thresholds the router uses."""
         for message in OFF_DOMAIN_QUESTIONS:

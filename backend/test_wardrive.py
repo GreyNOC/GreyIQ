@@ -1521,12 +1521,10 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertTrue(out.exists())
             # stdout parses as JSON on its own - no trailing status text.
-            payload = json.loads(buf.getvalue())
-            self.assertTrue(payload["ok"])
+            self.assertTrue(json.loads(buf.getvalue())["ok"])
             self.assertNotIn("report:", buf.getvalue())
             # ...and the status is not lost, just moved to stderr.
-            self.assertIn("report:", errbuf.getvalue())
-            self.assertIn(str(out), errbuf.getvalue())
+            self.assertIn(f"report: {out}", errbuf.getvalue())
 
     def test_human_mode_keeps_the_report_line_on_stdout(self) -> None:
         """The stderr routing is --json-only: an operator reading the terminal still sees it."""
