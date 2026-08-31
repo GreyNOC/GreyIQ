@@ -157,7 +157,10 @@ refutation panel; twelve survived and are fixed here. The ones worth naming:
 - **The primary CTA failed in its default state** at 3.4:1, and the learned hunt ranker had
   train/serve feature skew that made its whole `form:*` namespace unreachable at inference.
 
-Suite: **2581 tests**, 3 skipped, green.
+- Also folded in from `main` while this was in flight: an unclosed snapshot file handle in
+  `surface_drift`, and review fixes to the chat and `gn wardrive` output.
+
+Suite: **2583 tests**, 3 skipped, green.
 
 ## v3.0.1 - chain-engine QAQC, observation provenance, surface-drift engine
 
