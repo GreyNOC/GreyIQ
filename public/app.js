@@ -11261,8 +11261,10 @@ function ckRenderCampaign() {
     host.replaceChildren();
     host.append(cel("h2", "ck-section-title", "Live dashboard"));
     const hero = cel("div", "ck-cd-hero");
-    const globe = document.createElement("img");
-    globe.src = "./globe.svg"; globe.alt = ""; globe.width = 150; globe.height = 150;
+    // Masked span, not an <img>: the mark is painted with currentColor so it follows the
+    // theme instead of shipping one baked-in colour that loses contrast in the other one.
+    const globe = cel("span", "ck-hero-owl gn-owl");
+    globe.setAttribute("aria-hidden", "true");
     hero.append(globe);
     hero.append(cel("p", "ck-hint",
       "Nothing is running. Start a Single hunt, Full campaign, or Portfolio from New run — every target status and finding appears here live."));

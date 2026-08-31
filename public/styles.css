@@ -2921,20 +2921,34 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-brand h1 { margin: 0; font-size: 1.15rem; letter-spacing: -0.01em; }
 .ck-eyebrow { margin: 0; font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.13em; color: var(--muted); }
 
-/* --- GreyNOC globe brand mark --- */
+/* --- GreyNOC owl brand mark ---
+   Painted as a MASK filled with currentColor rather than an <img>, so the one asset works on
+   the charcoal sidebar and the light sidebar alike. An <img> cannot inherit currentColor, so a
+   coloured SVG would have had to pick one theme and lose contrast in the other.
+   The glyph is taller than it is wide (1000 x 1351), so every box below uses `contain`. */
+.gn-owl {
+  display: inline-block;
+  background-color: currentColor;
+  -webkit-mask: url("./owl.svg") center / contain no-repeat;
+  mask: url("./owl.svg") center / contain no-repeat;
+  flex: none;
+}
 .ck-logo-globe { display: inline-flex; align-items: center; justify-content: center; background: none; border: 0; padding: 0; }
-.ck-logo-globe img { width: 34px; height: 34px; display: block; }
+.ck-logo-globe.gn-owl { width: 30px; height: 34px; color: var(--ink); }
 .brand-row { display: flex; align-items: center; gap: 0.6rem; }
 .brand-row .icon-button { margin-left: auto; }
-.brand-globe { width: 30px; height: 30px; flex: none; }
+.brand-globe { width: 26px; height: 30px; color: var(--ink); }
+/* Idle campaign-dashboard hero: an illustration, so it sits at muted weight, never accent. */
+.ck-hero-owl { width: 111px; height: 150px; color: var(--muted); }
 
-/* Boot splash — the globe while the local engine spins up. */
+/* Boot splash — the owl while the local engine spins up. Its own surface, so the colours are
+   literals; they track the dark theme's --bg/--ink rather than the pre-v4 blue-greys. */
 .ck-splash { position: fixed; inset: 0; z-index: 120; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.7rem;
-  background: #0e1116; transition: opacity 0.5s ease; }
+  background: #1c1f23; transition: opacity 0.5s ease; }
 .ck-splash.is-hidden { opacity: 0; pointer-events: none; }
-.ck-splash-globe { width: min(46vw, 208px); height: auto; }
-.ck-splash-name { font-size: 1.6rem; font-weight: 800; letter-spacing: 0.16em; color: #e2e8ef; }
-.ck-splash-sub { font-size: 0.82rem; letter-spacing: 0.05em; color: #8a95a4; }
+.ck-splash-globe { width: min(46vw, 154px); height: min(62vw, 208px); color: #e6e8ea; }
+.ck-splash-name { font-size: 1.6rem; font-weight: 800; letter-spacing: 0.16em; color: #e6e8ea; }
+.ck-splash-sub { font-size: 0.82rem; letter-spacing: 0.05em; color: #9aa1a8; }
 
 /* Campaign-dashboard idle hero. */
 .ck-cd-hero { display: flex; flex-direction: column; align-items: center; gap: 0.6rem; padding: 1.6rem 0 0.4rem; text-align: center; }
@@ -3830,15 +3844,16 @@ body[data-app-mode="hunt"] .cockpit {
 
 .ck-splash {
   gap: 0.55rem;
-  background: #0a0e14;
+  background: #1c1f23;
 }
 
 .ck-splash-globe {
-  width: min(34vw, 144px);
+  width: min(26vw, 107px);
+  height: min(34vw, 144px);
 }
 
 .ck-splash-name {
-  color: #edf1f6;
+  color: #e6e8ea;
   font-size: 1.25rem;
   letter-spacing: 0.11em;
 }
