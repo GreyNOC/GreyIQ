@@ -5,6 +5,7 @@ wrapped before the model sees it (prompt-injection hardening)."""
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -15,6 +16,7 @@ if str(BACKEND_DIR) not in sys.path:
 import coder  # noqa: E402
 import trust  # noqa: E402
 from bughunter import hunt_brain  # noqa: E402
+from bughunter.prover_classes import PROVER_CLASSES  # noqa: E402
 
 SURFACE = {
     "endpoints": ["https://app.example.com/login", "https://app.example.com/api/orders",
@@ -160,6 +162,185 @@ class HuntBrainTests(unittest.TestCase):
         # the endpoint must appear INSIDE the untrusted block, never as bare instruction text
         block = captured["prompt"].split("<<UNTRUSTED::", 1)[1]
         self.assertIn("https://app.example.com/login", block)
+
+
+class ProverClassGateTests(unittest.TestCase):
+    """_validate_plan's class gate now uses the prover's REAL vocabulary instead of a hand-listed
+    subset. A class the prover has a check for survives; one it cannot confirm is still dropped."""
+
+    def setUp(self) -> None:
+        self._orig = (coder.coder_enabled, coder.coder_config, coder.generate)
+        self.addCleanup(lambda: self._restore())
+        coder.coder_enabled = lambda cfg: True
+        coder.coder_config = lambda cfg: {"provider": "anthropic"}
+
+    def _restore(self) -> None:
+        coder.coder_enabled, coder.coder_config, coder.generate = self._orig
+
+    def _classes_for(self, raw_classes: str) -> list[str]:
+        coder.generate = lambda messages, cfg: {
+            "text": ('{"param_hypotheses": [], "probe_priority": [{"endpoint": '
+                     f'"https://app.example.com/login", "classes": {raw_classes}}}]}}'),
+            "provider": "anthropic", "model": "claude"}
+        plan = hunt_brain.plan_hunt({}, "https://app.example.com/", "app.example.com", SURFACE)
+        rows = plan["probe_priority"]
+        return rows[0]["classes"] if rows else []
+
+    def test_newly_reachable_prover_classes_survive_validation(self) -> None:
+        # These were dropped by the old hand-listed gate even though the prover proves all of them.
+        self.assertEqual(self._classes_for('["jwt", "graphql", "debug"]'), ["jwt", "graphql", "debug"])
+        self.assertEqual(self._classes_for('["websocket", "sensitive", "cloud-exposure"]'),
+                         ["websocket", "sensitive", "cloud-exposure"])
+        self.assertEqual(self._classes_for('["csrf", "clickjacking"]'), ["csrf", "clickjacking"])
+
+    def test_classes_the_prover_cannot_confirm_are_still_dropped(self) -> None:
+        # Widening the vocabulary must not become "accept anything" -- an unconfirmable class would
+        # only ever steer budget at a lead the prover can never promote past 'candidate'.
+        self.assertEqual(self._classes_for('["xxe", "idor", "ssrf", "deserialization"]'), [])
+        self.assertEqual(self._classes_for('["xxe", "jwt"]'), ["jwt"])   # partial row keeps the real one
+
+    def test_aliases_still_fold_onto_the_canonical_tag(self) -> None:
+        self.assertEqual(self._classes_for('["lfi", "cswsh", "OS Command_Injection"]'),
+                         ["path-traversal", "websocket", "rce"])
+        self.assertEqual(self._classes_for('["open-redirect", "redirect"]'), ["redirect"])  # deduped
+
+    def test_the_exported_vocabulary_covers_the_prover_plus_its_aliases(self) -> None:
+        self.assertTrue(set(hunt_brain.ACTIVE_CLASSES) >= set(PROVER_CLASSES))
+        self.assertIn("lfi", hunt_brain.ACTIVE_CLASSES)                 # aliases stay accepted
+
+
+class OfflineRankerHookTests(unittest.TestCase):
+    """plan_hunt's optional seed_dir/runtime_dir hook for the learned offline ranker. Absent module,
+    absent weight file, or the kill switch must all mean 'exactly the pre-existing rule behaviour'."""
+
+    def setUp(self) -> None:
+        self._orig = coder.coder_enabled
+        self.addCleanup(lambda: setattr(coder, "coder_enabled", self._orig))
+        coder.coder_enabled = lambda cfg: False        # force the offline path
+
+    def test_still_callable_with_four_positional_args(self) -> None:
+        # every existing caller passes 4 positional args (+ priors kwarg); none may break.
+        plan = hunt_brain.plan_hunt({}, "https://app.example.com/", "app.example.com", SURFACE)
+        self.assertEqual(plan["provider"], "offline")
+        self.assertTrue(plan["probe_priority"])
+        self.assertEqual(plan, hunt_brain.plan_hunt({}, "https://app.example.com/", "app.example.com",
+                                                    SURFACE, None))
+
+    def test_empty_model_dirs_are_byte_identical_to_no_dirs_at_all(self) -> None:
+        base = hunt_brain.plan_hunt({}, "https://app.example.com/", "app.example.com", SURFACE)
+        with tempfile.TemporaryDirectory() as seed, tempfile.TemporaryDirectory() as runtime:
+            hooked = hunt_brain.plan_hunt({}, "https://app.example.com/", "app.example.com", SURFACE,
+                                          seed_dir=Path(seed), runtime_dir=Path(runtime))
+        self.assertEqual(hooked, base)                 # no weight file -> the rules, unchanged
+        self.assertNotIn("+ranker", hooked["notes"])
+
+    def test_load_ranker_returns_none_without_a_weight_file(self) -> None:
+        # No weight file on disk, and no dirs at all, both mean "use the rules".
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(hunt_brain._load_ranker(Path(tmp), Path(tmp)))
+        self.assertIsNone(hunt_brain._load_ranker(None, None))
+
+    def test_load_ranker_returns_none_when_the_optional_module_is_absent(self) -> None:
+        # hunt_model is an OPTIONAL module -- a frozen build may ship without it, and importing it
+        # must not be a precondition for hunting. Simulate the absent build via a blocked import.
+        import builtins
+        real_import = builtins.__import__
+
+        def blocked(name, *args, **kwargs):
+            if name == "bughunter" and args and args[2] and "hunt_model" in args[2]:
+                raise ImportError("no module named bughunter.hunt_model")
+            return real_import(name, *args, **kwargs)
+        self.addCleanup(lambda: setattr(builtins, "__import__", real_import))
+        builtins.__import__ = blocked
+        self.assertIsNone(hunt_brain._load_ranker(None, None))
+
+    def test_the_kill_switch_forces_the_rules_even_with_a_ranker_present(self) -> None:
+        # GREYIQ_OFFLINE_RANKER=0 is the operator's escape hatch (e.g. reproducing an older run).
+        import os
+        from bughunter import settings as bh_settings
+        orig = os.environ.get("GREYIQ_OFFLINE_RANKER")
+        self.addCleanup(lambda: os.environ.pop("GREYIQ_OFFLINE_RANKER", None)
+                        if orig is None else os.environ.__setitem__("GREYIQ_OFFLINE_RANKER", orig))
+        os.environ["GREYIQ_OFFLINE_RANKER"] = "0"
+        self.assertFalse(bh_settings.get_settings().offline_ranker_enabled)
+        self.assertIsNone(hunt_brain._load_ranker(Path("."), Path(".")))
+
+    def test_a_raising_ranker_loader_still_yields_the_rules_plan(self) -> None:
+        # fail-closed: the offline planner must never break a hunt, whatever the model layer does.
+        orig = hunt_brain._load_ranker
+        self.addCleanup(lambda: setattr(hunt_brain, "_load_ranker", orig))
+        base = hunt_brain.plan_hunt({}, "https://app.example.com/", "app.example.com", SURFACE)
+
+        def boom(seed_dir, runtime_dir):
+            raise RuntimeError("weight file is a directory")
+        hunt_brain._load_ranker = boom
+        plan = hunt_brain.plan_hunt({}, "https://app.example.com/", "app.example.com", SURFACE,
+                                    seed_dir=Path("."), runtime_dir=Path("."))
+        self.assertEqual(plan, hunt_brain._empty_plan())   # fail-closed, never a crash
+        self.assertTrue(base["probe_priority"])            # (and the un-hooked path still works)
+
+    def test_offline_plan_stays_scope_safe_and_within_the_prover_vocabulary(self) -> None:
+        plan = hunt_brain.plan_hunt({}, "https://app.example.com/", "app.example.com", SURFACE)
+        allowed = set(SURFACE["endpoints"])
+        for row in plan["probe_priority"]:
+            self.assertIn(row["endpoint"], allowed)              # verbatim in-scope, never invented
+            self.assertLessEqual(set(row["classes"]), set(PROVER_CLASSES))
+            self.assertLessEqual(len(row["classes"]), 6)
+
+
+class ReasoningBrainGateTests(unittest.TestCase):
+    """plan_hunt must gate on whether a REASONING brain is available, not on whether SOME coder is
+    selected. The deterministic ("offline"/"deterministic") coder is a real, selectable provider that
+    ``coder_enabled`` answers True for, but it has no chat completion at all — ``coder.generate``
+    raises CoderError for it by design. Gating on ``coder_enabled`` sent that configuration down the
+    LLM branch, where the raise fail-closed to an EMPTY plan: the hunt flew blind, strictly worse
+    than provider "off". These use the REAL coder gates (no monkeypatching) on purpose."""
+
+    _OFFLINE_KEYS = ("param_hypotheses", "probe_priority", "idor_candidates", "ssrf_params",
+                     "xss_params", "privileged_endpoints")
+
+    def _plan(self, cfg):
+        return hunt_brain.plan_hunt(cfg, "https://app.example.com/", "app.example.com", SURFACE)
+
+    def test_the_deterministic_coder_is_enabled_but_is_not_a_reasoning_brain(self) -> None:
+        for provider in sorted(coder.PROVIDERS_DETERMINISTIC):
+            cfg = {"enabled": True, "provider": provider}
+            self.assertTrue(coder.coder_enabled(cfg), provider)              # a real coding capability
+            self.assertFalse(coder.reasoning_brain_enabled(cfg), provider)   # but it cannot answer a prompt
+            with self.assertRaises(coder.CoderError):                        # ...proven by generate itself
+                coder.generate([{"role": "user", "content": "hi"}], cfg)
+
+    def test_selecting_the_deterministic_coder_keeps_the_offline_hunt_plan(self) -> None:
+        # The defect: with provider "offline" the hunt got {'used': False, 'probe_priority': [], ...}.
+        baseline = self._plan({"enabled": False, "provider": "off"})
+        self.assertTrue(baseline["probe_priority"])                          # the offline brain works
+        for provider in sorted(coder.PROVIDERS_DETERMINISTIC):
+            plan = self._plan({"enabled": True, "provider": provider})
+            self.assertEqual(plan["provider"], "offline", provider)
+            self.assertTrue(plan["used"], provider)
+            for key in self._OFFLINE_KEYS:
+                self.assertEqual(plan[key], baseline[key], f"{provider}:{key}")
+
+    def test_a_real_reasoning_provider_still_takes_the_llm_branch(self) -> None:
+        # The fix must not turn a configured LLM into an offline hunt.
+        orig = coder.generate
+        self.addCleanup(lambda: setattr(coder, "generate", orig))
+        coder.generate = lambda messages, cfg: {
+            "text": '{"param_hypotheses": ["returnUrl"], "probe_priority": []}',
+            "provider": "anthropic", "model": "claude"}
+        for provider in ("anthropic", "local", "openai"):
+            self.assertTrue(coder.reasoning_brain_enabled({"enabled": True, "provider": provider}))
+            plan = self._plan({"enabled": True, "provider": provider})
+            self.assertEqual(plan["param_hypotheses"], ["returnUrl"], provider)
+            self.assertEqual(plan["provider"], "anthropic", provider)
+
+    def test_reasoning_is_off_whenever_the_coder_is_off(self) -> None:
+        # reasoning_brain_enabled delegates to coder_enabled, so every "off" spelling and the
+        # disabled flag are honoured in exactly one place.
+        for cfg in (None, {}, {"enabled": False, "provider": "anthropic"},
+                    {"enabled": True, "provider": "off"}, {"enabled": True, "provider": "none"},
+                    {"enabled": True, "provider": "disabled"}, {"enabled": True, "provider": ""}):
+            self.assertFalse(coder.reasoning_brain_enabled(cfg), cfg)
 
 
 class DeterministicVeteranPlannerTests(unittest.TestCase):

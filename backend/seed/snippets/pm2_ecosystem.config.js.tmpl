@@ -1,0 +1,30 @@
+// Auto-scaffolded PM2 ecosystem config for {{name}}.
+// Start it with `pm2 start {{filename}} && pm2 save`, and run `pm2 startup` once so the
+// process list survives a reboot — an unsaved PM2 list is the classic "it died overnight".
+//
+// CommonJS on purpose: PM2 `require()`s this file, so it must NOT be parsed as an ES module.
+// In a package with "type": "module" the file has to keep the .cjs extension.
+module.exports = {
+  apps: [
+    {
+      name: '{{name}}',
+      script: '{{script}}',
+      cwd: '{{workdir}}',
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      max_restarts: 10,
+      max_memory_restart: '512M',
+      // Never put secrets in this file — it is committed. Real values live in .env,
+      // which PM2 reads via a loader in the app itself (dotenv) or the shell environment.
+      env: {
+        NODE_ENV: 'production',
+        HOST: '127.0.0.1',
+        PORT: '{{port}}',
+      },
+      error_file: 'logs/{{name}}-error.log',
+      out_file: 'logs/{{name}}-out.log',
+      time: true,
+    },
+  ],
+};

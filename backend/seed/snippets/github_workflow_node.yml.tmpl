@@ -1,0 +1,25 @@
+# Auto-scaffolded Node CI workflow. Adjust the node version and steps for your project.
+# `permissions: contents: read` is the least-privilege default — the workflow token can read
+# the repo and nothing else. Grant more only on the job that actually needs it.
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "{{package_manager}}"
+      - run: {{install_command}}
+      # TODO: adjust to your real check/test script.
+      - run: {{test_command}}

@@ -1,0 +1,26 @@
+# Auto-scaffolded .env.example — PLACEHOLDER VALUES ONLY.
+#
+# Copy to .env (which must be git-ignored) and fill the real values in THERE. Every value
+# below is deliberately a <replace-me> marker: this file is committed, so a single real
+# token pasted here is published to everyone who clones the repo — and stays in the git
+# history after you delete it. The agent's verify step scans this file for secret-shaped
+# values and FAILS the run if it finds one.
+
+# --- Runtime ---
+NODE_ENV=development
+HOST=127.0.0.1
+PORT={{port}}
+LOG_LEVEL=info
+
+# --- Datastores ---
+DATABASE_URL=<replace-me>
+REDIS_URL=<replace-me>
+
+# --- Credentials (never commit real ones) ---
+SESSION_SECRET=<replace-me>
+API_KEY=<replace-me>
+JWT_SIGNING_KEY=<replace-me>
+
+# --- Third-party services ---
+SMTP_URL=<replace-me>
+WEBHOOK_URL=<replace-me>

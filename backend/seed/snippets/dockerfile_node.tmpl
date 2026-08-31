@@ -1,0 +1,19 @@
+# Auto-scaffolded Node Dockerfile. Adjust the base tag, entrypoint, and port for your app.
+# Two stages so the runtime image carries no dev dependencies and no build toolchain —
+# a smaller image is a smaller attack surface, not just a faster pull.
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+FROM node:20-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+
+# The node image ships an unprivileged `node` user — never run the app as root.
+USER node
+EXPOSE {{port}}
+# TODO: replace with your real entrypoint.
+CMD ["node", "{{entry}}"]

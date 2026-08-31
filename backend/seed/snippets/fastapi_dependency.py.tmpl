@@ -1,0 +1,24 @@
+"""Auto-scaffolded FastAPI dependency `{{name}}`.
+
+A dependency is where authorization belongs: put it on the router/route, not inside the
+handler, so a new endpoint cannot forget it. The check below is a PLACEHOLDER — presence of
+a header is not authentication. Replace it with a real credential verification before use.
+"""
+from __future__ import annotations
+
+from typing import Annotated
+
+from fastapi import Depends, Header, HTTPException
+
+
+async def {{name}}(x_api_key: Annotated[str | None, Header()] = None) -> str:
+    # TODO: verify the credential against your real store, in constant time
+    # (hmac.compare_digest) so this does not become a timing oracle.
+    if not x_api_key:
+        raise HTTPException(status_code=401, detail="missing credentials")
+    return x_api_key
+
+
+# Annotate a handler parameter with this alias to require the dependency:
+#     async def handler(caller: {{cls}}Dep) -> dict[str, str]: ...
+{{cls}}Dep = Annotated[str, Depends({{name}})]

@@ -3,7 +3,7 @@ const BOT_DEFAULT_REVISION = 2;
 const DIMENSIONS = 384;
 const MAX_MEMORY_ITEMS = 32;
 const API_TIMEOUT_MS = 45000;
-const COLORS = ["#0e7c7b", "#6c5ce7", "#c95542", "#d69b2d", "#31572c", "#8f3985"];
+const COLORS = ["#ff6633", "#8ec7d8", "#4bb377", "#d9a441", "#9aa1a8", "#c98a6b"];
 const DEFAULT_SELECTED_TRAINING_SOURCES = [
   "src_starter_knowledge",
   "src_bug_bounty",
@@ -9092,15 +9092,15 @@ function ckBuildPocHtml(focus) {
   return [
     '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
     `<title>PoC — ${esc(focus.title)}</title><style>`,
-    "body{margin:0;font:14px/1.55 system-ui,Segoe UI,Roboto,sans-serif;background:#0b1020;color:#e6edf3}",
-    "h1{font-size:18px;margin:16px}h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#8aa0c6;margin:0 0 8px}",
-    "section{padding:12px 16px;border-top:1px solid #1e2a44}.meta{margin:0 16px 6px;color:#b6c2da}",
-    "code,pre{font-family:ui-monospace,Consolas,monospace}pre{white-space:pre-wrap;word-break:break-word;background:#111a2e;border:1px solid #1e2a44;border-radius:8px;padding:10px}",
-    ".warn{background:#3a2a08;color:#ffd98a;padding:10px 16px;border-bottom:2px solid #f0a500;font-size:13px}",
-    ".btn{display:inline-block;background:#f0a500;color:#111;border:0;border-radius:8px;padding:9px 14px;font:inherit;font-weight:600;cursor:pointer;text-decoration:none}",
-    ".out{margin-top:10px;min-height:2em}.note{color:#b6c2da;margin:0 0 10px}.sev{background:#7a1020;color:#fff;border-radius:5px;padding:1px 7px;font-weight:700;font-size:12px}",
-    "figure{margin:0 0 12px}figcaption{color:#8aa0c6;font-size:12px;margin-bottom:4px}img{max-width:100%;border:1px solid #1e2a44;border-radius:8px}",
-    "footer{padding:14px 16px;color:#7a88a6;font-size:12px}</style></head><body>",
+    "body{margin:0;font:14px/1.55 system-ui,Segoe UI,Roboto,sans-serif;background:#1c1f23;color:#e6e8ea}",
+    "h1{font-size:18px;margin:16px}h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#9aa1a8;margin:0 0 8px}",
+    "section{padding:12px 16px;border-top:1px solid #3a3f45}.meta{margin:0 16px 6px;color:#9aa1a8}",
+    "code,pre{font-family:ui-monospace,Consolas,monospace}pre{white-space:pre-wrap;word-break:break-word;background:#26292d;border:1px solid #3a3f45;border-radius:0;padding:10px}",
+    ".warn{background:#3a2318;color:#ffb08a;padding:10px 16px;border-bottom:2px solid #ff6633;font-size:13px}",
+    ".btn{display:inline-block;background:#ff6633;color:#1c1f23;border:0;border-radius:0;padding:9px 14px;font:inherit;font-weight:600;cursor:pointer;text-decoration:none}",
+    ".out{margin-top:10px;min-height:2em}.note{color:#9aa1a8;margin:0 0 10px}.sev{background:#e05252;color:#1c1f23;border-radius:0;padding:1px 7px;font-weight:700;font-size:12px}",
+    "figure{margin:0 0 12px}figcaption{color:#9aa1a8;font-size:12px;margin-bottom:4px}img{max-width:100%;border:1px solid #3a3f45;border-radius:0}",
+    "footer{padding:14px 16px;color:#9aa1a8;font-size:12px}</style></head><body>",
     '<div class="warn">⚠ Authorized security testing only — run this against a target you are permitted to test. Nothing executes until you click Run.</div>',
     `<h1>${esc(focus.title)}</h1>`,
     `<div class="meta"><span class="sev">${esc(String(focus.severity || "info").toUpperCase())}</span> ${esc(focus.className || "")}${focus.cwe ? " · " + esc(focus.cwe) : ""}</div>`,

@@ -1,0 +1,24 @@
+# Auto-scaffolded Compose file. Adjust the service name, port, and dependencies.
+# The published port is bound to 127.0.0.1 on purpose: Docker's port publishing punches
+# through the host firewall, so "0.0.0.0:8000:8000" silently exposes the service to the
+# whole network. Put a reverse proxy in front of it instead.
+services:
+  {{service}}:
+    build: .
+    image: {{service}}:local
+    ports:
+      - "127.0.0.1:{{port}}:{{port}}"
+    env_file:
+      - .env
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      # TODO: point this at your real health endpoint.
+      test: ["CMD", "true"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

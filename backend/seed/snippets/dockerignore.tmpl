@@ -1,0 +1,34 @@
+# Auto-scaffolded .dockerignore.
+# Two jobs: keep the build context small, and keep secrets/credentials OUT of the image.
+# Anything COPY'd in stays in a layer forever, even if a later step deletes it.
+.git
+.gitignore
+.github
+
+node_modules
+npm-debug.log*
+yarn-error.log*
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+dist/
+build/
+release/
+coverage/
+
+# Secrets and local state — never bake these into an image.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+runtime/

@@ -1,0 +1,25 @@
+// Auto-scaffolded Express router for {{path}}.
+// Mount it once: `app.use(require('./{{name}}_route'));`
+// ESM project ("type": "module" in package.json)? swap require/module.exports for
+// `import express from 'express'` / `export default router`.
+const express = require('express');
+
+const router = express.Router();
+
+router.get('{{path}}', (req, res) => {
+  // TODO: implement {{path}}. Treat req.query/req.params/req.body as untrusted:
+  // validate and coerce them before they reach a query, a path, or a shell.
+  res.json({ ok: true, path: '{{path}}' });
+});
+
+router.post('{{path}}', (req, res) => {
+  const payload = req.body || {};
+  if (Object.keys(payload).length === 0) {
+    res.status(422).json({ error: 'empty payload' });
+    return;
+  }
+  // TODO: validate `payload` against a schema, then persist it.
+  res.status(201).json({ ok: true, created: true });
+});
+
+module.exports = router;

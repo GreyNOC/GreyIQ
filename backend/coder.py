@@ -113,6 +113,13 @@ CODER_DEFAULTS: dict[str, Any] = {
 
 _PROVIDERS_OFF = {"", "off", "none", "disabled"}
 
+# Providers served by the DETERMINISTIC offline coder (agent._run_offline) rather than by an LLM:
+# a template + AST-edit engine gated by `verify`, no model and no network. They are deliberately
+# NOT in _PROVIDERS_OFF — "off" means the caller falls back to TinyGPT chat, whereas these are a
+# real, selectable coding capability with a real ceiling (scaffolds and mechanical edits).
+# `generate()` still refuses them: there is no chat completion here, only edits through the agent.
+PROVIDERS_DETERMINISTIC = frozenset({"offline", "deterministic"})
+
 
 class CoderError(RuntimeError):
     """A coding-brain request failed in a way worth showing the user."""
@@ -262,9 +269,38 @@ def coder_config(raw: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def coder_enabled(raw: dict[str, Any] | None) -> bool:
+    """True when SOME coding capability is selected — including the deterministic (offline) one.
+
+    This answers "can the Workbench agent do work?", NOT "is there a brain that can answer a
+    question?". Callers that need the latter must use ``reasoning_brain_enabled`` instead.
+    """
     cfg = coder_config(raw)
     provider = str(cfg.get("provider", "off")).strip().lower()
     return bool(cfg.get("enabled")) and provider not in _PROVIDERS_OFF
+
+
+def reasoning_brain_enabled(raw: dict[str, Any] | None) -> bool:
+    """True only when a brain that can answer a FREE-FORM PROMPT is configured.
+
+    WHY THIS IS SEPARATE FROM ``coder_enabled``: the deterministic providers are a real, selectable
+    coding capability (template + AST edits through the agent), so they are deliberately NOT in
+    ``_PROVIDERS_OFF`` and ``coder_enabled`` answers True for them. But they have no chat completion
+    at all — ``generate()`` raises CoderError for them BY DESIGN. Any feature that gates an LLM
+    prompt on ``coder_enabled`` therefore breaks the moment the operator selects the deterministic
+    coder: it takes the LLM branch, ``generate`` raises, and the feature fails closed — silently
+    losing whatever offline fallback the ``coder_enabled == False`` branch would have run. That is
+    strictly WORSE than provider "off". The hunt planner (``hunt_brain.plan_hunt``) hit exactly
+    this: selecting the deterministic coder replaced its full offline knowledge-rule plan with an
+    empty one, so the hunt flew blind.
+
+    Semantics: reasoning is available iff a coder is enabled AND it is not a deterministic
+    scaffolder. Delegating to ``coder_enabled`` keeps the "off" vocabulary defined in exactly one
+    place, so a future provider added to ``_PROVIDERS_OFF`` is honoured here for free.
+    """
+    if not coder_enabled(raw):
+        return False
+    provider = str(coder_config(raw).get("provider", "off")).strip().lower()
+    return provider not in PROVIDERS_DETERMINISTIC
 
 
 def public_config(raw: dict[str, Any] | None) -> dict[str, Any]:
@@ -277,6 +313,12 @@ def public_config(raw: dict[str, Any] | None) -> dict[str, Any]:
         block.pop("api_key", None)
         safe[name] = block
     safe["available"] = coder_enabled(raw)
+    # Tell the UI the truth about WHICH engine is answering. Without this flag the deterministic
+    # coder (no API key, no model name, no endpoint) reads as a half-finished configuration, when
+    # it is in fact the working offline path — scaffolds and mechanical edits, verify-gated.
+    provider = str(cfg.get("provider", "off")).strip().lower()
+    safe["deterministic"] = provider in PROVIDERS_DETERMINISTIC
+    safe["deterministic_providers"] = sorted(PROVIDERS_DETERMINISTIC)
     return safe
 
 
@@ -355,6 +397,13 @@ def generate(messages: list[dict[str, str]], raw_config: dict[str, Any] | None) 
 
     if provider in _PROVIDERS_OFF:
         raise CoderError("The coding brain is turned off.")
+    if provider in PROVIDERS_DETERMINISTIC:
+        # The deterministic coder has no chat completion — it only makes verify-gated EDITS through
+        # the agent. Say that plainly instead of "Unknown provider", which reads as a bad setting.
+        raise CoderError(
+            "The offline (deterministic) coder does not chat — it edits files. Use the Workbench "
+            "agent, or configure a Local model (Ollama) or Claude brain for conversation."
+        )
     if provider == "anthropic":
         # response_schema is Anthropic-only: it constrains the reply to valid JSON. Other providers
         # keep the prose-scraping path, so a caller can always fall back to _parse_json_object.

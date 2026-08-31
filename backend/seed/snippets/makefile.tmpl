@@ -1,0 +1,26 @@
+# Auto-scaffolded Makefile — one obvious entry point per task.
+# Recipe lines MUST start with a real TAB, not spaces; that is make's whole syntax.
+# `help` is the default target on purpose: a Makefile you have to read to use is a bad one.
+
+.DEFAULT_GOAL := help
+.PHONY: help install check test run clean
+
+help:  ## Show this help
+	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s
+", $$1, $$2}'
+
+install:  ## Install dependencies
+	{{install_command}}
+
+check:  ## Run the full gate (what CI runs)
+	{{check_command}}
+
+test:  ## Run the test suite
+	{{test_command}}
+
+run:  ## Run the app locally
+	{{run_command}}
+
+clean:  ## Remove build/cache artifacts (never touches source or .env)
+	@rm -rf dist build .pytest_cache .mypy_cache .ruff_cache coverage
+	@find . -name '__pycache__' -type d -prune -exec rm -rf {} +

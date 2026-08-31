@@ -1,0 +1,24 @@
+# Auto-scaffolded pre-commit config (.pre-commit-config.yaml).
+# Install the hook once: `pre-commit install`. `detect-private-key` and the large-file guard
+# are the two that earn their keep — a key or a blob committed once lives in the history
+# forever, and rewriting history after the fact is far more expensive than blocking the commit.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+      - id: detect-private-key
+
+  - repo: local
+    hooks:
+      - id: project-checks
+        name: project checks
+        entry: "{{check_command}}"
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]

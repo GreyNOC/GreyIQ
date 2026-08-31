@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
@@ -39,14 +40,20 @@ import brain_profiles
 import coder
 import trust
 from bughunter import investigator, offline_hunt
+from bughunter.prover_classes import CLASS_ALIASES, PROVER_CLASSES
 
 # The vuln classes the active prover (active_verify_service) can actually CONFIRM with a benign
-# differential. The brain's class suggestions are filtered to this set — a suggestion the prover
-# can't verify would only ever produce an unconfirmable lead, which we don't want it steering toward.
-ACTIVE_CLASSES: frozenset[str] = frozenset({
-    "xss", "sqli", "redirect", "open-redirect", "ssti", "rce", "command-injection",
-    "crlf", "path-traversal", "lfi", "cors", "nosqli", "host-header",
-})
+# differential, PLUS the spelling variants a brain may emit for them. The brain's class suggestions
+# are filtered to this set — a suggestion the prover can't verify would only ever produce an
+# unconfirmable lead, which we don't want it steering toward.
+#
+# This was a hand-maintained 13-name literal (10 canonical + 3 aliases) that drifted behind the
+# prover's real 18 tags, so a perfectly good jwt/graphql/debug/csrf suggestion was silently dropped.
+# It is now derived from prover_classes, which test_active_verify_service re-derives from the
+# prover's own source — one definition, mechanically enforced. Note the CANONICAL set (not this one)
+# is what _validate_plan gates on; this alias-inclusive set exists for callers asking "would the
+# brain's raw spelling be understood?".
+ACTIVE_CLASSES: frozenset[str] = PROVER_CLASSES | frozenset(CLASS_ALIASES)
 
 # A real HTTP parameter name — the SAME shape the active prover accepts (letters/digits/_-[]. up to
 # 40 chars, must start with a letter or underscore). Anything else (a URL, a payload, a sentence the
@@ -130,13 +137,13 @@ def _with_hypotheses(plan: dict[str, Any]) -> dict[str, Any]:
 
 
 def _norm_class(value: str) -> str:
-    """Fold a few brain spellings onto the active prover's class vocabulary."""
+    """Fold a brain spelling onto the active prover's canonical class vocabulary.
+
+    Whitespace/underscores are folded to dashes BEFORE the alias lookup, so "OS Command_Injection"
+    and "os-command-injection" land on the same canonical tag. The alias table lives in
+    prover_classes so the prover, the LLM planner, and the offline planner share one definition."""
     v = str(value or "").strip().lower().replace("_", "-").replace(" ", "-")
-    return {
-        "open-redirect": "redirect", "command-injection": "rce", "os-command-injection": "rce",
-        "lfi": "path-traversal", "local-file-inclusion": "path-traversal", "sql-injection": "sqli",
-        "no-sqli": "nosqli", "nosql-injection": "nosqli", "template-injection": "ssti",
-    }.get(v, v)
+    return CLASS_ALIASES.get(v, v)
 
 
 def _signal_words(value: str) -> set[str]:
@@ -457,7 +464,11 @@ def _validate_plan(parsed: Any, surface: dict[str, Any]) -> tuple[list[str], lis
         classes = []
         for c in raw_classes:
             norm = _norm_class(c)
-            if norm in {"redirect", "rce", "path-traversal", "nosqli"} or norm in ACTIVE_CLASSES:
+            # Gate on the CANONICAL prover vocabulary: after _norm_class every alias has already
+            # been folded, so an alias can never leak through un-normalized. This replaced a
+            # hand-listed subset that silently dropped jwt/graphql/debug/csrf/websocket/sensitive/
+            # cloud-exposure/clickjacking — classes the prover has had checks for all along.
+            if norm in PROVER_CLASSES:
                 if norm not in classes:
                     classes.append(norm)
         if not classes:
@@ -505,22 +516,55 @@ def _validate_plan(parsed: Any, surface: dict[str, Any]) -> tuple[list[str], lis
     return params, priority, idor_candidates, ssrf_params, xss_params, privileged_endpoints
 
 
+def _load_ranker(seed_dir: Path | None, runtime_dir: Path | None) -> Any | None:
+    """The learned offline ranker, or None (== use the hand-tuned rules).
+
+    Every failure mode collapses to None, which is a fully valid answer and exactly today's
+    behaviour: a build that ships without the optional ``hunt_model`` module, no weight file on
+    disk, a truncated/corrupt/hostile weight file, or the operator's GREYIQ_OFFLINE_RANKER kill
+    switch. The import is LAZY and inside the guard on purpose — hunt_brain must stay importable
+    (and the offline hunt must stay runnable) in a frozen build where hunt_model does not exist."""
+    try:
+        from bughunter import hunt_model, settings  # noqa: PLC0415 - lazy + optional by design
+        if not settings.get_settings().offline_ranker_enabled:
+            return None
+        return hunt_model.load_model(seed_dir, runtime_dir)
+    except Exception:  # noqa: BLE001 - no ranker is always a valid answer; never break a hunt
+        return None
+
+
 def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface: dict[str, Any],
-              priors: dict[str, float] | None = None,
+              priors: dict[str, float] | None = None, *,
+              seed_dir: Path | None = None, runtime_dir: Path | None = None,
               technique_context: str = "") -> dict[str, Any]:
     """Reason over the recon surface and propose where to probe.
 
     Returns ``{used, provider, model, param_hypotheses, probe_priority, hypotheses,
-    idor_candidates, ssrf_params, xss_params, notes}``. With a brain configured, the LLM produces the plan; with NO brain configured
-    the OFFLINE knowledge-rule engine (offline_hunt, sharpened by learned ``priors``) produces the same
+    idor_candidates, ssrf_params, xss_params, notes}``. With a REASONING brain configured (one
+    that can answer a free-form prompt — NOT the deterministic code-scaffolder, which cannot), the
+    LLM produces the plan; otherwise the OFFLINE knowledge-rule engine (offline_hunt, sharpened by
+    learned ``priors``) produces the same
     shape — so an offline hunt is steered too, no longer flying blind. All outputs (names + verbatim
     in-scope endpoints + class orderings) pass through _validate_plan either way; a name can't carry a
-    payload, so this only raises recall. Best-effort: any failure returns an empty plan."""
+    payload, so this only raises recall. Best-effort: any failure returns an empty plan.
+
+    ``seed_dir``/``runtime_dir`` are keyword-only and optional so every existing 4/5-positional-arg
+    caller is untouched. They locate the OPTIONAL learned offline ranker's weight file; with no file
+    (or no hunt_model module) the plan is byte-identical to the rules-only plan."""
     plan = _empty_plan()
-    if not coder.coder_enabled(coder_cfg):
-        # Offline hunt intelligence: knowledge rules + what the program has confirmed before.
+    # Gate on REASONING availability, not on "is a coder selected". The deterministic (offline)
+    # coder is a real, selectable provider that ``coder_enabled`` answers True for, but it cannot
+    # answer a planning prompt at all — ``coder.generate`` raises CoderError for it by design. Gating
+    # on ``coder_enabled`` therefore sent that configuration down the LLM branch, where the raise
+    # fail-closed to an EMPTY plan: no probe_priority, no param hypotheses, no idor/privileged
+    # candidates. The hunt flew blind, strictly worse than provider "off". See
+    # coder.reasoning_brain_enabled for the full rationale.
+    if not coder.reasoning_brain_enabled(coder_cfg):
+        # Offline hunt intelligence: knowledge rules + what the program has confirmed before,
+        # optionally re-ordered by the learned ranker (permutation-only; None == rules).
         try:
-            raw = offline_hunt.offline_plan(surface, priors)
+            model = _load_ranker(seed_dir, runtime_dir)
+            raw = offline_hunt.offline_plan(surface, priors, model=model)
             params, priority, idor, ssrf, xss, priv = _validate_plan(raw, surface)
             plan.update({"used": bool(raw.get("used")), "provider": "offline", "model": "greyiq-offline-hunt",
                          "param_hypotheses": params, "probe_priority": priority, "idor_candidates": idor,

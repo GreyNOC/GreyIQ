@@ -1,0 +1,28 @@
+"""Auto-scaffolded unittest subTest table for {{symbol}} ({{location}}).
+
+subTest is unittest's answer to pytest's parametrize: every row runs even after an earlier
+row fails, and the failure message names the row. Add the boundary and hostile rows — a
+table of happy-path rows proves nothing.
+"""
+from __future__ import annotations
+
+import unittest
+
+
+class Test{{cls}}Cases(unittest.TestCase):
+    CASES: tuple[tuple[str, str, str], ...] = (
+        ("empty", "", ""),
+        ("single", "x", "x"),
+        ("surrounding-whitespace", "  x  ", "x"),
+    )
+
+    def test_{{symbol}}_table(self) -> None:
+        for label, given, expected in self.CASES:
+            with self.subTest(case=label):
+                # TODO: call {{symbol}}(given) and assert against `expected`.
+                # The identity assertion below only proves the wiring — replace it.
+                self.assertEqual(given.strip(), expected)
+
+
+if __name__ == "__main__":
+    unittest.main()

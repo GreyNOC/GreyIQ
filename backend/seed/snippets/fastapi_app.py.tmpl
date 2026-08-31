@@ -1,0 +1,24 @@
+"""Auto-scaffolded FastAPI application entrypoint for {{module}}.
+
+Run it with ``uvicorn {{module}}_app:app --host 127.0.0.1 --port {{port}}``. The host is
+LOOPBACK on purpose: a local-first service should not be reachable off the box until you
+deliberately put a reverse proxy (which terminates TLS) in front of it.
+"""
+from __future__ import annotations
+
+from fastapi import FastAPI
+
+app = FastAPI(title="{{title}}", docs_url="/docs", redoc_url=None)
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    """Liveness probe — cheap, dependency-free, and safe to expose to a proxy or supervisor.
+
+    Deliberately reports nothing about versions, paths, or config: a health endpoint is the
+    first thing an unauthenticated scanner reads.
+    """
+    return {"status": "ok"}
+
+
+# TODO: include your routers here, e.g. `app.include_router(users_router)`.

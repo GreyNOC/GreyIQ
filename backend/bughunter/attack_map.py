@@ -37,15 +37,15 @@ from bughunter.playwright_env import ensure_bundled_browsers_path
 # unproven kinds are deliberately neutral slate: a green tell or a red impact box reads as proof at a
 # glance, so a stage that was never captured must not borrow that colour.
 _STAGES = {
-    "actor": ("#6366f1", "#eef2ff"),
-    "probe": ("#0ea5e9", "#e0f2fe"),
-    "observed": ("#16a34a", "#dcfce7"),
-    "control": ("#d97706", "#fef3c7"),
-    "confirmed": ("#dc2626", "#fee2e2"),
-    "pending": ("#64748b", "#f1f5f9"),
-    "candidate": ("#475569", "#e2e8f0"),
+    "actor": ("#d94f14", "#fdefe8"),
+    "probe": ("#5b6165", "#e9eaec"),
+    "observed": ("#17794a", "#dff2e8"),
+    "control": ("#9a6400", "#f7ecd6"),
+    "confirmed": ("#c62828", "#fbe3e3"),
+    "pending": ("#5b6165", "#eef0f1"),
+    "candidate": ("#8b9196", "#f1f2f3"),
 }
-_SEVERITY_COLOR = {"critical": "#7f1d1d", "high": "#dc2626", "medium": "#d97706", "low": "#2563eb", "info": "#4b5563"}
+_SEVERITY_COLOR = {"critical": "#8c1d1d", "high": "#c62828", "medium": "#9a6400", "low": "#5b6165", "info": "#8b9196"}
 _WIDTH = 860
 _MARGIN = 28
 _BOX_W = _WIDTH - 2 * _MARGIN
@@ -108,13 +108,13 @@ def _e(text: str) -> str:
 
 def _box(y: int, kind: str, label: str, body_lines: list[str]) -> tuple[str, int]:
     """One rounded stage box at ``y``; returns (svg, next_y). Height grows with the wrapped body."""
-    accent, fill = _STAGES.get(kind, ("#475569", "#f1f5f9"))
+    accent, fill = _STAGES.get(kind, ("#8b9196", "#f1f2f3"))
     body_h = max(1, len(body_lines)) * _LINE_H
     h = _LABEL_H + _PAD + body_h + _PAD
     parts = [
         f'<rect x="{_MARGIN}" y="{y}" width="{_BOX_W}" height="{h}" rx="10" '
         f'fill="{fill}" stroke="{accent}" stroke-width="1.5"/>',
-        f'<rect x="{_MARGIN}" y="{y}" width="6" height="{h}" rx="3" fill="{accent}"/>',
+        f'<rect x="{_MARGIN}" y="{y}" width="6" height="{h}" rx="0" fill="{accent}"/>',
         f'<text x="{_MARGIN + _PAD}" y="{y + _LABEL_H}" font-family="Segoe UI,Arial,sans-serif" '
         f'font-size="13" font-weight="700" fill="{accent}" letter-spacing="0.5">{_e(label)}</text>',
     ]
@@ -122,7 +122,7 @@ def _box(y: int, kind: str, label: str, body_lines: list[str]) -> tuple[str, int
     for line in body_lines:
         parts.append(
             f'<text x="{_MARGIN + _PAD}" y="{ty}" font-family="Consolas,SFMono-Regular,Menlo,monospace" '
-            f'font-size="13" fill="#0f172a">{_e(line)}</text>')
+            f'font-size="13" fill="#17191a">{_e(line)}</text>')
         ty += _LINE_H
     return "\n".join(parts), y + h
 
@@ -130,7 +130,7 @@ def _box(y: int, kind: str, label: str, body_lines: list[str]) -> tuple[str, int
 def _arrow(y: int) -> str:
     """A downward connector arrow centered between two boxes, occupying the _GAP below ``y``."""
     cx = _WIDTH // 2
-    return (f'<line x1="{cx}" y1="{y + 4}" x2="{cx}" y2="{y + _GAP - 6}" stroke="#94a3b8" '
+    return (f'<line x1="{cx}" y1="{y + 4}" x2="{cx}" y2="{y + _GAP - 6}" stroke="#cfd3d6" '
             f'stroke-width="2" marker-end="url(#arrow)"/>')
 
 
@@ -221,22 +221,22 @@ def build_attack_svg(finding: dict[str, Any], plan: dict[str, Any] | None = None
             y = y2
     total_h = y + _MARGIN
 
-    sev_color = _SEVERITY_COLOR.get(severity, "#4b5563")
+    sev_color = _SEVERITY_COLOR.get(severity, "#8b9196")
     # The eyebrow carries the gate's verdict: the .png is pasted into a report on its own, so the
     # state has to be legible without the surrounding prose.
     eyebrow = "GreyIQ · ATTACK PLAN · CONFIRMED" if confirmed else "GreyIQ · ATTACK PLAN · CANDIDATE (NOT CONFIRMED)"
     header = (
-        f'<rect x="0" y="0" width="{_WIDTH}" height="{header_h}" fill="#0f172a"/>'
+        f'<rect x="0" y="0" width="{_WIDTH}" height="{header_h}" fill="#1c1f23"/>'
         f'<text x="{_MARGIN}" y="30" font-family="Segoe UI,Arial,sans-serif" font-size="12" '
-        f'font-weight="700" fill="#94a3b8" letter-spacing="1.5">{_e(eyebrow)}</text>'
+        f'font-weight="700" fill="#9aa1a8" letter-spacing="1.5">{_e(eyebrow)}</text>'
         f'<text x="{_MARGIN}" y="56" font-family="Segoe UI,Arial,sans-serif" font-size="18" '
-        f'font-weight="700" fill="#f8fafc">{_e(title)}</text>'
-        f'<rect x="{_WIDTH - _MARGIN - 96}" y="20" width="96" height="34" rx="6" fill="{sev_color}"/>'
+        f'font-weight="700" fill="#e6e8ea">{_e(title)}</text>'
+        f'<rect x="{_WIDTH - _MARGIN - 96}" y="20" width="96" height="34" rx="0" fill="{sev_color}"/>'
         f'<text x="{_WIDTH - _MARGIN - 48}" y="42" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" '
         f'font-size="13" font-weight="700" fill="#ffffff">{_e(severity.upper())}</text>'
     )
     defs = ('<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto" '
-            'markerUnits="strokeWidth"><path d="M0,0 L7,3 L0,6 Z" fill="#94a3b8"/></marker></defs>')
+            'markerUnits="strokeWidth"><path d="M0,0 L7,3 L0,6 Z" fill="#cfd3d6"/></marker></defs>')
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{_WIDTH}" height="{total_h}" '
         f'viewBox="0 0 {_WIDTH} {total_h}" font-family="Segoe UI,Arial,sans-serif">'

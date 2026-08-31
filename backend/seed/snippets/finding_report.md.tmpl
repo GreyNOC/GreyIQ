@@ -1,0 +1,80 @@
+# {{title}}
+
+> Auto-scaffolded GreyNOC finding report. House rule: **reproducible or it didn't happen.**
+> Every claim below must be re-derivable from the evidence by someone who was not there.
+> Leave a field as `undetermined` rather than guessing — an invented severity, impact, or
+> CVE reference invalidates the whole report.
+
+| Field | Value |
+|---|---|
+| Finding ID | `{{finding_id}}` |
+| Reported | {{date}} |
+| Target / asset | undetermined |
+| Engagement / program | undetermined |
+| Authorization reference | undetermined — the signed scope this was tested under |
+| Status | draft |
+
+## 1. Overview
+
+One paragraph: what the defect is, where it lives, and why it matters. No adjectives that
+the evidence does not support.
+
+## 2. Severity
+
+| | |
+|---|---|
+| Severity | undetermined |
+| CVSS v3.1 vector | undetermined |
+| Justification | Derive from observed impact only. If impact was not demonstrated, say so. |
+
+## 3. Affected scope
+
+- Asset(s): undetermined
+- Endpoint / component: undetermined
+- Version / commit: undetermined
+- In-scope per the engagement scope file: **yes / no** (cite the scope entry)
+
+## 4. Reproduction
+
+Exact, minimal, copy-pasteable. A reader with the same authorization must reach the same
+result. Redact captured secrets; keep the request/response shape intact.
+
+```
+1. …
+2. …
+3. Observed: …
+```
+
+- Attached artifacts: `replay.sh`, `findings.har`, screenshots
+- Reproduction stability: undetermined (state successes / attempts; a one-off is not a finding)
+
+## 5. Evidence
+
+Minimal proof only — enough to prove the defect, never a bulk data pull. Note what was
+redacted and why.
+
+## 6. Impact
+
+What an attacker actually gains. Tie every sentence to something demonstrated in §4/§5.
+Speculative escalation belongs in §7, clearly labelled as untested.
+
+## 7. Untested escalation (optional)
+
+Explicitly hypothetical. Mark it as such or delete this section.
+
+## 8. Remediation
+
+Concrete fix, and the reason it closes the class rather than the instance.
+
+## 9. References
+
+Only sources actually consulted. Do not paste CVE text as original analysis.
+
+## 10. Disclosure timeline
+
+| Date | Event |
+|---|---|
+| {{date}} | Finding identified |
+| undetermined | Reported to the program |
+| undetermined | Vendor acknowledged |
+| undetermined | Fix verified |

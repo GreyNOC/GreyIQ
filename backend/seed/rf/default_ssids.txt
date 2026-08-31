@@ -1,0 +1,80 @@
+# GreyIQ wardrive — SSID patterns that CHANGE A VERDICT.
+#
+# Two independent jobs, distinguished by the `kind` column:
+#
+#   factory  — a network still broadcasting its FACTORY-DEFAULT SSID. That is a real
+#              finding: the shipped SSID very often means the shipped admin password and
+#              the shipped WPS PIN were never changed either, and it fingerprints the
+#              exact model to anyone within radio range.
+#   soft-ap  — an SSID pattern produced by a phone hotspot, a laptop soft-AP, a dev board
+#              or a portable router. Not itself a defect, but in a MANAGED RF environment
+#              it is an unmanaged AP, so it feeds rogue-AP triage.
+#   guest    — a deliberately-open guest/captive-portal or public-hotspot network. This is
+#              the FALSE-POSITIVE CONTROL for the open-network detector: an open BSS named
+#              "…-guest" is an intentional design decision, so the finding is downgraded to
+#              info instead of being reported as high-severity missing encryption.
+#
+# Matching is case-insensitive. A pattern ending in `*` is a PREFIX match; anything else
+# must match the whole SSID. Patterns are matched most-specific-first (longest pattern
+# wins) so `xfinitywifi` beats a bare `xfinity*`.
+#
+# This table is curated, not exhaustive — an SSID that is absent means "not a known
+# pattern", never "safe". Vintage: 2026-07.
+#
+# format: <pattern>\t<label>\t<kind>
+linksys	Linksys factory default	factory
+linksys*	Linksys factory default	factory
+netgear*	NETGEAR factory default	factory
+dlink	D-Link factory default	factory
+dlink-*	D-Link factory default	factory
+d-link*	D-Link factory default	factory
+tp-link_*	TP-Link factory default	factory
+tplink*	TP-Link factory default	factory
+asus	ASUS factory default	factory
+asus_*	ASUS factory default	factory
+belkin.*	Belkin factory default	factory
+tenda_*	Tenda factory default	factory
+tew-*	TRENDnet factory default	factory
+edimax*	Edimax factory default	factory
+zyxel*	Zyxel factory default	factory
+huawei-*	Huawei CPE factory default	factory
+zte-*	ZTE CPE factory default	factory
+fritz!box*	AVM FRITZ!Box factory default	factory
+speedport*	Telekom Speedport factory default	factory
+mikrotik*	MikroTik factory default	factory
+ubnt	Ubiquiti factory default	factory
+ubnt-*	Ubiquiti factory default	factory
+openwrt	OpenWrt factory default	factory
+lede	OpenWrt/LEDE factory default	factory
+dd-wrt	DD-WRT factory default	factory
+default	Unconfigured factory default	factory
+wireless	Unconfigured factory default	factory
+wlan	Unconfigured factory default	factory
+setup	Unconfigured factory default	factory
+esp_*	Espressif dev-board soft-AP	soft-ap
+esp32*	Espressif dev-board soft-AP	soft-ap
+esp8266*	Espressif dev-board soft-AP	soft-ap
+raspap*	RaspAP soft-AP	soft-ap
+hostapd*	hostapd soft-AP	soft-ap
+androidap*	Android phone hotspot	soft-ap
+android_*	Android phone hotspot	soft-ap
+direct-*	Wi-Fi Direct / P2P soft-AP	soft-ap
+hp-print-*	HP printer soft-AP	soft-ap
+chromecast*	Chromecast setup soft-AP	soft-ap
+mi phone*	Phone hotspot	soft-ap
+iphone	iPhone personal hotspot	soft-ap
+iphone*	iPhone personal hotspot	soft-ap
+guest	Guest network	guest
+guest*	Guest network	guest
+*-guest	Guest network	guest
+visitor*	Guest network	guest
+public wifi	Public hotspot	guest
+free wifi	Public hotspot	guest
+free public wifi	Public hotspot	guest
+xfinitywifi	Comcast public hotspot	guest
+cablewifi	Cable public hotspot	guest
+attwifi	AT&T public hotspot	guest
+optimumwifi	Optimum public hotspot	guest
+spectrumwifi	Spectrum public hotspot	guest
+eduroam	Federated education network	guest
+_the wifi	Public hotspot	guest

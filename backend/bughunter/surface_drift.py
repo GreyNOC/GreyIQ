@@ -375,7 +375,8 @@ def record_snapshot(
                 # so it cannot concatenate with this record into one unparseable line.
                 if existing and not existing.endswith("\n"):
                     line = "\n" + line
-            path.open("a", encoding="utf-8").write(line)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
             if existing.count("\n") + 1 > _MAX_LINES_BEFORE_COMPACTION:
                 _compact(path)
         return True

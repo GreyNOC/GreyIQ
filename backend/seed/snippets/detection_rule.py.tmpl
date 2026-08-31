@@ -1,0 +1,79 @@
+"""Auto-scaffolded GreyNOC detection rule: {{title}}.
+
+BEHAVIOR-based, not IOC-based — an IOC list ages out the day the operator rotates
+infrastructure; the behaviour (the sequence, the rate, the impossible pairing) is what the
+adversary has to keep doing. Follow the house playbook order when you fill this in:
+overview -> ATT&CK mapping -> detection strategy -> indicators -> logic -> investigation ->
+false positives -> tuning -> response.
+
+NOTHING here is guessed. SEVERITY, ATTACK_TECHNIQUES and the thresholds start empty or
+neutral on purpose: a technique ID invented to make the rule look finished is fabrication,
+and a severity nobody derived from real impact is worse than no severity at all. Leave a
+field undetermined until you can show where the value came from.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+RULE_ID = "{{rule_id}}"
+TITLE = "{{title}}"
+# TODO: derive from real observed impact. Until then this is a placeholder, not an assessment.
+SEVERITY = "undetermined"
+# TODO: e.g. ("T1110.003",). Empty means UNMAPPED — never guess a technique to fill the field.
+ATTACK_TECHNIQUES: tuple[str, ...] = ()
+# TODO: the log source(s) this rule reads, so a deployer knows what to onboard first.
+DATA_SOURCES: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class Detection:
+    """One alert. `evidence` must be reproducible from the source events alone."""
+
+    rule_id: str
+    title: str
+    severity: str
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+
+def matches(event: dict[str, Any]) -> bool:
+    """The per-event condition.
+
+    Returns False until implemented: a rule that fires by default is worse than no rule,
+    because it trains the analyst to ignore the channel.
+    """
+    # TODO: express the BEHAVIOUR, e.g.
+    #   return event.get("action") == "auth_failure" and event.get("outcome") == "denied"
+    return False
+
+
+def evaluate(events: list[dict[str, Any]]) -> list[Detection]:
+    """Run the rule over a batch of normalized events and return the detections.
+
+    Stateless per batch by design — correlation across batches belongs in the engine, not in
+    a rule, so a rule stays independently testable against a fixture of replayed events.
+    """
+    detections: list[Detection] = []
+    for event in events:
+        if not matches(event):
+            continue
+        detections.append(
+            Detection(
+                rule_id=RULE_ID,
+                title=TITLE,
+                severity=SEVERITY,
+                # Carry only what an analyst needs to re-derive the verdict. Never copy a
+                # whole event: it drags credentials and PII into the alert store.
+                evidence={
+                    "event_id": event.get("id"),
+                    "source": event.get("source"),
+                    "observed_at": event.get("timestamp"),
+                },
+            )
+        )
+    return detections
+
+
+# --- False positives (fill in from real tuning, not from imagination) ---
+# TODO: list the benign sources that trip this rule and how to distinguish them.
+KNOWN_FALSE_POSITIVES: tuple[str, ...] = ()
