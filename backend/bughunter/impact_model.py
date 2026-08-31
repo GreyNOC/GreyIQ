@@ -118,8 +118,23 @@ IMPACT_MODEL: dict[str, dict[str, str]] = {
         "attacker_capability": "An attacker uploads or retrieves a file that bypasses type/path/storage controls.",
         "affected_asset": "the web/file server, stored content, and other users' downloads.",
         "business_impact": "remote code execution (webshell), stored XSS, or arbitrary file read/overwrite.",
-        "proof_obligation": "Capture the upload request + the response/URL proving the dangerous file was accepted and is reachable/executed (e.g. a benign `.php`/SVG that runs), or a path-traversal write/read of an out-of-scope path stopped at proof.",
+        # The obligation deliberately names only the UPLOAD artifact. It used to also accept "a
+        # path-traversal write/read of an out-of-scope path", which let a read-only traversal
+        # satisfy an obligation whose class carries CWE-434 and this C:H/I:H/A:H vector. A traversal
+        # READ is its own class ('path-traversal', confidentiality-only) and proves nothing about
+        # integrity or availability here.
+        "proof_obligation": "Capture the upload request + the response/URL proving the dangerous file was accepted and is reachable/executed (e.g. a benign `.php`/SVG that runs) — stop at that marker, never a working shell.",
         "cvss_vector": "AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+    },
+    "path-traversal": {
+        "attacker_capability": "An attacker escapes the intended directory through a file/path parameter and reads files the web process can open.",
+        "affected_asset": "local files readable by the service — application source, configuration, and any credential stored in them.",
+        "business_impact": "disclosure of source/config/secrets, which lowers the cost of every follow-on attack (a leaked credential is a separate, chained finding).",
+        "proof_obligation": "Capture the traversal request reading ONE well-known, non-sensitive file (/etc/passwd, windows/win.ini) with its unmistakable signature in the response, plus the benign-filename control that does NOT return it — read only, never a write, and never bulk-read application data.",
+        # Confidentiality ONLY. This check proves a READ; it demonstrates no write, no execution,
+        # and no availability effect, so it must not inherit the file-upload class's C:H/I:H/A:H
+        # (8.8), which scored a read-only disclosure on an RCE-shaped vector. This one scores 7.5.
+        "cvss_vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
     },
     "business-logic": {
         "attacker_capability": "An attacker abuses a workflow by skipping, repeating, or reordering server-side steps.",
@@ -293,6 +308,7 @@ _REMEDIATION: dict[str, str] = {
     "websocket": "Validate the `Origin` header on the WebSocket handshake against an explicit allowlist and reject cross-site origins; bind the socket to an unpredictable per-session CSRF token rather than ambient cookies alone.",
     "redirect": "Allowlist redirect targets (relative paths or a fixed host set); validate with a host/scheme check (e.g. url_has_allowed_host_and_scheme) and reject off-host URLs.",
     "file-upload": "Validate type by content (not extension), store outside the web root with non-executable permissions and random names, and serve via a controlled handler.",
+    "path-traversal": "Never build a filesystem path from user input: map the parameter to an allowlisted identifier, then canonicalize the resolved path (realpath) and reject anything outside the intended root before opening it.",
     "business-logic": "Enforce the intended workflow and invariants server-side (ownership, quantity/price, state transitions); never trust client-asserted steps or amounts.",
     "supply-chain": "Pin and integrity-verify dependencies (lockfile + hashes), build from a clean source, and never pipe a remote download straight into a shell.",
     "ssti": "Render fixed template files and pass user input as context variables; never build the template string from input. Sandbox the engine where supported.",
@@ -327,6 +343,10 @@ _REFERENCES: dict[str, list[str]] = {
     "websocket": [f"{_CWE}/284.html", f"{_CWE}/346.html", "https://portswigger.net/web-security/websockets/cross-site-websocket-hijacking", "https://owasp.org/www-community/attacks/Cross_Site_WebSocket_Hijacking_CSWSH"],
     "redirect": [f"{_CS}/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html", f"{_CWE}/601.html"],
     "file-upload": [f"{_CS}/File_Upload_Cheat_Sheet.html", f"{_CWE}/434.html"],
+    # No _CS entry: the cheat-sheet series has no path-traversal sheet, and a report must never
+    # carry a link a triager clicks into a 404. The OWASP community attack page is the canonical
+    # OWASP reference here (same source the business-logic / subdomain-takeover rows already use).
+    "path-traversal": ["https://owasp.org/www-community/attacks/Path_Traversal", f"{_CWE}/22.html", "https://portswigger.net/web-security/file-path-traversal"],
     "business-logic": ["https://owasp.org/www-community/vulnerabilities/Business_logic_vulnerability", f"{_CWE}/840.html"],
     "supply-chain": [f"{_CS}/Vulnerable_Dependency_Management_Cheat_Sheet.html", f"{_CWE}/1357.html"],
     "ssti": ["https://portswigger.net/web-security/server-side-template-injection", f"{_CWE}/1336.html"],
@@ -381,6 +401,7 @@ _BUGCROWD_VRT: dict[str, str] = {
     "secrets": "sensitive_data_exposure.disclosure_of_secrets",
     "jwt": "broken_authentication_and_session_management.authentication_bypass",
     "file-upload": "unrestricted_file_upload",
+    "path-traversal": "",  # no VRT leaf verified for traversal/LFI — '' beats an invented path, and the report renders the honest placeholder
     "graphql": "",  # no clean Bugcrowd VRT leaf for GraphQL — report renders the honest placeholder
     "deserialization": "server_side_injection.remote_code_execution_rce",
     "nosqli": "server_side_injection.nosql_injection",

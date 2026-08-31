@@ -586,5 +586,136 @@ class ExecutiveSummaryTests(unittest.TestCase):
         self.assertIn("SSRF in /fetch via the url parameter", md)
 
 
+class ChainRoleTests(unittest.TestCase):
+    """The chain-role line must price THIS finding's step, not the chain's roll-up: the chain status
+    is derived from the strongest evidence in the chain, so a purely projected step printed under a
+    'confirmed' chain borrowed another finding's credibility."""
+
+    def _ctx(self, step_state: str, chain_status: str = "confirmed") -> tuple[dict, dict]:
+        finding = {"ref": "F2", "severity": "low", "confidence": "medium", "class_id": "cookies",
+                   "class_name": "Cookie flags", "title": "Session cookie without HttpOnly",
+                   "location": "https://a.example/login", "rule_id": "web.cookie-httponly"}
+        ctx = {
+            "tool": "GreyIQ BugHunter", "target": "https://a.example",
+            "profile": {"id": "web-app", "name": "Web application", "description": ""},
+            "findings": [finding], "attack_plans": {"F2": {"steps": ["a"]}},
+            "recommended_tools": [], "brain": {"used": False},
+            "investigation": {"attack_chains": [{
+                "id": "C1", "title": "Session theft to account takeover", "status": chain_status,
+                "projected_impact": "full account takeover", "refs": ["F1", "F2"],
+                "steps": [{"n": 2, "title": "Read the session cookie", "evidence_ref": "F2",
+                           "state": step_state}],
+            }]},
+        }
+        return ctx, finding
+
+    def test_a_projected_step_prints_its_own_state(self) -> None:
+        ctx, finding = self._ctx("projected")
+        md = report_lib.build_finding_markdown(ctx, finding)
+        self.assertIn("this step is *projected*", md)
+        self.assertIn("the chain is confirmed", md)          # ...attributed to the CHAIN, not the step
+        self.assertIn("its projected impact is full account takeover", md)
+        # the old wording put the chain's status where the step's belonged
+        self.assertNotIn("(confirmed) — reaching", md)
+
+    def test_a_proven_step_prints_proven(self) -> None:
+        ctx, finding = self._ctx("proven", chain_status="candidate")
+        md = report_lib.build_finding_markdown(ctx, finding)
+        self.assertIn("this step is *proven*", md)
+        self.assertIn("the chain is candidate", md)
+
+    def test_a_stateless_step_defaults_to_projected(self) -> None:
+        ctx, finding = self._ctx("")
+        md = report_lib.build_finding_markdown(ctx, finding)
+        self.assertIn("this step is *projected*", md)
+
+    def test_the_standalone_file_defines_proven_and_projected(self) -> None:
+        # The per-finding file carries no chain table, so the legend has to travel with the line.
+        ctx, finding = self._ctx("projected")
+        md = report_lib.build_finding_markdown(ctx, finding)
+        self.assertIn("**Chain role:**", md)
+        self.assertIn("a captured artifact the confirm gate accepted", md)
+        self.assertIn("*projected* step is the next thing to prove", md)
+
+    def test_the_full_report_body_carries_the_same_wording(self) -> None:
+        ctx, _finding = self._ctx("projected")
+        md = report_lib.build_markdown(ctx)
+        self.assertIn("this step is *projected*", md)
+
+
+class ConfirmedPlanProofStatusTests(unittest.TestCase):
+    """A confirmation reached WITHOUT an ``_active_proof`` — the live-credential / JWT-replay /
+    secret_hits routes — must land on the attack PLAN, not only on its CVSS. The plan's
+    ``proof_of_impact.status`` comes from ``_deterministic_proof_status``, which never consults
+    those carriers and so leaves 'candidate' behind; ``investigator._proof_status`` reads exactly
+    that field as the finding's CLAIM. Left stale, the cortex called a report-confirmed finding an
+    unproven lead ('gather-proof', not report-ready) in the same JSON document that confirmed it."""
+
+    def _hunt(self, finding: dict) -> dict:
+        """One real hunt over a stubbed code scan. The credential carrier is pre-set, so the
+        hunt's liveness loop skips this finding and no request leaves the process."""
+        original = bounty_lib.run_code_scan
+        bounty_lib.run_code_scan = lambda target, target_type, max_files=5000: {
+            "ok": True, "findings": [finding], "risk": "high", "score": 0.7,
+            "files_scanned": 1, "finding_count": 1,
+        }
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                return bounty_lib.run_bounty_hunt(
+                    tmp, "secrets", None, tmp, "local QA fixture", True, {},
+                    default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed", runtime_dir=None,
+                )
+        finally:
+            bounty_lib.run_code_scan = original
+
+    @staticmethod
+    def _live_credential_finding() -> dict:
+        # secret.github-pat is in secret_classification._CONFIRMED_VIA_LIVENESS, so a live
+        # validator result makes this a confirmed_secret — the one confirm route that returns
+        # early from report._proof_of_impact_detail, never touching the plan's own status.
+        return {
+            "rule_id": "secret.github-pat", "title": "GitHub personal access token in source",
+            "severity": "high", "confidence": "high", "category": "secret",
+            "file_path": "app/config.py", "line_start": 1, "line_end": 1,
+            "snippet": "GITHUB_TOKEN = <token>", "secret_value": "ghp_" + "A" * 36,
+            "_credential_proof": {
+                "live": True, "principal": "acme-bot", "scopes": "repo",
+                "http_status": 200, "endpoint": "https://api.github.com/user",
+                "detail": "GitHub authenticated the token as acme-bot (scopes: repo)",
+                "poc": "curl -s -H 'Authorization: token <redacted>' https://api.github.com/user",
+                "response_excerpt": '{"login": "acme-bot"}',
+            },
+        }
+
+    def test_confirmed_credential_route_syncs_the_plan_and_leaves_no_contradiction(self) -> None:
+        result = self._hunt(self._live_credential_finding())
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["proof_of_impact"]["F1"]["status"], "confirmed")
+        # The plan is the cortex's input; it must carry the same status the report granted.
+        self.assertEqual(result["attack_plans"]["F1"]["proof_of_impact"]["status"], "confirmed")
+        hypothesis = next(h for h in result["investigation"]["hypotheses"] if h["ref"] == "F1")
+        self.assertEqual(hypothesis["claimed_proof_status"], "confirmed")
+        self.assertEqual(hypothesis["status"], "confirmed")
+        self.assertTrue(hypothesis["report_ready"])
+        self.assertEqual(hypothesis["decision"], "report-now")
+        self.assertEqual(result["investigation"]["contradictions"], [])
+        self.assertEqual(result["investigation"]["metrics"]["contradictions"], 0)
+
+    def test_an_unproven_secret_is_never_promoted_by_the_sync(self) -> None:
+        # The sync only ECHOES the confirm authority: with the credential dead, classification
+        # marks the finding false_positive/candidate, the report stays unconfirmed, and the plan
+        # must NOT read 'confirmed'. (A dead credential is dropped from the report entirely.)
+        dead = self._live_credential_finding()
+        dead["_credential_proof"] = {"live": False, "http_status": 401, "detail": "token rejected"}
+        result = self._hunt(dead)
+        self.assertTrue(result["ok"], result.get("error"))
+        for ref, detail in (result["proof_of_impact"] or {}).items():
+            self.assertNotEqual(detail["status"], "confirmed", ref)
+        for ref, plan in (result["attack_plans"] or {}).items():
+            poi = plan.get("proof_of_impact")
+            if isinstance(poi, dict):
+                self.assertNotEqual(poi.get("status"), "confirmed", ref)
+
+
 if __name__ == "__main__":
     unittest.main()

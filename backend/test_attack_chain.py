@@ -184,7 +184,13 @@ class HonestyInvariantTests(unittest.TestCase):
 
     def test_confidence_is_the_weakest_link_not_the_mean(self) -> None:
         """Averaging is how a proven step carries an unproven one. A chain mixing a confirmed
-        finding with a projected step must score at the projected step's level."""
+        finding with a projected step must score at the projected step's level.
+
+        Asserting only "less than the fully-proven chain" did NOT pin this: the projected
+        ceiling clamps every non-proven chain to 54 anyway, so a mean (58 -> clamped to 54)
+        satisfied the inequality just as well as the minimum (34). The engine had to be pinned
+        to the weakest link's OWN value.
+        """
         result = attack_chain.build_attack_chains(
             [_confirmed("F1", "xss", "Reflected XSS", "https://app.test/s")], {},
             signals=attack_chain.cookie_signals(["sessionid=a; Path=/"], "https://app.test/"),
@@ -192,7 +198,35 @@ class HonestyInvariantTests(unittest.TestCase):
         takeover = next(c for c in result["chains"] if c["impact"] == "identity.other-user")
         proven_only = attack_chain.build_attack_chains(
             [_confirmed("F1", "sqli", "SQLi", "https://app.test/r")], {}, signals=[])["chains"][0]
+        self.assertEqual(takeover["confidence_score"], attack_chain._step_confidence(False))
+        self.assertLess(takeover["confidence_score"], attack_chain._PROJECTED_CEILING,
+                        "a mean would land at the ceiling, not at the weakest link")
+        self.assertEqual(
+            {s["proven"] for s in takeover["steps"] if s["evidence_ref"] or s["signal"]},
+            {True, False}, "the fixture must actually mix a proven and an unproven step")
+        self.assertEqual(proven_only["confidence_score"], attack_chain._step_confidence(True))
         self.assertLess(takeover["confidence_score"], proven_only["confidence_score"])
+
+    def test_an_inference_step_keeps_the_chain_partial_and_capped(self) -> None:
+        """A pure capability transition ("replay the token you now hold") is a logical
+        consequence, not a captured artifact — so a chain containing one can never be proven.
+
+        Every other fixture is either fully proven or has an unproven EVIDENCE step, so nothing
+        exercised the clue-less edge: marking those edges proven left the whole suite green.
+        """
+        result = attack_chain.build_attack_chains(
+            [_confirmed("F1", "request-smuggling", "Request smuggling", "https://app.test/x")],
+            {}, signals=[])
+        chain = next(c for c in result["chains"] if c["impact"] == "identity.other-user")
+        self.assertEqual([s["technique_id"] for s in chain["steps"]],
+                         ["request-smuggling-hijack", "session-token-to-identity"])
+        self.assertFalse(chain["steps"][1]["proven"],
+                         "a pure capability transition is a consequence, not a captured artifact")
+        self.assertEqual(chain["status"], "partial")
+        self.assertEqual(chain["proven_steps"], 1)
+        # Exact: the weakest EVIDENCE link here is 82, so losing the cap raises this to 82.
+        self.assertEqual(chain["confidence_score"], attack_chain._PROJECTED_CEILING)
+        self.assertEqual(result["metrics"]["proven_chains"], 0)
 
     def test_the_next_action_names_the_blocking_step(self) -> None:
         result = attack_chain.build_attack_chains(
@@ -263,10 +297,39 @@ class ConfirmGateProvenanceTests(unittest.TestCase):
 class SignalIntegrityTests(unittest.TestCase):
     def test_csrf_double_submit_cookie_is_not_a_session_cookie(self) -> None:
         """A double-submit CSRF cookie MUST be JS-readable — that is the pattern. Treating its
-        missing HttpOnly as token theft fabricated a takeover chain from a correct design."""
+        missing HttpOnly as token theft fabricated a takeover chain from a correct design.
+
+        `csrftoken`/`XSRF-TOKEN` are named in the docs so they stay pinned, but neither reaches
+        the exclusion regex — the positive session-name filter already drops them, so deleting
+        the exclusion entirely left the suite green. The names that actually depend on it are
+        the ones matching BOTH patterns.
+        """
         signals = attack_chain.cookie_signals(
-            ["csrftoken=abc; Path=/", "XSRF-TOKEN=def; Path=/"], "https://a.test/")
+            ["csrftoken=abc; Path=/", "XSRF-TOKEN=def; Path=/",
+             "authenticity_token=ghi; Path=/", "csrf_session=jkl; Path=/",
+             "session_csrf=mno; Path=/", "__RequestVerificationToken=pqr; Path=/"],
+            "https://a.test/")
         self.assertEqual(signals, [])
+        # Positive control: the fixture is not vacuous. A session-ish name with no anti-forgery
+        # marker DOES signal, so a future narrowing of the session regex cannot make the
+        # assertion above pass for the wrong reason — which is exactly what it did before.
+        self.assertTrue(attack_chain.cookie_signals(["auth_session=abc; Path=/"], "https://a.test/"))
+
+    def test_bearer_token_cookies_are_recognised_as_the_session(self) -> None:
+        """`auth_token`, `remember_token`, `id_token` ARE the session on a standard SPA/Rails
+        app. An over-broad anti-forgery exclusion swallowed all of them, so on those targets the
+        engine's headline chain never fired and the hunt reported nothing at all."""
+        for name in ("auth_token", "session_token", "remember_token", "id_token",
+                     "access_token", "jwt_token"):
+            with self.subTest(cookie=name):
+                kinds = {s["kind"] for s in attack_chain.cookie_signals(
+                    [f"{name}=abc; Path=/"], "https://a.test/")}
+                self.assertIn("cookie.session-no-httponly", kinds)
+        # ...but a bare `token` substring must NOT make every token-ish cookie the session.
+        for name in ("consent_token", "recaptcha_token", "preview_token"):
+            with self.subTest(cookie=name):
+                self.assertEqual(
+                    attack_chain.cookie_signals([f"{name}=abc; Path=/"], "https://a.test/"), [])
 
     def test_samesite_none_counts_as_sent_cross_site(self) -> None:
         """SameSite=None is the explicit opt-IN to cross-site sending, not protection."""
@@ -292,11 +355,20 @@ class SignalIntegrityTests(unittest.TestCase):
         self.assertNotIn("token.role-claim", {s["kind"] for s in signals})
 
     def test_token_in_body_requires_a_response_body_name(self) -> None:
-        """A login form's own token input is a REQUEST shape, not a token in a response."""
-        from_form = attack_chain.collect_signals(response_digest={"form_fields": ["csrf_token"]})
-        self.assertNotIn("response.token-in-body", {s["kind"] for s in from_form})
+        """A login form's own token input is a REQUEST shape, not a token in a response.
+
+        The negative half used `csrf_token`, which the token regex does not match at all — so
+        the assertion held whether or not request shapes fed the producer, and re-adding
+        `form_fields` to the loop left the suite green. It has to use names that DO match.
+        """
+        from_request = attack_chain.collect_signals(response_digest={
+            "form_fields": ["session", "api_key"], "interesting_names": ["access_token"]})
+        self.assertNotIn("response.token-in-body", {s["kind"] for s in from_request},
+                         "form_fields/interesting_names are request shapes, not response bodies")
         from_body = attack_chain.collect_signals(response_digest={"json_keys": ["access_token"]})
         self.assertIn("response.token-in-body", {s["kind"] for s in from_body})
+        self.assertIn("response.token-in-body", {s["kind"] for s in attack_chain.collect_signals(
+            response_digest={"json_keys": ["session"]})})
 
     def test_a_signal_about_one_finding_cannot_escalate_another(self) -> None:
         """Two exposed secrets, only one of them a cloud key: the chain must not take the
@@ -357,6 +429,316 @@ class NoiseFloorTests(unittest.TestCase):
         takeover = [c for c in result["chains"] if c["impact"] == "identity.other-user"]
         self.assertTrue(takeover, "the HttpOnly gap must now do a job")
         self.assertEqual({s["kind"] for s in result["signals_used"]}, {"cookie.session-no-httponly"})
+
+
+class ObservationProvenanceTests(unittest.TestCase):
+    """An observation is bound to WHERE it was made and WHICH finding it describes.
+
+    A campaign pools every target's signals into one graph, so without these bindings one
+    company's cookie flag gap composed into another company's confirmed XSS and was reported as
+    an account takeover whose second step is physically impossible on that target.
+    """
+
+    XSS = staticmethod(lambda host: _confirmed("F1", "xss", "Reflected XSS", f"https://{host}/s"))
+
+    def test_a_cookie_gap_on_an_unrelated_host_cannot_escalate_a_finding(self) -> None:
+        foreign = attack_chain.cookie_signals(["sid=abc; Path=/"], "https://www.acme-corp.example/")
+        result = attack_chain.build_attack_chains(
+            [self.XSS("app.zenith-bank.example")], {}, signals=foreign)
+        self.assertEqual([c for c in result["chains"] if c["impact"] == "identity.other-user"], [],
+                         "a different program's cookie cannot steal this target's session")
+
+    def test_the_same_gap_on_the_same_host_still_escalates(self) -> None:
+        same = attack_chain.cookie_signals(["sid=abc; Path=/"], "https://app.zenith-bank.example/")
+        result = attack_chain.build_attack_chains(
+            [self.XSS("app.zenith-bank.example")], {}, signals=same)
+        self.assertTrue([c for c in result["chains"] if c["impact"] == "identity.other-user"])
+
+    def test_sibling_subdomains_share_a_trust_boundary(self) -> None:
+        """Domain-scoped cookies really do cross sibling subdomains, and the campaign's whole
+        payoff is that composition — so it must be neither rejected nor score-penalised."""
+        sibling = attack_chain.cookie_signals(["sid=abc; Path=/"], "https://api.zenith-bank.example/")
+        same = attack_chain.cookie_signals(["sid=abc; Path=/"], "https://app.zenith-bank.example/")
+        finding = self.XSS("app.zenith-bank.example")
+        pick = lambda sigs: next(  # noqa: E731
+            c for c in attack_chain.build_attack_chains([finding], {}, signals=sigs)["chains"]
+            if c["impact"] == "identity.other-user")
+        self.assertEqual(pick(sibling)["priority_score"], pick(same)["priority_score"])
+
+    def test_a_claimed_subdomain_plus_a_parent_cookie_is_still_a_chain(self) -> None:
+        """The flagship cross-target chain: a takeover on one host and the domain-scoped cookie
+        observed on a sibling. Host binding must not delete the composition it exists to enable."""
+        takeover = _confirmed("F1", "subdomain-takeover", "Dangling CNAME", "https://old.corp.test/")
+        sibling = attack_chain.cookie_signals(
+            ["sid=abc; Path=/; Domain=.corp.test"], "https://www.corp.test/")
+        self.assertTrue(attack_chain.build_attack_chains([takeover], {}, signals=sibling)["chains"])
+        unrelated = attack_chain.cookie_signals(
+            ["sid=abc; Path=/; Domain=.other.test"], "https://www.other.test/")
+        self.assertEqual(
+            attack_chain.build_attack_chains([takeover], {}, signals=unrelated)["chains"], [])
+
+    def test_a_signal_survives_its_finding_being_renumbered(self) -> None:
+        """Refs are renumbered when a campaign pools findings (F1 -> C7) while the signals keep
+        the ref they were stamped with, so a ref-keyed provenance check silently discarded every
+        cross-target witness. Provenance is keyed on the finding's CONTENT instead."""
+        secret = {
+            "ref": "F1", "class_id": "secrets", "rule_id": "secret.aws",
+            "title": "AWS key in bundle", "location": "https://a.test/app.js", "severity": "high",
+            "secret_type": "aws_access_key_id", "_credential_proof": {"scopes": "admin,write"},
+        }
+        signals = attack_chain.collect_signals(findings=[secret])
+        self.assertTrue([s for s in signals if s["finding_key"]])
+        repooled = {**secret, "ref": "C7"}
+        chains = attack_chain.build_attack_chains([repooled], {}, signals=signals)["chains"]
+        self.assertTrue(chains, "the credential chain must survive the re-key")
+        for chain in chains:
+            self.assertEqual(chain["refs"], ["C7"])
+
+    def test_a_signal_names_the_host_it_was_observed_on(self) -> None:
+        """The rendered step carried only the kind and the prose, so a reader could not tell a
+        composition was cross-host — the one fact needed to catch a bad chain by reading it."""
+        result = attack_chain.build_attack_chains(
+            [self.XSS("app.test")], {},
+            signals=attack_chain.cookie_signals(["sid=a; Path=/"], "https://app.test/"))
+        steps = [s for c in result["chains"] for s in c["steps"] if s["signal"]]
+        self.assertTrue(steps)
+        for step in steps:
+            self.assertEqual(step["signal_host"], "app.test")
+
+
+class NoFabricationFromMislabelTests(unittest.TestCase):
+    """Each of these produced a confirmed, report-ready claim nobody observed."""
+
+    def test_a_confirmed_file_read_never_reports_code_execution(self) -> None:
+        """The path-traversal prover was class-tagged `file-upload`, so the upload-to-execution
+        technique fired and the engine reported a PROVEN RCE from a read-only file disclosure.
+        The producer is fixed; the table must also refuse to mint an impact from a bare class."""
+        lfi = _confirmed("F1", "file-upload", "Path traversal / local file read",
+                         "https://a.test/?file=../../etc/passwd")
+        for chain in attack_chain.build_attack_chains([lfi], {})["chains"]:
+            self.assertNotEqual(chain["impact"], "exec.server-code")
+
+    def test_a_confirmed_path_traversal_reaches_the_file_read_ladder(self) -> None:
+        """...and the honest technique it should have been firing all along now does."""
+        lfi = _confirmed("F1", "path-traversal", "Path traversal / local file read",
+                         "https://a.test/?file=../../etc/passwd")
+        impacts = {c["impact"] for c in attack_chain.build_attack_chains([lfi], {})["chains"]}
+        self.assertIn("read.server-file", impacts)
+
+    def test_graphql_introspection_is_not_a_cross_tenant_read(self) -> None:
+        """Introspection discloses the schema. It observes no boundary being crossed, so it
+        must not reach a terminal impact on its own — it is a lead for BOLA/BFLA."""
+        gql = _confirmed("F1", "graphql", "GraphQL introspection enabled",
+                         "https://a.test/graphql")
+        impacts = {c["impact"] for c in attack_chain.build_attack_chains([gql], {})["chains"]}
+        self.assertNotIn("read.other-object", impacts)
+        # Paired with an actual access-control finding it does its real job.
+        both = attack_chain.build_attack_chains(
+            [gql, _confirmed("F2", "access-control", "IDOR", "https://a.test/api/1")], {})
+        self.assertIn("read.other-object", {c["impact"] for c in both["chains"]})
+
+    def test_a_csrf_cookie_from_the_digest_cannot_fabricate_a_takeover(self) -> None:
+        """The digest builds its auth-cookie list on a wider pattern than the raw parser, so a
+        correct Django double-submit cookie reached the graph through the second door and
+        manufactured the exact chain the raw parser is tested to refuse."""
+        xss = _confirmed("F1", "xss", "Reflected XSS", "https://a.test/s")
+        digest = {"url": "https://a.test/",
+                  "cookie_flag_gaps": [{"cookie": "csrftoken", "missing": ["HttpOnly", "SameSite"]}]}
+        result = attack_chain.build_attack_chains([xss], {}, response_digest=digest)
+        self.assertEqual([c for c in result["chains"] if c["impact"] == "identity.other-user"], [])
+        real = {"url": "https://a.test/",
+                "cookie_flag_gaps": [{"cookie": "sessionid", "missing": ["HttpOnly"]}]}
+        self.assertTrue([c for c in attack_chain.build_attack_chains(
+            [xss], {}, response_digest=real)["chains"] if c["impact"] == "identity.other-user"])
+
+    def test_a_path_name_is_not_an_observation_of_a_write(self) -> None:
+        """`set` matched inside `/assets/` and `add` inside `/address`, so essentially every
+        target emitted the signal that promotes "read another tenant's data" to "MODIFY it"."""
+        signals = attack_chain.collect_signals(surface={"endpoints": [
+            "https://a.test/assets/img/logo.png", "https://a.test/address-book",
+            "https://a.test/credit-report", "https://a.test/products/editor"]})
+        self.assertNotIn("endpoint.state-changing", {s["kind"] for s in signals})
+        # An OBSERVED state-changing method still emits it.
+        observed = attack_chain.collect_signals(surface={"forms": [
+            {"action": "https://a.test/u", "method": "POST", "params": ["email"]}]})
+        self.assertIn("endpoint.state-changing", {s["kind"] for s in observed})
+
+    def test_a_stylesheet_is_not_an_authentication_flow(self) -> None:
+        """`reset` matched `/static/css/reset.css`, which was enough to carry an unproven
+        open-redirect lead all the way to an account-takeover chain."""
+        noise = attack_chain.collect_signals(surface={"endpoints": [
+            "https://cdn.a.test/static/css/reset.css", "https://a.test/order/confirmation",
+            "https://a.test/team/invited-speakers", "https://a.test/bundle.js"]})
+        self.assertNotIn("flow.auth-redirect", {s["kind"] for s in noise})
+        real = attack_chain.collect_signals(surface={"endpoints": ["https://a.test/auth/callback"]})
+        self.assertIn("flow.auth-redirect", {s["kind"] for s in real})
+
+    def test_a_repository_path_is_not_a_hostname(self) -> None:
+        """A code-scanner finding's location is a FILE PATH; splitting it on "/" made two files
+        in one repo look like two unrelated internet hosts and charged the cross-host penalty."""
+        same_repo = attack_chain.build_attack_chains([
+            _confirmed("F1", "disclosure", "Leaked ids", "backend/app/views.py"),
+            _confirmed("F2", "access-control", "Object id", "frontend/src/api.js")], {}, signals=[])
+        one_host = attack_chain.build_attack_chains([
+            _confirmed("F1", "disclosure", "Leaked ids", "https://a.test/feed"),
+            _confirmed("F2", "access-control", "Object id", "https://a.test/api/1")], {}, signals=[])
+
+        def _two_step(result: dict) -> dict:
+            return next(c for c in result["chains"] if len(c["steps"]) == 2)
+
+        self.assertEqual(_two_step(same_repo)["priority_score"], _two_step(one_host)["priority_score"])
+        self.assertEqual(_two_step(same_repo)["confidence_score"], _two_step(one_host)["confidence_score"])
+
+
+class CoverageTests(unittest.TestCase):
+    """Classes GreyIQ can confirm must actually reach the graph, and dead rows must not exist."""
+
+    def test_every_technique_can_fire_and_every_grant_is_consumed(self) -> None:
+        granted: set[str] = set()
+        required: set[str] = set()
+        for technique in attack_chain._TECHNIQUES:
+            granted |= set(technique["grants"])
+            required |= set(technique["requires"])
+            for capability in (*technique["grants"], *technique["requires"]):
+                self.assertIn(capability, attack_chain._CAPABILITY_LABELS,
+                              f"{technique['id']} names a capability with no label")
+        orphans = granted - required - set(attack_chain._IMPACTS)
+        # `read.server-side-response` is a deliberate descriptive grant on the SSRF row.
+        self.assertEqual(orphans, {"read.server-side-response"},
+                         "a granted capability nothing requires and no impact lists is a dead end: "
+                         "`_prune_path` drops the step from every witness it appears in")
+
+    def test_every_impact_is_reachable_from_an_entry(self) -> None:
+        for impact in attack_chain._IMPACTS:
+            with self.subTest(impact=impact):
+                self.assertTrue(
+                    any(impact in t["grants"] for t in attack_chain._TECHNIQUES),
+                    f"no technique grants {impact}, so the report can never state it")
+
+    def test_a_confirmed_cloud_store_contributes_to_the_graph(self) -> None:
+        """An anonymously listable bucket is the strongest cloud evidence the engine can
+        capture, and the class hint that makes it legible in the report also took it out of the
+        disclosure bucket that fed the identifier ladder — so it reached no chain at all."""
+        bucket = _confirmed("F1", "cloud-exposure", "Public cloud bucket (anonymous listing)",
+                            "https://s3.amazonaws.com/acme-backups/")
+        result = attack_chain.build_attack_chains([bucket], {})
+        self.assertTrue(result["chains"])
+        self.assertIn("disclose.sensitive-data", {c["impact"] for c in result["chains"]})
+
+    def test_a_denied_bucket_never_reads_as_an_anonymous_read(self) -> None:
+        """The bucket check stamps `cloud-exposure` on all three of its outcomes, including
+        "referenced but denied anonymous listing (403)" and "referenced, not probed". Those are
+        observations that the store is NOT open, so narrating them as "reads anonymously
+        (projected)" contradicts what was seen rather than proposing a next step."""
+        denied = _lead("F1", "cloud-exposure", "Cloud bucket referenced (access denied)",
+                       "https://s3.amazonaws.com/acme-backups/")
+        self.assertEqual(attack_chain.build_attack_chains([denied], {})["chains"], [])
+        # ...and the confirmed anonymous listing still does its job.
+        listed = _confirmed("F1", "cloud-exposure", "Public cloud bucket (anonymous listing)",
+                            "https://s3.amazonaws.com/acme-backups/")
+        self.assertTrue(attack_chain.build_attack_chains([listed], {})["chains"])
+
+    def test_an_unprobed_bucket_never_claims_the_target_is_cloud_hosted(self) -> None:
+        """The out-of-scope outcome carries an EMPTY location, so the signal it produced had no
+        host — and an unbound observation composed with a finding on any host, unlocking the
+        cloud-metadata pivot on any SSRF with nothing observed at all."""
+        unprobed = _lead("F1", "cloud-exposure", "Cloud bucket referenced (out of scope)", "")
+        kinds = {s["kind"] for s in attack_chain.collect_signals(findings=[unprobed])}
+        self.assertNotIn("infra.cloud-hosted", kinds)
+
+    def test_a_deserialization_sink_narrates_itself(self) -> None:
+        """The reporting layer folds category `deserialization` into class `rce`, so the ladder
+        described a deserialization sink as "input reaches a command interpreter"."""
+        finding = {**_confirmed("F1", "rce", "unserialize() on user input", "app/models/user.php"),
+                   "category": "deserialization"}
+        titles = [s["title"] for c in attack_chain.build_attack_chains([finding], {})["chains"]
+                  for s in c["steps"]]
+        self.assertIn("Untrusted data is deserialized", titles)
+        self.assertNotIn("Input reaches a command interpreter", titles)
+
+
+class SelectionTests(unittest.TestCase):
+    def test_a_proven_chain_is_never_evicted_by_a_projected_one(self) -> None:
+        """The per-impact bucket ranked on score alone while the final sort ranked proven-first,
+        so the bucket discarded a fully proven chain before the sort could ever see it."""
+        findings = [
+            _confirmed("F1", "sqli", "SQLi", "https://a.test/r"),
+            _lead("F2", "cors", "Permissive CORS", "https://a.test/api"),
+            _lead("F3", "nosqli", "NoSQL injection", "https://a.test/q"),
+        ]
+        result = attack_chain.build_attack_chains(findings, {}, signals=[])
+        disclosure = [c for c in result["chains"] if c["impact"] == "disclose.sensitive-data"]
+        self.assertTrue(any(c["status"] == "proven" for c in disclosure),
+                        "the captured SQLi chain must survive the per-impact cap")
+
+    def test_the_bucket_key_ranks_proof_above_score(self) -> None:
+        """The end-to-end fixture below cannot pin this on its own: with only two candidates for
+        the impact the per-impact cap never discriminates, so the test passes under BOTH ranking
+        keys. Pin the ordering decision itself — proof band must beat a higher raw score."""
+        rank = attack_chain._STATUS_RANK
+        self.assertGreater(rank["proven"], rank["partial"])
+        self.assertGreater(rank["partial"], rank["projected"])
+        proven = (rank["proven"], 100, -1)
+        better_scoring_partial = (rank["partial"], 999, -1)
+        self.assertGreater(proven, better_scoring_partial,
+                           "a proven chain must outrank a higher-scoring unproven one")
+
+    def test_a_late_technique_still_reaches_the_report_under_a_tight_budget(self) -> None:
+        """The search was depth-first over one shared budget, so the FIRST edge's subtree consumed
+        the whole allowance and any witness whose technique sits late in the table was lost. No
+        fixture approaches the budget, so plain DFS passes every other test in this file."""
+        findings = [_confirmed(f"F{i}", cls, f"{cls} finding", f"https://app.test/{cls}")
+                    for i, cls in enumerate(
+                        ["xss", "sqli", "ssrf", "xxe", "rce", "ssti", "cors", "redirect",
+                         "access-control", "disclosure", "secrets", "jwt", "csrf", "nosqli",
+                         "graphql", "subdomain-takeover", "request-smuggling"], 1)]
+        original = attack_chain._MAX_EXPANSIONS
+        try:
+            attack_chain._MAX_EXPANSIONS = 400  # force the budget to actually bind
+            result = attack_chain.build_attack_chains(findings, {}, signals=[])
+        finally:
+            attack_chain._MAX_EXPANSIONS = original
+        self.assertTrue(result["chains"])
+        impacts = {c["impact"] for c in result["chains"]}
+        self.assertGreater(len(impacts), 3,
+                           "a starved search reports only the impacts reachable from edge 0")
+        self.assertIn("exec.server-code", impacts,
+                      "command-injection sits late in the table and must still be found")
+
+    def test_the_narrative_names_the_capability_the_chain_used(self) -> None:
+        """XXE grants BOTH a file read and internal reach, so a chain resting on the second grant
+        used to narrate the first. The narrative is copied verbatim into the report."""
+        chains = attack_chain.build_attack_chains(
+            [_confirmed("F1", "xxe", "XXE", "https://app.test/x")], {}, signals=[])["chains"]
+        by_impact = {c["impact"]: c for c in chains}
+        self.assertIn("read.server-file", by_impact)
+        self.assertIn("net.internal", by_impact)
+        self.assertTrue(by_impact["read.server-file"]["narrative"].rstrip(".").endswith(
+            attack_chain._CAPABILITY_LABELS["read.server-file"]))
+        self.assertTrue(by_impact["net.internal"]["narrative"].rstrip(".").endswith(
+            attack_chain._CAPABILITY_LABELS["net.internal"]))
+
+    def test_one_attack_is_reported_once_however_many_findings_share_a_class(self) -> None:
+        """Distinctness was keyed on edge indices, so N findings of one class produced N
+        identical technique ladders that each consumed a report slot."""
+        findings = [_confirmed(f"F{i}", "sqli", f"SQLi {i}", f"https://a.test/r{i}")
+                    for i in range(1, 4)]
+        result = attack_chain.build_attack_chains(findings, {}, signals=[])
+        shapes = [(c["impact"], tuple(s["technique_id"] for s in c["steps"]))
+                  for c in result["chains"]]
+        self.assertEqual(len(shapes), len(set(shapes)), f"duplicate attacks: {shapes}")
+
+    def test_a_probe_lead_never_evicts_an_evidence_backed_chain(self) -> None:
+        """A signal-only path cites no finding, so the cortex routes it to the probe queue —
+        letting it compete for a report slot spent the budget on something unreportable."""
+        findings = [_confirmed("F1", "access-control", "IDOR", "https://a.test/api/1")]
+        signals = attack_chain.collect_signals(surface={"forms": [
+            {"action": "https://a.test/u", "method": "POST", "params": ["email", "is_admin"]}]})
+        result = attack_chain.build_attack_chains(findings, {}, signals=signals)
+        anchored = [c for c in result["chains"] if c["refs"]]
+        probes = [c for c in result["chains"] if not c["refs"]]
+        self.assertTrue(anchored, "the captured IDOR chain must be reported")
+        self.assertTrue(probes, "the mass-assignment lead must still reach the probe queue")
 
 
 class EscalationNoteTests(unittest.TestCase):

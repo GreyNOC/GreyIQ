@@ -12,7 +12,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 import coder  # noqa: E402
-from bughunter import active_verify_service, hunt_loop  # noqa: E402
+from bughunter import active_verify_service, hunt_loop, investigator  # noqa: E402
 from bughunter.settings import ScannerSettings  # noqa: E402
 
 
@@ -126,6 +126,117 @@ class HuntLoopTests(unittest.TestCase):
         self.assertIn("response_structure", blob)
         # a missing/empty digest degrades cleanly (no crash, empty structure)
         self.assertIn("response_structure", hunt_loop._observations_digest([], {"verified_classes": []}))
+
+    # --- the loop's own endpoint allowlist ------------------------------------------------------
+
+    def _stub_verify_capturing(self, used_per_turn: int = 1) -> list[list[str] | None]:
+        """Record the class_priority handed to each verify_active call."""
+        seen: list[list[str] | None] = []
+
+        def fake(target, findings, *, requests_budget=12, class_priority=None, **kw):
+            seen.append(list(class_priority) if class_priority else None)
+            self.turn += 1
+            return [], {"in_scope": True, "host": "t", "requests_used": used_per_turn,
+                        "rate_limited": False, "verified_classes": []}
+        active_verify_service.verify_active = fake
+        return seen
+
+    def _plan_brain(self, payload: str) -> None:
+        coder.generate = lambda messages, cfg: {"text": payload}
+
+    def test_class_steering_survives_a_surface_that_dropped_the_seed(self) -> None:
+        # bounty ranks the discovered URLs and can drop the seed from the surface it passes, while the
+        # loop still probes ONLY the seed. If the loop validated against that surface, every
+        # probe_priority row for target_url was dropped and class steering never reached the prober.
+        seen = self._stub_verify_capturing()
+        self._plan_brain('{"param_hypotheses": [], "probe_priority": '
+                         '[{"endpoint": "https://t/", "classes": ["sqli"]}], '
+                         '"xss_params": [], "done": false}')
+        hunt_loop.run_iterative_verify(
+            "https://t/", [], scope="t", requests_budget=100,
+            settings=self._settings(max_iters=5), coder_cfg={"provider": "x"},
+            surface={"endpoints": ["https://t/api?id=1", "https://t/search?q=1"], "params": []})
+        self.assertGreaterEqual(len(seen), 2)      # the plan was accepted -> the loop kept going
+        self.assertEqual(seen[1], ["sqli"])        # ...and the brain's class order reached the prober
+
+    def test_target_url_is_pinned_first_and_the_caller_surface_is_preserved(self) -> None:
+        captured: dict[str, object] = {}
+        self._stub_verify_capturing()
+        def gen(messages, cfg):
+            captured["prompt"] = messages[0]["content"]
+            return {"text": '{"param_hypotheses": [], "probe_priority": [], "xss_params": [], "done": true}'}
+        coder.generate = gen
+        hunt_loop.run_iterative_verify(
+            "https://t/", [], scope="t", requests_budget=100,
+            settings=self._settings(max_iters=2), coder_cfg={"provider": "x"},
+            surface={"endpoints": ["https://t/api?id=1"], "params": []})
+        self.assertIn("https://t/api?id=1", str(captured["prompt"]))   # caller's ranking still shown
+
+    # --- chain steering -------------------------------------------------------------------------
+
+    def test_chain_focus_surfaces_an_open_chain_behind_proven_ones(self) -> None:
+        # _build_chains sorts proven chains to the front, so slicing the top 3 BEFORE dropping the
+        # fully-proven ones hid the very chain this steering exists for. A blocked chain (its cited
+        # finding was contradicted) must stay out even though it has an unproven step.
+        proven = {"title": "proven", "status": "confirmed",
+                  "steps": [{"title": "s", "proven": True}], "projected_impact": "x"}
+        graph = {"attack_chains": [
+            {"title": "blocked", "status": "blocked", "projected_impact": "x",
+             "steps": [{"title": "contradicted step", "proven": False, "next_action": "resolve"}]},
+            dict(proven), dict(proven), dict(proven),
+            {"title": "open", "status": "supported", "projected_impact": "account takeover",
+             "steps": [{"title": "s1", "proven": True},
+                       {"title": "steal token", "proven": False, "next_action": "capture cookie"}]},
+        ]}
+        orig = investigator.build_investigation
+        investigator.build_investigation = lambda *a, **k: graph
+        self.addCleanup(lambda: setattr(investigator, "build_investigation", orig))
+        focus = hunt_loop._chain_focus([], {"endpoints": []}, {})
+        self.assertEqual([row["chain"] for row in focus], ["open"])
+        self.assertEqual(focus[0]["blocked_on"], "steal token")
+
+    # --- no-progress guard ----------------------------------------------------------------------
+
+    def test_identical_plan_every_turn_stops_after_one_repeat(self) -> None:
+        # The old guard only asked whether priority/xss were non-empty, so a brain repeating itself
+        # re-ran byte-identical probes until max_iters and drained the shared per-host bucket.
+        self._stub_verify_capturing()
+        self._plan_brain('{"param_hypotheses": [], "probe_priority": '
+                         '[{"endpoint": "https://t/", "classes": ["sqli"]}], '
+                         '"xss_params": ["q"], "done": false}')
+        hunt_loop.run_iterative_verify("https://t/", [], scope="t", requests_budget=100,
+                                       settings=self._settings(max_iters=9), coder_cfg={"provider": "x"})
+        self.assertEqual(self.turn, 2)             # one probe, one steered probe, then no new surface
+
+    def test_empty_plan_with_caller_class_priority_still_stops_immediately(self) -> None:
+        # Guards the measured regression: comparing new_priority to cur_priority directly would treat
+        # an EMPTY plan as a change (the real update rule keeps cur_priority when the plan is empty).
+        self._stub_verify_capturing()
+        self._plan_brain('{"param_hypotheses": [], "probe_priority": [], "xss_params": [], "done": false}')
+        hunt_loop.run_iterative_verify("https://t/", [], scope="t", requests_budget=100,
+                                       settings=self._settings(max_iters=9), coder_cfg={"provider": "x"},
+                                       class_priority=["xss"], xss_params=["q"])
+        self.assertEqual(self.turn, 1)
+
+    # --- coverage accounting --------------------------------------------------------------------
+
+    def test_requests_used_is_the_sum_across_turns(self) -> None:
+        # bounty feeds this meta into the authoritative graph as scan_meta, so reporting only the LAST
+        # turn's count understated the loop's spend — and disagreed with the non-loop path, which sums.
+        counts = iter([3, 5])
+        def fake(target, findings, *, requests_budget=12, **kw):
+            self.turn += 1
+            return [], {"in_scope": True, "host": "t", "requests_used": next(counts, 1),
+                        "rate_limited": False, "verified_classes": []}
+        active_verify_service.verify_active = fake
+        self._plan_brain('{"param_hypotheses": ["a"], "probe_priority": [], "xss_params": [], "done": false}')
+        _, meta = hunt_loop.run_iterative_verify("https://t/", [], scope="t", requests_budget=100,
+                                                 settings=self._settings(max_iters=2),
+                                                 coder_cfg={"provider": "x"})
+        self.assertEqual(self.turn, 2)
+        self.assertEqual(meta["requests_used"], 8)                 # 3 + 5, not the last turn's 5
+        # ...and the loop's own snapshot is built AFTER the override, so it carries the same number
+        self.assertEqual(meta["investigation"]["coverage"]["requests_used"], 8)
 
 
 if __name__ == "__main__":

@@ -8386,7 +8386,7 @@ function ckFullReportPanel(focus) {
   const hasMap = focus.attackMap && focus.attackMap.data_url;
   const mapBtn = cel("button", "ck-btn", hasMap ? "Re-render attack plan" : "🗺 Attack plan map");
   mapBtn.type = "button";
-  mapBtn.title = "Render a graphical map of the attack GreyIQ used to confirm this finding — saved as a .png in the POC download and embedded in the report";
+  mapBtn.title = "Render a graphical map of the attack path GreyIQ tested, marked with what is confirmed and what is still to prove — saved as a .png in the POC download and embedded in the report";
   mapBtn.addEventListener("click", () => ckRenderAttackMap(focus, mapBtn, shotWrap));
   s1.row.append(proveBtn, shotBtn, mapBtn);
   if (ckCanTestApiKeyAccess(focus)) {

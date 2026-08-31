@@ -124,11 +124,24 @@ def _chain_focus(findings: list[dict[str, Any]], surface: dict[str, Any],
             response_digest=meta.get("digest") if isinstance(meta.get("digest"), dict) else None,
         )
         focus: list[dict[str, Any]] = []
-        for chain in (graph.get("attack_chains") or [])[:3]:
+        # FILTER FIRST, THEN SLICE. investigator._build_chains sorts by (confirmed, confidence)
+        # descending and caps an unproven chain's confidence below a proven one's, so proven chains
+        # — the ones with nothing left to chase — always fill the front of the list. Taking the
+        # top 3 and *then* dropping the fully-proven ones meant the open chain this steering exists
+        # for was never surfaced on a productive hunt. A blocked chain is excluded too: it cites a
+        # finding the cortex marked contradicted and the report layer has already disqualified, so
+        # aiming the remaining request budget at it buys nothing. The chain list is capped at 16
+        # upstream, so scanning all of it costs nothing.
+        open_chains = [
+            c for c in (graph.get("attack_chains") or [])
+            if c.get("status") != "blocked"
+            and any(isinstance(s, dict) and not s.get("proven") for s in (c.get("steps") or []))
+        ]
+        for chain in open_chains[:3]:
             blocking = next((s for s in (chain.get("steps") or [])
                              if isinstance(s, dict) and not s.get("proven")), None)
             if blocking is None:
-                continue  # already fully backed — nothing for this loop to chase
+                continue  # unreachable after the filter; kept so a shape change can't crash steering
             focus.append({
                 "chain": chain.get("title", ""),
                 "reaches": chain.get("projected_impact", ""),
@@ -266,8 +279,27 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
     cur_priority = list(class_priority or [])
     cur_xss = list(xss_params or [])
     budget_remaining = int(requests_budget)
+    # verify_active's requests_used is PER CALL (that is why budget_remaining decrements by it below),
+    # so the loop's own spend is the SUM across turns — not the last turn's count, which is what
+    # `dict(last_meta)` would otherwise report to bounty -> investigator.coverage.requests_used. The
+    # non-loop path (bounty._aggregate_active_meta) already sums; the two active paths must agree.
+    total_requests = 0
     last_meta: dict[str, Any] = {"in_scope": True, "host": "", "requests_used": 0, "rate_limited": False, "verified_classes": []}
-    surf = surface or {"endpoints": [target_url], "params": params_tried}
+    # The loop's endpoint allowlist is its OWN. `_react_plan` validates the brain's probe_priority
+    # rows against surf["endpoints"], but the caller hands us the RANKED discovered surface — and
+    # bounty._rank_active_targets drops the seed when enough discovered URLs outscore it — so
+    # target_url, the ONLY url this loop ever probes, could be absent from its own allowlist. Every
+    # priority row then got discarded, class steering was dead, and the no-progress guard stopped
+    # the loop after turn 0. Pinning it here cannot widen the brain's reach past the module
+    # invariant: target_url is the caller's own already-scope-checked target, each turn calls
+    # verify_active(target_url) and nothing else, and the priority filter below independently
+    # requires endpoint == target_url. Deduped + order-preserving so the caller's ranking still
+    # drives the prompt's surface context.
+    _base = surface or {"endpoints": [], "params": params_tried}
+    surf = dict(_base)
+    surf["endpoints"] = list(dict.fromkeys(
+        [target_url, *(str(u).strip() for u in (_base.get("endpoints") or []) if str(u or "").strip())]
+    ))
 
     turn = -1  # so out_meta["loop_turns"] = turn + 1 is well-defined (0) even if max_iters <= 0
     for turn in range(max_iters):
@@ -283,6 +315,7 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
             merged.setdefault(_dedup_key(f), f)
         verified |= set(meta.get("verified_classes") or [])
         budget_remaining -= int(meta.get("requests_used") or 0)
+        total_requests += int(meta.get("requests_used") or 0)
         # Turn 0 not in scope / guard-refused: return immediately (nothing to iterate on).
         if not meta.get("in_scope", True) and turn == 0:
             meta = dict(meta)
@@ -299,17 +332,30 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
         plan = _react_plan(coder_cfg, target_url, scope, surf, observations, params_tried, budget_remaining)
         new_params = [p for p in plan["param_hypotheses"] if p.lower() not in {q.lower() for q in params_tried}]
         new_priority = [r.get("classes") for r in plan["probe_priority"] if r.get("endpoint") == target_url and r.get("classes")]
-        if plan["done"] or (not new_params and not new_priority and not plan["xss_params"]):
-            break  # brain is done OR proposed nothing new -> stop (no-progress guard)
+        # Compare what the NEXT turn would actually run against what this one ran. The old guard
+        # only checked that priority/xss were non-EMPTY, so a brain answering with the identical
+        # JSON every turn — the normal failure mode once observations stop changing — re-ran
+        # byte-identical deterministic probes until max_iters, burning the shared per-host bucket.
+        # The comparison must mirror the real update rule, not a fresh one: the priority assignment
+        # keeps the caller's ordering when new_priority is empty, so a naive
+        # `new_priority == cur_priority` test regresses the empty-plan case (measured: 1 repeat turn
+        # -> 6). Build the next state first, then stop when it equals the current one.
+        next_priority = (list(dict.fromkeys([c for row in new_priority for c in row]))
+                         if new_priority else cur_priority)
+        next_xss = list(dict.fromkeys(cur_xss + list(plan["xss_params"])))
+        if plan["done"] or (not new_params and next_priority == cur_priority and next_xss == cur_xss):
+            break  # brain is done OR proposed nothing NEW -> stop (no-progress guard)
         cur_params = params_tried = params_tried + new_params
-        if new_priority:
-            cur_priority = list(dict.fromkeys([c for row in new_priority for c in row]))
-        cur_xss = list(dict.fromkeys(cur_xss + list(plan["xss_params"])))
+        cur_priority = next_priority
+        cur_xss = next_xss
         _emit(f"hunt-loop turn {turn + 1}: +{len(new_params)} param(s), {budget_remaining} req budget left")
 
     out_meta = dict(last_meta)
     out_meta["verified_classes"] = sorted(verified)
     out_meta["loop_turns"] = turn + 1
+    # ORDER MATTERS: the summed spend must be on out_meta BEFORE the snapshot is built from it,
+    # or the loop's own graph records the last turn's count as the hunt's coverage.
+    out_meta["requests_used"] = total_requests
     final_results = list(merged.values())
     out_meta["investigation"] = _loop_snapshot(final_results, surf, out_meta)
     return final_results, out_meta

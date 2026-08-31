@@ -995,11 +995,15 @@ _SCREENSHOT_WARNING = ("Screenshot is NOT auto-redacted — review it for secret
                        "tokens, and other users' data before attaching it to a report.")
 
 
-def _append_screenshot(out: list[str], finding: dict[str, Any]) -> None:
+def _append_screenshot(out: list[str], finding: dict[str, Any], plan: dict[str, Any] | None = None) -> None:
     """Embed the captured VISUAL evidence by basename (so the .md and the .png resolve from the same
     folder): the proof screenshot AND the graphical attack-plan map, each optional and independent.
     Shared by the default report and the per-platform report so the visuals land on *every* report
-    surface, not only the platform package."""
+    surface, not only the platform package.
+
+    ``plan`` feeds the one confirm authority (_proof_of_impact_detail) so the map's caption states the
+    finding's real state — a map can be rendered for any lead, and calling that flow 'confirmed' in
+    the caption asserted a proof the gate never accepted."""
     names = _screenshot_names(finding)
     if names:
         out.append("## Screenshot evidence\n")
@@ -1014,10 +1018,18 @@ def _append_screenshot(out: list[str], finding: dict[str, Any]) -> None:
     if amap:
         name = amap.replace("\\", "/").rsplit("/", 1)[-1]
         out.append("## Attack-plan map\n")
-        out.append(f"![Attack-plan map — the attack GreyIQ used to confirm this finding]({name})")
-        out.append("")
-        out.append("> A visual map of the confirmed attack flow (actor → crafted probe → observed tell "
-                   "vs negative control → confirmed impact). The .png is included in this POC package.")
+        if str(_proof_of_impact_detail(finding, plan or {})["status"]) == "confirmed":
+            out.append(f"![Attack-plan map — the attack GreyIQ used to confirm this finding]({name})")
+            out.append("")
+            out.append("> A visual map of the confirmed attack flow (actor → crafted probe → observed tell "
+                       "vs negative control → confirmed impact). The .png is included in this POC package.")
+        else:
+            out.append(f"![Attack-plan map — the attack path GreyIQ tested for this candidate finding]({name})")
+            out.append("")
+            out.append("> A visual map of the attack path under test (actor → crafted probe → observed tell "
+                       "vs negative control → the impact still to prove). The confirm gate has not accepted "
+                       "this finding, so the map shows what is still outstanding, not a proven flow. The .png "
+                       "is included in this POC package.")
         out.append("")
 
 
@@ -1473,6 +1485,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
     out.append("")
 
     _append_bounty_triage(out, ctx, counts)
+    _append_surface_drift(out, ctx)
     _append_investigation(out, ctx)
     _append_next_steps(out, ctx)
 
@@ -1566,7 +1579,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
         _append_chain_role(out, ctx, ref)
         _append_proof_of_impact(out, finding, plan, heading="**Proof of impact:**")
         _append_proof_of_exploitability(out, finding, plan, heading="**Proof of exploitability:**")
-        _append_screenshot(out, finding)
+        _append_screenshot(out, finding, plan)
         _append_credential_proof(out, finding)
         remediation = finding.get("remediation") or plan.get("remediation")
         if remediation:
@@ -1642,6 +1655,10 @@ def _append_chain_role(out: list[str], ctx: dict[str, Any], ref: str) -> None:
     the finding it escalates gains the line saying what it now reaches. A triager reading a
     reflected XSS in isolation prices it as an XSS; the same finding labelled "step 1 of a
     chain to account takeover" is priced as what it actually is.
+
+    THIS finding's step state is printed alongside the chain's, attributed to different things: the
+    chain status is a roll-up over the STRONGEST evidence in the chain, so printing it alone let a
+    purely projected step borrow another finding's credibility.
     """
     investigation = ctx.get("investigation") if isinstance(ctx.get("investigation"), dict) else {}
     chains = investigation.get("attack_chains") if isinstance(investigation.get("attack_chains"), list) else []
@@ -1652,16 +1669,58 @@ def _append_chain_role(out: list[str], ctx: dict[str, Any], ref: str) -> None:
         for step in chain.get("steps") or []:
             if not isinstance(step, dict) or str(step.get("evidence_ref") or "") != str(ref):
                 continue
+            # 'proven'/'projected' is the SAME vocabulary the chain table prints, so the two surfaces
+            # cannot drift; the chain status keeps the table's 'candidate' default.
+            state = _md_escape_cell(str(step.get("state") or "projected"))
             lines.append(
                 f"- Step {_safe_display_int(step.get('n'))} of **{_md_escape_cell(chain.get('id') or '')} · "
-                f"{_md_escape_cell(chain.get('title') or '')}** "
-                f"({_md_escape_cell(chain.get('status') or '')}) — reaching "
+                f"{_md_escape_cell(chain.get('title') or '')}** — this step is *{state}*; the chain is "
+                f"{_md_escape_cell(chain.get('status') or 'candidate')} and its projected impact is "
                 f"{_md_escape_cell(chain.get('projected_impact') or 'higher impact')}."
             )
     if not lines:
         return
     out.append("**Chain role:**\n")
+    # The standalone per-finding file carries no chain table, so the two state words would be
+    # undefined there — the legend travels with the line that uses them.
+    out.append("_A *proven* step is backed by a captured artifact the confirm gate accepted; "
+               "a *projected* step is the next thing to prove._\n")
     out.extend(dict.fromkeys(lines))
+    out.append("")
+
+
+def _append_surface_drift(out: list[str], ctx: dict[str, Any]) -> None:
+    """What changed on this host since the last run.
+
+    Deliberately its own section, well away from the findings table: "a new admin endpoint
+    appeared" reads like a finding in a skim, and it is not one — nothing here was observed to
+    be broken. The section is emitted even when nothing changed, because "compared, nothing
+    moved" and "never compared" are different statements and only one of them is reassuring.
+    """
+    from bughunter import surface_drift
+
+    drift = ctx.get("drift")
+    if not isinstance(drift, dict) or not drift.get("status") or drift.get("status") == "unavailable":
+        return
+    lines = surface_drift.summary_lines(drift)
+    if not lines:
+        return
+    out.append("## Surface drift\n")
+    out.append(
+        "How this host's attack surface compares with the previous hunt. These are OBSERVATIONS "
+        "about the target's history, not findings: a change is a reason to go and test "
+        "something, never evidence that anything is exploitable."
+    )
+    out.append("")
+    for line in lines:
+        out.append(_md_escape_cell(line) if not line.startswith("- ") else f"- {_md_escape_cell(line[2:])}")
+    stale = ctx.get("stale_proofs") if isinstance(ctx.get("stale_proofs"), list) else []
+    if stale:
+        out.append("")
+        out.append("**Proofs to re-verify before submitting** — an endpoint these rest on has moved:")
+        for row in stale[:6]:
+            if isinstance(row, dict):
+                out.append(f"- {_md_escape_cell(row.get('chain') or '')}: {_md_escape_cell(row.get('why') or '')}")
     out.append("")
 
 
@@ -1998,6 +2057,10 @@ def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
             "algorithm": "", "verdict": "not-run", "metrics": {},
             "hypotheses": [], "attack_chains": [], "chain_probes": [], "contradictions": [],
         },
+        # How this host's surface compares with the previous hunt. Advisory and explicitly
+        # separate from `findings`: a delta is never a finding.
+        "drift": ctx.get("drift") or {},
+        "stale_proofs": ctx.get("stale_proofs") or [],
         "manual_checklist": ctx.get("manual_checklist", []),
         "submission_checklist": list(_SUBMISSION_CHECKLIST),
         "retest_checklist": list(_RETEST_CHECKLIST),
@@ -2100,7 +2163,7 @@ def build_finding_markdown(ctx: dict[str, Any], finding: dict[str, Any]) -> str:
     _append_chain_role(out, ctx, str(finding.get("ref") or ""))
     _append_proof_of_impact(out, finding, plan, heading="## Proof of impact\n")
     _append_proof_of_exploitability(out, finding, plan, heading="## Proof of exploitability\n")
-    _append_screenshot(out, finding)
+    _append_screenshot(out, finding, plan)
     _append_credential_proof(out, finding)
     remediation = finding.get("remediation") or plan.get("remediation")
     if remediation:

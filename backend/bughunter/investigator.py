@@ -69,6 +69,12 @@ _CLASS_ALIASES = {
     "template-injection": "ssti", "secret": "secrets", "credential": "secrets",
     "idor": "access-control", "bola": "access-control", "bfla": "access-control",
     "injection": "rce", "backdoor": "rce", "obfuscation": "rce",
+    # Spelling drift, not a distinct class: the API-discovery detector reported GraphQL
+    # introspection as "info-disclosure" while the active detector reported the SAME
+    # vulnerability as "graphql". An unaliased id reaches no technique in the chain engine, so
+    # the finding contributed nothing. The producers now agree; this alias is kept for stored
+    # ledger/history rows that still carry the old id.
+    "info-disclosure": "disclosure",
 }
 
 _RULE_CLASS_HINTS: tuple[tuple[str, str], ...] = (
@@ -319,6 +325,31 @@ def _evidence_score(
 _CHAIN_STATE_TO_CORTEX = {"proven": "confirmed", "partial": "supported", "projected": "candidate"}
 
 
+def _chain_next_action(chain: dict[str, Any], status: str, refs: list[str],
+                       by_ref: dict[str, dict[str, Any]]) -> str:
+    """What to do next with this chain, honest about which of the two gates it failed.
+
+    The chain layer and the cortex ask different questions — "did every STEP capture an
+    artifact?" versus "is this FINDING's evidence sound?" — and a chain can pass the first while
+    failing the second. When that happens the engine has already written "every step is backed
+    by a captured artifact — package the chain as one report", and printing that under a status
+    the cortex just downgraded invites a submission the evidence does not support.
+    """
+    if status == "blocked":
+        return ("Resolve the blocking evidence contradiction on the cited finding before "
+                "treating this chain as reportable.")
+    engine_action = _text(chain.get("next_action"), 600)
+    # `blocking_step` is 0 exactly when the engine found no unproven step.
+    fully_proven = not chain.get("blocking_step")
+    if fully_proven and status != "confirmed":
+        weak = [ref for ref in refs if by_ref[ref]["status"] != "confirmed"]
+        obligation = _text(by_ref[weak[0]]["next_action"], 400) if weak else ""
+        named = ", ".join(weak[:3]) or "a cited finding"
+        return (f"Every step captured an artifact, but {named} is not confirmed on its own "
+                f"evidence — close that gap before packaging this chain. {obligation}").strip()
+    return engine_action
+
+
 def _build_chains(
     hypotheses: list[dict[str, Any]],
     findings: list[dict[str, Any]],
@@ -398,13 +429,15 @@ def _build_chains(
             "confidence_score": confidence,
             "why": chain.get("narrative") or "",
             "projected_impact": chain.get("impact_label") or "",
-            # A blocked chain must not carry "package this as one report" as its next action,
-            # which is what the engine writes for a chain whose every step captured something.
-            "next_action": (
-                "Resolve the blocking evidence contradiction on the cited finding before "
-                "treating this chain as reportable."
-                if status == "blocked" else chain.get("next_action") or ""
-            ),
+            # A chain the cortex has downgraded must not carry "package this as one report" as
+            # its next action, which is what the engine writes for a chain whose every step
+            # captured something. The guard used to cover only `blocked`, so the OTHER downgrade
+            # — every step proven, but a cited finding's evidence is not sound enough to call
+            # the chain confirmed — still told the operator to submit it, in the report's
+            # closing line and in the action plan. Only the fully-proven case is overridden: a
+            # genuinely partial chain's action is already its blocking step's own instruction,
+            # which is more specific than anything written here.
+            "next_action": _chain_next_action(chain, status, refs, by_ref),
             # The ordered ladder — what makes this a chain and not a pair.
             "entry": chain.get("entry_label") or "",
             "chain_state": chain.get("status") or "projected",
@@ -415,8 +448,13 @@ def _build_chains(
         })
     chains.sort(key=lambda row: (row["status"] == "confirmed", row["confidence_score"]), reverse=True)
     chains = chains[:_MAX_CHAINS]
+    # `AC`, not `C`: a campaign pools its findings under refs C1..Cn, and a span report printed
+    # both namespaces side by side, so "chain C1 cites C1" named two unrelated things in one
+    # sentence. Chain ids are ephemeral (regenerated at every render, nothing persists or keys
+    # off them) whereas the finding refs are stored and test-pinned, so the chain side is the
+    # one that moves. `CP` for probes is already disjoint from both.
     for index, chain in enumerate(chains, 1):
-        chain["id"] = f"C{index}"
+        chain["id"] = f"AC{index}"
     for index, probe in enumerate(probes[:_MAX_CHAINS], 1):
         probe["id"] = f"CP{index}"
     return chains, probes[:_MAX_CHAINS]

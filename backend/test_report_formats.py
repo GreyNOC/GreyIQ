@@ -235,5 +235,81 @@ class StepsNumberingTests(unittest.TestCase):
         self.assertIn("2. Bravo step.", md)
 
 
+class ChainRoleInSubmissionTests(unittest.TestCase):
+    """The per-platform body is the file the operator pastes into the program's form — it is read on
+    its own, so the chain context has to travel with it exactly as it does in the default report."""
+
+    def _chained(self):
+        ctx, finding = _ctx_finding()
+        ctx["investigation"] = {"attack_chains": [{
+            "id": "C1", "title": "Reflected XSS to account takeover", "status": "candidate",
+            "projected_impact": "full account takeover", "refs": ["F1"],
+            "steps": [{"n": 1, "title": "Reflect script into the victim's session",
+                       "evidence_ref": "F1", "state": "projected"}],
+        }]}
+        return ctx, finding
+
+    def test_every_platform_body_carries_the_chain_role(self) -> None:
+        ctx, finding = self._chained()
+        for platform in ("hackerone", "yeswehack", "bugcrowd", "intigriti", "hackenproof"):
+            md = rf.render_finding(ctx, finding, platform)
+            self.assertIn("**Chain role:**", md, platform)
+            self.assertIn("this step is *projected*", md, platform)
+            self.assertIn("full account takeover", md, platform)
+            self.assertIn("a captured artifact the confirm gate accepted", md, platform)  # the legend
+
+    def test_the_chain_role_sits_between_impact_and_the_proof_sections(self) -> None:
+        # The canonical position from build_finding_markdown: after the impact prose, BEFORE
+        # proof-of-impact/exploitability — not appended after the proof the triager just read.
+        ctx, finding = self._chained()
+        md = rf.render_finding(ctx, finding, "hackerone")
+        self.assertLess(md.index("## Impact"), md.index("**Chain role:**"))
+        self.assertLess(md.index("**Chain role:**"), md.index("## Proof of impact"))
+        self.assertLess(md.index("**Chain role:**"), md.index("## Proof of exploitability"))
+
+    def test_the_submission_package_body_carries_it(self) -> None:
+        ctx, finding = self._chained()
+        package = sub.build_submission(ctx, finding, "hackerone")
+        self.assertIsNotNone(package)
+        self.assertIn("this step is *projected*", package["vulnerability_information"])
+
+    def test_a_context_with_no_investigation_renders_no_chain_section(self) -> None:
+        ctx, finding = _ctx_finding()
+        md = rf.render_finding(ctx, finding, "hackerone")
+        self.assertNotIn("**Chain role:**", md)
+
+    def test_the_cached_run_ctx_carries_the_investigation(self) -> None:
+        # The chain section is only as good as the ctx it is handed: the API caches a MINIMAL ctx per
+        # run, and every per-finding submission body is rendered from that copy. Drop the
+        # investigation there and the section above silently renders nothing in the shipped app.
+        import threading
+        from collections import OrderedDict
+
+        import greyiq_api as api
+
+        runtime = object.__new__(api.GreyIQRuntime)
+        runtime.lock = threading.RLock()
+        runtime.bounty_runs = OrderedDict()
+        ctx, finding = self._chained()
+        result = {"ok": True, "generated_at": ctx["generated_at"], "findings": [finding],
+                  "attack_plans": ctx["attack_plans"], "investigation": ctx["investigation"]}
+        runtime._cache_bounty_run(result, target=ctx["target"], scope=ctx["scope"], program="p")
+        package = runtime.build_submission_package(
+            api.SubmissionPackageRequest(run_id=result["run_id"], ref="F1", platform="hackerone"))
+        self.assertTrue(package["ok"])
+        self.assertIn("this step is *projected*", package["package"]["vulnerability_information"])
+
+    def test_both_renderers_produce_the_same_chain_line(self) -> None:
+        # Delegation, not a second implementation: the platform body and the default report must
+        # print byte-identical chain wording so a clamped status can never drift between them.
+        ctx, finding = self._chained()
+        platform_line = [ln for ln in rf.render_finding(ctx, finding, "bugcrowd").splitlines()
+                         if ln.startswith("- Step 1 of")]
+        default_line = [ln for ln in R.build_finding_markdown(ctx, finding).splitlines()
+                        if ln.startswith("- Step 1 of")]
+        self.assertEqual(platform_line, default_line)
+        self.assertTrue(platform_line)
+
+
 if __name__ == "__main__":
     unittest.main()

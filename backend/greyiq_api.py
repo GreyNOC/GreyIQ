@@ -2650,6 +2650,11 @@ class GreyIQRuntime:
             "generated_at": result.get("generated_at", ""),
             "target": target, "scope": scope,
             "attack_plans": result.get("attack_plans") or {},
+            # The investigation (bounded: top hypotheses + up to 8 chains) has to ride in the cached
+            # ctx, not just in `result`: every per-finding submission body is rendered from THIS ctx,
+            # and report._append_chain_role reads ctx["investigation"] — without it the file the
+            # operator pastes into the platform silently loses the chain the finding is a step of.
+            "investigation": result.get("investigation") or {},
             "disclose_automation": disclose_automation,
         }
         findings_by_ref = {str(f.get("ref")): f for f in (result.get("findings") or []) if f.get("ref")}

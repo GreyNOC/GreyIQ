@@ -42,16 +42,61 @@ class BuildDigestTests(unittest.TestCase):
         self.assertEqual(d["jwt"]["typ"], "JWT")
         self.assertNotIn("admin", json.dumps(d))          # the payload is NEVER decoded
 
+    @staticmethod
+    def _gaps(cookies: list[str], final_url: str = "https://app.test/") -> dict[str, list[str]]:
+        d = db.build_digest({"status": 200, "headers": {}, "cookies": cookies, "body": "{}",
+                             "final_url": final_url})
+        return {g["cookie"]: g["missing"] for g in d.get("cookie_flag_gaps") or []}
+
     def test_auth_cookie_flag_gaps_and_cors(self) -> None:
         d = db.build_digest({"status": 200,
                              "headers": {"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Credentials": "true"},
-                             "cookies": ["sessionid=abc; Path=/", "theme=dark; Path=/"], "body": "{}"})
+                             "cookies": ["sessionid=abc; Path=/", "theme=dark; Path=/"], "body": "{}",
+                             "final_url": "https://app.test/"})
         gaps = {g["cookie"]: g["missing"] for g in d["cookie_flag_gaps"]}
         self.assertIn("sessionid", gaps)                  # auth cookie flagged
         self.assertNotIn("theme", gaps)                   # a non-auth cookie is NOT flagged
         self.assertEqual(set(gaps["sessionid"]), {"Secure", "HttpOnly", "SameSite"})
         self.assertEqual(d["cors_acao"], "*")
         self.assertTrue(d["cors_allow_credentials"])       # the dangerous *+credentials combo
+
+    def test_cookie_value_containing_flag_words_does_not_suppress_the_gap(self) -> None:
+        # The VALUE is app/attacker-influenceable (a base64 blob contains most things). Scanning the
+        # whole Set-Cookie header for "httponly"/"secure" let a cookie hide its own flag gap — the
+        # digest fed that miss into the same chain graph as attack_chain.cookie_signals.
+        gaps = self._gaps(["sessionid=aHR0cG9ubHktc2VjdXJl_httponly_secure_samesite; Path=/"])
+        self.assertEqual(set(gaps["sessionid"]), {"Secure", "HttpOnly", "SameSite"})
+        # and the real attributes are still read off the attribute list, not the value
+        gaps = self._gaps(["sessionid=httponly; Path=/; HttpOnly; Secure; SameSite=Lax"])
+        self.assertEqual(gaps, {})
+
+    def test_samesite_none_counts_as_missing_samesite(self) -> None:
+        # SameSite=None is the explicit opt-IN to cross-site sending — the CSRF precondition, not
+        # protection. Reading its mere presence as "has SameSite" inverted the one value that matters.
+        self.assertEqual(self._gaps(["sessionid=a; Path=/; HttpOnly; Secure; SameSite=None"]),
+                         {"sessionid": ["SameSite"]})
+        self.assertEqual(self._gaps(["sessionid=a; Path=/; HttpOnly; Secure; samesite = none"]),
+                         {"sessionid": ["SameSite"]})
+        self.assertEqual(self._gaps(["sessionid=a; Path=/; HttpOnly; Secure; SameSite=Lax"]), {})
+
+    def test_secure_gap_is_https_gated_like_cookie_signals(self) -> None:
+        # cookie_signals only reports a missing Secure on an https page; the digest reported it
+        # unconditionally, so an http target grew a `cookie.session-no-secure` chain signal the
+        # chain engine itself would never have raised.
+        cookie = ["sessionid=a; Path=/; HttpOnly; SameSite=Lax"]
+        self.assertEqual(self._gaps(cookie, "https://app.test/"), {"sessionid": ["Secure"]})
+        self.assertEqual(self._gaps(cookie, "http://app.test/"), {})
+        self.assertEqual(self._gaps(cookie, ""), {})          # unknown scheme == not https
+        # an explicit url argument wins over the response's own final_url
+        d = db.build_digest({"status": 200, "headers": {}, "cookies": cookie, "body": "{}",
+                             "final_url": "http://app.test/"}, "https://app.test/")
+        self.assertEqual(d["cookie_flag_gaps"], [{"cookie": "sessionid", "missing": ["Secure"]}])
+
+    def test_cookie_gaps_never_carry_the_cookie_value(self) -> None:
+        d = db.build_digest({"status": 200, "headers": {}, "body": "{}", "final_url": "https://app.test/",
+                             "cookies": ["session_token=SUPER-SECRET-SESSION-VALUE; Path=/"]})
+        self.assertNotIn("SUPER-SECRET-SESSION-VALUE", json.dumps(d))   # NAME + flag facts only
+        self.assertIn("session_token", json.dumps(d))
 
     def test_form_fields_include_hidden_and_error_family(self) -> None:
         body = ('<form><input name="user"><input type=hidden name="is_admin" value="0"></form>'

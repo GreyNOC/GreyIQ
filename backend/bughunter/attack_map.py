@@ -1,9 +1,15 @@
-"""Attack-plan mapper — a GRAPHICAL (SVG → PNG) diagram of the attack GreyIQ used to confirm a finding.
+"""Attack-plan mapper — a GRAPHICAL (SVG → PNG) diagram of the attack GreyIQ ran against a finding.
 
-Turns a confirmed finding's attack plan + captured differential into a top-down flow diagram
-(actor → crafted probe → observed tell vs negative control → confirmed impact), saved as a ``.png``
+Turns a finding's attack plan + captured differential into a top-down flow diagram
+(actor → crafted probe → observed tell vs negative control → impact), saved as a ``.png``
 beside the proof screenshot in the finding's POC download so a triager SEES the attack, not just reads
 it. This is the visual counterpart to the text reproduction steps.
+
+HONEST BY CONSTRUCTION: the map is a proof artifact — it is embedded in the report body and copied
+into the platform submission package — so it renders the state the CONFIRM GATE assigned the finding
+(``report._proof_of_impact_detail``) and never a confirmation the gate withheld. Any renderable
+finding may be mapped, including a passive lead, so an unproven stage is drawn as the capture that is
+still outstanding rather than dropped or filled with narrative.
 
 SAFE BY CONSTRUCTION:
 - The SVG is built ENTIRELY from our own data. Every dynamic string is XML-escaped, control-char
@@ -23,16 +29,21 @@ import re
 from pathlib import Path
 from typing import Any
 
+from bughunter import report as report_lib
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.playwright_env import ensure_bundled_browsers_path
 
-# Stage palette (accent, fill) — cool→warm as the attack advances to the confirmed impact.
+# Stage palette (accent, fill) — cool→warm as the attack advances to the confirmed impact. The two
+# unproven kinds are deliberately neutral slate: a green tell or a red impact box reads as proof at a
+# glance, so a stage that was never captured must not borrow that colour.
 _STAGES = {
     "actor": ("#6366f1", "#eef2ff"),
     "probe": ("#0ea5e9", "#e0f2fe"),
     "observed": ("#16a34a", "#dcfce7"),
     "control": ("#d97706", "#fef3c7"),
     "confirmed": ("#dc2626", "#fee2e2"),
+    "pending": ("#64748b", "#f1f5f9"),
+    "candidate": ("#475569", "#e2e8f0"),
 }
 _SEVERITY_COLOR = {"critical": "#7f1d1d", "high": "#dc2626", "medium": "#d97706", "low": "#2563eb", "info": "#4b5563"}
 _WIDTH = 860
@@ -123,25 +134,41 @@ def _arrow(y: int) -> str:
             f'stroke-width="2" marker-end="url(#arrow)"/>')
 
 
+def _gate_confirmed(finding: dict[str, Any], plan: dict[str, Any]) -> bool:
+    """Ask THE confirm authority — ``report._proof_of_impact_detail``, the same gate the report body,
+    the submission package and the proof badge read — whether this finding is confirmed.
+
+    Deriving a second "looks confirmed" rule here would be a softer gate on the artifact a triager
+    trusts most, so this delegates and FAILS CLOSED: any error means the map claims nothing."""
+    try:
+        return str(report_lib._proof_of_impact_detail(finding, plan).get("status") or "") == "confirmed"
+    except Exception:  # noqa: BLE001 - an unreadable finding is not a confirmed one
+        return False
+
+
 def build_attack_svg(finding: dict[str, Any], plan: dict[str, Any] | None = None) -> str:
-    """Build the attack-flow SVG for a confirmed finding from its plan + captured differential.
-    Deterministic and dependency-free; every dynamic value is cleaned + XML-escaped."""
+    """Build the attack-flow SVG for a finding from its plan + captured differential, rendering the
+    state the confirm gate assigned it. Deterministic and dependency-free; every dynamic value is
+    cleaned + XML-escaped."""
     plan = plan if isinstance(plan, dict) else {}
     poi = plan.get("proof_of_impact") if isinstance(plan.get("proof_of_impact"), dict) else {}
     ev = finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {}
+    confirmed = _gate_confirmed(finding, plan)
 
-    title = _clean(finding.get("title") or finding.get("class_name") or "Confirmed finding", 120)
+    title = _clean(finding.get("title") or finding.get("class_name") or "Finding", 120)
     severity = _clean(finding.get("severity") or "", 12).lower() or "info"
     cls = _clean(finding.get("class_name") or finding.get("class_id") or "finding", 80)
     target = _clean(finding.get("location") or finding.get("file_path") or "", 200)
     actor = _clean(poi.get("actor") or "an unauthenticated attacker", 160)
     request_line = _clean(ev.get("request_line") or poi.get("method") or "", 200)
     request_header = _clean(ev.get("request_header") or "", 160)
-    observed = _clean(poi.get("observed_result") or ev.get("matched_value") or "the vulnerable behaviour was observed", 320)
+    observed = _clean(poi.get("observed_result") or ev.get("matched_value") or "", 320)
     control = _clean(poi.get("control_result") or "", 320)
+    obligation = _clean(poi.get("proof_obligation") or "", 260)
     impact = _clean(poi.get("proof_obligation") or plan.get("impact") or poi.get("affected_asset") or "", 260)
 
-    # Assemble the ordered stages (skip an empty one rather than draw a blank box).
+    # Assemble the ordered stages. A proof stage with nothing captured is drawn as the outstanding
+    # capture, never dropped and never filled with narrative — the gap IS the finding's state.
     stages: list[tuple[str, str, list[str]]] = []
     stages.append(("actor", "1 · ACTOR", _wrap(actor)))
     probe_body = [request_line] if request_line else []
@@ -151,13 +178,34 @@ def build_attack_svg(finding: dict[str, Any], plan: dict[str, Any] | None = None
         probe_body.append(f"target: {target}")
     stages.append(("probe", "2 · CRAFTED PROBE", _wrap(" ".join(probe_body) if not request_line else request_line)
                    if len(probe_body) <= 1 else [_clean(x, 200) for x in probe_body][:_MAX_LINES]))
-    stages.append(("observed", "3 · OBSERVED (the tell)", _wrap(observed)))
+    # 3 · the tell. Only a real captured string may fill this box: writing "the vulnerable behaviour
+    # was observed" when nothing was captured put a fabricated observation into a submitted artifact.
+    if observed:
+        stages.append(("observed" if confirmed else "pending",
+                       "3 · OBSERVED (the tell)" if confirmed
+                       else "3 · OBSERVED — NOT ACCEPTED BY THE CONFIRM GATE", _wrap(observed)))
+    else:
+        stages.append(("pending", "3 · OBSERVED — NOT CAPTURED YET",
+                       _wrap("still to capture: " + (obligation or "the response that shows the vulnerable "
+                                                                  "behaviour, beside the request that caused it"))))
+    # 4 · the negative control. NEVER dropped when empty: a missing control is exactly what a triager
+    # has to see, and silently omitting the stage made the map read as if the check had passed.
     if control:
         stages.append(("control", "4 · NEGATIVE CONTROL (rules out a false positive)", _wrap(control)))
+    else:
+        stages.append(("pending", "4 · NEGATIVE CONTROL — NOT CAPTURED YET",
+                       _wrap("still to capture: the same request without the attack condition, showing the "
+                             "benign response the tell differs from")))
     conf_body = [f"{cls} — severity {severity}"]
-    if impact:
-        conf_body += _wrap(impact, _WRAP, _MAX_LINES - 1)
-    stages.append(("confirmed", "✓ CONFIRMED", conf_body[:_MAX_LINES]))
+    if confirmed:
+        if impact:
+            conf_body += _wrap(impact, _WRAP, _MAX_LINES - 1)
+        stages.append(("confirmed", "✓ CONFIRMED", conf_body[:_MAX_LINES]))
+    else:
+        conf_body += _wrap("still to prove: " + (obligation or impact or "a captured artifact the confirm "
+                                                                        "gate accepts as proof of impact"),
+                           _WRAP, _MAX_LINES - 1)
+        stages.append(("candidate", "CANDIDATE — NOT YET CONFIRMED", conf_body[:_MAX_LINES]))
 
     # Header height, then lay out the boxes with arrows.
     header_h = 74
@@ -174,10 +222,13 @@ def build_attack_svg(finding: dict[str, Any], plan: dict[str, Any] | None = None
     total_h = y + _MARGIN
 
     sev_color = _SEVERITY_COLOR.get(severity, "#4b5563")
+    # The eyebrow carries the gate's verdict: the .png is pasted into a report on its own, so the
+    # state has to be legible without the surrounding prose.
+    eyebrow = "GreyIQ · ATTACK PLAN · CONFIRMED" if confirmed else "GreyIQ · ATTACK PLAN · CANDIDATE (NOT CONFIRMED)"
     header = (
         f'<rect x="0" y="0" width="{_WIDTH}" height="{header_h}" fill="#0f172a"/>'
         f'<text x="{_MARGIN}" y="30" font-family="Segoe UI,Arial,sans-serif" font-size="12" '
-        f'font-weight="700" fill="#94a3b8" letter-spacing="1.5">GreyIQ · ATTACK PLAN</text>'
+        f'font-weight="700" fill="#94a3b8" letter-spacing="1.5">{_e(eyebrow)}</text>'
         f'<text x="{_MARGIN}" y="56" font-family="Segoe UI,Arial,sans-serif" font-size="18" '
         f'font-weight="700" fill="#f8fafc">{_e(title)}</text>'
         f'<rect x="{_WIDTH - _MARGIN - 96}" y="20" width="96" height="34" rx="6" fill="{sev_color}"/>'

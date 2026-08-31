@@ -124,7 +124,12 @@ class GraphQLTests(unittest.TestCase):
 
     def test_finding_is_candidate_with_inline_plan(self) -> None:
         f = api._graphql_finding("https://api.example.com/graphql", api.parse_graphql_introspection(_INTROSPECTION))
-        self.assertEqual(f["class_id"], "info-disclosure")
+        # Same vocabulary the ACTIVE detector of this vulnerability emits (class "graphql" chains;
+        # category "disclosure" is what bounty's artifact/label tables key on). The old
+        # "info-disclosure" class_id matched no technique and no alias, so the finding chained to
+        # nothing and _classify re-emitted it as a junk category with no CWE.
+        self.assertEqual(f["class_id"], "graphql")
+        self.assertEqual(f["category"], "disclosure")
         self.assertEqual(f["rule_id"], "passive.graphql-introspection")
         self.assertEqual(f["_plan"]["proof_of_impact"]["status"], "candidate")
         self.assertEqual(f["_plan"]["cvss"]["base_severity"], "low")
@@ -165,7 +170,8 @@ class DiscoverDriverTests(unittest.TestCase):
         self.assertIn("category", out["params"])
         self.assertIsNotNone(out["graphql"])
         self.assertEqual(len(out["findings"]), 1)
-        self.assertEqual(out["findings"][0]["class_id"], "info-disclosure")
+        self.assertEqual(out["findings"][0]["class_id"], "graphql")
+        self.assertEqual(out["findings"][0]["category"], "disclosure")
 
     def test_out_of_scope_specs_are_never_fetched(self) -> None:
         fetched: list[str] = []

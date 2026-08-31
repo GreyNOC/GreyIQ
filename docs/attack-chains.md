@@ -22,9 +22,40 @@ is **not** an entry; it must be earned from observed evidence (mixed content, a 
 plaintext endpoint) via `net.mitm-position`. See "Why cookie flags are not findings" below
 for why that distinction matters.
 
-The search is a bounded DFS over capability space. Every recorded path is reduced to its
-**minimal witness** for the impact it reaches: a step that does not contribute is dropped,
-so a chain never lists an unrelated finding it happened to walk past.
+The search is a bounded **iterative-deepening** walk over capability space. Every recorded
+path is reduced to its **minimal witness** for the impact it reaches: a step that does not
+contribute is dropped, so a chain never lists an unrelated finding it happened to walk past.
+
+Deepening rather than a plain DFS, because the two are not equivalent under a budget. A
+complete search of a routine 13-class hunt needs roughly two million expansions against a
+20,000 budget, and a depth-first walk sharing one counter spends the entire allowance inside
+the *first* edge's subtree — instrumented, the set of root edges ever expanded was literally
+`[0]`. Every witness whose techniques sit late in the table was lost, so the output was
+biased by table position rather than by chain quality. Splitting the budget per root does not
+fix it (measured: byte-identical output), because the bias is recursive: each root's share is
+consumed by its own first child in turn. Deepening by length also matches how the engine
+ranks anyway — short witnesses score higher — so the budget goes to the chains most likely
+to be reported.
+
+## Provenance: an observation is bound to where and to what
+
+Two bindings, because there are two ways to invent a composition nobody saw.
+
+**Which host.** Every signal records the host it was observed on, and it may only escalate a
+chain whose findings sit inside the same registrable domain. Without this, a campaign — which
+pools every target's signals into one graph — composed one company's missing `HttpOnly` into
+another company's confirmed XSS and reported an account takeover whose second step is
+physically impossible on that target, because its session cookie *is* `HttpOnly`. Sibling
+subdomains are deliberately *not* rejected and carry no cross-host penalty: domain-scoped
+cookies really do cross them, and that composition is the campaign's entire payoff. IP
+literals are compared exactly, never through the registrable-domain heuristic, which would
+otherwise merge `1.2.3.4` and `9.8.3.4`.
+
+**Which finding.** Signals that describe one specific finding are matched on the finding's
+*content*, not its display ref. Refs are renumbered every time findings are pooled (a hunt's
+`F1` becomes a campaign's `C7`, then a span's `C31`) while the signal keeps the ref it was
+stamped with, so a ref-keyed check silently discarded every cross-target witness — the
+credential chains a span exists to build were dead in exactly the graph that needed them.
 
 ## Why cookie flags are not findings
 
@@ -92,11 +123,25 @@ contract tests in `backend/test_attack_chain.py`:
 - **A signal carrying a finding ref can only escalate a chain citing that finding.** With two
   exposed secrets, the chain must not pair the first finding's credential step with the second
   finding's "this one is a cloud key" observation.
-- **Nothing fabricates a signal it cannot observe.** Two signals in the vocabulary
-  (`token.role-claim`, `sink.admin-rendered`) have no honest producer today — the response
-  digest decodes a JWT header only, and proving a stored value renders in an *administrative*
-  view needs admin access GreyIQ does not have. They are left unemitted rather than guessed,
-  so the techniques consuming them simply never fire.
+- **Nothing fabricates a signal it cannot observe.** Three signals in the vocabulary
+  (`token.role-claim`, `sink.admin-rendered`, `sink.upload-executed`) have no honest producer
+  today — the response digest decodes a JWT header only, proving a stored value renders in an
+  *administrative* view needs admin access GreyIQ does not have, and nothing observes an
+  uploaded file being executed. They are left unemitted rather than guessed, so the techniques
+  consuming them simply never fire.
+- **A path name is not an observation.** `endpoint.state-changing` is emitted only from an
+  actually observed `POST`/`PUT`/`PATCH`/`DELETE` form method. The old path-name heuristic was
+  an unanchored alternation over the whole URL, so `set` matched inside `/assets/` and `add`
+  inside `/address` — meaning essentially every target emitted the one clue that promotes
+  "read another tenant's data" to "*modify* another tenant's data". Anchoring does not rescue
+  it: `/news/change-log` and `/pricing/add-ons` are read-only pages whose names still match.
+- **A terminal impact is never minted from a class label alone.** A confirmed path traversal
+  was class-tagged `file-upload`, which fired the upload-to-execution technique and reported a
+  *proven* remote code execution from a read-only file disclosure. The producer was corrected,
+  and the technique now requires an observed `sink.upload-executed` signal, so a future class
+  re-tag cannot mint an impact by itself. Likewise, GraphQL introspection grants only
+  `disclose.identifier` — it discloses a schema and observes no boundary being crossed, so it
+  is a lead for BOLA/BFLA rather than a cross-tenant read.
 
 The module is pure stdlib, deterministic, bounded on every dimension, and total: it runs at
 report time on a finished hunt, so it degrades to an empty result rather than raising.
@@ -109,7 +154,7 @@ report time on a finished hunt, so it degrades to an empty result rather than ra
 | `bounty` (single hunt) | collects signals from scanners + recon surface + response digest |
 | `investigator` | builds the chains; splits report chains from probe leads |
 | `report` | the **Attack chains** section — ordered step ladder per chain |
-| `next_steps` | "close chain C1" actions naming the blocking step |
+| `next_steps` | "close chain AC1" actions naming the blocking step |
 | `hunt_loop` | chain-aware steering: the next turn chases the blocked step |
 | `campaign` / portfolio | **cross-target** chains — findings on different hosts in one graph |
 | `agent` (`investigate_code`) | the ladder in the coding agent's evidence brief |

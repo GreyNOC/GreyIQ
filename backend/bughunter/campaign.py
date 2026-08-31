@@ -1698,6 +1698,11 @@ def _ctx_from_doc(doc: dict[str, Any]) -> dict[str, Any]:
         "tool": doc.get("tool", "GreyIQ BugHunter"), "version": doc.get("version", ""),
         "generated_at": doc.get("generated_at", ""), "target": doc.get("target", ""),
         "scope": doc.get("scope", ""), "attack_plans": doc.get("attack_plans", {}),
+        # The chain role travels with the submission body. A per-finding package is read on its
+        # own, so without this the file the operator pastes into the platform prices the finding
+        # as an isolated bug while the campaign report prices it as step 1 of an account
+        # takeover — the report and the submission disagreeing about the same finding.
+        "investigation": doc.get("investigation") or {},
     }
 
 

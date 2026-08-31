@@ -243,12 +243,19 @@ def _graphql_finding(gql_url: str, info: dict[str, Any]) -> dict[str, Any]:
         "title": "GraphQL introspection enabled",
         "severity": "low",
         "confidence": "high",  # the schema came back — introspection is definitively on
-        "category": "info-disclosure",
+        # Vocabulary is load-bearing, so mirror the ACTIVE detector of this same vulnerability exactly
+        # (active_verify_service `_finding("active.graphql-introspection", ..., "disclosure", "graphql")`):
+        #  - class_id "graphql" is a real chain class; the old "info-disclosure" matched no technique
+        #    and no alias, so normalize_class returned it verbatim and the finding chained to nothing.
+        #  - category "disclosure" is the key bounty._ARTIFACT_CATEGORIES / _CATEGORY_LABELS actually
+        #    hold ("Information disclosure", CWE-200). "graphql" as a CATEGORY would drop the
+        #    deterministic proof status to "missing" and degrade _classify to a CWE-less fallback.
+        "category": "disclosure",
         "location": gql_url,
         "file_path": gql_url,
         "line_start": 1, "line_end": 1,
-        "class_id": "info-disclosure",
-        "class_name": "Information disclosure",
+        "class_id": "graphql",
+        "class_name": "Information disclosure",  # display-only
         "cwe": "CWE-200",
         "owasp": "A05:2021 Security Misconfiguration",
         "vrt": "",

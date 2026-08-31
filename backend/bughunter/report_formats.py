@@ -225,17 +225,23 @@ def _section_evidence(out: list[str], finding: dict[str, Any], *, heading: str) 
         out.append("")
 
 
-def _section_screenshot(out: list[str], finding: dict[str, Any]) -> None:
+def _section_screenshot(out: list[str], finding: dict[str, Any], plan: dict[str, Any]) -> None:
     """Embed a captured proof screenshot — delegates to the shared ``report._append_screenshot``
-    so the default report and every per-platform report render screenshot evidence identically."""
-    R._append_screenshot(out, finding)
+    so the default report and every per-platform report render screenshot evidence identically.
+    ``plan`` rides along so the attack-map caption reads the same confirm gate here as there."""
+    R._append_screenshot(out, finding, plan)
     R._append_credential_proof(out, finding)
 
 
-def _section_impact(out: list[str], finding: dict[str, Any], plan: dict[str, Any]) -> None:
+def _section_impact(out: list[str], ctx: dict[str, Any], finding: dict[str, Any], plan: dict[str, Any]) -> None:
     impact = plan.get("impact") or finding.get("impact")
     if impact:
         out.append(f"## Impact\n\n{impact}\n")
+    # The chain role sits between the impact prose and the proof sections — the position
+    # build_finding_markdown uses — because this body is what the operator pastes into the platform
+    # form, read on its own with no report around it to supply the chain context. Delegated so the
+    # clamped status/state wording is identical on both surfaces.
+    R._append_chain_role(out, ctx, str(finding.get("ref") or ""))
     R._append_proof_of_impact(out, finding, plan, heading="## Proof of impact\n")
     R._append_proof_of_exploitability(out, finding, plan, heading="## Proof of exploitability\n")
 
@@ -283,8 +289,8 @@ def render_finding(ctx: dict[str, Any], finding: dict[str, Any], platform: str =
     _section_steps(out, plan)
     _section_poc(out, finding, plan)
     _section_evidence(out, finding, heading=profile["evidence"])
-    _section_screenshot(out, finding)
-    _section_impact(out, finding, plan)
+    _section_screenshot(out, finding, plan)
+    _section_impact(out, ctx, finding, plan)
     _section_remediation(out, finding, plan, heading=profile["remediation"])
     _section_references(out, finding)
     _section_retest(out)

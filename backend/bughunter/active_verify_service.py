@@ -2131,8 +2131,17 @@ def _check_path_traversal(http: _Http, url: str, extra_params: list[str] | None 
                       "matched_value": f"{fname} contents disclosed via '{param}'",
                       # The retrieved file content IS the demonstrated impact (redacted once by _finding).
                       "read_data": body[:1200]}
+                # class_hint MUST be 'path-traversal', never 'file-upload': what this check proves is a
+                # READ. Tagging it file-upload handed a confirmed file read CWE-434 and that class's
+                # RCE-shaped C:H/I:H/A:H vector (8.8), and made it eligible for the attack-chain
+                # technique keyed on class 'file-upload' — upload-to-execution, which GRANTS
+                # exec.server-code, i.e. a code-execution chain assembled out of a
+                # confidentiality-only bug. Under the right class the chain engine reaches the
+                # correct row (path-traversal-read, grants read.server-file). The category stays
+                # 'disclosure' (that is what a file read IS, and the report renders it under the
+                # disclosure label); the hint carries the precise class.
                 return _finding("active.path-traversal", f"Path traversal / local file read via '{param}' parameter",
-                                "high", "disclosure", "file-upload", url, proof, ev)
+                                "high", "disclosure", "path-traversal", url, proof, ev)
     return None
 
 

@@ -2,6 +2,162 @@
 
 Notable changes to GreyIQ.
 
+## v3.0.0 - chain-engine QAQC, observation provenance, surface-drift engine
+
+A whole-subsystem audit of the attack-chain engine (71 adversarial agents; 49 defects confirmed
+after refutation, 10 claims refuted and dropped) plus a new engine that gives the hunt a memory.
+
+### Fabrications closed — the engine claimed things nobody observed
+
+Each of these produced a **confirmed, report-ready** claim on evidence that did not support it.
+
+- **A read-only file disclosure was reported as a PROVEN remote code execution.**
+  `_check_path_traversal` tagged its finding `file-upload` (the 5th positional argument of
+  `_finding` is the class hint), so the chain engine's upload-to-execution technique fired and
+  produced `unauthenticated attacker → remote code execution`, status `proven`, with "package the
+  chain as one report" as the next action. The finding also carried CWE-434 and an RCE-shaped
+  CVSS vector for a confidentiality-only bug. The producer now tags `path-traversal` — a class
+  that had **no producer at all**, which is why the honest `path-traversal-read → read.server-file`
+  ladder was dead code — and it gains its own `VULN_CLASSES`, impact-model, remediation and
+  reference entries. The technique now additionally requires an observed execution signal, so a
+  future class re-tag cannot mint a terminal impact on its own.
+- **GraphQL introspection was reported as a confirmed cross-tenant data read.** Schema disclosure
+  observes no boundary being crossed, so it now grants only `disclose.identifier` — a lead for
+  BOLA/BFLA, which is what the check's own docstring always called it. Paired with a real
+  access-control finding it still reaches the object-read impact.
+- **A correct CSRF implementation produced an account-takeover chain.** The chain engine refuses
+  double-submit cookies (`csrftoken` MUST be JS-readable — that is the pattern), but the response
+  digest builds its auth-cookie list on a deliberately wider pattern and fed the same signal
+  family through a second, ungated door. One gate now guards both.
+- **A stylesheet made an open-redirect lead into an account takeover.** `_AUTH_FLOW_RE` was an
+  unanchored alternation run over the whole URL, so `reset` matched `/static/css/reset.css`. It is
+  now segment-anchored, applied to the path only, and static assets are skipped.
+- **Every site inflated "read another tenant's data" into "modify another tenant's data."**
+  `set` matched inside `/assets/`, `add` inside `/address`, `edit` inside `/credit`. A path *name*
+  is not an observation of a write, and anchoring does not rescue it (`/news/change-log`,
+  `/pricing/add-ons`), so the heuristic is gone: an observed `POST`/`PUT`/`PATCH`/`DELETE` form
+  method is now the only producer of that signal.
+- **The attack-plan map stamped "✓ CONFIRMED" on any finding**, filled its "observed" box with a
+  hardcoded sentence, and silently dropped the negative-control stage when none was captured —
+  and that PNG ships inside the platform submission package. The map now delegates to the single
+  confirm authority, renders `CANDIDATE — NOT YET CONFIRMED` with what remains to prove, and never
+  omits the control stage.
+
+### An observation is now bound to where it was made and what it describes
+
+- **Cross-program contamination.** A campaign pools every target's signals into one graph, and a
+  signal carried no host — so one company's missing `HttpOnly` composed into another company's
+  confirmed XSS and was reported as an account takeover whose second step is *physically
+  impossible* on that target, with nothing in the rendered step naming the other host. Signals now
+  carry their observation host and may only escalate a chain inside the same registrable domain.
+  Sibling subdomains are deliberately exempt — domain-scoped cookies really do cross them, and
+  that composition is the campaign's whole payoff — and IP literals are compared exactly, never
+  through the registrable-domain heuristic.
+- **Ref renumbering silently deleted every credential chain a campaign existed to build.** Display
+  refs are renumbered when findings are pooled (`F1` → `C7` → `C31`) while the signals kept the ref
+  they were stamped with, so provenance matched nothing and discarded every cross-target witness.
+  Provenance is now keyed on a content-derived finding identity that survives every re-key.
+- Rendered chain steps now name the host an observation came from — the one fact a reader needs to
+  catch a bad composition by reading the report.
+
+### The search stopped being biased by table position
+
+- `_enumerate_paths` shared one expansion budget across a depth-first walk, so the **first edge's
+  subtree consumed the entire allowance** — instrumented on a routine 13-class hunt, the set of
+  root edges ever expanded was literally `[0]`, and every witness whose techniques sat late in the
+  table was lost. Splitting the budget per root does not fix it (measured: byte-identical output),
+  because the bias is recursive. It now uses **iterative deepening**, which also matches how the
+  engine ranks: short witnesses score higher, so the budget goes to the chains most likely to be
+  reported.
+- A **fully proven chain was discarded before the proven-first sort could see it**: the per-impact
+  bucket ranked on score alone while the final sort ranked on proof. Both keys now rank by proof
+  band first.
+- Two candidates with the same technique sequence for one impact are the same attack, and were
+  each taking a report slot; signal-only paths (which the cortex routes to the probe queue, not the
+  report) were evicting chains built on captured evidence. Both fixed, the latter with its own
+  budget so the planner still gets its leads.
+- A **code-scanner file path was parsed as a hostname** (`backend/app/views.py` → host `backend`),
+  so every multi-finding chain in a code audit paid the cross-host penalty that exists to say
+  "these two may not even share a session".
+
+### Coverage gaps closed
+
+- Confirmed **cloud-exposure** findings (an anonymously listable bucket, an open Firebase store —
+  the strongest cloud evidence the engine can capture) contributed **nothing** to any chain: the
+  class hint that makes them legible in the report also took them out of the disclosure bucket
+  that feeds the identifier ladder. They now have their own technique.
+- **GraphQL introspection from the API-discovery path** was tagged `info-disclosure`, a class id no
+  technique consumes and no alias mapped — while the active detector reported the identical
+  vulnerability as `graphql`. Pure spelling drift; the producers now agree, with an alias kept for
+  stored ledger rows.
+- A **deserialization sink narrated itself as command injection**, because the reporting layer
+  folds that category into class `rce` (correctly, for the platform weakness mapping). Techniques
+  can now discriminate on the scanner category without changing the reported class.
+- The `oob-confirms-blind` technique granted a capability no technique required and no impact
+  listed, so the step was pruned out of every witness it appeared in — unreachable output that
+  still cost an edge. Removed; a captured callback already earns `proven` through the confirm gate.
+
+### Downgraded chains stopped inviting submissions
+
+A chain whose every *step* captured an artifact, but whose cited *finding* the cortex would not
+call confirmed, kept the engine's "every step is backed by a captured artifact — package the chain
+as one report" as its closing line and in the action plan. The guard covered only the `blocked`
+case. Both readiness paths now respect the downgrade. Cortex chain ids also moved to `AC*`: a
+campaign refs its pooled findings `C1..Cn`, so a span report printed "chain C1 cites C1", naming
+two unrelated things in one sentence.
+
+### New: the surface-drift engine (`bughunter/surface_drift.py`)
+
+Every other engine reasons about **one moment**; `OperatorLoop` re-runs campaigns on a cadence and
+each cycle starts blind. So GreyIQ could not notice the highest-signal event in bug bounty:
+**something changed**.
+
+- Fingerprints each crawled URL's response **shape** from responses recon *already fetched* and
+  currently discards, diffs each run against the last, and turns the deltas into ranked probe
+  targets, a "What changed" phase in the action plan, and a **Surface drift** report section.
+- **Re-opens blocked attack chains across time** — the payoff. `build_attack_chains` computes which
+  step a chain is stuck on and which capability it was waiting for, then throws it away, so run N
+  re-derives and re-blocks the identical chain even when run N's surface just started leaking
+  exactly what it needed. Chains are keyed by *shape* (impact + technique ids), never by the
+  rendered id, which is reassigned at every render.
+- **Zero new requests, structurally**: the module issues no HTTP at all, so it has no method, host
+  or URL of its own and the scope gate, SSRF guard, governor and request budget are untouched by
+  construction. A contract test scans the source for every egress symbol.
+- Honesty invariants, all contract-tested: a delta is never a finding and emits **no chain signal**
+  (a statement that something *changed* is not a statement that anything is exploitable); a
+  re-opened chain is a probe with `status: untested` that never inherits prior confidence; a first
+  run reports `first-observation`, never "no changes detected"; a baseline covering less than half
+  this run's surface is **refused rather than diffed**; absence is never evidence of a fix; decay is
+  monotone; shapes are names, never values.
+- Two things the naive version gets wrong, both found by driving a live target rather than by
+  tests: hashing the body makes every run report that everything changed (it hashes the digest's
+  name-only structure instead), and a site-wide change emitted one row per URL (a single dropped
+  CSP header produced eighteen identical rows that buried the real changes; site-wide changes now
+  collapse to one).
+
+### Also
+
+- The hunt loop's chain steering was dead: its own target URL was rejected by the plan allowlist
+  whenever recon dropped the seed, and `_chain_focus` sliced the top 3 chains *before* filtering out
+  the fully-proven ones — so on a productive hunt the steering window was always full of chains with
+  nothing left to chase. The no-progress guard also never compared class priorities, so a model
+  answering with the same JSON every turn re-ran byte-identical probes; and loop coverage reported
+  only the final turn's request count.
+- Chain context now travels with the submission body. `report_formats.render_finding` — the renderer
+  that actually produces `vulnerability_information` for every platform — never rendered it, and the
+  run cache dropped `investigation` before it got there, so the file pasted into HackerOne priced a
+  finding as isolated while the report priced it as step 1 of an account takeover.
+- The per-finding "Chain role" line dropped the step's own proven/projected marker, so a finding
+  whose step was purely projected inherited another finding's credibility.
+- A confirmed non-`_active_proof` route (JWT replay, live credential) left the plan's proof status
+  stale at `candidate`, so the cortex recorded a contradiction against a finding the report
+  confirmed.
+- `digest_builder` was a stale twin of the hardened cookie parser: it substring-scanned the whole
+  `Set-Cookie` header including the value, and treated `SameSite=None` — the explicit opt-*in* to
+  cross-site sending — as protection.
+- Test suite 2017 → 2100+, including contract tests for four documented invariants that were pinned
+  so loosely that deleting the guard they describe left the suite green.
+
 ## v2.9.0 - attack-chain engine, cookie findings demoted
 
 ### Attack-chain engine

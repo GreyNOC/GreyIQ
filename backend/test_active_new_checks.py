@@ -95,6 +95,62 @@ class PathTraversalTests(unittest.TestCase):
     def test_no_traversal_no_finding(self) -> None:
         self.assertIsNone(av._check_path_traversal(_LfiHttp(None), "https://t/download?file=a.pdf"))
 
+    def test_confirmed_read_is_classed_path_traversal_never_file_upload(self) -> None:
+        """A proven traversal is a READ. Tagging the class hint 'file-upload' gave the finding
+        CWE-434 and that class's RCE-shaped C:H/I:H/A:H vector, and pointed the chain engine at the
+        technique keyed on class 'file-upload' (upload-to-execution, which grants exec.server-code)
+        — a code-execution chain assembled out of a confidentiality-only bug. The hint has to name
+        the read class, and that class has to exist in VULN_CLASSES or bounty drops the hint and
+        falls through to the disclosure label."""
+        from bughunter import impact_model
+        from bughunter.bounty import VULN_CLASSES, _classify
+
+        f = av._check_path_traversal(_LfiHttp("file"), "https://t/download?file=a.pdf")
+        self.assertIsNotNone(f)
+        self.assertEqual(f["_active_class_hint"], "path-traversal")
+        self.assertNotEqual(f["_active_class_hint"], "file-upload")
+        self.assertIn("path-traversal", VULN_CLASSES)  # else the hint is discarded as unknown
+        self.assertEqual(VULN_CLASSES["path-traversal"]["cwe"], "CWE-22")
+        # The scanner CATEGORY stays 'disclosure' (a file read is disclosure) and must keep
+        # resolving to the disclosure label — so the new class claims no category of its own.
+        self.assertEqual(f["category"], "disclosure")
+        self.assertEqual(VULN_CLASSES["path-traversal"]["categories"], set())
+        self.assertEqual(_classify({"category": "disclosure"})[0], "disclosure")
+        # Confidentiality only: this check proves a read, never a write or execution.
+        vector = impact_model.cvss_for_class("path-traversal", confirmed=True)["vector"]
+        self.assertIn("C:H/I:N/A:N", vector)
+        self.assertNotEqual(vector, impact_model.impact_for_class("file-upload")["cvss_vector"])
+
+    def test_traversal_finding_annotates_to_the_read_class_end_to_end(self) -> None:
+        """The hint→class promotion bounty.py performs on every active finding, exercised on the
+        real returned dict: class_id/cwe/references must be the traversal ones, and the chain
+        engine must key on the READ technique, not upload-to-execution."""
+        from bughunter import attack_chain, impact_model
+        from bughunter.bounty import VULN_CLASSES, _classify
+
+        f = av._check_path_traversal(_LfiHttp("file"), "https://t/download?file=a.pdf")
+        hint = f["_active_class_hint"]
+        meta = VULN_CLASSES[hint]  # same promotion bounty.py does when hint in VULN_CLASSES
+        cid, cname, cwe, owasp = hint, meta["name"], meta["cwe"], meta.get("owasp", "")
+        self.assertEqual((cid, cwe), ("path-traversal", "CWE-22"))
+        self.assertTrue(cname and owasp)
+        self.assertNotEqual(cid, _classify(f)[0])  # category alone would mislabel it 'disclosure'
+        self.assertTrue(impact_model.references_for_class(cid))
+        self.assertIn("22.html", " ".join(impact_model.references_for_class(cid)))
+        self.assertTrue(impact_model.remediation_for_class(cid).strip())
+        # '' rather than an invented VRT leaf — the module's convention for an unverified mapping.
+        self.assertEqual(impact_model.bugcrowd_vrt(cid), "")
+        techniques = [t for t in attack_chain._TECHNIQUES if t.get("clue") == ("class", cid)]
+        self.assertTrue(techniques)
+        self.assertNotIn("exec.server-code", {g for t in techniques for g in t["grants"]})
+
+    def test_path_traversal_is_offerable_as_a_focus_class(self) -> None:
+        # A class the profiles never list can't be picked as a hunt focus, so the retag would
+        # have hidden it from the picker even though the check emits it.
+        from bughunter.bounty import BOUNTY_PROFILES
+        for pid in ("web-app", "api"):
+            self.assertIn("path-traversal", BOUNTY_PROFILES[pid]["classes"], pid)
+
 
 class DefaultAliasCoverageTests(unittest.TestCase):
     class _SearchReflect:

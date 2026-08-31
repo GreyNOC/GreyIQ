@@ -46,6 +46,7 @@ from bughunter import report as report_lib
 from bughunter import secret_classification
 from bughunter import screenshot_service
 from bughunter import sensitive_data
+from bughunter import surface_drift
 from bughunter import toolkit as toolkit_lib
 from bughunter import web_ingest
 from bughunter.code_scanner.redaction import redact_text
@@ -229,6 +230,24 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
             "For archives, check path traversal and zip-bomb protections without causing resource exhaustion.",
         ],
     },
+    "path-traversal": {
+        "name": "Path traversal / local file inclusion",
+        "cwe": "CWE-22",
+        "owasp": "A01:2021 Broken Access Control",
+        # DELIBERATELY EMPTY, and it must stay that way. The active LFI check keeps
+        # category='disclosure' (a traversal read IS information disclosure), and _classify walks
+        # these category sets FIRST — claiming 'disclosure' here would pull every unrelated
+        # disclosure finding into this class instead of the _CATEGORY_LABELS disclosure label.
+        # The class only ever arrives via the check's explicit _active_class_hint, which bypasses
+        # _classify entirely. Splitting it out of 'file-upload' is what stops a read-only file
+        # disclosure from inheriting CWE-434 and firing the upload-to-execution chain technique.
+        "categories": set(),
+        "checklist": [
+            "Find parameters that name a file or path (file, path, filename, template, download, doc, page, include).",
+            "Request one well-known, non-sensitive system file (/etc/passwd, windows/win.ini) and compare against a benign-filename control on the same parameter.",
+            "Once the read is proven, target the application's own config within scope to show sensitive-file disclosure — read only, never a write.",
+        ],
+    },
     "business-logic": {
         "name": "Business logic / workflow abuse",
         "cwe": "CWE-840",
@@ -397,7 +416,7 @@ BOUNTY_PROFILES: dict[str, dict[str, Any]] = {
         "description": "Passive scan of a live web page/app: headers, cookies, mixed content, exposed secrets, client-side XSS sinks, disclosure. Optionally a dynamic (Playwright) pass.",
         "kinds": {"url"},
         "scanners": ["web"],
-        "classes": ["xss", "auth", "ssrf", "secrets", "access-control", "csrf", "cors", "redirect", "file-upload", "business-logic", "ssti", "xxe", "nosqli", "jwt", "graphql", "prototype-pollution", "race-condition", "request-smuggling", "subdomain-takeover", "cloud-exposure"],
+        "classes": ["xss", "auth", "ssrf", "secrets", "access-control", "csrf", "cors", "redirect", "file-upload", "path-traversal", "business-logic", "ssti", "xxe", "nosqli", "jwt", "graphql", "prototype-pollution", "race-condition", "request-smuggling", "subdomain-takeover", "cloud-exposure"],
         "checklist": [
             "Spider the app for input points (forms, query params, JSON bodies, file uploads).",
             "Review CSP and CORS for gaps that enable XSS or cross-origin data theft.",
@@ -409,7 +428,7 @@ BOUNTY_PROFILES: dict[str, dict[str, Any]] = {
         "description": "Passive review of an HTTP API endpoint: auth headers, disclosure, error leakage, transport hardening. Most API bugs need authenticated manual testing — the checklist guides it.",
         "kinds": {"url"},
         "scanners": ["web"],
-        "classes": ["access-control", "auth", "ssrf", "sqli", "cors", "business-logic", "nosqli", "jwt", "graphql", "ssti", "xxe", "race-condition", "request-smuggling", "cloud-exposure"],
+        "classes": ["access-control", "auth", "ssrf", "sqli", "cors", "business-logic", "nosqli", "jwt", "graphql", "ssti", "xxe", "path-traversal", "race-condition", "request-smuggling", "cloud-exposure"],
         "checklist": [
             "Diff responses across roles for the same object id (IDOR / BOLA).",
             "Fuzz content-type and HTTP verbs; check for verb tampering and mass assignment.",
@@ -2041,6 +2060,17 @@ def _run_bounty_hunt_body(
     # campaign layer logs the trace instead — no double-logging. Stay None => no trace written.
     hunt_trace_surface: dict[str, Any] | None = None
     hunt_trace_plan: dict[str, Any] | None = None
+    # Surface drift against the previous run of this (program, host). Only a direct hunt does its
+    # own recon, so only a direct hunt has observations to diff; everything downstream treats an
+    # empty dict as "not compared", which is deliberately NOT the same as "nothing changed".
+    drift: dict[str, Any] = {}
+    drift_observations: dict[str, Any] = {}
+    # The surface the drift engine diffs AND records. It must be the same object on both sides:
+    # recording the hunt-trace surface (which holds the 4 RANKED probe targets) while diffing
+    # against the full recon crawl compared two different things, so every run reported the whole
+    # crawl as new and the real changes were buried.
+    drift_surface: dict[str, Any] = {}
+    drift_host = ""
     # Direct "Run Hunt" calls do not go through campaign.recon, so an active URL hunt would
     # otherwise probe only the literal starting URL. Add a small, scope-gated recon pass here
     # (campaign already supplies extra_params/class_priority, so it skips this branch) to mine
@@ -2069,8 +2099,53 @@ def _run_bounty_hunt_body(
                     min_interval_s=active_settings.active_min_interval_ms / 1000.0,
                     pool="recon",  # a SEPARATE per-host bucket from the active prover — recon must not drain it
                 ),
+                # Keep a name-only fingerprint of the responses this crawl already fetched, so
+                # the drift engine can diff them against the last run. Issues no request of its
+                # own — it is a decision not to throw the shape away.
+                observe=runtime_dir is not None,
             )
             active_targets = _rank_active_targets(clean_target, rec.get("urls") or [], limit=4)
+            # SURFACE DRIFT — the hunt's memory. Every run otherwise starts blind and spends the
+            # same fixed probe budget on the same hot-word URLs, whatever part of the app is new.
+            # At most 2 of the 4 slots go to what changed, so a stable target keeps normal
+            # coverage. Advisory and fail-open: any error here just means an unsteered run.
+            try:
+                drift_observations = rec.get("observations") or {}
+                drift_host = rec.get("host") or ""
+                drift_surface = {"endpoints": list(rec.get("urls") or []),
+                                 "params": list(rec.get("params") or []),
+                                 "forms": list(rec.get("forms") or [])}
+                drift = surface_drift.build_drift(
+                    runtime_dir, program=None, target=clean_target,
+                    host=drift_host, observations=drift_observations, surface=drift_surface)
+                # A delta's subject is its DIFF IDENTITY — deliberately query-stripped, so the
+                # same page does not look new every run. It is not a probe URL: probing the
+                # stripped form throws away the parameters that make an endpoint interesting, and
+                # comparing it to active_targets by string never matches the crawled URL for the
+                # same path, so the endpoint got queued twice and a real target was pushed out of
+                # the fixed 4-slot budget. Map each subject back to the crawled URL it identifies.
+                _crawled = {}
+                for _u in (rec.get("urls") or []):
+                    _crawled.setdefault(surface_drift.canonical_url(_u), str(_u))
+                _queued = {surface_drift.canonical_url(t) for t in active_targets}
+                changed = []
+                for _subject in surface_drift.delta_targets(drift, limit=2):
+                    _key = surface_drift.canonical_url(_subject)
+                    if not _key or _key in _queued:
+                        continue
+                    _probe = _crawled.get(_key, _subject)
+                    if scope_gate is not None and not scope_gate(
+                            (urlparse(_probe).hostname or "").lower()):
+                        continue
+                    _queued.add(_key)
+                    changed.append(_probe)
+                if changed:
+                    # Prepend: what changed since last run outranks a hot-word guess.
+                    active_targets = (changed + active_targets)[:4]
+                    _emit(f"surface drift: {len(drift.get('deltas') or [])} change(s) since "
+                          f"{drift.get('baseline_ts') or 'the last run'}; probing what moved first")
+            except Exception:  # noqa: BLE001 - steering is an optimization, never a blocker
+                drift = {}
             params_before = len(effective_extra_params)
             effective_extra_params = _merge_unique_strings(effective_extra_params, rec.get("params") or [], limit=40)
             if len(effective_extra_params) > params_before:
@@ -2470,6 +2545,20 @@ def _run_bounty_hunt_body(
         # so the two never disagree.
         detail = report_lib._proof_of_impact_detail(finding, attack_plans[ref])
         if detail["status"] == "confirmed":
+            # Mirror the confirmation onto the PLAN, not just the CVSS. The non-_active_proof routes
+            # (JWT replay / secret_hits / live credential) reach 'confirmed' through report.py while
+            # the plan still carries the deterministic 'candidate' from _deterministic_proof_status —
+            # which never consults those carriers. investigator._proof_status reads the plan as the
+            # finding's CLAIM, so a stale 'candidate' made the cortex file a report-confirmed finding
+            # as an unproven lead ('gather-proof', not report-ready) inside the very JSON document
+            # whose proof_of_impact said 'confirmed'. This only ECHOES a status the single confirm
+            # authority granted: every branch of report._proof_of_impact_detail that yields
+            # 'confirmed' is backed by _has_captured_artifact (the live-credential fast path uses that
+            # gate's own predicate, and classification stamps it confirmed_secret), so it cannot
+            # manufacture a confirmation here.
+            _poi_sync = attack_plans[ref].get("proof_of_impact")
+            if isinstance(_poi_sync, dict):
+                _poi_sync["status"] = "confirmed"
             attack_plans[ref]["cvss"] = (
                 active_cvss if isinstance(active_cvss, dict) and active_cvss.get("vector")
                 else impact_model.cvss_for_class(finding.get("class_id", ""), confirmed=True)
@@ -2610,6 +2699,28 @@ def _run_bounty_hunt_body(
     # from ctx["investigation"]. Building the plan first left that key absent on every hunt, so
     # the chain-driven phase silently never fired and every run fell back to the generic
     # class-pair advice.
+    # The drift engine's payoff for the chain layer, and the reason the hunt has a memory at
+    # all: `build_attack_chains` computes which step a chain is blocked on and which capability
+    # that step was waiting for, then discards it — so run N re-derives and re-blocks the
+    # identical chain even when run N's surface just started leaking exactly what it needed.
+    # Re-opened rows join the PROBE queue, never the chain list: a change is a reason to test,
+    # never evidence that anything worked.
+    try:
+        _chains = ctx["investigation"].get("attack_chains") or []
+        _reopened = surface_drift.reopened_chains(
+            drift, runtime_dir, program=None, target=clean_target,
+            host=drift_host or urlparse(clean_target).hostname or "")
+        for _index, _probe in enumerate(_reopened, 1):
+            _probe["id"] = f"CR{_index}"
+        ctx["investigation"]["chain_probes"] = (
+            list(ctx["investigation"].get("chain_probes") or []) + _reopened)[:16]
+        # A proof is a statement about a response that existed when it was captured; when that
+        # endpoint moves, say so rather than carrying the proof silently.
+        ctx["stale_proofs"] = surface_drift.stale_proof_probes(drift, _chains)
+    except Exception:  # noqa: BLE001 - advisory; a hunt must still report
+        ctx["stale_proofs"] = []
+    ctx["drift"] = drift
+
     ctx["next_steps"] = next_steps_lib.build_next_steps(ctx, brain.get("next_steps"))
     ctx["coverage"] = next_steps_lib.coverage_summary(ctx)
 
@@ -2651,6 +2762,20 @@ def _run_bounty_hunt_body(
             hunt_trace.record_trace(runtime_dir, program=None, target=clean_target,
                                     surface=hunt_trace_surface, plan=hunt_trace_plan,
                                     outcomes=_trace_outcomes)
+            # This run becomes the next run's baseline. Recorded here, beside the trace, and on
+            # the same condition — only a direct hunt does its own recon, so only a direct hunt
+            # observed a surface to remember. The blocked chains travel with it: that is what
+            # lets the NEXT run notice when a change may have unlocked one of them.
+            # A run that reached too little of the host to be compared is also too thin to BE
+            # the next baseline: storing it would make the following run report everything this
+            # one missed as new. Skipping leaves the last good snapshot in place.
+            if drift.get("status") != "degraded-run":
+                surface_drift.record_snapshot(
+                    runtime_dir, program=None, target=clean_target,
+                    host=drift_host or urlparse(clean_target).hostname or "",
+                    observations=drift_observations, surface=drift_surface,
+                    chains=ctx["investigation"].get("attack_chains") or [],
+                    deltas=drift.get("deltas") or [])
         except Exception:  # noqa: BLE001 - a trace write must never break a hunt
             pass
 
@@ -2710,6 +2835,10 @@ def _run_bounty_hunt_body(
         # session cookie scoped to the parent domain here and a claimable subdomain there is
         # a chain no single-target hunt can see, because neither host holds both halves.
         "chain_signals": ctx["chain_signals"],
+        # What changed on this host since the last run, and which previously-blocked chains that
+        # change may have re-opened. Advisory: nothing here is a finding.
+        "drift": drift,
+        "stale_proofs": ctx.get("stale_proofs") or [],
         "active_verified_classes": ctx["active_verified_classes"],
         "active_authorization": ctx["active_authorization"],
         "proof_artifacts_captured": proof_artifacts_captured,

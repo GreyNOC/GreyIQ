@@ -77,6 +77,22 @@ class ImpactModelTests(unittest.TestCase):
         for cid in impact_model.IMPACT_MODEL:
             self.assertGreater(impact_model.cvss_for_class(cid)["base_score"], 0.0, cid)
 
+    def test_path_traversal_is_confidentiality_only_and_distinct_from_file_upload(self) -> None:
+        # The active LFI check used to be class-tagged 'file-upload', which scored a proven
+        # read-only file disclosure on that class's RCE-shaped C:H/I:H/A:H vector (8.8) under
+        # CWE-434. Confidentiality-only is 7.5 — same High band, honest metrics.
+        traversal = impact_model.impact_for_class("path-traversal")
+        self.assertEqual(traversal["cvss_vector"], "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N")
+        self.assertNotEqual(traversal["cvss_vector"], impact_model.impact_for_class("file-upload")["cvss_vector"])
+        self.assertLess(
+            impact_model.cvss_for_class("path-traversal")["base_score"],
+            impact_model.cvss_for_class("file-upload")["base_score"],
+        )
+        self.assertEqual(VULN_CLASSES["path-traversal"]["cwe"], "CWE-22")
+        # The file-upload obligation must no longer accept a traversal read as its proof — that
+        # is a different class with a different (confidentiality-only) vector.
+        self.assertNotIn("path-traversal", impact_model.impact_for_class("file-upload")["proof_obligation"])
+
     def test_cvss_for_class_confirmed_flag(self) -> None:
         # Default (no confirmed=) stays a template estimate — the vector/score don't
         # change on confirmation, only the confidence and its justification.

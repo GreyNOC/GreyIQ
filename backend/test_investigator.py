@@ -252,6 +252,67 @@ class InvestigationCortexTests(unittest.TestCase):
         self.assertIn("unauthenticated", chained["entry"].lower())
         self.assertIn("another tenant", chained["projected_impact"].lower())
 
+    def test_chain_ids_never_collide_with_finding_refs(self) -> None:
+        """A campaign pools findings under C1..Cn, and the cortex renumbered chains into the
+        same namespace — so a span report printed "chain C1 cites C1", naming two unrelated
+        things in one sentence. The chain side is the ephemeral one, so it is the one that moved.
+        """
+        findings = [
+            {"ref": "C1", "class_id": "disclosure", "severity": "medium", "confidence": "high",
+             "title": "Leaked object ids", "location": "https://app.example/api/debug"},
+            {"ref": "C2", "class_id": "access-control", "severity": "high", "confidence": "medium",
+             "title": "Object authorization lead", "location": "https://app.example/api/orders/1"},
+        ]
+        graph = investigator.build_investigation(findings)
+        self.assertTrue(graph["attack_chains"])
+        chain_ids = {c["id"] for c in graph["attack_chains"]}
+        self.assertTrue(chain_ids.isdisjoint({f["ref"] for f in findings}))
+        for chain_id in chain_ids:
+            self.assertTrue(chain_id.startswith("AC"), chain_id)
+
+    def test_a_downgraded_chain_is_never_described_as_packageable(self) -> None:
+        """Every STEP captured an artifact, but the cited finding's own evidence is not sound,
+        so the cortex refuses to call the chain confirmed. The engine's "package the chain as
+        one report" line must not survive that downgrade — the guard used to cover only the
+        `blocked` case, so this one still invited the submission."""
+        # A secret whose severity conflicts with its classification: the confirm gate accepts
+        # the artifact, the cortex marks the hypothesis contradicted.
+        graph = investigator.build_investigation([{
+            "ref": "F1", "class_id": "sqli", "severity": "high", "confidence": "high",
+            "title": "SQL injection", "location": "https://app.example/r",
+            "proof_of_impact": {
+                "status": "confirmed",
+                "observed_result": "the boolean differential held across ten requests",
+                "control_result": "the control value returned the unmodified page",
+            },
+        }])
+        for chain in graph["attack_chains"]:
+            if chain["status"] == "confirmed":
+                continue
+            self.assertNotIn("package the chain as one report", chain["next_action"].lower(),
+                             f"{chain['id']} is {chain['status']} but reads as submittable")
+
+        # Pin the decision itself, so the guard is exercised whether or not a fixture happens
+        # to reach the clamp. `blocking_step == 0` is the engine saying every step is proven.
+        engine_chain = {
+            "next_action": "Every step is backed by a captured artifact — package the chain as one report.",
+            "blocking_step": 0,
+        }
+        by_ref = {"F1": {"status": "supported", "next_action": "Capture the second role's response."}}
+        for status in ("supported", "candidate", "blocked"):
+            with self.subTest(status=status):
+                action = investigator._chain_next_action(engine_chain, status, ["F1"], by_ref)
+                self.assertNotIn("package the chain", action.lower())
+        self.assertEqual(
+            investigator._chain_next_action(engine_chain, "confirmed", ["F1"], by_ref),
+            engine_chain["next_action"], "a genuinely confirmed chain keeps the engine's action")
+        # A partial chain's action is its blocking step's own instruction, which is more
+        # specific than anything the cortex could write — it must survive untouched.
+        partial = {"next_action": "Read document.cookie in a TEST account.", "blocking_step": 2}
+        self.assertEqual(
+            investigator._chain_next_action(partial, "supported", ["F1"], by_ref),
+            partial["next_action"])
+
     def test_chain_reports_the_same_impact_once_per_distinct_attack(self) -> None:
         """The same object read is reachable two ways here — unauthenticated via the
         disclosure, or directly with an account. Those are different attacks with different

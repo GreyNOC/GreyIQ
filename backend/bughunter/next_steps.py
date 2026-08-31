@@ -209,6 +209,30 @@ def build_next_steps(ctx: dict[str, Any], brain_next_steps: list[str] | None = N
     def add(phase: str, priority: str, action: str, detail: str, ref: str = "", tool: str = "") -> None:
         steps.append({"phase": phase, "priority": priority, "action": action, "detail": detail, "ref": ref, "tool": tool})
 
+    # --- Phase 0 · What changed since the last run ---
+    # First, because being early on a change is most of the edge in bug bounty, and because a
+    # delta decays: by the time it has been sitting in the report for six runs it is not news.
+    drift = ctx.get("drift") if isinstance(ctx.get("drift"), dict) else {}
+    for delta in (drift.get("deltas") or [])[:3]:
+        if not isinstance(delta, dict):
+            continue
+        age = int(delta.get("age_runs") or 0)
+        seen = f"Unchanged for {age} run(s) — already looked at once." if age else "New this run."
+        add("What changed", "hunt",
+            f"Probe what changed: {delta.get('label') or delta.get('kind')}",
+            f"{delta.get('subject')} — {delta.get('why')}. {seen} This is an observation about "
+            f"the target's history, not evidence that anything is exploitable.")
+    for probe in (ctx.get("investigation") or {}).get("chain_probes") or []:
+        if isinstance(probe, dict) and probe.get("blocked_runs"):
+            add("What changed", "chain",
+                f"Retry chain lead {probe.get('id')} — the surface may have unblocked it",
+                f"{probe.get('hypothesis')} {probe.get('next_action')}".strip())
+    for stale in (ctx.get("stale_proofs") or [])[:3]:
+        if isinstance(stale, dict):
+            add("What changed", "retest",
+                f"Re-verify {stale.get('chain')} before submitting — its endpoint moved",
+                f"{stale.get('why')} {stale.get('next_action')}".strip())
+
     # --- Phase 1 · Stabilize coverage (only when something is missing) ---
     scan_errors = ctx.get("scan_errors") or []
     scanners = ctx.get("scanners_run") or []
@@ -331,11 +355,22 @@ def build_next_steps(ctx: dict[str, Any], brain_next_steps: list[str] | None = N
                 f"{chain.get('title')} — a finding this chain cites has a blocking evidence "
                 f"contradiction. Resolve that first; do not package this chain until it clears."
             )
-        elif blocking is None:
+        elif blocking is None and str(chain.get("status") or "").lower() == "confirmed":
             detail = (
                 f"{chain.get('title')} — every step is backed by a captured artifact. "
                 f"Package the whole chain as ONE report: the chain, not the individual steps, is the impact."
             )
+        elif blocking is None:
+            # Every STEP captured an artifact, but the cortex refused to call the chain
+            # confirmed because a cited FINDING's own evidence is not sound. Two consumers
+            # derive "packageable" independently — the chain's next_action and this step-state
+            # scan — so both have to respect that downgrade or the action plan re-invites the
+            # submission the report layer just withheld.
+            detail = (
+                f"{chain.get('title')} — every step captured an artifact, but the chain is only "
+                f"{chain.get('status') or 'candidate'}: a cited finding's own evidence is not sound "
+                f"enough yet. {chain.get('next_action') or ''}"
+            ).strip()
         else:
             detail = (
                 f"{chain.get('title')} ({proven} of {total} step(s) proven). "

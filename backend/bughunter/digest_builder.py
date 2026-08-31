@@ -28,6 +28,7 @@ import binascii
 import json
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 from bughunter.code_scanner.redaction import redact_text
 
@@ -50,6 +51,13 @@ _INTERESTING_NAME_RE = re.compile(
 )
 # An auth-ish cookie NAME — only these are flagged for missing Secure/HttpOnly/SameSite (a tracking
 # cookie without HttpOnly is not a finding).
+# DELIBERATELY WIDER than the chain engine's session-cookie gate, which EXCLUDES csrf/xsrf/_token/
+# antiforgery (attack_chain._NOT_SESSION_COOKIE_RE): a double-submit CSRF cookie MUST be readable by
+# JavaScript, so its missing HttpOnly is the pattern working, not a defect. That width is intentional
+# HERE — the digest is a reasoning hint for the brain prompt, where "this app sets a CSRF cookie" is
+# genuine context. It is NOT safe downstream: any consumer that turns these gaps into chain steps or
+# a reportable finding MUST re-apply that session-cookie gate first, or it manufactures an
+# account-takeover chain out of a correct implementation.
 _AUTH_COOKIE_RE = re.compile(r"sess|sid|token|auth|jwt|login|remember|csrf|xsrf|identity|account", re.IGNORECASE)
 # A JWT-shaped token: base64url header that begins with the encoding of `{"` (eyJ), dot-separated.
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*")
@@ -141,18 +149,38 @@ def _jwt_alg(body: str, headers: dict[str, str], cookies: list[str]) -> dict[str
     return out
 
 
-def _cookie_flag_gaps(cookies: list[str]) -> list[dict[str, Any]]:
+def _cookie_flag_gaps(cookies: list[str], is_https: bool) -> list[dict[str, Any]]:
+    """Missing Secure/HttpOnly/SameSite on an auth-ish cookie — cookie NAMES and flag facts only.
+
+    Parsing MIRRORS ``attack_chain.cookie_signals`` on purpose: these gaps reach the SAME chain graph
+    (``collect_signals(response_digest=...)`` maps each missing flag to the same ``cookie.session-no-*``
+    signal), so any divergence here is a second, unhardened door into it.
+    """
     gaps: list[dict[str, Any]] = []
     for raw in (cookies or [])[:20]:
-        name = str(raw or "").split("=", 1)[0].strip()
+        # Parse ATTRIBUTES rather than substring-scanning the whole header. A cookie whose VALUE
+        # happens to contain "httponly"/"secure" (the value is app- or attacker-influenceable, and
+        # base64 blobs contain most things) otherwise silently suppressed its own flag gap.
+        parts = str(raw or "").split(";")
+        name = parts[0].split("=", 1)[0].strip()
         if not name or not _AUTH_COOKIE_RE.search(name):
             continue
-        low = str(raw).lower()
+        attrs: dict[str, str] = {}
+        for part in parts[1:]:
+            key, _, value = part.partition("=")
+            attrs[key.strip().lower()] = value.strip()
+        # SameSite=None is not "has SameSite" — it is the explicit opt-IN to cross-site sending, i.e.
+        # exactly the condition a CSRF step needs. Reading its presence as protection inverted the
+        # check on the one value that matters.
+        has_samesite = "samesite" in attrs and attrs.get("samesite", "").lower() != "none"
         missing = [flag for flag, present in (
-            ("Secure", "secure" in low),
-            ("HttpOnly", "httponly" in low),
-            ("SameSite", "samesite" in low),
+            ("HttpOnly", "httponly" in attrs),
+            ("SameSite", has_samesite),
         ) if not present]
+        # The Secure gap is gated on the page being https, as in cookie_signals: over cleartext the
+        # whole session is exposed regardless, so a per-cookie Secure gap is not the fact to surface.
+        if is_https and "secure" not in attrs:
+            missing.insert(0, "Secure")
         if missing:
             gaps.append({"cookie": _red(name), "missing": missing})
         if len(gaps) >= 8:
@@ -160,10 +188,16 @@ def _cookie_flag_gaps(cookies: list[str]) -> list[dict[str, Any]]:
     return gaps
 
 
-def build_digest(fetch_result: dict[str, Any] | None) -> dict[str, Any]:
+def build_digest(fetch_result: dict[str, Any] | None, url: str = "") -> dict[str, Any]:
     """Extract redacted, structural metadata from a captured response dict (the ``_consume`` shape:
     ``{status, headers, cookies, body}``). Returns a small dict, or ``{}`` on any problem so the caller
-    keeps today's behaviour. NEVER raises."""
+    keeps today's behaviour. NEVER raises.
+
+    ``url`` is the page the response came from; only its SCHEME is read (a missing Secure flag is a
+    gap on https and noise on cleartext — see ``_cookie_flag_gaps``). It is optional because the
+    ``_consume`` dict already carries ``final_url`` on both the success and the error path, so the
+    scheme is known without touching the call site; pass it explicitly when the URL is held out of
+    band. An unknown scheme counts as NOT https — the same default ``cookie_signals(url="")`` takes."""
     try:
         if not isinstance(fetch_result, dict):
             return {}
@@ -173,6 +207,17 @@ def build_digest(fetch_result: dict[str, Any] | None) -> dict[str, Any]:
         cookies = [str(c) for c in (fetch_result.get("cookies") or [])] if isinstance(fetch_result.get("cookies"), list) else []
 
         digest: dict[str, Any] = {"status": int(fetch_result.get("status") or 0)}
+
+        # The ORIGIN this digest describes — scheme://host[:port], never the path or query.
+        # Consumers that compose these observations into an attack have to know WHICH host they
+        # were made on; without it a pooled campaign graph silently composed one target's response
+        # shape into another target's chain. Origin only, so no path/query secret can ride along.
+        try:
+            _o = urlparse(str(fetch_result.get("final_url") or url or ""))
+            if _o.scheme in ("http", "https") and _o.hostname:
+                digest["origin"] = f"{_o.scheme}://{_o.netloc}".lower()
+        except ValueError:
+            pass
 
         # JSON key structure (names only) — the "what does this API expose" signal.
         json_keys: list[str] = []
@@ -214,7 +259,8 @@ def build_digest(fetch_result: dict[str, Any] | None) -> dict[str, Any]:
             if headers.get("access-control-allow-credentials", "").strip().lower() == "true":
                 digest["cors_allow_credentials"] = True
 
-        gaps = _cookie_flag_gaps(cookies)
+        page_url = str(url or fetch_result.get("final_url") or "")
+        gaps = _cookie_flag_gaps(cookies, page_url.lower().startswith("https://"))
         if gaps:
             digest["cookie_flag_gaps"] = gaps
 

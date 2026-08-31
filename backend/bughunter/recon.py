@@ -65,6 +65,7 @@ _MAX_JS = 8  # served-JS bundles mined per campaign (bounded)
 _MAX_SOURCE_MAPS = 6     # explicit, external sourceMappingURL files mined per campaign (bounded)
 _MAX_SITEMAPS = 6         # child/robots-declared sitemap files fetched per campaign (bounded)
 _MAX_SITEMAP_DEPTH = 2    # sitemap-index recursion depth cap
+_MAX_OBSERVATIONS = 300   # per-URL drift fingerprints retained when observe=True (memory bound)
 
 # Decode ONLY well-formed, ';'-terminated HTML/XML entities in an extracted URL (so a
 # properly-encoded '&amp;' becomes '&'), while leaving a RAW '&' untouched. Full
@@ -186,29 +187,48 @@ def discover(
     max_requests: int = 40,
     settings: Any = None,
     governor: HostRateGovernor | None = None,
+    observe: bool = False,
 ) -> dict[str, Any]:
     """Map the seed's surface (bounded). Returns {urls, host, sources, notes,
     endpoints, params, js_secrets, source_maps, tech, hints, dropped_out_of_scope, requests_used}.
-    ``scope_in(host) -> bool`` gates which hosts may be fetched (default: same-origin)."""
+    ``scope_in(host) -> bool`` gates which hosts may be fetched (default: same-origin).
+
+    ``observe=True`` additionally returns ``observations``: a per-URL, name-only structural
+    fingerprint of the responses this crawl ALREADY fetched, which the surface-drift engine
+    diffs against the previous run. It issues no extra request — it keeps what was in memory
+    and is otherwise discarded — so the scope gate, the SSRF guard and the request budget are
+    all untouched. Default-off, so no existing caller changes behaviour."""
     settings = settings or get_settings()
     try:
         sanitized = _guard_url(normalize_website_url(seed_url), settings.allow_private_urls, settings.web_allowed_ports)
     except WebsiteFetchError as exc:
         return {"urls": [seed_url], "host": "", "sources": {}, "notes": [f"recon skipped: {exc}"],
                 "endpoints": [], "params": [], "js_secrets": [], "source_maps": [], "tech": [],
-                "hints": {}, "websockets": [], "dropped_out_of_scope": 0, "requests_used": 0}
+                "hints": {}, "websockets": [], "dropped_out_of_scope": 0, "requests_used": 0,
+                "observations": {}}
     host = (urlparse(sanitized).hostname or "").lower()
     governor = governor or HostRateGovernor(
         capacity=max(settings.active_max_requests_per_host, max_pages + 6),
         min_interval_s=settings.active_min_interval_ms / 1000.0,
     )
     used = {"n": 0}
+    observations: dict[str, dict[str, Any]] = {}
 
     def budgeted_fetch(url: str) -> dict[str, Any] | None:
         if used["n"] >= max_requests:
             return None  # global per-campaign budget — the host-fan-out kill switch
         used["n"] += 1
-        return _safe_fetch(url, settings, governor)
+        fetched = _safe_fetch(url, settings, governor)
+        # Keep a name-only structural fingerprint of what we just fetched, instead of dropping
+        # the response the moment its links are mined. No extra request is issued; this is
+        # purely a decision not to throw the shape away.
+        if observe and fetched and len(observations) < _MAX_OBSERVATIONS:
+            from bughunter import surface_drift
+
+            row = surface_drift.observe(url, fetched)
+            if row.get("u"):
+                observations.setdefault(row["u"], row)
+        return fetched
 
     def host_ok(h: str) -> bool:
         h = (h or "").lower()
@@ -577,4 +597,5 @@ def discover(
         "tech": tech, "hints": hints, "websockets": sorted(websockets)[:30],
         "forms": forms_out, "api_findings": api_findings,
         "dropped_out_of_scope": dropped_oos, "requests_used": used["n"],
+        "observations": observations,
     }

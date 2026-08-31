@@ -1,6 +1,7 @@
-"""Attack-plan mapper — a graphical (SVG->PNG) diagram of the attack used to confirm a finding.
+"""Attack-plan mapper — a graphical (SVG->PNG) diagram of the attack run against a finding.
 Verifies the SVG is valid + injection-safe (target-derived proof text can never become live markup or
-script), the layout stays bounded on huge input, and the PNG renderer fails open (no Playwright ->
+script), the layout stays bounded on huge input, the map claims exactly what the confirm gate accepted
+(a candidate lead must never render as proof), and the PNG renderer fails open (no Playwright ->
 no map, never an exception)."""
 from __future__ import annotations
 
@@ -57,15 +58,52 @@ class AttackSvgTests(unittest.TestCase):
         minidom.parseString(svg)
         self.assertLess(len(svg), 20000)               # capped, not 50KB+ of text
 
-    def test_control_stage_omitted_when_absent(self) -> None:
+    def test_missing_control_is_drawn_as_an_outstanding_capture(self) -> None:
+        # An absent negative control is what a triager most needs to see; dropping the stage made the
+        # map read as though the false-positive check had passed.
         svg = am.build_attack_svg(self._finding(), self._plan(poi={"control_result": ""}))
-        self.assertNotIn("NEGATIVE CONTROL", svg)      # no blank control box
-        self.assertIn("CONFIRMED", svg)
+        self.assertIn("4 · NEGATIVE CONTROL — NOT CAPTURED YET", svg)
+        self.assertIn("still to capture:", svg)
+        self.assertNotIn("✓ CONFIRMED", svg)           # no control -> the gate never confirmed it
 
     def test_missing_plan_is_a_clean_default(self) -> None:
         svg = am.build_attack_svg({"title": "X", "severity": "low"}, None)
         minidom.parseString(svg)
-        self.assertIn("CONFIRMED", svg)
+        self.assertIn("CANDIDATE — NOT YET CONFIRMED", svg)
+        self.assertNotIn("✓ CONFIRMED", svg)
+
+    def test_unconfirmed_passive_lead_is_never_drawn_as_confirmed(self) -> None:
+        # The map is embedded in the report and copied into the submission package, so a lead the
+        # confirm gate never accepted must not carry a confirmed terminal stage or an observation
+        # that was never made.
+        lead = {"ref": "F7", "class_id": "headers", "title": "Missing Content-Security-Policy header",
+                "severity": "low"}
+        svg = am.build_attack_svg(lead, {})
+        minidom.parseString(svg)
+        self.assertNotIn("✓ CONFIRMED", svg)
+        self.assertNotIn("the vulnerable behaviour was observed", svg)
+        self.assertIn("CANDIDATE — NOT YET CONFIRMED", svg)
+        self.assertIn("3 · OBSERVED — NOT CAPTURED YET", svg)
+        self.assertIn("4 · NEGATIVE CONTROL — NOT CAPTURED YET", svg)
+        self.assertIn("CANDIDATE (NOT CONFIRMED)", svg)   # ...and in the header eyebrow
+
+    def test_a_bare_confirmed_status_cannot_promote_the_map(self) -> None:
+        # ONE confirm authority: report._proof_of_impact_detail caps a status with no captured
+        # differential at 'candidate', and the map must read the same gate rather than its own rule.
+        svg = am.build_attack_svg(
+            self._finding(),
+            {"proof_of_impact": {"status": "confirmed", "observed_result": "the endpoint returned data"}})
+        self.assertNotIn("✓ CONFIRMED", svg)
+        self.assertIn("CANDIDATE — NOT YET CONFIRMED", svg)
+        self.assertIn("the endpoint returned data", svg)   # the real capture is still drawn
+        self.assertIn("NOT ACCEPTED BY THE CONFIRM GATE", svg)
+
+    def test_the_proof_obligation_names_what_is_still_missing(self) -> None:
+        svg = am.build_attack_svg(
+            self._finding(),
+            {"proof_of_impact": {"proof_obligation": "a cross-account read of another user's order"}})
+        self.assertIn("a cross-account read of another user&#x27;s order", svg)
+        self.assertIn("still to prove:", svg)
 
     def test_render_fails_open_without_playwright(self) -> None:
         # if the SVG can't be rasterized, the caller gets ok:False, never an exception
@@ -136,6 +174,26 @@ class ReportEmbedTests(unittest.TestCase):
         md = "\n".join(out)
         self.assertIn("## Attack-plan map", md)
         self.assertNotIn("## Screenshot evidence", md)         # no screenshot section when there's no screenshot
+
+    def test_caption_does_not_call_an_unconfirmed_flow_confirmed(self) -> None:
+        from bughunter import report
+        out: list[str] = []
+        report._append_screenshot(out, {"ref": "F7", "title": "Missing CSP header",
+                                        "attack_map_path": "/run/screenshots/07-F7-attack-map.png"}, {})
+        md = "\n".join(out)
+        self.assertNotIn("confirmed attack flow", md)
+        self.assertNotIn("used to confirm this finding", md)
+        self.assertIn("candidate finding", md)
+        self.assertIn("the impact still to prove", md)
+
+    def test_caption_still_says_confirmed_for_a_captured_differential(self) -> None:
+        from bughunter import report
+        out: list[str] = []
+        plan = {"proof_of_impact": {"observed_result": "another tenant's invoice was returned (HTTP 200)",
+                                    "control_result": "the same read as the owner account returned 403"}}
+        report._append_screenshot(out, {"ref": "F1", "attack_map_path": "/run/screenshots/01-F1-attack-map.png"}, plan)
+        md = "\n".join(out)
+        self.assertIn("confirmed attack flow", md)
 
 
 if __name__ == "__main__":

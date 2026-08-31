@@ -32,6 +32,15 @@ HONESTY INVARIANTS (the house rule: reproducible or it didn't happen)
 * A projected chain's confidence is capped below the supported band, exactly like an
   unproven hypothesis in the cortex, so a long speculative chain can never out-rank a
   short proven one.
+* An observation is bound to WHERE it was made. A signal carries the host it was seen on,
+  and it may only escalate a chain whose findings sit inside the same registrable domain.
+  Without that, a campaign — which pools every target's signals into one graph — composed
+  one company's cookie flag gap into another company's account takeover, and the rendered
+  step named no host, so the report read as though both facts came from the same site.
+* An observation is bound to WHICH finding it describes, by the finding's CONTENT and not
+  by its display ref. Refs are renumbered when a campaign pools findings (F1 -> C7), so a
+  ref-keyed signal silently stopped matching the finding it belonged to the moment it
+  crossed a hunt boundary — deleting every credential chain a span existed to build.
 
 Pure stdlib, deterministic, bounded, and total (never raises) — it runs at report time
 on a finished hunt, so an exception here would discard completed work.
@@ -39,13 +48,16 @@ on a finished hunt, so an exception here would discard completed work.
 
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import re
 from typing import Any
 from urllib.parse import urlparse
 
 from bughunter import investigator
+from bughunter.registrable_domain import registrable_domain
 
-ALGORITHM_VERSION = "attack-chain-v1"
+ALGORITHM_VERSION = "attack-chain-v2"
 
 # Bounds — this runs inside a hunt, so every dimension is capped.
 _MAX_CHAINS = 12
@@ -53,9 +65,26 @@ _MAX_DEPTH = 6
 _MAX_CLUES = 400
 _MAX_EXPANSIONS = 20000
 _MAX_PATHS_PER_IMPACT = 2
+# Signal-only paths cite no finding, so the cortex routes them to the probe queue rather
+# than the report. They get their OWN budget: sharing the per-impact bucket meant a lead
+# nobody can report evicted a chain built on captured evidence, and conversely a hunt with
+# two anchored chains lost the mass-assignment probe the planner consumes.
+_MAX_PROBE_PATHS_PER_IMPACT = 1
+# A ref-carrying signal describes ONE finding, so one edge per distinct finding is needed
+# — but the count is otherwise unbounded (a hunt can produce dozens of secrets findings),
+# and edges multiply the DFS. Host-wide signals all share the empty key and collapse to one.
+_MAX_SIGNAL_EDGES_PER_KIND = 4
+# Recon-derived families are re-derivable and enormous (four rows per crawled URL); they
+# must never be able to consume the whole clue budget ahead of evidence-bearing families.
+_MAX_RECON_SIGNALS_PER_KIND = 8
 
 # Mirrors investigator's unproven ceiling: a projected chain must stay a lead.
 _PROJECTED_CEILING = 54
+
+# Selection must rank by proof band FIRST, everywhere. The per-impact bucket used to rank
+# on score alone and the final sort on (proven, score), so the bucket threw a fully proven
+# chain away before the proven-first sort could ever see it.
+_STATUS_RANK = {"proven": 2, "partial": 1, "projected": 0}
 
 # --------------------------------------------------------------------------------------
 # Capability vocabulary
@@ -92,7 +121,6 @@ _CAPABILITY_LABELS: dict[str, str] = {
     "cred.service": "hold a service/API credential",
     "disclose.identifier": "know real object identifiers or hidden paths",
     "disclose.sensitive-data": "read sensitive data they should not",
-    "egress.oob": "prove server-side egress to a controlled collaborator",
     "exec.browser-script": "execute script in the application's browser origin",
     "exec.server-code": "execute code server-side",
     "identity.admin": "act as an administrator",
@@ -118,6 +146,18 @@ _CAPABILITY_LABELS: dict[str, str] = {
 #               ("signal", <signal>)   -> a sub-finding observation (see collect_signals)
 #               None                   -> no clue needed; a pure capability transition
 # `weight` biases which path is preferred when several reach the same impact.
+# `requires_proven` (optional) refuses the row unless the confirm gate accepted the clue's
+#   evidence. Normal rows fire on an unproven clue and produce a PROJECTED step, which is the
+#   engine's way of saying "this is the hypothesis to prove". That is wrong when the finding is
+#   itself a NEGATIVE observation: a bucket that answered 403/AccessDenied is evidence it does
+#   NOT read anonymously, so narrating it as "reads anonymously (projected)" contradicts what was
+#   seen rather than proposing a next step.
+# `clue_category` (optional, class clues only) narrows a row to findings whose scanner
+#   CATEGORY matches, and simultaneously EXCLUDES those findings from the unnarrowed row
+#   for the same class. It exists because the reporting layer deliberately folds some
+#   categories into a broader class — a deserialization sink is reported AS rce, with
+#   rce's CWE and platform weakness mapping — which is right for the report and wrong for
+#   the chain ladder, where the step text should name what was actually found.
 _TECHNIQUES: tuple[dict[str, Any], ...] = (
     # --- Browser-side escalation. This is where the cookie flags earn their keep. -------
     {
@@ -255,6 +295,23 @@ _TECHNIQUES: tuple[dict[str, Any], ...] = (
         "action": "Capture the exact disclosed identifier or path returned to an unauthorized actor, with secrets redacted.",
     },
     {
+        # The strongest cloud evidence the engine can capture — an anonymously listable
+        # bucket, an open Firebase store — contributed NOTHING to any chain, because the
+        # `cloud-exposure` class hint that makes the finding legible in the report also took
+        # it out of the `disclosure` bucket that fed the identifier ladder.
+        "id": "public-cloud-store-anonymous-read",
+        "title": "A cloud bucket or data store reads anonymously",
+        "requires": (),
+        "clue": ("class", "cloud-exposure"),
+        # The bucket check stamps this class on all three of its outcomes, including
+        # "referenced but denied anonymous listing (403)" and "referenced, not probed". Those are
+        # observations that the store is NOT open, so they must not instantiate this step at all.
+        "requires_proven": True,
+        "grants": ("disclose.identifier", "disclose.sensitive-data"),
+        "weight": 7,
+        "action": "Capture the anonymous listing plus one non-sensitive object read, with a locked-bucket/authenticated 403 control; never download third-party data.",
+    },
+    {
         "id": "identifier-to-object-read",
         "title": "Replay a disclosed identifier across the authorization boundary",
         "requires": ("disclose.identifier",),
@@ -282,13 +339,14 @@ _TECHNIQUES: tuple[dict[str, Any], ...] = (
         "action": "Only against an object you own in a second test tenant: capture the accepted write and the rejected control.",
     },
     {
-        "id": "graphql-field-authorization",
-        "title": "GraphQL exposes an object/field past the REST boundary",
+        "id": "graphql-schema-disclosure",
+        "title": "GraphQL reveals its schema (operations, types, hidden fields)",
         "requires": (),
         "clue": ("class", "graphql"),
-        "grants": ("read.other-object",),
+        "grants": ("disclose.identifier",),
         "weight": 6,
         "action": "Replay the same query across two test roles and capture object- and field-level response differences.",
+        "note": "Introspection and field suggestions disclose the schema; they are a lead for BOLA/BFLA, not an observation that any boundary was crossed.",
     },
     {
         "id": "mass-assignment-privesc",
@@ -373,15 +431,12 @@ _TECHNIQUES: tuple[dict[str, Any], ...] = (
         "weight": 8,
         "action": "Capture a unique authorized callback for each primitive and a parser-configuration control.",
     },
-    {
-        "id": "oob-confirms-blind",
-        "title": "Out-of-band callback confirms a blind primitive",
-        "requires": ("net.internal",),
-        "clue": ("signal", "proof.oob-callback"),
-        "grants": ("egress.oob",),
-        "weight": 6,
-        "action": "Tie the callback token uniquely to the one request that produced it.",
-    },
+    # NOTE: there is no `oob-confirms-blind` row. A captured out-of-band callback models
+    # PROOF STRENGTH, not a new attacker capability, and this engine has no corroboration
+    # concept — so the row granted a capability (`egress.oob`) that no technique required
+    # and no impact listed, which meant `_prune_path` dropped the step from every witness it
+    # appeared in. It was unreachable output that still cost an edge. The callback already
+    # earns its keep through the confirm gate, which marks the SSRF/XXE step `proven`.
     {
         "id": "internal-to-metadata",
         "title": "The internal pivot reaches the cloud metadata service",
@@ -441,7 +496,13 @@ _TECHNIQUES: tuple[dict[str, Any], ...] = (
         "id": "deserialization-execution",
         "title": "Untrusted data is deserialized",
         "requires": (),
-        "clue": ("class", "deserialization"),
+        # The reporting layer folds category `deserialization` into class `rce` (that is the
+        # right call for the platform weakness mapping and a unit test pins it), so this row
+        # could never match on a `deserialization` class id — the chain simply narrated a
+        # deserialization sink as "input reaches a command interpreter". Match the reported
+        # class and discriminate on the category the scanner actually recorded.
+        "clue": ("class", "rce"),
+        "clue_category": "deserialization",
         "grants": ("exec.server-code",),
         "weight": 9,
         "action": "Use a benign, non-destructive gadget that only proves evaluation, and capture a control payload that is rejected.",
@@ -450,10 +511,11 @@ _TECHNIQUES: tuple[dict[str, Any], ...] = (
         "id": "upload-to-execution",
         "title": "Uploaded file is served from an executable path",
         "requires": (),
-        "clue": ("class", "file-upload"),
+        "clue": ("signal", "sink.upload-executed"),
         "grants": ("exec.server-code",),
         "weight": 8,
         "action": "Upload an inert marker file, capture it being executed/served, and remove it; never upload a working shell.",
+        "note": "An accepted upload is not execution; only the uploaded file being EXECUTED by the server is.",
     },
     {
         "id": "sql-injection-read",
@@ -544,6 +606,7 @@ _SIGNAL_LABELS: dict[str, str] = {
     "proof.oob-callback": "an out-of-band callback was captured",
     "response.token-in-body": "a token-like field appears in a response body",
     "sink.admin-rendered": "stored input is rendered in an administrative view",
+    "sink.upload-executed": "an uploaded file was observed being executed by the server",
     "transport.mixed-content": "an HTTPS page loads a plaintext subresource",
     "transport.plaintext-endpoint": "an in-scope endpoint is reachable over plaintext HTTP",
     "token.role-claim": "the token carries a role/privilege claim",
@@ -553,13 +616,45 @@ _SIGNAL_LABELS: dict[str, str] = {
 # Signal extraction
 # --------------------------------------------------------------------------------------
 _SESSION_COOKIE_RE = re.compile(
-    r"(sess|sid\b|auth|jwt|login|remember|identity|account)", re.IGNORECASE
+    r"(sess|sid\b|auth|jwt|login|remember|identity|account)"
+    # Anchored bearer-token cookie names. These ARE the session on a standard SPA, and the
+    # old exclusion below rejected every one of them, so the engine's flagship chain
+    # (confirmed XSS + missing HttpOnly -> account takeover) never fired on those targets.
+    # Anchored, never a bare `token` substring: `consent_token`/`recaptcha_token` are not
+    # the session, and asserting they are is how a fabricated takeover gets manufactured.
+    r"|^(access|id|refresh|bearer)[_\-]?token$|^token$",
+    re.IGNORECASE,
 )
 # Cookies that LOOK session-ish but are not the session, and whose flag "gaps" are by design.
 # A double-submit CSRF token cookie MUST be readable by JavaScript — that is the entire
 # pattern — so treating a missing HttpOnly on it as a token-theft step fabricated an
 # account-takeover chain out of a correct implementation. Checked before the match above.
-_NOT_SESSION_COOKIE_RE = re.compile(r"(csrf|xsrf|_token\b|antiforgery)", re.IGNORECASE)
+#
+# Scoped to anti-forgery names only. The previous bare `_token\b` alternative also swallowed
+# `auth_token`, `session_token`, `remember_token` (Devise's literal remember-me cookie) and
+# `id_token`, so on those targets the engine produced no chain at all — the opposite failure,
+# and just as silent.
+_NOT_SESSION_COOKIE_RE = re.compile(
+    r"(?:^|[_\-.])(csrf|xsrf|antiforgery)"
+    r"|(?:csrf|xsrf|anti[_\-]?forgery|request[_\-]?verification|authenticity)[_\-]?token",
+    re.IGNORECASE,
+)
+
+
+def is_session_cookie_name(name: Any) -> bool:
+    """True when ``name`` is a session-bearing cookie whose flag gaps are worth a signal.
+
+    Exported because the chain engine has TWO producers of the ``cookie.session-*`` family:
+    the raw ``Set-Cookie`` parser here and the response digest, which builds its own auth-cookie
+    list on a deliberately wider pattern (it feeds a reasoning prompt, where a CSRF cookie is
+    useful context). The digest path did not re-apply this gate, so the exact cookie the raw
+    path is documented and tested to reject arrived through the second door and fabricated the
+    takeover chain anyway. One gate, both doors.
+    """
+    label = _text(name, 120)
+    if not label or _NOT_SESSION_COOKIE_RE.search(label):
+        return False
+    return bool(_SESSION_COOKIE_RE.search(label))
 _ROLE_FIELD_RE = re.compile(
     r"^(is_?admin|admin|role|roles|is_?staff|is_?superuser|permission|permissions|scope|scopes"
     r"|privilege|privileges|is_?verified|account_?type|user_?type|group|groups|tier|plan)$",
@@ -568,10 +663,16 @@ _ROLE_FIELD_RE = re.compile(
 _TOKEN_FIELD_RE = re.compile(
     r"(access_?token|id_?token|refresh_?token|session|api_?key|secret|bearer|jwt)", re.IGNORECASE
 )
-_STATE_CHANGING_RE = re.compile(
-    r"(create|update|delete|remove|edit|set|add|invite|transfer|upload|change|reset|revoke|grant)",
-    re.IGNORECASE,
-)
+# NOTE: there is no path-name regex for `endpoint.state-changing` any more. It was an
+# unanchored alternation run over the WHOLE endpoint URL, so `set` matched inside `/assets/`,
+# `add` inside `/address`, and `edit` inside `/credit` — meaning essentially every target
+# emitted the signal, and it is the sole enabling clue for the step that promotes
+# "read another tenant's data" to "MODIFY another tenant's data". Anchoring it on path
+# segments does not fix the category error: `/news/change-log` and `/pricing/add-ons` are
+# read-only pages whose names still match. A path NAME is not an observation of a write.
+# `_surface_forms` — an actually observed POST/PUT/PATCH/DELETE method — is now the only
+# producer of this signal kind, which is the same reasoning that deleted `token.role-claim`
+# and `sink.admin-rendered` below.
 _CLOUD_HOST_RE = re.compile(
     r"(amazonaws\.com|azurewebsites\.net|cloudapp\.azure\.com|googleusercontent\.com"
     r"|appspot\.com|herokuapp\.com|cloudfront\.net|run\.app|azure\.com|gcp\.)",
@@ -579,8 +680,23 @@ _CLOUD_HOST_RE = re.compile(
 )
 _CLOUD_CRED_RE = re.compile(r"(aws|amazon|azure|gcp|google[_-]?cloud|s3|iam|sigv4)", re.IGNORECASE)
 _PRIVILEGED_SCOPE_RE = re.compile(r"(admin|write|full|owner|root|\*|superuser)", re.IGNORECASE)
+# Segment-anchored and applied to the PATH only. Unanchored over the whole URL, `reset`
+# matched `/static/css/reset.css` and `sso` matched any host containing those letters, so a
+# stylesheet was enough to carry an unproven open-redirect lead all the way to an
+# account-takeover chain. The boundaries also keep `/order/confirmation` and
+# `/team/invited-speakers` out, which a bare word-boundary would not.
 _AUTH_FLOW_RE = re.compile(
-    r"(login|logout|signin|sign-in|oauth|sso|saml|callback|authorize|reset|invite|verify|confirm)",
+    r"(?:^|[/_.\-])(login|logout|signin|sign-in|oauth|sso|saml|callback|authorize"
+    r"|reset|invite|verify|confirm)(?:$|[/_.\-])",
+    re.IGNORECASE,
+)
+# A static asset is never an authentication endpoint: a stylesheet named `reset.css` is not a
+# password-reset flow, and a script bundle carries every route name in the application, so a
+# match inside one describes the bundle's contents rather than this endpoint's role. Recon
+# already drops most of these before they reach the surface, so this is defence in depth for
+# callers that build a surface some other way.
+_STATIC_ASSET_RE = re.compile(
+    r"\.(?:js|mjs|cjs|json|map|css|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|eot)$",
     re.IGNORECASE,
 )
 
@@ -589,13 +705,63 @@ def _text(value: Any, limit: int = 400) -> str:
     return str(value or "").strip()[:limit]
 
 
-def _signal(kind: str, subject: str, why: str, *, source: str = "", ref: str = "") -> dict[str, Any]:
+def _absolute_host(value: Any) -> str:
+    """The host of an ABSOLUTE http(s) URL, or "" for anything else.
+
+    Deliberately strict, and deliberately not ``_host_of``. Most signal subjects are not URLs
+    at all — a field name (``is_admin``), a scope string (``admin,write``), a fingerprinted
+    tech name, a relative form action (``/update``) — and a lenient parser happily reports
+    ``is_admin`` and ``admin,write`` as hostnames, which then both fabricate cross-host
+    penalties and delete valid same-host chains.
+    """
+    subject = _text(value, 400)
+    try:
+        parsed = urlparse(subject)
+    except ValueError:
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return ""
+    return (parsed.hostname or "").lower()
+
+
+def finding_key(finding: dict[str, Any]) -> str:
+    """A stable identity for a finding, derived from its CONTENT rather than its display ref.
+
+    Display refs are renumbered every time findings are pooled — a hunt's ``F1`` becomes a
+    campaign's ``C7`` and then a span's ``C31`` — while the signals derived from that hunt kept
+    the ``F1`` they were stamped with. ``_signal_provenance_ok`` then found no clue with that
+    ref and discarded every witness using the signal, so the four finding-scoped signal kinds
+    (a credential being a cloud key, a captured callback) were silently dead in exactly the
+    cross-target graph a campaign exists to build. Keying on content survives every re-key,
+    and it cannot be remapped wrongly across hops the way a ref chain can.
+
+    Mirrors ``ledger.dedup_key``'s components deliberately (class + rule + digit-normalized
+    location) but is computed locally: this module stays pure and importing the ledger store
+    for one hash would couple the chain layer to persistence.
+    """
+    location = _text(finding.get("location") or finding.get("file_path"), 400)
+    normalized = re.sub(r"\d+", "N", location).lower()
+    raw = f"{investigator.normalize_class(finding)}|{_text(finding.get('rule_id'), 120)}|{normalized}"
+    return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:20]
+
+
+def _signal(kind: str, subject: str, why: str, *, source: str = "", ref: str = "",
+            host: str = "", fkey: str = "") -> dict[str, Any]:
     return {
         "kind": kind,
         "subject": _text(subject, 300),
         "why": _text(why, 300),
         "source": _text(source, 60),
         "ref": _text(ref, 40),
+        # WHERE the observation was made. A cookie flag gap belongs to the host that set the
+        # cookie; composing it into an attack on a different company's host — which is exactly
+        # what a pooled campaign graph did — asserts a step that is physically impossible
+        # there. Falls back to the subject when the caller does not name a host, because for
+        # the URL-subject families the subject IS the observation site.
+        "host": _text(host, 200).lower() or _absolute_host(subject),
+        # WHICH finding the observation describes, ref-independently. Empty for host-wide
+        # observations, which describe the site rather than any one finding.
+        "finding_key": _text(fkey, 40),
         "escalation_only": kind in ESCALATION_ONLY_SIGNALS,
     }
 
@@ -619,7 +785,7 @@ def cookie_signals(cookies: Any, url: str = "") -> list[dict[str, Any]]:
         # base64 blobs contain most things) otherwise silently suppressed its own flag gap.
         parts = cookie.split(";")
         name = parts[0].split("=", 1)[0].strip()
-        if not name or _NOT_SESSION_COOKIE_RE.search(name) or not _SESSION_COOKIE_RE.search(name):
+        if not is_session_cookie_name(name):
             continue
         attrs: dict[str, str] = {}
         for part in parts[1:]:
@@ -674,19 +840,36 @@ def collect_signals(
     def _extra_signals() -> None:
         for item in extra or []:
             if isinstance(item, dict) and item.get("kind"):
+                # Carried-in signals keep their own provenance. `host` and `finding_key` are
+                # what let a pooled campaign signal still say WHERE it was seen and WHICH
+                # finding it belongs to after that finding has been renumbered.
                 out.append(_signal(str(item.get("kind")), item.get("subject") or "",
                                    item.get("why") or "", source=item.get("source") or "",
-                                   ref=item.get("ref") or ""))
+                                   ref=item.get("ref") or "", host=item.get("host") or "",
+                                   fkey=item.get("finding_key") or ""))
 
     digest = response_digest if isinstance(response_digest, dict) else {}
+    # `origin` is what `digest_builder` records for exactly this purpose. Without it every
+    # digest-derived signal was stamped with an empty host, which made the host binding below a
+    # no-op for the entire family — the same door the cookie gate was reopened through once.
+    digest_host = _absolute_host(digest.get("origin") or digest.get("final_url") or digest.get("url"))
 
     def _digest_cookies() -> None:
         # The digest already extracts cookie flag gaps for the brain prompt; reuse them so
         # the chain engine sees the same facts even when the raw Set-Cookie list is gone.
+        #
+        # The digest builds its auth-cookie list on a deliberately WIDER pattern than the raw
+        # parser does — it includes csrf/xsrf, which is useful context in a reasoning prompt
+        # and is exactly the cookie `cookie_signals` is documented and tested to refuse. Two
+        # producers of one signal family means the gate has to be applied at BOTH doors: a
+        # correct Django double-submit `csrftoken` reached the graph through this one and
+        # fabricated an account-takeover chain out of a correct implementation.
         for gap in digest.get("cookie_flag_gaps") or []:
             if not isinstance(gap, dict):
                 continue
             name = _text(gap.get("cookie"), 120)
+            if not is_session_cookie_name(name):
+                continue
             missing = gap.get("missing") if isinstance(gap.get("missing"), list) else []
             for flag in missing:
                 kind = {
@@ -696,7 +879,7 @@ def collect_signals(
                 }.get(str(flag))
                 if kind:
                     out.append(_signal(kind, "", f"session cookie '{name}' is missing {flag}",
-                                       source="response-digest"))
+                                       source="response-digest", host=digest_host))
 
     def _digest_names() -> None:
         for name in [*(digest.get("interesting_names") or []), *(digest.get("form_fields") or [])][:200]:
@@ -704,7 +887,7 @@ def collect_signals(
             if _ROLE_FIELD_RE.match(label):
                 out.append(_signal("field.role-like", label,
                                    f"a role-like field '{label}' is present in the request/response shape",
-                                   source="response-digest"))
+                                   source="response-digest", host=digest_host))
         # response.token-in-body means what it says: the name came from a RESPONSE BODY. It was
         # also being emitted from form_fields (a request shape) and interesting_names (a mixed
         # bag), so a login form's own "token" input claimed a token appeared in a response —
@@ -715,11 +898,11 @@ def collect_signals(
             if _ROLE_FIELD_RE.match(label):
                 out.append(_signal("field.role-like", label,
                                    f"a role-like field '{label}' is present in the response body",
-                                   source="response-digest"))
+                                   source="response-digest", host=digest_host))
             elif _TOKEN_FIELD_RE.search(label):
                 out.append(_signal("response.token-in-body", label,
                                    f"a token-like field '{label}' appears in the response body",
-                                   source="response-digest"))
+                                   source="response-digest", host=digest_host))
         # NOTE: no `token.role-claim` signal is derived from the digest. The digest decodes a
         # JWT's HEADER only — never the payload — so the presence of an `alg` says a JWT is in
         # use and nothing whatsoever about a role/privilege claim inside it. Emitting it here
@@ -729,54 +912,73 @@ def collect_signals(
 
     surface_obj = surface if isinstance(surface, dict) else {}
 
+    # The recon families are re-derivable and enormous — a crawl yields hundreds of URLs and
+    # each can emit several rows — while `_build_graph` uses only the FIRST host-wide signal of
+    # each kind. Everything past that is provably dead weight that was crowding evidence-bearing
+    # signals out of the clue budget, so cap each kind at the producer.
+    recon_emitted: dict[str, int] = {}
+
+    def _recon(kind: str, subject: str, why: str) -> None:
+        if recon_emitted.get(kind, 0) >= _MAX_RECON_SIGNALS_PER_KIND:
+            return
+        recon_emitted[kind] = recon_emitted.get(kind, 0) + 1
+        out.append(_signal(kind, subject, why, source="recon"))
+
     def _surface_endpoints() -> None:
         endpoints = surface_obj.get("endpoints") if isinstance(surface_obj.get("endpoints"), list) else []
         for endpoint in endpoints[:200]:
             url = _text(endpoint, 400)
+            try:
+                path = urlparse(url).path or ""
+            except ValueError:
+                continue
             if url.lower().startswith("http://"):
-                out.append(_signal("transport.plaintext-endpoint", url,
-                                   "the endpoint was observed on plaintext HTTP", source="recon"))
-            if _STATE_CHANGING_RE.search(url):
-                out.append(_signal("endpoint.state-changing", url,
-                                   "the path name indicates a state-changing operation", source="recon"))
-            if _AUTH_FLOW_RE.search(url):
-                out.append(_signal("flow.auth-redirect", url,
-                                   "the endpoint sits inside an authentication flow", source="recon"))
-            if _CLOUD_HOST_RE.search(url):
-                out.append(_signal("infra.cloud-hosted", url,
-                                   "the host resolves to a cloud provider surface", source="recon"))
+                _recon("transport.plaintext-endpoint", url,
+                       "the endpoint was observed on plaintext HTTP")
+            if _AUTH_FLOW_RE.search(path) and not _STATIC_ASSET_RE.search(path):
+                _recon("flow.auth-redirect", url,
+                       "the endpoint path sits inside an authentication flow")
+            if _CLOUD_HOST_RE.search(_absolute_host(url)):
+                _recon("infra.cloud-hosted", url,
+                       "the host resolves to a cloud provider surface")
 
     def _surface_forms() -> None:
         for form in surface_obj.get("forms") or []:
             if not isinstance(form, dict):
                 continue
+            # An OBSERVED state-changing method — the only honest producer of this kind.
             if _text(form.get("method"), 10).upper() in {"POST", "PUT", "PATCH", "DELETE"}:
-                out.append(_signal("endpoint.state-changing", _text(form.get("action"), 300),
-                                   "an HTML form submits with a state-changing method", source="recon"))
+                _recon("endpoint.state-changing", _text(form.get("action"), 300),
+                       "an HTML form submits with a state-changing method")
             for field in form.get("params") or []:
                 if _ROLE_FIELD_RE.match(_text(field, 80)):
-                    out.append(_signal("field.role-like", _text(field, 80),
-                                       f"a role-like form field '{_text(field, 80)}' is submitted",
-                                       source="recon"))
+                    _recon("field.role-like", _text(field, 80),
+                           f"a role-like form field '{_text(field, 80)}' is submitted")
+
     def _surface_tech() -> None:
         for tech in surface_obj.get("tech") or []:
             if _CLOUD_HOST_RE.search(_text(tech, 120)):
-                out.append(_signal("infra.cloud-hosted", _text(tech, 120),
-                                   "a cloud platform was fingerprinted", source="recon"))
+                _recon("infra.cloud-hosted", _text(tech, 120), "a cloud platform was fingerprinted")
 
     def _finding_signals() -> None:
         for finding in findings or []:
             if not isinstance(finding, dict):
                 continue
             ref = _text(finding.get("ref"), 40)
+            # The ref is the DISPLAY name and is renumbered whenever findings are pooled; the
+            # key is the identity that survives that. Both travel: the ref keeps the report's
+            # cross-references readable, the key is what provenance is actually checked on.
+            fkey = finding_key(finding)
+            location = _text(finding.get("location") or finding.get("file_path"), 300)
+            host = _absolute_host(location)
             haystack = " ".join(
                 _text(finding.get(key), 300)
                 for key in ("title", "rule_id", "location", "file_path", "snippet", "secret_type")
             )
             if _CLOUD_CRED_RE.search(haystack) and investigator.normalize_class(finding) == "secrets":
-                out.append(_signal("credential.cloud-provider", _text(finding.get("location"), 300),
+                out.append(_signal("credential.cloud-provider", location,
                                    "the exposed credential looks like a cloud provider key",
-                                   source="finding", ref=ref))
+                                   source="finding", ref=ref, host=host, fkey=fkey))
             # ``scopes`` (plural) is the key every validator in credential_validation actually
             # writes; the singular ``scope`` and a top-level ``credential_scope`` exist nowhere
             # in the repo, so this read matched nothing and the privileged-scope step could
@@ -786,15 +988,38 @@ def collect_signals(
             if scope and _PRIVILEGED_SCOPE_RE.search(scope):
                 out.append(_signal("credential.privileged-scope", scope,
                                    "the validated credential reports privileged scope",
-                                   source="finding", ref=ref))
+                                   source="finding", ref=ref, host=host, fkey=fkey))
             proof = finding.get("_active_proof") if isinstance(finding.get("_active_proof"), dict) else {}
             if _text(proof.get("callback_id") or proof.get("interaction_id"), 200):
-                out.append(_signal("proof.oob-callback", _text(finding.get("location"), 300),
+                out.append(_signal("proof.oob-callback", location,
                                    "an out-of-band callback was captured for this finding",
-                                   source="finding", ref=ref))
+                                   source="finding", ref=ref, host=host, fkey=fkey))
             if "mixed-content" in _text(finding.get("rule_id"), 120).lower():
-                out.append(_signal("transport.mixed-content", _text(finding.get("location"), 300),
-                                   "an HTTPS page loads a plaintext subresource", source="finding", ref=ref))
+                # Host-wide, so no ref/key: it is a transport fact about the PAGE, not an
+                # observation that escalates the mixed-content finding itself. Stamped with a
+                # finding identity it was unusable — the consuming technique takes no class
+                # clue, so no witness could ever cite that finding, and provenance discarded
+                # every path containing the step. The whole branch was dead.
+                out.append(_signal("transport.mixed-content", location,
+                                   "an HTTPS page loads a plaintext subresource",
+                                   source="finding", host=host))
+            # An anonymously readable bucket or data store is itself the evidence that the target
+            # runs on that cloud, which is what the metadata-pivot step needs. Host-wide (no
+            # ref/key): it describes the infrastructure, not this one finding.
+            #
+            # Gated on the CONFIRM GATE and on having a real host. The bucket check emits the same
+            # class for a reference it was never allowed to probe (empty url), and that produced a
+            # host-less signal claiming a cloud surface was "confirmed" — which then unlocked the
+            # cloud-metadata pivot on any SSRF, on no observation at all.
+            if investigator.normalize_class(finding) == "cloud-exposure" and host:
+                try:
+                    cloud_proven = bool(investigator.has_confirming_artifact(finding, {}))
+                except Exception:  # noqa: BLE001 - a gate error must never break collection
+                    cloud_proven = False
+                if cloud_proven:
+                    out.append(_signal("infra.cloud-hosted", location,
+                                       "an anonymously readable cloud store was captured on this host",
+                                       source="finding", host=host))
             # NOTE: no `sink.admin-rendered` signal is derived here. Establishing that a stored
             # value renders in an ADMINISTRATIVE view requires authenticated admin access GreyIQ
             # does not have, so there is no honest way to observe it from a hunt; the previous
@@ -802,35 +1027,90 @@ def collect_signals(
             # The `admin-viewed-sink` technique stays in the table for a producer that can
             # genuinely observe this, and simply never fires until one exists.
 
-    for family in (_extra_signals, _digest_cookies, _digest_names,
-                   _surface_endpoints, _surface_forms, _surface_tech, _finding_signals):
+    # Evidence-bearing families FIRST. The list is hard-truncated at `_MAX_CLUES` below, and
+    # the recon families alone can fill it on a real crawl — so with findings last, a large
+    # surface silently deleted every ref-carrying, impact-bearing signal the engine has.
+    # `_finding_signals` must also precede `_extra_signals`: at span/portfolio scale the pooled
+    # `extra` list on its own can exceed the cap.
+    for family in (_finding_signals, _digest_cookies, _digest_names,
+                   _extra_signals, _surface_endpoints, _surface_forms, _surface_tech):
         _family(family)
 
-    # Deduplicate on (kind, subject) preserving first-seen order for determinism.
-    seen: set[tuple[str, str]] = set()
+    # Deduplicate preserving first-seen order for determinism. `ref` and `finding_key` are part
+    # of the key: two findings at the same location each get their own "this credential is a
+    # cloud key" observation, and collapsing them on (kind, subject) deleted the second
+    # finding's — which then had no signal edge and lost its entire chain.
+    seen: set[tuple[str, str, str, str]] = set()
     unique: list[dict[str, Any]] = []
     for item in out:
-        key = (item["kind"], item["subject"])
+        key = (item["kind"], item["subject"], item["ref"], item["finding_key"])
         if key in seen:
             continue
         seen.add(key)
         unique.append(item)
-    return unique[:_MAX_CLUES]
+    if len(unique) <= _MAX_CLUES:
+        return unique
+    # Over budget: reserve half the slots for finding-derived rows rather than letting a big
+    # crawl decide by arrival order which evidence survives. Re-emit in the original order so
+    # the output stays byte-stable for a given input.
+    derived = [item for item in unique if item["source"] == "finding"]
+    rest = [item for item in unique if item["source"] != "finding"]
+    keep_derived = derived[:max(_MAX_CLUES // 2, _MAX_CLUES - len(rest))]
+    keep_rest = rest[:_MAX_CLUES - len(keep_derived)]
+    kept = {id(item) for item in keep_derived} | {id(item) for item in keep_rest}
+    return [item for item in unique if id(item) in kept]
 
 
 # --------------------------------------------------------------------------------------
 # Chain construction
 # --------------------------------------------------------------------------------------
 def _host_of(location: str) -> str:
+    """The HOST a clue sits on, or "" when the location is not a URL at all.
+
+    A code-scanner finding's location is a repository-relative FILE PATH. Splitting one on "/"
+    and calling the first segment a host made ``backend/app/views.py`` and ``frontend/src/api.js``
+    — the same repo, the same target, the same commit — look like two unrelated internet hosts,
+    so every multi-finding chain in a code audit was charged the cross-host penalty that exists
+    to say "these two may not even share a session". Non-URLs return "" and are excluded from
+    the host set by the ``- {""}`` in ``_score_path``.
+    """
     try:
-        parsed = urlparse(location)
+        return (urlparse(location).hostname or "").lower()
     except ValueError:
         return ""
-    if parsed.hostname:
-        return parsed.hostname.lower()
-    normalized = re.sub(r"^[a-z][a-z0-9+.-]*:", "", str(location or "").strip(), flags=re.IGNORECASE)
-    normalized = normalized.replace("\\", "/").strip("/")
-    return normalized.split("/", 1)[0].lower()
+
+
+def _is_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _same_trust_boundary(left: str, right: str) -> bool:
+    """True when two hosts plausibly share a session and a CORS/cookie trust boundary.
+
+    Sibling subdomains of one registrable domain DO share domain-scoped cookies — that is the
+    whole premise of the subdomain-takeover technique, and the composition a campaign exists to
+    surface. Scoring them like unrelated vendors evicted the one genuinely cross-target chain a
+    span found.
+
+    IP literals are compared EXACTLY. ``registrable_domain`` is a last-two-labels heuristic, so
+    it maps ``1.2.3.4`` and ``9.8.3.4`` both to ``3.4``: reducing IPs through it would silently
+    merge two unrelated hosts that happen to share their last two octets, trading the old
+    over-penalty for a new false-merge. ``scan_auth`` guards its own registrable-domain check
+    the same way.
+    """
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    if _is_ip(left) or _is_ip(right):
+        return False
+    left_site = registrable_domain(left)
+    right_site = registrable_domain(right)
+    return bool(left_site) and left_site == right_site
 
 
 def _finding_clue(finding: dict[str, Any], plan: dict[str, Any], index: int) -> dict[str, Any]:
@@ -840,11 +1120,18 @@ def _finding_clue(finding: dict[str, Any], plan: dict[str, Any], index: int) -> 
         proven = bool(investigator.has_confirming_artifact(finding, plan))
     except Exception:  # noqa: BLE001 - a gate error must never break the chain build
         proven = False
+    location = _text(finding.get("location") or finding.get("file_path"), 400)
     return {
         "ref": ref,
+        "key": finding_key(finding),
         "class_id": investigator.normalize_class(finding),
+        # The scanner category the finding was recorded under. Carried because the reporting
+        # layer folds several categories into one class (deserialization -> rce), so the class
+        # alone cannot tell the ladder which technique actually describes what was found.
+        "category": _text(finding.get("category"), 80).lower(),
         "title": _text(finding.get("title") or finding.get("rule_id") or "Finding", 240),
-        "location": _text(finding.get("location") or finding.get("file_path"), 400),
+        "location": location,
+        "host": _host_of(location),
         "severity": _text(finding.get("severity"), 20).lower() or "info",
         "proven": proven,
     }
@@ -855,11 +1142,47 @@ def _step_confidence(proven: bool) -> int:
     return 82 if proven else 34
 
 
+_MAX_CLUES_PER_CLASS = 3
+
+
 def _build_graph(
     clues_by_class: dict[str, list[dict[str, Any]]],
     signals_by_kind: dict[str, list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
     """Instantiate every technique whose enabling clue is actually present."""
+    # A category-narrowed row claims its findings exclusively: without this the generic row for
+    # the same class fires on them too, so one deserialization sink produced both "untrusted
+    # data is deserialized" and "input reaches a command interpreter" for the same impact.
+    claimed_categories: dict[str, set[str]] = {}
+    for technique in _TECHNIQUES:
+        spec = technique.get("clue")
+        category = technique.get("clue_category")
+        if category and spec and spec[0] == "class":
+            claimed_categories.setdefault(spec[1], set()).add(str(category))
+
+    # A ref-carrying signal ("this credential is a cloud key") is only ever USABLE by a chain
+    # that also contains that finding's own clue — `_signal_provenance_ok` rejects the witness
+    # otherwise. So a clue a signal names must survive the per-class cap below, or the impact it
+    # unlocks disappears because of how many UNRELATED findings of the same class the hunt
+    # happened to produce.
+    pinned_keys = {
+        _text(signal.get("finding_key"), 40)
+        for rows in signals_by_kind.values() for signal in rows
+        if _text(signal.get("finding_key"), 40)
+    }
+
+    def _clues_for(class_id: str) -> list[dict[str, Any]]:
+        rows = clues_by_class.get(class_id, [])
+        if len(rows) <= _MAX_CLUES_PER_CLASS:
+            return rows
+        pinned = [row for row in rows if row["key"] in pinned_keys]
+        others = [row for row in rows if row["key"] not in pinned_keys]
+        # The cap still bounds the edge set (the DFS multiplies over it); pinning only changes
+        # WHICH clues fill it, never how many.
+        return (pinned + others)[:max(_MAX_CLUES_PER_CLASS, len(pinned))]
+
+    known_keys = {clue["key"] for rows in clues_by_class.values() for clue in rows}
+
     edges: list[dict[str, Any]] = []
     for technique in _TECHNIQUES:
         clue_spec = technique.get("clue")
@@ -868,35 +1191,80 @@ def _build_graph(
             continue
         kind, key = clue_spec
         if kind == "class":
-            for clue in clues_by_class.get(key, [])[:3]:
+            wanted = technique.get("clue_category")
+            excluded = claimed_categories.get(key, set()) if not wanted else set()
+            for clue in _clues_for(key):
+                if wanted and clue["category"] != str(wanted):
+                    continue
+                if clue["category"] in excluded:
+                    continue
+                if technique.get("requires_proven") and not clue["proven"]:
+                    continue
                 edges.append({"technique": technique, "clue": clue, "signal": None,
                               "proven": bool(clue["proven"])})
         else:
-            # ONE edge per signal kind. A second instance of the same kind produces a chain
-            # with identical steps, title and impact — the report printed the same attack
-            # twice because the two edges had different indices and so survived the path
-            # dedupe. Extra instances add nothing: the technique text is per-kind.
-            for signal in signals_by_kind.get(key, [])[:1]:
+            # ONE edge per distinct FINDING the signal describes. A single edge per kind was
+            # right for host-wide observations — a second instance produces a chain with
+            # identical steps, title and impact, which the report printed twice — but wrong for
+            # the finding-scoped kinds: with two exposed secrets, only the first finding's
+            # "it's a cloud key" observation existed as an edge, so the second finding's chain
+            # was rejected by provenance and vanished. Host-wide signals all carry the empty
+            # key and still collapse to exactly one edge.
+            rows = signals_by_kind.get(key, [])
+            # Prefer a signal attached to a PROVEN clue, so the strongest chain is the one that
+            # survives the per-kind bound below.
+            proven_keys = {clue["key"] for rows_ in clues_by_class.values()
+                           for clue in rows_ if clue["proven"]}
+            rows = sorted(rows, key=lambda row: _text(row.get("finding_key"), 40) in proven_keys,
+                          reverse=True)
+            seen_keys: set[str] = set()
+            for signal in rows:
+                signal_key = _text(signal.get("finding_key"), 40)
+                if signal_key and signal_key not in known_keys:
+                    continue  # can never pass provenance; the edge would only burn DFS budget
+                if signal_key in seen_keys:
+                    continue
+                seen_keys.add(signal_key)
                 # A signal is an OBSERVATION, never proof. This is the invariant that keeps a
                 # cookie flag from ever reading as a confirmed step.
                 edges.append({"technique": technique, "clue": None, "signal": signal, "proven": False})
+                if len(seen_keys) >= _MAX_SIGNAL_EDGES_PER_KIND:
+                    break
     return edges
 
 
 def _signal_provenance_ok(witness: list[dict[str, Any]]) -> bool:
-    """Reject a chain that escalates one finding using an observation about another.
+    """Reject a chain that composes an observation with evidence it does not belong to.
 
-    Most signals are host-wide (a cookie flag, a form field) and carry no ``ref``. The ones
-    that DO — "this credential is a cloud key", "this finding got an OOB callback" — describe
-    one specific finding, and pairing them with a step built from a different finding invents
-    a composition nobody observed: with two exposed secrets, the chain could take finding A's
-    credential step and finding B's "it's a cloud key" observation and report cloud compromise.
+    Two independent bindings, because there are two ways to invent a composition nobody saw.
+
+    WHICH FINDING. Most signals are host-wide (a cookie flag, a form field) and describe no
+    single finding. The ones that DO — "this credential is a cloud key", "this finding got an
+    OOB callback" — are matched on the finding's CONTENT key, not its display ref: refs are
+    renumbered whenever findings are pooled, so a ref-keyed check silently rejected every
+    cross-target witness and deleted the credential chains a campaign exists to build.
+
+    WHICH HOST. A cookie flag gap belongs to the host that set the cookie. Pooled into one
+    graph — which is exactly what a portfolio run does — an unrelated program's missing
+    HttpOnly composed into this program's confirmed XSS and reported an account takeover whose
+    second step is physically impossible on the target (its session cookie IS HttpOnly), with
+    nothing in the rendered step naming the other host. Sibling subdomains are NOT rejected:
+    a domain-scoped cookie observed on ``www`` genuinely does reach a claimed ``old`` sibling,
+    and that composition is the campaign's whole payoff.
     """
-    refs = {step["clue"]["ref"] for step in witness if step["clue"]}
+    keys = {step["clue"]["key"] for step in witness if step["clue"]}
+    hosts = {step["clue"]["host"] for step in witness if step["clue"]} - {""}
     for step in witness:
         signal = step["signal"]
-        signal_ref = _text(signal.get("ref"), 40) if signal else ""
-        if signal_ref and signal_ref not in refs:
+        if not signal:
+            continue
+        signal_key = _text(signal.get("finding_key"), 40)
+        if signal_key and signal_key not in keys:
+            return False
+        signal_host = _text(signal.get("host"), 200)
+        if signal_host and hosts and not any(
+            _same_trust_boundary(signal_host, host) for host in hosts
+        ):
             return False
     return True
 
@@ -925,8 +1293,22 @@ def _prune_path(path: list[dict[str, Any]], impact: str, entry: str) -> list[dic
 
 
 def _enumerate_paths(edges: list[dict[str, Any]], entry: str) -> list[tuple[list[dict[str, Any]], str]]:
-    """Bounded DFS from ``entry`` over capability space, collecting minimal witnesses for
-    every terminal impact reached. Deterministic: edges are explored in table order."""
+    """Bounded search from ``entry`` over capability space, collecting minimal witnesses for
+    every terminal impact reached. Deterministic: edges are explored in table order.
+
+    ITERATIVE DEEPENING, not a plain DFS. A complete search of a routine 13-class hunt needs
+    ~2M expansions against a 20k budget, and a depth-first walk with one shared counter spends
+    the entire allowance inside the FIRST edge's subtree — instrumented, the set of root edges
+    ever expanded was literally ``[0]``. Every witness whose edges sit late in the technique
+    table was lost, so the output was biased by table position rather than by chain quality.
+    Splitting the budget per root does NOT fix it (measured: byte-identical output), because
+    the bias is recursive — each root's share is consumed by its own first child in turn.
+
+    Deepening by length matches how the engine ranks anyway: `_score_path` prefers short
+    witnesses, so exhausting depth 1 before depth 2 spends the budget on the chains most
+    likely to be reported. The budget is shared across rounds, never reset, so total work stays
+    bounded and the result stays deterministic.
+    """
     found: list[tuple[list[dict[str, Any]], str]] = []
     seen: set[tuple[str, tuple[int, ...]]] = set()
     budget = [_MAX_EXPANSIONS]
@@ -944,7 +1326,8 @@ def _enumerate_paths(edges: list[dict[str, Any]], entry: str) -> list[tuple[list
             seen.add(key)
             found.append((witness, cap))
 
-    def walk(held: frozenset[str], used: tuple[int, ...], path: list[dict[str, Any]]) -> None:
+    def walk(held: frozenset[str], used: tuple[int, ...], path: list[dict[str, Any]],
+             limit: int = _MAX_DEPTH) -> None:
         if budget[0] <= 0 or len(path) >= _MAX_DEPTH:
             return
         for index, edge in enumerate(edges):
@@ -961,10 +1344,12 @@ def _enumerate_paths(edges: list[dict[str, Any]], entry: str) -> list[tuple[list
             budget[0] -= 1
             step = {**edge, "index": index}
             new_path = path + [step]
+            # Only the frontier is recorded: shallower paths were already recorded by earlier
+            # rounds, and `seen` dedupes, so this just avoids redundant `_prune_path` work.
             record(new_path, grants)
-            walk(held | set(grants), used + (index,), new_path)
+            walk(held | set(grants), used + (index,), new_path, limit)
 
-    walk(frozenset({entry}), (), [])
+    walk(frozenset({entry}), (), [], _MAX_DEPTH)
     return found
 
 
@@ -999,19 +1384,41 @@ def _score_path(path: list[dict[str, Any]], impact: str) -> tuple[int, int, str]
         score -= 20
     # Two findings on the same host are far likelier to compose than two on hosts that may
     # not even share a session, so a chain that hops hosts is ranked below one that doesn't.
-    hosts = {_host_of(step["clue"]["location"]) for step in path if step["clue"]} - {""}
-    if len(hosts) > 1:
-        score -= 12 * (len(hosts) - 1)
+    # Signal hosts count too: an observation made somewhere else is exactly as much of a hop as
+    # a finding made somewhere else, and leaving them out is how a pooled cookie gap from an
+    # unrelated program scored identically to a same-host one.
+    hosts = {step["clue"]["host"] for step in path if step["clue"]}
+    hosts |= {_text(step["signal"].get("host"), 200) for step in path if step["signal"]}
+    hosts -= {""}
+    # Sibling subdomains of one registrable domain share domain-scoped cookies and a CORS
+    # boundary, so the "may not even share a session" premise simply does not apply to them —
+    # and penalizing them evicted the one real cross-target chain a span produced.
+    sites: list[str] = []
+    for host in sorted(hosts):
+        if not any(_same_trust_boundary(host, other) for other in sites):
+            sites.append(host)
+    if len(sites) > 1:
+        score -= 12 * (len(sites) - 1)
         confidence = max(0, confidence - 6)
     return max(0, score), max(0, min(99, confidence)), status
 
 
-def _narrate(entry: str, path: list[dict[str, Any]]) -> str:
-    """One plain-English sentence a triager can read without decoding the graph."""
+def _narrate(entry: str, path: list[dict[str, Any]], impact: str) -> str:
+    """One plain-English sentence a triager can read without decoding the graph.
+
+    Names the capability the chain actually CONSUMED, not the first entry of the technique's
+    grants tuple. Two techniques grant two capabilities each (XXE and SSRF both grant
+    ``net.internal`` alongside a read primitive), so a chain resting on the second grant
+    narrated the one it never used — and the cortex copies this sentence verbatim into the
+    chain's ``why``, which is what the report prints.
+    """
     parts = [f"Starting as {_ENTRIES.get(entry, entry)}"]
-    for step in path:
-        grants = [cap for cap in step["technique"]["grants"]]
-        label = _CAPABILITY_LABELS.get(grants[0], grants[0]) if grants else ""
+    for position, step in enumerate(path):
+        grants = list(step["technique"]["grants"])
+        following = path[position + 1]["technique"]["requires"] if position + 1 < len(path) else ()
+        used = next((cap for cap in grants if cap in following or cap == impact), "")
+        label = _CAPABILITY_LABELS.get(used or (grants[0] if grants else ""),
+                                       used or (grants[0] if grants else ""))
         verb = "proven" if step["proven"] else "projected"
         parts.append(f"{step['technique']['title'].lower()} ({verb}) to {label}")
     return " → ".join(parts) + "."
@@ -1073,14 +1480,41 @@ def build_attack_chains(
 
         # Keep the best few paths per impact so the report shows distinct attacks, not
         # twelve permutations of the same one.
+        #
+        # Three corrections live in this block, all of them things that silently threw away the
+        # best chain:
+        #  * The bucket key must be a SUPERSET of the final ranking key. Ranking the bucket on
+        #    score alone meant a fully proven chain was discarded here, before the proven-first
+        #    sort below could ever see it — the two keys had drifted apart, which is the defect.
+        #  * Two candidates with the same technique sequence for the same impact are the same
+        #    attack. Distinctness was keyed on edge indices, so N findings of one class produced
+        #    N identical ladders that each took a slot. (Keyed per IMPACT, not globally: one
+        #    technique tuple legitimately reaches two impacts — an XXE grants both a file read
+        #    and internal reach — and a global dedupe would delete a real impact.)
+        #  * A path citing no finding is a probe lead the cortex routes away from the report, so
+        #    it gets its OWN budget instead of evicting a chain built on captured evidence.
+        def _rank(row: dict[str, Any]) -> tuple[int, int, int]:
+            return (_STATUS_RANK.get(row["status"], 0), row["score"], -len(row["path"]))
+
         by_impact: dict[str, list[dict[str, Any]]] = {}
-        for candidate in sorted(candidates, key=lambda row: (row["score"], -len(row["path"])), reverse=True):
-            bucket = by_impact.setdefault(candidate["impact"], [])
-            if len(bucket) < _MAX_PATHS_PER_IMPACT:
+        probes_by_impact: dict[str, list[dict[str, Any]]] = {}
+        shapes: set[tuple[str, tuple[str, ...]]] = set()
+        for candidate in sorted(candidates, key=_rank, reverse=True):
+            shape = (candidate["impact"],
+                     tuple(step["technique"]["id"] for step in candidate["path"]))
+            if shape in shapes:
+                continue
+            shapes.add(shape)
+            anchored = any(step["clue"] for step in candidate["path"])
+            table = by_impact if anchored else probes_by_impact
+            cap = _MAX_PATHS_PER_IMPACT if anchored else _MAX_PROBE_PATHS_PER_IMPACT
+            bucket = table.setdefault(candidate["impact"], [])
+            if len(bucket) < cap:
                 bucket.append(candidate)
         selected = sorted(
-            (c for bucket in by_impact.values() for c in bucket),
-            key=lambda row: (row["status"] == "proven", row["score"]), reverse=True,
+            [c for bucket in by_impact.values() for c in bucket]
+            + [c for bucket in probes_by_impact.values() for c in bucket],
+            key=_rank, reverse=True,
         )[:_MAX_CHAINS]
 
         chains: list[dict[str, Any]] = []
@@ -1106,10 +1540,24 @@ def build_attack_chains(
                     "title": technique["title"],
                     "requires": [_CAPABILITY_LABELS.get(cap, cap) for cap in technique["requires"]],
                     "grants": [_CAPABILITY_LABELS.get(cap, cap) for cap in technique["grants"]],
+                    # The raw capability ids alongside the prose. A consumer that has to REASON
+                    # about what a blocked step was waiting for needs the id — matching on the
+                    # human label would break the moment the label is reworded.
+                    "grants_ids": list(technique["grants"]),
+                    "requires_ids": list(technique["requires"]),
                     "evidence_ref": clue["ref"] if clue else "",
                     "evidence_title": clue["title"] if clue else "",
+                    # WHERE the cited finding was observed. A consumer that has to decide whether a
+                    # proof still holds needs the endpoint, and matching a URL against the finding's
+                    # human-readable TITLE — which is what the step used to expose — never matches.
+                    "evidence_location": clue["location"] if clue else "",
                     "signal": str(signal.get("kind")) if signal else "",
                     "signal_why": _text(signal.get("why"), 300) if signal else "",
+                    # WHERE the observation was made. The rendered step used to carry only the
+                    # kind and the prose, so a reader could not tell that a cookie flag gap had
+                    # been seen on a different host from the finding it escalates — the one
+                    # fact needed to catch a bad composition by reading the report.
+                    "signal_host": _text(signal.get("host"), 200) if signal else "",
                     "proven": bool(step["proven"]),
                     "state": "proven" if step["proven"] else "projected",
                     "next_action": technique.get("action", ""),
@@ -1132,7 +1580,7 @@ def build_attack_chains(
                 "proven_steps": sum(1 for step in steps if step["proven"]),
                 "refs": list(dict.fromkeys(refs)),
                 "steps": steps,
-                "narrative": _narrate(candidate["entry"], candidate["path"]),
+                "narrative": _narrate(candidate["entry"], candidate["path"], candidate["impact"]),
                 # The single most useful line: what to do next to close the chain.
                 "next_action": (unproven[0]["next_action"] if unproven
                                 else "Every step is backed by a captured artifact — package the chain as one report."),
