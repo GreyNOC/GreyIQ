@@ -511,7 +511,7 @@ function createWindow() {
     minHeight: 680,
     title: APP_NAME,
     backgroundColor: '#0a0e14',
-    // GreyNOC orb app icon for the window, taskbar/dock, and dev runs. On packaged
+    // GreyNOC owl app icon for the window, taskbar/dock, and dev runs. On packaged
     // Windows the taskbar uses the icon embedded in the exe (build/icon.ico via
     // electron-builder); setting it here also covers `electron .` dev runs and Linux,
     // where the window icon comes from this file rather than the executable.

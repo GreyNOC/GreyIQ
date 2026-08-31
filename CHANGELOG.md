@@ -128,7 +128,39 @@ added `path-traversal`, and the drift guard caught it.
 
 - electron 43.4.1 -> 44.0.0.
 
-Suite: **2580 tests**, 3 skipped, green.
+### Branding
+
+The app wears the GreyNOC owl. It replaces the orb on the window/taskbar icon, the Windows
+executable and the NSIS installer, and it replaces the globe *inside* the app -- boot splash,
+chat header, cockpit sidebar, and the idle dashboard hero. In-app it is a traced SVG painted as a
+CSS mask filled with `currentColor`, so one asset is legible on the charcoal sidebar and the light
+one alike; an `<img>` cannot inherit `currentColor` and would have had to pick a theme and lose
+contrast in the other. The `.ico` carries seven real frames so Windows picks per context. The boot
+splash was also still painted in the pre-v4 blue-greys -- they are hardcoded rather than tokenised,
+so the palette sweep never reached the first screen the app shows.
+
+### What an adversarial review caught before release
+
+Twenty claims were raised against this diff by independent finders and put to a three-skeptic
+refutation panel; twelve survived and are fixed here. The ones worth naming:
+
+- **The radius sweep ate three tokens.** The bulk rewrite matched the literal text
+  `border-radius: var(--radius-card)` inside the very comment documenting the token, and ran past
+  the comment's terminator to the next semicolon -- deleting `--radius-card` and sealing
+  `--radius-pill`, `--radius` and `--glow` inside an unterminated comment. Invisible, because an
+  undefined `var()` makes `border-radius` invalid-at-computed-value, which falls back to 0.
+- **A path-traversal refusal was silently defeated** in the ported traffic-client recipe: an
+  `or <default>` swallowed `_safe_rel`'s rejection, so a request naming `../../evil.py` wrote the
+  default file instead of refusing. Half that recipe's trigger had also been dropped in the port.
+- **Avatar initials broke for every pre-v4 bot.** Bot colours are persisted, so existing users kept
+  the old dark palette under v4's new dark ink. Ink is now derived per bot from its own luminance.
+- **The primary CTA failed in its default state** at 3.4:1, and the learned hunt ranker had
+  train/serve feature skew that made its whole `form:*` namespace unreachable at inference.
+
+- Also folded in from `main` while this was in flight: an unclosed snapshot file handle in
+  `surface_drift`, and review fixes to the chat and `gn wardrive` output.
+
+Suite: **2583 tests**, 3 skipped, green.
 
 ## v3.0.1 - chain-engine QAQC, observation provenance, surface-drift engine
 

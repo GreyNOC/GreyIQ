@@ -32,7 +32,11 @@
   --on-accent: #ffffff;
   --sidebar-bg: #e4e6e8;
   /* Square by contract. These stay as tokens rather than being deleted so that any stray
-     `border-radius: 0;
+     reference to one still resolves square, and so a future rounded variant is a one-line
+     change instead of another 168-site sweep. (Deliberately worded without a literal radius
+     declaration in it: a bulk rewrite of those declarations once matched this very comment and
+     ran past its terminator, silently swallowing the three tokens below.) */
+  --radius-card: 0;
   --radius-pill: 0;
   --radius: 0;
   --glow: transparent;  /* flat - no glows */
@@ -77,8 +81,10 @@ body[data-theme="dark"] {
   --line: #3a3f45;
   --teal: #ff6633;   /* legacy alias for the accent */
   --teal-2: #3a2318; /* soft signal wash - a burnt-orange tint of the panel, never a blue */
-  --coral: #ef6b6b;  /* semantic: down / critical - lifted from #e05252 to clear AA both as
-                        filled-chip background (with --on-accent ink) and as text on a panel */
+  --coral: #ef6b6b;  /* semantic: down / critical - lifted from #e05252 so it clears AA as a
+                        filled chip background under --on-accent ink (5.56) and as text on
+                        --surface (5.05). On the lighter --surface-2 it is 4.06, so use it as
+                        a fill there rather than as body text. */
   --violet: #9aa1a8; /* neutralized to grey - the accent is the only hue */
   --sun: #d9a441;    /* semantic: warn */
   --ok: #4bb377;     /* semantic: up / confirmed */
@@ -372,9 +378,10 @@ button:focus-visible {
   height: 2.35rem;
   border-radius: 0;
   background: var(--teal);
-  /* Literal, not var(--on-accent): the inline background is a fixed JS palette entry that does
-     not change with the theme, so its ink must not either. Every COLORS row clears AA here. */
-  color: #1c1f23;
+  /* Fallback only. app.js sets this inline per bot via inkOn(bot.color), because bot colours
+     are PERSISTED: a pre-v4 bot still carries the old dark palette, on which a fixed dark ink
+     renders initials at ~2:1. Theme-independent by design -- the background is not themed. */
+  color: #ffffff;
   font-size: 0.82rem;
   font-weight: 800;
 }
@@ -2921,20 +2928,34 @@ body[data-app-mode="hunt"] .cockpit {
 .ck-brand h1 { margin: 0; font-size: 1.15rem; letter-spacing: -0.01em; }
 .ck-eyebrow { margin: 0; font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.13em; color: var(--muted); }
 
-/* --- GreyNOC globe brand mark --- */
+/* --- GreyNOC owl brand mark ---
+   Painted as a MASK filled with currentColor rather than an <img>, so the one asset works on
+   the charcoal sidebar and the light sidebar alike. An <img> cannot inherit currentColor, so a
+   coloured SVG would have had to pick one theme and lose contrast in the other.
+   The glyph is taller than it is wide (1000 x 1351), so every box below uses `contain`. */
+.gn-owl {
+  display: inline-block;
+  background-color: currentColor;
+  -webkit-mask: url("./owl.svg") center / contain no-repeat;
+  mask: url("./owl.svg") center / contain no-repeat;
+  flex: none;
+}
 .ck-logo-globe { display: inline-flex; align-items: center; justify-content: center; background: none; border: 0; padding: 0; }
-.ck-logo-globe img { width: 34px; height: 34px; display: block; }
+.ck-logo-globe.gn-owl { width: 30px; height: 34px; color: var(--ink); }
 .brand-row { display: flex; align-items: center; gap: 0.6rem; }
 .brand-row .icon-button { margin-left: auto; }
-.brand-globe { width: 30px; height: 30px; flex: none; }
+.brand-globe { width: 26px; height: 30px; color: var(--ink); }
+/* Idle campaign-dashboard hero: an illustration, so it sits at muted weight, never accent. */
+.ck-hero-owl { width: 111px; height: 150px; color: var(--muted); }
 
-/* Boot splash — the globe while the local engine spins up. */
+/* Boot splash — the owl while the local engine spins up. Its own surface, so the colours are
+   literals; they track the dark theme's --bg/--ink rather than the pre-v4 blue-greys. */
 .ck-splash { position: fixed; inset: 0; z-index: 120; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.7rem;
-  background: #0e1116; transition: opacity 0.5s ease; }
+  background: #1c1f23; transition: opacity 0.5s ease; }
 .ck-splash.is-hidden { opacity: 0; pointer-events: none; }
-.ck-splash-globe { width: min(46vw, 208px); height: auto; }
-.ck-splash-name { font-size: 1.6rem; font-weight: 800; letter-spacing: 0.16em; color: #e2e8ef; }
-.ck-splash-sub { font-size: 0.82rem; letter-spacing: 0.05em; color: #8a95a4; }
+.ck-splash-globe { width: min(46vw, 154px); height: min(62vw, 208px); color: #e6e8ea; }
+.ck-splash-name { font-size: 1.6rem; font-weight: 800; letter-spacing: 0.16em; color: #e6e8ea; }
+.ck-splash-sub { font-size: 0.82rem; letter-spacing: 0.05em; color: #9aa1a8; }
 
 /* Campaign-dashboard idle hero. */
 .ck-cd-hero { display: flex; flex-direction: column; align-items: center; gap: 0.6rem; padding: 1.6rem 0 0.4rem; text-align: center; }
@@ -3275,7 +3296,7 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
 .ck-cd-sevpill { flex: none; min-width: 2.6rem; text-align: center; font-size: 0.62rem; font-weight: 800; text-transform: uppercase; padding: 0.16rem 0.32rem; border-radius: 0; background: var(--surface-2); color: var(--muted); }
 .ck-cd-sevpill.sev-critical { color: var(--on-accent); background: var(--coral); }
 .ck-cd-sevpill.sev-high { color: var(--on-accent); background: color-mix(in srgb, var(--coral) 78%, var(--sun)); }
-.ck-cd-sevpill.sev-medium { color: var(--ink); background: var(--sun); }
+.ck-cd-sevpill.sev-medium { color: var(--on-accent); background: var(--sun); }
 .ck-cd-sevpill.sev-low { color: var(--on-accent); background: var(--ok); }
 .ck-cd-finding-main { min-width: 0; flex: 1; }
 .ck-cd-finding-title { font-size: 0.8rem; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -3559,7 +3580,7 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
 }
 .ck-sevpill.sev-critical { color: var(--on-accent); background: var(--coral); }
 .ck-sevpill.sev-high     { color: var(--on-accent); background: var(--coral); }
-.ck-sevpill.sev-medium   { color: #17202b; background: var(--sun); }
+.ck-sevpill.sev-medium   { color: var(--on-accent); background: var(--sun); }
 .ck-sevpill.sev-low      { color: var(--on-accent); background: var(--ok); }
 .ck-sevpill.sev-info     { color: var(--text); background: var(--surface-2); }
 
@@ -3830,15 +3851,16 @@ body[data-app-mode="hunt"] .cockpit {
 
 .ck-splash {
   gap: 0.55rem;
-  background: #0a0e14;
+  background: #1c1f23;
 }
 
 .ck-splash-globe {
-  width: min(34vw, 144px);
+  width: min(26vw, 107px);
+  height: min(34vw, 144px);
 }
 
 .ck-splash-name {
-  color: #edf1f6;
+  color: #e6e8ea;
   font-size: 1.25rem;
   letter-spacing: 0.11em;
 }
@@ -4020,7 +4042,8 @@ body[data-app-mode="hunt"] .cockpit {
 }
 
 .ck-run:not(.is-ready) {
-  background: color-mix(in srgb, var(--accent) 72%, var(--surface));
+  background: transparent;
+  color: var(--accent);
 }
 
 .ck-run:focus-visible,

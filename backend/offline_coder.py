@@ -147,9 +147,11 @@ def _load_snippet(seed_dir: str | Path | None, name: str) -> str | None:
     bundled templates contain non-ASCII, so a half-copied install hits exactly that. Catching both
     means a corrupt template disables THAT recipe (with an honest reason) and nothing else.
 
-    Production passes the extracted seed directory explicitly; the source-tree ``backend/seed`` is
-    tried AFTER it so deterministic scaffolds stay available to direct/offline callers without
-    copying large templates into this module. Frozen/stripped builds find neither and return None."""
+    An explicit ``seed_dir`` is AUTHORITATIVE and is the ONLY place consulted -- production always
+    passes one. The source-tree ``backend/seed`` is consulted only when ``seed_dir`` is falsy,
+    which is the direct/offline caller (and dev) path. The two are deliberately NOT chained:
+    chaining would let a corrupt template in a shipped install be healed from a source tree that
+    is not there, so ``_gate_block`` would offer a recipe the install cannot actually render."""
     if not name:
         return None
     # An EXPLICIT seed_dir is authoritative: that install's copy is the answer, and a corrupt or
@@ -647,13 +649,23 @@ def _recipes() -> tuple[Recipe, ...]:
                 # "build" is not in the shared _V verb set but is the phrasing this request
                 # actually arrives in ("build a C2 traffic simulator"), so it is added HERE
                 # rather than to _V, which all 36 rows share.
-                rf"\b(?:{_V}|build){_GAP}"
-                r"\b(?:c2|command(?:\s+and|\s*&\s*)\s+control|https?|network|traffic)\b"
-                r"[^.?!]{0,100}\b(?:client|script|sender|request|traffic|simulat\w*)\b"
-                r"(?:[^.?!]{0,60}?\b(?:as|called|named)\s+[`'\"]?(?P<path>[A-Za-z0-9_.\-/]+\.py)\b)?",
+                # TWO alternatives, mirroring the pre-registry implementation: the transport word
+                # can come BEFORE the noun ("a C2 traffic simulator") or AFTER it ("a script to
+                # send traffic"). Carrying only the first silently narrowed a documented capability.
+                rf"\b(?:{_V}|build)(?:"
+                r"(?:[^.?!]{0,100}\b(?:c2|command(?:\s+and|\s*&\s*)\s+control|https?|network|traffic)\b"
+                r"[^.?!]{0,100}\b(?:client|script|sender|request|traffic|simulat\w*)\b)"
+                r"|(?:[^.?!]{0,100}\b(?:client|script|sender|simulat\w*)\b[^.?!]{0,100}"
+                r"\b(?:send|generate)\s+(?:https?\s+|network\s+)?traffic\b)"
+                r")"
+                r"(?:[^.?!]{0,60}?\b(?:as|called|named)\s+[`'\"]?(?P<path>[A-Za-z0-9_.\-/\\]+\.py)\b)?",
                 re.IGNORECASE),
             template="authorized_http_client.py.tmpl",
-            target=lambda m, root, s: _safe_rel(_named(m, "path", "")) or "authorized_http_client.py",
+            # No `or <default>` here: _safe_rel returns "" precisely for a path that escapes the
+            # workspace, and plan_edits turns an empty target into an honest refusal. Defaulting
+            # on "" would silently write a DIFFERENT file than the one the user named.
+            target=lambda m, root, s: (_safe_rel(_named(m, "path", ""))
+                                       if _named(m, "path", "") else "authorized_http_client.py"),
             slots=lambda m, root, s: {},
             summary=lambda m, root, rel: (
                 f"Scaffolded `{rel}`, a bounded authorized HTTP traffic client with explicit "

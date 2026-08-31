@@ -211,7 +211,8 @@ def _reorder_by_priors(classes: list[str], priors: dict[str, float] | None) -> l
 
 
 def _rank(candidates: list[str], priors: dict[str, float] | None, model: Any | None,
-          url: str, names: list[str], recon: list[str], tech: str) -> list[str]:
+          url: str, names: list[str], recon: list[str], tech: str,
+          form: dict[str, Any] | None = None) -> list[str]:
     """Order the candidate classes for ONE endpoint — the single seam a learned ranker may occupy.
 
     The model may only PERMUTE ``candidates``. A returned value that is not a permutation of exactly
@@ -226,7 +227,8 @@ def _rank(candidates: list[str], priors: dict[str, float] | None, model: Any | N
     if model is None:
         return _reorder_by_priors(candidates, priors)
     try:
-        ranked = list(model.rank_endpoint_classes(url, names, recon, tech, list(candidates), priors))
+        ranked = list(model.rank_endpoint_classes(url, names, recon, tech, list(candidates), priors,
+                                                  form=form))
     except Exception:  # noqa: BLE001 - a corrupt model must never break the offline plan
         return _reorder_by_priors(candidates, priors)
     if sorted(ranked) != sorted(candidates):  # not a permutation -> the model invented/dropped a class
@@ -269,6 +271,23 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
     endpoints = [str(u).strip() for u in (surface.get("endpoints") or []) if str(u or "").strip()]
     recon_params = {str(p).strip().lower() for p in (surface.get("params") or []) if str(p or "").strip()}
     tech = " ".join(str(t) for t in (surface.get("tech") or [])).lower()
+    # Keyed by form action, EXACTLY as hunt_train._collect keys it -- the learned ranker is fitted
+    # on the form:* feature namespace, so the serving path has to be able to produce it too.
+    # SANITISED on the way in: only the method and the field NAMES cross the seam, never a field
+    # VALUE. hunt_features reads nothing else, and the seam's contract is that a weight file --
+    # possibly stale or hostile -- is handed no page content.
+    forms_by_action: dict[str, dict[str, Any]] = {}
+    for _form in (surface.get("forms") or []):
+        if not isinstance(_form, dict):
+            continue
+        _action = str(_form.get("action") or "").strip()
+        if not _action or _action in forms_by_action:
+            continue
+        _fields = _form.get("params")
+        forms_by_action[_action] = {
+            "method": str(_form.get("method") or "GET"),
+            "params": [str(f) for f in _fields] if isinstance(_fields, list) else [],
+        }
     tech_boost = tuple(dict.fromkeys(c for key, cs in _TECH_CLASS.items() if key in tech for c in cs))
 
     ssrf_params: list[str] = []
@@ -285,7 +304,8 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
         names = _endpoint_params(url) or []
         alln = names + sorted(recon_params)
         candidates = _classes_for_endpoint(url, alln, tech_boost)
-        classes = _rank(candidates, priors, model, url, names, sorted(recon_params), tech)
+        classes = _rank(candidates, priors, model, url, names, sorted(recon_params), tech,
+                        forms_by_action.get(url))
         if classes and url not in seen_pri:
             seen_pri.add(url)
             priority.append({"endpoint": url, "classes": classes})

@@ -221,6 +221,8 @@ class Ranker:
         tech: str,
         candidates: list[str],
         priors: dict[str, float] | None = None,
+        *,
+        form: dict[str, Any] | None = None,
     ) -> list[str]:
         """Reorder ``candidates`` most-likely-first. ALWAYS a permutation of the input.
 
@@ -234,7 +236,12 @@ class Ranker:
         if len(ordered) < 2:
             return ordered
         try:
-            feats = hunt_features.endpoint_features(url, query_names, recon_params, tech)
+            # ``form`` MUST be threaded here. hunt_train._collect fits on the 5-argument vector,
+            # so omitting it made every `form:*` weight unreachable at inference -- and because
+            # MAX_FEATURES truncates the SORTED key list and `form:` sorts ahead of `param:`/
+            # `path:`/`shape:`/`tech:`, a capped endpoint produced a materially different vector
+            # in the two paths. Train and serve now build the identical map.
+            feats = hunt_features.endpoint_features(url, query_names, recon_params, tech, form)
             scored = [self.score(c, feats) * self._prior(priors, c) for c in ordered]
             index = sorted(range(len(ordered)), key=lambda i: (-scored[i], i))
             return [ordered[i] for i in index]
