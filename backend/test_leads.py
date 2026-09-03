@@ -146,6 +146,44 @@ class RedactionTests(unittest.TestCase):
         # The brief must be wrapped as untrusted data for a model.
         self.assertIn("UNTRUSTED", brief.upper())
 
+    def test_credential_in_the_target_url_is_not_exported(self) -> None:
+        """Operator-supplied metadata is a real leak path: a hunt is routinely started against a
+        signed URL or an OAuth callback carrying ?token=... . That value reaches `doc["target"]`
+        verbatim, and the queue AND the model-bound brief both render it."""
+        findings, plans = _confirmed_idor()
+        doc = _build_sidecar(findings, plans)
+        doc["target"] = f"https://app.example.com/cb?token={_SECRET}"
+        doc["scope"] = f"in scope: https://app.example.com/cb?token={_SECRET}"
+        report = leads.build_lead_report_from_doc(doc, source_path=f"/tmp/hunt?key={_SECRET}.json")
+        self.assertNotIn(_SECRET, json.dumps(report, default=str))
+        self.assertNotIn(_SECRET, leads.render_lead_brief(report, wrap=True))
+
+    def test_plan_supplied_proof_obligation_is_scrubbed(self) -> None:
+        """The cortex copies a plan's proof_of_impact.proof_obligation through verbatim into
+        hypotheses[].next_action and .gaps, and service/brain-built plans interpolate live URLs and
+        captured text into it with no redaction at the source."""
+        findings, plans = _confirmed_idor()
+        plans["F1"]["proof_of_impact"]["proof_obligation"] = (
+            f"Replay with the captured session token {_SECRET} against /api/account/1001/export."
+        )
+        doc = _build_sidecar(findings, plans)
+        report = leads.build_lead_report_from_doc(doc)
+        lead = report["hunts"][0]["leads"][0]
+        self.assertNotIn(_SECRET, lead["proof_obligation"])
+        self.assertNotIn(_SECRET, json.dumps(report, default=str))
+        self.assertNotIn(_SECRET, leads.render_lead_brief(report, wrap=True))
+
+    def test_export_never_mutates_the_callers_document(self) -> None:
+        """The defensive secret scrub assigns INTO nested proof_evidence/_credential_proof dicts, so
+        a shallow copy would rewrite the caller's own live document as a side effect of exporting."""
+        findings, plans = _confirmed_idor()
+        findings[0]["secret_value"] = _SECRET
+        findings[0]["proof_evidence"]["matched_value"] = _SECRET
+        doc = _build_sidecar(findings, plans)
+        before = json.dumps(doc, default=str)
+        leads.build_lead_report_from_doc(doc)
+        self.assertEqual(json.dumps(doc, default=str), before)
+
     def test_raw_carriers_are_not_even_keys_in_the_evidence(self) -> None:
         # Allowlist, not denylist: the dangerous fields are absent by construction, not stripped.
         findings, plans = _confirmed_idor()

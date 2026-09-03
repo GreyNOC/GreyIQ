@@ -672,6 +672,12 @@ class CampaignStopRequest(BaseModel):
     run_id: str = Field(min_length=1, max_length=100)
 
 
+class LeadsRequest(BaseModel):
+    # Download the finished hunt's investigation queue as a Markdown brief. Keyed by the cached
+    # run_id ONLY — the sidecar path is resolved server-side, so no client-supplied path is read.
+    run_id: str = Field(min_length=1, max_length=100)
+
+
 class PortfolioRequest(BaseModel):
     # Portfolio Hunt: run a full campaign across MANY saved programs concurrently (bounded).
     program_ids: list[str] = Field(default_factory=list, max_length=50)
@@ -3355,6 +3361,47 @@ class GreyIQRuntime:
                             "proof_status": item["proof_status"] or "candidate"})
         return summary
 
+    def export_leads(self, request: "LeadsRequest") -> dict[str, Any]:
+        """Render the finished hunt's investigation queue as ONE Markdown brief for download.
+
+        This is the in-app face of ``gn leads --brief``: the operator gets the ranked leads, their
+        evidence state, the contradictions against each, and the exact proof obligation that would
+        confirm it — as a single file they can hand to an analyst or paste to a model.
+
+        The sidecar is located from the CACHED RUN (never a client-supplied path), so this route
+        cannot be walked into an arbitrary file read. The brief is built by ``leads``, which projects
+        through a strict allowlist and scrubs every field, so no raw credential, response body, page
+        source, or screenshot path can ride along.
+        """
+        from bughunter import leads as leads_lib
+
+        with self.lock:
+            run = self.bounty_runs.get(request.run_id)
+        if not run:
+            return {"ok": False, "error": "This run is no longer cached — re-run the hunt to rebuild its leads."}
+        art = run.get("artifacts") or {}
+        # A campaign writes per-target sidecars under its own folder; a single hunt writes one JSON.
+        # Point the bridge at the folder for a campaign so it sweeps every target's leads.
+        source = str(art.get("output_dir") or "") if art.get("is_campaign") else str(art.get("json_path") or "")
+        if not source or not Path(source).exists():
+            return {"ok": False, "error": "This run's report file is no longer on disk — re-run the hunt."}
+        try:
+            report = leads_lib.build_lead_report(source)
+            markdown = leads_lib.render_lead_brief(report, wrap=True)
+        except Exception as exc:  # noqa: BLE001 - a download must fail with a message, not a 500
+            return {"ok": False, "error": f"Could not build the lead brief: {exc}"}
+        lead_count = sum(len(h.get("leads") or []) for h in report.get("hunts") or [])
+        safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "-" for c in str(s))[:48]  # noqa: E731
+        host = urlparse(str(run.get("target") or "")).hostname or str(run.get("target") or "hunt")
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        return {
+            "ok": True,
+            "markdown": markdown,
+            "filename": f"greyiq-leads-{safe(host)}-{stamp}.md",
+            "lead_count": lead_count,
+            "hunts": len(report.get("hunts") or []),
+        }
+
     def export_bundle(self, request: "BundleRequest") -> dict[str, Any]:
         """Zip the whole engagement (reports, per-platform packages, evidence,
         screenshots, research dossiers, JSON, replay.sh/findings.har, and a triager-facing
@@ -5629,6 +5676,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/bundle":
             request = validate_payload(BundleRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.export_bundle, request))
+            return
+        if method == "POST" and path == "/api/bounty/leads":
+            request = validate_payload(LeadsRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.export_leads, request))
             return
         if method == "POST" and path == "/api/bounty/research":
             request = validate_payload(ResearchRequest, await read_json_body(receive))

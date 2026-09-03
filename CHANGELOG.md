@@ -2,6 +2,37 @@
 
 Notable changes to GreyIQ.
 
+## v4.2.1 - download the hunt's leads, and four review fixes
+
+### Download leads (.md)
+
+The Hunt cockpit gains a **Download leads (.md)** button beside *Copy report*. It renders the
+finished hunt's whole investigation queue as ONE Markdown brief - every lead with its evidence
+state, the contradictions against it, and the exact artifact that would confirm it - ready to hand
+to an analyst or paste to a model. It is the in-app face of `gn leads --brief`, built through the
+same redaction-safe bridge, and the new `/api/bounty/leads` route resolves the sidecar from the
+**cached run id only**, so no client-supplied path is ever read.
+
+### Review fixes
+
+- **Negative knowledge no longer learns from a truncated run.** The prover walks `probe_priority` in
+  order and stops when its request budget is gone, so on a partial run the tail of the plan was never
+  probed. Recording those as misses conflated "never executed" with "executed and inert" and would
+  have systematically cooled exactly the endpoints that never got a fair chance. `record_hunt` now
+  takes `complete` (default **False**) and records misses only when the run errored nowhere, was in
+  scope, and was neither rate-limited nor skipped. Confirmations are still recorded either way -
+  they only ever grant immunity.
+- **The lead export no longer leaks operator-supplied metadata.** A hunt started against a signed URL
+  or a callback carrying `?token=...` put that value verbatim into `target`/`scope`/`path`, which the
+  JSON queue and the model-bound brief both rendered. All three now go through the scrubber like
+  every other field. (Reproduced, then pinned by test.)
+- **Proof equality is decided on the whole value, not a 2 kB prefix.** A full HTTP/HTML capture
+  routinely shares thousands of characters of boilerplate before the record that differs, so the old
+  prefix window could call a REAL differential identical and silently downgrade a confirmed finding
+  to candidate.
+- **`gn leads --brief` now honours `--status` / `--min-confidence`.** Filtering moved ahead of the
+  render branch; it previously applied only to the JSON and terminal output.
+
 ## v4.2.0 - negative knowledge: the hunt stops re-testing inert ground
 
 A hunt's probe budget is hard-capped (`offline_hunt._MAX_PRIORITY`) - the prover walks a ranked

@@ -118,6 +118,10 @@ per-program SSRF/OOB setup, running a hunt, and reports & submission. The cockpi
 a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the top bar).
 
 - **Scan** from chat: `scan code <path|repo>`, `scan web <url>`, `scan live <url>`.
+- **Download leads (.md)** — after a hunt finishes, the button beside *Copy report* in the Hunt
+  cockpit downloads the whole investigation queue as one Markdown brief: every lead with its
+  evidence state, the contradictions against it, and the exact artifact that would confirm it.
+  That file is what you hand to an analyst (or paste to Claude) to work the leads.
 - **Investigate leads with Claude**: `gn leads <bounty-*.json | engagement-folder>` exports a
   finished hunt's ranked investigation queue — the cortex's hypotheses, ordered attack chains,
   contradictions, and the exact proof obligation for each lead — as a stable, **redaction-safe**

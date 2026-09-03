@@ -387,13 +387,11 @@ def _cmd_leads(args: argparse.Namespace) -> int:
     from bughunter import leads as leads_lib
 
     report = leads_lib.build_lead_report(args.path)
-    if args.brief:
-        # A Markdown investigation brief, wrapped as untrusted data — ready to hand to a model.
-        print(leads_lib.render_lead_brief(report, ref=args.ref, wrap=not args.no_wrap))
-        return 0
 
-    # Optional filtering happens on the projected queue (never the raw sidecar), so a filtered
-    # export is the same shape as an unfiltered one — just fewer leads.
+    # Filter FIRST, so every renderer below sees the same queue. --brief used to return before this,
+    # which silently ignored --status/--min-confidence on exactly the output most likely to be handed
+    # to an analyst. Filtering happens on the projected queue (never the raw sidecar), so a filtered
+    # export keeps the same shape as an unfiltered one — just fewer leads.
     if args.ref or args.status or args.min_confidence is not None:
         for queue in report.get("hunts", []):
             queue["leads"] = [
@@ -402,6 +400,11 @@ def _cmd_leads(args: argparse.Namespace) -> int:
                 and (not args.status or _lead_matches_status(lead, args.status))
                 and (args.min_confidence is None or _lead_confidence(lead) >= args.min_confidence)
             ]
+
+    if args.brief:
+        # A Markdown investigation brief, wrapped as untrusted data — ready to hand to a model.
+        print(leads_lib.render_lead_brief(report, ref=args.ref, wrap=not args.no_wrap))
+        return 0
 
     if args.json:
         print(json.dumps(report, indent=2, default=str))

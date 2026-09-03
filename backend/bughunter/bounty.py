@@ -2205,9 +2205,10 @@ def _run_bounty_hunt_body(
                 if _cooled:
                     hb, _supp = negative_knowledge.apply_suppression(
                         hb, _cooled, changed_endpoints=negative_knowledge.changed_endpoint_keys(drift))
-                    if _supp.get("downranked") or _supp.get("dropped"):
-                        _emit(f"negative knowledge: deprioritised {_supp.get('downranked', 0)} and dropped "
-                              f"{_supp.get('dropped', 0)} tested-inert endpoint/class pair(s) from earlier hunts")
+                    if _supp.get("downranked"):
+                        _emit(f"negative knowledge: deprioritised {_supp.get('downranked', 0)} tested-inert "
+                              f"endpoint/class pair(s) from earlier hunts "
+                              f"({_supp.get('fully_cooled', 0)} endpoint(s) fully cooled)")
             except Exception:  # noqa: BLE001 - suppression is an optimizer, never a hunt breaker
                 pass
             # Capture the (surface, plan) input side for the trace log. effective_extra_params is
@@ -2789,8 +2790,44 @@ def _run_bounty_hunt_body(
             # immunized. This is what the NEXT run's cooled_pairs() reads to deprioritise inert ground.
             # record_hunt is internally fail-closed; it also honours the GREYIQ_NO_NEGATIVE_KNOWLEDGE
             # kill switch and runtime_dir is None.
+            #
+            # `complete` decides whether MISSES may be recorded at all. The prover walks
+            # probe_priority in order and stops when its request budget is gone, so on a truncated run
+            # the TAIL of the plan was never probed — recording those as misses would conflate "never
+            # executed" with "executed and inert" and would systematically cool exactly the endpoints
+            # that never got a fair chance. Only a run that errored nowhere, was in scope, was not
+            # rate-limited and was not skipped may teach a negative; confirmations are recorded either
+            # way, since they only ever grant immunity.
+            _nk_complete = (
+                not scan_errors
+                and active_meta.get("in_scope") is True
+                and not active_meta.get("rate_limited")
+                and not str(active_meta.get("skipped_reason") or "").strip()
+            )
+            # IMMUNITY MUST BE DECIDED ON WHAT THE ENGINE PROVED, NOT ON WHAT THIS REPORT SHOWED.
+            # `_trace_outcomes` is built from the REPORTABLE findings, which the report-side filters
+            # above already narrowed: the focus class (`-c xss` shows only xss — it never restricts
+            # what the prover probed), duplicate-lead grouping, and operator dismissals. A pair that
+            # genuinely confirmed can therefore be missing from those outcomes, and would then be
+            # written down as a MISS — cooling a route the engine actually proved, which is exactly
+            # the ever_confirmed immunity this store promises. So fold in every UNFILTERED finding the
+            # confirm gate accepts before recording.
+            _nk_outcomes = list(_trace_outcomes)
+            for _f in annotated:
+                if not isinstance(_f, dict) or not _f.get("class_id"):
+                    continue
+                try:
+                    if investigator.has_confirming_artifact(_f, {}):
+                        _nk_outcomes.append({
+                            "endpoint": str(_f.get("location") or _f.get("source_url") or clean_target),
+                            "class": str(_f.get("class_id") or ""),
+                            "proof_status": "confirmed",
+                        })
+                except Exception:  # noqa: BLE001 - immunity bookkeeping must never break a hunt
+                    continue
             negative_knowledge.record_hunt(runtime_dir, program=None, target=clean_target,
-                                           plan=hunt_trace_plan, outcomes=_trace_outcomes)
+                                           plan=hunt_trace_plan, outcomes=_nk_outcomes,
+                                           complete=bool(_nk_complete))
             # This run becomes the next run's baseline. Recorded here, beside the trace, and on
             # the same condition — only a direct hunt does its own recon, so only a direct hunt
             # observed a surface to remember. The blocked chains travel with it: that is what

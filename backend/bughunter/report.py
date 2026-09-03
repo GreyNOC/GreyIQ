@@ -545,13 +545,17 @@ def _proof_text_is_concrete(text: str) -> bool:
 # differential — so it is not an artifact. Keeping the normalization in one place is what stops
 # the two authorities from parting again; see investigator.has_confirming_artifact for the
 # post-mortem of the last time they did.
-_PROOF_TEXT_LIMIT = 2000
+# A generous SAFETY bound only — never a comparison window. Equality must be decided on the WHOLE
+# normalized value: a full HTTP/HTML capture routinely shares thousands of characters of boilerplate
+# before the record or marker that differs, so deciding "identical" from a prefix would refuse a
+# REAL differential and silently downgrade a confirmed finding to candidate. Captured proof text is
+# already bounded far below this upstream (proof_evidence.read_data caps at 8 kB).
+_PROOF_TEXT_LIMIT = 200_000
 
 
 def normalize_proof_text(value: Any, limit: int = _PROOF_TEXT_LIMIT) -> str:
-    """Canonical form for comparing an observed result against its control: bounded, whitespace-
-    collapsed, case-folded. Stripped then bounded, exactly as the cortex's ``_text`` does, so both
-    sides see the same prefix; the cap keeps the comparison flat on a huge captured body."""
+    """Canonical form for comparing an observed result against its control: whitespace-collapsed and
+    case-folded over the ENTIRE value, with only a pathological-input safety bound applied."""
     text = str(value or "").strip()[:limit]
     return re.sub(r"\s+", " ", text).strip().lower()
 
@@ -1358,6 +1362,13 @@ def _append_qa(out: list[str], ctx: dict[str, Any]) -> None:
         return
     corrections = [i for i in issues
                    if any(word in str(i.get("action") or "").lower() for word in ("downgrad", "cap", "removed"))]
+    # An issue can flag a claim the evidence does not support WITHOUT applying a severity correction
+    # (the class-general claim-integrity checks are informational — the renderer has already shown the
+    # finding as `candidate`, so re-punishing it on the severity side would double-count). The closing
+    # line must therefore not be derived from the corrections list alone: doing so printed "all claims
+    # matched the captured evidence" directly beneath a bullet reading "(unsupported)", in the one
+    # section whose entire purpose is showing a triager that GreyIQ audits its own claims.
+    flagged = [i for i in issues if str(i.get("verdict") or "").strip().lower() in {"unsupported", "no"}]
     out.append("## Pre-export QA (evidence vs claim)\n")
     out.append(
         "Before export, GreyIQ verifies that every severity and impact claim is backed by the captured "
@@ -1382,6 +1393,9 @@ def _append_qa(out: list[str], ctx: dict[str, Any]) -> None:
     if corrections:
         out.append(f"_{len(corrections)} downgrade-only correction(s) applied. GreyIQ never raises a severity here — "
                    "only lowers one to match the evidence._")
+    elif flagged:
+        out.append(f"_No severity correction was required, but {len(flagged)} claim(s) above are not backed by the "
+                   "captured evidence and are reported as unconfirmed rather than proven._")
     else:
         out.append("_All claims matched the captured evidence; no severity corrections were required._")
     out.append("")

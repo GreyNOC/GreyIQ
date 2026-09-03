@@ -126,6 +126,27 @@ def discover_sidecars(path: str | Path) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 
+def _deep_copy_findings(findings: Any) -> list[dict[str, Any]]:
+    """Deep-copy the finding dicts so the defensive scrub can never write through into the caller's
+    document. JSON round-trip where possible (fast, and the sidecar is JSON by construction); a
+    finding carrying a non-serialisable value falls back to copy.deepcopy, and only a finding that
+    defeats both is shallow-copied — still better than sharing."""
+    import copy
+
+    out: list[dict[str, Any]] = []
+    for finding in findings if isinstance(findings, list) else []:
+        if not isinstance(finding, dict):
+            continue
+        try:
+            out.append(json.loads(json.dumps(finding, default=str)))
+        except (TypeError, ValueError):
+            try:
+                out.append(copy.deepcopy(finding))
+            except Exception:  # noqa: BLE001 - never fail an export over a copy
+                out.append(dict(finding))
+    return out
+
+
 def _evidence_for(finding: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
     """Project ONE finding's evidence through the allowlist. Never emits a raw body, credential,
     snippet, screenshot path, or source_text — only redacted, bounded, structurally-safe fields."""
@@ -155,9 +176,14 @@ def _evidence_for(finding: dict[str, Any], plan: dict[str, Any]) -> dict[str, An
 def _hunt_meta(doc: dict[str, Any], source_path: str) -> dict[str, Any]:
     profile = doc.get("profile") if isinstance(doc.get("profile"), dict) else {}
     return {
-        "path": source_path,
-        "target": _s(doc.get("target"), 500),
-        "scope": _s(doc.get("scope"), 500),
+        # target/scope/path are OPERATOR-SUPPLIED and can carry a credential: a hunt is routinely
+        # started against a signed URL or a callback carrying ?token=..., and that value would
+        # otherwise be exported verbatim into both the JSON queue and the model-bound brief — the one
+        # artifact explicitly built to leave the machine. They go through the scrubber like every
+        # other free-text field; a normal URL or path is unchanged by it.
+        "path": _redacted(source_path, 500),
+        "target": _redacted(doc.get("target"), 500),
+        "scope": _redacted(doc.get("scope"), 500),
         "profile": _s(profile.get("id") or profile.get("name"), 80),
         "generated_at": _s(doc.get("generated_at"), 60),
         "version": _s(doc.get("version"), 40),
@@ -175,9 +201,13 @@ def build_lead_queue(doc: dict[str, Any], *, source_path: str = "") -> dict[str,
     fail-soft: a missing or malformed ``investigation`` yields an empty ``leads`` list, never a raise."""
     findings = doc.get("findings") if isinstance(doc.get("findings"), list) else []
     plans = doc.get("attack_plans") if isinstance(doc.get("attack_plans"), dict) else {}
-    # Work on a COPY and re-run classification defensively: idempotent, and it scrubs any raw secret
-    # that a producer left on the finding before we project it. Mutating here never touches the file.
-    safe_findings = [dict(f) for f in findings if isinstance(f, dict)]
+    # Work on a DEEP copy and re-run classification defensively: idempotent, and it scrubs any raw
+    # secret a producer left on the finding before we project it. The copy must be deep — a shallow
+    # dict(f) shares the nested proof_evidence / _credential_proof objects with the caller's document,
+    # and _scrub_raw_secret assigns INTO those, so exporting would silently rewrite the caller's own
+    # findings. That is invisible when the doc came off disk and a real surprise when it did not
+    # (build_lead_report_from_doc is handed a live in-memory document).
+    safe_findings = _deep_copy_findings(findings)
     try:
         secret_classification.apply_secret_classification(safe_findings)
     except Exception:  # noqa: BLE001 - a classification hiccup must never break the export
@@ -229,10 +259,14 @@ def build_lead_queue(doc: dict[str, Any], *, source_path: str = "") -> dict[str,
             "decision": _s(row.get("decision"), 40),
             "report_ready": bool(row.get("report_ready")),
             "location": _redacted(row.get("location"), 500),
+            # `artifacts` is a closed vocabulary of type NAMES, so it is structurally value-free.
             "artifacts": [_s(a, 60) for a in (row.get("artifacts") or []) if _s(a, 60)][:12],
-            "gaps": [_s(g, 400) for g in (row.get("gaps") or []) if _s(g, 400)][:6],
+            # `gaps` and `proof_obligation` are NOT: the cortex copies a plan-supplied
+            # proof_of_impact.proof_obligation through verbatim, and service- and brain-built plans
+            # interpolate live URLs and captured text into it without redacting at the source.
+            "gaps": [g for g in (_redacted(x, 400) for x in (row.get("gaps") or [])) if g][:6],
             # THE single most useful field for an analyst: the exact artifact that would confirm it.
-            "proof_obligation": _s(row.get("next_action"), 800),
+            "proof_obligation": _redacted(row.get("next_action"), 800),
             "contradictions": contradictions_by_ref.get(ref, []),
             "in_chains": chains_by_ref.get(ref, []),
             "chain_candidate": bool(row.get("chain_candidate")),
@@ -269,7 +303,8 @@ def _project_chain(chain: dict[str, Any]) -> dict[str, Any]:
             "evidence_location": _redacted(step.get("evidence_location"), 500),
             "proven": bool(step.get("proven")),
             "state": _s(step.get("state"), 20),
-            "next_action": _s(step.get("next_action"), 600),
+            # Inherits the same plan-sourced obligation text as a lead's proof_obligation.
+            "next_action": _redacted(step.get("next_action"), 600),
         })
     return {
         "id": _s(chain.get("id"), 20),
@@ -284,7 +319,7 @@ def _project_chain(chain: dict[str, Any]) -> dict[str, Any]:
         "step_count": chain.get("step_count"),
         "proven_steps": chain.get("proven_steps"),
         "blocking_step": chain.get("blocking_step"),
-        "next_action": _s(chain.get("next_action"), 800),
+        "next_action": _redacted(chain.get("next_action"), 800),
         "steps": steps,
     }
 
@@ -335,7 +370,8 @@ def build_lead_report_from_doc(doc: dict[str, Any], *, source_path: str = "") ->
     hunts = [build_lead_queue(doc, source_path=source_path)] if is_hunt_sidecar(doc) else []
     return {
         "schema": SCHEMA_VERSION,
-        "source": {"path": source_path, "sidecars": 1 if hunts else 0, "hunts": len(hunts)},
+        # Scrubbed like every other operator-supplied string — a path can carry a credential too.
+        "source": {"path": _redacted(source_path, 500), "sidecars": 1 if hunts else 0, "hunts": len(hunts)},
         "hunts": hunts,
     }
 
@@ -355,7 +391,7 @@ def build_lead_report(path: str | Path) -> dict[str, Any]:
             hunts.append(build_lead_queue(doc, source_path=str(sidecar)))
     return {
         "schema": SCHEMA_VERSION,
-        "source": {"path": str(path), "sidecars": len(sidecars), "hunts": len(hunts)},
+        "source": {"path": _redacted(str(path), 500), "sidecars": len(sidecars), "hunts": len(hunts)},
         "hunts": hunts,
     }
 
