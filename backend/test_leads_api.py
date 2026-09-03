@@ -86,6 +86,17 @@ class ExportLeadsTests(unittest.TestCase):
         self.assertNotIn(_SECRET, res["markdown"])
         self.assertNotIn(_SECRET, json.dumps(res, default=str))
 
+    def test_credential_in_a_non_url_target_never_reaches_the_filename(self) -> None:
+        """A source hunt names a local folder, so urlparse yields no hostname and the filename falls
+        back to the raw target. The slugger only rewrites punctuation, so a credential in an opaque
+        target would survive into the download filename even though the brief itself is scrubbed."""
+        run_id = self._cache_run(target=f"/tmp/token-{_SECRET}/repo")
+        res = self.rt.export_leads(g.LeadsRequest(run_id=run_id))
+        self.assertTrue(res["ok"], res)
+        self.assertNotIn(_SECRET, res["filename"])
+        self.assertNotIn(_SECRET, json.dumps(res, default=str))
+        self.assertTrue(res["filename"].endswith(".md"))
+
     def test_unknown_run_is_refused_without_reading_anything(self) -> None:
         res = self.rt.export_leads(g.LeadsRequest(run_id="no-such-run"))
         self.assertFalse(res["ok"])
