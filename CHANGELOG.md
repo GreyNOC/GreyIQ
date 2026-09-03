@@ -2,6 +2,33 @@
 
 Notable changes to GreyIQ.
 
+## v4.2.0 - negative knowledge: the hunt stops re-testing inert ground
+
+A hunt's probe budget is hard-capped (`offline_hunt._MAX_PRIORITY`) - the prover walks a ranked
+`probe_priority` list in order and stops when the budget runs out. On a **re-scan** of a program that
+budget was re-spent on the same `(endpoint, class)` pairs that were probed and produced nothing last
+time, crowding out surface that had never been looked at. The engine had no memory of what did NOT
+work.
+
+New `bughunter/negative_knowledge.py` gives it one. A planned `(endpoint, class)` that did not
+confirm is recorded as a **miss**; on the next run the cooled pairs are downranked so the budget
+flows to fresh surface instead.
+
+- **Endpoint-scoped, not class-scoped.** This deliberately complements
+  `brain_techniques.learned_hunt_priors` (which nudges a whole vulnerability CLASS down after
+  repeated misses program-wide) rather than duplicating it: a class that is dead on `/login` stays
+  fully hunted on every other route. Endpoints are keyed `host/path` with numeric, hex and UUID
+  segments collapsed, so `/order/1001` and `/order/2999` share one memory.
+- **It cannot blind the hunt.** Every safeguard is tested: a pair needs 2 misses before it is even
+  eligible; anything **ever confirmed is immunized permanently**; misses **decay after 45 days** and
+  earn a fresh probe; a pair is **re-enabled the instant `surface_drift` reports its endpoint
+  changed** (the "unless new evidence changes the situation" clause); suppression only **downranks**
+  within an endpoint, dropping a row only when *every* class on it is cooled; and
+  `GREYIQ_NO_NEGATIVE_KNOWLEDGE=1` turns the whole layer off.
+- **Honest by construction.** A miss is derived only from the same `(plan, outcomes)` pair the hunt
+  trace already records - no finer signal is invented than the engine actually observed. Recording
+  and suppression are both best-effort and fail-closed, so this bookkeeping can never break a hunt.
+
 ## v4.1.0 - evidence integrity, and the lead bridge to Claude
 
 Three changes that make GreyIQ better at *reasoning through* a hunt, not just recording one — and

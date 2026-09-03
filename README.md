@@ -151,6 +151,13 @@ a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the
   submit on its dashboard). URL targets can
   opt into the live browser pass, and focus classes also cover CSRF, CORS, open
   redirect, unsafe file upload, business logic, and supply-chain/dependency risk.
+- **Negative knowledge** — GreyIQ remembers what it already probed and did **not** confirm. A
+  planned `(endpoint, class)` that yields nothing becomes a *miss*; after two misses the pair is
+  downranked on the next hunt so the capped probe budget goes to surface that has never been looked
+  at, instead of re-testing inert ground. It can never blind a hunt: anything ever confirmed is
+  immune forever, misses decay after 45 days, a pair is re-enabled the moment **surface drift**
+  reports its endpoint changed, and suppression only reorders (dropping an endpoint only when every
+  class on it is cooled). Set `GREYIQ_NO_NEGATIVE_KNOWLEDGE=1` to turn it off.
 - **Agent security test** — red-teams GreyIQ's own agent in a throwaway sandbox
   (sandbox/policy probes always; opt-in prompt-injection + jailbreak behavioral probes)
   and reports a posture verdict.
