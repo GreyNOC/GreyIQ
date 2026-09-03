@@ -118,6 +118,16 @@ per-program SSRF/OOB setup, running a hunt, and reports & submission. The cockpi
 a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the top bar).
 
 - **Scan** from chat: `scan code <path|repo>`, `scan web <url>`, `scan live <url>`.
+- **Investigate leads with Claude**: `gn leads <bounty-*.json | engagement-folder>` exports a
+  finished hunt's ranked investigation queue — the cortex's hypotheses, ordered attack chains,
+  contradictions, and the exact proof obligation for each lead — as a stable, **redaction-safe**
+  `greyiq-lead-queue-v1`. Each lead carries its own evidence state, the contradictions that cite it,
+  and the chains it belongs to, inline. `--json` emits the machine queue; `--brief` renders a
+  Markdown investigation brief wrapped as untrusted data, ready to hand to a configured Claude brain
+  (or to Claude Code) to work lead by lead; `--status` / `--ref` / `--min-confidence` filter it. It
+  is assembled from a strict field allowlist and scrubs every field, so no raw credential, response
+  body, page source, or screenshot path ever leaves the machine — only the differential and the
+  safe sensitive-data labels.
 - **OSINT campaigns from the local CLI**: `gn osint example.com` correlates two public
   certificate-transparency indexes with Google and Cloudflare DNS, keeps claim-level source
   provenance, and writes `OSINT.md` + `osint.json`. Add `--hunt --scope "*.example.com" -y`
@@ -141,6 +151,13 @@ a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the
   submit on its dashboard). URL targets can
   opt into the live browser pass, and focus classes also cover CSRF, CORS, open
   redirect, unsafe file upload, business logic, and supply-chain/dependency risk.
+- **Negative knowledge** — GreyIQ remembers what it already probed and did **not** confirm. A
+  planned `(endpoint, class)` that yields nothing becomes a *miss*; after two misses the pair is
+  downranked on the next hunt so the capped probe budget goes to surface that has never been looked
+  at, instead of re-testing inert ground. It can never blind a hunt: anything ever confirmed is
+  immune forever, misses decay after 45 days, a pair is re-enabled the moment **surface drift**
+  reports its endpoint changed, and suppression only reorders (dropping an endpoint only when every
+  class on it is cooled). Set `GREYIQ_NO_NEGATIVE_KNOWLEDGE=1` to turn it off.
 - **Agent security test** — red-teams GreyIQ's own agent in a throwaway sandbox
   (sandbox/policy probes always; opt-in prompt-injection + jailbreak behavioral probes)
   and reports a posture verdict.

@@ -372,6 +372,106 @@ def _cmd_traces(args: argparse.Namespace) -> int:
     return 0
 
 
+_LEAD_STATUS_COLOR = {
+    "confirmed": "32", "supported": "36", "candidate": "33",
+    "contradicted": "1;31", "report-now": "32",
+}
+
+
+def _cmd_leads(args: argparse.Namespace) -> int:
+    """Export a finished hunt's ranked investigation queue — the lead bridge.
+
+    Reads a hunt's JSON sidecar (or sweeps an engagement directory) and emits the cortex's
+    hypotheses, chains, contradictions, and proof obligations as a redaction-safe queue an
+    analyst — or a configured Claude brain — can work lead by lead."""
+    from bughunter import leads as leads_lib
+
+    report = leads_lib.build_lead_report(args.path)
+    if args.brief:
+        # A Markdown investigation brief, wrapped as untrusted data — ready to hand to a model.
+        print(leads_lib.render_lead_brief(report, ref=args.ref, wrap=not args.no_wrap))
+        return 0
+
+    # Optional filtering happens on the projected queue (never the raw sidecar), so a filtered
+    # export is the same shape as an unfiltered one — just fewer leads.
+    if args.ref or args.status or args.min_confidence is not None:
+        for queue in report.get("hunts", []):
+            queue["leads"] = [
+                lead for lead in queue.get("leads", [])
+                if (not args.ref or lead.get("id") == args.ref)
+                and (not args.status or _lead_matches_status(lead, args.status))
+                and (args.min_confidence is None or _lead_confidence(lead) >= args.min_confidence)
+            ]
+
+    if args.json:
+        print(json.dumps(report, indent=2, default=str))
+        return 0
+
+    hunts = report.get("hunts") or []
+    if not hunts:
+        found = report.get("source", {}).get("sidecars", 0)
+        if found:
+            return _err(f"no GreyIQ hunt sidecar with an investigation graph under {args.path}.")
+        return _err(f"no hunt report found at {args.path} — pass a bounty-*.json sidecar or an engagement folder.")
+    for queue in hunts:
+        _print_lead_queue(queue)
+    return 0
+
+
+def _lead_confidence(lead: dict) -> int:
+    try:
+        return int(lead.get("confidence_score") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _lead_matches_status(lead: dict, status: str) -> bool:
+    want = status.strip().lower()
+    if want in {"report-ready", "ready"}:
+        return bool(lead.get("report_ready"))
+    return str(lead.get("status") or "").lower() == want
+
+
+def _print_lead_queue(queue: dict) -> None:
+    hunt = queue.get("hunt") or {}
+    metrics = queue.get("metrics") or {}
+    print(f"\n{_c('GreyIQ leads', '1')} — {hunt.get('target') or '(unknown target)'}")
+    verdict = queue.get("verdict") or ""
+    if verdict:
+        print(f"Verdict: {verdict}")
+    print(
+        f"Leads: {metrics.get('hypotheses', len(queue.get('leads') or []))}  "
+        f"{_c(str(metrics.get('confirmed', 0)) + ' confirmed', '32')}  "
+        f"{metrics.get('supported', 0)} supported  {metrics.get('contradictions', 0)} contradiction(s)  "
+        f"{metrics.get('attack_chains', 0)} chain(s)"
+    )
+    leads = queue.get("leads") or []
+    if not leads:
+        print("  (no leads at this depth)")
+        return
+    for lead in leads:
+        status = str(lead.get("status") or "")
+        color = _LEAD_STATUS_COLOR.get(status, "0")
+        rank = lead.get("rank")
+        tag = _c(f"[{lead.get('id')}]", "1")
+        print(f"  {tag} {lead.get('title') or 'Lead'}")
+        print(
+            f"      {_c(status, color)} · {lead.get('confidence_band')} confidence "
+            f"({lead.get('confidence_score')}) · {lead.get('class_id')}/{lead.get('severity')}"
+            + (f" · rank {rank}" if rank else "")
+            + ("  · report-ready" if lead.get("report_ready") else "")
+        )
+        for con in lead.get("contradictions") or []:
+            if con.get("blocking"):
+                print(_c(f"      ⚠ blocking: {con.get('message')}", "1;31"))
+        if lead.get("proof_obligation"):
+            print(f"      → to confirm: {lead['proof_obligation']}")
+        if lead.get("in_chains"):
+            print(f"      chains: {', '.join(lead['in_chains'])}")
+    print(f"\n  {_c('gn leads', '2')} <path> --brief   for a Claude-ready investigation brief; "
+          f"{_c('--json', '2')} for the machine queue.\n")
+
+
 def _operator_callables(coder_cfg: dict):
     """Build the operator's run_campaign_fn + submit_fn directly over the torch-free
     bughunter engine (no API). The submit path goes through the SAME hard-gated
@@ -887,6 +987,16 @@ def build_parser() -> argparse.ArgumentParser:
     traces = sub.add_parser("traces", help="show the offline-brain training corpus (hunt_traces.jsonl) recorded from your hunts")
     traces.add_argument("--json", action="store_true")
     traces.set_defaults(func=_cmd_traces)
+
+    leads = sub.add_parser("leads", help="export a finished hunt's ranked investigation queue (leads, chains, proof obligations) for an analyst or a Claude brain to work")
+    leads.add_argument("path", help="a bounty-*.json hunt sidecar, or an engagement folder to sweep")
+    leads.add_argument("--json", action="store_true", help="emit the machine-readable lead queue (greyiq-lead-queue-v1)")
+    leads.add_argument("--brief", action="store_true", help="render a Markdown investigation brief, wrapped as untrusted data, ready to hand to a model")
+    leads.add_argument("--no-wrap", action="store_true", help="with --brief, omit the untrusted-data wrapper (human reading only)")
+    leads.add_argument("--ref", default=None, help="show only this lead ref (e.g. H3)")
+    leads.add_argument("--status", default=None, help="filter by status: confirmed|supported|candidate|contradicted|report-ready")
+    leads.add_argument("--min-confidence", type=int, default=None, dest="min_confidence", help="only leads with confidence_score >= N")
+    leads.set_defaults(func=_cmd_leads)
 
     op = sub.add_parser("operator", help="autonomous operator — run a portfolio of programs unattended")
     op.set_defaults(func=_cmd_operator, op_action=None)

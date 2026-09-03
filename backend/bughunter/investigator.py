@@ -231,10 +231,17 @@ def _artifact_types(finding: dict[str, Any], plan: dict[str, Any]) -> list[str]:
     if request and response:
         artifacts.append("captured-request-response")
 
+    from bughunter import report  # local: report sits above this module
+
     for proof in _proof_sources(finding, plan):
         observed = _text(proof.get("observed_result"), 2000)
         control = _text(proof.get("control_result"), 2000)
-        if observed and control:
+        if observed and control and not report.proof_is_non_differential(proof):
+            # Inventory a differential ONLY when the pair actually differs. Crediting an identical
+            # pair here advertised a "differential" the confirm gate had just refused — the
+            # operator-facing artifact list contradicting the operator-facing status. An identical
+            # pair still falls through to 'captured-observation' below: something WAS observed,
+            # it just proves nothing on its own.
             artifacts.append("observed-control-differential")
         elif observed and _text(proof.get("method") or proof.get("request_line"), 1000):
             artifacts.append("captured-observation")
@@ -244,12 +251,21 @@ def _artifact_types(finding: dict[str, Any], plan: dict[str, Any]) -> list[str]:
 
 
 def _same_observed_and_control(finding: dict[str, Any], plan: dict[str, Any]) -> bool:
-    for proof in _proof_sources(finding, plan):
-        observed = re.sub(r"\s+", " ", _text(proof.get("observed_result"), 2000)).lower()
-        control = re.sub(r"\s+", " ", _text(proof.get("control_result"), 2000)).lower()
-        if observed and control and observed == control:
-            return True
-    return False
+    """True when ANY proof carrier pairs an observed result with an identical control.
+
+    Delegates the RULE to ``report.proof_is_non_differential`` — the confirm gate's own
+    predicate — so the two can never disagree on what "identical" means; this module used to
+    hold its own copy of the normalization, which is how the gate came to accept a pair this
+    function was simultaneously calling a contradiction. The INPUT set is deliberately wider
+    than the gate's: the gate judges the one canonical proof, whereas this scans every carrier
+    (``_active_proof``, plan and finding proofs) and raises a contradiction if any of them is
+    bogus. That asymmetry errs toward flagging, never toward confirming, so it is kept on
+    purpose rather than papered over.
+
+    ``report`` sits above this module; the import is local, as in ``has_confirming_artifact``."""
+    from bughunter import report  # local: report sits above this module
+
+    return any(report.proof_is_non_differential(proof) for proof in _proof_sources(finding, plan))
 
 
 def _contradictions(

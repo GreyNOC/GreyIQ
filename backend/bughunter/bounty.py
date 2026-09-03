@@ -40,6 +40,7 @@ from bughunter import impact_model
 from bughunter import investigator
 from bughunter import ledger
 from bughunter import learning
+from bughunter import negative_knowledge
 from bughunter import next_steps as next_steps_lib
 from bughunter import recon
 from bughunter import report as report_lib
@@ -2193,6 +2194,22 @@ def _run_bounty_hunt_body(
                 technique_context=technique_context,
             )
             hb = brain_techniques.enrich_hunt_plan(hb, surface_for_brain, hunt_techniques, priors)
+            # Negative knowledge: downrank (endpoint, class) pairs this program has probed before and
+            # never confirmed, so the capped probe budget flows to fresh surface instead of re-testing
+            # inert ground. Endpoints that surface_drift says changed are re-enabled (new evidence), and
+            # anything ever confirmed is immune. Applied HERE, before hunt_trace_plan is captured, so the
+            # trace and the negative-knowledge memory both reflect the plan that actually ran. Best-effort:
+            # any failure leaves the plan exactly as enriched.
+            try:
+                _cooled = negative_knowledge.cooled_pairs(runtime_dir, program=None, target=clean_target)
+                if _cooled:
+                    hb, _supp = negative_knowledge.apply_suppression(
+                        hb, _cooled, changed_endpoints=negative_knowledge.changed_endpoint_keys(drift))
+                    if _supp.get("downranked") or _supp.get("dropped"):
+                        _emit(f"negative knowledge: deprioritised {_supp.get('downranked', 0)} and dropped "
+                              f"{_supp.get('dropped', 0)} tested-inert endpoint/class pair(s) from earlier hunts")
+            except Exception:  # noqa: BLE001 - suppression is an optimizer, never a hunt breaker
+                pass
             # Capture the (surface, plan) input side for the trace log. effective_extra_params is
             # REBOUND below (never mutated in place) when brain params merge, so this snapshot
             # stays the recon-only surface. list() the endpoints/params to be doubly safe.
@@ -2767,6 +2784,13 @@ def _run_bounty_hunt_body(
             hunt_trace.record_trace(runtime_dir, program=None, target=clean_target,
                                     surface=hunt_trace_surface, plan=hunt_trace_plan,
                                     outcomes=_trace_outcomes)
+            # Fold the same (plan, outcomes) into the endpoint-scoped negative-knowledge memory: a
+            # planned (endpoint, class) that did not confirm becomes a miss, a confirmed one is
+            # immunized. This is what the NEXT run's cooled_pairs() reads to deprioritise inert ground.
+            # record_hunt is internally fail-closed; it also honours the GREYIQ_NO_NEGATIVE_KNOWLEDGE
+            # kill switch and runtime_dir is None.
+            negative_knowledge.record_hunt(runtime_dir, program=None, target=clean_target,
+                                           plan=hunt_trace_plan, outcomes=_trace_outcomes)
             # This run becomes the next run's baseline. Recorded here, beside the trace, and on
             # the same condition — only a direct hunt does its own recon, so only a direct hunt
             # observed a surface to remember. The blocked chains travel with it: that is what

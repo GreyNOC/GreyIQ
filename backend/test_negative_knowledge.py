@@ -1,0 +1,229 @@
+"""Negative knowledge (bughunter.negative_knowledge): remember what was probed and did NOT confirm,
+so a re-scan's capped budget stops re-testing inert (endpoint, class) ground.
+
+The subsystem must be genuinely useful AND genuinely self-limiting — these tests pin both halves:
+it downranks a repeatedly-inert pair, but it never suppresses a route that ever confirmed, never
+survives its TTL, is re-enabled the moment surface_drift flags the endpoint, never mutates the plan
+it is handed, and turns fully off under the kill switch. The record→cool→suppress cycle is exercised
+end to end against the real store on disk."""
+from __future__ import annotations
+
+import sys
+import tempfile
+import unittest
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+BACKEND_DIR = Path(__file__).resolve().parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from bughunter import negative_knowledge as nk  # noqa: E402
+
+_TARGET = "https://app.example.com"
+
+
+def _plan(*pairs: tuple[str, list[str]]) -> dict:
+    return {"probe_priority": [{"endpoint": ep, "classes": list(cls)} for ep, cls in pairs]}
+
+
+def _outcome(endpoint: str, class_id: str, status: str) -> dict:
+    return {"endpoint": endpoint, "class": class_id, "proof_status": status}
+
+
+def _iso(days_ago: int) -> str:
+    return (datetime.now(UTC) - timedelta(days=days_ago)).isoformat()
+
+
+class EndpointKeyTests(unittest.TestCase):
+    def test_numeric_and_uuid_segments_collapse(self) -> None:
+        a = nk.endpoint_key("https://app.example.com/api/order/1001/export")
+        b = nk.endpoint_key("https://app.example.com/api/order/2999/export")
+        self.assertEqual(a, b)
+        self.assertEqual(a, "app.example.com/api/order/{id}/export")
+        u = nk.endpoint_key("https://app.example.com/u/9f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f/profile")
+        self.assertEqual(u, "app.example.com/u/{id}/profile")
+
+    def test_query_and_trailing_slash_dropped(self) -> None:
+        self.assertEqual(
+            nk.endpoint_key("https://app.example.com/search/?q=secret123"),
+            "app.example.com/search",
+        )
+
+    def test_unparseable_is_empty(self) -> None:
+        self.assertEqual(nk.endpoint_key(""), "")
+        self.assertEqual(nk.endpoint_key(None), "")
+
+
+class RecordTests(unittest.TestCase):
+    def test_planned_unconfirmed_pair_accrues_misses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for _ in range(2):
+                nk.record_hunt(tmp, program=None, target=_TARGET,
+                               plan=_plan(("https://app.example.com/login", ["sqli", "xss"])),
+                               outcomes=[])
+            s = nk.summary(tmp, program=None, target=_TARGET)
+            self.assertEqual(s["pairs"], 2)
+            self.assertEqual(s["cooled"], 2)  # both hit MIN_MISSES=2
+
+    def test_confirmed_pair_is_immunized_and_never_cools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # Miss it once, then confirm it — confirmation must clear the miss and immunize forever.
+            nk.record_hunt(tmp, program=None, target=_TARGET,
+                           plan=_plan(("https://app.example.com/pay", ["idor"])), outcomes=[])
+            nk.record_hunt(tmp, program=None, target=_TARGET,
+                           plan=_plan(("https://app.example.com/pay", ["idor"])),
+                           outcomes=[_outcome("https://app.example.com/pay", "idor", "confirmed")])
+            # Even many later inconclusive runs must not re-cool a proven route.
+            for _ in range(3):
+                nk.record_hunt(tmp, program=None, target=_TARGET,
+                               plan=_plan(("https://app.example.com/pay", ["idor"])), outcomes=[])
+            self.assertEqual(nk.cooled_pairs(tmp, program=None, target=_TARGET), set())
+            self.assertEqual(nk.summary(tmp, program=None, target=_TARGET)["confirmed"], 1)
+
+    def test_single_miss_is_below_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            nk.record_hunt(tmp, program=None, target=_TARGET,
+                           plan=_plan(("https://app.example.com/x", ["rce"])), outcomes=[])
+            self.assertEqual(nk.cooled_pairs(tmp, program=None, target=_TARGET), set())
+
+    def test_none_runtime_and_empty_inputs_are_noops(self) -> None:
+        self.assertFalse(nk.record_hunt(None, program=None, target=_TARGET, plan=_plan(), outcomes=[]))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(nk.record_hunt(tmp, program=None, target=_TARGET, plan={}, outcomes=[]))
+
+
+class CoolingTests(unittest.TestCase):
+    def _seed_cooled(self, tmp: str, days_ago: int = 0) -> None:
+        for _ in range(2):
+            nk.record_hunt(tmp, program=None, target=_TARGET,
+                           plan=_plan(("https://app.example.com/login", ["sqli"])),
+                           outcomes=[], now=_iso(days_ago))
+
+    def test_cooled_within_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_cooled(tmp, days_ago=1)
+            cooled = nk.cooled_pairs(tmp, program=None, target=_TARGET)
+            self.assertIn(nk._pair_id("app.example.com/login", "sqli"), cooled)
+
+    def test_decays_past_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_cooled(tmp, days_ago=nk.TTL_DAYS + 5)
+            # Old misses earn a fresh look — nothing cooled today.
+            self.assertEqual(nk.cooled_pairs(tmp, program=None, target=_TARGET), set())
+
+    def test_kill_switch_disables_recording_and_cooling(self) -> None:
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ[nk._ENV_DISABLE] = "1"
+            try:
+                self.assertFalse(nk.enabled())
+                self.assertFalse(nk.record_hunt(tmp, program=None, target=_TARGET,
+                                                plan=_plan(("https://app.example.com/x", ["sqli"])), outcomes=[]))
+                self.assertEqual(nk.cooled_pairs(tmp, program=None, target=_TARGET), set())
+            finally:
+                del os.environ[nk._ENV_DISABLE]
+            self.assertTrue(nk.enabled())
+
+    def test_malformed_store_fails_soft(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / nk._STORE_NAME).write_text("{ not json", encoding="utf-8")
+            self.assertEqual(nk.cooled_pairs(tmp, program=None, target=_TARGET), set())
+
+
+class SuppressionTests(unittest.TestCase):
+    def test_cold_classes_are_downranked_within_an_endpoint(self) -> None:
+        cooled = {nk._pair_id("app.example.com/login", "sqli")}
+        plan = _plan(("https://app.example.com/login", ["sqli", "xss", "redirect"]))
+        out, stats = nk.apply_suppression(plan, cooled)
+        self.assertEqual(out["probe_priority"][0]["classes"], ["xss", "redirect", "sqli"])
+        self.assertEqual(stats["downranked"], 1)
+        self.assertEqual(stats["dropped"], 0)
+
+    def test_all_cold_endpoint_is_dropped(self) -> None:
+        cooled = {nk._pair_id("app.example.com/login", "sqli"),
+                  nk._pair_id("app.example.com/login", "xss")}
+        plan = _plan(("https://app.example.com/login", ["sqli", "xss"]),
+                     ("https://app.example.com/search", ["xss"]))
+        out, stats = nk.apply_suppression(plan, cooled)
+        eps = [r["endpoint"] for r in out["probe_priority"]]
+        self.assertEqual(eps, ["https://app.example.com/search"])  # the inert endpoint freed its slot
+        self.assertEqual(stats["dropped"], 1)
+
+    def test_changed_endpoint_is_re_enabled(self) -> None:
+        cooled = {nk._pair_id("app.example.com/login", "sqli")}
+        plan = _plan(("https://app.example.com/login", ["sqli", "xss"]))
+        out, stats = nk.apply_suppression(plan, cooled, changed_endpoints={"app.example.com/login"})
+        self.assertEqual(out["probe_priority"][0]["classes"], ["sqli", "xss"])  # untouched
+        self.assertEqual(stats, {"downranked": 0, "dropped": 0})
+
+    def test_input_plan_is_never_mutated_and_other_fields_survive(self) -> None:
+        cooled = {nk._pair_id("app.example.com/login", "sqli")}
+        plan = {"probe_priority": [{"endpoint": "https://app.example.com/login", "classes": ["sqli", "xss"]}],
+                "param_hypotheses": ["returnUrl"], "notes": "keep me", "used": True}
+        original = [dict(r) for r in plan["probe_priority"]]
+        out, _ = nk.apply_suppression(plan, cooled)
+        self.assertEqual(plan["probe_priority"], original)          # input untouched
+        self.assertIsNot(out["probe_priority"], plan["probe_priority"])
+        self.assertEqual(out["param_hypotheses"], ["returnUrl"])    # carried through
+        self.assertEqual(out["notes"], "keep me")
+        self.assertTrue(out["used"])
+
+    def test_empty_cooled_returns_owned_copy_unchanged(self) -> None:
+        plan = _plan(("https://app.example.com/login", ["sqli"]))
+        out, stats = nk.apply_suppression(plan, set())
+        self.assertEqual(out["probe_priority"], plan["probe_priority"])
+        self.assertEqual(stats, {"downranked": 0, "dropped": 0})
+
+
+class DriftBridgeTests(unittest.TestCase):
+    def test_changed_endpoint_keys_reads_the_relevant_delta_kinds(self) -> None:
+        drift = {"deltas": [
+            {"kind": "shape.changed", "subject": "https://app.example.com/login?x=1"},
+            {"kind": "endpoint.new", "subject": "https://app.example.com/api/v2/orders/5"},
+            {"kind": "param.new", "subject": "some_param"},          # not an endpoint kind
+        ]}
+        keys = nk.changed_endpoint_keys(drift)
+        self.assertIn("app.example.com/login", keys)
+        self.assertIn("app.example.com/api/v2/orders/{id}", keys)
+        self.assertEqual(len(keys), 2)
+
+    def test_none_drift_is_empty(self) -> None:
+        self.assertEqual(nk.changed_endpoint_keys(None), set())
+        self.assertEqual(nk.changed_endpoint_keys({}), set())
+
+
+class EndToEndTests(unittest.TestCase):
+    def test_record_then_cool_then_suppress_a_fresh_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = ("https://app.example.com/download", ["path-traversal", "rce"])
+            # Two inert hunts probe /download for path-traversal + rce, nothing confirms.
+            for _ in range(2):
+                nk.record_hunt(tmp, program=None, target=_TARGET, plan=_plan(probe), outcomes=[])
+            cooled = nk.cooled_pairs(tmp, program=None, target=_TARGET)
+            self.assertEqual(len(cooled), 2)
+            # A third hunt plans the same endpoint plus a brand-new one; suppression frees the inert slot.
+            fresh = _plan(probe, ("https://app.example.com/invoice", ["ssti"]))
+            out, stats = nk.apply_suppression(fresh, cooled)
+            eps = [r["endpoint"] for r in out["probe_priority"]]
+            self.assertEqual(eps, ["https://app.example.com/invoice"])
+            self.assertEqual(stats["dropped"], 1)
+
+    def test_confirmed_route_keeps_being_hunted_across_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = ("https://app.example.com/pay", ["idor", "xss"])
+            # idor confirmed; xss never does.
+            nk.record_hunt(tmp, program=None, target=_TARGET, plan=_plan(probe),
+                           outcomes=[_outcome("https://app.example.com/pay", "idor", "confirmed")])
+            for _ in range(2):
+                nk.record_hunt(tmp, program=None, target=_TARGET, plan=_plan(probe), outcomes=[])
+            cooled = nk.cooled_pairs(tmp, program=None, target=_TARGET)
+            # xss cooled, idor immune.
+            self.assertIn(nk._pair_id("app.example.com/pay", "xss"), cooled)
+            self.assertNotIn(nk._pair_id("app.example.com/pay", "idor"), cooled)
+            out, _ = nk.apply_suppression(_plan(probe), cooled)
+            self.assertEqual(out["probe_priority"][0]["classes"], ["idor", "xss"])  # idor stays first, endpoint kept
+
+
+if __name__ == "__main__":
+    unittest.main()
