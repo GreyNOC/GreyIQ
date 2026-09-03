@@ -2297,7 +2297,13 @@ class GreyIQRuntime:
             # the cached engine run), but the report must not *claim* confirmed without proof.
             status = str(p.status or "").strip().lower()
             observed = str(p.observed_result or "").strip()
-            has_differential = bool(observed and str(p.control_result or "").strip())
+            # "Differential" means both sides present AND they differ — the confirm gate's own
+            # predicate (report.proof_is_non_differential), so this overlay's cap and the rendered
+            # proof_status can never disagree for a pasted identical pair.
+            has_differential = bool(observed and str(p.control_result or "").strip()) and not (
+                bounty_report.proof_is_non_differential(
+                    {"observed_result": observed, "control_result": p.control_result})
+            )
             # Cap at 'candidate' for ANY incoming status that lacks a real observed-vs-control
             # differential — including an EMPTY status. Otherwise a caller reaches 'confirmed'
             # by staying silent: with no explicit status the overlay writes nothing, and the
@@ -2377,10 +2383,15 @@ class GreyIQRuntime:
         pe = {k: v for k, v in (request.proof_evidence.model_dump().items() if request.proof_evidence is not None else [])
               if str(v or "").strip()}
         has_poe = bool(pe) or bool(str(request.screenshot_path or "").strip())
-        # POI is real only with BOTH a positive observation and a negative control (the differential).
+        # POI is real only with BOTH a positive observation and a negative control that DIFFER —
+        # the confirm gate's own predicate, so this flag can't read "proof" while proof_status
+        # reads "candidate" for the same pasted identical pair.
         has_poi = bool(request.proof is not None
                        and str(request.proof.observed_result or "").strip()
-                       and str(request.proof.control_result or "").strip())
+                       and str(request.proof.control_result or "").strip()
+                       and not bounty_report.proof_is_non_differential(
+                           {"observed_result": request.proof.observed_result,
+                            "control_result": request.proof.control_result}))
         # 3) Runnable POC artifacts from the captured evidence (empty when nothing reconstructable).
         item = {"finding": {"ref": "R1", "title": str(request.title or ""), "location": location,
                             "proof_evidence": pe},

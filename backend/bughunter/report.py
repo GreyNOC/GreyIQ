@@ -233,6 +233,13 @@ def qa_validate_report(findings: list[dict[str, Any]], attack_plans: dict[str, A
       * Claims sensitive-data exposure / C:H  → a sensitive read must be captured, else strip C:H.
       * Claims High on a CORS finding          → a browser cross-origin PoC must exist, else cap Medium.
       * Response was 404/403/204/redirect + no sensitive read → cap the demonstrated impact to Low.
+    Class-general claim-integrity checks (every class, INFORMATIONAL — recorded, never a cap):
+      * Observed and control results are identical → no differential is established.
+      * Proof CLAIMS 'confirmed' but the confirm gate rejects the evidence → rendered as candidate.
+    Both are gated on what the finding CLAIMS, never on artifact ABSENCE: a static code finding has
+    no runtime artifact by nature and claims nothing, so it passes untouched — a naive
+    "no artifact ⇒ cap" rule would collapse the entire source-scanning profile (a static SQLi
+    resolves to Critical from its class template alone) to Low.
     Every correction is recorded as an issue so the change is auditable in the report + JSON."""
     plans = attack_plans or {}
     issues: list[dict[str, Any]] = []
@@ -320,6 +327,29 @@ def qa_validate_report(findings: list[dict[str, Any]], attack_plans: dict[str, A
             _record(finding, ref, "Is CORS evidence curl-only (server behaviour)?", "yes", "",
                     "Labelled as server-side header behaviour; cross-origin browser exploitability is not "
                     "proven from curl/same-site evidence.")
+
+        # Q5/Q6 — class-general claim integrity. These two are the checks the investigation cortex
+        # already makes for EVERY class (its `non-differential-control` and
+        # `confirmation-without-artifact` contradictions); the export gate never surfaced them, so a
+        # triager reading only the report saw a silent 'candidate' with no explanation of why.
+        # Both are INFORMATIONAL (empty action): they never move severity and never flip `ok`.
+        # _proof_of_impact_detail already renders these findings as 'candidate' — re-punishing them
+        # with a severity cap would double-count, and a severity cap keyed on evidence would also
+        # be the exact rule that guts the static-scanning profile (see the docstring).
+        proof = _proof_value(finding, plan)
+        claimed = _explicit_proof_status(finding, plan, proof)
+        if proof_is_non_differential(proof):
+            # The specific reason wins: an identical pair IS why there is no accepted artifact,
+            # so Q5 is not recorded on top of it — one bullet per root cause.
+            _record(finding, ref, "Do the observed and control results actually differ?", "no", "",
+                    "Observed and control are identical once normalized, so no differential is "
+                    "established; the confirm gate refuses it and the finding is not confirmed on "
+                    "this evidence.")
+        elif claimed == "confirmed" and not _has_captured_artifact(finding, proof):
+            _record(finding, ref, "Does the claimed 'confirmed' proof have a captured artifact?", "unsupported", "",
+                    "The proof asserts confirmation but no artifact the confirm gate accepts backs it "
+                    "(narrative text and a passive request are not proof); rendered as candidate, not "
+                    "confirmed.")
 
     return {"ok": not any(i.get("action") for i in issues), "issues": issues}
 
@@ -504,6 +534,43 @@ def _proof_text_is_concrete(text: str) -> bool:
     return bool(_CONCRETE_IMPACT_RE.search(cleaned))
 
 
+# --- Shared observed-vs-control predicate ---------------------------------------
+# ONE definition of "does this proof carry a real differential?", used by the confirm gate below
+# AND by the investigation cortex. The two used to hold separate copies of the rule: the gate
+# accepted any proof whose observed_result and control_result were both merely NON-EMPTY, while
+# investigator._same_observed_and_control flagged an IDENTICAL pair as a blocking contradiction.
+# A finding carrying the same bytes on both sides therefore rendered `proof_status: confirmed`
+# (and passed submission.submit_to_hackerone's hard gate) in the very report whose Investigation
+# section called it `contradicted`. A pair that does not differ is, by definition, not a
+# differential — so it is not an artifact. Keeping the normalization in one place is what stops
+# the two authorities from parting again; see investigator.has_confirming_artifact for the
+# post-mortem of the last time they did.
+_PROOF_TEXT_LIMIT = 2000
+
+
+def normalize_proof_text(value: Any, limit: int = _PROOF_TEXT_LIMIT) -> str:
+    """Canonical form for comparing an observed result against its control: bounded, whitespace-
+    collapsed, case-folded. Stripped then bounded, exactly as the cortex's ``_text`` does, so both
+    sides see the same prefix; the cap keeps the comparison flat on a huge captured body."""
+    text = str(value or "").strip()[:limit]
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def proof_is_non_differential(proof: Any) -> bool:
+    """True when a proof carries an observed/control pair that does NOT differ.
+
+    Both sides must be present. An empty pair is "no differential captured" — the honest default
+    of every static/deterministic plan (bounty._deterministic_attack_plan writes "" for both) —
+    which is not a differential that FAILED. Only the latter is a claim the evidence contradicts,
+    so only the latter is what this predicate names. Written as a positive "non-differential"
+    test so a naive ``observed == control`` can never be reintroduced and fire on "" == ""."""
+    if not isinstance(proof, dict):
+        return False
+    observed = normalize_proof_text(proof.get("observed_result"))
+    control = normalize_proof_text(proof.get("control_result"))
+    return bool(observed) and bool(control) and observed == control
+
+
 def _has_captured_artifact(
     finding: dict[str, Any],
     proof: Any,
@@ -547,7 +614,11 @@ def _has_captured_artifact(
     if isinstance(cred, dict) and cred.get("live") is True and secret_classification.has_confirmed_secret_proof(finding):
         return True
     if isinstance(proof, dict) and str(proof.get("observed_result") or "").strip() and str(proof.get("control_result") or "").strip():
-        return True
+        # Both sides present AND they differ. A pair that does not differ is not a differential
+        # (proof_is_non_differential). This check lives ONLY in this final branch on purpose: the
+        # credential, JWT-replay and secret_hits routes above are independent confirmations and
+        # must never be vetoed by a stray identical pair riding alongside a real one.
+        return not proof_is_non_differential(proof)
     return False
 
 

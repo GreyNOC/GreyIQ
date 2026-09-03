@@ -118,6 +118,16 @@ per-program SSRF/OOB setup, running a hunt, and reports & submission. The cockpi
 a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the top bar).
 
 - **Scan** from chat: `scan code <path|repo>`, `scan web <url>`, `scan live <url>`.
+- **Investigate leads with Claude**: `gn leads <bounty-*.json | engagement-folder>` exports a
+  finished hunt's ranked investigation queue — the cortex's hypotheses, ordered attack chains,
+  contradictions, and the exact proof obligation for each lead — as a stable, **redaction-safe**
+  `greyiq-lead-queue-v1`. Each lead carries its own evidence state, the contradictions that cite it,
+  and the chains it belongs to, inline. `--json` emits the machine queue; `--brief` renders a
+  Markdown investigation brief wrapped as untrusted data, ready to hand to a configured Claude brain
+  (or to Claude Code) to work lead by lead; `--status` / `--ref` / `--min-confidence` filter it. It
+  is assembled from a strict field allowlist and scrubs every field, so no raw credential, response
+  body, page source, or screenshot path ever leaves the machine — only the differential and the
+  safe sensitive-data labels.
 - **OSINT campaigns from the local CLI**: `gn osint example.com` correlates two public
   certificate-transparency indexes with Google and Cloudflare DNS, keeps claim-level source
   provenance, and writes `OSINT.md` + `osint.json`. Add `--hunt --scope "*.example.com" -y`

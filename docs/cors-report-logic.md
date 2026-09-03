@@ -122,6 +122,19 @@ Runs on every finding before export; applies **downgrade-only** corrections (nev
 4. **CORS evidence is curl-only?** → label it as **server-side header behaviour**, not browser exploitability.
 5. **CVSS aligned with evidence?** → no `C:H` without proven sensitive confidentiality impact.
 
+Checks 1–5 are CORS/confidentiality-scoped. Two further checks run on **every class** and are
+**informational** (recorded, never a severity cap):
+
+6. **Do observed and control actually differ?** → an identical pair once normalized is not a
+   differential. The confirm gate (`report.proof_is_non_differential`, shared with the
+   investigation cortex) refuses it, so the finding renders `candidate`, not `confirmed` — and this
+   is what stops it reaching the auto-submit gate.
+7. **Does a claimed `confirmed` proof have a captured artifact?** → if the confirm gate rejects the
+   evidence the finding is rendered `candidate`; this check makes that silent correction visible.
+
+Both are gated on what the finding **claims**, never on the *absence* of an artifact — a static
+code finding has no runtime artifact by nature and claims nothing, so it passes untouched.
+
 Every correction is recorded in the report's **"Pre-export QA (evidence vs claim)"** section and in
 the JSON sidecar (`qa.issues`) so a triager can audit exactly why a severity reads the way it does.
 

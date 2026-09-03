@@ -222,7 +222,15 @@ class InvestigationCortexTests(unittest.TestCase):
         }}}
         graph = investigator.build_investigation([finding], plans)
         self.assertEqual(graph["hypotheses"][0]["status"], "contradicted")
-        self.assertTrue(any(row["code"] == "non-differential-control" for row in graph["contradictions"]))
+        codes = {row["code"] for row in graph["contradictions"]}
+        self.assertIn("non-differential-control", codes)
+        # The confirm gate now shares this predicate (report.proof_is_non_differential), so the
+        # same pair is ALSO refused as a captured artifact — the cortex and the gate agree, where
+        # the gate used to accept any non-empty pair and render this finding 'confirmed'.
+        self.assertIn("confirmation-without-artifact", codes)
+        self.assertFalse(graph["hypotheses"][0]["report_ready"])
+        # And the artifact inventory no longer advertises a differential the gate refused.
+        self.assertNotIn("observed-control-differential", graph["hypotheses"][0]["artifacts"])
 
     def test_secret_classification_conflict_is_explicit(self) -> None:
         graph = investigator.build_investigation([{

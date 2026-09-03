@@ -9438,9 +9438,15 @@ function ckProofDots(rec) {
   // reproduction (replay.sh/findings.har rebuilt from a captured crafted request line, or a
   // supplied credential PoC), NOT the always-present auto-generated steps — so the dot doesn't
   // flip green→red the moment the operator hits "Get report ready".
+  // POI mirrors the server's report.proof_is_non_differential: BOTH sides present AND they differ
+  // once whitespace-collapsed and case-folded. An identical pair is not a differential, so the dot
+  // must not light for it — otherwise the badge reads "proof" while the server-rendered
+  // proof_status for the same finding reads "candidate".
+  const normProof = (v) => String(v || "").trim().slice(0, 2000).replace(/\s+/g, " ").trim().toLowerCase();
+  const poiDiffers = (o, c) => { const a = normProof(o), b = normProof(c); return !!(a && b && a !== b); };
   const on = {
     poc: rec.report_ready ? !!rp.poc : ckHasRunnablePoc(cap),
-    poi: rec.report_ready ? !!rp.poi : !!(poi.observed_result && poi.control_result),
+    poi: rec.report_ready ? !!rp.poi : poiDiffers(poi.observed_result, poi.control_result),
     // Mirror the server's has_poe = bool(proof_evidence) OR bool(screenshot_path): a screenshot-only
     // finding must preview POE ON, else the dot flips OFF→ON the moment "Get report ready" is clicked.
     poe: rec.report_ready ? !!rp.poe : !!(cap.proof_evidence || cap.credential_proof || cap.screenshot_path),

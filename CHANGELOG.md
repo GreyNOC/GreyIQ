@@ -2,6 +2,61 @@
 
 Notable changes to GreyIQ.
 
+## v4.1.0 - evidence integrity, and the lead bridge to Claude
+
+Three changes that make GreyIQ better at *reasoning through* a hunt, not just recording one — and
+close a real correctness hole on the path to a live submission.
+
+### The confirm authority stops accepting a non-differential as proof
+
+`report._has_captured_artifact` — the single "is there a real captured artifact?" gate the whole
+engine defers to — accepted any proof whose `observed_result` and `control_result` were both merely
+**non-empty**. It never checked the two actually **differ**. The investigation cortex, meanwhile,
+was already flagging an identical observed/control pair as a *blocking* `non-differential-control`
+contradiction. So one report could render `proof_status: confirmed` for a finding its own
+Investigation section called `contradicted` — and because `submission.submit_to_hackerone` hard-gates
+on exactly that `confirmed` status, a finding **with no established differential could pass the
+HackerOne auto-submit gate**. Demonstrated by execution, not inspection.
+
+- One shared predicate now decides it: `report.proof_is_non_differential` (normalize both sides —
+  bounded, whitespace-collapsed, case-folded — then require they differ), used by BOTH the confirm
+  gate and the cortex's `_same_observed_and_control`, so the two authorities can never part again.
+- The check lives ONLY in the gate's final observed/control branch: the credential, JWT-replay and
+  secret-hit confirmation routes are independent and are never vetoed by a stray identical pair.
+- An identical pair is not a *failed* differential — an EMPTY pair (the honest default of every
+  static/deterministic plan) still reads as "nothing captured", never as "identical", so the entire
+  source-scanning profile (a static SQLi is Critical from its class template alone) is untouched.
+- The API-side mirrors (`has_differential` on the client-proof overlay, `has_poi` in
+  `get_report_ready`) and the client POI dot in `public/app.js` share the same normalized-difference
+  test, so the badge, the VDP gate, and the rendered `proof_status` can no longer disagree.
+
+### QAQC gate: class-general claim-integrity checks
+
+`report.qa_validate_report` only ever fired on `cors`/`disclosure` findings. It now records two
+**informational, every-class** checks — "do observed and control actually differ?" and "does a
+claimed `confirmed` proof have a captured artifact?" — surfacing in the report's audit section the
+silent `candidate` downgrade the renderer already applied. Gated on what a finding *claims*, never on
+artifact *absence*, so a static lead (which claims nothing) is never touched.
+
+### `gn leads` — hand a hunt's investigation queue to an analyst or a Claude brain
+
+A finished hunt's evidence graph — ranked hypotheses, ordered attack chains, untested chain probes,
+contradictions, and the exact proof obligation for each lead — previously lived only *inside* a
+rendered report. The new `bughunter.leads` module and `gn leads <path>` command export it as a
+stable, **redaction-safe** lead queue (`greyiq-lead-queue-v1`): each lead carries its own evidence
+state, the contradictions that cite it, and the chains it participates in, inline. `--json` emits the
+machine queue; `--brief` renders a Markdown investigation brief wrapped as untrusted data, ready to
+hand to a configured Claude brain; `--status` / `--ref` / `--min-confidence` filter it; and a
+directory argument sweeps a whole engagement's `targets/` tree.
+
+- Built from a strict field **allowlist**, never a denylist over the raw finding — `build_json`
+  serializes findings wholesale, so a denylist would leak `source_text`, `screenshot_path`, the
+  `_credential_proof` carrier, or any raw field added later. Every free-text field is scrubbed with
+  `redact_text`, `apply_secret_classification` is re-run on the loaded copy, and response bodies are
+  never emitted (only the safe `sensitive_data_labels`). A planted credential in six different raw
+  carriers is proven, by test, to reach neither the queue nor the brief.
+
+
 ## v4.0.0 - the Burp-style redesign, and the subsystem that never shipped
 
 Two pieces of work were orphaned by the same collision on 2026-08-01, when the remote TACNOC
