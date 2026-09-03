@@ -225,6 +225,41 @@ class BriefTests(unittest.TestCase):
         self.assertIn("Mass assignment", brief)
         self.assertIn("nothing here is evidence", brief)
 
+    def test_ref_can_select_a_chain_probe(self) -> None:
+        """Probes carry their own id namespace (CP*/CR*). Narrowing on leads alone made
+        `--ref CP1` report "No leads found" for a probe sitting right there in the queue."""
+        findings, plans = _confirmed_idor()
+        doc = _build_sidecar(findings, plans)
+        doc["investigation"]["chain_probes"] = [{
+            "id": "CP1", "title": "Mass assignment via is_admin",
+            "hypothesis": "The signup form carries an is_admin field.",
+            "impact": "privilege escalation", "next_action": "Submit with is_admin=true as a test user.",
+            "signals": [], "status": "untested",
+        }]
+        report = leads.build_lead_report_from_doc(doc)
+        brief = leads.render_lead_brief(report, ref="CP1", wrap=False)
+        self.assertIn("CP1", brief)
+        self.assertIn("Mass assignment", brief)
+        self.assertNotIn("No leads found", brief)
+        self.assertNotIn("F1", brief)  # the finding is not selected by this ref
+
+    def test_brief_renders_only_the_probes_it_is_given(self) -> None:
+        """The brief must not re-read the raw queue: a caller that filtered (e.g. --status
+        confirmed) would otherwise still get every untested probe rendered."""
+        findings, plans = _confirmed_idor()
+        doc = _build_sidecar(findings, plans)
+        doc["investigation"]["chain_probes"] = [
+            {"id": "CP1", "title": "Untested lead", "hypothesis": "h", "impact": "i",
+             "next_action": "n", "signals": [], "status": "untested"},
+        ]
+        report = leads.build_lead_report_from_doc(doc)
+        # Simulate the CLI having filtered probes out (--status confirmed).
+        report["hunts"][0]["chain_probes"] = []
+        brief = leads.render_lead_brief(report, wrap=False)
+        self.assertNotIn("CP1", brief)
+        self.assertNotIn("nothing here is evidence", brief)  # section omitted entirely
+        self.assertIn("F1", brief)                            # the confirmed lead still renders
+
     def test_brief_names_the_proof_obligation(self) -> None:
         findings, plans = _confirmed_idor()
         doc = _build_sidecar(findings, plans)

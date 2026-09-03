@@ -393,13 +393,19 @@ def _cmd_leads(args: argparse.Namespace) -> int:
     # to an analyst. Filtering happens on the projected queue (never the raw sidecar), so a filtered
     # export keeps the same shape as an unfiltered one — just fewer leads.
     if args.ref or args.status or args.min_confidence is not None:
+        def _keep(row: dict) -> bool:
+            return ((not args.ref or row.get("id") == args.ref)
+                    and (not args.status or _lead_matches_status(row, args.status))
+                    and (args.min_confidence is None or _lead_confidence(row) >= args.min_confidence))
+
         for queue in report.get("hunts", []):
-            queue["leads"] = [
-                lead for lead in queue.get("leads", [])
-                if (not args.ref or lead.get("id") == args.ref)
-                and (not args.status or _lead_matches_status(lead, args.status))
-                and (args.min_confidence is None or _lead_confidence(lead) >= args.min_confidence)
-            ]
+            queue["leads"] = [lead for lead in queue.get("leads", []) if _keep(lead)]
+            # Chain probes are a second, id-namespaced lead type (CP*/CR*) that the brief renders,
+            # so the SAME filters have to reach them — otherwise `--status confirmed` still emitted
+            # every `untested` probe. The predicate works unchanged on a probe: it carries `status`,
+            # has no `report_ready`, and has no confidence score, so a `--min-confidence` floor
+            # correctly excludes an untested lead.
+            queue["chain_probes"] = [p for p in queue.get("chain_probes", []) if _keep(p)]
 
     if args.brief:
         # A Markdown investigation brief, wrapped as untrusted data — ready to hand to a model.
