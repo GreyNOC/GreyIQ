@@ -177,21 +177,32 @@ def _planned_pairs(plan: Any) -> set[str]:
 
 def record_hunt(runtime_dir: str | Path | None, *, program: str | None, target: str,
                 plan: dict[str, Any] | None, outcomes: list[dict[str, Any]] | None,
-                now: str | None = None) -> bool:
+                complete: bool = False, now: str | None = None) -> bool:
     """Fold one finished hunt into the store. A planned pair that did not confirm is a miss; a pair
     that confirmed is immunized (and any prior miss count on it is cleared). Best-effort and
     fail-closed — returns False and changes nothing on ``runtime_dir is None`` or any error, so a
     bookkeeping write can never break a hunt.
 
     ``plan`` and ``outcomes`` are the SAME objects the hunt trace records, so this adds a durable,
-    cross-run memory without observing anything the engine did not already log."""
+    cross-run memory without observing anything the engine did not already log.
+
+    ``complete`` asserts the run actually WORKED ITS WAY THROUGH the plan — no scanner error, active
+    verification in scope, not rate-limited or cut short. It defaults to False, and misses are
+    recorded ONLY when it is True, because "never executed" and "executed and inert" are different
+    facts and only the second is negative knowledge. The prover walks ``probe_priority`` in order and
+    stops when its request budget is gone, so the TAIL of every truncated run would otherwise accrue
+    misses for pairs nothing ever probed — a systematic bias that would cool exactly the endpoints
+    that never got a fair chance. Confirmations are always recorded (they only ever GRANT immunity,
+    so they are safe on a partial run); the default is conservative so a caller that cannot vouch for
+    completeness can never poison the store."""
     if runtime_dir is None or not enabled():
         return False
     try:
         confirmed = _confirmed_pairs(outcomes)
-        planned = _planned_pairs(plan)
-        # A pair can confirm without having been in probe_priority (a passive/static finding), so union
-        # the two: every confirmed pair is immunized, every planned-but-unconfirmed pair is a miss.
+        planned = _planned_pairs(plan) if complete else set()
+        # A pair can confirm without having been in probe_priority (a passive/static finding), so both
+        # sides matter: every confirmed pair is immunized, and — on a complete run only — every
+        # planned-but-unconfirmed pair is a miss.
         if not planned and not confirmed:
             return False
         stamp = _now_iso(now)
@@ -206,7 +217,8 @@ def record_hunt(runtime_dir: str | Path | None, *, program: str | None, target: 
                 row["confirmed"] = True
                 row["miss"] = 0
                 row["last_ts"] = stamp
-            for pid in planned:
+            # Misses only from a run that actually got through its plan — see ``complete``.
+            for pid in (planned if complete else set()):
                 if pid in confirmed:
                     continue
                 row = pairs.setdefault(pid, {"miss": 0, "last_ts": stamp, "confirmed": False})
@@ -267,7 +279,14 @@ def changed_endpoint_keys(drift: dict[str, Any] | None) -> set[str]:
         if not isinstance(delta, dict):
             continue
         kind = str(delta.get("kind") or "")
-        if kind in {"endpoint.new", "shape.changed", "auth.added", "form.new"}:
+        # Every endpoint-scoped drift kind, INCLUDING the ones that mean a defense came OFF.
+        # `auth.removed` is surface_drift's highest-weighted signal ("a gate came off — the single
+        # highest-signal change there is") and `cookie.flag-lost` / `header.security-removed` are the
+        # same shape: a route that was inert while protected is the first thing to re-probe once the
+        # protection is gone. Omitting them left the engine cooling exactly the endpoints that had
+        # just become interesting.
+        if kind in {"endpoint.new", "shape.changed", "auth.added", "form.new",
+                    "auth.removed", "cookie.flag-lost", "header.security-removed"}:
             key = endpoint_key(delta.get("subject"))
             if key:
                 out.add(key)
@@ -280,10 +299,17 @@ def apply_suppression(plan: dict[str, Any] | None, cooled: set[str], *,
     ``probe_priority``. Pure — the input plan is never mutated; every other plan field is carried
     through unchanged.
 
-    Within a kept endpoint row, cooled classes are moved AFTER the still-hot ones (the prover reaches
-    them only if budget remains). An endpoint whose every class is cooled is dropped entirely, freeing
-    its budget slot for fresh surface. An endpoint flagged by ``changed_endpoints`` is left exactly as
-    planned — a changed surface overrides its own history."""
+    Within an endpoint row, cooled classes are moved AFTER the still-hot ones, so the prover reaches
+    them only if budget remains. An endpoint flagged by ``changed_endpoints`` is left exactly as
+    planned — a changed surface overrides its own history.
+
+    Rows are REORDERED, never removed, even when every class on them is cooled. Dropping looked like
+    it freed a probe slot, but the caller does not work from this list: ``active_targets`` is fixed
+    before suppression runs and is never re-filtered, and the only consumer of ``probe_priority``
+    (``bounty._plan_priorities_by_endpoint``) FALLS BACK to an inferred priority for an endpoint it
+    cannot find. Dropping a row therefore saved no requests and merely replaced an explicit,
+    evidence-based ordering with a guess — strictly worse than the partial-cool path it was meant to
+    strengthen. Keeping the row preserves the ordering that actually reaches the prover."""
     if not isinstance(plan, dict):
         return ({} if plan is None else plan), {"downranked": 0, "dropped": 0}
     new_plan = dict(plan)
@@ -291,11 +317,11 @@ def apply_suppression(plan: dict[str, Any] | None, cooled: set[str], *,
     if not cooled or not isinstance(rows, list):
         # Still hand back a copy of the list so callers can treat the result as owned.
         new_plan["probe_priority"] = list(rows) if isinstance(rows, list) else rows
-        return new_plan, {"downranked": 0, "dropped": 0}
+        return new_plan, {"downranked": 0, "fully_cooled": 0}
     changed = changed_endpoints or set()
     out_rows: list[dict[str, Any]] = []
     downranked = 0
-    dropped = 0
+    fully_cooled = 0
     for row in rows:
         if not isinstance(row, dict):
             out_rows.append(row)
@@ -311,12 +337,11 @@ def apply_suppression(plan: dict[str, Any] | None, cooled: set[str], *,
             out_rows.append(row)
             continue
         if not hot:
-            dropped += 1  # every class on this endpoint is inert — free the whole slot
-            continue
+            fully_cooled += 1  # every class here is inert; keep the row, just fully deprioritised
         downranked += len(cold)
         out_rows.append({**row, "classes": hot + cold})
     new_plan["probe_priority"] = out_rows
-    return new_plan, {"downranked": downranked, "dropped": dropped}
+    return new_plan, {"downranked": downranked, "fully_cooled": fully_cooled}
 
 
 def summary(runtime_dir: str | Path | None, *, program: str | None, target: str,

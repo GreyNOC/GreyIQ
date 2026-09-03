@@ -61,7 +61,7 @@ class RecordTests(unittest.TestCase):
             for _ in range(2):
                 nk.record_hunt(tmp, program=None, target=_TARGET,
                                plan=_plan(("https://app.example.com/login", ["sqli", "xss"])),
-                               outcomes=[])
+                               outcomes=[], complete=True)
             s = nk.summary(tmp, program=None, target=_TARGET)
             self.assertEqual(s["pairs"], 2)
             self.assertEqual(s["cooled"], 2)  # both hit MIN_MISSES=2
@@ -70,21 +70,22 @@ class RecordTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             # Miss it once, then confirm it — confirmation must clear the miss and immunize forever.
             nk.record_hunt(tmp, program=None, target=_TARGET,
-                           plan=_plan(("https://app.example.com/pay", ["idor"])), outcomes=[])
+                           plan=_plan(("https://app.example.com/pay", ["idor"])), outcomes=[], complete=True)
             nk.record_hunt(tmp, program=None, target=_TARGET,
                            plan=_plan(("https://app.example.com/pay", ["idor"])),
-                           outcomes=[_outcome("https://app.example.com/pay", "idor", "confirmed")])
+                           outcomes=[_outcome("https://app.example.com/pay", "idor", "confirmed")],
+                           complete=True)
             # Even many later inconclusive runs must not re-cool a proven route.
             for _ in range(3):
                 nk.record_hunt(tmp, program=None, target=_TARGET,
-                               plan=_plan(("https://app.example.com/pay", ["idor"])), outcomes=[])
+                               plan=_plan(("https://app.example.com/pay", ["idor"])), outcomes=[], complete=True)
             self.assertEqual(nk.cooled_pairs(tmp, program=None, target=_TARGET), set())
             self.assertEqual(nk.summary(tmp, program=None, target=_TARGET)["confirmed"], 1)
 
     def test_single_miss_is_below_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             nk.record_hunt(tmp, program=None, target=_TARGET,
-                           plan=_plan(("https://app.example.com/x", ["rce"])), outcomes=[])
+                           plan=_plan(("https://app.example.com/x", ["rce"])), outcomes=[], complete=True)
             self.assertEqual(nk.cooled_pairs(tmp, program=None, target=_TARGET), set())
 
     def test_none_runtime_and_empty_inputs_are_noops(self) -> None:
@@ -92,13 +93,39 @@ class RecordTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertFalse(nk.record_hunt(tmp, program=None, target=_TARGET, plan={}, outcomes=[]))
 
+    def test_incomplete_run_records_no_misses(self) -> None:
+        """THE guard against the tail bias: the prover walks probe_priority in order and stops when
+        its budget is gone, so a truncated run never probed the tail. Recording those as misses would
+        cool exactly the endpoints that never got a fair chance. complete defaults to False."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for _ in range(5):
+                nk.record_hunt(tmp, program=None, target=_TARGET,
+                               plan=_plan(("https://app.example.com/deep", ["sqli", "rce"])),
+                               outcomes=[])  # complete omitted -> defaults False
+            self.assertEqual(nk.cooled_pairs(tmp, program=None, target=_TARGET), set())
+            self.assertEqual(nk.summary(tmp, program=None, target=_TARGET)["pairs"], 0)
+
+    def test_incomplete_run_still_grants_confirmation_immunity(self) -> None:
+        """A confirmation only ever GRANTS immunity, so it is safe to record from a partial run."""
+        with tempfile.TemporaryDirectory() as tmp:
+            nk.record_hunt(tmp, program=None, target=_TARGET,
+                           plan=_plan(("https://app.example.com/pay", ["idor"])),
+                           outcomes=[_outcome("https://app.example.com/pay", "idor", "confirmed")])
+            self.assertEqual(nk.summary(tmp, program=None, target=_TARGET)["confirmed"], 1)
+            # And that immunity holds against later complete runs that miss it.
+            for _ in range(3):
+                nk.record_hunt(tmp, program=None, target=_TARGET,
+                               plan=_plan(("https://app.example.com/pay", ["idor"])),
+                               outcomes=[], complete=True)
+            self.assertEqual(nk.cooled_pairs(tmp, program=None, target=_TARGET), set())
+
 
 class CoolingTests(unittest.TestCase):
     def _seed_cooled(self, tmp: str, days_ago: int = 0) -> None:
         for _ in range(2):
             nk.record_hunt(tmp, program=None, target=_TARGET,
                            plan=_plan(("https://app.example.com/login", ["sqli"])),
-                           outcomes=[], now=_iso(days_ago))
+                           outcomes=[], complete=True, now=_iso(days_ago))
 
     def test_cooled_within_ttl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -119,7 +146,8 @@ class CoolingTests(unittest.TestCase):
             try:
                 self.assertFalse(nk.enabled())
                 self.assertFalse(nk.record_hunt(tmp, program=None, target=_TARGET,
-                                                plan=_plan(("https://app.example.com/x", ["sqli"])), outcomes=[]))
+                                                plan=_plan(("https://app.example.com/x", ["sqli"])),
+                                                outcomes=[], complete=True))
                 self.assertEqual(nk.cooled_pairs(tmp, program=None, target=_TARGET), set())
             finally:
                 del os.environ[nk._ENV_DISABLE]
@@ -138,24 +166,29 @@ class SuppressionTests(unittest.TestCase):
         out, stats = nk.apply_suppression(plan, cooled)
         self.assertEqual(out["probe_priority"][0]["classes"], ["xss", "redirect", "sqli"])
         self.assertEqual(stats["downranked"], 1)
-        self.assertEqual(stats["dropped"], 0)
+        self.assertEqual(stats["fully_cooled"], 0)
 
-    def test_all_cold_endpoint_is_dropped(self) -> None:
+    def test_all_cold_endpoint_is_kept_but_fully_cooled(self) -> None:
+        """Rows are reordered, NEVER removed. Dropping looked like it freed a probe slot, but the
+        caller does not work from this list — active_targets is fixed before suppression and the only
+        consumer falls back to an INFERRED priority for an endpoint it cannot find. Dropping saved no
+        requests and replaced an evidence-based ordering with a guess."""
         cooled = {nk._pair_id("app.example.com/login", "sqli"),
                   nk._pair_id("app.example.com/login", "xss")}
         plan = _plan(("https://app.example.com/login", ["sqli", "xss"]),
                      ("https://app.example.com/search", ["xss"]))
         out, stats = nk.apply_suppression(plan, cooled)
         eps = [r["endpoint"] for r in out["probe_priority"]]
-        self.assertEqual(eps, ["https://app.example.com/search"])  # the inert endpoint freed its slot
-        self.assertEqual(stats["dropped"], 1)
+        self.assertEqual(eps, ["https://app.example.com/login", "https://app.example.com/search"])
+        self.assertEqual(stats["fully_cooled"], 1)
+        self.assertEqual(stats["downranked"], 2)
 
     def test_changed_endpoint_is_re_enabled(self) -> None:
         cooled = {nk._pair_id("app.example.com/login", "sqli")}
         plan = _plan(("https://app.example.com/login", ["sqli", "xss"]))
         out, stats = nk.apply_suppression(plan, cooled, changed_endpoints={"app.example.com/login"})
         self.assertEqual(out["probe_priority"][0]["classes"], ["sqli", "xss"])  # untouched
-        self.assertEqual(stats, {"downranked": 0, "dropped": 0})
+        self.assertEqual(stats, {"downranked": 0, "fully_cooled": 0})
 
     def test_input_plan_is_never_mutated_and_other_fields_survive(self) -> None:
         cooled = {nk._pair_id("app.example.com/login", "sqli")}
@@ -173,7 +206,7 @@ class SuppressionTests(unittest.TestCase):
         plan = _plan(("https://app.example.com/login", ["sqli"]))
         out, stats = nk.apply_suppression(plan, set())
         self.assertEqual(out["probe_priority"], plan["probe_priority"])
-        self.assertEqual(stats, {"downranked": 0, "dropped": 0})
+        self.assertEqual(stats, {"downranked": 0, "fully_cooled": 0})
 
 
 class DriftBridgeTests(unittest.TestCase):
@@ -188,6 +221,18 @@ class DriftBridgeTests(unittest.TestCase):
         self.assertIn("app.example.com/api/v2/orders/{id}", keys)
         self.assertEqual(len(keys), 2)
 
+    def test_defenses_coming_off_also_re_enable(self) -> None:
+        """auth.removed is surface_drift's highest-weighted signal ("a gate came off"). A route that
+        was inert WHILE PROTECTED is the first thing to re-probe once the protection is gone, so
+        these kinds must lift a cooled pair exactly like a new endpoint does."""
+        drift = {"deltas": [
+            {"kind": "auth.removed", "subject": "https://app.example.com/admin"},
+            {"kind": "cookie.flag-lost", "subject": "https://app.example.com/session"},
+            {"kind": "header.security-removed", "subject": "https://app.example.com/app"},
+        ]}
+        keys = nk.changed_endpoint_keys(drift)
+        self.assertEqual(keys, {"app.example.com/admin", "app.example.com/session", "app.example.com/app"})
+
     def test_none_drift_is_empty(self) -> None:
         self.assertEqual(nk.changed_endpoint_keys(None), set())
         self.assertEqual(nk.changed_endpoint_keys({}), set())
@@ -199,24 +244,25 @@ class EndToEndTests(unittest.TestCase):
             probe = ("https://app.example.com/download", ["path-traversal", "rce"])
             # Two inert hunts probe /download for path-traversal + rce, nothing confirms.
             for _ in range(2):
-                nk.record_hunt(tmp, program=None, target=_TARGET, plan=_plan(probe), outcomes=[])
+                nk.record_hunt(tmp, program=None, target=_TARGET, plan=_plan(probe), outcomes=[], complete=True)
             cooled = nk.cooled_pairs(tmp, program=None, target=_TARGET)
             self.assertEqual(len(cooled), 2)
             # A third hunt plans the same endpoint plus a brand-new one; suppression frees the inert slot.
             fresh = _plan(probe, ("https://app.example.com/invoice", ["ssti"]))
             out, stats = nk.apply_suppression(fresh, cooled)
             eps = [r["endpoint"] for r in out["probe_priority"]]
-            self.assertEqual(eps, ["https://app.example.com/invoice"])
-            self.assertEqual(stats["dropped"], 1)
+            self.assertEqual(eps, ["https://app.example.com/download", "https://app.example.com/invoice"])
+            self.assertEqual(stats["fully_cooled"], 1)
+            self.assertEqual(stats["downranked"], 2)
 
     def test_confirmed_route_keeps_being_hunted_across_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             probe = ("https://app.example.com/pay", ["idor", "xss"])
             # idor confirmed; xss never does.
-            nk.record_hunt(tmp, program=None, target=_TARGET, plan=_plan(probe),
+            nk.record_hunt(tmp, program=None, target=_TARGET, plan=_plan(probe), complete=True,
                            outcomes=[_outcome("https://app.example.com/pay", "idor", "confirmed")])
             for _ in range(2):
-                nk.record_hunt(tmp, program=None, target=_TARGET, plan=_plan(probe), outcomes=[])
+                nk.record_hunt(tmp, program=None, target=_TARGET, plan=_plan(probe), outcomes=[], complete=True)
             cooled = nk.cooled_pairs(tmp, program=None, target=_TARGET)
             # xss cooled, idor immune.
             self.assertIn(nk._pair_id("app.example.com/pay", "xss"), cooled)

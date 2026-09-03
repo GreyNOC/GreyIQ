@@ -237,6 +237,7 @@ const els = {
   bountyReport: document.querySelector("#bountyReport"),
   bountyReportActions: document.querySelector("#bountyReportActions"),
   bountyCopyReport: document.querySelector("#bountyCopyReport"),
+  bountyDownloadLeads: document.querySelector("#bountyDownloadLeads"),
   bountyToggleReport: document.querySelector("#bountyToggleReport"),
   redteamForm: document.querySelector("#redteamForm"),
   redteamBehavioral: document.querySelector("#redteamBehavioral"),
@@ -4299,6 +4300,15 @@ els.bountyForm?.addEventListener("submit", async (event) => {
       els.bountyStatus.textContent =
         `${warn}Done — risk ${String(res.risk).toUpperCase()}, ${res.finding_count} finding(s) [${sev}]${brain}${activeNote}. Report saved to: ${res.report_path}${perFiles}`;
       lastBountyReportMarkdown = res.report_markdown || "";
+      // The lead brief is rebuilt server-side from THIS run's sidecar, so remember which run the
+      // Download-leads button should ask for. A run with no findings is never cached and has no
+      // run_id, so the button stays hidden rather than offering an empty download.
+      lastBountyRunId = res.run_id || "";
+      if (els.bountyDownloadLeads) {
+        els.bountyDownloadLeads.hidden = !lastBountyRunId;
+        els.bountyDownloadLeads.disabled = false;
+        els.bountyDownloadLeads.textContent = "Download leads (.md)";
+      }
       renderBountyNextSteps(res.next_steps, res.coverage);
       if (els.bountyReport && lastBountyReportMarkdown) {
         els.bountyReport.textContent = lastBountyReportMarkdown;
@@ -4319,6 +4329,39 @@ els.bountyForm?.addEventListener("submit", async (event) => {
 });
 
 let lastBountyReportMarkdown = "";
+let lastBountyRunId = "";
+
+// Download the finished hunt's ranked investigation queue as ONE Markdown brief: each lead with its
+// evidence state, the contradictions against it, and the exact artifact that would confirm it. The
+// server builds it through the redaction-safe lead bridge, so no raw credential or response body
+// rides along — it is safe to hand to an analyst or paste to a model.
+els.bountyDownloadLeads?.addEventListener("click", async () => {
+  if (!lastBountyRunId) return;
+  const btn = els.bountyDownloadLeads;
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Building…";
+  try {
+    const res = await apiFetch("/api/bounty/leads", {
+      method: "POST",
+      body: JSON.stringify({ run_id: lastBountyRunId }),
+      timeoutMs: 60000,
+    });
+    if (res.ok === false) {
+      els.bountyStatus.textContent = res.error || "Could not build the lead brief.";
+      return;
+    }
+    ckDownloadText(res.filename || "greyiq-leads.md", res.markdown || "", "text/markdown");
+    const n = Number(res.lead_count || 0);
+    btn.textContent = `Downloaded ${n} lead${n === 1 ? "" : "s"}`;
+    setTimeout(() => { btn.textContent = label; }, 2500);
+  } catch (error) {
+    els.bountyStatus.textContent = error.message || "Could not build the lead brief.";
+    btn.textContent = label;
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 // Render the structured, ordered operator action plan returned by a hunt. DOM-built
 // (no innerHTML) so brain-authored step text can never inject markup.

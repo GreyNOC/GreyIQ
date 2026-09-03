@@ -64,15 +64,30 @@ class PredicateTests(unittest.TestCase):
         for value in (None, "", "confirmed", 7, [], ["a"]):
             self.assertFalse(report_lib.proof_is_non_differential(value), value)
 
-    def test_normalize_strips_then_bounds_like_the_cortex(self) -> None:
-        # Stripped FIRST so leading whitespace cannot eat the 2000-char window, then collapsed
-        # and case-folded — the exact order investigator._text + its normalization always used.
+    def test_normalize_collapses_whitespace_and_folds_case(self) -> None:
         raw = "   HTTP   200\n\tMARKER   absent   "
         self.assertEqual(report_lib.normalize_proof_text(raw), "http 200 marker absent")
-        long_a = "x" * 3000 + "A"
-        long_b = "x" * 3000 + "B"
-        # Beyond the bound the two are indistinguishable — a deliberate, documented ceiling.
-        self.assertEqual(report_lib.normalize_proof_text(long_a), report_lib.normalize_proof_text(long_b))
+
+    def test_equality_is_decided_on_the_whole_value_not_a_prefix(self) -> None:
+        """A full HTTP/HTML capture routinely shares thousands of characters of boilerplate before
+        the record that differs. Deciding "identical" from a prefix would refuse a REAL differential
+        and silently downgrade a confirmed finding to candidate, so the normalization must not
+        truncate into the comparison window."""
+        shared = "HTTP/1.1 200 OK\n" + ("<div>boilerplate</div>\n" * 400)  # ~9 kB of common prefix
+        observed = shared + "account 1001 balance 42"
+        control = shared + "403 forbidden for account 42"
+        self.assertNotEqual(report_lib.normalize_proof_text(observed), report_lib.normalize_proof_text(control))
+        self.assertFalse(report_lib.proof_is_non_differential(
+            {"observed_result": observed, "control_result": control}))
+        # …and the gate therefore still ACCEPTS this genuine differential.
+        self.assertTrue(report_lib._has_captured_artifact(
+            {"ref": "F1"}, {"observed_result": observed, "control_result": control}))
+
+    def test_long_identical_values_are_still_non_differential(self) -> None:
+        # The other direction: length must not make an identical pair look like a differential.
+        same = "HTTP/1.1 200 OK\n" + ("<div>boilerplate</div>\n" * 400)
+        self.assertTrue(report_lib.proof_is_non_differential(
+            {"observed_result": same, "control_result": same}))
 
 
 class ConfirmGateTests(unittest.TestCase):
@@ -227,6 +242,28 @@ class QaGateClaimIntegrityTests(unittest.TestCase):
         res = report_lib.qa_validate_report([finding], {"F1": plan})
         self.assertEqual(res["issues"], [])
         self.assertEqual(report_lib.resolve_severity(finding, plan), "critical")
+
+    def test_qa_section_never_contradicts_its_own_bullet(self) -> None:
+        """The closing line used to be derived from the CORRECTIONS list alone, so an informational
+        claim-integrity issue (verdict 'unsupported', no severity change) printed
+        "All claims matched the captured evidence" directly beneath a bullet saying the opposite —
+        in the one section whose purpose is showing a triager that GreyIQ audits its own claims."""
+        finding = {"ref": "F1", "class_id": "xss", "severity": "medium", "confidence": "high"}
+        plan = _plan(_OBSERVED, "")  # claims confirmed, no control -> Q5 fires, no correction
+        ctx = {"qa": report_lib.qa_validate_report([finding], {"F1": plan})}
+        out: list[str] = []
+        report_lib._append_qa(out, ctx)
+        rendered = "\n".join(out)
+        self.assertIn("unsupported", rendered)
+        self.assertNotIn("All claims matched the captured evidence", rendered)
+        self.assertIn("not backed by the captured evidence", rendered)
+
+    def test_qa_section_still_reports_a_clean_run_cleanly(self) -> None:
+        finding = {"ref": "F1", "class_id": "access-control", "severity": "high", "confidence": "high"}
+        ctx = {"qa": report_lib.qa_validate_report([finding], {"F1": _plan(_OBSERVED, _CONTROL)})}
+        out: list[str] = []
+        report_lib._append_qa(out, ctx)
+        self.assertEqual(out, [])  # no issues at all -> the section is omitted entirely
 
     def test_issue_carries_the_live_finding_for_ref_resync(self) -> None:
         # Every new issue must go through _record so the private ``_finding`` carrier rides
