@@ -422,8 +422,13 @@ def render_lead_brief(report: dict[str, Any], *, ref: str | None = None, wrap: b
     lines: list[str] = []
     for queue in report.get("hunts") or []:
         hunt = queue.get("hunt") or {}
+        # `ref` selects across BOTH collections. Chain probes carry their own id namespace (CP*/CR*),
+        # so narrowing on leads alone meant `--ref CP1` matched nothing and reported "No leads found"
+        # for a probe that is right there in the queue.
         selected = [lead for lead in queue.get("leads") or [] if not ref or lead.get("id") == ref]
-        if ref and not selected:
+        probes = [p for p in queue.get("chain_probes") or []
+                  if isinstance(p, dict) and (not ref or p.get("id") == ref)]
+        if ref and not selected and not probes:
             continue
         lines.append(f"# Hunt: {hunt.get('target') or '(unknown target)'}")
         meta = ", ".join(x for x in [
@@ -438,11 +443,13 @@ def render_lead_brief(report: dict[str, Any], *, ref: str | None = None, wrap: b
             lines.extend(_render_lead(lead))
         if not ref:
             lines.extend(_render_chains(queue))
-            # Chain probes are untested, signal-only or drift-reopened leads — never evidence, but
-            # often the most actionable thing in the queue ("go test this"). Omitting them made the
-            # brief not the whole investigation queue it claims to be, and on a hunt whose findings
-            # are all inert they can be the ONLY actionable rows in it.
-            lines.extend(_render_probes(queue))
+        # Chain probes are untested, signal-only or drift-reopened leads — never evidence, but often
+        # the most actionable thing in the queue ("go test this"). Omitting them made the brief not
+        # the whole investigation queue it claims to be, and on a hunt whose findings are all inert
+        # they can be the ONLY actionable rows in it. Rendered from the SELECTED list so a caller
+        # that filtered the queue (by status, ref, or confidence) gets a brief that honours it —
+        # rendering the raw queue here let `--status confirmed` emit every `untested` probe.
+        lines.extend(_render_probes(probes))
         lines.append("")
     body = "\n".join(lines).strip() or "No leads found."
     if wrap:
@@ -483,10 +490,11 @@ def _render_lead(lead: dict[str, Any]) -> list[str]:
     return out
 
 
-def _render_probes(queue: dict[str, Any]) -> list[str]:
+def _render_probes(probes: list[dict[str, Any]] | None) -> list[str]:
     """Untested chain leads: what to go TEST, kept visibly separate from what was observed so
-    nothing here can be read as a result."""
-    probes = queue.get("chain_probes") or []
+    nothing here can be read as a result. Takes the ALREADY-SELECTED probes so filtering stays the
+    caller's decision and the brief can never contradict the filters it was asked for."""
+    probes = probes or []
     if not probes:
         return []
     out = ["### Untested chain leads (nothing here is evidence — these are probes to run)"]

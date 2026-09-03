@@ -2,6 +2,25 @@
 
 Notable changes to GreyIQ.
 
+## v4.2.3 - the lead brief honours its own filters
+
+`gn leads --brief` rendered every chain probe regardless of the filters it was given, and could not
+select one at all:
+
+- `--brief --status confirmed` still emitted every `untested` probe.
+- `--brief --ref CP1` reported *"No leads found"* for a probe sitting in the queue, because `ref` was
+  matched against findings only and probes carry their own id namespace (`CP*` / `CR*`).
+
+Both are fixed. `_cmd_leads` applies the same predicate to `chain_probes` — it works on a probe
+unchanged, since a probe carries `status`, has no `report_ready`, and has no confidence score, so a
+`--min-confidence` floor correctly excludes an untested lead. `render_lead_brief` selects `ref` across
+both collections, and `_render_probes` now takes the **already-selected** list instead of re-reading
+`queue["chain_probes"]` — that second part is the structural fix, because re-reading the raw queue let
+the brief contradict whatever filter it was handed no matter what the caller did upstream.
+
+Introduced by the chain-probe section added in v4.2.2: a second lead type reached the brief without
+the filtering being extended to it.
+
 ## v4.2.2 - three more review fixes
 
 - **A credential in a non-URL target no longer reaches the download filename.** A source hunt names a
