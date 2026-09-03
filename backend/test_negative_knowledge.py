@@ -233,6 +233,26 @@ class DriftBridgeTests(unittest.TestCase):
         keys = nk.changed_endpoint_keys(drift)
         self.assertEqual(keys, {"app.example.com/admin", "app.example.com/session", "app.example.com/app"})
 
+    def test_collapsed_site_wide_delta_re_enables_everything(self) -> None:
+        """surface_drift._collapse folds a site-wide control loss into ONE delta whose subject is
+        prose ("3 endpoint(s)"), not a URL. Keying that as an endpoint produced an unmatched string
+        and re-enabled nothing — in exactly the case with the strongest reason to re-probe."""
+        drift = {"deltas": [{"kind": "header.security-removed", "subject": "3 endpoint(s)"}]}
+        self.assertEqual(nk.changed_endpoint_keys(drift), {nk.ALL_ENDPOINTS})
+
+    def test_site_wide_change_suppresses_nothing(self) -> None:
+        cooled = {nk._pair_id("app.example.com/login", "sqli"),
+                  nk._pair_id("app.example.com/login", "xss")}
+        plan = _plan(("https://app.example.com/login", ["sqli", "xss"]))
+        out, stats = nk.apply_suppression(plan, cooled, changed_endpoints={nk.ALL_ENDPOINTS})
+        self.assertEqual(out["probe_priority"][0]["classes"], ["sqli", "xss"])  # untouched
+        self.assertEqual(stats, {"downranked": 0, "fully_cooled": 0})
+
+    def test_url_subjects_still_resolve_to_one_endpoint(self) -> None:
+        # The wildcard must not swallow the normal per-endpoint path.
+        drift = {"deltas": [{"kind": "auth.removed", "subject": "https://app.example.com/admin"}]}
+        self.assertEqual(nk.changed_endpoint_keys(drift), {"app.example.com/admin"})
+
     def test_none_drift_is_empty(self) -> None:
         self.assertEqual(nk.changed_endpoint_keys(None), set())
         self.assertEqual(nk.changed_endpoint_keys({}), set())

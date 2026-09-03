@@ -2,6 +2,26 @@
 
 Notable changes to GreyIQ.
 
+## v4.2.2 - three more review fixes
+
+- **A credential in a non-URL target no longer reaches the download filename.** A source hunt names a
+  local folder, so `urlparse(...).hostname` is empty and the filename fell back to the raw target -
+  and the slugger only rewrites punctuation, so `ghp_...` survived it intact. The target is now
+  scrubbed before slugging (a hostname is unaffected; a path stays recognisable).
+- **The lead brief now includes untested chain probes.** `render_lead_brief` rendered only hypotheses
+  and proven chains, so the brief was not the whole investigation queue it advertises. On a hunt whose
+  findings are all inert, the signal-only and drift-reopened (`CR*`) leads can be the ONLY actionable
+  rows in the file. They render in their own section, explicitly labelled as probes to run rather than
+  results, with the `blocked_runs` age shown so a lead the surface may have just unblocked is visible.
+- **A site-wide control loss re-enables every cooled pair.** `surface_drift._collapse` folds a
+  host-wide change into ONE delta whose subject is prose (`"3 endpoint(s)"`), not a URL, so keying it
+  as an endpoint produced an unmatched string. The `header.security-removed` / `cookie.flag-lost`
+  triggers added in v4.2.1 therefore appeared to work while being inert in exactly the collapsed case
+  - a protection coming off across the whole surface, the strongest reason to re-probe there is. A
+  non-URL subject is now read as the host-wide change it is (`ALL_ENDPOINTS`), and suppression is
+  skipped for that run. Erring toward probing more is the correct direction here: a false re-enable
+  costs a little budget, a false suppression silently removes coverage.
+
 ## v4.2.1 - download the hunt's leads, and four review fixes
 
 ### Download leads (.md)

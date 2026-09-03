@@ -438,6 +438,11 @@ def render_lead_brief(report: dict[str, Any], *, ref: str | None = None, wrap: b
             lines.extend(_render_lead(lead))
         if not ref:
             lines.extend(_render_chains(queue))
+            # Chain probes are untested, signal-only or drift-reopened leads — never evidence, but
+            # often the most actionable thing in the queue ("go test this"). Omitting them made the
+            # brief not the whole investigation queue it claims to be, and on a hunt whose findings
+            # are all inert they can be the ONLY actionable rows in it.
+            lines.extend(_render_probes(queue))
         lines.append("")
     body = "\n".join(lines).strip() or "No leads found."
     if wrap:
@@ -474,6 +479,26 @@ def _render_lead(lead: dict[str, Any]) -> list[str]:
         out.append(f"- **Contradiction ({flag}, {con.get('code')}):** {con.get('message')}")
     if lead.get("in_chains"):
         out.append(f"- **In attack chains:** {', '.join(lead['in_chains'])}")
+    out.append("")
+    return out
+
+
+def _render_probes(queue: dict[str, Any]) -> list[str]:
+    """Untested chain leads: what to go TEST, kept visibly separate from what was observed so
+    nothing here can be read as a result."""
+    probes = queue.get("chain_probes") or []
+    if not probes:
+        return []
+    out = ["### Untested chain leads (nothing here is evidence — these are probes to run)"]
+    for probe in probes:
+        if not isinstance(probe, dict):
+            continue
+        blocked = probe.get("blocked_runs")
+        age = f" · blocked for {blocked} run(s), the surface may have unblocked it" if blocked else ""
+        out.append(
+            f"- **[{probe.get('id')}] {probe.get('title') or 'Chain lead'}** ({probe.get('status') or 'untested'}{age})"
+            f" — {probe.get('hypothesis') or ''} {probe.get('next_action') or ''}".rstrip()
+        )
     out.append("")
     return out
 

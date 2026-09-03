@@ -3392,7 +3392,13 @@ class GreyIQRuntime:
             return {"ok": False, "error": f"Could not build the lead brief: {exc}"}
         lead_count = sum(len(h.get("leads") or []) for h in report.get("hunts") or [])
         safe = lambda s: "".join(c if (c.isalnum() or c in "_-") else "-" for c in str(s))[:48]  # noqa: E731
-        host = urlparse(str(run.get("target") or "")).hostname or str(run.get("target") or "hunt")
+        # The filename is derived from the target, and a target is not always a URL — a source hunt
+        # names a local folder. `safe` only rewrites punctuation, so an opaque target carrying a
+        # credential (`/tmp/token-ghp_...`) would survive into the download filename even though the
+        # brief's own metadata is scrubbed. Redact before slugging: a hostname is unaffected, and a
+        # path keeps enough shape to stay recognisable.
+        _target = str(run.get("target") or "")
+        host = urlparse(_target).hostname or (leads_lib._redacted(_target, 120) or "hunt")
         stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         return {
             "ok": True,

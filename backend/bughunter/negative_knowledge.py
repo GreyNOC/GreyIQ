@@ -60,6 +60,13 @@ _KEY_SEP = "\t"  # separates endpoint-key from class inside a stored pair id; ne
 
 _ENV_DISABLE = "GREYIQ_NO_NEGATIVE_KNOWLEDGE"
 
+# Sentinel meaning "the whole host changed, re-enable everything". surface_drift COLLAPSES a
+# site-wide control loss into ONE delta whose subject is prose ("3 endpoint(s)"), not a URL — see
+# surface_drift._collapse — so there is no endpoint to name. Treating that as an endpoint key
+# produced an unmatched string and silently re-enabled nothing, in exactly the case with the
+# strongest reason to re-probe: a protection came off across the whole surface.
+ALL_ENDPOINTS = "*"
+
 # Endpoint identity: host + path with volatile id segments collapsed, so /order/1001 and /order/1002
 # share one memory. Query strings are dropped — the class dimension already separates concerns, and a
 # per-value key would never repeat across runs. Mirrors offline_hunt's numeric/uuid segment shapes.
@@ -287,10 +294,24 @@ def changed_endpoint_keys(drift: dict[str, Any] | None) -> set[str]:
         # just become interesting.
         if kind in {"endpoint.new", "shape.changed", "auth.added", "form.new",
                     "auth.removed", "cookie.flag-lost", "header.security-removed"}:
-            key = endpoint_key(delta.get("subject"))
-            if key:
-                out.add(key)
+            key = _subject_endpoint_key(delta.get("subject"))
+            # A collapsed, site-wide subject names no endpoint — it means the change hit the whole
+            # host, so nothing on it should stay cooled.
+            out.add(key if key else ALL_ENDPOINTS)
     return out
+
+
+def _subject_endpoint_key(subject: Any) -> str:
+    """The endpoint key a drift delta's subject names, or '' when it names no single endpoint.
+
+    ``surface_drift`` subjects are URLs except when ``_collapse`` folds a site-wide change into one
+    row, whose subject is prose like ``"3 endpoint(s)"``. Whitespace is the reliable tell: a URL
+    never contains a space, and every collapsed subject does."""
+    raw = str(subject or "").strip()
+    if not raw or " " in raw:
+        return ""
+    key = endpoint_key(raw)
+    return key if key.split("/", 1)[0] else ""
 
 
 def apply_suppression(plan: dict[str, Any] | None, cooled: set[str], *,
@@ -319,6 +340,11 @@ def apply_suppression(plan: dict[str, Any] | None, cooled: set[str], *,
         new_plan["probe_priority"] = list(rows) if isinstance(rows, list) else rows
         return new_plan, {"downranked": 0, "fully_cooled": 0}
     changed = changed_endpoints or set()
+    if ALL_ENDPOINTS in changed:
+        # A site-wide change (a security header or cookie flag lost across the host) invalidates
+        # every stored miss for this surface at once — suppress nothing this run.
+        new_plan["probe_priority"] = list(rows)
+        return new_plan, {"downranked": 0, "fully_cooled": 0}
     out_rows: list[dict[str, Any]] = []
     downranked = 0
     fully_cooled = 0

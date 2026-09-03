@@ -208,6 +208,23 @@ class BriefTests(unittest.TestCase):
         self.assertIn("F1", brief)
         self.assertNotIn("Second lead", brief)
 
+    def test_brief_includes_untested_chain_probes(self) -> None:
+        """Chain probes are untested, signal-only or drift-reopened leads. They are never evidence,
+        but on a hunt whose findings are all inert they can be the only actionable rows — so the
+        brief must carry them, clearly labelled as probes rather than results."""
+        findings, plans = _confirmed_idor()
+        doc = _build_sidecar(findings, plans)
+        doc["investigation"]["chain_probes"] = [{
+            "id": "CP1", "title": "Mass assignment via is_admin",
+            "hypothesis": "The signup form carries an is_admin field.",
+            "impact": "privilege escalation", "next_action": "Submit the form with is_admin=true as a test user.",
+            "signals": ["role-like field"], "status": "untested",
+        }]
+        brief = leads.render_lead_brief(leads.build_lead_report_from_doc(doc), wrap=False)
+        self.assertIn("CP1", brief)
+        self.assertIn("Mass assignment", brief)
+        self.assertIn("nothing here is evidence", brief)
+
     def test_brief_names_the_proof_obligation(self) -> None:
         findings, plans = _confirmed_idor()
         doc = _build_sidecar(findings, plans)
