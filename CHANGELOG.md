@@ -2,6 +2,35 @@
 
 Notable changes to GreyIQ.
 
+## v4.2.4 - the installer v4.2.3 never shipped
+
+Packaging only. No engine, API or UI code changed: `git diff v4.2.3..v4.2.4` touches the two version
+strings, this file, and one exclude list in the PyInstaller spec.
+
+v4.2.3 published with a single asset, `GreyIQ-4.2.3-portable.exe`. The NSIS installer and the
+`SHA256SUMS` file the house standard calls for - and that v4.0.0 shipped - were missing from it.
+They cannot be added after the fact: releases in this repo are **immutable once published**, which
+is exactly why `.github/workflows/release.yml` uploads every asset to a *draft* and only flips it to
+published once both platform jobs have finished. So the complete set is reissued here instead.
+
+- **`GreyIQ-4.2.4-portable.exe`**, **`GreyIQ-Setup-4.2.4.exe`** and **`SHA256SUMS-4.2.4.txt`**, all
+  three from ONE local build - so the checksums describe the binaries actually attached, rather than
+  a rebuild a downloader could never reproduce.
+
+### The freeze no longer aborts on a machine that has Qt6 installed
+
+`build/greyiq-backend.spec` excluded the Qt5-era bindings (`PyQt5`, `PySide2`) but not `PyQt6` /
+`PySide6`. Pillow's `ImageQt` references both 6-series bindings, so on a dev machine carrying them
+PyInstaller hits two Qt binding packages in one graph and **aborts the build outright** rather than
+choosing one. A CI runner is clean, so this never fired there - it only ever broke the local build,
+which is the one path still available while Actions is unavailable. GreyIQ itself never imports Qt,
+so the exclusion costs the shipped app nothing.
+
+The same class of build-environment leak is why this release was frozen in the script's isolated
+`.venv-build` rather than from system Python: an unpinned developer environment was otherwise
+pulling `scipy` into the bundle, and `collect_all("anthropic")` fails **silently** when the package
+is absent - it would have produced a clean-looking build whose every Claude path died at first use.
+
 ## v4.2.3 - the lead brief honours its own filters
 
 `gn leads --brief` rendered every chain probe regardless of the filters it was given, and could not
