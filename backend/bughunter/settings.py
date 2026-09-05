@@ -31,6 +31,9 @@ Env vars:
   ranker weight file is present (default on).
 - GREYIQ_HUNT_LOOP_OFFLINE : "1" to opt into the offline (brain-free) iterative re-plan
   pass (default off).
+- GREYIQ_HUNT_REPLAN : "1" to opt into the outer theorize->act wave — one extra bounded
+  pass aimed at the (endpoint, class) the investigation cortex says would most change the
+  verdict, across every scanner's findings rather than the seed URL alone (default off).
 - GREYIQ_OFFLINE_REPAIR : "0" to disable the offline coder's deterministic verify->repair
   loop (default on).
 - GREYIQ_OFFLINE_REPAIR_ROUNDS : repair attempts per failed edit, clamped to 0..3
@@ -99,6 +102,12 @@ class ScannerSettings:
     # max-iters AND the shared per-host governor + the single hunt's request budget (never expanded).
     hunt_loop_enabled: bool = False
     hunt_loop_max_iters: int = 3
+    # Outer theorize -> act wave. After the first active pass, the cortex can say which
+    # (endpoint, class) pair would most change the verdict — across EVERY scanner's findings,
+    # not just the seed URL the iterative loop probes. This runs that plan through the same
+    # gated prover once. OFF by default (opt-in), like the loop above, because it spends
+    # additional requests; the shared per-host governor still caps the real ceiling either way.
+    hunt_replan_enabled: bool = False
     # Passive OSINT recon enrichment (certificate-transparency subdomain seeding via crt.sh): OFF by
     # default (opt-in) — it queries a THIRD-PARTY service (the public CT logs) with the target's apex,
     # so the operator turns it on deliberately. Every CT-returned host is still scope-gated before it
@@ -149,6 +158,7 @@ def get_settings() -> ScannerSettings:
         active_time_sqli_margin_seconds=_float_env("GREYIQ_ACTIVE_TIME_SQLI_MARGIN_S", 3.0),
         hunt_loop_enabled=_bool_env("GREYIQ_HUNT_LOOP_ENABLED", False),
         hunt_loop_max_iters=max(1, min(_int_env("GREYIQ_HUNT_LOOP_MAX_ITERS", 3), 6)),
+        hunt_replan_enabled=_bool_env("GREYIQ_HUNT_REPLAN", False),
         recon_osint_enabled=_bool_env("GREYIQ_RECON_OSINT", False),
         offline_ranker_enabled=_bool_env("GREYIQ_OFFLINE_RANKER", True),
         hunt_loop_offline_enabled=_bool_env("GREYIQ_HUNT_LOOP_OFFLINE", False),
