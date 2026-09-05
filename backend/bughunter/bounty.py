@@ -1776,10 +1776,8 @@ def _infer_active_xss_params(url: str) -> list[str]:
     return _merge_unique_strings(hints, [], limit=8)
 
 
-# The outer theorize -> act wave. Bounded on every dimension: how many distinct endpoints it may
-# re-probe, how many classes on each, and how many requests the whole wave may spend. These are
-# deliberately small — the wave exists to close ONE high-value gap the first pass left open, not to
-# become a second hunt.
+# Bounds on the outer theorize -> act wave: endpoints, classes each, and total requests. Small on
+# purpose — it exists to close one high-value gap the first pass left open, not to be a second hunt.
 _REPLAN_MAX_TARGETS = 3
 _REPLAN_MAX_CLASSES = 3
 _REPLAN_BUDGET = 8
@@ -1822,13 +1820,11 @@ def _replan_wave(target_url: str, findings: list[dict[str, Any]], *, scope: str,
         plan = investigator.build_probe_plan(graph)
         if not plan:
             return [], info
-        # Pairs the first active pass ALREADY probed. Without this the wave re-runs exactly what just
-        # ran: an active finding records the probed URL as its location and its check's class, so
-        # every unconfirmed active result becomes a plan row pointing back at itself. Re-probing it
-        # spends the wave's whole budget re-deriving a known answer and appends a second copy of the
-        # finding that the duplicate grouping cannot collapse, because both carry captured proof. The
-        # wave is for leads the active pass did NOT test — static and passive findings, and chain
-        # blocking steps on endpoints it never reached.
+        # Pairs the first active pass already probed. An active finding records the probed URL as
+        # its location and its check's class, so every unconfirmed one becomes a plan row pointing
+        # back at itself — the wave would spend its budget re-deriving a known answer and append a
+        # duplicate that grouping cannot collapse (both carry proof). This wave is for what the
+        # active pass did NOT test: static and passive leads, and chains on untouched endpoints.
         probed: set[tuple[str, str]] = set()
         for finding in findings if isinstance(findings, list) else []:
             if not isinstance(finding, dict) or not isinstance(finding.get("_active_proof"), dict):
@@ -2421,11 +2417,11 @@ def _run_bounty_hunt_body(
             active_meta = {"in_scope": False, "skipped_reason": f"active verification error: {exc}"}
             _emit(f"active verification error: {exc}")
 
-        # OUTER THEORIZE -> ACT WAVE (opt-in). The first pass has run, so the cortex can now name the
-        # (endpoint, class) whose outcome would most change the verdict — reading EVERY scanner's
-        # findings, not the seed URL the iterative loop probes. Acting on that here, before
-        # classification / attack planning / the QA gate, is what makes it a re-plan rather than a
-        # late finding: whatever it captures flows through the rest of the pipeline normally.
+        # OUTER THEORIZE -> ACT WAVE (opt-in). With the first pass done the cortex can name the
+        # (endpoint, class) that would most change the verdict, across EVERY scanner's findings
+        # rather than the seed URL the iterative loop probes. It runs HERE, before classification /
+        # attack planning / the QA gate, so what it captures flows through them like any other
+        # active finding — after the final graph it would skip all of them.
         if active_meta.get("in_scope") and getattr(
                 settings or active_verify_service.get_settings(), "hunt_replan_enabled", False):
             try:

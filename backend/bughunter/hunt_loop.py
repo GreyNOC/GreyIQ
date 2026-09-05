@@ -57,15 +57,6 @@ from bughunter.settings import get_settings
 
 _PER_TURN_MIN = 4  # don't start a turn that can't afford a few probes
 
-# NOT reserving a share of the budget for the steered turns, deliberately. Capping turn 0 looks like
-# it funds the turns that know something, and does the opposite: `_Http` raises the SAME
-# ``_RateLimited`` when a call exhausts its own allotment as when the host governor throttles, so
-# verify_active reports ``rate_limited`` either way and the loop below treats that as a hard stop.
-# Hitting the cap is therefore exactly what prevents the reserved remainder from ever being spent —
-# and because turn 0 is the only pass that runs the check suite unrestricted, shrinking it also cuts
-# the tail of that suite (nosqli, crlf, cloud-exposure, sensitive, debug, websocket, path-traversal)
-# on the one turn allowed to reach it. Turn 0 keeps the full budget until those two are separable.
-
 # The error signature families digest_builder can match, mapped to the injection class the LLM prompt
 # tells the brain to prioritise for each. ``stacktrace`` is deliberately ABSENT: a generic traceback
 # names no injection family, and inventing one would be a guess — undetermined stays undetermined.
@@ -612,17 +603,15 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
     structural: list[dict[str, Any]] = []
     params_tried = list(extra_params or [])
     cur_params = list(extra_params or [])
-    # TWO priority lists, deliberately. `planner_priority` is what the PLANNER asked for and is the
-    # only thing the no-progress guard may compare, because the guard's question is "did the planner
-    # say anything new?". `cur_priority` is what actually runs: the planner's list plus the
-    # deterministic chain promotion. Folding the promotion into the guard's input is what made the
-    # guard undecidable — the promotion is stable across turns while the planner's list never
-    # contains it, so the two could never compare equal again and the loop ran to max_iters on
-    # byte-identical probes, which is precisely the regression the guard was written to stop.
+    # TWO priority lists, deliberately. `planner_priority` is what the PLANNER asked for and the
+    # ONLY thing the no-progress guard may compare against — its question is "did the planner say
+    # anything new?". `cur_priority` is what actually runs: that plus the chain promotion, which is
+    # derived from evidence already held and is therefore identical every turn. Feeding it to the
+    # guard makes the comparison permanently unequal and the loop runs to max_iters on identical
+    # probes.
     planner_priority = list(class_priority or [])
     cur_priority = list(class_priority or [])
-    # Set only when a turn is genuinely CLASS-steered (the planner named classes, or a chain
-    # promotion fired). A turn driven purely by new parameter names must not be restricted.
+    # Set only when a turn is genuinely CLASS-steered; a turn driven by new param names is not.
     focus_classes: list[str] = []
     cur_xss = list(xss_params or [])
     budget_remaining = int(requests_budget)
@@ -650,27 +639,24 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
 
     turn = -1  # so out_meta["loop_turns"] = turn + 1 is well-defined (0) even if max_iters <= 0
     for turn in range(max_iters):
+        # Turn 0 gets the FULL budget. Reserving a share for the steered turns is self-defeating
+        # while ``_Http`` raises the same ``_RateLimited`` for "spent my allotment" as for "the host
+        # is throttling": verify_active reports rate_limited either way and the break below treats
+        # it as final, so hitting a cap is what strands the reserve.
         per_turn = min(requests_budget, budget_remaining)
         if per_turn < _PER_TURN_MIN and turn > 0:
             break  # not enough left to be worth another round (turn 0 always runs)
-        # Turn 0 runs the suite in FULL, so recall is established before anything is restricted.
-        # After that a CLASS-STEERED turn probes only what the planner asked for, so the budget goes
-        # to the hypothesis that can still change the verdict instead of re-paying for ~24 checks the
-        # previous turn already ran.
+        # Turn 0 runs the suite in FULL, so recall is established before anything narrows. Only a
+        # CLASS-STEERED turn is then restricted (``focus_classes`` — see where it is set), never one
+        # that exists to try new parameter names: cur_priority is an ordered ranking, not a
+        # membership set, and an ordinary ranking can be entirely param-blind (clickjacking, cors,
+        # csrf, host-header, websocket), which would strip every param-consuming check.
         #
-        # Two things this must NOT do, both learned the hard way:
-        #   * It must not restrict a turn that exists because of new PARAMETER names. cur_priority is
-        #     an ordered ranking, not a membership set (see _apply_class_priority's own docstring),
-        #     and a perfectly ordinary ranking can be entirely param-blind — clickjacking, cors,
-        #     csrf, host-header, websocket. Restricting to it would remove every param-consuming
-        #     check on the exact turn whose whole purpose was to test the new names.
-        #   * It must not subtract `verified`. Those class ids come from each finding's
-        #     `_active_class_hint`, which is the IMPACT vocabulary, while the restriction matches
-        #     check-suite tags. The two collide on shared names — the debug-endpoint check reports a
-        #     confirmed `rce` hint, which would then delete the real command-injection check that had
-        #     never run. Skipping settled ground belongs in the planner (which reads the probe
-        #     digest's confirmed_classes and simply declines to promote them), where a vocabulary
-        #     mismatch costs a missed promotion rather than lost coverage.
+        # `verified` is deliberately NOT subtracted here. Those ids are finding `_active_class_hint`
+        # values (the impact vocabulary) while the filter matches check-suite tags; they collide on
+        # shared names, so a confirmed `rce` hint from the debug-endpoint check would delete the
+        # command-injection check that never ran. Declining to re-promote settled classes belongs in
+        # the planner, where the same mismatch costs a missed promotion rather than coverage.
         only_classes = focus_classes if (turn > 0 and focus_classes) else None
         results, meta = active_verify_service.verify_active(
             target_url, findings, scope=scope, requests_budget=max(_PER_TURN_MIN, per_turn),
@@ -717,33 +703,23 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
         # keeps the caller's ordering when new_priority is empty, so a naive
         # `new_priority == cur_priority` test regresses the empty-plan case (measured: 1 repeat turn
         # -> 6). Build the next state first, then stop when it equals the current one.
-        # Compared against `planner_priority`, NEVER against `cur_priority`: the latter carries the
-        # deterministic chain promotion, which is derived from evidence already held and is therefore
-        # identical every turn. Including it made the comparison permanently unequal, so the guard
-        # could never fire again and the loop re-ran byte-identical probes until max_iters.
+        # Against `planner_priority`, NEVER `cur_priority` — see where the two are declared.
         next_priority = (list(dict.fromkeys([c for row in new_priority for c in row]))
                          if new_priority else planner_priority)
         next_xss = list(dict.fromkeys(cur_xss + list(plan["xss_params"])))
         if plan["done"] or (not new_params and next_priority == planner_priority and next_xss == cur_xss):
             break  # brain is done OR proposed nothing NEW -> stop (no-progress guard)
-        # NEW names FIRST. Each check applies its own small per-call parameter cap, so appending fresh
-        # hypotheses to the tail of an ever-growing list meant the cap was spent re-probing names
-        # earlier turns had already cleared and the new hypothesis was never reached at all. Nothing
-        # is dropped — the previously tried names still follow — so this costs no recall.
+        # NEW names FIRST: each check applies its own small per-call param cap, so fresh hypotheses
+        # appended to a growing list never get reached. Nothing is dropped, only reordered.
         prior_params = list(params_tried)
         params_tried = prior_params + new_params
         cur_params = new_params + prior_params
         planner_priority = next_priority
         cur_xss = next_xss
-        # Deterministic chain-closing promotion. It re-orders the next turn's attention using
-        # evidence already captured, so it must never by itself justify another turn — which is why
-        # the guard above compares planner_priority and this lands only on cur_priority, the list
-        # that is actually handed to the prover.
+        # The chain promotion lands on cur_priority only, never on the guard's input above.
         promoted = _chain_probe_classes(turn_graph, target_url)
         cur_priority = _promote(planner_priority, promoted) if promoted else list(planner_priority)
-        # Restrict the next turn ONLY when it is genuinely class-steered. A turn that exists because
-        # the planner proposed new parameter NAMES must keep the full suite, or the param-consuming
-        # checks it was created to run can be filtered out by a param-blind ranking.
+        # A param-driven turn keeps the full suite; only a class-steered one may narrow.
         focus_classes = [] if new_params else list(cur_priority)
         _emit(f"hunt-loop turn {turn + 1}: +{len(new_params)} param(s), {budget_remaining} req budget left")
 

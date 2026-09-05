@@ -357,12 +357,10 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
         if classes and url not in seen_pri:
             seen_pri.add(url)
             priority.append({"endpoint": url, "classes": classes})
-        # object-scoped endpoint -> IDOR candidate. Model-selected endpoints are collected
-        # SEPARATELY rather than appended into the same list, because both lists are hard-capped at
-        # six on the way out and they are filled in discovery order — so a model firing on early
-        # endpoints would push out a rule-derived candidate discovered later. That is removal by
-        # crowding, and the selector's contract is that it may only ADD. Rule hits claim their slots
-        # first (see the return), and the model fills whatever is left.
+        # object-scoped endpoint -> IDOR candidate. Model picks go in a SEPARATE list because both
+        # are capped at six and filled in discovery order, so a model firing early would crowd out
+        # a rule hit found later — removal by the back door, when the selector may only add. Rule
+        # hits claim their slots at the return; the model fills what is left.
         _form = forms_by_action.get(url)
         _recon = sorted(recon_params)
         if _NUMERIC_SEG_RE.search(url) or _UUID_SEG_RE.search(url) or any(_hit(n, _IDOR_PARAM_HINTS) for n in names):
@@ -383,16 +381,11 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
             if _hit(n, _XSS_HINTS) and n not in xss_params:
                 xss_params.append(n)
 
-    # LEARNED names first, curated names behind them. The trainer distils the parameter names this
-    # program's confirmed hunts actually landed on, so those are better bets than a fixed list of
-    # eighteen — and being first is what matters, because each check applies its own small per-call
-    # parameter cap.
-    #
-    # The learned list is capped at the slots the curated list does NOT need. Without that cap the
-    # promise one line down is false: the final list is truncated at _CAP, so a learned table
-    # returning _CAP names pushes every curated name past the end and silently deletes the whole
-    # hand-tuned surface — a recall loss with no error and no signal. Ordering wins; displacement does
-    # not.
+    # LEARNED names lead — they are the ones this program's confirmed hunts landed on, and leading
+    # is what counts because each check applies its own small per-call param cap. But they are
+    # capped at the slots _SUGGEST does not need: the result is truncated at _CAP, so an unbounded
+    # learned table would push every curated name past the end and silently delete the hand-tuned
+    # surface. Ordering wins; displacement does not.
     learned_slots = max(0, _CAP - len(_SUGGEST))
     learned_names: list[str] = []
     for url in endpoints[:60]:

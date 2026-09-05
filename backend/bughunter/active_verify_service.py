@@ -2620,12 +2620,10 @@ def verify_active(
         # target's real structure instead of a 200-char excerpt; it carries no value and confirms
         # nothing. Empty dict when the landing fetch failed or nothing structural was present.
         "digest": digest_builder.build_digest(landing),
-        # What THIS pass provoked, as opposed to what the landing page always looks like. The landing
-        # digest above is identical on every call against one URL, so a caller looping over
-        # verify_active learns nothing new from it and can only reschedule the pass it already ran.
-        # This one changes whenever the probes change: the error families the probes triggered, and
-        # which classes answered but did not confirm. Derived from `results`, so it costs no request
-        # and confirms nothing — `verified` above is still the only statement about what was proven.
+        # What THIS pass provoked, rather than what the landing page always looks like. The digest
+        # above is identical on every call against one URL, so a caller looping over verify_active
+        # learns nothing from it; this one moves as the probes move. Derived from `results`, so no
+        # request and no claim — `verified` above remains the only statement about what was proven.
         "probe_digest": digest_builder.build_probe_digest(results),
         "skipped_reason": "",
     }

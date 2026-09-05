@@ -575,11 +575,10 @@ def _synthesize_hypotheses(
             "refs": refs[:8], "class_id": class_id,
         })
 
-    # (2) A credential and an exposed cloud surface in one graph. The chain engine composes a
-    # pair only where its table has a technique for it and provenance allows it; the QUESTION
-    # "does this key open that bucket?" is worth asking even when those conditions do not hold,
-    # because it is one cheap authorized call to answer. Suppressed when a chain already pairs
-    # them, so this never restates a lead the report is making properly.
+    # (2) A credential and an exposed cloud surface in one graph. The chain engine pairs them only
+    # where its table has a technique and provenance allows it, but "does this key open that
+    # bucket?" is one cheap authorized call to answer and worth asking regardless. Suppressed when
+    # a chain already pairs them, so it never restates a lead the report is making properly.
     secret_refs = sorted(dict.fromkeys(refs_by_class.get("secrets") or []))
     cloud_refs = sorted(dict.fromkeys(refs_by_class.get("cloud-exposure") or []))
     if secret_refs and cloud_refs:

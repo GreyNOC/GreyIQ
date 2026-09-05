@@ -318,14 +318,11 @@ def _build_finding(component: dict[str, str], cves: list[dict[str, Any]], url: s
     }
 
 
-# CWE -> the class the deterministic prover can actually CONFIRM for it.
-#
-# Deliberately PARTIAL. A CWE with no prover check is left out rather than mapped to something
-# adjacent: ReDoS (CWE-1333) and prototype pollution (CWE-1321) have no check at all, and SSRF
-# (CWE-918) is reached through ``ssrf_params`` plus the OOB collaborator rather than a class tag.
-# Steering probe budget at a class that cannot confirm is waste dressed up as intelligence, and the
-# planner vocabulary exists precisely so that cannot happen by accident. Every VALUE here is a
-# member of ``prover_classes.PROVER_CLASSES``; ``test_cve_service`` asserts that mechanically.
+# CWE -> the class the deterministic prover can actually CONFIRM for it. Deliberately PARTIAL: a
+# CWE with no check is omitted rather than mapped to something adjacent — ReDoS (CWE-1333) and
+# prototype pollution (CWE-1321) have none, and SSRF (CWE-918) is reached through ``ssrf_params``
+# and the OOB collaborator rather than a class tag. Steering budget at a class that cannot confirm
+# only wastes it. Every VALUE is in ``prover_classes.PROVER_CLASSES``; test_cve_service pins that.
 _CWE_PROBE_CLASS: dict[str, str] = {
     "CWE-79": "xss", "CWE-80": "xss", "CWE-83": "xss",
     "CWE-89": "sqli",
