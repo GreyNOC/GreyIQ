@@ -188,6 +188,76 @@ def _cookie_flag_gaps(cookies: list[str], is_https: bool) -> list[dict[str, Any]
     return gaps
 
 
+def build_probe_digest(tagged_results: Any) -> dict[str, Any]:
+    """Structural metadata about what the PROBES did — the observe half of a probe/observe loop.
+
+    Takes ``(check class tag, finding)`` pairs, NOT bare findings. The distinction is load-bearing:
+    a finding names the class of the IMPACT it represents, while the re-planner uses these names to
+    promote and restrict CHECKS. They diverge — the clickjacking check reports ``headers``, the
+    debug-endpoint check reports ``rce`` or ``secrets`` — so reading the finding's own hint would
+    tell the loop to run command injection when what produced the lead was the debug check, and to
+    focus on ``headers``, which matches no check at all and silently falls back to the full suite.
+
+    ``build_digest`` describes one captured response. This describes a whole differential pass: which
+    classes produced something, which of those the confirm gate accepted, and — the signal that
+    matters most for steering — which error families the probes THEMSELVES provoked.
+
+    Why a second digest exists at all: a landing page is the same page every turn, so an iterative
+    loop re-reading only the landing digest observes nothing new after turn 0 and can do no better
+    than reschedule the scan it already ran. What a probe *triggered* is different every turn, because
+    every turn sends different parameters and classes. A SQL error raised by a probe on turn 2 is
+    exactly the evidence that should promote sqli on turn 3, and until now it was distilled to a
+    200-character excerpt and dropped.
+
+    Extracted from findings the prover already produced — each ``_active_proof`` is redacted at the
+    source by ``_proof`` — never from a fresh request, so this costs nothing and leaks nothing. It
+    confirms nothing either: it only reports the status ``report._has_captured_artifact`` already
+    decided. Bounded and total: any problem yields ``{}`` and the caller keeps today's behaviour.
+    """
+    try:
+        rows = tagged_results if isinstance(tagged_results, (list, tuple)) else []
+        observed: list[str] = []
+        confirmed: list[str] = []
+        candidate: list[str] = []
+        families: list[str] = []
+        for entry in rows[:60]:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                continue
+            tag, row = entry
+            if not isinstance(row, dict):
+                continue
+            class_id = str(tag or "").strip().lower()
+            proof = row.get("_active_proof") if isinstance(row.get("_active_proof"), dict) else {}
+            status = str(proof.get("status") or "").strip().lower()
+            if class_id:
+                if class_id not in observed:
+                    observed.append(class_id)
+                bucket = confirmed if status == "confirmed" else candidate
+                if class_id not in bucket:
+                    bucket.append(class_id)
+            hay = _bounded_join(
+                [proof.get("observed_result") or "", proof.get("control_result") or "",
+                 proof.get("evidence") or ""], _BODY_SCAN_CAP)
+            for family, rx in _ERROR_FAMILIES:
+                if family not in families and rx.search(hay):
+                    families.append(family)
+        digest: dict[str, Any] = {}
+        if observed:
+            digest["classes_observed"] = observed[:24]
+        if confirmed:
+            digest["confirmed_classes"] = confirmed[:24]
+        # A class that produced a result the gate did NOT accept is the most steerable thing here:
+        # something responded, and one more probe may be what turns it into a real differential.
+        still_open = [c for c in candidate if c not in set(confirmed)]
+        if still_open:
+            digest["candidate_classes"] = still_open[:24]
+        if families:
+            digest["error_families"] = families
+        return digest
+    except Exception:  # noqa: BLE001 - a digest must NEVER break a hunt; fail open to the excerpt
+        return {}
+
+
 def build_digest(fetch_result: dict[str, Any] | None, url: str = "") -> dict[str, Any]:
     """Extract redacted, structural metadata from a captured response dict (the ``_consume`` shape:
     ``{status, headers, cookies, body}``). Returns a small dict, or ``{}`` on any problem so the caller

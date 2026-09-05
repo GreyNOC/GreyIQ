@@ -1,6 +1,7 @@
 """End-to-end campaign test against a local source folder (no network)."""
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import threading
@@ -542,6 +543,359 @@ class CampaignTests(unittest.TestCase):
             default_reports_dir=self.reports, runtime_dir=self.runtime, version="9.9.9",
         )
         self.assertFalse(result["ok"])
+
+
+class CampaignSteeringAndMemoryTests(unittest.TestCase):
+    """The campaign is the primary autonomous mode and was the one mode that never learned.
+
+    run_bounty_hunt's drift and negative-knowledge steering sit behind `extra_params is None and
+    class_priority is None`, and a campaign always supplies both — so every per-URL hunt skipped
+    that branch AND the snapshot/miss recording at the end of it. Meanwhile the CVE fingerprint,
+    the richest targeting signal the engine derives, ran after every URL had already been hunted.
+    """
+
+    TARGET = "https://app.example.com/"
+    SECOND = "https://app.example.com/orders/1001"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.reports = self.root / "reports"
+        self.runtime = self.root / "runtime"
+        self.runtime.mkdir(parents=True, exist_ok=True)
+        self.seen: list[dict] = []
+        self.cve_calls = 0
+        self._orig = (campaign.recon.discover, campaign.run_bounty_hunt,
+                      campaign.cve_service.scan_known_cves)
+        self.addCleanup(self._restore)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _restore(self) -> None:
+        (campaign.recon.discover, campaign.run_bounty_hunt,
+         campaign.cve_service.scan_known_cves) = self._orig
+
+    def _stub(self, *, urls=None, cve_findings=None, confirm_on=None, observations=None) -> None:
+        """Stub recon / the per-URL hunt / the CVE fetch so the campaign stays offline."""
+        urls = urls or [self.TARGET]
+        campaign.recon.discover = lambda t, **k: {
+            "urls": list(urls), "notes": [], "sources": {}, "js_secrets": [], "tech": [],
+            "params": [], "forms": [], "host": "app.example.com",
+            "observations": observations if observations is not None else {},
+        }
+
+        def fake_cve(*a, **k):
+            self.cve_calls += 1
+            return {"ok": True, "findings": list(cve_findings or [])}
+        campaign.cve_service.scan_known_cves = fake_cve
+
+        # A per-URL hunt whose active pass ran cleanly to completion. The shape matters: the
+        # campaign reads active_authorization to decide whether it may learn a MISS from this run.
+        clean = {"ok": True, "report_path": "", "scan_errors": [],
+                 "active_authorization": {"in_scope": True, "rate_limited": False,
+                                          "skipped_reason": "", "verified_classes": []}}
+
+        def fake_hunt(url, *a, **k):
+            self.seen.append({"url": url, "class_priority": list(k.get("class_priority") or [])})
+            if confirm_on and url == confirm_on:
+                doc = {"findings": [{"ref": "F1", "class_id": "xss", "rule_id": "active.xss",
+                                     "title": "Reflected XSS", "severity": "medium",
+                                     "location": url}],
+                       "proof_of_impact": {"F1": {"status": "confirmed",
+                                                  "observed_result": "o", "control_result": "c"}}}
+                path = self.root / f"hunt-{abs(hash(url))}.json"
+                path.write_text(json.dumps(doc), encoding="utf-8")
+                return {**clean, "json_path": str(path)}
+            return {**clean, "json_path": ""}
+        campaign.run_bounty_hunt = fake_hunt
+
+    def _run(self, **kw):
+        return campaign.run_campaign(
+            self.TARGET, scope="app.example.com", authorized=True, coder_cfg={},
+            default_reports_dir=self.reports, runtime_dir=self.runtime, version="9.9.9",
+            program="demo", active=True, **kw)
+
+    # --- CVE steering -----------------------------------------------------------------
+
+    def _cve_finding(self):
+        from bughunter import cve_service as cve
+        return cve._build_finding(
+            {"product": "jquery", "version": "1.8.0", "evidence": "jquery-1.8.0.min.js"},
+            cve.match_cves("jquery", "1.8.0"), self.TARGET)
+
+    def test_a_matched_advisory_steers_the_active_pass(self) -> None:
+        """The point of moving the scan earlier: an outdated jQuery is a concrete reason to try
+        reflected XSS on THIS host, and that has to reach the prover before it spends its budget."""
+        self._stub(cve_findings=[self._cve_finding()])
+        result = self._run()
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertTrue(self.seen)
+        self.assertEqual(self.seen[0]["class_priority"][0], "xss")
+
+    def test_the_advisory_scan_still_runs_only_once(self) -> None:
+        """Moving it earlier must not mean fetching the target twice."""
+        self._stub(cve_findings=[self._cve_finding()])
+        self._run()
+        self.assertEqual(self.cve_calls, 1)
+
+    def test_its_candidates_are_still_reported(self) -> None:
+        self._stub(cve_findings=[self._cve_finding()])
+        result = self._run()
+        classes = {f.get("class_id") for f in result["findings"]}
+        self.assertIn("vulnerable-component", classes)
+
+    def test_no_advisory_leaves_the_priority_untouched(self) -> None:
+        self._stub(cve_findings=[])
+        self._run()
+        self.assertEqual(self.seen[0]["class_priority"], [])
+
+    # --- cross-target learning --------------------------------------------------------
+
+    def test_a_confirmation_on_one_url_steers_the_next(self) -> None:
+        """The fan-out ran one frozen plan against every URL, so what the first target PROVED
+        could not change where the budget went on the second."""
+        self._stub(urls=[self.TARGET, self.SECOND], confirm_on=self.TARGET)
+        self._run()
+        self.assertEqual(len(self.seen), 2)
+        self.assertEqual(self.seen[0]["class_priority"], [])       # nothing known yet
+        self.assertEqual(self.seen[1]["class_priority"][0], "xss")  # ...now it is
+
+    def test_it_never_teaches_across_properties(self) -> None:
+        """A confirmation on one property says nothing about another, and the chain engine draws
+        the same boundary for the same reason."""
+        other = "https://other.example.org/page"
+        self._stub(urls=[self.TARGET, other], confirm_on=self.TARGET)
+        self._run()
+        self.assertEqual(len(self.seen), 2)
+        # Whatever the baseline heuristics gave the off-domain URL from its own shape is fine;
+        # what must NOT appear is the class the OTHER property proved.
+        self.assertNotIn("xss", self.seen[1]["class_priority"])
+
+    # --- cross-run memory -------------------------------------------------------------
+
+    def test_the_campaign_now_records_what_it_probed_and_did_not_confirm(self) -> None:
+        """Without this write the suppression below has nothing to read on the next run."""
+        from bughunter import negative_knowledge
+
+        self._stub(cve_findings=[self._cve_finding()])
+        self._run()
+        summary = negative_knowledge.summary(self.runtime, program="demo", target=self.TARGET)
+        self.assertGreater(summary["pairs"], 0, "the campaign learned nothing from its own run")
+
+    def test_a_cooled_pair_is_deprioritised_on_the_next_run(self) -> None:
+        """The payoff: a later run stops re-spending its budget on ground an earlier one proved
+        inert. Seeded so exactly ONE of the endpoint's two classes is cooled, because with a
+        single class a reorder is unobservable and the assertion would prove nothing.
+
+        Suppression only REORDERS — the cooled class must still be present, just behind the hot
+        one — so one bad run can never permanently hide a class from the next hunt.
+        """
+        from bughunter import negative_knowledge
+
+        search = "https://app.example.com/search?q=1"
+        # CONTROL first. The matched advisory prepends xss, so with no memory it leads. Without
+        # this the assertion below would pass on the baseline ordering alone and prove nothing.
+        self._stub(urls=[search], cve_findings=[self._cve_finding()])
+        self._run()
+        control = self.seen[0]["class_priority"]
+        self.assertEqual(control[0], "xss", f"control precondition failed: {control}")
+
+        # Now cool exactly ONE of the endpoint's classes — with a single class a reorder is
+        # unobservable, so the fixture needs a second, still-hot class to rank against.
+        seed_plan = {"probe_priority": [{"endpoint": search, "classes": ["xss"]}]}
+        for _ in range(negative_knowledge.MIN_MISSES):
+            negative_knowledge.record_hunt(self.runtime, program="demo", target=self.TARGET,
+                                           plan=seed_plan, outcomes=[], complete=True)
+        self.assertTrue(negative_knowledge.cooled_pairs(
+            self.runtime, program="demo", target=self.TARGET), "the pair should be cooled")
+
+        self.seen.clear()
+        self._run()
+        order = self.seen[0]["class_priority"]
+        self.assertIn("xss", order, "suppression must reorder, never remove")
+        self.assertIn("sqli", order)
+        self.assertGreater(order.index("xss"), order.index("sqli"),
+                           f"the cooled class was not deprioritised: {order}")
+
+    def test_a_snapshot_is_recorded_so_the_next_run_can_diff_it(self) -> None:
+        from bughunter import surface_drift
+
+        self._stub(observations={self.TARGET: {"st": 200, "sh": "abc"}})
+        self._run()
+        self.assertTrue(surface_drift.load_snapshots(
+            self.runtime, "demo", self.TARGET, "app.example.com"),
+            "the campaign path recorded no baseline")
+
+    def test_drift_reorders_the_fan_out_to_hunt_what_moved_first(self) -> None:
+        """An operator can stop a campaign between hunts and a long span may never reach the tail,
+        so the ORDER the fan-out walks is real budget."""
+        from bughunter import surface_drift
+
+        self._stub(urls=[self.TARGET, self.SECOND])
+        orig = surface_drift.delta_targets
+        surface_drift.delta_targets = lambda d, limit=2: [self.SECOND]
+        try:
+            self._run()
+        finally:
+            surface_drift.delta_targets = orig
+        self.assertEqual([row["url"] for row in self.seen], [self.SECOND, self.TARGET])
+
+    def test_the_reorder_can_never_add_lose_or_duplicate_a_url(self) -> None:
+        """Drift subjects come from the PREVIOUS run's stored observations. One that names nothing
+        this crawl saw must be dropped, not hunted: with no explicit scope the campaign's own gate
+        is None, so last run's memory could otherwise put an unchecked URL into this run's fan-out."""
+        from bughunter import surface_drift
+
+        ghost = "https://app.example.com/gone-since-last-run"
+        self._stub(urls=[self.TARGET, self.SECOND])
+        orig = surface_drift.delta_targets
+        surface_drift.delta_targets = lambda d, limit=2: [ghost, self.SECOND]
+        try:
+            self._run()
+        finally:
+            surface_drift.delta_targets = orig
+        hunted = [row["url"] for row in self.seen]
+        self.assertNotIn(ghost, hunted, "a URL this run never crawled must not be hunted")
+        self.assertEqual(sorted(hunted), sorted([self.TARGET, self.SECOND]))
+        self.assertEqual(len(hunted), len(set(hunted)))
+
+    def test_recon_is_asked_for_observations(self) -> None:
+        """Drift is impossible without them, and they cost no extra request."""
+        captured: dict = {}
+        campaign.recon.discover = lambda t, **k: (
+            captured.update(k) or {"urls": [self.TARGET], "notes": [], "sources": {},
+                                   "js_secrets": [], "tech": [], "params": [], "forms": [],
+                                   "host": "app.example.com", "observations": {}})
+        campaign.cve_service.scan_known_cves = lambda *a, **k: {"ok": True, "findings": []}
+        campaign.run_bounty_hunt = lambda *a, **k: {"ok": True, "json_path": "", "report_path": ""}
+        self._run()
+        self.assertTrue(captured.get("observe"))
+
+    def test_a_confirmed_pair_is_never_written_down_as_a_miss(self) -> None:
+        """`consolidated` is narrowed after the fan-out (dismissals, VDP policy) and deduped ACROSS
+        urls on a location that collapses digits anywhere — so a pair the prover CONFIRMED can be
+        absent from it while still sitting in the plan. Recording that as a miss would cool a route
+        the engine has proved, destroying the permanent immunity the store promises."""
+        from bughunter import negative_knowledge
+
+        # Two urls whose finding locations normalize to the same dedup key (digits collapse), so
+        # the second confirmed item is dropped from `consolidated` — but both are in the plan.
+        a, b = "https://app.example.com/api/v1/items", "https://app.example.com/api/v2/items"
+
+        clean = {"ok": True, "report_path": "", "scan_errors": [],
+                 "active_authorization": {"in_scope": True, "rate_limited": False,
+                                          "skipped_reason": "", "verified_classes": []}}
+        campaign.recon.discover = lambda t, **k: {
+            "urls": [a, b], "notes": [], "sources": {}, "js_secrets": [], "tech": [],
+            "params": [], "forms": [], "host": "app.example.com", "observations": {}}
+        campaign.cve_service.scan_known_cves = lambda *args, **kw: {"ok": True, "findings": []}
+
+        def fake_hunt(url, *args, **kw):
+            self.seen.append({"url": url, "class_priority": list(kw.get("class_priority") or [])})
+            doc = {"findings": [{"ref": "F1", "class_id": "xss", "rule_id": "active.xss",
+                                 "title": "Reflected XSS", "severity": "medium", "location": url}],
+                   "proof_of_impact": {"F1": {"status": "confirmed",
+                                              "observed_result": "o", "control_result": "c"}}}
+            path = self.root / f"hunt-{abs(hash(url))}.json"
+            path.write_text(json.dumps(doc), encoding="utf-8")
+            return {**clean, "json_path": str(path)}
+        campaign.run_bounty_hunt = fake_hunt
+
+        self._run()
+        store = json.loads((self.runtime / "bughunter_negative_knowledge.json").read_text(encoding="utf-8"))
+        pairs = store["programs"][negative_knowledge.program_key("demo", self.TARGET)]["pairs"]
+        for pair_id, row in pairs.items():
+            if pair_id.endswith("\txss"):
+                self.assertEqual(row["miss"], 0, f"{pair_id} was cooled despite being confirmed")
+                self.assertTrue(row["confirmed"], f"{pair_id} lost its immunity")
+
+    def test_the_snapshot_carries_the_chains_it_found(self) -> None:
+        """A chains-empty snapshot tells reopened_chains that nothing is blocked any more, which
+        pops every tracked shape and resets the blocked-run streak a direct hunt on the same
+        target had been building."""
+        from bughunter import surface_drift
+
+        chain = {"id": "AC1", "title": "Takeover", "status": "supported", "blocking_step": 2,
+                 "projected_impact": "account takeover", "refs": ["F1"],
+                 "steps": [{"n": 1, "proven": True, "title": "a"},
+                           {"n": 2, "proven": False, "title": "steal token", "grants_ids": ["read.session-token"]}]}
+        clean = {"ok": True, "report_path": "", "scan_errors": [],
+                 "active_authorization": {"in_scope": True, "rate_limited": False,
+                                          "skipped_reason": "", "verified_classes": []}}
+        campaign.recon.discover = lambda t, **k: {
+            "urls": [self.TARGET], "notes": [], "sources": {}, "js_secrets": [], "tech": [],
+            "params": [], "forms": [], "host": "app.example.com",
+            "observations": {self.TARGET: {"st": 200, "sh": "abc"}}}
+        campaign.cve_service.scan_known_cves = lambda *args, **kw: {"ok": True, "findings": []}
+
+        def fake_hunt(url, *args, **kw):
+            doc = {"findings": [], "proof_of_impact": {},
+                   "investigation": {"attack_chains": [chain]}}
+            path = self.root / "hunt.json"
+            path.write_text(json.dumps(doc), encoding="utf-8")
+            return {**clean, "json_path": str(path)}
+        campaign.run_bounty_hunt = fake_hunt
+
+        self._run()
+        snaps = surface_drift.load_snapshots(self.runtime, "demo", self.TARGET, "app.example.com")
+        self.assertTrue(snaps)
+        self.assertTrue(snaps[-1].get("chains"), "the snapshot recorded no chains, resetting streaks")
+
+    def test_the_drift_baseline_records_observed_params_not_brain_guesses(self) -> None:
+        """A param HYPOTHESIS is by construction a name the target did not serve — the validator
+        keeps one only when it is absent from the observed surface. Storing guesses as baseline
+        makes the next run diff one run's guesses against another's and report changes the site
+        never made."""
+        from bughunter import surface_drift
+
+        self._stub()
+        campaign.recon.discover = lambda t, **k: {
+            "urls": [self.TARGET], "notes": [], "sources": {}, "js_secrets": [], "tech": [],
+            "params": ["q"], "forms": [], "host": "app.example.com",
+            "observations": {self.TARGET: {"st": 200, "sh": "abc"}}}
+        orig_plan = campaign.hunt_brain.plan_hunt
+        campaign.hunt_brain.plan_hunt = lambda *args, **kw: {
+            "used": True, "provider": "stub", "model": "m", "param_hypotheses": ["returnUrl"],
+            "probe_priority": [], "idor_candidates": [], "ssrf_params": [], "xss_params": [],
+            "privileged_endpoints": [], "hypotheses": [], "notes": ""}
+        try:
+            self._run()
+        finally:
+            campaign.hunt_brain.plan_hunt = orig_plan
+        snaps = surface_drift.load_snapshots(self.runtime, "demo", self.TARGET, "app.example.com")
+        self.assertTrue(snaps)
+        stored = set((snaps[-1].get("struct") or {}).get("params") or [])
+        self.assertNotIn("returnUrl", stored, "a brain guess was stored as observed surface")
+
+    def test_a_truncated_active_pass_never_learns_a_miss(self) -> None:
+        """A per-URL prover that was rate-limited or cut off by its budget never reached the tail
+        of its own plan. Writing those pairs down as inert would cool exactly the endpoints that
+        never got a fair chance — the systematic bias the `complete` flag exists to prevent."""
+        from bughunter import negative_knowledge
+
+        self._stub(cve_findings=[self._cve_finding()])
+        inner = campaign.run_bounty_hunt
+        campaign.run_bounty_hunt = lambda *a, **k: {
+            **inner(*a, **k),
+            "active_authorization": {"in_scope": True, "rate_limited": True,
+                                     "skipped_reason": "", "verified_classes": []}}
+        self._run()
+        summary = negative_knowledge.summary(self.runtime, program="demo", target=self.TARGET)
+        self.assertEqual(summary["cooled"], 0)
+
+    def test_a_stopped_campaign_never_learns_a_miss(self) -> None:
+        """"Never executed" and "executed and inert" are different facts, and only the second is
+        knowledge. A run halted mid-fan-out must not cool the endpoints it never reached."""
+        from bughunter import negative_knowledge
+
+        self._stub(urls=[self.TARGET, self.SECOND], cve_findings=[self._cve_finding()])
+        orig_stopped = campaign.progress.is_stopped
+        campaign.progress.is_stopped = lambda _rid: True
+        try:
+            self._run()
+        finally:
+            campaign.progress.is_stopped = orig_stopped
+        summary = negative_knowledge.summary(self.runtime, program="demo", target=self.TARGET)
+        self.assertEqual(summary["cooled"], 0)
 
 
 class SeverityRollupTests(unittest.TestCase):

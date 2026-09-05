@@ -236,6 +236,41 @@ def _rank(candidates: list[str], priors: dict[str, float] | None, model: Any | N
     return ranked
 
 
+def _learned_params(model: Any | None, url: str, tech: str, cap: int) -> list[str]:
+    """Parameter NAMES the learned table has historically confirmed for this endpoint's purpose.
+
+    ``gn train-brain`` distils this table from the program's own CONFIRMED hunts and promotes it into
+    ``hunt_ranker.json`` — and until now nothing at hunt time ever read it, so two of the three things
+    the trainer learns were dead weight and what the engine discovered about its own targets never
+    reached the next hunt.
+
+    Fail-open to nothing: no model, no learned opinion, or any error yields ``[]`` and the caller
+    keeps its curated list, so recall cannot drop. Names only; ``hunt_brain._validate_plan`` still
+    re-checks every one against the parameter-name regex before it can reach the prober."""
+    if model is None:
+        return []
+    try:
+        return [str(n) for n in model.suggest_params_for_endpoint(url, tech, cap)]
+    except Exception:  # noqa: BLE001 - a corrupt model must never break the offline plan
+        return []
+
+
+def _model_selects(model: Any | None, kind: str, url: str, names: list[str],
+                   recon: list[str], tech: str, form: dict[str, Any] | None) -> bool:
+    """Does the learned selector want an object- (``idor``) or function-level (``privileged``) probe?
+
+    COMPLEMENTS the path/param heuristics — it can only ADD a candidate the rules missed, never
+    remove one they found — so a program whose confirmed IDORs never matched ``_IDOR_PARAM_HINTS``
+    can still teach the engine what its own object endpoints look like. Pure selection over endpoints
+    recon already discovered in scope; the prover re-gates scope and SSRF regardless."""
+    if model is None:
+        return False
+    try:
+        return bool(model.selects_endpoint(kind, url, names, recon, tech, form))
+    except Exception:  # noqa: BLE001 - fall back to the heuristics, never break a hunt
+        return False
+
+
 def _priority_sort_key(row: dict[str, Any], index: int) -> tuple[int, int, int]:
     """Rank ONE probe_priority row for the hard cap: strongest class, then breadth, then discovery.
 
@@ -264,10 +299,19 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
     first ones recon happened to discover.
 
     ``model`` is an OPTIONAL learned ranker (hunt_model). It is keyword-only and defaults to None so
-    every existing caller keeps byte-identical behaviour; when supplied it may only permute the rule-
-    proposed class candidates per endpoint (see ``_rank``) — it cannot reach param_hypotheses,
-    idor_candidates, privileged_endpoints, or the endpoint selection itself (the cap's sort key is
-    permutation-invariant, so it cannot decide which endpoints survive either)."""
+    every existing caller keeps byte-identical behaviour. It occupies exactly three seams, all of
+    them ADDITIVE and all of them re-validated downstream by ``hunt_brain._validate_plan``:
+
+      * per-endpoint class ORDER — it may only permute what the rules proposed (see ``_rank``);
+      * ``param_hypotheses`` — learned names lead, the curated ``_SUGGEST`` list still follows, so an
+        empty learned table changes nothing and recall cannot drop;
+      * ``idor_candidates`` / ``privileged_endpoints`` — OR'd with the path/param heuristics, so the
+        selector can only ADD an endpoint whose shape the hand-written hints miss, never remove one.
+
+    It still cannot decide WHICH ENDPOINTS SURVIVE the probe cap: ``_priority_sort_key`` stays
+    permutation-invariant, so endpoint selection remains rule-owned. Nor can it introduce an endpoint
+    — every candidate is drawn from the discovered in-scope set — or confirm anything, because the
+    deterministic prover still owns every confirmation."""
     endpoints = [str(u).strip() for u in (surface.get("endpoints") or []) if str(u or "").strip()]
     recon_params = {str(p).strip().lower() for p in (surface.get("params") or []) if str(p or "").strip()}
     tech = " ".join(str(t) for t in (surface.get("tech") or [])).lower()
@@ -295,6 +339,10 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
     param_hypotheses: list[str] = []
     idor_candidates: list[str] = []
     privileged_endpoints: list[str] = []
+    # Model-selected candidates, kept apart so the rule-derived ones above always win the capped
+    # slots and the learned selector can only ever fill what the rules left unused.
+    model_idor: list[str] = []
+    model_priv: list[str] = []
     priority: list[dict[str, Any]] = []
     seen_pri: set[str] = set()
 
@@ -309,21 +357,45 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
         if classes and url not in seen_pri:
             seen_pri.add(url)
             priority.append({"endpoint": url, "classes": classes})
-        # object-scoped endpoint -> IDOR candidate
+        # object-scoped endpoint -> IDOR candidate. Model picks go in a SEPARATE list because both
+        # are capped at six and filled in discovery order, so a model firing early would crowd out
+        # a rule hit found later — removal by the back door, when the selector may only add. Rule
+        # hits claim their slots at the return; the model fills what is left.
+        _form = forms_by_action.get(url)
+        _recon = sorted(recon_params)
         if _NUMERIC_SEG_RE.search(url) or _UUID_SEG_RE.search(url) or any(_hit(n, _IDOR_PARAM_HINTS) for n in names):
             if url not in idor_candidates:
                 idor_candidates.append(url)
+        elif url not in model_idor and _model_selects(model, "idor", url, names, _recon, tech, _form):
+            model_idor.append(url)
         # admin / privileged FUNCTION path -> BFLA candidate (function-level, not object-level)
         low_path = urlparse(url).path.lower()
-        if any(h in low_path for h in _PRIV_PATH_HINTS) and url not in privileged_endpoints:
-            privileged_endpoints.append(url)
+        if any(h in low_path for h in _PRIV_PATH_HINTS):
+            if url not in privileged_endpoints:
+                privileged_endpoints.append(url)
+        elif url not in model_priv and _model_selects(model, "privileged", url, names, _recon, tech, _form):
+            model_priv.append(url)
         for n in names + list(recon_params):
             if _hit(n, _SSRF_HINTS) and n not in ssrf_params:
                 ssrf_params.append(n)
             if _hit(n, _XSS_HINTS) and n not in xss_params:
                 xss_params.append(n)
 
-    for n in _SUGGEST:
+    # LEARNED names lead — they are the ones this program's confirmed hunts landed on, and leading
+    # is what counts because each check applies its own small per-call param cap. But they are
+    # capped at the slots _SUGGEST does not need: the result is truncated at _CAP, so an unbounded
+    # learned table would push every curated name past the end and silently delete the hand-tuned
+    # surface. Ordering wins; displacement does not.
+    learned_slots = max(0, _CAP - len(_SUGGEST))
+    learned_names: list[str] = []
+    for url in endpoints[:60]:
+        if len(learned_names) >= learned_slots:
+            break
+        for name in _learned_params(model, url, tech, learned_slots):
+            if (name.lower() not in recon_params and name not in learned_names
+                    and len(learned_names) < learned_slots):
+                learned_names.append(name)
+    for n in (*learned_names, *_SUGGEST):
         if n.lower() not in recon_params and n not in param_hypotheses:
             param_hypotheses.append(n)
 
@@ -339,8 +411,11 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
         "probe_priority": ranked_priority[:_MAX_PRIORITY],
         "ssrf_params": ssrf_params[:12],
         "xss_params": xss_params[:12],
-        "idor_candidates": idor_candidates[:6],
-        "privileged_endpoints": privileged_endpoints[:6],
+        # Rule hits first, then the learned selector's picks into whatever slots remain — so the
+        # selector adds and never displaces.
+        "idor_candidates": (idor_candidates + [u for u in model_idor if u not in idor_candidates])[:6],
+        "privileged_endpoints": (
+            privileged_endpoints + [u for u in model_priv if u not in privileged_endpoints])[:6],
         # ``notes`` is persisted verbatim in the hunt trace, so the training corpus records WHICH
         # brain produced each plan. A model with no readable version tag is reported as
         # "undetermined" rather than guessed — an unlabelled corpus row is worse than an honest one.

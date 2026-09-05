@@ -284,6 +284,34 @@ class Ranker:
         ranked = sorted(rows, key=lambda row: (-row[1], row[0]))
         return [name for name, _ in ranked[:cap]]
 
+    def suggest_params_for_endpoint(self, url: Any, tech: Any, cap: int) -> list[str]:
+        """``suggest_params`` keyed off an ENDPOINT rather than a precomputed bucket.
+
+        Exists so the offline planner can consume the learned parameter table without importing
+        ``hunt_features``: derivation stays inside this module, exactly as ``rank_endpoint_classes``
+        keeps it. Names only; an empty list means "no learned opinion" and the caller keeps its
+        curated list. Never raises — a serving path must degrade to the rules, not fail."""
+        try:
+            return self.suggest_params(hunt_features.purpose_bucket(url), str(tech or ""), int(cap))
+        except Exception:  # noqa: BLE001 - no learned opinion is always a valid answer
+            return []
+
+    def selects_endpoint(self, kind: str, url: Any, names: Any, recon: Any, tech: Any,
+                         form: dict[str, Any] | None = None) -> bool:
+        """Does the trained selector think this endpoint is worth a ``kind`` access-control probe?
+
+        The feature-extraction sibling of ``suggest_params_for_endpoint``, for the same reason. False
+        whenever there is no trained selector for the kind (``select`` returns exactly 0.5) or on any
+        error, so a caller reads False as "keep using the path/param heuristics" and can never lose
+        them by wiring this in. PURE SELECTION: it answers yes/no about an endpoint the caller already
+        discovered in scope, and can never introduce one."""
+        try:
+            feats = hunt_features.endpoint_features(
+                str(url or ""), list(names or []), list(recon or []), str(tech or ""), form)
+            return self.select(str(kind or ""), feats) > 0.5
+        except Exception:  # noqa: BLE001 - fall back to the heuristics, never break a hunt
+            return False
+
     def select(self, kind: str, feats: dict[str, float]) -> float:
         """P(this endpoint is worth an object-level (``idor``) / function-level
         (``privileged``) access-control probe). 0.5 == "no trained selector for this kind",

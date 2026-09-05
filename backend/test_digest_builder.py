@@ -143,5 +143,69 @@ class BuildDigestTests(unittest.TestCase):
         self.assertEqual(d["status"], 200)
 
 
+class BuildProbeDigestTests(unittest.TestCase):
+    """The observe half of a probe/observe loop. A landing page is identical every turn, so this is
+    the only structure that can tell one turn from the next against a single URL."""
+
+    @staticmethod
+    def _finding(class_hint: str, status: str, observed: str = "", tag: str | None = None) -> tuple:
+        """A (check suite tag, finding) pair, as verify_active hands them over."""
+        return (tag or class_hint,
+                {"_active_class_hint": class_hint,
+                 "_active_proof": {"status": status, "observed_result": observed}})
+
+    def test_it_records_the_check_that_ran_not_the_impact_it_reported(self) -> None:
+        """A finding names the class of the IMPACT; the re-planner promotes and restricts CHECKS.
+        The clickjacking check reports `headers` and the debug-endpoint check reports `rce`, so
+        reading the finding's hint would focus on a class matching no check at all, or run command
+        injection when what produced the lead was the debug probe."""
+        d = db.build_probe_digest([
+            self._finding("headers", "candidate", tag="clickjacking"),
+            self._finding("rce", "confirmed", tag="debug")])
+        self.assertEqual(d["candidate_classes"], ["clickjacking"])
+        self.assertEqual(d["confirmed_classes"], ["debug"])
+        self.assertNotIn("headers", d["classes_observed"])
+        self.assertNotIn("rce", d["classes_observed"])
+
+    def test_an_error_the_probe_provoked_is_surfaced(self) -> None:
+        """The whole point: a SQL error the probe TRIGGERED is what should promote sqli next turn.
+        The landing digest can never carry it, because the landing page did not raise it."""
+        d = db.build_probe_digest([
+            self._finding("sqli", "candidate", "HTTP 500 — You have an error in your SQL syntax near")])
+        self.assertEqual(d["error_families"], ["sql"])
+
+    def test_confirmed_and_still_open_classes_are_separated(self) -> None:
+        """A class that answered but did NOT confirm is one good probe from a differential; a
+        confirmed one is settled ground. Steering has to tell them apart."""
+        d = db.build_probe_digest([self._finding("xss", "confirmed"),
+                                   self._finding("cors", "candidate")])
+        self.assertEqual(d["confirmed_classes"], ["xss"])
+        self.assertEqual(d["candidate_classes"], ["cors"])
+        self.assertEqual(set(d["classes_observed"]), {"xss", "cors"})
+
+    def test_a_class_that_also_confirmed_is_not_reported_as_still_open(self) -> None:
+        d = db.build_probe_digest([self._finding("xss", "confirmed"),
+                                   self._finding("xss", "candidate")])
+        self.assertEqual(d["confirmed_classes"], ["xss"])
+        self.assertNotIn("candidate_classes", d)
+
+    def test_it_changes_between_turns_when_the_probes_change(self) -> None:
+        """The defect this exists to fix: two passes over one URL used to produce byte-identical
+        observations, so a loop over them could only reschedule the pass it already ran."""
+        first = db.build_probe_digest([self._finding("xss", "candidate", "reflected, encoded")])
+        second = db.build_probe_digest([
+            self._finding("sqli", "candidate", "SQLSTATE[42000]: syntax error")])
+        self.assertNotEqual(first, second)
+
+    def test_nothing_observed_is_an_empty_digest(self) -> None:
+        self.assertEqual(db.build_probe_digest([]), {})
+
+    def test_malformed_input_fails_open(self) -> None:
+        for bad in (None, "nope", 7, [None], ["x"], [{}], [("xss",)], [("xss", "no")],
+                    [("xss", {"_active_proof": "not-a-dict"})], [(None, {})]):
+            with self.subTest(value=bad):
+                self.assertIsInstance(db.build_probe_digest(bad), dict)
+
+
 if __name__ == "__main__":
     unittest.main()

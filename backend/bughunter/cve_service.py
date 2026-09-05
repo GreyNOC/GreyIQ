@@ -318,6 +318,72 @@ def _build_finding(component: dict[str, str], cves: list[dict[str, Any]], url: s
     }
 
 
+# CWE -> the class the deterministic prover can actually CONFIRM for it. Deliberately PARTIAL: a
+# CWE with no check is omitted rather than mapped to something adjacent — ReDoS (CWE-1333) and
+# prototype pollution (CWE-1321) have none, and SSRF (CWE-918) is reached through ``ssrf_params``
+# and the OOB collaborator rather than a class tag. Steering budget at a class that cannot confirm
+# only wastes it. Every VALUE is in ``prover_classes.PROVER_CLASSES``; test_cve_service pins that.
+_CWE_PROBE_CLASS: dict[str, str] = {
+    "CWE-79": "xss", "CWE-80": "xss", "CWE-83": "xss",
+    "CWE-89": "sqli",
+    "CWE-77": "rce", "CWE-78": "rce", "CWE-94": "rce", "CWE-95": "rce",
+    "CWE-917": "ssti", "CWE-1336": "ssti",
+    "CWE-22": "path-traversal", "CWE-23": "path-traversal", "CWE-98": "path-traversal",
+    "CWE-601": "redirect",
+    "CWE-93": "crlf", "CWE-113": "crlf",
+    "CWE-352": "csrf",
+    "CWE-1021": "clickjacking",
+    "CWE-346": "cors", "CWE-942": "cors",
+}
+
+
+def cve_probe_hints(findings: Any) -> list[str]:
+    """Vuln classes worth probing FIRST, derived from the CVEs the fingerprint actually matched.
+
+    This is the missing edge between the richest intelligence GreyIQ derives and the thing that
+    spends the request budget. A matched CVE names the exact weakness class of the exact library
+    the target is serving — an outdated jQuery is a concrete reason to try reflected XSS here, a
+    lodash with CVE-2021-23337 is a concrete reason to try template/command injection — yet that
+    knowledge only ever became a candidate finding in a report, and the scan ran after the active
+    pass had already spent its budget.
+
+    Reads every matched CVE's own ``cwe``, not just the headline one, so a library whose top CVE is
+    unprovable still contributes the classes its other CVEs imply. Ordered by the highest CVSS base
+    score backing each class, then by name so the result is deterministic.
+
+    HINTS ONLY. The returned names reorder existing, already-gated checks; the differential prover
+    still supplies every payload and owns every confirmation, so a version match can never become a
+    finding by itself. Never raises: a malformed finding list yields an empty list.
+    """
+    best: dict[str, float] = {}
+    try:
+        for finding in findings if isinstance(findings, (list, tuple)) else []:
+            if not isinstance(finding, dict):
+                continue
+            cves = finding.get("_cve_list")
+            rows = cves if isinstance(cves, (list, tuple)) else []
+            # Fall back to the finding's own headline CWE when the per-CVE list is absent.
+            head_cwe = finding.get("cwe")
+            candidates: list[tuple[str, float]] = []
+            for cve in rows:
+                if not isinstance(cve, dict):
+                    continue
+                try:
+                    score = float(cve.get("base_score") or 0.0)
+                except (TypeError, ValueError):
+                    score = 0.0
+                candidates.append((str(cve.get("cwe") or ""), score))
+            if not candidates and head_cwe:
+                candidates.append((str(head_cwe), 0.0))
+            for raw_cwe, score in candidates:
+                class_id = _CWE_PROBE_CLASS.get(raw_cwe.strip().upper())
+                if class_id and score > best.get(class_id, -1.0):
+                    best[class_id] = score
+        return sorted(best, key=lambda c: (-best[c], c))
+    except Exception:  # noqa: BLE001 - steering is advisory; never break a campaign
+        return []
+
+
 def build_plan(finding: dict[str, Any]) -> dict[str, Any]:
     """A candidate (version-fingerprint) attack plan for the report pipeline. The CVSS is the
     headline CVE's published vector; proof_of_impact is a CANDIDATE with a clear obligation —

@@ -1776,6 +1776,116 @@ def _infer_active_xss_params(url: str) -> list[str]:
     return _merge_unique_strings(hints, [], limit=8)
 
 
+# Bounds on the outer theorize -> act wave: endpoints, classes each, and total requests. Small on
+# purpose — it exists to close one high-value gap the first pass left open, not to be a second hunt.
+_REPLAN_MAX_TARGETS = 3
+_REPLAN_MAX_CLASSES = 3
+_REPLAN_BUDGET = 8
+
+
+def _replan_wave(target_url: str, findings: list[dict[str, Any]], *, scope: str, settings: Any,
+                 auth: Any, extra_params: list[str], surface: dict[str, Any],
+                 already_swept: set[str] | None = None,
+                 emit: Any = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """One bounded, evidence-driven re-probe of what the cortex says is still unresolved.
+
+    The pipeline runs its phases once, in order, and nothing revisits an earlier phase when later
+    knowledge arrives. That is a real loss, because by the time the first active pass is done the
+    engine can say exactly what it does not yet know: ``investigator.build_probe_plan`` reads the
+    evidence graph and names, per unproven lead and per blocked chain, the ``(endpoint, class)`` whose
+    outcome would change the verdict. Until now that conclusion only ever reached a human, in prose,
+    in the report — the run itself never acted on its own strongest lead.
+
+    This is deliberately WIDER than ``hunt_loop``, which probes the seed URL alone and re-plans from
+    one page's structure. This sees every scanner's findings pooled — code, passive web, live and
+    active — so it can chase the chain-blocking step on a URL the iterative loop never looked at.
+
+    WHERE IT SITS. Immediately after active verification and BEFORE classification, attack planning,
+    the QA gate and the authoritative graph, so anything it captures flows through the normal
+    pipeline like any other active finding. Running it after the final graph would have been easier
+    and wrong: those findings would have skipped every downgrade-only QA step the report depends on.
+
+    WHAT IT CANNOT DO. It calls the same ``verify_active`` — same scope binding, same SSRF/URL guard,
+    same GET-only method set, same shared per-host governor, so the real per-host ceiling is
+    unchanged whether or not this runs. It confirms nothing itself: ``report._has_captured_artifact``
+    still decides, from a captured differential, exactly as for the first pass. It cannot introduce a
+    host, because every endpoint comes from a finding THIS hunt already produced and is re-checked
+    against the caller's scope by the prover regardless. And it is opt-in and bounded, so the worst
+    case is a handful of extra benign requests that confirm nothing.
+
+    Returns ``(new_findings, info)``; fail-open to ``([], {...})`` on any error.
+    """
+    info: dict[str, Any] = {"ran": False, "targets": 0, "requests_used": 0, "confirmed": 0}
+    try:
+        graph = investigator.build_investigation(findings, surface=surface)
+        plan = investigator.build_probe_plan(graph)
+        if not plan:
+            return [], info
+        # Endpoints the first active pass already swept. `already_swept` is the authoritative half:
+        # the prover ran its whole check list against those URLs, so every class on them was tried
+        # whether or not it produced a finding — and a check that finds nothing returns None, so
+        # a "we tested this and it was clean" result leaves no trace in `findings` at all. Without
+        # it the wave re-runs identical negative tests and spends its bounded budget re-deriving
+        # answers the first pass already had. The (endpoint, class) pairs below then cover leads
+        # from targets outside that swept set. This wave is for what the active pass did NOT test:
+        # passive and static leads, and chain steps on endpoints it never reached.
+        swept = {str(u) for u in (already_swept or set()) if str(u)}
+        probed: set[tuple[str, str]] = set()
+        for finding in findings if isinstance(findings, list) else []:
+            if not isinstance(finding, dict) or not isinstance(finding.get("_active_proof"), dict):
+                continue
+            location = str(finding.get("location") or finding.get("file_path") or "")
+            if location:
+                probed.add((location, investigator.normalize_class(finding)))
+        # Group the plan by endpoint, best row first, so one endpoint is probed once for the few
+        # classes that matter on it rather than once per row.
+        by_endpoint: dict[str, list[str]] = {}
+        for row in plan:
+            endpoint = str(row.get("endpoint") or "")
+            class_id = str(row.get("class_id") or "")
+            if not endpoint or not class_id or endpoint in swept or (endpoint, class_id) in probed:
+                continue
+            if endpoint not in by_endpoint and len(by_endpoint) >= _REPLAN_MAX_TARGETS:
+                continue  # target cap reached; a later row may still add a class to a chosen endpoint
+            bucket = by_endpoint.setdefault(endpoint, [])
+            if class_id not in bucket and len(bucket) < _REPLAN_MAX_CLASSES:
+                bucket.append(class_id)
+        targets = [(endpoint, classes) for endpoint, classes in by_endpoint.items() if classes]
+        if not targets:
+            return [], info
+        # The SAME process-wide bucket the first pass used, so this wave competes for the existing
+        # per-host allowance instead of opening a second one.
+        governor = shared_governor(capacity=settings.active_max_requests_per_host,
+                                   min_interval_s=settings.active_min_interval_ms / 1000.0)
+        budget = _REPLAN_BUDGET
+        out: list[dict[str, Any]] = []
+        for endpoint, classes in targets:
+            if budget < 2:
+                break
+            results, meta = active_verify_service.verify_active(
+                endpoint, findings, scope=scope, requests_budget=budget, settings=settings,
+                governor=governor, auth=auth, extra_params=list(extra_params or []),
+                class_priority=classes, only_classes=classes)
+            spent = int(meta.get("requests_used") or 0)
+            budget -= spent
+            info["requests_used"] += spent
+            info["targets"] += 1
+            out.extend(results)
+            if meta.get("rate_limited"):
+                break
+        info["ran"] = True
+        info["confirmed"] = sum(
+            1 for f in out
+            if isinstance(f.get("_active_proof"), dict)
+            and str(f["_active_proof"].get("status") or "").lower() == "confirmed")
+        if callable(emit) and info["targets"]:
+            emit(f"re-plan wave: chased {info['targets']} unresolved lead(s) the investigation ranked "
+                 f"highest — {info['confirmed']} confirmed, {info['requests_used']} request(s)")
+        return out, info
+    except Exception:  # noqa: BLE001 - an optimizer pass must never break a hunt
+        return [], info
+
+
 def _proof_capture_highlight(finding: dict[str, Any]) -> str:
     pe = finding.get("proof_evidence")
     if not isinstance(pe, dict):
@@ -2245,6 +2355,10 @@ def _run_bounty_hunt_body(
     if (active or time_based) and authorized and kind == "url":
         _emit(f"running active verification against {len(raw_findings)} candidate(s)"
               + (" (time-based probes enabled)…" if time_based else "…"))
+        # Which URLs the active pass actually swept with the full check list — the iterative loop
+        # probes only the seed, the fan-out probes each ranked target. The re-plan wave reads this
+        # to avoid repeating tests that already ran and found nothing.
+        active_swept: set[str] = set()
         try:
             active_settings = settings or active_verify_service.get_settings()
             # Opt-in AI-driven iterative loop (probe -> observe -> re-plan): a bounded scheduler over
@@ -2266,6 +2380,7 @@ def _run_bounty_hunt_body(
                     xss_params=loop_xss_params, coder_cfg=coder_cfg,
                     surface={"endpoints": active_targets, "params": list(effective_extra_params or [])},
                     on_progress=_emit)
+                active_swept = {clean_target}  # the loop probes the seed and nothing else
             else:
                 active_findings = []
                 active_metas: list[dict[str, Any]] = []
@@ -2300,6 +2415,7 @@ def _run_bounty_hunt_body(
                     target_meta["target"] = active_target
                     active_metas.append(target_meta)
                     active_findings.extend(target_findings)
+                    active_swept.add(active_target)
                 active_meta = _aggregate_active_meta(active_metas)
             if active_findings:
                 raw_findings = list(raw_findings) + active_findings
@@ -2311,6 +2427,34 @@ def _run_bounty_hunt_body(
         except Exception as exc:  # noqa: BLE001 - active layer is best-effort; never break a hunt
             active_meta = {"in_scope": False, "skipped_reason": f"active verification error: {exc}"}
             _emit(f"active verification error: {exc}")
+
+        # OUTER THEORIZE -> ACT WAVE (opt-in). With the first pass done the cortex can name the
+        # (endpoint, class) that would most change the verdict, across EVERY scanner's findings
+        # rather than the seed URL the iterative loop probes. It runs HERE, before classification /
+        # attack planning / the QA gate, so what it captures flows through them like any other
+        # active finding — after the final graph it would skip all of them.
+        if active_meta.get("in_scope") and getattr(
+                settings or active_verify_service.get_settings(), "hunt_replan_enabled", False):
+            try:
+                replan_settings = settings or active_verify_service.get_settings()
+                replan_findings, replan_info = _replan_wave(
+                    clean_target, raw_findings, scope=scope, settings=replan_settings,
+                    auth=auth_ctx, extra_params=list(effective_extra_params or []),
+                    surface={"endpoints": list(active_targets),
+                             "params": list(effective_extra_params or [])},
+                    already_swept=active_swept, emit=_emit)
+                if replan_findings:
+                    raw_findings = list(raw_findings) + replan_findings
+                    if "active" not in scanners_run:
+                        scanners_run = list(scanners_run) + ["active"]
+                active_meta = dict(active_meta)
+                active_meta["replan"] = replan_info
+                # The wave's spend is part of THIS hunt's coverage; reporting only the first pass
+                # would understate what the target actually received.
+                active_meta["requests_used"] = (int(active_meta.get("requests_used") or 0)
+                                                + int(replan_info.get("requests_used") or 0))
+            except Exception as exc:  # noqa: BLE001 - an optimizer pass never breaks a hunt
+                _emit(f"re-plan wave skipped: {exc}")
 
         # Blind SSRF over the OOB collaborator — the one active probe that needs external infra, so
         # it runs only when the operator has configured a collaborator (base+secret). It injects a

@@ -147,7 +147,19 @@ a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the
   **Investigation intelligence** brief: calibrated confidence, typed evidence state,
   explicit proof gaps, contradiction detection, a ranked hypothesis queue, and
   correlated attack-chain leads. The same graph is available in the JSON sidecar and
-  hunt API. Reports also include retest guidance and platform-friendly one-file-per-finding
+  hunt API.
+- **Theorizing, not just scanning.** The hypothesis queue is ranked by *expected information
+  gain* — how much a test would collapse the unknown, and how many attack chains rest on it —
+  so the top lead is the one worth testing next rather than merely the biggest number. GreyIQ
+  also derives theories no single finding shows: three routes sharing one weakness on one
+  property is reported as a control missing at the framework layer, clearly marked as derived
+  and routed to the "worth testing" queue rather than presented as a result. Each lead names
+  the chains that confirming it would complete.
+- **Acting on it.** Set `GREYIQ_HUNT_REPLAN=1` to let a finished pass chase its own strongest
+  unresolved lead: the engine turns each proof obligation into a concrete (endpoint, class)
+  probe and runs one bounded extra wave through the same scope- and SSRF-gated prover, capped
+  at three endpoints and eight requests. It confirms nothing on its own — the captured-artifact
+  gate still decides — and it is off by default because it spends real requests. Reports also include retest guidance and platform-friendly one-file-per-finding
   exports. Reports reshape for
   HackerOne, YesWeHack, Bugcrowd, Intigriti, and **HackenProof** (web3: exchanges, protocols,
   smart contracts) — pick the format in Submissions. HackerOne is the only live-API submit;
@@ -161,7 +173,18 @@ a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the
   at, instead of re-testing inert ground. It can never blind a hunt: anything ever confirmed is
   immune forever, misses decay after 45 days, a pair is re-enabled the moment **surface drift**
   reports its endpoint changed, and suppression only reorders (dropping an endpoint only when every
-  class on it is cooled). Set `GREYIQ_NO_NEGATIVE_KNOWLEDGE=1` to turn it off.
+  class on it is cooled). Set `GREYIQ_NO_NEGATIVE_KNOWLEDGE=1` to turn it off. **Campaigns share this
+  memory too** — they read cooled pairs, hunt what surface drift says moved first, and write both
+  memories back, so the unattended mode stops re-testing ground it has already exhausted. A miss is
+  only ever learned from a campaign that finished its fan-out with every per-URL pass running clean,
+  and anything the prover confirmed is banked before the report's own filters can hide it.
+- **Each target teaches the next.** Within a campaign, a class confirmed on one URL moves to the
+  front of the probe order for the URLs not yet hunted on the same registrable domain — so a proven
+  IDOR on one object endpoint is a reason to try IDOR on its siblings. A matched CVE advisory does
+  the same job earlier: the component fingerprint now runs *before* the active pass and maps each
+  advisory's CWE to the class the prover can confirm, so an outdated jQuery aims the prober at
+  reflected XSS. Both only reorder; the differential prover still owns every confirmation, and a
+  version match never becomes a finding by itself.
 - **Agent security test** — red-teams GreyIQ's own agent in a throwaway sandbox
   (sandbox/policy probes always; opt-in prompt-injection + jailbreak behavioral probes)
   and reports a posture verdict.

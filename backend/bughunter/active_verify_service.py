@@ -421,6 +421,32 @@ def _proof(status: str, **fields: Any) -> dict[str, Any]:
 ACTIVE_PROVER_CLASSES: frozenset[str] = PROVER_CLASSES
 
 
+def _restrict_to_classes(checks: list[tuple[str, Any]], only_classes: list[str] | None) -> list[tuple[str, Any]]:
+    """Keep only the checks whose class the caller asked for. Pure: never adds or mutates a check.
+
+    ``_apply_class_priority`` REORDERS; this RESTRICTS, and the difference is the whole point of a
+    steered turn. Reordering alone still re-pays for every other check in the suite, so an iterative
+    loop that only reorders spends most of each extra turn recomputing the previous one — a turn that
+    wants "sqli on one new parameter" was also re-running clickjacking, csrf, three JWT probes, two
+    GraphQL probes, CORS, redirect, host-header, two XSS probes and the rest. Restricting lets the
+    reclaimed budget go to the hypothesis the caller actually wants tested.
+
+    FAIL-OPEN, twice over: an empty/None restriction leaves the list untouched, and a restriction that
+    matches nothing falls back to the full suite rather than silently probing nothing. Restricting can
+    only ever spend FEWER requests and can never mint a confirmation — the checks that do run are
+    byte-identical and the confirm gate is untouched. RECALL is the caller's responsibility: the hunt
+    loop restricts only on steered turns, after turn 0 has run the suite in full.
+    """
+    if not only_classes:
+        return checks
+    wanted = {str(c or "").strip().lower() for c in only_classes}
+    wanted.discard("")
+    if not wanted:
+        return checks
+    kept = [ck for ck in checks if ck[0] in wanted]
+    return kept or checks
+
+
 def _apply_class_priority(checks: list[tuple[str, Any]], class_priority: list[str] | None) -> list[tuple[str, Any]]:
     """Apply the caller's ordered class ranking, preserving default order within each rank.
 
@@ -2421,6 +2447,7 @@ def verify_active(
     extra_params: list[str] | None = None,
     class_priority: list[str] | None = None,
     xss_params: list[str] | None = None,
+    only_classes: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run the active checks against an in-scope target. Returns
     ``(active_findings, meta)``. ``active_findings`` are confirmed/candidate finding
@@ -2430,7 +2457,13 @@ def verify_active(
     ``extra_params`` are parameter NAMES recon discovered for this host (mined from the
     target's own JS/HTML). The param-keyed checks probe URL params UNION these, so an
     endpoint that carries no query string itself still gets its real parameters tested —
-    the surface recon found but the prover previously ignored."""
+    the surface recon found but the prover previously ignored.
+
+    ``only_classes`` RESTRICTS the suite to those classes instead of merely reordering it
+    (see ``_restrict_to_classes``), so a caller that already knows which hypothesis it is
+    chasing does not re-pay for the other ~24 checks. Fail-open and spend-reducing only; the
+    opt-in timing probes below are deliberately never restricted, because the operator asked
+    for those explicitly rather than a planner inferring them."""
     settings = settings or get_settings()
     discovered_params = _clean_param_names(extra_params)
     try:
@@ -2537,9 +2570,13 @@ def verify_active(
         # explicitly requested cannot be starved by this heavier file-read sweep.
         ("path-traversal", lambda: _check_path_traversal(http, sanitized, discovered_params)),
     ]
-    # Reasoning-steered ordering: promote the classes the brain flagged as most likely to hit on
-    # THIS endpoint so the shared request budget is spent where a real bug is most likely. It only
-    # REORDERS (never adds/removes a check) and preserves the tuned default order within each group.
+    # Reasoning-steered SELECTION, then ordering. The restriction runs first so the priority sort
+    # ranks only what will actually run; both are pure and neither can add a check the list above
+    # does not already define.
+    checks = _restrict_to_classes(checks, only_classes)
+    # Promote the classes the brain flagged as most likely to hit on THIS endpoint so the shared
+    # request budget is spent where a real bug is most likely. It only REORDERS (never adds/removes
+    # a check) and preserves the tuned default order within each group.
     checks = _apply_class_priority(checks, class_priority)
     # The time-based checks are the only ones that emit an executing payload (a bounded SLEEP /
     # sleep), so they are OPT-IN. They run after the lightweight/static-differential checks and are
@@ -2551,6 +2588,11 @@ def verify_active(
         checks.append(("rce", lambda: _check_time_rce(http, sanitized, settings, discovered_params)))
         checks.append(("sqli", lambda: _check_time_sqli(http, sanitized, settings, discovered_params)))
         checks.extend(path_checks)
+    # (suite tag, finding) for the probe digest. The tag is NOT the finding's class hint: a check
+    # reports the class of the IMPACT it found (clickjacking emits "headers", the debug-endpoint
+    # check emits "rce"/"secrets"), while the re-planner needs the name of the CHECK to promote or
+    # restrict. Keeping them side by side here avoids stamping another key onto the finding dicts.
+    tagged: list[tuple[str, dict[str, Any]]] = []
     for _cls, check in checks:
         if rate_limited:
             break
@@ -2571,6 +2613,7 @@ def verify_active(
             result = None
         if result:
             results.append(result)
+            tagged.append((_cls, result))
 
     verified = sorted({r["_active_class_hint"] for r in results if r.get("_active_proof", {}).get("status") == "confirmed"})
     meta = {
@@ -2583,6 +2626,11 @@ def verify_active(
         # target's real structure instead of a 200-char excerpt; it carries no value and confirms
         # nothing. Empty dict when the landing fetch failed or nothing structural was present.
         "digest": digest_builder.build_digest(landing),
+        # What THIS pass provoked, rather than what the landing page always looks like. The digest
+        # above is identical on every call against one URL, so a caller looping over verify_active
+        # learns nothing from it; this one moves as the probes move. Derived from `results`, so no
+        # request and no claim — `verified` above remains the only statement about what was proven.
+        "probe_digest": digest_builder.build_probe_digest(tagged),
         "skipped_reason": "",
     }
     return results, meta

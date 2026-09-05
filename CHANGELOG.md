@@ -2,34 +2,118 @@
 
 Notable changes to GreyIQ.
 
-## v4.2.4 - the installer v4.2.3 never shipped
+## v4.3.0 - the engine acts on what it worked out
 
-Packaging only. No engine, API or UI code changed: `git diff v4.2.3..v4.2.4` touches the two version
-strings, this file, and one exclude list in the PyInstaller spec.
+GreyIQ has always been good at reaching a conclusion and bad at using it. Three places computed
+exactly what should happen next and then wrote it into a report instead of doing it, and one loop
+that was supposed to learn between turns had been reading the wrong input all along. This release is
+about closing those edges. Nothing here relaxes an evidence rule: `report._has_captured_artifact` is
+still the only thing that can call anything confirmed, every new probe goes through the same
+scope-, SSRF- and governor-gated prover, and the two new request-spending behaviours are opt-in.
 
-v4.2.3 published with a single asset, `GreyIQ-4.2.3-portable.exe`. The NSIS installer and the
-`SHA256SUMS` file the house standard calls for - and that v4.0.0 shipped - were missing from it.
-They cannot be added after the fact: releases in this repo are **immutable once published**, which
-is exactly why `.github/workflows/release.yml` uploads every asset to a *draft* and only flips it to
-published once both platform jobs have finished. So the complete set is reissued here instead.
+**The iterative loop was observing the wrong thing.** `meta['digest']` is built from a fetch of the
+landing page, and the loop probes one URL, so the structure it re-read every turn was byte-identical
+after the first. The deterministic re-planner's whole termination argument is "continue only when the
+latest observation carries structure no earlier one did", so it fired immediately, and the LLM
+re-planner was handed the same page three times. The loop could not see the error its own probe had
+just raised, which meant the best it could do was reschedule the scan it had already run.
+`digest_builder.build_probe_digest` now turns a differential pass into structure: the error families
+the probes themselves provoked, which classes answered without confirming, and which are settled.
+That is the only part of an observation that differs between turns against one URL. Both re-planners
+read it, and the rules the LLM prompt has always stated in prose now execute deterministically -- an
+error family a *probe* triggered promotes its injection class, and a class that answered but did not
+confirm is promoted as the closest thing the pass produced to a lead. A confirmed class is never
+re-promoted; that ground is settled.
 
-- **`GreyIQ-4.2.4-portable.exe`**, **`GreyIQ-Setup-4.2.4.exe`** and **`SHA256SUMS-4.2.4.txt`**, all
-  three from ONE local build - so the checksums describe the binaries actually attached, rather than
-  a rebuild a downloader could never reproduce.
+**A steered turn now probes the hypothesis instead of the suite.** `class_priority` only ever
+REORDERED the ~25 checks, so a turn that wanted "sqli on one new parameter" re-paid for clickjacking,
+csrf, three JWT probes, two GraphQL probes, CORS, redirect, host-header and the rest -- extra turns
+were largely a recomputation of turn 0. `verify_active` gains `only_classes`, which restricts. Turn 0
+still runs the suite in full so recall is established before anything narrows, and the restriction
+fails open twice over. Two limits on it are load-bearing and worth stating: a turn driven by new
+*parameter* names is never restricted, because `class_priority` is an ordered ranking rather than a
+membership set and an ordinary ranking can be entirely param-blind; and the restriction never
+subtracts already-confirmed classes, because those ids come from the finding's impact vocabulary
+while the filter matches check-suite tags, and the two collide on shared names.
 
-### The freeze no longer aborts on a machine that has Qt6 installed
+**The cortex reasons about what to test, not only what was found.** It mapped each finding to exactly
+one hypothesis and ranked by expected payoff, so a near-certain low outranked a maximally-uncertain
+lead gating three chains -- while the lead brief promised to "favour the test that eliminates the most
+hypothesis space" and nothing computed it. Ranking now includes expected information gain
+(uncertainty, peaking at 50/100 and zero at either pole, times the chains resting on the lead), and it
+steers leads only, because ranking captured evidence by how little is left to learn about it would
+sink it in the queue. Alongside that: `build_probe_plan` states per unproven lead and per blocked
+chain the exact `(endpoint, class)` that would change the verdict, restricted to classes the prover
+can confirm and to locations already observed; `project_if_confirmed` names the chains a given lead
+would complete; and a synthesis pass derives the theory a pile of individually-unremarkable rows
+hides -- three routes sharing one weakness on one property is a control missing at the framework
+layer, not three coincidences. Derived rows are routed to the probe queue, which already means "worth
+testing" and never "found".
 
-`build/greyiq-backend.spec` excluded the Qt5-era bindings (`PyQt5`, `PySide2`) but not `PyQt6` /
-`PySide6`. Pillow's `ImageQt` references both 6-series bindings, so on a dev machine carrying them
-PyInstaller hits two Qt binding packages in one graph and **aborts the build outright** rather than
-choosing one. A CI runner is clean, so this never fired there - it only ever broke the local build,
-which is the one path still available while Actions is unavailable. GreyIQ itself never imports Qt,
-so the exclusion costs the shipped app nothing.
+**One bounded re-plan wave now runs inside the hunt** (`GREYIQ_HUNT_REPLAN`, default off). After the
+first active pass the cortex can name the unresolved lead worth chasing across *every* scanner's
+findings, not just the seed URL the loop probes. The wave re-probes the top few through the same
+prover, class-restricted, capped at three endpoints and eight requests, and stops on rate-limiting.
+It sits before classification, attack planning and the QA gate, so what it captures flows through the
+normal pipeline -- placing it after the final graph would have been easier and quietly wrong, since
+those findings would have skipped every downgrade-only QA step the report depends on.
 
-The same class of build-environment leak is why this release was frozen in the script's isolated
-`.venv-build` rather than from system Python: an unpinned developer environment was otherwise
-pulling `scipy` into the bundle, and `collect_all("anthropic")` fails **silently** when the package
-is absent - it would have produced a clean-looking build whose every Claude path died at first use.
+**The campaign path stops being the one mode that never learns.** Campaigns are how GreyIQ runs
+unattended, and they had no cross-run memory at all. `run_bounty_hunt`'s drift and
+negative-knowledge steering sit behind `extra_params is None and class_priority is None`, and a
+campaign always supplies both — so every per-URL hunt skipped that branch, *and* the snapshot and
+miss-recording at the end of it. The mode that hunts the same targets most often was re-testing
+ground it had already proved inert and never noticing what had changed. It now reads cooled
+`(endpoint, class)` pairs and downranks them, diffs its surface against the last run and hunts what
+moved first, and writes both memories back. Recon is asked for observations (no extra request — the
+shapes were already in memory and discarded).
+
+Three honesty guards came with it, each of which the direct-hunt path already had and the first
+draft of this did not. A miss is only learned from a campaign that finished its fan-out *and* whose
+every per-URL active pass ran clean — a prover that was rate-limited or cut short never reached the
+tail of its plan, so those pairs were not tested. Confirmations are banked unfiltered as they are
+observed, because `consolidated` is later narrowed by dismissals and the VDP policy and deduped
+across URLs on a location that collapses digits anywhere; without that a pair the prover *confirmed*
+could be written down as a miss and eventually cool a route the engine has proved. And the drift
+baseline records only *observed* parameter names, never the brain's hypotheses — a hypothesis is by
+construction a name the target did not serve, so storing it would make the next run diff one run's
+guesses against another's and report changes the site never made.
+
+**A campaign's early targets now inform its later ones.** The fan-out ran one frozen plan against
+every URL, so whatever the first target proved could not change where the budget went on the fifth —
+a parallel repetition of a single guess rather than a sequence that learns. A class confirmed on one
+URL now moves to the front of the priority for the URLs not yet hunted on the same registrable
+domain. Same-property only, additive, ordering-only.
+
+**A matched advisory now aims the prober.** The known-CVE fingerprint ran *after* every URL had been
+hunted and produced only candidate findings — the richest targeting signal the engine derives,
+arriving too late to influence a single request. It now runs before the fan-out (the same one GET,
+just earlier, and its findings are still consolidated from that same result) and maps each matched
+advisory's CWE to the class the prover can confirm for it, so an outdated jQuery is a concrete reason
+to try reflected XSS on this host. The map is deliberately partial: ReDoS, prototype pollution and
+SSRF have no prover check, so they are left out rather than mapped to something adjacent — steering
+budget at a class that cannot confirm is waste dressed up as intelligence.
+
+**Two thirds of what `gn train-brain` learns finally reaches a hunt.** The trainer distils a class
+ranker, a parameter-name table and idor/privileged selectors, and promotes all three into
+`hunt_ranker.json` -- but `Ranker.suggest_params` and `Ranker.select` had no caller outside the tests.
+The offline planner now asks the learned table for parameter names first (the curated list still
+follows, so recall cannot drop) and ORs the trained selectors into the access-control candidates, so a
+program whose confirmed IDORs never matched the hand-written hints can teach the engine what its own
+object endpoints look like. Endpoint *selection* under the probe cap stays rule-owned, as the ranker
+seam's contract promises.
+
+Three candidate optimisations were examined and deliberately not taken. Sharing one request budget
+across the active fan-out looked like it was restoring a per-hunt ceiling, but the process-wide
+per-host governor is the real ceiling and already binds; sharing would only let the first target
+starve the rest. Caching repeated GETs in `_Http` would have broken the opt-in time-based probes,
+which confirm on response *duration* -- a cached baseline returns instantly and could manufacture a
+false confirmation. And reserving a share of the budget for the loop's steered turns is
+self-defeating as the engine stands: `_Http` raises the same `_RateLimited` when a call exhausts its
+own allotment as when the host governor throttles, so hitting the reduced cap is precisely what
+makes the loop stop and strand the reserve -- while also cutting the tail of the check suite on the
+only turn allowed to run it unrestricted. Turn 0 keeps the full budget until those two conditions
+are distinguishable.
 
 ## v4.2.3 - the lead brief honours its own filters
 

@@ -414,6 +414,273 @@ class OfflineReactPlanTests(unittest.TestCase):
         self.assertEqual(self.turn, 1)            # flag off == exactly today's behaviour
 
 
+class ProbeObservationLoopTests(unittest.TestCase):
+    """The loop's observe step used to re-read the LANDING page every turn.
+
+    ``meta['digest']`` is built from a fetch of the same URL each time, so after turn 0 the structure
+    was byte-identical and the deterministic re-planner's whole termination argument ("continue only
+    when the latest observation carries structure no earlier one did") fired immediately. The loop
+    could not see the error its own probe raised, so it could only reschedule the scan it had run.
+    """
+
+    EP = "https://target.example/app"
+
+    def setUp(self) -> None:
+        # Restore EVERY coder hook these tests touch: one of them drives the LLM branch, and a
+        # leaked coder_config/generate silently changes what later classes in this file observe.
+        self._orig = (active_verify_service.verify_active, coder.coder_enabled,
+                      coder.coder_config, coder.generate)
+        self.addCleanup(lambda: self._restore())
+        coder.coder_enabled = lambda cfg: bool(cfg)
+        self.turn = 0
+        self.seen: list[dict] = []
+
+    def _restore(self) -> None:
+        (active_verify_service.verify_active, coder.coder_enabled,
+         coder.coder_config, coder.generate) = self._orig
+
+    def _settings(self, max_iters: int = 99) -> ScannerSettings:
+        return ScannerSettings(hunt_loop_enabled=True, hunt_loop_max_iters=max_iters,
+                               active_max_requests_per_host=500, hunt_loop_offline_enabled=True)
+
+    def _stub(self, probe_for_turn) -> None:
+        """A CONSTANT landing digest — the realistic case — with a varying probe digest."""
+        def fake(target, findings, *, requests_budget=12, class_priority=None,
+                 only_classes=None, extra_params=None, **kw):
+            self.turn += 1
+            self.seen.append({"budget": requests_budget, "only_classes": only_classes,
+                              "class_priority": list(class_priority or []),
+                              "extra_params": list(extra_params or [])})
+            return [], {"in_scope": True, "host": "target.example", "requests_used": 4,
+                        "rate_limited": False, "verified_classes": [],
+                        "digest": {"json_keys": ["same_key"]},          # identical every turn
+                        "probe_digest": probe_for_turn(self.turn)}
+        active_verify_service.verify_active = fake
+
+    def test_a_probe_provoked_error_keeps_the_offline_loop_alive(self) -> None:
+        """With a constant landing page, a probe that provokes a NEW error family each turn is real
+        new structure and must justify another turn. Before the probe digest existed it did not."""
+        families = {1: "sql", 2: "template", 3: "nosql"}
+        self._stub(lambda t: {"error_families": [families[t]]} if t in families else {})
+        hunt_loop.run_iterative_verify(self.EP, [], scope="target.example", requests_budget=100,
+                                       settings=self._settings(), coder_cfg=None)
+        self.assertGreater(self.turn, 2, "probe-provoked structure must keep the loop iterating")
+
+    def test_a_repeating_probe_digest_still_terminates(self) -> None:
+        """The termination argument has to survive the new signal: same structure, no new turn."""
+        self._stub(lambda t: {"error_families": ["sql"], "candidate_classes": ["sqli"]})
+        hunt_loop.run_iterative_verify(self.EP, [], scope="target.example", requests_budget=100,
+                                       settings=self._settings(), coder_cfg=None)
+        self.assertEqual(self.turn, 2)
+
+    def test_a_probe_provoked_family_promotes_its_injection_class(self) -> None:
+        obs = {"endpoint": self.EP, "digest": {}, "class_priority": ["xss"],
+               "probe_digest": {"error_families": ["sql"]}}
+        plan = hunt_loop._react_plan_offline({"endpoints": [self.EP], "params": []}, [obs], set(), 20)
+        self.assertEqual(plan["probe_priority"][0]["classes"], ["sqli", "xss"])
+
+    def test_a_class_that_answered_without_confirming_is_promoted(self) -> None:
+        """It is one good probe from a real differential — the best place to spend the next turn."""
+        obs = {"endpoint": self.EP, "digest": {}, "class_priority": [],
+               "probe_digest": {"candidate_classes": ["cors"]}}
+        plan = hunt_loop._react_plan_offline({"endpoints": [self.EP], "params": []}, [obs], set(), 20)
+        self.assertIn("cors", plan["probe_priority"][0]["classes"])
+
+    def test_an_already_confirmed_class_is_never_re_promoted(self) -> None:
+        """Settled ground. Re-probing it spends budget to re-learn what the gate already accepted."""
+        obs = {"endpoint": self.EP, "digest": {}, "class_priority": [],
+               "probe_digest": {"confirmed_classes": ["sqli"], "error_families": ["sql"],
+                                "candidate_classes": ["sqli"]}}
+        plan = hunt_loop._react_plan_offline({"endpoints": [self.EP], "params": []}, [obs], set(), 20)
+        self.assertEqual(plan["probe_priority"], [])
+        self.assertTrue(plan["done"])
+
+    def test_a_missing_probe_digest_degrades_to_todays_behaviour(self) -> None:
+        obs = {"endpoint": self.EP, "digest": {"error_family": "sql"}, "class_priority": ["xss"]}
+        plan = hunt_loop._react_plan_offline({"endpoints": [self.EP], "params": []}, [obs], set(), 20)
+        self.assertEqual(plan["probe_priority"][0]["classes"], ["sqli", "xss"])
+
+    def test_the_probe_structure_reaches_the_brain_prompt(self) -> None:
+        blob = hunt_loop._observations_digest([], {
+            "verified_classes": [], "requests_used": 1,
+            "probe_digest": {"error_families": ["template"], "candidate_classes": ["ssti"]}})
+        self.assertIn("probe_structure", blob)
+        self.assertIn("template", blob)
+
+    # --- budget and focus -------------------------------------------------------------
+
+    def test_turn_zero_keeps_the_whole_budget(self) -> None:
+        """Reserving a share for the steered turns is self-defeating and must stay un-done.
+
+        `_Http` raises the same `_RateLimited` when a call exhausts its own allotment as when the
+        host governor throttles, so verify_active reports `rate_limited` either way and the loop
+        treats it as a hard stop. Capping turn 0 therefore makes hitting the cap the very thing that
+        prevents the reserve from being spent — and since turn 0 is the only unrestricted pass,
+        shrinking it also cuts the tail of the check suite on the one turn allowed to reach it.
+        """
+        self._stub(lambda t: {})
+        hunt_loop.run_iterative_verify(self.EP, [], scope="target.example", requests_budget=100,
+                                       settings=self._settings(max_iters=3), coder_cfg=None)
+        self.assertEqual(self.seen[0]["budget"], 100)
+
+    def test_turn_zero_is_never_restricted(self) -> None:
+        """Recall is established by the unrestricted first pass; nothing may narrow before it."""
+        self._stub(lambda t: {"error_families": ["sql"] if t == 1 else ["template"]})
+        hunt_loop.run_iterative_verify(self.EP, [], scope="target.example", requests_budget=100,
+                                       settings=self._settings(max_iters=3), coder_cfg=None)
+        self.assertIsNone(self.seen[0]["only_classes"])
+
+    def _stub_classes_only(self) -> None:
+        """No new param NAMES (empty landing digest), only probe-provoked error families — the
+        genuinely class-steered turn."""
+        families = {1: "sql", 2: "template", 3: "nosql"}
+        def fake(target, findings, *, requests_budget=12, class_priority=None,
+                 only_classes=None, extra_params=None, **kw):
+            self.turn += 1
+            self.seen.append({"only_classes": None if only_classes is None else list(only_classes),
+                              "class_priority": list(class_priority or [])})
+            return [], {"in_scope": True, "host": "target.example", "requests_used": 2,
+                        "rate_limited": False, "verified_classes": [], "digest": {},
+                        "probe_digest": {"error_families": [families.get(self.turn, "sql")]}}
+        active_verify_service.verify_active = fake
+
+    def test_a_class_steered_turn_is_focused(self) -> None:
+        self._stub_classes_only()
+        hunt_loop.run_iterative_verify(self.EP, [], scope="target.example", requests_budget=100,
+                                       settings=self._settings(max_iters=3), coder_cfg=None)
+        self.assertGreaterEqual(len(self.seen), 2)
+        self.assertEqual(self.seen[1]["only_classes"], self.seen[1]["class_priority"])
+        self.assertIn("sqli", self.seen[1]["only_classes"])
+
+    def test_a_turn_driven_by_new_parameters_is_never_restricted(self) -> None:
+        """cur_priority is an ORDERED RANKING, not a membership set, and a perfectly ordinary one
+        can be entirely param-blind (clickjacking, cors, csrf, host-header, websocket). Restricting
+        to it on the turn whose whole purpose is testing new parameter names would delete every
+        param-consuming check — silently, because the fail-open only rescues a filter matching
+        nothing."""
+        self._stub(lambda t: {"error_families": ["sql"]})   # landing digest yields a new name
+        hunt_loop.run_iterative_verify(self.EP, [], scope="target.example", requests_budget=100,
+                                       settings=self._settings(max_iters=3), coder_cfg=None)
+        self.assertGreaterEqual(len(self.seen), 2)
+        self.assertIsNone(self.seen[1]["only_classes"],
+                          "a param-driven turn must keep the full suite")
+
+    def test_a_confirmed_class_is_never_subtracted_from_the_restriction(self) -> None:
+        """`verified_classes` is the finding's IMPACT vocabulary (`_active_class_hint`); the
+        restriction matches CHECK-SUITE tags. They collide on shared names — the debug-endpoint
+        check reports a confirmed `rce` hint — so subtracting one from the other would delete a
+        different check that had never run."""
+        def fake(target, findings, *, requests_budget=12, only_classes=None, **kw):
+            self.turn += 1
+            self.seen.append({"only_classes": None if only_classes is None else list(only_classes)})
+            return [], {"in_scope": True, "host": "target.example", "requests_used": 2,
+                        "rate_limited": False, "verified_classes": ["sqli"], "digest": {},
+                        "probe_digest": {"error_families": ["sql" if self.turn == 1 else "template"]}}
+        active_verify_service.verify_active = fake
+        hunt_loop.run_iterative_verify(self.EP, [], scope="target.example", requests_budget=100,
+                                       settings=self._settings(max_iters=3), coder_cfg=None)
+        self.assertGreaterEqual(len(self.seen), 2)
+        self.assertIn("sqli", self.seen[1]["only_classes"] or [],
+                      "a confirmed impact hint must not delete the same-named check")
+
+    def test_new_parameter_hypotheses_are_probed_before_exhausted_ones(self) -> None:
+        """Each check applies its own small per-call parameter cap, so appending fresh hypotheses to
+        the tail of a growing list spent the cap re-probing names earlier turns already cleared —
+        and the new hypothesis, the only reason to run another turn, was never reached."""
+        def fake(target, findings, *, requests_budget=12, extra_params=None, **kw):
+            self.turn += 1
+            self.seen.append({"extra_params": list(extra_params or [])})
+            return [], {"in_scope": True, "host": "target.example", "requests_used": 4,
+                        "rate_limited": False, "verified_classes": [],
+                        "digest": {"json_keys": [f"newkey{self.turn}"]}, "probe_digest": {}}
+        active_verify_service.verify_active = fake
+        hunt_loop.run_iterative_verify(
+            self.EP, [], scope="target.example", requests_budget=100,
+            settings=self._settings(max_iters=3), coder_cfg=None,
+            extra_params=["olda", "oldb"], surface={"endpoints": [self.EP], "params": []})
+        self.assertGreaterEqual(len(self.seen), 2)
+        later = self.seen[1]["extra_params"]
+        self.assertEqual(later[0], "newkey1", "the fresh hypothesis must be probed first")
+        self.assertEqual(set(later), {"newkey1", "olda", "oldb"}, "nothing may be dropped")
+
+    def test_chain_promotion_cannot_defeat_the_no_progress_guard(self) -> None:
+        """The regression this class of change keeps re-introducing.
+
+        The guard stops the loop when the planner proposes nothing new. The deterministic chain
+        promotion is derived from evidence already held, so it is IDENTICAL every turn — folding it
+        into the value the guard compares makes the comparison permanently unequal, the guard never
+        fires again, and the loop re-runs byte-identical probes until max_iters, draining a per-host
+        bucket that is shared across concurrent hunts. The earlier lock test misses this because its
+        stub returns no findings, so no chain exists and the promotion never fires at all.
+        """
+        def fake(target, findings, *, requests_budget=12, class_priority=None, **kw):
+            self.turn += 1
+            self.seen.append({"class_priority": list(class_priority or [])})
+            # A CORS candidate on the target host: enough for the cortex to emit a probe-plan row,
+            # so _chain_probe_classes returns ['cors'] on every subsequent turn.
+            return ([{"_active_class_hint": "cors", "rule_id": "active.cors",
+                      "location": self.EP, "file_path": self.EP,
+                      "_active_proof": {"status": "candidate", "observed_result": "reflects origin"}}],
+                    {"in_scope": True, "host": "target.example", "requests_used": 1,
+                     "rate_limited": False, "verified_classes": [], "digest": {}, "probe_digest": {}})
+        active_verify_service.verify_active = fake
+        coder.coder_enabled = lambda cfg: bool(cfg)
+        coder.coder_config = lambda cfg: {"provider": "x"}
+        # The documented failure mode: a brain answering with the identical JSON every turn.
+        coder.generate = lambda messages, cfg: {"text": (
+            '{"param_hypotheses": [], "probe_priority": [{"endpoint": "' + self.EP +
+            '", "classes": ["sqli", "cors"]}], "xss_params": [], "done": false}')}
+        hunt_loop.run_iterative_verify(
+            self.EP, [], scope="target.example", requests_budget=100,
+            settings=ScannerSettings(hunt_loop_enabled=True, hunt_loop_max_iters=6,
+                                     active_max_requests_per_host=500),
+            coder_cfg={"provider": "x"}, surface={"endpoints": [self.EP], "params": []})
+        self.assertEqual(self.turn, 2, "an identical plan must stop the loop even when a chain "
+                                       "promotion is reordering the probe list")
+
+    def test_the_promotion_still_reaches_the_prober(self) -> None:
+        """Fixing the guard must not silently disable the steering it guards against."""
+        graph = {"attack_chains": [], "hypotheses": []}
+        self.assertEqual(hunt_loop._promote(["sqli", "cors"], ["cors"]), ["cors", "sqli"])
+        self.assertEqual(hunt_loop._promote(["sqli"], []), ["sqli"])
+        self.assertEqual(hunt_loop._chain_probe_classes(graph, self.EP), [])
+
+    def test_restricting_classes_never_raises_the_request_budget(self) -> None:
+        self._stub(lambda t: {"error_families": ["sql"] if t == 1 else ["template"]})
+        _, meta = hunt_loop.run_iterative_verify(self.EP, [], scope="target.example",
+                                                 requests_budget=20, settings=self._settings(),
+                                                 coder_cfg=None)
+        self.assertLessEqual(meta["requests_used"], 20)
+
+
+class RestrictToClassesTests(unittest.TestCase):
+    """``_apply_class_priority`` reorders; ``_restrict_to_classes`` selects. A loop that only
+    reorders re-pays for the whole ~25-check suite on every steered turn."""
+
+    CHECKS = [("xss", lambda: None), ("sqli", lambda: None), ("cors", lambda: None),
+              ("xss", lambda: None)]
+
+    def test_it_keeps_only_the_requested_classes_in_order(self) -> None:
+        kept = active_verify_service._restrict_to_classes(self.CHECKS, ["xss"])
+        self.assertEqual([c for c, _ in kept], ["xss", "xss"])
+
+    def test_no_restriction_is_a_no_op(self) -> None:
+        for empty in (None, [], [""]):
+            with self.subTest(value=empty):
+                self.assertEqual(active_verify_service._restrict_to_classes(self.CHECKS, empty),
+                                 self.CHECKS)
+
+    def test_a_restriction_matching_nothing_falls_back_to_the_full_suite(self) -> None:
+        """Silently probing nothing would look like a clean target. Fail open instead."""
+        self.assertEqual(active_verify_service._restrict_to_classes(self.CHECKS, ["nope"]),
+                         self.CHECKS)
+
+    def test_it_never_adds_or_mutates_a_check(self) -> None:
+        kept = active_verify_service._restrict_to_classes(self.CHECKS, ["sqli", "cors"])
+        self.assertTrue(set(kept).issubset(set(self.CHECKS)))
+        self.assertEqual(len(self.CHECKS), 4)
+
+
 class DeterministicCoderIsNotAReasoningBrainTests(unittest.TestCase):
     """Selecting the deterministic coder provider must not be mistaken for configuring a brain.
 

@@ -39,6 +39,7 @@ from bughunter import (
     investigator,
     ledger,
     learning,
+    negative_knowledge,
     offline_hunt,
     progress,
     ranking,
@@ -49,6 +50,7 @@ from bughunter import (
     screenshot_service,
     secret_classification,
     submission,
+    surface_drift,
     vdp_policy,
     web_ingest,
 )
@@ -385,6 +387,13 @@ def _run_campaign_body(
     # or if the reasoning layer errored, so a trace is only written when both really exist.
     hunt_trace_surface: dict[str, Any] | None = None
     hunt_trace_plan: dict[str, Any] | None = None
+    # Computed BEFORE the fan-out so they can steer it, read again after — drift to decide whether
+    # this run may become the next baseline, the CVE result to consolidate without a second fetch.
+    drift: dict[str, Any] = {}
+    drift_host = ""
+    drift_observations: dict[str, Any] = {}
+    drift_surface: dict[str, Any] = {}
+    cve_result: dict[str, Any] = {}
     if kind == "url":
         _emit("recon: mapping the surface…")
         # Bind discovery to the SAME fail-closed scope gate the active prover uses, so
@@ -402,6 +411,9 @@ def _run_campaign_body(
                 min_interval_s=campaign_settings.active_min_interval_ms / 1000.0,
                 pool="recon",  # a SEPARATE per-host bucket from the active prover — recon must not drain it
             ),
+            # Name-only response shapes for surface_drift to diff against the last run. No extra
+            # request: they are already in memory and would otherwise be discarded.
+            observe=rt is not None,
         )
         urls = rec.get("urls") or [clean_target]
         recon_notes = rec.get("notes") or []
@@ -515,6 +527,94 @@ def _run_campaign_body(
         if hint_classes:
             for u in urls:
                 hunt_priority[u] = list(dict.fromkeys((hunt_priority.get(u) or []) + hint_classes))
+
+        # --- KNOWN-CVE fingerprint, ahead of the active pass so it can STEER it -----------------
+        # A matched advisory names the weakness class of the exact library this host serves, which
+        # is worth far more as targeting than as a report line. One GET, and the findings are still
+        # consolidated further down from this same result, so nothing is fetched twice.
+        try:
+            _emit("cve: fingerprinting front-end components…")
+            cve_result = cve_service.scan_known_cves(
+                clean_target,
+                scope=str(scope or "").strip() or cve_service._target_host(clean_target),
+                settings=campaign_settings)
+            cve_hints = cve_service.cve_probe_hints(cve_result.get("findings") or [])
+            if cve_hints:
+                # In FRONT of the generic stack hints: "this page serves a library with a known XSS"
+                # is evidence about this target, where a fingerprint hint is only an implication.
+                for u in urls:
+                    hunt_priority[u] = list(dict.fromkeys(cve_hints + (hunt_priority.get(u) or [])))
+                _emit(f"cve: matched advisories prioritise {', '.join(cve_hints[:4])} on this target")
+        except Exception:  # noqa: BLE001 - the CVE pass is enrichment; never break the campaign
+            cve_result = {}
+
+        # --- CROSS-RUN MEMORY ------------------------------------------------------------------
+        # The campaign has to steer itself here: run_bounty_hunt applies drift and negative
+        # knowledge only behind `extra_params is None and class_priority is None`, and a campaign
+        # always supplies both, so its per-URL hunts skip that branch (and the writes at the end of
+        # it — see the record step further down). Both engines are fail-open and only reorder.
+        if rt is not None:
+            try:
+                # Kept for the snapshot write at the end of the run.
+                drift_host = rec.get("host") or ""
+                drift_observations = rec.get("observations") or {}
+                # OBSERVED params only — `rec["params"]`, never the rebound `recon_params`, which
+                # also carries the brain's hypotheses. A hypothesis is by construction a name the
+                # target did NOT serve (the validator keeps it only if absent from the surface), so
+                # baselining one makes the next run diff guesses against guesses and emit param.new
+                # for names nothing served — which also flips on the heavier js.bundle-changed.
+                drift_surface = {"endpoints": list(urls),
+                                 "params": list(rec.get("params") or []),
+                                 "forms": list(recon_forms)}
+                drift = surface_drift.build_drift(
+                    rt, program=program, target=clean_target, host=drift_host,
+                    observations=drift_observations, surface=drift_surface)
+                # A delta's subject is a DIFF IDENTITY (query-stripped so a page does not look new
+                # every run), not a probe URL — map it back to the URL this crawl saw. A subject
+                # matching nothing crawled is DROPPED, not hunted: it comes from the previous run's
+                # observations, and with no explicit scope `scope_gate` is None, so nothing would
+                # re-check it. This can only reorder the set recon already produced.
+                crawled: dict[str, str] = {}
+                for u in urls:
+                    crawled.setdefault(surface_drift.canonical_url(u), str(u))
+                changed: list[str] = []
+                for subject in surface_drift.delta_targets(drift, limit=2):
+                    key = surface_drift.canonical_url(subject)
+                    probe = crawled.get(key) if key else None
+                    if not probe or probe in changed:
+                        continue
+                    if scope_gate is not None and not scope_gate((urlparse(probe).hostname or "").lower()):
+                        continue
+                    changed.append(probe)
+                if changed:
+                    # Hunt what MOVED first: the operator can stop between hunts and a long span may
+                    # never reach the tail, so fan-out order is real budget.
+                    _already = set(changed)
+                    urls = changed + [u for u in urls if u not in _already]
+                    _emit(f"surface drift: {len(drift.get('deltas') or [])} change(s) since "
+                          f"{drift.get('baseline_ts') or 'the last run'}; hunting what moved first")
+            except Exception:  # noqa: BLE001 - steering is an optimization, never a blocker
+                drift = {}
+            # Downrank (endpoint, class) pairs probed before that never confirmed, so the capped
+            # per-URL budget flows to unexhausted surface. `hunt_priority` is {url: [classes]}, so
+            # it is projected into the probe_priority shape apply_suppression takes, then read back.
+            try:
+                cooled = negative_knowledge.cooled_pairs(rt, program=program, target=clean_target)
+                if cooled and hunt_priority:
+                    projected = {"probe_priority": [{"endpoint": u, "classes": list(cs)}
+                                                    for u, cs in hunt_priority.items()]}
+                    suppressed, stats = negative_knowledge.apply_suppression(
+                        projected, cooled,
+                        changed_endpoints=negative_knowledge.changed_endpoint_keys(drift))
+                    for row in suppressed.get("probe_priority") or []:
+                        if isinstance(row, dict) and row.get("endpoint"):
+                            hunt_priority[str(row["endpoint"])] = list(row.get("classes") or [])
+                    if stats.get("downranked"):
+                        _emit(f"negative knowledge: deprioritised {stats['downranked']} tested-inert "
+                              f"endpoint/class pair(s) from earlier hunts "
+                              f"({stats.get('fully_cooled', 0)} endpoint(s) fully cooled)")
+            except Exception:  # noqa: BLE001 - suppression is an optimizer, never a hunt breaker
+                pass
     else:
         urls = [clean_target]
         recon_notes, recon_sources = [], {}
@@ -545,11 +645,27 @@ def _run_campaign_body(
     # registered by the span); here we just stream that target's findings as URLs finish.
     if progress_unit is None:
         progress.set_targets(progress_run_id, urls)
+    # Negative knowledge may only learn a MISS from a run that finished its plan: "never executed"
+    # and "executed and inert" are different facts, and only the second is knowledge. Two ways this
+    # run can fall short — the fan-out stopping early, and any single URL's active pass being
+    # rate-limited, refused, or cut off by its budget (the per-URL mirror of run_bounty_hunt's own
+    # condition for a direct hunt).
+    stopped_early = False
+    active_clean = True
+    # IMMUNITY IS DECIDED ON WHAT THE ENGINE PROVED, NOT ON WHAT THE REPORT SHOWED. `consolidated`
+    # is later narrowed by dismissals and the VDP filter, and deduped across urls on a location
+    # that collapses digits anywhere — so a confirmed pair can vanish from it while still sitting
+    # in the plan, and would be written down as a miss. Bank every confirmation unfiltered here.
+    nk_confirmed: list[dict[str, Any]] = []
+    # Chains from each per-target investigation, pooled for the drift snapshot: an empty `chains`
+    # list reads as "nothing is blocked any more" and resets reopened_chains' blocked-run streak.
+    campaign_chains: list[dict[str, Any]] = []
     for index, url in enumerate(urls, 1):
         # Cooperative cancellation: the operator's Stop halts BETWEEN url hunts (a hunt
         # in flight finishes its current url, then we bail with whatever's been found).
         if progress.is_stopped(progress_run_id):
             _emit("stop requested — halting this target after the current URL")
+            stopped_early = True
             break
         _emit(f"hunt {index}/{len(urls)}: {url}")
         if progress_unit is None:
@@ -568,16 +684,39 @@ def _run_campaign_body(
             if progress_unit is None:
                 progress.mark_target(progress_run_id, url, "error", error=str(result.get("error") or ""))
             continue
+        # Did THIS url's pass get through its plan? Anything less and no miss may be learned.
+        _am = result.get("active_authorization")
+        _am = _am if isinstance(_am, dict) else {}
+        if (result.get("scan_errors") or _am.get("in_scope") is not True
+                or _am.get("rate_limited") or str(_am.get("skipped_reason") or "").strip()):
+            active_clean = False
         if isinstance(result.get("chain_signals"), list):
             campaign_signals.extend(result["chain_signals"])
         doc = _read_json(result.get("json_path", ""))
+        # Already computed by this target's investigation, so pooling costs nothing.
+        _inv = doc.get("investigation") if isinstance(doc.get("investigation"), dict) else {}
+        campaign_chains.extend(c for c in (_inv.get("attack_chains") or []) if isinstance(c, dict))
         url_new: list[dict[str, Any]] = []  # findings first-seen at THIS url, for the live dashboard
+        confirmed_here: list[str] = []      # classes THIS url proved — see the promotion below
         for finding in doc.get("findings") or []:
             # Dedup across targets by class + rule + normalized location.
             norm_loc = re.sub(r"\d+", "N", str(finding.get("location") or ""))
             key = f"{finding.get('class_id')}|{finding.get('rule_id')}|{norm_loc}"
             ref = str(finding.get("ref") or "")
             proof_status = _proof_status(doc, ref)
+            # Collected BEFORE the dedup guard: a class this URL proved is evidence about the host
+            # whether or not an earlier URL already reported the same finding.
+            if proof_status == "confirmed":
+                _cls = str(finding.get("class_id") or "").strip()
+                if _cls and _cls not in confirmed_here:
+                    confirmed_here.append(_cls)
+                # Against BOTH the planned url and the finding's own location, since the plan is
+                # keyed by url and the finding may name another endpoint. Over-granting immunity
+                # only costs a re-probe; a false suppression silently removes coverage.
+                for _ep in dict.fromkeys([url, str(finding.get("location") or "")]):
+                    if _ep and _cls:
+                        nk_confirmed.append({"endpoint": _ep, "class": _cls,
+                                             "proof_status": "confirmed"})
             item = {
                 "finding": finding,
                 "source_url": url,
@@ -618,6 +757,22 @@ def _run_campaign_body(
                             # captured artifact, which a bare status can't supply.
                             "proof_detail": (doc.get("proof_of_impact") or {}).get(ref) or {},
                             "proof_evidence": finding.get("proof_evidence") or None})
+        # --- Let this target teach the ones still queued ---------------------------------------
+        # A class confirmed here is the best evidence available that it is live on a sibling route
+        # of the same property — a proven IDOR on one object endpoint is a reason to try IDOR on
+        # the next — so it leads the priority for the URLs not yet hunted. Same registrable domain
+        # only, since a confirmation on one property says nothing about another (the chain engine
+        # draws that boundary too). Additive and order-only; the gated prover still owns confirm.
+        if confirmed_here:
+            try:
+                here = registrable_domain((urlparse(url).hostname or "").lower())
+                for later in urls[index:]:
+                    if not here or registrable_domain((urlparse(later).hostname or "").lower()) != here:
+                        continue
+                    hunt_priority[later] = list(dict.fromkeys(
+                        confirmed_here + (hunt_priority.get(later) or [])))
+            except ValueError:
+                pass  # a malformed URL is not a reason to abandon the campaign
         # Stream this URL's findings live — attributed to the span's named target when
         # running under one, else to the URL itself (single-target campaign).
         progress.add_findings(progress_run_id, progress_unit or url, url_new)
@@ -666,10 +821,10 @@ def _run_campaign_body(
     # scope defaults to the target's own host when the campaign was run without an explicit
     # scope, matching recon's "fetch the thing you pointed at" behaviour. ---
     if kind == "url":
-        cve_scope = str(scope or "").strip() or cve_service._target_host(clean_target)
         try:
-            _emit("cve: fingerprinting front-end components…")
-            cve_res = cve_service.scan_known_cves(clean_target, scope=cve_scope)
+            # Fingerprinted before the fan-out (above) so its advisories could steer the probe
+            # order; reuse that result rather than fetching twice. Empty if the early pass errored.
+            cve_res = cve_result if isinstance(cve_result, dict) else {}
             for c_index, finding in enumerate(cve_res.get("findings") or [], 1):
                 # Dedup by product (one finding per outdated library, whichever page served it).
                 key = f"cve|{finding.get('_cve_product')}"
@@ -907,6 +1062,35 @@ def _run_campaign_body(
             hunt_trace.record_trace(rt, program=program, target=clean_target,
                                     surface=hunt_trace_surface, plan=hunt_trace_plan,
                                     consolidated=consolidated)
+        # The two memories bounty writes only on the branch a campaign skips, so the steering added
+        # before the fan-out has something to read next run.
+        if kind == "url":
+            try:
+                # The plan as it was actually spent, in the probe_priority shape the store reads.
+                nk_plan = {"probe_priority": [{"endpoint": u, "classes": list(cs)}
+                                              for u, cs in hunt_priority.items()]}
+                # Gates MISSES only — confirmations are always recorded, since they only grant
+                # immunity. See stopped_early / active_clean where they are declared.
+                nk_complete = bool(
+                    effective_active and per_target and not stopped_early and active_clean
+                    and all(t.get("ok") for t in per_target))
+                negative_knowledge.record_hunt(
+                    rt, program=program, target=clean_target, plan=nk_plan,
+                    # Report-shaped outcomes PLUS the unfiltered confirmations banked above —
+                    # without the second half a filtered-out confirm is recorded as a miss.
+                    outcomes=hunt_trace.outcomes_from_findings(consolidated) + nk_confirmed,
+                    complete=nk_complete)
+                # This run becomes the next run's baseline — unless it saw too little of the host
+                # to be compared, when storing it would make the next run call everything new.
+                if drift.get("status") != "degraded-run" and drift_observations:
+                    surface_drift.record_snapshot(
+                        rt, program=program, target=clean_target,
+                        host=drift_host or urlparse(clean_target).hostname or "",
+                        observations=drift_observations, surface=drift_surface,
+                        chains=campaign_chains,  # omitting these resets the blocked-run streak
+                        deltas=drift.get("deltas"))
+            except Exception:  # noqa: BLE001 - bookkeeping must never break a completed campaign
+                pass
 
     # Publish a local, redacted POE decision into the in-product operations stream. This is
     # dialogue for the running app, never an external submission or production-side mutation.
