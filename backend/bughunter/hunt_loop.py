@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 import brain_profiles
 import coder
@@ -55,6 +56,14 @@ from bughunter.rate_limit import shared_governor
 from bughunter.settings import get_settings
 
 _PER_TURN_MIN = 4  # don't start a turn that can't afford a few probes
+
+# Share of the hunt's request budget turn 0 may spend when the loop can actually iterate. Turn 0 is
+# the UNSTEERED baseline sweep — it runs the caller's priority against the full check suite — and it
+# was handed the entire budget, so the steered turns this loop exists for ran on whatever the broad
+# sweep happened to leave. Reserving the remainder does not raise total spend (the decrementing
+# budget and the shared governor are unchanged); it just stops the least-informed turn from taking
+# everything. With max_iters == 1 there is nothing to reserve for, so turn 0 keeps the full budget.
+_TURN0_SHARE = 0.6
 
 # The error signature families digest_builder can match, mapped to the injection class the LLM prompt
 # tells the brain to prioritise for each. ``stacktrace`` is deliberately ABSENT: a generic traceback
@@ -174,19 +183,79 @@ def _loop_snapshot(
     return graph
 
 
+def _turn_graph(findings: list[dict[str, Any]], surface: dict[str, Any],
+                meta: dict[str, Any]) -> dict[str, Any]:
+    """Build the loop's provisional evidence graph ONCE for this turn.
+
+    Both consumers below — the chain focus the brain reads and the deterministic class promotion —
+    used to build their own, which meant running the full cortex plus the attack-chain correlation
+    twice per turn over an identical finding set. Fail-open: an empty graph just means an unsteered
+    turn, which is exactly what the loop did before any of this existed.
+    """
+    try:
+        return investigator.build_investigation(
+            findings, surface=surface, scan_meta=meta,
+            response_digest=meta.get("digest") if isinstance(meta.get("digest"), dict) else None,
+        )
+    except Exception:  # noqa: BLE001 - steering is advisory; never break the loop
+        return {}
+
+
+def _chain_probe_classes(graph: dict[str, Any], target_url: str) -> list[str]:
+    """The classes the cortex's own probe plan says would most change the verdict on THIS target.
+
+    ``_chain_focus`` already worked out which chain sits one captured artifact from real impact, but
+    it only ever expressed that as prose inside the observation blob — so an offline hunt got no
+    chain steering at all, and an LLM hunt got a hint it was free to ignore. This turns the same
+    knowledge into a deterministic promotion both planners inherit, by reusing the structured probe
+    plan the cortex now emits (``investigator.build_probe_plan``), whose rows already rank a chain's
+    blocking step above a loose lead of the same class.
+
+    Reorder-only: it yields class NAMES the prover already implements, drawn from a plan built out of
+    evidence this hunt captured. It cannot introduce an endpoint — the loop probes ``target_url`` and
+    nothing else — and it cannot confirm anything. Host-matched rather than URL-matched because a
+    finding's location carries the query string the probe used while ``target_url`` does not; the
+    comparison decides only which class runs first against a URL the caller already scope-checked.
+    """
+    try:
+        host = (urlparse(str(target_url or "")).hostname or "").lower()
+        if not host:
+            return []
+        out: list[str] = []
+        for row in investigator.build_probe_plan(graph):
+            row_host = (urlparse(str(row.get("endpoint") or "")).hostname or "").lower()
+            if row_host != host:
+                continue
+            class_id = str(row.get("class_id") or "").strip().lower()
+            if class_id and class_id not in out:
+                out.append(class_id)
+        return out[:6]
+    except Exception:  # noqa: BLE001 - steering is advisory; never break the loop
+        return []
+
+
+def _promote(classes: list[str], promoted: list[str]) -> list[str]:
+    """``promoted`` in front, everything already planned behind it, order otherwise preserved."""
+    return list(dict.fromkeys([*promoted, *classes]))
+
+
 def _chain_focus(findings: list[dict[str, Any]], surface: dict[str, Any],
-                 meta: dict[str, Any]) -> list[dict[str, Any]]:
+                 meta: dict[str, Any], graph: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """The open chains worth spending the remaining budget on, best first.
 
     Deterministic and derived only from what has already been captured — it reorders the
     loop's attention, it never adds a probe or claims a result. Fail-open: steering is an
     optimization, so any error here just means an unsteered turn.
+
+    ``graph`` lets the caller pass the turn's already-built investigation so the cortex and the
+    chain correlation are not run twice; omitted, it builds its own exactly as before.
     """
     try:
-        graph = investigator.build_investigation(
-            findings, surface=surface, scan_meta=meta,
-            response_digest=meta.get("digest") if isinstance(meta.get("digest"), dict) else None,
-        )
+        if graph is None:
+            graph = investigator.build_investigation(
+                findings, surface=surface, scan_meta=meta,
+                response_digest=meta.get("digest") if isinstance(meta.get("digest"), dict) else None,
+            )
         focus: list[dict[str, Any]] = []
         # FILTER FIRST, THEN SLICE. investigator._build_chains sorts by (confirmed, confidence)
         # descending and caps an unproven chain's confidence below a proven one's, so proven chains
@@ -240,6 +309,11 @@ def _observations_digest(findings: list[dict[str, Any]], meta: dict[str, Any],
         # structure the brain reasons over instead of a blind param nudge. Extracted, redacted, no
         # values; it steers WHICH scope-gated classes/params to try next, never introduces a probe.
         "response_structure": meta.get("digest") if isinstance(meta.get("digest"), dict) else {},
+        # What THIS turn's probes provoked: the error families they triggered and the classes that
+        # answered without confirming. Unlike `response_structure` (the landing page, identical every
+        # turn against one URL) this changes as the probes change, so it is the part of an
+        # observation that can actually justify a different next turn.
+        "probe_structure": meta.get("probe_digest") if isinstance(meta.get("probe_digest"), dict) else {},
         # Which attack chains are one captured artifact away from real impact. Derived from
         # our own confirmed evidence (never from model prose), so it is a priority hint, not
         # a claim: the brain should aim the next turn at closing one of these.
@@ -268,6 +342,12 @@ def _build_react_prompt(target: str, scope: str, surface: dict[str, Any], observ
         "looking fields (search/q/name/message) -> xss_params; a present JWT or cookie-flag gap is context "
         "worth steering toward header/token classes. Propose param NAMES drawn from the structure, not "
         "guesses.\n"
+        "READ `probe_structure` FIRST — it is what YOUR LAST TURN CAUSED, not what the page always looks "
+        "like, so it is the part of an observation that can actually justify a different next turn. Its "
+        "`error_families` are errors the probes themselves provoked (sql/nosql/template -> prioritise that "
+        "injection class); its `candidate_classes` answered but did not confirm, so they sit one good probe "
+        "from a real differential and are usually the best place to spend this turn; its "
+        "`confirmed_classes` are settled — do NOT spend budget re-proving them.\n"
         "PRIORITISE CLOSING A CHAIN: each observation carries `open_attack_chains` — chains already "
         "part-proven that are blocked on ONE more captured artifact. Turning a part-proven chain into a "
         "complete one is worth far more than finding another unrelated low. If a chain is blocked on a "
@@ -304,8 +384,18 @@ def _observed_structure(obs: dict[str, Any], fallback_endpoint: str) -> dict[str
       * a JWT header shape observed -> the ``jwt`` class; an auth cookie missing HttpOnly/SameSite ->
         ``csrf`` (both only reach the prober if the validator's class vocabulary covers them — if it
         doesn't, _validate_plan simply drops them, which degrades and never breaks)
+    On top of those LANDING-page rules it reads the PROBE digest — what this turn's probes actually
+    provoked — which is the only part of an observation that changes from turn to turn against one
+    URL. Two rules run off it, and they are the executable form of what the LLM prompt asks for in
+    prose: an error family a PROBE triggered promotes its injection class (the "a 500/stack trace ->
+    prioritise ssti/sqli" rule, now sourced from the response the probe caused rather than from the
+    landing page), and a class that answered without confirming is promoted as the closest thing the
+    pass produced to a lead. Confirmed classes are deliberately NOT promoted: that ground is settled,
+    and re-probing it spends budget to re-learn what the gate already accepted.
+
     Everything here is EXTRACTED from the digest (already redacted + value-free); nothing is invented."""
     digest = obs.get("digest") if isinstance(obs.get("digest"), dict) else {}
+    probe = obs.get("probe_digest") if isinstance(obs.get("probe_digest"), dict) else {}
     endpoint = str(obs.get("endpoint") or "").strip() or fallback_endpoint
 
     names: list[str] = []
@@ -332,6 +422,20 @@ def _observed_structure(obs: dict[str, Any], fallback_endpoint: str) -> dict[str
         missing = {str(m).strip().lower() for m in (raw_missing if isinstance(raw_missing, (list, tuple)) else [])}
         if missing & _CSRF_COOKIE_FLAGS and "csrf" not in classes:
             classes.append("csrf")
+
+    # --- what THIS turn's probes provoked (the only part that varies against one URL) ---
+    settled = {str(c).strip().lower()
+               for c in (probe.get("confirmed_classes") if isinstance(probe.get("confirmed_classes"), list) else [])}
+    raw_families = probe.get("error_families")
+    for family in (raw_families if isinstance(raw_families, (list, tuple)) else [])[:4]:
+        promoted = _ERROR_FAMILY_CLASS.get(str(family or "").strip().lower())
+        if promoted and promoted not in classes and promoted not in settled:
+            classes.append(promoted)
+    raw_candidates = probe.get("candidate_classes")
+    for entry in (raw_candidates if isinstance(raw_candidates, (list, tuple)) else [])[:8]:
+        name = str(entry or "").strip().lower()
+        if name and name not in classes and name not in settled:
+            classes.append(name)
 
     hints = _xss_hints()
     baseline = [str(c).strip() for c in (obs.get("class_priority") or []) if str(c or "").strip()] \
@@ -534,13 +638,27 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
 
     turn = -1  # so out_meta["loop_turns"] = turn + 1 is well-defined (0) even if max_iters <= 0
     for turn in range(max_iters):
-        per_turn = min(requests_budget, budget_remaining)
+        # Turn 0 is the UNSTEERED sweep. Capping its share leaves something for the steered turns
+        # this loop exists for; it never raises total spend, which the decrementing budget below and
+        # the shared governor still own.
+        turn_cap = requests_budget
+        if turn == 0 and max_iters > 1:
+            turn_cap = max(_PER_TURN_MIN, int(requests_budget * _TURN0_SHARE))
+        per_turn = min(turn_cap, budget_remaining)
         if per_turn < _PER_TURN_MIN and turn > 0:
             break  # not enough left to be worth another round (turn 0 always runs)
+        # Turn 0 runs the suite in FULL, so recall is established before anything is restricted.
+        # After that, a steered turn probes only what the planner asked for, minus what is already
+        # confirmed — so the budget goes to hypotheses that can still change the verdict instead of
+        # re-paying for ~24 checks the previous turn already ran. Fail-open: no steer, no restriction.
+        only_classes = None
+        if turn > 0 and cur_priority:
+            only_classes = [c for c in cur_priority if c not in verified] or None
         results, meta = active_verify_service.verify_active(
             target_url, findings, scope=scope, requests_budget=max(_PER_TURN_MIN, per_turn),
             settings=settings, governor=governor, time_based=time_based, auth=auth,
-            extra_params=cur_params, class_priority=cur_priority or None, xss_params=cur_xss or None)
+            extra_params=cur_params, class_priority=cur_priority or None, xss_params=cur_xss or None,
+            only_classes=only_classes)
         last_meta = meta
         for f in results:
             merged.setdefault(_dedup_key(f), f)
@@ -557,11 +675,16 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
         # Chain-aware steering: the loop knows which chain is one step from real impact, so
         # the next turn chases THAT class instead of whatever class looks locally interesting.
         # A confirmed XSS with a token-theft step still open is worth more budget than a fresh
-        # unrelated lead, and only the chain layer knows that.
+        # unrelated lead, and only the chain layer knows that. ONE graph feeds both the prose the
+        # brain reads and the deterministic promotion applied after the guard below.
+        turn_graph = _turn_graph(list(merged.values()), surf, meta)
         observations.append(_observations_digest(
-            results, meta, chain_focus=_chain_focus(list(merged.values()), surf, meta)))
+            results, meta, chain_focus=_chain_focus(list(merged.values()), surf, meta, graph=turn_graph)))
         structural.append({"endpoint": target_url,
                            "digest": meta.get("digest") if isinstance(meta.get("digest"), dict) else {},
+                           # What the probes provoked this turn — the part that actually differs
+                           # between turns, and so the part that can justify running another one.
+                           "probe_digest": meta.get("probe_digest") if isinstance(meta.get("probe_digest"), dict) else {},
                            "verified_classes": list(meta.get("verified_classes") or []),
                            "class_priority": list(cur_priority)})
         plan = _react_plan(coder_cfg, target_url, scope, surf, observations, params_tried, budget_remaining,
@@ -581,9 +704,21 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
         next_xss = list(dict.fromkeys(cur_xss + list(plan["xss_params"])))
         if plan["done"] or (not new_params and next_priority == cur_priority and next_xss == cur_xss):
             break  # brain is done OR proposed nothing NEW -> stop (no-progress guard)
-        cur_params = params_tried = params_tried + new_params
+        # NEW names FIRST. Each check applies its own small per-call parameter cap, so appending fresh
+        # hypotheses to the tail of an ever-growing list meant the cap was spent re-probing names
+        # earlier turns had already cleared and the new hypothesis was never reached at all. Nothing
+        # is dropped — the previously tried names still follow — so this costs no recall.
+        prior_params = list(params_tried)
+        params_tried = prior_params + new_params
+        cur_params = new_params + prior_params
         cur_priority = next_priority
         cur_xss = next_xss
+        # Deterministic chain-closing promotion, applied AFTER the no-progress guard on purpose. It
+        # re-orders the next turn's attention using evidence already captured, so it must never by
+        # itself look like progress: if the planner has nothing new to say, the loop still stops.
+        promoted = _chain_probe_classes(turn_graph, target_url)
+        if promoted:
+            cur_priority = _promote(cur_priority, promoted)
         _emit(f"hunt-loop turn {turn + 1}: +{len(new_params)} param(s), {budget_remaining} req budget left")
 
     out_meta = dict(last_meta)
