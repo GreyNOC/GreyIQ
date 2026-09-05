@@ -236,6 +236,41 @@ def _rank(candidates: list[str], priors: dict[str, float] | None, model: Any | N
     return ranked
 
 
+def _learned_params(model: Any | None, url: str, tech: str, cap: int) -> list[str]:
+    """Parameter NAMES the learned table has historically confirmed for this endpoint's purpose.
+
+    ``gn train-brain`` distils this table from the program's own CONFIRMED hunts and promotes it into
+    ``hunt_ranker.json`` — and until now nothing at hunt time ever read it, so two of the three things
+    the trainer learns were dead weight and what the engine discovered about its own targets never
+    reached the next hunt.
+
+    Fail-open to nothing: no model, no learned opinion, or any error yields ``[]`` and the caller
+    keeps its curated list, so recall cannot drop. Names only; ``hunt_brain._validate_plan`` still
+    re-checks every one against the parameter-name regex before it can reach the prober."""
+    if model is None:
+        return []
+    try:
+        return [str(n) for n in model.suggest_params_for_endpoint(url, tech, cap)]
+    except Exception:  # noqa: BLE001 - a corrupt model must never break the offline plan
+        return []
+
+
+def _model_selects(model: Any | None, kind: str, url: str, names: list[str],
+                   recon: list[str], tech: str, form: dict[str, Any] | None) -> bool:
+    """Does the learned selector want an object- (``idor``) or function-level (``privileged``) probe?
+
+    COMPLEMENTS the path/param heuristics — it can only ADD a candidate the rules missed, never
+    remove one they found — so a program whose confirmed IDORs never matched ``_IDOR_PARAM_HINTS``
+    can still teach the engine what its own object endpoints look like. Pure selection over endpoints
+    recon already discovered in scope; the prover re-gates scope and SSRF regardless."""
+    if model is None:
+        return False
+    try:
+        return bool(model.selects_endpoint(kind, url, names, recon, tech, form))
+    except Exception:  # noqa: BLE001 - fall back to the heuristics, never break a hunt
+        return False
+
+
 def _priority_sort_key(row: dict[str, Any], index: int) -> tuple[int, int, int]:
     """Rank ONE probe_priority row for the hard cap: strongest class, then breadth, then discovery.
 
@@ -264,10 +299,19 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
     first ones recon happened to discover.
 
     ``model`` is an OPTIONAL learned ranker (hunt_model). It is keyword-only and defaults to None so
-    every existing caller keeps byte-identical behaviour; when supplied it may only permute the rule-
-    proposed class candidates per endpoint (see ``_rank``) — it cannot reach param_hypotheses,
-    idor_candidates, privileged_endpoints, or the endpoint selection itself (the cap's sort key is
-    permutation-invariant, so it cannot decide which endpoints survive either)."""
+    every existing caller keeps byte-identical behaviour. It occupies exactly three seams, all of
+    them ADDITIVE and all of them re-validated downstream by ``hunt_brain._validate_plan``:
+
+      * per-endpoint class ORDER — it may only permute what the rules proposed (see ``_rank``);
+      * ``param_hypotheses`` — learned names lead, the curated ``_SUGGEST`` list still follows, so an
+        empty learned table changes nothing and recall cannot drop;
+      * ``idor_candidates`` / ``privileged_endpoints`` — OR'd with the path/param heuristics, so the
+        selector can only ADD an endpoint whose shape the hand-written hints miss, never remove one.
+
+    It still cannot decide WHICH ENDPOINTS SURVIVE the probe cap: ``_priority_sort_key`` stays
+    permutation-invariant, so endpoint selection remains rule-owned. Nor can it introduce an endpoint
+    — every candidate is drawn from the discovered in-scope set — or confirm anything, because the
+    deterministic prover still owns every confirmation."""
     endpoints = [str(u).strip() for u in (surface.get("endpoints") or []) if str(u or "").strip()]
     recon_params = {str(p).strip().lower() for p in (surface.get("params") or []) if str(p or "").strip()}
     tech = " ".join(str(t) for t in (surface.get("tech") or [])).lower()
@@ -309,13 +353,20 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
         if classes and url not in seen_pri:
             seen_pri.add(url)
             priority.append({"endpoint": url, "classes": classes})
-        # object-scoped endpoint -> IDOR candidate
-        if _NUMERIC_SEG_RE.search(url) or _UUID_SEG_RE.search(url) or any(_hit(n, _IDOR_PARAM_HINTS) for n in names):
+        # object-scoped endpoint -> IDOR candidate. The learned selector is OR'd in, never
+        # substituted: it can add an object endpoint whose shape the hand-written hints do not
+        # describe, and "no trained selector" is False, which is exactly today's behaviour.
+        _form = forms_by_action.get(url)
+        _recon = sorted(recon_params)
+        if _NUMERIC_SEG_RE.search(url) or _UUID_SEG_RE.search(url) or any(_hit(n, _IDOR_PARAM_HINTS) for n in names) \
+                or _model_selects(model, "idor", url, names, _recon, tech, _form):
             if url not in idor_candidates:
                 idor_candidates.append(url)
         # admin / privileged FUNCTION path -> BFLA candidate (function-level, not object-level)
         low_path = urlparse(url).path.lower()
-        if any(h in low_path for h in _PRIV_PATH_HINTS) and url not in privileged_endpoints:
+        if (any(h in low_path for h in _PRIV_PATH_HINTS)
+                or _model_selects(model, "privileged", url, names, _recon, tech, _form)) \
+                and url not in privileged_endpoints:
             privileged_endpoints.append(url)
         for n in names + list(recon_params):
             if _hit(n, _SSRF_HINTS) and n not in ssrf_params:
@@ -323,7 +374,18 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
             if _hit(n, _XSS_HINTS) and n not in xss_params:
                 xss_params.append(n)
 
-    for n in _SUGGEST:
+    # LEARNED names first, curated names behind them. The trainer distils the parameter names this
+    # program's confirmed hunts actually landed on, so those are better bets than a fixed list of
+    # eighteen — but the curated list still follows, so an empty learned table (or no model at all)
+    # leaves the output byte-identical to before and recall can never drop.
+    learned_names: list[str] = []
+    for url in endpoints[:60]:
+        if len(learned_names) >= _CAP:
+            break
+        for name in _learned_params(model, url, tech, _CAP):
+            if name.lower() not in recon_params and name not in learned_names:
+                learned_names.append(name)
+    for n in (*learned_names, *_SUGGEST):
         if n.lower() not in recon_params and n not in param_hypotheses:
             param_hypotheses.append(n)
 

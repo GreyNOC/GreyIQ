@@ -271,6 +271,109 @@ class _StubRanker:
         return self.reply if self.reply is not None else list(reversed(candidates))
 
 
+class _LearningRanker(_StubRanker):
+    """A ranker that also answers the two heads the trainer learns but nothing used to serve."""
+
+    def __init__(self, params=None, selects=(), boom_params: bool = False) -> None:
+        super().__init__()
+        self.params = list(params or [])
+        self.selects = set(selects)
+        self.boom_params = boom_params
+        self.seen_kinds: list[str] = []
+
+    def rank_endpoint_classes(self, url, names, recon, tech, candidates, priors, *, form=None):
+        return list(candidates)          # identity: keep these tests about the other two seams
+
+    def suggest_params_for_endpoint(self, url, tech, cap):
+        if self.boom_params:
+            raise RuntimeError("corrupt weights")
+        return self.params[:cap]
+
+    def selects_endpoint(self, kind, url, names, recon, tech, form=None):
+        self.seen_kinds.append(kind)
+        return kind in self.selects
+
+
+class LearnedParamAndSelectorSeamTests(unittest.TestCase):
+    """``gn train-brain`` learns three things and promotes them all into hunt_ranker.json, but only
+    the class ranker was ever served — the learned parameter table and the idor/privileged selectors
+    had no hunt-time caller at all, so what the engine learned from its own confirmed hunts never
+    reached the next one. Both are additive: they may only ADD, never remove or replace."""
+
+    SURFACE = {"endpoints": ["https://t.example/download?file=x"], "params": [], "tech": ["PHP"]}
+
+    def _plan(self, model=None, surface=None):
+        return offline_hunt.offline_plan(surface or self.SURFACE, None, model=model)
+
+    def test_learned_names_lead_and_the_curated_list_still_follows(self) -> None:
+        names = self._plan(_LearningRanker(params=["filepath", "attachment"]))["param_hypotheses"]
+        self.assertEqual(names[:2], ["filepath", "attachment"])
+        for curated in offline_hunt._SUGGEST:
+            self.assertIn(curated, names, "the curated list must survive, so recall cannot drop")
+
+    def test_no_learned_opinion_is_byte_identical_to_no_model(self) -> None:
+        self.assertEqual(self._plan(_LearningRanker(params=[]))["param_hypotheses"],
+                         self._plan(None)["param_hypotheses"])
+
+    def test_a_raising_param_head_falls_back_to_the_curated_list(self) -> None:
+        self.assertEqual(self._plan(_LearningRanker(boom_params=True))["param_hypotheses"],
+                         self._plan(None)["param_hypotheses"])
+
+    def test_a_ranker_without_the_new_heads_still_works(self) -> None:
+        """A weight file (or stub) from before these heads existed must degrade, not explode."""
+        self.assertEqual(self._plan(_StubRanker())["param_hypotheses"],
+                         self._plan(None)["param_hypotheses"])
+
+    def test_learned_names_are_still_only_names(self) -> None:
+        """The learned table is operator-local but still untrusted input to the prober; the plan
+        gate re-checks every name. Nothing that is not a parameter name may survive."""
+        hostile = ["https://evil.example/x", "drop table users", "bad name", "<script>", "okname"]
+        plan = self._plan(_LearningRanker(params=hostile))
+        params, _pri, _i, _s, _x, _p = hunt_brain._validate_plan(plan, self.SURFACE)
+        self.assertIn("okname", params)
+        for bad in hostile[:-1]:
+            self.assertNotIn(bad, params)
+
+    # --- the access-control selectors -------------------------------------------------
+
+    PLAIN = {"endpoints": ["https://t.example/reports/summary"], "params": [], "tech": []}
+    OBJECT = {"endpoints": ["https://t.example/order/1001"], "params": [], "tech": []}
+
+    def test_the_selector_adds_an_object_endpoint_the_hints_miss(self) -> None:
+        """A program whose confirmed IDORs never matched _IDOR_PARAM_HINTS can still teach the
+        engine what its own object endpoints look like."""
+        self.assertEqual(self._plan(None, self.PLAIN)["idor_candidates"], [])
+        self.assertEqual(self._plan(_LearningRanker(selects=["idor"]), self.PLAIN)["idor_candidates"],
+                         ["https://t.example/reports/summary"])
+
+    def test_the_selector_adds_a_privileged_endpoint_the_hints_miss(self) -> None:
+        self.assertEqual(self._plan(None, self.PLAIN)["privileged_endpoints"], [])
+        self.assertEqual(
+            self._plan(_LearningRanker(selects=["privileged"]), self.PLAIN)["privileged_endpoints"],
+            ["https://t.example/reports/summary"])
+
+    def test_a_negative_selector_never_removes_a_heuristic_candidate(self) -> None:
+        """It is OR'd with the rules, so an untrained or disagreeing selector costs nothing."""
+        self.assertEqual(self._plan(_LearningRanker(selects=[]), self.OBJECT)["idor_candidates"],
+                         self._plan(None, self.OBJECT)["idor_candidates"])
+
+    def test_candidates_are_always_verbatim_in_scope_endpoints(self) -> None:
+        plan = self._plan(_LearningRanker(selects=["idor", "privileged"]), self.PLAIN)
+        allowed = set(self.PLAIN["endpoints"])
+        self.assertTrue(set(plan["idor_candidates"]).issubset(allowed))
+        self.assertTrue(set(plan["privileged_endpoints"]).issubset(allowed))
+
+    def test_the_model_cannot_change_which_endpoints_survive_the_cap(self) -> None:
+        """The one seam deliberately left closed: endpoint selection under _MAX_PRIORITY stays
+        rule-owned, because _priority_sort_key is permutation-invariant."""
+        surface = {"endpoints": [f"https://t.example/p{i}/search?q=1" for i in range(40)],
+                   "params": [], "tech": []}
+        with_model = self._plan(_LearningRanker(params=["z"], selects=["idor"]), surface)
+        without = self._plan(None, surface)
+        self.assertEqual([r["endpoint"] for r in with_model["probe_priority"]],
+                         [r["endpoint"] for r in without["probe_priority"]])
+
+
 class RankerSeamTests(unittest.TestCase):
     """The learned ranker may only PERMUTE the rule-proposed candidates. Anything else is discarded
     and the deterministic prior ordering is used, so a corrupt/hostile weight file can shift budget
