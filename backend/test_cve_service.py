@@ -175,5 +175,57 @@ class ScopeGateTests(unittest.TestCase):
         self.assertFalse(res["ok"])
 
 
+class ProbeHintTests(unittest.TestCase):
+    """A matched advisory names the exact weakness class of the exact library this target serves.
+    That is the strongest targeting signal the engine derives, and it used to reach nothing."""
+
+    def _finding(self, product: str) -> dict:
+        return {"_cve_list": cve._KNOWN_CVES[product], "cwe": cve._KNOWN_CVES[product][0]["cwe"]}
+
+    def test_every_mapped_class_is_one_the_prover_can_confirm(self) -> None:
+        """Steering budget at a class with no check is waste dressed up as intelligence. The
+        planner vocabulary exists so that cannot happen by accident; this pins it mechanically."""
+        from bughunter.prover_classes import PROVER_CLASSES
+
+        for cwe, class_id in cve._CWE_PROBE_CLASS.items():
+            self.assertIn(class_id, PROVER_CLASSES, f"{cwe} maps to unprovable {class_id}")
+
+    def test_an_xss_advisory_prioritises_xss(self) -> None:
+        self.assertEqual(cve.cve_probe_hints([self._finding("jquery")]), ["xss"])
+
+    def test_it_reads_every_matched_cve_not_just_the_headline(self) -> None:
+        """lodash's headline CVEs are prototype pollution, which has no prover check; its
+        CWE-94 template-injection advisory is the one that can actually be chased."""
+        self.assertEqual(cve.cve_probe_hints([self._finding("lodash")]), ["rce"])
+
+    def test_a_library_with_no_provable_advisory_yields_nothing(self) -> None:
+        """moment's CVEs are ReDoS (CWE-1333). Mapping that to an adjacent class would send the
+        prover after something it cannot confirm."""
+        self.assertEqual(cve.cve_probe_hints([self._finding("moment")]), [])
+
+    def test_hints_are_ordered_by_the_strongest_advisory_backing_them(self) -> None:
+        hints = cve.cve_probe_hints([self._finding("jquery"), self._finding("lodash")])
+        self.assertEqual(hints, ["rce", "xss"])   # rce is backed by a 7.2, xss by a 6.1
+
+    def test_it_is_deterministic(self) -> None:
+        args = [self._finding("jquery"), self._finding("lodash"), self._finding("bootstrap")]
+        self.assertEqual(cve.cve_probe_hints(args), cve.cve_probe_hints(args))
+
+    def test_it_falls_back_to_the_findings_own_cwe(self) -> None:
+        self.assertEqual(cve.cve_probe_hints([{"cwe": "CWE-89"}]), ["sqli"])
+
+    def test_a_real_finding_produces_hints(self) -> None:
+        finding = cve._build_finding(
+            {"product": "jquery", "version": "1.8.0", "evidence": "jquery-1.8.0.min.js"},
+            cve.match_cves("jquery", "1.8.0"), "https://app.example/")
+        self.assertEqual(cve.cve_probe_hints([finding]), ["xss"])
+
+    def test_malformed_input_never_raises(self) -> None:
+        for bad in (None, "nope", 7, [None], ["x"], [{}], [{"_cve_list": "no"}],
+                    [{"_cve_list": [{"cwe": "CWE-79", "base_score": "junk"}]}]):
+            with self.subTest(value=bad):
+                self.assertIsInstance(cve.cve_probe_hints(bad), list)
+
+
 if __name__ == "__main__":
     unittest.main()

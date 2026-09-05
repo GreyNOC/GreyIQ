@@ -58,6 +58,42 @@ It sits before classification, attack planning and the QA gate, so what it captu
 normal pipeline -- placing it after the final graph would have been easier and quietly wrong, since
 those findings would have skipped every downgrade-only QA step the report depends on.
 
+**The campaign path stops being the one mode that never learns.** Campaigns are how GreyIQ runs
+unattended, and they had no cross-run memory at all. `run_bounty_hunt`'s drift and
+negative-knowledge steering sit behind `extra_params is None and class_priority is None`, and a
+campaign always supplies both — so every per-URL hunt skipped that branch, *and* the snapshot and
+miss-recording at the end of it. The mode that hunts the same targets most often was re-testing
+ground it had already proved inert and never noticing what had changed. It now reads cooled
+`(endpoint, class)` pairs and downranks them, diffs its surface against the last run and hunts what
+moved first, and writes both memories back. Recon is asked for observations (no extra request — the
+shapes were already in memory and discarded).
+
+Three honesty guards came with it, each of which the direct-hunt path already had and the first
+draft of this did not. A miss is only learned from a campaign that finished its fan-out *and* whose
+every per-URL active pass ran clean — a prover that was rate-limited or cut short never reached the
+tail of its plan, so those pairs were not tested. Confirmations are banked unfiltered as they are
+observed, because `consolidated` is later narrowed by dismissals and the VDP policy and deduped
+across URLs on a location that collapses digits anywhere; without that a pair the prover *confirmed*
+could be written down as a miss and eventually cool a route the engine has proved. And the drift
+baseline records only *observed* parameter names, never the brain's hypotheses — a hypothesis is by
+construction a name the target did not serve, so storing it would make the next run diff one run's
+guesses against another's and report changes the site never made.
+
+**A campaign's early targets now inform its later ones.** The fan-out ran one frozen plan against
+every URL, so whatever the first target proved could not change where the budget went on the fifth —
+a parallel repetition of a single guess rather than a sequence that learns. A class confirmed on one
+URL now moves to the front of the priority for the URLs not yet hunted on the same registrable
+domain. Same-property only, additive, ordering-only.
+
+**A matched advisory now aims the prober.** The known-CVE fingerprint ran *after* every URL had been
+hunted and produced only candidate findings — the richest targeting signal the engine derives,
+arriving too late to influence a single request. It now runs before the fan-out (the same one GET,
+just earlier, and its findings are still consolidated from that same result) and maps each matched
+advisory's CWE to the class the prover can confirm for it, so an outdated jQuery is a concrete reason
+to try reflected XSS on this host. The map is deliberately partial: ReDoS, prototype pollution and
+SSRF have no prover check, so they are left out rather than mapped to something adjacent — steering
+budget at a class that cannot confirm is waste dressed up as intelligence.
+
 **Two thirds of what `gn train-brain` learns finally reaches a hunt.** The trainer distils a class
 ranker, a parameter-name table and idor/privileged selectors, and promotes all three into
 `hunt_ranker.json` -- but `Ranker.suggest_params` and `Ranker.select` had no caller outside the tests.

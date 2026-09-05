@@ -173,7 +173,18 @@ a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the
   at, instead of re-testing inert ground. It can never blind a hunt: anything ever confirmed is
   immune forever, misses decay after 45 days, a pair is re-enabled the moment **surface drift**
   reports its endpoint changed, and suppression only reorders (dropping an endpoint only when every
-  class on it is cooled). Set `GREYIQ_NO_NEGATIVE_KNOWLEDGE=1` to turn it off.
+  class on it is cooled). Set `GREYIQ_NO_NEGATIVE_KNOWLEDGE=1` to turn it off. **Campaigns share this
+  memory too** — they read cooled pairs, hunt what surface drift says moved first, and write both
+  memories back, so the unattended mode stops re-testing ground it has already exhausted. A miss is
+  only ever learned from a campaign that finished its fan-out with every per-URL pass running clean,
+  and anything the prover confirmed is banked before the report's own filters can hide it.
+- **Each target teaches the next.** Within a campaign, a class confirmed on one URL moves to the
+  front of the probe order for the URLs not yet hunted on the same registrable domain — so a proven
+  IDOR on one object endpoint is a reason to try IDOR on its siblings. A matched CVE advisory does
+  the same job earlier: the component fingerprint now runs *before* the active pass and maps each
+  advisory's CWE to the class the prover can confirm, so an outdated jQuery aims the prober at
+  reflected XSS. Both only reorder; the differential prover still owns every confirmation, and a
+  version match never becomes a finding by itself.
 - **Agent security test** — red-teams GreyIQ's own agent in a throwaway sandbox
   (sandbox/policy probes always; opt-in prompt-injection + jailbreak behavioral probes)
   and reports a posture verdict.
