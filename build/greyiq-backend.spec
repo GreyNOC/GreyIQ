@@ -211,7 +211,14 @@ a = Analysis(  # noqa: F821
     runtime_hooks=[],
     # Hard-exclude the PyTorch family so nothing drags it back in transitively — it is
     # the offline-model dependency we deliberately drop to keep the app lean/fast.
-    excludes=["tkinter", "matplotlib", "pytest", "PyQt5", "PySide2",
+    excludes=["tkinter", "matplotlib", "pytest",
+              # Qt bindings: Pillow's ImageQt references BOTH 6-series bindings, and
+              # PyInstaller refuses to collect two Qt binding packages -- it aborts the
+              # whole build. A clean CI runner has none installed so this never fired
+              # there, but any dev machine carrying PyQt6+PySide6 could not freeze at
+              # all, which matters because the local build is the ONLY path while
+              # Actions is unavailable. GreyIQ itself never imports Qt.
+              "PyQt5", "PySide2", "PyQt6", "PySide6", "shiboken6", "qtpy",
               "torch", "torchvision", "torchaudio", "torchgen", "functorch"],
     noarchive=False,
     cipher=block_cipher,
