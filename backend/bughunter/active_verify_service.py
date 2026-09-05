@@ -2588,6 +2588,11 @@ def verify_active(
         checks.append(("rce", lambda: _check_time_rce(http, sanitized, settings, discovered_params)))
         checks.append(("sqli", lambda: _check_time_sqli(http, sanitized, settings, discovered_params)))
         checks.extend(path_checks)
+    # (suite tag, finding) for the probe digest. The tag is NOT the finding's class hint: a check
+    # reports the class of the IMPACT it found (clickjacking emits "headers", the debug-endpoint
+    # check emits "rce"/"secrets"), while the re-planner needs the name of the CHECK to promote or
+    # restrict. Keeping them side by side here avoids stamping another key onto the finding dicts.
+    tagged: list[tuple[str, dict[str, Any]]] = []
     for _cls, check in checks:
         if rate_limited:
             break
@@ -2608,6 +2613,7 @@ def verify_active(
             result = None
         if result:
             results.append(result)
+            tagged.append((_cls, result))
 
     verified = sorted({r["_active_class_hint"] for r in results if r.get("_active_proof", {}).get("status") == "confirmed"})
     meta = {
@@ -2624,7 +2630,7 @@ def verify_active(
         # above is identical on every call against one URL, so a caller looping over verify_active
         # learns nothing from it; this one moves as the probes move. Derived from `results`, so no
         # request and no claim — `verified` above remains the only statement about what was proven.
-        "probe_digest": digest_builder.build_probe_digest(results),
+        "probe_digest": digest_builder.build_probe_digest(tagged),
         "skipped_reason": "",
     }
     return results, meta

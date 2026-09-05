@@ -1785,6 +1785,7 @@ _REPLAN_BUDGET = 8
 
 def _replan_wave(target_url: str, findings: list[dict[str, Any]], *, scope: str, settings: Any,
                  auth: Any, extra_params: list[str], surface: dict[str, Any],
+                 already_swept: set[str] | None = None,
                  emit: Any = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """One bounded, evidence-driven re-probe of what the cortex says is still unresolved.
 
@@ -1820,11 +1821,15 @@ def _replan_wave(target_url: str, findings: list[dict[str, Any]], *, scope: str,
         plan = investigator.build_probe_plan(graph)
         if not plan:
             return [], info
-        # Pairs the first active pass already probed. An active finding records the probed URL as
-        # its location and its check's class, so every unconfirmed one becomes a plan row pointing
-        # back at itself — the wave would spend its budget re-deriving a known answer and append a
-        # duplicate that grouping cannot collapse (both carry proof). This wave is for what the
-        # active pass did NOT test: static and passive leads, and chains on untouched endpoints.
+        # Endpoints the first active pass already swept. `already_swept` is the authoritative half:
+        # the prover ran its whole check list against those URLs, so every class on them was tried
+        # whether or not it produced a finding — and a check that finds nothing returns None, so
+        # a "we tested this and it was clean" result leaves no trace in `findings` at all. Without
+        # it the wave re-runs identical negative tests and spends its bounded budget re-deriving
+        # answers the first pass already had. The (endpoint, class) pairs below then cover leads
+        # from targets outside that swept set. This wave is for what the active pass did NOT test:
+        # passive and static leads, and chain steps on endpoints it never reached.
+        swept = {str(u) for u in (already_swept or set()) if str(u)}
         probed: set[tuple[str, str]] = set()
         for finding in findings if isinstance(findings, list) else []:
             if not isinstance(finding, dict) or not isinstance(finding.get("_active_proof"), dict):
@@ -1838,7 +1843,7 @@ def _replan_wave(target_url: str, findings: list[dict[str, Any]], *, scope: str,
         for row in plan:
             endpoint = str(row.get("endpoint") or "")
             class_id = str(row.get("class_id") or "")
-            if not endpoint or not class_id or (endpoint, class_id) in probed:
+            if not endpoint or not class_id or endpoint in swept or (endpoint, class_id) in probed:
                 continue
             if endpoint not in by_endpoint and len(by_endpoint) >= _REPLAN_MAX_TARGETS:
                 continue  # target cap reached; a later row may still add a class to a chosen endpoint
@@ -2350,6 +2355,10 @@ def _run_bounty_hunt_body(
     if (active or time_based) and authorized and kind == "url":
         _emit(f"running active verification against {len(raw_findings)} candidate(s)"
               + (" (time-based probes enabled)…" if time_based else "…"))
+        # Which URLs the active pass actually swept with the full check list — the iterative loop
+        # probes only the seed, the fan-out probes each ranked target. The re-plan wave reads this
+        # to avoid repeating tests that already ran and found nothing.
+        active_swept: set[str] = set()
         try:
             active_settings = settings or active_verify_service.get_settings()
             # Opt-in AI-driven iterative loop (probe -> observe -> re-plan): a bounded scheduler over
@@ -2371,6 +2380,7 @@ def _run_bounty_hunt_body(
                     xss_params=loop_xss_params, coder_cfg=coder_cfg,
                     surface={"endpoints": active_targets, "params": list(effective_extra_params or [])},
                     on_progress=_emit)
+                active_swept = {clean_target}  # the loop probes the seed and nothing else
             else:
                 active_findings = []
                 active_metas: list[dict[str, Any]] = []
@@ -2405,6 +2415,7 @@ def _run_bounty_hunt_body(
                     target_meta["target"] = active_target
                     active_metas.append(target_meta)
                     active_findings.extend(target_findings)
+                    active_swept.add(active_target)
                 active_meta = _aggregate_active_meta(active_metas)
             if active_findings:
                 raw_findings = list(raw_findings) + active_findings
@@ -2431,7 +2442,7 @@ def _run_bounty_hunt_body(
                     auth=auth_ctx, extra_params=list(effective_extra_params or []),
                     surface={"endpoints": list(active_targets),
                              "params": list(effective_extra_params or [])},
-                    emit=_emit)
+                    already_swept=active_swept, emit=_emit)
                 if replan_findings:
                     raw_findings = list(raw_findings) + replan_findings
                     if "active" not in scanners_run:

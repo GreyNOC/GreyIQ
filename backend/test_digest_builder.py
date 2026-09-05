@@ -148,9 +148,24 @@ class BuildProbeDigestTests(unittest.TestCase):
     the only structure that can tell one turn from the next against a single URL."""
 
     @staticmethod
-    def _finding(class_hint: str, status: str, observed: str = "") -> dict:
-        return {"_active_class_hint": class_hint,
-                "_active_proof": {"status": status, "observed_result": observed}}
+    def _finding(class_hint: str, status: str, observed: str = "", tag: str | None = None) -> tuple:
+        """A (check suite tag, finding) pair, as verify_active hands them over."""
+        return (tag or class_hint,
+                {"_active_class_hint": class_hint,
+                 "_active_proof": {"status": status, "observed_result": observed}})
+
+    def test_it_records_the_check_that_ran_not_the_impact_it_reported(self) -> None:
+        """A finding names the class of the IMPACT; the re-planner promotes and restricts CHECKS.
+        The clickjacking check reports `headers` and the debug-endpoint check reports `rce`, so
+        reading the finding's hint would focus on a class matching no check at all, or run command
+        injection when what produced the lead was the debug probe."""
+        d = db.build_probe_digest([
+            self._finding("headers", "candidate", tag="clickjacking"),
+            self._finding("rce", "confirmed", tag="debug")])
+        self.assertEqual(d["candidate_classes"], ["clickjacking"])
+        self.assertEqual(d["confirmed_classes"], ["debug"])
+        self.assertNotIn("headers", d["classes_observed"])
+        self.assertNotIn("rce", d["classes_observed"])
 
     def test_an_error_the_probe_provoked_is_surfaced(self) -> None:
         """The whole point: a SQL error the probe TRIGGERED is what should promote sqli next turn.
@@ -186,7 +201,8 @@ class BuildProbeDigestTests(unittest.TestCase):
         self.assertEqual(db.build_probe_digest([]), {})
 
     def test_malformed_input_fails_open(self) -> None:
-        for bad in (None, "nope", 7, [None], ["x"], [{"_active_proof": "not-a-dict"}], [{}]):
+        for bad in (None, "nope", 7, [None], ["x"], [{}], [("xss",)], [("xss", "no")],
+                    [("xss", {"_active_proof": "not-a-dict"})], [(None, {})]):
             with self.subTest(value=bad):
                 self.assertIsInstance(db.build_probe_digest(bad), dict)
 

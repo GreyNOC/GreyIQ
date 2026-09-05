@@ -61,11 +61,11 @@ class ReplanWaveTests(unittest.TestCase):
                            "rate_limited": rate_limited, "verified_classes": []}
         active_verify_service.verify_active = fake
 
-    def _run(self, findings=None):
+    def _run(self, findings=None, already_swept=None):
         return bounty._replan_wave(
             "https://app.example/", findings if findings is not None else FINDINGS,
             scope="app.example", settings=self._settings(), auth=None,
-            extra_params=[], surface=SURFACE)
+            extra_params=[], surface=SURFACE, already_swept=already_swept)
 
     # --- it acts on the cortex's own conclusion ---------------------------------------
 
@@ -168,6 +168,25 @@ class ReplanWaveTests(unittest.TestCase):
         self.assertEqual(self.calls, [], "the wave re-probed a pair the active pass already ran")
         self.assertEqual(out, [])
         self.assertEqual(info["requests_used"], 0)
+
+    def test_an_endpoint_the_active_pass_already_swept_is_skipped(self) -> None:
+        """A check that finds nothing returns None, so "tested and clean" leaves NO trace in the
+        findings — the (endpoint, class) exclusion cannot see it. Without the swept set the wave
+        re-runs identical negative tests and spends its budget re-deriving a known answer."""
+        self._stub()
+        out, info = self._run(already_swept={"https://app.example/api/me",
+                                             "https://app.example/search"})
+        self.assertEqual(self.calls, [], "the wave re-probed an endpoint already swept")
+        self.assertEqual(out, [])
+        self.assertEqual(info["requests_used"], 0)
+
+    def test_a_lead_outside_the_swept_set_is_still_chased(self) -> None:
+        """The swept set must narrow the wave, not disable it: an endpoint the active pass never
+        reached is exactly what the wave exists for."""
+        self._stub()
+        self._run(already_swept={"https://app.example/api/me"})
+        self.assertTrue(self.calls, "an unswept lead must still be chased")
+        self.assertEqual(self.calls[0]["target"], "https://app.example/search")
 
     def test_a_lead_the_active_pass_never_touched_is_still_chased(self) -> None:
         """The other half: suppressing already-probed pairs must not suppress everything. A passive

@@ -188,8 +188,15 @@ def _cookie_flag_gaps(cookies: list[str], is_https: bool) -> list[dict[str, Any]
     return gaps
 
 
-def build_probe_digest(results: Any) -> dict[str, Any]:
+def build_probe_digest(tagged_results: Any) -> dict[str, Any]:
     """Structural metadata about what the PROBES did — the observe half of a probe/observe loop.
+
+    Takes ``(check class tag, finding)`` pairs, NOT bare findings. The distinction is load-bearing:
+    a finding names the class of the IMPACT it represents, while the re-planner uses these names to
+    promote and restrict CHECKS. They diverge — the clickjacking check reports ``headers``, the
+    debug-endpoint check reports ``rce`` or ``secrets`` — so reading the finding's own hint would
+    tell the loop to run command injection when what produced the lead was the debug check, and to
+    focus on ``headers``, which matches no check at all and silently falls back to the full suite.
 
     ``build_digest`` describes one captured response. This describes a whole differential pass: which
     classes produced something, which of those the confirm gate accepted, and — the signal that
@@ -208,15 +215,18 @@ def build_probe_digest(results: Any) -> dict[str, Any]:
     decided. Bounded and total: any problem yields ``{}`` and the caller keeps today's behaviour.
     """
     try:
-        rows = results if isinstance(results, list) else []
+        rows = tagged_results if isinstance(tagged_results, (list, tuple)) else []
         observed: list[str] = []
         confirmed: list[str] = []
         candidate: list[str] = []
         families: list[str] = []
-        for row in rows[:60]:
+        for entry in rows[:60]:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                continue
+            tag, row = entry
             if not isinstance(row, dict):
                 continue
-            class_id = str(row.get("_active_class_hint") or row.get("category") or "").strip().lower()
+            class_id = str(tag or "").strip().lower()
             proof = row.get("_active_proof") if isinstance(row.get("_active_proof"), dict) else {}
             status = str(proof.get("status") or "").strip().lower()
             if class_id:
