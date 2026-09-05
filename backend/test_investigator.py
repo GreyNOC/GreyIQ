@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import sys
 import unittest
 from pathlib import Path
@@ -398,6 +399,244 @@ class InvestigationCortexTests(unittest.TestCase):
         graph = investigator.build_investigation([None, "bad", {"severity": {"x": 1}}], {"H3": 7})
         self.assertEqual(graph["algorithm"], investigator.ALGORITHM_VERSION)
         self.assertLessEqual(len(graph["hypotheses"]), investigator._MAX_HYPOTHESES)
+
+
+class ActiveTheorizingTests(unittest.TestCase):
+    """The cortex has to answer "what should I test NEXT", not only "what did we find".
+
+    Everything here is advisory by construction: ranking, derived theories, projections and probe
+    plans. None of it may confirm anything, and the confirm-authority contracts above still hold.
+    """
+
+    @staticmethod
+    def _lead(ref: str, **over: object) -> dict:
+        row = {"ref": ref, "class_id": "xss", "severity": "medium", "confidence_score": 30,
+               "status": "candidate", "priority_score": 10.0}
+        row.update(over)
+        return row
+
+    def test_information_gain_peaks_at_maximum_uncertainty(self) -> None:
+        """A lead at either certainty pole teaches nothing by being tested; one at 50/100 is the
+        test that eliminates the most hypothesis space. That is what the lead brief promises."""
+        rows = [self._lead("A", confidence_score=50), self._lead("B", confidence_score=4)]
+        investigator._score_information_gain(rows, [])
+        self.assertGreater(rows[0]["expected_information_gain"],
+                           rows[1]["expected_information_gain"])
+
+    def test_chain_leverage_outranks_an_isolated_lead(self) -> None:
+        """Collapsing a finding several chains rest on resolves more of the graph than an equally
+        uncertain dead end. The flat chain bonus this replaced could not express the difference."""
+        rows = [self._lead("A"), self._lead("B")]
+        chains = [
+            {"id": "AC1", "refs": ["A"], "status": "candidate", "chain_state": "projected"},
+            {"id": "AC2", "refs": ["A"], "status": "candidate", "chain_state": "projected"},
+        ]
+        investigator._score_information_gain(rows, chains)
+        self.assertEqual((rows[0]["chain_leverage"], rows[1]["chain_leverage"]), (2, 0))
+        self.assertTrue(rows[0]["chain_candidate"])
+        self.assertFalse(rows[1]["chain_candidate"])
+        self.assertGreater(rows[0]["priority_score"], rows[1]["priority_score"])
+
+    def test_information_gain_never_demotes_confirmed_evidence(self) -> None:
+        """Confirmed findings are certain, so their information gain is LOW by construction. If
+        that fed the ranking, captured evidence would sink below speculation in the queue the
+        operator reads top-down."""
+        graph = investigator.build_investigation(
+            [
+                {"ref": "F1", "class_id": "sqli", "title": "SQL injection", "severity": "high",
+                 "confidence": "high", "location": "https://app.example/api/search"},
+                {"ref": "F2", "class_id": "xss", "title": "Reflected input", "severity": "medium",
+                 "confidence": "medium", "location": "https://app.example/search"},
+            ],
+            {"F1": {"proof_of_impact": {
+                "status": "confirmed", "method": "GET parameter differential",
+                "observed_result": "true condition returned 17 rows",
+                "control_result": "false condition returned 0 rows"}}},
+        )
+        self.assertEqual(graph["hypotheses"][0]["ref"], "F1")
+        self.assertEqual(graph["hypotheses"][0]["decision"], "report-now")
+
+    def test_every_hypothesis_carries_the_new_decision_fields(self) -> None:
+        graph = investigator.build_investigation([
+            {"ref": "F1", "class_id": "xss", "title": "Reflected input", "severity": "medium",
+             "confidence": "medium", "location": "https://app.example/search"}])
+        item = graph["hypotheses"][0]
+        for field in ("expected_information_gain", "chain_leverage", "unlocks_chains",
+                      "chain_candidate"):
+            self.assertIn(field, item)
+
+    # --- derived theories -------------------------------------------------------------
+
+    SYSTEMIC = [
+        {"ref": f"F{i}", "class_id": "xss", "title": "Reflected input", "severity": "medium",
+         "confidence": "medium", "location": f"https://app.example/page/{i}"}
+        for i in range(1, 4)
+    ]
+
+    def test_a_repeated_class_on_one_property_becomes_a_systemic_theory(self) -> None:
+        """Three routes with the same weakness is the signature of a control missing at the
+        framework layer — a different (usually higher) report than any single row. No per-finding
+        pass and no pairwise technique table can reach that conclusion."""
+        graph = investigator.build_investigation([dict(f) for f in self.SYSTEMIC])
+        synthesized = [p for p in graph["chain_probes"] if p.get("kind") == "synthesis"]
+        self.assertTrue(synthesized, "three same-class routes on one domain must synthesize")
+        row = synthesized[0]
+        self.assertTrue(row["id"].startswith("SH"))
+        self.assertEqual(row["status"], "untested")
+        self.assertTrue(row["derived"])
+        self.assertTrue(row["next_action"])
+
+    def test_a_derived_theory_is_never_reported_as_a_result(self) -> None:
+        """The whole safety argument for synthesizing at all: it is a question to go answer.
+        It must stay out of attack_chains, which is where OBSERVED compositions are printed."""
+        graph = investigator.build_investigation([dict(f) for f in self.SYSTEMIC])
+        for chain in graph["attack_chains"]:
+            self.assertNotEqual(chain.get("kind"), "synthesis")
+            self.assertFalse(str(chain.get("id", "")).startswith("SH"))
+        self.assertEqual(graph["metrics"]["chain_probes"], len(graph["chain_probes"]))
+        for probe in graph["chain_probes"]:
+            self.assertEqual(probe["status"], "untested")
+
+    def test_two_findings_are_a_coincidence_not_a_system(self) -> None:
+        graph = investigator.build_investigation([dict(f) for f in self.SYSTEMIC[:2]])
+        self.assertFalse([p for p in graph["chain_probes"] if p.get("kind") == "synthesis"])
+
+    def test_a_missing_header_run_does_not_synthesize(self) -> None:
+        """A header absent on nine routes is one server default, not a control designed and then
+        forgotten nine times. Synthesizing there would manufacture noise at scale."""
+        graph = investigator.build_investigation([
+            {"ref": f"F{i}", "class_id": "headers", "title": "Missing Referrer-Policy",
+             "severity": "low", "confidence": "high", "location": f"https://app.example/p/{i}"}
+            for i in range(1, 6)])
+        self.assertFalse([p for p in graph["chain_probes"] if p.get("kind") == "synthesis"])
+
+    def test_source_only_findings_never_synthesize_a_host_theory(self) -> None:
+        """A systemic claim is about a property. Static matches carry no host, so grouping them
+        would invent a domain-wide conclusion from files."""
+        graph = investigator.build_investigation([
+            {"ref": f"F{i}", "class_id": "sqli", "title": "String-built query", "severity": "high",
+             "confidence": "low", "file_path": f"app/mod{i}.py", "snippet": "q = 'SELECT ' + v"}
+            for i in range(1, 5)])
+        self.assertFalse([p for p in graph["chain_probes"] if p.get("kind") == "synthesis"])
+
+    # --- what-if projection -----------------------------------------------------------
+
+    PROVEN_CHAIN = {
+        "hypotheses": [{"ref": "F1", "status": "supported"}, {"ref": "F2", "status": "confirmed"}],
+        "attack_chains": [{"id": "AC1", "refs": ["F1", "F2"], "status": "supported",
+                           "chain_state": "proven", "projected_impact": "account takeover"}],
+    }
+
+    def test_projection_names_the_chain_one_sound_finding_away(self) -> None:
+        out = investigator.project_if_confirmed(self.PROVEN_CHAIN, "F1")
+        self.assertEqual(out["unlocks_chains"], ["AC1"])
+        self.assertTrue(out["would_complete_chain"])
+        self.assertIn("account takeover", out["projected_impacts"])
+
+    def test_projection_mutates_nothing_and_confirms_nothing(self) -> None:
+        """It assumes an outcome that has not happened. If that assumption could persist, the
+        cortex would have invented a confirmation — the one thing it exists to prevent."""
+        before = copy.deepcopy(self.PROVEN_CHAIN)
+        out = investigator.project_if_confirmed(self.PROVEN_CHAIN, "F1")
+        self.assertEqual(self.PROVEN_CHAIN, before)
+        self.assertIn("Projection only", out["note"])
+
+    def test_a_partial_chain_is_not_unlocked_by_soundness_alone(self) -> None:
+        """A partial chain is missing a captured ARTIFACT. Confirming a cited finding's evidence
+        does not supply one, so promising it would send the operator after the wrong test."""
+        partial = {
+            "hypotheses": [{"ref": "F1", "status": "supported"}],
+            "attack_chains": [{"id": "AC1", "refs": ["F1"], "status": "supported",
+                               "chain_state": "partial", "projected_impact": "takeover"}],
+        }
+        self.assertEqual(investigator.project_if_confirmed(partial, "F1")["unlocks_chains"], [])
+
+    def test_a_blocked_chain_is_never_projected_as_unlockable(self) -> None:
+        blocked = {
+            "hypotheses": [{"ref": "F1", "status": "contradicted"}],
+            "attack_chains": [{"id": "AC1", "refs": ["F1"], "status": "blocked",
+                               "chain_state": "proven", "projected_impact": "takeover"}],
+        }
+        self.assertFalse(investigator.project_if_confirmed(blocked, "F1")["would_complete_chain"])
+
+    def test_projection_tolerates_a_malformed_graph(self) -> None:
+        for bad in (None, {}, {"attack_chains": "nope", "hypotheses": 7}):
+            with self.subTest(graph=bad):
+                self.assertFalse(investigator.project_if_confirmed(bad, "F1")["unlocks_chains"])
+
+    # --- the executable probe plan ----------------------------------------------------
+
+    def test_probe_plan_turns_an_unproven_lead_into_a_runnable_row(self) -> None:
+        """The obligation used to exist only as English inside next_action, so the one decision
+        the cortex is best placed to make could not be handed to the prover that would test it."""
+        graph = investigator.build_investigation([
+            {"ref": "F1", "class_id": "xss", "title": "Reflected input", "severity": "medium",
+             "confidence": "medium", "location": "https://app.example/search"}])
+        plan = investigator.build_probe_plan(graph)
+        self.assertTrue(plan)
+        row = plan[0]
+        self.assertEqual(row["endpoint"], "https://app.example/search")
+        self.assertEqual(row["class_id"], "xss")
+        self.assertEqual(row["status"], "untested")
+        self.assertEqual(row["source"], "unconfirmed-hypothesis")
+        self.assertTrue(row["obligation"])
+
+    def test_probe_plan_omits_what_the_prover_cannot_confirm(self) -> None:
+        """A class the differential prover has no check for could only ever return another
+        unconfirmable lead, so steering budget at it is waste dressed as a plan."""
+        graph = investigator.build_investigation([
+            {"ref": "F1", "class_id": "disclosure", "title": "Directory listing", "severity": "low",
+             "confidence": "high", "location": "https://app.example/files/"}])
+        self.assertNotIn("disclosure", {row["class_id"] for row in
+                                        investigator.build_probe_plan(graph)})
+
+    def test_probe_plan_omits_source_locations_and_confirmed_findings(self) -> None:
+        """There is nothing for an ACTIVE prober to point at in a source file, and a confirmed
+        finding has already captured its artifact — re-probing it buys nothing."""
+        graph = investigator.build_investigation(
+            [
+                {"ref": "F1", "class_id": "sqli", "title": "String-built query", "severity": "high",
+                 "confidence": "low", "file_path": "app.py", "snippet": "q = 'SELECT ' + v"},
+                {"ref": "F2", "class_id": "sqli", "title": "SQL injection", "severity": "high",
+                 "confidence": "high", "location": "https://app.example/api/search"},
+            ],
+            {"F2": {"proof_of_impact": {
+                "status": "confirmed", "method": "GET parameter differential",
+                "observed_result": "true condition returned 17 rows",
+                "control_result": "false condition returned 0 rows"}}},
+        )
+        self.assertEqual(investigator.build_probe_plan(graph), [])
+
+    def test_probe_plan_prefers_the_step_blocking_a_chain(self) -> None:
+        """A blocking step stands between a part-proven ladder and a real reportable impact, so
+        it outranks a loose lead of the same class even when the lead looks more uncertain."""
+        graph = investigator.build_investigation([
+            {"ref": "F1", "class_id": "cors", "severity": "medium", "confidence": "medium",
+             "title": "Permissive CORS", "location": "https://app.example/api/me"},
+            {"ref": "F2", "class_id": "xss", "severity": "medium", "confidence": "medium",
+             "title": "Reflected input", "location": "https://app.example/search"},
+        ])
+        plan = investigator.build_probe_plan(graph)
+        self.assertTrue(plan)
+        self.assertEqual(plan[0]["source"], "chain-blocking-step")
+        self.assertEqual(plan[0]["class_id"], "cors")
+        self.assertTrue(plan[0]["chain_id"])
+        loose = next(row for row in plan if row["source"] == "unconfirmed-hypothesis")
+        self.assertGreater(plan[0]["priority"], loose["priority"])
+
+    def test_probe_plan_is_deterministic_and_bounded(self) -> None:
+        graph = investigator.build_investigation([
+            {"ref": f"F{i}", "class_id": "xss", "severity": "medium", "confidence": "medium",
+             "title": "Reflected input", "location": f"https://app.example/s/{i}"}
+            for i in range(60)])
+        first = investigator.build_probe_plan(graph)
+        self.assertEqual(first, investigator.build_probe_plan(graph))
+        self.assertLessEqual(len(first), investigator._MAX_PROBE_PLAN_ROWS)
+
+    def test_probe_plan_tolerates_a_malformed_graph(self) -> None:
+        for bad in (None, {}, {"hypotheses": "nope", "attack_chains": 3}):
+            with self.subTest(graph=bad):
+                self.assertEqual(investigator.build_probe_plan(bad), [])
 
 
 class InvestigationReportTests(unittest.TestCase):

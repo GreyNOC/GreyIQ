@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 from bughunter import secret_classification
 
@@ -20,6 +21,16 @@ ALGORITHM_VERSION = "investigation-cortex-v1"
 
 _MAX_HYPOTHESES = 200
 _MAX_CHAINS = 16
+# Derived (never observed) rows the synthesis pass may append to the probe queue.
+_MAX_SYNTHESIZED = 6
+# How many DISTINCT locations must share one class on one registrable domain before the engine
+# will call it systemic rather than a run of unrelated findings. Two is a coincidence.
+_SYSTEMIC_MIN_LOCATIONS = 3
+# Classes too weak to carry a systemic conclusion: a missing header on nine routes is one server
+# default, not a control that was designed and then forgotten on nine routes.
+_NO_SYNTHESIS_CLASSES = frozenset({"headers", "unclassified", ""})
+# Bound on the structured probe plan handed to an executor.
+_MAX_PROBE_PLAN_ROWS = 40
 _SEVERITY_VALUE = {"critical": 100, "high": 80, "medium": 58, "low": 32, "info": 10}
 _CONFIDENCE_BASE = {"high": 54, "medium": 40, "low": 24, "unknown": 30, "": 30}
 # A hypothesis reaches the "supported" band at this score; without an artifact the confirm
@@ -92,6 +103,13 @@ _RULE_CLASS_HINTS: tuple[tuple[str, str], ...] = (
 
 def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _list(value: Any) -> list[Any]:
+    """Coerce to a list. ``x or []`` only rescues FALSY values, so a graph field holding a truthy
+    non-list (``7``, ``"nope"`` — shapes a model reply or a hand-edited sidecar can produce) would
+    be iterated and raise. This module's contract is that malformed input degrades to empty."""
+    return value if isinstance(value, list) else []
 
 
 def _text(value: Any, limit: int = 500) -> str:
@@ -476,6 +494,185 @@ def _build_chains(
     return chains, probes[:_MAX_CHAINS]
 
 
+def _location_domain(location: Any) -> str:
+    """The registrable domain a finding sits on, or '' for a non-URL location (a source file).
+
+    Grouping is by registrable domain rather than exact host for the same reason the chain engine
+    composes across siblings: one control missing on ``api.x.com`` and ``www.x.com`` is one missing
+    control on one property, not two coincidences.
+    """
+    raw = str(location or "").strip()
+    if "://" not in raw:
+        return ""
+    try:
+        host = (urlparse(raw).hostname or "").lower()
+    except ValueError:
+        return ""  # a malformed authority is not a grouping key
+    if not host:
+        return ""
+    try:
+        from bughunter.registrable_domain import registrable_domain
+
+        return registrable_domain(host) or host
+    except Exception:  # noqa: BLE001 - grouping is advisory; the exact host is a fine fallback
+        return host
+
+
+def _synthesize_hypotheses(
+    hypotheses: list[dict[str, Any]], chains: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Derive theories neither the per-finding pass nor the pairwise technique table can reach.
+
+    ``build_investigation`` maps each finding to exactly one hypothesis, and the chain engine
+    composes only the class pairs its technique table already knows. Neither can say "the same
+    control is absent on nine routes, so the control itself was never applied" — a systemic
+    conclusion that is frequently the real, higher-severity bug behind a pile of individually
+    unremarkable rows, and the thing an experienced hunter notices first.
+
+    These rows are DERIVED, never observed. Each carries a proof obligation and nothing else, is
+    marked ``derived``/``kind: synthesis``, and is routed to ``chain_probes`` — the queue that
+    already means "worth testing", never "found". So a synthesized theory can be read as a
+    question to go answer and can never be read as a result, which is the same separation that
+    keeps signal-only chains out of the report.
+    """
+    locations_by_key: dict[tuple[str, str], set[str]] = {}
+    refs_by_key: dict[tuple[str, str], list[str]] = {}
+    refs_by_class: dict[str, list[str]] = {}
+    for item in hypotheses:
+        class_id = str(item.get("class_id") or "")
+        ref = str(item.get("ref") or "")
+        refs_by_class.setdefault(class_id, []).append(ref)
+        domain = _location_domain(item.get("location"))
+        if not domain or class_id in _NO_SYNTHESIS_CLASSES:
+            continue
+        key = (domain, class_id)
+        locations_by_key.setdefault(key, set()).add(str(item.get("location") or ""))
+        refs_by_key.setdefault(key, []).append(ref)
+
+    rows: list[dict[str, Any]] = []
+    # (1) One class, many routes, one property -> the control is absent, not forgotten N times.
+    for (domain, class_id), locations in sorted(locations_by_key.items()):
+        if len(locations) < _SYSTEMIC_MIN_LOCATIONS:
+            continue
+        refs = sorted(dict.fromkeys(refs_by_key.get((domain, class_id)) or []))
+        rows.append({
+            "id": "", "title": f"Systemic {class_id} weakness across {domain}",
+            "hypothesis": (
+                f"{len(locations)} separate locations on {domain} carry the same {class_id} "
+                f"weakness ({', '.join(refs[:4])}). Individually those read as a run of findings; "
+                "together they are the signature of a control missing at the framework or gateway "
+                "layer, which is a different and usually higher-severity report than any single "
+                "row. DERIVED from the pattern — nothing here has been observed to be broken "
+                "systemically."),
+            "impact": (
+                f"A control gap covering every {class_id} surface on {domain}, rather than "
+                f"{len(locations)} isolated routes."),
+            "next_action": (
+                f"Test a {class_id} case on a route that is NOT in the cited set. If it also "
+                f"holds, the finding is the missing control itself, not the individual routes. "
+                f"{proof_obligation(class_id)}"),
+            "signals": [], "status": "untested", "kind": "synthesis", "derived": True,
+            "refs": refs[:8], "class_id": class_id,
+        })
+
+    # (2) A credential and an exposed cloud surface in one graph. The chain engine composes a
+    # pair only where its table has a technique for it and provenance allows it; the QUESTION
+    # "does this key open that bucket?" is worth asking even when those conditions do not hold,
+    # because it is one cheap authorized call to answer. Suppressed when a chain already pairs
+    # them, so this never restates a lead the report is making properly.
+    secret_refs = sorted(dict.fromkeys(refs_by_class.get("secrets") or []))
+    cloud_refs = sorted(dict.fromkeys(refs_by_class.get("cloud-exposure") or []))
+    if secret_refs and cloud_refs:
+        already = any(
+            set(_list(chain.get("refs"))) & set(secret_refs)
+            and set(_list(chain.get("refs"))) & set(cloud_refs)
+            for chain in chains
+        )
+        if not already:
+            rows.append({
+                "id": "", "title": "Exposed credential against the exposed cloud surface",
+                "hypothesis": (
+                    f"This graph holds both an exposed credential ({', '.join(secret_refs[:3])}) and "
+                    f"an exposed cloud surface ({', '.join(cloud_refs[:3])}), and no chain pairs "
+                    "them. Whether the one opens the other is unproven and untested — DERIVED from "
+                    "their co-occurrence, not from any observed access."),
+                "impact": "Credentialed access to the exposed cloud surface, if the two are related.",
+                "next_action": (
+                    "Make the least-privileged authorized call that would distinguish the two cases, "
+                    f"and record scope without storing the raw value. {proof_obligation('secrets')}"),
+                "signals": [], "status": "untested", "kind": "synthesis", "derived": True,
+                "refs": (secret_refs[:4] + cloud_refs[:4]), "class_id": "secrets",
+            })
+    return rows[:_MAX_SYNTHESIZED]
+
+
+def _unlocked_chain_ids(
+    ref: str, chains: list[dict[str, Any]], status_by_ref: dict[str, str]
+) -> list[str]:
+    """Chain ids that would reach ``confirmed`` if — and only if — ``ref`` became confirmed.
+
+    Deliberately narrow. ``chain_state == 'proven'`` means the chain layer already saw a captured
+    artifact behind EVERY step, so the only thing still holding the chain below ``confirmed`` is
+    the cortex's clamp on a cited finding whose own evidence is not sound. A chain that is merely
+    ``partial`` is missing an artifact, which confirming this finding would not supply, and a
+    ``blocked`` chain needs its contradiction resolved before any of this matters.
+    """
+    out: list[str] = []
+    for chain in chains:
+        refs = [str(r) for r in _list(chain.get("refs"))]
+        if ref not in refs:
+            continue
+        if chain.get("status") in {"confirmed", "blocked"} or chain.get("chain_state") != "proven":
+            continue
+        if all(status_by_ref.get(other) == "confirmed" for other in refs if other != ref):
+            chain_id = str(chain.get("id") or "")
+            if chain_id:
+                out.append(chain_id)
+    return out[:6]
+
+
+def _score_information_gain(
+    hypotheses: list[dict[str, Any]], chains: list[dict[str, Any]]
+) -> None:
+    """Annotate each lead with what TESTING it would buy, and let that sharpen the ranking.
+
+    Payoff ranking answers "which finding is worth the most?". The queue exists to answer a
+    different question — "which single test should I run next?" — and the lead brief has always
+    promised to favour the test that eliminates the most hypothesis space while nothing actually
+    computed it. Two terms do:
+
+    * **uncertainty** peaks for a lead near 50/100 and falls to zero at either pole. A lead at 95
+      or at 5 is already settled in practice; testing it teaches almost nothing.
+    * **leverage** counts the chains resting on the lead. Collapsing a finding three chains depend
+      on resolves far more of the graph than an equally uncertain dead end — which is also why the
+      flat chain bonus this replaces was too blunt to express it.
+
+    Information gain steers LEADS only. Adding it to a confirmed row would rank settled evidence by
+    how little is left to learn about it, so the ``report-now`` band keeps its existing ordering and
+    is reached first by the decision sort key regardless. Mutates in place; ordering stays total and
+    deterministic.
+    """
+    leverage: dict[str, int] = {}
+    for chain in chains:
+        for ref in _list(chain.get("refs")):
+            leverage[str(ref)] = leverage.get(str(ref), 0) + 1
+    status_by_ref = {str(item.get("ref")): str(item.get("status")) for item in hypotheses}
+    for item in hypotheses:
+        ref = str(item["ref"])
+        count = leverage.get(ref, 0)
+        item["chain_candidate"] = count > 0
+        item["chain_leverage"] = count
+        uncertainty = max(0.0, 1.0 - abs(int(item["confidence_score"]) - 50) / 50.0)
+        value = _CLASS_VALUE.get(item["class_id"], 2) + _SEVERITY_VALUE.get(item["severity"], 10) * 0.12
+        item["expected_information_gain"] = round(uncertainty * value * (1 + count), 1)
+        item["unlocks_chains"] = _unlocked_chain_ids(ref, chains, status_by_ref)
+        bonus = 3.0 + 2.0 * count if count else 0.0
+        if item["status"] != "confirmed":
+            bonus += item["expected_information_gain"]
+        if bonus:
+            item["priority_score"] = round(min(140.0, item["priority_score"] + bonus), 1)
+
+
 def build_investigation(
     findings: list[dict[str, Any]] | None,
     attack_plans: dict[str, Any] | None = None,
@@ -588,13 +785,14 @@ def build_investigation(
         extra=signals if isinstance(signals, list) else None,
     )
     chains, chain_probes = _build_chains(hypotheses, identified, plans, signals, surface)
-    chain_refs = {ref for chain in chains for ref in chain["refs"]}
-    for item in hypotheses:
-        if item["ref"] in chain_refs:
-            item["priority_score"] = round(min(110.0, item["priority_score"] + 5), 1)
-            item["chain_candidate"] = True
-        else:
-            item["chain_candidate"] = False
+    # Derived theories join the PROBE queue, never ``attack_chains``: a synthesized pattern is a
+    # question to go answer, and the probe queue is the one place that already means exactly that.
+    # `SH` keeps them distinguishable from the engine's `CP` signal-only leads at a glance.
+    synthesized = _synthesize_hypotheses(hypotheses, chains)
+    for index, row in enumerate(synthesized, 1):
+        row["id"] = f"SH{index}"
+    chain_probes = list(chain_probes) + synthesized
+    _score_information_gain(hypotheses, chains)
     hypotheses.sort(
         key=lambda row: (row["decision"] == "report-now", row["priority_score"], row["confidence_score"]),
         reverse=True,
@@ -673,3 +871,132 @@ def build_probe_hypotheses(plan: dict[str, Any] | None) -> list[dict[str, Any]]:
     for index, item in enumerate(hypotheses, 1):
         item["id"] = f"P{index}"
     return hypotheses
+
+
+def project_if_confirmed(investigation: dict[str, Any] | None, ref: str) -> dict[str, Any]:
+    """What would confirming ``ref`` buy, computed without running anything.
+
+    The graph already knows which chains are one sound finding away from complete, but that
+    knowledge only ever reached the operator as a chain's own next_action — so "which pending test
+    is worth the most?" had to be answered by eye. This answers it directly, and is what lets a
+    planner spend its next request on the lead that resolves the most graph.
+
+    STRICTLY A PROJECTION. It assumes an outcome that has not happened, returns a fresh dict, and
+    mutates nothing. It never writes a status, never persists the assumed state, and never reaches
+    the confirm gate: ``report._has_captured_artifact`` still decides what is actually confirmed,
+    and it decides that only from a captured artifact.
+    """
+    obj = _dict(investigation)
+    chains = [c for c in _list(obj.get("attack_chains")) if isinstance(c, dict)]
+    hypotheses = [h for h in _list(obj.get("hypotheses")) if isinstance(h, dict)]
+    status_by_ref = {str(h.get("ref")): str(h.get("status")) for h in hypotheses}
+    target = _text(ref, 40)
+    unlocks = _unlocked_chain_ids(target, chains, status_by_ref) if target else []
+    impacts = [
+        _text(chain.get("projected_impact"), 240)
+        for chain in chains
+        if str(chain.get("id") or "") in set(unlocks)
+    ]
+    return {
+        "ref": target,
+        "unlocks_chains": unlocks,
+        "would_complete_chain": bool(unlocks),
+        "projected_impacts": [item for item in dict.fromkeys(impacts) if item],
+        "note": "Projection only. Nothing is confirmed until the confirm gate accepts a captured artifact.",
+    }
+
+
+def _prover_classes() -> frozenset[str]:
+    """The classes the active differential prover can actually confirm, or an empty set.
+
+    Read lazily so this module stays importable (and the cortex stays usable) in a build that
+    ships without the prover. Empty means "unknown", and the caller then filters nothing rather
+    than silently emitting an empty plan.
+    """
+    try:
+        from bughunter.prover_classes import PROVER_CLASSES
+
+        return PROVER_CLASSES
+    except Exception:  # noqa: BLE001 - an absent prover vocabulary must not break planning
+        return frozenset()
+
+
+def build_probe_plan(investigation: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Project the cortex's own unproven leads into STRUCTURED probe specifications.
+
+    ``build_probe_hypotheses`` expands a probe plan the planner already wrote. This closes the
+    loop from the other end: it reads the finished evidence graph and states, per unproven lead and
+    per blocked chain, the exact ``(endpoint, class)`` an executor would have to probe to change the
+    verdict. Until now that instruction existed only as English inside ``next_action``, so the one
+    decision the cortex is best placed to make — what to test next — could not be handed to the
+    prover that would test it, and died in the report.
+
+    This EMITS A PLAN. It runs nothing, fetches nothing, confirms nothing, and authorizes nothing.
+    Every row is an input to the same scope-gated, SSRF-gated, rate-governed differential prover,
+    which remains the sole authority on whether anything is confirmed. Two restrictions keep it
+    inside the engine's existing box:
+
+    * a row's class must be one the prover can actually confirm, so a plan can never steer budget
+      at a class whose only possible outcome is another unconfirmable lead;
+    * a row's endpoint must be a verbatim ``http(s)`` location THIS graph already observed, so a
+      plan can never introduce a host the hunt did not already reach. Scope is still re-decided by
+      the prover, which is what makes this safe rather than merely conventional.
+    """
+    obj = _dict(investigation)
+    hypotheses = [h for h in _list(obj.get("hypotheses")) if isinstance(h, dict)]
+    chains = [c for c in _list(obj.get("attack_chains")) if isinstance(c, dict)]
+    prover = _prover_classes()
+    by_ref = {str(h.get("ref") or ""): h for h in hypotheses}
+    rows: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def add(item: dict[str, Any], *, source: str, chain_id: str = "", boost: float = 0.0) -> None:
+        endpoint = _text(item.get("location"), 1000)
+        if not endpoint.lower().startswith(("http://", "https://")):
+            return  # a source file is nothing the ACTIVE prover can point at
+        class_id = _CLASS_ALIASES.get(
+            _text(item.get("class_id"), 80).lower(), _text(item.get("class_id"), 80).lower()
+        )
+        if not class_id or (prover and class_id not in prover):
+            return
+        try:
+            priority = float(item.get("expected_information_gain") or 0.0) + boost
+        except (TypeError, ValueError):
+            priority = boost
+        key = (endpoint, class_id)
+        existing = rows.get(key)
+        if existing is not None and float(existing.get("priority") or 0.0) >= priority:
+            return
+        rows[key] = {
+            "ref": _text(item.get("ref"), 40),
+            "chain_id": chain_id,
+            "endpoint": endpoint,
+            "class_id": class_id,
+            "source": source,
+            "obligation": _text(item.get("next_action"), 800) or proof_obligation(class_id),
+            "priority": round(priority, 1),
+            "status": "untested",
+        }
+
+    for item in hypotheses:
+        if str(item.get("status")) != "confirmed":
+            add(item, source="unconfirmed-hypothesis")
+
+    # A blocked chain's blocking step is the single highest-value test in the graph: it is what
+    # stands between a part-proven ladder and a real, reportable impact, so it outranks a loose
+    # lead of the same class even when the lead looks individually more uncertain.
+    for chain in chains:
+        if chain.get("status") in {"confirmed", "blocked"}:
+            continue
+        for step in _list(chain.get("steps")):
+            if not isinstance(step, dict) or step.get("proven"):
+                continue
+            cited = by_ref.get(_text(step.get("evidence_ref"), 40))
+            if cited:
+                add(cited, source="chain-blocking-step",
+                    chain_id=_text(chain.get("id"), 20), boost=12.0)
+            break  # only the FIRST unproven step is actionable; the rest are gated behind it
+
+    ordered = sorted(
+        rows.values(), key=lambda row: (row["priority"], row["endpoint"], row["class_id"]), reverse=True
+    )
+    return ordered[:_MAX_PROBE_PLAN_ROWS]
