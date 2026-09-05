@@ -363,6 +363,30 @@ class LearnedParamAndSelectorSeamTests(unittest.TestCase):
         self.assertTrue(set(plan["idor_candidates"]).issubset(allowed))
         self.assertTrue(set(plan["privileged_endpoints"]).issubset(allowed))
 
+    def test_a_large_learned_table_never_evicts_the_curated_list(self) -> None:
+        """The regression: param_hypotheses is truncated at _CAP, so prepending a learned table of
+        _CAP names pushed every curated name past the end — a total, silent recall loss behind a
+        docstring promising the opposite. Ordering may win; displacement may not."""
+        big = [f"learned{i}" for i in range(30)]
+        names = self._plan(_LearningRanker(params=big))["param_hypotheses"]
+        for curated in offline_hunt._SUGGEST:
+            self.assertIn(curated, names, f"curated name {curated} was evicted by the learned table")
+        self.assertEqual(names[0], "learned0", "learned names must still lead")
+
+    def test_model_selected_endpoints_never_evict_rule_derived_ones(self) -> None:
+        """Both candidate lists are hard-capped at six and filled in discovery order, so a model
+        firing on early endpoints would crowd out a rule hit found later. That is removal by
+        crowding, and the selector's contract is that it may only ADD."""
+        surface = {"endpoints": [f"https://t.example/plain/pg{i}" for i in range(8)]
+                                + ["https://t.example/order/1001"],
+                   "params": [], "tech": []}
+        rule_only = self._plan(None, surface)["idor_candidates"]
+        self.assertEqual(rule_only, ["https://t.example/order/1001"])
+        with_model = self._plan(_LearningRanker(selects=["idor"]), surface)["idor_candidates"]
+        for kept in rule_only:
+            self.assertIn(kept, with_model, "a rule-derived candidate was crowded out")
+        self.assertGreater(len(with_model), len(rule_only), "the model should still add")
+
     def test_the_model_cannot_change_which_endpoints_survive_the_cap(self) -> None:
         """The one seam deliberately left closed: endpoint selection under _MAX_PRIORITY stays
         rule-owned, because _priority_sort_key is permutation-invariant."""

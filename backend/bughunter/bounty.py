@@ -1822,20 +1822,34 @@ def _replan_wave(target_url: str, findings: list[dict[str, Any]], *, scope: str,
         plan = investigator.build_probe_plan(graph)
         if not plan:
             return [], info
+        # Pairs the first active pass ALREADY probed. Without this the wave re-runs exactly what just
+        # ran: an active finding records the probed URL as its location and its check's class, so
+        # every unconfirmed active result becomes a plan row pointing back at itself. Re-probing it
+        # spends the wave's whole budget re-deriving a known answer and appends a second copy of the
+        # finding that the duplicate grouping cannot collapse, because both carry captured proof. The
+        # wave is for leads the active pass did NOT test — static and passive findings, and chain
+        # blocking steps on endpoints it never reached.
+        probed: set[tuple[str, str]] = set()
+        for finding in findings if isinstance(findings, list) else []:
+            if not isinstance(finding, dict) or not isinstance(finding.get("_active_proof"), dict):
+                continue
+            location = str(finding.get("location") or finding.get("file_path") or "")
+            if location:
+                probed.add((location, investigator.normalize_class(finding)))
         # Group the plan by endpoint, best row first, so one endpoint is probed once for the few
         # classes that matter on it rather than once per row.
         by_endpoint: dict[str, list[str]] = {}
         for row in plan:
             endpoint = str(row.get("endpoint") or "")
             class_id = str(row.get("class_id") or "")
-            if not endpoint or not class_id:
+            if not endpoint or not class_id or (endpoint, class_id) in probed:
                 continue
+            if endpoint not in by_endpoint and len(by_endpoint) >= _REPLAN_MAX_TARGETS:
+                continue  # target cap reached; a later row may still add a class to a chosen endpoint
             bucket = by_endpoint.setdefault(endpoint, [])
             if class_id not in bucket and len(bucket) < _REPLAN_MAX_CLASSES:
                 bucket.append(class_id)
-            if len(by_endpoint) >= _REPLAN_MAX_TARGETS and endpoint not in by_endpoint:
-                break
-        targets = list(by_endpoint.items())[:_REPLAN_MAX_TARGETS]
+        targets = [(endpoint, classes) for endpoint, classes in by_endpoint.items() if classes]
         if not targets:
             return [], info
         # The SAME process-wide bucket the first pass used, so this wave competes for the existing

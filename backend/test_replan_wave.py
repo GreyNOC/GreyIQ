@@ -152,6 +152,40 @@ class ReplanWaveTests(unittest.TestCase):
         self.assertEqual(out, [])
         self.assertFalse(self.calls)
 
+    def test_it_never_re_probes_what_the_active_pass_already_tested(self) -> None:
+        """The regression: an active finding records the probed URL as its location and its check's
+        class, so every unconfirmed active result becomes a plan row pointing back at itself. The
+        wave would then spend its whole budget re-deriving a known answer and append a second copy
+        of the finding that duplicate grouping cannot collapse, because both carry captured proof.
+        The wave is for leads the active pass did NOT test."""
+        already = [{"ref": "F1", "class_id": "cors", "severity": "medium", "confidence": "medium",
+                    "title": "Permissive CORS", "location": "https://app.example/api/me",
+                    "file_path": "https://app.example/api/me",
+                    "_active_class_hint": "cors",
+                    "_active_proof": {"status": "candidate", "observed_result": "reflects origin"}}]
+        self._stub()
+        out, info = self._run(already)
+        self.assertEqual(self.calls, [], "the wave re-probed a pair the active pass already ran")
+        self.assertEqual(out, [])
+        self.assertEqual(info["requests_used"], 0)
+
+    def test_a_lead_the_active_pass_never_touched_is_still_chased(self) -> None:
+        """The other half: suppressing already-probed pairs must not suppress everything. A passive
+        or static lead carries no _active_proof, so it remains the wave's whole reason to exist."""
+        mixed = [
+            {"ref": "F1", "class_id": "cors", "severity": "medium", "confidence": "medium",
+             "title": "Permissive CORS", "location": "https://app.example/api/me",
+             "file_path": "https://app.example/api/me", "_active_class_hint": "cors",
+             "_active_proof": {"status": "candidate", "observed_result": "reflects origin"}},
+            {"ref": "F2", "class_id": "xss", "severity": "medium", "confidence": "medium",
+             "title": "Reflected input", "location": "https://app.example/search"},
+        ]
+        self._stub()
+        self._run(mixed)
+        self.assertTrue(self.calls, "an untested passive lead must still be chased")
+        self.assertEqual(self.calls[0]["target"], "https://app.example/search")
+        self.assertIn("xss", self.calls[0]["only_classes"])
+
     # --- failure behaviour ------------------------------------------------------------
 
     def test_an_exploding_prover_never_breaks_the_hunt(self) -> None:

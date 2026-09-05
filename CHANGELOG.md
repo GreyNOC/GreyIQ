@@ -30,8 +30,11 @@ REORDERED the ~25 checks, so a turn that wanted "sqli on one new parameter" re-p
 csrf, three JWT probes, two GraphQL probes, CORS, redirect, host-header and the rest -- extra turns
 were largely a recomputation of turn 0. `verify_active` gains `only_classes`, which restricts. Turn 0
 still runs the suite in full so recall is established before anything narrows, and the restriction
-fails open twice over. Turn 0 also stops taking the entire request budget: it is the *unsteered*
-sweep, and it was starving the steered turns the loop exists for.
+fails open twice over. Two limits on it are load-bearing and worth stating: a turn driven by new
+*parameter* names is never restricted, because `class_priority` is an ordered ranking rather than a
+membership set and an ordinary ranking can be entirely param-blind; and the restriction never
+subtracts already-confirmed classes, because those ids come from the finding's impact vocabulary
+while the filter matches check-suite tags, and the two collide on shared names.
 
 **The cortex reasons about what to test, not only what was found.** It mapped each finding to exactly
 one hypothesis and ranked by expected payoff, so a near-certain low outranked a maximally-uncertain
@@ -64,12 +67,17 @@ program whose confirmed IDORs never matched the hand-written hints can teach the
 object endpoints look like. Endpoint *selection* under the probe cap stays rule-owned, as the ranker
 seam's contract promises.
 
-Two candidate optimisations were examined and deliberately not taken. Sharing one request budget
+Three candidate optimisations were examined and deliberately not taken. Sharing one request budget
 across the active fan-out looked like it was restoring a per-hunt ceiling, but the process-wide
 per-host governor is the real ceiling and already binds; sharing would only let the first target
 starve the rest. Caching repeated GETs in `_Http` would have broken the opt-in time-based probes,
 which confirm on response *duration* -- a cached baseline returns instantly and could manufacture a
-false confirmation.
+false confirmation. And reserving a share of the budget for the loop's steered turns is
+self-defeating as the engine stands: `_Http` raises the same `_RateLimited` when a call exhausts its
+own allotment as when the host governor throttles, so hitting the reduced cap is precisely what
+makes the loop stop and strand the reserve -- while also cutting the tail of the check suite on the
+only turn allowed to run it unrestricted. Turn 0 keeps the full budget until those two conditions
+are distinguishable.
 
 ## v4.2.3 - the lead brief honours its own filters
 
