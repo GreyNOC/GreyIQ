@@ -2272,9 +2272,11 @@ def _check_jwt_weak_secret(http: _Http, url: str, discovered_token: str = "") ->
     new_payload = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     new_sig = _b64url_encode(hmac.new(secret.encode("utf-8"), f"{new_header}.{new_payload}".encode("ascii"), digest).digest())
     forged = f"{new_header}.{new_payload}.{new_sig}"
-    # The offline crack already self-certifies; the live request only corroborates. A network
-    # failure keeps the finding confirmed (the crypto is the proof).
+    # The offline crack self-certifies HOW THE STRING WAS SIGNED. Whether this application trusts
+    # the token is a separate question, and on the discovered path it is the load-bearing one --
+    # see the status decision below.
     server_note = "the recovered secret proves forgery offline (self-certifying); not sent to the server"
+    accepted = False
     try:
         baseline = http.fetch(url, extra_headers=baseline_headers) if baseline_headers else http.fetch(url)
         # NEGATIVE CONTROL, the same one alg:none and alg-confusion take before either narrates a
@@ -2293,6 +2295,7 @@ def _check_jwt_weak_secret(http: _Http, url: str, discovered_token: str = "") ->
                 and 200 <= int(baseline.get("status") or 0) < 300):
             same = _body_similar(str(baseline.get("body") or ""), str(probe.get("body") or ""))
             if same >= _JWT_BODY_SAME:
+                accepted = True
                 server_note = (f"a token forged with the recovered secret (a claim that was never issued) was "
                                f"accepted (HTTP {probe['status']}) and returned the same content as the real "
                                f"token (HTTP {baseline['status']}, body match {same:.0%}), while a "
@@ -2300,17 +2303,36 @@ def _check_jwt_weak_secret(http: _Http, url: str, discovered_token: str = "") ->
                                f"server does verify, and it accepted our signature")
     except _ActiveError:
         pass
+    # WHOSE TOKEN IS IT. A credential the OPERATOR supplied is a live session by construction, so
+    # cracking it proves their own token is forgeable and the byte-equality is the whole proof. A
+    # token merely READ OUT OF THE PAGE is not that. It may be a documentation sample -- the jwt.io
+    # example token is signed with "your-256-bit-secret", which is in the weak list above -- and
+    # cracking that proves how a string in someone's docs was signed, not that this application
+    # trusts it. Reporting that as a confirmed CRITICAL forgery is a false positive of exactly the
+    # kind the evidence rule exists to stop, so the discovered path has to SHOW the server honouring
+    # a forged token before it claims one. Without that it is a candidate, which is honest: a weak
+    # signing secret sitting in a served token is worth a look even when its owner is unclear.
+    discovered_only = found is None
+    status = "confirmed" if (accepted or not discovered_only) else "candidate"
+    limitations = "" if status == "confirmed" else (
+        "The token was read out of the target's own response rather than supplied as a credential, and the "
+        "server was not shown to accept a token forged with the recovered secret. The weak secret is proven by "
+        "byte-equality; that this application TRUSTS this token is not. Replay a forged token against an "
+        "endpoint that requires the session to settle it -- a sample token in documentation cracks identically."
+    )
     proof = _proof(
-        "confirmed", method=f"offline HMAC-{alg} crack of the JWT signing secret",
+        status, method=f"offline HMAC-{alg} crack of the JWT signing secret",
         affected_asset="every identity/role/scope the token asserts — arbitrary token forgery",
         observed_result=f"the {alg} signing secret is a well-known weak value ('{secret}'), recovered offline by byte-matching HMAC-{alg} of the token's own signing input",
         control_result=server_note,
         evidence=f"HMAC-{alg}(header.payload, weak-secret) equals the token's real signature — cryptographic byte-equality, self-certifying",
+        limitations=limitations,
     )
     ev = {"request_line": f"GET {url}", "request_header": f"{header_name}: <token forged with the recovered secret>",
           "response_status": "offline crack (self-certifying)", "matched_value": f"weak HMAC-{alg} signing secret recovered: '{secret}'"}
-    return _finding("active.jwt-weak-secret", "JWT signed with a weak/guessable secret (arbitrary token forgery)",
-                    "critical", "jwt", "jwt", url, proof, ev)
+    title = ("JWT signed with a weak/guessable secret (arbitrary token forgery)" if status == "confirmed" else
+             "JWT served by the target is signed with a weak/guessable secret (acceptance not shown)")
+    return _finding("active.jwt-weak-secret", title, "critical", "jwt", "jwt", url, proof, ev)
 
 
 # Traversal payload -> the unmistakable signature of the file it reads. Each is gated by a

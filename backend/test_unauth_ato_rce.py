@@ -578,6 +578,138 @@ class JwtWeakSecretUnauthTests(unittest.TestCase):
         self.assertIn("corrupted-signature copy was rejected", control)
 
 
+class WeakSecretOwnershipTests(unittest.TestCase):
+    """Cracking a string proves how it was signed, not that this application trusts it."""
+
+    # jwt.io's own example token is signed with this, and it is in the engine's weak-secret list — so
+    # a docs page that shows an example token is the exact false-positive shape to defend against.
+    DOC_SECRET = "your-256-bit-secret"
+
+    def test_a_token_scraped_from_the_page_is_only_a_candidate(self) -> None:
+        http = _FakeHttp(body="our public API docs, showing an example token")
+        found = av._check_jwt_weak_secret(http, "https://app.example.com/docs",
+                                          discovered_token=_hs_token(self.DOC_SECRET))
+        self.assertIsNotNone(found)
+        self.assertEqual(found["_active_proof"]["status"], "candidate")
+        self.assertIn("acceptance not shown", found["title"])
+        self.assertIn("TRUSTS this token is not", found["_active_proof"]["limitations"])
+
+    def test_a_scraped_token_the_server_honours_is_confirmed(self) -> None:
+        real = _hs_token("secret")
+        page = "the authenticated account page for user 42"
+
+        class _Verifying(_FakeHttp):
+            def fetch(self, url, *, method="GET", extra_headers=None, read_body=True):
+                super().fetch(url, method=method, extra_headers=extra_headers, read_body=read_body)
+                token = (extra_headers or {}).get("Authorization", "").replace("Bearer ", "")
+                head, _, rest = token.partition(".")
+                payload, _, sig = rest.partition(".")
+                good = (not token) or token == real or sig == _hs_token(
+                    "secret", payload=json.loads(base64.urlsafe_b64decode(payload + "==")) if payload else {}
+                ).split(".")[2]
+                return {"status": 200 if good else 401, "headers": {},
+                        "body": page if good else "unauthorized", "cookies": [],
+                        "final_url": url, "location": None, "elapsed": 0.01}
+
+        found = av._check_jwt_weak_secret(_Verifying(), "https://app.example.com/", discovered_token=real)
+        self.assertEqual(found["_active_proof"]["status"], "confirmed")
+        self.assertEqual(found["_active_proof"]["limitations"], "")
+
+    def test_an_operator_credential_stays_confirmed_on_the_crypto_alone(self) -> None:
+        # The operator's own session token IS a live credential, so the byte-equality is the proof;
+        # a network failure on the corroboration must not demote it.
+        from bughunter.scan_auth import build_auth
+
+        class _Dead(_FakeHttp):
+            def fetch(self, url, *, method="GET", extra_headers=None, read_body=True):
+                raise av._ActiveError("connection reset")
+
+        http = _Dead()
+        http.auth = build_auth("https://app.example.com/",
+                               headers=["Authorization: Bearer " + _hs_token("secret")])
+        found = av._check_jwt_weak_secret(http, "https://app.example.com/")
+        self.assertIsNotNone(found)
+        self.assertEqual(found["_active_proof"]["status"], "confirmed")
+
+
+class ServedTokenTransportTests(unittest.TestCase):
+    """A token is replayed on the transport it arrived on, or the verifier never sees it."""
+
+    def test_a_cookie_token_rebuilds_the_whole_cookie_header(self) -> None:
+        token = _hs_token("secret")
+        landing = {"cookies": ["csrf=abc123; Path=/", "session=" + token + "; HttpOnly", "theme=dark"],
+                   "body": "", "headers": {}}
+        name, found, rebuild = oob._served_token_carrier(landing)
+        self.assertEqual(name, "Cookie")
+        self.assertEqual(found, token)
+        # Every crumb survives; only the JWT one is swapped.
+        self.assertEqual(rebuild("FORGED"), "csrf=abc123; session=FORGED; theme=dark")
+
+    def test_a_body_token_is_replayed_as_a_bearer(self) -> None:
+        token = _hs_token("secret")
+        name, found, rebuild = oob._served_token_carrier(
+            {"cookies": [], "body": json.dumps({"access_token": token}), "headers": {}})
+        self.assertEqual(name, "Authorization")
+        self.assertEqual(rebuild("FORGED"), "Bearer FORGED")
+
+    def test_no_token_yields_no_carrier(self) -> None:
+        self.assertIsNone(oob._served_token_carrier({"cookies": [], "body": "nothing", "headers": {}}))
+        self.assertIsNone(oob._served_token_carrier(None))
+
+    def test_the_key_probe_sends_a_cookie_token_back_as_a_cookie(self) -> None:
+        # Regression: a cookie-session app never saw the forged token, so the probe could not provoke
+        # the fetch it exists to observe and reported a clean "no callback" on a vulnerable target.
+        token = _hs_token("secret")
+        _Collaborator(hit_for=set()).install(self)
+
+        class _CookieSession(_FakeHttp):
+            def fetch(self, url, *, method="GET", extra_headers=None, read_body=True):
+                super().fetch(url, method=method, extra_headers=extra_headers, read_body=read_body)
+                return {"status": 200, "headers": {}, "body": "", "final_url": url, "location": None,
+                        "elapsed": 0.01, "cookies": ["session=" + token + "; HttpOnly"]}
+
+        http = _CookieSession()
+        oob.confirm_jwt_key_injection("https://app.example.com/", base=BASE, secret=SECRET,
+                                      scope="app.example.com", settings=get_settings(), http=http,
+                                      poll_attempts=1, poll_delay_s=0.0)
+        replays = [h for h in http.headers_sent if h.get("Cookie")]
+        self.assertTrue(replays, "the forged token must ride back in a Cookie header")
+        self.assertNotIn("Authorization", replays[0])
+        self.assertTrue(replays[0]["Cookie"].startswith("session="))
+
+
+class OobGovernorSharingTests(unittest.TestCase):
+    """A caller that forgets governor= must not get a private per-host allowance."""
+
+    def _records(self):
+        seen = []
+        real = oob.shared_governor
+        self.addCleanup(setattr, oob, "shared_governor", real)
+
+        def spy(**kwargs):
+            seen.append(kwargs)
+            return real(**kwargs)
+
+        oob.shared_governor = spy
+        return seen
+
+    def test_blind_rce_draws_on_the_process_wide_bucket(self) -> None:
+        seen = self._records()
+        _Collaborator(hit_for=set()).install(self)
+        oob.confirm_blind_rce("https://app.example.com/?cmd=x", base=BASE, secret=SECRET,
+                              scope="app.example.com", settings=get_settings(),
+                              poll_attempts=1, poll_delay_s=0.0, probe_headers=False)
+        self.assertTrue(seen, "the shared governor must be used when none is passed")
+
+    def test_the_jwt_key_probe_draws_on_the_process_wide_bucket(self) -> None:
+        seen = self._records()
+        _Collaborator(hit_for=set()).install(self)
+        oob.confirm_jwt_key_injection("https://app.example.com/", base=BASE, secret=SECRET,
+                                      scope="app.example.com", settings=get_settings(),
+                                      poll_attempts=1, poll_delay_s=0.0)
+        self.assertTrue(seen)
+
+
 class JwtEmbeddedJwkTests(unittest.TestCase):
     """The token carries the key that verifies it — total forgery, and no collaborator needed."""
 

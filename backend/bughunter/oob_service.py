@@ -69,7 +69,7 @@ from bughunter.active_verify_service import (
     _with_query,
     host_in_active_scope,
 )
-from bughunter.rate_limit import HostRateGovernor
+from bughunter.rate_limit import HostRateGovernor, shared_governor
 from bughunter.settings import get_settings
 from bughunter.web_ingest import WebsiteFetchError, guarded_dns_scope, normalize_website_url
 from bughunter.web_scan_service import _USER_AGENT, _guard_url, current_user_agent
@@ -251,7 +251,11 @@ def confirm_blind_ssrf(
     except WebsiteFetchError as exc:
         return {"ok": False, "error": f"target refused by the URL guard: {exc}"}
 
-    governor = governor or HostRateGovernor(
+    # The PROCESS-WIDE bucket by default, not a private one. A caller that omits governor= (the API
+    # confirm routes do) was otherwise handed its own allowance, so the per-host ceiling the settings
+    # call process-wide was really that number once per prover, and concurrent hunts against one host
+    # sent their OOB traffic entirely outside the budget the main active pass draws down.
+    governor = governor or shared_governor(
         capacity=settings.active_max_requests_per_host, min_interval_s=settings.active_min_interval_ms / 1000.0)
     http = http or _Http(settings, governor, max_requests=10)
     # The brain's SSRF picks (params it judges take a URL/host here — image_url, webhook, feed, …) are
@@ -888,7 +892,11 @@ def confirm_blind_rce(
     except WebsiteFetchError as exc:
         return {"ok": False, "error": "target refused by the URL guard: {0}".format(exc)}
 
-    governor = governor or HostRateGovernor(
+    # The PROCESS-WIDE bucket by default, not a private one. A caller that omits governor= (the API
+    # confirm routes do) was otherwise handed its own allowance, so the per-host ceiling the settings
+    # call process-wide was really that number once per prover, and concurrent hunts against one host
+    # sent their OOB traffic entirely outside the budget the main active pass draws down.
+    governor = governor or shared_governor(
         capacity=settings.active_max_requests_per_host, min_interval_s=settings.active_min_interval_ms / 1000.0)
     http = http or _Http(settings, governor, max_requests=12)
     timeout = settings.web_fetch_timeout_seconds
@@ -1061,6 +1069,49 @@ def confirm_blind_rce(
 _JWT_KEY_URL_FIELDS: tuple[str, ...] = ("jku", "x5u")
 # A replayed token rides in a request header, so it has to stay a sane size.
 _MAX_TOKEN_CHARS = 8192
+
+
+def _served_token_carrier(landing: dict[str, Any] | None) -> tuple[str, str, Any] | None:
+    """A JWT the target served, with the transport it arrived on: (header_name, token, rebuild).
+
+    ``_extract_jwt_token`` looks in Set-Cookie FIRST, because a cookie a site sets is its own session
+    rather than something echoed in a page -- but it returns the bare value, so every caller replayed
+    it as ``Authorization: Bearer``. Against a cookie-session application that header is read by
+    nothing: the forged token never reaches the verifier, the probe cannot provoke the fetch it exists
+    to observe, and the result is a clean-looking "no callback" on a target that may well be
+    vulnerable. A false negative on the most common session shape there is.
+
+    So the cookie case rebuilds the ORIGINAL Cookie header with every crumb the landing response set,
+    swapping only the JWT one. Anything found elsewhere (body, response header) is a bearer token and
+    is replayed as one. Returns None when the response carried no usable JWT.
+    """
+    if not isinstance(landing, dict):
+        return None
+    crumbs: list[tuple[str, str]] = []
+    jwt_index = -1
+    for raw_cookie in (landing.get("cookies") or []):
+        name, sep, value = str(raw_cookie).split(";", 1)[0].partition("=")
+        name, value = name.strip(), value.strip()
+        if not sep or not name:
+            continue
+        if jwt_index < 0 and _JWT_RE.match(value):
+            jwt_index = len(crumbs)
+        crumbs.append((name, value))
+    if jwt_index >= 0:
+        token = crumbs[jwt_index][1]
+
+        def rebuild_cookie(new_token: str) -> str:
+            pairs = [(n, new_token if i == jwt_index else v) for i, (n, v) in enumerate(crumbs)]
+            return "; ".join("{0}={1}".format(n, v) for n, v in pairs)
+
+        return ("Cookie", token, rebuild_cookie)
+    try:
+        token = _extract_jwt_token(landing)
+    except Exception:  # noqa: BLE001 - a crafted body is a no-op, never a crash
+        token = ""
+    if not token:
+        return None
+    return ("Authorization", token, lambda new_token: "Bearer {0}".format(new_token))
 
 
 def forge_jwt_key_url(token: str, field: str, url: str) -> str:
@@ -1238,21 +1289,27 @@ def confirm_jwt_key_injection(
     except WebsiteFetchError as exc:
         return {"ok": False, "error": "target refused by the URL guard: {0}".format(exc)}
 
-    governor = governor or HostRateGovernor(
+    # The PROCESS-WIDE bucket by default, not a private one. A caller that omits governor= (the API
+    # confirm routes do) was otherwise handed its own allowance, so the per-host ceiling the settings
+    # call process-wide was really that number once per prover, and concurrent hunts against one host
+    # sent their OOB traffic entirely outside the budget the main active pass draws down.
+    governor = governor or shared_governor(
         capacity=settings.active_max_requests_per_host, min_interval_s=settings.active_min_interval_ms / 1000.0)
     http = http or _Http(settings, governor, max_requests=6)
     timeout = settings.web_fetch_timeout_seconds
 
     real_token = str(jwt or "").strip()
+    # An operator-supplied token is a bare value, so it can only be replayed as a bearer token. One we
+    # find ourselves is replayed on the transport it arrived on -- see _served_token_carrier.
+    header_name, rebuild = "Authorization", (lambda new_token: "Bearer {0}".format(new_token))
     if not real_token:
         try:
             landing = http.fetch(sanitized)
         except (_ActiveError, WebsiteFetchError) as exc:
             return {"ok": False, "error": "could not read the target for a token: {0}".format(exc)}
-        try:
-            real_token = _extract_jwt_token(landing)
-        except Exception:  # noqa: BLE001 - a crafted body is a no-op, never a crash
-            real_token = ""
+        carrier = _served_token_carrier(landing)
+        if carrier is not None:
+            header_name, real_token, rebuild = carrier
     # Validate the shape from EITHER source before forging. The four in-pass JWT checks all gate on
     # _JWT_RE; this did not, and an operator pasting a token that wrapped across lines (a newline
     # INSIDE a segment, which .strip() does not touch) produced a forged token carrying LF. http.client
@@ -1277,7 +1334,7 @@ def confirm_jwt_key_injection(
         if not forged:
             break  # malformed token -- the next field would fail identically
         try:
-            http.fetch(sanitized, extra_headers={"Authorization": "Bearer {0}".format(forged)})
+            http.fetch(sanitized, extra_headers={header_name: rebuild(forged)})
         except (_ActiveError, WebsiteFetchError):
             continue
         fields_tried.append(field)
