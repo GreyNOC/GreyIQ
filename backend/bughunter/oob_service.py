@@ -62,7 +62,7 @@ from bughunter.active_verify_service import (
     _JWT_RE,
     _b64url_decode,
     _b64url_encode,
-    _extract_jwt_token,
+    _served_token_carrier,
     _Http,
     _NoRedirect,
     _candidate_params,
@@ -1069,49 +1069,6 @@ def confirm_blind_rce(
 _JWT_KEY_URL_FIELDS: tuple[str, ...] = ("jku", "x5u")
 # A replayed token rides in a request header, so it has to stay a sane size.
 _MAX_TOKEN_CHARS = 8192
-
-
-def _served_token_carrier(landing: dict[str, Any] | None) -> tuple[str, str, Any] | None:
-    """A JWT the target served, with the transport it arrived on: (header_name, token, rebuild).
-
-    ``_extract_jwt_token`` looks in Set-Cookie FIRST, because a cookie a site sets is its own session
-    rather than something echoed in a page -- but it returns the bare value, so every caller replayed
-    it as ``Authorization: Bearer``. Against a cookie-session application that header is read by
-    nothing: the forged token never reaches the verifier, the probe cannot provoke the fetch it exists
-    to observe, and the result is a clean-looking "no callback" on a target that may well be
-    vulnerable. A false negative on the most common session shape there is.
-
-    So the cookie case rebuilds the ORIGINAL Cookie header with every crumb the landing response set,
-    swapping only the JWT one. Anything found elsewhere (body, response header) is a bearer token and
-    is replayed as one. Returns None when the response carried no usable JWT.
-    """
-    if not isinstance(landing, dict):
-        return None
-    crumbs: list[tuple[str, str]] = []
-    jwt_index = -1
-    for raw_cookie in (landing.get("cookies") or []):
-        name, sep, value = str(raw_cookie).split(";", 1)[0].partition("=")
-        name, value = name.strip(), value.strip()
-        if not sep or not name:
-            continue
-        if jwt_index < 0 and _JWT_RE.match(value):
-            jwt_index = len(crumbs)
-        crumbs.append((name, value))
-    if jwt_index >= 0:
-        token = crumbs[jwt_index][1]
-
-        def rebuild_cookie(new_token: str) -> str:
-            pairs = [(n, new_token if i == jwt_index else v) for i, (n, v) in enumerate(crumbs)]
-            return "; ".join("{0}={1}".format(n, v) for n, v in pairs)
-
-        return ("Cookie", token, rebuild_cookie)
-    try:
-        token = _extract_jwt_token(landing)
-    except Exception:  # noqa: BLE001 - a crafted body is a no-op, never a crash
-        token = ""
-    if not token:
-        return None
-    return ("Authorization", token, lambda new_token: "Bearer {0}".format(new_token))
 
 
 def forge_jwt_key_url(token: str, field: str, url: str) -> str:
