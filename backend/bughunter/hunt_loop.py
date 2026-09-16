@@ -57,6 +57,15 @@ from bughunter.settings import get_settings
 
 _PER_TURN_MIN = 4  # don't start a turn that can't afford a few probes
 
+# TOTAL requests the iterative loop may spend across all its turns. Turn 0 runs the suite in full (it
+# is the pass that establishes recall before anything narrows), so this has to seat a whole sweep at
+# active_verify_service's per-pass default AND leave room for the focused turns after it — those are
+# class-restricted by `only_classes`, so they are cheap. Sized at the pass default plus roughly half
+# again. Leaving this at the old 12 after the pass budget was raised would have made the OPT-IN
+# reactive loop strictly worse at recall than the plain single pass it is supposed to improve on:
+# turn 0 would have been capped at 12 and starved exactly the checks the wider budget just unblocked.
+_LOOP_TOTAL_BUDGET = 150
+
 # The error signature families digest_builder can match, mapped to the injection class the LLM prompt
 # tells the brain to prioritise for each. ``stacktrace`` is deliberately ABSENT: a generic traceback
 # names no injection family, and inventing one would be a guess — undetermined stays undetermined.
@@ -571,7 +580,7 @@ def _react_plan(coder_cfg: dict[str, Any] | None, target: str, scope: str, surfa
 
 
 def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, scope: str = "",
-                         requests_budget: int = 12, settings: Any = None, time_based: bool = False,
+                         requests_budget: int = _LOOP_TOTAL_BUDGET, settings: Any = None, time_based: bool = False,
                          auth: Any = None, extra_params: list[str] | None = None,
                          class_priority: list[str] | None = None, xss_params: list[str] | None = None,
                          coder_cfg: dict[str, Any] | None = None, surface: dict[str, Any] | None = None,

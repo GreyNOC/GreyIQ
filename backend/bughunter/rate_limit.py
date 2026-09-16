@@ -17,6 +17,28 @@ import threading
 import time
 
 
+# Loopback literals + the reserved name. Kept as a prefix/exact test rather than an ipaddress parse:
+# throttle() runs on every single request and the host here is already the resolved, lowercased
+# hostname, so this stays allocation-free and total on any input (including "").
+_LOOPBACK_NAMES = frozenset({"localhost", "::1", "[::1]", "0:0:0:0:0:0:0:1"})
+
+
+def _is_loopback(host: str) -> bool:
+    """True for a 127.0.0.0/8 dotted-quad, the IPv6 loopback, and the reserved name 'localhost'.
+
+    Matched as a full dotted-quad rather than a "127." prefix: a prefix test also accepts a REGISTRABLE
+    name like "127.example.com", which anyone can own, and would hand that host the exemption. Getting
+    this wrong costs politeness rather than safety (the token bucket bounds volume either way), but a
+    pacing exemption should never be something an attacker can name themselves. Unrecognised input
+    simply gets the normal pacing, so the failure direction is the polite one.
+    """
+    if host in _LOOPBACK_NAMES:
+        return True
+    octets = host.split(".")
+    return (len(octets) == 4 and octets[0] == "127"
+            and all(o.isdigit() and len(o) <= 3 and int(o) <= 255 for o in octets))
+
+
 class HostRateGovernor:
     """A token bucket + minimum-interval gate, keyed by host.
 
@@ -38,8 +60,16 @@ class HostRateGovernor:
     def throttle(self, host: str) -> bool:
         """Reserve one request slot for ``host``. Returns False (send nothing) when
         the per-host bucket is exhausted; otherwise spaces the send by the minimum
-        interval (sleeping the bounded remainder) and returns True."""
+        interval (sleeping the bounded remainder) and returns True.
+
+        The interval is waived for LOOPBACK only. It exists to be gentle with somebody else's
+        server — a bug-bounty target, a staging box, a third party — and the machine this process is
+        already running on is none of those. The token bucket still applies unchanged, so the volume
+        cap (the part that actually bounds what a host absorbs) is identical either way; only the
+        pacing is dropped, and only where there is no one to pace for. Reaching loopback at all
+        already requires the operator to have set GREYIQ_SCAN_ALLOW_PRIVATE_URLS."""
         key = (host or "").strip().lower()
+        interval = 0.0 if _is_loopback(key) else self.min_interval_s
         with self._lock:
             now = time.monotonic()
             state = self._buckets.get(key)
@@ -55,7 +85,7 @@ class HostRateGovernor:
             # Schedule this send no sooner than min_interval after the previously
             # scheduled one, so concurrent callers still serialize gently.
             send_at = max(now, state["next_send"])
-            state["next_send"] = send_at + self.min_interval_s
+            state["next_send"] = send_at + interval
             wait = send_at - now
         if wait > 0:
             # Sleep the FULL reserved remainder, not min(wait, min_interval_s):

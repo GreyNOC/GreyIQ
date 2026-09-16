@@ -2499,6 +2499,53 @@ def _run_bounty_hunt_body(
             except Exception as exc:  # noqa: BLE001
                 _emit(f"blind-XXE OOB probe error: {exc}")
 
+        # Blind OS command injection over the same collaborator. The in-pass prover can only confirm
+        # command injection the target hands back — an echoed arithmetic substitution, or a response it
+        # delays. Unauthenticated RCE routinely does neither (the command runs in a worker, a queue
+        # consumer or a log pipeline and the response is a fast identical 200), which left the engine's
+        # highest-severity class provable only in its most visible form. This probes parameters AND the
+        # request headers that reach a shell without any parameter existing, and confirms only on a
+        # collaborator hit whose MATCHED bare-URL control stayed silent — so an application that merely
+        # fetches URLs it finds (an unfurler, a plain SSRF) is reported as that, never as a CRITICAL RCE.
+        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+            try:
+                _emit("running blind-RCE OOB probe (collaborator configured)…")
+                rce = oob_service.confirm_blind_rce(clean_target, base=oob_base, secret=oob_secret,
+                                                    scope=scope, settings=settings,
+                                                    extra_params=effective_extra_params)
+                if rce.get("ok") and rce.get("finding") and rce.get("status") in ("confirmed", "candidate"):
+                    raw_findings = list(raw_findings) + [rce["finding"]]
+                    if "active" not in scanners_run:
+                        scanners_run = list(scanners_run) + ["active"]
+                    _emit(f"blind-RCE OOB: {rce.get('status')} via {rce.get('param') or rce.get('header')}")
+                else:
+                    _emit(f"blind-RCE OOB: {rce.get('status') or rce.get('error') or 'no callback'}")
+            except Exception as exc:  # noqa: BLE001
+                _emit(f"blind-RCE OOB probe error: {exc}")
+
+        # JWT signing-key URL injection (jku/x5u) over the same collaborator — an unauthenticated
+        # account-takeover primitive the three in-pass JWT checks structurally cannot see. Those attack
+        # the key the server already holds; this asks whether the server lets the TOKEN name where the
+        # key comes from. A verifier that fetches an attacker-named JWKS accepts tokens signed by the
+        # attacker, i.e. any identity. It is invisible in-band (a server that fetches the URL and then
+        # rejects the token answers exactly like one that never fetched), so the fetch is the only
+        # observable and it is only observable out of band. Uses the token the app hands an ANONYMOUS
+        # visitor, so no session is needed; a target that issues none is a clean no-op.
+        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+            try:
+                _emit("running JWT key-URL injection OOB probe (collaborator configured)…")
+                jwtk = oob_service.confirm_jwt_key_injection(clean_target, base=oob_base, secret=oob_secret,
+                                                             scope=scope, settings=settings)
+                if jwtk.get("ok") and jwtk.get("finding") and jwtk.get("status") in ("confirmed", "candidate"):
+                    raw_findings = list(raw_findings) + [jwtk["finding"]]
+                    if "active" not in scanners_run:
+                        scanners_run = list(scanners_run) + ["active"]
+                    _emit(f"JWT key-URL OOB: {jwtk.get('status')} via '{jwtk.get('field')}'")
+                else:
+                    _emit(f"JWT key-URL OOB: {jwtk.get('status') or jwtk.get('error') or 'no callback'}")
+            except Exception as exc:  # noqa: BLE001
+                _emit(f"JWT key-URL OOB probe error: {exc}")
+
     # Credential validation: a leaked Firebase/Google API key is only a REAL finding if it's live.
     # Gated by ``authorized`` — it sends ONE benign, read-only GET to the credential's OWN issuer
     # (Google, never the target), carrying only the found key, to prove liveness + name the project.

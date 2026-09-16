@@ -386,7 +386,13 @@ def references_for_class(class_id: str) -> list[str]:
 # severity rating, so a report carries both platforms' language. Estimated — '' for a
 # class with no clean VRT mapping (the report only renders the row when non-empty).
 _BUGCROWD_VRT: dict[str, str] = {
-    "rce": "server_security_misconfiguration.remote_code_execution_rce",
+    # Server-Side Injection, not Server Security Misconfiguration: the VRT parents RCE under injection,
+    # and this file already agreed with that everywhere else — the dead "deserialization" row below
+    # files the identical leaf under server_side_injection, and taxonomy._CWE_TO_VRT maps both of this
+    # class's CWEs (78, 94) to "Server-Side Injection > Remote Code Execution (RCE)". This entry is the
+    # PRIMARY source for a Bugcrowd submission (bugcrowd_vrt() is preferred over the CWE fallback), so
+    # the disagreement mis-parented the category on every RCE report the engine filed.
+    "rce": "server_side_injection.remote_code_execution_rce",
     "xss": "cross_site_scripting_xss.reflected",
     "sqli": "server_side_injection.sql_injection",
     "ssrf": "server_side_injection.server_side_request_forgery_ssrf",

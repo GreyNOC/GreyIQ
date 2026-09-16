@@ -195,6 +195,80 @@ class RunBountyHuntProgressTests(unittest.TestCase):
             bounty.oob_service.confirm_blind_xxe = orig
         self.assertEqual(called, [])                             # no collaborator -> the XXE pass never fires
 
+    def test_blind_rce_and_jwt_key_probes_run_when_a_collaborator_is_configured(self) -> None:
+        # The two unauthenticated provers added in v4.4.0 run beside blind SSRF/XXE, behind the same
+        # collaborator gate, and their findings must reach the report like any other active finding.
+        from bughunter import bounty
+        url = f"http://127.0.0.1:{self.server.server_port}/"
+        seen: list = []
+        rce_finding = {"rule_id": "active.blind-rce-oob", "title": "Blind OS command injection",
+                       "severity": "critical", "class_id": "rce", "location": url, "category": "injection",
+                       "proof_evidence": {"request_line": f"GET {url}"}}
+        jwt_finding = {"rule_id": "active.jwt-key-url-injection-oob", "title": "JWT jku injection",
+                       "severity": "high", "class_id": "jwt", "location": url, "category": "auth",
+                       "proof_evidence": {"request_line": f"GET {url}"}}
+        orig = (bounty.oob_service.confirm_blind_ssrf, bounty.oob_service.confirm_blind_xxe,
+                bounty.oob_service.confirm_blind_rce, bounty.oob_service.confirm_jwt_key_injection)
+        bounty.oob_service.confirm_blind_ssrf = lambda *a, **k: {"ok": True, "status": "no-callback"}
+        bounty.oob_service.confirm_blind_xxe = lambda *a, **k: {"ok": True, "status": "no-callback"}
+        bounty.oob_service.confirm_blind_rce = lambda target, **k: (seen.append(("rce", target)),
+            {"ok": True, "status": "confirmed", "param": "cmd", "finding": dict(rce_finding)})[1]
+        bounty.oob_service.confirm_jwt_key_injection = lambda target, **k: (seen.append(("jwt", target)),
+            {"ok": True, "status": "confirmed", "field": "jku", "finding": dict(jwt_finding)})[1]
+        lines: list[str] = []
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                report = run_bounty_hunt(
+                    url, "web-app", None, tmp, "127.0.0.1", True, {}, active=True,
+                    oob_base="https://collab.example", oob_secret="s3cr3t",
+                    default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed", on_progress=lines.append)
+        finally:
+            (bounty.oob_service.confirm_blind_ssrf, bounty.oob_service.confirm_blind_xxe,
+             bounty.oob_service.confirm_blind_rce, bounty.oob_service.confirm_jwt_key_injection) = orig
+        self.assertTrue(report.get("ok"), report.get("error"))
+        self.assertEqual(seen, [("rce", url), ("jwt", url)])
+        self.assertTrue(any("blind-RCE OOB: confirmed via cmd" in ln for ln in lines), lines)
+        self.assertTrue(any("JWT key-URL OOB: confirmed via 'jku'" in ln for ln in lines), lines)
+
+    def test_blind_rce_and_jwt_key_probes_are_skipped_without_a_collaborator(self) -> None:
+        from bughunter import bounty
+        url = f"http://127.0.0.1:{self.server.server_port}/"
+        called: list = []
+        orig = (bounty.oob_service.confirm_blind_rce, bounty.oob_service.confirm_jwt_key_injection)
+        bounty.oob_service.confirm_blind_rce = lambda *a, **k: called.append("rce")
+        bounty.oob_service.confirm_jwt_key_injection = lambda *a, **k: called.append("jwt")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                run_bounty_hunt(url, "web-app", None, tmp, "127.0.0.1", True, {}, active=True,
+                                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed")
+        finally:
+            (bounty.oob_service.confirm_blind_rce, bounty.oob_service.confirm_jwt_key_injection) = orig
+        self.assertEqual(called, [])
+
+    def test_a_raising_oob_prover_never_breaks_the_hunt(self) -> None:
+        # Each OOB block is best-effort: infrastructure the operator runs (a tunnel, a phone) is the
+        # least reliable part of a hunt, and it must never be able to take the hunt down with it.
+        from bughunter import bounty
+        url = f"http://127.0.0.1:{self.server.server_port}/"
+        orig = (bounty.oob_service.confirm_blind_rce, bounty.oob_service.confirm_jwt_key_injection)
+
+        def boom(*a, **k):
+            raise RuntimeError("collaborator tunnel is down")
+
+        bounty.oob_service.confirm_blind_rce = boom
+        bounty.oob_service.confirm_jwt_key_injection = boom
+        lines: list[str] = []
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                report = run_bounty_hunt(
+                    url, "web-app", None, tmp, "127.0.0.1", True, {}, active=True,
+                    oob_base="https://collab.example", oob_secret="s3cr3t",
+                    default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed", on_progress=lines.append)
+        finally:
+            (bounty.oob_service.confirm_blind_rce, bounty.oob_service.confirm_jwt_key_injection) = orig
+        self.assertTrue(report.get("ok"), report.get("error"))
+        self.assertTrue(any("blind-RCE OOB probe error" in ln for ln in lines), lines)
+
     def test_run_id_bound_sink_lands_in_the_shared_progress_buffer(self) -> None:
         url = f"http://127.0.0.1:{self.server.server_port}/"
         progress.start_run("hunt-run-1")
