@@ -62,8 +62,7 @@ from bughunter.active_verify_service import (
     _JWT_RE,
     _b64url_decode,
     _b64url_encode,
-    _extract_jwt_token,
-    served_token_carrier,
+    _served_token_carrier,
     _Http,
     _NoRedirect,
     _candidate_params,
@@ -1265,7 +1264,7 @@ def confirm_jwt_key_injection(
             landing = http.fetch(sanitized)
         except (_ActiveError, WebsiteFetchError) as exc:
             return {"ok": False, "error": "could not read the target for a token: {0}".format(exc)}
-        carrier = served_token_carrier(landing)
+        carrier = _served_token_carrier(landing)
         if carrier is not None:
             header_name, real_token, rebuild = carrier
     # Validate the shape from EITHER source before forging. The four in-pass JWT checks all gate on
