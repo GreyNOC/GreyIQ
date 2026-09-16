@@ -97,19 +97,26 @@ _RCE_PARAMS = ("cmd", "command", "exec", "ping", "host", "ip", "domain", "query"
 # Default per-pass request ceiling. Twelve could not seat the suite, and no ordering could fix that:
 # against a one-parameter URL the landing fetch, CORS, the three redirect probes and the three
 # host-header probes spend ten between them, so whichever injection check was ordered last got
-# nothing. Ordering could only ever choose WHICH class starved. A full sweep of the ~25 checks costs
-# on the order of 80-90 requests against a parametered endpoint, so this is sized to seat the whole
-# suite rather than to ration it — the operator's authorization, not an arbitrary default, is what
-# says a hundred benign requests to one target is acceptable.
+# nothing. Ordering could only ever choose WHICH class starved.
+#
+# MEASURED, not estimated. Driven against the E2E fixture with an unbounded budget so nothing
+# truncates: 62 requests for a one-parameter URL, 90 for three parameters (with or without six
+# recon-discovered names -- the per-check caps bind first), and 99 with the opt-in timing probes on.
+# A JWT-bearing target adds roughly fifteen more (four JWT checks, each taking its own baseline and
+# negative control) and a GraphQL path a couple. 160 seats that worst case with headroom. An earlier
+# draft guessed "80-90" from a partial reading and set 100, which truncated a timing hunt at exactly
+# the heaviest check -- reintroducing, one check further down, the starvation it existed to cure.
 #
 # This is a ceiling, not a target: every check is self-gating (path-gated, signature-gated, or exits
-# on the first param that answers), so an ordinary target still costs far less. Politeness is still
-# ENFORCED rather than promised, by two things this does not touch: the inter-request floor
-# (GREYIQ_ACTIVE_MIN_INTERVAL_MS, 500ms) and the process-wide per-host token bucket
-# (GREYIQ_ACTIVE_MAX_REQUESTS_PER_HOST), which must stay above this or the bucket, not the budget,
-# becomes the real limit. Callers that size their own budget (the hunt loop's per-turn slice, the
-# re-plan wave) pass it explicitly and are unaffected.
-_DEFAULT_REQUESTS_BUDGET = 100
+# on the first parameter that answers), so an ordinary target costs far less. Politeness is still
+# ENFORCED rather than promised, by two things this does not relax: the inter-request floor
+# (GREYIQ_ACTIVE_MIN_INTERVAL_MS, 500 ms) and the process-wide per-host token bucket
+# (GREYIQ_ACTIVE_MAX_REQUESTS_PER_HOST). That bucket must stay above this value TIMES the fan-out --
+# one hunt runs up to four ranked endpoints on one host through the SAME bucket -- or the bucket,
+# not the budget, silently becomes the real limit and the later siblings get nothing. Callers that
+# size their own budget (the hunt loop, the re-plan wave, the API re-verify paths) pass it
+# explicitly and are unaffected.
+_DEFAULT_REQUESTS_BUDGET = 160
 _PATH_PARAMS = ("file", "filename", "path", "page", "template", "doc", "download", "attachment")
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 # SQL-specific error signatures only — a generic stack trace is not SQL injection.
@@ -1206,21 +1213,14 @@ def _check_ssti(http: _Http, url: str, extra_params: list[str] | None = None) ->
     return None
 
 
-def _check_rce_command_injection(http: _Http, url: str, extra_params: list[str] | None = None,
-                                 limit: int = 3, skip: int = 0) -> dict[str, Any] | None:
+def _check_rce_command_injection(http: _Http, url: str, extra_params: list[str] | None = None) -> dict[str, Any] | None:
     """Confirm OS command injection with a BENIGN shell-substitution arithmetic probe: if the
     parameter reaches a shell, ``$(expr 111 + 111)`` / `` `expr 111 + 111` `` is evaluated and its
     result (222) echoed back. Only ``expr`` runs — no real command, no side effect. A literal
     control that is NOT substituted rules out a coincidental echo. GET-only; one marker per probe.
     This is the arithmetic-echo sibling of the SSTI check, for a shell context rather than a
-    template engine — the safe way to prove RCE without executing a real payload.
-
-    ``limit`` / ``skip`` slice the candidate list so the suite can register this check TWICE: once
-    early with ``limit=1`` (a reserved two-request slot that guarantees the only CRITICAL class in
-    the suite is probed on its likeliest parameter before the budget is gone) and once later with
-    ``skip=1`` for the remaining parameters. The slice is taken AFTER ranking, so ``skip=1`` drops
-    exactly the parameter the reserved slot already covered and the pair never probes one twice."""
-    params = _candidate_params(url, extra_params, _RCE_PARAMS, limit)[max(0, int(skip)):]
+    template engine — the safe way to prove RCE without executing a real payload."""
+    params = _candidate_params(url, extra_params, _RCE_PARAMS, 3)
     # BOTH substitution forms ($(...) and backticks) ride in ONE probe, each behind its own
     # marker — so this check costs exactly what SSTI does: one control + one probe per param.
     sig_dollar, sig_tick = f"{_MARK}D222", f"{_MARK}T222"
@@ -1940,7 +1940,7 @@ def _check_jwt_jwk_embedded(http: _Http, url: str, discovered_token: str = "") -
     """Confirm the server verifies a token with a key the TOKEN ITSELF carries (the ``jwk`` JOSE
     header, CVE-2018-0114's class) — unauthenticated, total token forgery.
 
-    This is the sibling of ``_check_jwt_key_url_injection``'s out-of-band jku/x5u probe, for the case
+    This is the sibling of ``oob_service.confirm_jwt_key_injection``'s out-of-band jku/x5u probe, for the case
     where the attacker does not have to host anything at all: the key travels inside the token. Where
     jku/x5u can only be observed out of band (the fetch is the tell), an embedded key needs no
     collaborator and no infrastructure, so this one runs in the ordinary pass and fires on a hunt that
@@ -2277,18 +2277,27 @@ def _check_jwt_weak_secret(http: _Http, url: str, discovered_token: str = "") ->
     server_note = "the recovered secret proves forgery offline (self-certifying); not sent to the server"
     try:
         baseline = http.fetch(url, extra_headers=baseline_headers) if baseline_headers else http.fetch(url)
+        # NEGATIVE CONTROL, the same one alg:none and alg-confusion take before either narrates a
+        # bypass: a copy of the REAL token with a corrupted signature must be REJECTED. Without it a
+        # body match proves nothing about whether the token was honoured -- on a wholly public
+        # endpoint the baseline and the forged response are identical because the server never looked
+        # at either token, and an earlier draft reported exactly that as "was accepted ... body match
+        # 100%". That is a fabricated corroboration attached to a real finding, which is worse than
+        # the vaguer wording it replaced.
+        parts_real = real_token.split(".")
+        control = http.fetch(url, extra_headers={
+            header_name: rebuild(f"{parts_real[0]}.{parts_real[1]}.{_corrupt_jwt_signature(parts_real[2])}")})
         probe = http.fetch(url, extra_headers={header_name: rebuild(forged)})
-        if 200 <= int(probe.get("status") or 0) < 300 and 200 <= int(baseline.get("status") or 0) < 300:
-            # A 2xx pair is not acceptance on its own: a public page answers 200 for ANY Authorization
-            # header, forged or absent, so on the discovered-token path status alone would narrate a
-            # server-side accept that never happened. Require the forged response to carry the same
-            # content the real token returns — the identical gate the alg:none and alg-confusion
-            # checks apply before either calls a bypass proven.
+        verifies = not (200 <= int(control.get("status") or 0) < 300)
+        if (verifies and 200 <= int(probe.get("status") or 0) < 300
+                and 200 <= int(baseline.get("status") or 0) < 300):
             same = _body_similar(str(baseline.get("body") or ""), str(probe.get("body") or ""))
             if same >= _JWT_BODY_SAME:
-                server_note = (f"a token forged with the recovered secret (a claim that was never issued) was accepted "
-                               f"(HTTP {probe['status']}) and returned the same content as the real token "
-                               f"(HTTP {baseline['status']}, body match {same:.0%})")
+                server_note = (f"a token forged with the recovered secret (a claim that was never issued) was "
+                               f"accepted (HTTP {probe['status']}) and returned the same content as the real "
+                               f"token (HTTP {baseline['status']}, body match {same:.0%}), while a "
+                               f"corrupted-signature copy was rejected (HTTP {control['status']}) -- so the "
+                               f"server does verify, and it accepted our signature")
     except _ActiveError:
         pass
     proof = _proof(
@@ -2739,33 +2748,28 @@ def verify_active(
         ("cors", lambda: _check_cors(http, sanitized)),
         ("redirect", lambda: _check_open_redirect(http, sanitized, discovered_params)),
         ("host-header", lambda: _check_host_header(http, sanitized)),
-        # RESERVED FIRST-PARAMETER SLOT for the only CRITICAL check in the suite. The param-keyed
-        # probes share a small budget and run to exhaustion in order, so POSITION alone decided whether
-        # a check ran at all: with the default 12-request budget, the landing fetch plus cors /
-        # redirect / host-header (up to 7 between them) and the two XSS passes (up to 6 each) reached
-        # the ceiling before command injection was ever called. On exactly the param-rich endpoints
-        # most likely to carry it, the highest-value class in the suite fired zero probes. The comment
-        # that used to sit on the full check claimed a priority it did not have ("ahead of the SQLi
-        # variants so a CRITICAL RCE gets request-budget priority") — sitting behind the XSS pair is
-        # what actually decided it.
-        #
-        # Simply moving the whole check up only MOVES the starvation onto XSS (the suite does not fit
-        # in one pass against a parametered URL, and cannot: a full sweep exceeds even the governor's
-        # per-host ceiling). A bigger budget is not free either — it drains the same process-wide
-        # per-host token bucket the fan-out to sibling endpoints draws from. So the scarce budget buys
-        # BREADTH first: two requests here guarantee the critical class is probed on its single
-        # likeliest parameter, and the full sweep below deepens onto the remaining parameters only if
-        # budget survives the rest of the suite. ``skip=1`` there means the two never re-probe the same
-        # parameter, so the guarantee costs nothing on a pass that would have reached the check anyway.
-        ("rce", lambda: _check_rce_command_injection(http, sanitized, discovered_params, limit=1)),
         ("xss", lambda: _check_reflected_xss(http, sanitized, discovered_params, priority=xss_params)),
         # Context-aware XSS runs right after the element-content check — catches the JS-string /
         # attribute breakouts that check structurally can't confirm.
         ("xss", lambda: _check_reflected_xss_context(http, sanitized, discovered_params, priority=xss_params)),
         ("ssti", lambda: _check_ssti(http, sanitized, discovered_params)),
-        # The rest of the command-injection sweep — parameters 2..N, the first one having already been
-        # probed by the reserved slot above.
-        ("rce", lambda: _check_rce_command_injection(http, sanitized, discovered_params, skip=1)),
+        # OS command injection via benign $(expr) shell substitution — arithmetic only, no real command
+        # runs. Sits next to SSTI (both are safe arithmetic-echo injection probes) and ahead of the SQLi
+        # variants.
+        #
+        # ORDER IS NO LONGER WHAT DECIDES WHETHER THIS RUNS, and that is the point. Under the old
+        # 12-request ceiling the param-keyed probes ran to exhaustion in sequence, so whichever check
+        # was ordered last fired zero probes — on a parametered URL the landing fetch plus cors /
+        # redirect / host-header and the two XSS passes reached the ceiling before this one was
+        # reached, and the highest-severity class in the suite was never tested. Ordering cannot fix
+        # that; it only chooses which class starves, and an earlier draft of this release moved the
+        # check up and starved reflected XSS instead (the E2E suite caught it immediately). A reserved
+        # first-parameter slot was tried next and was worse: registering the check twice emitted TWO
+        # critical findings for one endpoint when two parameters were injectable, and it silently stole
+        # the two requests the fixed-budget re-verify path needed to reach XSS. The budget is what was
+        # wrong, so the budget is what was fixed — see _DEFAULT_REQUESTS_BUDGET. This check keeps its
+        # tuned position, and a pass that can afford the suite now reaches it.
+        ("rce", lambda: _check_rce_command_injection(http, sanitized, discovered_params)),
         ("sqli", lambda: _check_error_sqli(http, sanitized, discovered_params)),
         ("sqli", lambda: _check_bool_sqli(http, sanitized, discovered_params)),
         ("nosqli", lambda: _check_nosqli(http, sanitized, discovered_params)),

@@ -14,23 +14,33 @@ here relaxes an evidence rule:
 `report._has_captured_artifact` remains the only thing that can call anything confirmed, and every
 new probe is scope-bound, SSRF-guarded and governed exactly like the existing ones.
 
-**The suite could not fit in its own budget, and position decided who starved.** Against a
+**The suite could not fit in its own budget, and position alone decided who starved.** Against a
 one-parameter URL the landing fetch plus CORS, the three redirect probes and the three host-header
 probes spend ten requests between them; the ceiling was twelve. Whatever was ordered last therefore
-ran zero probes — and what was ordered last included the only CRITICAL check in the suite. On exactly
-the parameter-rich endpoints most likely to carry command injection, command injection was never
-tested. The comment sitting on that check claimed the opposite ("ahead of the SQLi variants so a
-CRITICAL RCE gets request-budget priority"); sitting behind the two XSS passes is what actually
-decided it. Reordering alone cannot fix this, it only chooses a different victim — moving the check up
-starves reflected XSS instead, which the E2E suite catches immediately. So the budget is now sized to
-seat the suite (100 per pass, against a full sweep costing 80-90) rather than to ration it, the
-per-host bucket was raised above it so the bucket does not silently become the real limit, and the
-critical check additionally holds a reserved first-parameter slot ahead of the XSS pair. The reserved
-slot and the full sweep never probe the same parameter twice, so the guarantee is free on any pass
-that would have reached the check anyway. Politeness is untouched and still *enforced* rather than
-promised: the 500 ms inter-request floor and the process-wide per-host token bucket are what bound a
-hunt, and neither was relaxed. The opt-in iterative loop was raised with it — left at twelve it would
-have been strictly worse at recall than the single pass it exists to improve on.
+fired zero probes -- and what was ordered last included the only CRITICAL check in the suite. Two
+fixes were tried and discarded before the right one, and both failures are worth recording.
+Reordering the check up the list only MOVES the starvation: it starved reflected XSS instead, which
+the end-to-end suite caught within a minute. A reserved one-parameter slot -- registering the check
+twice, once early and once for the remaining parameters -- was worse, because one endpoint could then
+report the same class twice: two CRITICAL findings for one bug, which is exactly what a triager
+penalises. It also quietly took the two requests the fixed-budget re-verify path needed to reach XSS,
+so a reproducible finding was scored unstable and its submission kept rendering "candidate".
+
+The budget was the problem, so the budget is what changed -- MEASURED rather than estimated. A full
+sweep costs 62 requests against a one-parameter URL, 90 against three, and 99 with the opt-in timing
+probes on, so the per-pass default is 160. The per-host bucket has to hold not one pass but the whole
+fan-out, since a hunt runs up to four ranked endpoints on one host through the SAME process-wide
+bucket; it is 700. The refill rate moved with it: at the old 0.5/s a bucket that size took 23 minutes
+to recover, and the shared governor lives as long as the process, so the next hunt against that host
+would have drawn on a dead bucket. At 1.0/s it is still half the send rate the inter-request floor
+permits, so the ceiling keeps binding. The opt-in iterative loop went to 400 for a related reason:
+turn 0 deliberately takes the whole remaining allowance, so a total sized at one pass would have let
+it take everything and the "iterative" loop would have degenerated into a single pass.
+
+Politeness is unchanged where it matters, and still ENFORCED rather than promised: the 500 ms
+inter-request floor and the token bucket are what bound a hunt, neither is relaxed for a real target,
+and the out-of-band provers now draw on that same shared bucket instead of each opening a private one
+-- the ceiling the settings called "process-wide" was really that number once per prover.
 
 **Blind OS command injection now confirms out of band.** The prover could confirm command injection
 two ways, and both need the target to hand something back: an echoed `$(expr 111 + 111)`, or a
@@ -66,6 +76,26 @@ application hands an *anonymous* visitor, which is what makes it a no-session pr
 issues none is a clean no-op. It is scored for the fetch it proved (7.5) and not the takeover it
 implies, with the remaining step named in the plan rather than assumed.
 
+**What separates command execution from an app that merely fetches URLs.** The blind-RCE probe's
+entire severity rests on a matched control: the same callback URL, sent as a BARE value, must stay
+silent. The first draft adjudicated that control with a single zero-delay read at the instant the
+probe's hit appeared, while the probe itself had been given four reads across eight seconds. The
+asymmetry ran the wrong way -- the probe value carries one callback per shell context and the control
+carries one in total, so against any async fetcher the probe lands inside its window and the control
+lands just after the single read it was granted. A 200 ms race decided a CVSS 9.8. The control now
+gets the probe's full polling budget, and a FRESH bare control is re-sent and polled as well, which
+also covers an app that only services the second request from a new IP and a fleet where the control
+happened to land on a node without the fetcher. Either control answering means no RCE is claimed.
+
+The callback's User-Agent is read now, too. The payload only ever runs curl or wget, so a hit whose
+UA names an application HTTP client is evidence against the shell claim and downgrades it; an absent
+or unrecognised UA still confirms, because the bare-URL control is the primary control and an egress
+proxy may rewrite the header. That gate is deliberately local to this prover -- blind SSRF, XXE and
+the JWT key-source probe are all *supposed* to be answered by an application client. And a sweep
+where every token failed its pre-probe control now reports `not-probed` rather than `no-callback`:
+nothing was sent, so "no callback observed" would be a false negative wearing the costume of a clean
+result.
+
 **A self-signed token is now tested without any infrastructure at all.** The jku/x5u probe above
 needs a collaborator, and plenty of hunts run without one configured — so the same idea is also
 covered in the ordinary pass, for the case where the attacker does not have to host anything: the key
@@ -78,8 +108,8 @@ The claims are carried over byte for byte: what is proven is that an attacker-ch
 never a privilege granted to ourselves.
 
 **The politeness floor no longer applies to loopback.** Seating the full suite made every local E2E
-pass spend 80 requests at the 500 ms inter-request floor, which turned one module of the test suite
-from 67 s into 236 s. That floor exists to be gentle with somebody else's server — a target, a staging
+pass spend up to 99 requests at the 500 ms inter-request floor, which turned one module of the test
+suite from 67 s into 236 s. That floor exists to be gentle with somebody else's server — a target, a staging
 box, a third party — and the machine the process is already running on is none of those. The token
 bucket, which is the part that actually bounds what a host absorbs, is unchanged for every host
 including loopback; only the pacing is dropped, and only where there is nobody to pace for. Matched as
@@ -94,8 +124,12 @@ pacing exemption should never be something an attacker can name for themselves.
   worth catching, and where the crack costs zero requests. It now reads the token the target itself
   handed back, like its two siblings. Its live corroboration had to be tightened to match: on that
   path the baseline is not automatically authenticated, so a public page answering 200 to any
-  `Authorization` header would have been narrated as the server accepting a forged token. It now
-  requires the forged response to carry the same content the real token returns.
+  `Authorization` header was narrated as the server accepting a forged token. A body-match gate alone
+  did not fix it either: on a wholly public endpoint the two responses are identical precisely BECAUSE
+  the server ignored both tokens, so it reported "was accepted, body match 100%" about a server that
+  never looked. It now takes the same corrupted-signature control its two siblings take -- the copy
+  with a broken signature must be REJECTED before any acceptance is narrated. The finding itself was
+  always confirmed by the offline crack; it was the corroboration that was fabricated.
 - The command-injection probe `break`ed its parameter loop on a transient network error while its own
   control `continue`d, so one reset on the first candidate discarded every remaining candidate.
 - Nine classes name two CWEs because one rarely covers a class, and taxonomy routing read only the

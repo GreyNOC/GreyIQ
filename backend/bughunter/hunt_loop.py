@@ -57,14 +57,17 @@ from bughunter.settings import get_settings
 
 _PER_TURN_MIN = 4  # don't start a turn that can't afford a few probes
 
-# TOTAL requests the iterative loop may spend across all its turns. Turn 0 runs the suite in full (it
-# is the pass that establishes recall before anything narrows), so this has to seat a whole sweep at
-# active_verify_service's per-pass default AND leave room for the focused turns after it — those are
-# class-restricted by `only_classes`, so they are cheap. Sized at the pass default plus roughly half
-# again. Leaving this at the old 12 after the pass budget was raised would have made the OPT-IN
-# reactive loop strictly worse at recall than the plain single pass it is supposed to improve on:
-# turn 0 would have been capped at 12 and starved exactly the checks the wider budget just unblocked.
-_LOOP_TOTAL_BUDGET = 150
+# TOTAL requests the iterative loop may spend across all its turns, and it has to be a MULTIPLE of a
+# single pass rather than one pass's worth. Turn 0 takes min(requests_budget, remaining) -- the whole
+# thing, deliberately (see the comment on that line: reserving a share for later turns is
+# self-defeating when hitting a cap raises the same _RateLimited that ends the loop). So whatever
+# turn 0 does not spend IS the entire allowance for every steered turn after it. A sweep measures up
+# to ~99 requests and the per-pass default is 160, so sizing this at one pass would let turn 0 take
+# all of it and the 'iterative' loop would degenerate to a single pass. At 400 a full turn 0 still
+# leaves ~240 for the class-restricted turns that follow, which are far cheaper than the opening
+# sweep. Leaving it at the old 12 after the pass budget was raised would have been worse still: the
+# OPT-IN reactive loop would have had strictly less recall than the plain single pass it improves on.
+_LOOP_TOTAL_BUDGET = 400
 
 # The error signature families digest_builder can match, mapped to the injection class the LLM prompt
 # tells the brain to prioritise for each. ``stacktrace`` is deliberately ABSENT: a generic traceback

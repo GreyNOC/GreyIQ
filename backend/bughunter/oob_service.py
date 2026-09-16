@@ -59,6 +59,7 @@ def _is_crawler_ua(ua: str) -> bool:
 
 from bughunter.active_verify_service import (
     _ActiveError,
+    _JWT_RE,
     _b64url_decode,
     _b64url_encode,
     _extract_jwt_token,
@@ -96,7 +97,13 @@ def poll_collaborator(base: str, secret: str, token: str, *, timeout: float = 8.
     request = urllib.request.Request(url, method="GET", headers={
         "Authorization": f"Bearer {secret}", "User-Agent": _USER_AGENT, "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as resp:
+        # NOT urlopen(): the default opener FOLLOWS redirects and re-sends the Authorization header
+        # to the redirect target, which here is the OOB SECRET. A collaborator that 3xxs -- a tunnel
+        # reconfigured, a domain lapsed, a provider interstitial -- would hand that bearer token to
+        # whoever now answers. _NoRedirect turns a 3xx into an HTTPError instead, so the secret only
+        # ever reaches the host the operator configured.
+        opener = urllib.request.build_opener(_NoRedirect())
+        with opener.open(request, timeout=timeout) as resp:
             data = json.loads(resp.read(1_000_000).decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
@@ -121,6 +128,16 @@ def poll_collaborator(base: str, secret: str, token: str, *, timeout: float = 8.
         count = 0
     raw_hits = data.get("hits")
     hits = [h for h in raw_hits if isinstance(h, dict)] if isinstance(raw_hits, list) else []
+    # The NESTED "headers" of each hit was never checked, and every confirm site reads it as
+    # (hit.get("headers") or {}).get("user-agent") -- so a hit carrying headers as a string or a list
+    # (the same tainted-tunnel threat model the coercions above exist for) raised AttributeError out
+    # of the prover. Normalise it here, once, rather than at each of the five read sites.
+    # Coerce only a PRESENT-but-wrong-typed value; an absent key is left absent, because the read
+    # sites already spell it (hit.get("headers") or {}) and inventing the key would change the hit
+    # shape every caller and test sees.
+    for hit in hits:
+        if "headers" in hit and not isinstance(hit["headers"], dict):
+            hit["headers"] = {}
     return {"ok": True, "count": count, "hits": hits}
 
 
@@ -581,6 +598,18 @@ _RCE_WRAPPERS: dict[str, str] = {
 }
 
 
+def _header_value(name: str, payload: str) -> str:
+    """The value to send in header ``name``, keeping any identity that header is meant to carry.
+
+    User-Agent is the header a bug-bounty program can REQUIRE its researcher marker on, so the
+    payload is appended to the real UA rather than replacing it -- every shell context opens with
+    its own separator, so appending is exactly as injectable and leaves the traffic attributable.
+    Referer and X-Forwarded-For carry no identity, so they take the payload alone."""
+    if name.lower() == "user-agent":
+        return "{0} {1}".format(current_user_agent(_USER_AGENT), payload)
+    return payload
+
+
 def _rce_probe_value(base: str, token: str, max_len: int = _RCE_PROBE_MAX_RAW,
                      header_safe: bool = False) -> str:
     """Every shell context that fits ``max_len``, in ONE value, all pointing at the SAME token.
@@ -730,6 +759,73 @@ def _poll_for_hit(base: str, secret: str, token: str, *, attempts: int, delay_s:
     return None
 
 
+# The ONLY thing the RCE payload ever runs is `curl -s <url>` or `wget -q -O- <url>`, so a callback is
+# corroborated by its User-Agent: real curl sends "curl/8.x", wget sends "Wget/1.x". A hit whose UA
+# names an APPLICATION HTTP client instead — the stack a webhook validator, link unfurler or plain
+# SSRF would use — is evidence AGAINST the shell claim, from data already in hand.
+#
+# _is_crawler_ua deliberately lets these library UAs through as confirmed, which is right for blind
+# SSRF (they are exactly what a vulnerable server's own fetch sends) and wrong here, where telling a
+# shell's fetcher from an application's IS the claim. Only POSITIVE contrary evidence downgrades: an
+# absent or unrecognised UA still confirms, because the matched bare-URL control is the primary
+# control and an egress proxy may rewrite the header.
+_APP_CLIENT_UA_RE = re.compile(
+    r"python-requests|python-urllib|aiohttp|httpx|go-http-client|okhttp|java/|jakarta|apache-httpclient|"
+    r"axios|node-fetch|undici|libwww-perl|guzzle|ruby|php|dart|\.net|restsharp|postman|insomnia",
+    re.IGNORECASE,
+)
+
+
+def _ua_contradicts_shell(ua: str) -> bool:
+    """True when the callback's UA names an application HTTP client rather than curl/wget."""
+    text = str(ua or "")
+    if not text.strip():
+        return False  # nothing recorded -> no contrary evidence
+    if re.search(r"curl/|wget", text, re.IGNORECASE):
+        return False  # exactly what the payload runs
+    return bool(_APP_CLIENT_UA_RE.search(text)) or _is_crawler_ua(text)
+
+
+def _bare_control_answered(base: str, secret: str, ctrl_token: str, *, resend: Any,
+                           attempts: int, delay_s: float, timeout: float,
+                           errors: list[str]) -> str:
+    """Did the SAME callback, sent WITHOUT shell syntax, also reach the collaborator?
+
+    This is the control that separates command execution from an application that simply fetches URLs
+    it finds, so it has to be adjudicated as carefully as the probe was — and an earlier draft did not.
+    It polled the control ONCE with no delay at the instant the probe's hit was first seen, while the
+    probe had been given four reads over eight seconds. That asymmetry runs the wrong way: the probe
+    value carries a callback URL per shell context and the control carries one, so against any async or
+    jittered fetcher the probe's earliest fetch lands inside its window and the control's single fetch
+    lands just after the one read it was granted. A 200 ms race then decided a CVSS 9.8.
+
+    Two things fix it. The original control is polled with the probe's FULL budget, and a FRESH bare
+    control is re-sent and polled too. The re-send also covers the two cases a symmetric poll alone
+    would miss: an app that only services the second request from a new IP (the original control was
+    request one), and a heterogeneous fleet where the control happened to land on a node without the
+    fetcher. Either control answering means the callback is not attributable to a shell.
+    """
+    if _poll_for_hit(base, secret, ctrl_token, attempts=attempts, delay_s=delay_s,
+                     timeout=timeout, errors=errors) is not None:
+        return "fetched"
+    second = _fresh_token(base, secret, timeout=timeout, errors=errors)
+    if not second:
+        # A control we cannot attribute is not a control. Fail CLOSED -- the whole severity rests on
+        # the bare URL having stayed silent, so without a second opinion this refuses to claim
+        # execution. Reported as UNVERIFIABLE rather than as a fetch: saying "the target fetched the
+        # bare URL" when the truth is "no control token could be minted" would be a fabrication of
+        # its own, just in the conservative direction.
+        return "unverifiable"
+    try:
+        resend(second)
+    except (_ActiveError, WebsiteFetchError, ValueError):
+        return "unverifiable"
+    if _poll_for_hit(base, secret, second, attempts=attempts, delay_s=delay_s,
+                     timeout=timeout, errors=errors) is not None:
+        return "fetched"
+    return ""
+
+
 def _fresh_token(base: str, secret: str, *, timeout: float, errors: list[str]) -> str:
     """A newly minted token whose pre-probe negative control PASSED (the collaborator holds nothing
     for it yet). Empty string when the control could not be established — a token we cannot prove was
@@ -824,18 +920,26 @@ def confirm_blind_rce(
                             timeout=timeout, errors=poll_errors)
         if hit is None:
             continue
-        bare = _poll_for_hit(base, secret, ctrl_token, attempts=1, delay_s=0.0, timeout=timeout,
-                             errors=poll_errors)
-        if bare is not None:
-            # The bare URL was fetched too -> this parameter is a URL fetcher, and the wrapped hit is
-            # not attributable to a shell. Never a CRITICAL here; hand the operator the SSRF lead.
+        control = _bare_control_answered(
+            base, secret, ctrl_token,
+            resend=lambda tok: http.fetch(_with_query(sanitized, {param: callback_url(base, tok)})),
+            attempts=poll_attempts, delay_s=poll_delay_s, timeout=timeout, errors=poll_errors)
+        if control:
+            # Either the bare URL was fetched too -- so this parameter is a URL fetcher and the
+            # wrapped hit is not attributable to a shell -- or no control could be established at
+            # all. Neither is a CRITICAL, and they are reported as the different things they are.
             return {"ok": True, "status": "url-fetch", "param": param, "token": probe_token,
-                    "control_token": ctrl_token,
-                    "reason": ("the target fetched the BARE callback URL from '{0}' as well, so the callback is "
-                               "an application URL fetch (blind SSRF), not proof of command execution — run the "
-                               "blind-SSRF prover on this parameter.".format(param))}
+                    "control_token": ctrl_token, "control": control,
+                    "reason": (("the target fetched the BARE callback URL from '{0}' as well, so the callback "
+                                "is an application URL fetch (blind SSRF), not proof of command execution -- "
+                                "run the blind-SSRF prover on this parameter.".format(param))
+                               if control == "fetched" else
+                               ("'{0}' produced a callback, but the bare-URL control could not be established, "
+                                "so command execution is NOT proven -- nothing here distinguishes a shell from "
+                                "an application that fetches the URL. Re-run with the collaborator reachable."
+                                .format(param)))}
         ua = (hit.get("headers") or {}).get("user-agent", "")
-        confirmed = not _is_crawler_ua(ua)
+        confirmed = not _ua_contradicts_shell(ua)
         where = "the '{0}' parameter".format(param)
         request_line = "GET {0}".format(probe_url)
         finding = _build_rce_finding(sanitized, where, probe_token, base, hit, request_line, confirmed)
@@ -864,9 +968,17 @@ def confirm_blind_rce(
                 header_tokens[name] = tok
         if ctrl_token and header_tokens:
             try:
-                http.fetch(sanitized, extra_headers={n: callback_url(base, ctrl_token) for n in header_tokens})
+                # A program can REQUIRE its researcher marker on every request it receives, and
+                # _Http.fetch applies extra_headers AFTER its own User-Agent, so putting the payload
+                # there replaced the marker outright and sent two unidentified requests. Appending to
+                # the real UA keeps every shell context working (each starts with its own separator)
+                # and keeps the traffic attributable. Referer / X-Forwarded-For carry no identity, so
+                # they take the payload alone.
                 http.fetch(sanitized, extra_headers={
-                    n: _rce_probe_value(base, t, header_safe=True) for n, t in header_tokens.items()})
+                    n: _header_value(n, callback_url(base, ctrl_token)) for n in header_tokens})
+                http.fetch(sanitized, extra_headers={
+                    n: _header_value(n, _rce_probe_value(base, t, header_safe=True))
+                    for n, t in header_tokens.items()})
             # ValueError is in the tuple because the HTTP stack itself validates header VALUES: a
             # payload carrying CR/LF is refused before any socket work (request splitting), and that
             # refusal is a ValueError, not one of the prover's own errors. The payload above is built
@@ -880,16 +992,24 @@ def confirm_blind_rce(
                                     timeout=timeout, errors=poll_errors)
                 if hit is None:
                     continue
-                bare = _poll_for_hit(base, secret, ctrl_token, attempts=1, delay_s=0.0, timeout=timeout,
-                                     errors=poll_errors)
-                if bare is not None:
+                control = _bare_control_answered(
+                    base, secret, ctrl_token,
+                    resend=lambda tok: http.fetch(
+                        sanitized, extra_headers={n: _header_value(n, callback_url(base, tok))
+                                                  for n in header_tokens}),
+                    attempts=poll_attempts, delay_s=poll_delay_s, timeout=timeout,
+                    errors=poll_errors)
+                if control:
                     return {"ok": True, "status": "url-fetch", "header": name, "token": tok,
-                            "control_token": ctrl_token,
-                            "reason": ("the target also fetched the BARE callback URL sent in these headers, so the "
-                                       "callback is an application URL fetch (blind SSRF), not proof of command "
-                                       "execution.")}
+                            "control_token": ctrl_token, "control": control,
+                            "reason": ("the target also fetched the BARE callback URL sent in these headers, so "
+                                       "the callback is an application URL fetch (blind SSRF), not proof of "
+                                       "command execution."
+                                       if control == "fetched" else
+                                       "a callback landed, but the bare-URL control could not be established, "
+                                       "so command execution is NOT proven here.")}
                 ua = (hit.get("headers") or {}).get("user-agent", "")
-                confirmed = not _is_crawler_ua(ua)
+                confirmed = not _ua_contradicts_shell(ua)
                 where = "the {0} request header".format(name)
                 request_line = "GET {0}   ({1}: {2})".format(
                     sanitized, name, _rce_probe_value(base, tok, header_safe=True))
@@ -902,8 +1022,16 @@ def confirm_blind_rce(
                                    "negative_control": "the fresh token was empty before the probe",
                                    "matched_control": "the same callback sent bare in the same headers was never fetched"}}
 
-    if not tried and not headers_tried and poll_errors:
-        return {"ok": False, "error": poll_errors[0]}
+    if not tried and not headers_tried:
+        # NOTHING reached the target: every token failed its pre-probe negative control, or the
+        # collaborator would not answer. "no-callback" would read as "tested, clean" and get emitted
+        # to the operator as a result -- a false negative dressed as a negative result, which is the
+        # house rule running backwards. Say plainly that the class was not tested.
+        return {"ok": False, "status": "not-probed", "poll_errors": poll_errors,
+                "error": (poll_errors[0] if poll_errors else
+                          "no collaborator token could be established as empty before probing, so a later "
+                          "callback could not have been attributed to this probe -- nothing was sent and "
+                          "blind command injection was NOT tested here.")}
     # Nothing called home on the points this sweep could reach automatically. Hand back an ASSISTED
     # kit on a fresh token -- the per-context payloads carrying curl AND wget -- so the operator can
     # deliver one to a POST body, a JSON field, a file name or any other sink this GET-only prover
@@ -931,6 +1059,8 @@ def confirm_blind_rce(
 # itself is the only observable, and it is observable only out of band -- which is why this lives here
 # beside blind SSRF rather than in the active suite.
 _JWT_KEY_URL_FIELDS: tuple[str, ...] = ("jku", "x5u")
+# A replayed token rides in a request header, so it has to stay a sane size.
+_MAX_TOKEN_CHARS = 8192
 
 
 def forge_jwt_key_url(token: str, field: str, url: str) -> str:
@@ -1123,6 +1253,15 @@ def confirm_jwt_key_injection(
             real_token = _extract_jwt_token(landing)
         except Exception:  # noqa: BLE001 - a crafted body is a no-op, never a crash
             real_token = ""
+    # Validate the shape from EITHER source before forging. The four in-pass JWT checks all gate on
+    # _JWT_RE; this did not, and an operator pasting a token that wrapped across lines (a newline
+    # INSIDE a segment, which .strip() does not touch) produced a forged token carrying LF. http.client
+    # then refuses the Authorization value with a bare ValueError -- and catching WebsiteFetchError
+    # does not catch it, because WebsiteFetchError is a ValueError SUBCLASS and catching the child
+    # never catches the parent. The cap is the same reasoning: _EMBEDDED_JWT_RE has unbounded segments
+    # over a 200 KB body scan, so a bloated page could otherwise have us replay a ~200 KB header.
+    if real_token and (len(real_token) > _MAX_TOKEN_CHARS or not _JWT_RE.match(real_token)):
+        return {"ok": False, "error": "that JWT is not a well-formed, replayable token (shape or length)."}
     if not real_token:
         return {"ok": True, "status": "no-token",
                 "reason": ("the target handed back no JWT for an anonymous visitor, so there is no token whose "

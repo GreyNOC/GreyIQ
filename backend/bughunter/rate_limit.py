@@ -17,20 +17,25 @@ import threading
 import time
 
 
-# Loopback literals + the reserved name. Kept as a prefix/exact test rather than an ipaddress parse:
-# throttle() runs on every single request and the host here is already the resolved, lowercased
-# hostname, so this stays allocation-free and total on any input (including "").
+# Loopback literals + the reserved name. Compared with string tests rather than an ipaddress parse
+# because throttle() runs on every single request; this stays allocation-free and total on any input
+# (including "").
 _LOOPBACK_NAMES = frozenset({"localhost", "::1", "[::1]", "0:0:0:0:0:0:0:1"})
 
 
 def _is_loopback(host: str) -> bool:
     """True for a 127.0.0.0/8 dotted-quad, the IPv6 loopback, and the reserved name 'localhost'.
 
-    Matched as a full dotted-quad rather than a "127." prefix: a prefix test also accepts a REGISTRABLE
-    name like "127.example.com", which anyone can own, and would hand that host the exemption. Getting
-    this wrong costs politeness rather than safety (the token bucket bounds volume either way), but a
-    pacing exemption should never be something an attacker can name themselves. Unrecognised input
-    simply gets the normal pacing, so the failure direction is the polite one.
+    Matched as a FULL dotted-quad, never a "127." prefix: a prefix test also accepts a registrable
+    name like "127.example.com", which anyone can own, and would hand that host the exemption.
+    Getting this wrong costs politeness rather than safety (the token bucket bounds volume either
+    way), but a pacing exemption should never be something an attacker can name for themselves.
+
+    ``host`` is the hostname as WRITTEN in the URL, not a resolved address — throttle() is called
+    before any DNS answer is in hand. So a name that merely resolves to loopback ("app.localhost", a
+    *.nip.io address, a hosts-file alias) is not waived and simply gets the normal pacing. That is the
+    correct direction to fail: anything unrecognised is treated as somebody else's server. Callers
+    must lowercase first, which throttle() does.
     """
     if host in _LOOPBACK_NAMES:
         return True
@@ -49,7 +54,18 @@ class HostRateGovernor:
     so callers stay synchronous and simple.
     """
 
-    def __init__(self, capacity: int = 20, min_interval_s: float = 0.5, refill_per_s: float = 0.5) -> None:
+    # DEFAULT_REFILL_PER_S is tied to the bucket size and the inter-request floor; all three move
+    # together. The floor caps sends at 1/min_interval_s (2/s at the 500 ms default), so a refill at
+    # or above that rate tops the bucket up as fast as it drains and the ceiling stops being a
+    # ceiling -- refill must stay strictly below it. The other end is recovery: at the old 0.5/s a
+    # bucket sized for a whole fan-out takes ~23 minutes to refill from empty, and shared_governor()
+    # below is a process-lifetime singleton, so a second hunt against the same host inside that
+    # window would draw on a near-dead bucket. 1.0/s is half the send rate (the ceiling still binds)
+    # and refills 700 tokens in ~12 minutes.
+    DEFAULT_REFILL_PER_S = 1.0
+
+    def __init__(self, capacity: int = 700, min_interval_s: float = 0.5,
+                 refill_per_s: float = DEFAULT_REFILL_PER_S) -> None:
         self.capacity = max(1, int(capacity))
         self.min_interval_s = max(0.0, float(min_interval_s))
         self.refill_per_s = max(0.0, float(refill_per_s))
@@ -117,7 +133,8 @@ _shared_lock = threading.Lock()
 _shared_governors: dict[tuple[int, float, float], "HostRateGovernor"] = {}
 
 
-def shared_governor(capacity: int = 20, min_interval_s: float = 0.5, refill_per_s: float = 0.5,
+def shared_governor(capacity: int = 700, min_interval_s: float = 0.5,
+                    refill_per_s: float = HostRateGovernor.DEFAULT_REFILL_PER_S,
                     pool: str = "") -> "HostRateGovernor":
     """Return a PROCESS-WIDE HostRateGovernor for this config so every concurrent hunt hitting the same
     registrable host draws from ONE token bucket. The governor already keys its buckets by host

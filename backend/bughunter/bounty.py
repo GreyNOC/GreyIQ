@@ -2456,6 +2456,23 @@ def _run_bounty_hunt_body(
             except Exception as exc:  # noqa: BLE001 - an optimizer pass never breaks a hunt
                 _emit(f"re-plan wave skipped: {exc}")
 
+        def _oob_governor():
+            """The SAME process-wide per-host bucket the active pass draws from.
+
+            Each OOB prover used to build its own private governor, so the per-host ceiling the
+            settings call "process-wide" was really that number ONCE PER PROVER — four separate
+            allowances against one host in a single hunt. Actual spend stayed small (each prover's
+            _Http caps itself), so this was a ceiling that did not mean what it said rather than a
+            live over-send; a program with an avoid_dos policy is owed the real number.
+            """
+            # ``settings`` is an OPTIONAL parameter of this function and is routinely None (the OOB
+            # provers each resolve their own default), so it must be resolved here before any attribute
+            # is read — dereferencing it directly raised inside the best-effort blocks below, which
+            # swallowed it as "probe error" and quietly skipped both new classes.
+            cfg = settings or active_verify_service.get_settings()
+            return shared_governor(capacity=cfg.active_max_requests_per_host,
+                                   min_interval_s=cfg.active_min_interval_ms / 1000.0)
+
         # Blind SSRF over the OOB collaborator — the one active probe that needs external infra, so
         # it runs only when the operator has configured a collaborator (base+secret). It injects a
         # fresh, unguessable callback token per candidate param, probes, and polls the collaborator;
@@ -2467,7 +2484,7 @@ def _run_bounty_hunt_body(
                 ssrf = oob_service.confirm_blind_ssrf(clean_target, base=oob_base, secret=oob_secret,
                                                       scope=scope, settings=settings,
                                                       extra_params=effective_extra_params,
-                                                      priority=ssrf_params)
+                                                      priority=ssrf_params, governor=_oob_governor())
                 if ssrf.get("ok") and ssrf.get("finding") and ssrf.get("status") in ("confirmed", "candidate"):
                     raw_findings = list(raw_findings) + [ssrf["finding"]]
                     if "active" not in scanners_run:
@@ -2512,7 +2529,8 @@ def _run_bounty_hunt_body(
                 _emit("running blind-RCE OOB probe (collaborator configured)…")
                 rce = oob_service.confirm_blind_rce(clean_target, base=oob_base, secret=oob_secret,
                                                     scope=scope, settings=settings,
-                                                    extra_params=effective_extra_params)
+                                                    extra_params=effective_extra_params,
+                                                    governor=_oob_governor())
                 if rce.get("ok") and rce.get("finding") and rce.get("status") in ("confirmed", "candidate"):
                     raw_findings = list(raw_findings) + [rce["finding"]]
                     if "active" not in scanners_run:
@@ -2535,7 +2553,8 @@ def _run_bounty_hunt_body(
             try:
                 _emit("running JWT key-URL injection OOB probe (collaborator configured)…")
                 jwtk = oob_service.confirm_jwt_key_injection(clean_target, base=oob_base, secret=oob_secret,
-                                                             scope=scope, settings=settings)
+                                                             scope=scope, settings=settings,
+                                                             governor=_oob_governor())
                 if jwtk.get("ok") and jwtk.get("finding") and jwtk.get("status") in ("confirmed", "candidate"):
                     raw_findings = list(raw_findings) + [jwtk["finding"]]
                     if "active" not in scanners_run:

@@ -17,11 +17,12 @@ Env vars:
 - GREYIQ_WEB_FETCH_TIMEOUT : per-request fetch timeout in seconds (default 8).
 - GREYIQ_WEB_FETCH_MAX_BYTES : max bytes read per fetch (default 3_000_000).
 - GREYIQ_ACTIVE_MAX_REQUESTS_PER_HOST : hard ceiling of active-verification requests
-  the per-host governor allows (default 300). This is the process-wide politeness
-  ceiling and it must stay ABOVE the per-pass budget in active_verify_service, or the
-  bucket rather than the budget decides when a pass stops and the last checks in the
-  suite never run. 300 seats roughly three full-budget passes, so a hunt that fans out
-  to sibling endpoints on one host still draws tokens for them.
+  the per-host governor allows for the whole PROCESS (default 700). This is the real
+  politeness ceiling, and it must stay above the per-pass budget in
+  active_verify_service TIMES the fan-out: one hunt runs up to four ranked endpoints
+  on a host through the same bucket, so a bucket sized for a single pass starves the
+  siblings and kills the re-plan wave. 700 covers 4 x 160 plus the wave. Lower it to
+  tighten a hunt; the per-pass budget then stops being the binding limit.
 - GREYIQ_ACTIVE_MIN_INTERVAL_MS : minimum delay between active requests to one host
   (default 500 ms).
 - GREYIQ_ACTIVE_SCAN_ALLOWLIST : comma-separated host suffixes that count as in-scope
@@ -96,7 +97,7 @@ class ScannerSettings:
     web_allowed_ports: frozenset[int] = field(default_factory=lambda: _DEFAULT_PORTS)
     web_fetch_timeout_seconds: float = 8.0
     web_fetch_max_bytes: int = 3_000_000
-    active_max_requests_per_host: int = 300
+    active_max_requests_per_host: int = 700
     active_min_interval_ms: int = 500
     active_scan_allowlist: tuple[str, ...] = ()
     active_time_sqli_delay_seconds: float = 4.0
@@ -155,7 +156,7 @@ def get_settings() -> ScannerSettings:
         web_allowed_ports=_ports_env("GREYIQ_WEB_ALLOWED_PORTS", _DEFAULT_PORTS),
         web_fetch_timeout_seconds=_float_env("GREYIQ_WEB_FETCH_TIMEOUT", 8.0),
         web_fetch_max_bytes=_int_env("GREYIQ_WEB_FETCH_MAX_BYTES", 3_000_000),
-        active_max_requests_per_host=_int_env("GREYIQ_ACTIVE_MAX_REQUESTS_PER_HOST", 300),
+        active_max_requests_per_host=_int_env("GREYIQ_ACTIVE_MAX_REQUESTS_PER_HOST", 700),
         active_min_interval_ms=_int_env("GREYIQ_ACTIVE_MIN_INTERVAL_MS", 500),
         active_scan_allowlist=_suffixes_env("GREYIQ_ACTIVE_SCAN_ALLOWLIST"),
         active_time_sqli_delay_seconds=_float_env("GREYIQ_ACTIVE_TIME_SQLI_DELAY_S", 4.0),
