@@ -17,6 +17,33 @@ import threading
 import time
 
 
+# Loopback literals + the reserved name. Compared with string tests rather than an ipaddress parse
+# because throttle() runs on every single request; this stays allocation-free and total on any input
+# (including "").
+_LOOPBACK_NAMES = frozenset({"localhost", "::1", "[::1]", "0:0:0:0:0:0:0:1"})
+
+
+def _is_loopback(host: str) -> bool:
+    """True for a 127.0.0.0/8 dotted-quad, the IPv6 loopback, and the reserved name 'localhost'.
+
+    Matched as a FULL dotted-quad, never a "127." prefix: a prefix test also accepts a registrable
+    name like "127.example.com", which anyone can own, and would hand that host the exemption.
+    Getting this wrong costs politeness rather than safety (the token bucket bounds volume either
+    way), but a pacing exemption should never be something an attacker can name for themselves.
+
+    ``host`` is the hostname as WRITTEN in the URL, not a resolved address — throttle() is called
+    before any DNS answer is in hand. So a name that merely resolves to loopback ("app.localhost", a
+    *.nip.io address, a hosts-file alias) is not waived and simply gets the normal pacing. That is the
+    correct direction to fail: anything unrecognised is treated as somebody else's server. Callers
+    must lowercase first, which throttle() does.
+    """
+    if host in _LOOPBACK_NAMES:
+        return True
+    octets = host.split(".")
+    return (len(octets) == 4 and octets[0] == "127"
+            and all(o.isdigit() and len(o) <= 3 and int(o) <= 255 for o in octets))
+
+
 class HostRateGovernor:
     """A token bucket + minimum-interval gate, keyed by host.
 
@@ -27,7 +54,18 @@ class HostRateGovernor:
     so callers stay synchronous and simple.
     """
 
-    def __init__(self, capacity: int = 20, min_interval_s: float = 0.5, refill_per_s: float = 0.5) -> None:
+    # DEFAULT_REFILL_PER_S is tied to the bucket size and the inter-request floor; all three move
+    # together. The floor caps sends at 1/min_interval_s (2/s at the 500 ms default), so a refill at
+    # or above that rate tops the bucket up as fast as it drains and the ceiling stops being a
+    # ceiling -- refill must stay strictly below it. The other end is recovery: at the old 0.5/s a
+    # bucket sized for a whole fan-out takes ~23 minutes to refill from empty, and shared_governor()
+    # below is a process-lifetime singleton, so a second hunt against the same host inside that
+    # window would draw on a near-dead bucket. 1.0/s is half the send rate (the ceiling still binds)
+    # and refills 700 tokens in ~12 minutes.
+    DEFAULT_REFILL_PER_S = 1.0
+
+    def __init__(self, capacity: int = 700, min_interval_s: float = 0.5,
+                 refill_per_s: float = DEFAULT_REFILL_PER_S) -> None:
         self.capacity = max(1, int(capacity))
         self.min_interval_s = max(0.0, float(min_interval_s))
         self.refill_per_s = max(0.0, float(refill_per_s))
@@ -38,8 +76,16 @@ class HostRateGovernor:
     def throttle(self, host: str) -> bool:
         """Reserve one request slot for ``host``. Returns False (send nothing) when
         the per-host bucket is exhausted; otherwise spaces the send by the minimum
-        interval (sleeping the bounded remainder) and returns True."""
+        interval (sleeping the bounded remainder) and returns True.
+
+        The interval is waived for LOOPBACK only. It exists to be gentle with somebody else's
+        server — a bug-bounty target, a staging box, a third party — and the machine this process is
+        already running on is none of those. The token bucket still applies unchanged, so the volume
+        cap (the part that actually bounds what a host absorbs) is identical either way; only the
+        pacing is dropped, and only where there is no one to pace for. Reaching loopback at all
+        already requires the operator to have set GREYIQ_SCAN_ALLOW_PRIVATE_URLS."""
         key = (host or "").strip().lower()
+        interval = 0.0 if _is_loopback(key) else self.min_interval_s
         with self._lock:
             now = time.monotonic()
             state = self._buckets.get(key)
@@ -55,7 +101,7 @@ class HostRateGovernor:
             # Schedule this send no sooner than min_interval after the previously
             # scheduled one, so concurrent callers still serialize gently.
             send_at = max(now, state["next_send"])
-            state["next_send"] = send_at + self.min_interval_s
+            state["next_send"] = send_at + interval
             wait = send_at - now
         if wait > 0:
             # Sleep the FULL reserved remainder, not min(wait, min_interval_s):
@@ -87,7 +133,8 @@ _shared_lock = threading.Lock()
 _shared_governors: dict[tuple[int, float, float], "HostRateGovernor"] = {}
 
 
-def shared_governor(capacity: int = 20, min_interval_s: float = 0.5, refill_per_s: float = 0.5,
+def shared_governor(capacity: int = 700, min_interval_s: float = 0.5,
+                    refill_per_s: float = HostRateGovernor.DEFAULT_REFILL_PER_S,
                     pool: str = "") -> "HostRateGovernor":
     """Return a PROCESS-WIDE HostRateGovernor for this config so every concurrent hunt hitting the same
     registrable host draws from ONE token bucket. The governor already keys its buckets by host

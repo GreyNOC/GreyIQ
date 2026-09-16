@@ -41,11 +41,35 @@ def cwe_number(cwe: Any) -> str:
     Accepts "CWE-79", "cwe 79", "79", "CWE-79 / CWE-80" (takes the first), etc. Total:
     any non-matching input (None, "", "n/a") yields ''.
     """
-    match = _CWE_RE.search(str(cwe or ""))
-    if match:
-        return match.group(1)
+    numbers = cwe_numbers(cwe)
+    return numbers[0] if numbers else ""
+
+
+def cwe_numbers(cwe: Any) -> list[str]:
+    """EVERY CWE number in a reference, in order — ["78", "94"] for "CWE-78 / CWE-94".
+
+    Nine of the engine's classes name two CWEs, because one id rarely covers a class on its own: rce is
+    "CWE-78 / CWE-94", jwt is "CWE-347 / CWE-345", auth is "CWE-287 / CWE-384", access-control is
+    "CWE-639 / CWE-284". Taking only the first made the second unreachable for TAXONOMY ROUTING, and a
+    program decides which ids it enables: one that lists CWE-94 but not CWE-78 matched nothing for a
+    confirmed RCE, so the report filed with no machine-readable weakness and landed in the triage
+    backlog — for a finding the engine had actually proven. Both mapping functions below now try each
+    id in order and take the first that resolves, so the second CWE is a fallback rather than dead text.
+
+    Total: any non-matching input (None, "", "n/a") yields []. A bare "79" is accepted as ["79"].
+    """
+    found = _CWE_RE.findall(str(cwe or ""))
+    if found:
+        # Dedupe, preserving order: "CWE-94 / CWE-94" must not make the caller try the same id twice.
+        seen: set[str] = set()
+        out: list[str] = []
+        for number in found:
+            if number not in seen:
+                seen.add(number)
+                out.append(number)
+        return out
     stripped = str(cwe or "").strip()
-    return stripped if stripped.isdigit() else ""
+    return [stripped] if stripped.isdigit() else []
 
 
 # ---------------------------------------------------------------------------
@@ -103,8 +127,15 @@ _CWE_TO_VRT: dict[str, str] = {
 
 
 def cwe_to_vrt(cwe: Any) -> str | None:
-    """Bugcrowd VRT category path for a CWE (best-effort estimate), or None if unmapped."""
-    return _CWE_TO_VRT.get(cwe_number(cwe))
+    """Bugcrowd VRT category path for a CWE (best-effort estimate), or None if unmapped.
+
+    Tries every id the reference names, in order, so a class whose FIRST CWE is unmapped still
+    resolves through its second (see ``cwe_numbers``)."""
+    for number in cwe_numbers(cwe):
+        mapped = _CWE_TO_VRT.get(number)
+        if mapped:
+            return mapped
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -131,17 +162,20 @@ def match_weakness_id(weaknesses: list[dict[str, Any]] | None, cwe: Any) -> int 
     match -> None, and the caller simply omits weakness_id (the pre-v2 behavior). Never
     raises on malformed entries.
     """
-    number = cwe_number(cwe)
-    if not number or not weaknesses:
+    numbers = cwe_numbers(cwe)
+    if not numbers or not weaknesses:
         return None
-    for entry in weaknesses:
-        if not isinstance(entry, dict):
-            continue
-        if _external_cwe(entry) != number:
-            continue
-        raw_id = entry.get("id")
-        try:
-            return int(str(raw_id).strip())
-        except (TypeError, ValueError):
-            continue
+    # Ordered by the finding's own CWE preference, not by the program's list order: the first id is the
+    # class's primary weakness, so a program that enables BOTH still routes to the primary one.
+    for number in numbers:
+        for entry in weaknesses:
+            if not isinstance(entry, dict):
+                continue
+            if _external_cwe(entry) != number:
+                continue
+            raw_id = entry.get("id")
+            try:
+                return int(str(raw_id).strip())
+            except (TypeError, ValueError):
+                continue
     return None

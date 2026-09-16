@@ -2,6 +2,148 @@
 
 Notable changes to GreyIQ.
 
+## v4.4.0 - hunting what an unauthenticated attacker actually gets
+
+A QA/QC pass over the hunt engine, its technique and its reporting, aimed at the two classes the
+operator is judged on and the position a bounty hunt actually starts from: account takeover and
+remote code execution, with no session. Two things came out of it. The engine could only ever prove
+the *talkative* half of each class — the bug that echoes something back — and several checks it
+already owned were unreachable in the hunt it runs most: one because it needed a credential the hunt
+does not have, the rest because the request budget ran out before the suite reached them. Nothing
+here relaxes an evidence rule:
+`report._has_captured_artifact` remains the only thing that can call anything confirmed, and every
+new probe is scope-bound, SSRF-guarded and governed exactly like the existing ones.
+
+**The suite could not fit in its own budget, and position alone decided who starved.** Against a
+one-parameter URL the landing fetch plus CORS, the three redirect probes and the three host-header
+probes spend ten requests between them; the ceiling was twelve. Whatever was ordered last therefore
+fired zero probes -- and what was ordered last included the only CRITICAL check in the suite. Two
+fixes were tried and discarded before the right one, and both failures are worth recording.
+Reordering the check up the list only MOVES the starvation: it starved reflected XSS instead, which
+the end-to-end suite caught within a minute. A reserved one-parameter slot -- registering the check
+twice, once early and once for the remaining parameters -- was worse, because one endpoint could then
+report the same class twice: two CRITICAL findings for one bug, which is exactly what a triager
+penalises. It also quietly took the two requests the fixed-budget re-verify path needed to reach XSS,
+so a reproducible finding was scored unstable and its submission kept rendering "candidate".
+
+The budget was the problem, so the budget is what changed -- MEASURED rather than estimated. A full
+sweep costs 62 requests against a one-parameter URL, 90 against three, and 99 with the opt-in timing
+probes on, so the per-pass default is 160. The per-host bucket has to hold not one pass but the whole
+fan-out, since a hunt runs up to four ranked endpoints on one host through the SAME process-wide
+bucket; it is 700. The refill rate moved with it: at the old 0.5/s a bucket that size took 23 minutes
+to recover, and the shared governor lives as long as the process, so the next hunt against that host
+would have drawn on a dead bucket. At 1.0/s it is still half the send rate the inter-request floor
+permits, so the ceiling keeps binding. The opt-in iterative loop went to 400 for a related reason:
+turn 0 deliberately takes the whole remaining allowance, so a total sized at one pass would have let
+it take everything and the "iterative" loop would have degenerated into a single pass.
+
+Politeness is unchanged where it matters, and still ENFORCED rather than promised: the 500 ms
+inter-request floor and the token bucket are what bound a hunt, neither is relaxed for a real target,
+and the out-of-band provers now draw on that same shared bucket instead of each opening a private one
+-- the ceiling the settings called "process-wide" was really that number once per prover.
+
+**Blind OS command injection now confirms out of band.** The prover could confirm command injection
+two ways, and both need the target to hand something back: an echoed `$(expr 111 + 111)`, or a
+response the injected `sleep` delays. Real unauthenticated RCE routinely does neither — the command
+runs in a worker, a queue consumer or a log pipeline, and the HTTP response is a fast, identical 200.
+`oob_service.confirm_blind_rce` closes that with the mechanism the collaborator already provides for
+SSRF and XXE: a shell-wrapped callback URL, and a recorded hit as proof that request data reached a
+command interpreter. It probes parameters *and* the three request headers that reach a shell without
+any parameter having to exist, each header carrying its own token so a hit names the exact one.
+
+The second control is the part that matters. The fresh-token control blind SSRF relies on proves only
+that the callback happened *because of this probe* — not that a shell made it. An application that
+fetches any URL it finds in a parameter (an unfurler, a webhook validator, a plain SSRF) calls home
+for the wrapped value too, and reporting that as a CRITICAL RCE would be a fabricated severity. So
+every probe is paired with a matched control on its own fresh token: the same callback URL as a bare
+value, no shell metacharacters, sent *first* so it has had at least as long to land. If the bare
+control is fetched as well the result is `url-fetch` and the operator is pointed at the blind-SSRF
+prover; only a hit on the wrapped token with a silent bare control confirms execution. The payload is
+also built to a budget rather than assumed to fit — `MAX_URL_LENGTH` rejects an over-long URL inside
+`_Http.fetch`, and the sweep treats that as "skip this parameter", so a long collaborator hostname
+would have disabled the whole probe in silence.
+
+**JWT `jku`/`x5u` key-source injection is now provable, unauthenticated.** The three JWT checks all
+attack the key the server already holds — forge `alg:none`, re-use the public key as an HMAC secret,
+crack a weak secret offline. None covered the fourth and most direct route to takeover: telling the
+verifier *where to get the key*. A server that resolves a key set named by the token it is verifying
+will validate a token signed with the attacker's own key, which is any identity it likes.
+`confirm_jwt_key_injection` repoints the header at a collaborator URL, carries the payload and
+signature over verbatim, and treats the fetch as the finding. It is invisible in band by construction
+— a server that fetches the URL and then rejects the token answers exactly like one that never
+fetched — so out of band is the only place it is observable. The token used is the one the
+application hands an *anonymous* visitor, which is what makes it a no-session probe; a target that
+issues none is a clean no-op. It is scored for the fetch it proved (7.5) and not the takeover it
+implies, with the remaining step named in the plan rather than assumed.
+
+**What separates command execution from an app that merely fetches URLs.** The blind-RCE probe's
+entire severity rests on a matched control: the same callback URL, sent as a BARE value, must stay
+silent. The first draft adjudicated that control with a single zero-delay read at the instant the
+probe's hit appeared, while the probe itself had been given four reads across eight seconds. The
+asymmetry ran the wrong way -- the probe value carries one callback per shell context and the control
+carries one in total, so against any async fetcher the probe lands inside its window and the control
+lands just after the single read it was granted. A 200 ms race decided a CVSS 9.8. The control now
+gets the probe's full polling budget, and a FRESH bare control is re-sent and polled as well, which
+also covers an app that only services the second request from a new IP and a fleet where the control
+happened to land on a node without the fetcher. Either control answering means no RCE is claimed.
+
+The callback's User-Agent is read now, too. The payload only ever runs curl or wget, so a hit whose
+UA names an application HTTP client is evidence against the shell claim and downgrades it; an absent
+or unrecognised UA still confirms, because the bare-URL control is the primary control and an egress
+proxy may rewrite the header. That gate is deliberately local to this prover -- blind SSRF, XXE and
+the JWT key-source probe are all *supposed* to be answered by an application client. And a sweep
+where every token failed its pre-probe control now reports `not-probed` rather than `no-callback`:
+nothing was sent, so "no callback observed" would be a false negative wearing the costume of a clean
+result.
+
+**A self-signed token is now tested without any infrastructure at all.** The jku/x5u probe above
+needs a collaborator, and plenty of hunts run without one configured — so the same idea is also
+covered in the ordinary pass, for the case where the attacker does not have to host anything: the key
+travels *inside* the token. `_check_jwt_jwk_embedded` mints an RSA keypair, embeds the public half in
+the forged token's `jwk` header, signs with the private half, and a verifier that trusts the embedded
+key validates it. It reuses the alg:none scaffold exactly — the real token authenticates, a
+corrupted-signature copy is REJECTED (so the server does verify, and a server that verifies nothing is
+never credited to this check), and the self-signed copy is ACCEPTED with the same authenticated body.
+The claims are carried over byte for byte: what is proven is that an attacker-chosen key is trusted,
+never a privilege granted to ourselves.
+
+**The politeness floor no longer applies to loopback.** Seating the full suite made every local E2E
+pass spend up to 99 requests at the 500 ms inter-request floor, which turned one module of the test
+suite from 67 s into 236 s. That floor exists to be gentle with somebody else's server — a target, a staging
+box, a third party — and the machine the process is already running on is none of those. The token
+bucket, which is the part that actually bounds what a host absorbs, is unchanged for every host
+including loopback; only the pacing is dropped, and only where there is nobody to pace for. Matched as
+a full dotted-quad, not a `127.` prefix, because `127.example.com` is a name anyone can register and a
+pacing exemption should never be something an attacker can name for themselves.
+
+**Three checks that could not fire, and two taxonomies that disagreed with themselves.**
+
+- The offline HMAC crack reached its token only through an operator credential, so
+  `_check_jwt_weak_secret` returned `None` before doing anything in every unauthenticated hunt — the
+  exact hunt where an app handing an anonymous visitor an HS256 guest token signed with `secret` is
+  worth catching, and where the crack costs zero requests. It now reads the token the target itself
+  handed back, like its two siblings. Its live corroboration had to be tightened to match: on that
+  path the baseline is not automatically authenticated, so a public page answering 200 to any
+  `Authorization` header was narrated as the server accepting a forged token. A body-match gate alone
+  did not fix it either: on a wholly public endpoint the two responses are identical precisely BECAUSE
+  the server ignored both tokens, so it reported "was accepted, body match 100%" about a server that
+  never looked. It now takes the same corrupted-signature control its two siblings take -- the copy
+  with a broken signature must be REJECTED before any acceptance is narrated. The finding itself was
+  always confirmed by the offline crack; it was the corroboration that was fabricated.
+- The command-injection probe `break`ed its parameter loop on a transient network error while its own
+  control `continue`d, so one reset on the first candidate discarded every remaining candidate.
+- Nine classes name two CWEs because one rarely covers a class, and taxonomy routing read only the
+  first. A program that enables CWE-94 but not CWE-78 matched nothing for a *confirmed* RCE, so the
+  report filed with no machine-readable weakness and landed in the triage backlog. Both mapping
+  functions now try each id in order, primary first.
+- Bugcrowd's VRT parented RCE under Server Security Misconfiguration while the same file's other row
+  and `taxonomy._CWE_TO_VRT` both put it under Server-Side Injection. That entry is the primary source
+  for a Bugcrowd submission, so every RCE the engine filed there carried the wrong category.
+- The one debug endpoint classed `rce` reported confirmed CRITICAL code execution on reachability
+  alone. Unauthenticated Jolokia is a genuine critical and keeps its severity, but the check proves an
+  exposed management port, not a running command, and the proof now says so — reporting reachability
+  as demonstrated execution is the exact over-claim the evidence rule exists to prevent.
+
 ## v4.3.0 - the engine acts on what it worked out
 
 GreyIQ has always been good at reaching a conclusion and bad at using it. Three places computed

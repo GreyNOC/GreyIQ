@@ -642,10 +642,19 @@ class SupervisorLoopTests(unittest.TestCase):
                                             "seed_targets": ["https://b.com"], "auto_submit": False})
         calls: list[str] = []
         started = threading.Event()
+        kill_engaged = threading.Event()
 
         def run_campaign_fn(target, *, scope, program, active, live, deep=False, max_pages=12):
             calls.append(program)
             started.set()
+            # HOLD the supervisor inside the first program's campaign until the test has actually
+            # engaged the kill switch. Without this the test only *hoped* to win a race: it set the
+            # event after started.wait() returned, while the supervisor was already running out the
+            # tail of _run_one (touch_run + emits) toward the p2 check. On a loaded runner the
+            # supervisor got there first and p2 ran, so the test failed intermittently in CI while
+            # passing locally. The product ordering under test -- the per-program
+            # `if self.stop_event.is_set(): break` -- is unchanged and is still what is asserted.
+            self.assertTrue(kill_engaged.wait(timeout=5), "the test must engage the kill switch first")
             return {"ok": True, "run_id": "r", "findings": [], "proof_of_impact": {}}
 
         loop = OperatorLoop(self.rt, run_campaign_fn=run_campaign_fn, submit_fn=lambda *a, **k: {})
@@ -656,6 +665,7 @@ class SupervisorLoopTests(unittest.TestCase):
         # ever reaching the second due program.
         self.assertTrue(started.wait(timeout=5))
         loop.stop_event.set()
+        kill_engaged.set()
         thread.join(timeout=5)
         self.assertFalse(thread.is_alive())
         self.assertEqual(calls, ["p1"])  # p2 never ran

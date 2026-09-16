@@ -2456,6 +2456,23 @@ def _run_bounty_hunt_body(
             except Exception as exc:  # noqa: BLE001 - an optimizer pass never breaks a hunt
                 _emit(f"re-plan wave skipped: {exc}")
 
+        def _oob_governor():
+            """The SAME process-wide per-host bucket the active pass draws from.
+
+            Each OOB prover used to build its own private governor, so the per-host ceiling the
+            settings call "process-wide" was really that number ONCE PER PROVER — four separate
+            allowances against one host in a single hunt. Actual spend stayed small (each prover's
+            _Http caps itself), so this was a ceiling that did not mean what it said rather than a
+            live over-send; a program with an avoid_dos policy is owed the real number.
+            """
+            # ``settings`` is an OPTIONAL parameter of this function and is routinely None (the OOB
+            # provers each resolve their own default), so it must be resolved here before any attribute
+            # is read — dereferencing it directly raised inside the best-effort blocks below, which
+            # swallowed it as "probe error" and quietly skipped both new classes.
+            cfg = settings or active_verify_service.get_settings()
+            return shared_governor(capacity=cfg.active_max_requests_per_host,
+                                   min_interval_s=cfg.active_min_interval_ms / 1000.0)
+
         # Blind SSRF over the OOB collaborator — the one active probe that needs external infra, so
         # it runs only when the operator has configured a collaborator (base+secret). It injects a
         # fresh, unguessable callback token per candidate param, probes, and polls the collaborator;
@@ -2467,7 +2484,7 @@ def _run_bounty_hunt_body(
                 ssrf = oob_service.confirm_blind_ssrf(clean_target, base=oob_base, secret=oob_secret,
                                                       scope=scope, settings=settings,
                                                       extra_params=effective_extra_params,
-                                                      priority=ssrf_params)
+                                                      priority=ssrf_params, governor=_oob_governor())
                 if ssrf.get("ok") and ssrf.get("finding") and ssrf.get("status") in ("confirmed", "candidate"):
                     raw_findings = list(raw_findings) + [ssrf["finding"]]
                     if "active" not in scanners_run:
@@ -2498,6 +2515,55 @@ def _run_bounty_hunt_body(
                     _emit(f"blind-XXE OOB: {xxe.get('status') or xxe.get('error') or 'no callback'}")
             except Exception as exc:  # noqa: BLE001
                 _emit(f"blind-XXE OOB probe error: {exc}")
+
+        # Blind OS command injection over the same collaborator. The in-pass prover can only confirm
+        # command injection the target hands back — an echoed arithmetic substitution, or a response it
+        # delays. Unauthenticated RCE routinely does neither (the command runs in a worker, a queue
+        # consumer or a log pipeline and the response is a fast identical 200), which left the engine's
+        # highest-severity class provable only in its most visible form. This probes parameters AND the
+        # request headers that reach a shell without any parameter existing, and confirms only on a
+        # collaborator hit whose MATCHED bare-URL control stayed silent — so an application that merely
+        # fetches URLs it finds (an unfurler, a plain SSRF) is reported as that, never as a CRITICAL RCE.
+        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+            try:
+                _emit("running blind-RCE OOB probe (collaborator configured)…")
+                rce = oob_service.confirm_blind_rce(clean_target, base=oob_base, secret=oob_secret,
+                                                    scope=scope, settings=settings,
+                                                    extra_params=effective_extra_params,
+                                                    governor=_oob_governor())
+                if rce.get("ok") and rce.get("finding") and rce.get("status") in ("confirmed", "candidate"):
+                    raw_findings = list(raw_findings) + [rce["finding"]]
+                    if "active" not in scanners_run:
+                        scanners_run = list(scanners_run) + ["active"]
+                    _emit(f"blind-RCE OOB: {rce.get('status')} via {rce.get('param') or rce.get('header')}")
+                else:
+                    _emit(f"blind-RCE OOB: {rce.get('status') or rce.get('error') or 'no callback'}")
+            except Exception as exc:  # noqa: BLE001
+                _emit(f"blind-RCE OOB probe error: {exc}")
+
+        # JWT signing-key URL injection (jku/x5u) over the same collaborator — an unauthenticated
+        # account-takeover primitive the three in-pass JWT checks structurally cannot see. Those attack
+        # the key the server already holds; this asks whether the server lets the TOKEN name where the
+        # key comes from. A verifier that fetches an attacker-named JWKS accepts tokens signed by the
+        # attacker, i.e. any identity. It is invisible in-band (a server that fetches the URL and then
+        # rejects the token answers exactly like one that never fetched), so the fetch is the only
+        # observable and it is only observable out of band. Uses the token the app hands an ANONYMOUS
+        # visitor, so no session is needed; a target that issues none is a clean no-op.
+        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+            try:
+                _emit("running JWT key-URL injection OOB probe (collaborator configured)…")
+                jwtk = oob_service.confirm_jwt_key_injection(clean_target, base=oob_base, secret=oob_secret,
+                                                             scope=scope, settings=settings,
+                                                             governor=_oob_governor())
+                if jwtk.get("ok") and jwtk.get("finding") and jwtk.get("status") in ("confirmed", "candidate"):
+                    raw_findings = list(raw_findings) + [jwtk["finding"]]
+                    if "active" not in scanners_run:
+                        scanners_run = list(scanners_run) + ["active"]
+                    _emit(f"JWT key-URL OOB: {jwtk.get('status')} via '{jwtk.get('field')}'")
+                else:
+                    _emit(f"JWT key-URL OOB: {jwtk.get('status') or jwtk.get('error') or 'no callback'}")
+            except Exception as exc:  # noqa: BLE001
+                _emit(f"JWT key-URL OOB probe error: {exc}")
 
     # Credential validation: a leaked Firebase/Google API key is only a REAL finding if it's live.
     # Gated by ``authorized`` — it sends ONE benign, read-only GET to the credential's OWN issuer
