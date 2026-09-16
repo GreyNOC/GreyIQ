@@ -1810,6 +1810,48 @@ def _served_token_carrier(landing: dict[str, Any] | None) -> tuple[str, str, Cal
 _JWT_SCAN_CAP = 200_000  # never scan more than ~200 KB of body for a token
 
 
+def served_token_carrier(landing: dict[str, Any] | None) -> tuple[str, str, Callable[[str], str]] | None:
+    """A JWT the target served, WITH the transport it arrived on: (header_name, token, rebuild).
+
+    ``_extract_jwt_token`` looks in Set-Cookie first, and rightly so -- a cookie the site sets is its
+    own session rather than something echoed into a page -- but it returns the bare value, so every
+    caller replayed it as ``Authorization: Bearer``. A cookie-session application reads nothing from
+    that header, which costs each JWT check differently and all of them badly: the forgery never
+    reaches the verifier, the corrupted-signature control comes back 200 because the server never
+    looked at it, and the check bails. For the weak-secret check that is worse than a miss, because
+    its acceptance gate then cannot promote a GENUINE cookie-session forgery past 'candidate'.
+
+    So the cookie case rebuilds the original Cookie header with every crumb the landing response set,
+    swapping only the JWT one. Anything found elsewhere (body, response header) is a bearer token and
+    replays as one. Returns None when the response carried no usable JWT.
+    """
+    if not isinstance(landing, dict):
+        return None
+    crumbs: list[tuple[str, str]] = []
+    jwt_index = -1
+    for raw_cookie in (landing.get("cookies") or []):
+        name, sep, value = str(raw_cookie).split(";", 1)[0].partition("=")
+        name, value = name.strip(), value.strip()
+        if not sep or not name:
+            continue
+        if jwt_index < 0 and _JWT_RE.match(value):
+            jwt_index = len(crumbs)
+        crumbs.append((name, value))
+    if jwt_index >= 0:
+        def rebuild_cookie(new_token: str) -> str:
+            pairs = [(n, new_token if i == jwt_index else v) for i, (n, v) in enumerate(crumbs)]
+            return "; ".join(f"{n}={v}" for n, v in pairs)
+
+        return ("Cookie", crumbs[jwt_index][1], rebuild_cookie)
+    try:
+        token = _extract_jwt_token(landing)
+    except Exception:  # noqa: BLE001 - a crafted body is a no-op, never a crash
+        token = ""
+    if not token:
+        return None
+    return ("Authorization", token, lambda new_token: f"Bearer {new_token}")
+
+
 def _forge_alg_none_variants(token: str) -> list[str]:
     """The alg:none-forged variants of `token` (same header keys except alg, SAME
     payload bytes, empty signature) -- both the RFC-correct 'header.payload.' form
@@ -1860,7 +1902,9 @@ def _body_similar(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, na, nb).ratio()
 
 
-def _check_jwt_alg_none(http: _Http, url: str, discovered_token: str = "") -> dict[str, Any] | None:
+def _check_jwt_alg_none(http: _Http, url: str, discovered_token: str = "", *,
+                        discovered_carrier: tuple[str, str, Callable[[str], str]] | None = None,
+                        ) -> dict[str, Any] | None:
     """Confirm the server accepts an UNSIGNED (alg:none) copy of a real session token as
     authenticated — one of the highest-signal, lowest-effort JWT bugs in real programs.
 
@@ -1877,6 +1921,11 @@ def _check_jwt_alg_none(http: _Http, url: str, discovered_token: str = "") -> di
     baseline_headers: dict[str, str] | None = None
     if found is not None:
         header_name, real_token, rebuild = found
+    elif discovered_carrier is not None:
+        # The transport the token actually arrived on (see _served_token_carrier). Preferred over the
+        # bare value, because replaying a cookie session as a bearer header reaches no verifier at all.
+        header_name, real_token, rebuild = discovered_carrier
+        baseline_headers = {header_name: rebuild(real_token)}
     elif discovered_token and _JWT_RE.match(discovered_token):
         # The target handed us a JWT but the operator supplied no auth — test the app's OWN token.
         header_name, real_token = "Authorization", discovered_token
@@ -1972,7 +2021,9 @@ def _rsa_jwk_and_signer() -> tuple[dict[str, str], Any] | None:
     return jwk, (lambda data: key.sign(data, padding.PKCS1v15(), hashes.SHA256()))
 
 
-def _check_jwt_jwk_embedded(http: _Http, url: str, discovered_token: str = "") -> dict[str, Any] | None:
+def _check_jwt_jwk_embedded(http: _Http, url: str, discovered_token: str = "", *,
+                            discovered_carrier: tuple[str, str, Callable[[str], str]] | None = None,
+                            ) -> dict[str, Any] | None:
     """Confirm the server verifies a token with a key the TOKEN ITSELF carries (the ``jwk`` JOSE
     header, CVE-2018-0114's class) — unauthenticated, total token forgery.
 
@@ -1994,6 +2045,11 @@ def _check_jwt_jwk_embedded(http: _Http, url: str, discovered_token: str = "") -
     baseline_headers: dict[str, str] | None = None
     if found is not None:
         header_name, real_token, rebuild = found
+    elif discovered_carrier is not None:
+        # The transport the token actually arrived on (see _served_token_carrier). Preferred over the
+        # bare value, because replaying a cookie session as a bearer header reaches no verifier at all.
+        header_name, real_token, rebuild = discovered_carrier
+        baseline_headers = {header_name: rebuild(real_token)}
     elif discovered_token and _JWT_RE.match(discovered_token):
         header_name, real_token = "Authorization", discovered_token
         rebuild = lambda new: f"Bearer {new}"  # noqa: E731
@@ -2135,7 +2191,9 @@ def _fetch_rsa_public_pems(http: _Http, url: str, kid: str = "") -> list[bytes]:
     return pems[:4]
 
 
-def _check_jwt_alg_confusion(http: _Http, url: str, discovered_token: str = "") -> dict[str, Any] | None:
+def _check_jwt_alg_confusion(http: _Http, url: str, discovered_token: str = "", *,
+                             discovered_carrier: tuple[str, str, Callable[[str], str]] | None = None,
+                             ) -> dict[str, Any] | None:
     """Confirm RS256->HS256 ALGORITHM CONFUSION: the server verifies its JWTs with an RSA PUBLIC key
     but can be tricked into treating a token as HS256 (symmetric), so a token HMAC-signed with that
     PUBLIC key — which anyone can fetch from the JWKS — is accepted as authentic. Token forgery / full
@@ -2145,6 +2203,11 @@ def _check_jwt_alg_confusion(http: _Http, url: str, discovered_token: str = "") 
     baseline_headers: dict[str, str] | None = None
     if found is not None:
         header_name, real_token, rebuild = found
+    elif discovered_carrier is not None:
+        # The transport the token actually arrived on (see _served_token_carrier). Preferred over the
+        # bare value, because replaying a cookie session as a bearer header reaches no verifier at all.
+        header_name, real_token, rebuild = discovered_carrier
+        baseline_headers = {header_name: rebuild(real_token)}
     elif discovered_token and _JWT_RE.match(discovered_token):
         header_name, real_token = "Authorization", discovered_token
         rebuild = lambda new: f"Bearer {new}"  # noqa: E731
@@ -2802,14 +2865,17 @@ def verify_active(
         # request budget before they're reached: alg:none fires on the operator's OR the target's own
         # JWT (weak-secret cracks the HMAC key OFFLINE and spends requests only on a hit), and GraphQL
         # introspection only fires on a graphql-shaped path.
-        ("jwt", lambda: _check_jwt_alg_none(http, sanitized, discovered_token=discovered_jwt)),
-        ("jwt", lambda: _check_jwt_alg_confusion(http, sanitized, discovered_token=discovered_jwt)),
+        ("jwt", lambda: _check_jwt_alg_none(http, sanitized, discovered_token=discovered_jwt,
+                                            discovered_carrier=discovered_carrier)),
+        ("jwt", lambda: _check_jwt_alg_confusion(http, sanitized, discovered_token=discovered_jwt,
+                                                 discovered_carrier=discovered_carrier)),
         ("jwt", lambda: _check_jwt_weak_secret(http, sanitized, discovered_carrier=discovered_carrier)),
         # Embedded-key forgery: the token carries the public half of a key we just generated, so a
         # verifier that trusts the jwk header validates a token we signed. Unlike the jku/x5u probe in
         # oob_service it needs no collaborator and no hosted key, so it is the one total-forgery check
         # that fires on a hunt with no out-of-band infrastructure configured at all.
-        ("jwt", lambda: _check_jwt_jwk_embedded(http, sanitized, discovered_token=discovered_jwt)),
+        ("jwt", lambda: _check_jwt_jwk_embedded(http, sanitized, discovered_token=discovered_jwt,
+                                                discovered_carrier=discovered_carrier)),
         ("graphql", lambda: _check_graphql_introspection(http, sanitized)),
         # Schema disclosure via error field-suggestions — fires even when introspection is disabled,
         # so it catches the leak the introspection check misses. Graphql-path-gated, one benign query.

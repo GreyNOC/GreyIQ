@@ -693,21 +693,31 @@ class WeakSecretTransportTests(unittest.TestCase):
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0]["_active_proof"]["status"], "confirmed")
         self.assertIn("corrupted-signature copy was rejected", findings[0]["_active_proof"]["control_result"])
+        # Asserted as invariants over the cookie traffic rather than as a fixed request count: ALL
+        # FOUR JWT checks take the carrier now, not only this one, so the number of cookie-carrying
+        # requests is a property of the suite rather than of the behaviour under test.
         cookie_requests = [(headers, status) for headers, status in zip(http.headers_sent[1:], http.statuses)
                            if "Cookie" in headers]
-        self.assertEqual([status for _, status in cookie_requests], [200, 401, 200])
+        self.assertTrue(cookie_requests)
         replayed = []
         for headers, _ in cookie_requests:
             self.assertEqual(set(headers), {"Cookie"})
             cookies = dict(crumb.split("=", 1) for crumb in headers["Cookie"].split("; "))
-            self.assertEqual(cookies["csrf"], "abc123")
+            self.assertEqual(cookies["csrf"], "abc123")   # every sibling crumb survives the rebuild
             self.assertEqual(cookies["theme"], "dark")
             replayed.append(cookies["session"])
-        self.assertEqual(replayed[0], http.real)
-        self.assertNotEqual(replayed[1], http.real)
-        self.assertNotEqual(replayed[2], http.real)
-        forged_payload = json.loads(base64.urlsafe_b64decode(replayed[2].split(".")[1] + "=="))
-        self.assertEqual(forged_payload, {"sub": "guest", "greyiq_poc": av._MARK})
+        # The real token was replayed (the authenticated baseline), and a forgery carrying the benign
+        # marker claim was accepted -- which is what the weak-secret corroboration rests on.
+        self.assertIn(http.real, replayed)
+        forged = [t for t in replayed if t != http.real]
+        self.assertTrue(forged)
+        poc = [t for t in forged
+               if json.loads(base64.urlsafe_b64decode(t.split(".")[1] + "==")).get("greyiq_poc") == av._MARK]
+        self.assertEqual(len(poc), 1, "exactly one marker-claim forgery is replayed")
+        self.assertEqual(json.loads(base64.urlsafe_b64decode(poc[0].split(".")[1] + "==")),
+                         {"sub": "guest", "greyiq_poc": av._MARK})
+        # A corrupted-signature copy was replayed on the same carrier and rejected.
+        self.assertIn(401, [status for _, status in cookie_requests])
 
     def test_cookie_token_ignored_by_public_endpoint_stays_a_candidate(self) -> None:
         http = self._SigningServer(ignores_tokens=True)
@@ -715,7 +725,9 @@ class WeakSecretTransportTests(unittest.TestCase):
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0]["_active_proof"]["status"], "candidate")
         self.assertNotIn("was accepted", findings[0]["_active_proof"]["control_result"])
-        self.assertEqual(len([headers for headers in http.headers_sent if "Cookie" in headers]), 3)
+        # Again a property, not a count: what matters is that the replay used the cookie carrier at
+        # all, and that a server ignoring tokens still cannot produce an "accepted" narrative.
+        self.assertTrue([headers for headers in http.headers_sent if "Cookie" in headers])
 
     def test_active_pass_keeps_body_and_header_tokens_on_bearer_transport(self) -> None:
         for source in ("body", "header"):
@@ -752,7 +764,7 @@ class ServedTokenTransportTests(unittest.TestCase):
         token = _hs_token("secret")
         landing = {"cookies": ["csrf=abc123; Path=/", "session=" + token + "; HttpOnly", "theme=dark"],
                    "body": "", "headers": {}}
-        name, found, rebuild = oob._served_token_carrier(landing)
+        name, found, rebuild = av._served_token_carrier(landing)
         self.assertEqual(name, "Cookie")
         self.assertEqual(found, token)
         # Every crumb survives; only the JWT one is swapped.
@@ -760,14 +772,67 @@ class ServedTokenTransportTests(unittest.TestCase):
 
     def test_a_body_token_is_replayed_as_a_bearer(self) -> None:
         token = _hs_token("secret")
-        name, found, rebuild = oob._served_token_carrier(
+        name, found, rebuild = av._served_token_carrier(
             {"cookies": [], "body": json.dumps({"access_token": token}), "headers": {}})
         self.assertEqual(name, "Authorization")
         self.assertEqual(rebuild("FORGED"), "Bearer FORGED")
 
     def test_no_token_yields_no_carrier(self) -> None:
-        self.assertIsNone(oob._served_token_carrier({"cookies": [], "body": "nothing", "headers": {}}))
-        self.assertIsNone(oob._served_token_carrier(None))
+        self.assertIsNone(av._served_token_carrier({"cookies": [], "body": "nothing", "headers": {}}))
+        self.assertIsNone(av._served_token_carrier(None))
+
+    def test_a_cookie_session_weak_secret_is_promoted_to_confirmed(self) -> None:
+        """The carrier is what lets the acceptance gate settle a genuine cookie-session forgery.
+
+        Gating the discovered-token path on server acceptance (so a docs sample stays a candidate)
+        only works if the forged token reaches the verifier. Replayed as a bearer header against a
+        cookie-session app it reaches nothing, so a REAL vulnerability would have been stuck at
+        candidate -- the gate turning into a false negative instead of the false positive it removed.
+        """
+        real = _hs_token("secret")
+        page = "the authenticated account page for user 42"
+
+        class _CookieOnly(_FakeHttp):
+            """Reads its session only from Cookie, and actually verifies the HS256 signature."""
+
+            def fetch(self, url, *, method="GET", extra_headers=None, read_body=True):
+                super().fetch(url, method=method, extra_headers=extra_headers, read_body=read_body)
+                token = ""
+                for crumb in (extra_headers or {}).get("Cookie", "").split(";"):
+                    name, _, value = crumb.strip().partition("=")
+                    if name == "session":
+                        token = value
+                good = False
+                parts = token.split(".")
+                if len(parts) == 3:
+                    expected = base64.urlsafe_b64encode(hmac.new(
+                        b"secret", (parts[0] + "." + parts[1]).encode(), hashlib.sha256).digest()
+                    ).rstrip(b"=").decode()
+                    good = expected == parts[2]
+                return {"status": 200 if good else 401, "headers": {},
+                        "body": page if good else "please log in", "cookies": [],
+                        "final_url": url, "location": None, "elapsed": 0.01}
+
+        landing = {"cookies": ["csrf=abc", "session=" + real + "; HttpOnly"], "body": "", "headers": {}}
+        carrier = av._served_token_carrier(landing)
+        with_carrier = av._check_jwt_weak_secret(_CookieOnly(), "https://app.example.com/",
+                                                 discovered_carrier=carrier)
+        self.assertIsNotNone(with_carrier)
+        self.assertEqual(with_carrier["_active_proof"]["status"], "confirmed")
+
+        # The same application, replayed the old way, cannot be settled: the header is read by nothing.
+        as_bearer = av._check_jwt_weak_secret(_CookieOnly(), "https://app.example.com/",
+                                              discovered_token=real)
+        self.assertEqual(as_bearer["_active_proof"]["status"], "candidate")
+
+    def test_verify_active_hands_the_carrier_to_the_jwt_checks(self) -> None:
+        # The wiring, not just the helper: a landing response that sets a JWT cookie must reach the
+        # checks as a Cookie carrier, or none of the above applies in a real pass.
+        import inspect
+        source = inspect.getsource(av.verify_active)
+        self.assertIn("_served_token_carrier(landing)", source)
+        self.assertEqual(source.count("discovered_carrier=discovered_carrier"), 4,
+                         "all four JWT checks must receive the carrier")
 
     def test_the_key_probe_sends_a_cookie_token_back_as_a_cookie(self) -> None:
         # Regression: a cookie-session app never saw the forged token, so the probe could not provoke

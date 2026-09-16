@@ -79,11 +79,19 @@ implies, with the remaining step named in the plan rather than assumed.
 **A discovered token is replayed on the transport it arrived on.** `_extract_jwt_token` looks in
 Set-Cookie first, and rightly so -- a cookie a site sets is its own session rather than something
 echoed into a page -- but it returns the bare value, so every caller replayed it as
-`Authorization: Bearer`. Against a cookie-session application that header is read by nothing: the
-forged token never reaches the verifier, the jku/x5u probe cannot provoke the fetch it exists to
-observe, and the result is a clean-looking "no callback" on a target that may well be vulnerable. The
-cookie case now rebuilds the original Cookie header with every crumb the response set, swapping only
-the JWT one.
+`Authorization: Bearer`. Against a cookie-session application that header is read by nothing, and the
+cost differs per check while being bad in all of them: the forged token never reaches the verifier,
+the corrupted-signature control comes back 200 because the server never looked at it, and the check
+bails. The jku/x5u probe reported a clean "no callback" on a target that may well be vulnerable.
+
+For the weak-secret check it was worse than a miss. Gating the discovered-token path on server
+acceptance -- the fix that stops a docs sample being called a confirmed forgery -- only settles
+anything if the forgery actually reaches the verifier, so a bearer replay turned that gate into a
+false NEGATIVE on cookie sessions: a genuine weak-secret takeover stuck at candidate, unsubmittable.
+`served_token_carrier` now returns the transport alongside the token, the cookie case rebuilds the
+original Cookie header with every crumb the response set and swaps only the JWT one, and all four JWT
+checks plus the out-of-band key-source probe take it. A token found in a body or a response header is
+a bearer token and still replays as one.
 
 **What separates command execution from an app that merely fetches URLs.** The blind-RCE probe's
 entire severity rests on a matched control: the same callback URL, sent as a BARE value, must stay
