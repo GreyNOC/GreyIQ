@@ -1771,6 +1771,42 @@ def _extract_jwt_token(response: dict[str, Any] | None) -> str:
     return ""
 
 
+def _served_token_carrier(landing: dict[str, Any] | None) -> tuple[str, str, Callable[[str], str]] | None:
+    """A served JWT as (header_name, token, rebuild), preserving its replay transport.
+
+    Set-Cookie tokens keep every companion cookie, replacing only the JWT crumb.
+    Tokens found in the body or other headers retain the bearer-token fallback.
+    Shared with the OOB prover so both paths use the same cookie reconstruction.
+    """
+    if not isinstance(landing, dict):
+        return None
+    crumbs: list[tuple[str, str]] = []
+    jwt_index = -1
+    for raw_cookie in (landing.get("cookies") or []):
+        name, sep, value = str(raw_cookie).split(";", 1)[0].partition("=")
+        name, value = name.strip(), value.strip()
+        if not sep or not name:
+            continue
+        if jwt_index < 0 and _JWT_RE.match(value):
+            jwt_index = len(crumbs)
+        crumbs.append((name, value))
+    if jwt_index >= 0:
+        token = crumbs[jwt_index][1]
+
+        def rebuild_cookie(new_token: str) -> str:
+            pairs = [(n, new_token if i == jwt_index else v) for i, (n, v) in enumerate(crumbs)]
+            return "; ".join("{0}={1}".format(n, v) for n, v in pairs)
+
+        return ("Cookie", token, rebuild_cookie)
+    try:
+        token = _extract_jwt_token(landing)
+    except Exception:  # noqa: BLE001 - a crafted body is a no-op, never a crash
+        token = ""
+    if not token:
+        return None
+    return ("Authorization", token, lambda new_token: "Bearer {0}".format(new_token))
+
+
 _JWT_SCAN_CAP = 200_000  # never scan more than ~200 KB of body for a token
 
 
@@ -2231,7 +2267,13 @@ def _crack_jwt_hs_secret(token: str) -> tuple[str, str] | None:
     return None
 
 
-def _check_jwt_weak_secret(http: _Http, url: str, discovered_token: str = "") -> dict[str, Any] | None:
+def _check_jwt_weak_secret(
+    http: _Http,
+    url: str,
+    discovered_token: str = "",
+    *,
+    discovered_carrier: tuple[str, str, Callable[[str], str]] | None = None,
+) -> dict[str, Any] | None:
     """Recover a weak HMAC signing secret for a JWT (OFFLINE, self-certifying), then corroborate by
     signing a MINIMALLY-MODIFIED benign token that was never issued and showing the server accepts
     it. No privilege claim is tampered with. CRITICAL — a recovered secret forges arbitrary tokens.
@@ -2246,16 +2288,21 @@ def _check_jwt_weak_secret(http: _Http, url: str, discovered_token: str = "") ->
     baseline_headers: dict[str, str] | None = None
     if found is not None:
         header_name, real_token, rebuild = found
-    elif discovered_token and _JWT_RE.match(discovered_token):
-        header_name, real_token = "Authorization", discovered_token
-        rebuild = lambda new: f"Bearer {new}"  # noqa: E731
+    else:
+        if discovered_carrier is not None:
+            header_name, real_token, rebuild = discovered_carrier
+        elif discovered_token:
+            header_name, real_token = "Authorization", discovered_token
+            rebuild = lambda new: f"Bearer {new}"  # noqa: E731
+        else:
+            return None
+        if not _JWT_RE.match(real_token):
+            return None
         # The operator-credential path gets its authenticated baseline for free (_Http.fetch attaches
         # the session same-site). A DISCOVERED token does not, so the baseline must carry the real
-        # token explicitly — otherwise the corroboration below would compare a forged-token response
-        # against an ANONYMOUS one and call a public 200 page "accepted".
+        # token on its original carrier, just like the control and forgery below. A cookie-only app
+        # ignores Authorization, so replaying a Set-Cookie token as Bearer cannot show acceptance.
         baseline_headers = {header_name: rebuild(real_token)}
-    else:
-        return None
     cracked = _crack_jwt_hs_secret(real_token)
     if cracked is None:
         return None  # the offline crack IS the finding-cost; no crack -> silent, zero requests
@@ -2272,9 +2319,11 @@ def _check_jwt_weak_secret(http: _Http, url: str, discovered_token: str = "") ->
     new_payload = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     new_sig = _b64url_encode(hmac.new(secret.encode("utf-8"), f"{new_header}.{new_payload}".encode("ascii"), digest).digest())
     forged = f"{new_header}.{new_payload}.{new_sig}"
-    # The offline crack already self-certifies; the live request only corroborates. A network
-    # failure keeps the finding confirmed (the crypto is the proof).
+    # The offline crack self-certifies HOW THE STRING WAS SIGNED. Whether this application trusts
+    # the token is a separate question, and on the discovered path it is the load-bearing one --
+    # see the status decision below.
     server_note = "the recovered secret proves forgery offline (self-certifying); not sent to the server"
+    accepted = False
     try:
         baseline = http.fetch(url, extra_headers=baseline_headers) if baseline_headers else http.fetch(url)
         # NEGATIVE CONTROL, the same one alg:none and alg-confusion take before either narrates a
@@ -2293,6 +2342,7 @@ def _check_jwt_weak_secret(http: _Http, url: str, discovered_token: str = "") ->
                 and 200 <= int(baseline.get("status") or 0) < 300):
             same = _body_similar(str(baseline.get("body") or ""), str(probe.get("body") or ""))
             if same >= _JWT_BODY_SAME:
+                accepted = True
                 server_note = (f"a token forged with the recovered secret (a claim that was never issued) was "
                                f"accepted (HTTP {probe['status']}) and returned the same content as the real "
                                f"token (HTTP {baseline['status']}, body match {same:.0%}), while a "
@@ -2300,17 +2350,36 @@ def _check_jwt_weak_secret(http: _Http, url: str, discovered_token: str = "") ->
                                f"server does verify, and it accepted our signature")
     except _ActiveError:
         pass
+    # WHOSE TOKEN IS IT. A credential the OPERATOR supplied is a live session by construction, so
+    # cracking it proves their own token is forgeable and the byte-equality is the whole proof. A
+    # token merely READ OUT OF THE PAGE is not that. It may be a documentation sample -- the jwt.io
+    # example token is signed with "your-256-bit-secret", which is in the weak list above -- and
+    # cracking that proves how a string in someone's docs was signed, not that this application
+    # trusts it. Reporting that as a confirmed CRITICAL forgery is a false positive of exactly the
+    # kind the evidence rule exists to stop, so the discovered path has to SHOW the server honouring
+    # a forged token before it claims one. Without that it is a candidate, which is honest: a weak
+    # signing secret sitting in a served token is worth a look even when its owner is unclear.
+    discovered_only = found is None
+    status = "confirmed" if (accepted or not discovered_only) else "candidate"
+    limitations = "" if status == "confirmed" else (
+        "The token was read out of the target's own response rather than supplied as a credential, and the "
+        "server was not shown to accept a token forged with the recovered secret. The weak secret is proven by "
+        "byte-equality; that this application TRUSTS this token is not. Replay a forged token against an "
+        "endpoint that requires the session to settle it -- a sample token in documentation cracks identically."
+    )
     proof = _proof(
-        "confirmed", method=f"offline HMAC-{alg} crack of the JWT signing secret",
+        status, method=f"offline HMAC-{alg} crack of the JWT signing secret",
         affected_asset="every identity/role/scope the token asserts — arbitrary token forgery",
         observed_result=f"the {alg} signing secret is a well-known weak value ('{secret}'), recovered offline by byte-matching HMAC-{alg} of the token's own signing input",
         control_result=server_note,
         evidence=f"HMAC-{alg}(header.payload, weak-secret) equals the token's real signature — cryptographic byte-equality, self-certifying",
+        limitations=limitations,
     )
     ev = {"request_line": f"GET {url}", "request_header": f"{header_name}: <token forged with the recovered secret>",
           "response_status": "offline crack (self-certifying)", "matched_value": f"weak HMAC-{alg} signing secret recovered: '{secret}'"}
-    return _finding("active.jwt-weak-secret", "JWT signed with a weak/guessable secret (arbitrary token forgery)",
-                    "critical", "jwt", "jwt", url, proof, ev)
+    title = ("JWT signed with a weak/guessable secret (arbitrary token forgery)" if status == "confirmed" else
+             "JWT served by the target is signed with a weak/guessable secret (acceptance not shown)")
+    return _finding("active.jwt-weak-secret", title, "critical", "jwt", "jwt", url, proof, ev)
 
 
 # Traversal payload -> the unmistakable signature of the file it reads. Each is gated by a
@@ -2708,16 +2777,16 @@ def verify_active(
         landing = None
 
     results: list[dict[str, Any]] = []
-    # A JWT the TARGET ITSELF handed back in the landing response (Set-Cookie / body / header) — reused
-    # by the alg:none check when the operator supplied no JWT credential, so it can test the app's OWN
-    # token for a signature-verification bypass. Extracted from a response already fetched (no request);
-    # the check re-validates the token authenticates before proving anything, so a stray token is a no-op.
+    # Preserve the carrier of a JWT the target served so the weak-secret acceptance gate sends the
+    # baseline, control and forgery on the same transport. Other JWT checks still take the bare value.
+    # Extraction reuses the landing response and costs no request.
     # This runs OUTSIDE the per-check try/except below, so belt-and-suspenders: a malformed landing
     # body (e.g. a crafted token whose header blows the recursion limit) must never abort the pass.
     try:
-        discovered_jwt = _extract_jwt_token(landing)
+        discovered_carrier = _served_token_carrier(landing)
     except Exception:  # noqa: BLE001 - a crafted landing body is a no-op, never a crash
-        discovered_jwt = ""
+        discovered_carrier = None
+    discovered_jwt = discovered_carrier[1] if discovered_carrier is not None else ""
     # Order: header-only first (cheap), then the request-heavier probes. Each check
     # is wrapped so a budget exhaustion stops cleanly without raising.
     # Each check is tagged with the normalized vuln class it confirms, so the reasoning layer's
@@ -2735,7 +2804,7 @@ def verify_active(
         # introspection only fires on a graphql-shaped path.
         ("jwt", lambda: _check_jwt_alg_none(http, sanitized, discovered_token=discovered_jwt)),
         ("jwt", lambda: _check_jwt_alg_confusion(http, sanitized, discovered_token=discovered_jwt)),
-        ("jwt", lambda: _check_jwt_weak_secret(http, sanitized, discovered_token=discovered_jwt)),
+        ("jwt", lambda: _check_jwt_weak_secret(http, sanitized, discovered_carrier=discovered_carrier)),
         # Embedded-key forgery: the token carries the public half of a key we just generated, so a
         # verifier that trusts the jwk header validates a token we signed. Unlike the jku/x5u probe in
         # oob_service it needs no collaborator and no hosted key, so it is the one total-forgery check

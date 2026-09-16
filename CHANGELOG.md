@@ -76,6 +76,15 @@ application hands an *anonymous* visitor, which is what makes it a no-session pr
 issues none is a clean no-op. It is scored for the fetch it proved (7.5) and not the takeover it
 implies, with the remaining step named in the plan rather than assumed.
 
+**A discovered token is replayed on the transport it arrived on.** `_extract_jwt_token` looks in
+Set-Cookie first, and rightly so -- a cookie a site sets is its own session rather than something
+echoed into a page -- but it returns the bare value, so every caller replayed it as
+`Authorization: Bearer`. Against a cookie-session application that header is read by nothing: the
+forged token never reaches the verifier, the jku/x5u probe cannot provoke the fetch it exists to
+observe, and the result is a clean-looking "no callback" on a target that may well be vulnerable. The
+cookie case now rebuilds the original Cookie header with every crumb the response set, swapping only
+the JWT one.
+
 **What separates command execution from an app that merely fetches URLs.** The blind-RCE probe's
 entire severity rests on a matched control: the same callback URL, sent as a BARE value, must stay
 silent. The first draft adjudicated that control with a single zero-delay read at the instant the
@@ -130,6 +139,13 @@ pacing exemption should never be something an attacker can name for themselves.
   never looked. It now takes the same corrupted-signature control its two siblings take -- the copy
   with a broken signature must be REJECTED before any acceptance is narrated. The finding itself was
   always confirmed by the offline crack; it was the corroboration that was fabricated.
+
+  Reaching a served token also changed what the finding may CLAIM. Cracking a string proves how that
+  string was signed, never that this application trusts it -- and a docs page showing an example token
+  cracks identically, because jwt.io's own sample is signed with `your-256-bit-secret`, which sits in
+  the weak-secret list. So an operator-supplied credential, a live session by construction, stays
+  confirmed on the crypto alone, while a token read out of the target's own response is a CANDIDATE
+  until the server is shown to honour a token forged with that secret.
 - The command-injection probe `break`ed its parameter loop on a transient network error while its own
   control `continue`d, so one reset on the first candidate discarded every remaining candidate.
 - Nine classes name two CWEs because one rarely covers a class, and taxonomy routing read only the

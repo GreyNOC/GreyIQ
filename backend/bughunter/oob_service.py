@@ -62,14 +62,14 @@ from bughunter.active_verify_service import (
     _JWT_RE,
     _b64url_decode,
     _b64url_encode,
-    _extract_jwt_token,
+    _served_token_carrier,
     _Http,
     _NoRedirect,
     _candidate_params,
     _with_query,
     host_in_active_scope,
 )
-from bughunter.rate_limit import HostRateGovernor
+from bughunter.rate_limit import HostRateGovernor, shared_governor
 from bughunter.settings import get_settings
 from bughunter.web_ingest import WebsiteFetchError, guarded_dns_scope, normalize_website_url
 from bughunter.web_scan_service import _USER_AGENT, _guard_url, current_user_agent
@@ -251,7 +251,11 @@ def confirm_blind_ssrf(
     except WebsiteFetchError as exc:
         return {"ok": False, "error": f"target refused by the URL guard: {exc}"}
 
-    governor = governor or HostRateGovernor(
+    # The PROCESS-WIDE bucket by default, not a private one. A caller that omits governor= (the API
+    # confirm routes do) was otherwise handed its own allowance, so the per-host ceiling the settings
+    # call process-wide was really that number once per prover, and concurrent hunts against one host
+    # sent their OOB traffic entirely outside the budget the main active pass draws down.
+    governor = governor or shared_governor(
         capacity=settings.active_max_requests_per_host, min_interval_s=settings.active_min_interval_ms / 1000.0)
     http = http or _Http(settings, governor, max_requests=10)
     # The brain's SSRF picks (params it judges take a URL/host here — image_url, webhook, feed, …) are
@@ -888,7 +892,11 @@ def confirm_blind_rce(
     except WebsiteFetchError as exc:
         return {"ok": False, "error": "target refused by the URL guard: {0}".format(exc)}
 
-    governor = governor or HostRateGovernor(
+    # The PROCESS-WIDE bucket by default, not a private one. A caller that omits governor= (the API
+    # confirm routes do) was otherwise handed its own allowance, so the per-host ceiling the settings
+    # call process-wide was really that number once per prover, and concurrent hunts against one host
+    # sent their OOB traffic entirely outside the budget the main active pass draws down.
+    governor = governor or shared_governor(
         capacity=settings.active_max_requests_per_host, min_interval_s=settings.active_min_interval_ms / 1000.0)
     http = http or _Http(settings, governor, max_requests=12)
     timeout = settings.web_fetch_timeout_seconds
@@ -1238,21 +1246,27 @@ def confirm_jwt_key_injection(
     except WebsiteFetchError as exc:
         return {"ok": False, "error": "target refused by the URL guard: {0}".format(exc)}
 
-    governor = governor or HostRateGovernor(
+    # The PROCESS-WIDE bucket by default, not a private one. A caller that omits governor= (the API
+    # confirm routes do) was otherwise handed its own allowance, so the per-host ceiling the settings
+    # call process-wide was really that number once per prover, and concurrent hunts against one host
+    # sent their OOB traffic entirely outside the budget the main active pass draws down.
+    governor = governor or shared_governor(
         capacity=settings.active_max_requests_per_host, min_interval_s=settings.active_min_interval_ms / 1000.0)
     http = http or _Http(settings, governor, max_requests=6)
     timeout = settings.web_fetch_timeout_seconds
 
     real_token = str(jwt or "").strip()
+    # An operator-supplied token is a bare value, so it can only be replayed as a bearer token. One we
+    # find ourselves is replayed on the transport it arrived on -- see _served_token_carrier.
+    header_name, rebuild = "Authorization", (lambda new_token: "Bearer {0}".format(new_token))
     if not real_token:
         try:
             landing = http.fetch(sanitized)
         except (_ActiveError, WebsiteFetchError) as exc:
             return {"ok": False, "error": "could not read the target for a token: {0}".format(exc)}
-        try:
-            real_token = _extract_jwt_token(landing)
-        except Exception:  # noqa: BLE001 - a crafted body is a no-op, never a crash
-            real_token = ""
+        carrier = _served_token_carrier(landing)
+        if carrier is not None:
+            header_name, real_token, rebuild = carrier
     # Validate the shape from EITHER source before forging. The four in-pass JWT checks all gate on
     # _JWT_RE; this did not, and an operator pasting a token that wrapped across lines (a newline
     # INSIDE a segment, which .strip() does not touch) produced a forged token carrying LF. http.client
@@ -1277,7 +1291,7 @@ def confirm_jwt_key_injection(
         if not forged:
             break  # malformed token -- the next field would fail identically
         try:
-            http.fetch(sanitized, extra_headers={"Authorization": "Bearer {0}".format(forged)})
+            http.fetch(sanitized, extra_headers={header_name: rebuild(forged)})
         except (_ActiveError, WebsiteFetchError):
             continue
         fields_tried.append(field)
