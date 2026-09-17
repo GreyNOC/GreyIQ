@@ -2,6 +2,38 @@
 
 Notable changes to GreyIQ.
 
+## v4.4.1 - the shipped runtime moves to Electron 44.3.0
+
+No GreyIQ source changed in this release. `git diff v4.4.0..HEAD` touches `package.json` and
+`package-lock.json` and nothing else: the whole content is the Electron devDependency moving 44.0.0
+to 44.3.0 (#175). That is still a change to what ships, which is why it gets a version rather than a
+silent rebuild - electron-builder bundles the Electron runtime into both the portable and the
+installer, so the binary a user runs is not the one v4.4.0 produced.
+
+What the runtime gained across 44.1.0, 44.2.0 and 44.3.0:
+
+- **Chromium 152.0.7977.65 to 152.0.7977.78, Node.js 24.19.0 to 24.20.0**, plus backported fixes from
+  upstream Chromium, V8, ANGLE and Skia. This is the browser engine the cockpit renders in and the
+  Node the main process runs on, so it is the part of the bump that carries the most weight.
+- **An ASAR integrity violation now exits with code 1 instead of an access violation on Windows**
+  (electron#53455). GreyIQ ships asar-packed, so this is the tamper-detection path failing as
+  designed rather than crashing ambiguously.
+- **No main-process crash after a large volume of renderer IPC** (electron#53417), and none when a
+  file dialog is opened on a window that is closing at the same time (electron#53583). Both are
+  reachable from ordinary cockpit use.
+
+Most of the renderer hardening in 44.3.0 does not change GreyIQ's posture, and this entry does not
+claim it: the window runs `contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`,
+`webSecurity: true` (`electron/main.cjs:519`) and enables no `<webview>`, so the `<webview>` popup
+and `nodeIntegrationInWorker` subframe fixes have no surface here. The AppX/MSIX WebGPU/SwiftShader
+fix in 44.1.0 does not apply either - GreyIQ ships portable and NSIS, not MSIX.
+
+`npm audit` reports six advisories (one critical, five high). None reach the artifact: the production
+dependency tree is empty, every advisory is transitive under `app-builder-lib` or `@electron/get`,
+and `build.files` packages only `electron/**/*` and `package.json`. That is build-machine exposure,
+not shipped exposure, and it is recorded here so the distinction is on the record rather than
+assumed.
+
 ## v4.4.0 - hunting what an unauthenticated attacker actually gets
 
 A QA/QC pass over the hunt engine, its technique and its reporting, aimed at the two classes the
