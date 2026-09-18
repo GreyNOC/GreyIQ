@@ -259,6 +259,51 @@ class FailClosedCouplingStillHoldsTests(TempRuntimeMixin, unittest.TestCase):
         prog = pf.upsert_program(self.runtime_dir, {"name": "Acme", "h1_program_stats": "not-a-dict"})
         self.assertEqual(prog["h1_program_stats"], {})
 
+    def test_ywh_program_stats_round_trip_and_unknown_keys_dropped(self) -> None:
+        prog = pf.upsert_program(self.runtime_dir, {
+            "name": "Acme", "scope_text": "acme.com",
+            "ywh_program_stats": {
+                "public": True, "vpn_required": True, "offers_bounty": 1,
+                "currency": "EUR", "business_unit": "Acme Corp",
+                "user_agent_marker": "-ywh-bugbounty-acme",
+                "bounty_reward_max": "7000", "reports_count": 12,
+                "totally_unexpected_field": "should be dropped",
+            },
+        })
+        stats = prog["ywh_program_stats"]
+        self.assertTrue(stats["public"])
+        self.assertTrue(stats["vpn_required"])
+        self.assertTrue(stats["offers_bounty"])          # coerced to bool
+        self.assertEqual(stats["currency"], "EUR")
+        self.assertEqual(stats["business_unit"], "Acme Corp")
+        self.assertEqual(stats["user_agent_marker"], "-ywh-bugbounty-acme")
+        self.assertEqual(stats["bounty_reward_max"], 7000)   # coerced to int
+        self.assertNotIn("totally_unexpected_field", stats)
+        reloaded = pf.get_program(self.runtime_dir, prog["id"])
+        self.assertEqual(reloaded["ywh_program_stats"]["currency"], "EUR")
+
+    def test_ywh_program_stats_non_dict_is_ignored(self) -> None:
+        prog = pf.upsert_program(self.runtime_dir, {"name": "Acme", "ywh_program_stats": "not-a-dict"})
+        self.assertEqual(prog["ywh_program_stats"], {})
+
+    def test_ywh_marker_copy_is_sanitized_like_the_ua_suffix(self) -> None:
+        # user_agent_marker is a COPY of the value that drives the outbound User-Agent, so
+        # a CR/LF from a compromised API response must not be persisted here either.
+        prog = pf.upsert_program(self.runtime_dir, {
+            "name": "Acme",
+            "ywh_program_stats": {"user_agent_marker": "-ywh-acme\r\nX-Injected: 1"},
+        })
+        marker = prog["ywh_program_stats"]["user_agent_marker"]
+        self.assertNotIn("\r", marker)
+        self.assertNotIn("\n", marker)
+
+    def test_ywh_marker_keeps_the_leading_space_the_importer_adds(self) -> None:
+        # The suffix is appended VERBATIM with no separator, so the space is load-bearing.
+        prog = pf.upsert_program(self.runtime_dir, {
+            "name": "Acme", "user_agent_suffix": " -ywh-bugbounty-acme",
+        })
+        self.assertEqual(prog["user_agent_suffix"], " -ywh-bugbounty-acme")
+
     def test_oob_allowed_is_not_coupled_to_the_scope_fail_closed_gate(self) -> None:
         # oob_allowed is a policy-confirmation flag surfaced in the UI (a confirm-dialog
         # skip before jumping to the OOB panel), NOT a scope/authorization gate itself --

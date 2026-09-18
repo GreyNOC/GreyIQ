@@ -58,6 +58,37 @@ Many programs restrict structured-scope visibility to invited or paid researcher
 403/404 here is common and is *not* a bug — GreyIQ tells you plainly and points at the CSV
 fallback instead of failing silently.
 
+**Fetch from YesWeHack (API).** Pick **From YesWeHack** in the program wizard, or set the
+Platform to YesWeHack and click **Fetch scope from YesWeHack**. Search by name, or paste the
+program slug (or the full `yeswehack.com/programs/…` URL). GreyIQ calls YesWeHack's own API —
+`GET /programs?page=N` to search, then `GET /programs/{slug}` for the program itself.
+
+Unlike HackerOne's, **no credential is needed for a public program**: YesWeHack serves public
+programs' scope, rules and marker anonymously, so the common case works with an empty
+Submissions bar. Sign in only for a private or invited program (a 403 says so). Like every
+other non-target call, this fires only on your explicit click.
+
+One fetch fills in everything the hunt needs:
+
+- **Scope** — every `scopes[]` entry becomes a structured-scope row, with its asset type, its
+  value tier (`asset_value`) as Max severity, and the reward range that tier actually pays
+  (YesWeHack prices assets per tier via `reward_grid_*`, falling back to the default grid).
+- **Out of scope** — YesWeHack's out-of-scope list mixes real host patterns with prose. Host-
+  shaped lines become **unticked** scope rows, which is what GreyIQ turns into enforced
+  out-of-scope hosts; the prose stays readable in Notes rather than being pushed into the host
+  matcher as a fake hostname.
+- **Rules of engagement** — the program's rules text, qualifying and non-qualifying
+  vulnerability classes, test-account instructions, VPN requirement and source-IP restrictions
+  are written into **Notes**, binding constraints first.
+- **The required user-agent marker** — most YesWeHack programs require a per-program tag on
+  every request so they can attribute your traffic. GreyIQ puts it straight into **Required
+  user-agent suffix**, the same field the hunt engine appends verbatim to every in-scope
+  request, so an imported program is in-policy without extra setup. A re-fetch never
+  overwrites a marker or Notes you have edited by hand.
+
+A program that is disabled on YesWeHack, requires the VPN, or restricts testing to specific
+source IPs is called out in the fetch result *and* tagged on the saved program row.
+
 - Your **API token**: hackerone.com → Settings → **API Token** (this is a token, not your
   account password).
 - Your **API username**: shown right next to the token on that same settings page.
@@ -111,6 +142,23 @@ username, and API token. The token field is write-only — GreyIQ never reads it
 UI once saved. These same credentials power both the read-only scope import described above
 and the (separately gated) HackerOne report submission described in
 [Reports & submission](#4-reports--submission).
+
+### YesWeHack credentials
+
+Optional — the **YesWeHack** bar in **Submissions** starts at *anonymous · public programs
+only*, and that is a fully working state. Sign in only to reach a private or invited program.
+
+Signing in posts your email and password once to the local backend, which exchanges them with
+YesWeHack for a session token (`POST /login`, then `POST /account/totp` when your account has
+2FA). **Only the returned token is stored — the password is never written to disk, never
+logged, and never read back to the UI.** YesWeHack tokens are short-lived; when one expires
+the fetch says so and you sign in again. **Sign out** clears the stored token.
+
+A Personal Access Token can be pasted instead (tucked under *Use a Personal Access Token*) —
+YesWeHack issues those to program-manager and business-unit roles rather than hunter accounts.
+
+There is no YesWeHack submit API for researchers, so YesWeHack stays **export-only**: GreyIQ
+formats the report for YesWeHack's form and you file it on the platform.
 
 ## 2. SSRF / OOB setup, per program
 
@@ -235,7 +283,9 @@ Confirmed (and reportable candidate) findings appear in the **Submissions** tab:
   bounded non-GET request, always explicitly opted into per-call.
 - **Egress is deliberately narrow.** Everything talks to your authorized target, except:
   the HackerOne report submission (`api.hackerone.com`, write, hard-gated, manual), the
-  HackerOne scope import described above (`api.hackerone.com`, read-only, manual), optional
+  HackerOne scope import described above (`api.hackerone.com`, read-only, manual), the
+  YesWeHack program search / scope import and sign-in (`api.yeswehack.com`, read-only apart
+  from the sign-in exchange itself, manual), optional
   repo-draft enrichment (`api.github.com` or `gitlab.com`, unauthenticated read-only, one GET
   per repository, explicit click only), an
   optional certificate-transparency lookup for subdomain seeding (`crt.sh`, read-only), the

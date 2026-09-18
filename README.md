@@ -112,7 +112,9 @@ as commands to execute.
 
 See [docs/USER_GUIDE.md](docs/USER_GUIDE.md) for the full Hunt-cockpit walkthrough —
 Program setup (including starting an inactive draft from only a public forge repository link,
-or pulling real scope from HackerOne's API or a CSV/paste import),
+or pulling real scope from HackerOne's API, from YesWeHack's API — scope, rules of engagement
+and the program's required user-agent marker, no sign-in needed for a public program — or from
+a CSV/paste import),
 opt-in shallow cloning/adversarial scanning of program-provided public source repositories,
 per-program SSRF/OOB setup, running a hunt, and reports & submission. The cockpit also opens
 a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the top bar).
@@ -225,7 +227,10 @@ and removes it after the scan. Web/live scans refuse private/loopback hosts unle
 `GREYIQ_SCAN_ALLOW_PRIVATE_URLS=1`.
 
 Fixed third-party egress is narrow and documented. HackerOne import/submission uses
-`api.hackerone.com` only on its corresponding operator action. The optional **Enrich from
+`api.hackerone.com` only on its corresponding operator action. YesWeHack program search,
+scope import and sign-in use `api.yeswehack.com` the same way — read-only apart from the
+sign-in exchange, on an explicit click only, host-pinned, and with redirects refused so a
+credential can never follow a hop off that host. The optional **Enrich from
 forge (read-only)** action uses one unauthenticated GET per selected repository to
 `api.github.com` (GitHub) or `gitlab.com` (GitLab); it has a hard timeout, never runs in the
 background, and only returns homepage/web domains as **unticked** scope suggestions. Enrichment

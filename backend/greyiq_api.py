@@ -386,6 +386,7 @@ from bughunter import vdp_policy as bounty_vdp  # noqa: E402
 from bughunter import secret_classification as bounty_secret_class  # noqa: E402
 from bughunter import hackerone_import as bounty_h1_import  # noqa: E402
 from bughunter import hackerone_activity as bounty_h1_activity  # noqa: E402
+from bughunter import yeswehack_import as bounty_ywh_import  # noqa: E402
 from bughunter import forge_metadata as bounty_forge_metadata  # noqa: E402
 from bughunter import taxonomy as bounty_taxonomy  # noqa: E402
 from bughunter import fsutil as bounty_fsutil  # noqa: E402
@@ -1031,6 +1032,25 @@ class HackerOneCredsRequest(BaseModel):
     api_credential: str = Field(default="", max_length=600)
 
 
+class YesWeHackCredsRequest(BaseModel):
+    # Shown back to the operator so they can tell which account is signed in. Never used
+    # as a credential on its own.
+    email: str = Field(default="", max_length=200)
+    # A YesWeHack JWT (from sign-in) or a Personal Access Token. Optional by design:
+    # YesWeHack serves public program scope anonymously.
+    api_token: str = Field(default="", max_length=4000)
+    token_kind: str = Field(default="jwt", max_length=8)  # "jwt" | "pat"
+    clear_token: bool = False  # explicit "sign out" — an empty api_token alone never clears
+
+
+class YesWeHackLoginRequest(BaseModel):
+    email: str = Field(min_length=1, max_length=200)
+    # Used for ONE POST /login exchange and never stored — only the returned JWT is
+    # persisted. See yeswehack_import.login.
+    password: str = Field(min_length=1, max_length=400)
+    totp_code: str = Field(default="", max_length=10)
+
+
 class ProgramUpsertRequest(BaseModel):
     id: str | None = Field(default=None, max_length=120)
     name: str = Field(default="", max_length=200)
@@ -1046,6 +1066,7 @@ class ProgramUpsertRequest(BaseModel):
     oob_allowed: bool = False
     disclose_automation: bool = False  # this program's terms require disclosing automated-tool assistance in submitted reports
     h1_program_stats: dict[str, Any] = Field(default_factory=dict)  # real signals from HackerOne's program resource (offers_bounties, fast_payments, etc.)
+    ywh_program_stats: dict[str, Any] = Field(default_factory=dict)  # the same for YesWeHack (reward range, VPN/IP constraints, the required UA marker) — see yeswehack_import.fetch_program_scope
     notes: str = Field(default="", max_length=4000)
     account_access: dict[str, Any] = Field(default_factory=dict)  # research-account email/password/login_url/cookie — SENSITIVE (portfolio._clean_account_access bounds it; password/cookie redacted on read-back)
     admin_account_access: dict[str, Any] = Field(default_factory=dict)  # SECOND (high-privilege) research account for dual-account BFLA — same shape+redaction as account_access; the low-priv account_access is the "user" session
@@ -1175,6 +1196,15 @@ class HackerOneReportStatusRequest(BaseModel):
 
 class HackerOneSyncRequest(BaseModel):
     limit: int = Field(default=25, ge=1, le=100)
+
+
+class YesWeHackImportRequest(BaseModel):
+    # A slug, or a pasted program URL the importer reduces to its last path segment.
+    slug: str = Field(min_length=1, max_length=400)
+
+
+class YesWeHackProgramsRequest(BaseModel):
+    query: str = Field(default="", max_length=120)
 
 
 class OperatorStartRequest(BaseModel):
@@ -3745,6 +3775,82 @@ class GreyIQRuntime:
         stored = _load_secrets()
         return (stored.get("hackerone.team_handle", ""), stored.get("hackerone.api_username", ""), stored.get("hackerone.api_token", ""))
 
+    # ---- YesWeHack --------------------------------------------------------------
+    # Same generic secrets store as HackerOne/OOB/the coder providers — no new machinery.
+    # Unlike HackerOne, a credential is OPTIONAL here: YesWeHack serves public programs'
+    # scope, rules and markers anonymously, so an operator can import without signing in.
+
+    def yeswehack_creds_status(self) -> dict[str, Any]:
+        """Creds presence for the UI — NEVER returns the token."""
+        stored = _load_secrets()
+        return {
+            "ok": True,
+            "email": stored.get("yeswehack.email", ""),
+            "token_kind": stored.get("yeswehack.token_kind", "") or "jwt",
+            "has_token": bool(stored.get("yeswehack.api_token")),
+        }
+
+    def save_yeswehack_creds(self, request: "YesWeHackCredsRequest") -> dict[str, Any]:
+        # Only write a field the caller actually SENT. _store_secret treats "" as a delete,
+        # so writing every field unconditionally would make a partial save (the PAT box, or
+        # sign-out, which posts only clear_token) silently wipe the other stored values.
+        # Same exclude_unset reasoning as upsert_program.
+        if "email" in request.model_fields_set:
+            _store_secret("yeswehack.email", request.email.strip())
+        if request.clear_token:
+            # Explicit sign-out. Kept separate from "empty field" so saving the slug
+            # alone can't silently drop a working session token.
+            _store_secret("yeswehack.api_token", "")
+            _store_secret("yeswehack.token_kind", "")
+        elif request.api_token.strip():
+            kind = "pat" if request.token_kind.strip().lower() == "pat" else "jwt"
+            _store_secret("yeswehack.api_token", request.api_token.strip())
+            _store_secret("yeswehack.token_kind", kind)
+        return self.yeswehack_creds_status()
+
+    def yeswehack_login(self, request: "YesWeHackLoginRequest") -> dict[str, Any]:
+        """Exchange a YesWeHack email+password (+TOTP) for a JWT and store only the JWT.
+
+        The password reaches this process for exactly one POST to api.yeswehack.com and is
+        never written to the secrets file, the logs, or the response."""
+        result = bounty_ywh_import.login(request.email, request.password, totp_code=request.totp_code)
+        if not result.get("ok"):
+            # totp_required is carried through so the UI can ask for the 6-digit code.
+            return {"ok": False, "error": result.get("error", "Sign-in failed."),
+                    "totp_required": bool(result.get("totp_required"))}
+        _store_secret("yeswehack.api_token", str(result.get("token") or ""))
+        _store_secret("yeswehack.token_kind", "jwt")
+        _store_secret("yeswehack.email", request.email.strip())
+        status = self.yeswehack_creds_status()
+        status["message"] = result.get("message", "Signed in to YesWeHack.")
+        return status
+
+    def test_yeswehack_creds(self) -> dict[str, Any]:
+        """Probe the stored credential (or the anonymous path, when none is stored)
+        against a real endpoint. Read-only — never mutates the secrets store."""
+        token, kind = self._yeswehack_creds()
+        return bounty_ywh_import.verify_credentials(token, kind)
+
+    def yeswehack_programs(self, request: "YesWeHackProgramsRequest") -> dict[str, Any]:
+        """Search the programs this credential can see (anonymous = the public catalogue),
+        so the operator can find a program without already knowing its slug."""
+        token, kind = self._yeswehack_creds()
+        return bounty_ywh_import.list_programs(token=token, token_kind=kind, query=request.query)
+
+    def import_yeswehack_scope(self, request: "YesWeHackImportRequest") -> dict[str, Any]:
+        """Preview a YesWeHack program's scope, rules of engagement and required
+        user-agent marker — a documented read to a fixed non-target host, only on this
+        explicit, operator-clicked call (never automatic/background). Returns a PREVIEW;
+        nothing is saved until the operator submits the Program form."""
+        token, kind = self._yeswehack_creds()
+        return bounty_ywh_import.fetch_program_scope(request.slug, token=token, token_kind=kind)
+
+    def _yeswehack_creds(self) -> tuple[str, str]:
+        """(token, token_kind). An empty token is the supported anonymous mode."""
+        stored = _load_secrets()
+        return (stored.get("yeswehack.api_token", ""),
+                stored.get("yeswehack.token_kind", "") or "jwt")
+
     # ---- OOB collaborator (out-of-band blind-bug confirmation) --------------------
     def _oob_config(self) -> tuple[str, str]:
         stored = _load_secrets()
@@ -5767,6 +5873,20 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/hackerone/test":
             await send_json(send, await asyncio.to_thread(runtime.test_hackerone_creds))
             return
+        if method == "GET" and path == "/api/bounty/yeswehack/creds":
+            await send_json(send, await asyncio.to_thread(runtime.yeswehack_creds_status))
+            return
+        if method == "POST" and path == "/api/bounty/yeswehack/creds":
+            request = validate_payload(YesWeHackCredsRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.save_yeswehack_creds, request))
+            return
+        if method == "POST" and path == "/api/bounty/yeswehack/login":
+            request = validate_payload(YesWeHackLoginRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.yeswehack_login, request))
+            return
+        if method == "POST" and path == "/api/bounty/yeswehack/test":
+            await send_json(send, await asyncio.to_thread(runtime.test_yeswehack_creds))
+            return
         if method == "GET" and path == "/api/operator/programs":
             await send_json(send, await asyncio.to_thread(runtime.list_programs))
             return
@@ -5796,6 +5916,14 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/hackerone/import-scope":
             request = validate_payload(HackerOneImportRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.import_hackerone_scope, request))
+            return
+        if method == "POST" and path == "/api/yeswehack/import-scope":
+            request = validate_payload(YesWeHackImportRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.import_yeswehack_scope, request))
+            return
+        if method == "POST" and path == "/api/yeswehack/programs":
+            request = validate_payload(YesWeHackProgramsRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.yeswehack_programs, request))
             return
         if method == "POST" and path == "/api/hackerone/hacktivity":
             request = validate_payload(HackerOneHacktivityRequest, await read_json_body(receive))
