@@ -256,6 +256,41 @@ class HostTokenNormalizationTests(unittest.TestCase):
             self.assertTrue(campaign._target_host_excluded(host, excluded),
                             f"{host} must be excluded, got {excluded}")
 
+    def test_non_web_assets_never_become_campaign_targets(self) -> None:
+        # A YesWeHack Android asset is published as its STORE URL, so deriving a target
+        # from it schedules a scan of play.google.com / apps.apple.com — third parties who
+        # authorized nothing — and a bare package id resolves to an unrelated host.
+        from bughunter import campaign, portfolio
+
+        program = _program(scopes=[
+            {"scope": "*.acme.example", "scope_type": "web-application", "asset_value": "HIGH"},
+            {"scope": "https://play.google.com/store/apps/details?id=com.acme.app",
+             "scope_type": "mobile-application-android", "asset_value": "MEDIUM"},
+            {"scope": "https://apps.apple.com/fr/app/acme/id972602800",
+             "scope_type": "mobile-application-ios", "asset_value": "MEDIUM"},
+            {"scope": "com.acme.mobile", "scope_type": "mobile-application-android", "asset_value": "LOW"},
+            {"scope": "acme-cli.exe", "scope_type": "executable", "asset_value": "LOW"},
+        ], out_of_scope=[])
+        r = ywh.fetch_program_scope("acme", fetch=lambda url, **kw: program)
+        record = portfolio._normalize({"name": "Acme", "structured_scope": r["structured_scope"]})
+        targets = campaign.program_campaign_targets(record)
+        self.assertEqual(targets, ["https://acme.example"])
+        joined = " ".join(targets)
+        for third_party in ("play.google.com", "apps.apple.com", "com.acme.mobile"):
+            self.assertNotIn(third_party, joined)
+
+    def test_web_and_api_assets_still_become_targets(self) -> None:
+        from bughunter import campaign, portfolio
+
+        program = _program(scopes=[
+            {"scope": "api.acme.example", "scope_type": "api", "asset_value": "HIGH"},
+            {"scope": "https://app.acme.example/", "scope_type": "web-application", "asset_value": "HIGH"},
+        ], out_of_scope=[])
+        r = ywh.fetch_program_scope("acme", fetch=lambda url, **kw: program)
+        record = portfolio._normalize({"name": "Acme", "structured_scope": r["structured_scope"]})
+        self.assertEqual(sorted(campaign.program_campaign_targets(record)),
+                         ["https://api.acme.example", "https://app.acme.example/"])
+
     def test_duplicate_exclusions_collapse(self) -> None:
         program = _program(out_of_scope=["https://a.acme.example/x", "a.acme.example", "a.acme.example:443"])
         r = ywh.fetch_program_scope("acme", fetch=lambda url, **kw: program)
@@ -334,6 +369,22 @@ class ConstraintWarningTests(unittest.TestCase):
         self.assertEqual(sorted(outs), ["also.acme.example", "blocked.acme.example"])
         self.assertEqual(len(r["structured_scope"]), 3)
         self.assertIn("in-scope entries did not fit", " ".join(r["warnings"]))
+
+    def test_a_long_exclusion_list_is_read_past_the_display_limit(self) -> None:
+        # _iter_strings' 200 default used to truncate out_of_scope BEFORE the entry budget
+        # ran, so exclusion 201+ vanished with no warning and stayed huntable.
+        oos = [f"h{i}.acme.example" for i in range(260)]
+        r = ywh.fetch_program_scope("acme", fetch=lambda url, **kw: _program(scopes=[], out_of_scope=oos))
+        outs = [e["identifier"] for e in r["structured_scope"] if not e["eligible_for_submission"]]
+        self.assertEqual(len(outs), 260)
+        self.assertIn("h259.acme.example", outs)
+        self.assertNotIn("were not read at all", " ".join(r["warnings"]))
+
+    def test_exclusions_beyond_the_read_cap_are_reported_not_dropped_silently(self) -> None:
+        oos = [f"h{i}.acme.example" for i in range(ywh._MAX_ENTRIES + 7)]
+        r = ywh.fetch_program_scope("acme", fetch=lambda url, **kw: _program(scopes=[], out_of_scope=oos))
+        self.assertIn("7 out-of-scope line(s) past the first 500 were not read at all",
+                      " ".join(r["warnings"]))
 
     def test_exclusions_that_themselves_overflow_are_reported(self) -> None:
         r = ywh.fetch_program_scope(

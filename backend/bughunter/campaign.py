@@ -1268,6 +1268,17 @@ def _target_host_excluded(candidate: str, excluded_hosts: list[str]) -> bool:
     return False
 
 
+# Structured-scope asset types that are IN SCOPE but are not web endpoints, so a
+# "hunt the whole scope" campaign must not derive a URL from one. Named in HackerOne's
+# vocabulary, which yeswehack_import maps its own scope_type values onto. "OTHER" and ""
+# are deliberately absent: CSV and hand-entered rows leave asset_type empty, and those
+# must keep working exactly as before.
+_NON_WEB_ASSET_TYPES = frozenset({
+    "GOOGLE_PLAY_APP_ID", "APPLE_STORE_APP_ID", "WINDOWS_APP_STORE_APP_ID", "OTHER_APK",
+    "TESTFLIGHT", "SOURCE_CODE", "DOWNLOADABLE_EXECUTABLES", "HARDWARE", "SMART_CONTRACT",
+})
+
+
 def program_campaign_targets(program: dict[str, Any], max_targets: int = _MAX_PROGRAM_TARGETS) -> list[str]:
     """The list of concrete URLs a "hunt this program's whole scope" campaign should
     run. Uses ``seed_targets`` (an operator's own hand-curated hunt list) plus any
@@ -1309,6 +1320,15 @@ def program_campaign_targets(program: dict[str, Any], max_targets: int = _MAX_PR
         # A forge repository is never fetched as a web page. It is included only
         # through the explicit clone_repositories opt-in above.
         if is_supported_remote_git_url(identifier):
+            continue
+        # Neither is a mobile app, a binary, a smart contract or source: those assets are
+        # in scope for the PROGRAM but are not web endpoints, and deriving a target from
+        # one sends traffic somewhere nobody authorized. A YesWeHack Android asset is
+        # published as its store URL, so this row would otherwise schedule a scan of
+        # play.google.com or apps.apple.com -- a third party -- and a bare package id like
+        # "com.vendor.mobile" resolves to https://com.vendor.mobile, an unrelated host.
+        # HackerOne imports carry the same asset types and the same hazard.
+        if str(entry.get("asset_type") or "").strip().upper() in _NON_WEB_ASSET_TYPES:
             continue
         url = _representative_host(identifier)
         if url and url not in seen and not _target_host_excluded(url, excluded_hosts):

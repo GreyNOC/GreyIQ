@@ -7166,12 +7166,21 @@ function ckProgramSetupForm(prefill) {
         // Merge (dedupe by identifier, fetched rows win on a match) rather than replace —
         // a fetch must never silently discard hand-typed or CSV-merged rows already in
         // the table.
-        const { rows: merged, truncated } = ckMergeScopeRows(
-          scopeTable.ckCollect().filter((e) => !entries.some((f) => f.identifier.toLowerCase() === e.identifier.toLowerCase())),
-          entries
-        );
+        // Fetched rows go FIRST. ckMergeScopeRows fills up to the cap in order, so putting
+        // existing rows first meant a nearly-full table silently discarded the rows just
+        // fetched — including out-of-scope exclusions, which is the one direction that
+        // must never be lost. Within the fetched set, exclusions lead for the same reason.
+        const fetchedFirst = [
+          ...entries.filter((e) => !e.eligible_for_submission),
+          ...entries.filter((e) => e.eligible_for_submission),
+        ];
+        const keptExisting = scopeTable.ckCollect()
+          .filter((e) => !entries.some((f) => f.identifier.toLowerCase() === e.identifier.toLowerCase()));
+        const { rows: merged, truncated } = ckMergeScopeRows(fetchedFirst, keptExisting);
         scopeTable.ckReplace(merged);
-        if (truncated) mergeNote = ` Capped at ${CK_MAX_SCOPE_ENTRIES} scope entries — some existing rows were dropped.`;
+        // Say which rows actually went — it used to claim "existing rows were dropped"
+        // while it was in fact dropping the fetched ones.
+        if (truncated) mergeNote = ` Capped at ${CK_MAX_SCOPE_ENTRIES} scope entries — ${keptExisting.length - (merged.length - fetchedFirst.length)} existing row(s) did not fit; every fetched row was kept.`;
       }
       const fetchedRepositories = ckRepositoryUrlsFromScope(entries);
       if (fetchedRepositories.length) {

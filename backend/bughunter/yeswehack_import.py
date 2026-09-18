@@ -315,16 +315,25 @@ def _clean_entry(raw: Any, program: dict[str, Any], currency: str) -> dict[str, 
     }
 
 
-def _out_of_scope_entries(program: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+def _out_of_scope_entries(program: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str], int]:
     """Split the out_of_scope list into enforceable host patterns and readable prose.
 
     Host-shaped lines become structured-scope rows with eligible_for_submission=False,
     which is what portfolio._normalize turns into out_of_scope_hosts (an exclusion the
-    hunt actually honors). Everything else is returned as prose for the notes digest."""
+    hunt actually honors). Everything else is returned as prose for the notes digest.
+
+    Third element: how many raw lines were past the read cap and never classified — the
+    caller must warn about those rather than let a forbidden host vanish quietly."""
     entries: list[dict[str, Any]] = []
     prose: list[str] = []
     seen: set[str] = set()
-    for item in _iter_strings(program.get("out_of_scope")):
+    raw = program.get("out_of_scope")
+    raw_count = len(raw) if isinstance(raw, list) else 0
+    # _iter_strings' 200 default is a guard for display lists; applying it HERE silently
+    # dropped exclusion 201 and beyond before the 500-entry budget below ever ran, so a
+    # forbidden host in a long list just vanished. Read up to the real entry cap, and the
+    # caller reports anything past it rather than letting it disappear.
+    for item in _iter_strings(raw, limit=_MAX_ENTRIES):
         text = item.strip()
         if not text:
             continue
@@ -346,7 +355,7 @@ def _out_of_scope_entries(program: dict[str, Any]) -> tuple[list[dict[str, Any]]
             "instruction": f"Out of scope (YesWeHack program): {text}"[:2000],
             "max_severity": "",
         })
-    return entries, prose
+    return entries, prose, max(0, raw_count - _MAX_ENTRIES)
 
 
 def _marker_suffix(marker: str) -> str:
@@ -718,12 +727,17 @@ def fetch_program_scope(
     # an in-scope row costs an opportunity; losing an out-of-scope row would leave a host
     # the program forbade looking merely un-listed, and the hunt would go at it. The safe
     # direction is the one that hunts less.
-    oos_entries, oos_prose = _out_of_scope_entries(program)
+    oos_entries, oos_prose, oos_unread = _out_of_scope_entries(program)
     entries: list[dict[str, Any]] = oos_entries[:max_entries]
     if len(oos_entries) > len(entries):
         warnings.append(
             f"Only the first {len(entries)} of {len(oos_entries)} out-of-scope entries fit — "
             "add the rest to out-of-scope hosts by hand before hunting."
+        )
+    if oos_unread:
+        warnings.append(
+            f"{oos_unread} out-of-scope line(s) past the first {_MAX_ENTRIES} were not read at all — "
+            "check the program page and add any hosts among them by hand before hunting."
         )
 
     raw_scopes = [s for s in (program.get("scopes") or []) if isinstance(s, dict)] \
