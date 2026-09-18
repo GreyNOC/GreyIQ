@@ -2,7 +2,12 @@
 #
 # GreyIQ — one-command local release build.
 #
-#   scripts/release.sh [--dry-run] [--here] [--purge-venv] [--skip-check] [--yes]
+#   bash scripts/release.sh [--dry-run] [--here] [--purge-venv] [--skip-check] [--yes]
+#
+# Run it from Git Bash. `bash` is not on PowerShell's PATH by default, so from a
+# PowerShell prompt call it as:
+#   & "$env:ProgramFiles\Git\bin\bash.exe" scripts/release.sh
+# The build step itself shells back out to powershell.exe for build-portable.ps1.
 #
 # What it does, in order:
 #   1. Verifies package.json and backend/_version.py agree (the same drift check CI runs).
