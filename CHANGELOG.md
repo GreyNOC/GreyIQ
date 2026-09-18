@@ -2,6 +2,95 @@
 
 Notable changes to GreyIQ.
 
+## v4.5.0 - YesWeHack becomes a place you set a program up from, not just a report format
+
+YesWeHack has been in the platform registry since the report formats landed, but only as an output
+shape: you could render a finding for its form, and that was the whole relationship. Setting the
+program up was still manual - retype the scope, retype the exclusions, and find the user-agent tag
+the program requires somewhere in its rules. This release makes it a source. `From YesWeHack` in the
+program wizard (and `Fetch scope from YesWeHack` in the form) pulls the program from
+`api.yeswehack.com` and fills in the record.
+
+**No credential is needed for a public program, and that is the default.** Verified against the live
+API, not assumed: `GET /programs?page=N` and `GET /programs/{slug}` both answer 200 unauthenticated,
+so the Submissions bar starts at *anonymous - public programs only* and the common case needs no
+secret at all. Sign-in exists for private/invited programs and exchanges email+password (plus TOTP)
+for a session token via `POST /login` / `POST /account/totp`; only the returned token is stored - the
+password is never written to the secrets file, never logged, and never read back. A Personal Access
+Token (`X-AUTH-TOKEN`) works too, for the manager-role accounts YesWeHack issues them to. The fetcher
+carries the same posture as the HackerOne one: host-pinned, redirects captured rather than followed
+so a credential cannot hop off-host, bounded reads, and a retry policy that never retries a
+deterministic 401/403/404.
+
+One fetch fills scope, out-of-scope, rules of engagement, qualifying and non-qualifying classes, the
+per-tier reward grid, test-account instructions, VPN and source-IP constraints - and the marker.
+**The marker is the part that makes the import worth having.** Most YesWeHack programs require a
+per-program tag on the User-Agent of every request so they can attribute the traffic; GreyIQ already
+had exactly that field (`portfolio.user_agent_suffix`, appended verbatim by
+`web_ingest.set_ua_suffix`), so the import writes the program's own value straight into it and an
+imported program is in-policy without further setup. A re-fetch never overwrites a marker or Notes
+the operator has edited.
+
+**An adversarial review caught a scope-safety bug before this shipped, and it is worth recording
+because the tests had certified the broken behaviour.** YesWeHack's out-of-scope list is free text
+that mixes real host patterns with prose, so the importer classified each line and stored the
+host-shaped ones as exclusions. The classifier accepted `https://shop.acme.example/checkout` and
+`api.acme.example:8443` - but both scope matchers (`campaign._target_host_excluded` and the
+equivalent check in `active_verify_service`) parse the *candidate* host and compare the exclusion
+token **verbatim**. A URL- or port-shaped token therefore matched nothing: the host stayed huntable
+while the UI reported the exclusion as captured. Three of four exclusions in the reproduction were
+inert, and the test suite asserted those two forms were "enforceable", so 54 green tests locked it
+in. The fix normalises each line to the bare host token the matchers actually honour, at the
+importer, where the data arrives - and the regression test now runs end-to-end through
+`portfolio._normalize` into the real matcher rather than asserting on the classifier alone.
+
+Two smaller decisions came out of the same review. **Exclusions are budgeted before in-scope rows**:
+when the 500-entry cap has to drop something, losing an in-scope row costs an opportunity, while
+losing an out-of-scope row would leave a forbidden host looking merely un-listed - so the cap now
+drops in the direction that hunts less. And **a prose exclusion is never dropped silently**: a rule
+the host matcher cannot enforce is surfaced in the fetch result and in Notes, because a count that
+implied every exclusion was captured is worse than no count.
+
+YesWeHack stays **export-only**. There is no researcher report-creation endpoint in YesWeHack's own
+client or its Burp extension, so nothing here claims a submit path that does not exist; the one-click
+API submit remains HackerOne-only and YesWeHack reports are filed on the platform.
+
+This release also carries the **v4.4.1 changelog entry, which was published as a tag but never merged
+to main** - `git diff v4.4.1 origin/main` was the version bump and that entry, and nothing else. The
+entry is restored below so the history does not skip a shipped version.
+
+## v4.4.1 - the shipped runtime moves to Electron 44.3.0
+
+No GreyIQ source changed in this release. `git diff v4.4.0..HEAD` touches `package.json` and
+`package-lock.json` and nothing else: the whole content is the Electron devDependency moving 44.0.0
+to 44.3.0 (#175). That is still a change to what ships, which is why it gets a version rather than a
+silent rebuild - electron-builder bundles the Electron runtime into both the portable and the
+installer, so the binary a user runs is not the one v4.4.0 produced.
+
+What the runtime gained across 44.1.0, 44.2.0 and 44.3.0:
+
+- **Chromium 152.0.7977.65 to 152.0.7977.78, Node.js 24.19.0 to 24.20.0**, plus backported fixes from
+  upstream Chromium, V8, ANGLE and Skia. This is the browser engine the cockpit renders in and the
+  Node the main process runs on, so it is the part of the bump that carries the most weight.
+- **An ASAR integrity violation now exits with code 1 instead of an access violation on Windows**
+  (electron#53455). GreyIQ ships asar-packed, so this is the tamper-detection path failing as
+  designed rather than crashing ambiguously.
+- **No main-process crash after a large volume of renderer IPC** (electron#53417), and none when a
+  file dialog is opened on a window that is closing at the same time (electron#53583). Both are
+  reachable from ordinary cockpit use.
+
+Most of the renderer hardening in 44.3.0 does not change GreyIQ's posture, and this entry does not
+claim it: the window runs `contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`,
+`webSecurity: true` (`electron/main.cjs:519`) and enables no `<webview>`, so the `<webview>` popup
+and `nodeIntegrationInWorker` subframe fixes have no surface here. The AppX/MSIX WebGPU/SwiftShader
+fix in 44.1.0 does not apply either - GreyIQ ships portable and NSIS, not MSIX.
+
+`npm audit` reports six advisories (one critical, five high). None reach the artifact: the production
+dependency tree is empty, every advisory is transitive under `app-builder-lib` or `@electron/get`,
+and `build.files` packages only `electron/**/*` and `package.json`. That is build-machine exposure,
+not shipped exposure, and it is recorded here so the distinction is on the record rather than
+assumed.
+
 ## v4.4.0 - hunting what an unauthenticated attacker actually gets
 
 A QA/QC pass over the hunt engine, its technique and its reporting, aimed at the two classes the

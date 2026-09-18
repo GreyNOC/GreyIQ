@@ -4800,6 +4800,7 @@ const ckState = {
   sort: { key: "rank", dir: 1 },
   view: "program",
   h1: null,              // { team_handle, api_username, has_token } — never the token
+  ywh: null,             // { email, token_kind, has_token } — never the token. A YesWeHack credential is OPTIONAL: public programs import anonymously.
   platform: "hackerone", // report format for Copy/Download (server re-shapes per platform)
   triage: {},            // ref -> "submitted" | "drafted" (client-side worklist marks)
   reportFocus: null,     // a finding pinned open as a Full report on the Submissions page (from a drawer's "View full report")
@@ -6036,6 +6037,17 @@ async function ckFetchCreds() {
   return ckState.h1;
 }
 
+// YesWeHack's equivalent. Kept a separate call so a slow/absent one never blocks the
+// other — and note that a null here is NOT an error state: public YesWeHack programs
+// import anonymously, so "no credential" is a perfectly usable configuration.
+async function ckFetchYwhCreds() {
+  try {
+    const res = await apiFetch("/api/bounty/yeswehack/creds", { timeoutMs: 6000 });
+    ckState.ywh = res && res.ok ? res : null;
+  } catch (_) { ckState.ywh = null; }
+  return ckState.ywh;
+}
+
 function ckCanSubmit(f) {
   return ckEffectiveProof(f) === "confirmed" && ckState.h1 && ckState.h1.has_token && ckState.h1.team_handle;
 }
@@ -6885,7 +6897,13 @@ function ckProgramSetupRow(p) {
   const li = cel("li"); li.style.flexWrap = "wrap";
   const left = cel("div"); left.style.flex = "1";
   left.append(cel("span", "ck-ftitle", p.name || p.id));
-  if (p.platform_handle) left.append(document.createTextNode(" "), cel("span", "ck-tag", `HackerOne: ${p.platform_handle}`));
+  // Label the handle with the program's OWN platform — it was hardcoded to "HackerOne",
+  // which mislabelled every YesWeHack/HackenProof program's slug. "manual"/unknown has no
+  // platform name worth printing, so it degrades to a plain "Handle:".
+  if (p.platform_handle) {
+    const platLabel = (CK_PLATFORMS.find((x) => x.id === p.platform) || {}).name || "Handle";
+    left.append(document.createTextNode(" "), cel("span", "ck-tag", `${platLabel}: ${p.platform_handle}`));
+  }
   if (p.policy_profile) {
     const pol = cel("span", "ck-tag ck-tag-policy", p.policy_profile === "nasa" ? "NASA VDP · policy-locked" : `VDP: ${p.policy_profile} · policy-locked`);
     pol.title = "This program is bound to a VDP policy: in-scope hosts only, excluded endpoints/classes suppressed, confirmed findings only, no DoS.";
@@ -6900,6 +6918,19 @@ function ckProgramSetupRow(p) {
   if (stats.fast_payments) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Fast payments"));
   if (stats.gold_standard_safe_harbor) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Gold Standard Safe Harbor"));
   if (stats.open_scope) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Open scope"));
+  // YesWeHack's equivalents — the two that change how you hunt (VPN / source-IP gating)
+  // are called out first, since violating either can get an account removed.
+  const ywh = p.ywh_program_stats || {};
+  if (ywh.vpn_required) left.append(document.createTextNode(" "), cel("span", "ck-tag", "YWH VPN required"));
+  if (ywh.ip_restricted) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Source-IP restricted"));
+  if (ywh.user_agent_marker) {
+    const m = cel("span", "ck-tag", "UA marker set");
+    m.title = `This program requires the user-agent marker ${ywh.user_agent_marker} on every request.`;
+    left.append(document.createTextNode(" "), m);
+  }
+  if (ywh.bounty_reward_max) left.append(document.createTextNode(" "), cel("span", "ck-tag", `Bounty ${ywh.bounty_reward_min || 0}–${ywh.bounty_reward_max}${ywh.currency ? " " + ywh.currency : ""}`));
+  if (ywh.vdp) left.append(document.createTextNode(" "), cel("span", "ck-tag", "VDP (no bounty)"));
+  if (ywh.disabled) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Program disabled on YWH"));
   const n = (p.structured_scope || []).length;
   left.append(cel("div", "ck-floc", `${p.scope_text || "(no scope)"} · ${n} structured scope entr${n === 1 ? "y" : "ies"}`));
   if (stats.number_of_valid_reports_for_user > 0) {
@@ -6997,6 +7028,7 @@ function ckProgramSetupForm(prefill) {
     const lab = handle.wrap.querySelector("span");
     if (!lab) return;
     lab.textContent = platSelect.value === "hackenproof" ? "HackenProof program slug (hackenproof.com/programs/…)"
+      : platSelect.value === "yeswehack" ? "YesWeHack program slug (yeswehack.com/programs/…)"
       : platSelect.value === "hackerone" ? "HackerOne team handle" : "Program handle (optional)";
   };
   platSelect.addEventListener("change", syncHandleLabel);
@@ -7007,11 +7039,29 @@ function ckProgramSetupForm(prefill) {
   // etc.) — carried here so a Save persists them even though the form has no dedicated
   // fields for them; re-fetching overwrites this with fresher data.
   let fetchedProgramStats = editing ? (editing.h1_program_stats || {}) : ((seed && seed.h1_program_stats) || {});
+  // Same idea for YesWeHack: reward range, VPN/source-IP constraints and the required UA
+  // marker, carried so a Save persists them even though the form has no fields for them.
+  let fetchedYwhStats = editing ? (editing.ywh_program_stats || {}) : ((seed && seed.ywh_program_stats) || {});
 
   const fetchBar = cel("div", "ck-import-row");
   const fetchBtn = cel("button", "ck-btn", "Fetch scope from HackerOne"); fetchBtn.type = "button";
   const hacktivityBtn = cel("button", "ck-btn", "Recent hacktivity"); hacktivityBtn.type = "button";
   fetchBar.append(fetchBtn, hacktivityBtn);
+  // The fetch button RETARGETS with the Platform select; it never disappears. Hiding it
+  // for non-importable platforms looked tidier but was a regression: a repo draft and a
+  // manual program store platform "manual", and a VDP preset stores "bugcrowd", so all
+  // three lost the HackerOne fetch they have always had — and getting it back would have
+  // meant flipping the Platform select, which rewrites the program's saved export format
+  // as a side effect. So only YesWeHack changes the target; everything else keeps the
+  // previous behaviour exactly. Hacktivity is HackerOne-only and has no YesWeHack
+  // equivalent, so it is the one thing that hides.
+  const syncFetchBar = () => {
+    const isYwh = platSelect.value === "yeswehack";
+    fetchBtn.textContent = `Fetch scope from ${isYwh ? "YesWeHack" : "HackerOne"}`;
+    hacktivityBtn.hidden = isYwh;
+  };
+  platSelect.addEventListener("change", syncFetchBar);
+  syncFetchBar();
   const fetchNote = cel("p", "ck-status");
   form.append(fetchBar, fetchNote);
   const hacktivityPanel = cel("div", "ck-hacktivity-panel"); hacktivityPanel.hidden = true;
@@ -7084,29 +7134,53 @@ function ckProgramSetupForm(prefill) {
 
   fetchBtn.addEventListener("click", async () => {
     const h = handle.input.value.trim();
-    if (!h) { fetchNote.className = "ck-status is-error"; fetchNote.textContent = "Enter a HackerOne team handle first."; return; }
+    const isYwh = platSelect.value === "yeswehack";
+    if (!h) {
+      fetchNote.className = "ck-status is-error";
+      fetchNote.textContent = isYwh ? "Enter a YesWeHack program slug first." : "Enter a HackerOne team handle first.";
+      return;
+    }
     const label = fetchBtn.textContent; fetchBtn.disabled = true; fetchBtn.textContent = "Fetching…";
     fetchNote.className = "ck-status"; fetchNote.textContent = "";
     try {
-      const res = await apiFetch("/api/hackerone/import-scope", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ handle: h }) });
+      const res = isYwh
+        ? await apiFetch("/api/yeswehack/import-scope", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ slug: h }) })
+        : await apiFetch("/api/hackerone/import-scope", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ handle: h }) });
       if (!res || res.ok === false) {
         fetchNote.className = "ck-status is-error";
         fetchNote.textContent = (res && res.error) || "Could not fetch scope.";
         return;
       }
-      fetchedProgramStats = res.program_stats || {};
+      if (isYwh) {
+        fetchedYwhStats = res.program_stats || {};
+        // The program's required user-agent marker and its rules digest only OVERWRITE an
+        // empty field — a re-fetch must never clobber what the operator typed or edited.
+        if (res.user_agent_suffix && !uaSuffix.input.value.trim()) uaSuffix.input.value = res.user_agent_suffix;
+        if (res.notes_digest && !notes.input.value.trim()) notes.input.value = res.notes_digest;
+      } else {
+        fetchedProgramStats = res.program_stats || {};
+      }
       const entries = res.structured_scope || [];
       let mergeNote = "";
       if (entries.length) {
         // Merge (dedupe by identifier, fetched rows win on a match) rather than replace —
         // a fetch must never silently discard hand-typed or CSV-merged rows already in
         // the table.
-        const { rows: merged, truncated } = ckMergeScopeRows(
-          scopeTable.ckCollect().filter((e) => !entries.some((f) => f.identifier.toLowerCase() === e.identifier.toLowerCase())),
-          entries
-        );
+        // Fetched rows go FIRST. ckMergeScopeRows fills up to the cap in order, so putting
+        // existing rows first meant a nearly-full table silently discarded the rows just
+        // fetched — including out-of-scope exclusions, which is the one direction that
+        // must never be lost. Within the fetched set, exclusions lead for the same reason.
+        const fetchedFirst = [
+          ...entries.filter((e) => !e.eligible_for_submission),
+          ...entries.filter((e) => e.eligible_for_submission),
+        ];
+        const keptExisting = scopeTable.ckCollect()
+          .filter((e) => !entries.some((f) => f.identifier.toLowerCase() === e.identifier.toLowerCase()));
+        const { rows: merged, truncated } = ckMergeScopeRows(fetchedFirst, keptExisting);
         scopeTable.ckReplace(merged);
-        if (truncated) mergeNote = ` Capped at ${CK_MAX_SCOPE_ENTRIES} scope entries — some existing rows were dropped.`;
+        // Say which rows actually went — it used to claim "existing rows were dropped"
+        // while it was in fact dropping the fetched ones.
+        if (truncated) mergeNote = ` Capped at ${CK_MAX_SCOPE_ENTRIES} scope entries — ${keptExisting.length - (merged.length - fetchedFirst.length)} existing row(s) did not fit; every fetched row was kept.`;
       }
       const fetchedRepositories = ckRepositoryUrlsFromScope(entries);
       if (fetchedRepositories.length) {
@@ -7141,7 +7215,9 @@ function ckProgramSetupForm(prefill) {
   form.append(toggles);
 
   const notes = ckTextareaField("Notes (policy excerpt, reward table, anything worth remembering)", "");
-  notes.input.value = editing ? (editing.notes || "") : "";
+  // A YesWeHack import seeds this with its rules digest (RoE, reward grid, out-of-scope
+  // prose, qualifying/non-qualifying classes) — the operator can edit it before saving.
+  notes.input.value = editing ? (editing.notes || "") : ((seed && seed.notes) || "");
   notes.input.rows = 3;
   form.append(notes.wrap);
 
@@ -7169,7 +7245,10 @@ function ckProgramSetupForm(prefill) {
   const accCookie = ckTextareaField("Session cookie — optional fallback if auto-login can't drive the form (CAPTCHA/SSO)", "");
   if (acc.cookie_set) accCookie.input.placeholder = "•••• saved session cookie — leave blank to keep";
   accCookie.input.rows = 2;
-  const uaSuffix = ckField('Required user-agent suffix (appended to every request, e.g. " -BugBounty-acme-31337 ")', "text", (editing && editing.user_agent_suffix) || "");
+  // Pre-filled from a YesWeHack import — every YesWeHack program publishes the marker it
+  // requires on in-scope traffic, and this is the field the hunt engine appends verbatim.
+  const uaSuffix = ckField('Required user-agent suffix (appended to every request, e.g. " -BugBounty-acme-31337 ")', "text",
+    editing ? (editing.user_agent_suffix || "") : ((seed && seed.user_agent_suffix) || ""));
   accWrap.append(accEmail.wrap, accPassword.wrap, accLoginUrl.wrap, accRegisterUrl.wrap, accCookie.wrap, uaSuffix.wrap);
   advanced.append(accWrap);
 
@@ -7256,6 +7335,7 @@ function ckProgramSetupForm(prefill) {
       oob_allowed: oobAllowed.input.checked,
       disclose_automation: discloseAutomation.input.checked,
       h1_program_stats: fetchedProgramStats,
+      ywh_program_stats: fetchedYwhStats,
       notes: notes.input.value,
       // A blank password/cookie means "keep the saved one" (the server merge-preserves them, since
       // they're read back redacted); email/URLs/suffix are sent verbatim so clearing them takes effect.
@@ -7431,6 +7511,7 @@ function ckWizardStart() {
   grid.append(
     mk("repo", "🔗", "From a repo link", "Paste a public repo. We check it, then set up a source-only draft you can hunt right away."),
     mk("hackerone", "🎯", "From HackerOne", "Enter a program handle to pull real scope from the API, or paste its scope table."),
+    mk("yeswehack", "🐝", "From YesWeHack", "Search or paste a program slug. Pulls scope, rules and the required user-agent marker — no sign-in needed for public programs."),
     mk("manual", "✎", "Manually", "Name it and add scope yourself — full control."),
   );
   box.append(grid);
@@ -7459,6 +7540,7 @@ function ckWizardIdentify() {
   back.addEventListener("click", () => { ckFlow.step = 0; void ckRenderProgram(); });
   if (ckFlow.choice === "repo") box.append(ckWizardIdentifyRepo(nav));
   else if (ckFlow.choice === "hackerone") box.append(ckWizardIdentifyH1(nav));
+  else if (ckFlow.choice === "yeswehack") box.append(ckWizardIdentifyYWH(nav));
   else box.append(ckWizardIdentifyManual(nav));
   nav.prepend(back);
   box.append(nav);
@@ -7555,7 +7637,7 @@ function ckWizardIdentifyH1(nav) {
     go.addEventListener("click", () => {
       ckSetView("submissions");
       setTimeout(() => {
-        const bar = ck.views.submissions?.querySelector(".ck-creds");
+        const bar = ck.views.submissions?.querySelector(".ck-creds-h1");
         if (bar) { bar.scrollIntoView({ behavior: "smooth", block: "start" }); bar.querySelector("input")?.focus(); }
       }, 60);
     });
@@ -7595,6 +7677,146 @@ function ckWizardIdentifyH1(nav) {
   });
   nav.append(cont);
   return box;
+}
+
+// The YesWeHack path. Unlike HackerOne's, this needs NO stored credential for a public
+// program — YesWeHack serves scope, rules and the program's required user-agent marker
+// anonymously — so the step leads with a searchable program picker instead of a creds
+// warning, and only points at sign-in when the API actually answers 403 (private program).
+function ckWizardIdentifyYWH(nav) {
+  const box = cel("div");
+  box.append(cel("h3", "ck-wiz-title", "Pull scope from YesWeHack"));
+  box.append(cel("p", "ck-hint", "Search for the program, or paste its slug (or full yeswehack.com/programs/… URL). Public programs need no sign-in. We pull the scope, out-of-scope list, rules of engagement, reward grid and the user-agent marker the program requires on every request."));
+
+  // Program search — so the operator never has to already know the slug.
+  const search = ckField("Search YesWeHack programs", "text", "");
+  const searchBtn = cel("button", "ck-btn", "Search"); searchBtn.type = "button";
+  const results = cel("div", "ck-hacktivity-panel"); results.hidden = true;
+  box.append(search.wrap, searchBtn, results);
+
+  const slug = ckField("Program slug (yeswehack.com/programs/…)", "text", "");
+  box.append(slug.wrap);
+  const fetchBtn = cel("button", "ck-btn", "Fetch scope"); fetchBtn.type = "button";
+  const note = cel("p", "ck-status");
+  const signin = cel("div", "ck-wiz-crednote");
+  box.append(fetchBtn, note, signin);
+  const cont = cel("button", "ck-btn primary", "Continue →"); cont.type = "button"; cont.disabled = true;
+  let fetched = null;
+
+  const offerSignin = () => {
+    signin.replaceChildren();
+    const go = cel("button", "ck-btn", "Sign in to YesWeHack →"); go.type = "button";
+    go.addEventListener("click", () => {
+      ckSetView("submissions");
+      setTimeout(() => {
+        const bar = ck.views.submissions?.querySelector(".ck-creds-ywh");
+        if (bar) { bar.scrollIntoView({ behavior: "smooth", block: "start" }); bar.querySelector("input")?.focus(); }
+      }, 60);
+    });
+    signin.append(go);
+  };
+
+  searchBtn.addEventListener("click", async () => {
+    const q = search.input.value.trim();
+    searchBtn.disabled = true; searchBtn.textContent = "Searching…";
+    note.className = "ck-status"; note.textContent = "";
+    try {
+      const res = await apiFetch("/api/yeswehack/programs", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ query: q }) });
+      results.replaceChildren();
+      if (!res || res.ok === false) {
+        note.className = "ck-status is-error"; note.textContent = (res && res.error) || "Could not list programs.";
+        results.hidden = true; return;
+      }
+      const list = res.programs || [];
+      const SHOWN = 40;
+      // Surface the server's warnings — a "no match" that was really a truncated walk of
+      // the catalogue must not read as a definitive "this program does not exist".
+      for (const w of res.warnings || []) results.append(cel("p", "ck-status is-warn", w));
+      if (!list.length) {
+        results.append(cel("p", "ck-status", q ? `No program matched "${q}". Paste the slug below instead.` : "No programs returned."));
+      } else {
+        // Say how many are actually RENDERED: printing the full count above a 40-row list
+        // made the header and the list disagree.
+        results.append(cel("p", "ck-hint", list.length > SHOWN
+          ? `${list.length} programs matched — showing the first ${SHOWN}. Narrow the search, or paste the slug below.`
+          : `${list.length} program${list.length === 1 ? "" : "s"} — pick one to load its slug.`));
+        for (const p of list.slice(0, SHOWN)) {
+          const row = cel("button", "ck-textlink"); row.type = "button";
+          const reward = p.bounty_reward_max ? ` · up to ${p.bounty_reward_max}` : "";
+          const kind = p.vdp ? "VDP" : (p.offers_bounty ? "bounty" : p.program_type || "");
+          row.textContent = `${p.title} — ${p.slug} · ${p.scopes_count} scope${p.scopes_count === 1 ? "" : "s"}${reward}${kind ? ` · ${kind}` : ""}`;
+          row.addEventListener("click", () => { slug.input.value = p.slug; fetchBtn.click(); });
+          const line = cel("div"); line.append(row);
+          results.append(line);
+        }
+      }
+      results.hidden = false;
+    } catch (err) { note.className = "ck-status is-error"; note.textContent = err.message || "Search failed."; }
+    finally { searchBtn.disabled = false; searchBtn.textContent = "Search"; }
+  });
+  search.input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); searchBtn.click(); } });
+
+  fetchBtn.addEventListener("click", async () => {
+    const s = slug.input.value.trim();
+    if (!s) { note.className = "ck-status is-error"; note.textContent = "Enter or pick a YesWeHack program slug first."; return; }
+    fetchBtn.disabled = true; fetchBtn.textContent = "Fetching…";
+    note.className = "ck-status"; note.textContent = ""; signin.replaceChildren();
+    try {
+      const res = await apiFetch("/api/yeswehack/import-scope", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ slug: s }) });
+      if (!res || res.ok === false) {
+        note.className = "ck-status is-error";
+        note.textContent = (res && res.error) || "Could not fetch scope. You can still continue and add scope by hand.";
+        // 401 too, not just 403 — an expired JWT is the ONE failure where signing in again
+        // is literally the fix, and it was the one case that got no button.
+        if (res && /\b401\b|403|private|invited|expired/i.test(String(res.error || ""))) offerSignin();
+        fetched = { name: s, platform: "yeswehack", platform_handle: s }; cont.disabled = false; cont.textContent = "Continue anyway →"; return;
+      }
+      fetched = ckYwhPrefill(res, s);
+      const entries = fetched.structured_scope || [];
+      const inScope = entries.filter((e) => e.eligible_for_submission).length;
+      const excluded = entries.length - inScope;
+      // "enforced", not just "out of scope": a YesWeHack out-of-scope list mixes host
+      // patterns with prose, and only the host patterns can bind in the scope matcher.
+      // The prose ones come back as a warning below — never let the count imply they were
+      // all captured.
+      note.className = "ck-status";
+      note.textContent = `Fetched ${inScope} in-scope and ${excluded} enforced out-of-scope entr${excluded === 1 ? "y" : "ies"} for "${fetched.name}".`
+        + ((res.warnings || []).length ? " " + res.warnings.join(" ") : "")
+        + " Review and save on the next step.";
+      cont.disabled = false; cont.textContent = "Continue →";
+    } catch (err) { note.className = "ck-status is-error"; note.textContent = err.message || "Fetch failed."; }
+    finally { fetchBtn.disabled = false; if (fetchBtn.textContent === "Fetching…") fetchBtn.textContent = "Fetch scope"; }
+  });
+  slug.input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); fetchBtn.click(); } });
+
+  cont.addEventListener("click", () => {
+    if (!fetched) {
+      const s = slug.input.value.trim();
+      fetched = { name: s || "New program", platform: "yeswehack", platform_handle: s };
+    }
+    ckProgEdit = null; ckFlow.prefill = fetched; ckFlow.view = "form"; void ckRenderProgram();
+  });
+  nav.append(cont);
+  return box;
+}
+
+// Shape a YesWeHack import response into the Program form's prefill seed. Shared by the
+// wizard step and the form's own re-fetch so the two can't drift.
+// The marker matters most: YesWeHack programs require their user_agent tag on every
+// request, and user_agent_suffix is exactly the field the hunt engine appends verbatim
+// (web_ingest.set_ua_suffix), so an imported program is in-policy without extra setup.
+function ckYwhPrefill(res, slug) {
+  const entries = res.structured_scope || [];
+  return {
+    name: res.program_name || slug,
+    platform: "yeswehack",
+    platform_handle: res.slug || slug,
+    structured_scope: entries,
+    repository_urls: ckRepositoryUrlsFromScope(entries),
+    ywh_program_stats: res.program_stats || {},
+    user_agent_suffix: res.user_agent_suffix || "",
+    notes: res.notes_digest || "",
+  };
 }
 
 function ckWizardIdentifyManual(nav) {
@@ -8789,6 +9011,7 @@ function ckRenderSubmissions() {
   if (ckState.reportFocus) host.append(ckFullReportPanel(ckState.reportFocus));
 
   host.append(ckCredsBar());
+  host.append(ckYesWeHackCredsBar());
   host.append(ckHackeroneActivityPanel());
   host.append(ckFormatBar());
   host.append(ckReportsExportBar());
@@ -10201,7 +10424,9 @@ function ckRenderProofResult(box, res) {
 // token; the server splits it. A "Test" button probes a real authenticated endpoint so
 // the operator gets a server-authoritative answer instead of guessing the username.
 function ckCredsBar() {
-  const wrap = cel("div", "ck-creds");
+  // ck-creds-h1 distinguishes this from the YesWeHack bar (and from the activity panels,
+  // which reuse .ck-creds) so a deep-link can scroll to the right one.
+  const wrap = cel("div", "ck-creds ck-creds-h1");
   const h1 = ckState.h1;
   const head = cel("div", "ck-creds-head");
   head.append(cel("strong", null, "HackerOne API"));
@@ -10258,6 +10483,120 @@ function ckCredsBar() {
       else { note.classList.add("is-error"); note.textContent = `✗ ${(res && res.error) || "HackerOne rejected these credentials."}`; }
     } catch (err) { note.classList.add("is-error"); note.textContent = err.message || "Could not reach HackerOne."; }
   });
+  wrap.append(form);
+  return wrap;
+}
+
+// YesWeHack sign-in. Deliberately shaped differently from the HackerOne bar, because the
+// platform is: public programs import with NO credential, so the bar says so up front and
+// sign-in is framed as the thing you do only for a private/invited program.
+//
+// The password is posted once to the local backend, exchanged there for a YesWeHack JWT,
+// and never stored — only the JWT is kept (see greyiq_api.yeswehack_login). A Personal
+// Access Token can be pasted instead for manager-role accounts.
+function ckYesWeHackCredsBar() {
+  const wrap = cel("div", "ck-creds ck-creds-ywh");
+  const ywh = ckState.ywh;
+  const head = cel("div", "ck-creds-head");
+  head.append(cel("strong", null, "YesWeHack"));
+  head.append(cel("span", "ck-tag", ywh && ywh.has_token
+    ? `signed in${ywh.email ? ` · ${ywh.email}` : ""}${ywh.token_kind === "pat" ? " · PAT" : ""}`
+    : "anonymous · public programs only"));
+  wrap.append(head);
+
+  const form = cel("form", "ck-learn-form");
+  const help = cel("p", "ck-hint", "Public YesWeHack programs import without signing in — leave this empty unless you need a private or invited program. Signing in exchanges your password for a short-lived session token; the password itself is never stored.");
+  help.style.flexBasis = "100%";
+  form.append(help);
+
+  const email = ckField("YesWeHack email", "text", (ywh && ywh.email) || "");
+  const password = ckField("Password (used once to sign in, never stored)", "password", "");
+  const totp = ckField("2FA code (only if your account has 2FA)", "text", "");
+  totp.input.autocomplete = "one-time-code";
+  totp.input.inputMode = "numeric";
+  form.append(email.wrap, password.wrap, totp.wrap);
+
+  // Declared before the buttons so every handler below closes over an initialized node.
+  const note = cel("p", "ck-status");
+  note.style.flexBasis = "100%";
+
+  const signIn = cel("button", "ck-btn primary", "Sign in"); signIn.type = "submit";
+  const test = cel("button", "ck-btn", "Test connection"); test.type = "button";
+  form.append(signIn, test);
+  if (ywh && ywh.has_token) {
+    const out = cel("button", "ck-btn", "Sign out"); out.type = "button";
+    out.addEventListener("click", async () => {
+      try {
+        // clear_token is an explicit flag: an empty password field must never be mistaken
+        // for "drop my session".
+        const res = await apiFetch("/api/bounty/yeswehack/creds", { method: "POST", body: JSON.stringify({ clear_token: true }) });
+        ckState.ywh = res && res.ok ? res : null;
+        ckRenderSubmissions();
+      } catch (err) { note.textContent = err.message || "Could not sign out."; note.classList.add("is-error"); }
+    });
+    form.append(out);
+  }
+  form.append(note);
+
+  // A Personal Access Token is the other supported credential — YesWeHack issues these to
+  // program-manager / business-unit roles rather than hunter accounts, so it's tucked away.
+  const patBox = cel("details", "ck-advanced");
+  patBox.append(cel("summary", "ck-advanced-summary", "Use a Personal Access Token instead"));
+  const patField = ckField("Personal Access Token (X-AUTH-TOKEN)", "password", "");
+  patField.input.placeholder = ywh && ywh.has_token && ywh.token_kind === "pat" ? "•••••• (saved — leave blank to keep)" : "paste your PAT";
+  const patSave = cel("button", "ck-btn", "Save token"); patSave.type = "button";
+  patSave.addEventListener("click", async () => {
+    const value = patField.input.value.trim();
+    if (!value) { note.classList.add("is-error"); note.textContent = "Paste a Personal Access Token first."; return; }
+    note.classList.remove("is-error"); note.textContent = "Saving…";
+    try {
+      const res = await apiFetch("/api/bounty/yeswehack/creds", {
+        method: "POST", body: JSON.stringify({ api_token: value, token_kind: "pat", email: email.input.value.trim() })
+      });
+      ckState.ywh = res && res.ok ? res : ckState.ywh;
+      note.textContent = "Saved."; ckRenderSubmissions();
+    } catch (err) { note.classList.add("is-error"); note.textContent = err.message || "Could not save."; }
+  });
+  patBox.append(patField.wrap, patSave);
+  patBox.style.flexBasis = "100%";
+  form.append(patBox);
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!email.input.value.trim() || !password.input.value) {
+      note.classList.add("is-error");
+      note.textContent = "Enter your YesWeHack email and password — or skip sign-in entirely for public programs.";
+      return;
+    }
+    signIn.disabled = true; note.classList.remove("is-error"); note.textContent = "Signing in…";
+    try {
+      const res = await apiFetch("/api/bounty/yeswehack/login", {
+        method: "POST", timeoutMs: 30000,
+        body: JSON.stringify({ email: email.input.value.trim(), password: password.input.value, totp_code: totp.input.value.trim() })
+      });
+      if (!res || res.ok === false) {
+        note.classList.add("is-error");
+        note.textContent = `✗ ${(res && res.error) || "YesWeHack rejected the sign-in."}`;
+        if (res && res.totp_required) totp.input.focus();
+        return;
+      }
+      ckState.ywh = res;
+      password.input.value = ""; totp.input.value = "";
+      note.textContent = `✓ ${res.message || "Signed in."}`;
+      ckRenderSubmissions();
+    } catch (err) { note.classList.add("is-error"); note.textContent = err.message || "Could not reach YesWeHack."; }
+    finally { signIn.disabled = false; }
+  });
+
+  test.addEventListener("click", async () => {
+    note.classList.remove("is-error"); note.textContent = "Testing…";
+    try {
+      const res = await apiFetch("/api/bounty/yeswehack/test", { method: "POST", timeoutMs: 20000 });
+      if (res && res.ok) { note.classList.remove("is-error"); note.textContent = `✓ ${res.message || "YesWeHack reachable."}`; }
+      else { note.classList.add("is-error"); note.textContent = `✗ ${(res && res.error) || "YesWeHack rejected the credential."}`; }
+    } catch (err) { note.classList.add("is-error"); note.textContent = err.message || "Could not reach YesWeHack."; }
+  });
+
   wrap.append(form);
   return wrap;
 }
@@ -11885,7 +12224,7 @@ function bootCockpit() {
   ckUpdateLaunchReadiness();
   void ckPopulateProfiles();
   void (async () => {
-    await ckFetchCreds();
+    await Promise.all([ckFetchCreds(), ckFetchYwhCreds()]);
     await ckRenderProgram();   // also fetches + populates the launch rail's Program picker
     ckUpdateSpanScopeToggle();  // reflect a restored active program without clobbering the restored checked state
     ckMaybeShowWizard();
