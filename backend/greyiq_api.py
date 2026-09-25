@@ -757,6 +757,12 @@ class ProofEvidenceInput(BaseModel):
     set_cookie: str = Field(default="", max_length=2000)
     matched_value: str = Field(default="", max_length=6000)
     read_data: str = Field(default="", max_length=8000)
+    # Generic, value-free names for the sensitive data the capturing check classified on the RAW
+    # body ("a JWT (session/bearer token)", "email address(es)"). report._sensitive_read_captured
+    # and the CORS severity wording both read it, and redaction rewrites the excerpt they would
+    # otherwise re-scan — so a model that doesn't declare it silently drops the one signal that
+    # tells a rebuilt report a sensitive read really happened.
+    sensitive_data_labels: str = Field(default="", max_length=2000)
 
 
 class FindingReportRequest(BaseModel):
@@ -961,13 +967,15 @@ class StoredXssRequest(BaseModel):
 
 
 class StoredXssBeaconRequest(BaseModel):
+    # NO base/secret here, deliberately. The collaborator URL + secret are read server-side from
+    # the saved OOB config, exactly as oob-ssrf / oob-xxe / mint / poll do. They used to be request
+    # fields, which made this route unreachable from the app: oob_config_status returns only
+    # `has_secret`, never the secret itself, so no client could ever fill them in.
     view_url: str = Field(min_length=1, max_length=4000)   # where the stored content renders
     inject_url: str = Field(default="", max_length=4000)   # the form endpoint (auto-send only)
     field: str = Field(default="", max_length=200)         # the field to submit into (auto-send only)
     scope: str = Field(default="", max_length=2000)
     platform: str = Field(default="hackerone", max_length=20)
-    base: str = Field(default="", max_length=2000)         # OOB collaborator base URL
-    secret: str = Field(default="", max_length=200)        # OOB collaborator secret
     send: bool = Field(default=False)               # opt-in: POST the beacon into the field, then render + poll
     token: str = Field(default="", max_length=64)   # re-render/re-poll an assisted token after injecting manually
     cookie: str = Field(default="", max_length=8000)
@@ -3962,10 +3970,15 @@ class GreyIQRuntime:
         """Confirm stored XSS via an OOB collaborator beacon rendered in a browser — proves the injected
         markup EXECUTES on render (catches DOM/JS-rendered stored XSS a source fetch misses). Assisted by
         default (mint a token + beacon payloads, hand back to submit, then re-render/poll); ``send=True``
-        opts in to GreyIQ POSTing the beacon, rendering the view headlessly, and polling the collaborator."""
+        opts in to GreyIQ POSTing the beacon, rendering the view headlessly, and polling the collaborator.
+
+        The collaborator base + secret come from the SAVED OOB config, never from the request — the
+        secret is write-only (oob_config_status reports only its presence), so a client could not
+        supply it even if asked."""
+        base, secret = self._oob_config()
         res = bounty_stored_xss.confirm_stored_xss_beacon(
             view_url=request.view_url, inject_url=request.inject_url, field=request.field,
-            base=request.base, secret=request.secret, scope=request.scope, send=bool(request.send),
+            base=base, secret=secret, scope=request.scope, send=bool(request.send),
             token=(request.token or None), cookie=request.cookie, headers=request.headers)
         if not res.get("ok"):
             return res

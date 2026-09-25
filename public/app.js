@@ -3350,6 +3350,7 @@ function renderChangesPanel(changes) {
     body.className = "change-preview";
     body.hidden = true;
     body.append(buildDiffView(change));
+    body.append(buildRevertControl(change));
     head.addEventListener("click", () => {
       body.hidden = !body.hidden;
       head.setAttribute("aria-expanded", String(!body.hidden));
@@ -3357,6 +3358,61 @@ function renderChangesPanel(changes) {
     card.append(head, body);
     els.changesPanel.append(card);
   });
+}
+
+// Per-file revert, on the change entry this card is already showing. "Undo last agent run" is
+// all-or-nothing and consumes the snapshot; this puts ONE file back while keeping the rest of the
+// run. /api/workspace/rollback is built for exactly this: it refuses a file whose content no
+// longer matches what the run left (the user has edited it since) and one whose before/after
+// snapshot was clipped, so it can only ever restore a file it can restore faithfully.
+function buildRevertControl(change) {
+  const wrap = document.createElement("div");
+  wrap.className = "workflow-rollback";
+  const status = document.createElement("p");
+  status.className = "workflow-rollback-note";
+  status.setAttribute("aria-live", "polite");
+  if (change.before_truncated || change.after_truncated) {
+    status.textContent = "This file is too large to revert from the saved snapshot — use Undo last agent run.";
+    wrap.append(status);
+    return wrap;
+  }
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "workflow-undo";
+  btn.textContent = change.existed ? "Revert this file" : "Delete this created file";
+  status.textContent = change.existed
+    ? "Restores just this file to its state before the run."
+    : "Removes just this file, which the run created.";
+  btn.addEventListener("click", async () => {
+    if (!state.agentWorkspace) { status.textContent = "Pick a workspace first."; return; }
+    const label = btn.textContent;
+    btn.disabled = true; btn.textContent = "Reverting…";
+    try {
+      const res = await apiFetch("/api/workspace/rollback", {
+        method: "POST",
+        body: JSON.stringify({ workspace: state.agentWorkspace, changes: [change] })
+      });
+      if (!res || res.ok === false) {
+        // Surface the per-file reason (e.g. "changed after the agent run"), not just "failed".
+        status.textContent = (res && (res.errors || [])[0]) || (res && res.error) || "Revert failed.";
+        btn.disabled = false; btn.textContent = label;
+        return;
+      }
+      // Drop it from the run's change list so the panel stops offering a revert that is done, and
+      // the Changes count matches what is still applied.
+      state.lastAgentChanges = (Array.isArray(state.lastAgentChanges) ? state.lastAgentChanges : [])
+        .filter((c) => c.path !== change.path);
+      saveState();
+      void refreshWorkspaceTree();
+      renderChangesPanel(state.lastAgentChanges);
+      renderWorkflowPanel();
+    } catch (error) {
+      status.textContent = `Revert failed: ${error.message || error}`;
+      btn.disabled = false; btn.textContent = label;
+    }
+  });
+  wrap.append(btn, status);
+  return wrap;
 }
 
 // ---- Workflow tab: Plan -> Change -> Verify -> Explain (the guided trust loop) ----
@@ -3548,7 +3604,10 @@ async function undoLastAgentRun() {
       body: JSON.stringify({ workspace: state.agentWorkspace })
     });
     if (!res || res.ok === false) {
-      window.alert((res && res.error) || "Undo failed.");
+      // Name the files, not just the failure: the common case now is "you edited this after the
+      // run, so it was left alone", and the operator can only act on that if they know which.
+      const why = (res && Array.isArray(res.errors) && res.errors.length) ? `\n\n${res.errors.join("\n")}` : "";
+      window.alert(((res && res.error) || "Undo failed.") + why);
       return;
     }
     state.agentSnapshot = { available: false, count: 0 };
@@ -4804,6 +4863,7 @@ const ckState = {
   platform: "hackerone", // report format for Copy/Download (server re-shapes per platform)
   triage: {},            // ref -> "submitted" | "drafted" (client-side worklist marks)
   reportFocus: null,     // a finding pinned open as a Full report on the Submissions page (from a drawer's "View full report")
+  lastDeleted: null,     // { title, dedupKey } of the finding just deleted from the board — the handle "Undo delete" needs
   sub: { query: "", sev: "all", proof: "all", sort: "severity" }  // Submissions page search / filter / sort
 };
 
@@ -5251,6 +5311,40 @@ function ckProofMatchesFinding(activeFindings, f) {
   });
 }
 
+// The active-prover result to fold into a finding's report: the CLASS-MATCHED confirmed one —
+// the same one the server persists onto the cached run (_persist_proof_of_impact) — falling back
+// to the first confirmed result so a prover that reports no class hint still yields proof.
+// Null when nothing confirmed.
+function ckBestActiveProof(activeFindings, f) {
+  const confirmed = (activeFindings || []).filter((r) => r.status === "confirmed");
+  if (!confirmed.length) return null;
+  const cls = String(f.class_id || f.cls || f.className || "").toLowerCase();
+  const matched = confirmed.find((r) => {
+    const hint = String(r.class_hint || "").toLowerCase();
+    return hint && cls && (hint === cls || cls.includes(hint) || hint.includes(cls));
+  });
+  return matched || confirmed[0];
+}
+
+// The observed-vs-control differential (POI) an active-prover result carries, in the shape the
+// report routes accept.
+function ckActiveProofObj(best) {
+  return { status: best.status || "candidate", method: best.method || "", observed_result: best.observed || "",
+           control_result: best.control || "", evidence: best.evidence || "", affected_asset: best.affected_asset || "" };
+}
+
+// The captured request/response artifact (POE) an active-prover result carries. /prove returns one
+// per result (_compact_active carries proof_evidence through), and the server records it on the
+// cached run — but a finding re-proven from history or the drawer has no cached run to read back,
+// so unless the client keeps it here the freshly captured artifact never reaches that finding's
+// report and only the observed/control prose survives. Empty (all-blank) evidence returns null so
+// a proof-less result can't blank a better artifact the finding already had.
+function ckActiveProofEvidence(best) {
+  const pe = best && best.proof_evidence;
+  if (!pe || typeof pe !== "object") return null;
+  return Object.keys(pe).some((k) => String(pe[k] || "").trim()) ? pe : null;
+}
+
 // Re-render whichever finding views are live so a status change shows at once.
 function ckSyncFindingViews() {
   if (ckState.view === "findings") {
@@ -5283,6 +5377,18 @@ function ckDeriveRisk(findings) {
 function ckRenderFindings() {
   const host = ck.views.findings;
   host.replaceChildren();
+  // Undo for the last board delete. Above the empty-state early return on purpose: deleting the
+  // only finding leaves an empty board, which is exactly when an accidental delete is hardest to
+  // notice and most worth being able to take back.
+  if (ckState.lastDeleted) {
+    const d = ckState.lastDeleted;
+    // Both callbacks only clear the state — no re-render, or the "Restored" line the operator
+    // just earned would be swept away by the rebuild it triggered. Restoring lifts the ledger
+    // suppression for FUTURE hunts; it does not put the row back on this in-memory board.
+    host.append(ckUndoDeleteBar(d.title, d.dedupKey,
+      () => { ckState.lastDeleted = null; },
+      () => { ckState.lastDeleted = null; }));
+  }
   const res = ckState.result;
   // A standalone confirm tool (IDOR/BFLA/takeover/CVE/…) can populate ckState.findings
   // WITHOUT ever running a hunt (res stays null) — show the board whenever there's
@@ -5626,6 +5732,55 @@ function ckRenderDetail(f) {
 // no future hunt or campaign surfaces it again, then drop it from the in-memory board and
 // close the drawer. The server derives the key from class_id/rule_id/location — the same
 // fields the engine keys on — so the deletion sticks across runs, targets, and programs.
+// "Delete finding" is a SUPPRESSION, not an erase: the server records the finding's stable dedup
+// key so no future hunt surfaces it again, and /api/bounty/finding/restore lifts that suppression.
+// The dismiss response's dedup_key is the only handle on it — the server derives the key itself
+// when the caller had none, so nothing left in the app can recompute it. Discard it and a
+// mis-click is permanent. This bar keeps it, and spends it on one click.
+function ckUndoDeleteBar(title, dedupKey, onRestored, onDismiss) {
+  const bar = cel("div", "ck-actions");
+  const note = cel("span", "ck-hint", `Deleted “${title}” — it won't be surfaced again.`);
+  bar.append(note);
+  if (onDismiss) {
+    // The board's bar outlives the row it replaced, so it needs a way off the screen that isn't
+    // "undo the delete you meant".
+    const hide = cel("button", "ck-btn", "Dismiss");
+    hide.type = "button"; hide.title = "Hide this notice (the finding stays deleted)";
+    hide.addEventListener("click", () => { onDismiss(); bar.remove(); });
+    bar.append(hide);
+  }
+  if (!dedupKey) return bar;  // nothing to restore with; say what happened, offer no dead button
+  const undo = cel("button", "ck-btn", "Undo delete");
+  undo.type = "button";
+  undo.title = "Lift the suppression so future hunts can surface this finding again";
+  undo.addEventListener("click", async () => {
+    undo.disabled = true; undo.textContent = "Restoring…";
+    let res;
+    try {
+      res = await apiFetch("/api/bounty/finding/restore", {
+        method: "POST", timeoutMs: 15000, body: JSON.stringify({ dedup_key: dedupKey }),
+      });
+    } catch (err) {
+      undo.disabled = false; undo.textContent = "Undo delete";
+      note.textContent = err.message || "Could not restore the finding.";
+      return;
+    }
+    if (!res || res.ok === false) {
+      undo.disabled = false; undo.textContent = "Undo delete";
+      note.textContent = (res && res.error) || "Could not restore the finding.";
+      return;
+    }
+    undo.remove();
+    // restore is idempotent, so be honest about which of the two things happened.
+    note.textContent = res.restored
+      ? `Restored “${title}” — future hunts can surface it again.`
+      : `“${title}” wasn't suppressed, so there was nothing to restore.`;
+    if (onRestored) onRestored(Boolean(res.restored));
+  });
+  bar.append(undo);
+  return bar;
+}
+
 async function ckDeleteFinding(f, btn) {
   if (!window.confirm(
     `Delete "${f.title}"?\n\nIt's removed from this board and will never be surfaced again in future hunts or campaigns. `
@@ -5652,6 +5807,8 @@ async function ckDeleteFinding(f, btn) {
     window.alert((res && res.error) || "Could not delete the finding.");
     return;
   }
+  // Keep the suppression key the server recorded, so the board can offer one-click Undo.
+  ckState.lastDeleted = { title: f.title || "this finding", dedupKey: res.dedup_key || f.dedupKey || "" };
   // Drop THIS finding only, then refresh counts + drawer. ref is NOT unique across
   // ckState.findings — standalone confirm tools reuse "F1", so a hunt finding and a
   // separately-confirmed finding can share a ref. Match the same identity the insert-dedup
@@ -8304,13 +8461,53 @@ function ckOobPanel() {
   const mintBar = cel("div", "ck-actions");
   const mintBtn = cel("button", "ck-btn", "Mint callback URL"); mintBtn.type = "button";
   const mintOut = cel("p", "ck-hint"); mintOut.style.flexBasis = "100%";
+  // A minted token is only useful if you can ask the collaborator whether anything hit it. Without
+  // this the Mint button hands the operator a token they can never check — the blind provers poll
+  // their own tokens internally, but a payload the operator pasted by hand has no other read-back.
+  const pollForm = cel("form", "ck-learn-form");
+  const ptoken = ckField("Token to check (a minted token, or one a prover handed back)", "text", "");
+  pollForm.append(ptoken.wrap);
+  const pollBtn = cel("button", "ck-btn", "Check for callbacks"); pollBtn.type = "submit"; pollForm.append(pollBtn);
+  const pollNote = cel("p", "ck-status"); pollNote.style.flexBasis = "100%";
+  const pollOut = cel("div", "ck-research");
   mintBtn.addEventListener("click", async () => {
     try {
       const m = await apiFetch("/api/oob/mint", { method: "POST", body: "{}" });
       mintOut.textContent = (m && m.ok) ? `Paste into a payload: ${m.callback_url}  (token ${m.token})` : ((m && m.error) || "Configure the collaborator first.");
+      if (m && m.ok && m.token) ptoken.input.value = m.token;  // so "Check for callbacks" is one click away
     } catch (err) { mintOut.textContent = err.message || "Mint failed."; }
   });
+  pollForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const token = ptoken.input.value.trim();
+    if (!token) { pollNote.classList.add("is-error"); pollNote.textContent = "Enter (or mint) a token first."; return; }
+    const label = pollBtn.textContent; pollBtn.disabled = true; pollBtn.textContent = "Polling…";
+    pollNote.classList.remove("is-error"); pollNote.textContent = ""; pollOut.replaceChildren();
+    try {
+      const res = await apiFetch("/api/oob/poll", { method: "POST", timeoutMs: 20000, body: JSON.stringify({ token }) });
+      if (!res || res.ok === false) {
+        pollNote.classList.add("is-error"); pollNote.textContent = (res && res.error) || "Poll failed.";
+      } else if (!res.count) {
+        // Honest on absence: no callback is not a negative result about the target, only about
+        // this token so far. Nothing here promotes anything to confirmed.
+        pollNote.textContent = `No callback on token ${token} yet — the payload may not have run, or not yet.`;
+      } else {
+        pollNote.textContent = `${res.count} callback(s) on token ${token}.`;
+        for (const hit of res.hits || []) {
+          const card = cel("div", "ck-cd-rv-card");
+          card.append(cel("div", "ck-cd-rv-card-head", `${hit.method || "GET"} ${hit.path || ""}`));
+          const g = cel("dl", "ck-meta-grid");
+          const add = (k, v) => { if (v) { g.append(cel("dt", null, k)); g.append(cel("dd", null, String(v))); } };
+          add("Source", hit.ip); add("User-Agent", (hit.headers || {})["user-agent"]); add("When", hit.at || hit.ts);
+          if (g.childNodes.length) card.append(g);
+          pollOut.append(card);
+        }
+      }
+    } catch (err) { pollNote.classList.add("is-error"); pollNote.textContent = err.message || "Poll failed."; }
+    finally { pollBtn.disabled = false; pollBtn.textContent = label; }
+  });
   mintBar.append(mintBtn); wrap.append(mintBar); wrap.append(mintOut);
+  wrap.append(pollForm); wrap.append(pollNote); wrap.append(pollOut);
 
   const sform = cel("form", "ck-learn-form");
   const turl = ckField("Target URL (with a server-side-fetch parameter)", "text", "");
@@ -8395,6 +8592,76 @@ function ckOobPanel() {
     finally { xrun.disabled = false; xrun.textContent = label; }
   });
   wrap.append(xform); wrap.append(xnote); wrap.append(xout);
+  wrap.append(ckStoredXssBeaconForm());
+  return wrap;
+}
+
+// Stored XSS confirmed by an OOB beacon that FIRES on render — the stronger sibling of the
+// marker-based stored-XSS form (which only proves the markup was stored unescaped). It lives in
+// the OOB panel because it needs the configured collaborator: base + secret are read server-side
+// from the saved config, exactly like blind SSRF/XXE, and are never part of this request.
+function ckStoredXssBeaconForm() {
+  const wrap = cel("div");
+  wrap.append(cel("h2", "ck-section-title", "Out-of-band (OOB) — stored XSS beacon"));
+  wrap.append(cel("p", "ck-hint",
+    "Proves stored markup EXECUTES on render (what a marker in the page source can't show). GreyIQ mints a beacon payload pointing at your collaborator — submit it into the target field yourself, then re-check the token to render the view and poll. Tick “Send automatically” to have GreyIQ POST the beacon, render headlessly and poll for you."));
+  const form = cel("form", "ck-learn-form");
+  const viewUrl = ckField("View URL (where the stored content renders)", "text", "");
+  const injectUrl = ckField("Inject URL (form endpoint — auto-send only)", "text", "");
+  const field = ckField("Field name (auto-send only)", "text", "");
+  const cookie = ckField("Session Cookie (optional)", "text", "");
+  const token = ckField("Token (to re-check after a manual submit — optional)", "text", "");
+  const scope = ckField("Scope (name the host)", "text", state.ckScope || "");
+  form.append(viewUrl.wrap, injectUrl.wrap, field.wrap, cookie.wrap, token.wrap, scope.wrap);
+  const sendWrap = cel("label", "ck-hint"); sendWrap.style.flexBasis = "100%";
+  const sendBox = cel("input"); sendBox.type = "checkbox"; sendBox.style.marginRight = "6px";
+  sendWrap.append(sendBox, document.createTextNode("Send the beacon automatically (POST into the field — the only non-GET egress)"));
+  form.append(sendWrap);
+  const run = cel("button", "ck-btn primary", "Confirm stored XSS (beacon)"); run.type = "submit"; form.append(run);
+  const note = cel("p", "ck-status"); note.style.flexBasis = "100%";
+  const out = cel("div", "ck-research");
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!viewUrl.input.value.trim()) { note.classList.add("is-error"); note.textContent = "The view URL is required."; return; }
+    const label = run.textContent; run.disabled = true; run.textContent = sendBox.checked ? "Sending…" : "Polling…";
+    note.classList.remove("is-error"); note.textContent = ""; out.replaceChildren();
+    try {
+      const res = await apiFetch("/api/bounty/stored-xss-beacon", {
+        method: "POST", timeoutMs: 120000, body: JSON.stringify({
+          view_url: viewUrl.input.value.trim(), inject_url: injectUrl.input.value.trim(),
+          field: field.input.value.trim(), cookie: cookie.input.value.trim(),
+          token: token.input.value.trim(), send: sendBox.checked,
+          scope: scope.input.value.trim(), platform: ckState.platform || "hackerone",
+        }),
+      });
+      if (!res || res.ok === false) {
+        note.classList.add("is-error"); note.textContent = (res && res.error) || "Check failed.";
+      } else if (res.status === "confirmed") {
+        out.append(cel("p", "ck-ftitle", "✅ Stored XSS CONFIRMED (beacon executed on render)"));
+        ckState.runId = res.run_id || ckState.runId;
+        const row = { runId: res.run_id || ckState.runId, ref: res.ref || "F1", title: res.title || "Stored XSS (OOB beacon)",
+                      severity: res.severity || "high", proof: "confirmed", className: "Stored / persistent XSS",
+                      cwe: "CWE-79", plan: {}, cvss: {}, proofObj: { status: "confirmed" }, description: "" };
+        ckState.findings = (ckState.findings || []).filter((f) => !(f.ref === row.ref && f.className === row.className)).concat(row);
+        ckBadgeCount("submissions", ckState.findings.filter((f) => f.proof === "confirmed" || f.proof === "candidate").length);
+        if (res.report) { const pre = cel("pre", "ck-research-md"); pre.textContent = res.report; pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "320px"; pre.style.overflow = "auto"; out.append(pre); }
+        out.append(cel("p", "ck-hint", "Added to Submissions."));
+      } else if (res.status === "ready") {
+        if (res.token) token.input.value = res.token;
+        out.append(cel("p", "ck-hint", `Submit one of these into the target field, then click Confirm again to render + poll token ${res.token}:`));
+        const pl = res.payloads || {};
+        for (const k of Object.keys(pl)) {
+          out.append(cel("p", "ck-ftitle", k));
+          const pre = cel("pre", "ck-research-md"); pre.textContent = pl[k]; pre.style.whiteSpace = "pre-wrap"; pre.style.maxHeight = "140px"; pre.style.overflow = "auto"; out.append(pre);
+        }
+      } else {
+        if (res.token) token.input.value = res.token;
+        note.textContent = `No beacon callback (${res.status}). ${res.reason || res.error || ""}`;
+      }
+    } catch (err) { note.classList.add("is-error"); note.textContent = err.message || "Check failed."; }
+    finally { run.disabled = false; run.textContent = label; }
+  });
+  form.append(note); wrap.append(form); wrap.append(out);
   return wrap;
 }
 
@@ -8864,10 +9131,13 @@ async function ckPrepareFullReport(f, btn, statusEl, shotWrap) {
           });
           if (res && res.ok !== false) {
             if ((res.confirmed || 0) && ckProofMatchesFinding(res.findings, f)) {
-              const best = (res.findings || []).find((x) => x.status === "confirmed");
+              const best = ckBestActiveProof(res.findings, f);
               if (best) {
-                f.proofObj = { status: "confirmed", method: best.method || "", observed_result: best.observed || "",
-                               control_result: best.control || "", evidence: best.evidence || "", affected_asset: best.affected_asset || "" };
+                f.proofObj = ckActiveProofObj(best);
+                // Keep the captured request/response too — step 3 below rebuilds the report from
+                // this finding, and without it the concrete headers/read_data are gone.
+                const pe = ckActiveProofEvidence(best);
+                if (pe) f.proofEvidence = pe;
               }
               ckMarkStatus(f, { proof: "confirmed" });
             }
@@ -9770,15 +10040,24 @@ async function ckGetReportReady(rec, btn, status, li) {
   rec.report_ready = true;
   rec.report_ready_proof = res.ready || {};
   if (res.proof_status) rec.proof_status = res.proof_status;
+  // The runnable POC artifacts the server just rebuilt from this finding's captured crafted
+  // request. They come back on THIS response only (they aren't stored in the ledger), so cache
+  // them on the record — otherwise the replay.sh/findings.har a triager needs is thrown away the
+  // moment it arrives and a history finding has no reproduction artifact at all. A row readied in
+  // an earlier session gets them back through "Re-ready report", which returns the same pair.
+  rec.poc_replay = String(res.replay || "");
+  rec.poc_har = res.har || null;
   const r = res.ready || {};
   const parts = ["poc", "poi", "poe"].filter((k) => r[k]).map((k) => k.toUpperCase());
+  const artifacts = [rec.poc_replay ? "replay.sh" : "", rec.poc_har ? "findings.har" : ""].filter(Boolean);
   // Rebuild the row (so the ready badge + dots + button label update) and carry the confirmation
   // onto the fresh row's status span — setting it on the old span would be discarded by the swap.
   const fresh = ckReportTr(rec);
   const freshStatus = fresh.querySelector(".ck-status");
   if (freshStatus) {
     freshStatus.className = "ck-status is-ok";
-    freshStatus.textContent = `Report ready · ${parts.join(" + ") || "steps only"} (${res.proof_status || "candidate"})`;
+    freshStatus.textContent = `Report ready · ${parts.join(" + ") || "steps only"} (${res.proof_status || "candidate"})`
+      + (artifacts.length ? ` · ${artifacts.join(" + ")} ready to download` : "");
   }
   if (li.isConnected) {
     li.replaceWith(fresh);
@@ -9956,6 +10235,17 @@ function ckReportTr(rec) {
   if (rec.report_ready) menuItems.push({ label: "Re-ready report", onClick: () => ckGetReportReady(rec, primary, status, tr) });
   menuItems.push({ label: "Copy report", onClick: async () => { try { const md = await ckReportFromLedger(rec); await ckCopy(md); } catch (_) { /* copy blocked */ } } });
   menuItems.push({ label: "Download .md", onClick: async () => { try { const md = await ckReportFromLedger(rec); ckDownloadText(`${ckSlug(rec.title || "finding")}.md`, md); } catch (_) { /* build failed */ } } });
+  // The runnable reproduction artifacts get-report-ready returned for this finding. Offered only
+  // when they exist: the server builds them from a captured crafted request line, so a finding
+  // with nothing reconstructable gets no empty file to hand a triager.
+  if (rec.poc_replay) {
+    menuItems.push({ label: "Download replay.sh",
+      onClick: () => ckDownloadText(`replay-${ckSlug(rec.title || "finding")}.sh`, rec.poc_replay, "text/x-shellscript") });
+  }
+  if (rec.poc_har) {
+    menuItems.push({ label: "Download findings.har",
+      onClick: () => ckDownloadText(`findings-${ckSlug(rec.title || "finding")}.har`, JSON.stringify(rec.poc_har, null, 2), "application/json") });
+  }
   acts.append(primary, ckKebab(menuItems), status);
   tdActions.append(acts);
   tr.append(tdActions);
@@ -10269,7 +10559,12 @@ function ckHistoryRow(rec) {
     if (ckState._history && Array.isArray(ckState._history.findings)) {
       ckState._history.findings = ckState._history.findings.filter((x) => x !== rec);
     }
-    li.remove();
+    // Keep the row in place as an Undo bar rather than removing it: the dismiss response's
+    // dedup_key is the only handle on the suppression, and dropping the row drops the key with it.
+    li.replaceChildren(ckUndoDeleteBar(rec.title || "this finding", res.dedup_key || rec.dedup_key || "",
+      // Drop the cached ledger so the next render refetches and the restored record comes back
+      // in its proper place, rather than being spliced into a stale list at the wrong position.
+      (restored) => { if (restored) ckState._history = null; }));
   });
   acts.append(copyBtn, dlBtn, delBtn);
   li.append(acts);
@@ -10289,6 +10584,11 @@ function ckCapturedProofFields(rec) {
       request_line: pe.request_line || "", request_header: pe.request_header || "",
       response_status: pe.response_status || "", response_header: pe.response_header || "",
       set_cookie: pe.set_cookie || "", matched_value: pe.matched_value || "", read_data: pe.read_data || "",
+      // Value-free names for the sensitive data the capturing check classified on the raw body.
+      // The report's QA gate reads these to decide whether a sensitive read was really captured,
+      // and they survive redaction where the excerpt itself does not — so dropping them here
+      // downgrades a rebuilt CORS report that the original hunt got right.
+      sensitive_data_labels: pe.sensitive_data_labels || "",
     };
   }
   const poi = cap.proof_of_impact;
@@ -10371,14 +10671,17 @@ async function ckCreateProofOfImpact(f, btn, statusEl, resultEl) {
   // (dashboard, board, history) and persist. Only on a class match — never on an unrelated
   // confirmation at the same URL.
   if (conf && ckProofMatchesFinding(res.findings, f)) {
-    // Fold the captured differential onto the finding so the rebuilt report shows it (the
-    // /finding/report fallback reads f.proofObj), and drop the cached markdown so the preview
-    // refetches the now-confirmed report instead of the stale "candidate" one. The engine has
-    // also persisted this proof onto the cached run, so the canonical package agrees.
-    const best = (res.findings || []).find((x) => x.status === "confirmed");
+    // Fold the captured differential AND the captured request/response artifact onto the finding
+    // so the rebuilt report shows both (the /finding/report fallback reads f.proofObj and
+    // f.proofEvidence), and drop the cached markdown so the preview refetches the now-confirmed
+    // report instead of the stale "candidate" one. The engine has also persisted this proof onto
+    // the cached run, so the canonical package agrees — but a finding proven from history has no
+    // cached run, and there the client copy is the only place the fresh artifact survives.
+    const best = ckBestActiveProof(res.findings, f);
     if (best) {
-      f.proofObj = { status: "confirmed", method: best.method || "", observed_result: best.observed || "",
-                     control_result: best.control || "", evidence: best.evidence || "", affected_asset: best.affected_asset || "" };
+      f.proofObj = ckActiveProofObj(best);
+      const pe = ckActiveProofEvidence(best);
+      if (pe) f.proofEvidence = pe;
     }
     f._md = null;
     ckMarkStatus(f, { proof: "confirmed" });
@@ -12024,7 +12327,18 @@ async function ckProveFinding(f) {
     setState({ state: "done", result: res });
     // Promote this finding to confirmed across the app when the active pass confirmed its
     // OWN class (matched), so the dashboard/board/history/submissions all agree + it persists.
-    if ((res.confirmed || 0) && ckProofMatchesFinding(res.findings, f)) ckMarkStatus(f, { proof: "confirmed" });
+    if ((res.confirmed || 0) && ckProofMatchesFinding(res.findings, f)) {
+      // Keep the differential AND the captured request/response on the finding itself, not only in
+      // the drawer's reverify state — "View full report" normalizes f, not that state, so without
+      // this the artifact just captured is invisible to every report path but the drawer's own.
+      const best = ckBestActiveProof(res.findings, f);
+      if (best) {
+        f.proofObj = ckActiveProofObj(best);
+        const pe = ckActiveProofEvidence(best);
+        if (pe) f.proofEvidence = pe;
+      }
+      ckMarkStatus(f, { proof: "confirmed" });
+    }
   } else {
     setState({ state: "error", error: (res && res.error) || "Proof of impact could not be gathered." });
   }
@@ -12034,14 +12348,18 @@ async function ckDrawerReport(f) {
   const key = String(f._i);
   const setState = (s) => { ckCampaign.report[key] = s; ckCampaign.reverifyVersion++; if (ckState.view === "campaign") ckRenderCampaign(); };
   setState({ state: "running" });
-  // Fold in the strongest proof gathered above (prefer a confirmed active check).
+  // Fold in the strongest proof gathered above (prefer a class-matched confirmed active check) —
+  // both its differential AND the request/response artifact it captured. The artifact is what
+  // makes the report show the concrete headers / reflected marker a triager asks for; dropping it
+  // left the drawer's report carrying observed/control prose only.
   let proof = null;
+  let proofEvidence = null;
   const rv = ckCampaign.reverify[key];
   if (rv && rv.state === "done" && (rv.result.findings || []).length) {
     const fnds = rv.result.findings;
-    const best = fnds.find((x) => x.status === "confirmed") || fnds[0];
-    proof = { status: best.status || "candidate", method: best.method || "", observed_result: best.observed || "",
-              control_result: best.control || "", evidence: best.evidence || "", affected_asset: best.affected_asset || "" };
+    const best = ckBestActiveProof(fnds, f) || fnds[0];
+    proof = ckActiveProofObj(best);
+    proofEvidence = ckActiveProofEvidence(best);
   }
   let res;
   try {
@@ -12052,6 +12370,7 @@ async function ckDrawerReport(f) {
         class_id: f.class_id || "", location: f.location || f.target || "", cwe: f.cwe || "", rule_id: f.rule || "",
         target: f.target || f.location || "", scope: ckCampaign.scope || "",
         platform: ckState.platform || "hackerone", proof,
+        proof_evidence: proofEvidence,
         // The live dashboard streams findings PRE-policy-filter; re-assert the bound program's VDP
         // policy here so a withheld finding can't be turned into a submittable report from the drawer.
         policy_profile: ckActivePolicyProfile(),
