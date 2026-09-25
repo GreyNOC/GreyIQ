@@ -61,6 +61,40 @@ PROVER_CLASSES: frozenset[str] = frozenset({
 # PROVER_CLASSES. Keys are written already-normalized (lowercase, dashes) — the callers that use this
 # table lowercase and fold whitespace/underscores to dashes first, so "OS Command_Injection" and
 # "os-command-injection" both land on the same key.
+# The IMPACT class a check reports is not always the check's own tag. A check is tagged with what it
+# PROBES; its finding is stamped with what the result MEANS. Five checks differ, mechanically derived
+# from verify_active's suite and the ``class_hint`` each one passes to ``_finding``:
+#
+#     clickjacking -> headers        crlf        -> redirect     host-header -> redirect
+#     sensitive    -> disclosure     debug       -> disclosure / rce
+#
+# That split is invisible until something tries to match a PLAN against an OUTCOME, because plans
+# speak tags and findings speak impacts. negative_knowledge does exactly that, and the mismatch meant
+# those five could never be immunised: a route whose CRLF check had confirmed a real bug recorded the
+# confirmation under ``redirect`` while the plan recorded a miss under ``crlf``, so after two clean
+# runs the engine cooled the very check that had proven the bug. Anything joining the two vocabularies
+# must fold through this map first.
+#
+# Kept HERE for the same reason the tag set is: one definition, and ``test_active_verify_service``
+# re-derives the real mapping with ``ast`` and fails the suite if a check starts reporting an impact
+# this map does not cover.
+IMPACT_TO_CHECK_TAGS: dict[str, frozenset[str]] = {
+    "headers": frozenset({"clickjacking"}),
+    "redirect": frozenset({"redirect", "crlf", "host-header"}),
+    "disclosure": frozenset({"sensitive", "debug"}),
+    "rce": frozenset({"rce", "debug"}),
+}
+
+
+def check_tags_for_impact(class_id: str) -> frozenset[str]:
+    """The check tags that can report ``class_id`` as their impact, including the tag of the same
+    name when one exists. Returns just the class itself when the two vocabularies agree."""
+    key = str(class_id or "").strip().lower()
+    if not key:
+        return frozenset()
+    return IMPACT_TO_CHECK_TAGS.get(key, frozenset({key}))
+
+
 CLASS_ALIASES: dict[str, str] = {
     "open-redirect": "redirect",
     "command-injection": "rce",

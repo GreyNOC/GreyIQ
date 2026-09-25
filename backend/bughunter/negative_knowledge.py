@@ -150,7 +150,24 @@ def _parse_ts(value: Any) -> datetime | None:
 
 def _confirmed_pairs(outcomes: Any) -> set[str]:
     """Pair ids that reached a confirmed proof status this hunt — from the SAME outcome rows the hunt
-    trace records (``proof_status == 'confirmed'``)."""
+    trace records (``proof_status == 'confirmed'``).
+
+    An outcome's ``class`` is the IMPACT the finding carries, while a planned pair's class is the
+    prover's CHECK TAG, and for five checks those differ (see
+    ``prover_classes.IMPACT_TO_CHECK_TAGS``). Immunity is therefore recorded under every tag that
+    could have produced the impact, not just the impact's own name. Without the fold the two halves
+    could never meet for those checks: a confirmed CRLF injection banked immunity under ``redirect``
+    while the plan accrued misses under ``crlf``, and after two clean runs the engine cooled the one
+    check that had proven a submittable bug on that route — the exact opposite of this module's
+    promise that anything ever confirmed is immune.
+
+    Folding widens immunity slightly (a confirmed open redirect also immunises ``crlf`` and
+    ``host-header`` on that route). That is the safe direction, and the direction this module already
+    chooses elsewhere: a false re-enable costs a little budget, a false suppression silently removes
+    coverage.
+    """
+    from bughunter.prover_classes import check_tags_for_impact
+
     confirmed: set[str] = set()
     for row in outcomes if isinstance(outcomes, list) else []:
         if not isinstance(row, dict):
@@ -159,8 +176,11 @@ def _confirmed_pairs(outcomes: Any) -> set[str]:
             continue
         ep = endpoint_key(row.get("endpoint"))
         cls = str(row.get("class") or "").strip().lower()
-        if ep and cls:
-            confirmed.add(_pair_id(ep, cls))
+        if not ep or not cls:
+            continue
+        confirmed.add(_pair_id(ep, cls))
+        for tag in check_tags_for_impact(cls):
+            confirmed.add(_pair_id(ep, tag))
     return confirmed
 
 
