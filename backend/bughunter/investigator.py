@@ -235,8 +235,17 @@ def _artifact_types(finding: dict[str, Any], plan: dict[str, Any]) -> list[str]:
     evidence = _dict(finding.get("proof_evidence"))
     if _text(evidence.get("matched_value") or evidence.get("set_cookie"), 1000):
         artifacts.append("captured-matched-value")
+    # ``read_data`` is the proof_evidence schema's key for a captured response body — it is what all
+    # 15 in-module producers in active_verify_service write, plus api_discovery_service and the
+    # access-control/stored-XSS services. The four names read here before it
+    # (response_body/response_body_excerpt/body_excerpt/sensitive_data) have NO producer anywhere in
+    # the repo, so this branch never fired and the 22-point "captured-response-body" weight below was
+    # dead: a GraphQL introspection or .env disclosure that captured the whole body scored as if it
+    # had captured nothing, and also lost the per-extra-artifact breadth bonus. The dead names are
+    # kept as trailing fallbacks (harmless, and they document the shapes this once accepted).
     body = _text(
-        evidence.get("response_body") or evidence.get("response_body_excerpt")
+        evidence.get("read_data") or evidence.get("sensitive_data_labels")
+        or evidence.get("response_body") or evidence.get("response_body_excerpt")
         or evidence.get("body_excerpt") or evidence.get("sensitive_data"), 2000
     )
     if body:

@@ -57,6 +57,7 @@ _CRAWLER_UA_RE = re.compile(
 def _is_crawler_ua(ua: str) -> bool:
     return bool(_CRAWLER_UA_RE.search(str(ua or "")))
 
+from bughunter import impact_model
 from bughunter.active_verify_service import (
     _ActiveError,
     _JWT_RE,
@@ -195,16 +196,18 @@ def _ssrf_plan(target_url: str, param: str, token: str, base: str, hit: dict[str
         "poc": f"GET {_with_query(target_url, {param: cb})}\n# -> out-of-band callback recorded at {base}/oob/{token}",
         "impact": ("The server can be made to issue requests to attacker-chosen hosts — internal services, cloud "
                    "metadata (credential theft), and otherwise-unreachable infrastructure behind the firewall."),
-        "cvss": {
-            "vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N", "base_score": 8.5, "base_severity": "high",
-            "estimated": not confirmed,
-            "justification": (
+        # Derived from the vector (this one is 7.7, not the 8.5 that was hardcoded) so the printed
+        # score and the vector beside it can never disagree — see impact_model.cvss_block.
+        "cvss": impact_model.cvss_block(
+            "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N",
+            estimated=not confirmed,
+            justification=(
                 "Actively confirmed with a real out-of-band collaborator hit correlated to a fresh, unguessable "
                 "token — not a template estimate." if confirmed else
                 "The callback source doesn't look like the target's own server-side fetch (crawler/preview-bot "
                 "UA); confirm the source before treating this as proven."
             ),
-        },
+        ),
         "remediation": "Allow-list outbound destinations; block internal/metadata ranges; pin the resolved IP.",
         "proof_of_impact": {
             "status": "confirmed" if confirmed else "candidate",
@@ -405,16 +408,16 @@ def _xxe_plan(target_url: str, token: str, base: str, hit: dict[str, Any], confi
         "impact": ("XML external-entity processing lets an attacker make the server fetch attacker-chosen URLs "
                    "(internal services, cloud metadata) and, depending on the parser, read local files — SSRF and "
                    "file disclosure from a single XML submission."),
-        "cvss": {
-            "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N", "base_score": 8.6, "base_severity": "high",
-            "estimated": not confirmed,
-            "justification": (
+        "cvss": impact_model.cvss_block(
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N",
+            estimated=not confirmed,
+            justification=(
                 "Actively confirmed with a real out-of-band collaborator hit correlated to a fresh, unguessable "
                 "token — not a template estimate." if confirmed else
                 "The callback source doesn't look like the target's own server-side fetch (crawler/preview-bot "
                 "UA); confirm the source before treating this as proven."
             ),
-        },
+        ),
         "remediation": "Disable DTDs / external-entity resolution in the XML parser; use a hardened, secure-processing config.",
         "proof_of_impact": {
             "status": "confirmed" if confirmed else "candidate",
@@ -712,18 +715,17 @@ def _rce_plan(target_url: str, where: str, token: str, base: str, hit: dict[str,
         "impact": ("Arbitrary OS commands run on the application server as the service account: full server "
                    "compromise, theft of application data and credentials, and lateral movement into anything "
                    "the host can reach."),
-        "cvss": {
-            # Unauthenticated, network-reachable command execution. Matches impact_model's "rce" vector.
-            "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-            "base_score": 9.8, "base_severity": "critical",
-            "estimated": not confirmed,
-            "justification": (
+        # Unauthenticated, network-reachable command execution. Matches impact_model's "rce" vector.
+        "cvss": impact_model.cvss_block(
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            estimated=not confirmed,
+            justification=(
                 "Actively confirmed by a real out-of-band callback correlated to a fresh, unguessable token, "
                 "with a matched bare-URL control that was never fetched — not a template estimate."
                 if confirmed else
                 "The callback source doesn't look like the target's own execution (crawler/preview-bot UA); "
                 "confirm the source before treating this as proven."),
-        },
+        ),
         "remediation": "Execute without a shell (argv array, shell=False), allow-list values, and drop privileges.",
         "proof_of_impact": {
             "status": "confirmed" if confirmed else "candidate",
@@ -1168,15 +1170,14 @@ def _jwt_key_plan(target_url: str, field: str, token: str, base: str, hit: dict[
         "impact": ("The verifier trusts a key source chosen by the token it is verifying, so an unauthenticated "
                    "attacker can sign their own tokens and be accepted as any user — full account takeover, "
                    "including administrative accounts."),
-        "cvss": {
+        "cvss": impact_model.cvss_block(
             # Prices what was PROVEN: an unauthenticated attacker steers a server-side fetch during token
             # verification. Full forgery (C:H/I:H -> 9.8) follows only once the server is shown to ACCEPT a
             # key served from that URL, which this probe deliberately does not attempt -- see the
             # justification and the escalation step above.
-            "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
-            "base_score": 7.5, "base_severity": "high",
-            "estimated": not confirmed,
-            "justification": (
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+            estimated=not confirmed,
+            justification=(
                 "The out-of-band callback proves the verifier fetched the URL the token named — captured "
                 "against a fresh, unguessable token that recorded nothing beforehand. Scored for the proven "
                 "server-side fetch only. If the server also ACCEPTS a key served from that URL the impact is "
@@ -1184,7 +1185,7 @@ def _jwt_key_plan(target_url: str, field: str, token: str, base: str, hit: dict[
                 if confirmed else
                 "The callback source doesn't look like the verifier's own fetch (crawler/preview-bot UA); "
                 "confirm the source before treating this as proven."),
-        },
+        ),
         "remediation": "Pin verification to a server-configured key set; reject tokens carrying jku/x5u/jwk.",
         "proof_of_impact": {
             "status": "confirmed" if confirmed else "candidate",

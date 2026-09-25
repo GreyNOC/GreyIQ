@@ -289,10 +289,15 @@ from repo_ingest import ingest_repositories  # noqa: E402
 # to a clear message rather than crashing. See _ensure_ml_runtime / _ml_runtime_status.
 SolinEngine = None  # type: ignore[assignment,misc]
 TrainingSettings = None  # type: ignore[assignment,misc]
+ValidationMonitorSettings = None  # type: ignore[assignment,misc]
 run_training_loop = None  # type: ignore[assignment]
+collect_dataset_stats = None  # type: ignore[assignment]
+model_config_for = None  # type: ignore[assignment]
+approx_parameter_count = None  # type: ignore[assignment]
+MODEL_PRESETS: dict[str, dict[str, Any]] = {}
 # Mirror training_runtime's defaults so request models and settings validate without
 # importing it (and thus without paying the torch import cost) at boot.
-MAX_TRAINING_CHARS = 8_000_000
+MAX_TRAINING_CHARS = 16_000_000
 DEFAULT_MAX_ITERS = 1000
 DEFAULT_EVAL_INTERVAL = 100
 DEFAULT_LEARNING_RATE = 3e-4
@@ -311,6 +316,7 @@ def _ensure_ml_runtime() -> bool:
     brain never call this."""
     global _ML_RUNTIME_AVAILABLE, _ML_RUNTIME_ERROR, SolinEngine, TrainingSettings, run_training_loop
     global MAX_TRAINING_CHARS, DEFAULT_MAX_ITERS, DEFAULT_EVAL_INTERVAL, DEFAULT_LEARNING_RATE
+    global ValidationMonitorSettings, collect_dataset_stats, model_config_for, approx_parameter_count, MODEL_PRESETS
     if _ML_RUNTIME_AVAILABLE is not None:
         return _ML_RUNTIME_AVAILABLE
     try:
@@ -320,7 +326,12 @@ def _ensure_ml_runtime() -> bool:
             DEFAULT_LEARNING_RATE as _LR,
             DEFAULT_MAX_ITERS as _MI,
             MAX_TRAINING_CHARS as _MC,
+            MODEL_PRESETS as _MP,
             TrainingSettings as _TS,
+            ValidationMonitorSettings as _VMS,
+            approx_parameter_count as _APC,
+            collect_dataset_stats as _CDS,
+            model_config_for as _MCF,
             run_training_loop as _RL,
         )
     except Exception as exc:  # noqa: BLE001 - torch/numpy may be missing or fail to load (DLL, ABI, ARM wheel)
@@ -330,6 +341,8 @@ def _ensure_ml_runtime() -> bool:
         return False
     SolinEngine, TrainingSettings, run_training_loop = _Engine, _TS, _RL
     MAX_TRAINING_CHARS, DEFAULT_MAX_ITERS, DEFAULT_EVAL_INTERVAL, DEFAULT_LEARNING_RATE = _MC, _MI, _EI, _LR
+    ValidationMonitorSettings, collect_dataset_stats = _VMS, _CDS
+    model_config_for, approx_parameter_count, MODEL_PRESETS = _MCF, _APC, _MP
     _ML_RUNTIME_AVAILABLE = True
     _ML_RUNTIME_ERROR = ""
     return True
@@ -364,7 +377,7 @@ from bughunter.chat_commands import (  # noqa: E402
 # install and fallback_reply()'s single canned sentence. Safe to import at boot — it pulls
 # nothing heavier than re/difflib/math/pathlib.
 import solin_domain  # noqa: E402
-from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names, _deterministic_attack_plan, cwe_for_class, build_replay_script as bounty_build_replay, build_findings_har as bounty_build_har  # noqa: E402
+from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names, _deterministic_attack_plan, cwe_for_class, owasp_for_class, build_replay_script as bounty_build_replay, build_findings_har as bounty_build_har  # noqa: E402
 from bughunter import campaign as bounty_campaign  # noqa: E402
 from bughunter import learning as bounty_learning  # noqa: E402
 from bughunter import submission as bounty_submission  # noqa: E402
@@ -447,6 +460,9 @@ TRAINING_SOURCE_FILES = {
     "src_preferred_examples": "greyiq_preferred_examples.txt",
     "src_local_notes": "greyiq_local_notes.txt",
     "src_imported_docs": "greyiq_imported_docs.txt",
+    # Mirrors training_runtime.SOURCE_TEXT_FILES — normalize_source_ids allowlists against this dict,
+    # so an id missing here is silently dropped from every request.
+    "src_manuals": "greyiq_manual_pdfs.txt",
 }
 
 BUGHUNTER_CORE_ID = "core_greyiq_bughunter"
@@ -567,13 +583,53 @@ class PreferenceRequest(BaseModel):
 
 
 class TrainingRequest(BaseModel):
+    # The Studio's Train panel drives every field here. Anything the trainer supports but this model
+    # omits is unreachable from the app — which is how ValidationMonitorSettings (patience/min_delta/
+    # auto_stop/save_best_only/restore_best) and batch_size_override sat implemented-but-unusable while
+    # every run was locked to patience 3 / min_delta 1e-4 / auto-stop on. test_training_api asserts that
+    # every field here actually reaches TrainingSettings.
     max_iters: int = Field(default=120, ge=1, le=100_000)
     eval_interval: int = Field(default=40, ge=1, le=100_000)
-    learning_rate: float = Field(default=DEFAULT_LEARNING_RATE, gt=0.0, le=1.0)
+    # Ceiling lowered from 1.0: a learning rate anywhere near 1.0 diverges a transformer to NaN within
+    # a handful of steps. The trainer now refuses to persist a diverged run, but the sane ceiling keeps
+    # an operator from wasting the run at all. 1e-2 is already 30x the 3e-4 default.
+    learning_rate: float = Field(default=DEFAULT_LEARNING_RATE, gt=0.0, le=1e-2)
     device_preference: str = Field(default="auto", max_length=20)
     source_ids: list[str] = Field(default_factory=list)
     fresh_start: bool = False
-    dataset_char_cap: int = Field(default=MAX_TRAINING_CHARS, ge=0, le=100_000_000)
+    # 0 no longer means "unbounded": load_all_text reads the whole corpus into one string and
+    # build_dataset materialises an int64 tensor from it, so an unbounded cap OOM-kills the backend.
+    # The maximum is the documented RAM ceiling rather than an arbitrary 100M.
+    dataset_char_cap: int = Field(default=MAX_TRAINING_CHARS, ge=100_000, le=MAX_TRAINING_CHARS)
+    # Which architecture to train. 'compact' is the shipped checkpoint's shape, so the default RESUMES
+    # and improves the model the operator already has; the bigger presets start a new lineage from
+    # random weights (the previous one is archived, never overwritten in place).
+    model_size: str = Field(default="compact", max_length=20)
+    # 0 = size the batch from the architecture's context length (see training_runtime.batch_size_for).
+    batch_size_override: int = Field(default=0, ge=0, le=512)
+    # --- early-stopping / best-model monitor ---
+    patience: int = Field(default=3, ge=1, le=50)
+    min_delta: float = Field(default=0.0001, ge=0.0, le=1.0)
+    auto_stop: bool = True
+    save_best_only: bool = True
+    restore_best: bool = True
+
+
+class HuntBrainTrainRequest(BaseModel):
+    """Train the OFFLINE HUNT ranker from local hunt traces — the hunting half of the Studio.
+
+    This is a different brain from TinyGPT: a small, auditable linear model over the value-free
+    endpoint features in hunt_features, which only ever REORDERS the prover's existing checks. It was
+    reachable solely via `gn train-brain`, and its holdout/epochs/lr were not even exposed there, so
+    the app could neither train nor inspect it. Promotion stays gated on beating the rules baseline on
+    a held-out split — these fields tune the attempt, they cannot force a promotion."""
+    dry_run: bool = False          # evaluate and report, write nothing
+    min_rows: int = Field(default=200, ge=1, le=100_000)
+    holdout: float = Field(default=0.2, gt=0.0, lt=1.0)
+    epochs: int = Field(default=40, ge=1, le=1_000)
+    lr: float = Field(default=0.1, gt=0.0, le=10.0)
+    l2: float = Field(default=1e-4, ge=0.0, le=1.0)
+    rng_seed: int = Field(default=1337, ge=0, le=2**31 - 1)
 
 
 class DeviceRequest(BaseModel):
@@ -757,6 +813,11 @@ class ProofEvidenceInput(BaseModel):
     set_cookie: str = Field(default="", max_length=2000)
     matched_value: str = Field(default="", max_length=6000)
     read_data: str = Field(default="", max_length=8000)
+    # The generic-English NAME of the sensitive data the captured body disclosed ("a JWT
+    # (session/bearer token); email address(es)") — never the data itself. Carried because it is what
+    # survives redaction: once read_data shows only [REDACTED_…] markers, this is the only thing left
+    # that lets the rebuilt report state what was actually at risk (report._sensitive_read_captured).
+    sensitive_data_labels: str = Field(default="", max_length=400)
 
 
 class FindingReportRequest(BaseModel):
@@ -1290,6 +1351,13 @@ class TrainingState:
     last_error: str = ""
     logs: list[str] = field(default_factory=list)
     runtime: dict[str, Any] = field(default_factory=lambda: {"status": "idle", "stage": "idle", "detail": ""})
+    # Per-eval loss points, so the Studio can draw a curve instead of showing one number at whatever
+    # moment it happened to poll. Bounded: a long run must not grow this without limit, and the early
+    # points are the interesting ones, so the tail is dropped rather than the head.
+    history: list[dict[str, Any]] = field(default_factory=list)
+    # Echo of the resolved settings this run was started with (model size, batch, monitor), so the
+    # panel can show what is running rather than what the form currently holds.
+    settings: dict[str, Any] = field(default_factory=dict)
 
 
 def _confirm_route(fn):
@@ -1326,8 +1394,8 @@ _H1_STATE_TO_LEARNING_OUTCOME = {
 # Code-WRITING / -editing intent, for the offline honesty short-circuit (docs/offline-coder-strategy.md).
 # Deliberately NARROW: it must match "write me a function" / "fix this script" / "generate a test", but
 # NOT general code *discussion* ("what is an API?", "explain python") — TinyGPT can attempt prose on
-# those. A 0.8M char model cannot produce code, so when no brain is configured we say so honestly
-# instead of spending forward passes on output the quality gate would discard anyway.
+# those. A tiny (well under 10M-param) char model cannot produce code, so when no brain is configured
+# we say so honestly instead of spending forward passes on output the quality gate would discard anyway.
 _CODEGEN_INTENT_RE = re.compile(
     r"\b(write|create|generate|implement|build|add|make|fix|refactor|edit|modify|debug|scaffold)\b"
     r"[^.?!]{0,60}\b(code|script|function|method|class|module|program|endpoint|route|component|"
@@ -1466,7 +1534,116 @@ class GreyIQRuntime:
             "last_error": self.training.last_error,
             "status": self.training.runtime,
             "recent_logs": self.training.logs[:20],
+            # The loss curve and the settings the run is actually using — the Train panel renders both,
+            # and without them an operator can only see a single instantaneous number.
+            "history": list(self.training.history),
+            "settings": dict(self.training.settings),
         }
+
+    def set_training_paused(self, paused: bool) -> dict[str, Any]:
+        """Pause or resume the running cycle. 409 when nothing is running, so the UI cannot show a
+        paused state for a run that does not exist. The trainer checks this predicate at the top of
+        every optimizer step (training_runtime._wait_while_paused)."""
+        with self.lock:
+            if not self.training.active:
+                raise HTTPError(409, "No training run is active.")
+            self.training.paused = bool(paused)
+            state = "paused" if paused else "running"
+            self.training.runtime = {
+                **self.training.runtime,
+                "detail": f"Training {state} by the operator.",
+            }
+        self.log(f"Training {state} by the operator.")
+        return self.training_payload()
+
+    def request_training_stop(self) -> dict[str, Any]:
+        """Ask the running cycle to stop at its next step boundary; it saves a checkpoint first."""
+        with self.lock:
+            if not self.training.active:
+                raise HTTPError(409, "No training run is active.")
+            self.training.stop_requested = True
+            # Stopping while paused would otherwise block forever in _wait_while_paused.
+            self.training.paused = False
+        self.log("Training stop requested by the operator.")
+        return self.training_payload()
+
+    def training_dataset_preview(self) -> dict[str, Any]:
+        """What a run would train on, and what each model size would cost — for the Train panel.
+
+        Answers the questions an operator has BEFORE spending a run: how much text is actually there,
+        which sources it came from, whether the character cap will truncate it, and whether the corpus
+        is even large enough for a longer-context preset."""
+        if not _ensure_ml_runtime():
+            raise HTTPError(503, _ML_RUNTIME_ERROR)
+        try:
+            stats = collect_dataset_stats(RUNTIME_DIR) or {}
+        except Exception as exc:  # noqa: BLE001 - a preview must never 500 the panel
+            return {"ok": False, "error": f"Could not read the training data: {exc}"}
+        # collect_dataset_stats reports the data/ files and train.txt separately; the trainer reads both.
+        total = int(stats.get("extracted_characters") or 0) + int(stats.get("root_train_characters") or 0)
+        # Parameter counts scale with the vocabulary, so read the real one when it exists.
+        vocab_size = 339
+        try:
+            vocab_doc = json.loads((RUNTIME_DIR / "solin_vocab.json").read_text(encoding="utf-8"))
+            vocab_size = int(vocab_doc.get("vocab_size") or len(vocab_doc.get("stoi") or {}) or vocab_size)
+        except Exception:  # noqa: BLE001 - no vocab yet on a fresh install; the default is close enough
+            pass
+        sizes = []
+        for name, preset in (MODEL_PRESETS or {}).items():
+            block = int(preset.get("block_size") or 0)
+            sizes.append({
+                "id": name,
+                "parameters": approx_parameter_count(preset, vocab_size),
+                "block_size": block,
+                "n_layer": int(preset.get("n_layer") or 0),
+                "n_embd": int(preset.get("n_embd") or 0),
+                # Both the train and val split must exceed one context window; the split is 90/10, so
+                # the validation side is the binding constraint.
+                "min_chars": block * 10 + 1,
+                "fits": total > block * 10,
+            })
+        return {
+            "ok": True,
+            **stats,
+            "total_characters": total,
+            "vocab_size": vocab_size,
+            "cap": MAX_TRAINING_CHARS,
+            "capped": total > MAX_TRAINING_CHARS,
+            "model_sizes": sizes,
+            "default_model_size": "compact",
+        }
+
+    def hunt_model_status(self) -> dict[str, Any]:
+        """Which hunt ranker is ACTIVE (bundled seed vs locally trained), what it scored when it was
+        promoted, and how much trace corpus exists versus how much a retrain needs. Torch-free."""
+        try:
+            from bughunter import hunt_train
+            return {"ok": True, **hunt_train.show_status(RUNTIME_DIR, SEED_DIR, hunt_train.DEFAULT_MIN_ROWS)}
+        except Exception as exc:  # noqa: BLE001 - a status read must never 500 the panel
+            return {"ok": False, "error": f"Could not read the hunt model: {exc}"}
+
+    def train_hunt_brain(self, request: "HuntBrainTrainRequest") -> dict[str, Any]:
+        """Run a hunt-ranker training attempt. Returns the result dict in every case — a refusal
+        (too few rows, or the trained model failed to beat the rules baseline on the holdout) is a
+        normal outcome, not an error, and ``ok`` is only true when a model was actually promoted."""
+        try:
+            from bughunter import hunt_train
+            result = hunt_train.train(
+                RUNTIME_DIR,
+                seed_dir=SEED_DIR,
+                epochs=request.epochs,
+                lr=request.lr,
+                l2=request.l2,
+                rng_seed=request.rng_seed,
+                holdout=request.holdout,
+                min_rows=request.min_rows,
+                dry_run=request.dry_run,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface the reason rather than a generic 500
+            self.log(traceback.format_exc())
+            return {"ok": False, "error": f"Hunt-brain training failed: {exc}"}
+        self.log(f"hunt-brain training: {result.get('detail') or result.get('reason') or result}")
+        return result
 
     def get_engine(self) -> "SolinEngine":
         with self.lock:
@@ -1959,6 +2136,10 @@ class GreyIQRuntime:
             # web_ingest.set_ua_suffix inside the hunt.
             user_agent_suffix=request.user_agent_suffix,
             on_progress=bounty_progress.sink(run_id) if run_id else None,
+            # The operator's Stop button. Without this a single hunt could not hear it at all: the pill
+            # flipped to "Stopped" while the active fan-out, the re-plan wave and all four OOB provers
+            # kept sending. The campaign paths below already poll this same flag between their URLs.
+            should_stop=(lambda rid=run_id: bounty_progress.is_stopped(rid)) if run_id else None,
             # When a collaborator is configured, an active+authorized URL hunt also runs the blind-SSRF
             # OOB probe automatically (the token is the reproducible 'sheriff flag').
             oob_base=self._oob_config()[0], oob_secret=self._oob_config()[1],
@@ -2287,11 +2468,18 @@ class GreyIQRuntime:
         # finding often has no cwe): otherwise the platform gets no weakness and infers a wrong
         # one — e.g. HackerOne suggesting CWE-16 for a CORS report that should be CWE-284.
         cwe = str(request.cwe or "").strip() or cwe_for_class(class_id)
+        # Same reason, same fix, for the OWASP category: six renderers read finding["owasp"] -- the
+        # report's finding block and summary table, and the HackerOne, Bugcrowd and Intigriti
+        # submission bodies -- and this builder never set it. So a report rebuilt from a
+        # ledger/history finding dropped the OWASP row the same finding showed during its original
+        # hunt, on the report AND on the filed submission. FindingReportRequest carries no owasp
+        # field, so the class mapping is the only source here.
+        owasp = owasp_for_class(class_id)
         finding = {
             "ref": ref, "title": str(request.title or "Security finding"),
             "severity": str(request.severity or "info"), "class_name": str(request.class_name or ""),
             "class_id": class_id, "location": str(request.location or request.target or ""),
-            "cwe": cwe, "rule_id": str(request.rule_id or ""),
+            "cwe": cwe, "owasp": owasp, "rule_id": str(request.rule_id or ""),
             "description": str(request.description or ""), "screenshot_path": str(request.screenshot_path or ""),
         }
         # Carry the engine's captured request/response artifact (a history/board finding brings
@@ -2433,8 +2621,13 @@ class GreyIQRuntime:
                             "proof_evidence": pe},
                 "source_url": location, "proof_status": proof_status,
                 "proof_of_impact": (request.proof.model_dump() if request.proof is not None else {})}
-        replay, replay_n = bounty_build_replay([item])
-        har, har_n = bounty_build_har([item], version=VERSION)
+        # confirmed_only=False: unlike the download bundle (whose replay.sh header and INDEX announce
+        # these as the requests that CONFIRMED each finding), this is a PREVIEW of one finding the
+        # operator is still assembling a report for. A runnable crafted request is useful to them
+        # whether or not the differential has been captured yet, and the readiness panel reports POC
+        # separately from POE/POI rather than implying confirmation.
+        replay, replay_n = bounty_build_replay([item], confirmed_only=False)
+        har, har_n = bounty_build_har([item], version=VERSION, confirmed_only=False)
         # POC readiness = a REAL runnable reproduction is present: a replay.sh/findings.har rebuilt
         # from a captured crafted request line, or an operator/brain-supplied runnable PoC
         # (request.poc). The assembled report ALWAYS carries deterministic reproduction steps, but
@@ -2578,6 +2771,10 @@ class GreyIQRuntime:
             excluded_hosts=excluded_hosts,
             on_progress=bounty_progress.sink(run_id) if run_id else None,
             progress_run_id=run_id or None,
+            # The OOB collaborator, same source as the single-hunt route. Without it every
+            # autonomous path had the four out-of-band provers (blind SSRF/XXE/RCE, JWT
+            # key-URL injection) permanently disabled -- see campaign._run_campaign_body.
+            oob_base=self._oob_config()[0], oob_secret=self._oob_config()[1],
         )
         self._cache_bounty_run(result, target=request.target, scope=request.scope, program=request.program,
                                 program_id=str(program_obj.get("id")) if program_obj else None,
@@ -2634,6 +2831,10 @@ class GreyIQRuntime:
             excluded_hosts=excluded_hosts,
             on_progress=bounty_progress.sink(run_id) if run_id else None,
             progress_run_id=run_id or None,
+            # The OOB collaborator, same source as the single-hunt route. Without it every
+            # autonomous path had the four out-of-band provers (blind SSRF/XXE/RCE, JWT
+            # key-URL injection) permanently disabled -- see campaign._run_campaign_body.
+            oob_base=self._oob_config()[0], oob_secret=self._oob_config()[1],
         )
         target_label = f"{program_label} — {len(targets)} in-scope target(s)"
         # program_id is the REAL portfolio id (program_label above is the display name,
@@ -2707,6 +2908,10 @@ class GreyIQRuntime:
             include_attack_map=request.attack_map,
             on_progress=bounty_progress.sink(run_id) if run_id else None,
             progress_run_id=run_id or None,
+            # The OOB collaborator, same source as the single-hunt route. Without it every
+            # autonomous path had the four out-of-band provers (blind SSRF/XXE/RCE, JWT
+            # key-URL injection) permanently disabled -- see campaign._run_campaign_body.
+            oob_base=self._oob_config()[0], oob_secret=self._oob_config()[1],
         )
         if result.get("ok") and skipped:
             result.setdefault("errors", []).insert(0, f"Skipped {len(skipped)} program(s) with no huntable targets: {', '.join(skipped[:8])}.")
@@ -4699,10 +4904,11 @@ class GreyIQRuntime:
         coder_reply = self._coder_reply(request)
         if coder_reply is not None:
             return coder_reply
-        # No coding brain configured AND this is a code-WRITING request: the ~0.8M-param offline model
-        # cannot write code (64-char context, ~0% code in its corpus; its own quality gate discards
-        # code-shaped output). Be honest and point at the real path instead of generating a reply that
-        # gets thrown away — this also avoids the wasted CPU forward passes. See docs/offline-coder-strategy.md.
+        # No coding brain configured AND this is a code-WRITING request: the tiny offline model
+        # cannot write code (a narrow char-level context, ~0% code in its corpus; its own quality gate
+        # discards code-shaped output). Be honest and point at the real path instead of generating a
+        # reply that gets thrown away — this also avoids the wasted CPU forward passes. See
+        # docs/offline-coder-strategy.md.
         if _looks_like_codegen_request(request.message):
             return {
                 "request_id": uuid4().hex,
@@ -4821,11 +5027,30 @@ class GreyIQRuntime:
         with self.lock:
             if self.training.active:
                 raise HTTPError(409, "Training is already active.")
+            resolved_size = normalize_model_size(request.model_size)
             self.training = TrainingState(
                 active=True,
                 job_id=f"job_{uuid4().hex[:12]}",
                 started_at=datetime.now(UTC).isoformat(),
                 runtime={"status": "queued", "stage": "queued", "detail": "Training is queued."},
+                # Echoed so the panel can show what this run is actually doing (and so a stale form
+                # cannot misreport it). A fresh TrainingState also resets the loss history.
+                settings={
+                    "model_size": resolved_size,
+                    "max_iters": request.max_iters,
+                    "eval_interval": request.eval_interval,
+                    "learning_rate": request.learning_rate,
+                    "batch_size_override": request.batch_size_override,
+                    "dataset_char_cap": request.dataset_char_cap,
+                    "fresh_start": bool(request.fresh_start),
+                    "device_preference": normalize_device(request.device_preference),
+                    "source_ids": normalize_source_ids(request.source_ids),
+                    "patience": request.patience,
+                    "min_delta": request.min_delta,
+                    "auto_stop": bool(request.auto_stop),
+                    "save_best_only": bool(request.save_best_only),
+                    "restore_best": bool(request.restore_best),
+                },
             )
 
         settings = TrainingSettings(
@@ -4840,6 +5065,19 @@ class GreyIQRuntime:
             source_ids=normalize_source_ids(request.source_ids),
             dataset_char_cap=request.dataset_char_cap,
             fresh_start=request.fresh_start,
+            # Architecture + step size. An unknown model_size falls back to the default preset inside
+            # model_config_for rather than failing the run.
+            model_size=normalize_model_size(request.model_size),
+            batch_size_override=request.batch_size_override,
+            # The early-stopping / best-model monitor. This was previously left at its dataclass
+            # defaults, so the whole ValidationMonitorSettings surface was implemented but unreachable.
+            validation=ValidationMonitorSettings(
+                patience=request.patience,
+                min_delta=request.min_delta,
+                auto_stop=request.auto_stop,
+                save_best_only=request.save_best_only,
+                restore_best=request.restore_best,
+            ),
         )
 
         def should_stop() -> bool:
@@ -4848,9 +5086,32 @@ class GreyIQRuntime:
         def should_pause() -> bool:
             return self.training.paused
 
+        _MAX_HISTORY_POINTS = 400
+
         def on_status(status: dict[str, Any]) -> None:
             with self.lock:
-                self.training.runtime = status
+                # MERGE, don't replace. The trainer emits two shapes: rich ValidationStatus dicts
+                # (losses, device, batch size, dataset size) and coarse lifecycle events from
+                # _emit_runtime_status that carry only status/stage/detail plus zeroed numeric fields.
+                # Replacing wholesale meant the run's achieved losses, device, batch size and
+                # stop_reason vanished at exactly the moment the operator wanted them — when the run
+                # stopped or errored. Zero/empty incoming values no longer erase a known one.
+                merged = dict(self.training.runtime)
+                for key, value in (status or {}).items():
+                    if value in (None, "", 0) and merged.get(key) not in (None, "", 0):
+                        continue  # a coarse event has no opinion on this field; keep what we know
+                    merged[key] = value
+                self.training.runtime = merged
+                # Record a loss point per eval so the panel can draw a curve.
+                if status.get("val_loss") is not None:
+                    point = {
+                        "step": status.get("current_step") or status.get("epoch") or 0,
+                        "train_loss": status.get("train_loss"),
+                        "val_loss": status.get("val_loss"),
+                        "best_val_loss": status.get("best_val_loss"),
+                    }
+                    if len(self.training.history) < _MAX_HISTORY_POINTS:
+                        self.training.history.append(point)
 
         def run() -> None:
             try:
@@ -4890,6 +5151,14 @@ class GreyIQRuntime:
 
         threading.Thread(target=run, name="greyiq-training", daemon=True).start()
         return self.training_payload()
+
+
+def normalize_model_size(value: str | None) -> str:
+    """A known MODEL_PRESETS key, or the shipped default. Never raises, so a stale client cannot
+    fail a run — an unrecognised size trains the compact (resume-in-place) architecture."""
+    normalized = str(value or "").strip().lower()
+    known = set(MODEL_PRESETS) or {"compact", "standard", "large"}
+    return normalized if normalized in known else "compact"
 
 
 def normalize_device(value: str | None) -> str:
@@ -5993,17 +6262,30 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "GET" and path == "/api/train/status":
             await send_json(send, runtime.training_payload())
             return
+        if method == "GET" and path == "/api/hunt/model":
+            await send_json(send, await asyncio.to_thread(runtime.hunt_model_status))
+            return
+        if method == "POST" and path == "/api/hunt/train":
+            request = validate_payload(HuntBrainTrainRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.train_hunt_brain, request))
+            return
+        if method == "GET" and path == "/api/train/dataset":
+            # What the trainer would actually read, BEFORE committing to a run: per-source character
+            # counts, the total, whether the cap will bite, and each model size's parameter count and
+            # minimum corpus. collect_dataset_stats existed for this and had no route, so the Train
+            # panel could only show what happened after the fact.
+            await send_json(send, await asyncio.to_thread(runtime.training_dataset_preview))
+            return
+        # pause/resume/stop mutate shared run state, so they take the lock and refuse when no run is
+        # active — POSTing pause to an idle runtime used to report paused:true and mean nothing.
         if method == "POST" and path == "/api/train/pause":
-            runtime.training.paused = True
-            await send_json(send, runtime.training_payload())
+            await send_json(send, runtime.set_training_paused(True))
             return
         if method == "POST" and path == "/api/train/resume":
-            runtime.training.paused = False
-            await send_json(send, runtime.training_payload())
+            await send_json(send, runtime.set_training_paused(False))
             return
         if method == "POST" and path == "/api/train/stop":
-            runtime.training.stop_requested = True
-            await send_json(send, runtime.training_payload())
+            await send_json(send, runtime.request_training_stop())
             return
         if method == "POST" and path == "/api/runtime/device":
             request = validate_payload(DeviceRequest, await read_json_body(receive))

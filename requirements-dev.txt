@@ -1,0 +1,9 @@
+# Development and CI only — deliberately NOT in requirements.txt, which is the runtime install list
+# the frozen build is assembled from (build/greyiq-backend.spec also excludes pytest by name).
+#
+# `npm run check:python` runs pytest rather than `unittest discover`. That is not a style preference:
+# unittest's loader only collects unittest.TestCase subclasses, so the 59 module-level `def test_*`
+# functions across 8 files were collected by NOBODY in CI -- among them all 25 tests of the
+# secret-reportability classifier, the 10 of the VDP policy gate, and the 5 of the VDP report gate.
+# The repo already shipped a pytest.ini pointing at `backend`; only package.json had not caught up.
+pytest>=8.0,<10.0

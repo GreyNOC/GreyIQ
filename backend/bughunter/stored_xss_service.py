@@ -26,6 +26,7 @@ import urllib.request
 from typing import Any
 from urllib.parse import urlencode, urlparse
 
+from bughunter import impact_model
 from bughunter.active_verify_service import _ActiveError, _Http, _NoRedirect, host_in_active_scope
 from bughunter.oob_service import _is_crawler_ua, callback_url, mint_token, poll_collaborator
 from bughunter.playwright_env import ensure_bundled_browsers_path
@@ -121,14 +122,15 @@ def _build_finding(view_url: str, inject_url: str, field: str, kind: str, marker
         "poc": f"# After submitting the payload, the view page returns it raw:\n# GET {view_url}\n# -> ...{build_payloads(marker)[kind]}...",
         "impact": ("Stored XSS executes attacker JavaScript in the browser of everyone who views the content — session "
                    "theft, account takeover, and actions performed as the victim, with no per-victim interaction needed."),
-        "cvss": {
-            "vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:C/C:H/I:H/A:N", "base_score": 8.0, "base_severity": "high",
-            "estimated": False,
-            "justification": (
+        # Derived from the vector (8.7, not the hardcoded 8.0) — see impact_model.cvss_block.
+        "cvss": impact_model.cvss_block(
+            "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:C/C:H/I:H/A:N",
+            estimated=False,
+            justification=(
                 f"Actively confirmed: a unique marker payload ({marker}) was submitted and observed rendering "
                 "UNESCAPED on a separate view — not a template estimate."
             ),
-        },
+        ),
         "remediation": finding["remediation"],
         "proof_of_impact": {
             "status": "confirmed",
@@ -376,15 +378,16 @@ def _build_beacon_finding(view_url: str, inject_url: str, field: str, token: str
         "impact": ("Stored XSS executes attacker JavaScript in the browser of everyone who views the content — "
                    "session theft, account takeover, and actions performed as the victim, with no per-victim "
                    "interaction beyond viewing the page."),
-        "cvss": {
-            "vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:C/C:H/I:H/A:N", "base_score": 8.0, "base_severity": "high",
-            "estimated": not confirmed,
-            "justification": (
+        # Derived from the vector (8.7, not the hardcoded 8.0) — see impact_model.cvss_block.
+        "cvss": impact_model.cvss_block(
+            "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:C/C:H/I:H/A:N",
+            estimated=not confirmed,
+            justification=(
                 f"Actively confirmed: an injected beacon (token {token}) fired an out-of-band request from a real "
                 "browser render of the view page — not a template estimate." if confirmed else
                 "The callback source looks like a crawler/preview bot rather than the render — confirm before treating as proven."
             ),
-        },
+        ),
         "remediation": finding["remediation"],
         "proof_of_impact": {
             "status": "confirmed" if confirmed else "candidate",

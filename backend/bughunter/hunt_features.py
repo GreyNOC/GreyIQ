@@ -49,7 +49,14 @@ from urllib.parse import parse_qsl, urlparse
 
 # Bumped whenever a NAMESPACE changes (a new/renamed/removed feature family). Weight files
 # carry this number and are rejected on mismatch — see hunt_model.load_model.
-FEATURE_VERSION = 1
+# v2: the ``param:hint=*`` features are derived from ``offline_hunt``'s hint tuples, and those tuples
+# were broadened (ssrf gained notify/connect, xss gained html/note/reply, traversal gained
+# export/resource, sqli gained code, idor gained uuid/guid/reference). The NAMESPACE is unchanged, but
+# the PREDICATE behind each feature is not: `?uuid=` now sets ``param:hint=idor`` where it previously
+# did not, so a weight fitted before the change is being applied to a different question. That is
+# exactly the silent wrongness this version guards, so it counts as a contract change — load_model
+# rejects a v1 file and `gn train-brain` has to re-earn promotion on a recomputed corpus.
+FEATURE_VERSION = 2
 
 # Hard ceiling on the features one endpoint may emit. Bounds both the training cost and the
 # blast radius of a pathological recon URL (a 4 KB path with 300 segments). Truncation is

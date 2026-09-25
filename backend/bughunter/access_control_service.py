@@ -977,8 +977,11 @@ def _build_session_invalidation_finding(authed_url: str, logout_url: str, detail
                 f"curl -s -i '{authed_url}' -H 'Cookie: <pre-logout session>'\n"
                 f"# -> HTTP {detail.get('status_replay')} with your authenticated content (session still alive)"),
         "impact": model.get("business_impact", ""),
-        "cvss": {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:L/A:N", "base_score": 6.5, "base_severity": "medium", "estimated": False,
-                 "justification": "Actively confirmed: the same session authenticated after a successful logout (anonymous control denied)."},
+        # Score/severity derived from the vector (impact_model.cvss_block) so the number can never
+        # disagree with the vector printed beside it: this one is 7.1 High, and was shipping as 6.5 medium.
+        "cvss": impact_model.cvss_block(
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:L/A:N", estimated=False,
+            justification="Actively confirmed: the same session authenticated after a successful logout (anonymous control denied)."),
         "remediation": finding["remediation"],
         "proof_of_impact": {
             "status": "confirmed",

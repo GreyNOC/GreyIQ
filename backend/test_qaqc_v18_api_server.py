@@ -110,8 +110,12 @@ def test_get_report_ready_not_persisted_returns_not_ok_and_no_event(monkeypatch)
                         lambda *a, **k: False)
     monkeypatch.setattr(greyiq_api.bounty_ledger, "upsert_findings",
                         lambda *a, **k: None)
-    monkeypatch.setattr(greyiq_api, "bounty_build_replay", lambda items: ("", 0))
-    monkeypatch.setattr(greyiq_api, "bounty_build_har", lambda items, version=None: (None, 0))
+    # Mirror the real signatures, including confirmed_only, so these fakes can't silently pass while
+    # the production call shape drifts.
+    monkeypatch.setattr(greyiq_api, "bounty_build_replay",
+                        lambda items, confirmed_only=True: ("", 0))
+    monkeypatch.setattr(greyiq_api, "bounty_build_har",
+                        lambda items, version=None, confirmed_only=True: (None, 0))
 
     fake_self = types.SimpleNamespace(
         build_finding_report=lambda request: {
@@ -140,8 +144,14 @@ def test_get_report_ready_persisted_returns_ok_and_fires_event(monkeypatch):
                         lambda *a, **k: events.append((a, k)))
     monkeypatch.setattr(greyiq_api.bounty_ledger, "mark_report_ready",
                         lambda *a, **k: True)
-    monkeypatch.setattr(greyiq_api, "bounty_build_replay", lambda items: ("", 0))
-    monkeypatch.setattr(greyiq_api, "bounty_build_har", lambda items, version=None: (None, 0))
+    # This is the READINESS PREVIEW, not the download bundle: it must opt out of the confirmed-only
+    # replay guard, or a candidate finding the operator is still assembling would report no POC at
+    # all. Record the kwarg rather than ignoring it — that opt-out is only wired here.
+    artifact_calls = []
+    monkeypatch.setattr(greyiq_api, "bounty_build_replay",
+                        lambda items, confirmed_only=True: (artifact_calls.append(("replay", confirmed_only)), ("", 0))[1])
+    monkeypatch.setattr(greyiq_api, "bounty_build_har",
+                        lambda items, version=None, confirmed_only=True: (artifact_calls.append(("har", confirmed_only)), (None, 0))[1])
 
     fake_self = types.SimpleNamespace(
         build_finding_report=lambda request: {
@@ -160,3 +170,6 @@ def test_get_report_ready_persisted_returns_ok_and_fires_event(monkeypatch):
     assert result["persisted"] is True
     assert result["ok"] is True
     assert len(events) == 1
+    # The finding above is a CANDIDATE. Both artifact builders must have been asked to skip the
+    # confirmed-only guard, or the readiness panel would report no POC for anything unconfirmed.
+    assert artifact_calls == [("replay", False), ("har", False)], artifact_calls
