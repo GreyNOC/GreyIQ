@@ -10,6 +10,7 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+from bughunter import rate_limit  # noqa: E402
 from bughunter.rate_limit import HostRateGovernor  # noqa: E402
 
 
@@ -74,6 +75,89 @@ class RateGovernorTests(unittest.TestCase):
         g = HostRateGovernor(capacity=1, min_interval_s=0.0, refill_per_s=0.0)
         self.assertTrue(g.throttle("MÜNCHEN.de"))
         self.assertFalse(g.throttle("münchen.de"))  # same bucket, lowercased
+
+
+class SharedGovernorResetTests(unittest.TestCase):
+    """``reset_shared_governors`` is the process-boundary seam the suite depends on.
+
+    The governors are process-lifetime singletons on purpose, so ~150 test modules sharing one
+    interpreter all draw on the single 127.0.0.1 bucket. Measured: five modules spend 1012 tokens
+    against a capacity of 700, which used to leave the later ones probing NOTHING — a vacuous pass,
+    not a loud failure. Each of those modules now resets at its module boundary; these tests keep the
+    seam working and keep the process-wide sharing it must not break.
+    """
+
+    def tearDown(self) -> None:
+        # Never leave this test's own bookkeeping behind for the modules that follow.
+        rate_limit.reset_shared_governors()
+
+    def test_reset_hands_back_a_fresh_bucket(self) -> None:
+        rate_limit.reset_shared_governors()
+        gov = rate_limit.shared_governor(capacity=3, min_interval_s=0.0, refill_per_s=0.0)
+        for _ in range(3):
+            self.assertTrue(gov.throttle("app.example.com"))
+        self.assertFalse(gov.throttle("app.example.com"))  # drained
+
+        rate_limit.reset_shared_governors()
+        fresh = rate_limit.shared_governor(capacity=3, min_interval_s=0.0, refill_per_s=0.0)
+        self.assertIsNot(fresh, gov)
+        self.assertEqual(fresh.remaining("app.example.com"), 3)
+        self.assertTrue(fresh.throttle("app.example.com"))
+
+    def test_without_a_reset_the_bucket_is_still_shared_process_wide(self) -> None:
+        # The invariant the reset must NOT break: two callers with the same config share one bucket,
+        # so concurrent hunts cannot multiply a host's budget by the worker count.
+        rate_limit.reset_shared_governors()
+        a = rate_limit.shared_governor(capacity=2, min_interval_s=0.0, refill_per_s=0.0)
+        b = rate_limit.shared_governor(capacity=2, min_interval_s=0.0, refill_per_s=0.0)
+        self.assertIs(a, b)
+        self.assertTrue(a.throttle("shared.example.com"))
+        self.assertTrue(b.throttle("shared.example.com"))
+        self.assertFalse(a.throttle("shared.example.com"))  # b spent the second token
+
+    def test_reset_clears_every_pool_and_config(self) -> None:
+        rate_limit.reset_shared_governors()
+        active = rate_limit.shared_governor(capacity=1, min_interval_s=0.0, refill_per_s=0.0)
+        recon = rate_limit.shared_governor(capacity=1, min_interval_s=0.0, refill_per_s=0.0, pool="recon")
+        self.assertIsNot(active, recon)  # separate pools, as shared_governor documents
+        active.throttle("h")
+        recon.throttle("h")
+        rate_limit.reset_shared_governors()
+        self.assertEqual(rate_limit.shared_governor(capacity=1, min_interval_s=0.0, refill_per_s=0.0).remaining("h"), 1)
+        self.assertEqual(
+            rate_limit.shared_governor(capacity=1, min_interval_s=0.0, refill_per_s=0.0, pool="recon").remaining("h"), 1)
+
+    def test_active_layer_test_modules_reset_at_their_module_boundary(self) -> None:
+        """The modules that spend this budget must each declare a setUpModule reset.
+
+        Enforced mechanically because the failure mode is invisible: a module that forgets it does
+        not fail, it silently stops sending probes. If a new module starts driving the active layer
+        against a loopback fixture, add the reset (and add it here).
+        """
+        import ast
+
+        spenders = (
+            "test_active_verify_service.py",
+            "test_bounty_progress.py",
+            "test_campaign_active_honesty.py",
+            "test_cvss_confirmation.py",
+            "test_web_scan_service.py",
+        )
+        for name in spenders:
+            with self.subTest(module=name):
+                tree = ast.parse((BACKEND_DIR / name).read_text(encoding="utf-8"))
+                setup = next(
+                    (node for node in tree.body
+                     if isinstance(node, ast.FunctionDef) and node.name == "setUpModule"),
+                    None,
+                )
+                self.assertIsNotNone(setup, f"{name} drives the active layer but has no setUpModule")
+                calls = [
+                    n.func.attr for n in ast.walk(setup)
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                ]
+                self.assertIn("reset_shared_governors", calls,
+                              f"{name}'s setUpModule must call rate_limit.reset_shared_governors()")
 
 
 if __name__ == "__main__":

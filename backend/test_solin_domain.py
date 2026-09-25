@@ -2,7 +2,7 @@
 
 The load-bearing one is :meth:`ComposeVerbatimTests.test_compose_answer_body_is_verbatim`:
 it asserts mechanically that the answer body is a CONTIGUOUS slice of a bundled card, which
-is what guarantees the 0.8M-param TinyGPT model never authors a sentence of security
+is what guarantees the tiny (well under 10M-param) TinyGPT model never authors a sentence of security
 advice. The other load-bearing one is :meth:`TorchFreeTests` — the shipped build has no
 torch and no solin_core, so a single stray import there would silently return every real
 user to ``fallback_reply``'s canned platitude.

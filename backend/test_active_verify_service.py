@@ -34,9 +34,20 @@ if str(BACKEND_DIR) not in sys.path:
 
 from bughunter import active_verify_service as av  # noqa: E402
 from bughunter import hunt_brain, offline_hunt, web_ingest  # noqa: E402
+from bughunter import rate_limit  # noqa: E402
 from bughunter.prover_classes import CLASS_ALIASES, PROVER_CLASSES, check_tags_for_impact  # noqa: E402
 from bughunter.rate_limit import HostRateGovernor  # noqa: E402
 from bughunter.settings import get_settings  # noqa: E402
+
+
+def setUpModule() -> None:
+    """Start from a full per-host active-request budget — see rate_limit.reset_shared_governors().
+
+    This module spends 72 of the shared 127.0.0.1 bucket's 700 tokens. It is the prover's own test
+    file, so a drained bucket here would quietly turn the suite's core active-layer coverage into
+    assertions about probes that were never sent.
+    """
+    rate_limit.reset_shared_governors()
 
 
 class _Stub:
@@ -614,6 +625,93 @@ class ActiveCheckTests(unittest.TestCase):
                         "body": '<?xml version="1.0"?><ListBucketResult><Contents><Key>x</Key></Contents></ListBucketResult>'}
         f = av._check_open_bucket(WrongShapeStub(), landing, "acmestorage.blob.core.windows.net", s)
         self.assertIsNone(f)
+
+
+class ExposureCvssTests(unittest.TestCase):
+    """A confirmed read exposure must be scored from what it disclosed, not a flat class default.
+
+    _DEBUG_ENDPOINTS grades each entry itself (heapdump "critical", the actuator index "medium") and
+    _check_sensitive_paths captures the served file, but both passed cvss=None — so bounty.py stamped
+    impact_model.cvss_for_class('disclosure'), a flat C:L / 5.3 Medium. Since the report resolves
+    severity from the CVSS rather than the raw label, a confirmed full JVM heap dump was SUBMITTED as
+    "Medium, low confidentiality impact", contradicting its own severity field.
+    """
+
+    def test_grade_sizes_the_vector_and_never_claims_integrity_or_availability(self) -> None:
+        critical = av._exposure_cvss("critical", "a heap dump at /actuator/heapdump")
+        high = av._exposure_cvss("high", "actuator env at /actuator/env")
+        medium = av._exposure_cvss("medium", "the actuator index at /actuator")
+        self.assertEqual(critical["vector"], "AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N")
+        self.assertEqual(high["vector"], "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N")
+        self.assertEqual(medium["vector"], "AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N")
+        self.assertGreater(critical["base_score"], high["base_score"])
+        self.assertGreater(high["base_score"], medium["base_score"])
+        for block in (critical, high, medium):
+            # GET-only evidence proves no write and no execution, however serious the disclosure.
+            self.assertIn("I:N/A:N", block["vector"])
+            self.assertFalse(block["estimated"])          # derived from captured evidence, not a template
+            self.assertTrue(block["justification"].strip())
+            # A read-only exposure can never reach the Critical band: 9.0+ needs impact this cannot show.
+            self.assertNotEqual(block["base_severity"], "Critical")
+
+    def test_an_unknown_grade_falls_back_to_the_class_vector(self) -> None:
+        self.assertIsNone(av._exposure_cvss("", "x"))
+        self.assertIsNone(av._exposure_cvss("bogus", "x"))
+
+    def test_a_served_secret_file_outranks_a_served_config_file(self) -> None:
+        # _check_sensitive_paths grades from the EVIDENCE: a body that classifies as real secret
+        # material is a credential exposure reaching other systems; one that does not stays High/S:U.
+        with_secrets = av._exposure_cvss("critical", "an .env at /.env")
+        without = av._exposure_cvss("high", "a .git/config at /.git/config")
+        self.assertIn("S:C", with_secrets["vector"])
+        self.assertIn("S:U", without["vector"])
+
+
+class SensitiveDataNamingTests(unittest.TestCase):
+    """Every captured body gets its disclosed data NAMED, not just the CORS one.
+
+    sensitive_data's contract is "classify the RAW body, before redact_text runs" — redaction rewrites
+    tokens to [REDACTED_…] markers the classifier can no longer match. Only _cors_impact_tier obeyed
+    it, so a served .env, an actuator dump, a GraphQL schema or a traversal read left
+    sensitive_data_labels unset: report.py printed no "Sensitive data exposed:" line and
+    bounty._write_sensitive_data_files skipped the finding, losing a disclosure's strongest impact
+    evidence. _finding now classifies at the one choke point all 15 producers pass through.
+    """
+
+    def test_a_served_dotenv_capture_names_its_secrets_while_the_excerpt_stays_redacted(self) -> None:
+        body = ("AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n"
+                "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n")
+        f = av._finding("active.exposed-file", "Sensitive file exposed: /.env", "high", "disclosure",
+                        "disclosure", "https://t/", av._proof("confirmed", observed_result="served"),
+                        {"request_line": "GET https://t/.env", "read_data": body})
+        labels = f["proof_evidence"].get("sensitive_data_labels", "")
+        self.assertIn("AWS access key ID", labels)
+        self.assertIn("AWS secret access key", labels)
+        # The naming must not come at the cost of the redaction guarantee.
+        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", f["proof_evidence"]["read_data"])
+
+    def test_a_captured_session_token_body_is_named(self) -> None:
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.abcdefghijklmnop"
+        f = av._finding("active.graphql-introspection", "GraphQL introspection", "low", "disclosure",
+                        "graphql", "https://t/graphql", av._proof("confirmed"),
+                        {"read_data": '{"access_token":"%s"}' % jwt})
+        self.assertIn("JWT", f["proof_evidence"].get("sensitive_data_labels", ""))
+
+    def test_a_producer_that_already_classified_is_left_alone(self) -> None:
+        # _cors_impact_tier classifies with its own richer summary; the choke point must not overwrite it.
+        f = av._finding("active.cors", "CORS", "high", "", "cors", "https://t/", av._proof("confirmed"),
+                        {"read_data": '{"email":"victim@acme.com"}', "sensitive_data_labels": "preset label"})
+        self.assertEqual(f["proof_evidence"]["sensitive_data_labels"], "preset label")
+
+    def test_a_finding_with_no_captured_body_gains_no_label(self) -> None:
+        f = av._finding("active.clickjacking", "framable", "low", "headers", "headers", "https://t/",
+                        av._proof("candidate"), {"request_line": "GET https://t/"})
+        self.assertNotIn("sensitive_data_labels", f["proof_evidence"])
+
+    def test_an_unclassifiable_body_gains_no_label(self) -> None:
+        f = av._finding("active.path-traversal", "traversal", "high", "disclosure", "path-traversal",
+                        "https://t/", av._proof("confirmed"), {"read_data": "root:x:0:0:root:/root:/bin/bash"})
+        self.assertNotIn("sensitive_data_labels", f["proof_evidence"])
 
 
 class WithOperatorTests(unittest.TestCase):

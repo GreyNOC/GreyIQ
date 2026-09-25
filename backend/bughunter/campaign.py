@@ -303,6 +303,16 @@ def _run_campaign_body(
     progress_run_id: str | None = None,
     progress_unit: str | None = None,
     submission_claim: tuple[set[str], "threading.Lock"] | None = None,
+    # The operator's OOB collaborator. Without these reaching the per-URL hunt below, the four
+    # out-of-band provers -- blind SSRF, blind XXE, blind RCE and JWT key-URL injection -- were
+    # unreachable from EVERY autonomous path: run_bounty_hunt gates each one on a configured
+    # collaborator, only the single-hunt API route passed one, and a campaign passed nothing. Four
+    # confirmable classes, three of them Critical, that could only ever fire from a manual one-URL
+    # hunt. Forwarding them weakens no gate: the provers stay behind active + authorized + in-scope
+    # inside run_bounty_hunt, and a collaborator only exists because the operator pasted one into
+    # Settings, which is the opt-in.
+    oob_base: str = "",
+    oob_secret: str = "",
 ) -> dict[str, Any]:
     """Run a full campaign. Returns {ok, campaign_path, json_path, urls_scanned,
     finding_count, confirmed_count, submission_paths, ...} or {ok: False, error}.
@@ -685,6 +695,11 @@ def _run_campaign_body(
             version=version, run_live=live, active=effective_active, time_based=(time_based or deep), auth=auth, per_finding=False,
             extra_params=recon_params, on_progress=_emit, settings=campaign_settings, class_priority=hunt_priority.get(url),
             ssrf_params=brain_ssrf_params, xss_params=brain_xss_params,
+            # Make Stop responsive WITHIN a URL, not only between them. The loop above already breaks on
+            # progress.is_stopped, but a single URL's active fan-out, re-plan wave and OOB provers can run
+            # for a long time — so without this the operator waits out the current URL after hitting Stop.
+            should_stop=(lambda rid=progress_run_id: progress.is_stopped(rid)) if progress_run_id else None,
+            oob_base=oob_base, oob_secret=oob_secret,
         )
         per_target.append({"target": url, "ok": result.get("ok", False),
                            "report_path": result.get("report_path", ""), "error": result.get("error", "")})
@@ -1285,6 +1300,17 @@ def _target_host_excluded(candidate: str, excluded_hosts: list[str]) -> bool:
     return False
 
 
+# Structured-scope asset types that are IN SCOPE but are not web endpoints, so a
+# "hunt the whole scope" campaign must not derive a URL from one. Named in HackerOne's
+# vocabulary, which yeswehack_import maps its own scope_type values onto. "OTHER" and ""
+# are deliberately absent: CSV and hand-entered rows leave asset_type empty, and those
+# must keep working exactly as before.
+_NON_WEB_ASSET_TYPES = frozenset({
+    "GOOGLE_PLAY_APP_ID", "APPLE_STORE_APP_ID", "WINDOWS_APP_STORE_APP_ID", "OTHER_APK",
+    "TESTFLIGHT", "SOURCE_CODE", "DOWNLOADABLE_EXECUTABLES", "HARDWARE", "SMART_CONTRACT",
+})
+
+
 def program_campaign_targets(program: dict[str, Any], max_targets: int = _MAX_PROGRAM_TARGETS) -> list[str]:
     """The list of concrete URLs a "hunt this program's whole scope" campaign should
     run. Uses ``seed_targets`` (an operator's own hand-curated hunt list) plus any
@@ -1327,6 +1353,15 @@ def program_campaign_targets(program: dict[str, Any], max_targets: int = _MAX_PR
         # through the explicit clone_repositories opt-in above.
         if is_supported_remote_git_url(identifier):
             continue
+        # Neither is a mobile app, a binary, a smart contract or source: those assets are
+        # in scope for the PROGRAM but are not web endpoints, and deriving a target from
+        # one sends traffic somewhere nobody authorized. A YesWeHack Android asset is
+        # published as its store URL, so this row would otherwise schedule a scan of
+        # play.google.com or apps.apple.com -- a third party -- and a bare package id like
+        # "com.vendor.mobile" resolves to https://com.vendor.mobile, an unrelated host.
+        # HackerOne imports carry the same asset types and the same hazard.
+        if str(entry.get("asset_type") or "").strip().upper() in _NON_WEB_ASSET_TYPES:
+            continue
         url = _representative_host(identifier)
         if url and url not in seen and not _target_host_excluded(url, excluded_hosts):
             seen.add(url)
@@ -1367,6 +1402,10 @@ def run_campaign_over_targets(
     policy_profile: str = "",
     progress_run_id: str | None = None,
     progress_unit: str | None = None,
+    # Forwarded verbatim to every per-target run_campaign — see _run_campaign_body for why the four
+    # out-of-band provers were otherwise unreachable from any autonomous path.
+    oob_base: str = "",
+    oob_secret: str = "",
 ) -> dict[str, Any]:
     """Run one full ``run_campaign`` per target (bounded, deduped, best-effort — one
     bad target never aborts the rest) and merge the results into a single combined
@@ -1471,6 +1510,7 @@ def run_campaign_over_targets(
                 policy_profile=policy_profile,
                 progress_run_id=progress_run_id, progress_unit=unit,
                 submission_claim=submission_claim,  # dedup identical findings across concurrent targets
+                oob_base=oob_base, oob_secret=oob_secret,
             )
             if progress_unit is None:
                 if result.get("ok"):
@@ -1618,6 +1658,10 @@ def run_portfolio_campaign(
     include_attack_map: bool = True,
     progress_run_id: str | None = None,
     max_concurrent_programs: int = _PORTFOLIO_MAX_PROGRAMS,
+    # Forwarded to every program's span. The operator loop is the MOST autonomous path, so it is the
+    # one where an unreachable prover costs the most: it runs unattended, for hours.
+    oob_base: str = "",
+    oob_secret: str = "",
 ) -> dict[str, Any]:
     # (policy_profile is per-program here; read from each spec below, not a portfolio-wide arg.)
     """Run a full campaign across MULTIPLE saved programs CONCURRENTLY (bounded), merged into
@@ -1706,6 +1750,7 @@ def run_portfolio_campaign(
                 user_agent_suffix=spec["user_agent_suffix"],
                 excluded_hosts=spec["excluded_hosts"], include_attack_map=include_attack_map, on_progress=_p_emit,
                 progress_run_id=progress_run_id, progress_unit=label,
+                oob_base=oob_base, oob_secret=oob_secret,
             )
             progress.mark_target(progress_run_id, label, "done" if result.get("ok") else "error",
                                  error="" if result.get("ok") else str(result.get("error") or ""))

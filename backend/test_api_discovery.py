@@ -132,7 +132,11 @@ class GraphQLTests(unittest.TestCase):
         self.assertEqual(f["category"], "disclosure")
         self.assertEqual(f["rule_id"], "passive.graphql-introspection")
         self.assertEqual(f["_plan"]["proof_of_impact"]["status"], "candidate")
-        self.assertEqual(f["_plan"]["cvss"]["base_severity"], "low")
+        # The drift this fixes: the block hardcoded "low" beside a vector that scores 5.3, which is the
+        # Medium band. A triager pasting the vector into the NVD calculator got a different severity than
+        # the report printed. Both now come from the one vector (impact_model.cvss_block).
+        self.assertEqual(f["_plan"]["cvss"]["base_score"], 5.3)
+        self.assertEqual(f["_plan"]["cvss"]["base_severity"], "Medium")
 
     def test_query_and_mutation_operations_surfaced(self) -> None:
         # The introspection query already fetches fields{name}; the parser now surfaces the actual

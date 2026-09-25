@@ -17,9 +17,19 @@ REPO_ROOT = BACKEND_DIR.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from bughunter import progress  # noqa: E402
+from bughunter import progress, rate_limit  # noqa: E402
 from bughunter.bounty import run_bounty_hunt  # noqa: E402
 from bughunter.campaign import run_campaign  # noqa: E402
+
+
+def setUpModule() -> None:
+    """Start from a full per-host active-request budget — see rate_limit.reset_shared_governors().
+
+    This module is the suite's heaviest consumer of the process-wide 127.0.0.1 bucket (573 of its
+    700 tokens), so without a module-boundary reset it both inherits an already-drained bucket and
+    starves every active-layer module that runs after it.
+    """
+    rate_limit.reset_shared_governors()
 
 
 class ProgressBufferTests(unittest.TestCase):
@@ -194,6 +204,80 @@ class RunBountyHuntProgressTests(unittest.TestCase):
         finally:
             bounty.oob_service.confirm_blind_xxe = orig
         self.assertEqual(called, [])                             # no collaborator -> the XXE pass never fires
+
+    def test_blind_rce_and_jwt_key_probes_run_when_a_collaborator_is_configured(self) -> None:
+        # The two unauthenticated provers added in v4.4.0 run beside blind SSRF/XXE, behind the same
+        # collaborator gate, and their findings must reach the report like any other active finding.
+        from bughunter import bounty
+        url = f"http://127.0.0.1:{self.server.server_port}/"
+        seen: list = []
+        rce_finding = {"rule_id": "active.blind-rce-oob", "title": "Blind OS command injection",
+                       "severity": "critical", "class_id": "rce", "location": url, "category": "injection",
+                       "proof_evidence": {"request_line": f"GET {url}"}}
+        jwt_finding = {"rule_id": "active.jwt-key-url-injection-oob", "title": "JWT jku injection",
+                       "severity": "high", "class_id": "jwt", "location": url, "category": "auth",
+                       "proof_evidence": {"request_line": f"GET {url}"}}
+        orig = (bounty.oob_service.confirm_blind_ssrf, bounty.oob_service.confirm_blind_xxe,
+                bounty.oob_service.confirm_blind_rce, bounty.oob_service.confirm_jwt_key_injection)
+        bounty.oob_service.confirm_blind_ssrf = lambda *a, **k: {"ok": True, "status": "no-callback"}
+        bounty.oob_service.confirm_blind_xxe = lambda *a, **k: {"ok": True, "status": "no-callback"}
+        bounty.oob_service.confirm_blind_rce = lambda target, **k: (seen.append(("rce", target)),
+            {"ok": True, "status": "confirmed", "param": "cmd", "finding": dict(rce_finding)})[1]
+        bounty.oob_service.confirm_jwt_key_injection = lambda target, **k: (seen.append(("jwt", target)),
+            {"ok": True, "status": "confirmed", "field": "jku", "finding": dict(jwt_finding)})[1]
+        lines: list[str] = []
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                report = run_bounty_hunt(
+                    url, "web-app", None, tmp, "127.0.0.1", True, {}, active=True,
+                    oob_base="https://collab.example", oob_secret="s3cr3t",
+                    default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed", on_progress=lines.append)
+        finally:
+            (bounty.oob_service.confirm_blind_ssrf, bounty.oob_service.confirm_blind_xxe,
+             bounty.oob_service.confirm_blind_rce, bounty.oob_service.confirm_jwt_key_injection) = orig
+        self.assertTrue(report.get("ok"), report.get("error"))
+        self.assertEqual(seen, [("rce", url), ("jwt", url)])
+        self.assertTrue(any("blind-RCE OOB: confirmed via cmd" in ln for ln in lines), lines)
+        self.assertTrue(any("JWT key-URL OOB: confirmed via 'jku'" in ln for ln in lines), lines)
+
+    def test_blind_rce_and_jwt_key_probes_are_skipped_without_a_collaborator(self) -> None:
+        from bughunter import bounty
+        url = f"http://127.0.0.1:{self.server.server_port}/"
+        called: list = []
+        orig = (bounty.oob_service.confirm_blind_rce, bounty.oob_service.confirm_jwt_key_injection)
+        bounty.oob_service.confirm_blind_rce = lambda *a, **k: called.append("rce")
+        bounty.oob_service.confirm_jwt_key_injection = lambda *a, **k: called.append("jwt")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                run_bounty_hunt(url, "web-app", None, tmp, "127.0.0.1", True, {}, active=True,
+                                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed")
+        finally:
+            (bounty.oob_service.confirm_blind_rce, bounty.oob_service.confirm_jwt_key_injection) = orig
+        self.assertEqual(called, [])
+
+    def test_a_raising_oob_prover_never_breaks_the_hunt(self) -> None:
+        # Each OOB block is best-effort: infrastructure the operator runs (a tunnel, a phone) is the
+        # least reliable part of a hunt, and it must never be able to take the hunt down with it.
+        from bughunter import bounty
+        url = f"http://127.0.0.1:{self.server.server_port}/"
+        orig = (bounty.oob_service.confirm_blind_rce, bounty.oob_service.confirm_jwt_key_injection)
+
+        def boom(*a, **k):
+            raise RuntimeError("collaborator tunnel is down")
+
+        bounty.oob_service.confirm_blind_rce = boom
+        bounty.oob_service.confirm_jwt_key_injection = boom
+        lines: list[str] = []
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                report = run_bounty_hunt(
+                    url, "web-app", None, tmp, "127.0.0.1", True, {}, active=True,
+                    oob_base="https://collab.example", oob_secret="s3cr3t",
+                    default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed", on_progress=lines.append)
+        finally:
+            (bounty.oob_service.confirm_blind_rce, bounty.oob_service.confirm_jwt_key_injection) = orig
+        self.assertTrue(report.get("ok"), report.get("error"))
+        self.assertTrue(any("blind-RCE OOB probe error" in ln for ln in lines), lines)
 
     def test_run_id_bound_sink_lands_in_the_shared_progress_buffer(self) -> None:
         url = f"http://127.0.0.1:{self.server.server_port}/"
@@ -403,3 +487,63 @@ class StructuredSnapshotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KillSwitchReachesADirectHuntTests(unittest.TestCase):
+    """Stop must halt a SINGLE hunt's probing, not just relabel the UI.
+
+    campaign.py polls progress.is_stopped between targets and between URLs, but a direct hunt only
+    ever received ``on_progress`` — a one-way message sink. So clicking Stop flipped the pill to
+    "Stopped" and disabled the button while the active fan-out, the re-plan wave and all four OOB
+    provers kept sending requests at a host the operator had just realised was out of scope. That is
+    the one control in an authorized-testing tool that has to work.
+
+    These tests assert the wiring rather than driving a live hunt: the predicate exists, every probe
+    launch site consults it, and a broken predicate cannot abort a legitimate run.
+    """
+
+    def test_the_hunt_body_accepts_and_consults_a_stop_predicate(self) -> None:
+        import inspect
+
+        from bughunter import bounty
+
+        signature = inspect.signature(bounty._run_bounty_hunt_body)
+        self.assertIn("should_stop", signature.parameters,
+                      "the hunt body cannot be told to stop")
+        source = inspect.getsource(bounty._run_bounty_hunt_body)
+        self.assertIn("def _stopped()", source)
+        # Every place that starts sending must check it: the per-target active fan-out, the re-plan
+        # wave, and each of the four OOB provers (which inject callback tokens and then poll).
+        self.assertGreaterEqual(source.count("_stopped()"), 6,
+                                "a probe launch site is not gated on the kill switch")
+
+    def test_a_raising_predicate_does_not_abort_the_hunt(self) -> None:
+        # A broken kill switch must fail OPEN — aborting a legitimate, authorized hunt because a
+        # status lookup raised would be its own bug.
+        import inspect
+
+        from bughunter import bounty
+
+        source = inspect.getsource(bounty._run_bounty_hunt_body)
+        start = source.index("def _stopped()")
+        # The helper's own body: from its def to the first line at the enclosing indent that follows it.
+        body = source[start:start + 700]
+        self.assertIn("except Exception", body,
+                      "_stopped() does not swallow a raising predicate, so a broken status lookup "
+                      "would abort an authorized hunt")
+        self.assertIn("return False", body)
+
+    def test_both_entry_points_pass_the_predicate(self) -> None:
+        api = (BACKEND_DIR / "greyiq_api.py").read_text(encoding="utf-8")
+        self.assertIn("should_stop=(lambda rid=run_id: bounty_progress.is_stopped(rid))", api,
+                      "the direct-hunt route does not pass the kill switch")
+        campaign_src = (BACKEND_DIR / "bughunter" / "campaign.py").read_text(encoding="utf-8")
+        self.assertIn("should_stop=(lambda rid=progress_run_id: progress.is_stopped(rid))", campaign_src,
+                      "a campaign's per-URL hunt does not pass the kill switch, so Stop waits out the URL")
+
+    def test_the_flag_itself_round_trips(self) -> None:
+        run_id = "killswitch-contract-test"
+        progress.start_run(run_id)
+        self.assertFalse(progress.is_stopped(run_id))
+        progress.request_stop(run_id)
+        self.assertTrue(progress.is_stopped(run_id))

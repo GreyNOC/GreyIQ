@@ -62,8 +62,49 @@ const TRAINING_SOURCES = [
     id: "src_imported_docs",
     name: "Imported Documents",
     description: "Longer pasted or ingested document text."
+  },
+  {
+    id: "src_manuals",
+    name: "Bundled Manuals",
+    description: "The shipped manual/PDF extract — the largest corpus available (~6 MB)."
   }
 ];
+
+// Defaults for a training run. Kept in one place so the form, the reset button and the request all
+// agree, and so the shape persisted in localStorage has a single definition.
+const DEFAULT_TRAIN_SETTINGS = {
+  modelSize: "compact",
+  maxIters: 160,
+  evalInterval: 40,
+  learningRate: 0.0003,
+  batchSize: 0,          // 0 = size it from the architecture's context length
+  device: "auto",
+  datasetCapMb: 16,
+  freshStart: false,
+  autoStop: true,
+  patience: 3,
+  minDelta: 0.0001,
+  restoreBest: true,
+  saveBestOnly: true
+};
+
+// Brain sizes, described in terms an operator can choose between. The backend is the source of truth
+// for the actual shapes (training_runtime.MODEL_PRESETS) and /api/train/dataset reports real parameter
+// counts; these are the labels and the honest trade-off for each.
+const MODEL_SIZE_LABELS = {
+  compact: {
+    label: "Compact — keeps improving your current model",
+    note: "The shape your model already has, so a run continues from where it left off. Fastest, and safe on CPU."
+  },
+  standard: {
+    label: "Standard — bigger brain, starts over",
+    note: "About 8x the capacity and 4x the context. Starts from random weights, so it needs a real corpus and many more steps before it beats Compact. Your current model is archived, not replaced."
+  },
+  large: {
+    label: "Large — biggest brain, wants a GPU",
+    note: "Roughly 26x the capacity. Expect a long run on CPU. Starts from random weights; your current model is archived."
+  }
+};
 
 const DEFAULT_BOTS = [
   {
@@ -201,6 +242,46 @@ const els = {
   agentCmdPolicy: document.querySelector("#agentCmdPolicy"),
   trainingSourceList: document.querySelector("#trainingSourceList"),
   trainButton: document.querySelector("#trainButton"),
+  trainPause: document.querySelector("#trainPause"),
+  trainStop: document.querySelector("#trainStop"),
+  trainStatus: document.querySelector("#trainStatus"),
+  trainProgress: document.querySelector("#trainProgress"),
+  trainProgressBar: document.querySelector("#trainProgressBar"),
+  trainProgressFill: document.querySelector("#trainProgressFill"),
+  trainProgressLabel: document.querySelector("#trainProgressLabel"),
+  trainCurve: document.querySelector("#trainCurve"),
+  trainLossValue: document.querySelector("#trainLossValue"),
+  valLossValue: document.querySelector("#valLossValue"),
+  bestLossValue: document.querySelector("#bestLossValue"),
+  trainDeviceValue: document.querySelector("#trainDeviceValue"),
+  trainBatchValue: document.querySelector("#trainBatchValue"),
+  trainCorpusValue: document.querySelector("#trainCorpusValue"),
+  trainSettingsForm: document.querySelector("#trainSettingsForm"),
+  trainModelSize: document.querySelector("#trainModelSize"),
+  trainModelSizeNote: document.querySelector("#trainModelSizeNote"),
+  trainMaxIters: document.querySelector("#trainMaxIters"),
+  trainEvalInterval: document.querySelector("#trainEvalInterval"),
+  trainLearningRate: document.querySelector("#trainLearningRate"),
+  trainBatchSize: document.querySelector("#trainBatchSize"),
+  trainDevice: document.querySelector("#trainDevice"),
+  trainDatasetCap: document.querySelector("#trainDatasetCap"),
+  trainFreshStart: document.querySelector("#trainFreshStart"),
+  trainAutoStop: document.querySelector("#trainAutoStop"),
+  trainPatience: document.querySelector("#trainPatience"),
+  trainPatienceRow: document.querySelector("#trainPatienceRow"),
+  trainMinDelta: document.querySelector("#trainMinDelta"),
+  trainRestoreBest: document.querySelector("#trainRestoreBest"),
+  trainSaveBestOnly: document.querySelector("#trainSaveBestOnly"),
+  trainSettingsReset: document.querySelector("#trainSettingsReset"),
+  trainDatasetRefresh: document.querySelector("#trainDatasetRefresh"),
+  trainDatasetStatus: document.querySelector("#trainDatasetStatus"),
+  huntModelSource: document.querySelector("#huntModelSource"),
+  huntModelRows: document.querySelector("#huntModelRows"),
+  huntModelScore: document.querySelector("#huntModelScore"),
+  huntBrainRefresh: document.querySelector("#huntBrainRefresh"),
+  huntBrainDryRun: document.querySelector("#huntBrainDryRun"),
+  huntBrainTrain: document.querySelector("#huntBrainTrain"),
+  huntBrainStatus: document.querySelector("#huntBrainStatus"),
   trainingDataCount: document.querySelector("#trainingDataCount"),
   choiceCount: document.querySelector("#choiceCount"),
   modelState: document.querySelector("#modelState"),
@@ -425,6 +506,7 @@ function loadState() {
     backendPreference: "cpu",
     botDefaultRevision: BOT_DEFAULT_REVISION,
     selectedTrainingSources: [...DEFAULT_SELECTED_TRAINING_SOURCES],
+    trainSettings: { ...DEFAULT_TRAIN_SETTINGS },
     agentMode: false,
     agentWorkspace: "",
     theme: "dark",
@@ -477,6 +559,9 @@ function loadState() {
       ...saved,
       botDefaultRevision: BOT_DEFAULT_REVISION,
       selectedTrainingSources: normalizeSelectedTrainingSources(saved.selectedTrainingSources),
+      // Merge over the defaults so a settings object saved by an older build (missing the newer
+      // fields) still yields a complete, valid form rather than undefined inputs.
+      trainSettings: { ...DEFAULT_TRAIN_SETTINGS, ...(saved.trainSettings || {}) },
       bots: migrateDefaultBots(saved.bots, saved.botDefaultRevision).map((bot) => ({
         ...bot,
         weights: normalizeWeights(bot.weights)
@@ -659,12 +744,15 @@ async function refreshServiceStatus({ silent = false } = {}) {
     // that bailed empty at boot (the lazy poll is how a late backend gets noticed).
     if (state.panelMode === "security") ensureSecurityData();
     if (state.panelMode === "ops") void loadBrainOpsStatus({ force: true });
+    if (state.panelMode === "train") ensureTrainData();
     if (!silent) {
       render();
     } else {
       renderBackend();
-      // Only rebuild the training/memory panel when something it shows actually
-      // changed — a no-op poll must not wipe the user's focus/scroll there.
+      // Progress/loss change on every tick, and none of it touches focus or scroll, so it renders
+      // unconditionally. Only the memory LIST is gated: it calls replaceChildren(), which would
+      // steal focus and reset scroll on a no-op poll.
+      renderTrainingProgress();
       if (trainingSignature() !== lastTrainingSignature) {
         renderTraining();
       }
@@ -1472,6 +1560,8 @@ function render() {
   renderChat();
   renderTraining();
   renderTrainingSources();
+  renderTrainSettingsForm();
+  renderTrainingProgress();
   renderAgentBar();
   renderBackend();
   saveState();
@@ -1666,6 +1756,7 @@ function trainingSignature() {
   return JSON.stringify([
     Boolean(t.active), Boolean(t.paused),
     t.status?.status || t.status?.stage || "",
+    t.status?.stop_reason || "",
     t.last_error || "", t.finished_at || "",
     memories.length, Boolean(activeBot()?.trainedAt), state.activeBotId,
   ]);
@@ -1677,11 +1768,20 @@ function renderTraining() {
   const trainingStatus = training?.status?.status || training?.status?.stage || "";
   els.trainingDataCount.textContent = memories.filter((memory) => memory.kind === "training_data" || memory.kind === "example").length;
   els.choiceCount.textContent = memories.filter((memory) => memory.kind === "preference").length;
-  els.modelState.textContent = training?.active
-    ? "Training"
-    : trainingStatus === "complete" || activeBot().trainedAt
-      ? "Trained"
-      : "Fresh";
+  // Derived from BACKEND state only. This used to fall back to activeBot().trainedAt — a timestamp
+  // the in-browser preference fit sets on every rating — so the meter read "Trained" for a TinyGPT
+  // model that had never run a single optimizer step.
+  els.modelState.textContent = (() => {
+    if (service.available === false) return "Service offline";
+    if (service.status?.engine_ready === false && service.status?.engine_error) return "No local model";
+    if (training?.active) return training.paused ? "Paused" : "Training";
+    if (trainingStatus === "error" || training?.last_error) return "Error";
+    if (trainingStatus === "diverged") return "Diverged";
+    if (trainingStatus === "stopped") return "Stopped";
+    if (trainingStatus === "complete" || trainingStatus === "completed") return "Trained";
+    if (service.status?.engine_ready) return "Ready";
+    return "Fresh";
+  })();
   els.memoryList.replaceChildren();
 
   for (const memory of memories.slice().reverse().slice(0, 10)) {
@@ -1708,6 +1808,194 @@ function renderTraining() {
     els.memoryList.append(item);
   }
   lastTrainingSignature = trainingSignature();
+}
+
+// --- Studio · training settings form -----------------------------------------------------------
+// The panel's controls are the single source of truth for a run's parameters. Everything here is
+// persisted in state.trainSettings so a reopened Studio remembers what the operator chose.
+
+function trainSettings() {
+  return { ...DEFAULT_TRAIN_SETTINGS, ...(state.trainSettings || {}) };
+}
+
+function renderTrainModelSizes(sizes) {
+  // Options come from MODEL_SIZE_LABELS (the human framing); /api/train/dataset supplies the real
+  // parameter counts and whether the corpus is even large enough for each one.
+  if (!els.trainModelSize) return;
+  const current = trainSettings().modelSize;
+  const byId = new Map((sizes || []).map((row) => [row.id, row]));
+  els.trainModelSize.replaceChildren();
+  for (const [id, meta] of Object.entries(MODEL_SIZE_LABELS)) {
+    const info = byId.get(id);
+    const option = document.createElement("option");
+    option.value = id;
+    option.textContent = info && info.parameters
+      ? `${meta.label} · ${(info.parameters / 1e6).toFixed(1)}M params`
+      : meta.label;
+    // A preset the current corpus cannot fill would fail at build_dataset, so say so up front
+    // rather than letting the run start and raise.
+    if (info && info.fits === false) {
+      option.textContent += " · corpus too small";
+      option.disabled = true;
+    }
+    els.trainModelSize.append(option);
+  }
+  els.trainModelSize.value = current;
+  if (els.trainModelSize.value !== current) els.trainModelSize.value = DEFAULT_TRAIN_SETTINGS.modelSize;
+  renderTrainModelSizeNote();
+}
+
+function renderTrainModelSizeNote() {
+  if (!els.trainModelSizeNote) return;
+  const meta = MODEL_SIZE_LABELS[trainSettings().modelSize];
+  els.trainModelSizeNote.textContent = meta ? meta.note : "";
+}
+
+function renderTrainSettingsForm() {
+  const settings = trainSettings();
+  if (!els.trainSettingsForm) return;
+  // The size selector must be usable even with no backend: /api/train/dataset enriches the options
+  // with real parameter counts, but an offline Studio would otherwise render an empty <select>.
+  if (els.trainModelSize && !els.trainModelSize.options.length) renderTrainModelSizes([]);
+  const set = (el, value) => { if (el) el.value = String(value); };
+  const check = (el, value) => { if (el) el.checked = Boolean(value); };
+  set(els.trainMaxIters, settings.maxIters);
+  set(els.trainEvalInterval, settings.evalInterval);
+  set(els.trainLearningRate, settings.learningRate);
+  set(els.trainBatchSize, settings.batchSize);
+  set(els.trainDatasetCap, settings.datasetCapMb);
+  if (els.trainDevice) els.trainDevice.value = settings.device;
+  check(els.trainFreshStart, settings.freshStart);
+  check(els.trainAutoStop, settings.autoStop);
+  set(els.trainPatience, settings.patience);
+  set(els.trainMinDelta, settings.minDelta);
+  check(els.trainRestoreBest, settings.restoreBest);
+  check(els.trainSaveBestOnly, settings.saveBestOnly);
+  // Patience/min-improvement only mean anything while early stopping is on.
+  if (els.trainPatienceRow) els.trainPatienceRow.classList.toggle("is-inert", !settings.autoStop);
+  renderTrainModelSizeNote();
+}
+
+function readTrainSettingsForm() {
+  const previous = trainSettings();
+  const num = (el, fallback) => {
+    // A BLANK input is Number("") === 0, which is finite — so the fallback never fired and clearing a
+    // field to retype it persisted maxIters: 1 / learningRate: 0 into localStorage on blur, silently
+    // destroying the operator's settings. Treat blank as "no opinion".
+    const raw = el ? el.value : "";
+    if (String(raw).trim() === "") return fallback;
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : fallback;
+  };
+  return {
+    modelSize: (els.trainModelSize && els.trainModelSize.value) || previous.modelSize,
+    maxIters: Math.max(1, Math.round(num(els.trainMaxIters, previous.maxIters))),
+    evalInterval: Math.max(1, Math.round(num(els.trainEvalInterval, previous.evalInterval))),
+    learningRate: num(els.trainLearningRate, previous.learningRate),
+    batchSize: Math.max(0, Math.round(num(els.trainBatchSize, previous.batchSize))),
+    device: (els.trainDevice && els.trainDevice.value) || previous.device,
+    datasetCapMb: Math.min(16, Math.max(1, Math.round(num(els.trainDatasetCap, previous.datasetCapMb)))),
+    freshStart: Boolean(els.trainFreshStart && els.trainFreshStart.checked),
+    autoStop: Boolean(els.trainAutoStop && els.trainAutoStop.checked),
+    patience: Math.min(50, Math.max(1, Math.round(num(els.trainPatience, previous.patience)))),
+    minDelta: Math.max(0, num(els.trainMinDelta, previous.minDelta)),
+    restoreBest: Boolean(els.trainRestoreBest && els.trainRestoreBest.checked),
+    saveBestOnly: Boolean(els.trainSaveBestOnly && els.trainSaveBestOnly.checked)
+  };
+}
+
+// --- Studio · live run readout ------------------------------------------------------------------
+
+function formatLoss(value) {
+  return Number.isFinite(Number(value)) ? Number(value).toFixed(4) : "—";
+}
+
+function formatChars(value) {
+  const n = Number(value) || 0;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
+  if (n >= 1e3) return `${Math.round(n / 1e3)} KB`;
+  return `${n} chars`;
+}
+
+function renderLossCurve(history) {
+  // Two polylines over a shared y-scale. Drawn as SVG children (never innerHTML) to match this
+  // file's DOM-only rule for anything derived from backend data.
+  const svg = els.trainCurve;
+  if (!svg) return;
+  const points = (history || []).filter((row) => Number.isFinite(Number(row.val_loss)));
+  for (const node of [...svg.querySelectorAll("polyline")]) node.remove();
+  if (points.length < 2) {
+    svg.hidden = true;
+    return;
+  }
+  const values = [];
+  for (const row of points) {
+    if (Number.isFinite(Number(row.val_loss))) values.push(Number(row.val_loss));
+    if (Number.isFinite(Number(row.train_loss))) values.push(Number(row.train_loss));
+  }
+  const max = Math.max(...values);
+  const min = Math.min(...values);
+  const span = max - min || 1;
+  const project = (rows, key) => rows
+    .map((row, index) => {
+      const value = Number(row[key]);
+      if (!Number.isFinite(value)) return null;
+      const x = (index / Math.max(1, rows.length - 1)) * 240;
+      const y = 58 - ((value - min) / span) * 56;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .filter(Boolean)
+    .join(" ");
+  for (const [key, className] of [["train_loss", "curve-train"], ["val_loss", "curve-val"]]) {
+    const coords = project(points, key);
+    if (!coords) continue;
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+    line.setAttribute("points", coords);
+    line.setAttribute("class", className);
+    svg.append(line);
+  }
+  svg.hidden = false;
+}
+
+function renderTrainingProgress() {
+  // Runs on EVERY status poll (not behind the memory-list signature gate), because progress is the
+  // one thing that changes continuously while a run is in flight.
+  const training = service.status?.training;
+  const status = training?.status || {};
+  const active = Boolean(training?.active);
+  if (els.trainPause) {
+    els.trainPause.hidden = !active;
+    els.trainPause.textContent = training?.paused ? "Resume" : "Pause";
+  }
+  if (els.trainStop) els.trainStop.hidden = !active;
+  if (els.trainButton) els.trainButton.disabled = active;
+
+  const step = Number(status.current_step) || 0;
+  const total = Number(status.total_steps) || 0;
+  const history = Array.isArray(training?.history) ? training.history : [];
+  const show = active || history.length > 0 || Boolean(status.stop_reason);
+  if (els.trainProgress) els.trainProgress.hidden = !show;
+  if (!show) return;
+
+  const pct = total > 0 ? Math.min(100, Math.round((step / total) * 100)) : 0;
+  if (els.trainProgressFill) els.trainProgressFill.style.width = `${pct}%`;
+  if (els.trainProgressBar) els.trainProgressBar.setAttribute("aria-valuenow", String(pct));
+  if (els.trainProgressLabel) {
+    const stage = String(status.stage || status.status || "").replaceAll("_", " ");
+    const reason = status.stop_reason ? ` · ${String(status.stop_reason).replaceAll("_", " ")}` : "";
+    els.trainProgressLabel.textContent = total
+      ? `step ${step} / ${total}${stage ? ` · ${stage}` : ""}${reason}`
+      : `${stage || "idle"}${reason}`;
+  }
+  if (els.trainLossValue) els.trainLossValue.textContent = formatLoss(status.train_loss);
+  if (els.valLossValue) els.valLossValue.textContent = formatLoss(status.val_loss);
+  if (els.bestLossValue) els.bestLossValue.textContent = formatLoss(status.best_val_loss);
+  if (els.trainDeviceValue) els.trainDeviceValue.textContent = status.device || "—";
+  if (els.trainBatchValue) els.trainBatchValue.textContent = status.batch_size ? String(status.batch_size) : "—";
+  if (els.trainCorpusValue) {
+    els.trainCorpusValue.textContent = status.dataset_chars ? formatChars(status.dataset_chars) : "—";
+  }
+  renderLossCurve(history);
 }
 
 function renderTrainingSources() {
@@ -2092,6 +2380,37 @@ els.trainingFolderForm?.addEventListener("submit", async (event) => {
   render();
 });
 
+// --- Studio · training controls -----------------------------------------------------------------
+// Every field the backend accepts is driven from the form. The panel previously posted a hardcoded
+// {max_iters: 160, eval_interval: 40, fresh_start: false} and reported failures nowhere: an operator
+// could click Train, have the request rejected, and see nothing change.
+
+function trainRequestBody() {
+  const settings = trainSettings();
+  return {
+    model_size: settings.modelSize,
+    max_iters: settings.maxIters,
+    eval_interval: settings.evalInterval,
+    learning_rate: settings.learningRate,
+    batch_size_override: settings.batchSize,
+    // The dedicated Device selector wins; the CPU/GPU header segments remain the fallback for a
+    // settings object saved before that selector existed.
+    device_preference: settings.device || (state.backendPreference === "gpu" ? "cuda" : "cpu"),
+    dataset_char_cap: Math.round(settings.datasetCapMb * 1_000_000),
+    source_ids: normalizeSelectedTrainingSources(state.selectedTrainingSources),
+    fresh_start: settings.freshStart,
+    patience: settings.patience,
+    min_delta: settings.minDelta,
+    auto_stop: settings.autoStop,
+    save_best_only: settings.saveBestOnly,
+    restore_best: settings.restoreBest
+  };
+}
+
+function setTrainStatus(message) {
+  if (els.trainStatus) els.trainStatus.textContent = message || "";
+}
+
 els.trainButton.addEventListener("click", async () => {
   if (els.trainButton.disabled) return;  // single-flight: block re-clicks while a run is in flight
   const bot = activeBot();
@@ -2100,25 +2419,30 @@ els.trainButton.addEventListener("click", async () => {
   render();
 
   if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    setTrainStatus("The local GreyIQ service is not running, so there is nothing to train.");
     return;
+  }
+
+  const settings = trainSettings();
+  // Switching architecture cannot continue the existing weights, so say so before spending the run
+  // rather than letting the operator discover it in the log.
+  if (settings.modelSize !== "compact") {
+    setTrainStatus(`Starting a NEW ${settings.modelSize} model from scratch — your current model is archived, not overwritten.`);
+  } else {
+    setTrainStatus("Training…");
   }
 
   els.trainButton.disabled = true;
   try {
-    els.modelState.textContent = "Training";
     await apiFetch("/api/train/start", {
       method: "POST",
       timeoutMs: 10000,
-      body: JSON.stringify({
-        max_iters: 160,
-        eval_interval: 40,
-        device_preference: state.backendPreference === "gpu" ? "cuda" : "cpu",
-        source_ids: normalizeSelectedTrainingSources(state.selectedTrainingSources),
-        fresh_start: false
-      })
+      body: JSON.stringify(trainRequestBody())
     });
     await refreshServiceStatus({ silent: true });
   } catch (error) {
+    // Surface it. service.lastError alone is write-only as far as this panel is concerned.
+    setTrainStatus(error.message || "Training did not start.");
     service.lastError = error.message || "Training did not start";
     await refreshServiceStatus({ silent: true });
   } finally {
@@ -2126,6 +2450,178 @@ els.trainButton.addEventListener("click", async () => {
   }
   render();
 });
+
+if (els.trainPause) {
+  els.trainPause.addEventListener("click", async () => {
+    const paused = Boolean(service.status?.training?.paused);
+    const route = paused ? "/api/train/resume" : "/api/train/pause";
+    els.trainPause.disabled = true;
+    try {
+      await apiFetch(route, { method: "POST", timeoutMs: 10000 });
+      setTrainStatus(paused ? "Resumed." : "Paused — the run stops at the next step boundary.");
+      await refreshServiceStatus({ silent: true });
+    } catch (error) {
+      setTrainStatus(error.message || "Could not change the run state.");
+    } finally {
+      els.trainPause.disabled = false;
+      renderTrainingProgress();
+    }
+  });
+}
+
+if (els.trainStop) {
+  els.trainStop.addEventListener("click", async () => {
+    els.trainStop.disabled = true;
+    try {
+      await apiFetch("/api/train/stop", { method: "POST", timeoutMs: 10000 });
+      setTrainStatus("Stopping — the trainer saves a checkpoint before it exits.");
+      await refreshServiceStatus({ silent: true });
+    } catch (error) {
+      setTrainStatus(error.message || "Could not stop the run.");
+    } finally {
+      els.trainStop.disabled = false;
+      renderTrainingProgress();
+    }
+  });
+}
+
+if (els.trainSettingsForm) {
+  els.trainSettingsForm.addEventListener("change", () => {
+    state.trainSettings = readTrainSettingsForm();
+    saveState();
+    renderTrainSettingsForm();
+  });
+}
+
+if (els.trainSettingsReset) {
+  els.trainSettingsReset.addEventListener("click", () => {
+    state.trainSettings = { ...DEFAULT_TRAIN_SETTINGS };
+    saveState();
+    renderTrainSettingsForm();
+    setTrainStatus("Training settings reset to defaults.");
+  });
+}
+
+async function loadTrainingDataset() {
+  // What the trainer would actually read, and what each brain size would cost — asked BEFORE
+  // committing to a run.
+  if (!els.trainDatasetStatus) return;
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.trainDatasetStatus.textContent = "The local GreyIQ service is not running.";
+    return;
+  }
+  els.trainDatasetStatus.textContent = "Checking the corpus…";
+  try {
+    const info = await apiFetch("/api/train/dataset", { timeoutMs: 20000 });
+    if (info.ok === false) {
+      els.trainDatasetStatus.textContent = info.error || "Could not read the training data.";
+      return;
+    }
+    renderTrainModelSizes(info.model_sizes);
+    const parts = [
+      `${formatChars(info.total_characters)} of text`,
+      `${Number(info.extracted_files) || 0} file(s)`,
+      `model on disk: ${info.model_name || "none"}`
+    ];
+    if (info.capped) parts.push(`capped at ${formatChars(info.cap)}`);
+    els.trainDatasetStatus.textContent = parts.join(" · ");
+  } catch (error) {
+    els.trainDatasetStatus.textContent = error.message || "Could not read the training data.";
+  }
+}
+
+if (els.trainDatasetRefresh) {
+  els.trainDatasetRefresh.addEventListener("click", () => void loadTrainingDataset());
+}
+
+// --- Studio · hunting brain (the offline hunt ranker) -------------------------------------------
+// A different model from TinyGPT: it orders which checks the prover spends its budget on, learned
+// from the operator's own confirmed/unconfirmed outcomes. Promotion stays gated on beating the
+// built-in rules on held-out programs, so "Train" here is an attempt, not a guarantee.
+
+function renderHuntModel(info) {
+  const active = (info && info.active_model) || {};
+  const corpus = (info && info.corpus) || {};
+  const evaluation = (info && info.eval) || {};
+  if (els.huntModelSource) {
+    els.huntModelSource.textContent = info && info.loaded
+      ? `${info.source || "unknown"}${active.version_tag || info.version_tag ? ` · ${active.version_tag || info.version_tag}` : ""}`
+      : "rules only";
+  }
+  // Key names verified against a live GET /api/hunt/model response (hunt_train.show_status):
+  // corpus = {hunts, programs, labeled_rows, confirmed_rows, paid_rows, min_rows, rows_needed}.
+  if (els.huntModelRows) {
+    const rows = Number(corpus.labeled_rows ?? 0);
+    const needed = Number(corpus.min_rows ?? 0);
+    const short = Number(corpus.rows_needed ?? 0);
+    els.huntModelRows.textContent = needed
+      ? `${rows} / ${needed}${short > 0 ? ` · ${short} more needed` : ""}`
+      : String(rows);
+  }
+  if (els.huntModelScore) {
+    // The eval block is only populated once a model has been trained and gated; before that it is {}.
+    // hunt_train reports the promotion metric as recall@3 for the model and the rules baseline it had
+    // to beat, so show that pair — a bare score with nothing to compare it to says little.
+    const score = evaluation.recall_at_3_model ?? evaluation.model_score ?? evaluation.score ?? null;
+    const baseline = evaluation.recall_at_3_rules ?? evaluation.rules_score ?? evaluation.baseline ?? null;
+    if (score === null || score === undefined) {
+      els.huntModelScore.textContent = Number(corpus.hunts) ? "not trained yet" : "no hunts yet";
+    } else {
+      els.huntModelScore.textContent = baseline === null || baseline === undefined
+        ? String(score)
+        : `${score} vs rules ${baseline}`;
+    }
+  }
+}
+
+async function loadHuntModel() {
+  if (!els.huntModelSource) return;
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    if (els.huntBrainStatus) els.huntBrainStatus.textContent = "The local GreyIQ service is not running.";
+    return;
+  }
+  try {
+    const info = await apiFetch("/api/hunt/model", { timeoutMs: 20000 });
+    renderHuntModel(info);
+    if (els.huntBrainStatus && info.ok === false) els.huntBrainStatus.textContent = info.error || "";
+  } catch (error) {
+    if (els.huntBrainStatus) els.huntBrainStatus.textContent = error.message || "Could not read the hunt model.";
+  }
+}
+
+async function trainHuntBrain(dryRun) {
+  if (!els.huntBrainStatus) return;
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.huntBrainStatus.textContent = "The local GreyIQ service is not running.";
+    return;
+  }
+  for (const button of [els.huntBrainTrain, els.huntBrainDryRun]) {
+    if (button) button.disabled = true;
+  }
+  els.huntBrainStatus.textContent = dryRun ? "Evaluating against the rules baseline…" : "Training…";
+  try {
+    const result = await apiFetch("/api/hunt/train", {
+      method: "POST",
+      timeoutMs: 180000,
+      body: JSON.stringify({ dry_run: Boolean(dryRun) })
+    });
+    // A refusal is a normal outcome here (too few traces, or it failed to beat the rules), so report
+    // the reason rather than treating ok:false as an error.
+    els.huntBrainStatus.textContent = result.detail || result.reason
+      || (result.ok ? "Promoted a newly trained ranker." : "Not promoted — the built-in rules still win.");
+    await loadHuntModel();
+  } catch (error) {
+    els.huntBrainStatus.textContent = error.message || "Hunt-brain training failed.";
+  } finally {
+    for (const button of [els.huntBrainTrain, els.huntBrainDryRun]) {
+      if (button) button.disabled = false;
+    }
+  }
+}
+
+if (els.huntBrainRefresh) els.huntBrainRefresh.addEventListener("click", () => void loadHuntModel());
+if (els.huntBrainDryRun) els.huntBrainDryRun.addEventListener("click", () => void trainHuntBrain(true));
+if (els.huntBrainTrain) els.huntBrainTrain.addEventListener("click", () => void trainHuntBrain(false));
 
 // ---- Coding brain (local model / Claude / OpenAI-compatible) ----
 let coderConfig = null;
@@ -2493,6 +2989,19 @@ function setPanelMode(mode, focusTab = false) {
   // the dropdowns blank with no retry.
   if (mode === "security") ensureSecurityData();
   if (mode === "ops") void loadBrainOpsStatus();
+  if (mode === "train") ensureTrainData();
+}
+
+// The Train panel's corpus preview and hunt-model status both need the local service, so they load
+// when the panel is shown (and again on a service-up transition) rather than at boot — the same lazy
+// pattern the Security and Ops panels use. Cheap and idempotent.
+let trainDataLoaded = false;
+function ensureTrainData(force = false) {
+  if (!service.available) return;
+  if (trainDataLoaded && !force) return;
+  trainDataLoaded = true;
+  void loadTrainingDataset();
+  void loadHuntModel();
 }
 
 // Populate the Security panel's selectors if they haven't loaded yet. Idempotent
@@ -4800,6 +5309,7 @@ const ckState = {
   sort: { key: "rank", dir: 1 },
   view: "program",
   h1: null,              // { team_handle, api_username, has_token } — never the token
+  ywh: null,             // { email, token_kind, has_token } — never the token. A YesWeHack credential is OPTIONAL: public programs import anonymously.
   platform: "hackerone", // report format for Copy/Download (server re-shapes per platform)
   triage: {},            // ref -> "submitted" | "drafted" (client-side worklist marks)
   reportFocus: null,     // a finding pinned open as a Full report on the Submissions page (from a drawer's "View full report")
@@ -6036,6 +6546,17 @@ async function ckFetchCreds() {
   return ckState.h1;
 }
 
+// YesWeHack's equivalent. Kept a separate call so a slow/absent one never blocks the
+// other — and note that a null here is NOT an error state: public YesWeHack programs
+// import anonymously, so "no credential" is a perfectly usable configuration.
+async function ckFetchYwhCreds() {
+  try {
+    const res = await apiFetch("/api/bounty/yeswehack/creds", { timeoutMs: 6000 });
+    ckState.ywh = res && res.ok ? res : null;
+  } catch (_) { ckState.ywh = null; }
+  return ckState.ywh;
+}
+
 function ckCanSubmit(f) {
   return ckEffectiveProof(f) === "confirmed" && ckState.h1 && ckState.h1.has_token && ckState.h1.team_handle;
 }
@@ -6885,7 +7406,13 @@ function ckProgramSetupRow(p) {
   const li = cel("li"); li.style.flexWrap = "wrap";
   const left = cel("div"); left.style.flex = "1";
   left.append(cel("span", "ck-ftitle", p.name || p.id));
-  if (p.platform_handle) left.append(document.createTextNode(" "), cel("span", "ck-tag", `HackerOne: ${p.platform_handle}`));
+  // Label the handle with the program's OWN platform — it was hardcoded to "HackerOne",
+  // which mislabelled every YesWeHack/HackenProof program's slug. "manual"/unknown has no
+  // platform name worth printing, so it degrades to a plain "Handle:".
+  if (p.platform_handle) {
+    const platLabel = (CK_PLATFORMS.find((x) => x.id === p.platform) || {}).name || "Handle";
+    left.append(document.createTextNode(" "), cel("span", "ck-tag", `${platLabel}: ${p.platform_handle}`));
+  }
   if (p.policy_profile) {
     const pol = cel("span", "ck-tag ck-tag-policy", p.policy_profile === "nasa" ? "NASA VDP · policy-locked" : `VDP: ${p.policy_profile} · policy-locked`);
     pol.title = "This program is bound to a VDP policy: in-scope hosts only, excluded endpoints/classes suppressed, confirmed findings only, no DoS.";
@@ -6900,6 +7427,19 @@ function ckProgramSetupRow(p) {
   if (stats.fast_payments) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Fast payments"));
   if (stats.gold_standard_safe_harbor) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Gold Standard Safe Harbor"));
   if (stats.open_scope) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Open scope"));
+  // YesWeHack's equivalents — the two that change how you hunt (VPN / source-IP gating)
+  // are called out first, since violating either can get an account removed.
+  const ywh = p.ywh_program_stats || {};
+  if (ywh.vpn_required) left.append(document.createTextNode(" "), cel("span", "ck-tag", "YWH VPN required"));
+  if (ywh.ip_restricted) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Source-IP restricted"));
+  if (ywh.user_agent_marker) {
+    const m = cel("span", "ck-tag", "UA marker set");
+    m.title = `This program requires the user-agent marker ${ywh.user_agent_marker} on every request.`;
+    left.append(document.createTextNode(" "), m);
+  }
+  if (ywh.bounty_reward_max) left.append(document.createTextNode(" "), cel("span", "ck-tag", `Bounty ${ywh.bounty_reward_min || 0}–${ywh.bounty_reward_max}${ywh.currency ? " " + ywh.currency : ""}`));
+  if (ywh.vdp) left.append(document.createTextNode(" "), cel("span", "ck-tag", "VDP (no bounty)"));
+  if (ywh.disabled) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Program disabled on YWH"));
   const n = (p.structured_scope || []).length;
   left.append(cel("div", "ck-floc", `${p.scope_text || "(no scope)"} · ${n} structured scope entr${n === 1 ? "y" : "ies"}`));
   if (stats.number_of_valid_reports_for_user > 0) {
@@ -6997,6 +7537,7 @@ function ckProgramSetupForm(prefill) {
     const lab = handle.wrap.querySelector("span");
     if (!lab) return;
     lab.textContent = platSelect.value === "hackenproof" ? "HackenProof program slug (hackenproof.com/programs/…)"
+      : platSelect.value === "yeswehack" ? "YesWeHack program slug (yeswehack.com/programs/…)"
       : platSelect.value === "hackerone" ? "HackerOne team handle" : "Program handle (optional)";
   };
   platSelect.addEventListener("change", syncHandleLabel);
@@ -7007,11 +7548,29 @@ function ckProgramSetupForm(prefill) {
   // etc.) — carried here so a Save persists them even though the form has no dedicated
   // fields for them; re-fetching overwrites this with fresher data.
   let fetchedProgramStats = editing ? (editing.h1_program_stats || {}) : ((seed && seed.h1_program_stats) || {});
+  // Same idea for YesWeHack: reward range, VPN/source-IP constraints and the required UA
+  // marker, carried so a Save persists them even though the form has no fields for them.
+  let fetchedYwhStats = editing ? (editing.ywh_program_stats || {}) : ((seed && seed.ywh_program_stats) || {});
 
   const fetchBar = cel("div", "ck-import-row");
   const fetchBtn = cel("button", "ck-btn", "Fetch scope from HackerOne"); fetchBtn.type = "button";
   const hacktivityBtn = cel("button", "ck-btn", "Recent hacktivity"); hacktivityBtn.type = "button";
   fetchBar.append(fetchBtn, hacktivityBtn);
+  // The fetch button RETARGETS with the Platform select; it never disappears. Hiding it
+  // for non-importable platforms looked tidier but was a regression: a repo draft and a
+  // manual program store platform "manual", and a VDP preset stores "bugcrowd", so all
+  // three lost the HackerOne fetch they have always had — and getting it back would have
+  // meant flipping the Platform select, which rewrites the program's saved export format
+  // as a side effect. So only YesWeHack changes the target; everything else keeps the
+  // previous behaviour exactly. Hacktivity is HackerOne-only and has no YesWeHack
+  // equivalent, so it is the one thing that hides.
+  const syncFetchBar = () => {
+    const isYwh = platSelect.value === "yeswehack";
+    fetchBtn.textContent = `Fetch scope from ${isYwh ? "YesWeHack" : "HackerOne"}`;
+    hacktivityBtn.hidden = isYwh;
+  };
+  platSelect.addEventListener("change", syncFetchBar);
+  syncFetchBar();
   const fetchNote = cel("p", "ck-status");
   form.append(fetchBar, fetchNote);
   const hacktivityPanel = cel("div", "ck-hacktivity-panel"); hacktivityPanel.hidden = true;
@@ -7084,29 +7643,53 @@ function ckProgramSetupForm(prefill) {
 
   fetchBtn.addEventListener("click", async () => {
     const h = handle.input.value.trim();
-    if (!h) { fetchNote.className = "ck-status is-error"; fetchNote.textContent = "Enter a HackerOne team handle first."; return; }
+    const isYwh = platSelect.value === "yeswehack";
+    if (!h) {
+      fetchNote.className = "ck-status is-error";
+      fetchNote.textContent = isYwh ? "Enter a YesWeHack program slug first." : "Enter a HackerOne team handle first.";
+      return;
+    }
     const label = fetchBtn.textContent; fetchBtn.disabled = true; fetchBtn.textContent = "Fetching…";
     fetchNote.className = "ck-status"; fetchNote.textContent = "";
     try {
-      const res = await apiFetch("/api/hackerone/import-scope", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ handle: h }) });
+      const res = isYwh
+        ? await apiFetch("/api/yeswehack/import-scope", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ slug: h }) })
+        : await apiFetch("/api/hackerone/import-scope", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ handle: h }) });
       if (!res || res.ok === false) {
         fetchNote.className = "ck-status is-error";
         fetchNote.textContent = (res && res.error) || "Could not fetch scope.";
         return;
       }
-      fetchedProgramStats = res.program_stats || {};
+      if (isYwh) {
+        fetchedYwhStats = res.program_stats || {};
+        // The program's required user-agent marker and its rules digest only OVERWRITE an
+        // empty field — a re-fetch must never clobber what the operator typed or edited.
+        if (res.user_agent_suffix && !uaSuffix.input.value.trim()) uaSuffix.input.value = res.user_agent_suffix;
+        if (res.notes_digest && !notes.input.value.trim()) notes.input.value = res.notes_digest;
+      } else {
+        fetchedProgramStats = res.program_stats || {};
+      }
       const entries = res.structured_scope || [];
       let mergeNote = "";
       if (entries.length) {
         // Merge (dedupe by identifier, fetched rows win on a match) rather than replace —
         // a fetch must never silently discard hand-typed or CSV-merged rows already in
         // the table.
-        const { rows: merged, truncated } = ckMergeScopeRows(
-          scopeTable.ckCollect().filter((e) => !entries.some((f) => f.identifier.toLowerCase() === e.identifier.toLowerCase())),
-          entries
-        );
+        // Fetched rows go FIRST. ckMergeScopeRows fills up to the cap in order, so putting
+        // existing rows first meant a nearly-full table silently discarded the rows just
+        // fetched — including out-of-scope exclusions, which is the one direction that
+        // must never be lost. Within the fetched set, exclusions lead for the same reason.
+        const fetchedFirst = [
+          ...entries.filter((e) => !e.eligible_for_submission),
+          ...entries.filter((e) => e.eligible_for_submission),
+        ];
+        const keptExisting = scopeTable.ckCollect()
+          .filter((e) => !entries.some((f) => f.identifier.toLowerCase() === e.identifier.toLowerCase()));
+        const { rows: merged, truncated } = ckMergeScopeRows(fetchedFirst, keptExisting);
         scopeTable.ckReplace(merged);
-        if (truncated) mergeNote = ` Capped at ${CK_MAX_SCOPE_ENTRIES} scope entries — some existing rows were dropped.`;
+        // Say which rows actually went — it used to claim "existing rows were dropped"
+        // while it was in fact dropping the fetched ones.
+        if (truncated) mergeNote = ` Capped at ${CK_MAX_SCOPE_ENTRIES} scope entries — ${keptExisting.length - (merged.length - fetchedFirst.length)} existing row(s) did not fit; every fetched row was kept.`;
       }
       const fetchedRepositories = ckRepositoryUrlsFromScope(entries);
       if (fetchedRepositories.length) {
@@ -7141,7 +7724,9 @@ function ckProgramSetupForm(prefill) {
   form.append(toggles);
 
   const notes = ckTextareaField("Notes (policy excerpt, reward table, anything worth remembering)", "");
-  notes.input.value = editing ? (editing.notes || "") : "";
+  // A YesWeHack import seeds this with its rules digest (RoE, reward grid, out-of-scope
+  // prose, qualifying/non-qualifying classes) — the operator can edit it before saving.
+  notes.input.value = editing ? (editing.notes || "") : ((seed && seed.notes) || "");
   notes.input.rows = 3;
   form.append(notes.wrap);
 
@@ -7169,7 +7754,10 @@ function ckProgramSetupForm(prefill) {
   const accCookie = ckTextareaField("Session cookie — optional fallback if auto-login can't drive the form (CAPTCHA/SSO)", "");
   if (acc.cookie_set) accCookie.input.placeholder = "•••• saved session cookie — leave blank to keep";
   accCookie.input.rows = 2;
-  const uaSuffix = ckField('Required user-agent suffix (appended to every request, e.g. " -BugBounty-acme-31337 ")', "text", (editing && editing.user_agent_suffix) || "");
+  // Pre-filled from a YesWeHack import — every YesWeHack program publishes the marker it
+  // requires on in-scope traffic, and this is the field the hunt engine appends verbatim.
+  const uaSuffix = ckField('Required user-agent suffix (appended to every request, e.g. " -BugBounty-acme-31337 ")', "text",
+    editing ? (editing.user_agent_suffix || "") : ((seed && seed.user_agent_suffix) || ""));
   accWrap.append(accEmail.wrap, accPassword.wrap, accLoginUrl.wrap, accRegisterUrl.wrap, accCookie.wrap, uaSuffix.wrap);
   advanced.append(accWrap);
 
@@ -7256,6 +7844,7 @@ function ckProgramSetupForm(prefill) {
       oob_allowed: oobAllowed.input.checked,
       disclose_automation: discloseAutomation.input.checked,
       h1_program_stats: fetchedProgramStats,
+      ywh_program_stats: fetchedYwhStats,
       notes: notes.input.value,
       // A blank password/cookie means "keep the saved one" (the server merge-preserves them, since
       // they're read back redacted); email/URLs/suffix are sent verbatim so clearing them takes effect.
@@ -7431,6 +8020,7 @@ function ckWizardStart() {
   grid.append(
     mk("repo", "🔗", "From a repo link", "Paste a public repo. We check it, then set up a source-only draft you can hunt right away."),
     mk("hackerone", "🎯", "From HackerOne", "Enter a program handle to pull real scope from the API, or paste its scope table."),
+    mk("yeswehack", "🐝", "From YesWeHack", "Search or paste a program slug. Pulls scope, rules and the required user-agent marker — no sign-in needed for public programs."),
     mk("manual", "✎", "Manually", "Name it and add scope yourself — full control."),
   );
   box.append(grid);
@@ -7459,6 +8049,7 @@ function ckWizardIdentify() {
   back.addEventListener("click", () => { ckFlow.step = 0; void ckRenderProgram(); });
   if (ckFlow.choice === "repo") box.append(ckWizardIdentifyRepo(nav));
   else if (ckFlow.choice === "hackerone") box.append(ckWizardIdentifyH1(nav));
+  else if (ckFlow.choice === "yeswehack") box.append(ckWizardIdentifyYWH(nav));
   else box.append(ckWizardIdentifyManual(nav));
   nav.prepend(back);
   box.append(nav);
@@ -7555,7 +8146,7 @@ function ckWizardIdentifyH1(nav) {
     go.addEventListener("click", () => {
       ckSetView("submissions");
       setTimeout(() => {
-        const bar = ck.views.submissions?.querySelector(".ck-creds");
+        const bar = ck.views.submissions?.querySelector(".ck-creds-h1");
         if (bar) { bar.scrollIntoView({ behavior: "smooth", block: "start" }); bar.querySelector("input")?.focus(); }
       }, 60);
     });
@@ -7595,6 +8186,146 @@ function ckWizardIdentifyH1(nav) {
   });
   nav.append(cont);
   return box;
+}
+
+// The YesWeHack path. Unlike HackerOne's, this needs NO stored credential for a public
+// program — YesWeHack serves scope, rules and the program's required user-agent marker
+// anonymously — so the step leads with a searchable program picker instead of a creds
+// warning, and only points at sign-in when the API actually answers 403 (private program).
+function ckWizardIdentifyYWH(nav) {
+  const box = cel("div");
+  box.append(cel("h3", "ck-wiz-title", "Pull scope from YesWeHack"));
+  box.append(cel("p", "ck-hint", "Search for the program, or paste its slug (or full yeswehack.com/programs/… URL). Public programs need no sign-in. We pull the scope, out-of-scope list, rules of engagement, reward grid and the user-agent marker the program requires on every request."));
+
+  // Program search — so the operator never has to already know the slug.
+  const search = ckField("Search YesWeHack programs", "text", "");
+  const searchBtn = cel("button", "ck-btn", "Search"); searchBtn.type = "button";
+  const results = cel("div", "ck-hacktivity-panel"); results.hidden = true;
+  box.append(search.wrap, searchBtn, results);
+
+  const slug = ckField("Program slug (yeswehack.com/programs/…)", "text", "");
+  box.append(slug.wrap);
+  const fetchBtn = cel("button", "ck-btn", "Fetch scope"); fetchBtn.type = "button";
+  const note = cel("p", "ck-status");
+  const signin = cel("div", "ck-wiz-crednote");
+  box.append(fetchBtn, note, signin);
+  const cont = cel("button", "ck-btn primary", "Continue →"); cont.type = "button"; cont.disabled = true;
+  let fetched = null;
+
+  const offerSignin = () => {
+    signin.replaceChildren();
+    const go = cel("button", "ck-btn", "Sign in to YesWeHack →"); go.type = "button";
+    go.addEventListener("click", () => {
+      ckSetView("submissions");
+      setTimeout(() => {
+        const bar = ck.views.submissions?.querySelector(".ck-creds-ywh");
+        if (bar) { bar.scrollIntoView({ behavior: "smooth", block: "start" }); bar.querySelector("input")?.focus(); }
+      }, 60);
+    });
+    signin.append(go);
+  };
+
+  searchBtn.addEventListener("click", async () => {
+    const q = search.input.value.trim();
+    searchBtn.disabled = true; searchBtn.textContent = "Searching…";
+    note.className = "ck-status"; note.textContent = "";
+    try {
+      const res = await apiFetch("/api/yeswehack/programs", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ query: q }) });
+      results.replaceChildren();
+      if (!res || res.ok === false) {
+        note.className = "ck-status is-error"; note.textContent = (res && res.error) || "Could not list programs.";
+        results.hidden = true; return;
+      }
+      const list = res.programs || [];
+      const SHOWN = 40;
+      // Surface the server's warnings — a "no match" that was really a truncated walk of
+      // the catalogue must not read as a definitive "this program does not exist".
+      for (const w of res.warnings || []) results.append(cel("p", "ck-status is-warn", w));
+      if (!list.length) {
+        results.append(cel("p", "ck-status", q ? `No program matched "${q}". Paste the slug below instead.` : "No programs returned."));
+      } else {
+        // Say how many are actually RENDERED: printing the full count above a 40-row list
+        // made the header and the list disagree.
+        results.append(cel("p", "ck-hint", list.length > SHOWN
+          ? `${list.length} programs matched — showing the first ${SHOWN}. Narrow the search, or paste the slug below.`
+          : `${list.length} program${list.length === 1 ? "" : "s"} — pick one to load its slug.`));
+        for (const p of list.slice(0, SHOWN)) {
+          const row = cel("button", "ck-textlink"); row.type = "button";
+          const reward = p.bounty_reward_max ? ` · up to ${p.bounty_reward_max}` : "";
+          const kind = p.vdp ? "VDP" : (p.offers_bounty ? "bounty" : p.program_type || "");
+          row.textContent = `${p.title} — ${p.slug} · ${p.scopes_count} scope${p.scopes_count === 1 ? "" : "s"}${reward}${kind ? ` · ${kind}` : ""}`;
+          row.addEventListener("click", () => { slug.input.value = p.slug; fetchBtn.click(); });
+          const line = cel("div"); line.append(row);
+          results.append(line);
+        }
+      }
+      results.hidden = false;
+    } catch (err) { note.className = "ck-status is-error"; note.textContent = err.message || "Search failed."; }
+    finally { searchBtn.disabled = false; searchBtn.textContent = "Search"; }
+  });
+  search.input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); searchBtn.click(); } });
+
+  fetchBtn.addEventListener("click", async () => {
+    const s = slug.input.value.trim();
+    if (!s) { note.className = "ck-status is-error"; note.textContent = "Enter or pick a YesWeHack program slug first."; return; }
+    fetchBtn.disabled = true; fetchBtn.textContent = "Fetching…";
+    note.className = "ck-status"; note.textContent = ""; signin.replaceChildren();
+    try {
+      const res = await apiFetch("/api/yeswehack/import-scope", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ slug: s }) });
+      if (!res || res.ok === false) {
+        note.className = "ck-status is-error";
+        note.textContent = (res && res.error) || "Could not fetch scope. You can still continue and add scope by hand.";
+        // 401 too, not just 403 — an expired JWT is the ONE failure where signing in again
+        // is literally the fix, and it was the one case that got no button.
+        if (res && /\b401\b|403|private|invited|expired/i.test(String(res.error || ""))) offerSignin();
+        fetched = { name: s, platform: "yeswehack", platform_handle: s }; cont.disabled = false; cont.textContent = "Continue anyway →"; return;
+      }
+      fetched = ckYwhPrefill(res, s);
+      const entries = fetched.structured_scope || [];
+      const inScope = entries.filter((e) => e.eligible_for_submission).length;
+      const excluded = entries.length - inScope;
+      // "enforced", not just "out of scope": a YesWeHack out-of-scope list mixes host
+      // patterns with prose, and only the host patterns can bind in the scope matcher.
+      // The prose ones come back as a warning below — never let the count imply they were
+      // all captured.
+      note.className = "ck-status";
+      note.textContent = `Fetched ${inScope} in-scope and ${excluded} enforced out-of-scope entr${excluded === 1 ? "y" : "ies"} for "${fetched.name}".`
+        + ((res.warnings || []).length ? " " + res.warnings.join(" ") : "")
+        + " Review and save on the next step.";
+      cont.disabled = false; cont.textContent = "Continue →";
+    } catch (err) { note.className = "ck-status is-error"; note.textContent = err.message || "Fetch failed."; }
+    finally { fetchBtn.disabled = false; if (fetchBtn.textContent === "Fetching…") fetchBtn.textContent = "Fetch scope"; }
+  });
+  slug.input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); fetchBtn.click(); } });
+
+  cont.addEventListener("click", () => {
+    if (!fetched) {
+      const s = slug.input.value.trim();
+      fetched = { name: s || "New program", platform: "yeswehack", platform_handle: s };
+    }
+    ckProgEdit = null; ckFlow.prefill = fetched; ckFlow.view = "form"; void ckRenderProgram();
+  });
+  nav.append(cont);
+  return box;
+}
+
+// Shape a YesWeHack import response into the Program form's prefill seed. Shared by the
+// wizard step and the form's own re-fetch so the two can't drift.
+// The marker matters most: YesWeHack programs require their user_agent tag on every
+// request, and user_agent_suffix is exactly the field the hunt engine appends verbatim
+// (web_ingest.set_ua_suffix), so an imported program is in-policy without extra setup.
+function ckYwhPrefill(res, slug) {
+  const entries = res.structured_scope || [];
+  return {
+    name: res.program_name || slug,
+    platform: "yeswehack",
+    platform_handle: res.slug || slug,
+    structured_scope: entries,
+    repository_urls: ckRepositoryUrlsFromScope(entries),
+    ywh_program_stats: res.program_stats || {},
+    user_agent_suffix: res.user_agent_suffix || "",
+    notes: res.notes_digest || "",
+  };
 }
 
 function ckWizardIdentifyManual(nav) {
@@ -8789,6 +9520,7 @@ function ckRenderSubmissions() {
   if (ckState.reportFocus) host.append(ckFullReportPanel(ckState.reportFocus));
 
   host.append(ckCredsBar());
+  host.append(ckYesWeHackCredsBar());
   host.append(ckHackeroneActivityPanel());
   host.append(ckFormatBar());
   host.append(ckReportsExportBar());
@@ -10066,6 +10798,9 @@ function ckCapturedProofFields(rec) {
       request_line: pe.request_line || "", request_header: pe.request_header || "",
       response_status: pe.response_status || "", response_header: pe.response_header || "",
       set_cookie: pe.set_cookie || "", matched_value: pe.matched_value || "", read_data: pe.read_data || "",
+      // The disclosed data's NAME is the one impact field that survives redaction: read_data comes
+      // back as [REDACTED_…] markers, so without this a rebuilt report cannot say what was at risk.
+      sensitive_data_labels: pe.sensitive_data_labels || "",
     };
   }
   const poi = cap.proof_of_impact;
@@ -10201,7 +10936,9 @@ function ckRenderProofResult(box, res) {
 // token; the server splits it. A "Test" button probes a real authenticated endpoint so
 // the operator gets a server-authoritative answer instead of guessing the username.
 function ckCredsBar() {
-  const wrap = cel("div", "ck-creds");
+  // ck-creds-h1 distinguishes this from the YesWeHack bar (and from the activity panels,
+  // which reuse .ck-creds) so a deep-link can scroll to the right one.
+  const wrap = cel("div", "ck-creds ck-creds-h1");
   const h1 = ckState.h1;
   const head = cel("div", "ck-creds-head");
   head.append(cel("strong", null, "HackerOne API"));
@@ -10258,6 +10995,120 @@ function ckCredsBar() {
       else { note.classList.add("is-error"); note.textContent = `✗ ${(res && res.error) || "HackerOne rejected these credentials."}`; }
     } catch (err) { note.classList.add("is-error"); note.textContent = err.message || "Could not reach HackerOne."; }
   });
+  wrap.append(form);
+  return wrap;
+}
+
+// YesWeHack sign-in. Deliberately shaped differently from the HackerOne bar, because the
+// platform is: public programs import with NO credential, so the bar says so up front and
+// sign-in is framed as the thing you do only for a private/invited program.
+//
+// The password is posted once to the local backend, exchanged there for a YesWeHack JWT,
+// and never stored — only the JWT is kept (see greyiq_api.yeswehack_login). A Personal
+// Access Token can be pasted instead for manager-role accounts.
+function ckYesWeHackCredsBar() {
+  const wrap = cel("div", "ck-creds ck-creds-ywh");
+  const ywh = ckState.ywh;
+  const head = cel("div", "ck-creds-head");
+  head.append(cel("strong", null, "YesWeHack"));
+  head.append(cel("span", "ck-tag", ywh && ywh.has_token
+    ? `signed in${ywh.email ? ` · ${ywh.email}` : ""}${ywh.token_kind === "pat" ? " · PAT" : ""}`
+    : "anonymous · public programs only"));
+  wrap.append(head);
+
+  const form = cel("form", "ck-learn-form");
+  const help = cel("p", "ck-hint", "Public YesWeHack programs import without signing in — leave this empty unless you need a private or invited program. Signing in exchanges your password for a short-lived session token; the password itself is never stored.");
+  help.style.flexBasis = "100%";
+  form.append(help);
+
+  const email = ckField("YesWeHack email", "text", (ywh && ywh.email) || "");
+  const password = ckField("Password (used once to sign in, never stored)", "password", "");
+  const totp = ckField("2FA code (only if your account has 2FA)", "text", "");
+  totp.input.autocomplete = "one-time-code";
+  totp.input.inputMode = "numeric";
+  form.append(email.wrap, password.wrap, totp.wrap);
+
+  // Declared before the buttons so every handler below closes over an initialized node.
+  const note = cel("p", "ck-status");
+  note.style.flexBasis = "100%";
+
+  const signIn = cel("button", "ck-btn primary", "Sign in"); signIn.type = "submit";
+  const test = cel("button", "ck-btn", "Test connection"); test.type = "button";
+  form.append(signIn, test);
+  if (ywh && ywh.has_token) {
+    const out = cel("button", "ck-btn", "Sign out"); out.type = "button";
+    out.addEventListener("click", async () => {
+      try {
+        // clear_token is an explicit flag: an empty password field must never be mistaken
+        // for "drop my session".
+        const res = await apiFetch("/api/bounty/yeswehack/creds", { method: "POST", body: JSON.stringify({ clear_token: true }) });
+        ckState.ywh = res && res.ok ? res : null;
+        ckRenderSubmissions();
+      } catch (err) { note.textContent = err.message || "Could not sign out."; note.classList.add("is-error"); }
+    });
+    form.append(out);
+  }
+  form.append(note);
+
+  // A Personal Access Token is the other supported credential — YesWeHack issues these to
+  // program-manager / business-unit roles rather than hunter accounts, so it's tucked away.
+  const patBox = cel("details", "ck-advanced");
+  patBox.append(cel("summary", "ck-advanced-summary", "Use a Personal Access Token instead"));
+  const patField = ckField("Personal Access Token (X-AUTH-TOKEN)", "password", "");
+  patField.input.placeholder = ywh && ywh.has_token && ywh.token_kind === "pat" ? "•••••• (saved — leave blank to keep)" : "paste your PAT";
+  const patSave = cel("button", "ck-btn", "Save token"); patSave.type = "button";
+  patSave.addEventListener("click", async () => {
+    const value = patField.input.value.trim();
+    if (!value) { note.classList.add("is-error"); note.textContent = "Paste a Personal Access Token first."; return; }
+    note.classList.remove("is-error"); note.textContent = "Saving…";
+    try {
+      const res = await apiFetch("/api/bounty/yeswehack/creds", {
+        method: "POST", body: JSON.stringify({ api_token: value, token_kind: "pat", email: email.input.value.trim() })
+      });
+      ckState.ywh = res && res.ok ? res : ckState.ywh;
+      note.textContent = "Saved."; ckRenderSubmissions();
+    } catch (err) { note.classList.add("is-error"); note.textContent = err.message || "Could not save."; }
+  });
+  patBox.append(patField.wrap, patSave);
+  patBox.style.flexBasis = "100%";
+  form.append(patBox);
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!email.input.value.trim() || !password.input.value) {
+      note.classList.add("is-error");
+      note.textContent = "Enter your YesWeHack email and password — or skip sign-in entirely for public programs.";
+      return;
+    }
+    signIn.disabled = true; note.classList.remove("is-error"); note.textContent = "Signing in…";
+    try {
+      const res = await apiFetch("/api/bounty/yeswehack/login", {
+        method: "POST", timeoutMs: 30000,
+        body: JSON.stringify({ email: email.input.value.trim(), password: password.input.value, totp_code: totp.input.value.trim() })
+      });
+      if (!res || res.ok === false) {
+        note.classList.add("is-error");
+        note.textContent = `✗ ${(res && res.error) || "YesWeHack rejected the sign-in."}`;
+        if (res && res.totp_required) totp.input.focus();
+        return;
+      }
+      ckState.ywh = res;
+      password.input.value = ""; totp.input.value = "";
+      note.textContent = `✓ ${res.message || "Signed in."}`;
+      ckRenderSubmissions();
+    } catch (err) { note.classList.add("is-error"); note.textContent = err.message || "Could not reach YesWeHack."; }
+    finally { signIn.disabled = false; }
+  });
+
+  test.addEventListener("click", async () => {
+    note.classList.remove("is-error"); note.textContent = "Testing…";
+    try {
+      const res = await apiFetch("/api/bounty/yeswehack/test", { method: "POST", timeoutMs: 20000 });
+      if (res && res.ok) { note.classList.remove("is-error"); note.textContent = `✓ ${res.message || "YesWeHack reachable."}`; }
+      else { note.classList.add("is-error"); note.textContent = `✗ ${(res && res.error) || "YesWeHack rejected the credential."}`; }
+    } catch (err) { note.classList.add("is-error"); note.textContent = err.message || "Could not reach YesWeHack."; }
+  });
+
   wrap.append(form);
   return wrap;
 }
@@ -11885,7 +12736,7 @@ function bootCockpit() {
   ckUpdateLaunchReadiness();
   void ckPopulateProfiles();
   void (async () => {
-    await ckFetchCreds();
+    await Promise.all([ckFetchCreds(), ckFetchYwhCreds()]);
     await ckRenderProgram();   // also fetches + populates the launch rail's Program picker
     ckUpdateSpanScopeToggle();  // reflect a restored active program without clobbering the restored checked state
     ckMaybeShowWizard();

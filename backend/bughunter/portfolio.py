@@ -37,8 +37,8 @@ _MAX_REPOSITORIES = 25    # each repository becomes a full source campaign; keep
 # Field defaults — every automation flag defaults to the SAFE/off value.
 _DEFAULTS: dict[str, Any] = {
     "name": "",
-    "platform": "manual",          # 'hackerone' | 'hackenproof' | 'manual' — report-format + display tag. Only 'hackerone' (with a handle) can auto-submit; the others are export-only.
-    "platform_handle": "",         # HackerOne team handle (for auto-submit) / HackenProof program slug (hackenproof.com/programs/{slug})
+    "platform": "manual",          # 'hackerone' | 'yeswehack' | 'hackenproof' | 'manual' — report-format + display tag. Only 'hackerone' (with a handle) can auto-submit; the others are export-only.
+    "platform_handle": "",         # HackerOne team handle (for auto-submit) / YesWeHack program slug (yeswehack.com/programs/{slug}) / HackenProof program slug
     "scope_text": "",              # free-text, passed verbatim to run_campaign(scope=)
     "in_scope_hosts": [],
     "out_of_scope_hosts": [],
@@ -54,6 +54,7 @@ _DEFAULTS: dict[str, Any] = {
     "oob_allowed": False,          # operator-confirmed: this program's policy permits out-of-band/collaborator testing
     "disclose_automation": False,  # operator-confirmed: this program's terms require disclosing automated-tool assistance in submitted reports
     "h1_program_stats": {},        # real signals from HackerOne's program resource (offers_bounties, fast_payments, etc.) — see hackerone_import.fetch_structured_scope
+    "ywh_program_stats": {},       # the same, for YesWeHack (reward range, VPN/IP constraints, the required UA marker) — see yeswehack_import.fetch_program_scope
     "notes": "",                   # free text — policy excerpt, reward table, anything pasted in
     "account_access": {},          # program research-account access (email/password/login_url/cookie) — see _clean_account_access. SENSITIVE: only ever sent to the program's OWN login page / in-scope hosts, never logged, password redacted in API responses.
     "admin_account_access": {},    # OPTIONAL second, HIGHER-privilege research account (same shape as account_access). When set, unlocks the autonomous BFLA / cross-tenant checks — the low-priv account_access is the "attacker" session, this is the ground-truth admin session. SENSITIVE, same handling.
@@ -185,6 +186,36 @@ def _clean_h1_program_stats(stats: Any) -> dict[str, Any]:
     return out
 
 
+_YWH_STATS_BOOL_FIELDS = ("public", "vdp", "disabled", "offers_bounty", "offers_gift",
+                          "vpn_required", "ip_restricted", "hall_of_fame")
+_YWH_STATS_STR_FIELDS = ("program_type", "status", "currency", "business_unit", "user_agent_marker")
+_YWH_STATS_INT_FIELDS = ("bounty_reward_min", "bounty_reward_max", "reports_count",
+                         "average_reward", "max_reward", "average_first_response_days")
+
+
+def _clean_ywh_program_stats(stats: Any) -> dict[str, Any]:
+    """Coerce YesWeHack program-resource stats to a fixed known-key shape — same rule as
+    _clean_h1_program_stats: never store an unbounded blob straight from a third-party API."""
+    if not isinstance(stats, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for field in _YWH_STATS_BOOL_FIELDS:
+        if field in stats:
+            out[field] = bool(stats.get(field))
+    for field in _YWH_STATS_STR_FIELDS:
+        if field in stats:
+            # Same sanitizer as user_agent_suffix, not just a length clamp:
+            # user_agent_marker is a copy of the value that drives the outbound UA header,
+            # so a CR/LF from a compromised API response must not be persisted here either
+            # — even though the live UA path sanitizes again downstream. 120 chars matches
+            # user_agent_suffix's bound; the other strings are short labels.
+            out[field] = _clean_ua_suffix(stats.get(field))
+    for field in _YWH_STATS_INT_FIELDS:
+        if field in stats:
+            out[field] = _safe_int(stats.get(field), 0)
+    return out
+
+
 # The program research-account block: the operator's OWN credentials for THIS program's authorized
 # research account (email + password to auto-login, or a pasted session cookie / auth headers as a
 # fallback), plus the login/register URLs. Sent ONLY to the program's own login page (same-site,
@@ -275,6 +306,7 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     out["oob_allowed"] = bool(out.get("oob_allowed"))
     out["disclose_automation"] = bool(out.get("disclose_automation"))
     out["h1_program_stats"] = _clean_h1_program_stats(out.get("h1_program_stats"))
+    out["ywh_program_stats"] = _clean_ywh_program_stats(out.get("ywh_program_stats"))
     out["notes"] = str(out.get("notes") or "")[:4000]
     out["account_access"] = _clean_account_access(out.get("account_access"))
     out["admin_account_access"] = _clean_account_access(out.get("admin_account_access"))
