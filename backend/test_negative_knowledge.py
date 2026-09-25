@@ -159,6 +159,82 @@ class CoolingTests(unittest.TestCase):
             self.assertEqual(nk.cooled_pairs(tmp, program=None, target=_TARGET), set())
 
 
+class ParamLevelTests(unittest.TestCase):
+    """Parameter-level negatives come ONLY from a prover that reports what it actually sent.
+
+    The main in-pass prover computes its candidate list locally, returns early on the first hit,
+    and skips a parameter whose fetch raised — so re-deriving that list yields an upper bound on
+    what was tried, not what was tried. The out-of-band provers are different: each parameter
+    carried a unique collaborator token and the poll window closed with no callback, which is a
+    real negative observation. Only that reaches this store."""
+
+    EP = "https://app.example.com/fetch"
+
+    def test_a_probed_parameter_cools_after_repetition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for _ in range(2):
+                nk.record_param_misses(tmp, program=None, target=_TARGET, endpoint=self.EP,
+                                       class_id="ssrf", params=["url", "next"])
+            cooled = nk.cooled_params(tmp, program=None, target=_TARGET,
+                                      endpoint=self.EP, class_id="ssrf")
+            self.assertEqual(cooled, {"url", "next"})
+
+    def test_one_probe_is_below_the_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            nk.record_param_misses(tmp, program=None, target=_TARGET, endpoint=self.EP,
+                                   class_id="ssrf", params=["url"])
+            self.assertEqual(nk.cooled_params(tmp, program=None, target=_TARGET,
+                                              endpoint=self.EP, class_id="ssrf"), set())
+
+    def test_params_are_scoped_to_their_class_and_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for _ in range(2):
+                nk.record_param_misses(tmp, program=None, target=_TARGET, endpoint=self.EP,
+                                       class_id="ssrf", params=["url"])
+            # Same parameter name, different class -> not cooled.
+            self.assertEqual(nk.cooled_params(tmp, program=None, target=_TARGET,
+                                              endpoint=self.EP, class_id="rce"), set())
+            # Same parameter and class, different endpoint -> not cooled.
+            self.assertEqual(nk.cooled_params(tmp, program=None, target=_TARGET,
+                                              endpoint="https://app.example.com/other",
+                                              class_id="ssrf"), set())
+
+    def test_param_rows_never_leak_into_the_endpoint_cooled_set(self) -> None:
+        """A parameter row carries a third key segment. Returned from cooled_pairs it could never
+        match a probe_priority pair, but it would inflate every count built from that set."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for _ in range(2):
+                nk.record_param_misses(tmp, program=None, target=_TARGET, endpoint=self.EP,
+                                       class_id="ssrf", params=["url", "next", "dest"])
+            self.assertEqual(nk.cooled_pairs(tmp, program=None, target=_TARGET), set())
+
+    def test_prioritise_untried_reorders_and_never_drops(self) -> None:
+        """Dropping would risk blinding a re-scan; the provers cap their walk, so order alone
+        decides what gets a token."""
+        params = ["url", "image", "next", "callback"]
+        out = nk.prioritise_untried(params, {"url", "next"})
+        self.assertEqual(sorted(out), sorted(params), "a parameter was dropped")
+        self.assertEqual(out, ["image", "callback", "url", "next"])
+        self.assertEqual(nk.prioritise_untried(params, set()), params)
+
+    def test_empty_and_disabled_paths_are_noops(self) -> None:
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(nk.record_param_misses(tmp, program=None, target=_TARGET,
+                                                    endpoint=self.EP, class_id="ssrf", params=[]), 0)
+            self.assertEqual(nk.record_param_misses(None, program=None, target=_TARGET,
+                                                    endpoint=self.EP, class_id="ssrf", params=["url"]), 0)
+            os.environ[nk._ENV_DISABLE] = "1"
+            try:
+                self.assertEqual(nk.record_param_misses(tmp, program=None, target=_TARGET,
+                                                        endpoint=self.EP, class_id="ssrf",
+                                                        params=["url"]), 0)
+                self.assertEqual(nk.cooled_params(tmp, program=None, target=_TARGET,
+                                                  endpoint=self.EP, class_id="ssrf"), set())
+            finally:
+                del os.environ[nk._ENV_DISABLE]
+
+
 class SuppressionTests(unittest.TestCase):
     def test_cold_classes_are_downranked_within_an_endpoint(self) -> None:
         cooled = {nk._pair_id("app.example.com/login", "sqli")}
