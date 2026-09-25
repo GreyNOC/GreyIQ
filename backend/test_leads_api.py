@@ -18,6 +18,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 import greyiq_api as g  # noqa: E402
 from bughunter import investigator  # noqa: E402
+from bughunter import leads  # noqa: E402
 from bughunter import report as report_lib  # noqa: E402
 
 _SECRET = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
@@ -79,6 +80,26 @@ class ExportLeadsTests(unittest.TestCase):
         run_id = self._cache_run()
         res = self.rt.export_leads(g.LeadsRequest(run_id=run_id))
         self.assertNotIn(_SECRET, res["markdown"])
+        # The structured rows are the SAME projection the brief renders from, but assert them
+        # explicitly: a redaction guarantee that holds only for the rendered string would be a
+        # guarantee the in-app view does not have.
+        self.assertNotIn(_SECRET, json.dumps(res["report"], default=str))
+
+    def test_the_structured_queue_is_returned_for_the_in_app_view(self) -> None:
+        """The cockpit renders the queue; it cannot read a Markdown blob. This pins that the rows
+        the CLI's --json exposes are reachable in-app too, with the fields an operator acts on."""
+        run_id = self._cache_run()
+        res = self.rt.export_leads(g.LeadsRequest(run_id=run_id))
+        report = res["report"]
+        self.assertEqual(report["schema"], leads.SCHEMA_VERSION)
+        hunts = report["hunts"]
+        self.assertEqual(len(hunts), 1)
+        lead = hunts[0]["leads"][0]
+        self.assertEqual(lead["id"], "F1")
+        # The fields the view is built on.
+        for key in ("status", "severity", "confidence_score", "proof_obligation", "decision", "rank"):
+            self.assertIn(key, lead)
+        self.assertTrue(lead["proof_obligation"])
 
     def test_credential_in_the_target_never_reaches_the_download(self) -> None:
         run_id = self._cache_run(target=f"https://app.example.com/cb?token={_SECRET}")

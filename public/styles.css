@@ -3477,6 +3477,18 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
 .ck-list .ck-floc { flex: 1; }
 .ck-tag { font-size: 0.7rem; color: var(--muted); padding: 0.12rem 0.45rem; border: 1px solid var(--border); border-radius: 0; white-space: nowrap; }
 
+/* Investigation queue — the cockpit's in-app lead view. Information-dense on purpose: an
+   operator scans it to decide what to work next, so each lead shows its evidence state, the
+   proof it still needs, and anything the engine says contradicts it. */
+.ck-leads-panel { margin-top: 0.9rem; display: flex; flex-direction: column; gap: 0.55rem; }
+.ck-lead { border: 1px solid var(--border); border-left-width: 3px; padding: 0.6rem 0.7rem; background: var(--panel-2); }
+.ck-lead-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.45rem; margin-bottom: 0.3rem; }
+.ck-lead-head strong { font-size: 0.85rem; }
+/* The single most useful line per lead: the exact artifact that would confirm it. */
+.ck-lead-obligation { font-size: 0.78rem; margin: 0.3rem 0 0; color: var(--text); }
+/* The engine's own evidence disagreeing with itself — never rendered as a quiet hint. */
+.ck-lead-contra { font-size: 0.76rem; margin: 0.3rem 0 0; color: var(--danger, #b3261e); }
+
 /* Report Center — "report ready" badge + POC/POI/POE presence dots. */
 .ck-ready-badge {
   font-size: 0.68rem; font-weight: 700; letter-spacing: 0.02em; white-space: nowrap;

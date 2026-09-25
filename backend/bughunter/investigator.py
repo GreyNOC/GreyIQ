@@ -173,6 +173,31 @@ def has_confirming_artifact(finding: dict[str, Any], plan: dict[str, Any] | None
     return report._has_captured_artifact(finding, _canonical_proof(finding, _dict(plan)))
 
 
+def has_refuting_artifact(finding: dict[str, Any], plan: dict[str, Any] | None = None) -> bool:
+    """True only when this finding's captured evidence REFUTES the claim it was captured for.
+
+    The counterpart to :func:`has_confirming_artifact`, and deliberately much narrower. Absence of
+    proof is not refutation: a lead nobody has tested yet, and a lead whose test came back negative,
+    both fail the confirm gate, and treating them alike is what would let "not yet demonstrated" be
+    presented as "shown impossible".
+
+    The ONE thing the engine observes that genuinely refutes is a captured observed/control pair
+    that does not differ: the differential was run and it failed. ``report.proof_is_non_differential``
+    is that predicate, and it requires BOTH sides to be non-empty, so an untested lead (empty pair)
+    can never reach it.
+
+    Explicitly NOT sourced from the cortex's other contradiction codes.
+    ``confirmation-without-artifact`` and ``secret-severity-conflict`` are claim-vs-evidence
+    bookkeeping — a label was wrong — and a wrong label is not evidence that an attack step is
+    impossible. Wiring those in would overstate in the opposite direction from the overstatements
+    this module exists to prevent.
+    """
+    from bughunter import report  # local: report sits above this module
+
+    proof = _canonical_proof(finding, _dict(plan))
+    return bool(report.proof_is_non_differential(proof))
+
+
 def _canonical_proof(finding: dict[str, Any], plan: dict[str, Any]) -> Any:
     """The proof the confirm gate would be applied to — same precedence as ``report._proof_value``.
 
@@ -365,7 +390,11 @@ def _evidence_score(
 # the cortex's is the evidence layer's. Map rather than let two vocabularies leak into one
 # report: a chain whose every step is backed by an accepted artifact IS confirmed, a chain
 # with at least one such step is supported, and a chain of pure leads stays a candidate.
-_CHAIN_STATE_TO_CORTEX = {"proven": "confirmed", "partial": "supported", "projected": "candidate"}
+# `broken` MUST be listed. The lookup below defaults an unknown status to "candidate", which is
+# clamped only to the unproven ceiling (54) — so a chain the engine has declared refuted would read
+# as an ordinary lead here and keep more than double the confidence a contradicted chain is allowed.
+_CHAIN_STATE_TO_CORTEX = {"proven": "confirmed", "partial": "supported", "projected": "candidate",
+                          "broken": "blocked"}
 
 
 def _chain_next_action(chain: dict[str, Any], status: str, refs: list[str],

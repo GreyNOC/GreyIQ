@@ -2861,17 +2861,52 @@ def _run_bounty_hunt_body(
         if str(oob_base or "").strip() and str(oob_secret or "").strip() and not _stopped():
             try:
                 _emit("running blind-SSRF OOB probe (collaborator configured)…")
+                # Spend the OOB budget on parameters this program has NOT already probed without a
+                # callback. The prover walks its candidate list under a hard cap, so order decides
+                # what actually gets a token — this reorders, never drops, so the set is unchanged
+                # and a parameter that becomes interesting after a deploy is still reachable.
+                _ssrf_cooled = negative_knowledge.cooled_params(
+                    runtime_dir, program=None, target=clean_target,
+                    endpoint=clean_target, class_id="ssrf")
+                if _ssrf_cooled:
+                    _emit(f"negative knowledge: {len(_ssrf_cooled)} parameter(s) already probed "
+                          "without a callback — trying fresh ones first")
+                # `deprioritise` is applied inside the prover's candidate builder, after every source
+                # is merged and before the cap. Reordering this list here could not work: names parsed
+                # from the target URL are merged AHEAD of it, so on an already-parametered target two
+                # cooled URL-local names would still consume the whole cap.
                 ssrf = oob_service.confirm_blind_ssrf(clean_target, base=oob_base, secret=oob_secret,
                                                       scope=scope, settings=settings,
                                                       extra_params=effective_extra_params,
-                                                      priority=ssrf_params, governor=_oob_governor())
+                                                      priority=ssrf_params,
+                                                      deprioritise=_ssrf_cooled,
+                                                      governor=_oob_governor())
                 if ssrf.get("ok") and ssrf.get("finding") and ssrf.get("status") in ("confirmed", "candidate"):
                     raw_findings = list(raw_findings) + [ssrf["finding"]]
                     if "active" not in scanners_run:
                         scanners_run = list(scanners_run) + ["active"]
                     _emit(f"blind-SSRF OOB: {ssrf.get('status')} via '{ssrf.get('param')}'")
+                    # A parameter that produced a callback is immune from here on. Without this a
+                    # sink could carry two earlier misses and stay cooled for the whole TTL — the
+                    # same immunity hole the endpoint half was fixed for.
+                    negative_knowledge.record_param_confirmation(
+                        runtime_dir, program=None, target=clean_target,
+                        endpoint=clean_target, class_id="ssrf", param=ssrf.get("param"))
                 else:
                     _emit(f"blind-SSRF OOB: {ssrf.get('status') or ssrf.get('error') or 'no callback'}")
+                # THE honest parameter-level negative: each of these carried a unique collaborator
+                # token and no callback arrived in the poll window, so the request demonstrably went
+                # out and the thing demonstrably did not happen. Only recorded for `no-callback` —
+                # an error or an out-of-scope refusal means the probe never ran, which is not a
+                # negative result about the parameter.
+                # Only a poll window that COMPLETED is a negative result. `no-callback` is also
+                # returned when the probe went out but the collaborator poll itself errored, and
+                # that is an unobservable outcome, not evidence the parameter is inert — banking it
+                # would cool a live sink after two transient network failures.
+                if str(ssrf.get("status") or "") == "no-callback" and not ssrf.get("poll_errors"):
+                    negative_knowledge.record_param_misses(
+                        runtime_dir, program=None, target=clean_target,
+                        endpoint=clean_target, class_id="ssrf", params=ssrf.get("params_tried"))
             except Exception as exc:  # noqa: BLE001
                 _emit(f"blind-SSRF OOB probe error: {exc}")
 
@@ -2907,17 +2942,31 @@ def _run_bounty_hunt_body(
         if str(oob_base or "").strip() and str(oob_secret or "").strip() and not _stopped():
             try:
                 _emit("running blind-RCE OOB probe (collaborator configured)…")
+                _rce_cooled = negative_knowledge.cooled_params(
+                    runtime_dir, program=None, target=clean_target,
+                    endpoint=clean_target, class_id="rce")
                 rce = oob_service.confirm_blind_rce(clean_target, base=oob_base, secret=oob_secret,
                                                     scope=scope, settings=settings,
                                                     extra_params=effective_extra_params,
+                                                    deprioritise=_rce_cooled,
                                                     governor=_oob_governor())
                 if rce.get("ok") and rce.get("finding") and rce.get("status") in ("confirmed", "candidate"):
                     raw_findings = list(raw_findings) + [rce["finding"]]
                     if "active" not in scanners_run:
                         scanners_run = list(scanners_run) + ["active"]
                     _emit(f"blind-RCE OOB: {rce.get('status')} via {rce.get('param') or rce.get('header')}")
+                    # Only a PARAMETER confirmation is immunized here: this prover can also confirm
+                    # through a request header, which carries no parameter row to clear.
+                    if rce.get("param"):
+                        negative_knowledge.record_param_confirmation(
+                            runtime_dir, program=None, target=clean_target,
+                            endpoint=clean_target, class_id="rce", param=rce.get("param"))
                 else:
                     _emit(f"blind-RCE OOB: {rce.get('status') or rce.get('error') or 'no callback'}")
+                if str(rce.get("status") or "") == "no-callback" and not rce.get("poll_errors"):
+                    negative_knowledge.record_param_misses(
+                        runtime_dir, program=None, target=clean_target,
+                        endpoint=clean_target, class_id="rce", params=rce.get("params_tried"))
             except Exception as exc:  # noqa: BLE001
                 _emit(f"blind-RCE OOB probe error: {exc}")
 

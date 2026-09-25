@@ -363,7 +363,11 @@ def build_next_steps(ctx: dict[str, Any], brain_next_steps: list[str] | None = N
         # inside ctx["investigation"], so the returned plan silently lost Phases 1-3 and the
         # report rendered the injected dicts as blank rows in the chain's own step table.
         chain_steps = chain.get("steps") if isinstance(chain.get("steps"), list) else []
-        blocking = next((s for s in chain_steps if isinstance(s, dict) and not s.get("proven")), None)
+        # Name a step the operator can actually attempt. A step downstream of a refuted
+        # prerequisite is unproven but not actionable, so advertising it as "Blocking step N"
+        # would send them at work that cannot land until the prerequisite is re-established.
+        blocking = next((s for s in chain_steps if isinstance(s, dict) and not s.get("proven")
+                         and s.get("state") != "unreachable"), None)
         proven = _safe_int(chain.get("proven_steps"))
         total = _safe_int(chain.get("step_count")) or len(chain_steps)
         if str(chain.get("status") or "").lower() == "blocked":
