@@ -3597,16 +3597,23 @@ class GreyIQRuntime:
         return summary
 
     def export_leads(self, request: "LeadsRequest") -> dict[str, Any]:
-        """Render the finished hunt's investigation queue as ONE Markdown brief for download.
+        """The finished hunt's investigation queue — as a Markdown brief AND as structured rows.
 
-        This is the in-app face of ``gn leads --brief``: the operator gets the ranked leads, their
-        evidence state, the contradictions against each, and the exact proof obligation that would
-        confirm it — as a single file they can hand to an analyst or paste to a model.
+        This is the in-app face of ``gn leads``: the operator gets the ranked leads, their evidence
+        state, the contradictions against each, and the exact proof obligation that would confirm
+        it — either as one file to hand to an analyst, or rendered in the cockpit.
+
+        ``report`` carries the SAME projection the brief is rendered from. It was already being
+        built here and thrown away, which left the in-app operator with a file download and no way
+        to actually READ the queue — the CLI had ``--json`` and the cockpit had nothing. Returning
+        it costs one key and no extra work, and it cannot widen what crosses the boundary because
+        the brief is rendered from this very object: anything reachable in ``report`` was already
+        reachable in ``markdown``.
 
         The sidecar is located from the CACHED RUN (never a client-supplied path), so this route
-        cannot be walked into an arbitrary file read. The brief is built by ``leads``, which projects
-        through a strict allowlist and scrubs every field, so no raw credential, response body, page
-        source, or screenshot path can ride along.
+        cannot be walked into an arbitrary file read. Both shapes are built by ``leads``, which
+        projects through a strict allowlist and scrubs every field, so no raw credential, response
+        body, page source, or screenshot path can ride along.
         """
         from bughunter import leads as leads_lib
 
@@ -3638,6 +3645,7 @@ class GreyIQRuntime:
         return {
             "ok": True,
             "markdown": markdown,
+            "report": report,
             "filename": f"greyiq-leads-{safe(host)}-{stamp}.md",
             "lead_count": lead_count,
             "hunts": len(report.get("hunts") or []),

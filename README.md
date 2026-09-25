@@ -129,10 +129,12 @@ a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the
   cracked weak HMAC secret and a self-signed `jwk` embedded key against the token the site hands an
   ANONYMOUS visitor (no session needed), and the collaborator additionally proves `jku`/`x5u`
   key-source injection — the verifier fetching a signing key the token itself named.
-- **Download leads (.md)** — after a hunt finishes, the button beside *Copy report* in the Hunt
-  cockpit downloads the whole investigation queue as one Markdown brief: every lead with its
-  evidence state, the contradictions against it, and the exact artifact that would confirm it.
-  That file is what you hand to an analyst (or paste to Claude) to work the leads.
+- **Leads** — after a hunt finishes, the **Leads** button in the Hunt cockpit's export row renders
+  the whole investigation queue in the app: every lead with its evidence state, the exact artifact
+  that would confirm it, the gaps still open, and anything the engine says contradicts it. The same
+  panel downloads it as one Markdown brief — that file is what you hand to an analyst (or paste to
+  Claude) to work the leads. (A *Download leads (.md)* button also exists in the AI Studio surface;
+  the cockpit is where a hunt actually runs, which is why the queue is rendered there.)
 - **Investigate leads with Claude**: `gn leads <bounty-*.json | engagement-folder>` exports a
   finished hunt's ranked investigation queue — the cortex's hypotheses, ordered attack chains,
   contradictions, and the exact proof obligation for each lead — as a stable, **redaction-safe**

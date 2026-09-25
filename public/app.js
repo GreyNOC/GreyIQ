@@ -10066,12 +10066,115 @@ function ckReportsExportBar() {
   csvBtn.addEventListener("click", () => ckExportLedgerCsv(csvBtn));
   row.append(csvBtn);
 
+  // Leads — the hunt's ranked investigation queue, READ IN THE APP. The same engine already
+  // backed a Download-leads button, but that button lives in the AI Studio surface, which is
+  // display:none in the cockpit's default mode — so a cockpit-only operator could not reach it
+  // at all, and even reaching it only ever produced a file. This renders the queue instead.
+  const leadsBtn = cel("button", "ck-btn", "Leads");
+  leadsBtn.type = "button";
+  leadsBtn.disabled = !ckState.runId;
+  leadsBtn.title = ckState.runId
+    ? "The ranked investigation queue: what each lead still needs before it is reportable"
+    : "Run a hunt or campaign first";
+  const leadsPanel = cel("div", "ck-leads-panel");
+  leadsBtn.addEventListener("click", () => ckShowLeads(leadsBtn, leadsPanel));
+  row.append(leadsBtn);
+
   wrap.append(row);
   wrap.append(cel("p", "ck-hint",
-    "Engagement report = one polished document across a run's findings. .zip = the whole run (reports, evidence, screenshots). CSV = every finding across all runs, for a spreadsheet."));
+    "Engagement report = one polished document across a run's findings. .zip = the whole run (reports, evidence, screenshots). CSV = every finding across all runs, for a spreadsheet. Leads = what to investigate next, and the exact proof each one is missing."));
   wrap.append(zipNote);
+  wrap.append(leadsPanel);
   wrap.append(preview);
   return wrap;
+}
+
+// Render the investigation queue in the cockpit. The server returns BOTH the rendered brief and
+// the structured rows it was rendered from; this reads the rows, so the operator gets a queue they
+// can scan rather than a file they have to open elsewhere. Every field here came through leads.py's
+// allowlist projection, so nothing unredacted can reach the DOM. DOM-built, never innerHTML.
+async function ckShowLeads(btn, panel) {
+  if (!ckState.runId) { panel.textContent = "Run a hunt or campaign first."; return; }
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "Building…";
+  panel.replaceChildren();
+  try {
+    const res = await apiFetch("/api/bounty/leads", {
+      method: "POST", timeoutMs: 60000, body: JSON.stringify({ run_id: ckState.runId })
+    });
+    if (!res || res.ok === false) {
+      panel.append(cel("p", "ck-hint", (res && res.error) || "Could not build the lead queue."));
+      return;
+    }
+    ckRenderLeadQueue(panel, res);
+  } catch (error) {
+    panel.append(cel("p", "ck-hint", error.message || "Could not build the lead queue."));
+  } finally {
+    btn.disabled = false; btn.textContent = label;
+  }
+}
+
+function ckRenderLeadQueue(panel, res) {
+  const report = res.report || {};
+  const hunts = report.hunts || [];
+  const head = cel("div", "ck-creds-head");
+  head.append(cel("strong", null, `Investigation queue — ${res.lead_count || 0} lead(s)`));
+  panel.append(head);
+
+  const dl = cel("button", "ck-btn", "Download brief (.md)");
+  dl.type = "button";
+  dl.addEventListener("click", () => ckDownloadText(res.filename || "greyiq-leads.md", res.markdown || "", "text/markdown"));
+  panel.append(dl);
+
+  if (!hunts.length) {
+    panel.append(cel("p", "ck-hint", "No investigation graph in this run's report."));
+    return;
+  }
+  for (const queue of hunts) {
+    const hunt = queue.hunt || {};
+    if (hunts.length > 1) panel.append(cel("p", "ck-hint", hunt.target || ""));
+    if (queue.verdict) panel.append(cel("p", "ck-hint", queue.verdict));
+    const leads = queue.leads || [];
+    if (!leads.length) panel.append(cel("p", "ck-hint", "No leads in this hunt."));
+    for (const lead of leads) {
+      const row = cel("div", "ck-lead");
+      const title = cel("div", "ck-lead-head");
+      title.append(cel("strong", null, `[${lead.id}] ${lead.title || "Lead"}`));
+      // Status and decision are what tell an operator whether to report it or keep working.
+      title.append(cel("span", "ck-tag", String(lead.status || "")));
+      if (lead.severity) title.append(cel("span", "ck-tag", String(lead.severity)));
+      if (typeof lead.confidence_score === "number") {
+        title.append(cel("span", "ck-tag", `confidence ${lead.confidence_score}`));
+      }
+      row.append(title);
+      if (lead.location) row.append(cel("p", "ck-hint", String(lead.location)));
+      if (lead.decision) row.append(cel("p", "ck-hint", `Next: ${lead.decision}`));
+      // THE field an operator acts on — the exact artifact that would confirm this lead.
+      if (lead.proof_obligation) {
+        const ob = cel("p", "ck-lead-obligation");
+        ob.append(cel("strong", null, "To confirm: "));
+        ob.append(document.createTextNode(String(lead.proof_obligation)));
+        row.append(ob);
+      }
+      for (const gap of (lead.gaps || [])) row.append(cel("p", "ck-hint", `Gap: ${gap}`));
+      // A contradiction is the engine saying its own evidence disagrees — never hide it.
+      for (const c of (lead.contradictions || [])) {
+        row.append(cel("p", "ck-lead-contra", `Contradiction (${c.code || ""}): ${c.message || ""}`));
+      }
+      if ((lead.in_chains || []).length) {
+        row.append(cel("p", "ck-hint", `In chain(s): ${(lead.in_chains || []).join(", ")}`));
+      }
+      panel.append(row);
+    }
+    // Untested chain leads are often the only actionable rows on an otherwise inert hunt.
+    const probes = queue.chain_probes || [];
+    if (probes.length) {
+      panel.append(cel("p", "ck-hint", "Untested chain leads (probes to run — not evidence):"));
+      for (const p of probes) {
+        panel.append(cel("p", "ck-hint", `[${p.id}] ${p.title || ""} — ${p.next_action || ""}`));
+      }
+    }
+  }
 }
 
 async function ckGenerateEngagementReport(source, btn, previewEl) {

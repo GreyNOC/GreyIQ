@@ -2,6 +2,33 @@
 
 Notable changes to GreyIQ.
 
+## v4.6.0 - the investigation queue, in the app
+
+### The lead queue is readable in the cockpit, and reachable at all
+
+The **Download leads (.md)** button shipped in v4.2.1 was documented as being in the Hunt cockpit.
+It was not. It lives in the AI Studio surface (`#panelSecurity`, inside `.app-shell`), and
+`body[data-app-mode="hunt"] .app-shell { display: none }` with `appMode: "hunt"` as the default -
+so an operator who works in the cockpit, which is where a hunt is actually launched, could not
+reach it at all. README and CHANGELOG both asserted otherwise; both are corrected.
+
+The cockpit's export row now carries a **Leads** button that renders the queue *in the app*: each
+lead with its status, severity, confidence, the gaps still open, anything the engine says
+contradicts it, which chains it participates in, and - the line an operator actually acts on - the
+exact artifact that would confirm it. Untested chain leads render in their own section, labelled as
+probes rather than results. The same panel still downloads the Markdown brief.
+
+`export_leads` now returns the structured `report` alongside `markdown`. It was already building
+that object and discarding it, which is why the in-app operator had a file download and no way to
+READ the queue while the CLI had `--json`. This cannot widen what crosses the API boundary: the
+brief is *rendered from* this same object, so anything reachable in `report` was already reachable
+in `markdown` - and the redaction tests now assert against both.
+
+No `/api/bounty/investigate` route was added. The endpoint half already exists as
+`POST /api/bounty/leads`, and "investigate" is this codebase's established name for the per-finding
+active re-probe drawer (`/api/bounty/finding/reverify`); a second route by that name would leave
+two differently-shaped endpoints called the same thing.
+
 ## v4.5.0 - YesWeHack becomes a place you set a program up from, not just a report format
 
 YesWeHack has been in the platform registry since the report formats landed, but only as an output
@@ -413,12 +440,17 @@ the filtering being extended to it.
 
 ### Download leads (.md)
 
-The Hunt cockpit gains a **Download leads (.md)** button beside *Copy report*. It renders the
-finished hunt's whole investigation queue as ONE Markdown brief - every lead with its evidence
-state, the contradictions against it, and the exact artifact that would confirm it - ready to hand
-to an analyst or paste to a model. It is the in-app face of `gn leads --brief`, built through the
-same redaction-safe bridge, and the new `/api/bounty/leads` route resolves the sidecar from the
-**cached run id only**, so no client-supplied path is ever read.
+A **Download leads (.md)** button renders the finished hunt's whole investigation queue as ONE
+Markdown brief - every lead with its evidence state, the contradictions against it, and the exact
+artifact that would confirm it - ready to hand to an analyst or paste to a model. It is the in-app
+face of `gn leads --brief`, built through the same redaction-safe bridge, and the new
+`/api/bounty/leads` route resolves the sidecar from the **cached run id only**, so no
+client-supplied path is ever read.
+
+> **Correction (v4.6.0):** this entry originally said the button was in the Hunt cockpit beside
+> *Copy report*. It was not — it shipped in the AI Studio surface, which is `display: none` in the
+> cockpit's default hunt mode, so a cockpit-only operator could not reach it. v4.6.0 puts the queue
+> in the cockpit for real, as a rendered view rather than only a download.
 
 ### Review fixes
 
