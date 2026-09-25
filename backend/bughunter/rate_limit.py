@@ -133,6 +133,25 @@ _shared_lock = threading.Lock()
 _shared_governors: dict[tuple[int, float, float], "HostRateGovernor"] = {}
 
 
+def reset_shared_governors() -> None:
+    """Drop every process-wide governor, so the next ``shared_governor()`` call builds a fresh one.
+
+    This exists for PROCESS-BOUNDARY callers — above all the test suite. The governors above are
+    deliberately process-lifetime singletons (that is what makes the per-host politeness cap real
+    rather than per-hunt), and nothing on a hunt path may call this: resetting mid-engagement would
+    hand a host a second full bucket and break the guarantee the module docstring makes.
+
+    The suite needs it because ~150 test modules share ONE interpreter and almost every local
+    fixture binds 127.0.0.1, so they all draw on that single host's 700-token bucket. Once it is
+    empty every later active check is refused, which does not just fail a test — it makes the test
+    VACUOUS: no probe is sent, so an assertion like "this fixture produces no false positive" passes
+    without exercising anything. Tests that drive the active layer call this in setUp so each starts
+    from a full, known budget.
+    """
+    with _shared_lock:
+        _shared_governors.clear()
+
+
 def shared_governor(capacity: int = 700, min_interval_s: float = 0.5,
                     refill_per_s: float = HostRateGovernor.DEFAULT_REFILL_PER_S,
                     pool: str = "") -> "HostRateGovernor":

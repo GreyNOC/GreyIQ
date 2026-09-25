@@ -587,6 +587,19 @@ def register_cli(sub: Any) -> None:
     parser.set_defaults(func=_cmd_train_brain)
 
 
+# Public aliases. The CLI reached the two names below through their private spellings, which meant a
+# second caller (the Studio's hunt-brain panel, via GET /api/hunt/model) had to import underscored
+# names to ask "which ranker is active and is a retrain worth it?". Naming them makes that a supported
+# read rather than a reach into module internals.
+DEFAULT_MIN_ROWS = _DEFAULT_MIN_ROWS
+
+
+def show_status(runtime_dir: Path | str, seed_dir: Path | str | None = None,
+                min_rows: int = _DEFAULT_MIN_ROWS) -> dict[str, Any]:
+    """Which hunt ranker is ACTIVE, what it scored, and how much corpus exists — see ``_show``."""
+    return _show(Path(runtime_dir), Path(seed_dir) if seed_dir is not None else None, int(min_rows))
+
+
 def _show(runtime_dir: Path, seed_dir: Path | None, min_rows: int) -> dict[str, Any]:
     """The ``--show`` payload: which model is ACTIVE (and whether it is the bundled seed or a
     locally trained one), what it scored when it was promoted, and — the part that keeps the

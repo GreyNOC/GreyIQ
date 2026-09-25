@@ -53,3 +53,61 @@ class OnDemandReportCweTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CrlfClassTests(unittest.TestCase):
+    """A confirmed CRLF response-header injection must be filed as header injection, not open redirect.
+
+    The prover can CONFIRM this class (it captures the injected header on its own wire line against a
+    no-CRLF control) but the class had no VULN_CLASSES entry, so _check_crlf hinted 'redirect' and the
+    report went out as CWE-601 "URL Redirection to Untrusted Site", OWASP A01, with remediation telling
+    the team to allowlist redirect targets — the wrong weakness and the wrong fix on a real finding.
+    """
+
+    def test_the_class_exists_with_the_right_weakness_and_fix(self) -> None:
+        from bughunter import impact_model
+        from bughunter.bounty import VULN_CLASSES, cwe_for_class
+
+        self.assertIn("crlf", VULN_CLASSES)
+        self.assertIn("113", cwe_for_class("crlf"))          # CWE-113, not CWE-601
+        self.assertNotIn("601", cwe_for_class("crlf"))
+        self.assertEqual(VULN_CLASSES["crlf"]["owasp"], "A03:2021 Injection")
+        self.assertIn("response header", impact_model.remediation_for_class("crlf"))
+        self.assertTrue(impact_model.references_for_class("crlf"))
+        # Empty categories on purpose: the class only arrives via the check's explicit class hint, so it
+        # cannot swallow unrelated 'disclosure' findings.
+        self.assertEqual(VULN_CLASSES["crlf"]["categories"], set())
+
+    def test_the_template_score_matches_what_the_prover_demonstrates(self) -> None:
+        from bughunter import impact_model
+
+        block = impact_model.cvss_for_class("crlf", confirmed=True)
+        # Header injection proven, escalation not yet — the same 6.1 band as open redirect / reflected
+        # XSS. An I:H vector here would score a marker header at 9.3 Critical.
+        self.assertEqual(block["base_score"], 6.1)
+        self.assertEqual(block["base_severity"], "Medium")
+
+    def test_the_crlf_check_hints_the_crlf_class(self) -> None:
+        import ast
+        import re
+
+        source = (BACKEND_DIR / "bughunter" / "active_verify_service.py").read_text(encoding="utf-8")
+        match = re.search(r'_finding\(\s*"active\.crlf".*?\)', source, re.S)
+        self.assertIsNotNone(match, "the CRLF check's _finding call moved")
+        call = ast.parse(match.group(0).strip(), mode="eval").body
+        # _finding(rule_id, title, severity, category, class_hint, ...)
+        self.assertEqual(call.args[4].value, "crlf", "the CRLF check must hint its own class")
+        self.assertEqual(call.args[3].value, "disclosure", "the scanner category must stay 'disclosure'")
+
+    def test_a_legacy_redirect_classed_crlf_finding_still_reproduces(self) -> None:
+        # A ledger finding recorded before CRLF had its own class carries class_id 'redirect' with a crlf
+        # rule_id; it must keep producing CRLF reproduction steps rather than falling through.
+        from bughunter.bounty import _generic_concrete_repro
+
+        pe = {"request_line": "GET https://t/?next=%0d%0aX-Greyiq-Crlf:mark",
+              "response_header": "X-Greyiq-Crlf: mark", "matched_value": "injected response header"}
+        for class_id in ("crlf", "redirect"):
+            with self.subTest(class_id=class_id):
+                steps, _poc = _generic_concrete_repro({"rule_id": "active.crlf"}, class_id,
+                                                      "https://t/", pe)
+                self.assertTrue(any("response splitting" in s for s in steps))

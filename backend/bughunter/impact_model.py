@@ -107,6 +107,26 @@ IMPACT_MODEL: dict[str, dict[str, str]] = {
         # its own per-finding vector; a real data-read impact needs the browser PoC above.
         "cvss_vector": "AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:N/A:N",
     },
+    "crlf": {
+        "attacker_capability": ("An attacker injects CR/LF into a value the server copies into a response "
+                                "header, adding headers (or a body) of their choosing to the response."),
+        "affected_asset": "every client and cache that reads the split response, plus the victim's session cookies.",
+        "business_impact": ("response splitting — attacker-controlled Set-Cookie (session fixation), "
+                            "web-cache poisoning served to other users, and reflected XSS carried in the "
+                            "injected body."),
+        "proof_obligation": ("Capture the response showing the injected header on its own wire line, with a "
+                             "control request (no CR/LF) that does not carry it, then show the concrete "
+                             "escalation you claim (a poisoned cache entry, an injected Set-Cookie, or script "
+                             "execution from the split body)."),
+        # Scored for what the prover actually CONFIRMS: the injected header arrives on its own wire line
+        # against a no-CRLF control. That is header injection, not yet a poisoned cache entry or a
+        # hijacked session — so integrity stays Low and this lands at 6.1 Medium, the same band as the
+        # open-redirect and reflected-XSS templates. It sits above them in practice only once the
+        # operator demonstrates the escalation this class's proof_obligation asks for; claiming I:H here
+        # would score a marker header at 9.3 Critical, the exact over-claim the evidence rule forbids.
+        # Scope is Changed because a split response is served to other clients and caches.
+        "cvss_vector": "AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+    },
     "redirect": {
         "attacker_capability": "An attacker supplies a redirect parameter that sends users to an external site.",
         "affected_asset": "users following links, and any token passed through the redirect (OAuth code, reset token).",
@@ -306,6 +326,10 @@ _REMEDIATION: dict[str, str] = {
     "csrf": "Require an unpredictable per-session anti-CSRF token (or SameSite=strict cookies) on every state-changing request and verify it server-side.",
     "cors": "Reflect Origin only from an explicit allowlist, never combine `Access-Control-Allow-Origin: *`/reflected with `Allow-Credentials: true`, and never trust `null`.",
     "websocket": "Validate the `Origin` header on the WebSocket handshake against an explicit allowlist and reject cross-site origins; bind the socket to an unpredictable per-session CSRF token rather than ambient cookies alone.",
+    "crlf": ("Reject CR, LF and NUL in any value copied into a response header, and set headers through the "
+             "framework's header API rather than by string concatenation — modern server stacks refuse "
+             "header values containing newlines when you use that API. Validate the value against an "
+             "allowlist where it names a URL or filename."),
     "redirect": "Allowlist redirect targets (relative paths or a fixed host set); validate with a host/scheme check (e.g. url_has_allowed_host_and_scheme) and reject off-host URLs.",
     "file-upload": "Validate type by content (not extension), store outside the web root with non-executable permissions and random names, and serve via a controlled handler.",
     "path-traversal": "Never build a filesystem path from user input: map the parameter to an allowlisted identifier, then canonicalize the resolved path (realpath) and reject anything outside the intended root before opening it.",
@@ -341,6 +365,7 @@ _REFERENCES: dict[str, list[str]] = {
     "csrf": [f"{_CS}/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html", f"{_CWE}/352.html"],
     "cors": [f"{_CS}/HTML5_Security_Cheat_Sheet.html", f"{_CWE}/284.html", f"{_CWE}/346.html", f"{_CWE}/942.html", "https://portswigger.net/web-security/cors"],
     "websocket": [f"{_CWE}/284.html", f"{_CWE}/346.html", "https://portswigger.net/web-security/websockets/cross-site-websocket-hijacking", "https://owasp.org/www-community/attacks/Cross_Site_WebSocket_Hijacking_CSWSH"],
+    "crlf": [f"{_CS}/HTTP_Headers_Cheat_Sheet.html", f"{_CWE}/113.html", f"{_CWE}/93.html"],
     "redirect": [f"{_CS}/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html", f"{_CWE}/601.html"],
     "file-upload": [f"{_CS}/File_Upload_Cheat_Sheet.html", f"{_CWE}/434.html"],
     # No _CS entry: the cheat-sheet series has no path-traversal sheet, and a report must never
@@ -412,7 +437,12 @@ _BUGCROWD_VRT: dict[str, str] = {
     "deserialization": "server_side_injection.remote_code_execution_rce",
     "nosqli": "server_side_injection.nosql_injection",
     "headers": "server_security_misconfiguration.security_headers",
-    "disclosure": "sensitive_data_exposure.disclosure_of_known_vulnerabilities",
+    # NOT disclosure_of_known_vulnerabilities: that leaf is for REPORTING a publicly-known vulnerability
+    # (Bugcrowd prices it informational/P5). Mapping the whole disclosure class to it meant a confirmed
+    # unauthenticated read of /.aws/credentials — captured body plus catch-all negative control — was
+    # submitted pre-priced as informational. '' falls through to taxonomy.cwe_to_vrt("CWE-200") =
+    # "Sensitive Data Exposure", the honest parent, exactly as websocket/path-traversal/graphql do above.
+    "disclosure": "",
 }
 
 
@@ -490,6 +520,27 @@ def cvss_severity(score: float) -> str:
 def impact_for_class(class_id: str) -> dict[str, str]:
     """The impact-model entry for a class id (falls back to a generic model)."""
     return IMPACT_MODEL.get(str(class_id or ""), _GENERIC_MODEL)
+
+
+def cvss_block(vector: str, *, estimated: bool = False, justification: str = "") -> dict[str, Any]:
+    """A report-ready CVSS block whose score and severity are DERIVED from ``vector``.
+
+    Use this instead of writing ``base_score``/``base_severity`` literals next to a vector. Eight of
+    the eleven hardcoded blocks in this package had drifted from the vector printed beside them — a
+    confirmed post-logout session replay rendered "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:L/A:N — 6.5
+    medium" when that vector is 7.1 High, and two stored-XSS blocks under-reported 8.7 as 8.0. A
+    triager who pastes the vector into the NVD calculator and gets a different number stops trusting
+    the whole report, and the severity the platform receives comes from the score, not the vector, so
+    the drift silently mis-files the finding. Deriving both from the one input makes them unable to
+    disagree; ``test_impact_model`` walks every literal block in the package and asserts it."""
+    scored = cvss_base_score(vector)
+    return {
+        "vector": vector,
+        "base_score": scored["score"],
+        "base_severity": scored["severity"],
+        "estimated": bool(estimated),
+        "justification": str(justification or ""),
+    }
 
 
 def cvss_for_class(class_id: str, *, confirmed: bool = False) -> dict[str, Any]:

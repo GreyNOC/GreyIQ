@@ -23,6 +23,7 @@ import urllib.request
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from bughunter import impact_model
 from bughunter import dns_mini
 from bughunter.active_verify_service import host_in_active_scope
 from bughunter.settings import get_settings
@@ -261,7 +262,8 @@ def build_plan(finding: dict[str, Any]) -> dict[str, Any]:
             f"Check whether the {service} resource is unclaimed — the page returns no live content / an error.",
             f"If claimable, register the matching {service} resource, serve a benign marker to prove control, then release it.",
         ]
-        cvss = {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", "base_score": 6.5, "base_severity": "medium", "estimated": True}
+        # Derived from the vector (6.1, not the hardcoded 6.5) — see impact_model.cvss_block.
+        cvss = impact_model.cvss_block("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", estimated=True)
         poi = {
             "status": "candidate",
             "method": "DNS CNAME correlation to a takeoverable service (no resource was claimed)",
@@ -277,14 +279,15 @@ def build_plan(finding: dict[str, Any]) -> dict[str, Any]:
             f"Fetch https://{host}/ and observe the {service} 'unclaimed' page (fingerprint: \"{finding.get('snippet', '')}\").",
             f"Claim the {service} resource (register the matching bucket/app/page), serve a benign marker file to prove control, then release it.",
         ]
-        cvss = {
-            "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:H/A:N", "base_score": 7.6, "base_severity": "high",
-            "estimated": False,
-            "justification": (
+        # Derived from the vector (8.2, not the hardcoded 7.6) — see impact_model.cvss_block.
+        cvss = impact_model.cvss_block(
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:H/A:N",
+            estimated=False,
+            justification=(
                 f"Actively confirmed: {host} serves the {service} 'unclaimed resource' fingerprint page, which "
                 "only appears when the DNS record dangles to a claimable resource — not a template estimate."
             ),
-        }
+        )
         poi = {
             "status": "confirmed",
             "method": "GET fetch + dangling-service fingerprint match (no resource was claimed)",

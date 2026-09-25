@@ -18,7 +18,7 @@ may import ``solin_domain``; ``solin_domain`` must never import ``solin_core``, 
 THE CONTRACT, restated from ``bughunter/offline_hunt.py``: it can raise USEFULNESS, never
 TRUTHFULNESS. :func:`compose_answer` performs no generation of any kind — the answer body
 is a CONTIGUOUS slice of a bundled card, so ``excerpt in card.body`` is literally true and
-the test suite asserts it. The 0.8M-param char model cannot smuggle a hallucinated security
+the test suite asserts it. The tiny (well under 10M-param) char model cannot smuggle a hallucinated security
 claim through this path because nothing on this path can author a sentence. Everything the
 composer adds around the excerpt is a fixed, authored template line and a ``Source:`` cite.
 

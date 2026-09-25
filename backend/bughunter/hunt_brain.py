@@ -105,6 +105,29 @@ _STATE_CHANGE_SIGNALS = frozenset({
     "create", "update", "delete", "remove", "change", "transfer", "checkout", "purchase", "admin",
     "settings", "profile", "password", "invite", "upload",
 })
+# The four PROVER_CLASSES the heuristic engine used to have ZERO recall for — every other
+# active-check class above has a signal set, but cloud-exposure/sensitive/websocket/clickjacking
+# fell through to "no scores -> skip" no matter how obviously an endpoint's path named them. Same
+# "only reorders existing, already-gated checks" contract as every set above: these only decide
+# which endpoint the prober visits first, never whether the check runs or what it may do.
+_CLOUD_SIGNALS = frozenset({
+    "s3", "bucket", "storage", "blob", "cdn", "assets", "static", "azure", "gcs", "cloudfront",
+    "spaces", "firebase",
+})
+_SENSITIVE_SIGNALS = frozenset({
+    "env", "git", "config", "backup", "swagger", "wpconfig", "dump", "bak", "secret",
+    "credentials", "htpasswd", "phpinfo",
+})
+_WEBSOCKET_SIGNALS = frozenset({
+    "ws", "wss", "websocket", "socket", "socketio", "realtime", "stream", "notify",
+    "notifications", "live",
+})
+# Narrower than _AUTH_SIGNALS/_STATE_CHANGE_SIGNALS on purpose: clickjacking is the LOWEST-severity
+# active class (see offline_hunt._CLASS_SIGNAL), so it only fires on pages that are themselves the
+# sensitive user-facing ACTION worth a framing check, not on every auth-adjacent endpoint.
+_FRAMEABLE_SIGNALS = frozenset({
+    "login", "signin", "checkout", "payment", "transfer", "confirm", "pay",
+})
 
 HUNT_BRAIN_SYSTEM_PROMPT = (
     "You are an elite web-application penetration tester assisting an AUTHORIZED bug-bounty hunt. "
@@ -222,6 +245,10 @@ def heuristic_plan(surface: dict[str, Any]) -> dict[str, Any]:
         nosql_hits = words & _NOSQL_SIGNALS
         xss_hits = words & _XSS_SIGNALS
         auth_hits = words & _AUTH_SIGNALS
+        cloud_hits = words & _CLOUD_SIGNALS
+        sensitive_hits = words & _SENSITIVE_SIGNALS
+        websocket_hits = words & _WEBSOCKET_SIGNALS
+        frameable_hits = words & _FRAMEABLE_SIGNALS
 
         if command_hits:
             add("rce", 120, f"command-like endpoint/parameter: {sorted(command_hits)[0]}")
@@ -255,6 +282,15 @@ def heuristic_plan(surface: dict[str, Any]) -> dict[str, Any]:
                 add("host-header", 82, "absolute-link/auth callback surface")
         if any(w in path_words for w in ("debug", "actuator", "jolokia", "management", "heapdump")):
             add("debug", 125, "debug/management endpoint semantic")
+        if sensitive_hits:
+            add("sensitive", 90, f"sensitive-path semantic: {sorted(sensitive_hits)[0]}")
+        if cloud_hits or any(t in tech_text for t in ("aws", "s3", "azure", "cloudfront", "gcs", "firebase")):
+            signal = sorted(cloud_hits)[0] if cloud_hits else "cloud tech fingerprint"
+            add("cloud-exposure", 70, f"cloud-storage semantic: {signal}")
+        if websocket_hits:
+            add("websocket", 56, f"realtime/socket semantic: {sorted(websocket_hits)[0]}")
+        if frameable_hits:
+            add("clickjacking", 38, f"sensitive user-facing action page: {sorted(frameable_hits)[0]}")
         method = str(form.get("method") or "GET").upper()
         if method not in {"GET", "HEAD", "OPTIONS"} and words & _STATE_CHANGE_SIGNALS:
             add("csrf", 80, f"state-changing {method} form")

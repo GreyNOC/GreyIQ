@@ -492,12 +492,37 @@ def _apply_class_priority(checks: list[tuple[str, Any]], class_priority: list[st
 
 def _finding(rule_id: str, title: str, severity: str, category: str, class_hint: str, url: str,
              proof: dict[str, Any], proof_evidence: dict[str, str], cvss: dict[str, Any] | None = None) -> dict[str, Any]:
+    evidence = dict(proof_evidence)
+    # NAME the sensitive data a captured body disclosed, for EVERY producer — not just CORS.
+    #
+    # sensitive_data's module docstring states the ordering rule: classify the RAW body, because
+    # redaction rewrites JWTs/tokens to [REDACTED_…] markers the classifier can no longer match, so
+    # classifying a redacted excerpt silently under-reports. Exactly one producer obeyed it
+    # (_cors_impact_tier), and it is the only reason that path can say "leaks a victim JWT + email".
+    # Every other capture — a served .env, an actuator/env dump, a GraphQL schema, a traversal read —
+    # left sensitive_data_labels unset, so report.py printed no "Sensitive data exposed:" line and
+    # bounty._write_sensitive_data_files skipped the finding entirely: the strongest impact evidence a
+    # disclosure finding has was simply never named.
+    #
+    # Doing it HERE, at the one choke point every check's evidence passes through, covers all 15
+    # in-module producers with one change and guarantees the raw-before-redaction ordering. The labels
+    # are generic English (never the secret itself), so they survive the redaction pass below intact.
+    # A producer that already classified (CORS) is left alone, and any failure is swallowed — naming
+    # the data is an impact enrichment and must never break a confirmed finding.
+    raw_body = str(evidence.get("read_data") or "")
+    if raw_body and not str(evidence.get("sensitive_data_labels") or "").strip():
+        try:
+            labels = sensitive_data.classify(raw_body)
+        except Exception:  # noqa: BLE001 - impact enrichment is best-effort, never load-bearing
+            labels = []
+        if labels:
+            evidence["sensitive_data_labels"] = "; ".join(labels)
     return {
         "rule_id": rule_id, "title": title, "severity": severity, "confidence": "high",
         "category": category, "file_path": url, "line_start": 1, "line_end": 1,
         "snippet": _redact(proof.get("observed_result") or "")[:240],
         "remediation": "", "redacted": True,
-        "proof_evidence": {k: _redact(v) for k, v in proof_evidence.items() if str(v or "").strip()},
+        "proof_evidence": {k: _redact(v) for k, v in evidence.items() if str(v or "").strip()},
         "_active_proof": proof,
         "_active_cvss": cvss,
         "_active_class_hint": class_hint,
@@ -572,7 +597,7 @@ def _check_cswsh(http: "_Http", url: str, landing: dict[str, Any] | None = None)
         {"request_line": f"GET {url}   (Upgrade: websocket; Origin: {_MARKER_ORIGIN})",
          "response_status": "101 Switching Protocols",
          "matched_value": f"Sec-WebSocket-Accept derived from the key we sent ({accept})"},
-        {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:N/A:N", "base_score": 3.1, "base_severity": "low", "estimated": True},
+        impact_model.cvss_block("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:N/A:N", estimated=True),
     )
 
 def _cors_cvss(tier: str) -> dict[str, Any]:
@@ -602,6 +627,60 @@ def _cors_cvss(tier: str) -> dict[str, Any]:
         why = ("The CORS header misconfiguration is confirmed, but only on a non-sensitive response (non-2xx, "
                "empty, or unauthenticated), so no cross-origin read of sensitive authenticated data is "
                "demonstrated. Severity stays Low until impact is shown on an authenticated data endpoint.")
+    return {
+        "vector": vector,
+        "base_score": scored["score"],
+        "base_severity": scored["severity"],
+        "estimated": False,
+        "justification": why,
+    }
+
+
+def _exposure_cvss(severity: str, what: str) -> dict[str, Any] | None:
+    """A per-finding CVSS v3.1 block for a CONFIRMED unauthenticated read exposure, sized to the
+    check's own graded severity instead of the flat class default.
+
+    Why this exists: these checks grade each entry themselves (``_DEBUG_ENDPOINTS`` marks
+    ``/actuator/heapdump`` "critical" — a full JVM heap dump, i.e. every in-memory secret, token and
+    active session downloadable — while ``/actuator`` the index is "medium"), but they passed
+    ``cvss=None``, so bounty.py stamped ``impact_model.cvss_for_class('disclosure', ...)``: a flat
+    ``C:L`` / 5.3 Medium for all of them. Because the report resolves severity from the CVSS rather
+    than the raw label, a confirmed heap dump or a served ``.aws/credentials`` was SUBMITTED as
+    "Medium, low confidentiality impact" — under-reporting the most serious thing these checks find,
+    and contradicting the finding's own severity field.
+
+    Honest by construction: a read-only exposure claims confidentiality ONLY. Integrity and
+    availability stay ``I:N/A:N`` however serious the disclosure is, because GET-only evidence proves
+    no write or execution — that stays the province of the ``rce``-hinted entries (Jolokia), which
+    already carry their own class vector. The ceiling is therefore ``S:C/C:H`` (8.6 High), never
+    Critical, since 9.0+ requires impact this evidence cannot demonstrate.
+
+      critical — total secret/session material in the body (heap dump, cloud credentials, .env):
+                 scope change, because the credentials compromise components beyond this one.
+      high     — full configuration / logs / source-level internals (actuator env, phpinfo, logfile).
+      medium   — operational metadata only (actuator index, server-status): the class default.
+
+    Returns ``None`` for an unrecognised grade, so the caller falls back to today's class vector."""
+    tier = str(severity or "").strip().lower()
+    if tier == "critical":
+        vector = "AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N"
+        why = (f"Unauthenticated read of {what} is confirmed by a captured response against a control that "
+               "does not return it. Confidentiality is High and the scope is Changed because the disclosed "
+               "material (in-memory secrets/sessions or cloud credentials) authenticates to components "
+               "beyond this endpoint. Integrity and availability are scored None: the probe is GET-only, so "
+               "no write or execution is demonstrated.")
+    elif tier == "high":
+        vector = "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+        why = (f"Unauthenticated read of {what} is confirmed by a captured response against a control that "
+               "does not return it. Confidentiality is High (full configuration/internals are readable); "
+               "integrity and availability are None because the probe is GET-only.")
+    elif tier == "medium":
+        vector = "AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+        why = (f"Unauthenticated read of {what} is confirmed, but the disclosed content is operational "
+               "metadata rather than secrets, so confidentiality impact is Low.")
+    else:
+        return None
+    scored = impact_model.cvss_base_score(vector)
     return {
         "vector": vector,
         "base_score": scored["score"],
@@ -1461,7 +1540,11 @@ def _check_crlf(http: _Http, url: str, extra_params: list[str] | None = None) ->
                   # request/response shows the injected header exactly as it landed on the wire.
                   "response_header": f"X-Greyiq-Crlf: {_MARK}",
                   "matched_value": f"injected response header X-Greyiq-Crlf: {_MARK}"}
-            return _finding("active.crlf", f"CRLF / response-header injection via '{param}'", "high", "disclosure", "redirect", url, proof, ev)
+            # class_hint 'crlf', not 'redirect': what this proved is a response-header injection
+            # (CWE-113), and filing it as CWE-601 open redirect gave the report the wrong weakness and
+            # remediation. bounty.VULN_CLASSES['crlf'] and impact_model now carry the real entry. The
+            # scanner CATEGORY stays 'disclosure' so no unrelated disclosure finding is pulled in.
+            return _finding("active.crlf", f"CRLF / response-header injection via '{param}'", "high", "disclosure", "crlf", url, proof, ev)
     return None
 
 
@@ -2655,7 +2738,19 @@ def _check_sensitive_paths(http: _Http, url: str) -> dict[str, Any] | None:
             ev = {"request_line": f"GET {origin}{path}", "response_status": f"HTTP {status}", "matched_value": f"{name} exposed",
                   # The served file content IS the demonstrated exposure (secrets redacted once by _finding).
                   "read_data": body[:1200]}
-            return _finding("active.exposed-file", f"Sensitive file exposed: {path}", "high", "disclosure", "disclosure", url, proof, ev)
+            # Grade from the EVIDENCE, not the filename: a served file whose captured body classifies
+            # as real secret material (.env with live keys, .aws/credentials, wp-config.php.bak) is a
+            # credential exposure whose blast radius reaches other systems, so it earns the
+            # scope-changed C:H vector; a .git/config or a dump without recognisable secrets stays
+            # High-confidentiality but unchanged-scope. Without a per-finding vector both reported as
+            # the flat 'disclosure' class default of C:L / 5.3 Medium.
+            try:
+                graded = "critical" if sensitive_data.classify(body) else "high"
+            except Exception:  # noqa: BLE001 - grading is enrichment; fall back to the old flat 'high'
+                graded = "high"
+            return _finding("active.exposed-file", f"Sensitive file exposed: {path}", graded, "disclosure",
+                            "disclosure", url, proof, ev,
+                            cvss=_exposure_cvss(graded, f"{name} at {path}"))
     return None
 
 
@@ -2765,8 +2860,12 @@ def _check_debug_endpoints(http: _Http, url: str) -> dict[str, Any] | None:
             )
             ev = {"request_line": f"GET {origin}{path}", "response_status": f"HTTP {status}",
                   "matched_value": f"{name} exposed at {path}", "read_data": body[:1200]}
+            # Size the CVSS to THIS entry's graded severity. Only for the disclosure-classed entries:
+            # the one `rce`-hinted entry (Jolokia) must keep its class vector, which its limitations
+            # text above is written against.
+            exposure_cvss = None if class_hint == "rce" else _exposure_cvss(severity, f"{name} at {path}")
             return _finding("active.debug-endpoint", f"{name} exposed unauthenticated: {path}",
-                            severity, "disclosure", class_hint, url, proof, ev)
+                            severity, "disclosure", class_hint, url, proof, ev, cvss=exposure_cvss)
     return None
 
 

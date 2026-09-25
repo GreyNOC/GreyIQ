@@ -17,10 +17,20 @@ REPO_ROOT = BACKEND_DIR.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from bughunter import attack_chain  # noqa: E402
+from bughunter import attack_chain, rate_limit  # noqa: E402
 from bughunter.bounty import run_bounty_hunt  # noqa: E402
 from bughunter.web_ingest import WebsiteFetchError  # noqa: E402
 from bughunter.web_scan_service import _analyze, _guard_url, run_web_scan  # noqa: E402
+
+
+def setUpModule() -> None:
+    """Start from a full per-host active-request budget — see rate_limit.reset_shared_governors().
+
+    This module spends 165 of the shared 127.0.0.1 bucket's 700 tokens and runs alphabetically last
+    among the suite's active-layer consumers, so it is the one most likely to find the bucket empty
+    and silently probe nothing.
+    """
+    rate_limit.reset_shared_governors()
 
 
 class GuardUrlIpv6Tests(unittest.TestCase):
@@ -149,7 +159,10 @@ class WebScanRedactionTests(unittest.TestCase):
             self.assertNotIn(raw_key, markdown)
             self.assertNotIn(raw_key, json.dumps(json_doc))
             self.assertIn("[REDACTED_SECRET", markdown)
-            self.assertEqual("CWE-200", json_doc["findings"][0]["cwe"])
+            # CWE-798 leads for the secrets class (hard-coded credentials), with CWE-200 kept as the
+            # fallback for a program that only enables Information Disclosure — the primary CWE used to
+            # disagree with the class's own OWASP category, references and Bugcrowd leaf.
+            self.assertEqual("CWE-798 / CWE-200", json_doc["findings"][0]["cwe"])
             # A Google/Firebase AIza key is a PUBLIC client key by default — strict classification
             # downgrades it and marks it INFORMATIONAL, so the deterministic proof is 'missing'
             # (a lead, not a candidate secret) and never 'ready'. It is NOT a captured artifact.

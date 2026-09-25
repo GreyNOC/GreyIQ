@@ -99,7 +99,14 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
     },
     "secrets": {
         "name": "Exposed secret / credential",
-        "cwe": "CWE-200",
+        # CWE-798 leads, CWE-200 stays as the fallback. The primary CWE disagreed with everything else
+        # this class declares: its OWASP is A07 (Identification & Authentication Failures), its
+        # reference list cites CWE-798, and its Bugcrowd leaf is sensitive_data_exposure.
+        # disclosure_of_secrets — which taxonomy.cwe_to_vrt resolves from 798, not from 200. Filed under
+        # 200 alone, a validator-confirmed live credential reached HackerOne as "Information Disclosure"
+        # even when the program had "Use of Hard-coded Credentials" enabled and priced it far higher.
+        # cwe_numbers tries 798 first and falls back to 200 for a program that only enables the latter.
+        "cwe": "CWE-798 / CWE-200",
         "owasp": "A07:2021 Identification & Authentication Failures",
         "categories": {"secret", "secret_exposed"},
         "checklist": [
@@ -206,6 +213,25 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
             "Check whether the handshake completes (101) while carrying an attacker-controlled Origin.",
             "If it does, host a browser PoC on an attacker origin and confirm a logged-in victim's socket "
             "serves authenticated data cross-site.",
+        ],
+    },
+    "crlf": {
+        "name": "CRLF / HTTP response-header injection",
+        # CWE-113 (CRLF in an HTTP header) with CWE-93 (improper CRLF neutralization) as the parent. This
+        # class exists because the prover can CONFIRM a header injection (it captures the injected header
+        # on the wire against a no-CRLF control) but had no entry here, so the finding was filed under
+        # `redirect`: weakness CWE-601 "URL Redirection to Untrusted Site", OWASP A01, with remediation
+        # telling the team to allowlist redirect targets — the wrong weakness AND the wrong fix.
+        "cwe": "CWE-113 / CWE-93",
+        "owasp": "A03:2021 Injection",
+        # Empty on purpose: the class only ever arrives via the check's explicit _active_class_hint. The
+        # CRLF check keeps category='disclosure', and claiming that category here would pull every
+        # unrelated disclosure finding into this class (the same reasoning path-traversal documents).
+        "categories": set(),
+        "checklist": [
+            "Find values the response copies into a header: redirect targets (Location), Set-Cookie attributes, custom X- headers, and anything echoed into Content-Disposition.",
+            "Inject an encoded CR/LF (%0d%0a) followed by a marker header and confirm the marker arrives as its OWN header line, with a control request that omits the CR/LF as the comparison.",
+            "Escalate to the concrete impact before reporting: an attacker-set Set-Cookie (session fixation), a poisoned cache entry served to another user, or script execution from an injected body.",
         ],
     },
     "redirect": {
@@ -356,7 +382,11 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
     "request-smuggling": {
         "name": "HTTP request smuggling / desync",
         "cwe": "CWE-444",
-        "owasp": "A06:2021 Vulnerable & Outdated Components",
+        # A04, not A06: CWE-444 is an inconsistent-interpretation/design flaw between a front end and a
+        # back end, and OWASP maps it under Insecure Design. Filing a desync PoC as "Vulnerable &
+        # Outdated Components" on an OWASP-driven submission form (report_formats._meta_table renders
+        # this field verbatim for Intigriti) reads as an outdated-dependency report and gets triaged as one.
+        "owasp": "A04:2021 Insecure Design",
         "categories": set(),
         "checklist": [
             "Identify a front-end/back-end chain (CDN, proxy, LB) and test CL.TE / TE.CL / TE.TE desync with timing probes.",
@@ -390,15 +420,21 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
 
 # Categories that aren't a core bounty class get a readable label so every
 # finding carries a class in the report.
+#
+# Every VULN_CLASSES entry above carries name + cwe + owasp; this table used to stop at cwe,
+# so any finding that fell through to it (a real, not-uncommon path -- see _classify below)
+# shipped in a report with an EMPTY OWASP field. A platform report form asks for both, so
+# owasp is filled in here the same way, using the standard OWASP Top 10 (2021) root cause for
+# each category.
 _CATEGORY_LABELS: dict[str, dict[str, str]] = {
-    "crypto": {"name": "Weak cryptography", "cwe": "CWE-327"},
-    "dependency": {"name": "Vulnerable dependency", "cwe": "CWE-1104"},
-    "network": {"name": "Insecure network / transport", "cwe": "CWE-295"},
-    "ci": {"name": "Insecure CI/CD workflow", "cwe": "CWE-1395"},
-    "headers": {"name": "Security hardening (headers)", "cwe": "CWE-693"},
-    "mixed_content": {"name": "Mixed content", "cwe": "CWE-311"},
-    "disclosure": {"name": "Information disclosure", "cwe": "CWE-200"},
-    "chrome-extension": {"name": "Browser extension misconfiguration", "cwe": "CWE-272"},
+    "crypto": {"name": "Weak cryptography", "cwe": "CWE-327", "owasp": "A02:2021 Cryptographic Failures"},
+    "dependency": {"name": "Vulnerable dependency", "cwe": "CWE-1104", "owasp": "A06:2021 Vulnerable & Outdated Components"},
+    "network": {"name": "Insecure network / transport", "cwe": "CWE-295", "owasp": "A02:2021 Cryptographic Failures"},
+    "ci": {"name": "Insecure CI/CD workflow", "cwe": "CWE-1395", "owasp": "A08:2021 Software & Data Integrity Failures"},
+    "headers": {"name": "Security hardening (headers)", "cwe": "CWE-693", "owasp": "A05:2021 Security Misconfiguration"},
+    "mixed_content": {"name": "Mixed content", "cwe": "CWE-311", "owasp": "A02:2021 Cryptographic Failures"},
+    "disclosure": {"name": "Information disclosure", "cwe": "CWE-200", "owasp": "A05:2021 Security Misconfiguration"},
+    "chrome-extension": {"name": "Browser extension misconfiguration", "cwe": "CWE-272", "owasp": "A05:2021 Security Misconfiguration"},
 }
 
 
@@ -532,7 +568,7 @@ def _classify(finding: dict[str, Any]) -> tuple[str, str, str, str]:
             return cid, meta["name"], meta["cwe"], meta.get("owasp", "")
     label = _CATEGORY_LABELS.get(category)
     if label:
-        return category, label["name"], label["cwe"], ""
+        return category, label["name"], label["cwe"], label.get("owasp", "")
     return category or "other", (category or "Other").replace("_", " ").title(), "", ""
 
 
@@ -627,15 +663,56 @@ def _poi_of(item: dict[str, Any]) -> dict[str, Any]:
     return poi if isinstance(poi, dict) else {}
 
 
-def build_replay_script(items: list[dict[str, Any]]) -> tuple[str, int]:
+def _resolved_proof_status(item: dict[str, Any]) -> str:
+    """An item's proof status as the caller resolved it, or ``""`` when the caller supplied none.
+
+    Reads the same two places ``greyiq_api._run_replay_items`` and ``campaign`` write it: the item's
+    own ``proof_status``, else the observed-vs-control block's ``status``."""
+    status = str(item.get("proof_status") or "").strip().lower()
+    if not status:
+        status = str(_poi_of(item).get("status") or "").strip().lower()
+    return status
+
+
+def _is_replayable(item: dict[str, Any], confirmed_only: bool = True) -> bool:
+    """Whether ``item`` may appear in a ``replay.sh`` / ``findings.har`` that CLAIMS confirmation.
+
+    The bundle artifacts announce themselves as the requests that CONFIRMED a finding — replay.sh says
+    so in its header, the HAR docstring says so, and the bundle INDEX repeats the claim — so a
+    candidate or missing lead riding along makes the whole bundle misrepresent itself. A triager who
+    re-runs a passive ``web.missing-header.*`` curl sees a perfectly ordinary response and reasonably
+    concludes the confirmed findings are noise too. ``campaign`` pre-filters to
+    ``proof_status == "confirmed"`` before calling, but the single-hunt bundle path does not:
+    ``greyiq_api._run_replay_items`` builds an item for EVERY finding in the cached run and hands the
+    lot to both builders.
+
+    ``confirmed_only=False`` is for the one caller whose artifact makes no such claim:
+    ``greyiq_api.get_report_ready`` rebuilds a runnable PREVIEW of a single finding the operator is
+    still assembling a report for, where a runnable request line is useful regardless of whether the
+    differential has been captured yet.
+
+    An item with NO resolved status at all is passed through either way: that caller either
+    pre-filtered or does not track status, and this is a backstop against mislabelling, not a second
+    confirm authority (``report._has_captured_artifact`` remains the only one)."""
+    if not confirmed_only:
+        return True
+    return _resolved_proof_status(item) in ("", "confirmed")
+
+
+def build_replay_script(items: list[dict[str, Any]], confirmed_only: bool = True) -> tuple[str, int]:
     """A runnable ``replay.sh`` reproducing each CONFIRMED finding's crafted benign request as a
     copy-paste ``curl`` (reusing ``_curl_from_evidence``). Every GreyIQ active probe is an idempotent
     GET/HEAD/OPTIONS, so the reproductions are safe to re-run IN SCOPE with the operator's own
     authorization. Any detected secret is redacted as a belt-and-suspenders. Returns
-    ``(script_text, count)``; ``("", 0)`` when no confirmed finding captured a crafted request line."""
+    ``(script_text, count)``; ``("", 0)`` when no confirmed finding captured a crafted request line.
+
+    Items whose resolved proof status is anything other than 'confirmed' are skipped unless
+    ``confirmed_only=False`` — see ``_is_replayable``."""
     body: list[str] = []
     n = 0
     for it in (items or []):
+        if not _is_replayable(it, confirmed_only):
+            continue
         finding = it.get("finding") if isinstance(it.get("finding"), dict) else {}
         pe = finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {}
         url = str(finding.get("location") or it.get("source_url") or "")
@@ -671,15 +748,21 @@ def build_replay_script(items: list[dict[str, Any]]) -> tuple[str, int]:
     return text + "\n", n
 
 
-def build_findings_har(items: list[dict[str, Any]], version: str = "", generated_at: str = "") -> tuple[dict[str, Any], int]:
+def build_findings_har(items: list[dict[str, Any]], version: str = "", generated_at: str = "",
+                       confirmed_only: bool = True) -> tuple[dict[str, Any], int]:
     """A minimal, valid HAR 1.2 log of the crafted requests that confirmed each finding — importable
     into Burp / browser devtools to re-issue. Each entry carries only the benign crafted request line +
     a literal (non-placeholder) crafted header; response BODIES are never embedded (GreyIQ's
     differential-only proof discipline) — only the redacted observed-differential summary. Returns
-    ``(har, count)``."""
+    ``(har, count)``.
+
+    Items whose resolved proof status is anything other than 'confirmed' are skipped unless
+    ``confirmed_only=False`` — see ``_is_replayable``."""
     stamp = str(generated_at or "").strip() or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     entries: list[dict[str, Any]] = []
     for it in (items or []):
+        if not _is_replayable(it, confirmed_only):
+            continue
         finding = it.get("finding") if isinstance(it.get("finding"), dict) else {}
         pe = finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {}
         req_line = str(pe.get("request_line") or "").strip()
@@ -732,15 +815,39 @@ def _html_open_poc(target: str, title: str, lead: str) -> str:
 
 
 def _html_csrf_poc(target: str) -> str:
+    """A CSRF PoC TEMPLATE the operator completes from the real form.
+
+    Deliberately not a finished, auto-submitting PoC. ``_check_csrf`` proves only that the page serves
+    a state-changing POST form with no anti-CSRF token — it captures neither the form's ``action`` nor
+    any field name, so the concrete request cannot be reconstructed here. This used to emit a page that
+    auto-POSTed an invented ``example_param=attacker-controlled`` to the PAGE url: against a real form
+    (``action="/account/email"``, fields ``email``/``confirm``) it changes nothing, so the report
+    presented a filled-in Proof of concept that silently does not work, and the finding's honest
+    'candidate' proof obligation was contradicted by an artifact that looked complete.
+
+    So: the placeholders are loud, the auto-submit is gone (submitting the wrong request is what made
+    this look finished), and the surrounding page states what must be substituted. Capturing the form's
+    action and input names in ``_check_csrf`` is what would let this be emitted complete."""
     a = _hattr(target)
     return (
-        "<!doctype html>\n<meta charset=\"utf-8\">\n<title>CSRF PoC</title>\n"
-        "<p>Open this page while authenticated to the target; it auto-submits the state-changing "
-        "request cross-site with no anti-CSRF token.</p>\n"
+        "<!doctype html>\n<meta charset=\"utf-8\">\n<title>CSRF PoC (template — complete before use)</title>\n"
+        "<p><strong>Template, not a finished PoC.</strong> GreyIQ confirmed this page serves a "
+        "state-changing POST form with no anti-CSRF token, but it did not capture that form's "
+        "<code>action</code> or field names, so they must be filled in from the target's own HTML:</p>\n"
+        "<ol>\n"
+        f"  <li>Replace the form <code>action</code> below with the real form's action (the page is "
+        f"<code>{a}</code>; the action is often a different path).</li>\n"
+        "  <li>Replace the hidden input(s) with the real form's field names and the values that make a "
+        "meaningful change.</li>\n"
+        "  <li>Host this on an origin you control, open it while authenticated to the target, submit, "
+        "and confirm the state actually changed server-side.</li>\n"
+        "</ol>\n"
         f"<form action=\"{a}\" method=\"POST\">\n"
-        "  <input type=\"hidden\" name=\"example_param\" value=\"attacker-controlled\">\n"
+        "  <!-- REPLACE: the real form's field names/values, one hidden input each. -->\n"
+        "  <input type=\"hidden\" name=\"REPLACE_WITH_REAL_FIELD_NAME\" value=\"attacker-controlled\">\n"
         "  <input type=\"submit\" value=\"Submit the cross-site request\">\n</form>\n"
-        "<script>document.forms[0].submit();</script>\n"
+        "<!-- No auto-submit on purpose: firing an unmodified template proves nothing and reads as a\n"
+        "     working PoC in a report. Submit it yourself once the fields above are real. -->\n"
     )
 
 
@@ -755,12 +862,23 @@ def _html_frame_poc(target: str) -> str:
 
 
 def _jwt_forge_poc(pe: dict[str, Any]) -> str:
-    """A forged-token PoC from the recovered HMAC secret — the demonstrated impact of a weak
-    JWT secret (arbitrary token forgery / privilege escalation)."""
+    """A forged-token PoC from the RECOVERED HMAC secret — the demonstrated impact of a weak JWT
+    secret (arbitrary token forgery / privilege escalation).
+
+    Returns "" unless a secret was actually recovered. Only ``active.jwt-weak-secret`` writes a
+    ``matched_value`` in the ``recovered: '…'`` shape; the other three JWT checks
+    (alg:none, alg-confusion, embedded-jwk) prove a DIFFERENT mechanism and recover no secret. This
+    used to default to the literal string ``<recovered-secret>`` and ``HS256``, so a confirmed Critical
+    alg:none finding shipped a pyjwt script that HMAC-signs with the placeholder text — the wrong
+    technique AND not runnable. A wrong PoC is worse than none: the triager runs it, nothing happens,
+    and the real finding looks false. Those classes now carry their exact recipe in the reproduction
+    STEPS instead (see ``_generic_concrete_repro``) and leave the PoC block to the captured evidence."""
     matched = str(pe.get("matched_value") or "")
     m = re.search(r"recovered:\s*'([^']*)'", matched)
+    if not m:
+        return ""
     alg_m = re.search(r"HMAC-(HS\d+)", matched)
-    secret = m.group(1) if m else "<recovered-secret>"
+    secret = m.group(1)
     alg = alg_m.group(1) if alg_m else "HS256"
     return (
         "# Forge an elevated token with the recovered signing secret, then replay it.\n"
@@ -845,10 +963,33 @@ def _generic_concrete_repro(finding: dict[str, Any], class_id: str, url: str,
     confirm = ("Confirm the response demonstrates the issue"
                + (f": {matched}" if matched else "")
                + (f" (observed {status})" if status else "") + ".")
-    steps = [
-        f"Send the exact request GreyIQ used to confirm this — benign and idempotent: `{curl}`",
-        confirm,
-    ]
+    # A crafted header the report cannot print verbatim (it holds a forged token, so the capture
+    # stores it as "Authorization: <forged alg:none token>") is DROPPED from the curl by
+    # _curl_from_evidence. Calling what is left "the exact request GreyIQ used to confirm this" makes
+    # the report disprove itself: the triager runs a bare unauthenticated GET, sees the ordinary
+    # anonymous page, and concludes the Critical auth-bypass is noise. Say what the request actually
+    # needs, and name the bare one as the control it really is.
+    req_hdr = str(pe.get("request_header") or "").strip()
+    if "<" in req_hdr:
+        # Name the header and hand over a runnable command that takes the token from a shell
+        # variable. The placeholder TEXT itself is never echoed into the command (a triager must
+        # never be able to paste a literal "<forged>" into a shell — test_active_new_checks guards
+        # that), and the bare request is labelled as what it actually is: the negative control.
+        hdr_name = (req_hdr.split(":", 1)[0] or "Authorization").strip() or "Authorization"
+        steps = [
+            f"This was confirmed with a crafted `{hdr_name}` header whose value you mint yourself — the "
+            f"steps below describe exactly how. Put the FULL header value "
+            f"(including any `Bearer ` prefix the app uses) in a shell variable and send: "
+            f"`FORGED='...' && curl -i -H \"{hdr_name}: $FORGED\" {shlex.quote(target)}`",
+            f"Negative control — the SAME request WITHOUT that header must not show the same result: "
+            f"`{curl}`. The difference between the two requests is the finding.",
+            confirm,
+        ]
+    else:
+        steps = [
+            f"Send the exact request GreyIQ used to confirm this — benign and idempotent: `{curl}`",
+            confirm,
+        ]
     poc = ""
     rid = str(finding.get("rule_id") or "")
     if class_id in ("xss", "client_sink"):
@@ -856,7 +997,9 @@ def _generic_concrete_repro(finding: dict[str, Any], class_id: str, url: str,
                      "Open the crafted URL above in a browser (or the PoC page below) to see it execute.")
         poc = _html_open_poc(target, "Reflected XSS PoC",
                              "Loading the crafted URL executes the injected script in the target's origin.")
-    elif class_id == "redirect" and "crlf" in rid:
+    elif class_id == "crlf" or (class_id == "redirect" and "crlf" in rid):
+        # The `redirect` half is kept for history: a ledger finding recorded before CRLF got its own
+        # class still carries class_id 'redirect' with a crlf rule_id, and must still reproduce.
         steps.append("The injected CR/LF sequence adds an attacker-controlled header to the response "
                      "(HTTP response splitting). Escalate to Set-Cookie injection, web-cache poisoning, or "
                      "reflected XSS carried in the split response.")
@@ -871,17 +1014,46 @@ def _generic_concrete_repro(finding: dict[str, Any], class_id: str, url: str,
         poc = _html_open_poc(target, "Open-redirect PoC",
                              "Following the crafted URL sends the browser to an attacker-controlled host.")
     elif class_id == "csrf":
-        steps.append("Host the PoC form below on an origin you control and open it while authenticated to "
-                     "the target; it performs the state-changing request cross-site with no anti-CSRF token.")
+        steps.append("Read the target's form HTML and note its `action` and field names — the check proves "
+                     "the form carries no anti-CSRF token but does not capture them. Complete the PoC "
+                     "template below with the real action and fields, host it on an origin you control, "
+                     "open it while authenticated to the target, submit it, and confirm the state actually "
+                     "changed server-side. That state change is the proof; the missing token alone is not.")
         poc = _html_csrf_poc(target)
     elif class_id == "headers":
         steps.append("The page can be framed cross-origin. Host the PoC frame below to demonstrate a "
                      "clickjacking overlay that hijacks a victim's clicks.")
         poc = _html_frame_poc(target)
     elif class_id == "jwt":
-        steps.append("Using the signing secret shown in the evidence, forge a token with elevated claims "
-                     "and replay it — the server accepts your forged token as authenticated (arbitrary "
-                     "token forgery / privilege escalation).")
+        # Each JWT check proves a DIFFERENT acceptance flaw, so each needs its own recipe. The single
+        # "use the signing secret shown in the evidence" step was only ever true for weak-secret; for
+        # the other three no secret exists, so it sent the triager looking for evidence that isn't
+        # there and paired it with an HMAC script that cannot reproduce the finding.
+        if "alg-none" in rid:
+            steps.append("The server accepted a token whose header declares `alg: none` with an EMPTY "
+                         "signature — signature verification is effectively disabled. Rebuild it from the "
+                         "captured token: base64url(`{\"alg\":\"none\",\"typ\":\"JWT\"}`) + '.' + "
+                         "base64url(the original payload, with `sub`/`role` changed) + '.' (a trailing dot "
+                         "and no signature bytes), then replay it in the same header. Any claim can be set, "
+                         "so this is full authentication bypass / privilege escalation.")
+        elif "alg-confusion" in rid:
+            steps.append("The server accepted an RS256-issued token re-signed as HMAC using its own RSA "
+                         "PUBLIC key as the shared secret (algorithm confusion): it picks the algorithm from "
+                         "the attacker-controlled header instead of pinning the expected one. Fetch the "
+                         "public key (its JWKS / certificate), then HMAC-sign the modified payload with the "
+                         "public key BYTES as the key. Since that key is public, anyone can mint valid "
+                         "tokens — full authentication bypass.")
+        elif "jwk" in rid:
+            steps.append("The server trusted a public key EMBEDDED in the token's own `jwk` header, so it "
+                         "verifies against a key the attacker supplied. Generate your own keypair, put its "
+                         "public JWK in the header, sign the modified payload with your private key, and "
+                         "replay — the server validates the signature against your key and accepts the "
+                         "forged claims. Full authentication bypass.")
+        else:
+            steps.append("Using the signing secret recovered in the evidence, forge a token with elevated "
+                         "claims and replay it — the server accepts your forged token as authenticated "
+                         "(arbitrary token forgery / privilege escalation).")
+        # Returns "" for every class except weak-secret, where a real secret was recovered.
         poc = _jwt_forge_poc(pe)
     elif class_id == "rce":
         steps.append("The benign `$(expr 111 + 111)` shell substitution was evaluated server-side (→ 222), "
@@ -951,18 +1123,31 @@ def _firebase_exposure_finding(exp: dict[str, Any], project: str) -> dict[str, A
     already READ it unauthenticated), with the default-deny rules as the negative control."""
     service = str(exp.get("service") or "Firebase data store")
     endpoint = str(exp.get("endpoint") or "")
+    # For Cloud Storage the probe's ``endpoint`` is the canonical bucket NAME (gs://<project>.appspot.com),
+    # which no HTTP client can fetch — putting it in request_line/location made the report's step 1
+    # `curl -sSiL gs://…`, which errors out on any machine, and put the same dead line in replay.sh and
+    # findings.har. The probe already built the working HTTPS reproduction in ``repro``
+    # (firebasestorage.googleapis.com/v0/b/<project>.appspot.com/o), so use THAT as the request target
+    # and keep the gs:// name where it belongs: naming the affected asset.
+    reproduce = str(exp.get("repro") or "")
+    http_endpoint = endpoint
+    if not endpoint.lower().startswith(("http://", "https://")):
+        url_m = re.search(r"https?://[^\s'\"]+", reproduce)
+        if url_m:
+            http_endpoint = url_m.group(0)
+    bucket_note = f" ({endpoint})" if endpoint and http_endpoint != endpoint else ""
     proof = {
         "status": "confirmed",
         "method": "benign unauthenticated GET (Realtime DB shallow read / Storage list — no stored values read)",
         "actor": "an unauthenticated attacker (no credentials, no key)",
-        "affected_asset": f"the Firebase project '{project}' {service}",
+        "affected_asset": f"the Firebase project '{project}' {service}{bucket_note}",
         "observed_result": str(exp.get("detail") or f"{service} returned data to an unauthenticated request"),
         "control_result": "Firebase's DEFAULT security rules deny anonymous read; this project's rules allow it — a misconfiguration, not the platform default",
         "evidence": str(exp.get("evidence") or ""),
         "limitations": "", "proof_obligation": "",
     }
     ev = {
-        "request_line": f"GET {endpoint}",
+        "request_line": f"GET {http_endpoint}",
         "request_header": "", "response_status": "HTTP 200",
         "matched_value": f"{service} readable unauthenticated",
         "read_data": str(exp.get("evidence") or ""),
@@ -971,7 +1156,7 @@ def _firebase_exposure_finding(exp: dict[str, Any], project: str) -> dict[str, A
         "rule_id": "active.firebase-exposure",
         "title": f"Open {service} — unauthenticated read (project {project})",
         "severity": str(exp.get("severity") or "high"), "confidence": "high",
-        "category": "disclosure", "file_path": endpoint, "location": endpoint,
+        "category": "disclosure", "file_path": http_endpoint, "location": http_endpoint,
         "line_start": 1, "line_end": 1, "snippet": str(exp.get("detail") or "")[:240],
         "remediation": "Lock the Firebase security rules to require authentication (deny public read) and scope access per authenticated user.",
         "redacted": True, "proof_evidence": ev,
@@ -2423,7 +2608,20 @@ def _run_bounty_hunt_body(
                     scanners_run = list(scanners_run) + ["active"]
             elif active_meta.get("in_scope"):
                 scanners_run = list(scanners_run) + ["active"]
-            _emit(f"active verification complete — {len(active_findings)} confirmed")
+            # Count the CONFIRMED subset, not the whole list: verify_active returns candidate-grade
+            # findings alongside confirmed ones (clickjacking and CSRF are always 'candidate', so are
+            # the no-credentials CORS variant, body-only host-header reflection, and the denied /
+            # out-of-scope open-bucket notes). Emitting len(active_findings) told the operator
+            # "2 confirmed" for a site that merely lacks X-Frame-Options and serves a tokenless form,
+            # while the report for those same two findings correctly read "Candidate / unverified" —
+            # the progress stream and the report disagreeing on the one word this engine is built on.
+            _confirmed_n = sum(
+                1 for f in active_findings
+                if str((f.get("_active_proof") or {}).get("status") or "").lower() == "confirmed")
+            _emit(
+                f"active verification complete — {_confirmed_n} confirmed"
+                + (f", {len(active_findings) - _confirmed_n} candidate" if len(active_findings) > _confirmed_n else "")
+            )
         except Exception as exc:  # noqa: BLE001 - active layer is best-effort; never break a hunt
             active_meta = {"in_scope": False, "skipped_reason": f"active verification error: {exc}"}
             _emit(f"active verification error: {exc}")

@@ -17,9 +17,19 @@ REPO_ROOT = BACKEND_DIR.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from bughunter import progress  # noqa: E402
+from bughunter import progress, rate_limit  # noqa: E402
 from bughunter.bounty import run_bounty_hunt  # noqa: E402
 from bughunter.campaign import run_campaign  # noqa: E402
+
+
+def setUpModule() -> None:
+    """Start from a full per-host active-request budget — see rate_limit.reset_shared_governors().
+
+    This module is the suite's heaviest consumer of the process-wide 127.0.0.1 bucket (573 of its
+    700 tokens), so without a module-boundary reset it both inherits an already-drained bucket and
+    starves every active-layer module that runs after it.
+    """
+    rate_limit.reset_shared_governors()
 
 
 class ProgressBufferTests(unittest.TestCase):

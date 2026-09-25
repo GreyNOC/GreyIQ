@@ -1,6 +1,6 @@
 """Offline hunt intelligence — the no-LLM hunt brain.
 
-TinyGPT (the 0.8M-param char-level model) is far too small to reason about vulnerability classes or
+TinyGPT (the tiny, well-under-10M-param char-level model) is far too small to reason about vulnerability classes or
 emit the structured guidance the hunt needs, so the OFFLINE path (no Claude/Ollama configured) used to
 get an EMPTY plan — it hunted blind. ``offline_plan`` fills that: it produces the SAME plan shape
 ``hunt_brain.plan_hunt`` does (param_hypotheses / probe_priority / ssrf_params / xss_params /
@@ -30,18 +30,21 @@ from bughunter.prover_classes import PROVER_CLASSES
 # param-name substring -> the vuln class it most likely feeds. Ordered by specificity in _classify.
 _SSRF_HINTS = ("url", "uri", "dest", "target", "callback", "webhook", "image", "avatar", "photo", "feed",
                "rss", "proxy", "fetch", "load", "site", "link", "source", "remote", "xml", "endpoint",
-               "redirect_uri", "return_to", "continue", "domain", "host", "server", "upload")
+               "redirect_uri", "return_to", "continue", "domain", "host", "server", "upload",
+               "notify", "connect")
 _XSS_HINTS = ("q", "s", "query", "search", "keyword", "term", "name", "title", "message", "comment",
-              "text", "body", "content", "desc", "subject", "error", "msg", "lang", "return", "ref")
+              "text", "body", "content", "desc", "subject", "error", "msg", "lang", "return", "ref",
+              "html", "note", "reply")
 _REDIRECT_HINTS = ("redirect", "next", "return", "url", "goto", "dest", "continue", "target", "back", "callback")
 _RCE_HINTS = ("cmd", "exec", "command", "ping", "host", "ip", "run", "shell", "exe", "system", "func")
 _TRAVERSAL_HINTS = ("file", "path", "page", "include", "doc", "document", "download", "attachment", "dir",
-                    "folder", "load", "read", "view", "template", "img")
+                    "folder", "load", "read", "view", "template", "img", "export", "resource")
 _SSTI_HINTS = ("template", "tpl", "render", "theme", "view", "layout", "format", "pattern")
 _SQLI_HINTS = ("id", "user", "uid", "order", "sort", "filter", "category", "cat", "product", "item",
-               "search", "query", "num", "page", "select", "where", "column", "field")
+               "search", "query", "num", "page", "select", "where", "column", "field", "code")
 _IDOR_PARAM_HINTS = ("id", "user_id", "userid", "uid", "account", "account_id", "order", "order_id",
-                     "invoice", "customer", "profile", "doc_id", "file_id", "record", "object")
+                     "invoice", "customer", "profile", "doc_id", "file_id", "record", "object",
+                     "uuid", "guid", "reference")
 
 # tech fingerprint -> classes to boost (a rendering/interpreter stack implies its injection surface).
 _TECH_CLASS = {

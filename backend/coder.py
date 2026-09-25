@@ -1,7 +1,7 @@
 """GreyIQ coding brain — routes chat to a capable model when one is configured.
 
 This is what makes GreyIQ able to actually code. The tiny local TinyGPT model
-(0.8M params, char-level) stays only as the offline last-resort fallback; when a
+(well under 10M params, char-level) stays only as the offline last-resort fallback; when a
 "brain" is configured here, coding/serious chat is answered by it instead.
 
 Providers (OpenAI-compatible ones share a client; Claude uses its official SDK):

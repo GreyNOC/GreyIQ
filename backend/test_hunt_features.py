@@ -26,7 +26,7 @@ class VersionContractTests(unittest.TestCase):
         # Weight files are indexed by these namespaces. Changing/adding/removing one MUST bump
         # FEATURE_VERSION (hunt_model rejects a mismatch), so this assertion is the tripwire
         # that forces the bump and a retrain rather than a silently wrong model.
-        self.assertEqual(hunt_features.FEATURE_VERSION, 1)
+        self.assertEqual(hunt_features.FEATURE_VERSION, 2)
         self.assertEqual(hunt_features.MAX_FEATURES, 64)
 
 
