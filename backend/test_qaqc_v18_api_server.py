@@ -67,6 +67,37 @@ def test_null_byte_path_returns_404_not_500():
     assert _status(sent) == 404
 
 
+def test_null_byte_path_is_refused_even_where_resolve_tolerates_it(monkeypatch):
+    """The same 404 on a platform whose .resolve() does not raise on a NUL.
+
+    The test above only sees the intended 404 where the OS does the rejecting for it: on POSIX
+    .resolve() raises ValueError('embedded null byte'). Windows returns the path unchanged, then
+    Path.exists() answers False for the same unraisable reason, and the request fell through to
+    the SPA fallback -- GET /%00 was served index.html with a 200. Stubbing .resolve() to the
+    identity reproduces that platform here, so this pins the rejection rather than the OS.
+    """
+    greyiq_api.GREYIQ_ACCESS_KEY = ""
+    monkeypatch.setattr(Path, "resolve", lambda self, strict=False: self)
+    scope = {
+        "type": "http", "method": "GET", "path": "/\x00", "scheme": "http",
+        "headers": [(b"host", b"127.0.0.1:8766")],
+    }
+    assert _status(_drive_route(scope)) == 404
+
+
+def test_static_target_refuses_nulls_and_traversal_but_passes_ordinary_names():
+    target = greyiq_api._static_target
+    public = greyiq_api.PUBLIC_DIR.resolve()
+    # Refused: a NUL anywhere in the name, and any name that leaves PUBLIC_DIR.
+    assert target("\x00") is None
+    assert target("assets/app\x00.js") is None, "a NUL past the first character is still a NUL"
+    assert target("../backend/greyiq_api.py") is None
+    # Served: the SPA and its assets, whether or not the file happens to exist -- a name that
+    # simply is not there falls through to send_index(), which is how client-side routes work.
+    assert target("index.html") == public / "index.html"
+    assert target("dashboard/findings") == public / "dashboard" / "findings"
+
+
 # --- Host-header allowlist: DNS rebinding refused ------------------------------
 
 def test_host_header_allowed_matrix():

@@ -5840,6 +5840,37 @@ async def send_json(send: Any, payload: Any, status_code: int = 200) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
+def _static_target(relative_path: str) -> Path | None:
+    """The file under ``PUBLIC_DIR`` a request path names, or ``None`` if it names none.
+
+    ``None`` is the single "refuse this, 404" answer for every reason a request path is not a
+    servable name: a traversal out of ``PUBLIC_DIR``, an OS that will not even parse the string,
+    and a NUL byte.
+
+    The NUL is checked here rather than left to the OS because the two platforms disagree about
+    who notices it, and the disagreement was silent. On POSIX ``.resolve()`` raises
+    ``ValueError('embedded null byte')``, which the guard below catches -- so ``GET /%00``
+    answered 404 and the test pinning that passed. On Windows ``.resolve()`` returns the path
+    with the NUL still in it, ``relative_to`` is happy because it really is under ``PUBLIC_DIR``,
+    and then ``Path.exists()`` swallows the same ValueError and answers False -- so the request
+    fell through to the SPA fallback and a NUL probe was served index.html with a 200. Rejecting
+    the byte in Python gives one answer on both.
+
+    ``.resolve()`` stays INSIDE the try for everything else it raises on: a path this OS will not
+    parse must become the 404 below, not an escape into the generic 500 handler with a logged
+    traceback. Doing the whole decision here is what lets a test assert the rule itself rather
+    than whichever half of it the test machine's OS happens to implement.
+    """
+    if "\x00" in relative_path:
+        return None
+    try:
+        file_path = (PUBLIC_DIR / relative_path).resolve()
+        file_path.relative_to(PUBLIC_DIR.resolve())
+    except (ValueError, OSError):
+        return None
+    return file_path
+
+
 async def send_file(send: Any, path: Path, status_code: int = 200) -> None:
     try:
         body = await asyncio.to_thread(path.read_bytes)
@@ -6405,15 +6436,8 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             await send_json(send, {"error": "not found"}, 404)
             return
 
-        relative_path = unquote(path.lstrip("/")) or "index.html"
-        try:
-            # .resolve() itself raises ValueError('embedded null byte') / OSError on a
-            # trivially malformed path (e.g. GET /%00 -> relative_path "\x00"), so it must
-            # live INSIDE the guard alongside the traversal check -- otherwise it escapes to
-            # the generic 500 handler with a logged traceback instead of the intended 404.
-            file_path = (PUBLIC_DIR / relative_path).resolve()
-            file_path.relative_to(PUBLIC_DIR.resolve())
-        except (ValueError, OSError):
+        file_path = _static_target(unquote(path.lstrip("/")) or "index.html")
+        if file_path is None:
             await send_json(send, {"error": "not found"}, 404)
             return
         if file_path.exists() and file_path.is_file():
