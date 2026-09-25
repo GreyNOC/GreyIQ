@@ -225,14 +225,11 @@ class RestoreAFindingTests(unittest.TestCase):
         board = _js_function("ckDeleteFinding")
         self.assertIn("res.dedup_key", board, "the board delete drops the only handle on the suppression")
         self.assertIn("ckState.lastDeleted", board)
-        # The history row's delete lives inside the row builder, not a function of its own.
-        history = _js_function("ckHistoryRow") if "function ckHistoryRow(" in JS else JS
-        self.assertRegex(
-            history,
-            r"res\.dedup_key \|\| rec\.dedup_key",
-            "the history delete drops the dedup_key the dismiss response returned",
-        )
-        self.assertIn("ckUndoDeleteBar(rec.title", JS, "the history row removes itself with no way back")
+        history = _js_function("ckHistoryRow")
+        self.assertIn("res.dedup_key || rec.dedup_key", history,
+                      "the history delete drops the dedup_key the dismiss response returned")
+        self.assertIn("ckUndoDeleteBar(rec.title", history,
+                      "the history row removes itself with no way back")
 
     def test_the_board_renders_the_undo_before_the_empty_state(self) -> None:
         # Deleting the last finding leaves an empty board — exactly when an accidental delete is

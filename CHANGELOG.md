@@ -59,6 +59,68 @@ This release also carries the **v4.4.1 changelog entry, which was published as a
 to main** - `git diff v4.4.1 origin/main` was the version bump and that entry, and nothing else. The
 entry is restored below so the history does not skip a shipped version.
 
+**Six one-directional wiring gaps, where the engine computed something real and nothing collected
+it.** This whole class is invisible at runtime: a response field the client never reads looks exactly
+like a field the server never sent, and a route with no caller looks exactly like a route nobody
+needs. Nothing errors, nothing logs, and the capability simply is not there.
+
+Two were values thrown away on arrival. **`get_report_ready` rebuilds a runnable `replay.sh` and a
+`findings.har`** for the finding being readied - from its captured crafted request, deliberately
+without the confirmed-only filter the bundle path applies, because this is a preview of a finding
+still being assembled. Both ride that one response and are never stored in the ledger, so the Report
+Center dropped them and a history finding had no reproduction artifact at all. It now keeps them on
+the record and offers each as a download, but only when it has one: the server returns `""`/`null`
+when nothing was reconstructable, and an unconditional menu item would hand a triager an empty file
+and call it a reproduction. **`/prove` returns the captured request/response artifact per result**
+(`_compact_active` has carried `proof_evidence` since the Prove flow was built), and every call site
+kept the observed/control prose and discarded the artifact. For a finding proven from the cached run
+that was survivable - the engine persists the same artifact server-side - but a finding re-proven
+from *history* has no cached run to read it back from, so the concrete headers a triager asks for
+were gone. All three prove sites now fold it onto the finding and the campaign drawer's report sends
+it. `ProofEvidenceInput` also gained `sensitive_data_labels`, which `report.py` reads in two places
+and the request model was silently dropping - the labels are classified on the *raw* body and survive
+redaction where the excerpt they would otherwise be re-derived from does not.
+
+Four were routes with nothing on the other end. **`/api/bounty/finding/restore`** existed while both
+delete sites discarded the `dedup_key` the dismiss response returns - and that key is the only handle
+on the suppression a delete records, because the server derives it when the caller has none. An
+accidental delete was therefore permanent. Both sites keep it now and offer *Undo delete*, honestly:
+restore is idempotent, so the bar distinguishes "restored" from "there was nothing to restore", and
+it says that restoring lifts the suppression for future hunts rather than putting the row back on the
+in-memory board. **`/api/oob/poll`** existed while *Mint callback URL* handed the operator a token
+nothing could check; the blind provers poll their own tokens internally, but a payload pasted by hand
+had no read-back at all. The OOB panel gets a poll control that Mint pre-fills. Worth more than it
+was, now that the collaborator config reaches every hunt path and the four blind provers actually
+run.
+
+**`/api/workspace/rollback` was the orphan, but the wired route was the bug.** `/api/agent/undo`
+wrote the pre-run text back over whatever was on disk, with no way to tell "still exactly what the
+run wrote" from "the user has been working in this file for an hour since" - so an undo destroyed
+work the agent had never touched. `workspace.rollback_changes` has always refused that case and
+documented refusing it; the snapshot route had no fingerprint to refuse it with. The snapshot now
+carries the sha256 of what the run last wrote, and restore skips any file matching neither that nor
+the pre-run text, reporting it per-file instead of overwriting it. A file already put back one at a
+time is not a conflict, and a snapshot written before the fingerprint existed still restores exactly
+as it did. The same payload was also dropping `content_unavailable`, so the existing guard against
+blanking a file whose original could not be read had never once fired in the real pipeline - its test
+hand-built the entry the serializer omitted. The orphaned route is wired where it belongs: per-file
+*Revert* in the Changes panel, the conservative sibling of an all-or-nothing undo.
+
+**`/api/bounty/stored-xss-beacon` was unwireable by construction, and the fix is server-side.** It
+took the OOB collaborator base and secret as *request* fields while `oob_config_status` returns only
+`has_secret`, never the secret - so no client could ever fill them in, and making one able to would
+mean weakening the boundary that keeps the secret server-side. Instead the route now reads the saved
+config exactly as `oob-ssrf`, `oob-xxe`, mint and poll do, the two fields are gone from the request
+model, and a client that sends them is ignored. With the secret never leaving the server, the panel
+gets a form.
+
+`backend/test_route_wiring_contracts.py` pins each seam in both directions - the client reads the
+field, *and* every field the route returns is read by something, with the three deliberate exceptions
+named and justified - because a producer with no consumer and a consumer with no producer fail
+identically and silently. It also carries a register of the eleven `/api` routes the app still does
+not call, each with the reason, so a new orphan fails the gate rather than quietly never shipping.
+Every fix was verified non-vacuous by reverting it and watching its test go red.
+
 ## v4.4.1 - the shipped runtime moves to Electron 44.3.0
 
 No GreyIQ source changed in this release. `git diff v4.4.0..HEAD` touches `package.json` and

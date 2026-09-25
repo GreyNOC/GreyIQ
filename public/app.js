@@ -5728,15 +5728,10 @@ function ckRenderDetail(f) {
   host.append(researchWrap);
 }
 
-// Delete a board finding: permanently suppress it (server records its stable dedup key) so
-// no future hunt or campaign surfaces it again, then drop it from the in-memory board and
-// close the drawer. The server derives the key from class_id/rule_id/location — the same
-// fields the engine keys on — so the deletion sticks across runs, targets, and programs.
-// "Delete finding" is a SUPPRESSION, not an erase: the server records the finding's stable dedup
-// key so no future hunt surfaces it again, and /api/bounty/finding/restore lifts that suppression.
-// The dismiss response's dedup_key is the only handle on it — the server derives the key itself
-// when the caller had none, so nothing left in the app can recompute it. Discard it and a
-// mis-click is permanent. This bar keeps it, and spends it on one click.
+// A delete is a SUPPRESSION, not an erase — and /api/bounty/finding/restore lifts it. The
+// dismiss response's dedup_key is the only handle on that suppression, because the server derives
+// the key itself when the caller had none and nothing left in the app can recompute it. Discard
+// it and a mis-click is permanent. This bar keeps it, and spends it on one click.
 function ckUndoDeleteBar(title, dedupKey, onRestored, onDismiss) {
   const bar = cel("div", "ck-actions");
   const note = cel("span", "ck-hint", `Deleted “${title}” — it won't be surfaced again.`);
@@ -5781,6 +5776,10 @@ function ckUndoDeleteBar(title, dedupKey, onRestored, onDismiss) {
   return bar;
 }
 
+// Delete a board finding: permanently suppress it (server records its stable dedup key) so
+// no future hunt or campaign surfaces it again, then drop it from the in-memory board and
+// close the drawer. The server derives the key from class_id/rule_id/location — the same
+// fields the engine keys on — so the deletion sticks across runs, targets, and programs.
 async function ckDeleteFinding(f, btn) {
   if (!window.confirm(
     `Delete "${f.title}"?\n\nIt's removed from this board and will never be surfaced again in future hunts or campaigns. `
@@ -8429,7 +8428,7 @@ function ckOobPanel() {
   const wrap = cel("div");
   wrap.id = "ckOobPanel";  // scroll target for the "Set up SSRF/OOB →" program-row shortcut
   wrap.append(cel("h2", "ck-section-title", "Out-of-band (OOB) — blind SSRF"));
-  wrap.append(cel("p", "ck-hint", "Confirm blind bugs with your own collaborator: the probe injects a unique callback URL and polls the collaborator for a hit. Configure your collaborator (e.g. your phone's tunnel), then auto-confirm blind SSRF, or mint a URL to paste into a manual XXE / blind-XSS payload."));
+  wrap.append(cel("p", "ck-hint", "Confirm blind bugs with your own collaborator: the probe injects a unique callback URL and polls the collaborator for a hit. Configure your collaborator (e.g. your phone's tunnel), then auto-confirm blind SSRF / XXE / stored-XSS-on-render below — or mint a URL to paste into a payload of your own and check that token for callbacks yourself."));
 
   const cfg = cel("div", "ck-creds");
   const head = cel("div", "ck-creds-head"); head.append(cel("strong", null, "Collaborator"));
