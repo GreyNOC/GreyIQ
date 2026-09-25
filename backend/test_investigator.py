@@ -401,6 +401,38 @@ class InvestigationCortexTests(unittest.TestCase):
         self.assertLessEqual(len(graph["hypotheses"]), investigator._MAX_HYPOTHESES)
 
 
+class ArtifactVocabularyTests(unittest.TestCase):
+    """The artifact inventory must read the REAL proof_evidence schema keys.
+
+    ``_artifact_types`` used to derive its 22-point "captured-response-body" artifact from
+    response_body / response_body_excerpt / body_excerpt / sensitive_data — four names with no
+    producer anywhere in the repo. The schema key every capture site actually writes is ``read_data``
+    (active_verify_service._finding and 14 sibling producers, api_discovery_service, the
+    access-control and stored-XSS services), so the branch never fired and a finding that captured a
+    whole disclosed body scored as if it had captured nothing.
+    """
+
+    def test_read_data_is_inventoried_as_a_captured_response_body(self) -> None:
+        artifacts = investigator._artifact_types(
+            {"ref": "F1", "proof_evidence": {"read_data": '{"email":"victim@acme.com","balance":1337}'}}, {})
+        self.assertIn("captured-response-body", artifacts)
+
+    def test_the_inventoried_names_exist_in_the_real_schema(self) -> None:
+        # Guards the drift that made this dead: whatever key names this function reads for the body
+        # artifact, at least one of them must be a key a producer actually writes.
+        import re
+
+        source = (BACKEND_DIR / "bughunter" / "active_verify_service.py").read_text(encoding="utf-8")
+        produced = set(re.findall(r'"(read_data|response_body|response_body_excerpt|body_excerpt|sensitive_data)"', source))
+        self.assertIn("read_data", produced,
+                      "active_verify_service no longer writes read_data — update _artifact_types to the new key")
+
+    def test_a_finding_with_no_captured_body_is_unchanged(self) -> None:
+        artifacts = investigator._artifact_types(
+            {"ref": "F1", "proof_evidence": {"request_line": "GET https://t/", "response_status": "HTTP 200"}}, {})
+        self.assertNotIn("captured-response-body", artifacts)
+
+
 class ActiveTheorizingTests(unittest.TestCase):
     """The cortex has to answer "what should I test NEXT", not only "what did we find".
 

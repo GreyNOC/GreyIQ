@@ -58,13 +58,70 @@ class OfflinePlanTests(unittest.TestCase):
             self.assertIn(row["endpoint"], allowed)                # never invents a URL
 
     def test_learned_priors_reorder_classes(self) -> None:
-        # the LEARNING signal: a class the program has rewarded is tried first
+        # the LEARNING signal: a class the program has rewarded is tried first.
+        # Boost a class that /search?q= genuinely admits (its own q= is a sink for both xss and sqli)
+        # rather than one it does not, because priors REORDER candidates — they cannot conjure one.
         base = offline_hunt.offline_plan(_SURFACE)
         search = next(r for r in base["probe_priority"] if "search" in r["endpoint"])
-        boosted = offline_hunt.offline_plan(_SURFACE, priors={"path-traversal": 5.0})
+        self.assertEqual(search["classes"][:2], ["xss", "sqli"])     # untouched order
+        boosted = offline_hunt.offline_plan(_SURFACE, priors={"sqli": 5.0})
         search2 = next(r for r in boosted["probe_priority"] if "search" in r["endpoint"])
-        self.assertIn("path-traversal", search["classes"])
-        self.assertEqual(search2["classes"][0], "path-traversal")   # boosted to the front
+        self.assertEqual(search2["classes"][0], "sqli")              # boosted to the front
+
+    def test_class_cues_come_from_the_endpoints_own_params_not_the_whole_host(self) -> None:
+        """A param seen elsewhere on the host must not re-class an endpoint that does not take it.
+
+        offline_plan used to pass `names + sorted(recon_params)` — every endpoint got cues from the
+        WHOLE host's param list, so the per-endpoint ranking said the same thing about all of them.
+        Because _classes_for_endpoint caps the set and appends newly-reachable classes last, the
+        shared params saturated the cap and truncated the endpoint's own classes away, and with every
+        score then equal the priority cap broke ties by discovery order — evicting high-signal
+        endpoints in favour of whatever happened to be crawled first.
+        """
+        plan = offline_hunt.offline_plan(_SURFACE)
+        by_endpoint = {row["endpoint"]: row["classes"] for row in plan["probe_priority"]}
+
+        # `file` belongs to /download; it must not make /search a path-traversal target...
+        self.assertNotIn("path-traversal", by_endpoint["https://t/search?q=x"])
+        # ...nor `q` make /download an xss/sqli one...
+        for leaked in ("xss", "sqli"):
+            self.assertNotIn(leaked, by_endpoint["https://t/download?file=a.pdf"])
+        # ...while each endpoint still leads with the class its OWN input justifies.
+        self.assertEqual(by_endpoint["https://t/download?file=a.pdf"][0], "path-traversal")
+        self.assertEqual(by_endpoint["https://t/search?q=x"][0], "xss")
+        self.assertEqual(by_endpoint["https://t/redirect?url=x"][0], "redirect")
+
+        # The consequence that matters: distinct endpoints get distinct guidance. Host-wide cues
+        # collapsed a whole surface onto a couple of identical class-sets.
+        distinct = {tuple(classes) for classes in by_endpoint.values()}
+        self.assertGreaterEqual(len(distinct), 5, f"per-endpoint ranking collapsed: {distinct}")
+
+        # Scoping the CUES must not narrow COVERAGE. The host-wide recon params reach the prover as
+        # extra_params, which _candidate_params unions into every param-keyed check on every
+        # endpoint, so `file` is still tried on /search — it just no longer re-classes it. Pin that
+        # union here, because it is the reason this scoping is safe.
+        from bughunter.active_verify_service import _candidate_params  # noqa: PLC0415
+
+        tried = _candidate_params("https://t/search?q=x", sorted(_SURFACE["params"]), (), 4)
+        self.assertEqual([n.lower() for n in tried[:1]], ["q"])   # its own param leads
+        self.assertIn("file", [n.lower() for n in tried])         # the host-wide name is still tried
+
+        # param_hypotheses, by contrast, deliberately omits already-discovered names: they are
+        # already in extra_params, so proposing them again would only burn the hypothesis cap.
+        self.assertNotIn("file", plan["param_hypotheses"])
+
+    def test_form_fields_of_the_endpoints_own_form_do_count_as_its_cues(self) -> None:
+        # The flip side of scoping: a POST target's cues live in its form, not its query string.
+        surface = {
+            "endpoints": ["https://t/upload", "https://t/about"],
+            "params": [],
+            "tech": [],
+            "forms": [{"action": "https://t/upload", "method": "post", "params": ["filename", "template"]}],
+        }
+        plan = offline_hunt.offline_plan(surface)
+        by_endpoint = {row["endpoint"]: row["classes"] for row in plan["probe_priority"]}
+        self.assertIn("path-traversal", by_endpoint["https://t/upload"])   # from the form's filename
+        self.assertNotIn("path-traversal", by_endpoint.get("https://t/about", []))
 
     def test_noisy_prior_falls_below_unseen_neutral_classes(self) -> None:
         # learned_priors are multipliers around neutral=1.0. A known-noisy 0.5

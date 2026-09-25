@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import importlib
+import importlib.util
 import os
 import sys
 import tempfile
@@ -11,6 +11,19 @@ from pathlib import Path
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
+
+# solin_core imports torch at module scope, and torch is a heavy OPTIONAL dependency: the frozen
+# build ships without it (build/greyiq-backend.spec), the whole point of test_boot_no_torch.py is that
+# the app degrades cleanly when it is absent, and the CLI is torch-free by design. Skip the module
+# rather than letting the import blow up.
+#
+# This matters more than it used to. Under `unittest discover` an import error here was logged and the
+# other ~2950 tests still ran; pytest treats a collection error as fatal and INTERRUPTS the whole run,
+# so without this guard `npm run check` reports zero tests on any machine without torch — turning the
+# release gate off entirely rather than narrowing it.
+if importlib.util.find_spec("torch") is None:  # pragma: no cover - environment-dependent
+    raise unittest.SkipTest("torch is not installed; solin_core cannot be imported (the app degrades "
+                            "without it by design — see test_boot_no_torch.py)")
 
 import solin_core  # noqa: E402
 from solin_core import (  # noqa: E402

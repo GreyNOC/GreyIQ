@@ -197,7 +197,7 @@
             <button class="text-button" type="button" id="brainOpsRefresh">Refresh</button>
           </div>
           <section class="brain-technique-list" id="brainTechniqueList" aria-live="polite">
-            <p class="ops-empty">Waiting for the local engine?</p>
+            <p class="ops-empty">Waiting for the local engine…</p>
           </section>
 
           <div class="ops-section-heading">
@@ -234,9 +234,137 @@
           </section>
 
           <button class="text-button primary-action" id="trainButton" type="button">Train the local model</button>
+          <div class="folder-actions">
+            <button class="text-button" type="button" id="trainPause" hidden>Pause</button>
+            <button class="text-button danger" type="button" id="trainStop" hidden>Stop</button>
+          </div>
+          <p class="folder-status" id="trainStatus" aria-live="polite"></p>
+
+          <!-- Live run: progress, the loss curve, and what the trainer actually chose. Everything here
+               comes from /api/train/status — the panel used to discard all of it. -->
+          <section class="train-progress" id="trainProgress" aria-label="Training progress" hidden>
+            <div class="train-progress-bar" role="progressbar" aria-labelledby="trainProgressLabel"
+                 aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="trainProgressBar">
+              <span id="trainProgressFill"></span>
+            </div>
+            <p class="folder-status" id="trainProgressLabel">step 0 / 0</p>
+            <svg class="train-curve" id="trainCurve" viewBox="0 0 240 60" preserveAspectRatio="none"
+                 role="img" aria-labelledby="trainCurveLabel" hidden>
+              <title id="trainCurveLabel">Training and validation loss per evaluation</title>
+            </svg>
+            <div class="meter-wrap" aria-label="Run metrics">
+              <div class="meter-row"><span>Train loss</span><strong id="trainLossValue">—</strong></div>
+              <div class="meter-row"><span>Val loss</span><strong id="valLossValue">—</strong></div>
+              <div class="meter-row"><span>Best val</span><strong id="bestLossValue">—</strong></div>
+              <div class="meter-row"><span>Device</span><strong id="trainDeviceValue">—</strong></div>
+              <div class="meter-row"><span>Batch</span><strong id="trainBatchValue">—</strong></div>
+              <div class="meter-row"><span>Corpus</span><strong id="trainCorpusValue">—</strong></div>
+            </div>
+          </section>
+
+          <details class="mode-fold" id="trainSettingsFold">
+            <summary><span>Training settings</span><svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></summary>
+            <form class="choice-form" id="trainSettingsForm">
+              <label>
+                <span>Brain size</span>
+                <select id="trainModelSize" name="trainModelSize"></select>
+              </label>
+              <p class="folder-status" id="trainModelSizeNote"></p>
+
+              <div class="field-grid">
+                <label>
+                  <span>Steps</span>
+                  <input id="trainMaxIters" name="trainMaxIters" type="number" min="1" max="100000" step="10">
+                </label>
+                <label>
+                  <span>Check every</span>
+                  <input id="trainEvalInterval" name="trainEvalInterval" type="number" min="1" max="100000" step="5">
+                </label>
+              </div>
+
+              <div class="field-grid">
+                <label>
+                  <span>Learning rate</span>
+                  <input id="trainLearningRate" name="trainLearningRate" type="number" min="0.000001" max="0.01" step="0.0001">
+                </label>
+                <label>
+                  <span>Batch size</span>
+                  <input id="trainBatchSize" name="trainBatchSize" type="number" min="0" max="512" step="1" placeholder="auto">
+                </label>
+              </div>
+
+              <div class="field-grid">
+                <label>
+                  <span>Device</span>
+                  <select id="trainDevice" name="trainDevice">
+                    <option value="auto">Auto (detect)</option>
+                    <option value="cpu">CPU</option>
+                    <option value="cuda">GPU (CUDA)</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Corpus cap (MB)</span>
+                  <input id="trainDatasetCap" name="trainDatasetCap" type="number" min="1" max="16" step="1">
+                </label>
+              </div>
+
+              <label class="toggle-row" for="trainFreshStart">
+                <input id="trainFreshStart" type="checkbox">
+                <span><strong>Start from scratch</strong><small>Ignore the existing checkpoint and retrain from random weights.</small></span>
+              </label>
+              <label class="toggle-row" for="trainAutoStop">
+                <input id="trainAutoStop" type="checkbox">
+                <span><strong>Stop early when it plateaus</strong><small>End the run once validation loss stops improving.</small></span>
+              </label>
+              <div class="field-grid" id="trainPatienceRow">
+                <label>
+                  <span>Patience</span>
+                  <input id="trainPatience" name="trainPatience" type="number" min="1" max="50" step="1">
+                </label>
+                <label>
+                  <span>Min improvement</span>
+                  <input id="trainMinDelta" name="trainMinDelta" type="number" min="0" max="1" step="0.0001">
+                </label>
+              </div>
+              <label class="toggle-row" for="trainRestoreBest">
+                <input id="trainRestoreBest" type="checkbox">
+                <span><strong>Keep the best weights</strong><small>Restore the best-scoring step at the end instead of the last one.</small></span>
+              </label>
+              <label class="toggle-row" for="trainSaveBestOnly">
+                <input id="trainSaveBestOnly" type="checkbox">
+                <span><strong>Only publish improvements</strong><small>Write the model file only when a step beats the best score so far.</small></span>
+              </label>
+
+              <div class="folder-actions">
+                <button class="text-button" type="button" id="trainSettingsReset">Reset to defaults</button>
+                <button class="text-button" type="button" id="trainDatasetRefresh">Check the corpus</button>
+              </div>
+              <p class="folder-status" id="trainDatasetStatus" aria-live="polite"></p>
+            </form>
+          </details>
 
           <div class="source-heading">Train on</div>
           <section class="source-picker" id="trainingSourceList" aria-label="Training sources"></section>
+
+          <details class="mode-fold" id="huntBrainFold">
+            <summary><span>Hunting brain</span><svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></summary>
+            <div class="choice-form">
+              <p class="folder-status">A separate, auditable ranker that orders which checks the prover
+                spends its budget on. It learns from your own confirmed and unconfirmed hunt outcomes,
+                and is only promoted when it beats the built-in rules on held-out programs.</p>
+              <section class="meter-wrap" aria-label="Hunting brain status">
+                <div class="meter-row"><span>Active model</span><strong id="huntModelSource">—</strong></div>
+                <div class="meter-row"><span>Trace rows</span><strong id="huntModelRows">—</strong></div>
+                <div class="meter-row"><span>Last score</span><strong id="huntModelScore">—</strong></div>
+              </section>
+              <div class="folder-actions">
+                <button class="text-button" type="button" id="huntBrainRefresh">Refresh</button>
+                <button class="text-button" type="button" id="huntBrainDryRun">Evaluate only</button>
+                <button class="text-button primary-action" type="button" id="huntBrainTrain">Train the hunting brain</button>
+              </div>
+              <p class="folder-status" id="huntBrainStatus" aria-live="polite"></p>
+            </div>
+          </details>
 
           <details class="mode-fold">
             <summary><span>Add a preference</span><svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></summary>

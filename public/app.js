@@ -62,8 +62,49 @@ const TRAINING_SOURCES = [
     id: "src_imported_docs",
     name: "Imported Documents",
     description: "Longer pasted or ingested document text."
+  },
+  {
+    id: "src_manuals",
+    name: "Bundled Manuals",
+    description: "The shipped manual/PDF extract — the largest corpus available (~6 MB)."
   }
 ];
+
+// Defaults for a training run. Kept in one place so the form, the reset button and the request all
+// agree, and so the shape persisted in localStorage has a single definition.
+const DEFAULT_TRAIN_SETTINGS = {
+  modelSize: "compact",
+  maxIters: 160,
+  evalInterval: 40,
+  learningRate: 0.0003,
+  batchSize: 0,          // 0 = size it from the architecture's context length
+  device: "auto",
+  datasetCapMb: 16,
+  freshStart: false,
+  autoStop: true,
+  patience: 3,
+  minDelta: 0.0001,
+  restoreBest: true,
+  saveBestOnly: true
+};
+
+// Brain sizes, described in terms an operator can choose between. The backend is the source of truth
+// for the actual shapes (training_runtime.MODEL_PRESETS) and /api/train/dataset reports real parameter
+// counts; these are the labels and the honest trade-off for each.
+const MODEL_SIZE_LABELS = {
+  compact: {
+    label: "Compact — keeps improving your current model",
+    note: "The shape your model already has, so a run continues from where it left off. Fastest, and safe on CPU."
+  },
+  standard: {
+    label: "Standard — bigger brain, starts over",
+    note: "About 8x the capacity and 4x the context. Starts from random weights, so it needs a real corpus and many more steps before it beats Compact. Your current model is archived, not replaced."
+  },
+  large: {
+    label: "Large — biggest brain, wants a GPU",
+    note: "Roughly 26x the capacity. Expect a long run on CPU. Starts from random weights; your current model is archived."
+  }
+};
 
 const DEFAULT_BOTS = [
   {
@@ -201,6 +242,46 @@ const els = {
   agentCmdPolicy: document.querySelector("#agentCmdPolicy"),
   trainingSourceList: document.querySelector("#trainingSourceList"),
   trainButton: document.querySelector("#trainButton"),
+  trainPause: document.querySelector("#trainPause"),
+  trainStop: document.querySelector("#trainStop"),
+  trainStatus: document.querySelector("#trainStatus"),
+  trainProgress: document.querySelector("#trainProgress"),
+  trainProgressBar: document.querySelector("#trainProgressBar"),
+  trainProgressFill: document.querySelector("#trainProgressFill"),
+  trainProgressLabel: document.querySelector("#trainProgressLabel"),
+  trainCurve: document.querySelector("#trainCurve"),
+  trainLossValue: document.querySelector("#trainLossValue"),
+  valLossValue: document.querySelector("#valLossValue"),
+  bestLossValue: document.querySelector("#bestLossValue"),
+  trainDeviceValue: document.querySelector("#trainDeviceValue"),
+  trainBatchValue: document.querySelector("#trainBatchValue"),
+  trainCorpusValue: document.querySelector("#trainCorpusValue"),
+  trainSettingsForm: document.querySelector("#trainSettingsForm"),
+  trainModelSize: document.querySelector("#trainModelSize"),
+  trainModelSizeNote: document.querySelector("#trainModelSizeNote"),
+  trainMaxIters: document.querySelector("#trainMaxIters"),
+  trainEvalInterval: document.querySelector("#trainEvalInterval"),
+  trainLearningRate: document.querySelector("#trainLearningRate"),
+  trainBatchSize: document.querySelector("#trainBatchSize"),
+  trainDevice: document.querySelector("#trainDevice"),
+  trainDatasetCap: document.querySelector("#trainDatasetCap"),
+  trainFreshStart: document.querySelector("#trainFreshStart"),
+  trainAutoStop: document.querySelector("#trainAutoStop"),
+  trainPatience: document.querySelector("#trainPatience"),
+  trainPatienceRow: document.querySelector("#trainPatienceRow"),
+  trainMinDelta: document.querySelector("#trainMinDelta"),
+  trainRestoreBest: document.querySelector("#trainRestoreBest"),
+  trainSaveBestOnly: document.querySelector("#trainSaveBestOnly"),
+  trainSettingsReset: document.querySelector("#trainSettingsReset"),
+  trainDatasetRefresh: document.querySelector("#trainDatasetRefresh"),
+  trainDatasetStatus: document.querySelector("#trainDatasetStatus"),
+  huntModelSource: document.querySelector("#huntModelSource"),
+  huntModelRows: document.querySelector("#huntModelRows"),
+  huntModelScore: document.querySelector("#huntModelScore"),
+  huntBrainRefresh: document.querySelector("#huntBrainRefresh"),
+  huntBrainDryRun: document.querySelector("#huntBrainDryRun"),
+  huntBrainTrain: document.querySelector("#huntBrainTrain"),
+  huntBrainStatus: document.querySelector("#huntBrainStatus"),
   trainingDataCount: document.querySelector("#trainingDataCount"),
   choiceCount: document.querySelector("#choiceCount"),
   modelState: document.querySelector("#modelState"),
@@ -425,6 +506,7 @@ function loadState() {
     backendPreference: "cpu",
     botDefaultRevision: BOT_DEFAULT_REVISION,
     selectedTrainingSources: [...DEFAULT_SELECTED_TRAINING_SOURCES],
+    trainSettings: { ...DEFAULT_TRAIN_SETTINGS },
     agentMode: false,
     agentWorkspace: "",
     theme: "dark",
@@ -477,6 +559,9 @@ function loadState() {
       ...saved,
       botDefaultRevision: BOT_DEFAULT_REVISION,
       selectedTrainingSources: normalizeSelectedTrainingSources(saved.selectedTrainingSources),
+      // Merge over the defaults so a settings object saved by an older build (missing the newer
+      // fields) still yields a complete, valid form rather than undefined inputs.
+      trainSettings: { ...DEFAULT_TRAIN_SETTINGS, ...(saved.trainSettings || {}) },
       bots: migrateDefaultBots(saved.bots, saved.botDefaultRevision).map((bot) => ({
         ...bot,
         weights: normalizeWeights(bot.weights)
@@ -659,12 +744,15 @@ async function refreshServiceStatus({ silent = false } = {}) {
     // that bailed empty at boot (the lazy poll is how a late backend gets noticed).
     if (state.panelMode === "security") ensureSecurityData();
     if (state.panelMode === "ops") void loadBrainOpsStatus({ force: true });
+    if (state.panelMode === "train") ensureTrainData();
     if (!silent) {
       render();
     } else {
       renderBackend();
-      // Only rebuild the training/memory panel when something it shows actually
-      // changed — a no-op poll must not wipe the user's focus/scroll there.
+      // Progress/loss change on every tick, and none of it touches focus or scroll, so it renders
+      // unconditionally. Only the memory LIST is gated: it calls replaceChildren(), which would
+      // steal focus and reset scroll on a no-op poll.
+      renderTrainingProgress();
       if (trainingSignature() !== lastTrainingSignature) {
         renderTraining();
       }
@@ -1472,6 +1560,8 @@ function render() {
   renderChat();
   renderTraining();
   renderTrainingSources();
+  renderTrainSettingsForm();
+  renderTrainingProgress();
   renderAgentBar();
   renderBackend();
   saveState();
@@ -1666,6 +1756,7 @@ function trainingSignature() {
   return JSON.stringify([
     Boolean(t.active), Boolean(t.paused),
     t.status?.status || t.status?.stage || "",
+    t.status?.stop_reason || "",
     t.last_error || "", t.finished_at || "",
     memories.length, Boolean(activeBot()?.trainedAt), state.activeBotId,
   ]);
@@ -1677,11 +1768,20 @@ function renderTraining() {
   const trainingStatus = training?.status?.status || training?.status?.stage || "";
   els.trainingDataCount.textContent = memories.filter((memory) => memory.kind === "training_data" || memory.kind === "example").length;
   els.choiceCount.textContent = memories.filter((memory) => memory.kind === "preference").length;
-  els.modelState.textContent = training?.active
-    ? "Training"
-    : trainingStatus === "complete" || activeBot().trainedAt
-      ? "Trained"
-      : "Fresh";
+  // Derived from BACKEND state only. This used to fall back to activeBot().trainedAt — a timestamp
+  // the in-browser preference fit sets on every rating — so the meter read "Trained" for a TinyGPT
+  // model that had never run a single optimizer step.
+  els.modelState.textContent = (() => {
+    if (service.available === false) return "Service offline";
+    if (service.status?.engine_ready === false && service.status?.engine_error) return "No local model";
+    if (training?.active) return training.paused ? "Paused" : "Training";
+    if (trainingStatus === "error" || training?.last_error) return "Error";
+    if (trainingStatus === "diverged") return "Diverged";
+    if (trainingStatus === "stopped") return "Stopped";
+    if (trainingStatus === "complete" || trainingStatus === "completed") return "Trained";
+    if (service.status?.engine_ready) return "Ready";
+    return "Fresh";
+  })();
   els.memoryList.replaceChildren();
 
   for (const memory of memories.slice().reverse().slice(0, 10)) {
@@ -1708,6 +1808,194 @@ function renderTraining() {
     els.memoryList.append(item);
   }
   lastTrainingSignature = trainingSignature();
+}
+
+// --- Studio · training settings form -----------------------------------------------------------
+// The panel's controls are the single source of truth for a run's parameters. Everything here is
+// persisted in state.trainSettings so a reopened Studio remembers what the operator chose.
+
+function trainSettings() {
+  return { ...DEFAULT_TRAIN_SETTINGS, ...(state.trainSettings || {}) };
+}
+
+function renderTrainModelSizes(sizes) {
+  // Options come from MODEL_SIZE_LABELS (the human framing); /api/train/dataset supplies the real
+  // parameter counts and whether the corpus is even large enough for each one.
+  if (!els.trainModelSize) return;
+  const current = trainSettings().modelSize;
+  const byId = new Map((sizes || []).map((row) => [row.id, row]));
+  els.trainModelSize.replaceChildren();
+  for (const [id, meta] of Object.entries(MODEL_SIZE_LABELS)) {
+    const info = byId.get(id);
+    const option = document.createElement("option");
+    option.value = id;
+    option.textContent = info && info.parameters
+      ? `${meta.label} · ${(info.parameters / 1e6).toFixed(1)}M params`
+      : meta.label;
+    // A preset the current corpus cannot fill would fail at build_dataset, so say so up front
+    // rather than letting the run start and raise.
+    if (info && info.fits === false) {
+      option.textContent += " · corpus too small";
+      option.disabled = true;
+    }
+    els.trainModelSize.append(option);
+  }
+  els.trainModelSize.value = current;
+  if (els.trainModelSize.value !== current) els.trainModelSize.value = DEFAULT_TRAIN_SETTINGS.modelSize;
+  renderTrainModelSizeNote();
+}
+
+function renderTrainModelSizeNote() {
+  if (!els.trainModelSizeNote) return;
+  const meta = MODEL_SIZE_LABELS[trainSettings().modelSize];
+  els.trainModelSizeNote.textContent = meta ? meta.note : "";
+}
+
+function renderTrainSettingsForm() {
+  const settings = trainSettings();
+  if (!els.trainSettingsForm) return;
+  // The size selector must be usable even with no backend: /api/train/dataset enriches the options
+  // with real parameter counts, but an offline Studio would otherwise render an empty <select>.
+  if (els.trainModelSize && !els.trainModelSize.options.length) renderTrainModelSizes([]);
+  const set = (el, value) => { if (el) el.value = String(value); };
+  const check = (el, value) => { if (el) el.checked = Boolean(value); };
+  set(els.trainMaxIters, settings.maxIters);
+  set(els.trainEvalInterval, settings.evalInterval);
+  set(els.trainLearningRate, settings.learningRate);
+  set(els.trainBatchSize, settings.batchSize);
+  set(els.trainDatasetCap, settings.datasetCapMb);
+  if (els.trainDevice) els.trainDevice.value = settings.device;
+  check(els.trainFreshStart, settings.freshStart);
+  check(els.trainAutoStop, settings.autoStop);
+  set(els.trainPatience, settings.patience);
+  set(els.trainMinDelta, settings.minDelta);
+  check(els.trainRestoreBest, settings.restoreBest);
+  check(els.trainSaveBestOnly, settings.saveBestOnly);
+  // Patience/min-improvement only mean anything while early stopping is on.
+  if (els.trainPatienceRow) els.trainPatienceRow.classList.toggle("is-inert", !settings.autoStop);
+  renderTrainModelSizeNote();
+}
+
+function readTrainSettingsForm() {
+  const previous = trainSettings();
+  const num = (el, fallback) => {
+    // A BLANK input is Number("") === 0, which is finite — so the fallback never fired and clearing a
+    // field to retype it persisted maxIters: 1 / learningRate: 0 into localStorage on blur, silently
+    // destroying the operator's settings. Treat blank as "no opinion".
+    const raw = el ? el.value : "";
+    if (String(raw).trim() === "") return fallback;
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : fallback;
+  };
+  return {
+    modelSize: (els.trainModelSize && els.trainModelSize.value) || previous.modelSize,
+    maxIters: Math.max(1, Math.round(num(els.trainMaxIters, previous.maxIters))),
+    evalInterval: Math.max(1, Math.round(num(els.trainEvalInterval, previous.evalInterval))),
+    learningRate: num(els.trainLearningRate, previous.learningRate),
+    batchSize: Math.max(0, Math.round(num(els.trainBatchSize, previous.batchSize))),
+    device: (els.trainDevice && els.trainDevice.value) || previous.device,
+    datasetCapMb: Math.min(16, Math.max(1, Math.round(num(els.trainDatasetCap, previous.datasetCapMb)))),
+    freshStart: Boolean(els.trainFreshStart && els.trainFreshStart.checked),
+    autoStop: Boolean(els.trainAutoStop && els.trainAutoStop.checked),
+    patience: Math.min(50, Math.max(1, Math.round(num(els.trainPatience, previous.patience)))),
+    minDelta: Math.max(0, num(els.trainMinDelta, previous.minDelta)),
+    restoreBest: Boolean(els.trainRestoreBest && els.trainRestoreBest.checked),
+    saveBestOnly: Boolean(els.trainSaveBestOnly && els.trainSaveBestOnly.checked)
+  };
+}
+
+// --- Studio · live run readout ------------------------------------------------------------------
+
+function formatLoss(value) {
+  return Number.isFinite(Number(value)) ? Number(value).toFixed(4) : "—";
+}
+
+function formatChars(value) {
+  const n = Number(value) || 0;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
+  if (n >= 1e3) return `${Math.round(n / 1e3)} KB`;
+  return `${n} chars`;
+}
+
+function renderLossCurve(history) {
+  // Two polylines over a shared y-scale. Drawn as SVG children (never innerHTML) to match this
+  // file's DOM-only rule for anything derived from backend data.
+  const svg = els.trainCurve;
+  if (!svg) return;
+  const points = (history || []).filter((row) => Number.isFinite(Number(row.val_loss)));
+  for (const node of [...svg.querySelectorAll("polyline")]) node.remove();
+  if (points.length < 2) {
+    svg.hidden = true;
+    return;
+  }
+  const values = [];
+  for (const row of points) {
+    if (Number.isFinite(Number(row.val_loss))) values.push(Number(row.val_loss));
+    if (Number.isFinite(Number(row.train_loss))) values.push(Number(row.train_loss));
+  }
+  const max = Math.max(...values);
+  const min = Math.min(...values);
+  const span = max - min || 1;
+  const project = (rows, key) => rows
+    .map((row, index) => {
+      const value = Number(row[key]);
+      if (!Number.isFinite(value)) return null;
+      const x = (index / Math.max(1, rows.length - 1)) * 240;
+      const y = 58 - ((value - min) / span) * 56;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .filter(Boolean)
+    .join(" ");
+  for (const [key, className] of [["train_loss", "curve-train"], ["val_loss", "curve-val"]]) {
+    const coords = project(points, key);
+    if (!coords) continue;
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+    line.setAttribute("points", coords);
+    line.setAttribute("class", className);
+    svg.append(line);
+  }
+  svg.hidden = false;
+}
+
+function renderTrainingProgress() {
+  // Runs on EVERY status poll (not behind the memory-list signature gate), because progress is the
+  // one thing that changes continuously while a run is in flight.
+  const training = service.status?.training;
+  const status = training?.status || {};
+  const active = Boolean(training?.active);
+  if (els.trainPause) {
+    els.trainPause.hidden = !active;
+    els.trainPause.textContent = training?.paused ? "Resume" : "Pause";
+  }
+  if (els.trainStop) els.trainStop.hidden = !active;
+  if (els.trainButton) els.trainButton.disabled = active;
+
+  const step = Number(status.current_step) || 0;
+  const total = Number(status.total_steps) || 0;
+  const history = Array.isArray(training?.history) ? training.history : [];
+  const show = active || history.length > 0 || Boolean(status.stop_reason);
+  if (els.trainProgress) els.trainProgress.hidden = !show;
+  if (!show) return;
+
+  const pct = total > 0 ? Math.min(100, Math.round((step / total) * 100)) : 0;
+  if (els.trainProgressFill) els.trainProgressFill.style.width = `${pct}%`;
+  if (els.trainProgressBar) els.trainProgressBar.setAttribute("aria-valuenow", String(pct));
+  if (els.trainProgressLabel) {
+    const stage = String(status.stage || status.status || "").replaceAll("_", " ");
+    const reason = status.stop_reason ? ` · ${String(status.stop_reason).replaceAll("_", " ")}` : "";
+    els.trainProgressLabel.textContent = total
+      ? `step ${step} / ${total}${stage ? ` · ${stage}` : ""}${reason}`
+      : `${stage || "idle"}${reason}`;
+  }
+  if (els.trainLossValue) els.trainLossValue.textContent = formatLoss(status.train_loss);
+  if (els.valLossValue) els.valLossValue.textContent = formatLoss(status.val_loss);
+  if (els.bestLossValue) els.bestLossValue.textContent = formatLoss(status.best_val_loss);
+  if (els.trainDeviceValue) els.trainDeviceValue.textContent = status.device || "—";
+  if (els.trainBatchValue) els.trainBatchValue.textContent = status.batch_size ? String(status.batch_size) : "—";
+  if (els.trainCorpusValue) {
+    els.trainCorpusValue.textContent = status.dataset_chars ? formatChars(status.dataset_chars) : "—";
+  }
+  renderLossCurve(history);
 }
 
 function renderTrainingSources() {
@@ -2092,6 +2380,37 @@ els.trainingFolderForm?.addEventListener("submit", async (event) => {
   render();
 });
 
+// --- Studio · training controls -----------------------------------------------------------------
+// Every field the backend accepts is driven from the form. The panel previously posted a hardcoded
+// {max_iters: 160, eval_interval: 40, fresh_start: false} and reported failures nowhere: an operator
+// could click Train, have the request rejected, and see nothing change.
+
+function trainRequestBody() {
+  const settings = trainSettings();
+  return {
+    model_size: settings.modelSize,
+    max_iters: settings.maxIters,
+    eval_interval: settings.evalInterval,
+    learning_rate: settings.learningRate,
+    batch_size_override: settings.batchSize,
+    // The dedicated Device selector wins; the CPU/GPU header segments remain the fallback for a
+    // settings object saved before that selector existed.
+    device_preference: settings.device || (state.backendPreference === "gpu" ? "cuda" : "cpu"),
+    dataset_char_cap: Math.round(settings.datasetCapMb * 1_000_000),
+    source_ids: normalizeSelectedTrainingSources(state.selectedTrainingSources),
+    fresh_start: settings.freshStart,
+    patience: settings.patience,
+    min_delta: settings.minDelta,
+    auto_stop: settings.autoStop,
+    save_best_only: settings.saveBestOnly,
+    restore_best: settings.restoreBest
+  };
+}
+
+function setTrainStatus(message) {
+  if (els.trainStatus) els.trainStatus.textContent = message || "";
+}
+
 els.trainButton.addEventListener("click", async () => {
   if (els.trainButton.disabled) return;  // single-flight: block re-clicks while a run is in flight
   const bot = activeBot();
@@ -2100,25 +2419,30 @@ els.trainButton.addEventListener("click", async () => {
   render();
 
   if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    setTrainStatus("The local GreyIQ service is not running, so there is nothing to train.");
     return;
+  }
+
+  const settings = trainSettings();
+  // Switching architecture cannot continue the existing weights, so say so before spending the run
+  // rather than letting the operator discover it in the log.
+  if (settings.modelSize !== "compact") {
+    setTrainStatus(`Starting a NEW ${settings.modelSize} model from scratch — your current model is archived, not overwritten.`);
+  } else {
+    setTrainStatus("Training…");
   }
 
   els.trainButton.disabled = true;
   try {
-    els.modelState.textContent = "Training";
     await apiFetch("/api/train/start", {
       method: "POST",
       timeoutMs: 10000,
-      body: JSON.stringify({
-        max_iters: 160,
-        eval_interval: 40,
-        device_preference: state.backendPreference === "gpu" ? "cuda" : "cpu",
-        source_ids: normalizeSelectedTrainingSources(state.selectedTrainingSources),
-        fresh_start: false
-      })
+      body: JSON.stringify(trainRequestBody())
     });
     await refreshServiceStatus({ silent: true });
   } catch (error) {
+    // Surface it. service.lastError alone is write-only as far as this panel is concerned.
+    setTrainStatus(error.message || "Training did not start.");
     service.lastError = error.message || "Training did not start";
     await refreshServiceStatus({ silent: true });
   } finally {
@@ -2126,6 +2450,178 @@ els.trainButton.addEventListener("click", async () => {
   }
   render();
 });
+
+if (els.trainPause) {
+  els.trainPause.addEventListener("click", async () => {
+    const paused = Boolean(service.status?.training?.paused);
+    const route = paused ? "/api/train/resume" : "/api/train/pause";
+    els.trainPause.disabled = true;
+    try {
+      await apiFetch(route, { method: "POST", timeoutMs: 10000 });
+      setTrainStatus(paused ? "Resumed." : "Paused — the run stops at the next step boundary.");
+      await refreshServiceStatus({ silent: true });
+    } catch (error) {
+      setTrainStatus(error.message || "Could not change the run state.");
+    } finally {
+      els.trainPause.disabled = false;
+      renderTrainingProgress();
+    }
+  });
+}
+
+if (els.trainStop) {
+  els.trainStop.addEventListener("click", async () => {
+    els.trainStop.disabled = true;
+    try {
+      await apiFetch("/api/train/stop", { method: "POST", timeoutMs: 10000 });
+      setTrainStatus("Stopping — the trainer saves a checkpoint before it exits.");
+      await refreshServiceStatus({ silent: true });
+    } catch (error) {
+      setTrainStatus(error.message || "Could not stop the run.");
+    } finally {
+      els.trainStop.disabled = false;
+      renderTrainingProgress();
+    }
+  });
+}
+
+if (els.trainSettingsForm) {
+  els.trainSettingsForm.addEventListener("change", () => {
+    state.trainSettings = readTrainSettingsForm();
+    saveState();
+    renderTrainSettingsForm();
+  });
+}
+
+if (els.trainSettingsReset) {
+  els.trainSettingsReset.addEventListener("click", () => {
+    state.trainSettings = { ...DEFAULT_TRAIN_SETTINGS };
+    saveState();
+    renderTrainSettingsForm();
+    setTrainStatus("Training settings reset to defaults.");
+  });
+}
+
+async function loadTrainingDataset() {
+  // What the trainer would actually read, and what each brain size would cost — asked BEFORE
+  // committing to a run.
+  if (!els.trainDatasetStatus) return;
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.trainDatasetStatus.textContent = "The local GreyIQ service is not running.";
+    return;
+  }
+  els.trainDatasetStatus.textContent = "Checking the corpus…";
+  try {
+    const info = await apiFetch("/api/train/dataset", { timeoutMs: 20000 });
+    if (info.ok === false) {
+      els.trainDatasetStatus.textContent = info.error || "Could not read the training data.";
+      return;
+    }
+    renderTrainModelSizes(info.model_sizes);
+    const parts = [
+      `${formatChars(info.total_characters)} of text`,
+      `${Number(info.extracted_files) || 0} file(s)`,
+      `model on disk: ${info.model_name || "none"}`
+    ];
+    if (info.capped) parts.push(`capped at ${formatChars(info.cap)}`);
+    els.trainDatasetStatus.textContent = parts.join(" · ");
+  } catch (error) {
+    els.trainDatasetStatus.textContent = error.message || "Could not read the training data.";
+  }
+}
+
+if (els.trainDatasetRefresh) {
+  els.trainDatasetRefresh.addEventListener("click", () => void loadTrainingDataset());
+}
+
+// --- Studio · hunting brain (the offline hunt ranker) -------------------------------------------
+// A different model from TinyGPT: it orders which checks the prover spends its budget on, learned
+// from the operator's own confirmed/unconfirmed outcomes. Promotion stays gated on beating the
+// built-in rules on held-out programs, so "Train" here is an attempt, not a guarantee.
+
+function renderHuntModel(info) {
+  const active = (info && info.active_model) || {};
+  const corpus = (info && info.corpus) || {};
+  const evaluation = (info && info.eval) || {};
+  if (els.huntModelSource) {
+    els.huntModelSource.textContent = info && info.loaded
+      ? `${info.source || "unknown"}${active.version_tag || info.version_tag ? ` · ${active.version_tag || info.version_tag}` : ""}`
+      : "rules only";
+  }
+  // Key names verified against a live GET /api/hunt/model response (hunt_train.show_status):
+  // corpus = {hunts, programs, labeled_rows, confirmed_rows, paid_rows, min_rows, rows_needed}.
+  if (els.huntModelRows) {
+    const rows = Number(corpus.labeled_rows ?? 0);
+    const needed = Number(corpus.min_rows ?? 0);
+    const short = Number(corpus.rows_needed ?? 0);
+    els.huntModelRows.textContent = needed
+      ? `${rows} / ${needed}${short > 0 ? ` · ${short} more needed` : ""}`
+      : String(rows);
+  }
+  if (els.huntModelScore) {
+    // The eval block is only populated once a model has been trained and gated; before that it is {}.
+    // hunt_train reports the promotion metric as recall@3 for the model and the rules baseline it had
+    // to beat, so show that pair — a bare score with nothing to compare it to says little.
+    const score = evaluation.recall_at_3_model ?? evaluation.model_score ?? evaluation.score ?? null;
+    const baseline = evaluation.recall_at_3_rules ?? evaluation.rules_score ?? evaluation.baseline ?? null;
+    if (score === null || score === undefined) {
+      els.huntModelScore.textContent = Number(corpus.hunts) ? "not trained yet" : "no hunts yet";
+    } else {
+      els.huntModelScore.textContent = baseline === null || baseline === undefined
+        ? String(score)
+        : `${score} vs rules ${baseline}`;
+    }
+  }
+}
+
+async function loadHuntModel() {
+  if (!els.huntModelSource) return;
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    if (els.huntBrainStatus) els.huntBrainStatus.textContent = "The local GreyIQ service is not running.";
+    return;
+  }
+  try {
+    const info = await apiFetch("/api/hunt/model", { timeoutMs: 20000 });
+    renderHuntModel(info);
+    if (els.huntBrainStatus && info.ok === false) els.huntBrainStatus.textContent = info.error || "";
+  } catch (error) {
+    if (els.huntBrainStatus) els.huntBrainStatus.textContent = error.message || "Could not read the hunt model.";
+  }
+}
+
+async function trainHuntBrain(dryRun) {
+  if (!els.huntBrainStatus) return;
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.huntBrainStatus.textContent = "The local GreyIQ service is not running.";
+    return;
+  }
+  for (const button of [els.huntBrainTrain, els.huntBrainDryRun]) {
+    if (button) button.disabled = true;
+  }
+  els.huntBrainStatus.textContent = dryRun ? "Evaluating against the rules baseline…" : "Training…";
+  try {
+    const result = await apiFetch("/api/hunt/train", {
+      method: "POST",
+      timeoutMs: 180000,
+      body: JSON.stringify({ dry_run: Boolean(dryRun) })
+    });
+    // A refusal is a normal outcome here (too few traces, or it failed to beat the rules), so report
+    // the reason rather than treating ok:false as an error.
+    els.huntBrainStatus.textContent = result.detail || result.reason
+      || (result.ok ? "Promoted a newly trained ranker." : "Not promoted — the built-in rules still win.");
+    await loadHuntModel();
+  } catch (error) {
+    els.huntBrainStatus.textContent = error.message || "Hunt-brain training failed.";
+  } finally {
+    for (const button of [els.huntBrainTrain, els.huntBrainDryRun]) {
+      if (button) button.disabled = false;
+    }
+  }
+}
+
+if (els.huntBrainRefresh) els.huntBrainRefresh.addEventListener("click", () => void loadHuntModel());
+if (els.huntBrainDryRun) els.huntBrainDryRun.addEventListener("click", () => void trainHuntBrain(true));
+if (els.huntBrainTrain) els.huntBrainTrain.addEventListener("click", () => void trainHuntBrain(false));
 
 // ---- Coding brain (local model / Claude / OpenAI-compatible) ----
 let coderConfig = null;
@@ -2493,6 +2989,19 @@ function setPanelMode(mode, focusTab = false) {
   // the dropdowns blank with no retry.
   if (mode === "security") ensureSecurityData();
   if (mode === "ops") void loadBrainOpsStatus();
+  if (mode === "train") ensureTrainData();
+}
+
+// The Train panel's corpus preview and hunt-model status both need the local service, so they load
+// when the panel is shown (and again on a service-up transition) rather than at boot — the same lazy
+// pattern the Security and Ops panels use. Cheap and idempotent.
+let trainDataLoaded = false;
+function ensureTrainData(force = false) {
+  if (!service.available) return;
+  if (trainDataLoaded && !force) return;
+  trainDataLoaded = true;
+  void loadTrainingDataset();
+  void loadHuntModel();
 }
 
 // Populate the Security panel's selectors if they haven't loaded yet. Idempotent
@@ -10289,6 +10798,9 @@ function ckCapturedProofFields(rec) {
       request_line: pe.request_line || "", request_header: pe.request_header || "",
       response_status: pe.response_status || "", response_header: pe.response_header || "",
       set_cookie: pe.set_cookie || "", matched_value: pe.matched_value || "", read_data: pe.read_data || "",
+      // The disclosed data's NAME is the one impact field that survives redaction: read_data comes
+      // back as [REDACTED_…] markers, so without this a rebuilt report cannot say what was at risk.
+      sensitive_data_labels: pe.sensitive_data_labels || "",
     };
   }
   const poi = cap.proof_of_impact;
