@@ -35,7 +35,7 @@ if str(BACKEND_DIR) not in sys.path:
 from bughunter import active_verify_service as av  # noqa: E402
 from bughunter import hunt_brain, offline_hunt, web_ingest  # noqa: E402
 from bughunter import rate_limit  # noqa: E402
-from bughunter.prover_classes import CLASS_ALIASES, PROVER_CLASSES  # noqa: E402
+from bughunter.prover_classes import CLASS_ALIASES, PROVER_CLASSES, check_tags_for_impact  # noqa: E402
 from bughunter.rate_limit import HostRateGovernor  # noqa: E402
 from bughunter.settings import get_settings  # noqa: E402
 
@@ -779,6 +779,75 @@ class ProverClassVocabularyTests(unittest.TestCase):
         tags = self._tags_from_source()
         self.assertTrue(tags, "parsed zero check tags -- the ast anchor has moved, fix this test")
         self.assertEqual(tags, set(PROVER_CLASSES))
+
+    def _tag_to_impacts_from_source(self) -> dict[str, set[str]]:
+        """Re-derive, from this module's own source, which IMPACT class each check tag can report.
+
+        A check is tagged with what it PROBES; its finding is stamped with what the result MEANS,
+        via the 5th positional argument to `_finding`. Anything that joins a plan (tags) to an
+        outcome (impacts) has to know where those two disagree.
+        """
+        source = (BACKEND_DIR / "bughunter" / "active_verify_service.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        fn_hints: dict[str, set[str]] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            hints: set[str] = set()
+            for sub in ast.walk(node):
+                if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+                        and sub.func.id == "_finding" and len(sub.args) >= 5):
+                    arg = sub.args[4]
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        hints.add(arg.value)
+                    else:
+                        hints.add("<dynamic>")
+            if hints:
+                fn_hints[node.name] = hints
+
+        out: dict[str, set[str]] = {}
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+                    and node.target.id == "checks" and isinstance(node.value, ast.List)):
+                continue
+            for element in node.value.elts:
+                tag = element.elts[0].value
+                called = {n.func.id for n in ast.walk(element.elts[1])
+                          if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+                for fn in called:
+                    if fn.startswith("_check_"):
+                        out.setdefault(tag, set()).update(fn_hints.get(fn, set()))
+        return out
+
+    def test_every_impact_a_check_reports_folds_back_to_its_tag(self) -> None:
+        """The plan/outcome vocabulary join must stay complete.
+
+        negative_knowledge matches a PLANNED (endpoint, check-tag) against a CONFIRMED
+        (endpoint, impact-class). Five checks report an impact under a different name than their
+        tag, and when that fold was missing those five could never be immunised — a route whose
+        CRLF check had confirmed a real bug still accrued misses under `crlf` and was cooled after
+        two clean runs. A new check reporting a novel impact must fail here, not silently in a
+        store nobody reads."""
+        derived = self._tag_to_impacts_from_source()
+        self.assertTrue(derived, "parsed zero check tags -- the ast anchor has moved, fix this test")
+        for tag, impacts in sorted(derived.items()):
+            for impact in impacts:
+                if impact == "<dynamic>" or impact == tag:
+                    continue  # a dynamic hint is covered by the explicit entries asserted below
+                self.assertIn(
+                    tag, check_tags_for_impact(impact),
+                    f"check {tag!r} reports impact {impact!r}, but that impact does not fold back "
+                    f"to {tag!r} — negative knowledge can never immunise this pair",
+                )
+
+    def test_the_dynamic_debug_impacts_are_covered(self) -> None:
+        """`_check_debug_endpoints` picks its class hint per row of `_DEBUG_ENDPOINTS`, so ast sees
+        only `<dynamic>`. Pin the real values so the fold cannot rot silently."""
+        hints = {row[4] for row in av._DEBUG_ENDPOINTS}
+        self.assertTrue(hints <= {"disclosure", "rce", "secrets"}, f"new debug impact: {hints}")
+        for impact in hints:
+            self.assertIn("debug", check_tags_for_impact(impact),
+                          f"debug endpoints report {impact!r} but it does not fold back to 'debug'")
 
     def test_the_planners_cannot_propose_a_class_the_prover_cannot_confirm(self) -> None:
         # offline_hunt gates its rule suggestions on this set; hunt_brain gates the LLM's on it.

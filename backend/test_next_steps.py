@@ -17,6 +17,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from bughunter import next_steps  # noqa: E402
+from bughunter import secret_classification  # noqa: E402
 
 
 def _finding(ref: str, raw_severity: str, *, confidence: str = "high", class_id: str = "ssrf") -> dict:
@@ -67,7 +68,16 @@ class SeverityResolutionTests(unittest.TestCase):
 
     def test_confirmed_source_secret_step_reviews_captured_proof(self) -> None:
         finding = _finding("F1", "high", class_id="secrets")
-        finding.update({"class_name": "Secrets / exposed credentials", "location": "src/settings.py"})
+        finding.update({
+            "class_name": "Secrets / exposed credentials", "location": "src/settings.py",
+            # What a REAL validated credential carries. The confirm gate reads these, not the
+            # plan's status string: a live credential counts only for a rule whose issuer can
+            # actually authenticate it (_CONFIRMED_VIA_LIVENESS), so a public browser key
+            # answering its own issuer never qualifies.
+            "rule_id": "secret.openai-key",
+            "secret_classification": secret_classification.CONFIRMED_SECRET,
+            "_credential_proof": {"live": True},
+        })
         plan = {
             "proof_of_impact": {
                 "status": "confirmed",
@@ -86,6 +96,33 @@ class SeverityResolutionTests(unittest.TestCase):
         self.assertIn("issuer success response", confirm_step["detail"])
         self.assertIn("blast radius", confirm_step["detail"])
         self.assertNotIn("Capture the exact request/response", confirm_step["detail"])
+
+    def test_a_claimed_confirmation_with_no_artifact_is_not_called_confirmed(self) -> None:
+        """The action plan must not announce a confirmation the report's own proof section denies.
+
+        A configured brain writes `proof_of_impact.status` verbatim into the plan, and that brain
+        reads target-derived recon and response text — so trusting the string let injected prose
+        produce "already confirmed … review it before submission" for a finding with nothing
+        captured. The confirm gate is the only authority on this."""
+        finding = _finding("F1", "low", class_id="headers")
+        plan = {"proof_of_impact": {"status": "confirmed",
+                                    "summary": "The model says this is exploitable."}}
+        ctx = {"findings": [finding], "attack_plans": {"F1": plan}, "scanners_run": ["web"], "kind": "url"}
+        step = next(s for s in next_steps.build_next_steps(ctx)
+                    if s["phase"] == "Confirm findings" and s["ref"] == "F1")
+        self.assertNotIn("Review confirmed proof", step["action"])
+        self.assertIn("Confirm F1", step["action"])
+
+    def test_a_live_public_client_key_is_not_called_confirmed(self) -> None:
+        """A live Google/Firebase browser key answering its own issuer is the expected behaviour of
+        that key, not an exploit — the gate refuses it, so the action plan must too."""
+        finding = _finding("F1", "info", class_id="secrets")
+        finding.update({"secret_classification": secret_classification.PUBLIC_CLIENT_KEY,
+                        "_credential_proof": {"live": True}})
+        ctx = {"findings": [finding], "attack_plans": {}, "scanners_run": ["code"], "kind": "path"}
+        step = next(s for s in next_steps.build_next_steps(ctx)
+                    if s["phase"] == "Confirm findings" and s["ref"] == "F1")
+        self.assertNotIn("Review confirmed proof", step["action"])
 
 
 class ChainPhaseTests(unittest.TestCase):

@@ -54,7 +54,15 @@ from bughunter import (
     vdp_policy,
     web_ingest,
 )
-from bughunter.bounty import _classify, _infer_kind, _safe_slug, build_findings_har, build_replay_script, run_bounty_hunt
+from bughunter.bounty import (
+    _classify,
+    _deterministic_attack_plan,
+    _infer_kind,
+    _safe_slug,
+    build_findings_har,
+    build_replay_script,
+    run_bounty_hunt,
+)
 from bughunter.rate_limit import shared_governor
 from bughunter.registrable_domain import registrable_domain
 from bughunter.settings import get_settings
@@ -812,8 +820,17 @@ def _run_campaign_body(
         # A public client key / dead credential is informational, not a submittable candidate.
         _sc = str(finding.get("secret_classification") or "")
         pstatus = "missing" if _sc in (secret_classification.PUBLIC_CLIENT_KEY, secret_classification.FALSE_POSITIVE) else "candidate"
+        # Carry an inline plan, like every other directly-consolidated source (CVE, GraphQL, IDOR,
+        # BFLA). This branch was the one exception: it has no per-URL run behind it, so it had no
+        # `source_json` sidecar to read a plan from either, and the submission package fell through
+        # to an EMPTY plan — shipping "_Verify manually within your authorized scope._" where the
+        # numbered reproduction belongs, with no impact paragraph and no CVSS row. A PEM body or an
+        # AWS secret key mined out of served JS classifies as a confirmed secret and keeps its High
+        # severity, so these are exactly the packages an operator files.
+        _js_plan = _deterministic_attack_plan(finding, cid)
         consolidated.append({"finding": finding, "source_url": finding["location"], "source_report": "",
-                             "source_json": "", "proof_status": pstatus, "cvss": {}})
+                             "source_json": "", "proof_status": pstatus,
+                             "cvss": _js_plan.get("cvss") or {}, "plan": _js_plan})
 
     # --- API-discovery candidates (GraphQL introspection): each carries its own inline plan. ---
     for finding in recon_api_findings:
@@ -1651,7 +1668,7 @@ def run_portfolio_campaign(
     one combined result shaped like a single campaign — so the Findings board + Submissions hub
     render a portfolio hunt exactly like a single one. Each program is a dashboard unit; its
     findings stream under it as they surface. ``programs`` is a list of resolved specs:
-    ``{label, scope, targets, excluded_hosts, disclose_automation}``.
+    ``{label, scope, targets, excluded_hosts, disclose_automation, platform}``.
 
     Reuses ``run_campaign_over_targets`` verbatim per program (portfolio mode:
     ``progress_unit=<program label>``), so every fail-closed safety property (scope binding,
@@ -1676,6 +1693,10 @@ def run_portfolio_campaign(
                       "admin_account_access": p.get("admin_account_access") if isinstance(p.get("admin_account_access"), dict) else {},
                       "idor_pairs": p.get("idor_pairs") if isinstance(p.get("idor_pairs"), list) else [],
                       "policy_profile": str(p.get("policy_profile") or ""),
+                      # Per-program, like policy_profile: a portfolio routinely spans programs on
+                      # DIFFERENT platforms, so one portfolio-wide id can only be right for some of
+                      # them. Empty falls back to the portfolio-wide `platform` arg below.
+                      "platform": str(p.get("platform") or ""),
                       "user_agent_suffix": str(p.get("user_agent_suffix") or "")})
     if not clean:
         return {"ok": False, "error": "No huntable programs — each needs seed targets, an opted-in source repository, or an imported/built structured scope."}
@@ -1727,7 +1748,7 @@ def run_portfolio_campaign(
                 spec["targets"], scope=spec["scope"], authorized=authorized, coder_cfg=coder_cfg,
                 default_reports_dir=portfolio_root, seed_dir=seed_dir, runtime_dir=runtime_dir, version=version,
                 active=active, time_based=time_based, auth=auth, live=live, program=label, max_pages=max_pages,
-                platform=platform, deep=deep, disclose_automation=spec["disclose_automation"],
+                platform=spec.get("platform") or platform, deep=deep, disclose_automation=spec["disclose_automation"],
                 account_access=spec["account_access"], admin_account_access=spec.get("admin_account_access"),
                 idor_pairs=spec.get("idor_pairs"), policy_profile=spec.get("policy_profile", ""),
                 user_agent_suffix=spec["user_agent_suffix"],
