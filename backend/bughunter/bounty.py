@@ -2868,20 +2868,30 @@ def _run_bounty_hunt_body(
                 _ssrf_cooled = negative_knowledge.cooled_params(
                     runtime_dir, program=None, target=clean_target,
                     endpoint=clean_target, class_id="ssrf")
-                _ssrf_priority = negative_knowledge.prioritise_untried(ssrf_params, _ssrf_cooled)
                 if _ssrf_cooled:
                     _emit(f"negative knowledge: {len(_ssrf_cooled)} parameter(s) already probed "
                           "without a callback — trying fresh ones first")
+                # `deprioritise` is applied inside the prover's candidate builder, after every source
+                # is merged and before the cap. Reordering this list here could not work: names parsed
+                # from the target URL are merged AHEAD of it, so on an already-parametered target two
+                # cooled URL-local names would still consume the whole cap.
                 ssrf = oob_service.confirm_blind_ssrf(clean_target, base=oob_base, secret=oob_secret,
                                                       scope=scope, settings=settings,
-                                                      extra_params=negative_knowledge.prioritise_untried(
-                                                          effective_extra_params, _ssrf_cooled),
-                                                      priority=_ssrf_priority, governor=_oob_governor())
+                                                      extra_params=effective_extra_params,
+                                                      priority=ssrf_params,
+                                                      deprioritise=_ssrf_cooled,
+                                                      governor=_oob_governor())
                 if ssrf.get("ok") and ssrf.get("finding") and ssrf.get("status") in ("confirmed", "candidate"):
                     raw_findings = list(raw_findings) + [ssrf["finding"]]
                     if "active" not in scanners_run:
                         scanners_run = list(scanners_run) + ["active"]
                     _emit(f"blind-SSRF OOB: {ssrf.get('status')} via '{ssrf.get('param')}'")
+                    # A parameter that produced a callback is immune from here on. Without this a
+                    # sink could carry two earlier misses and stay cooled for the whole TTL — the
+                    # same immunity hole the endpoint half was fixed for.
+                    negative_knowledge.record_param_confirmation(
+                        runtime_dir, program=None, target=clean_target,
+                        endpoint=clean_target, class_id="ssrf", param=ssrf.get("param"))
                 else:
                     _emit(f"blind-SSRF OOB: {ssrf.get('status') or ssrf.get('error') or 'no callback'}")
                 # THE honest parameter-level negative: each of these carried a unique collaborator
@@ -2889,7 +2899,11 @@ def _run_bounty_hunt_body(
                 # out and the thing demonstrably did not happen. Only recorded for `no-callback` —
                 # an error or an out-of-scope refusal means the probe never ran, which is not a
                 # negative result about the parameter.
-                if str(ssrf.get("status") or "") == "no-callback":
+                # Only a poll window that COMPLETED is a negative result. `no-callback` is also
+                # returned when the probe went out but the collaborator poll itself errored, and
+                # that is an unobservable outcome, not evidence the parameter is inert — banking it
+                # would cool a live sink after two transient network failures.
+                if str(ssrf.get("status") or "") == "no-callback" and not ssrf.get("poll_errors"):
                     negative_knowledge.record_param_misses(
                         runtime_dir, program=None, target=clean_target,
                         endpoint=clean_target, class_id="ssrf", params=ssrf.get("params_tried"))
@@ -2933,17 +2947,23 @@ def _run_bounty_hunt_body(
                     endpoint=clean_target, class_id="rce")
                 rce = oob_service.confirm_blind_rce(clean_target, base=oob_base, secret=oob_secret,
                                                     scope=scope, settings=settings,
-                                                    extra_params=negative_knowledge.prioritise_untried(
-                                                        effective_extra_params, _rce_cooled),
+                                                    extra_params=effective_extra_params,
+                                                    deprioritise=_rce_cooled,
                                                     governor=_oob_governor())
                 if rce.get("ok") and rce.get("finding") and rce.get("status") in ("confirmed", "candidate"):
                     raw_findings = list(raw_findings) + [rce["finding"]]
                     if "active" not in scanners_run:
                         scanners_run = list(scanners_run) + ["active"]
                     _emit(f"blind-RCE OOB: {rce.get('status')} via {rce.get('param') or rce.get('header')}")
+                    # Only a PARAMETER confirmation is immunized here: this prover can also confirm
+                    # through a request header, which carries no parameter row to clear.
+                    if rce.get("param"):
+                        negative_knowledge.record_param_confirmation(
+                            runtime_dir, program=None, target=clean_target,
+                            endpoint=clean_target, class_id="rce", param=rce.get("param"))
                 else:
                     _emit(f"blind-RCE OOB: {rce.get('status') or rce.get('error') or 'no callback'}")
-                if str(rce.get("status") or "") == "no-callback":
+                if str(rce.get("status") or "") == "no-callback" and not rce.get("poll_errors"):
                     negative_knowledge.record_param_misses(
                         runtime_dir, program=None, target=clean_target,
                         endpoint=clean_target, class_id="rce", params=rce.get("params_tried"))

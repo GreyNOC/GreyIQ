@@ -208,6 +208,41 @@ class ParamLevelTests(unittest.TestCase):
                                        class_id="ssrf", params=["url", "next", "dest"])
             self.assertEqual(nk.cooled_pairs(tmp, program=None, target=_TARGET), set())
 
+    def test_a_confirming_parameter_clears_its_cooled_state(self) -> None:
+        """Without this the parameter half had the immunity hole the endpoint half was fixed for
+        twice: a sink could carry two earlier misses, then prove a bug, and still be ordered behind
+        untried names for the whole TTL."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for _ in range(2):
+                nk.record_param_misses(tmp, program=None, target=_TARGET, endpoint=self.EP,
+                                       class_id="ssrf", params=["url"])
+            self.assertEqual(nk.cooled_params(tmp, program=None, target=_TARGET,
+                                              endpoint=self.EP, class_id="ssrf"), {"url"})
+            nk.record_param_confirmation(tmp, program=None, target=_TARGET, endpoint=self.EP,
+                                         class_id="ssrf", param="url")
+            self.assertEqual(nk.cooled_params(tmp, program=None, target=_TARGET,
+                                              endpoint=self.EP, class_id="ssrf"), set())
+            # And it stays immune through later inconclusive runs.
+            for _ in range(3):
+                nk.record_param_misses(tmp, program=None, target=_TARGET, endpoint=self.EP,
+                                       class_id="ssrf", params=["url"])
+            self.assertEqual(nk.cooled_params(tmp, program=None, target=_TARGET,
+                                              endpoint=self.EP, class_id="ssrf"), set())
+
+    def test_deprioritise_reaches_url_local_params_before_the_cap(self) -> None:
+        """The caller cannot get this right by reordering its own extra list: names parsed from the
+        target URL are merged AHEAD of it, so on an already-parametered target two cooled URL-local
+        names consume the entire per-check cap and a fresh name is never probed."""
+        from bughunter.active_verify_service import _candidate_params
+
+        url = "https://app.example.com/?old1=x&old2=x"
+        self.assertEqual(_candidate_params(url, ["fresh"], ("cmd",), 2), ["old1", "old2"])
+        capped = _candidate_params(url, ["fresh"], ("cmd",), 2, deprioritise={"old1", "old2"})
+        self.assertEqual(capped[0], "fresh")
+        # Reorder, never remove — the full set survives when the cap allows it.
+        full = _candidate_params(url, ["fresh"], ("cmd",), 9, deprioritise={"old1", "old2"})
+        self.assertEqual(full, ["fresh", "old1", "old2"])
+
     def test_prioritise_untried_reorders_and_never_drops(self) -> None:
         """Dropping would risk blinding a re-scan; the provers cap their walk, so order alone
         decides what gets a token."""

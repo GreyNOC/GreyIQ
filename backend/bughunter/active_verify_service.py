@@ -279,7 +279,8 @@ def _clean_param_names(names: Any) -> list[str]:
 
 
 def _candidate_params(url: str, extra: list[str] | None, default: tuple[str, ...], limit: int,
-                      priority: list[str] | None = None) -> list[str]:
+                      priority: list[str] | None = None,
+                      deprioritise: set[str] | None = None) -> list[str]:
     """Ordered, deduped parameter names a param-keyed check should probe: ``priority`` names FIRST
     (the reasoning layer's class-specific picks — e.g. the params it judges take a URL for SSRF, or
     reflect input for XSS — the highest-signal targets, so within the small per-check cap they get
@@ -289,7 +290,14 @@ def _candidate_params(url: str, extra: list[str] | None, default: tuple[str, ...
     endpoint with no discovered name still bails — they never invent an injection point.
 
     ``priority`` is NAMES ONLY (a name can never carry a payload); the check still supplies the payload
-    and independently confirms, so a brain-suggested name can raise recall but never precision."""
+    and independently confirms, so a brain-suggested name can raise recall but never precision.
+
+    ``deprioritise`` moves names to the BACK of the assembled list — names this program has already
+    probed without result. It is applied after every source is merged and BEFORE the cap, which is
+    the only place it can work: the caller cannot do it by reordering its own ``extra`` list, because
+    names parsed from the URL are merged ahead of that list and would still consume the whole cap on
+    an already-parametered target. Reordering only, never removal: the set is unchanged, so a name
+    that becomes interesting after a deploy is still reachable."""
     out: list[str] = []
     seen: set[str] = set()
 
@@ -309,6 +317,11 @@ def _candidate_params(url: str, extra: list[str] | None, default: tuple[str, ...
     if not out:
         for name in default:
             _add(name)
+    if deprioritise:
+        stale_keys = {str(n).strip().lower() for n in deprioritise if str(n or "").strip()}
+        if stale_keys:
+            out = ([n for n in out if n.strip().lower() not in stale_keys]
+                   + [n for n in out if n.strip().lower() in stale_keys])
     return out[:limit]
 
 

@@ -318,6 +318,42 @@ def record_param_misses(runtime_dir: str | Path | None, *, program: str | None, 
         return 0
 
 
+def record_param_confirmation(runtime_dir: str | Path | None, *, program: str | None, target: str,
+                              endpoint: str, class_id: str, param: str,
+                              now: str | None = None) -> bool:
+    """Immunize ONE parameter that produced a real callback: clear its misses, mark it confirmed.
+
+    Without this the parameter half had the immunity hole the endpoint half was fixed for twice: a
+    parameter could accumulate two misses, then confirm, and still be read back as cooled for the
+    whole TTL — so the next capped run would order the sink that just proved a bug behind untried
+    names. Nothing else writes ``confirmed`` for a parameter row, so a confirmation has to be
+    recorded where it happens."""
+    if runtime_dir is None or not enabled():
+        return False
+    try:
+        ep = endpoint_key(endpoint)
+        cls = str(class_id or "").strip().lower()
+        name = str(param or "").strip().lower()
+        if not ep or not cls or not name:
+            return False
+        stamp = _now_iso(now)
+        with _LOCK:
+            data = _load(runtime_dir)
+            prog = data.setdefault("programs", {}).setdefault(
+                program_key(program, target), {"pairs": {}, "updated_at": None})
+            row = prog.setdefault("pairs", {}).setdefault(
+                _param_pair_id(ep, cls, name), {"miss": 0, "last_ts": stamp, "confirmed": False})
+            row["confirmed"] = True
+            row["miss"] = 0
+            row["last_ts"] = stamp
+            prog["updated_at"] = stamp
+            data["updated_at"] = stamp
+            _save(runtime_dir, data)
+        return True
+    except Exception:  # noqa: BLE001 - bookkeeping must never break a hunt
+        return False
+
+
 def cooled_params(runtime_dir: str | Path | None, *, program: str | None, target: str,
                   endpoint: str, class_id: str, min_misses: int = MIN_MISSES,
                   ttl_days: int = TTL_DAYS, now: str | None = None) -> set[str]:
