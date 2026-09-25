@@ -112,6 +112,44 @@ class TheSyntaxGateMustReadEveryModuleTests(unittest.TestCase):
         # And an empty sweep must fail rather than pass forever.
         self.assertIn("the walk is broken", source)
 
+    def test_the_python_gate_finds_this_checkouts_modules_from_where_it_lives(self) -> None:
+        # The outcome, where the test below asserts the shape: run the gate's REAL walk and require
+        # it to find this repo. The regex guard cannot see a walk broken any other way — a wrong
+        # `parents[]` index for ROOT, a TARGETS entry that no longer exists — and those land as the
+        # same "found no Python modules" bail-out on whoever runs the gate next.
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("greyiq_check_syntax", ROOT / "scripts" / "check-syntax.py")
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
+        self.assertGreater(
+            len(gate._modules()), 100,
+            "the syntax gate's own walk finds almost nothing in this checkout, so `npm run check` "
+            "cannot run here at all",
+        )
+
+    def test_no_skip_name_above_the_repo_can_empty_the_walk(self) -> None:
+        """The skip list must be matched against a ROOT-RELATIVE path, never an absolute one.
+
+        ``Path.parts`` on an absolute path carries every ancestor segment above the repo, so a
+        checkout that merely LIVES under a directory named like a skip entry matched every file
+        and the sweep came back empty — tripping the "broken walk" bail-out on a good tree. A
+        ``.claude/worktrees/<name>`` checkout, which is this repo's own worktree convention, hit it
+        on ".claude": `npm run check` could not run at all where the work is done, and the two
+        walks in this file failed with "found only 0 modules". Those two only fail from inside such
+        a checkout, so this asserts the shape instead — it fails anywhere.
+        """
+        for name in ("scripts/check-syntax.py", "backend/test_ci_gate.py"):
+            with self.subTest(file=name):
+                source = (ROOT / name).read_text(encoding="utf-8")
+                for walked in re.findall(r"isdisjoint\((\w+(?:\.\w+|\(\w*\))*)\.parts\)", source):
+                    self.assertIn(
+                        "relative_to(ROOT)", walked,
+                        f"{name} matches the skip list against `{walked}.parts`; make it "
+                        "`relative_to(ROOT).parts` or a checkout under a skip-named directory "
+                        "silently skips every file",
+                    )
+
     def test_the_js_gate_is_derived_rather_than_hand_listed(self) -> None:
         command = str(SCRIPTS.get("check:js") or "")
         self.assertIn("check-syntax.mjs", command)
@@ -129,7 +167,9 @@ class TheSyntaxGateMustReadEveryModuleTests(unittest.TestCase):
             path.relative_to(ROOT).as_posix()
             for suffix in ("*.js", "*.mjs", "*.cjs")
             for path in ROOT.rglob(suffix)
-            if skip.isdisjoint(path.parts)
+            # Relative to ROOT — see _no_skip_name_above_the_repo below for why an absolute
+            # path.parts here matched every file and emptied the list.
+            if skip.isdisjoint(path.relative_to(ROOT).parts)
         )
         for expected in ("ecosystem.config.cjs", "scripts/check-devops.cjs",
                          "server.mjs", "public/app.js",
@@ -283,7 +323,7 @@ class EveryModuleActuallyCompilesTests(unittest.TestCase):
         failures: list[str] = []
         checked = 0
         for path in sorted(BACKEND_DIR.rglob("*.py")):
-            if not skip.isdisjoint(path.parts):
+            if not skip.isdisjoint(path.relative_to(ROOT).parts):
                 continue
             checked += 1
             with warnings.catch_warnings():

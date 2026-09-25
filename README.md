@@ -83,7 +83,10 @@ gets it on every run), a **Workflow** tab that lays each run out as
 **Plan → Change → Verify → Explain**, plus a file tree, a read-only preview with line
 numbers + light syntax highlighting, a Changes/diff tab, Agent Steps, and a Verify
 panel. **Undo last agent run** rolls the workspace back to its exact state before the
-run. Drag the divider to resize, or slide it to the top to
+run, and each card in the Changes tab can **Revert** just that one file. Neither will
+overwrite a file you have edited since the run — it is reported and left alone, because
+an undo that destroys work the agent never touched is worse than no undo.
+Drag the divider to resize, or slide it to the top to
 **dock** the workbench (chat moves to a 1/3 side panel). A light/dark theme toggle is in
 the header.
 
