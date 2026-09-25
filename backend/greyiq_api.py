@@ -2764,6 +2764,10 @@ class GreyIQRuntime:
             excluded_hosts=excluded_hosts,
             on_progress=bounty_progress.sink(run_id) if run_id else None,
             progress_run_id=run_id or None,
+            # The OOB collaborator, same source as the single-hunt route. Without it every
+            # autonomous path had the four out-of-band provers (blind SSRF/XXE/RCE, JWT
+            # key-URL injection) permanently disabled -- see campaign._run_campaign_body.
+            oob_base=self._oob_config()[0], oob_secret=self._oob_config()[1],
         )
         self._cache_bounty_run(result, target=request.target, scope=request.scope, program=request.program,
                                 program_id=str(program_obj.get("id")) if program_obj else None,
@@ -2820,6 +2824,10 @@ class GreyIQRuntime:
             excluded_hosts=excluded_hosts,
             on_progress=bounty_progress.sink(run_id) if run_id else None,
             progress_run_id=run_id or None,
+            # The OOB collaborator, same source as the single-hunt route. Without it every
+            # autonomous path had the four out-of-band provers (blind SSRF/XXE/RCE, JWT
+            # key-URL injection) permanently disabled -- see campaign._run_campaign_body.
+            oob_base=self._oob_config()[0], oob_secret=self._oob_config()[1],
         )
         target_label = f"{program_label} — {len(targets)} in-scope target(s)"
         # program_id is the REAL portfolio id (program_label above is the display name,
@@ -2893,6 +2901,10 @@ class GreyIQRuntime:
             include_attack_map=request.attack_map,
             on_progress=bounty_progress.sink(run_id) if run_id else None,
             progress_run_id=run_id or None,
+            # The OOB collaborator, same source as the single-hunt route. Without it every
+            # autonomous path had the four out-of-band provers (blind SSRF/XXE/RCE, JWT
+            # key-URL injection) permanently disabled -- see campaign._run_campaign_body.
+            oob_base=self._oob_config()[0], oob_secret=self._oob_config()[1],
         )
         if result.get("ok") and skipped:
             result.setdefault("errors", []).insert(0, f"Skipped {len(skipped)} program(s) with no huntable targets: {', '.join(skipped[:8])}.")

@@ -188,6 +188,30 @@ def _load_coder_config(use_brain: bool) -> dict:
     return coder_cfg
 
 
+def _oob_config() -> tuple[str, str]:
+    """The operator's OOB collaborator (url, secret) from the runtime secrets store.
+
+    Same file and same keys ``greyiq_api._oob_config`` reads, so a collaborator configured in the
+    desktop app is honoured by the CLI too. Without this, ``gn hunt`` and ``gn campaign`` had the four
+    out-of-band provers -- blind SSRF, blind XXE, blind RCE and JWT key-URL injection -- permanently
+    disabled, because run_bounty_hunt gates each one on a configured collaborator. Read directly
+    rather than through greyiq_api so the CLI keeps its import-light, torch-free startup.
+
+    Total: an unreadable or malformed store means "no collaborator", which disables the provers —
+    exactly the behaviour before this existed. It never invents one.
+    """
+    try:
+        stored = json.loads((RUNTIME_DIR / "secrets.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ("", "")
+    if not isinstance(stored, dict):
+        return ("", "")
+    base = str(stored.get("oob.collaborator_url") or "").strip()
+    secret = str(stored.get("oob.secret") or "").strip()
+    # Both or neither: a base with no secret cannot mint a token, and the provers require both.
+    return (base, secret) if base and secret else ("", "")
+
+
 def _cmd_hunt(args: argparse.Namespace) -> int:
     from bughunter.bounty import run_bounty_hunt
 
@@ -217,6 +241,7 @@ def _cmd_hunt(args: argparse.Namespace) -> int:
             auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
             per_finding=args.per_finding,
             on_progress=_progress(args, fx),
+            oob_base=_oob_config()[0], oob_secret=_oob_config()[1],
         )
         _fx_report(fx, result)
     if not result.get("ok"):
@@ -278,6 +303,7 @@ def _cmd_campaign(args: argparse.Namespace) -> int:
             platform=getattr(args, "platform", "hackerone") or "hackerone",
             deep=getattr(args, "deep", False),
             on_progress=_progress(args, fx),
+            oob_base=_oob_config()[0], oob_secret=_oob_config()[1],
         )
         _fx_report(fx, result)
     if not result.get("ok"):
