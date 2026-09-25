@@ -2,6 +2,92 @@
 
 Notable changes to GreyIQ.
 
+## v4.6.0 - The reports say only what the run proved, and the gate that checks them actually runs
+
+The first tagged release since v4.4.1, so it also delivers the v4.5.0 changes below, which landed on
+`main` but were never tagged. The theme of everything new here is the same: GreyIQ was printing
+claims its own evidence did not support, and the gate that was supposed to catch that had been
+quietly measuring almost nothing.
+
+**The quality gate was reporting success over work it never did.** `npm run check` is this project's
+only gate - CI runs it, `scripts/release.sh` runs it, a contributor runs it before pushing - and two
+of its three parts were covering far less than they appeared to. The test runner, `unittest
+discover`, collects only `unittest.TestCase` subclasses; eight files write their tests as
+module-level `def test_*` functions, so **59 tests ran nowhere**, among them all 25 of the
+secret-reportability classifier (which decides whether a discovered credential may be reported at
+all), the 10 of the VDP policy gate, the 5 of the VDP report gate, and the DNS-rebinding guard.
+Nothing looked wrong: both runners print a healthy pass count. `pytest.ini` had been in the repo the
+whole time; only `package.json` never caught up. The static check, meanwhile, compiled exactly one
+file of 297 - which is how `bughunter/fsutil.py` shipped an invalid escape sequence (a SyntaxWarning
+today, a SyntaxError in a later Python) in a docstring that no test could reach. `check:js` had
+drifted the same way, missing two shipped files including the version-drift gate `npm run check`
+itself invokes. Both syntax gates are now derived from the tree and fail on an empty sweep, the
+runner is pytest, and a tag can no longer publish untested code: `release.yml` gained a `gate` job
+that every build job depends on, because CI triggers on branches and pull requests and a tag is
+neither.
+
+**Reports no longer contradict themselves.** Eight of eleven hardcoded CVSS blocks printed a score
+their own vector does not produce - a confirmed post-logout session replay rendered a 7.1 High
+vector as "6.5 medium" - and the severity a platform receives comes from the score. A confirmed
+`/actuator/heapdump`, every in-memory secret downloadable and graded `critical` by the check itself,
+was submitted as "Medium, low confidentiality impact". Confirmed CRLF response-header injection was
+filed as CWE-601 open redirect with "allowlist redirect targets" as the remediation. Every report
+rebuilt from history silently dropped its OWASP row - six renderers read the field and the on-demand
+builder never set it - and three classes linked a CWE they do not declare, so a triager who clicked
+the reference landed on a different weakness than the CWE row had just named.
+
+**And they no longer claim evidence the engine never captured.** The CORS reproduction fell back to a
+hard-coded `Access-Control-Allow-Credentials: true` whenever the captured headers carried none, so it
+asked the triager to observe a header the prover had just proved absent and built a credentialed-read
+impact on top of it. The guided action plan kept its own copy of the confirm rule and read a field a
+configured brain writes verbatim, so target-derived prose could make it announce "already confirmed"
+for a finding whose proof section two sections earlier says nothing was captured. Three of the four
+JWT classes shipped a PoC that HMAC-signs with the literal string `<recovered-secret>`. For a
+forged-token finding, "the exact request GreyIQ used to confirm this" was a bare unauthenticated GET.
+The operator's opening move could render as `S e`, because one consumer iterated a newline-delimited
+string character by character. All of it now branches on what was actually observed, and the
+coding brain can no longer overwrite a captured reproduction: a runnable PoC built from real evidence
+wins outright, the same floor the CVSS already had.
+
+**Findings reach the platform routed.** A cached run carries a display label and a real program key
+that are not interchangeable, and both submit-path readers used the label - so `get_program` returned
+nothing, the resolved HackerOne Asset came back empty, the preflight's asset picker was empty too,
+and **every report filed through the cockpit went up unrouted**. A saved program's own `platform`
+never reached the packager either, so a Bugcrowd or Intigriti program's packages came out
+HackerOne-shaped, the NASA VDP preset included. And grouped duplicate locations were dropped from
+every platform body and from the HackerOne API payload: on a six-lead group the on-demand report
+showed 6 of 6 and every submission showed 1 of 6, understating impact and inviting an informational
+close.
+
+**The hunting engine reaches what it was supposed to.** Stop had no effect on a direct hunt: the pill
+flipped to "Stopped" and the active fan-out, the re-plan wave and all four out-of-band provers kept
+sending at a host the operator had just realised was out of scope. Those four provers - blind SSRF,
+blind XXE, blind RCE, JWT key-URL injection, the only way this engine can prove a bug whose effect is
+not visible in the response - were unreachable from every autonomous path, including the unattended
+operator loop. The origin root was evicted from the active target set, so the two root-only checks
+(a served `.git/config` or `.env`; `/actuator/heapdump`, Jolokia, `/.aws/credentials`) never ran on
+any target where recon found four parametered URLs. Per-endpoint class ranking was identical for
+every endpoint. And negative knowledge could not immunise five of its own checks, because a plan
+speaks check tags while an outcome speaks proven impact: a route whose CRLF check had confirmed a
+real bug banked it under `redirect`, accrued misses under `crlf`, and after two clean runs cooled the
+very check that had proven the bug.
+
+**The Studio and the CLI can both train both brains.** TinyGPT's capacity is selectable - `compact`
+(the shipped checkpoint's shape, so a run resumes and improves it), `standard`, `large` - and a
+differently-shaped model can no longer silently replace a trained one, because the outgoing lineage
+is archived first and a diverged run is not persisted at all. Validation loss was a single random
+batch with dropout still active, compared against a `min_delta` of 1e-4; it is now averaged in eval
+mode. The entire early-stopping monitor was implemented and unreachable - no request field, no route,
+no control - and the Train panel posted a hardcoded 160 steps and reported failures nowhere. New
+`gn train-coder` trains the coding brain from the terminal on **arbitrary directories of your own
+documents**, which the Studio never offered; `--show` and `--dry-run` work without torch, text and
+source ingest without pypdf, and a size change that cannot resume the checkpoint refuses without
+`--yes`. `gn train-brain`'s own five parameters were unreachable and are now flags. And `gn hunt`,
+which printed nothing at all for minutes, now draws a live status line that flashes in severity
+colour when a finding is confirmed.
+
+Also: `electron` 44.3.0 -> 44.4.3.
+
 ## v4.5.0 - YesWeHack becomes a place you set a program up from, not just a report format
 
 YesWeHack has been in the platform registry since the report formats landed, but only as an output
