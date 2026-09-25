@@ -41,7 +41,14 @@ def _modules() -> list[Path]:
         if not base.is_dir():
             continue
         for path in base.rglob("*.py"):
-            if SKIP_PARTS.isdisjoint(path.parts):
+            # Match against the path RELATIVE to ROOT, never the absolute one: path.parts on an
+            # absolute path carries every ancestor segment above the repo too, so a checkout that
+            # merely LIVES under a directory named like one of these matched every file and the
+            # sweep came back empty -- the "broken walk" bail-out below, on a perfectly good tree.
+            # A .claude/worktrees/<name> checkout (this repo's own worktree convention) hit it on
+            # ".claude", so the gate could not run at all where the work is done. check-syntax.mjs
+            # is immune by construction: it walks with readdir and tests each directory's own name.
+            if SKIP_PARTS.isdisjoint(path.relative_to(ROOT).parts):
                 found.append(path)
     return sorted(found)
 

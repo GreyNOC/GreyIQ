@@ -170,6 +170,30 @@ def _meta_table(out: list[str], ctx: dict[str, Any], finding: dict[str, Any], pl
     out.append("")
 
 
+def _section_affected_locations(out: list[str], finding: dict[str, Any]) -> None:
+    """Every location a grouped duplicate-lead finding covers.
+
+    ``bounty._group_duplicate_leads`` collapses near-identical leads into ONE representative
+    carrying ``grouped_locations`` — so the meta table's single "Asset / endpoint" row is the
+    representative only, and without this section the submission body claims one affected URL
+    where the engine found several. That understates impact and invites an "informational"
+    close. ``report.build_finding_markdown`` already renders this; the per-platform bodies
+    (and, through ``submission.build_submission``, the HackerOne API payload) must match, or
+    the same finding reads differently depending on which surface produced it. No-op for an
+    ungrouped finding, so a normal report is byte-identical to before."""
+    grouped = R._grouped_locations(finding)
+    if not grouped:
+        return
+    out.append("## Affected locations\n")
+    out.append(f"{len(grouped)} locations share this root cause — filed once, listing each affected path:")
+    out.append("")
+    for loc in grouped[:25]:
+        out.append(f"- {R._code(loc)}")
+    if len(grouped) > 25:
+        out.append(f"- _(+{len(grouped) - 25} more)_")
+    out.append("")
+
+
 def _section_authorization(out: list[str], ctx: dict[str, Any]) -> None:
     out.append("## Authorization & scope\n")
     out.append("> Authorized testing only — reported against an in-scope target.")
@@ -284,6 +308,7 @@ def render_finding(ctx: dict[str, Any], finding: dict[str, Any], platform: str =
     out.append("")
 
     _meta_table(out, ctx, finding, plan, platform)
+    _section_affected_locations(out, finding)
     _section_authorization(out, ctx)
     _section_summary(out, finding, _ai_summary(ctx, finding, plan, platform))
     _section_steps(out, plan)
