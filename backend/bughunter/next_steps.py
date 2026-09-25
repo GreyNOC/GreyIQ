@@ -136,12 +136,26 @@ def _first_actions(ref: str, attack_plans: dict[str, Any], fallback: list[str]) 
 
 
 def _proof_already_confirmed(finding: dict[str, Any], plan: dict[str, Any] | None) -> bool:
-    """True when the proof engine has already captured a confirmed impact artifact."""
-    proof = (plan or {}).get("proof_of_impact") if isinstance(plan, dict) else None
-    if isinstance(proof, dict) and str(proof.get("status") or "").strip().lower() == "confirmed":
-        return True
-    credential = finding.get("_credential_proof") if isinstance(finding.get("_credential_proof"), dict) else {}
-    return credential.get("live") is True
+    """True only when the single confirm authority accepts this finding's captured evidence.
+
+    This used to hold its OWN copy of the rule, and both halves were re-derivations the gate
+    deliberately refuses. It read ``plan["proof_of_impact"]["status"] == "confirmed"``, but a
+    configured brain writes that status verbatim into the plan and the brain reads target-derived
+    recon and response text — so injected prose could make the report's action plan announce
+    "already confirmed … review it before submission" for a finding whose own proof section, two
+    sections earlier, says nothing was captured. And it treated a live credential as proof, which
+    the gate refuses precisely because a public Google/Firebase browser key answering its own
+    issuer is the expected behaviour of that key, not an exploit.
+
+    Delegating means the operator's instructions can never disagree with the evidence printed
+    beside them. ``investigator`` is imported locally to keep this module's import surface flat.
+    """
+    from bughunter import investigator
+
+    try:
+        return bool(investigator.has_confirming_artifact(finding, plan if isinstance(plan, dict) else {}))
+    except Exception:  # noqa: BLE001 - an action plan must never break a finished report
+        return False
 
 
 def _safe_int(value: Any) -> int:

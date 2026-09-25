@@ -54,7 +54,15 @@ from bughunter import (
     vdp_policy,
     web_ingest,
 )
-from bughunter.bounty import _classify, _infer_kind, _safe_slug, build_findings_har, build_replay_script, run_bounty_hunt
+from bughunter.bounty import (
+    _classify,
+    _deterministic_attack_plan,
+    _infer_kind,
+    _safe_slug,
+    build_findings_har,
+    build_replay_script,
+    run_bounty_hunt,
+)
 from bughunter.rate_limit import shared_governor
 from bughunter.registrable_domain import registrable_domain
 from bughunter.settings import get_settings
@@ -797,8 +805,17 @@ def _run_campaign_body(
         # A public client key / dead credential is informational, not a submittable candidate.
         _sc = str(finding.get("secret_classification") or "")
         pstatus = "missing" if _sc in (secret_classification.PUBLIC_CLIENT_KEY, secret_classification.FALSE_POSITIVE) else "candidate"
+        # Carry an inline plan, like every other directly-consolidated source (CVE, GraphQL, IDOR,
+        # BFLA). This branch was the one exception: it has no per-URL run behind it, so it had no
+        # `source_json` sidecar to read a plan from either, and the submission package fell through
+        # to an EMPTY plan — shipping "_Verify manually within your authorized scope._" where the
+        # numbered reproduction belongs, with no impact paragraph and no CVSS row. A PEM body or an
+        # AWS secret key mined out of served JS classifies as a confirmed secret and keeps its High
+        # severity, so these are exactly the packages an operator files.
+        _js_plan = _deterministic_attack_plan(finding, cid)
         consolidated.append({"finding": finding, "source_url": finding["location"], "source_report": "",
-                             "source_json": "", "proof_status": pstatus, "cvss": {}})
+                             "source_json": "", "proof_status": pstatus,
+                             "cvss": _js_plan.get("cvss") or {}, "plan": _js_plan})
 
     # --- API-discovery candidates (GraphQL introspection): each carries its own inline plan. ---
     for finding in recon_api_findings:

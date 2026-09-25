@@ -291,5 +291,44 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(out["probe_priority"][0]["classes"], ["idor", "xss"])  # idor stays first, endpoint kept
 
 
+class VocabularyFoldTests(unittest.TestCase):
+    """A plan speaks CHECK TAGS; an outcome speaks the IMPACT the finding carries. Five checks
+    report an impact under a different name than their tag, so without a fold the two halves of a
+    pair id could never meet — and the store cooled the exact checks that had proven bugs."""
+
+    # (check tag the plan carries, impact class the finding reports)
+    DIVERGENT = (("crlf", "redirect"), ("host-header", "redirect"),
+                 ("clickjacking", "headers"), ("sensitive", "disclosure"), ("debug", "rce"))
+
+    def test_a_confirmed_impact_immunises_the_tag_that_produced_it(self) -> None:
+        for tag, impact in self.DIVERGENT:
+            with self.subTest(tag=tag):
+                with tempfile.TemporaryDirectory() as tmp:
+                    probe = ("https://app.example.com/download", [tag])
+                    # Two clean runs that CONFIRM the bug. The check reports its impact class.
+                    for _ in range(2):
+                        nk.record_hunt(tmp, program=None, target=_TARGET, plan=_plan(probe),
+                                       complete=True,
+                                       outcomes=[_outcome("https://app.example.com/download",
+                                                          impact, "confirmed")])
+                    cooled = nk.cooled_pairs(tmp, program=None, target=_TARGET)
+                    self.assertNotIn(
+                        nk._pair_id("app.example.com/download", tag), cooled,
+                        f"{tag!r} confirmed as {impact!r} twice and was still cooled")
+
+    def test_an_unrelated_class_on_the_same_route_still_cools(self) -> None:
+        """The fold must not become blanket route-level immunity — a class that really is inert
+        on a productive route is still what the capped probe budget should skip."""
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = ("https://app.example.com/download", ["crlf", "xss"])
+            for _ in range(2):
+                nk.record_hunt(tmp, program=None, target=_TARGET, plan=_plan(probe), complete=True,
+                               outcomes=[_outcome("https://app.example.com/download",
+                                                  "redirect", "confirmed")])
+            cooled = nk.cooled_pairs(tmp, program=None, target=_TARGET)
+            self.assertIn(nk._pair_id("app.example.com/download", "xss"), cooled)
+            self.assertNotIn(nk._pair_id("app.example.com/download", "crlf"), cooled)
+
+
 if __name__ == "__main__":
     unittest.main()
