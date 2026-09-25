@@ -112,6 +112,22 @@ class TheSyntaxGateMustReadEveryModuleTests(unittest.TestCase):
         # And an empty sweep must fail rather than pass forever.
         self.assertIn("the walk is broken", source)
 
+    def test_the_python_gate_finds_this_checkouts_modules_from_where_it_lives(self) -> None:
+        # The outcome, where the test below asserts the shape: run the gate's REAL walk and require
+        # it to find this repo. The regex guard cannot see a walk broken any other way — a wrong
+        # `parents[]` index for ROOT, a TARGETS entry that no longer exists — and those land as the
+        # same "found no Python modules" bail-out on whoever runs the gate next.
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("greyiq_check_syntax", ROOT / "scripts" / "check-syntax.py")
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
+        self.assertGreater(
+            len(gate._modules()), 100,
+            "the syntax gate's own walk finds almost nothing in this checkout, so `npm run check` "
+            "cannot run here at all",
+        )
+
     def test_no_skip_name_above_the_repo_can_empty_the_walk(self) -> None:
         """The skip list must be matched against a ROOT-RELATIVE path, never an absolute one.
 
