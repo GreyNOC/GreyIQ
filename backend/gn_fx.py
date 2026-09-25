@@ -84,11 +84,36 @@ def _truthy_off(name: str) -> bool:
     return str(os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _term_allows_motion(term: str | None, os_name: str) -> bool:
+    """The ``TERM`` rule, as a pure function of the two inputs it actually depends on.
+
+    Two distinct cases were once collapsed into one expression (``… not in {"dumb", ""} or
+    os.name == "nt"``), and the ``or`` let Windows overrule both of them:
+
+      * ``TERM=dumb`` is an operator explicitly asking for no escape sequences. It wins on every
+        platform. Windows has no say in it — ``dumb`` is set deliberately, never by default.
+      * An EMPTY ``TERM`` is the only thing the platform gets to decide. On POSIX it means no
+        terminfo entry, so nothing may be assumed; on Windows it is simply the norm — cmd.exe,
+        PowerShell and Windows Terminal all leave ``TERM`` unset while handling ANSI perfectly
+        well — so an unset ``TERM`` there is not evidence of a dumb terminal.
+
+    Taking the platform as an argument rather than reading ``os.name`` keeps both halves of that
+    matrix testable from either platform, which is the whole reason the bug shipped: on Linux
+    ``TERM=dumb`` worked, and the test that asserts it could not see the Windows branch at all.
+    """
+    normalized = str(term or "").strip().lower()
+    if normalized == "dumb":
+        return False
+    return bool(normalized) or os_name == "nt"
+
+
 def enabled(stream: TextIO | None = None) -> bool:
     """Whether motion is appropriate for this invocation.
 
     Mirrors ``gn_cli._color_enabled`` but on the stream the frames go to, because stdout and stderr
     are redirected independently: ``gn hunt … --json > out.json`` still has a human watching stderr.
+    The one deliberate difference is an empty ``TERM``: colour is a single SGR code and stays on,
+    while motion needs cursor control, so it wants a terminal that has named itself.
     """
     stream = stream if stream is not None else sys.stderr
     try:
@@ -98,7 +123,7 @@ def enabled(stream: TextIO | None = None) -> bool:
         return False
     if os.getenv("NO_COLOR") is not None or _truthy_off("GN_NO_FX"):
         return False
-    return str(os.getenv("TERM") or "").strip().lower() not in {"dumb", ""} or os.name == "nt"
+    return _term_allows_motion(os.getenv("TERM"), os.name)
 
 
 def _pick_frames(stream: TextIO) -> dict[str, Any]:
