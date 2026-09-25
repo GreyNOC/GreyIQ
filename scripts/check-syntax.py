@@ -41,7 +41,13 @@ def _modules() -> list[Path]:
         if not base.is_dir():
             continue
         for path in base.rglob("*.py"):
-            if SKIP_PARTS.isdisjoint(path.parts):
+            # Match SKIP_PARTS against the path RELATIVE to the repo root. An absolute path's
+            # .parts also carries every ancestor directory name, so a checkout that merely LIVES
+            # under a directory named .claude / dist / build / release / runtime matched the skip
+            # list on its own ancestry and the sweep found nothing — which is every Claude Code
+            # worktree, since those are .claude/worktrees/<name>. The gate then exited 1 on
+            # "the walk is broken" before compiling a single module.
+            if SKIP_PARTS.isdisjoint(path.relative_to(ROOT).parts):
                 found.append(path)
     return sorted(found)
 

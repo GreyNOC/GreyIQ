@@ -112,6 +112,23 @@ class TheSyntaxGateMustReadEveryModuleTests(unittest.TestCase):
         # And an empty sweep must fail rather than pass forever.
         self.assertIn("the walk is broken", source)
 
+    def test_the_python_gate_finds_this_checkouts_modules_from_where_it_lives(self) -> None:
+        # The gate matched its skip list against ABSOLUTE path parts, which carry the checkout's own
+        # ancestry — so a tree living under a directory named .claude / dist / build / release /
+        # runtime skipped every file in itself and exited 1 on "the walk is broken". That is every
+        # Claude Code worktree (.claude/worktrees/<name>), i.e. the machine doing the work, while a
+        # plain CI clone was fine. Run the gate's real walk here rather than asserting on its source.
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("greyiq_check_syntax", ROOT / "scripts" / "check-syntax.py")
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
+        self.assertGreater(
+            len(gate._modules()), 100,
+            "the syntax gate's own walk finds almost nothing in this checkout, so `npm run check` "
+            "cannot run here at all — the skip list is matching the checkout's own path",
+        )
+
     def test_the_js_gate_is_derived_rather_than_hand_listed(self) -> None:
         command = str(SCRIPTS.get("check:js") or "")
         self.assertIn("check-syntax.mjs", command)
@@ -125,11 +142,13 @@ class TheSyntaxGateMustReadEveryModuleTests(unittest.TestCase):
         # The point of deriving it: these two were missing from the hand-listed set, and one of them
         # IS the gate that `npm run check` calls to catch version drift.
         skip = {"node_modules", ".git", "runtime", "release", "dist", "build", ".venv-build", ".claude"}
+        # Relative to ROOT, like the walker itself: an absolute path's .parts carries the ancestry
+        # too, so a checkout under a directory named .claude / dist / build matches its own address.
         shipped = sorted(
             path.relative_to(ROOT).as_posix()
             for suffix in ("*.js", "*.mjs", "*.cjs")
             for path in ROOT.rglob(suffix)
-            if skip.isdisjoint(path.parts)
+            if skip.isdisjoint(path.relative_to(ROOT).parts)
         )
         for expected in ("ecosystem.config.cjs", "scripts/check-devops.cjs",
                          "server.mjs", "public/app.js",
@@ -283,7 +302,9 @@ class EveryModuleActuallyCompilesTests(unittest.TestCase):
         failures: list[str] = []
         checked = 0
         for path in sorted(BACKEND_DIR.rglob("*.py")):
-            if not skip.isdisjoint(path.parts):
+            # Relative to ROOT: an absolute path's .parts carries the checkout's own ancestry, so a
+            # tree living under a directory named .claude / dist / build skipped every file in it.
+            if not skip.isdisjoint(path.relative_to(ROOT).parts):
                 continue
             checked += 1
             with warnings.catch_warnings():
