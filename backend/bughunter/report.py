@@ -78,15 +78,22 @@ def normalize_steps(raw: Any) -> list[str]:
     …), which is exactly the garbled "steps to reproduce" a HackerOne triager rejects.
     This splits a string on newlines (never char-by-char), drops blanks, and strips any
     leading enumerator the source already added, so the renderer's numbering is the only
-    numbering. Returns a list of clean step strings."""
+    numbering. Returns a list of clean step strings.
+
+    Newlines are split out of LIST ITEMS too, not just a bare string. A brain that returns
+    ``["1. Send the request\n2. Observe the reflection\n3. Confirm it executes"]`` means three
+    steps; treating it as one left the inner ``2.``/``3.`` markers embedded in step 1, so the
+    rendered procedure was numbered by two different authorities at once and every consumer
+    that counts steps saw a single step where the triager reads three."""
     if raw is None:
         return []
     items = raw.splitlines() if isinstance(raw, str) else (raw if isinstance(raw, (list, tuple)) else [raw])
     out: list[str] = []
     for item in items:
-        text = re.sub(r"^\s*(?:\d+[.)]|[-*•])\s+", "", str(item).strip()).strip()
-        if text:
-            out.append(text)
+        for line in str(item).splitlines():
+            text = re.sub(r"^\s*(?:\d+[.)]|[-*•])\s+", "", line.strip()).strip()
+            if text:
+                out.append(text)
     return out
 
 
@@ -1426,7 +1433,13 @@ def _finding_check_results(finding: dict[str, Any], plan: dict[str, Any]) -> lis
     DOCUMENTATION-completeness signal only — the request-line point below is evidence
     bookkeeping and must NEVER feed proof['ready']/status (proof confirmation has its
     own gate in _has_captured_artifact)."""
-    steps = plan.get("steps") or []
+    # Count the steps the READER will actually see. Reading the raw field measured something
+    # else entirely: a newline-delimited string made `len` a CHARACTER count, so any plan whose
+    # steps arrived as prose passed "specific enough to replay" on length alone, while a list
+    # holding one multi-line blob counted as a single step and failed the check despite
+    # rendering a full numbered procedure. Both the checklist and the completeness score read
+    # this, so they have to agree with the renderer, which normalizes.
+    steps = normalize_steps(plan.get("steps"))
     impact = plan.get("impact") or finding.get("impact")
     proof = _proof_of_impact_detail(finding, plan)
     remediation = finding.get("remediation") or plan.get("remediation")

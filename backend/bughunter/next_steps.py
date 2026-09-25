@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from bughunter.report import resolve_severity
+from bughunter.report import normalize_steps, resolve_severity
 
 # Severity / confidence → numeric weight. A finding's "act on this next" score is
 # severity-dominant but confidence-aware, so we don't send the operator chasing a
@@ -118,7 +118,11 @@ def _first_actions(ref: str, attack_plans: dict[str, Any], fallback: list[str]) 
     """The most concrete opening move for a finding: the first 1-2 reproduction
     steps from its attack plan, else the first class-checklist item."""
     plan = (attack_plans or {}).get(ref) or {}
-    steps = [str(s).strip() for s in (plan.get("steps") or []) if str(s).strip()]
+    # normalize_steps, NOT a bare iteration: `steps` is only meant to be a list of strings, but a
+    # brain or an imported ctx can hand over one newline-delimited STRING — and iterating a string
+    # walks it character by character, so the operator's opening move rendered as "S e". Same
+    # coercion the report renderer uses, so the action plan and the report agree on the procedure.
+    steps = normalize_steps(plan.get("steps"))
     # Skip the generic "Locate the issue at ..." lead the deterministic planner
     # prepends — the operator wants the *test*, not "go look at it".
     meaningful = [s for s in steps if not s.lower().startswith("locate the issue")]

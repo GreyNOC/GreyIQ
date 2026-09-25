@@ -454,6 +454,98 @@ class BountyReportTests(unittest.TestCase):
         self.assertTrue(any("Passive web review" in c for c in cov["covered"]))
 
 
+class ReproductionStepsTests(unittest.TestCase):
+    """A triager's first act is to replay the bug, so every surface that delivers a repro must
+    deliver it as an ORDERED, NUMBERED procedure — and everything that counts steps has to count
+    the same steps the reader sees."""
+
+    # The two shapes a brain (or a cached/imported ctx) really hands over.
+    AS_STRING = "Send a GET to /search?q=marker\nObserve the marker reflected unencoded\nConfirm it executes"
+    AS_BLOB = ["1. Send a GET to /search?q=marker\n2. Observe reflection\n3. Confirm execution"]
+    AS_LIST = ["Send a GET to /search?q=marker", "Observe reflection", "Confirm execution"]
+
+    def test_every_shape_normalizes_to_the_same_numbered_procedure(self) -> None:
+        for label, raw in (("string", self.AS_STRING), ("blob", self.AS_BLOB), ("list", self.AS_LIST)):
+            with self.subTest(shape=label):
+                steps = report_lib.normalize_steps(raw)
+                self.assertEqual(len(steps), 3, f"{label} must yield three steps: {steps}")
+                for step in steps:
+                    self.assertNotRegex(step, r"^\s*(?:\d+[.)]|[-*•])\s",
+                                        "the renderer owns the numbering, not the source")
+                    self.assertNotIn("\n", step, "a step must be one line so numbering stays 1:1")
+
+    def test_a_bare_string_is_never_walked_character_by_character(self) -> None:
+        """The failure this guards: iterating a string yields 'S', 'e', 'n'… which reached the
+        operator's action plan as the literal opening move "S e"."""
+        self.assertEqual(report_lib.normalize_steps("Send the request")[0], "Send the request")
+
+    def test_the_readiness_check_counts_what_the_reader_sees(self) -> None:
+        """Reading the raw field measured a CHARACTER count for a string (so any prose passed on
+        length alone) and a single item for a multi-line blob (so a full procedure read as
+        'not specific enough'). Both must agree with the rendered step count."""
+        for label, raw in (("string", self.AS_STRING), ("blob", self.AS_BLOB), ("list", self.AS_LIST)):
+            with self.subTest(shape=label):
+                plan = {"steps": raw}
+                rendered = len(report_lib.normalize_steps(raw))
+                row = next(ok for ok, text in report_lib._finding_check_results({"ref": "F1"}, plan)
+                           if "Reproduction steps" in text)
+                self.assertEqual(row, rendered >= 2, f"{label}: checklist disagrees with the render")
+
+    def test_one_real_step_is_not_advertised_as_replayable(self) -> None:
+        plan = {"steps": ["Look at the page"]}
+        self.assertFalse(next(ok for ok, text in report_lib._finding_check_results({"ref": "F1"}, plan)
+                              if "Reproduction steps" in text))
+
+    def test_the_operator_action_plan_quotes_real_steps(self) -> None:
+        for label, raw in (("string", self.AS_STRING), ("blob", self.AS_BLOB)):
+            with self.subTest(shape=label):
+                opening = next_steps_lib._first_actions("F1", {"F1": {"steps": raw}}, [])
+                self.assertIn("Send a GET", opening)
+                self.assertNotRegex(opening, r"^\w \w$", "char-by-char garbling returned")
+
+    def test_the_main_report_numbers_the_steps(self) -> None:
+        ctx = _ctx_with_finding(steps=self.AS_LIST)
+        markdown = report_lib.build_markdown(ctx)
+        self.assertIn("1. Send a GET to /search?q=marker", markdown)
+        self.assertIn("2. Observe reflection", markdown)
+        self.assertIn("3. Confirm execution", markdown)
+
+    def test_every_platform_export_numbers_the_steps(self) -> None:
+        """render_finding is the one renderer behind all five platforms, so the numbered procedure
+        must survive each reshaping."""
+        from bughunter import report_formats
+
+        ctx = _ctx_with_finding(steps=self.AS_LIST)
+        finding = ctx["findings"][0]
+        for platform in ("hackerone", "yeswehack", "bugcrowd", "intigriti", "hackenproof"):
+            with self.subTest(platform=platform):
+                body = report_formats.render_finding(ctx, finding, platform)
+                self.assertIn("## Steps to reproduce", body)
+                self.assertIn("1. Send a GET to /search?q=marker", body)
+                self.assertIn("3. Confirm execution", body)
+
+
+def _ctx_with_finding(*, steps: list[str]) -> dict:
+    """A minimal reportable, confirmed finding plus the plan carrying its repro steps."""
+    finding = {
+        "ref": "F1", "rule_id": "active.reflected-xss", "title": "Reflected XSS",
+        "class_id": "xss", "class_name": "Reflected XSS", "severity": "medium",
+        "confidence": "high", "location": "https://app.example/search",
+        "proof_evidence": {"request_line": "GET https://app.example/search?q=marker",
+                           "response_status": "HTTP 200"},
+    }
+    plans = {"F1": {"steps": steps, "impact": "Script executes in a victim session.",
+                    "proof_of_impact": {"status": "confirmed", "method": "differential",
+                                        "observed_result": "marker executed",
+                                        "control_result": "encoded, inert"}}}
+    return {
+        "tool": "GreyIQ BugHunter", "version": "test", "target": "https://app.example",
+        "profile": {"name": "Web app"}, "risk": "medium", "score": 0.5,
+        "findings": [finding], "attack_plans": plans, "scanners_run": ["active"],
+        "authorized": True, "brain": {}, "next_steps": [], "coverage": {},
+    }
+
+
 class SeverityOrderingTests(unittest.TestCase):
     def test_order_by_resolved_severity_renumbers_and_rekeys(self) -> None:
         from bughunter.bounty import _order_by_resolved_severity
