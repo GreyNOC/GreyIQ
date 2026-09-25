@@ -1879,7 +1879,12 @@ function renderTrainSettingsForm() {
 function readTrainSettingsForm() {
   const previous = trainSettings();
   const num = (el, fallback) => {
-    const value = Number(el && el.value);
+    // A BLANK input is Number("") === 0, which is finite — so the fallback never fired and clearing a
+    // field to retype it persisted maxIters: 1 / learningRate: 0 into localStorage on blur, silently
+    // destroying the operator's settings. Treat blank as "no opinion".
+    const raw = el ? el.value : "";
+    if (String(raw).trim() === "") return fallback;
+    const value = Number(raw);
     return Number.isFinite(value) ? value : fallback;
   };
   return {
@@ -2555,8 +2560,10 @@ function renderHuntModel(info) {
   }
   if (els.huntModelScore) {
     // The eval block is only populated once a model has been trained and gated; before that it is {}.
-    const score = evaluation.model_score ?? evaluation.score ?? null;
-    const baseline = evaluation.rules_score ?? evaluation.baseline ?? null;
+    // hunt_train reports the promotion metric as recall@3 for the model and the rules baseline it had
+    // to beat, so show that pair — a bare score with nothing to compare it to says little.
+    const score = evaluation.recall_at_3_model ?? evaluation.model_score ?? evaluation.score ?? null;
+    const baseline = evaluation.recall_at_3_rules ?? evaluation.rules_score ?? evaluation.baseline ?? null;
     if (score === null || score === undefined) {
       els.huntModelScore.textContent = Number(corpus.hunts) ? "not trained yet" : "no hunts yet";
     } else {
@@ -10791,6 +10798,9 @@ function ckCapturedProofFields(rec) {
       request_line: pe.request_line || "", request_header: pe.request_header || "",
       response_status: pe.response_status || "", response_header: pe.response_header || "",
       set_cookie: pe.set_cookie || "", matched_value: pe.matched_value || "", read_data: pe.read_data || "",
+      // The disclosed data's NAME is the one impact field that survives redaction: read_data comes
+      // back as [REDACTED_…] markers, so without this a rebuilt report cannot say what was at risk.
+      sensitive_data_labels: pe.sensitive_data_labels || "",
     };
   }
   const poi = cap.proof_of_impact;

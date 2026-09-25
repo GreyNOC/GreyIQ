@@ -677,6 +677,10 @@ def _run_campaign_body(
             version=version, run_live=live, active=effective_active, time_based=(time_based or deep), auth=auth, per_finding=False,
             extra_params=recon_params, on_progress=_emit, settings=campaign_settings, class_priority=hunt_priority.get(url),
             ssrf_params=brain_ssrf_params, xss_params=brain_xss_params,
+            # Make Stop responsive WITHIN a URL, not only between them. The loop above already breaks on
+            # progress.is_stopped, but a single URL's active fan-out, re-plan wave and OOB provers can run
+            # for a long time — so without this the operator waits out the current URL after hitting Stop.
+            should_stop=(lambda rid=progress_run_id: progress.is_stopped(rid)) if progress_run_id else None,
         )
         per_target.append({"target": url, "ok": result.get("ok", False),
                            "report_path": result.get("report_path", ""), "error": result.get("error", "")})

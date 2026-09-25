@@ -487,3 +487,63 @@ class StructuredSnapshotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KillSwitchReachesADirectHuntTests(unittest.TestCase):
+    """Stop must halt a SINGLE hunt's probing, not just relabel the UI.
+
+    campaign.py polls progress.is_stopped between targets and between URLs, but a direct hunt only
+    ever received ``on_progress`` — a one-way message sink. So clicking Stop flipped the pill to
+    "Stopped" and disabled the button while the active fan-out, the re-plan wave and all four OOB
+    provers kept sending requests at a host the operator had just realised was out of scope. That is
+    the one control in an authorized-testing tool that has to work.
+
+    These tests assert the wiring rather than driving a live hunt: the predicate exists, every probe
+    launch site consults it, and a broken predicate cannot abort a legitimate run.
+    """
+
+    def test_the_hunt_body_accepts_and_consults_a_stop_predicate(self) -> None:
+        import inspect
+
+        from bughunter import bounty
+
+        signature = inspect.signature(bounty._run_bounty_hunt_body)
+        self.assertIn("should_stop", signature.parameters,
+                      "the hunt body cannot be told to stop")
+        source = inspect.getsource(bounty._run_bounty_hunt_body)
+        self.assertIn("def _stopped()", source)
+        # Every place that starts sending must check it: the per-target active fan-out, the re-plan
+        # wave, and each of the four OOB provers (which inject callback tokens and then poll).
+        self.assertGreaterEqual(source.count("_stopped()"), 6,
+                                "a probe launch site is not gated on the kill switch")
+
+    def test_a_raising_predicate_does_not_abort_the_hunt(self) -> None:
+        # A broken kill switch must fail OPEN — aborting a legitimate, authorized hunt because a
+        # status lookup raised would be its own bug.
+        import inspect
+
+        from bughunter import bounty
+
+        source = inspect.getsource(bounty._run_bounty_hunt_body)
+        start = source.index("def _stopped()")
+        # The helper's own body: from its def to the first line at the enclosing indent that follows it.
+        body = source[start:start + 700]
+        self.assertIn("except Exception", body,
+                      "_stopped() does not swallow a raising predicate, so a broken status lookup "
+                      "would abort an authorized hunt")
+        self.assertIn("return False", body)
+
+    def test_both_entry_points_pass_the_predicate(self) -> None:
+        api = (BACKEND_DIR / "greyiq_api.py").read_text(encoding="utf-8")
+        self.assertIn("should_stop=(lambda rid=run_id: bounty_progress.is_stopped(rid))", api,
+                      "the direct-hunt route does not pass the kill switch")
+        campaign_src = (BACKEND_DIR / "bughunter" / "campaign.py").read_text(encoding="utf-8")
+        self.assertIn("should_stop=(lambda rid=progress_run_id: progress.is_stopped(rid))", campaign_src,
+                      "a campaign's per-URL hunt does not pass the kill switch, so Stop waits out the URL")
+
+    def test_the_flag_itself_round_trips(self) -> None:
+        run_id = "killswitch-contract-test"
+        progress.start_run(run_id)
+        self.assertFalse(progress.is_stopped(run_id))
+        progress.request_stop(run_id)
+        self.assertTrue(progress.is_stopped(run_id))

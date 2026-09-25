@@ -2136,6 +2136,10 @@ class GreyIQRuntime:
             # web_ingest.set_ua_suffix inside the hunt.
             user_agent_suffix=request.user_agent_suffix,
             on_progress=bounty_progress.sink(run_id) if run_id else None,
+            # The operator's Stop button. Without this a single hunt could not hear it at all: the pill
+            # flipped to "Stopped" while the active fan-out, the re-plan wave and all four OOB provers
+            # kept sending. The campaign paths below already poll this same flag between their URLs.
+            should_stop=(lambda rid=run_id: bounty_progress.is_stopped(rid)) if run_id else None,
             # When a collaborator is configured, an active+authorized URL hunt also runs the blind-SSRF
             # OOB probe automatically (the token is the reproducible 'sheriff flag').
             oob_base=self._oob_config()[0], oob_secret=self._oob_config()[1],

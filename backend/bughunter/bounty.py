@@ -1889,6 +1889,28 @@ def _rank_active_targets(seed: str, urls: list[str] | tuple[str, ...] | set[str]
         return [seed]
     if seed not in selected and len(selected) < limit:
         selected.append(seed)
+
+    # ALWAYS keep the origin root in the set. Two of the highest-value active checks are root-ONLY by
+    # construction — _check_sensitive_paths (a served .git/.env, so source and live credentials) and
+    # _check_debug_endpoints (/actuator/heapdump, Jolokia, /.aws/credentials) both return None unless
+    # the URL path is empty, because they probe a fixed list once per host rather than per endpoint.
+    # The ranking above deliberately scores a bare root LOWEST (no query, no hot word, and an explicit
+    # -1), so on any target where recon found `limit` parametered URLs the root was evicted and those
+    # checks silently never ran on a direct hunt: the engine could not find an exposed .env on a site
+    # with four interesting URLs. Reserve the last slot for the root instead of hoping it survives.
+    try:
+        parsed_seed = urlparse(seed)
+        origin_root = f"{parsed_seed.scheme}://{parsed_seed.netloc}/" if parsed_seed.netloc else ""
+    except ValueError:
+        origin_root = ""
+    # limit >= 2 only: with a budget of one target the operator's own URL wins, because swapping it for
+    # the root would mean never probing the thing they actually typed.
+    if (limit >= 2 and origin_root
+            and not any(url.rstrip("/") == origin_root.rstrip("/") for url in selected)):
+        # Evict the LOWEST-ranked entry rather than growing past the cap — the cap is a request-spend
+        # bound, so overflowing it would spend budget the caller did not authorise.
+        selected = selected[: limit - 1]
+        selected.append(origin_root)
     return selected
 
 
@@ -2274,6 +2296,13 @@ def _run_bounty_hunt_body(
     per_finding: bool = False,
     extra_params: list[str] | None = None,
     on_progress: Any = None,
+    # The operator's kill switch, as a predicate the caller owns (greyiq_api passes
+    # ``lambda: progress.is_stopped(run_id)``). A DIRECT hunt previously had no way to hear Stop at
+    # all: campaign.py checks progress.is_stopped between targets and between URLs, but a single hunt
+    # only received ``on_progress``, a one-way message sink. So clicking Stop flipped the pill to
+    # "Stopped", disabled the button — and the active fan-out, the re-plan wave and the OOB probes all
+    # kept sending requests at a production host the operator had just realised was out of scope.
+    should_stop: Any = None,
     settings: Any = None,
     oob_base: str = "",
     oob_secret: str = "",
@@ -2292,6 +2321,17 @@ def _run_bounty_hunt_body(
                 on_progress(msg)
             except Exception:  # noqa: BLE001 - a progress sink must never break the hunt
                 pass
+
+    def _stopped() -> bool:
+        """True once the operator has asked this run to stop. Total: a raising or absent predicate
+        means "keep going", because a broken kill switch must not abort a legitimate hunt — the
+        checks below are placed so that honouring it early is always safe."""
+        if not callable(should_stop):
+            return False
+        try:
+            return bool(should_stop())
+        except Exception:  # noqa: BLE001
+            return False
 
     clean_target = str(target or "").strip()
     if not clean_target:
@@ -2576,6 +2616,9 @@ def _run_bounty_hunt_body(
                     min_interval_s=active_settings.active_min_interval_ms / 1000.0,
                 )
                 for active_target in active_targets:
+                    if _stopped():
+                        _emit("stop requested — halting the active pass before the next target")
+                        break
                     target_priority = _priority_for_active_target(
                         active_target, endpoint_class_priorities, effective_class_priority,
                     )
@@ -2631,7 +2674,7 @@ def _run_bounty_hunt_body(
         # rather than the seed URL the iterative loop probes. It runs HERE, before classification /
         # attack planning / the QA gate, so what it captures flows through them like any other
         # active finding — after the final graph it would skip all of them.
-        if active_meta.get("in_scope") and getattr(
+        if active_meta.get("in_scope") and not _stopped() and getattr(
                 settings or active_verify_service.get_settings(), "hunt_replan_enabled", False):
             try:
                 replan_settings = settings or active_verify_service.get_settings()
@@ -2676,7 +2719,10 @@ def _run_bounty_hunt_body(
         # fresh, unguessable callback token per candidate param, probes, and polls the collaborator;
         # a hit that appears ONLY after the probe (fresh-token negative control) is a confirmed blind
         # SSRF, with the token as the reproducible "sheriff flag". Best-effort; never breaks a hunt.
-        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+        # Each of the four OOB provers below carries its own ``not _stopped()`` guard: every one injects
+        # callback tokens and then polls the collaborator, so starting one after the operator hit Stop
+        # keeps sending at the target for as long as its poll window lasts.
+        if str(oob_base or "").strip() and str(oob_secret or "").strip() and not _stopped():
             try:
                 _emit("running blind-SSRF OOB probe (collaborator configured)…")
                 ssrf = oob_service.confirm_blind_ssrf(clean_target, base=oob_base, secret=oob_secret,
@@ -2699,7 +2745,7 @@ def _run_bounty_hunt_body(
         # DNS-pinned target and polls; the entity fetches ONLY the collaborator callback (no target file
         # is ever read), and a hit that appears solely after the probe (fresh-token negative control)
         # confirms blind XXE. Best-effort; a target that doesn't parse XML is a clean no-op; never breaks a hunt.
-        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+        if str(oob_base or "").strip() and str(oob_secret or "").strip() and not _stopped():
             try:
                 _emit("running blind-XXE OOB probe (collaborator configured)…")
                 xxe = oob_service.confirm_blind_xxe(clean_target, base=oob_base, secret=oob_secret,
@@ -2722,7 +2768,7 @@ def _run_bounty_hunt_body(
         # request headers that reach a shell without any parameter existing, and confirms only on a
         # collaborator hit whose MATCHED bare-URL control stayed silent — so an application that merely
         # fetches URLs it finds (an unfurler, a plain SSRF) is reported as that, never as a CRITICAL RCE.
-        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+        if str(oob_base or "").strip() and str(oob_secret or "").strip() and not _stopped():
             try:
                 _emit("running blind-RCE OOB probe (collaborator configured)…")
                 rce = oob_service.confirm_blind_rce(clean_target, base=oob_base, secret=oob_secret,
@@ -2747,7 +2793,7 @@ def _run_bounty_hunt_body(
         # rejects the token answers exactly like one that never fetched), so the fetch is the only
         # observable and it is only observable out of band. Uses the token the app hands an ANONYMOUS
         # visitor, so no session is needed; a target that issues none is a clean no-op.
-        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+        if str(oob_base or "").strip() and str(oob_secret or "").strip() and not _stopped():
             try:
                 _emit("running JWT key-URL injection OOB probe (collaborator configured)…")
                 jwtk = oob_service.confirm_jwt_key_injection(clean_target, base=oob_base, secret=oob_secret,

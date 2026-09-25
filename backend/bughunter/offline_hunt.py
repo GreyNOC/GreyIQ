@@ -353,8 +353,28 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
     # analogue of the LLM proposing param_hypotheses. Only NEW names (not already discovered) are added.
     for url in endpoints[:60]:
         names = _endpoint_params(url) or []
-        alln = names + sorted(recon_params)
-        candidates = _classes_for_endpoint(url, alln, tech_boost)
+        # Match the parameter cues against THIS endpoint's own inputs — its query names plus, when it is
+        # a form action, that form's fields. It used to be `names + sorted(recon_params)`: the whole
+        # HOST's recon params, the same list for every endpoint. That made the per-endpoint ranking
+        # meaningless, and because _classes_for_endpoint caps at six classes and appends the
+        # newly-reachable ones LAST, the shared params saturated every slot and truncated them away.
+        #
+        # Measured on a surface of ten /ws/room-N plus fifteen /download?file= endpoints with twelve
+        # ordinary host params: all twenty rows collapsed to just TWO distinct class-sets, `websocket`
+        # never appeared on the websocket endpoints at all, and because every score was identical the
+        # _MAX_PRIORITY cap broke the tie by discovery order — evicting five /download?file= endpoints
+        # in favour of ws rooms. Own-params only restores path-traversal as the top class on the
+        # download endpoints and keeps all fifteen.
+        #
+        # The host-wide list is NOT lost, and no coverage is dropped. _rank still receives it
+        # separately, so the learned ranker keeps that feature; and the prover gets the same list as
+        # `extra_params`, where active_verify_service._candidate_params unions it into EVERY
+        # param-keyed check on EVERY endpoint. So a name discovered on one endpoint is still TRIED on
+        # the others — it just no longer votes on which CLASS that other endpoint looks like. Only the
+        # ORDER the prover spends its budget in changes, which is the one thing this ranking is for.
+        _own_form = forms_by_action.get(url) or {}
+        own = names + [str(field) for field in (_own_form.get("params") or []) if str(field or "").strip()]
+        candidates = _classes_for_endpoint(url, own, tech_boost)
         classes = _rank(candidates, priors, model, url, names, sorted(recon_params), tech,
                         forms_by_action.get(url))
         if classes and url not in seen_pri:
