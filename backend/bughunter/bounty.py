@@ -2969,10 +2969,38 @@ def _run_bounty_hunt_body(
         _emit(f"brain enrichment FAILED (report is deterministic-only): {brain['error']}")
     else:
         _emit("brain enrichment skipped (no brain configured)")
+    _finding_by_ref = {str(f.get("ref")): f for f in display if f.get("ref")}
     for ref, plan in brain.get("attack_plans", {}).items():
         if ref in attack_plans and (plan.get("steps") or plan.get("poc")):
             base = attack_plans[ref]
             merged = {**base, **{k: v for k, v in plan.items() if v}}
+            # A CONCRETE reproduction is an ARTIFACT, not prose, and the brain must not be able to
+            # replace one. `_deterministic_attack_plan` sets steps/poc from `_concrete_repro` when the
+            # captured evidence supports a real crafted request and a runnable PoC -- and the plain
+            # dict merge above overwrote both with whatever the brain returned. Measured: a confirmed
+            # CORS finding's 782-character runnable PoC page (the artifact a triager opens to watch
+            # the cross-origin read happen) was replaced by the three characters "N/A", and its
+            # reproduction steps by "Read the report.". A wrong PoC is worse than none: the triager
+            # runs it, nothing happens, and a real finding looks false.
+            #
+            # This is the same floor the two blocks below already apply to proof_of_impact and CVSS,
+            # extended to the two fields that carry the reproduction. The brain still enriches freely
+            # where there is no concrete reproduction to protect (a candidate's generic checklist),
+            # and its prose is kept as additional context rather than discarded.
+            # Recomputed from the finding rather than recorded on the plan: _concrete_repro is pure,
+            # and a private marker key on the plan would have to be stripped before the report ships.
+            _finding = _finding_by_ref.get(str(ref)) or {}
+            _concrete_steps, _concrete_poc = _concrete_repro(_finding, str(_finding.get("class_id") or ""))
+            if _concrete_poc:
+                # The brain's poc is DISCARDED here rather than kept alongside: report.py reads only
+                # plan["poc"], so a second field would be dead weight, and prose about a runnable
+                # artifact the brain did not produce adds nothing a triager can run. Same precedence
+                # the CVSS block below applies — the deterministic artifact wins outright.
+                merged["poc"] = _concrete_poc
+            if _concrete_steps:
+                brain_steps = [str(x) for x in (plan.get("steps") or []) if str(x or "").strip()]
+                extra = [x for x in brain_steps if x not in _concrete_steps]
+                merged["steps"] = list(_concrete_steps) + extra
             # The deterministic proof obligation + CVSS are the floor: keep them when
             # the brain didn't supply its own, so the report is never left without
             # the "capture this to prove impact" guidance or a severity vector.
