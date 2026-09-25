@@ -98,7 +98,16 @@ def enabled(stream: TextIO | None = None) -> bool:
         return False
     if os.getenv("NO_COLOR") is not None or _truthy_off("GN_NO_FX"):
         return False
-    return str(os.getenv("TERM") or "").strip().lower() not in {"dumb", ""} or os.name == "nt"
+    term = str(os.getenv("TERM") or "").strip().lower()
+    # ``TERM=dumb`` is the universal, deliberate "render nothing clever" signal, so it wins on every
+    # platform. The Windows clause below exists only to rescue an UNSET TERM — Windows terminals do
+    # not conventionally set it, and treating absence as "dumb" would disable motion for every
+    # Windows user. Folding both into one expression let ``or os.name == "nt"`` swallow the explicit
+    # opt-out too, so a Windows operator who asked for no effects still got them. The suite catches
+    # this only on Windows, and the release gate runs on Linux — hence it shipped.
+    if term == "dumb":
+        return False
+    return term != "" or os.name == "nt"
 
 
 def _pick_frames(stream: TextIO) -> dict[str, Any]:

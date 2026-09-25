@@ -6385,10 +6385,17 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             return
 
         relative_path = unquote(path.lstrip("/")) or "index.html"
+        # Reject an embedded null byte EXPLICITLY rather than relying on .resolve() to raise.
+        # It raises ValueError('embedded null byte') on POSIX but NOT on Windows, where the path
+        # resolves happily, stays inside PUBLIC_DIR, simply does not exist, and so falls through to
+        # the SPA index — a 200 where the other platform returns 404. Checking here makes a
+        # malformed path answer identically everywhere instead of depending on the host OS.
+        if "\x00" in relative_path:
+            await send_json(send, {"error": "not found"}, 404)
+            return
         try:
-            # .resolve() itself raises ValueError('embedded null byte') / OSError on a
-            # trivially malformed path (e.g. GET /%00 -> relative_path "\x00"), so it must
-            # live INSIDE the guard alongside the traversal check -- otherwise it escapes to
+            # .resolve() can still raise ValueError/OSError on other trivially malformed paths, so
+            # it stays INSIDE the guard alongside the traversal check -- otherwise it escapes to
             # the generic 500 handler with a logged traceback instead of the intended 404.
             file_path = (PUBLIC_DIR / relative_path).resolve()
             file_path.relative_to(PUBLIC_DIR.resolve())
