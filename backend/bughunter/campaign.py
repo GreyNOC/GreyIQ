@@ -1668,7 +1668,7 @@ def run_portfolio_campaign(
     one combined result shaped like a single campaign — so the Findings board + Submissions hub
     render a portfolio hunt exactly like a single one. Each program is a dashboard unit; its
     findings stream under it as they surface. ``programs`` is a list of resolved specs:
-    ``{label, scope, targets, excluded_hosts, disclose_automation}``.
+    ``{label, scope, targets, excluded_hosts, disclose_automation, platform}``.
 
     Reuses ``run_campaign_over_targets`` verbatim per program (portfolio mode:
     ``progress_unit=<program label>``), so every fail-closed safety property (scope binding,
@@ -1693,6 +1693,10 @@ def run_portfolio_campaign(
                       "admin_account_access": p.get("admin_account_access") if isinstance(p.get("admin_account_access"), dict) else {},
                       "idor_pairs": p.get("idor_pairs") if isinstance(p.get("idor_pairs"), list) else [],
                       "policy_profile": str(p.get("policy_profile") or ""),
+                      # Per-program, like policy_profile: a portfolio routinely spans programs on
+                      # DIFFERENT platforms, so one portfolio-wide id can only be right for some of
+                      # them. Empty falls back to the portfolio-wide `platform` arg below.
+                      "platform": str(p.get("platform") or ""),
                       "user_agent_suffix": str(p.get("user_agent_suffix") or "")})
     if not clean:
         return {"ok": False, "error": "No huntable programs — each needs seed targets, an opted-in source repository, or an imported/built structured scope."}
@@ -1744,7 +1748,7 @@ def run_portfolio_campaign(
                 spec["targets"], scope=spec["scope"], authorized=authorized, coder_cfg=coder_cfg,
                 default_reports_dir=portfolio_root, seed_dir=seed_dir, runtime_dir=runtime_dir, version=version,
                 active=active, time_based=time_based, auth=auth, live=live, program=label, max_pages=max_pages,
-                platform=platform, deep=deep, disclose_automation=spec["disclose_automation"],
+                platform=spec.get("platform") or platform, deep=deep, disclose_automation=spec["disclose_automation"],
                 account_access=spec["account_access"], admin_account_access=spec.get("admin_account_access"),
                 idor_pairs=spec.get("idor_pairs"), policy_profile=spec.get("policy_profile", ""),
                 user_agent_suffix=spec["user_agent_suffix"],

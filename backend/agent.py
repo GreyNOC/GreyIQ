@@ -16,6 +16,7 @@ Safety:
 """
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import re
@@ -547,6 +548,10 @@ class ToolBox:
         # (clipped for the UI payload), this keeps the complete bytes so an undo
         # restores files exactly.
         self.snapshot: dict[str, dict[str, Any]] = {}
+        # sha256 of the content this run LAST wrote to each touched file, keyed by rel
+        # path. Rollback compares it against what is on disk now: a file the user edited
+        # after the run no longer matches, and must not be silently overwritten.
+        self.post_run_hashes: dict[str, str] = {}
         # Directories the run created (that did not exist at first touch), deepest
         # first — so a rollback can remove them and an undo is actually clean.
         self.created_dirs: list[str] = []
@@ -708,6 +713,9 @@ class ToolBox:
 
     def _record_change(self, target: Path, operation: str, before: str | None, after: str) -> None:
         rel = target.relative_to(self.root).as_posix()
+        # Hash the FULL post-run content (not the clipped `after` below) so rollback can tell
+        # "still exactly what the run left here" from "the user has edited it since".
+        self.post_run_hashes[rel] = _content_hash(after)
         for existing in self.changes:
             if existing["path"] == rel:
                 # A later edit/write to the same file: keep the original "before",
@@ -839,9 +847,19 @@ class ToolBox:
     def snapshot_payload(self) -> list[dict[str, Any]]:
         """Full pre-run state of touched files (and the directories the run created),
         for one-click rollback. Created-dir entries are deepest-first so restore can
-        rmdir them bottom-up after the files inside are removed."""
+        rmdir them bottom-up after the files inside are removed.
+
+        ``content_unavailable`` and ``after_sha256`` ride along because ``restore_snapshot``
+        reads both: without the first it blanks a file whose original it never captured, and
+        without the second it overwrites edits the user made after the run."""
         payload = [
-            {"path": rel, "existed": entry["existed"], "content": entry["content"]}
+            {
+                "path": rel,
+                "existed": entry["existed"],
+                "content": entry["content"],
+                "content_unavailable": bool(entry.get("content_unavailable")),
+                "after_sha256": self.post_run_hashes.get(rel, ""),
+            }
             for rel, entry in self.snapshot.items()
         ]
         for rel in sorted(self.created_dirs, key=lambda p: p.count("/"), reverse=True):
@@ -2435,10 +2453,21 @@ def _run_tool_loop(
     )
 
 
+def _content_hash(text: str) -> str:
+    """Stable digest of a file's text, for "is this still what the run wrote?" checks."""
+    return hashlib.sha256(str(text or "").encode("utf-8", "replace")).hexdigest()
+
+
 def restore_snapshot(files: list[dict[str, Any]], workspace: str) -> dict[str, Any]:
     """Roll a workspace back to a captured pre-run snapshot: rewrite modified files
     to their originals and delete files the run created. Every path is resolved and
-    confined to the workspace root, like the agent's own tools."""
+    confined to the workspace root, like the agent's own tools.
+
+    A file the user edited AFTER the run is refused, not overwritten — the same guarantee
+    ``workspace.rollback_changes`` gives. The snapshot carries ``after_sha256`` (what the run
+    left on disk); if the file matches neither that nor the pre-run content, the edit is the
+    user's and undoing it here would destroy work the run never touched. A snapshot written
+    before that field existed has no hash, so it restores as it always did."""
     root = Path(str(workspace or "")).expanduser().resolve()
     if not root.is_dir():
         raise AgentError(f"Workspace is not a folder: {workspace}")
@@ -2462,13 +2491,23 @@ def restore_snapshot(files: list[dict[str, Any]], workspace: str) -> dict[str, A
                     target.rmdir()
                     deleted.append(rel + "/")
                 continue
-            if entry.get("existed"):
-                if entry.get("content_unavailable"):
-                    # Pre-existed but its content wasn't captured — leave it untouched rather than
-                    # blanking it with "" (never destroy data we can't faithfully restore).
+            if entry.get("existed") and entry.get("content_unavailable"):
+                # Pre-existed but its content wasn't captured — leave it untouched rather than
+                # blanking it with "" (never destroy data we can't faithfully restore).
+                continue
+            before = str(entry.get("content") or "")
+            after_sha = str(entry.get("after_sha256") or "")
+            current = _read_for_rollback(target)
+            if after_sha and current is not None:
+                now = _content_hash(current)
+                # Already back at the pre-run text (e.g. reverted one file at a time) is a
+                # no-op, not a conflict — only content that is neither is the user's own edit.
+                if now != after_sha and not (entry.get("existed") and now == _content_hash(before)):
+                    errors.append(f"{rel}: file changed after the agent run; review it before undoing.")
                     continue
+            if entry.get("existed"):
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(str(entry.get("content") or ""), encoding="utf-8")
+                target.write_text(before, encoding="utf-8")
                 restored.append(rel)
             elif target.exists():
                 target.unlink()
@@ -2476,3 +2515,14 @@ def restore_snapshot(files: list[dict[str, Any]], workspace: str) -> dict[str, A
         except OSError as exc:
             errors.append(f"{rel}: {exc}")
     return {"restored": restored, "deleted": deleted, "errors": errors}
+
+
+def _read_for_rollback(target: Path) -> str | None:
+    """The file's current text, or None when it is absent or unreadable (an unreadable file
+    can't be compared, so the conflict check abstains rather than blocking the rollback)."""
+    if not target.is_file():
+        return None
+    try:
+        return target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None

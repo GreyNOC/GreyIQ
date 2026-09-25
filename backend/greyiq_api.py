@@ -1022,13 +1022,15 @@ class StoredXssRequest(BaseModel):
 
 
 class StoredXssBeaconRequest(BaseModel):
+    # NO base/secret here, deliberately. The collaborator URL + secret are read server-side from
+    # the saved OOB config, exactly as oob-ssrf / oob-xxe / mint / poll do. They used to be request
+    # fields, which made this route unreachable from the app: oob_config_status returns only
+    # `has_secret`, never the secret itself, so no client could ever fill them in.
     view_url: str = Field(min_length=1, max_length=4000)   # where the stored content renders
     inject_url: str = Field(default="", max_length=4000)   # the form endpoint (auto-send only)
     field: str = Field(default="", max_length=200)         # the field to submit into (auto-send only)
     scope: str = Field(default="", max_length=2000)
     platform: str = Field(default="hackerone", max_length=20)
-    base: str = Field(default="", max_length=2000)         # OOB collaborator base URL
-    secret: str = Field(default="", max_length=200)        # OOB collaborator secret
     send: bool = Field(default=False)               # opt-in: POST the beacon into the field, then render + poll
     token: str = Field(default="", max_length=64)   # re-render/re-poll an assisted token after injecting manually
     cookie: str = Field(default="", max_length=8000)
@@ -2734,6 +2736,14 @@ class GreyIQRuntime:
         admin_account_access = program_obj.get("admin_account_access") if program_obj else None
         idor_pairs = program_obj.get("idor_pairs") if program_obj else None
         policy_profile = str(program_obj.get("policy_profile") or "") if program_obj else ""
+        # The saved program's destination platform SHAPES every submission package written to disk
+        # (report_formats picks the per-platform field set + severity vocabulary). Without it the
+        # engine default stood, so a Bugcrowd/Intigriti/YesWeHack program's on-disk packages came
+        # out HackerOne-shaped — wrong severity vocabulary and missing the required VRT/CVSS field.
+        # normalize_platform here so the engine is always handed a real platform id: a program's
+        # 'manual' (the portfolio default) is not a report format, and normalizing maps it to the
+        # same default the engine already used, leaving those programs exactly as they were.
+        platform = bounty_formats.normalize_platform(program_obj.get("platform") if program_obj else "")
         # An explicit per-run tag wins over the saved program's (the operator typed it for THIS run);
         # otherwise the program's stored requirement stands, exactly as before. The value is carried
         # VERBATIM (only the emptiness test is trimmed) — a program dictates its own spacing, which is
@@ -2761,6 +2771,7 @@ class GreyIQRuntime:
             admin_account_access=admin_account_access,
             idor_pairs=idor_pairs,
             policy_profile=policy_profile,
+            platform=platform,
             user_agent_suffix=user_agent_suffix,
             live=request.live,
             program=request.program,
@@ -2817,6 +2828,9 @@ class GreyIQRuntime:
             admin_account_access=program.get("admin_account_access"),
             idor_pairs=program.get("idor_pairs"),
             policy_profile=str(program.get("policy_profile") or ""),
+            # The program's destination platform shapes every submission package this span writes
+            # (see the same line in the single-target path for why it must be forwarded).
+            platform=bounty_formats.normalize_platform(program.get("platform")),
             # Same precedence as the single-target path: a per-run tag the operator typed for THIS
             # span wins; otherwise the program's saved requirement. Carried verbatim.
             user_agent_suffix=(str(request.user_agent_suffix or "")
@@ -2880,6 +2894,9 @@ class GreyIQRuntime:
                 "admin_account_access": program.get("admin_account_access"),
                 "idor_pairs": program.get("idor_pairs"),
                 "policy_profile": str(program.get("policy_profile") or ""),
+                # Per-program, like policy_profile: a portfolio spans programs on different
+                # platforms, so each one's packages must be shaped for ITS destination.
+                "platform": bounty_formats.normalize_platform(program.get("platform")),
                 "user_agent_suffix": str(program.get("user_agent_suffix") or ""),
             })
         if not specs:
@@ -3776,6 +3793,20 @@ class GreyIQRuntime:
             cache[handle] = res.get("weaknesses") if res.get("ok") else []
         return bounty_taxonomy.match_weakness_id(cache.get(handle) or [], cwe)
 
+    @staticmethod
+    def _run_program_id(run: dict[str, Any] | None) -> str:
+        """The portfolio id of the program a cached run is bound to, for a portfolio lookup.
+
+        A cached run carries BOTH keys and they are not interchangeable: "program" is the
+        DISPLAY label (a span caches the program's name, the plain path the operator's free
+        text) while "program_id" is the real key portfolio.get_program indexes on. The id is
+        derived from the name (learning.program_key slugifies it), so reading "program" here
+        hands get_program "Acme Corp" where the store is keyed "acme-corp" and the lookup
+        silently misses. Fall back to "program" only for a run cached before program_id
+        existed — _cache_bounty_run itself defaults program_id to program, so the fallback
+        is the same value on every run this build writes."""
+        return str((run or {}).get("program_id") or (run or {}).get("program") or "").strip()
+
     def _match_structured_scope_id(self, run: dict[str, Any] | None, finding: dict[str, Any],
                                    override: str = "") -> str:
         """Resolve the HackerOne structured_scope_id for a finding's host so a filed report is
@@ -3785,7 +3816,7 @@ class GreyIQRuntime:
         Returns '' when nothing matches (report files un-routed, as before)."""
         if str(override or "").strip():
             return str(override).strip()
-        program_id = str((run or {}).get("program") or "").strip()
+        program_id = self._run_program_id(run)
         if not program_id:
             return ""
         program = bounty_portfolio.get_program(RUNTIME_DIR, program_id)
@@ -3918,7 +3949,7 @@ class GreyIQRuntime:
         pf = bounty_submission.preflight(package, platform)
 
         assets: list[dict[str, str]] = []
-        program_id = str((run or {}).get("program") or "").strip()
+        program_id = self._run_program_id(run)
         if program_id:
             program = bounty_portfolio.get_program(RUNTIME_DIR, program_id)
             for entry in (program or {}).get("structured_scope") or []:
@@ -4175,10 +4206,15 @@ class GreyIQRuntime:
         """Confirm stored XSS via an OOB collaborator beacon rendered in a browser — proves the injected
         markup EXECUTES on render (catches DOM/JS-rendered stored XSS a source fetch misses). Assisted by
         default (mint a token + beacon payloads, hand back to submit, then re-render/poll); ``send=True``
-        opts in to GreyIQ POSTing the beacon, rendering the view headlessly, and polling the collaborator."""
+        opts in to GreyIQ POSTing the beacon, rendering the view headlessly, and polling the collaborator.
+
+        The collaborator base + secret come from the SAVED OOB config, never from the request — the
+        secret is write-only (oob_config_status reports only its presence), so a client could not
+        supply it even if asked."""
+        base, secret = self._oob_config()
         res = bounty_stored_xss.confirm_stored_xss_beacon(
             view_url=request.view_url, inject_url=request.inject_url, field=request.field,
-            base=request.base, secret=request.secret, scope=request.scope, send=bool(request.send),
+            base=base, secret=secret, scope=request.scope, send=bool(request.send),
             token=(request.token or None), cookie=request.cookie, headers=request.headers)
         if not res.get("ok"):
             return res
