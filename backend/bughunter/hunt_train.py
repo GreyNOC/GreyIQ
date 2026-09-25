@@ -54,6 +54,7 @@ import json
 import math
 import os
 import random
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -582,7 +583,20 @@ def register_cli(sub: Any) -> None:
     parser.add_argument("--dry-run", action="store_true", help="evaluate and print, write nothing")
     parser.add_argument("--show", action="store_true",
                         help="print the ACTIVE model (seed vs runtime, created_at, eval) and exit")
-    parser.add_argument("--min-rows", type=int, default=_DEFAULT_MIN_ROWS)
+    parser.add_argument("--min-rows", type=int, default=_DEFAULT_MIN_ROWS,
+                        help=f"refuse to train below this many labeled rows (default {_DEFAULT_MIN_ROWS})")
+    # train() has accepted these five since it was written and the CLI passed NONE of them, so the
+    # only reachable configuration was the default one. They are the whole of the fit: holdout decides
+    # how honest the promotion gate is, and epochs/lr/l2 decide whether the fit converges at all on a
+    # corpus whose size the operator cannot control.
+    parser.add_argument("--holdout", type=float, default=0.2, metavar="FRACTION",
+                        help="fraction of PROGRAMS held out to score against the rules baseline "
+                             "(default 0.2; 0 disables the gate and is refused)")
+    parser.add_argument("--epochs", type=int, default=40, help="gradient steps per class (default 40)")
+    parser.add_argument("--lr", type=float, default=0.1, help="learning rate (default 0.1)")
+    parser.add_argument("--l2", type=float, default=1e-4, help="L2 penalty (default 1e-4)")
+    parser.add_argument("--seed", type=int, default=1337, dest="rng_seed",
+                        help="RNG seed; the same corpus and seed retrain byte-identically (default 1337)")
     parser.add_argument("--json", action="store_true")
     parser.set_defaults(func=_cmd_train_brain)
 
@@ -665,7 +679,25 @@ def _cmd_train_brain(args: Any) -> int:
             print("  enough rows to train: run `gn train-brain`.")
         return 0
 
-    result = train(runtime_dir, seed_dir=seed_dir, min_rows=min_rows, dry_run=bool(getattr(args, "dry_run", False)))
+    # Every knob train() takes, forwarded. getattr with the signature default so a caller that builds
+    # its own Namespace (the tests do) keeps working without listing all of them.
+    holdout = float(getattr(args, "holdout", 0.2))
+    if not 0.0 < holdout < 1.0:
+        print("refused: --holdout must be between 0 and 1 (exclusive). It is the held-out program "
+              "fraction the promotion gate scores against the rules baseline; without it a model "
+              "would be promoted on its own training data.", file=sys.stderr)
+        return 1
+    result = train(
+        runtime_dir,
+        seed_dir=seed_dir,
+        min_rows=min_rows,
+        dry_run=bool(getattr(args, "dry_run", False)),
+        holdout=holdout,
+        epochs=int(getattr(args, "epochs", 40)),
+        lr=float(getattr(args, "lr", 0.1)),
+        l2=float(getattr(args, "l2", 1e-4)),
+        rng_seed=int(getattr(args, "rng_seed", 1337)),
+    )
     if as_json:
         print(json.dumps(result, indent=2, default=str))
         return 0 if result["ok"] else 1

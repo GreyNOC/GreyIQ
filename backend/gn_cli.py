@@ -40,6 +40,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 # --- Resolve seed/runtime dirs exactly like greyiq_api (frozen vs dev). ---
@@ -75,7 +76,8 @@ _ALWAYS_DISPATCH: tuple[str, ...] = ("gn",)
 # import light — it runs on every `import gn_cli`, and pulling torch/pandas in at
 # registration time would break test_boot_no_torch.py and CLI startup. Import the engine
 # inside the command function, exactly like the _cmd_* handlers below.
-_VERB_PLUGINS: tuple[str, ...] = ("bughunter.hunt_train", "bughunter.wardrive.cli", "edit_mine")
+_VERB_PLUGINS: tuple[str, ...] = ("bughunter.hunt_train", "coder_train",
+                                  "bughunter.wardrive.cli", "edit_mine")
 
 _SEV_COLOR = {"critical": "1;31", "high": "31", "medium": "33", "low": "36", "info": "2"}
 
@@ -86,6 +88,71 @@ def _color_enabled() -> bool:
 
 def _c(text: str, code: str) -> str:
     return f"\033[{code}m{text}\033[0m" if _color_enabled() else text
+
+
+def _pad(text: str, code: str, width: int) -> str:
+    """Colour ``text`` and pad it to ``width`` VISIBLE characters.
+
+    Every column in this file used to be written ``f"{_c(name, '36'):<28}"``, which pads the
+    ANSI-WRAPPED string — so with colour on, the nine invisible bytes of the escape sequence were
+    counted as content and every column was nine characters short. `gn classes`, `gn profiles`,
+    `gn tools`, `gn stats` and the operator listing all rendered as a ragged mess on a real terminal
+    and looked perfect in the tests, which capture through StringIO and so never colour at all.
+    Pad on the plain text, then wrap.
+    """
+    body = str(text)
+    filler = " " * max(0, int(width) - len(body))
+    return _c(body, code) + filler
+
+
+def _fx(args: argparse.Namespace, title: str) -> Any:
+    """The live animated status line for a long verb — see ``gn_fx``.
+
+    Inert (not one byte written) unless stderr is a terminal a human is watching, and never under
+    ``--json`` even on a terminal: a caller redirecting stdout to a file is still a machine consumer
+    and the phase lines would confuse a log. ``--no-fx`` and ``GN_NO_FX=1`` both turn it off.
+    """
+    import gn_fx
+
+    off = bool(getattr(args, "no_fx", False)) or bool(getattr(args, "json", False))
+    return gn_fx.scanner(title, active=False if off else None)
+
+
+def _progress(args: argparse.Namespace, fx: Any) -> Any:
+    """The ``on_progress`` sink the engines take.
+
+    Three modes, in priority order: nothing under ``--json`` (stdout must stay one parseable
+    document); the live line when a human is watching stderr; otherwise the historical dim stdout
+    line, byte-identical to what this printed before the animation existed — which is what a pipe,
+    a CI log and the whole test suite get.
+    """
+    import gn_fx
+
+    if getattr(args, "json", False):
+        return None
+    return gn_fx.progress_sink(fx, fallback=(lambda m: print(_c(f"  - {m}", "2"))))
+
+
+def _fx_report(fx: Any, result: dict) -> None:
+    """Flash the live line once per CONFIRMED finding, in its own severity colour.
+
+    Confirmed only, and read from the engine's own proof status rather than the severity field: the
+    whole point of this program is that a candidate is not a finding, so a passive header lead must
+    not flash Critical across the operator's terminal. A run that confirms nothing leaves the line
+    showing the phase and nothing else, which is the honest outcome.
+    """
+    if fx is None or not getattr(fx, "active", False):
+        return
+    try:
+        for finding in (result.get("findings") or []):
+            if not isinstance(finding, dict):
+                continue
+            status = str(finding.get("proof_status") or (finding.get("proof_of_impact") or {}).get("status") or "")
+            if status.strip().lower() != "confirmed":
+                continue
+            fx.hit(str(finding.get("severity") or "info"), str(finding.get("title") or ""))
+    except Exception:  # noqa: BLE001 - a decoration must never break a completed hunt
+        pass
 
 
 def _err(message: str) -> int:
@@ -127,24 +194,31 @@ def _cmd_hunt(args: argparse.Namespace) -> int:
     if not args.authorize:
         return _err("a hunt tests a live/owned target — pass -y/--authorize to confirm you're authorized and in scope.")
     out_dir = args.out or str(RUNTIME_DIR / "reports")
-    result = run_bounty_hunt(
-        args.target,
-        args.profile,
-        args.vuln_class,
-        out_dir,
-        args.scope or "",
-        True,  # authorized — gated by --authorize above
-        _load_coder_config(args.brain),
-        default_reports_dir=RUNTIME_DIR / "reports",
-        seed_dir=SEED_DIR,
-        runtime_dir=RUNTIME_DIR,
-        version=VERSION,
-        run_live=args.live,
-        active=args.active or getattr(args, "time_based", False) or getattr(args, "deep", False),  # --time-based/--deep imply --active
-        time_based=getattr(args, "time_based", False),
-        auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
-        per_finding=args.per_finding,
-    )
+    # A direct hunt used to pass no on_progress at ALL, so nothing printed between the command and the
+    # summary -- minutes of silence in which a working hunt and a hung one look identical.
+    fx = _fx(args, args.target)
+    with fx:
+        fx.phase("starting hunt")
+        result = run_bounty_hunt(
+            args.target,
+            args.profile,
+            args.vuln_class,
+            out_dir,
+            args.scope or "",
+            True,  # authorized — gated by --authorize above
+            _load_coder_config(args.brain),
+            default_reports_dir=RUNTIME_DIR / "reports",
+            seed_dir=SEED_DIR,
+            runtime_dir=RUNTIME_DIR,
+            version=VERSION,
+            run_live=args.live,
+            active=args.active or getattr(args, "time_based", False) or getattr(args, "deep", False),  # --time-based/--deep imply --active
+            time_based=getattr(args, "time_based", False),
+            auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
+            per_finding=args.per_finding,
+            on_progress=_progress(args, fx),
+        )
+        _fx_report(fx, result)
     if not result.get("ok"):
         return _err(result.get("error", "the hunt could not run."))
     if args.json:
@@ -182,26 +256,30 @@ def _cmd_campaign(args: argparse.Namespace) -> int:
 
     if not args.authorize:
         return _err("a campaign tests a live/owned target end-to-end — pass -y/--authorize to confirm scope.")
-    result = run_campaign(
-        args.target,
-        scope=args.scope or "",
-        authorized=True,
-        coder_cfg=_load_coder_config(args.brain),
-        default_reports_dir=RUNTIME_DIR / "reports",
-        seed_dir=SEED_DIR,
-        runtime_dir=RUNTIME_DIR,
-        version=VERSION,
-        active=args.active or getattr(args, "time_based", False) or getattr(args, "deep", False),  # --time-based/--deep imply --active
-        time_based=getattr(args, "time_based", False),
-        auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
-        live=args.live,
-        program=args.program,
-        max_pages=args.max_pages,
-        osint=getattr(args, "osint", False),
-        platform=getattr(args, "platform", "hackerone") or "hackerone",
-        deep=getattr(args, "deep", False),
-        on_progress=(lambda m: print(_c(f"  - {m}", "2"))) if not args.json else None,
-    )
+    fx = _fx(args, args.target)
+    with fx:
+        fx.phase("starting campaign")
+        result = run_campaign(
+            args.target,
+            scope=args.scope or "",
+            authorized=True,
+            coder_cfg=_load_coder_config(args.brain),
+            default_reports_dir=RUNTIME_DIR / "reports",
+            seed_dir=SEED_DIR,
+            runtime_dir=RUNTIME_DIR,
+            version=VERSION,
+            active=args.active or getattr(args, "time_based", False) or getattr(args, "deep", False),  # --time-based/--deep imply --active
+            time_based=getattr(args, "time_based", False),
+            auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
+            live=args.live,
+            program=args.program,
+            max_pages=args.max_pages,
+            osint=getattr(args, "osint", False),
+            platform=getattr(args, "platform", "hackerone") or "hackerone",
+            deep=getattr(args, "deep", False),
+            on_progress=_progress(args, fx),
+        )
+        _fx_report(fx, result)
     if not result.get("ok"):
         return _err(result.get("error", "the campaign could not run."))
     if args.json:
@@ -229,6 +307,11 @@ def _cmd_osint(args: argparse.Namespace) -> int:
     if args.active and not args.hunt:
         return _err("--active is valid only with --hunt.")
 
+    # Started, not `with`-wrapped: this function has five early `return _err(...)` exits below, and
+    # gn_fx.stop_all() in main()'s finally clears the line on every one of them.
+    fx = _fx(args, args.target)
+    fx.start()
+    fx.phase("passive OSINT collection")
     result = osint_engine.run_campaign(
         args.target,
         output_dir=args.out or (RUNTIME_DIR / "osint"),
@@ -272,11 +355,13 @@ def _cmd_osint(args: argparse.Namespace) -> int:
             program=args.program or result.get("apex"),
             max_pages=args.max_pages,
             platform=args.platform,
-            on_progress=(lambda m: print(_c(f"  - {m}", "2"))) if not args.json else None,
+            on_progress=_progress(args, fx),
         )
         if not hunt_result.get("ok"):
             return _err(hunt_result.get("error", "the verified-host hunt could not run."))
+        _fx_report(fx, hunt_result)
 
+    fx.stop()
     if args.json:
         payload = dict(result)
         if hunt_result is not None:
@@ -336,7 +421,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
             return 0
         print(_c("Bounty learning — by program:", "1"))
         for key, summary in sorted(progs.items(), key=lambda kv: -kv[1]["bounty_total"]):
-            print(f"  {_c(key, '36'):<28} submitted {summary['submitted']}, rewarded {summary['rewarded']}, ${summary['bounty_total']:g}")
+            print(f"  {_pad(key, '36', 28)} submitted {summary['submitted']}, rewarded {summary['rewarded']}, ${summary['bounty_total']:g}")
         print("\nRun `gn stats --program <key>` for the class breakdown.")
         return 0
     print(_c(f"Program: {data['program']}", "1"))
@@ -553,7 +638,7 @@ def _cmd_operator(args: argparse.Namespace) -> int:
         for p in progs:
             flags = " ".join(f for f, on in (("active", p["active"]), ("live", p["live"]), ("deep", p.get("deep")),
                                              ("auto-submit", p["auto_submit"]), ("enabled", p["enabled"])) if on) or "disabled"
-            print(f"  {_c(p['id'], '36'):<24} {p['name']}  [{flags}]  scope: {p['scope_text'] or '(none)'}  "
+            print(f"  {_pad(p['id'], '36', 24)} {p['name']}  [{flags}]  scope: {p['scope_text'] or '(none)'}  "
                   f"targets: {len(p['seed_targets'])}  every {p['interval_minutes']}m")
         return 0
 
@@ -821,7 +906,7 @@ def _cmd_platforms(args: argparse.Namespace) -> int:
     print(_c("Report formats (use --platform <id> on a campaign):", "1"))
     for p in platforms:
         default = "  (default)" if p["id"] == report_formats.DEFAULT_PLATFORM else ""
-        print(f"  {_c(p['id'], '36'):<28} {p['name']}{default}")
+        print(f"  {_pad(p['id'], '36', 28)} {p['name']}{default}")
         print(f"      {p['blurb']}")
     return 0
 
@@ -836,7 +921,7 @@ def _cmd_profiles(args: argparse.Namespace) -> int:
     print(_c("Hunt profiles:", "1"))
     for profile in data["profiles"]:
         kinds = ", ".join(profile.get("kinds") or [])
-        print(f"  {_c(profile['id'], '36'):<28} {profile['name']}  ({kinds})")
+        print(f"  {_pad(profile['id'], '36', 28)} {profile['name']}  ({kinds})")
         print(f"      {profile['description']}")
     return 0
 
@@ -850,7 +935,7 @@ def _cmd_classes(args: argparse.Namespace) -> int:
         return 0
     print(_c(f"Vuln classes ({len(classes)}):", "1"))
     for cls in classes:
-        print(f"  {_c(cls['id'], '36'):<28} {cls['name']}")
+        print(f"  {_pad(cls['id'], '36', 28)} {cls['name']}")
     return 0
 
 
@@ -866,12 +951,20 @@ def _cmd_tools(args: argparse.Namespace) -> int:
             return 0
         print(_c(f"Tools for {', '.join(args.classes)}:", "1"))
         for tool in tools:
-            print(f"  {_c(tool.get('name', ''), '36'):<24} {tool.get('description', '')}")
+            print(f"  {_pad(tool.get('name', ''), '36', 24)} {tool.get('description', '')}")
             print(f"      {tool.get('url', '')}")
         return 0
     payload = toolkit_lib.catalog_payload(SEED_DIR, RUNTIME_DIR)
     print(f"{payload.get('count', 0)} curated tools. Pass a class id (see `gn classes`), e.g. `gn tools xss ssrf`.")
     return 0
+
+
+def _cmd_fx(args: argparse.Namespace) -> int:
+    """`gn fx` — draw the live status line for a few seconds, so a terminal can be checked without
+    committing to a real hunt. Exits 2 with an explanation when motion is not appropriate here."""
+    import gn_fx
+
+    return gn_fx.demo(getattr(args, "seconds", 6.0))
 
 
 def _cmd_version(_args: argparse.Namespace) -> int:
@@ -929,6 +1022,8 @@ def build_parser() -> argparse.ArgumentParser:
     hunt.add_argument("--per-finding", action="store_true", help="also write one submission-ready file per finding")
     hunt.add_argument("-y", "--authorize", action="store_true", help="confirm you are AUTHORIZED to test the target (required)")
     hunt.add_argument("--json", action="store_true", help="print the machine-readable result")
+    hunt.add_argument("--no-fx", action="store_true",
+                       help="no live animated status line (also: GN_NO_FX=1, NO_COLOR, or a non-tty)")
     hunt.set_defaults(func=_cmd_hunt)
 
     camp = sub.add_parser("campaign", help="end-to-end: recon -> hunt every URL -> prove -> submission packages -> learn")
@@ -952,6 +1047,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="aggressive: implies --active + time-based blind SQLi, and auto-captures a screenshot + writes a brain-researched dossier for each confirmed lead")
     camp.add_argument("-y", "--authorize", action="store_true", help="confirm you are AUTHORIZED + in scope (required)")
     camp.add_argument("--json", action="store_true")
+    camp.add_argument("--no-fx", action="store_true",
+                       help="no live animated status line (also: GN_NO_FX=1, NO_COLOR, or a non-tty)")
     camp.set_defaults(func=_cmd_campaign)
 
     osint = sub.add_parser("osint", help="passive multi-source domain research with evidence provenance")
@@ -974,6 +1071,8 @@ def build_parser() -> argparse.ArgumentParser:
     osint.add_argument("-y", "--authorize", action="store_true",
                        help="confirm authorization for --hunt (not required for passive OSINT)")
     osint.add_argument("--json", action="store_true", help="print the machine-readable campaign result")
+    osint.add_argument("--no-fx", action="store_true",
+                       help="no live animated status line (also: GN_NO_FX=1, NO_COLOR, or a non-tty)")
     osint.set_defaults(func=_cmd_osint)
 
     learn = sub.add_parser("learn", help="record a finding's bounty outcome (teaches the engine)")
@@ -1112,6 +1211,10 @@ def build_parser() -> argparse.ArgumentParser:
     tools.add_argument("--json", action="store_true")
     tools.set_defaults(func=_cmd_tools)
 
+    fxdemo = sub.add_parser("fx", help="preview the live status animation in this terminal")
+    fxdemo.add_argument("--seconds", type=float, default=6.0, help="how long to run the preview")
+    fxdemo.set_defaults(func=_cmd_fx)
+
     version = sub.add_parser("version", help="print the version")
     version.set_defaults(func=_cmd_version)
 
@@ -1156,6 +1259,18 @@ def main(argv: list[str] | None = None) -> int:
         return _err("interrupted.")
     except Exception as exc:  # noqa: BLE001 - the CLI must report, not traceback-dump
         return _err(f"{type(exc).__name__}: {exc}")
+    finally:
+        # Clear any live status line before the shell prompt comes back, on EVERY exit: a clean
+        # return, an early `return _err(...)`, a Ctrl-C, or an engine exception. Without this a
+        # half-drawn frame is the last thing on the operator's terminal, and on Ctrl-C the cursor is
+        # left mid-line. Guarded because a missing or broken decoration must never change the exit
+        # code the operator's script reads.
+        try:
+            import gn_fx
+
+            gn_fx.stop_all()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 if __name__ == "__main__":
