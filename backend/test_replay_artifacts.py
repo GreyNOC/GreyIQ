@@ -135,6 +135,53 @@ class FindingsHarTests(unittest.TestCase):
         self.assertEqual(n, 0)
         self.assertEqual(har["log"]["entries"], [])
 
+    def test_unconfirmed_items_are_not_bundled_as_confirming_requests(self) -> None:
+        # replay.sh's header, the HAR docstring and the bundle INDEX all announce these as the requests
+        # that CONFIRMED each finding. campaign pre-filters to proof_status=='confirmed', but the
+        # single-hunt bundle path (greyiq_api._run_replay_items) builds an item for EVERY finding in the
+        # run, so eleven passive header leads used to ship under that banner and a triager who re-ran
+        # one saw an ordinary response. The choke-point guard drops anything not confirmed.
+        confirmed = _item("F1", "Reflected XSS", "GET https://t/q?x=1")
+        confirmed["proof_status"] = "confirmed"
+        candidate = _item("F2", "Missing CSP header", "GET https://t/")
+        candidate["proof_status"] = "candidate"
+        missing = _item("F3", "Missing HSTS header", "GET https://t/about")
+        missing["proof_status"] = "missing"
+
+        sh, n = bounty.build_replay_script([confirmed, candidate, missing])
+        self.assertEqual(n, 1, "only the confirmed finding may be replayed")
+        self.assertIn("https://t/q?x=1", sh)
+        self.assertNotIn("https://t/about", sh)
+
+        har, hn = bounty.build_findings_har([confirmed, candidate, missing])
+        self.assertEqual(hn, 1, "only the confirmed finding may enter the HAR")
+        self.assertEqual(har["log"]["entries"][0]["request"]["url"], "https://t/q?x=1")
+
+    def test_status_carried_on_the_proof_of_impact_block_is_honoured(self) -> None:
+        # greyiq_api._run_replay_items resolves the status from the plan's proof_of_impact when the
+        # finding itself carries none, so the guard must read that shape too.
+        item = _item("F1", "XSS", "GET https://t/q?x=1")
+        item["proof_of_impact"] = {"status": "candidate", "observed_result": "reflected"}
+        self.assertEqual(bounty.build_replay_script([item])[1], 0)
+        item["proof_of_impact"]["status"] = "confirmed"
+        self.assertEqual(bounty.build_replay_script([item])[1], 1)
+
+    def test_the_report_ready_preview_opts_out_of_the_confirmed_only_guard(self) -> None:
+        # greyiq_api.get_report_ready rebuilds a runnable PREVIEW for one finding the operator is still
+        # assembling a report for — it makes no "this confirmed it" claim, so a candidate must still
+        # produce a replay/HAR there (the readiness panel reports POC separately from POE/POI).
+        candidate = _item("F1", "CORS", "GET https://t/api/me")
+        candidate["proof_status"] = "candidate"
+        self.assertEqual(bounty.build_replay_script([candidate])[1], 0)                       # bundle: excluded
+        self.assertEqual(bounty.build_replay_script([candidate], confirmed_only=False)[1], 1)  # preview: kept
+        self.assertEqual(bounty.build_findings_har([candidate])[1], 0)
+        self.assertEqual(bounty.build_findings_har([candidate], confirmed_only=False)[1], 1)
+
+    def test_an_item_with_no_status_at_all_is_still_replayed(self) -> None:
+        # The guard is a backstop for callers that hand over unfiltered findings, not a second confirm
+        # authority: a caller that supplies no status (a pre-filtered list) keeps its old behaviour.
+        self.assertEqual(bounty.build_replay_script([_item("F1", "XSS", "GET https://t/q?x=1")])[1], 1)
+
     def test_a_secret_in_the_request_url_or_header_is_redacted_in_the_har(self) -> None:
         # QAQC: a secret riding in a crafted request's URL/header must NOT leak into findings.har (the
         # same guarantee replay.sh gives) — parity with build_replay_script's redaction.

@@ -26,7 +26,23 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from bughunter import campaign  # noqa: E402
+from bughunter import campaign, rate_limit  # noqa: E402
+
+
+def setUpModule() -> None:
+    """Start this module from a full per-host active-request budget.
+
+    ``bughunter.rate_limit`` keeps its governors as PROCESS-WIDE singletons on purpose (that is what
+    makes the per-host politeness cap real rather than per-hunt), and nearly every test fixture in
+    this suite binds 127.0.0.1 — so all ~150 modules share that one host's 700-token bucket in a
+    single interpreter. Measured drain: test_bounty_progress 573 + test_active_verify_service 72 +
+    test_campaign_active_honesty 106 = 751 tokens spent alphabetically BEFORE this module, which
+    needs 96. Without this reset the governor refuses every active check here and the test does not
+    merely fail — it goes VACUOUS: no probe is sent, so an assertion about what the prover produced
+    passes having exercised nothing. Resetting at the module boundary is safe (no hunt path may do
+    it) and keeps each module's budget independent of suite ordering.
+    """
+    rate_limit.reset_shared_governors()
 
 
 class _ReflectHandler(BaseHTTPRequestHandler):

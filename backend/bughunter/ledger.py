@@ -107,7 +107,14 @@ def _prog_bucket(data: dict[str, Any], pid: str) -> dict[str, Any]:
     return data.setdefault("programs", {}).setdefault(pid, {"findings": {}})
 
 
-_PE_KEYS = ("request_line", "request_header", "response_status", "response_header", "set_cookie", "matched_value", "read_data")
+# sensitive_data_labels rides along deliberately: it is the generic-English NAME of the data a
+# captured body disclosed ("a JWT (session/bearer token); email address(es)"), never the data itself,
+# so the ledger's redact-before-persist posture is unaffected. It is also the only surviving impact
+# evidence once read_data has been redacted to [REDACTED_…] markers — report._sensitive_read_captured,
+# report.py's "Sensitive data exposed:" line and bounty._write_sensitive_data_files all key off it, so
+# a report rebuilt from history after a restart lost the disclosure's strongest claim without it.
+_PE_KEYS = ("request_line", "request_header", "response_status", "response_header", "set_cookie",
+            "matched_value", "read_data", "sensitive_data_labels")
 _POI_KEYS = ("status", "method", "observed_result", "control_result", "evidence", "affected_asset",
              "blast_radius", "impact_narrative", "authenticated_read_request", "authenticated_read_response")
 

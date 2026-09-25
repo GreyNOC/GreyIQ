@@ -213,8 +213,12 @@ def _compact_proof_evidence(pe: Any) -> dict[str, Any] | None:
     # Singular request_header/response_header — the real proof_evidence schema (matches
     # ProofEvidenceInput + the report builder); the plural forms would silently drop the crafted
     # request / response header evidence a CORS / redirect / host-header report reproduces from.
+    # sensitive_data_labels too: it names the disclosed data in generic English (never the data), and
+    # it is what remains once read_data is redacted — the dashboard drawer and any report rebuilt from
+    # this snapshot would otherwise be unable to say what was at risk.
     out = {k: str(pe.get(k))[:3000] for k in ("request_line", "request_header", "response_header",
-                                             "response_status", "matched_value", "read_data") if pe.get(k)}
+                                             "response_status", "matched_value", "read_data",
+                                             "sensitive_data_labels") if pe.get(k)}
     return out or None
 
 

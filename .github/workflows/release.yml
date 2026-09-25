@@ -19,8 +19,47 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # A tag push or a manual dispatch used to go straight from `pip install` to PyInstaller, so a
+  # SIGNED release could be published from a commit whose tests had never run anywhere — the CI
+  # workflow only triggers on push-to-main and pull_request, neither of which a tag is. This gate
+  # runs the suite against the exact commit being shipped, and every build job depends on it, so a
+  # failure stops the release before any asset or draft exists.
+  #
+  # ubuntu-latest deliberately: the 1x minute multiplier keeps a release affordable, and the
+  # Windows-only PowerShell recipe case is already covered by the windows build job's own platform.
+  gate:
+    name: Quality gate (must pass before anything is built)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch, for the same asset-size reason the build jobs use it below.
+          pip install "torch>=2.13,<3.0" --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+          npm ci
+
+      - name: Run the quality gate
+        run: npm run check
+
   windows:
     name: Build Windows portable + installer
+    needs: gate
     runs-on: windows-latest
     steps:
       - name: Check out repository

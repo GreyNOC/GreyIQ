@@ -48,7 +48,10 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(f["_active_class_hint"], "ssrf")
         self.assertEqual(f["_active_proof"]["status"], "confirmed")
         self.assertIn("control_result", f["_active_proof"])   # fresh-token negative control
-        self.assertEqual(f["_active_cvss"]["base_severity"], "high")
+        # Derived from the vector via impact_model.cvss_block, so it is the canonical capitalized band
+        # cvss_base_score returns (the same form cvss_for_class and report.py:220 already produce).
+        self.assertEqual(f["_active_cvss"]["base_severity"], "High")
+        self.assertEqual(f["_active_cvss"]["base_score"], 7.7)   # the vector's real score (was hardcoded 8.5)
 
     def test_candidate_ssrf_finding_is_not_confirmed(self) -> None:
         hit = {"method": "GET", "ip": "1.2.3.4", "headers": {"user-agent": "bot"}}
@@ -225,7 +228,10 @@ class XxeTests(unittest.TestCase):
         self.assertEqual(f["_active_class_hint"], "xxe")
         self.assertEqual(f["_active_proof"]["status"], "confirmed")
         self.assertIn("control_result", f["_active_proof"])          # fresh-token negative control
-        self.assertEqual(f["_active_cvss"]["base_severity"], "high")
+        self.assertEqual(f["_active_cvss"]["base_severity"], "High")
+        # XXE's vector is PR:N/S:C (8.6) — its score was already right; only the band's case changed when
+        # the block moved to impact_model.cvss_block.
+        self.assertEqual(f["_active_cvss"]["base_score"], 8.6)
         # end-to-end: the carriers make it a CAPTURED ARTIFACT, so the report renders it confirmed
         poi = f["_active_proof"]
         self.assertTrue(report._has_captured_artifact(f, poi, poi.get("observed_result", "")))

@@ -477,10 +477,7 @@ class NoNewOrphanRoutesTests(unittest.TestCase):
         "/api/scan/code": "the pre-cockpit scan API, kept for CLI/API clients",
         "/api/scan/live": "the pre-cockpit scan API, kept for CLI/API clients",
         "/api/scan/web": "the pre-cockpit scan API, kept for CLI/API clients",
-        "/api/train/pause": "no Train-panel control is bound to it yet",
-        "/api/train/resume": "no Train-panel control is bound to it yet",
-        "/api/train/status": "no Train-panel control is bound to it yet",
-        "/api/train/stop": "no Train-panel control is bound to it yet",
+        "/api/train/status": "the same training_payload the app already receives inside /api/status",
     }
 
     def test_no_route_becomes_orphaned_without_being_declared(self) -> None:
