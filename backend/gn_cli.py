@@ -83,7 +83,13 @@ _SEV_COLOR = {"critical": "1;31", "high": "31", "medium": "33", "low": "36", "in
 
 
 def _color_enabled() -> bool:
-    return sys.stdout.isatty() and os.getenv("NO_COLOR") is None and os.getenv("TERM") != "dumb"
+    # The stdout half of the pair documented on ``gn_fx.enabled``. ``TERM=dumb`` wins here too,
+    # and it is normalised before comparing: the bare ``!= "dumb"`` let ``TERM=DUMB`` and a
+    # trailing space through, while gn_fx lower()s and strip()s, so one shell could get colour
+    # and no motion from the same request. An empty TERM still keeps colour here: one SGR code
+    # needs no terminfo entry, where the cursor control gn_fx uses is the stricter ask.
+    return (sys.stdout.isatty() and os.getenv("NO_COLOR") is None
+            and str(os.getenv("TERM") or "").strip().lower() != "dumb")
 
 
 def _c(text: str, code: str) -> str:

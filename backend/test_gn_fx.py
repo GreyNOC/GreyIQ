@@ -103,6 +103,74 @@ class OnlyForAHumanTests(unittest.TestCase):
         self.assertFalse(gn_fx.enabled(_Hostile()))
 
 
+class TermDumbWinsOnEveryPlatformTests(unittest.TestCase):
+    """The precedence between ``TERM`` and the platform, pinned from either platform.
+
+    ``test_term_dumb_turns_it_off`` above could only ever exercise the branch for the machine it
+    ran on, so ``… not in {"dumb", ""} or os.name == "nt"`` passed CI (ubuntu) for a year while
+    every Windows console animated straight through an explicit ``TERM=dumb``. The rule is a pure
+    function of (TERM, platform), so assert the whole matrix instead of half of it.
+    """
+
+    def test_dumb_is_refused_whatever_the_platform(self) -> None:
+        for os_name in ("posix", "nt"):
+            for term in ("dumb", "DUMB", " dumb ", "Dumb"):
+                with self.subTest(os_name=os_name, term=term):
+                    self.assertFalse(gn_fx._term_allows_motion(term, os_name),
+                                     "TERM=dumb is a deliberate 'no escape sequences' and must win")
+
+    def test_an_empty_term_is_the_only_case_the_platform_decides(self) -> None:
+        # Windows consoles leave TERM unset and still take ANSI; on POSIX it means no terminfo.
+        for term in (None, "", "   "):
+            with self.subTest(term=term):
+                self.assertTrue(gn_fx._term_allows_motion(term, "nt"))
+                self.assertFalse(gn_fx._term_allows_motion(term, "posix"))
+
+    def test_a_named_terminal_is_allowed_on_both(self) -> None:
+        for os_name in ("posix", "nt"):
+            for term in ("xterm", "xterm-256color", "screen"):
+                with self.subTest(os_name=os_name, term=term):
+                    self.assertTrue(gn_fx._term_allows_motion(term, os_name))
+
+    def test_enabled_asks_that_rule_rather_than_re_deriving_it(self) -> None:
+        # The bug was a second, divergent copy of the rule inlined into enabled().
+        stream = _tty()
+        for var in ("NO_COLOR", "GN_NO_FX"):
+            os.environ.pop(var, None)
+        old = os.environ.get("TERM")
+        self.addCleanup(lambda: os.environ.__setitem__("TERM", old) if old else os.environ.pop("TERM", None))
+        for term in ("dumb", "DUMB", "xterm"):
+            with self.subTest(term=term):
+                os.environ["TERM"] = term
+                self.assertEqual(gn_fx.enabled(stream), gn_fx._term_allows_motion(term, os.name))
+
+    def test_colour_refuses_dumb_exactly_as_motion_does(self) -> None:
+        # gn_fx.enabled documents itself as the mirror of this, so the pair must not disagree:
+        # the bare `os.getenv("TERM") != "dumb"` here passed `DUMB` and ` dumb ` through.
+        import contextlib
+
+        class _Tty:
+            def isatty(self) -> bool:
+                return True
+
+        old = os.environ.get("TERM")
+        self.addCleanup(lambda: os.environ.__setitem__("TERM", old) if old else os.environ.pop("TERM", None))
+        no_color = os.environ.pop("NO_COLOR", None)
+        if no_color is not None:
+            self.addCleanup(os.environ.__setitem__, "NO_COLOR", no_color)
+        with contextlib.redirect_stdout(_Tty()):
+            os.environ["TERM"] = "xterm"
+            colour_on_a_terminal = gn_cli._color_enabled()
+            refused: dict[str, bool] = {}
+            for term in ("dumb", "DUMB", " dumb "):
+                os.environ["TERM"] = term
+                refused[term] = gn_cli._color_enabled()
+        self.assertTrue(colour_on_a_terminal, "precondition: a named TERM on a tty should colour")
+        for term, enabled in refused.items():
+            with self.subTest(term=term):
+                self.assertFalse(enabled, f"TERM={term!r} still coloured")
+
+
 class GlyphsAreProbedNotAssumedTests(unittest.TestCase):
     def test_a_cp1252_console_gets_the_ascii_frame_set(self) -> None:
         stream = _tty("cp1252")
