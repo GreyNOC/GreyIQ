@@ -269,14 +269,21 @@ def _chain_focus(findings: list[dict[str, Any]], surface: dict[str, Any],
         # finding the cortex marked contradicted and the report layer has already disqualified, so
         # aiming the remaining request budget at it buys nothing. The chain list is capped at 16
         # upstream, so scanning all of it costs nothing.
+        # This decides where the NEXT turn spends live request budget, so "open" has to mean
+        # genuinely attemptable. A step downstream of a refuted prerequisite is not proven, but it
+        # also cannot be attempted as written — steering at it would spend real requests on work the
+        # engine has already established cannot succeed until the prerequisite is re-established.
+        def _attemptable(step: Any) -> bool:
+            return (isinstance(step, dict) and not step.get("proven")
+                    and step.get("state") != "unreachable")
+
         open_chains = [
             c for c in (graph.get("attack_chains") or [])
-            if c.get("status") != "blocked"
-            and any(isinstance(s, dict) and not s.get("proven") for s in (c.get("steps") or []))
+            if c.get("status") not in {"blocked", "broken"}
+            and any(_attemptable(s) for s in (c.get("steps") or []))
         ]
         for chain in open_chains[:3]:
-            blocking = next((s for s in (chain.get("steps") or [])
-                             if isinstance(s, dict) and not s.get("proven")), None)
+            blocking = next((s for s in (chain.get("steps") or []) if _attemptable(s)), None)
             if blocking is None:
                 continue  # unreachable after the filter; kept so a shape change can't crash steering
             focus.append({
