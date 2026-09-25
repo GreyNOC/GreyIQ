@@ -373,17 +373,27 @@ _REFERENCES: dict[str, list[str]] = {
     # OWASP reference here (same source the business-logic / subdomain-takeover rows already use).
     "path-traversal": ["https://owasp.org/www-community/attacks/Path_Traversal", f"{_CWE}/22.html", "https://portswigger.net/web-security/file-path-traversal"],
     "business-logic": ["https://owasp.org/www-community/vulnerabilities/Business_logic_vulnerability", f"{_CWE}/840.html"],
-    "supply-chain": [f"{_CS}/Vulnerable_Dependency_Management_Cheat_Sheet.html", f"{_CWE}/1357.html"],
+    # Leads with the two CWEs the class DECLARES (CWE-1104 unmaintained / CWE-1395 vulnerable
+    # third-party component). CWE-1357 (reliance on an insufficiently trustworthy component) is
+    # kept after them as the parent, but it is not what the report's CWE row says.
+    "supply-chain": [f"{_CS}/Vulnerable_Dependency_Management_Cheat_Sheet.html",
+                     f"{_CWE}/1104.html", f"{_CWE}/1395.html", f"{_CWE}/1357.html"],
     "ssti": ["https://portswigger.net/web-security/server-side-template-injection", f"{_CWE}/1336.html"],
     "xxe": [f"{_CS}/XML_External_Entity_Prevention_Cheat_Sheet.html", f"{_CWE}/611.html", "https://portswigger.net/web-security/xxe"],
     "nosqli": [f"{_CS}/Injection_Prevention_Cheat_Sheet.html", f"{_CWE}/943.html", "https://portswigger.net/web-security/nosql-injection"],
     "jwt": [f"{_CS}/JSON_Web_Token_for_Java_Cheat_Sheet.html", f"{_CWE}/347.html", "https://portswigger.net/web-security/jwt"],
-    "graphql": [f"{_CS}/GraphQL_Cheat_Sheet.html", f"{_CWE}/200.html"],
+    # CWE-639 (authorization bypass through a user-controlled key) and CWE-770 (no resource
+    # limits) are what this class declares; CWE-200 is only the disclosure side of introspection.
+    "graphql": [f"{_CS}/GraphQL_Cheat_Sheet.html",
+                f"{_CWE}/639.html", f"{_CWE}/770.html", f"{_CWE}/200.html"],
     "prototype-pollution": ["https://portswigger.net/web-security/prototype-pollution", f"{_CWE}/1321.html"],
     "race-condition": ["https://portswigger.net/web-security/race-conditions", f"{_CWE}/362.html"],
     "request-smuggling": ["https://portswigger.net/web-security/request-smuggling", f"{_CWE}/444.html"],
     "subdomain-takeover": ["https://owasp.org/www-community/Subdomain_Takeover", f"{_CWE}/350.html"],
-    "cloud-exposure": [f"{_CS}/Secrets_Management_Cheat_Sheet.html", f"{_CWE}/200.html"],
+    # CWE-732 (incorrect permission assignment) and CWE-668 (resource exposed to the wrong
+    # sphere) are the declared pair — the misconfiguration itself. CWE-200 is the consequence.
+    "cloud-exposure": [f"{_CS}/Secrets_Management_Cheat_Sheet.html",
+                       f"{_CWE}/732.html", f"{_CWE}/668.html", f"{_CWE}/200.html"],
     "crypto": [f"{_CS}/Cryptographic_Storage_Cheat_Sheet.html", f"{_CWE}/327.html"],
     "dependency": [f"{_CS}/Vulnerable_Dependency_Management_Cheat_Sheet.html", f"{_CWE}/1395.html"],
     "network": [f"{_CS}/Transport_Layer_Security_Cheat_Sheet.html", f"{_CWE}/295.html", f"{_CWE}/319.html"],

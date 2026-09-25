@@ -377,7 +377,7 @@ from bughunter.chat_commands import (  # noqa: E402
 # install and fallback_reply()'s single canned sentence. Safe to import at boot — it pulls
 # nothing heavier than re/difflib/math/pathlib.
 import solin_domain  # noqa: E402
-from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names, _deterministic_attack_plan, cwe_for_class, build_replay_script as bounty_build_replay, build_findings_har as bounty_build_har  # noqa: E402
+from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names, _deterministic_attack_plan, cwe_for_class, owasp_for_class, build_replay_script as bounty_build_replay, build_findings_har as bounty_build_har  # noqa: E402
 from bughunter import campaign as bounty_campaign  # noqa: E402
 from bughunter import learning as bounty_learning  # noqa: E402
 from bughunter import submission as bounty_submission  # noqa: E402
@@ -2468,11 +2468,18 @@ class GreyIQRuntime:
         # finding often has no cwe): otherwise the platform gets no weakness and infers a wrong
         # one — e.g. HackerOne suggesting CWE-16 for a CORS report that should be CWE-284.
         cwe = str(request.cwe or "").strip() or cwe_for_class(class_id)
+        # Same reason, same fix, for the OWASP category: six renderers read finding["owasp"] -- the
+        # report's finding block and summary table, and the HackerOne, Bugcrowd and Intigriti
+        # submission bodies -- and this builder never set it. So a report rebuilt from a
+        # ledger/history finding dropped the OWASP row the same finding showed during its original
+        # hunt, on the report AND on the filed submission. FindingReportRequest carries no owasp
+        # field, so the class mapping is the only source here.
+        owasp = owasp_for_class(class_id)
         finding = {
             "ref": ref, "title": str(request.title or "Security finding"),
             "severity": str(request.severity or "info"), "class_name": str(request.class_name or ""),
             "class_id": class_id, "location": str(request.location or request.target or ""),
-            "cwe": cwe, "rule_id": str(request.rule_id or ""),
+            "cwe": cwe, "owasp": owasp, "rule_id": str(request.rule_id or ""),
             "description": str(request.description or ""), "screenshot_path": str(request.screenshot_path or ""),
         }
         # Carry the engine's captured request/response artifact (a history/board finding brings

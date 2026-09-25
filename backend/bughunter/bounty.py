@@ -582,6 +582,23 @@ def cwe_for_class(class_id: str) -> str:
     return str((meta or {}).get("cwe") or "")
 
 
+def owasp_for_class(class_id: str) -> str:
+    """The canonical OWASP Top-10 2021 category for a class id (e.g. 'cors' -> 'A05:2021 ...'), or
+    '' when the class has no vetted mapping.
+
+    The twin of :func:`cwe_for_class`, and it exists for the same reason. ``build_finding_report``
+    filled the CWE from the class but never the OWASP category, while SIX renderers read
+    ``finding["owasp"]`` -- the hunt report's finding block and summary table, and the HackerOne,
+    Bugcrowd and Intigriti submission bodies. So a report rebuilt from a ledger/history finding
+    silently dropped the OWASP row that the same finding showed during its original hunt, on the
+    report AND on the filed submission. The project's own test asserts CWE and OWASP must both be
+    present for the other classification path; this is the path that was exempt.
+    """
+    cid = str(class_id or "").strip().lower()
+    meta = VULN_CLASSES.get(cid) or _CATEGORY_LABELS.get(cid)
+    return str((meta or {}).get("owasp") or "")
+
+
 # Scanner categories / rule prefixes whose finding ALREADY carries a concrete
 # captured artifact (a real leaked value or error body) — enough for a 'candidate'
 # proof status. Everything else is 'missing' until the operator captures proof. A
