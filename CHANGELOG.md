@@ -77,9 +77,9 @@ kept the observed/control prose and discarded the artifact. For a finding proven
 that was survivable - the engine persists the same artifact server-side - but a finding re-proven
 from *history* has no cached run to read it back from, so the concrete headers a triager asks for
 were gone. All three prove sites now fold it onto the finding and the campaign drawer's report sends
-it. `ProofEvidenceInput` also gained `sensitive_data_labels`, which `report.py` reads in two places
-and the request model was silently dropping - the labels are classified on the *raw* body and survive
-redaction where the excerpt they would otherwise be re-derived from does not.
+it. The selection also moved to the *class-matched* confirmed result - the one
+`_persist_proof_of_impact` picks server-side - so the artifact belongs to the finding it is attached
+to, rather than to whichever check happened to confirm first at the same URL.
 
 Four were routes with nothing on the other end. **`/api/bounty/finding/restore`** existed while both
 delete sites discarded the `dedup_key` the dismiss response returns - and that key is the only handle
@@ -117,9 +117,23 @@ gets a form.
 `backend/test_route_wiring_contracts.py` pins each seam in both directions - the client reads the
 field, *and* every field the route returns is read by something, with the three deliberate exceptions
 named and justified - because a producer with no consumer and a consumer with no producer fail
-identically and silently. It also carries a register of the eleven `/api` routes the app still does
-not call, each with the reason, so a new orphan fails the gate rather than quietly never shipping.
-Every fix was verified non-vacuous by reverting it and watching its test go red.
+identically and silently. It also carries a register of the `/api` routes the app still does not
+call, each with the reason, so a new orphan fails the gate rather than quietly never shipping - and
+the register fails just as loudly when a route on it *becomes* wired, so it can only shrink by
+someone looking at it. Every fix was verified non-vacuous by reverting it and watching its test go
+red.
+
+**And `npm run check` could not run in a Claude Code worktree at all.** `scripts/check-syntax.py`
+matched its skip list against the *absolute* path's `.parts`, which carry every ancestor directory
+name - so a checkout that merely LIVES under a directory named `.claude` / `dist` / `build` /
+`release` / `runtime` skipped every file in itself, found zero modules, and exited on its own "the
+walk is broken" guard. Every Claude Code worktree is `.claude/worktrees/<name>`, so the gate worked
+in CI and refused to start on the machine doing the work. Matching relative to the repo root fixes
+it and gives the same semantics as `check-syntax.mjs`, whose walk descends from the root and was
+never affected; 305 modules compile clean where the gate previously would not begin. Two tests in
+`test_ci_gate.py` had copied the same comparison and failed the same way, and the new test for it
+runs the gate's real walk rather than asserting on its source - a source assertion would have passed
+throughout.
 
 ## v4.4.1 - the shipped runtime moves to Electron 44.3.0
 
