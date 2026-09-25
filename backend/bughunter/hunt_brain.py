@@ -110,10 +110,30 @@ _STATE_CHANGE_SIGNALS = frozenset({
 # fell through to "no scores -> skip" no matter how obviously an endpoint's path named them. Same
 # "only reorders existing, already-gated checks" contract as every set above: these only decide
 # which endpoint the prober visits first, never whether the check runs or what it may do.
+# Path words that genuinely name a cloud object store. "static", "assets" and "cdn" were here and
+# had to come out: on any bundled front end EVERY chunk URL (/static/js/chunk-0.js,
+# /assets/css/app.css) matched, scored 70, and claimed one of the 20 priority rows. Measured on a
+# realistic crawl of 20 asset URLs plus 6 high-signal endpoints, ALL twenty rows went to asset URLs
+# and /admin/users, /actuator/env and /download?file= were every one of them evicted -- because the
+# cap below used to keep the first rows rather than the best. A JS chunk served off the app's own
+# origin is not an object store, and _check_cloud_exposure cannot confirm anything against it.
 _CLOUD_SIGNALS = frozenset({
-    "s3", "bucket", "storage", "blob", "cdn", "assets", "static", "azure", "gcs", "cloudfront",
-    "spaces", "firebase",
+    "s3", "bucket", "blob", "gcs", "cloudfront", "spaces", "firebase", "minio",
 })
+# The reliable cloud-storage tell is the HOST, not a path word: a bucket is reached at a
+# bucket-shaped hostname. Matched as a suffix/substring of the netloc so a path called /storage on
+# the app's own origin no longer reads as one.
+_CLOUD_HOST_SIGNALS = (
+    "s3.amazonaws.com", ".s3.", "storage.googleapis.com", ".blob.core.windows.net",
+    ".digitaloceanspaces.com", ".r2.cloudflarestorage.com", "firebasestorage.googleapis.com",
+    ".oss-", ".cos.ap-",
+)
+# Extensions that are a served build artifact. With no OTHER signal on the URL these are not probe
+# targets -- they cost a capped row and no check can confirm anything against them.
+_STATIC_ASSET_SUFFIXES = (
+    ".js", ".mjs", ".css", ".map", ".woff", ".woff2", ".ttf", ".eot", ".otf", ".ico",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".avif", ".mp4", ".webm",
+)
 _SENSITIVE_SIGNALS = frozenset({
     "env", "git", "config", "backup", "swagger", "wpconfig", "dump", "bak", "secret",
     "credentials", "htpasswd", "phpinfo",
@@ -284,9 +304,17 @@ def heuristic_plan(surface: dict[str, Any]) -> dict[str, Any]:
             add("debug", 125, "debug/management endpoint semantic")
         if sensitive_hits:
             add("sensitive", 90, f"sensitive-path semantic: {sorted(sensitive_hits)[0]}")
-        if cloud_hits or any(t in tech_text for t in ("aws", "s3", "azure", "cloudfront", "gcs", "firebase")):
-            signal = sorted(cloud_hits)[0] if cloud_hits else "cloud tech fingerprint"
-            add("cloud-exposure", 70, f"cloud-storage semantic: {signal}")
+        # A bucket-shaped HOST is strong evidence; a bucket-ish path word is weaker; a tech
+        # fingerprint alone is weakest and no longer enough on its own for a URL that is plainly a
+        # build artifact (see _static_only below).
+        host_low = (parsed.netloc or "").lower()
+        cloud_host = next((h for h in _CLOUD_HOST_SIGNALS if h in host_low), "")
+        if cloud_host:
+            add("cloud-exposure", 96, f"cloud object-store host: {cloud_host.strip('.')}")
+        elif cloud_hits:
+            add("cloud-exposure", 70, f"cloud-storage semantic: {sorted(cloud_hits)[0]}")
+        elif any(t in tech_text for t in ("aws", "s3", "azure", "cloudfront", "gcs", "firebase")):
+            add("cloud-exposure", 44, "cloud tech fingerprint")
         if websocket_hits:
             add("websocket", 56, f"realtime/socket semantic: {sorted(websocket_hits)[0]}")
         if frameable_hits:
@@ -297,12 +325,23 @@ def heuristic_plan(surface: dict[str, Any]) -> dict[str, Any]:
 
         if not scores:
             continue
+        # A served build artifact with nothing but a weak tech fingerprint behind it is not a probe
+        # target: no check can confirm anything against a JS chunk, and the row is capped.
+        if (path_low.endswith(_STATIC_ASSET_SUFFIXES) and not cloud_host
+                and max(scores.values()) < 50):
+            continue
         ordered = sorted(scores, key=lambda c: (-scores[c], c))[:6]
         why = "; ".join(reasons[c] for c in ordered[:2])[:160]
         rows.append({"endpoint": endpoint, "classes": ordered, "why": why,
                      "score": scores[ordered[0]], "source": "deterministic-veteran-heuristics"})
-        if len(rows) >= _MAX_PRIORITY_ROWS:
-            break
+    # Cap by SCORE, not by discovery order. The loop used to `break` at _MAX_PRIORITY_ROWS, so the
+    # cap kept whatever recon happened to crawl first -- and recon crawls the HTML head first, which
+    # is where the asset URLs are. Measured before this: on 20 asset URLs plus 6 high-signal
+    # endpoints, all 20 rows were assets and /admin/users, /actuator/env and /download?file= were all
+    # evicted. Sorted descending, ties broken by the endpoint string so the plan stays deterministic
+    # (a hunt must replan identically on an unchanged surface).
+    rows.sort(key=lambda row: (-int(row.get("score") or 0), str(row.get("endpoint") or "")))
+    rows = rows[:_MAX_PRIORITY_ROWS]
     return _with_hypotheses({
         "used": bool(rows), "provider": "deterministic", "model": "veteran-heuristics-v1",
         "param_hypotheses": [], "probe_priority": rows,
