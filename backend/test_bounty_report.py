@@ -464,6 +464,34 @@ class ReproductionStepsTests(unittest.TestCase):
     AS_BLOB = ["1. Send a GET to /search?q=marker\n2. Observe reflection\n3. Confirm execution"]
     AS_LIST = ["Send a GET to /search?q=marker", "Observe reflection", "Confirm execution"]
 
+    # A step that legitimately spans lines: a fenced example, and a shell continuation.
+    AS_FENCED = ["1. Send the crafted request:\n```\ncurl -i -X POST \\\n  -H 'Origin: x' \\\n  'https://t/api'\n```",
+                 "2. Observe the reflection in the response headers."]
+    AS_CONTINUATION = ["Replay the request:\ncurl -i \\\n  -H 'Origin: https://attacker.example' \\\n  'https://target/api'"]
+
+    def test_a_fenced_example_stays_inside_its_step(self) -> None:
+        """Splitting every line of a multiline item turned each request line and each fence marker
+        into its own numbered step, which breaks the Markdown fence and hands the triager a garbled
+        procedure — the exact failure normalize_steps exists to prevent."""
+        steps = report_lib.normalize_steps(self.AS_FENCED)
+        self.assertEqual(len(steps), 2, steps)
+        self.assertEqual(steps[0].count("```"), 2, "the fence was split across steps")
+        self.assertIn("curl -i -X POST", steps[0])
+        self.assertIn("'https://t/api'", steps[0])
+
+    def test_a_multiline_command_is_one_step(self) -> None:
+        steps = report_lib.normalize_steps(self.AS_CONTINUATION)
+        self.assertEqual(len(steps), 1, steps)
+        self.assertIn("-H 'Origin: https://attacker.example'", steps[0])
+
+    def test_a_fence_inside_an_enumerated_blob_survives_the_split(self) -> None:
+        """Both rules at once: the blob really is three steps, and step 1's fence must stay whole."""
+        steps = report_lib.normalize_steps(
+            "1. Run:\n```\nGET /a HTTP/1.1\nHost: t\n```\n2. Observe 200\n3. Confirm")
+        self.assertEqual(len(steps), 3, steps)
+        self.assertEqual(steps[0].count("```"), 2, steps[0])
+        self.assertEqual(steps[1], "Observe 200")
+
     def test_every_shape_normalizes_to_the_same_numbered_procedure(self) -> None:
         for label, raw in (("string", self.AS_STRING), ("blob", self.AS_BLOB), ("list", self.AS_LIST)):
             with self.subTest(shape=label):
@@ -544,6 +572,57 @@ def _ctx_with_finding(*, steps: list[str]) -> dict:
         "findings": [finding], "attack_plans": plans, "scanners_run": ["active"],
         "authorized": True, "brain": {}, "next_steps": [], "coverage": {},
     }
+
+
+class CorsEvidenceAgreementTests(unittest.TestCase):
+    """A CORS submission answers "were credentials returned?" in four places — the steps, the PoC,
+    the impact narrative and the CVSS. They must all give the same answer, because a triager who
+    follows steps that say "no credentials" and then reads an Impact paragraph promising an
+    authenticated cross-origin read closes the report as invalid."""
+
+    @staticmethod
+    def _finding(matched: str) -> dict:
+        return {
+            "ref": "F1", "title": "CORS reflects arbitrary Origin", "class_id": "cors",
+            "severity": "medium", "confidence": "high", "rule_id": "active.cors.reflect",
+            "location": "https://target.example/api/me",
+            "proof_evidence": {"request_header": "Origin: https://attacker.example",
+                               "matched_value": matched, "response_status": "HTTP 200"},
+        }
+
+    ACAO = "Access-Control-Allow-Origin: https://attacker.example"
+
+    def test_reflection_only_never_claims_an_authenticated_read(self) -> None:
+        plan = bounty_lib._deterministic_attack_plan(self._finding(self.ACAO), "cors")
+        blob = " ".join([plan["impact"], plan["proof_of_impact"]["affected_asset"],
+                         plan["proof_of_impact"]["proof_obligation"]]).lower()
+        self.assertIn("unauthenticated", blob)
+        self.assertIn("reflection alone is not impact", blob)
+        # The steps and the impact must agree.
+        steps = " ".join(plan["steps"]).lower()
+        self.assertIn("access-control-allow-credentials", steps)
+        self.assertNotIn("credentials: 'include'", plan.get("poc", "").lower())
+
+    def test_reflection_only_scores_no_confidentiality_impact(self) -> None:
+        cvss = bounty_lib._deterministic_attack_plan(self._finding(self.ACAO), "cors")["cvss"]
+        self.assertIn("C:N", cvss["vector"])
+        self.assertEqual(cvss["base_score"], 0.0)
+        self.assertIn("no authenticated", cvss["justification"].lower())
+
+    def test_a_credentialed_capture_keeps_the_full_impact_model(self) -> None:
+        """The fix must not blunt the real bug: with Allow-Credentials captured, nothing changes."""
+        f = self._finding(f"{self.ACAO}; Access-Control-Allow-Credentials: true")
+        plan = bounty_lib._deterministic_attack_plan(f, "cors")
+        self.assertIn("authenticated responses", plan["impact"].lower())
+        self.assertIn("C:L", plan["cvss"]["vector"])
+        self.assertIn("credentials: \"include\"", plan.get("poc", "").lower())
+
+    def test_the_credential_question_has_one_answer(self) -> None:
+        """The steps/PoC and the impact/CVSS must read the evidence through the SAME predicate."""
+        self.assertTrue(bounty_lib._cors_is_credentialed(
+            {"matched_value": f"{self.ACAO}; Access-Control-Allow-Credentials: true"}))
+        self.assertFalse(bounty_lib._cors_is_credentialed({"matched_value": self.ACAO}))
+        self.assertFalse(bounty_lib._cors_is_credentialed({}))
 
 
 class SeverityOrderingTests(unittest.TestCase):

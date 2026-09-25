@@ -911,6 +911,24 @@ def _jwt_forge_poc(pe: dict[str, Any]) -> str:
     )
 
 
+def _cors_allow_credentials_header(pe: dict[str, Any]) -> str:
+    """The captured ``Access-Control-Allow-Credentials`` header, or '' when the target returned none."""
+    for part in str((pe or {}).get("matched_value") or "").split(";"):
+        if "allow-credentials" in part.lower():
+            return part.strip()
+    return ""
+
+
+def _cors_is_credentialed(pe: dict[str, Any]) -> bool:
+    """True only when the CAPTURED evidence shows ``Allow-Credentials: true``.
+
+    ONE definition, because three parts of the same submission answer this question and used to
+    answer it differently: the reproduction steps, the PoC, and the impact/CVSS narrative. A single
+    predicate is what keeps the Impact paragraph from promising an authenticated cross-origin read
+    on the page after the steps say no credentials were returned."""
+    return _cors_allow_credentials_header(pe).lower().rstrip().endswith("true")
+
+
 def _cors_concrete_repro(finding: dict[str, Any], url: str, pe: dict[str, Any]) -> tuple[list[str], str]:
     """CORS's bespoke reproduction: the precise credentialed cross-origin request, the ACAO /
     Allow-Credentials headers as distinct headers, and a PoC page that actually reads the
@@ -939,8 +957,8 @@ def _cors_concrete_repro(finding: dict[str, Any], url: str, pe: dict[str, Any]) 
     # the engine had proved absent, with steps 4-5 building a credentialed-read impact on top of it.
     # A triager who follows that, sees no such header, and finds the PoC read nothing closes the
     # report as invalid — and rightly.
-    acac = next((h for h in hdr_parts if "allow-credentials" in h.lower()), "")
-    credentialed = acac.lower().rstrip().endswith("true")
+    acac = _cors_allow_credentials_header(pe)
+    credentialed = _cors_is_credentialed(pe)
     # Single-line steps (normalize_steps splits on newline, so keep each on one line).
     curl = f"curl -i -H 'Origin: {origin}' -H 'Cookie: <YOUR authenticated session cookie>' '{url}'"
     if credentialed:
@@ -1307,6 +1325,38 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
         steps = concrete_steps
 
     model = impact_model.impact_for_class(class_id)
+    # A CORS finding whose captured evidence shows NO Allow-Credentials is a different bug from the
+    # one the cors impact model describes. The model speaks throughout of reading AUTHENTICATED
+    # responses with the victim's credentials, and its proof obligation demands a credentialed
+    # browser PoC — so leaving it in place put an Impact paragraph, an affected asset, a proof
+    # obligation and a CVSS justification in the same submission that all contradict the
+    # reproduction steps two sections above, and re-asserted exactly the unsupported claim the
+    # reflection-only steps exist to drop. Restate the model for what was actually captured.
+    _cors_reflection_only = (
+        class_id == "cors"
+        and not _cors_is_credentialed(finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {})
+    )
+    if _cors_reflection_only:
+        model = dict(model)
+        model["attacker_capability"] = (
+            "An attacker-controlled page can read this endpoint's response cross-origin because the "
+            "target reflects its Origin. No Access-Control-Allow-Credentials was returned, so the "
+            "read is UNAUTHENTICATED — it reaches only what the endpoint already serves without a session."
+        )
+        model["affected_asset"] = (
+            "whatever this endpoint returns to an unauthenticated caller; no authenticated response is "
+            "reachable through this finding as captured."
+        )
+        model["business_impact"] = (
+            "cross-origin reading of unauthenticated responses — informational unless this endpoint "
+            "serves sensitive data without a session, or another route on the same origin reflects the "
+            "Origin AND allows credentials."
+        )
+        model["proof_obligation"] = (
+            "Capture what this endpoint returns to an unauthenticated cross-origin read and show that "
+            "data is sensitive — or find a route on the same origin that reflects the Origin WITH "
+            "`Allow-Credentials: true` and prove the authenticated read there. Reflection alone is not impact."
+        )
     impact_text = (
         f"{model['attacker_capability']} "
         f"Affected asset: {model['affected_asset']} "
@@ -1354,6 +1404,30 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
                 "Use only one read-only issuer request. Do not perform writes, enumeration, prompt submission, or data extraction."
             )
     cvss = impact_model.cvss_for_class(class_id)
+    # Same reasoning as the impact text above, applied to the vector: the modelled cors C:L estimates
+    # a cross-origin read of AUTHENTICATED data, which this finding's evidence does not support.
+    # Recompute the whole vector rather than only the justification, so score, vector and 'why' agree
+    # — the pattern the secrets branch below already establishes. C:N scores 0.0, which
+    # resolve_severity deliberately does NOT treat as a severity tier, so the finding's own severity
+    # (what the prover assigned to the no-credentials variant) governs instead of a modelled claim.
+    if _cors_reflection_only and isinstance(cvss, dict):
+        _refl_vector = "/".join(
+            ("C:N" if part.upper().startswith("C:") else part)
+            for part in str(cvss.get("vector") or "").split("/")
+        )
+        _refl_scored = impact_model.cvss_base_score(_refl_vector)["score"]
+        cvss = {
+            **cvss,
+            "vector": _refl_vector,
+            "base_score": _refl_scored,
+            "base_severity": impact_model.cvss_severity(_refl_scored),
+            "justification": (
+                "Origin reflection was captured without Allow-Credentials, so no authenticated "
+                "cross-origin read is demonstrated: confidentiality impact is scored N until the "
+                "operator shows the unauthenticated response carries sensitive data."
+            ),
+            "estimated": True,
+        }
     # An UNPROVEN exposed secret (public client key / unverified candidate) must not carry the
     # secrets-class High CVSS: resolve_severity lets a plan CVSS base_severity win over the finding's
     # own (already-downgraded) severity, which would silently re-inflate it. Cap the CVSS base_severity

@@ -84,17 +84,76 @@ def normalize_steps(raw: Any) -> list[str]:
     ``["1. Send the request\n2. Observe the reflection\n3. Confirm it executes"]`` means three
     steps; treating it as one left the inner ``2.``/``3.`` markers embedded in step 1, so the
     rendered procedure was numbered by two different authorities at once and every consumer
-    that counts steps saw a single step where the triager reads three."""
+    that counts steps saw a single step where the triager reads three.
+
+    But a multiline list item is NOT always several steps. One step legitimately carries a
+    multi-line ``curl`` continuation or a fenced block, and splitting those turns every request
+    line and every fence marker into its own numbered step — which breaks the fence and hands the
+    triager a garbled procedure, the same failure this function exists to prevent. So a LIST item
+    is split only when its lines really are several enumerated steps; otherwise it stays one step,
+    and a fenced region is never split at all. Lines inside an enumerated block that do not start
+    their own step are kept as continuation of the step above them.
+
+    A bare STRING is different: it carries no step boundaries of its own, so newlines are the only
+    signal available and each line is a step (never characters — that produced "1. S" / "2. e")."""
     if raw is None:
         return []
-    items = raw.splitlines() if isinstance(raw, str) else (raw if isinstance(raw, (list, tuple)) else [raw])
+    if isinstance(raw, str):
+        return _split_steps_block(raw, split_plain_lines=True)
+    items = raw if isinstance(raw, (list, tuple)) else [raw]
     out: list[str] = []
     for item in items:
-        for line in str(item).splitlines():
-            text = re.sub(r"^\s*(?:\d+[.)]|[-*•])\s+", "", line.strip()).strip()
-            if text:
-                out.append(text)
+        out.extend(_split_steps_block(str(item), split_plain_lines=False))
     return out
+
+
+_STEP_ENUMERATOR_RE = re.compile(r"^\s*(?:\d+[.)]|[-*•])\s+")
+_STEP_FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+
+
+def _split_steps_block(text: str, *, split_plain_lines: bool) -> list[str]:
+    """Split ONE steps block into clean steps. See :func:`normalize_steps` for the rules."""
+    lines = text.splitlines()
+    if not lines:
+        return []
+    # Two or more enumerators mean the block really is a list of steps written into one value.
+    enumerated = sum(1 for line in lines if _STEP_ENUMERATOR_RE.match(line)) >= 2
+    out: list[str] = []
+    buf: list[str] = []
+    in_fence = False
+
+    def flush() -> None:
+        if buf:
+            joined = "\n".join(buf).strip()
+            if joined:
+                out.append(joined)
+            buf.clear()
+
+    for line in lines:
+        if _STEP_FENCE_RE.match(line):
+            in_fence = not in_fence
+            buf.append(line)
+            continue
+        if in_fence:  # never split inside a fenced example
+            buf.append(line)
+            continue
+        if enumerated:
+            if _STEP_ENUMERATOR_RE.match(line):
+                flush()
+                buf.append(_STEP_ENUMERATOR_RE.sub("", line.strip()).strip())
+            elif line.strip():
+                buf.append(line.rstrip())  # continuation of the step above
+        elif split_plain_lines:
+            flush()
+            stripped = _STEP_ENUMERATOR_RE.sub("", line.strip()).strip()
+            if stripped:
+                buf.append(stripped)
+        else:
+            buf.append(line.rstrip())
+    flush()
+    # A single-step item may still carry one leading enumerator to strip.
+    return [_STEP_ENUMERATOR_RE.sub("", s, count=1).strip() if _STEP_ENUMERATOR_RE.match(s) else s
+            for s in out if s.strip()]
 
 
 def resolve_severity(finding: dict[str, Any], plan: dict[str, Any] | None = None) -> str:
