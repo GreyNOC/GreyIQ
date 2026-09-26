@@ -256,9 +256,103 @@ _HUNT_AUTHORIZE = ("a hunt tests a live/owned target — pass -y/--authorize to 
                    "authorized and in scope.")
 
 
+#: The depth variables, in one place because `hunt` and `dash` must register the SAME set (a test
+#: pins dash's namespace as a superset of hunt's) and `/help -v` renders this exact table.
+#: Every row names the real setting it moves and what bounds the extra spend — a flag whose
+#: "effect" is behaviour the engine already performs unconditionally is not a flag, it is a lie,
+#: and several candidates were dropped for exactly that.
+DEPTH_VARIABLES: tuple[dict[str, str], ...] = (
+    {"flag": "-Th, --theorize", "knob": "hunt_loop_enabled + hunt_loop_offline_enabled",
+     "means": "iterative theorize -> probe -> re-plan on the seed URL",
+     "bound": "<=400 requests total, <=6 turns, stops early on no progress",
+     "note": "implies --active. Trades the 4-endpoint fan-out for depth on ONE url."},
+    {"flag": "-Tn, --turns N", "knob": "hunt_loop_max_iters",
+     "means": "how many theorize turns -Th may take, 1-6",
+     "bound": "clamped to 1..6; the 400-request budget still binds first",
+     "note": "no effect without -Th. Default 3."},
+    {"flag": "-Ch, --chain", "knob": "hunt_replan_enabled",
+     "means": "after the active pass, re-probe the step that blocks the best chain",
+     "bound": "<=3 endpoints, <=3 classes, <=8 requests, once",
+     "note": "implies --active. One bounded wave, not a second hunt."},
+    {"flag": "-v, --variables", "knob": "(help only)",
+     "means": "print this table",
+     "bound": "no engine call, no requests",
+     "note": "`/help -v` in the cockpit, `gn hunt --variables` in a shell."},
+)
+
+
+def variables_lines() -> list[str]:
+    """``/help -v`` and ``gn hunt --variables``: the depth table with its real knobs and bounds."""
+    lines = ["hunt depth variables", ""]
+    for row in DEPTH_VARIABLES:
+        lines.append(f"  {row['flag']:<18} {row['means']}")
+        lines.append(f"  {'':<18}   engine knob : {row['knob']}")
+        lines.append(f"  {'':<18}   bounded by  : {row['bound']}")
+        lines.append(f"  {'':<18}   {row['note']}")
+        lines.append("")
+    lines.extend([
+        "  Stop is honoured between turns and before the chain wave - a turn already in flight",
+        "  finishes first, exactly as `stop` promises everywhere else.",
+        "",
+        "  Theorizing and chaining NEVER promote a theory to a finding: only a captured artifact",
+        "  confirms. More depth buys more tested leads, not more claimed bugs.",
+    ])
+    return lines
+
+
+def _register_depth_flags(parser: argparse.ArgumentParser) -> None:
+    """The same four options on `hunt` and `dash`. Short forms are case-sensitive on purpose:
+    -Th/-Tn/-Ch read as words, and argparse would otherwise collide -t with --time-based."""
+    parser.add_argument("-Th", "--theorize", action="store_true",
+                        help="iterative theorize -> probe -> re-plan on the seed URL "
+                             "(implies --active; <=400 requests, <=6 turns)")
+    parser.add_argument("-Tn", "--turns", type=int, default=None, metavar="N",
+                        help="how many theorize turns -Th may take, 1-6 (default 3)")
+    parser.add_argument("-Ch", "--chain", action="store_true",
+                        help="after the active pass, re-probe the step blocking the best chain "
+                             "(implies --active; <=3 endpoints, <=8 requests)")
+    parser.add_argument("-v", "--variables", action="store_true",
+                        help="print the depth-variable table and exit")
+
+
+def depth_settings(args: argparse.Namespace) -> Any:
+    """The ``settings`` object for this hunt, or None when no depth flag was passed.
+
+    Returns None rather than a default-valued copy so an untouched hunt keeps taking the engine's
+    own ``get_settings()`` — handing down a snapshot taken at parse time would silently freeze any
+    env var the engine would otherwise re-read.
+    """
+    import dataclasses
+
+    from bughunter.active_verify_service import get_settings
+
+    theorize = bool(getattr(args, "theorize", False))
+    chain = bool(getattr(args, "chain", False))
+    turns = getattr(args, "turns", None)
+    if not (theorize or chain or turns is not None):
+        return None
+    changes: dict[str, Any] = {}
+    if theorize:
+        # BOTH, or the loop enables and then dies at turn 0: without a reasoning brain the planner
+        # returns an empty done=True plan unless the offline half is on too (hunt_loop.py).
+        changes["hunt_loop_enabled"] = True
+        changes["hunt_loop_offline_enabled"] = True
+    if chain:
+        changes["hunt_replan_enabled"] = True
+    if turns is not None:
+        # The same clamp settings.py applies to the env var. hunt_loop reads this back with no
+        # clamp of its own, so an unclamped 9999 here would be honoured as 9999 turns.
+        changes["hunt_loop_max_iters"] = max(1, min(int(turns), 6))
+    return dataclasses.replace(get_settings(), **changes)
+
+
 def _cmd_hunt(args: argparse.Namespace) -> int:
     from bughunter.bounty import run_bounty_hunt
 
+    if getattr(args, "variables", False):
+        for line in variables_lines():
+            print(line)
+        return 0
     if not args.authorize:
         return _err(_HUNT_AUTHORIZE)
     reports = _reports_dir()
@@ -281,11 +375,16 @@ def _cmd_hunt(args: argparse.Namespace) -> int:
             runtime_dir=RUNTIME_DIR,
             version=VERSION,
             run_live=args.live,
-            active=args.active or getattr(args, "time_based", False) or getattr(args, "deep", False),  # --time-based/--deep imply --active
+            # -Th/-Ch imply --active for the same reason --time-based does: both branches live
+            # inside `if (active or time_based) and authorized and kind == "url"`, so without it
+            # the flag would be accepted and then quietly do nothing.
+            active=(args.active or getattr(args, "time_based", False) or getattr(args, "deep", False)
+                    or getattr(args, "theorize", False) or getattr(args, "chain", False)),
             time_based=getattr(args, "time_based", False),
             auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
             per_finding=args.per_finding,
             on_progress=_progress(args, fx),
+            settings=depth_settings(args),
             oob_base=_oob_config()[0], oob_secret=_oob_config()[1],
         )
         _fx_report(fx, result)
@@ -1096,12 +1195,14 @@ def _dash_hunt(args: argparse.Namespace, run_id: str, into: dict) -> int:
         runtime_dir=RUNTIME_DIR,
         version=VERSION,
         run_live=args.live,
-        active=args.active or getattr(args, "time_based", False) or getattr(args, "deep", False),
+        active=(args.active or getattr(args, "time_based", False) or getattr(args, "deep", False)
+                or getattr(args, "theorize", False) or getattr(args, "chain", False)),
         time_based=getattr(args, "time_based", False),
         auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
         per_finding=args.per_finding,
         on_progress=bounty_progress.sink(run_id),
         should_stop=(lambda rid=run_id: bounty_progress.is_stopped(rid)),
+        settings=depth_settings(args),
         oob_base=_oob_config()[0], oob_secret=_oob_config()[1],
     )
     gn_dash.stream_result(run_id, target, result)
@@ -1138,6 +1239,66 @@ def _dash_source(args: argparse.Namespace) -> Any:
                                   token=token, label=str(chosen.get("target") or ""))
 
 
+def _cmd_dash_home(args: argparse.Namespace) -> int:
+    """`gn dash --home` (what `GreyNOC Start` runs) — the idle cockpit, and the loop around it.
+
+    The cockpit itself starts nothing. It hands back what the operator asked for in
+    ``source.pending`` and this relaunches ``_cmd_dash`` in the real mode. ``/quit`` leaves no
+    pending action, which is how it ends.
+
+    It does NOT come back to home afterwards, tempting as a resident shell is. ``_cmd_dash`` prints
+    the hunt summary onto the restored terminal on its way out, and the report path in it is the one
+    thing the operator still needs once the panels are gone — re-entering the alternate screen would
+    wipe it. Handing the terminal back is worth more than staying resident.
+
+    Relaunching rather than swapping the source under the running poller is deliberate: the poller
+    owns a socket and a thread, and tearing those down underneath a repaint to graft a new source on
+    buys nothing an operator can see, at the cost of the one race this module has stayed free of.
+    """
+    import gn_dash
+    import gn_tui
+
+    refusal = gn_tui.refusal()
+    if refusal:
+        # No hunt to fall back to here, so — like --attach — it says why instead of doing nothing.
+        return _err(refusal)
+    small = gn_dash.size_refusal(gn_tui.terminal_size(sys.stdout))
+    if small:
+        return _err(small)
+    if getattr(args, "braille", False):
+        os.environ["GN_DASH_GLYPHS"] = "braille"
+
+    source = gn_dash.HomeSource()
+    code = gn_dash.run(source, run_subcommand=_dash_subcommand,
+                       refresh_hz=getattr(args, "refresh", 4.0))
+    pending = getattr(source, "pending", None)
+    if not isinstance(pending, dict):
+        return code
+    action = str(pending.get("action") or "")
+    # A FRESH namespace: mutating `args` would leave --home set, and _cmd_dash would recurse
+    # straight back into this function.
+    nxt = argparse.Namespace(**vars(args))
+    nxt.home = False
+    if action == "hunt":
+        nxt.target, nxt.attach = str(pending.get("target") or ""), False
+        # The cockpit demanded -y before it recorded the ask; this carries that consent through
+        # rather than re-asking on a terminal the operator has already answered on.
+        nxt.authorize = True
+        # The depth variables the operator typed after the target. Only the three the cockpit
+        # parses are read, by name, so nothing else in `pending` can reach the namespace.
+        depth = pending.get("depth")
+        if isinstance(depth, dict):
+            nxt.theorize = bool(depth.get("theorize"))
+            nxt.chain = bool(depth.get("chain"))
+            turns = depth.get("turns")
+            nxt.turns = int(turns) if isinstance(turns, int) else None
+    elif action == "attach":
+        nxt.target, nxt.attach, nxt.authorize = "", True, False
+    else:
+        return code
+    return _cmd_dash(nxt)
+
+
 def _cmd_dash(args: argparse.Namespace) -> int:
     """`gn dash` — the full-screen cockpit over a hunt this process runs, or one it attaches to.
 
@@ -1165,6 +1326,9 @@ def _cmd_dash(args: argparse.Namespace) -> int:
 
     if getattr(args, "self_test", False):
         return gn_dash.self_test()
+
+    if bool(getattr(args, "home", False)):
+        return _cmd_dash_home(args)
 
     attach = bool(getattr(args, "attach", False))
     target = str(getattr(args, "target", "") or "").strip()
@@ -1278,6 +1442,7 @@ def build_parser() -> argparse.ArgumentParser:
     hunt.add_argument("--json", action="store_true", help="print the machine-readable result")
     hunt.add_argument("--no-fx", action="store_true",
                        help="no live animated status line (also: GN_NO_FX=1, NO_COLOR, or a non-tty)")
+    _register_depth_flags(hunt)
     hunt.set_defaults(func=_cmd_hunt)
 
     camp = sub.add_parser("campaign", help="end-to-end: recon -> hunt every URL -> prove -> submission packages -> learn")
@@ -1493,6 +1658,9 @@ def build_parser() -> argparse.ArgumentParser:
     dash.add_argument("--json", action="store_true", help="no dashboard: run the hunt and print the machine-readable result")
     dash.add_argument("--no-fx", action="store_true",
                       help="no live animation; with a redirected stream this runs exactly like `gn hunt`")
+    dash.add_argument("--home", action="store_true",
+                      help="open the idle HOME cockpit with nothing running; drive it with /hunt, "
+                           "/attach, /usage (this is what `GreyNOC Start` runs)")
     dash.add_argument("--attach", action="store_true",
                       help="watch a run the local backend is already holding instead of starting one")
     dash.add_argument("--run-id", dest="run_id", default="",
@@ -1505,6 +1673,7 @@ def build_parser() -> argparse.ArgumentParser:
                       help="braille sparklines — off by default because the encode probe cannot see whether your FONT has U+28xx (also: GN_DASH_GLYPHS=braille|rich|box|ascii)")
     dash.add_argument("--self-test", dest="self_test", action="store_true",
                       help="draw one frame, tear it down, and report the glyph tier, key reader, console VT state, size and host counters")
+    _register_depth_flags(dash)
     dash.set_defaults(func=_cmd_dash)
 
     version = sub.add_parser("version", help="print the version")
@@ -1540,6 +1709,14 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "gn":  # tolerate `greyiq-backend.exe gn hunt ...`
         argv = argv[1:]
+    # `--variables` is answered BEFORE parse_args, because `hunt`'s target is a required positional
+    # and argparse enforces that first: `gn hunt --variables` would otherwise exit 2 demanding a
+    # target for a flag that describes flags and runs nothing. Scoped to the verbs that own the
+    # table so it cannot shadow another verb's -v.
+    if argv and argv[0] in ("hunt", "dash") and {"-v", "--variables"} & set(argv[1:]):
+        for line in variables_lines():
+            print(line)
+        return 0
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):

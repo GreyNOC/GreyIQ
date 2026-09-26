@@ -97,8 +97,18 @@ STOP_WORDING = "stopping - after the current step (bounty.py checks between prob
 DASH_REFUSAL = "`dash` cannot be run from inside the dashboard."
 HUNT_REFUSAL = ("a hunt is already on screen; a second one would evict this run from the progress "
                 "store (_MAX_RUNS=8).")
+#: The same family of verbs, refused on HOME for a DIFFERENT and honest reason: nothing is on screen
+#: to evict, but HomeSource watches no run, so anything started here would run unwatched behind an
+#: idle cockpit. `/hunt` is the one that relaunches properly.
+HOME_HUNT_REFUSAL = ("this cockpit is not watching a run, so that would run unwatched behind it - "
+                     "use `/hunt <url> -y` to start one the panels follow, or run it from a shell.")
 BUSY_REFUSAL = "one pane command at a time ({busy} is still running)."
 NO_GOVERNOR = "probe rate / host buckets: n/a - local only (no HTTP exposure)"
+
+#: The standing hint on the idle HOME cockpit. It is re-shown whenever a command's feedback expires,
+#: because an empty cockpit with an empty message line gives an operator nothing to type.
+HOME_HINT = ("no hunt running - /hunt <url> -y to start one, /attach to watch the app, "
+             "/usage for load, /help for everything")
 
 #: Status marks. Chosen by TIER NAME rather than probed, because the tier probe only proves what that
 #: tier's own glyph set encodes: a cp437 console takes the box drawings and the shades but has no
@@ -930,9 +940,21 @@ VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("operator stop", hook="operator_stop", needs="operator-stop",
              help="stop the operator loop (attached backends only)",
              latency="between programs and targets; will not interrupt a campaign already running"),
+    VerbSpec("usage", hook="usage", help="engine + system load, in the OUTPUT pane", immediate=True),
     VerbSpec("help", hook="help", help="this table, in the OUTPUT pane", immediate=True),
     VerbSpec("quit", hook="quit", aliases=("q",), help="leave the dashboard", immediate=True),
 )
+
+#: HOME-only verbs, kept OUT of ``VERBS`` on purpose. As global specs they would match in every mode
+#: and a `hunt` typed into a live cockpit would answer "not available on this run" instead of
+#: HUNT_REFUSAL, which is the message that actually explains the problem (it would evict the run on
+#: screen). Gated on the ``home`` capability, which only :class:`HomeSource` offers.
+_HOME_VERBS: dict[str, VerbSpec] = {
+    "hunt": VerbSpec("hunt", hook="home_hunt", args="<url> -y", needs="home", immediate=True,
+                     help="start a hunt and watch it (-y confirms you are authorized)"),
+    "attach": VerbSpec("attach", hook="home_attach", needs="home", immediate=True,
+                       help="watch a run the desktop app's backend is already holding"),
+}
 
 #: Verbs that would put a second hunt into this process's progress store, evicting the run on screen.
 _HUNT_VERBS = frozenset({"hunt", "campaign"})
@@ -979,6 +1001,13 @@ def parse_command(line: str, *, capabilities: frozenset[str] = frozenset(),
     text = str(line or "").strip()
     if not text:
         return ParsedCommand("empty")
+    # A leading slash is OPTIONAL, not required: `/usage` reads like the CLI it is modelled on, and
+    # bare `usage` keeps working for anyone already used to the pane. Exactly one slash is eaten, so
+    # a stray `//` still reaches the unknown-command path rather than being silently normalised.
+    if text.startswith("/"):
+        text = text[1:].lstrip()
+        if not text:
+            return ParsedCommand("empty")
     try:
         tokens = shlex.split(text)
     except ValueError:
@@ -990,7 +1019,8 @@ def parse_command(line: str, *, capabilities: frozenset[str] = frozenset(),
     spec, args = _match_verb(tokens)
     if spec is not None:
         if spec.needs and spec.needs not in held:
-            mode = "attached" if "operator-stop" in held else "in-process"
+            mode = ("home" if "home" in held
+                    else "attached" if "operator-stop" in held else "in-process")
             return ParsedCommand("refused", name=spec.name, verb=spec,
                                  error=f"`{spec.name}` is not available on this run "
                                        f"({mode} mode does not offer `{spec.needs}`).")
@@ -998,11 +1028,19 @@ def parse_command(line: str, *, capabilities: frozenset[str] = frozenset(),
 
     name = tokens[0].lower()
     rest = tuple(tokens[1:])
+    # Before the hunt refusal below: on the HOME cockpit there is no run on screen to evict, so
+    # `hunt` is the whole point rather than the thing to refuse.
+    if name in _HOME_VERBS and "home" in held:
+        return ParsedCommand("verb", name=name, args=rest, verb=_HOME_VERBS[name])
     if name in _SELF_VERBS:
         return ParsedCommand("refused", name=name, error=DASH_REFUSAL)
     starts_hunt = (name in _HUNT_VERBS
                    or (name == "osint" and "--hunt" in rest)
                    or (name == "operator" and rest[:1] == ("run",)))
+    if starts_hunt and "home" in held:
+        # Nothing is on screen to evict here, so HUNT_REFUSAL would be a false statement. The real
+        # problem on HOME is different and worth saying accurately.
+        return ParsedCommand("refused", name=name, error=HOME_HUNT_REFUSAL)
     if watching and starts_hunt:
         return ParsedCommand("refused", name=name, error=HUNT_REFUSAL)
     known = tuple(commands) if commands is not None else _cli_commands()
@@ -1012,6 +1050,18 @@ def parse_command(line: str, *, capabilities: frozenset[str] = frozenset(),
     return ParsedCommand("subcommand", name=name, args=rest)
 
 
+def _variables_lines() -> list[str]:
+    """``/help -v`` — the depth-variable table, owned by gn_cli so the cockpit and the shell cannot
+    describe the same flags differently. Imported lazily and degrades to a one-liner, because a
+    help command must never be the thing that takes the cockpit down."""
+    try:
+        import gn_cli
+
+        return list(gn_cli.variables_lines())
+    except Exception:  # noqa: BLE001
+        return ["the depth-variable table is not available in this build."]
+
+
 def help_lines(capabilities: frozenset[str]) -> list[str]:
     """The VERBS table, rendered for the OUTPUT pane, with each verb's REAL latency beside it.
 
@@ -1019,10 +1069,14 @@ def help_lines(capabilities: frozenset[str]) -> list[str]:
     the next scheduling pass. An operator who reads "stop" and watches probes keep landing for eighty
     seconds concludes the tool is broken — so the wait is written down where they will read it.
     """
-    lines = ["pane commands", ""]
-    for spec in VERBS:
-        available = (not spec.needs) or spec.needs in (capabilities or frozenset())
-        name = f"{spec.name} {spec.args}".strip()
+    held = capabilities or frozenset()
+    lines = ["pane commands  (the leading / is optional)", ""]
+    # HOME verbs first when they apply: on an idle cockpit they are the only two that do anything,
+    # so burying them under `stop`/`reverify` — both unavailable there — reads as a dead pane.
+    specs = [*( _HOME_VERBS.values() if "home" in held else () ), *VERBS]
+    for spec in specs:
+        available = (not spec.needs) or spec.needs in held
+        name = f"/{spec.name} {spec.args}".strip()
         mark = "  " if available else "x "
         lines.append(f"{mark}{name:<22} {spec.help}")
         if spec.latency:
@@ -1042,6 +1096,122 @@ def help_lines(capabilities: frozenset[str]) -> list[str]:
 
 
 # --- sources ------------------------------------------------------------------------------------
+class HomeSource:
+    """The idle HOME cockpit: the dashboard with no run behind it.
+
+    ``gn dash`` previously had two modes and both required something to already exist — a target to
+    hunt, or a run to attach to. Neither is true when an operator has only just opened a terminal,
+    which is exactly when they want the tool. This is the third mode: panels empty, system strip
+    live, and a command line to drive it from.
+
+    ``poll`` returns the same empty-but-VALID envelope the other two sources return a full one of,
+    so :func:`render` still cannot tell the modes apart and there is no idle-specific drawing path.
+
+    It starts nothing itself. ``/hunt`` and ``/attach`` record what the operator asked for in
+    :attr:`pending` and leave the loop; the caller reads it and relaunches the cockpit in the real
+    mode. Swapping a live source underneath the poller thread would be the alternative, and it would
+    mean a half-torn-down socket racing a repaint for no gain the operator can see.
+    """
+
+    def __init__(self) -> None:
+        #: ``{"action": "hunt", "target": ...}`` or ``{"action": "attach"}``; read after ``run()``.
+        self.pending: dict[str, Any] | None = None
+
+    # --- RunSource ---------------------------------------------------------------------------------
+    def poll(self, after: int = 0) -> dict:
+        return {"events": [], "count": 0,
+                "snapshot": {"targets": [], "findings": [],
+                             "stats": {"targets_total": 0, "targets_done": 0, "findings_total": 0,
+                                       "confirmed_total": 0, "severity_counts": {}}}}
+
+    def capabilities(self) -> frozenset[str]:
+        # `programs` is offered because the portfolio is FILE-backed - it is readable and writable
+        # with no run in flight, which makes `/program list` useful precisely here. `stop`,
+        # `reverify` and `governor` are withheld: there is nothing to stop, re-probe or throttle.
+        return frozenset({"home", "programs"})
+
+    def label(self) -> str:
+        return "home"
+
+    def governor(self) -> tuple[dict[str, Any], ...]:
+        return ()
+
+
+def usage_report(*, snapshot: dict[str, Any] | None, governor: Sequence[dict[str, Any]] | None,
+                 rate: float | None, sysmon: dict[str, Any] | None, elapsed: float,
+                 label: str, status: str, capabilities: frozenset[str] = frozenset()) -> list[str]:
+    """``/usage`` — what this hunt and this machine are actually spending. Pure, so it is testable.
+
+    Every number here is one the engine already measures. Nothing is inferred: a probe rate the
+    governor cannot supply prints ``--`` rather than ``0``, for the same reason gn_sysmon renders a
+    rejected sample as ``--`` — ``0`` is a claim, and an absent reading is not zero.
+    """
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    findings = snapshot.get("findings") or []
+    stats = snapshot.get("stats") if isinstance(snapshot.get("stats"), dict) else {}
+    done, total = completion(snapshot)
+    counts = proof_counts(findings)
+    confirmed = _int(stats.get("confirmed_total")) or counts.get("confirmed", 0)
+    findings_total = _int(stats.get("findings_total")) or len(list(findings))
+
+    lines = ["$ usage", "", "ENGINE"]
+    lines.append(f"  status          {status}")
+    lines.append(f"  run             {label or '(none)'}")
+    lines.append(f"  uptime          {_clock(elapsed)}")
+    lines.append(f"  targets         {done}/{total} done")
+    # Candidate is DERIVED here for the same reason the findings panel derives it: total - confirmed
+    # is not a candidate count, it folds in every "missing". The cap is named when it is reached,
+    # because progress.set_findings HARD-DROPS past _MAX_FINDINGS_PER_RUN and snapshot then counts
+    # the truncated list — printing that as a bare total would under-report a busy run silently.
+    capped = " (cap reached - the store keeps 400/run)" if findings_total >= 400 else ""
+    lines.append(f"  findings        {findings_total} total, {confirmed} confirmed, "
+                 f"{counts.get('candidate', 0)} candidate{capped}")
+    # BOTH governor lines sit behind the capability. Without a governor the dashboard never calls
+    # source.governor() at all, so an empty tuple here means "never measured", not "no buckets" —
+    # and "none yet" would be a measurement this mode did not make.
+    if "governor" not in (capabilities or frozenset()):
+        lines.append("  probe rate      -- (n/a - not exposed in this mode)")
+        lines.append("  host buckets    -- (n/a - not exposed in this mode)")
+    else:
+        lines.append(f"  probe rate      {'--' if rate is None else f'~{rate:.1f}/s'} (est)")
+        rows = [row for row in (governor or ()) if isinstance(row, dict)]
+        if rows:
+            lines.append("  host buckets    (tokens remaining / capacity)")
+            for row in sorted(rows, key=lambda r: (_int(r.get("tokens")),
+                                                   _plain(r.get("host") or "?"))):
+                lines.append(f"    {_plain(row.get('host') or '?'):<30} "
+                             f"{_int(row.get('tokens'))}/{max(1, _int(row.get('capacity')))}")
+        else:
+            lines.append("  host buckets    none yet - one appears once a host has been throttled")
+
+    sysmon = sysmon if isinstance(sysmon, dict) else {}
+    disk_path = str(sysmon.get("disk_path") or "")
+    lines.extend(["", "SYSTEM"])
+    lines.append(f"  cpu             {_pct(sysmon.get('cpu_percent'))}")
+    lines.append(f"  memory          {_pct(sysmon.get('mem_percent'))}  "
+                 f"{_bytes(sysmon.get('mem_used'))} / {_bytes(sysmon.get('mem_total'))}")
+    lines.append(f"  disk            {_pct(sysmon.get('disk_percent'))}  "
+                 f"{_bytes(sysmon.get('disk_used'))} / {_bytes(sysmon.get('disk_total'))}"
+                 f"{f'  ({disk_path})' if disk_path else ''}")
+    lines.append("")
+    lines.append("  -- means the probe would not answer, which is not the same as zero.")
+    return lines
+
+
+def _bytes(value: Any) -> str:
+    """Bytes as GB/MB, or ``--``. Never 0 for an absent reading — see :func:`usage_report`."""
+    try:
+        count = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    if count < 0:
+        return "--"
+    for unit, size in (("TB", 1024 ** 4), ("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if count >= size:
+            return f"{count / size:.1f}{unit}"
+    return f"{int(count)}B"
+
+
 class LocalSource:
     """An in-process run, read straight out of ``bughunter.progress``.
 
@@ -1796,9 +1966,12 @@ class Dashboard:
         self._cpu_history: list[float | None] = []
         self._governor_prev: tuple[dict[str, Any], ...] = ()
         self._governor_at: float | None = None
-        self._message = ""
+        self._home = "home" in self._state.capabilities
+        self._message = HOME_HINT if self._home else ""
         self._message_at = 0.0
-        self._status = "RUNNING"
+        # IDLE, not RUNNING: nothing is running, and a pill that says otherwise is the one lie the
+        # whole module is written to avoid.
+        self._status = "IDLE" if self._home else "RUNNING"
         self._stop_requested = False
         self._output = OutputTail()
         self._pool: ThreadPoolExecutor | None = None
@@ -1941,7 +2114,9 @@ class Dashboard:
             if self._last_good is not None and self._status in ("NO BACKEND", "STALE"):
                 stale = max(0.0, now - self._last_good)
             if self._message and now - self._message_at > _MESSAGE_SECONDS:
-                self._message = ""
+                # On HOME the line falls back to the hint rather than to blank: an idle cockpit with
+                # an empty message line tells an operator nothing about what to type next.
+                self._message = HOME_HINT if self._home else ""
             started = self._first_data or self._started
             state = DashState(
                 label=_label_of(self._source),
@@ -2072,11 +2247,16 @@ class Dashboard:
         if " " in text.strip():
             return text
         prefix = text.strip().lower()
+        # The slash is stripped for matching and put back on the completion, so `/us<Tab>` completes
+        # to `/usage ` rather than failing to match anything and looking broken.
+        slash = prefix.startswith("/")
+        prefix = prefix[1:] if slash else prefix
         pool = sorted({spec.name.split(" ")[0] for spec in VERBS}
+                      | (set(_HOME_VERBS) if self._home else set())
                       | set(self._commands if self._commands is not None else _cli_commands()))
         matches = [name for name in pool if name.startswith(prefix)]
         if len(matches) == 1:
-            self._line.set(matches[0] + " ")
+            self._line.set(("/" if slash else "") + matches[0] + " ")
         elif matches:
             self.note(" ".join(matches[:12]))
         return self._line.text
@@ -2103,7 +2283,9 @@ class Dashboard:
                                watching=not self._attached, commands=self._commands)
         if parsed.kind == "empty":
             return
-        if not self._allow_control and parsed.name not in ("quit", "help"):
+        # `usage` joins quit/help as a read-only verb: it displays readings and changes nothing, so
+        # withholding it from a --no-control pane would withhold information, not authority.
+        if not self._allow_control and parsed.name not in ("quit", "help", "usage"):
             self.note("control is off for this pane (--no-control); q to leave.")
             return
         if parsed.kind == "refused":
@@ -2248,14 +2430,111 @@ class Dashboard:
         return (True, f"{program_id} is due now - effective at the operator's next scheduling pass "
                       f"(<=15s idle tick)")
 
-    def _verb_help(self, _args: Sequence[str]) -> tuple[bool, str]:
+    def _verb_usage(self, _args: Sequence[str]) -> tuple[bool, str]:
+        """``/usage`` — engine + system load, assembled from readings the dashboard already holds."""
+        sample = self._sample()
+        with self._lock:
+            snapshot, governor = self._snapshot or {}, self._governor_prev
+            rate = self._rate_history[-1] if self._rate_history else None
+            started = self._first_data or self._started
+            elapsed, status = max(0.0, self._clock() - started), self._status
+            capabilities = self._state.capabilities
         self._output.clear()
-        for line in help_lines(self._state.capabilities):
+        for line in usage_report(snapshot=snapshot, governor=governor, rate=rate, sysmon=sample,
+                                 elapsed=elapsed, label=_label_of(self._source), status=status,
+                                 capabilities=capabilities):
+            self._output.add(line)
+        self._tab = self._focus = "output"
+        self._unread = False
+        return (True, "usage is in the OUTPUT pane")
+
+    def _verb_home_hunt(self, args: Sequence[str]) -> tuple[bool, str]:
+        """``/hunt <url> -y`` on HOME: record the ask and leave, so the caller relaunches for real.
+
+        ``-y`` is demanded HERE rather than inherited from however the cockpit was opened. A hunt
+        sends live traffic at someone's host, and `GreyNOC Start` carries no authorization with it —
+        treating the act of opening a dashboard as consent to probe a target typed into it later is
+        exactly the confusion the flag exists to prevent.
+        """
+        flags = {"-y", "--authorize"}
+        authorized = any(str(arg) in flags for arg in args)
+        rest = [str(arg) for arg in args if str(arg) not in flags]
+        depth, targets, expecting = {}, [], False
+        for arg in rest:
+            if expecting:                       # the N of `-Tn N`
+                depth["turns"] = arg
+                expecting = False
+                continue
+            low = arg.lower()
+            if low in ("-th", "--theorize"):
+                depth["theorize"] = True
+            elif low in ("-ch", "--chain"):
+                depth["chain"] = True
+            elif low in ("-tn", "--turns"):
+                expecting = True
+            else:
+                targets.append(arg)
+        if not targets:
+            return (False, "hunt needs a target, e.g. `/hunt https://example.com -y`.")
+        if expecting:
+            return (False, "-Tn needs a number of turns, e.g. `-Tn 5`.")
+        if depth.get("turns") is not None:
+            try:
+                depth["turns"] = int(depth["turns"])
+            except (TypeError, ValueError):
+                return (False, f"-Tn needs a whole number, not {depth['turns']!r}.")
+            if not depth.get("theorize"):
+                # Accepting it silently would let the operator think they asked for more depth.
+                return (False, "-Tn only has an effect with -Th; add -Th or drop -Tn.")
+        if not authorized:
+            return (False, f"add -y to confirm you are AUTHORIZED to test {targets[0]} - "
+                           f"`/hunt {targets[0]} -y`.")
+        asked = " ".join(k for k in ("theorize", "chain") if depth.get(k))
+        return self._set_pending({"action": "hunt", "target": targets[0], "depth": depth},
+                                 done=f"starting a hunt on {targets[0]}"
+                                      + (f" ({asked})" if asked else "") + " ...")
+
+    def _verb_home_attach(self, _args: Sequence[str]) -> tuple[bool, str]:
+        return self._set_pending({"action": "attach"},
+                                 done="attaching to the backend's newest un-stopped run ...")
+
+    def _set_pending(self, pending: dict[str, Any], *, done: str) -> tuple[bool, str]:
+        """Hand the ask back to whoever opened the cockpit, then leave the loop.
+
+        REFUSED while a pane command is in flight, even though these verbs are ``immediate`` and so
+        run above ``submit``'s own ``_busy`` check. The relaunch runs ``_cmd_dash`` in THIS process,
+        and a ``gn`` subcommand on the worker still holds sys.stdout/sys.stderr through
+        ``redirect_stdout(self._output)`` in :func:`_dash_subcommand` — a PROCESS-wide swap, and
+        ``run()`` tears down with ``shutdown(wait=False)``, so it does not wait for that to unwind.
+        Relaunching under it means ``gn_tui.refusal()`` reads the dead cockpit's OutputTail, whose
+        ``isatty()`` is False by construction: ``/attach`` would exit 2 into a discarded buffer, and
+        ``/hunt`` would fall through ``_cmd_dash``'s ``else _cmd_hunt(args)`` into a HEADLESS hunt —
+        live traffic at someone's host with its summary and report path swallowed.
+
+        ``_busy`` is exactly the right flag to read: ``_reap`` clears it only once the future is
+        done and the redirect has unwound, which is why it is polled from the loop rather than
+        freed by a done-callback.
+        """
+        if self._busy:
+            return (False, BUSY_REFUSAL.format(busy=self._busy))
+        try:
+            self._source.pending = pending
+        except Exception:  # noqa: BLE001 - a source that cannot hold it simply does not relaunch
+            return (False, "this cockpit cannot launch from here.")
+        self._quit.set()
+        return (True, done)
+
+    def _verb_help(self, args: Sequence[str]) -> tuple[bool, str]:
+        wants_variables = any(str(a).lower() in ("-v", "--variables") for a in args)
+        self._output.clear()
+        for line in (_variables_lines() if wants_variables
+                     else help_lines(self._state.capabilities)):
             self._output.add(line)
         self._tab = "output"
         self._focus = "output"
         self._unread = False
-        return (True, "help is in the OUTPUT pane")
+        return (True, ("depth variables are in the OUTPUT pane" if wants_variables
+                       else "help is in the OUTPUT pane"))
 
     def _verb_quit(self, _args: Sequence[str]) -> tuple[bool, str]:
         self._quit.set()
