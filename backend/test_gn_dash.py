@@ -773,6 +773,36 @@ class HomeSourceTests(_Case):
                 self.assertIn(expect, board.snapshot_state(gn_tui.Size(100, 30)).message)
                 self.assertIsNone(source.pending)
 
+    def test_an_unknown_option_is_refused_not_swallowed_as_a_target(self) -> None:
+        # Unrecognised tokens used to land in `targets`, of which only [0] survived, so a typo or
+        # an unsupported flag launched a hunt with materially different probing than was asked for.
+        for line in ("/hunt https://x -y --active", "/hunt https://x -y -Chh",
+                     "/hunt https://x -y -T h", "/hunt https://x -y --theorise"):
+            with self.subTest(line=line):
+                source = gn_dash.HomeSource()
+                board = self.board(source)
+                board.submit(line)
+                self.assertIn("unknown option",
+                              board.snapshot_state(gn_tui.Size(100, 30)).message)
+                self.assertIsNone(source.pending)
+
+    def test_two_targets_are_refused_rather_than_hunting_the_first(self) -> None:
+        source = gn_dash.HomeSource()
+        board = self.board(source)
+        board.submit("/hunt https://a https://b -y")
+        message = board.snapshot_state(gn_tui.Size(100, 30)).message
+        self.assertIn("one target at a time", message)
+        self.assertIn("https://b", message, "say which ones, so the mistake is obvious")
+        self.assertIsNone(source.pending)
+
+    def test_turns_followed_by_a_flag_is_a_missing_value_not_a_bad_number(self) -> None:
+        source = gn_dash.HomeSource()
+        board = self.board(source)
+        board.submit("/hunt https://x -y -Th -Tn -Ch")
+        self.assertIn("needs a number of turns",
+                      board.snapshot_state(gn_tui.Size(100, 30)).message)
+        self.assertIsNone(source.pending)
+
     def test_a_depth_flag_is_never_mistaken_for_the_target(self) -> None:
         source = gn_dash.HomeSource()
         board = self.board(source)

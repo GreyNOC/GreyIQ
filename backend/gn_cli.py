@@ -315,6 +315,21 @@ def _register_depth_flags(parser: argparse.ArgumentParser) -> None:
                         help="print the depth-variable table and exit")
 
 
+def depth_refusal(args: argparse.Namespace) -> str:
+    """``""`` when the depth flags are coherent, else why they are not.
+
+    ``-Tn`` moves ``hunt_loop_max_iters``, which the engine reads ONLY when the loop is on. Without
+    ``-Th`` the hunt therefore succeeds while silently ignoring the depth that was asked for, and an
+    operator reads a normal-looking summary as the result of a deeper experiment. The cockpit's
+    ``/hunt`` already refuses this exact pair; the shell path must agree, or the same command means
+    two different things depending on where it was typed.
+    """
+    if getattr(args, "turns", None) is not None and not getattr(args, "theorize", False):
+        return ("-Tn/--turns only has an effect with -Th/--theorize (it sets the loop's iteration "
+                "count, and the loop is off) - add -Th, or drop -Tn.")
+    return ""
+
+
 def depth_settings(args: argparse.Namespace) -> Any:
     """The ``settings`` object for this hunt, or None when no depth flag was passed.
 
@@ -353,6 +368,9 @@ def _cmd_hunt(args: argparse.Namespace) -> int:
         for line in variables_lines():
             print(line)
         return 0
+    refusal = depth_refusal(args)
+    if refusal:
+        return _err(refusal)
     if not args.authorize:
         return _err(_HUNT_AUTHORIZE)
     reports = _reports_dir()
@@ -1326,6 +1344,12 @@ def _cmd_dash(args: argparse.Namespace) -> int:
 
     if getattr(args, "self_test", False):
         return gn_dash.self_test()
+
+    # Before the home branch AND before the alternate screen: a refusal printed into a screen that
+    # is about to be discarded is a refusal the operator never sees.
+    refusal = depth_refusal(args)
+    if refusal:
+        return _err(refusal)
 
     if bool(getattr(args, "home", False)):
         return _cmd_dash_home(args)

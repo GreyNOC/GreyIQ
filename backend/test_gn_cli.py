@@ -582,6 +582,41 @@ class DepthVariableTests(unittest.TestCase):
             self.assertTrue(captured.get("active"), f"{flag} must imply --active")
             self.assertIsNotNone(captured.get("settings"), f"{flag} must hand down a settings object")
 
+    def test_turns_without_theorize_is_refused_on_the_shell_path_too(self) -> None:
+        # -Tn alone sets hunt_loop_max_iters while the loop stays off, so the hunt would succeed
+        # while silently ignoring the depth asked for. The cockpit already refuses this pair; the
+        # same command must not mean two different things depending on where it was typed.
+        for verb in ("hunt", "dash"):
+            with self.subTest(verb=verb):
+                args = gn_cli.build_parser().parse_args(
+                    [verb, "https://t.example", "-y", "-Tn", "5"])
+                self.assertIn("only has an effect with -Th", gn_cli.depth_refusal(args))
+
+    def test_turns_with_theorize_is_accepted(self) -> None:
+        args = gn_cli.build_parser().parse_args(
+            ["hunt", "https://t.example", "-y", "-Th", "-Tn", "5"])
+        self.assertEqual(gn_cli.depth_refusal(args), "")
+
+    def test_the_shell_refuses_before_running_the_hunt_at_all(self) -> None:
+        with mock.patch("bughunter.bounty.run_bounty_hunt") as hunt, \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            code = gn_cli._cmd_hunt(gn_cli.build_parser().parse_args(
+                ["hunt", "https://t.example", "-y", "-Tn", "5"]))
+        self.assertEqual(code, 2)
+        hunt.assert_not_called()
+        self.assertIn("-Tn", err.getvalue())
+
+    def test_dash_refuses_before_entering_the_alternate_screen(self) -> None:
+        # A refusal printed into a screen about to be discarded is one the operator never sees.
+        with mock.patch("gn_dash.run") as run, mock.patch.object(gn_cli, "_cmd_dash_home") as home, \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            code = gn_cli._cmd_dash(gn_cli.build_parser().parse_args(
+                ["dash", "--home", "-Tn", "5"]))
+        self.assertEqual(code, 2)
+        run.assert_not_called()
+        home.assert_not_called()
+        self.assertIn("-Tn", err.getvalue())
+
     def test_variables_prints_the_table_without_needing_a_target(self) -> None:
         # `hunt`'s target is a required positional, so this is answered before parse_args.
         for argv in (["hunt", "--variables"], ["hunt", "-v"], ["dash", "-v"]):

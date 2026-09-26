@@ -2462,6 +2462,8 @@ class Dashboard:
         depth, targets, expecting = {}, [], False
         for arg in rest:
             if expecting:                       # the N of `-Tn N`
+                if arg.startswith("-"):
+                    return (False, "-Tn needs a number of turns, e.g. `-Tn 5`.")
                 depth["turns"] = arg
                 expecting = False
                 continue
@@ -2472,12 +2474,22 @@ class Dashboard:
                 depth["chain"] = True
             elif low in ("-tn", "--turns"):
                 expecting = True
+            elif arg.startswith("-"):
+                # NOT swept into targets. Everything unrecognised used to land there and only
+                # targets[0] survived, so `-Chh` (a typo) or `--active` was silently discarded and
+                # the hunt launched with materially different probing than the operator asked for.
+                return (False, f"unknown option {arg} - this pane takes -y, -Th, -Ch and -Tn N. "
+                               f"`/help -v` lists them.")
             else:
                 targets.append(arg)
-        if not targets:
-            return (False, "hunt needs a target, e.g. `/hunt https://example.com -y`.")
         if expecting:
             return (False, "-Tn needs a number of turns, e.g. `-Tn 5`.")
+        if not targets:
+            return (False, "hunt needs a target, e.g. `/hunt https://example.com -y`.")
+        if len(targets) > 1:
+            # Silently hunting the first of several is the same class of bug: the operator named
+            # two hosts and only one would have been probed.
+            return (False, f"one target at a time; got {len(targets)}: {' '.join(targets)}.")
         if depth.get("turns") is not None:
             try:
                 depth["turns"] = int(depth["turns"])
