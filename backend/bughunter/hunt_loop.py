@@ -594,7 +594,15 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
                          auth: Any = None, extra_params: list[str] | None = None,
                          class_priority: list[str] | None = None, xss_params: list[str] | None = None,
                          coder_cfg: dict[str, Any] | None = None, surface: dict[str, Any] | None = None,
-                         on_progress: Any = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+                         on_progress: Any = None,
+                         # The operator's kill switch, same predicate bounty.py passes everywhere
+                         # else. Without it this loop was the ONE active path that could not hear
+                         # Stop: the fan-out checks between targets (bounty.py "halting the active
+                         # pass before the next target"), but a loop turn would keep going until
+                         # max-iters or the 400-request budget ran out — up to 200+ seconds of
+                         # un-cancellable traffic at a live host after the operator pressed Stop.
+                         should_stop: Any = None,
+                         ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Iteratively drive ``verify_active`` against ``target_url``: probe -> observe -> re-plan, bounded
     by max-iters, a shared governor, and a decrementing budget (total requests <= a single hunt's).
     Returns the SAME (results, meta) shape as verify_active, so run_bounty_hunt can swap it in."""
@@ -612,6 +620,20 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
                 on_progress(msg)
             except Exception:  # noqa: BLE001
                 pass
+
+    def _stopped() -> bool:
+        """Total, and fail-OPEN: a predicate that raises must not be read as "stop".
+
+        Treating a broken kill switch as a stop would silently truncate every hunt the moment the
+        caller's predicate had a bad day; treating it as "keep going" costs one extra turn at worst,
+        and the budget still bounds that.
+        """
+        if not callable(should_stop):
+            return False
+        try:
+            return bool(should_stop())
+        except Exception:  # noqa: BLE001
+            return False
 
     merged: dict[str, dict[str, Any]] = {}
     verified: set[str] = set()
@@ -657,7 +679,15 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
     ))
 
     turn = -1  # so out_meta["loop_turns"] = turn + 1 is well-defined (0) even if max_iters <= 0
+    stopped_at: int | None = None   # the turn index a Stop cut in at, so loop_turns stays honest
     for turn in range(max_iters):
+        # BEFORE any spend, mirroring the fan-out's "between targets" granularity. A turn already
+        # in flight is not interrupted — verify_active owns its own requests — so the honest
+        # promise is the same one `stop` makes everywhere else: after the current step.
+        if _stopped():
+            _emit("stop requested - halting the theorize loop before the next turn")
+            stopped_at = turn
+            break
         # Turn 0 gets the FULL budget. Reserving a share for the steered turns is self-defeating
         # while ``_Http`` raises the same ``_RateLimited`` for "spent my allotment" as for "the host
         # is throttling": verify_active reports rate_limited either way and the break below treats
@@ -744,7 +774,10 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
 
     out_meta = dict(last_meta)
     out_meta["verified_classes"] = sorted(verified)
-    out_meta["loop_turns"] = turn + 1
+    # A turn cut short by Stop never ran, so it is not counted: `turn + 1` would report a turn's
+    # worth of work that produced no requests and no findings.
+    out_meta["loop_turns"] = stopped_at if stopped_at is not None else turn + 1
+    out_meta["stopped"] = stopped_at is not None
     # ORDER MATTERS: the summed spend must be on out_meta BEFORE the snapshot is built from it,
     # or the loop's own graph records the last turn's count as the hunt's coverage.
     out_meta["requests_used"] = total_requests
