@@ -67,6 +67,20 @@ function Write-Step([string]$Message) {
     Write-Host "==> $Message" -ForegroundColor Cyan
 }
 
+function New-OutputDir([string]$Path) {
+    # Create an output directory, parents and all, and say nothing if it is already there.
+    # A clean checkout has none of dist\, release\ or the PyInstaller work dir - they are all
+    # gitignored build products - so every one of them has to be created by whoever gets there
+    # first. PyInstaller and electron-builder each make their own, but only after minutes of
+    # work, and the artifact scan at the end of this script reads release\ whether or not
+    # electron-builder got far enough to create it. Making them up front costs nothing and
+    # removes the class of "the build worked, the report says it did not" failure.
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
+    return $Path
+}
+
 # --- Locate the repo root (this script lives in <root>/build) ---
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
@@ -112,12 +126,23 @@ Assert-LastExit "CPU torch install"
 Write-Step "Installing Playwright Chromium (bundled for proof screenshots)"
 & $Py -m playwright install chromium; Assert-LastExit "playwright install chromium"
 
+# --- Output directories ---
+# Named explicitly and passed to PyInstaller rather than left to its cwd-relative defaults, so the
+# directories this script creates are provably the ones the freeze writes into.
+Write-Step "Preparing output directories"
+$DistDir    = New-OutputDir (Join-Path $RepoRoot "dist")
+$ReleaseDir = New-OutputDir (Join-Path $RepoRoot "release")
+$WorkDir    = New-OutputDir (Join-Path $RepoRoot "build\pyinstaller")
+Write-Host "    dist:    $DistDir"
+Write-Host "    release: $ReleaseDir"
+Write-Host "    work:    $WorkDir"
+
 # --- Freeze the backend ---
 Write-Step "Freezing the backend with PyInstaller"
-& $Py -m PyInstaller --noconfirm --clean build/greyiq-backend.spec
+& $Py -m PyInstaller --noconfirm --clean --distpath $DistDir --workpath $WorkDir build/greyiq-backend.spec
 Assert-LastExit "PyInstaller freeze"
 
-$BackendExe = Join-Path $RepoRoot "dist\greyiq-backend\greyiq-backend.exe"
+$BackendExe = Join-Path $DistDir "greyiq-backend\greyiq-backend.exe"
 if (-not (Test-Path $BackendExe)) {
     throw "Frozen backend not found at $BackendExe"
 }
@@ -148,6 +173,20 @@ if (-not $SkipSmokeTest) {
     if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
     if (-not $ok) { throw "Frozen backend did not answer /api/health within 180s." }
     Write-Host "    Backend answered /api/health on port $smokePort."
+
+    # The dash cockpit imports gn_dash / gn_tui / gn_sysmon at FUNCTION level, which PyInstaller's
+    # static analysis cannot see; greyiq-backend.spec force-includes them by name. Nothing else in
+    # this pipeline would notice if that line were dropped - the verb would parse fine and then die
+    # on the import in front of an operator, which is exactly how 'gn wardrive' shipped broken in
+    # v2.6.0. --self-test performs the real imports and prints what it picked, so this checks the
+    # OUTPUT, not the exit code: it exits 2 here and is right to, because this shell is not a
+    # terminal and no frame was drawn.
+    Write-Step "Smoke-testing the dash cockpit in the frozen bundle"
+    $dashOut = (& $BackendExe dash --self-test) -join "`n"
+    if ($dashOut -notmatch "gn dash self-test") {
+        throw "The frozen backend could not run 'dash --self-test' - gn_dash/gn_tui/gn_sysmon are missing from the bundle. Output: $dashOut"
+    }
+    Write-Host "    Dash modules present in the frozen bundle."
 }
 
 # --- Node dependencies ---
@@ -174,7 +213,7 @@ Assert-LastExit "electron-builder"
 # --- Report artifacts ---
 $version = (Get-Content (Join-Path $RepoRoot "package.json") -Raw | ConvertFrom-Json).version
 Write-Step "Build complete - GreyIQ v$version"
-$artifacts = Get-ChildItem (Join-Path $RepoRoot "release") -Filter *.exe -ErrorAction SilentlyContinue
+$artifacts = Get-ChildItem $ReleaseDir -Filter *.exe -ErrorAction SilentlyContinue
 if ($artifacts) {
     foreach ($a in $artifacts) {
         Write-Host ("    {0}  ({1:N0} MB)" -f $a.Name, ($a.Length / 1MB)) -ForegroundColor Green

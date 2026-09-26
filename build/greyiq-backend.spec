@@ -63,7 +63,16 @@ hiddenimports = [
 # the bundle — the feature would then work in dev and silently degrade in the shipped exe.
 # Force-include each ONLY if it exists, so this spec stays valid at every point in the
 # rollout (before the module lands, after it lands, and if it is later dropped).
-for _opt in ("edit_ops", "offline_repair", "edit_mine", "solin_domain"):
+#
+# gn_dash / gn_tui / gn_sysmon are the `gn dash` cockpit. gn_cli imports gn_dash INSIDE
+# _cmd_dash (unguarded, like _cmd_fx does with gn_fx) so the renderer stays off every other
+# verb's startup path — which is exactly the function-level import the analysis cannot see.
+# Without these three names the verb parses in the frozen exe and then dies on the import,
+# and no test can catch it: they are not _VERB_PLUGINS, so the loader's fail-closed skip
+# (and the test that pins it) never sees them. Flat modules, so the isfile guard matches;
+# a package under backend/gn_dash/ would not, which is why they are flat.
+for _opt in ("edit_ops", "offline_repair", "edit_mine", "solin_domain",
+             "gn_dash", "gn_tui", "gn_sysmon"):
     if os.path.isfile(os.path.join(BACKEND, _opt + ".py")):
         hiddenimports.append(_opt)
 

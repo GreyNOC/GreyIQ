@@ -167,9 +167,13 @@ class EveryCallerSuppliesItTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertIn(key, API_SOURCE)
 
-    def test_both_cli_hunt_verbs_supply_it(self) -> None:
-        self.assertEqual(CLI_SOURCE.count("oob_base=_oob_config()[0]"), 2,
-                         "gn hunt and gn campaign must both honour a configured collaborator")
+    def test_every_cli_hunt_verb_supplies_it(self) -> None:
+        # Three engine-launching call sites in gn_cli: `gn hunt`, `gn campaign`, and the hunt
+        # `gn dash <target>` runs behind the cockpit. A verb that starts a hunt without the
+        # collaborator has the four out-of-band provers silently disabled, which looks exactly
+        # like a target that is not vulnerable.
+        self.assertEqual(CLI_SOURCE.count("oob_base=_oob_config()[0]"), 3,
+                         "gn hunt, gn campaign and gn dash must all honour a configured collaborator")
 
 
 class TheCliReaderIsTotalTests(unittest.TestCase):
