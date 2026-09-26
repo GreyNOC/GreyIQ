@@ -21,6 +21,7 @@ testing are the ones that would let it mislead an operator or take the hunt down
 """
 from __future__ import annotations
 
+import base64
 import contextlib
 import io
 import json
@@ -646,10 +647,17 @@ class _Backend:
     """A real ``http.server`` standing in for the backend, recording every request it sees."""
 
     def __init__(self, *, token: str = "tok", health: bool = True, require_key: bool = False,
-                 raw_body: bytes | None = None, payload: dict | None = None) -> None:
+                 gate: bool = True, access_key: str = "", raw_body: bytes | None = None,
+                 payload: dict | None = None) -> None:
         self.token = token
         self.health = health
         self.require_key = require_key
+        # greyiq_api._access_key_authorized: the key is compared against the PASSWORD field and the
+        # username is ignored, and the gate runs ahead of everything including /api/health.
+        self.access_key = access_key
+        # gate=False is the decoy: something else on the port that answers health like GreyIQ but
+        # does not refuse an unauthenticated POST in GreyIQ's words.
+        self.gate = gate
         self.raw_body = raw_body
         self.payload = payload if payload is not None else {
             "ok": True, "events": [{"at": "2026-01-01T00:00:01+00:00", "message": "hello"}],
@@ -697,8 +705,27 @@ class _Backend:
             def _json(self, status: int, payload: dict) -> None:
                 self._send(status, json.dumps(payload).encode("utf-8"))
 
+            def _key_refused(self) -> bool:
+                """The access-key gate, ahead of everything - /api/health included."""
+                if not backend.access_key:
+                    return False
+                raw = str(self.headers.get("Authorization") or "")
+                offered = ""
+                if raw.lower().startswith("basic "):
+                    try:  # split ONCE: a key may itself contain a colon
+                        offered = base64.b64decode(raw[6:]).decode("utf-8").split(":", 1)[1]
+                    except Exception:  # noqa: BLE001
+                        offered = ""
+                if offered == backend.access_key:
+                    return False
+                self._send(401, json.dumps({"error": "authentication required"}).encode("utf-8"),
+                           {"WWW-Authenticate": 'Basic realm="GreyIQ"'})
+                return True
+
             def do_GET(self) -> None:  # noqa: N802
                 backend.hits.append(("GET", self.path, self.headers.get("X-GreyIQ-Token")))
+                if self._key_refused():
+                    return
                 if self.path == "/api/health" and backend.health:
                     self._json(200, {"status": "ok"})
                     return
@@ -709,6 +736,8 @@ class _Backend:
                 self.rfile.read(length)
                 token = self.headers.get("X-GreyIQ-Token")
                 backend.hits.append(("POST", self.path, token))
+                if self._key_refused():
+                    return
                 if backend.require_key:
                     # greyiq_api.send_unauthorized: the GREYIQ_ACCESS_KEY gate answers 401 with a
                     # Basic challenge, ahead of the session-token check.
@@ -716,6 +745,9 @@ class _Backend:
                                {"WWW-Authenticate": 'Basic realm="GreyIQ"'})
                     return
                 if token != backend.token:
+                    if not backend.gate:
+                        self._json(200, {"ok": True, "decoy": True})
+                        return
                     self._json(403, {"error": "missing or invalid session token"})
                     return
                 if backend.raw_body is not None:
@@ -762,12 +794,32 @@ class AttachedSourceTests(_Case):
         with self.assertRaises(gn_dash.SourceError) as caught:
             source.poll(0)
         self.assertTrue(caught.exception.fatal)
-        self.assertIn("/api/health", caught.exception.message)
+        self.assertIn("no GreyIQ backend answered", caught.exception.message)
         self.assertEqual(server_tokens := decoy.tokens_seen(), {None},
                          f"a token reached an unverified port: {server_tokens}")
         self.assertTrue(all(method == "GET" for method, _path, _token in decoy.hits))
 
-    def test_discovery_accepts_the_port_that_answers_health(self) -> None:
+    def test_no_token_reaches_a_port_that_answers_health_but_not_the_token_gate(self) -> None:
+        # /api/health is deliberately unfingerprintable - a bare {"status": "ok"}, which any number
+        # of local dev servers also answer. Accepting it as identity handed X-GreyIQ-Token to
+        # whatever held the port first. Identity now needs the port to reproduce GreyIQ's own auth
+        # refusal, which is obtainable WITHOUT authenticating. This decoy answers health and then
+        # accepts the unauthenticated POST, so it is not GreyIQ and must never see the token.
+        decoy = self.backend(health=True, gate=False)
+        self.patch(gn_dash, "_PORT_BASE", decoy.port)
+        self.patch(gn_dash, "_PORT_SPAN", 1)
+        self.setenv("GREYIQ_PORT", None)
+        source = gn_dash.AttachedSource("run-1", token="super-secret", timeout=2.0)
+        with self.assertRaises(gn_dash.SourceError) as caught:
+            source.poll(0)
+        self.assertTrue(caught.exception.fatal)
+        self.assertEqual(server_tokens := decoy.tokens_seen(), {None},
+                         f"a token reached a port that never proved it was GreyIQ: {server_tokens}")
+        probes = [(method, path) for method, path, _token in decoy.hits]
+        self.assertIn(("GET", "/api/health"), probes)
+        self.assertIn(("POST", "/api/bounty/runs"), probes, "the gate probe is what earns identity")
+
+    def test_discovery_accepts_the_port_that_reproduces_the_token_gate(self) -> None:
         server = self.backend()
         self.patch(gn_dash, "_PORT_BASE", server.port)
         self.patch(gn_dash, "_PORT_SPAN", 1)
@@ -775,6 +827,8 @@ class AttachedSourceTests(_Case):
         source = gn_dash.AttachedSource("run-1", token=server.token, timeout=2.0)
         self.assertEqual(source.poll(0)["count"], 1)
         self.assertEqual(server.hits[0][:2], ("GET", "/api/health"))
+        self.assertEqual(server.hits[1], ("POST", "/api/bounty/runs", None),
+                         "the probe that establishes identity must carry no credential")
 
     def test_greyiq_port_is_used_before_any_walk(self) -> None:
         server = self.backend()
@@ -782,6 +836,34 @@ class AttachedSourceTests(_Case):
         self.patch(gn_dash, "_PORT_SPAN", 0)   # any walk at all would now fail
         source = gn_dash.AttachedSource("run-1", token=server.token, timeout=2.0)
         self.assertEqual(source.poll(0)["count"], 1)
+
+    def test_the_access_key_is_sent_on_discovery_as_well_as_on_the_poll(self) -> None:
+        # The access-key gate runs ahead of EVERYTHING in greyiq_api, /api/health included, so a
+        # client that omits it gets 401 on the discovery probes too and concludes no backend exists.
+        # Advising "set GREYIQ_ACCESS_KEY" while ignoring it was advice that could not be followed.
+        server = self.backend(access_key="s3cret")
+        self.setenv("GREYIQ_ACCESS_KEY", "s3cret")
+        self.patch(gn_dash, "_PORT_BASE", server.port)
+        self.patch(gn_dash, "_PORT_SPAN", 1)
+        self.setenv("GREYIQ_PORT", None)
+        source = gn_dash.AttachedSource("run-1", token=server.token, timeout=2.0)
+        self.assertEqual(source.poll(0)["count"], 1)
+
+    def test_an_access_key_containing_a_colon_is_sent_whole(self) -> None:
+        # The server takes any username and compares the PASSWORD to the key, so the key goes in the
+        # password field verbatim. Splitting it on a colon would truncate it to "https" and the
+        # operator would see a 401 they could not explain.
+        server = self.backend(access_key="https://key:with:colons")
+        self.setenv("GREYIQ_ACCESS_KEY", "https://key:with:colons")
+        self.assertEqual(self.source(server).poll(0)["count"], 1)
+
+    def test_a_wrong_access_key_is_a_fatal_401_not_a_silent_no_backend(self) -> None:
+        server = self.backend(access_key="right")
+        self.setenv("GREYIQ_ACCESS_KEY", "wrong")
+        with self.assertRaises(gn_dash.SourceError) as caught:
+            self.source(server).poll(0)
+        self.assertTrue(caught.exception.fatal)
+        self.assertIn("GREYIQ_ACCESS_KEY", caught.exception.message)
 
     def test_a_401_with_a_challenge_names_the_access_key_and_is_fatal(self) -> None:
         server = self.backend(require_key=True)
@@ -894,6 +976,40 @@ class TokenDiscoveryTests(_Case):
             self.patch(gn_dash, "runtime_dirs", lambda: (os.path.join(tmp, "nope"),))
             self.setenv("GREYIQ_SESSION_TOKEN", None)
             self.assertEqual(gn_dash.read_token(), "")
+
+    def test_the_token_reports_which_runtime_dir_it_came_from(self) -> None:
+        # Whichever dir held the token is, by construction, the one the backend is using - so it is
+        # also the portfolio the program verbs must act on.
+        with TemporaryDirectory() as tmp:
+            empty, real = os.path.join(tmp, "empty"), os.path.join(tmp, "real")
+            os.makedirs(empty)
+            os.makedirs(real)
+            with open(os.path.join(real, "session.token"), "w", encoding="utf-8") as handle:
+                handle.write("from-file\n")
+            self.patch(gn_dash, "runtime_dirs", lambda: (empty, real))
+            self.setenv("GREYIQ_SESSION_TOKEN", None)
+            self.assertEqual(gn_dash.read_token_source(), ("from-file", real))
+            self.assertEqual(gn_dash.read_token_source("explicit"), ("explicit", ""))
+            self.setenv("GREYIQ_SESSION_TOKEN", "from-env")
+            self.assertEqual(gn_dash.read_token_source(), ("from-env", ""),
+                             "a token that came from no file names no dir")
+
+    def test_the_program_verbs_act_on_the_dir_the_token_came_from(self) -> None:
+        # The backend commonly runs on Electron's user-data runtime while this shell's
+        # gn_cli.RUNTIME_DIR is the checkout's runtime/. Reading the shell's dir listed a different
+        # portfolio than the operator being watched, and enable/now reported success while writing a
+        # file the running operator never reads.
+        import gn_cli
+
+        with TemporaryDirectory() as tmp:
+            shell, backend = os.path.join(tmp, "shell"), os.path.join(tmp, "backend")
+            self.patch(gn_cli, "RUNTIME_DIR", shell)
+            _module, chosen = gn_dash._portfolio(_ScriptedSource(runtime_dir=backend))
+            self.assertEqual(chosen, backend)
+            _module, chosen = gn_dash._portfolio(_ScriptedSource(runtime_dir=""))
+            self.assertEqual(chosen, shell, "a local hunt has no attached dir; the shell's is right")
+            _module, chosen = gn_dash._portfolio(None)
+            self.assertEqual(chosen, shell)
 
     def test_the_runtime_dirs_include_the_desktop_apps_own_location(self) -> None:
         self.setenv("GREYIQ_RUNTIME_DIR", os.path.join("x", "runtime"))
@@ -1084,7 +1200,8 @@ class _ScriptedSource:
     """A source that answers from a canned list, then repeats the last frame."""
 
     def __init__(self, frames: list[dict] | None = None, *, caps: frozenset[str] | None = None,
-                 error: Exception | None = None) -> None:
+                 error: Exception | None = None, runtime_dir: str = "") -> None:
+        self.runtime_dir = runtime_dir  # as AttachedSource carries the dir its token came from
         self.frames = frames or [{"events": [], "count": 0, "snapshot": {"targets": [], "findings": []}}]
         self.caps = caps if caps is not None else frozenset({"stop", "reverify", "programs"})
         self.error = error
@@ -1163,6 +1280,26 @@ class LoopTests(_Case):
         state = board.snapshot_state(gn_tui.Size(80, 24))
         self.assertEqual(state.status, "STOPPING")
         self.assertIn("stopping - after the current step", state.message)
+
+    def test_program_now_refuses_an_unknown_id_and_mints_nothing(self) -> None:
+        # upsert_program CREATES what it cannot find, so a mistyped id used to answer "due now" about
+        # a program that had never existed and leave the typo in portfolio.json as a phantom
+        # scheduled record. enable/disable already fail closed via set_enabled; this matches them.
+        from bughunter import portfolio
+
+        with TemporaryDirectory() as tmp:
+            portfolio.upsert_program(tmp, {"id": "acme", "name": "Acme",
+                                           "next_run_at": "2099-01-01T00:00:00+00:00"})
+            board = self.dash(_ScriptedSource(runtime_dir=tmp))
+            board.submit("program now acme-typo")
+            self.assertIn("no program with id", board.snapshot_state(gn_tui.Size(80, 24)).message)
+            self.assertEqual([row["id"] for row in portfolio.list_programs(tmp)], ["acme"])
+            board.submit("program now acme")
+            self.assertIn("due now", board.snapshot_state(gn_tui.Size(80, 24)).message)
+            self.assertIsNone(portfolio.get_program(tmp, "acme")["next_run_at"],
+                              "a falsy next_run_at is what _is_due reads as 'run this one next'")
+            self.assertIsNone(portfolio.get_program(tmp, "acme")["last_run_at"],
+                              "touch_run would have falsified the history the funnel reads")
 
     def test_a_refused_command_reports_instead_of_running(self) -> None:
         board = self.dash()

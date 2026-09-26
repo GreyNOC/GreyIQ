@@ -30,16 +30,20 @@ module exists to prevent:
     HTTP, so those panels read ``n/a - local only``; a lost backend freezes the last good snapshot
     behind a ``stale`` badge and a ``NO BACKEND`` pill. Clearing the panels to zeros would read as
     "nothing found", which is a different claim from "we lost contact".
-  * **The token goes nowhere until a probe has answered.** Port discovery walks 8766..8845 with an
-    unauthenticated ``GET /api/health``; only the port that answers is ever sent the session token,
-    and only over loopback. A discovery loop that POSTed the token at every local port would be a
-    credential leak looking for a listener.
+  * **The token goes nowhere until the port has proved it is GreyIQ.** Port discovery walks
+    8766..8845 carrying no credential, and a port must clear two token-free checks before it is
+    trusted: ``GET /api/health`` answering ``{"status": "ok"}``, AND an unauthenticated POST to a
+    gated route being refused with GreyIQ's own ``missing or invalid session token``. Health alone
+    is not enough — it is deliberately unfingerprintable, so accepting it meant another user who
+    bound a lower port first would be handed ``X-GreyIQ-Token`` by the walk. A discovery loop that
+    sprays a credential at every local listener is a leak looking for one.
 
 Nothing here may raise into a hunt: the poller, the command worker and the sampler are all wrapped,
 and :func:`render` itself degrades to an honest one-line error frame rather than taking the loop down.
 """
 from __future__ import annotations
 
+import base64
 import contextlib
 import io
 import json
@@ -112,6 +116,12 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 #: Electron's ``findFreePort(8766)`` walks 80 ports; discovery has to cover the same ground.
 _PORT_BASE, _PORT_SPAN = 8766, 80
 _TOKEN_HEADER = "X-GreyIQ-Token"
+# The token-free identity probe. Any /api/* path except /api/health is gated, and the gate answers
+# an unauthenticated request with 403 and exactly this body (greyiq_api). Being refused in GreyIQ's
+# own words is what identifies the backend BEFORE the token is ever sent; /api/bounty/runs is chosen
+# because it is read-only and field-free, so even a hypothetical unrefused POST changes nothing.
+_GATE_PROBE_PATH = "/api/bounty/runs"
+_GATE_REFUSAL = "missing or invalid session token"
 
 ACCESS_KEY_MESSAGE = ("the backend requires GREYIQ_ACCESS_KEY; set it in this shell and reattach.")
 STALE_TOKEN_MESSAGE = ("the backend restarted - its session token was regenerated; reattach.")
@@ -1201,11 +1211,22 @@ def _user_data_runtime() -> str:
 
 def read_token(explicit: str = "") -> str:
     """The session token: ``--token``, then ``$GREYIQ_SESSION_TOKEN``, then each runtime dir."""
+    return read_token_source(explicit)[0]
+
+
+def read_token_source(explicit: str = "") -> tuple[str, str]:
+    """``(token, the runtime dir it came from)``; the dir is ``""`` for ``--token``/env.
+
+    The dir matters beyond bookkeeping. Attaching from a shell to the desktop app's backend is the
+    normal case, and the two runtime dirs are never the same — that split is the whole reason
+    ``runtime_dirs`` probes more than one. Whichever dir held the token is, by construction, the one
+    the backend is using, so it is also the portfolio those program verbs must act on.
+    """
     if explicit:
-        return str(explicit).strip()
+        return (str(explicit).strip(), "")
     env = str(os.getenv("GREYIQ_SESSION_TOKEN") or "").strip()
     if env:
-        return env
+        return (env, "")
     for directory in runtime_dirs():
         try:
             with open(os.path.join(directory, "session.token"), "r", encoding="utf-8") as handle:
@@ -1213,8 +1234,8 @@ def read_token(explicit: str = "") -> str:
         except OSError:
             continue
         if token:
-            return token
-    return ""
+            return (token, directory)
+    return ("", "")
 
 
 class AttachedSource:
@@ -1242,7 +1263,9 @@ class AttachedSource:
                 fatal=True)
         self._timeout = max(0.5, float(timeout or 4.0))
         self._label = str(label or "")
-        self._token = read_token(token)
+        # The dir the token came from IS the backend's runtime dir, and the program verbs act on
+        # that portfolio rather than this shell's — see _portfolio.
+        self._token, self.runtime_dir = read_token_source(token)
         self._port = int(port) if port else None
 
     # --- RunSource ---------------------------------------------------------------------------------
@@ -1307,24 +1330,44 @@ class AttachedSource:
         return f"http://{host}:{int(port)}"
 
     def _discover_port(self) -> int:
-        """``$GREYIQ_PORT`` first, then an unauthenticated walk of 8766..8845.
-
-        ``/api/health`` is the one ``/api/*`` path exempt from the token gate and answers a bare
-        ``{"status": "ok"}`` — deliberately unfingerprintable. That is exactly why it is the probe:
-        the walk hands nothing to whatever else might be listening on a local port.
-        """
+        """``$GREYIQ_PORT`` first, then a token-free walk of 8766..8845."""
         env = str(os.getenv("GREYIQ_PORT") or "").strip()
-        if env.isdigit() and self._healthy(int(env)):
+        if env.isdigit() and self._is_greyiq(int(env)):
             return int(env)
         for port in range(_PORT_BASE, _PORT_BASE + _PORT_SPAN):
-            if self._healthy(port):
+            if self._is_greyiq(port):
                 return port
         raise SourceError(
-            f"no GreyIQ backend answered /api/health on {self._host}:{_PORT_BASE}-"
+            f"no GreyIQ backend answered on {self._host}:{_PORT_BASE}-"
             f"{_PORT_BASE + _PORT_SPAN - 1}; start the app, or pass --port.", fatal=True)
 
-    def _healthy(self, port: int) -> bool:
+    def _is_greyiq(self, port: int) -> bool:
+        """Is a GreyIQ backend listening here — established WITHOUT handing over the token?
+
+        ``/api/health`` alone cannot answer this. It is deliberately unfingerprintable, so it
+        replies with a bare ``{"status": "ok"}`` — one of the most common health shapes there is.
+        Accepting that as proof of identity meant the very next request sent ``X-GreyIQ-Token`` to
+        whatever was listening. On a multi-user box another user can bind 8766 before GreyIQ takes
+        8767, and while they cannot read the owner-only token file, the walk would have delivered
+        the token to them.
+
+        So identity needs a signal only GreyIQ produces, obtainable without authenticating. The
+        token gate itself is that signal: every ``/api/*`` path except ``/api/health`` answers an
+        unauthenticated request with 403 and exactly ``{"error": "missing or invalid session
+        token"}``. Being REFUSED in GreyIQ's own words is the proof, and the probe that earns it
+        carries no credential — a foreign listener that happens to return ``{"status":"ok"}`` does
+        not also refuse a POST in those words.
+
+        This raises the bar from "answers a common health shape" to "reproduces GreyIQ's auth gate".
+        It is not a cryptographic identity check, and it is not meant to be: the session token is
+        explicitly not real authentication once the server is reachable beyond loopback (see
+        greyiq_api), which is why ``--attach`` refuses a non-loopback host in the first place.
+        """
+        return self._health_ok(port) and self._gate_ok(port)
+
+    def _health_ok(self, port: int) -> bool:
         request = urllib.request.Request(self._base(port) + "/api/health", method="GET")
+        self._apply_access_key(request)
         try:
             with urllib.request.urlopen(request, timeout=min(1.0, self._timeout)) as response:
                 body = response.read(256)
@@ -1334,6 +1377,47 @@ class AttachedSource:
             return json.loads(body.decode("utf-8", "replace")).get("status") == "ok"
         except (ValueError, AttributeError):
             return False
+
+    def _gate_ok(self, port: int) -> bool:
+        """A DELIBERATELY unauthenticated POST to a token-gated route. No token header is set."""
+        request = urllib.request.Request(
+            self._base(port) + _GATE_PROBE_PATH, data=b"{}", method="POST",
+            headers={"Content-Type": "application/json"})
+        self._apply_access_key(request)  # the access key gates the token gate; see _apply_access_key
+        try:
+            with urllib.request.urlopen(request, timeout=min(1.0, self._timeout)):
+                return False  # answered an unauthenticated POST: not GreyIQ's gate
+        except urllib.error.HTTPError as exc:
+            if int(getattr(exc, "code", 0) or 0) != 403:
+                return False
+            try:
+                body = json.loads(exc.read(256).decode("utf-8", "replace"))
+            except Exception:  # noqa: BLE001
+                return False
+            return isinstance(body, dict) and body.get("error") == _GATE_REFUSAL
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _apply_access_key(self, request: urllib.request.Request) -> None:
+        """Add HTTP Basic auth when ``GREYIQ_ACCESS_KEY`` is set.
+
+        That gate runs before EVERYTHING in greyiq_api — ahead of the token gate and ahead of
+        ``/api/health`` — so against a backend started with an access key, a client that omits it
+        gets 401 on every request including discovery. Without this the walk found no backend at
+        all, and an explicit ``--port`` reported "set GREYIQ_ACCESS_KEY", naming a variable this
+        client then ignored: advice that could not be followed.
+        """
+        key = str(os.getenv("GREYIQ_ACCESS_KEY") or "")
+        if not key:
+            return
+        # The server takes ANY username and compares the PASSWORD against the key
+        # (greyiq_api._access_key_authorized), so the key goes in the password field verbatim —
+        # never split on a colon, which would silently truncate a key that contains one.
+        try:
+            raw = base64.b64encode(f"gn:{key}".encode("utf-8")).decode("ascii")
+        except Exception:  # noqa: BLE001 - a key we cannot encode is one we cannot send
+            return
+        request.add_header("Authorization", "Basic " + raw)
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         port = self.port
@@ -1359,6 +1443,7 @@ class AttachedSource:
         request = urllib.request.Request(
             self._base(port) + path, data=body, method="POST",
             headers={"Content-Type": "application/json", _TOKEN_HEADER: self._token})
+        self._apply_access_key(request)
         try:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
                 raw = response.read()
@@ -2105,7 +2190,7 @@ class Dashboard:
         return handler()
 
     def _verb_program_list(self, _args: Sequence[str]) -> tuple[bool, str]:
-        portfolio, runtime = _portfolio()
+        portfolio, runtime = _portfolio(self._source)
         if portfolio is None:
             return (False, "the portfolio is not readable from here.")
         self._output.clear()
@@ -2128,7 +2213,7 @@ class Dashboard:
     def _set_program(self, args: Sequence[str], enabled: bool) -> tuple[bool, str]:
         if not args:
             return (False, "that needs a program id (see `program list`).")
-        portfolio, runtime = _portfolio()
+        portfolio, runtime = _portfolio(self._source)
         if portfolio is None:
             return (False, "the portfolio is not writable from here.")
         record = portfolio.set_enabled(runtime, str(args[0]), enabled)
@@ -2144,14 +2229,23 @@ class Dashboard:
         ``touch_run`` unconditionally stamps ``last_run_at = now``, which falsifies the scheduling
         history the pipeline funnel reads. ``_is_due`` treats a falsy ``next_run_at`` as due, so
         clearing it is the honest hook for "run this one next".
+
+        The id is RESOLVED first. ``upsert_program`` creates what it cannot find, so a mistyped id
+        silently minted a new default-enabled program: the dashboard answered "due now" about a
+        program that had never existed, and left the typo behind in ``portfolio.json`` as a phantom
+        scheduled record. ``enable``/``disable`` right above already fail closed on an unknown id
+        via ``set_enabled``; this now matches them.
         """
         if not args:
             return (False, "that needs a program id (see `program list`).")
-        portfolio, runtime = _portfolio()
+        portfolio, runtime = _portfolio(self._source)
         if portfolio is None:
             return (False, "the portfolio is not writable from here.")
-        portfolio.upsert_program(runtime, {"id": str(args[0]), "next_run_at": None})
-        return (True, f"{args[0]} is due now - effective at the operator's next scheduling pass "
+        program_id = str(args[0])
+        if portfolio.get_program(runtime, program_id) is None:
+            return (False, f"no program with id {program_id!r}.")
+        portfolio.upsert_program(runtime, {"id": program_id, "next_run_at": None})
+        return (True, f"{program_id} is due now - effective at the operator's next scheduling pass "
                       f"(<=15s idle tick)")
 
     def _verb_help(self, _args: Sequence[str]) -> tuple[bool, str]:
@@ -2197,16 +2291,30 @@ def _last_message(events: Sequence[dict[str, Any]]) -> str:
     return ""
 
 
-def _portfolio() -> tuple[Any, Any]:
+def _portfolio(source: Any = None) -> tuple[Any, Any]:
     """``(portfolio module, runtime dir)`` — file-backed, so it works in both modes and across
-    processes: the operator loop re-reads the portfolio each program cycle."""
+    processes: the operator loop re-reads the portfolio each program cycle.
+
+    WHICH runtime dir is the whole question in attached mode. The backend commonly runs on
+    Electron's user-data runtime while this shell's ``gn_cli.RUNTIME_DIR`` is the checkout's
+    ``runtime/``, and reading the shell's dir showed a different portfolio than the operator being
+    watched — ``program list`` listed the wrong programs, and ``enable``/``now`` reported success
+    while changing a file the running operator never reads. Token discovery already resolved the
+    backend's dir (that is where ``session.token`` was found), so prefer it and fall back to the
+    shell's only when attaching did not go through a file.
+    """
     try:
         import gn_cli
         from bughunter import portfolio
-
-        return portfolio, gn_cli.RUNTIME_DIR
     except Exception:  # noqa: BLE001
         return None, None
+    attached = ""
+    if source is not None:
+        try:
+            attached = str(getattr(source, "runtime_dir", "") or "")
+        except Exception:  # noqa: BLE001 - a source that cannot answer is simply not attached
+            attached = ""
+    return portfolio, (attached or gn_cli.RUNTIME_DIR)
 
 
 def run(source: Any, *, run_subcommand: Callable[..., tuple[int, str]] | None = None,
