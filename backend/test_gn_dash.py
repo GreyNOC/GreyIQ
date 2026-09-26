@@ -431,9 +431,33 @@ class ParseCommandTests(_Case):
         kwargs.setdefault("commands", self.COMMANDS)
         return gn_dash.parse_command(line, **kwargs)  # type: ignore[arg-type]
 
+    HOME = frozenset({"home", "programs"})
+
     def test_an_empty_line_is_not_a_command(self) -> None:
         for line in ("", "   ", "\t"):
             self.assertEqual(self.parse(line).kind, "empty")
+
+    def test_a_leading_slash_is_optional_and_means_the_same_verb(self) -> None:
+        # The CLI idiom (/usage) and the bare verb have to be the same command, or the help text is
+        # wrong for half the people reading it.
+        for bare, slashed in (("usage", "/usage"), ("help", "/help"), ("quit", "/quit"),
+                              ("stop", "/stop"), ("program list", "/program list")):
+            with self.subTest(verb=bare):
+                plain, slash = self.parse(bare), self.parse(slashed)
+                self.assertEqual(slash.kind, plain.kind)
+                self.assertEqual(slash.name, plain.name)
+
+    def test_exactly_one_slash_is_eaten_so_a_typo_still_reaches_the_error(self) -> None:
+        # `//usage` is a typo, not a verb. Normalising any run of slashes would hide it.
+        self.assertEqual(self.parse("/").kind, "empty")
+        parsed = self.parse("//usage")
+        self.assertEqual(parsed.kind, "refused")
+        self.assertIn("unknown command", parsed.error)
+
+    def test_usage_needs_no_capability_so_every_mode_can_ask(self) -> None:
+        for caps in (self.LOCAL, self.ATTACHED, self.HOME, frozenset()):
+            with self.subTest(caps=sorted(caps)):
+                self.assertEqual(self.parse("/usage", capabilities=caps).kind, "verb")
 
     def test_quoting_is_honoured(self) -> None:
         parsed = self.parse('program enable "acme corp"')
@@ -459,6 +483,22 @@ class ParseCommandTests(_Case):
                 self.assertEqual(parsed.kind, "refused")
                 self.assertEqual(parsed.error, gn_dash.HUNT_REFUSAL)
                 self.assertIn("_MAX_RUNS=8", parsed.error)
+
+    def test_hunt_is_a_verb_on_home_because_there_is_no_run_to_evict(self) -> None:
+        parsed = self.parse("/hunt https://x -y", capabilities=self.HOME, watching=True)
+        self.assertEqual(parsed.kind, "verb")
+        self.assertEqual(parsed.name, "hunt")
+        self.assertEqual(parsed.args, ("https://x", "-y"))
+        attach = self.parse("/attach", capabilities=self.HOME)
+        self.assertEqual((attach.kind, attach.name), ("verb", "attach"))
+
+    def test_a_live_cockpit_still_explains_WHY_a_second_hunt_is_refused(self) -> None:
+        # The home verbs are kept out of the global VERBS table for exactly this: as a global spec
+        # with needs="home", this would answer "not available on this run", which does not tell the
+        # operator that the problem is eviction of the run they are looking at.
+        parsed = self.parse("hunt https://x -y", capabilities=self.LOCAL, watching=True)
+        self.assertEqual(parsed.error, gn_dash.HUNT_REFUSAL)
+        self.assertIn("_MAX_RUNS=8", parsed.error)
 
     def test_the_same_hunt_is_allowed_when_attached_to_another_process(self) -> None:
         # The progress store is per-process, so a hunt started here cannot evict the watched run.
@@ -641,6 +681,299 @@ class LocalSourceTests(_Case):
                                 {"target": "https://b.example"}, {"target": "not a url"}, None]}
         self.assertEqual(gn_dash.run_scope(snapshot), "a.example b.example")
         self.assertEqual(gn_dash.run_scope({}), "")
+
+
+class HomeSourceTests(_Case):
+    """The idle cockpit: it must look like every other source and must start nothing itself."""
+
+    def board(self, source: object) -> gn_dash.Dashboard:
+        return gn_dash.Dashboard(source, stream=io.StringIO(), inp=io.StringIO(),  # type: ignore[arg-type]
+                                 size=(100, 30), sampler=False)
+
+    def test_its_poll_is_the_same_envelope_every_other_source_returns(self) -> None:
+        # render() must not be able to tell the modes apart - that is the whole structural claim of
+        # the module, and an idle source that answered a different shape would break it.
+        polled = gn_dash.HomeSource().poll(0)
+        self.assertEqual(set(polled), {"events", "count", "snapshot"})
+        self.assertEqual(set(polled["snapshot"]), {"targets", "findings", "stats"})
+        self.assertEqual(polled["snapshot"]["targets"], [])
+        self.assertEqual(polled["count"], 0)
+
+    def test_it_offers_programs_but_not_stop_reverify_or_governor(self) -> None:
+        caps = gn_dash.HomeSource().capabilities()
+        self.assertIn("home", caps)
+        self.assertIn("programs", caps, "the portfolio is file-backed; it reads fine with no run")
+        for withheld in ("stop", "reverify", "governor"):
+            self.assertNotIn(withheld, caps, f"nothing to {withheld} on an idle cockpit")
+
+    def test_the_pill_reads_idle_not_running_and_the_hint_is_shown(self) -> None:
+        board = self.board(gn_dash.HomeSource())
+        state = board.snapshot_state(gn_tui.Size(100, 30))
+        self.assertEqual(state.status, "IDLE", "RUNNING with nothing running would be a lie")
+        self.assertEqual(state.message, gn_dash.HOME_HINT)
+
+    def test_the_hint_comes_back_after_a_command_message_expires(self) -> None:
+        # An idle cockpit whose message line goes blank tells the operator nothing to type next.
+        clock = [1000.0]
+        board = gn_dash.Dashboard(gn_dash.HomeSource(), stream=io.StringIO(), inp=io.StringIO(),
+                                  size=(100, 30), sampler=False, clock=lambda: clock[0])
+        board.note("something happened")
+        self.assertEqual(board.snapshot_state(gn_tui.Size(100, 30)).message, "something happened")
+        clock[0] += 600.0
+        self.assertEqual(board.snapshot_state(gn_tui.Size(100, 30)).message, gn_dash.HOME_HINT)
+
+    def test_an_idle_frame_renders_without_raising(self) -> None:
+        board = self.board(gn_dash.HomeSource())
+        board._absorb(gn_dash.HomeSource().poll(0))
+        state = board.snapshot_state(gn_tui.Size(100, 30))
+        rows = gn_dash.render(state, gn_tui.Size(100, 30), _tier())
+        self.assertEqual(len(rows), 30)
+
+    def test_hunt_refuses_without_authorization_and_records_nothing(self) -> None:
+        # Opening a dashboard is not consent to probe a host typed into it later.
+        source = gn_dash.HomeSource()
+        board = self.board(source)
+        board.submit("/hunt https://example.com")
+        self.assertIn("-y", board.snapshot_state(gn_tui.Size(100, 30)).message)
+        self.assertIsNone(source.pending, "an unauthorized hunt must not be queued")
+        self.assertFalse(board._quit.is_set())
+
+    def test_hunt_with_authorization_records_the_ask_and_leaves(self) -> None:
+        source = gn_dash.HomeSource()
+        board = self.board(source)
+        board.submit("/hunt https://example.com -y")
+        self.assertEqual(source.pending, {"action": "hunt", "target": "https://example.com",
+                                          "depth": {}})
+        self.assertTrue(board._quit.is_set(), "the launcher relaunches; the cockpit steps aside")
+
+    def test_the_depth_variables_ride_through_to_the_relaunch(self) -> None:
+        source = gn_dash.HomeSource()
+        board = self.board(source)
+        board.submit("/hunt https://x -y -Th -Ch -Tn 5")
+        self.assertEqual(source.pending, {"action": "hunt", "target": "https://x",
+                                          "depth": {"theorize": True, "chain": True, "turns": 5}})
+
+    def test_turns_without_theorize_is_refused_rather_than_silently_ignored(self) -> None:
+        # hunt_loop_max_iters does nothing unless the loop is on; accepting -Tn alone would let the
+        # operator believe they asked for depth they are not getting.
+        source = gn_dash.HomeSource()
+        board = self.board(source)
+        board.submit("/hunt https://x -y -Tn 5")
+        self.assertIn("only has an effect with -Th",
+                      board.snapshot_state(gn_tui.Size(100, 30)).message)
+        self.assertIsNone(source.pending)
+
+    def test_a_malformed_turns_value_is_refused(self) -> None:
+        for line, expect in (("/hunt https://x -y -Th -Tn", "needs a number"),
+                             ("/hunt https://x -y -Th -Tn abc", "whole number")):
+            with self.subTest(line=line):
+                source = gn_dash.HomeSource()
+                board = self.board(source)
+                board.submit(line)
+                self.assertIn(expect, board.snapshot_state(gn_tui.Size(100, 30)).message)
+                self.assertIsNone(source.pending)
+
+    def test_an_unknown_option_is_refused_not_swallowed_as_a_target(self) -> None:
+        # Unrecognised tokens used to land in `targets`, of which only [0] survived, so a typo or
+        # an unsupported flag launched a hunt with materially different probing than was asked for.
+        for line in ("/hunt https://x -y --active", "/hunt https://x -y -Chh",
+                     "/hunt https://x -y -T h", "/hunt https://x -y --theorise"):
+            with self.subTest(line=line):
+                source = gn_dash.HomeSource()
+                board = self.board(source)
+                board.submit(line)
+                self.assertIn("unknown option",
+                              board.snapshot_state(gn_tui.Size(100, 30)).message)
+                self.assertIsNone(source.pending)
+
+    def test_two_targets_are_refused_rather_than_hunting_the_first(self) -> None:
+        source = gn_dash.HomeSource()
+        board = self.board(source)
+        board.submit("/hunt https://a https://b -y")
+        message = board.snapshot_state(gn_tui.Size(100, 30)).message
+        self.assertIn("one target at a time", message)
+        self.assertIn("https://b", message, "say which ones, so the mistake is obvious")
+        self.assertIsNone(source.pending)
+
+    def test_turns_followed_by_a_flag_is_a_missing_value_not_a_bad_number(self) -> None:
+        source = gn_dash.HomeSource()
+        board = self.board(source)
+        board.submit("/hunt https://x -y -Th -Tn -Ch")
+        self.assertIn("needs a number of turns",
+                      board.snapshot_state(gn_tui.Size(100, 30)).message)
+        self.assertIsNone(source.pending)
+
+    def test_a_depth_flag_is_never_mistaken_for_the_target(self) -> None:
+        source = gn_dash.HomeSource()
+        board = self.board(source)
+        board.submit("/hunt -Th -y")
+        self.assertIn("needs a target", board.snapshot_state(gn_tui.Size(100, 30)).message)
+        self.assertIsNone(source.pending)
+
+    def test_help_v_shows_the_depth_table_and_plain_help_still_shows_the_verbs(self) -> None:
+        board = self.board(gn_dash.HomeSource())
+        board.submit("/help -v")
+        out = board.snapshot_state(gn_tui.Size(100, 30)).output
+        self.assertIn("hunt depth variables", out[0])
+        self.assertTrue(any("-Th" in line for line in out))
+        self.assertTrue(any("engine knob" in line for line in out),
+                        "each row must name the real knob it moves, not just a description")
+        board.submit("/help")
+        self.assertTrue(board.snapshot_state(gn_tui.Size(100, 30)).output[0]
+                        .startswith("pane commands"))
+
+    def test_hunt_without_a_target_says_so(self) -> None:
+        source = gn_dash.HomeSource()
+        board = self.board(source)
+        board.submit("/hunt -y")
+        self.assertIn("needs a target", board.snapshot_state(gn_tui.Size(100, 30)).message)
+        self.assertIsNone(source.pending)
+
+    def test_attach_records_the_ask_and_leaves(self) -> None:
+        source = gn_dash.HomeSource()
+        board = self.board(source)
+        board.submit("/attach")
+        self.assertEqual(source.pending, {"action": "attach"})
+        self.assertTrue(board._quit.is_set())
+
+    def test_no_relaunch_while_a_pane_command_still_holds_stdout(self) -> None:
+        # These verbs are `immediate`, so they run ABOVE submit()'s own _busy check. The relaunch
+        # happens in this process while _dash_subcommand still has sys.stdout redirected into the
+        # dying cockpit's OutputTail (a process-wide swap that run() does not wait out). /attach
+        # would exit 2 into a discarded buffer; /hunt would fall through to a HEADLESS hunt -- live
+        # traffic at someone's host with the summary and report path swallowed.
+        for line in ("/hunt https://example.com -y", "/attach"):
+            with self.subTest(line=line):
+                source = gn_dash.HomeSource()
+                board = self.board(source)
+                board._busy = "gn scan"
+                board.submit(line)
+                self.assertIn("one pane command at a time",
+                              board.snapshot_state(gn_tui.Size(100, 30)).message)
+                self.assertIsNone(source.pending, "relaunching under a live redirect loses the run")
+                self.assertFalse(board._quit.is_set())
+
+    def test_a_campaign_on_home_is_refused_for_the_true_reason(self) -> None:
+        # "a hunt is already on screen" is simply false on an idle cockpit.
+        for line in ("campaign https://x", "osint x --hunt", "operator run"):
+            with self.subTest(line=line):
+                parsed = gn_dash.parse_command(line, capabilities=gn_dash.HomeSource().capabilities(),
+                                               commands=("campaign", "osint", "operator"))
+                self.assertEqual(parsed.kind, "refused")
+                self.assertEqual(parsed.error, gn_dash.HOME_HUNT_REFUSAL)
+                self.assertNotIn("already on screen", parsed.error)
+
+    def test_tab_completes_a_slashed_prefix_and_keeps_the_slash(self) -> None:
+        board = self.board(gn_dash.HomeSource())
+        board._line.set("/us")
+        self.assertEqual(board._complete(), "/usage ")
+        board._line.set("us")
+        self.assertEqual(board._complete(), "usage ", "the bare form must still complete")
+
+    def test_tab_completes_a_home_only_verb(self) -> None:
+        board = self.board(gn_dash.HomeSource())
+        board._line.set("/att")
+        self.assertEqual(board._complete(), "/attach ")
+
+    def test_help_on_home_leads_with_the_two_verbs_that_do_anything(self) -> None:
+        lines = gn_dash.help_lines(gn_dash.HomeSource().capabilities())
+        text = "\n".join(lines)
+        self.assertIn("/hunt", text)
+        self.assertIn("/attach", text)
+        self.assertIn("/usage", text)
+        body = [line for line in lines if line.strip().startswith(("/", "x /"))]
+        self.assertTrue(body and "/hunt" in body[0],
+                        "stop/reverify are both unavailable here; leading with them reads as dead")
+
+    def test_a_withheld_verb_names_home_rather_than_in_process(self) -> None:
+        parsed = gn_dash.parse_command("/stop", capabilities=gn_dash.HomeSource().capabilities())
+        self.assertEqual(parsed.kind, "refused")
+        self.assertIn("home", parsed.error)
+
+
+class UsageReportTests(_Case):
+    BASE = {"snapshot": {}, "governor": (), "rate": None, "sysmon": {}, "elapsed": 0.0,
+            "label": "", "status": "IDLE"}
+
+    def report(self, **kwargs: object) -> str:
+        return "\n".join(gn_dash.usage_report(**{**self.BASE, **kwargs}))  # type: ignore[arg-type]
+
+    def test_an_absent_reading_is_a_dash_never_a_zero(self) -> None:
+        # The same rule gn_sysmon applies to a rejected sample: 0 is a claim, absent is not zero.
+        text = self.report(capabilities=frozenset({"governor"}))
+        for line in text.splitlines():
+            if line.strip().startswith(("cpu", "memory", "disk", "probe rate")):
+                self.assertIn("--", line, line)
+                self.assertNotRegex(line, r"\b0(\.0)?%", line)
+
+    def test_it_reports_engine_and_system_sections(self) -> None:
+        text = self.report()
+        self.assertIn("ENGINE", text)
+        self.assertIn("SYSTEM", text)
+
+    def test_candidates_are_derived_not_total_minus_confirmed(self) -> None:
+        # total - confirmed is NOT a candidate count: it folds in every "missing".
+        findings = [{"ref": "F-1", "proof": "confirmed"}, {"ref": "F-2", "proof": "candidate"},
+                    {"ref": "F-3", "proof": "missing"}]
+        snapshot = {"findings": findings,
+                    "stats": {"findings_total": 3, "confirmed_total": 1, "targets_total": 1,
+                              "targets_done": 1}}
+        line = [ln for ln in self.report(snapshot=snapshot).splitlines() if "findings" in ln][0]
+        self.assertIn("3 total", line)
+        self.assertIn("1 confirmed", line)
+        self.assertIn("1 candidate", line, "the 'missing' one is neither confirmed nor candidate")
+
+    def test_the_probe_rate_says_n_a_when_the_source_cannot_measure_it(self) -> None:
+        line = [ln for ln in self.report().splitlines() if "probe rate" in ln][0]
+        self.assertIn("n/a", line, "a local run has no governor exposure; -- alone would imply it does")
+
+    def test_host_buckets_say_n_a_rather_than_none_when_never_measured(self) -> None:
+        # Attached mode withholds "governor", so _absorb never calls source.governor() and the
+        # tuple is empty because nothing was ASKED, not because no host has been throttled.
+        # "none yet" would report a measurement this mode never made.
+        line = [ln for ln in self.report().splitlines() if "host buckets" in ln][0]
+        self.assertIn("n/a", line)
+        self.assertNotIn("none yet", line)
+
+    def test_host_buckets_are_listed_busiest_first(self) -> None:
+        governor = ({"host": "a.example", "tokens": 9, "capacity": 10},
+                    {"host": "b.example", "tokens": 1, "capacity": 10})
+        text = self.report(governor=governor, capabilities=frozenset({"governor"}))
+        self.assertLess(text.index("b.example"), text.index("a.example"))
+        self.assertIn("1/10", text)
+
+    def test_equal_buckets_order_stably_by_host(self) -> None:
+        # Determinism: a tie on tokens must not leave the order up to dict iteration.
+        governor = ({"host": "z.example", "tokens": 5, "capacity": 10},
+                    {"host": "a.example", "tokens": 5, "capacity": 10})
+        text = self.report(governor=governor, capabilities=frozenset({"governor"}))
+        self.assertLess(text.index("a.example"), text.index("z.example"))
+
+    def test_a_capped_findings_count_says_so(self) -> None:
+        # progress.set_findings hard-drops past 400/run, so a bare total under-reports silently.
+        snapshot = {"findings": [], "stats": {"findings_total": 400, "confirmed_total": 2}}
+        line = [ln for ln in self.report(snapshot=snapshot).splitlines() if "findings" in ln][0]
+        self.assertIn("cap reached", line)
+        uncapped = {"findings": [], "stats": {"findings_total": 12, "confirmed_total": 2}}
+        line = [ln for ln in self.report(snapshot=uncapped).splitlines() if "findings" in ln][0]
+        self.assertNotIn("cap", line)
+
+    def test_bytes_render_as_units_and_a_bad_value_is_a_dash(self) -> None:
+        self.assertEqual(gn_dash._bytes(None), "--")
+        self.assertEqual(gn_dash._bytes("nonsense"), "--")
+        self.assertEqual(gn_dash._bytes(-1), "--")
+        self.assertEqual(gn_dash._bytes(512), "512B")
+        self.assertTrue(gn_dash._bytes(2 * 1024 ** 3).endswith("GB"))
+
+    def test_usage_lands_in_the_output_pane_from_any_mode(self) -> None:
+        for source in (gn_dash.HomeSource(), _ScriptedSource()):
+            with self.subTest(source=type(source).__name__):
+                board = gn_dash.Dashboard(source, stream=io.StringIO(), inp=io.StringIO(),  # type: ignore[arg-type]
+                                          size=(100, 30), sampler=False)
+                board.submit("/usage")
+                state = board.snapshot_state(gn_tui.Size(100, 30))
+                self.assertEqual(state.tab, "output")
+                self.assertIn("ENGINE", "\n".join(state.output))
 
 
 class _Backend:
@@ -1335,7 +1668,8 @@ class LoopTests(_Case):
         board.submit("help")
         state = board.snapshot_state(gn_tui.Size(80, 24))
         self.assertEqual(state.tab, "output")
-        self.assertIn("pane commands", state.output)
+        self.assertTrue(state.output[0].startswith("pane commands"), state.output[0])
+        self.assertIn("the leading / is optional", state.output[0])
         self.assertFalse(state.unread_output)
 
     def test_quit_ends_the_loop(self) -> None:

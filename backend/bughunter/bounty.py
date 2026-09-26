@@ -2747,7 +2747,9 @@ def _run_bounty_hunt_body(
                     ),
                     xss_params=loop_xss_params, coder_cfg=coder_cfg,
                     surface={"endpoints": active_targets, "params": list(effective_extra_params or [])},
-                    on_progress=_emit)
+                    # The same predicate the fan-out below checks between targets. Without it this
+                    # branch was the one active path Stop could not reach.
+                    on_progress=_emit, should_stop=should_stop)
                 active_swept = {clean_target}  # the loop probes the seed and nothing else
             else:
                 active_findings = []
