@@ -242,6 +242,76 @@ explicitly selected U.S. federal VDP profiles (currently NASA); a `.gov` domain 
 does not silently activate a profile. Authorization, scope, private-address, rate, and evidence gates
 remain universal because they prevent false attribution and out-of-scope traffic.
 
+### The terminal cockpit — `gn dash`
+
+`gn dash` is `gn hunt` with the whole terminal: live panels for targets, findings over time,
+per-host rate limiting and the activity log, plus a command line you can type other `gn` verbs
+into while the run continues.
+
+```text
+gn dash https://example.com --scope "*.example.com" --active -y
+gn dash --attach                       # watch a run the desktop app is already running
+gn dash --attach --run-id <id>         # ...or a specific one
+gn dash --self-test                    # check this terminal without starting a hunt
+```
+
+It takes every option `gn hunt` takes, and **anything that makes panels inappropriate falls back
+to running exactly `gn hunt`** — `--json`, a redirected stdout, a pipe on stdin, `NO_COLOR`,
+`TERM=dumb`, `GN_NO_FX=1` or `GN_NO_DASH=1`. `gn dash … --json | jq` is one clean JSON document,
+and `gn dash … > report.txt` is byte-for-byte what `gn hunt` would have written. A terminal
+smaller than 60×18 is the one exception: it refuses and says so, because you clearly wanted the
+panels, and quietly hunting without them would be a different command from the one you typed.
+
+**Keys.** `Tab` cycles LOG / OUTPUT / TARGETS, `PgUp`/`PgDn` scroll whichever has focus, `Up`/`Down`
+walk the command history, `Ctrl-L` repaints, `q` quits. Type `help` in the pane for the verb table
+— it lists each control verb with its **real** latency, and greys out the ones this run does not
+offer.
+
+**`--attach`** watches a run another process is already holding, over loopback only
+(`127.0.0.1`, `::1`, `localhost`) and only after `GET /api/health` has answered on the port —
+nothing sends the session token to a port that has not identified itself. It finds the port from
+`$GREYIQ_PORT`, then `--port`, then a walk of 8766–8845, and the token from `--token`, then
+`$GREYIQ_SESSION_TOKEN`, then `session.token` under `$GREYIQ_RUNTIME_DIR` or the desktop app's own
+runtime folder. With no `--run-id` it attaches to the newest run that has not been asked to stop.
+If the backend restarts, the header pill goes `NO BACKEND` and the panels **freeze on the last
+good snapshot** behind a `stale Ns` badge — they are never cleared to zeros, because an empty
+panel reads as "nothing found", which is a different claim from "we lost contact".
+
+**`--self-test`** enters the alternate screen, draws one frame, hands the terminal back, and
+prints what it picked: glyph tier, key reader, console VT state, measured size, and which host
+counters answered. Run it first on an unfamiliar terminal — it is the fastest way to find out why
+a console is showing a wall of empty boxes.
+
+**Glyphs.** Block-bar sparklines by default, dropping to `░▒▓` on a cp437/cp850 console and to
+`_.:|` on an ASCII-only one. Braille is **off by default even on UTF-8**: `gn` forces both streams
+to UTF-8 at startup, so the encoding probe always says yes and cannot tell that your font has no
+U+28xx glyphs. Override with `GN_DASH_GLYPHS=braille|rich|box|ascii`, or `--braille` for that one
+run. `GN_NO_DASH=1` turns the cockpit off for a shell (same vocabulary as `GN_NO_FX`: `1`, `true`,
+`yes`, `on`).
+
+**What the panels claim, exactly.** The dashboard is deliberately pedantic about the difference
+between a measurement and a guess:
+
+- **`probe rate ~N/s (est, local)`** — *estimated*, derived from per-host token-bucket deltas, not
+  counted requests. Nothing in the engine counts requests per second, so this is labelled `est`
+  rather than presented as a reading.
+- **`n/a — local only`** — the rate panel and the host buckets in `--attach` mode. Those numbers
+  exist only inside the hunting process and are not exposed over HTTP, so they are reported as
+  unavailable rather than as zero.
+- **`--`** — any host counter (CPU, memory, disk) this machine would not answer. Never `0`: zero
+  is a claim.
+- **`total 400 (cap)`** — the findings stream is capped at 400 per run. A flat line that is really
+  a truncation is labelled as one.
+- **`stopping — after the current step`** — what the `stop` verb actually promises. The engine
+  checks the stop flag *between* probes, so a stop can take a full active pass (up to ~80s per
+  ranked endpoint) to take effect. The pill turns `DONE` only when the run itself returns. It is
+  never reported as "stopped" on request.
+- **Completion (`done/total`) counts skipped targets.** A stopped campaign marks its remaining
+  targets `skipped`, and a percentage that ignored them would sit below 100% forever.
+
+The dashboard writes **no files** — no frame log, no panel capture. Reports come from the hunt,
+exactly as they do without it.
+
 ## 4. Reading results
 
 The **Findings** board shows every finding with a proof-status pill:

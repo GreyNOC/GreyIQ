@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import threading
 import time
+from typing import Any
 
 
 # Loopback literals + the reserved name. Compared with string tests rather than an ipaddress parse
@@ -174,3 +175,58 @@ def shared_governor(capacity: int = 700, min_interval_s: float = 0.5,
             gov = HostRateGovernor(*cfg)
             _shared_governors[key] = gov
         return gov
+
+
+def governor_snapshot() -> list[dict[str, Any]]:
+    """Every live per-host bucket in this process, as plain data, for an operator display.
+
+    ``remaining()`` answers for one host whose name the caller already has. A dashboard needs the
+    opposite: WHICH hosts is this process pacing right now, and how near is each to its ceiling —
+    the one live, real ceiling a hunt runs into. Answering that needs ``_shared_governors`` and each
+    governor's ``_buckets``, both private, so the choice is this accessor or a display module
+    reaching into module internals and silently disagreeing with ``remaining()`` the first time the
+    refill math is touched. It reuses that math here rather than restating it.
+
+    Read-only in the strict sense: **it reserves nothing**. It recomputes the refill accrued since
+    each bucket was last touched exactly as ``remaining()`` does, and does NOT write it back —
+    persisting a refill from a display poll would credit a host tokens at whatever rate the operator
+    happens to be refreshing at, turning the process-wide cap into a function of the UI.
+
+    The two locks are taken one after the other and never nested: the governors are copied out under
+    ``_shared_lock``, which is released before any bucket is read. Nesting them would put a display
+    refresh on the critical path of every hunt's ``shared_governor()`` lookup, and would be the only
+    place in the module where two of these locks are held at once.
+
+    Total. It sits in front of a security tool and is only ever a readout, so nothing here may raise
+    into a caller: on anything unexpected it returns the rows gathered so far (possibly none). A
+    stale panel is a far better failure than a dead hunt.
+
+    ``tokens`` is ``int``-truncated like ``remaining()``, so it is a floor, not an exact count.
+    Rows are in creation order (governors by config, hosts by first contact) and a host appears only
+    once it has been throttled at least once — a host with a full, untouched bucket has no row,
+    because the bucket does not exist yet.
+    """
+    rows: list[dict[str, Any]] = []
+    try:
+        with _shared_lock:
+            governors = [(str(key[0]), gov) for key, gov in _shared_governors.items()]
+        for pool, gov in governors:
+            capacity = gov.capacity
+            refill_per_s = gov.refill_per_s
+            # Copy under the governor's own lock: throttle() mutates these dicts in place, so an
+            # unlocked walk can read a bucket mid-update (or trip over a dict resized by a
+            # concurrent first-contact host).
+            with gov._lock:  # noqa: SLF001 - same module; _buckets is not safe to read unlocked
+                now = time.monotonic()
+                buckets = [(host, float(state["tokens"]), float(state["last_refill"]))
+                           for host, state in gov._buckets.items()]
+            for host, tokens, last_refill in buckets:
+                rows.append({
+                    "pool": pool,
+                    "host": host,
+                    "tokens": int(min(float(capacity), tokens + (now - last_refill) * refill_per_s)),
+                    "capacity": int(capacity),
+                })
+    except Exception:  # noqa: BLE001 - a readout must never be the reason a hunt dies
+        pass
+    return rows

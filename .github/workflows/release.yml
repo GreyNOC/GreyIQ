@@ -70,11 +70,36 @@ jobs:
         with:
           node-version: '22'
 
+      # electron 44.x ships no install script, so `npm ci` never downloads the ~150 MB
+      # Electron binary; electron-builder fetches it at the final step through got with a
+      # 600 s TOTAL request deadline. A clean windows-latest runner therefore re-downloads
+      # it every run, and a slow mirror can blow that deadline after the whole freeze is
+      # done. Cache @electron/get's store so the fetch is a cache hit on every run but the
+      # first, and pull it explicitly (below) BEFORE the expensive freeze either way.
+      - name: Cache the Electron binary (@electron/get store)
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\electron\Cache
+          key: electron-cache-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-cache-${{ runner.os }}-
+
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
           python-version: '3.11'
           cache: pip
+
+      - name: Install npm dependencies + the Electron binary
+        shell: pwsh
+        # Ahead of the freeze on purpose: install.js has no got deadline and warms the cache
+        # electron-builder reads, so a slow or failed download costs seconds here instead of a
+        # discarded twenty-minute build at the last step. Mirrors build/build-portable.ps1.
+        run: |
+          npm ci
+          node "node_modules/electron/install.js"
+          if (-not (Test-Path "node_modules/electron/dist")) {
+            throw "Electron not installed: node_modules/electron/dist is missing after install.js."
+          }
 
       - name: Install Python runtime + build dependencies
         run: |
@@ -123,12 +148,10 @@ jobs:
           if (-not $ok) { throw "Frozen backend did not answer /api/health within 180s." }
           Write-Output "Frozen backend launched and answered /api/health."
 
-      - name: Install npm dependencies
-        run: npm ci
-
-      # Ollama is NO LONGER bundled (it was ~1.4 GB / 86% of the old portable). The
-      # app downloads it on demand to userData the first time the local model is
-      # selected — see electron/main.cjs ensureBaseOllama.
+      # npm ci + the Electron binary were installed before the freeze (above), so nothing
+      # to do here. Ollama is NO LONGER bundled (it was ~1.4 GB / 86% of the old portable);
+      # the app downloads it on demand to userData at first local-model use — see
+      # electron/main.cjs ensureBaseOllama.
 
       - name: Build portable + installer (electron-builder)
         run: npx electron-builder --win portable nsis --publish never
@@ -213,11 +236,30 @@ jobs:
         with:
           node-version: '22'
 
+      # See the Windows job: electron 44.x ships no install script, so the Electron binary
+      # is downloaded lazily by electron-builder unless we pull it first. Cache the
+      # @electron/get store (~/.cache/electron on Linux) and fetch explicitly before the freeze.
+      - name: Cache the Electron binary (@electron/get store)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/electron
+          key: electron-cache-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-cache-${{ runner.os }}-
+
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
           python-version: '3.11'
           cache: pip
+
+      - name: Install npm dependencies + the Electron binary
+        # Ahead of the freeze on purpose: install.js has no got deadline and warms the cache
+        # electron-builder reads, so a slow or failed download costs seconds here instead of a
+        # discarded build at the last step.
+        run: |
+          npm ci
+          node node_modules/electron/install.js
+          test -d node_modules/electron/dist || { echo "Electron not installed: node_modules/electron/dist missing after install.js."; exit 1; }
 
       - name: Install Python runtime + build dependencies
         run: |
@@ -261,12 +303,10 @@ jobs:
           if [ "$ok" -ne 1 ]; then echo "Frozen backend did not answer /api/health within 180s."; exit 1; fi
           echo "Frozen backend launched and answered /api/health."
 
-      - name: Install npm dependencies
-        run: npm ci
-
-      # Ollama is NO LONGER bundled — downloaded on demand at first local-model use
-      # (electron/main.cjs ensureBaseOllama). This also frees the ~1.4 GB that
-      # previously contributed to the runner's "No space left on device" pressure.
+      # npm ci + the Electron binary were installed before the freeze (above). Ollama is NO
+      # LONGER bundled — downloaded on demand at first local-model use (electron/main.cjs
+      # ensureBaseOllama), which also frees the ~1.4 GB that previously contributed to the
+      # runner's "No space left on device" pressure.
 
       - name: Build Linux GUI (electron-builder AppImage)
         run: npx electron-builder --linux AppImage --publish never

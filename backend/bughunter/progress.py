@@ -21,6 +21,13 @@ _lock = threading.Lock()
 _runs: dict[str, dict[str, Any]] = {}
 _run_order: list[str] = []
 _stopped: set[str] = set()  # run_ids the operator asked to cancel (cooperative-cancellation flags)
+# _stopped deliberately OUTLIVES its run's buffer (see start_run), so it needs its own bound or it
+# is the one structure here that grows for the life of the process. Its FIFO is kept exactly
+# parallel to the set — every add and every removal touches both — because a drifting order list
+# would trim entries that are still in the set, i.e. revoke a live stop request. 256 is ~32x
+# _MAX_RUNS: far past any plausible backlog of stop requests, still a few KB at worst.
+_MAX_STOPPED = 256
+_stopped_order: list[str] = []
 
 # --- App-wide (cross-run) event ring -------------------------------------------
 # A single global stream the UI polls at /api/bounty/events so ANY tab can react
@@ -34,30 +41,61 @@ _global_base_seq = 0  # how many events have been trimmed off the front (keeps '
 
 
 def start_run(run_id: str) -> None:
-    """Reset (or create) the buffer for run_id, evicting the oldest run past _MAX_RUNS."""
+    """Reset (or create) the buffer for run_id, evicting the oldest run past _MAX_RUNS.
+
+    Eviction drops the run's BUFFER but deliberately leaves its stop flag alone. Buffer eviction is
+    driven purely by how many OTHER runs have since started, which says nothing about whether this
+    one is still probing somebody's production host: a long campaign that has been asked to stop is
+    exactly the run most likely to still be running when eight newer ones begin, and discarding its
+    flag there silently un-cancelled it — the loops in campaign.py/bounty.py poll ``is_stopped`` and
+    would have simply carried on. The flag is cleared HERE instead, on the one event that genuinely
+    means "this id is a new run": ``start_run`` for the same id. ``_stopped`` is bounded on its own
+    (see ``request_stop``) rather than by riding on eviction.
+    """
     if not run_id:
         return
     with _lock:
         # `events` is the text log (existing); `targets`/`target_index`/`findings` are the
-        # structured campaign-dashboard state streamed as targets complete.
-        _runs[run_id] = {"events": [], "base_seq": 0, "targets": [], "target_index": {}, "findings": []}
-        _stopped.discard(run_id)  # a fresh run is never pre-cancelled
+        # structured campaign-dashboard state streamed as targets complete. `started_at` is the
+        # only wall-clock stamp for the run itself: every other stamp here belongs to an event, so
+        # without it a run with no events yet cannot be dated or ordered by an attaching client.
+        _runs[run_id] = {"events": [], "base_seq": 0, "targets": [], "target_index": {}, "findings": [],
+                         "started_at": datetime.now(UTC).isoformat()}
+        _clear_stop_locked(run_id)  # a fresh run is never pre-cancelled
         if run_id in _run_order:
             _run_order.remove(run_id)
         _run_order.append(run_id)
         while len(_run_order) > _MAX_RUNS:
             evicted = _run_order.pop(0)
             _runs.pop(evicted, None)
-            _stopped.discard(evicted)
+
+
+def _clear_stop_locked(run_id: str) -> None:
+    """Drop ``run_id``'s stop flag from BOTH the set and its FIFO. Caller holds ``_lock``."""
+    if run_id in _stopped:
+        _stopped.discard(run_id)
+        try:
+            _stopped_order.remove(run_id)
+        except ValueError:  # never observed; the two are kept parallel, but a desync must not raise
+            pass
 
 
 def request_stop(run_id: str) -> None:
     """Ask a running campaign to cancel. The campaign loops poll ``is_stopped`` between
-    targets/URLs and wind down cleanly, returning whatever was found so far."""
+    targets/URLs and wind down cleanly, returning whatever was found so far.
+
+    Idempotent: re-requesting a stop does not re-queue the id in the FIFO, so an operator leaning on
+    the Stop button cannot push older, still-live stop requests out of the bound."""
     if not run_id:
         return
     with _lock:
-        _stopped.add(str(run_id))
+        rid = str(run_id)
+        if rid in _stopped:
+            return
+        _stopped.add(rid)
+        _stopped_order.append(rid)
+        while len(_stopped_order) > _MAX_STOPPED:
+            _stopped.discard(_stopped_order.pop(0))
 
 
 def is_stopped(run_id: str) -> bool:
@@ -309,3 +347,48 @@ def snapshot(run_id: str) -> dict[str, Any]:
             "stats": {"targets_total": len(targets), "targets_done": done,
                       "findings_total": len(findings), "confirmed_total": confirmed,
                       "severity_counts": sev_counts}}
+
+
+def list_runs() -> list[dict[str, Any]]:
+    """The runs this process is holding progress for, newest first — a picker, not a report.
+
+    A ``run_id`` is minted by the client that launched the run (``crypto.randomUUID()`` in the
+    browser) and is written down nowhere a second process can read it, so an operator attaching from
+    a shell can only ever watch a run they started themselves. This is the discovery step that makes
+    attaching to somebody else's run possible at all.
+
+    **There is no "finished" here to report, and none is invented.** Nothing marks a run complete —
+    the route simply returns when the hunt returns — so a run that ended an hour ago is
+    indistinguishable from one still probing. ``stopped`` means a stop was REQUESTED, never that the
+    run has wound down. The honest signals a caller can act on are ``started_at`` and whether the
+    counts are still moving between polls.
+
+    Ordered by ``_run_order``, reversed: that is the same FIFO ``_MAX_RUNS`` evicts from, so the
+    first row is the run furthest from being evicted. Not sorted by ``started_at`` — restarting an
+    id refreshes its place in the eviction queue, and eviction order is what a watcher actually
+    cares about.
+
+    Read-only: it creates nothing and evicts nothing. Cheap enough to poll (one lock, no copying of
+    event or finding bodies).
+    """
+    with _lock:
+        rows = []
+        for run_id in reversed(_run_order):
+            entry = _runs.get(run_id)
+            if entry is None:
+                continue
+            targets = entry["targets"]
+            rows.append({
+                "run_id": run_id,
+                "started_at": str(entry.get("started_at") or ""),
+                "stopped": run_id in _stopped,
+                # The first registered work unit, which is what makes two live runs tellable apart
+                # in a picker. Empty until the campaign registers its units (a direct hunt that has
+                # not reached set_targets yet, or a run that only ever logged text), so a caller
+                # must fall back to the run id rather than render a blank label.
+                "target": str(targets[0].get("target") or "") if targets else "",
+                "targets_total": len(targets),
+                "findings_total": len(entry["findings"]),
+                "events": entry["base_seq"] + len(entry["events"]),
+            })
+        return rows

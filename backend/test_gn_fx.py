@@ -366,6 +366,9 @@ class CliIntegrationTests(unittest.TestCase):
         for argv in (["hunt", "https://t.example", "--no-fx"],
                      ["campaign", "https://t.example", "--no-fx"],
                      ["osint", "t.example", "--no-fx"],
+                     # `dash` too: its namespace is a strict superset of hunt's, and the degradation
+                     # paths hand that namespace straight to _cmd_hunt, which reads no_fx.
+                     ["dash", "https://t.example", "--no-fx"],
                      ["train-coder", "--no-fx"]):
             with self.subTest(verb=argv[0]):
                 self.assertTrue(parser.parse_args(argv).no_fx)

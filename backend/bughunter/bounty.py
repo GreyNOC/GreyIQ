@@ -1482,14 +1482,21 @@ def _resolve_output_dir(output_dir: str | None, default_reports_dir: Path) -> Pa
     "put my reports in a new subfolder of somewhere I already have" while closing
     off using this as a write-anywhere-including-never-existed-before-paths
     primitive (e.g. a startup/scheduled-task directory that doesn't exist yet).
-    Falls back to ``default_reports_dir`` for anything else."""
+    Falls back to ``default_reports_dir`` for anything else.
+
+    The DEFAULT is created with its parents; a caller-supplied path is not. That asymmetry is the
+    whole rule: ``default_reports_dir`` is a path this program chose (``runtime/reports``), and on a
+    clean checkout no part of it exists yet, so ``parents=False`` turned the very first `gn hunt`
+    into a ``FileNotFoundError`` naming a directory the operator had never heard of. An
+    ``output_dir`` the caller named keeps the one-level rule above — it may create the leaf, never
+    the tree — so this stays unusable as a write-anywhere primitive."""
     if output_dir and str(output_dir).strip():
         target = Path(str(output_dir).strip()).expanduser().resolve()
-        if not target.is_dir() and not target.parent.is_dir():
-            target = Path(default_reports_dir).resolve()
-    else:
-        target = Path(default_reports_dir).resolve()
-    target.mkdir(parents=False, exist_ok=True)
+        if target.is_dir() or target.parent.is_dir():
+            target.mkdir(parents=False, exist_ok=True)
+            return target
+    target = Path(default_reports_dir).resolve()
+    target.mkdir(parents=True, exist_ok=True)
     return target
 
 

@@ -473,6 +473,7 @@ class NoNewOrphanRoutesTests(unittest.TestCase):
         "/api/health": "the readiness gate the Electron shell and the release smoke tests poll",
         "/api/bounty/finding/reverify": "superseded in the UI by /finding/prove; still served for API clients",
         "/api/bounty/platforms": "the app ships the same list as CK_PLATFORMS and renders it offline",
+        "/api/bounty/runs": "the run picker for `gn dash --attach`; the app mints its own run ids, so it has nothing to discover",
         "/api/operator/vdp-profiles": "the app ships the profile list; the route is for API clients",
         "/api/scan/code": "the pre-cockpit scan API, kept for CLI/API clients",
         "/api/scan/live": "the pre-cockpit scan API, kept for CLI/API clients",

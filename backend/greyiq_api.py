@@ -725,6 +725,16 @@ class BountyEventsRequest(BaseModel):
     after: int = Field(default=0, ge=0)
 
 
+class BountyRunsRequest(BaseModel):
+    # Which runs this process is tracking. Deliberately FIELD-FREE: a run_id is minted by whichever
+    # client launched the run, so a second client (the `gn dash --attach` shell) has no id to send
+    # and nothing to filter by -- and with no field, there is nothing a caller could supply to steer
+    # the route at anything but this process's own progress store. The model exists so the route
+    # goes through the same validate_payload gate as every other POST rather than growing a
+    # bespoke path.
+    pass
+
+
 class CampaignStopRequest(BaseModel):
     run_id: str = Field(min_length=1, max_length=100)
 
@@ -2187,6 +2197,22 @@ class GreyIQRuntime:
         # `snapshot` carries the structured campaign-dashboard state (per-target status +
         # streamed findings + rolled-up stats); `events`/`count` remain the text log.
         return {"ok": True, **bounty_progress.tail(run_id, after), "snapshot": bounty_progress.snapshot(run_id)}
+
+    def list_bounty_runs(self) -> dict[str, Any]:
+        """The runs this backend is holding live progress for, newest first — the discovery step
+        for a client that did not mint the run_id itself.
+
+        /api/bounty/progress requires a run_id (BountyProgressRequest, min_length=1) and run ids are
+        minted client-side, so an operator attaching from a separate process — `gn dash --attach` —
+        has no way to name the run they want to watch. Read-only: it lists, it never starts, stops
+        or evicts anything. `stopped` reports that a stop was REQUESTED, not that the run has wound
+        down; nothing in the store marks a run finished (see progress.list_runs).
+
+        Named `list_bounty_runs`, not `bounty_runs`: `self.bounty_runs` is already the finished-run
+        artifact cache this class keeps. Shadowing it with a method would have broken every route
+        that reads that cache — and the collision is silent, because the attribute simply wins.
+        """
+        return {"ok": True, "runs": bounty_progress.list_runs()}
 
     def bounty_events(self, after: int = 0) -> dict[str, Any]:
         """The app-wide event stream — findings confirmed, reports readied, submissions filed —
@@ -6053,6 +6079,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/progress":
             request = validate_payload(BountyProgressRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.bounty_progress, request.run_id, request.after))
+            return
+        if method == "POST" and path == "/api/bounty/runs":
+            validate_payload(BountyRunsRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.list_bounty_runs))
             return
         if method == "POST" and path == "/api/bounty/events":
             request = validate_payload(BountyEventsRequest, await read_json_body(receive))

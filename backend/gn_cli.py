@@ -166,6 +166,37 @@ def _err(message: str) -> int:
     return 2
 
 
+def _ensure_dir(path: Path | str) -> Path:
+    """Create an output directory THIS PROGRAM chose, parents and all, idempotently.
+
+    A clean checkout has no ``runtime/``. The API server makes it at boot
+    (``greyiq_api``: ``RUNTIME_DIR.mkdir(parents=True)``) and nothing on the CLI path ever did, so
+    the first `gn hunt` on a fresh clone died inside ``bounty._resolve_output_dir`` — which calls
+    ``mkdir(parents=False)`` — with a bare ``FileNotFoundError`` naming a reports directory the
+    operator had not asked for and could not place. The same hole swallowed `gn osint`, `gn bfla`
+    and `gn idor` whenever ``GREYIQ_RUNTIME_DIR`` pointed somewhere not yet created.
+
+    Only for paths this program chose (``RUNTIME_DIR`` and its subdirectories). A directory the
+    OPERATOR named with ``-o`` is handed to the engine untouched: ``bounty._resolve_output_dir``
+    deliberately refuses to conjure a brand-new multi-level tree at an arbitrary path, and
+    pre-creating it here would quietly defeat that containment guard from the outside.
+
+    Total. An unwritable path is returned unchanged so the verb fails at the write, with the real
+    error about the real file, instead of here with a second error about a directory.
+    """
+    target = Path(path)
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return target
+
+
+def _reports_dir() -> Path:
+    """``runtime/reports``, created on demand — the default every report-writing verb falls back to."""
+    return _ensure_dir(RUNTIME_DIR / "reports")
+
+
 def _load_coder_config(use_brain: bool) -> dict:
     """Deterministic by default. With --brain, load the configured brain from the
     runtime config (merging the perms-restricted secrets store), mirroring the API."""
@@ -218,12 +249,20 @@ def _oob_config() -> tuple[str, str]:
     return (base, secret) if base and secret else ("", "")
 
 
+#: One sentence, one place. `gn hunt` and `gn dash` gate on the same thing and must refuse in the
+#: same words: an operator who learns the wording from one verb and gets a different sentence from
+#: the other has been told there are two different rules.
+_HUNT_AUTHORIZE = ("a hunt tests a live/owned target — pass -y/--authorize to confirm you're "
+                   "authorized and in scope.")
+
+
 def _cmd_hunt(args: argparse.Namespace) -> int:
     from bughunter.bounty import run_bounty_hunt
 
     if not args.authorize:
-        return _err("a hunt tests a live/owned target — pass -y/--authorize to confirm you're authorized and in scope.")
-    out_dir = args.out or str(RUNTIME_DIR / "reports")
+        return _err(_HUNT_AUTHORIZE)
+    reports = _reports_dir()
+    out_dir = args.out or str(reports)
     # A direct hunt used to pass no on_progress at ALL, so nothing printed between the command and the
     # summary -- minutes of silence in which a working hunt and a hung one look identical.
     fx = _fx(args, args.target)
@@ -237,7 +276,7 @@ def _cmd_hunt(args: argparse.Namespace) -> int:
             args.scope or "",
             True,  # authorized — gated by --authorize above
             _load_coder_config(args.brain),
-            default_reports_dir=RUNTIME_DIR / "reports",
+            default_reports_dir=reports,
             seed_dir=SEED_DIR,
             runtime_dir=RUNTIME_DIR,
             version=VERSION,
@@ -295,7 +334,7 @@ def _cmd_campaign(args: argparse.Namespace) -> int:
             scope=args.scope or "",
             authorized=True,
             coder_cfg=_load_coder_config(args.brain),
-            default_reports_dir=RUNTIME_DIR / "reports",
+            default_reports_dir=_reports_dir(),
             seed_dir=SEED_DIR,
             runtime_dir=RUNTIME_DIR,
             version=VERSION,
@@ -346,7 +385,7 @@ def _cmd_osint(args: argparse.Namespace) -> int:
     fx.phase("passive OSINT collection")
     result = osint_engine.run_campaign(
         args.target,
-        output_dir=args.out or (RUNTIME_DIR / "osint"),
+        output_dir=args.out or _ensure_dir(RUNTIME_DIR / "osint"),
         max_hosts=args.max_hosts,
         timeout=args.timeout,
     )
@@ -378,7 +417,7 @@ def _cmd_osint(args: argparse.Namespace) -> int:
             scope=args.scope,
             authorized=True,
             coder_cfg=_load_coder_config(args.brain),
-            default_reports_dir=RUNTIME_DIR / "reports",
+            default_reports_dir=_reports_dir(),
             seed_dir=SEED_DIR,
             runtime_dir=RUNTIME_DIR,
             version=VERSION,
@@ -612,7 +651,7 @@ def _operator_callables(coder_cfg: dict):
     def run_campaign_fn(target, *, scope, program, active, live, deep=False, max_pages=12):
         result = campaign_mod.run_campaign(
             target, scope=scope, authorized=True, coder_cfg=coder_cfg,
-            default_reports_dir=RUNTIME_DIR / "reports", seed_dir=SEED_DIR, runtime_dir=RUNTIME_DIR,
+            default_reports_dir=_reports_dir(), seed_dir=SEED_DIR, runtime_dir=RUNTIME_DIR,
             version=VERSION, active=active, live=live, deep=deep, program=program, max_pages=max_pages,
         )
         last["result"], last["target"], last["scope"] = result, target, scope
@@ -658,7 +697,9 @@ def _cmd_operator(args: argparse.Namespace) -> int:
     from bughunter import operator as operator_mod
     from bughunter import portfolio
 
-    rt = str(RUNTIME_DIR)
+    # The portfolio, the ledger and the operator's state all land under the runtime dir; the verb
+    # writes on nearly every action, so it is created up front rather than at each write site.
+    rt = str(_ensure_dir(RUNTIME_DIR))
     action = getattr(args, "op_action", None)
 
     if action == "list" or action is None:
@@ -834,7 +875,7 @@ def _cmd_bfla(args: argparse.Namespace) -> int:
     print(_c("BFLA / broken function-level authorization CONFIRMED", "32") + f" at {finding['title']}")
     print(f"  differential: {res.get('detail')}")
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    out = args.out or str(RUNTIME_DIR / "reports" / f"bfla-{stamp}.md")
+    out = args.out or str(_reports_dir() / f"bfla-{stamp}.md")
     try:
         Path(out).parent.mkdir(parents=True, exist_ok=True)
         Path(out).write_text(md, encoding="utf-8")
@@ -897,7 +938,7 @@ def _cmd_idor(args: argparse.Namespace) -> int:
     print(_c("IDOR / broken access control CONFIRMED", "32") + f" at {finding['title']}")
     print(f"  differential: {res.get('detail')}")
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    out = args.out or str(RUNTIME_DIR / "reports" / f"idor-{stamp}.md")
+    out = args.out or str(_reports_dir() / f"idor-{stamp}.md")
     try:
         Path(out).parent.mkdir(parents=True, exist_ok=True)
         Path(out).write_text(md, encoding="utf-8")
@@ -997,6 +1038,187 @@ def _cmd_fx(args: argparse.Namespace) -> int:
     import gn_fx
 
     return gn_fx.demo(getattr(args, "seconds", 6.0))
+
+
+def _dash_subcommand(argv: list[str], sink: Any = None) -> tuple[int, str]:
+    """Run one real ``gn`` verb typed into the dashboard pane; hand back ``(exit code, output)``.
+
+    The body lives in ``gn_dash`` because it owns what the pane needs around the call — the refusal
+    vocabulary and the ``OutputTail`` the OUTPUT pane reads WHILE a slow verb is still writing — and
+    a second copy here is exactly the hand-maintained duplicate that made ``CLI_COMMANDS`` wrong for
+    seven verbs. This name exists so the wiring reads in one direction: ``_cmd_dash`` hands the
+    dashboard a CLI-owned dispatcher, rather than the dashboard reaching back for one.
+    """
+    import gn_dash
+
+    return gn_dash._dash_subcommand(argv, sink)  # noqa: SLF001 - one feature, three modules
+
+
+def _dash_hunt(args: argparse.Namespace, run_id: str, into: dict) -> int:
+    """The hunt ``gn dash <target>`` watches, as the callable ``gn_dash.run`` drives on its worker.
+
+    The same engine call ``_cmd_hunt`` makes, with two differences, both forced by the terminal now
+    belonging to the renderer:
+
+      * Progress goes to ``bughunter.progress``, not ``gn_fx``. A status line written onto a screen
+        the dashboard is row-diffing punches a hole in the frame that never repairs, and the store
+        is where the panels read from anyway — the same store the API route writes, so a
+        dash-launched hunt and an app-launched one produce identical snapshots.
+      * ``should_stop`` is wired to the flag the pane's ``stop`` verb sets. Without it that verb
+        would set something nothing reads, and the ``STOPPING`` pill would be a lie on screen.
+
+    The result is stashed in ``into`` instead of returned, so ``_cmd_dash`` can print the ordinary
+    hunt summary onto the RESTORED terminal: the report path is the one thing the operator still
+    needs after the panels are gone, and it would otherwise die with the alternate screen.
+    """
+    from bughunter import progress as bounty_progress
+    from bughunter.bounty import run_bounty_hunt
+
+    import gn_dash
+
+    target = str(args.target)
+    reports = _reports_dir()
+    # Register the single work unit exactly as the API route does, or the TARGETS panel stays empty
+    # through a run that is working and the header reads 0/0 for its whole life.
+    bounty_progress.start_run(run_id)
+    bounty_progress.set_targets(run_id, [target])
+    bounty_progress.mark_target(run_id, target, "running")
+    result = run_bounty_hunt(
+        target,
+        args.profile,
+        args.vuln_class,
+        args.out or str(reports),
+        args.scope or "",
+        True,  # authorized — gated by --authorize in _cmd_dash, before the screen is entered
+        _load_coder_config(args.brain),
+        default_reports_dir=reports,
+        seed_dir=SEED_DIR,
+        runtime_dir=RUNTIME_DIR,
+        version=VERSION,
+        run_live=args.live,
+        active=args.active or getattr(args, "time_based", False) or getattr(args, "deep", False),
+        time_based=getattr(args, "time_based", False),
+        auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
+        per_finding=args.per_finding,
+        on_progress=bounty_progress.sink(run_id),
+        should_stop=(lambda rid=run_id: bounty_progress.is_stopped(rid)),
+        oob_base=_oob_config()[0], oob_secret=_oob_config()[1],
+    )
+    gn_dash.stream_result(run_id, target, result)
+    into["result"] = result
+    return 0 if result.get("ok") else 2
+
+
+def _dash_source(args: argparse.Namespace) -> Any:
+    """The ``--attach`` source, discovering the run id when the operator did not name one.
+
+    Run ids are minted by whoever launched the run (``crypto.randomUUID()`` in the desktop app) and
+    written down nowhere, so requiring ``--run-id`` would make ``--attach`` unusable by the operator
+    who is most likely to want it. The picker takes the newest run that has NOT been asked to stop;
+    ``progress.list_runs`` cannot report "finished", so this deliberately does not pretend to skip
+    completed runs — it skips the one signal that is real.
+    """
+    import gn_dash
+
+    host = str(getattr(args, "host", "") or "127.0.0.1")
+    port = getattr(args, "port", None)
+    token = str(getattr(args, "token", "") or "")
+    run_id = str(getattr(args, "run_id", "") or "").strip()
+    probe = gn_dash.AttachedSource(run_id, host=host, port=port, token=token)
+    if run_id:
+        return probe
+    live = [row for row in probe.list_runs() if not row.get("stopped")]
+    if not live:
+        raise gn_dash.SourceError(
+            "the backend is holding no un-stopped run to attach to — start one in the app, or pass "
+            "--run-id.", fatal=True)
+    chosen = live[0]
+    # probe.port, so naming the run does not cost a second 8766..8845 walk.
+    return gn_dash.AttachedSource(str(chosen.get("run_id") or ""), host=host, port=probe.port,
+                                  token=token, label=str(chosen.get("target") or ""))
+
+
+def _cmd_dash(args: argparse.Namespace) -> int:
+    """`gn dash` — the full-screen cockpit over a hunt this process runs, or one it attaches to.
+
+    The dash namespace is a strict SUPERSET of ``hunt``'s, which is what lets every degradation be a
+    one-line delegation to :func:`_cmd_hunt` instead of a second hunt path that can drift: ``--json``,
+    a redirected stdout, ``NO_COLOR``, ``TERM=dumb``, ``GN_NO_FX``, ``GN_NO_DASH``, a pipe on stdin.
+    All of them run the identical hunt and print the identical summary, byte for byte. A test pins
+    the superset property, because the day it stops holding the delegation starts raising
+    ``AttributeError`` on a namespace instead of hunting.
+
+    A terminal that is merely TOO SMALL refuses rather than delegating. That asymmetry is deliberate:
+    a redirected stream means nobody is watching and a hunt is what was wanted, while a 40-column
+    window means somebody IS watching and asked for panels — running the hunt silently instead would
+    be a different command from the one they typed.
+
+    ``import gn_dash`` is inside the function and unguarded, exactly as ``_cmd_fx`` imports gn_fx: at
+    module scope it would put the renderer and gn_sysmon's ctypes probe on the startup path of every
+    `gn version`, and wrapped in a try/except it would be invisible to PyInstaller's analysis — the
+    verb would work in dev and vanish from the frozen exe.
+    """
+    from uuid import uuid4
+
+    import gn_dash
+    import gn_tui
+
+    if getattr(args, "self_test", False):
+        return gn_dash.self_test()
+
+    attach = bool(getattr(args, "attach", False))
+    target = str(getattr(args, "target", "") or "").strip()
+    if attach and target:
+        return _err("--attach watches a run the backend is already holding; it takes no target.")
+    if not attach and not target:
+        return _err("`gn dash` needs a target to hunt, or --attach to watch a run already in flight.")
+    if args.json:
+        if attach:
+            return _err("--attach needs an interactive terminal; POST /api/bounty/progress directly "
+                        "for a machine feed.")
+        return _cmd_hunt(args)
+
+    refusal = gn_tui.refusal()
+    if refusal:
+        # Attaching has no hunt to fall back to, so it must say why instead of doing nothing.
+        return _err(refusal) if attach else _cmd_hunt(args)
+    small = gn_dash.size_refusal(gn_tui.terminal_size(sys.stdout))
+    if small:
+        return _err(small)
+    if not attach and not args.authorize:
+        # Before the alternate screen: a refusal printed into a screen that is about to be discarded
+        # is a refusal the operator never sees.
+        return _err(_HUNT_AUTHORIZE)
+    if getattr(args, "braille", False):
+        # Written into the environment rather than passed down, so the flag reaches gn_tui.tier()
+        # through the same door GN_DASH_GLYPHS does and there is exactly one place glyphs get
+        # chosen. Assignment, not setdefault: an argument typed on this command outranks the shell
+        # it was typed in. Set only once every refusal is behind us, so a delegated `gn hunt` never
+        # inherits an environment this verb edited on its way out.
+        os.environ["GN_DASH_GLYPHS"] = "braille"
+
+    holder: dict = {}
+    try:
+        if attach:
+            source, launch = _dash_source(args), None
+        else:
+            run_id = str(getattr(args, "run_id", "") or "").strip() or f"gn-dash-{uuid4().hex[:12]}"
+            source = gn_dash.LocalSource(run_id, target)
+
+            def launch() -> int:  # type: ignore[misc]
+                return _dash_hunt(args, run_id, holder)
+
+        code = gn_dash.run(source, run_subcommand=_dash_subcommand, launch=launch,
+                           refresh_hz=getattr(args, "refresh", 4.0))
+    except gn_dash.SourceError as exc:
+        return _err(exc.message)
+
+    result = holder.get("result")
+    if isinstance(result, dict) and not result.get("ok"):
+        return _err(result.get("error", "the hunt could not run."))
+    if isinstance(result, dict):
+        _print_hunt_summary(result)
+    return code
 
 
 def _cmd_version(_args: argparse.Namespace) -> int:
@@ -1247,6 +1469,44 @@ def build_parser() -> argparse.ArgumentParser:
     fxdemo.add_argument("--seconds", type=float, default=6.0, help="how long to run the preview")
     fxdemo.set_defaults(func=_cmd_fx)
 
+    # A CORE verb, registered here beside `fx` and never through _VERB_PLUGINS: that loader is
+    # fail-closed (see _register_plugin_verbs), so a dashboard that failed to import would silently
+    # cost the verb and `gn dash` would fall through run_frozen's dispatch and boot the API server.
+    # Every option `hunt` defines is repeated here on purpose — the namespace has to be a strict
+    # superset for the --json / non-tty delegation to _cmd_hunt to be total.
+    dash = sub.add_parser("dash", help="full-screen cockpit: run a hunt, or attach to one, with live panels")
+    dash.add_argument("target", nargs="?", default="", help="https:// URL, repo URL, or local path (omit with --attach)")
+    dash.add_argument("-p", "--profile", default="full-sweep", help="hunt profile (default: full-sweep; see `gn profiles`)")
+    dash.add_argument("-c", "--class", dest="vuln_class", default=None, help="focus vuln class (see `gn classes`)")
+    dash.add_argument("-s", "--scope", default="", help="program/scope notes (name the host here to allow active checks)")
+    dash.add_argument("--active", action="store_true", help="active verification: send benign probes to PROVE findings (URL targets)")
+    dash.add_argument("--time-based", dest="time_based", action="store_true",
+                      help="opt-in: add the bounded-SLEEP blind-SQLi probe (implies --active)")
+    dash.add_argument("--cookie", default="", help="scan behind a login: a Cookie header value, sent to the target host + subdomains ONLY")
+    dash.add_argument("--header", action="append", metavar="'Name: value'",
+                      help="extra auth header (repeatable); sent same-site only")
+    dash.add_argument("--live", action="store_true", help="dynamic Playwright browser pass (URL targets)")
+    dash.add_argument("--brain", action="store_true", help="use the configured LLM brain to enrich (default: deterministic)")
+    dash.add_argument("-o", "--out", default=None, help="report output folder (default: runtime/reports)")
+    dash.add_argument("--per-finding", action="store_true", help="also write one submission-ready file per finding")
+    dash.add_argument("-y", "--authorize", action="store_true", help="confirm you are AUTHORIZED to test the target (required to hunt)")
+    dash.add_argument("--json", action="store_true", help="no dashboard: run the hunt and print the machine-readable result")
+    dash.add_argument("--no-fx", action="store_true",
+                      help="no live animation; with a redirected stream this runs exactly like `gn hunt`")
+    dash.add_argument("--attach", action="store_true",
+                      help="watch a run the local backend is already holding instead of starting one")
+    dash.add_argument("--run-id", dest="run_id", default="",
+                      help="the run to watch with --attach (default: the newest un-stopped run)")
+    dash.add_argument("--host", default="127.0.0.1", help="--attach host; loopback only (127.0.0.1, ::1, localhost)")
+    dash.add_argument("--port", type=int, default=None, help="--attach port (default: $GREYIQ_PORT, else probe 8766-8845)")
+    dash.add_argument("--token", default="", help="--attach session token (default: $GREYIQ_SESSION_TOKEN, else runtime/session.token)")
+    dash.add_argument("--refresh", type=float, default=4.0, help="repaints per second, clamped to 0.5-20 (default 4)")
+    dash.add_argument("--braille", action="store_true",
+                      help="braille sparklines — off by default because the encode probe cannot see whether your FONT has U+28xx (also: GN_DASH_GLYPHS=braille|rich|box|ascii)")
+    dash.add_argument("--self-test", dest="self_test", action="store_true",
+                      help="draw one frame, tear it down, and report the glyph tier, key reader, console VT state, size and host counters")
+    dash.set_defaults(func=_cmd_dash)
+
     version = sub.add_parser("version", help="print the version")
     version.set_defaults(func=_cmd_version)
 
@@ -1303,7 +1563,32 @@ def main(argv: list[str] | None = None) -> int:
             gn_fx.stop_all()
         except Exception:  # noqa: BLE001
             pass
+        # And give the whole terminal back, for the same reason and with the same guard. A separate
+        # registry from gn_fx's on purpose (see gn_tui._LIVE): a pane command calls gn_fx.stop_all()
+        # because the verb it ran started a Scanner, and that must not tear down the dashboard the
+        # operator is looking at. gn_dash.run unwinds its own ExitStack first, so on a normal exit
+        # this finds nothing left to do — it is here for the paths that skipped that unwind, where a
+        # live alternate screen would otherwise swallow the message main() just printed.
+        #
+        # Looked up in sys.modules rather than imported: nothing can be holding the terminal if the
+        # module that takes it was never loaded, and importing it here would put ctypes/termios on
+        # the exit path of every `gn version`.
+        try:
+            tui = sys.modules.get("gn_tui")
+            if tui is not None:
+                tui.teardown_all()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 if __name__ == "__main__":
+    # `python backend/gn_cli.py …` (which is what `npm run gn` does) loads this file as __main__,
+    # so `sys.modules["gn_cli"]` is absent — and two modules look for RUNTIME_DIR exactly there
+    # rather than importing this one: gn_dash.runtime_dirs, which is how `--attach` finds
+    # session.token, and gn_sysmon._runtime_dir, which is how the system strip knows WHICH volume
+    # its disk percentage is about. Neither may import gn_cli (it reconfigures stdout/stderr at
+    # import, and a sampler is not allowed to have opinions about the caller's streams), so the
+    # alias is published here instead. setdefault, never assignment: if a real `gn_cli` is already
+    # imported, that one is the module those lookups should see.
+    sys.modules.setdefault("gn_cli", sys.modules[__name__])
     raise SystemExit(main())
