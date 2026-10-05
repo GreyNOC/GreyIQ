@@ -5566,9 +5566,13 @@ runtime = GreyIQRuntime()
 
 def health() -> dict[str, Any]:
     """/api/health is the one /api/* path exempt from the session-token gate (it's
-    the liveness check Electron polls before a session even exists), so it must never
-    reveal more than a bare liveness signal to an unauthenticated caller — no app name
-    or version string for a scanner to fingerprint."""
+    the liveness check Electron polls before a session even exists). When Electron
+    supplies a per-launch ID, echo it so the shell can distinguish this backend
+    from another process on the port. Standalone servers keep the bare liveness
+    signal; neither mode exposes the app name or version."""
+    launch_id = os.getenv("GREYIQ_LAUNCH_ID", "")
+    if launch_id:
+        return {"status": "ok", "launchId": launch_id}
     return {"status": "ok"}
 
 

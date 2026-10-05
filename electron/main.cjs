@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const https = require('node:https');
 const net = require('node:net');
+const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { probeHealth } = require('./health.cjs');
 
@@ -296,14 +297,14 @@ function resolveBackendCommand() {
   return { exe: py.exe, args: py.args, cwd: PROJECT_ROOT };
 }
 
-async function waitForBackend(port) {
+async function waitForBackend(port, launchId) {
   const deadline = Date.now() + STARTUP_TIMEOUT_MS;
   while (Date.now() < deadline) {
     // If the backend process died, stop waiting immediately instead of burning
     // the whole timeout — the error page should appear right away.
     if (backendExited) return false;
     // eslint-disable-next-line no-await-in-loop
-    if (await probeHealth(HOST, port)) return true;
+    if (await probeHealth(HOST, port, launchId)) return true;
     // eslint-disable-next-line no-await-in-loop
     await new Promise((resolve) => setTimeout(resolve, HEALTH_POLL_MS));
   }
@@ -351,10 +352,12 @@ async function startBackend() {
     return;  // nothing to spawn or wait for — showApp() will render the error page
   }
   if (app.isPackaged) ensureExecutable(command.exe);
+  const launchId = crypto.randomBytes(32).toString('hex');
   const env = {
     ...process.env,
     GREYIQ_HOST: HOST,
     GREYIQ_PORT: String(backendPort),
+    GREYIQ_LAUNCH_ID: launchId,
     GREYIQ_RUNTIME_DIR: process.env.GREYIQ_RUNTIME_DIR || RUNTIME_DIR,
     PYTHONUTF8: '1',
   };
@@ -413,7 +416,7 @@ async function startBackend() {
     }
   });
 
-  backendReady = await waitForBackend(backendPort);
+  backendReady = await waitForBackend(backendPort, launchId);
   if (!backendReady && !startupError) {
     startupError = `Backend did not become ready within ${Math.round(STARTUP_TIMEOUT_MS / 1000)}s.`;
   }

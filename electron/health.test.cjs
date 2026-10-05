@@ -21,15 +21,29 @@ async function withServer(respond, check) {
 test('accepts the GreyIQ health contract', async () => {
   await withServer((res) => {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end('{"status":"ok"}');
-  }, async (port) => assert.equal(await probeHealth('127.0.0.1', port), true));
+    res.end('{"status":"ok","launchId":"current-launch"}');
+  }, async (port) => assert.equal(await probeHealth('127.0.0.1', port, 'current-launch'), true));
+});
+
+test('rejects missing, wrong, and unconfigured launch IDs', async () => {
+  for (const [body, expectedLaunchId] of [
+    ['{"status":"ok"}', 'current-launch'],
+    ['{"status":"ok","launchId":"old-launch"}', 'current-launch'],
+    ['{"status":"ok","launchId":"current-launch"}', undefined],
+  ]) {
+    // eslint-disable-next-line no-await-in-loop
+    await withServer((res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(body);
+    }, async (port) => assert.equal(await probeHealth('127.0.0.1', port, expectedLaunchId), false));
+  }
 });
 
 test('rejects wrong status, non-JSON, and malformed health bodies', async () => {
   const cases = [
-    [404, 'application/json', '{"status":"ok"}'],
-    [200, 'text/html', '{"status":"ok"}'],
-    [200, 'application/json', '{"status":"starting"}'],
+    [404, 'application/json', '{"status":"ok","launchId":"current-launch"}'],
+    [200, 'text/html', '{"status":"ok","launchId":"current-launch"}'],
+    [200, 'application/json', '{"status":"starting","launchId":"current-launch"}'],
     [200, 'application/json', '{bad json}'],
   ];
   for (const [status, contentType, body] of cases) {
@@ -37,13 +51,13 @@ test('rejects wrong status, non-JSON, and malformed health bodies', async () => 
     await withServer((res) => {
       res.writeHead(status, { 'Content-Type': contentType });
       res.end(body);
-    }, async (port) => assert.equal(await probeHealth('127.0.0.1', port), false));
+    }, async (port) => assert.equal(await probeHealth('127.0.0.1', port, 'current-launch'), false));
   }
 });
 
 test('rejects an oversized health body', async () => {
   await withServer((res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', padding: 'x'.repeat(2048) }));
-  }, async (port) => assert.equal(await probeHealth('127.0.0.1', port), false));
+    res.end(JSON.stringify({ status: 'ok', launchId: 'current-launch', padding: 'x'.repeat(2048) }));
+  }, async (port) => assert.equal(await probeHealth('127.0.0.1', port, 'current-launch'), false));
 });
