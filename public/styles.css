@@ -1111,9 +1111,52 @@ label {
   word-break: break-all;
 }
 
-/* label rows use display:grid, which overrides the [hidden] attribute */
-.brain-form [data-brain-field][hidden] {
+.model-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0.3rem;
+}
+
+.model-actions .text-button {
+  width: auto;
+  padding: 0.35rem 0.55rem;
+  font-size: 0.7rem;
+}
+
+.hf-import {
+  display: grid;
+  gap: 0.5rem;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  padding: 0.7rem;
+  min-width: 0;
+}
+
+.hf-import[hidden] {
   display: none;
+}
+
+.hf-import h3,
+.hf-import p {
+  margin: 0;
+}
+
+.hf-import h3 {
+  font-size: 0.82rem;
+  color: var(--ink);
+}
+
+.hf-import input {
+  min-width: 0;
+}
+
+.hf-import #brainHfStatus {
+  overflow-wrap: anywhere;
+}
+
+/* Explicit component display rules must not override hidden form controls. */
+.brain-form [hidden] {
+  display: none !important;
 }
 
 .project-brief,
