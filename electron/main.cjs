@@ -7,6 +7,7 @@ const http = require('node:http');
 const https = require('node:https');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
+const { probeHealth } = require('./health.cjs');
 
 const APP_NAME = 'GreyIQ';
 const HOST = '127.0.0.1';
@@ -194,6 +195,7 @@ function launchTacnoc() {
 let mainWindow = null;
 let backendProcess = null;
 let ollamaProcess = null;
+let ollamaStartPromise = null;
 let backendPort = DEFAULT_PORT;
 let backendReady = false;
 let backendExited = false;
@@ -294,28 +296,6 @@ function resolveBackendCommand() {
   return { exe: py.exe, args: py.args, cwd: PROJECT_ROOT };
 }
 
-function probeHealth(port) {
-  return new Promise((resolve) => {
-    const req = http.get(
-      {
-        host: HOST,
-        port,
-        path: '/api/health',
-        timeout: 2000,
-      },
-      (res) => {
-        res.resume();
-        resolve(res.statusCode >= 200 && res.statusCode < 500);
-      },
-    );
-    req.on('error', () => resolve(false));
-    req.on('timeout', () => {
-      req.destroy();
-      resolve(false);
-    });
-  });
-}
-
 async function waitForBackend(port) {
   const deadline = Date.now() + STARTUP_TIMEOUT_MS;
   while (Date.now() < deadline) {
@@ -323,7 +303,7 @@ async function waitForBackend(port) {
     // the whole timeout — the error page should appear right away.
     if (backendExited) return false;
     // eslint-disable-next-line no-await-in-loop
-    if (await probeHealth(port)) return true;
+    if (await probeHealth(HOST, port)) return true;
     // eslint-disable-next-line no-await-in-loop
     await new Promise((resolve) => setTimeout(resolve, HEALTH_POLL_MS));
   }
@@ -579,7 +559,7 @@ function ollamaResponding() {
       { host: '127.0.0.1', port: OLLAMA_PORT, path: '/api/tags', timeout: 1500 },
       (res) => {
         res.resume();
-        resolve(true);
+        resolve(res.statusCode === 200 && String(res.headers['content-type'] || '').includes('application/json'));
       },
     );
     req.on('error', () => resolve(false));
@@ -645,8 +625,13 @@ async function gpuVendor() {
 
 function downloadFile(url, dest, redirects = 5) {
   return new Promise((resolve, reject) => {
-    const lib = url.startsWith('https:') ? https : http;
-    const req = lib.get(url, { timeout: 60000 }, (res) => {
+    // This archive is executed after extraction. A release redirect must never
+    // downgrade its transport to HTTP.
+    if (parseUrl(url)?.protocol !== 'https:') {
+      reject(new Error('runtime download requires HTTPS'));
+      return;
+    }
+    const req = https.get(url, { timeout: 60000 }, (res) => {
       const status = res.statusCode || 0;
       if (status >= 300 && status < 400 && res.headers.location) {
         res.resume();
@@ -760,25 +745,37 @@ async function resolveOllamaRuntime() {
 }
 
 async function startOllama() {
+  if (ollamaStartPromise) return ollamaStartPromise;
+  ollamaStartPromise = startOllamaOnce();
+  try {
+    return await ollamaStartPromise;
+  } finally {
+    ollamaStartPromise = null;
+  }
+}
+
+async function startOllamaOnce() {
   // On-demand local brain: provision the Ollama runtime (downloaded on first use),
   // then start it — unless a system Ollama is already serving on the port. Triggered
   // by the renderer when the user selects the local model, NEVER at boot.
   if (await ollamaResponding()) return true;
-  const baseBin = await ensureBaseOllama();
-  if (!baseBin || !fs.existsSync(baseBin)) return false;
+  const baseBin = app.isPackaged
+    ? await ensureBaseOllama()
+    : (process.env.GREYIQ_OLLAMA_PATH || 'ollama');
+  if (!baseBin || (app.isPackaged && !fs.existsSync(baseBin))) return false;
   // Pick a GPU-capable runtime (NVIDIA works on the base runner; AMD ROCm is fetched
-  // once), always falling back to the base binary.
-  const ollamaBin = (await resolveOllamaRuntime()) || OLLAMA_BIN;
-  ensureExecutable(ollamaBin);
+  // once). Development uses the system binary instead of a bundled download.
+  const ollamaBin = app.isPackaged ? ((await resolveOllamaRuntime()) || baseBin) : baseBin;
+  if (app.isPackaged) ensureExecutable(ollamaBin);
   const modelsDir = path.join(app.getPath('userData'), 'ollama-models');
-  try {
+  const ollamaEnv = { ...process.env, OLLAMA_HOST: `127.0.0.1:${OLLAMA_PORT}` };
+  if (app.isPackaged) {
     fs.mkdirSync(modelsDir, { recursive: true });
-  } catch (_) {
-    // ignore
+    ollamaEnv.OLLAMA_MODELS = modelsDir;
   }
   try {
     ollamaProcess = spawn(ollamaBin, ['serve'], {
-      env: { ...process.env, OLLAMA_HOST: `127.0.0.1:${OLLAMA_PORT}`, OLLAMA_MODELS: modelsDir },
+      env: ollamaEnv,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
       // POSIX group leader so killTree reaps Ollama's model-runner grandchildren.
@@ -786,8 +783,25 @@ async function startOllama() {
     });
     ollamaProcess.stdout.on('data', (chunk) => process.stdout.write(`[Ollama] ${chunk}`));
     ollamaProcess.stderr.on('data', (chunk) => process.stdout.write(`[Ollama] ${chunk}`));
-    ollamaProcess.on('error', (err) => process.stderr.write(`[Ollama] failed to start: ${err.message}\n`));
-    return true;
+    let exited = false;
+    ollamaProcess.once('exit', () => { exited = true; });
+    const spawned = await new Promise((resolve) => {
+      ollamaProcess.once('spawn', () => resolve(true));
+      ollamaProcess.once('error', (err) => {
+        process.stderr.write(`[Ollama] failed to start: ${err.message}\n`);
+        resolve(false);
+      });
+    });
+    if (!spawned || exited || ollamaProcess.exitCode !== null) return false;
+    const deadline = Date.now() + 30000;
+    while (!exited && Date.now() < deadline) {
+      // eslint-disable-next-line no-await-in-loop
+      if (await ollamaResponding()) return true;
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    killTree(ollamaProcess);
+    return false;
   } catch (err) {
     process.stderr.write(`[Ollama] spawn error: ${err.message}\n`);
     return false;

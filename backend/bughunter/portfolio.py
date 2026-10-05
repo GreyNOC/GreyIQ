@@ -3,7 +3,7 @@
 A small, atomically-written JSON store of the bug-bounty PROGRAMS the autonomous
 operator works: each carries its scope (fed verbatim to the same fail-closed
 ``host_in_active_scope`` gate the active prover uses), its cadence, and its
-fail-closed automation flags (active/live/auto_submit all default to the SAFE value).
+fail-closed automation flags (active/live default off; legacy auto_submit is always off).
 
 Pure / dependency-free / frozen-safe: one JSON file under the runtime dir, written
 atomically, mutations serialized behind a process lock. No network. Storing a
@@ -37,8 +37,8 @@ _MAX_REPOSITORIES = 25    # each repository becomes a full source campaign; keep
 # Field defaults — every automation flag defaults to the SAFE/off value.
 _DEFAULTS: dict[str, Any] = {
     "name": "",
-    "platform": "manual",          # 'hackerone' | 'yeswehack' | 'hackenproof' | 'manual' — report-format + display tag. Only 'hackerone' (with a handle) can auto-submit; the others are export-only.
-    "platform_handle": "",         # HackerOne team handle (for auto-submit) / YesWeHack program slug (yeswehack.com/programs/{slug}) / HackenProof program slug
+    "platform": "manual",          # 'hackerone' | 'yeswehack' | 'hackenproof' | 'manual' — report-format + display tag; only the human operator submits.
+    "platform_handle": "",         # HackerOne team handle for manual routing / YesWeHack or HackenProof program slug
     "scope_text": "",              # free-text, passed verbatim to run_campaign(scope=)
     "in_scope_hosts": [],
     "out_of_scope_hosts": [],
@@ -64,10 +64,10 @@ _DEFAULTS: dict[str, Any] = {
     "active": False,               # capture proof-of-impact (active verification)
     "live": False,                 # dynamic Playwright pass
     "deep": False,                 # aggressive: time-based SQLi + auto screenshot + research per confirmed lead
-    "auto_submit": False,          # FILE confirmed findings automatically — DANGER, default off
+    "auto_submit": False,          # legacy field: always normalized off; only a human submits
     "max_pages": 12,
     "interval_minutes": 1440,      # how often the operator re-runs this program
-    "max_submits_per_day": 3,      # hard throttle on auto-submission
+    "max_submits_per_day": 3,      # legacy stored field; automatic submission is disabled
     "enabled": True,               # the operator schedules it
     "created_at": None,
     "last_run_at": None,
@@ -332,23 +332,21 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     if (out["clone_repositories"] and out["repository_urls"]
             and not out["repo_draft_pending"] and not str(out.get("scope_text") or "").strip()):
         out["scope_text"] = "\n".join(out["repository_urls"])
-    # Fail-closed coupling: active/live/deep/auto_submit require a non-empty scope.
+    # Fail-closed coupling: active/live/deep require a non-empty scope.
     if not str(out.get("scope_text") or "").strip():
         out["active"] = False
         out["live"] = False
         out["deep"] = False
-        out["auto_submit"] = False
     # Deep implies proof-of-impact (it adds time-based SQLi + screenshot/research per
     # confirmed lead), so a deep program is always active.
     if out.get("deep"):
         out["active"] = True
-    # Auto-submit additionally requires a platform handle to even attempt a file.
-    if out["auto_submit"] and not (out["platform"] == "hackerone" and str(out.get("platform_handle") or "").strip()):
-        out["auto_submit"] = False
+    # Old portfolio.json records and API clients may still carry auto_submit=True.
+    # Normalize it off on both reads and writes so persisted flags cannot arm a loop.
+    out["auto_submit"] = False
     out["max_pages"] = max(1, min(_safe_int(out.get("max_pages") or 12, 12), 50))
     out["interval_minutes"] = max(5, _safe_int(out.get("interval_minutes") or 1440, 1440))
-    # 0 is a LEGAL value here ("never auto-submit"), so default only on missing/None --
-    # NOT `or 3`, which would coerce a deliberate 0 back to 3 and re-arm the auto-submit path.
+    # Keep the legacy cap for storage compatibility; it no longer controls filing.
     out["max_submits_per_day"] = max(0, min(_safe_int(out.get("max_submits_per_day", 3), 3), 25))
     out["in_scope_hosts"] = [str(h).strip() for h in (out.get("in_scope_hosts") or []) if str(h).strip()]
     out["out_of_scope_hosts"] = [str(h).strip() for h in (out.get("out_of_scope_hosts") or []) if str(h).strip()]

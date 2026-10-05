@@ -238,6 +238,26 @@ def _login_auth(account_access: dict[str, Any] | None, scope: str,
     return None
 
 
+def _bind_unknown_issuer_to_target(auth: dict[str, Any] | None, target: str) -> dict[str, Any] | None:
+    """Keep a direct paste on its named target's registrable site during recon.
+
+    A caller may provide a cookie without a login URL. The one named target is
+    the narrowest available binding; without it, each discovered in-scope URL
+    would re-bind the same cookie to its own host, including another company
+    domain named in broad program scope. A source path has no host and gets no
+    network credential.
+    """
+    if not isinstance(auth, dict) or str(auth.get("issuer_host") or "").strip():
+        return auth
+    if not (str(auth.get("cookie") or "").strip() or auth.get("headers")):
+        return auth
+    try:
+        host = urlparse(str(target or "")).hostname or ""
+    except ValueError:
+        host = ""
+    return {**auth, "issuer_host": host} if host else None
+
+
 def run_campaign(target: str, *, account_access: dict[str, Any] | None = None,
                  user_agent_suffix: str = "", **kwargs: Any) -> dict[str, Any]:
     """Run a campaign, first honoring this program's HUNTING REQUIREMENTS:
@@ -266,6 +286,8 @@ def run_campaign(target: str, *, account_access: dict[str, Any] | None = None,
         auth = _login_auth(account_access, scope, kwargs.get("excluded_hosts"), _emit)
         if auth:
             kwargs["auth"] = auth
+    if isinstance(kwargs.get("auth"), dict):
+        kwargs["auth"] = _bind_unknown_issuer_to_target(kwargs["auth"], target)
     # The program's required UA tag rides every in-scope request for the duration of this hunt.
     ua_token = web_ingest.set_ua_suffix(user_agent_suffix or "")
     try:
@@ -916,6 +938,7 @@ def _run_campaign_body(
     admin_auth: dict[str, Any] | None = None
     if (effective_active and admin_account_access and _has_primary and (privileged_endpoints or idor_pairs)):
         admin_auth = _login_auth(admin_account_access, scope, excluded_hosts, _emit)
+        admin_auth = _bind_unknown_issuer_to_target(admin_auth, clean_target)
         if not (isinstance(admin_auth, dict) and (str(admin_auth.get("cookie") or "").strip() or admin_auth.get("headers"))):
             admin_auth = None
             _emit("dual-account access-control: skipped — the second account did not resolve a session (fail-closed).")
@@ -1433,10 +1456,43 @@ def run_campaign_over_targets(
             except Exception:  # noqa: BLE001
                 pass
 
+    # A credential with no verified issuer may be used for one target (or a
+    # same-registrable-site set), but must not be re-bound across unrelated
+    # domains. That includes request-level auth and saved pasted cookies whose
+    # login_url is absent or outside the program's scope.
+    try:
+        hosts = [(urlparse(target).hostname or "") for target in capped]
+    except ValueError:
+        hosts = []
+    cross_site_span = (len(capped) > 1 and
+                       (not hosts or not hosts[0] or
+                        any(not scan_auth.same_registrable_site(host, hosts[0]) for host in hosts[1:])))
+    account_access_for_targets = account_access
+    admin_access_for_targets = admin_account_access
+    if cross_site_span and auth and not str(auth.get("issuer_host") or "").strip():
+        _emit("multi-domain span: request session has no verified issuer; scanning without it")
+        auth = None
+        account_access_for_targets = None  # no per-target fallback that rebinds the same cookie
+
     # Log in to the program's research account ONCE for the whole span (not once per target), then
     # pass the resulting session to every target's run_campaign (which skips re-login when auth is set).
-    if auth is None and account_access:
-        auth = _login_auth(account_access, scope, excluded_hosts, _emit)
+    if auth is None and account_access_for_targets:
+        auth = _login_auth(account_access_for_targets, scope, excluded_hosts, _emit)
+        if cross_site_span:
+            account_access_for_targets = None  # never retry an unbound paste once per target
+            if auth and not str(auth.get("issuer_host") or "").strip():
+                _emit("multi-domain span: saved session has no verified issuer; scanning without it")
+                auth = None
+
+    if (cross_site_span and isinstance(admin_access_for_targets, dict)
+            and str(admin_access_for_targets.get("cookie") or "").strip()):
+        # The secondary account is resolved inside each inner campaign. Inspect
+        # a pasted cookie's issuer once here (no login/network on this path) so
+        # the inner campaigns cannot each rebind an unissued admin session.
+        secondary = _login_auth(admin_access_for_targets, scope, excluded_hosts, _emit)
+        if not secondary or not str(secondary.get("issuer_host") or "").strip():
+            _emit("multi-domain span: secondary session has no verified issuer; omitting it")
+            admin_access_for_targets = None
 
     # Shared submission claim: the span's targets run CONCURRENTLY (below), and two targets can
     # surface the same finding (identical dedup_key). This process-local set + lock lets each
@@ -1503,10 +1559,10 @@ def run_campaign_over_targets(
                 target, scope=scope, authorized=authorized, coder_cfg=coder_cfg,
                 default_reports_dir=span_root, seed_dir=seed_dir, runtime_dir=runtime_dir,
                 version=version, active=active, time_based=time_based, auth=auth,
-                account_access=account_access, user_agent_suffix=user_agent_suffix, live=live,
+                account_access=account_access_for_targets, user_agent_suffix=user_agent_suffix, live=live,
                 program=program, max_pages=max_pages, osint=osint, platform=platform, deep=deep,
                 disclose_automation=disclose_automation, on_progress=_target_emit, excluded_hosts=excluded_hosts,
-                admin_account_access=admin_account_access, idor_pairs=idor_pairs, include_attack_map=include_attack_map,
+                admin_account_access=admin_access_for_targets, idor_pairs=idor_pairs, include_attack_map=include_attack_map,
                 policy_profile=policy_profile,
                 progress_run_id=progress_run_id, progress_unit=unit,
                 submission_claim=submission_claim,  # dedup identical findings across concurrent targets

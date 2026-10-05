@@ -37,6 +37,18 @@ class RegistrableDomainTests(unittest.TestCase):
         self.assertNotEqual(registrable_domain("myapp.herokuapp.com"), registrable_domain("victim-unrelated.herokuapp.com"))
         self.assertEqual(registrable_domain("myteam.github.io"), "myteam.github.io")
 
+    def test_multi_label_cloud_suffixes_keep_tenants_distinct(self) -> None:
+        self.assertEqual(registrable_domain("victim.s3.amazonaws.com"), "victim.s3.amazonaws.com")
+        self.assertEqual(registrable_domain("attacker.s3.amazonaws.com"), "attacker.s3.amazonaws.com")
+        self.assertEqual(registrable_domain("myaccount.blob.core.windows.net"),
+                         "myaccount.blob.core.windows.net")
+        self.assertEqual(registrable_domain("other.blob.core.windows.net"),
+                         "other.blob.core.windows.net")
+        self.assertNotEqual(registrable_domain("victim.s3.amazonaws.com"),
+                            registrable_domain("attacker.s3.amazonaws.com"))
+        self.assertNotEqual(registrable_domain("myaccount.blob.core.windows.net"),
+                            registrable_domain("other.blob.core.windows.net"))
+
     def test_bare_suffix_with_too_few_labels_falls_back(self) -> None:
         # Can't bump further than the host actually has -- degenerate but never crashes.
         self.assertEqual(registrable_domain("co.uk"), "co.uk")

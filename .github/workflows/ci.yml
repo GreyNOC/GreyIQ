@@ -36,7 +36,7 @@ jobs:
           cache: pip
 
       - name: Install Python dependencies
-        run: python -m pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt -r requirements-test.txt
 
       # Separate file, and separate step, so the pip-audit gate below keeps auditing exactly the
       # runtime install list. pytest is the test RUNNER: `unittest discover` cannot collect the

@@ -201,10 +201,9 @@ rail (which the Program picker can autofill):
   findings, and (in **Deep** mode) auto-captures a screenshot + writes a research dossier
   for every confirmed lead.
 - **Autonomous operator** (Operator tab) — works your whole **portfolio** of programs
-  unattended on a schedule: recon → hunt → prove → dedup → report, repeated per program at
-  its configured interval. Auto-submit is off by default and, when armed, is gated by
-  confirmed-proof + non-duplicate + a per-program daily cap — review-only until you
-  explicitly arm it, and the kill switch stops it immediately.
+  on a schedule: recon → hunt → prove → dedup → local report, repeated per program at
+  its configured interval. It queues findings for human review and never submits them.
+  The kill switch stops the schedule after the current step.
 
 All three default to **passive-only**. Ticking **"Test for proof of impact (active)"** turns
 on benign, in-scope-only active probes that can mark a finding **Confirmed** instead of just
@@ -363,6 +362,6 @@ Confirmed (and reportable candidate) findings appear in the **Submissions** tab:
   read-only public-index queries), and
   polling your own OOB collaborator server (a host you configured). Nothing else leaves the
   machine.
-- **Nothing auto-submits without you arming it.** The Operator's auto-submit is
-  quadruple-gated (explicitly armed + per-program opt-in + server-recomputed confirmed proof
-  + a daily cap), and the kill switch stops the whole loop immediately.
+- **Only you submit reports.** The Operator queues findings and report packages locally.
+  Review the evidence and use the manual submission action if you decide to file a report.
+  The kill switch stops scheduled work after the current step.

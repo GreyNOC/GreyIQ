@@ -2,6 +2,16 @@
 
 Notable changes to GreyIQ.
 
+## v4.8.0 - verified learning and safer operator controls
+
+- Record coding-brain exchanges in a local learning log, with verified replay limited to
+  code changes that pass workspace verification. TinyGPT drafts require the optional offline
+  runtime, which is not bundled in the portable app.
+- Remove unattended HackerOne submission from portfolio operations. Scheduled hunts queue
+  findings for human review, and legacy auto-submit requests are refused.
+- Recheck program scope on account-login redirects and subrequests before sending credentials.
+- Harden desktop backend and Ollama startup checks, and expand API, CLI, and frontend wiring tests.
+
 ## v4.7.0 - Hugging Face GGUF models in the local brain
 
 - Import compatible Hugging Face GGUF repositories into GreyIQ's local Ollama model library.

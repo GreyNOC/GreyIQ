@@ -2945,8 +2945,13 @@ els.brainDownload?.addEventListener("click", async () => {
     return;
   }
   els.brainDownload.disabled = true;
-  els.brainModelStatus.textContent = "Starting model download…";
+  els.brainModelStatus.textContent = "Preparing the local model runtime…";
   try {
+    if (typeof window.greyiqDesktop?.ensureOllama === "function") {
+      const runtime = await window.greyiqDesktop.ensureOllama();
+      if (!runtime?.ok) throw new Error(runtime?.error || "Local model runtime could not start.");
+    }
+    els.brainModelStatus.textContent = "Starting model download…";
     const res = await apiFetch("/api/coder/pull", { method: "POST", timeoutMs: 10000, body: JSON.stringify({}) });
     if (res.ok === false) {
       els.brainModelStatus.textContent = res.error || "Could not start the download.";
@@ -7297,27 +7302,26 @@ const CK_WALKTHROUGHS = {
   },
   "operator": {
     summary: "How the autonomous operator works — walkthrough",
-    intro: "The operator works a PORTFOLIO of programs unattended: for each enabled program it runs the full loop on a schedule — recon → hunt → prove → dedup → report. It only files findings when you've armed auto-submit, and the kill switch stops it instantly. (Programs are shared with the Program tab — add/import scope there, tune automation here; both edit the same record.)",
+    intro: "The operator works a PORTFOLIO of programs on a schedule: recon → hunt → prove → dedup → report. Findings are queued for your review and only you can submit them. The kill switch stops the scheduled work. (Programs are shared with the Program tab — add/import scope there, tune automation here; both edit the same record.)",
     sections: [
       { h4: "Add a program", list: [
         "Name + Scope — the hosts/wildcards you're authorized to test (the fail-closed gate; active and deep modes need a non-empty scope).",
         "Seed targets — the URLs/hosts to hunt each cycle (each within scope).",
         "Program source repositories — optional public repository roots; enable clone + scan to include them in each scheduled cycle alongside web targets.",
-        "Cadence + daily cap — how often it re-runs, and the most it may auto-submit per day.",
-        "HackerOne handle — required only if you want auto-submit.",
+        "Cadence — how often it re-runs.",
+        "Platform handle — identifies the program for reports and manual submission.",
       ] },
       { h4: "Pick how hard it works each program", list: [
         ["Active. ", "Capture proof of impact with benign crafted probes."],
         ["Deep auto-work. ", "Adds time-based SQLi plus an auto proof-screenshot + research dossier per confirmed lead — needs the host in Scope."],
-        ["Auto-submit. ", "FILE confirmed, non-duplicate findings automatically — per-program opt-in, needs a handle, capped per day. Default off (review-only)."],
+        ["Review findings. ", "Inspect the evidence and reporting draft before you decide whether to submit manually."],
       ] },
       { h4: "Run it", ordered: true, list: [
-        ["Arm (optional). ", "Tick “Arm auto-submit” only if you want hands-off filing — every other gate still applies."],
         ["Start. ", "It runs due programs sequentially; watch the Activity log and the Money pipeline funnel fill in."],
         ["Kill switch. ", "Stop immediately at any time — it halts after the current step."],
       ] },
     ],
-    safety: "Auto-submit is triple-gated (armed + per-program opt-in + confirmed & non-duplicate + daily cap) and defaults to review-only. Starting confirms you're authorized to test every enabled program's scope.",
+    safety: "Starting confirms you're authorized to test every enabled program's scope. Only the human operator decides whether to submit a report.",
   },
   "surface": {
     summary: "What the Surface tab does — walkthrough",
@@ -7836,15 +7840,14 @@ function ckProgramSetupForm(prefill) {
   const seed = (!editing && prefill && typeof prefill === "object") ? prefill : null;
   const form = cel("form", "ck-prog-setup-form");
   const name = ckField("Program name", "text", editing ? (editing.name || "") : (seed && seed.name) || "");
-  // Platform tag: picks the report format and display. Only HackerOne (with a handle) can
-  // auto-submit over its API; HackenProof and the rest are export-only — GreyIQ formats the
-  // report for that platform's form and you submit it on the platform's dashboard.
+  // Platform tag picks the report format and display. GreyIQ formats the report
+  // for that platform; the human operator decides whether to submit it.
   const platWrap = cel("label");
   platWrap.append(cel("span", null, "Platform"));
   const platSelect = cel("select");
   // Every supported report-format platform (HackerOne, YesWeHack, Bugcrowd, Intigriti,
   // HackenProof) plus a catch-all — sourced from CK_PLATFORMS so this list can't drift from
-  // the backend registry. HackerOne can auto-submit via its API; the rest are export-only.
+  // the backend registry.
   const platformOptions = [...CK_PLATFORMS.map((p) => [p.id, p.name]), ["manual", "Other / manual"]];
   for (const [pid, pname] of platformOptions) {
     const o = cel("option", null, pname); o.value = pid; platSelect.append(o);
@@ -8132,10 +8135,10 @@ function ckProgramSetupForm(prefill) {
     .filter((p) => p && p.url_a && p.url_b);
 
   // Cross-link: this gentle form owns identity, structured scope, and account access; a saved
-  // program's run schedule, activation, and auto-submit live on the Operator tab. Say so, since
+  // program's run schedule and activation live on the Operator tab. Say so, since
   // neither editor is complete on its own.
   form.append(cel("p", "ck-hint ck-crosslink",
-    "Scheduling, activation (active/paused), and auto-submit for a saved program are set on the Operator tab."));
+    "Scheduling and activation (active/paused) for a saved program are set on the Operator tab."));
 
   const submit = cel("button", "ck-btn primary", editing ? "Update program" : "Save program");
   submit.type = "submit";
@@ -8684,7 +8687,7 @@ const CK_WIZARD_STEPS = [
   { title: "SSRF/OOB setup (optional)", body: "If the program's policy allows out-of-band/collaborator testing, tick that on its form, then use “Set up SSRF/OOB →” on the program row to land here with scope pre-filled. Skip this step if you don't need it.", view: "idor" },
   { title: "Run your first hunt", body: "Back in the launch rail: pick your program (fills in Target/Scope), tick “I'm authorized to test this target”, and click Run hunt. Start with a Single hunt before a full campaign.", view: "program", focusSelector: "#ckActiveProgram" },
   { title: "Read the results", body: "Findings land here with a proof-status column — Confirmed means GreyIQ actually proved it with a benign probe, not just flagged a pattern. Click any row for the evidence.", view: "findings" },
-  { title: "Generate a report", body: "Confirmed findings show up in Submissions — copy the Markdown, download it, or (once you've saved HackerOne API creds) submit it directly. Nothing is ever auto-filed without you arming it.", view: "submissions" },
+  { title: "Generate a report", body: "Confirmed findings show up in Submissions — review the evidence, copy or download the Markdown, and submit manually if you decide to file it.", view: "submissions" },
 ];
 
 function ckDismissWizard() {
@@ -11889,7 +11892,7 @@ async function ckRenderOperator() {
   const host = ck.views.operator;
   host.replaceChildren();
   host.append(cel("h2", "ck-section-title", "Autonomous operator"));
-  host.append(cel("p", "ck-hint", "Add the programs you're authorized to hunt, then arm the operator. It runs each program on its schedule — recon, hunt, prove, dedup, report — and (only when you explicitly arm auto-submit per program) files confirmed, non-duplicate findings within a daily cap. The kill switch stops it immediately."));
+  host.append(cel("p", "ck-hint", "Add the programs you're authorized to hunt, then start the operator. It runs each program on its schedule — recon, hunt, prove, dedup, report — and queues findings for your review. You decide whether to submit a report. The kill switch stops the scheduled work."));
   host.append(ckWalkthrough("operator"));
 
   let data = null;
@@ -11898,22 +11901,17 @@ async function ckRenderOperator() {
   }
   if (!data || data.ok === false) { host.append(cel("p", "ck-status is-error", "Local engine not running.")); return; }
 
-  // --- Control bar: start / stop / arm auto-submit ---
+  // --- Control bar: start / stop scheduled review-only work ---
   const ctl = cel("div", "ck-op-ctl");
   const running = Boolean(data.running);
   const statusPill = cel("span", `ck-pill ${running ? "is-armed" : ""}`);
   statusPill.append(cel("span", null, "Operator: "), cel("strong", null, running ? "running" : "stopped"));
   ctl.append(statusPill);
 
-  const armWrap = cel("label", "ck-switch ck-auth");
-  const arm = cel("input"); arm.type = "checkbox"; arm.id = "ckOpArm";
-  armWrap.append(arm, ckArmLabel());
-  ctl.append(armWrap);
-
   if (!running) {
     const startBtn = cel("button", "ck-btn primary", "Start operator");
     startBtn.type = "button";
-    startBtn.addEventListener("click", () => ckOperatorStart(arm.checked));
+    startBtn.addEventListener("click", ckOperatorStart);
     ctl.append(startBtn);
   } else {
     const stopBtn = cel("button", "ck-btn", "■ Kill switch — stop");
@@ -11985,24 +11983,17 @@ async function ckRenderOperator() {
   host.append(ckProgramForm());
 }
 
-function ckArmLabel() {
-  const span = cel("span");
-  span.append(cel("strong", null, "Arm auto-submit"));
-  span.append(document.createTextNode(" — file confirmed, non-duplicate findings to HackerOne automatically (per-program opt-in + daily cap still apply). Off = review-only."));
-  return span;
-}
-
 // Guards against a double Start (two /operator/start calls) and a Start racing a Stop —
-// important because the operator can auto-submit to live bounty programs.
+// important because the scheduled work can make authorized test requests.
 let ckOperatorBusy = false;
 
-async function ckOperatorStart(allowSubmit) {
+async function ckOperatorStart() {
   if (ckOperatorBusy) return;
-  if (allowSubmit && !window.confirm("ARM AUTO-SUBMIT?\n\nThe operator will FILE confirmed findings to your HackerOne programs automatically (only programs you set auto-submit on, only confirmed + non-duplicate findings, within each program's daily cap). Only do this for authorized, in-scope programs.")) return;
   if (!window.confirm("Start the operator on your portfolio? You confirm you are AUTHORIZED to test every enabled program's scope.")) return;
   ckOperatorBusy = true;
   try {
-    await apiFetch("/api/operator/start", { method: "POST", body: JSON.stringify({ authorized: true, allow_submit: Boolean(allowSubmit) }) });
+    const res = await apiFetch("/api/operator/start", { method: "POST", body: JSON.stringify({ authorized: true, allow_submit: false }) });
+    if (!res?.ok) throw new Error(res?.error || "The operator did not start.");
     void ckRenderOperator();
   } catch (err) { window.alert(err.message || "Could not start."); }
   finally { ckOperatorBusy = false; }
@@ -12011,8 +12002,7 @@ async function ckOperatorStart(allowSubmit) {
 async function ckOperatorStop() {
   if (ckOperatorBusy) return;
   ckOperatorBusy = true;
-  // A failed Stop must NOT be silent — an operator that thinks it stopped (but is still
-  // auto-submitting) is the worst outcome here.
+  // A failed Stop must not be silent: authorized testing may still be running.
   try { await apiFetch("/api/operator/stop", { method: "POST", body: JSON.stringify({}) }); }
   catch (err) { window.alert((err.message || "Could not reach the engine") + "\n\nAutomation may still be running — reopen Automation to check its status."); }
   finally { ckOperatorBusy = false; setTimeout(() => void ckRenderOperator(), 400); }
@@ -12027,13 +12017,6 @@ async function ckOperatorPollEvents() {
     const row = cel("div", "ck-op-event");
     row.append(cel("span", "ck-op-time", (ev.at || "").slice(11, 19)), cel("span", null, ev.message || ""));
     log.append(row);
-    // "submitted <pid>: <title> -> <url>" (operator.py's own _emit prefix) is the
-    // single most important background event in the app -- a confirmed finding was
-    // just auto-filed to a live bounty program while nobody was necessarily watching.
-    if (String(ev.message || "").startsWith("submitted ") && document.hidden) {
-      ckBumpTitleBadge(1);
-      void ckNotify("GreyIQ — finding submitted", ev.message);
-    }
   }
   if (res.events && res.events.length) { ckOpEventCount = res.count || (ckOpEventCount + res.events.length); log.scrollTop = log.scrollHeight; }
   if (!log.childNodes.length) log.append(cel("p", "ck-hint", "No activity yet. Start the operator to see live progress."));
@@ -12043,7 +12026,6 @@ function ckProgramRow(prog, funnel) {
   const li = cel("li"); li.style.flexWrap = "wrap";
   const left = cel("div"); left.style.flex = "1";
   left.append(cel("span", "ck-ftitle", prog.name || prog.id));
-  if (prog.auto_submit) left.append(document.createTextNode(" "), cel("span", "ck-tag", "auto-submit"));
   if (!prog.enabled) left.append(document.createTextNode(" "), cel("span", "ck-tag", "disabled"));
   const fp = (funnel && funnel.programs && funnel.programs[prog.id]) || null;
   const meta = `${prog.scope_text || "(no scope)"} · ${ckEstimateSpanTargets(prog).length} target(s)` + (fp ? ` · ${fp.stages.submitted || 0} submitted · $${fp.bounty_total || 0}` : "");
@@ -12066,7 +12048,7 @@ function ckProgramRow(prog, funnel) {
   toggle.type = "button";
   toggle.addEventListener("click", async () => {
     try {
-      await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify({ id: prog.id, name: prog.name, scope_text: prog.scope_text, seed_targets: prog.seed_targets, active: prog.active, live: prog.live, auto_submit: prog.auto_submit, platform: prog.platform, platform_handle: prog.platform_handle, interval_minutes: prog.interval_minutes, max_submits_per_day: prog.max_submits_per_day, max_pages: prog.max_pages, enabled: !prog.enabled }) });
+      await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify({ id: prog.id, name: prog.name, scope_text: prog.scope_text, seed_targets: prog.seed_targets, active: prog.active, live: prog.live, auto_submit: false, platform: prog.platform, platform_handle: prog.platform_handle, interval_minutes: prog.interval_minutes, max_submits_per_day: prog.max_submits_per_day, max_pages: prog.max_pages, enabled: !prog.enabled }) });
       await ckRefreshProgramsEverywhere();
       void ckRenderOperator();
     } catch (err) { window.alert(err.message || "Could not update the program — the engine may be unreachable, so the change may not have applied."); }
@@ -12097,10 +12079,9 @@ function ckProgramForm() {
   repositories.input.value = editing ? (editing.repository_urls || []).join("\n") : "";
   repositories.input.rows = 3;
   repositories.input.placeholder = "https://github.com/program/repository";
-  const handle = ckField("Program handle — HackerOne team handle (auto-submit) or HackenProof slug", "text", editing ? (editing.platform_handle || "") : "");
+  const handle = ckField("Program handle — platform team handle or slug", "text", editing ? (editing.platform_handle || "") : "");
   const interval = ckField("Re-run every (minutes)", "number", editing ? String(editing.interval_minutes || 1440) : "1440");
-  const cap = ckField("Max auto-submits / day", "number", editing ? String(editing.max_submits_per_day ?? 3) : "3");
-  form.append(name.wrap, scope.wrap, targets.wrap, repositories.wrap, handle.wrap, interval.wrap, cap.wrap);
+  form.append(name.wrap, scope.wrap, targets.wrap, repositories.wrap, handle.wrap, interval.wrap);
   form.append(ckTargetImport(targets, scope));
 
   const toggles = cel("div", "ck-toggles");
@@ -12108,8 +12089,7 @@ function ckProgramForm() {
   const active = ckToggle("Capture proof of impact (active)", editing ? !!editing.active : true);
   const live = ckToggle("Dynamic Playwright pass", editing ? !!editing.live : false);
   const deep = ckToggle("Deep auto-work (time-based SQLi + screenshot + research per confirmed lead)", editing ? !!editing.deep : false);
-  const auto = ckToggle("Auto-submit confirmed findings (per-program opt-in)", editing ? !!editing.auto_submit : false);
-  toggles.append(cloneRepositories.wrap, active.wrap, live.wrap, deep.wrap, auto.wrap);
+  toggles.append(cloneRepositories.wrap, active.wrap, live.wrap, deep.wrap);
   form.append(toggles);
 
   const submit = cel("button", "ck-btn primary", editing ? "Update program" : "Save program");
@@ -12141,8 +12121,9 @@ function ckProgramForm() {
       platform: editing ? (editing.platform || (handle.input.value.trim() ? "hackerone" : "manual"))
                         : (handle.input.value.trim() ? "hackerone" : "manual"),
       platform_handle: handle.input.value.trim(),
-      active: active.input.checked, live: live.input.checked, deep: deep.input.checked, auto_submit: auto.input.checked,
-      interval_minutes: Number(interval.input.value) || 1440, max_submits_per_day: Number(cap.input.value) || 3
+      active: active.input.checked, live: live.input.checked, deep: deep.input.checked, auto_submit: false,
+      interval_minutes: Number(interval.input.value) || 1440,
+      max_submits_per_day: editing ? Number(editing.max_submits_per_day ?? 3) : 3
     };
     if (editing) {
       // Update the existing record: carry its id + the fields the form doesn't expose so
@@ -13160,10 +13141,8 @@ async function ckDrawerReport(f) {
   else setState({ state: "error", error: (res && res.error) || "Report could not be built." });
 }
 
-// --- Completion alerts: a hunt/campaign can run for minutes, and the autonomous
-// operator auto-submitting a confirmed bounty is arguably the most important event
-// in the app -- both need to reach an operator who has tabbed away, not just whoever
-// happens to be staring at the launch rail when it finishes. Two independent,
+// --- Completion alerts: a hunt/campaign can run for minutes, so results should
+// reach an operator who has tabbed away. Two independent,
 // stacking signals: a tab-title badge (works everywhere, zero permissions) and a
 // native OS notification (louder, but needs a one-time permission grant). Both are
 // gated on document.hidden so a focused, watching operator never gets spammed with

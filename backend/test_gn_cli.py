@@ -212,7 +212,12 @@ class GnCliTests(unittest.TestCase):
                 code, _, err = _run(["operator", "run"])
                 self.assertEqual(code, 2)
                 self.assertIn("authorize", err.lower())
-                # auto-submit without a handle is dropped fail-closed.
+                with mock.patch("bughunter.campaign.run_campaign") as run:
+                    code, _, err = _run(["operator", "run", "--once", "-y", "--allow-submit"])
+                self.assertEqual(code, 2)
+                self.assertIn("automatic submission is disabled", err.lower())
+                run.assert_not_called()
+                # Legacy program flag is accepted but normalized off.
                 _run(["operator", "add", "--name", "NoHandle", "--scope", "x.com", "--auto-submit"])
                 self.assertEqual(_run(["operator", "remove", "acme"])[0], 0)
             finally:

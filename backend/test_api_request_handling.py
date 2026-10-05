@@ -14,6 +14,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
@@ -61,6 +62,19 @@ def _run_post_route(path: str, payload: dict) -> _Capture:
     scope = {"method": "POST", "path": path, "headers": headers, "scheme": "http", "query_string": b""}
     asyncio.run(g.route_http(scope, _receive_once(body), cap.send))
     return cap
+
+
+class OperatorStartGateTests(unittest.TestCase):
+    def test_legacy_allow_submit_payload_is_rejected_without_starting(self) -> None:
+        with patch.object(g.runtime, "_get_operator") as get_operator:
+            response = _run_post_route("/api/operator/start", {"authorized": True, "allow_submit": True})
+        self.assertEqual(response.status, 200)
+        body = json.loads(response.body)
+        self.assertFalse(body["ok"])
+        self.assertFalse(body["started"])
+        self.assertFalse(body["allow_submit"])
+        self.assertIn("disabled", body["error"].lower())
+        get_operator.assert_not_called()
 
 
 class ReadJsonBodyTests(unittest.TestCase):

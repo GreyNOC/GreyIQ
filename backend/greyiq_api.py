@@ -271,6 +271,7 @@ if str(BACKEND_DIR) not in sys.path:
 import agent as coding_agent  # noqa: E402
 import brain_profiles  # noqa: E402
 import brain_techniques  # noqa: E402
+import coding_learning_bridge  # noqa: E402
 import coder  # noqa: E402
 import project_memory  # noqa: E402
 import workspace as workspace_fs  # noqa: E402
@@ -448,6 +449,7 @@ SEED_FILES = (
 )
 SEED_DATA_FILES = (
     "greyiq_starter_knowledge.txt",
+    "greyiq_coding_knowledge.txt",
     "greyiq_bug_bounty_knowledge.txt",
     # Native-text extract of the Manual_pdfs library, bundled so the local model
     # trains on it on first run (copied into RUNTIME_DIR/data by ensure_runtime).
@@ -1286,7 +1288,7 @@ class YesWeHackProgramsRequest(BaseModel):
 
 class OperatorStartRequest(BaseModel):
     authorized: bool = False
-    allow_submit: bool = False  # ARM auto-submit (still per-program opt-in + confirmed-only + dedup'd)
+    allow_submit: bool = False  # legacy clients: explicitly refused by operator_start
 
 
 class OperatorEventsRequest(BaseModel):
@@ -1468,8 +1470,7 @@ class GreyIQRuntime:
         # In-memory only (drop-oldest); the on-disk report/JSON sidecar is the durable
         # copy. Lets the cockpit fetch a canonical build_submission package per finding.
         self.bounty_runs: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
-        # The autonomous operator loop (lazy — created on first start so its callables
-        # bind to this runtime's hard-gated run_campaign + submit_finding).
+        # The portfolio hunt scheduler (lazy — created on first start).
         self._operator: "OperatorLoop | None" = None
         self.store = AICoreStore(RUNTIME_DIR)
         ensure_runtime()
@@ -1769,7 +1770,14 @@ class GreyIQRuntime:
     def brain_status(self, workspace: str | None = None) -> dict[str, Any]:
         """Public metadata only: technique names/counts, aggregate outcomes, and guardrails."""
         root = workspace or str(PROJECT_ROOT)
-        return brain_techniques.status_snapshot(RUNTIME_DIR, SEED_DIR, root)
+        status = brain_techniques.status_snapshot(RUNTIME_DIR, SEED_DIR, root)
+        try:
+            from learning_engine import LearningEngine
+
+            status["recursive_learning"] = LearningEngine(RUNTIME_DIR).status()
+        except Exception:  # noqa: BLE001 - learning telemetry is advisory
+            status["recursive_learning"] = {"available": False}
+        return status
 
     def coder_test(self) -> dict[str, Any]:
         try:
@@ -1906,6 +1914,9 @@ class GreyIQRuntime:
                 runtime_dir=RUNTIME_DIR,
                 seed_dir=SEED_DIR,
             )
+            lesson = coding_learning_bridge.learn_from_verified_run(
+                RUNTIME_DIR, prompt=request.message, result=result
+            )
             snapshot_meta = self._persist_snapshot(request.workspace, result.get("snapshot") or [])
             return {
                 "ok": True,
@@ -1924,6 +1935,7 @@ class GreyIQRuntime:
                 "snapshot_count": snapshot_meta["count"],
                 "model_name": f"{result['provider']}:{result['model']}",
                 "provider": result["provider"],
+                "tinygpt_lesson": lesson,
             }
         except coding_agent.AgentError as exc:
             # A mid-run failure may have partially written files; persist the snapshot the run
@@ -1994,6 +2006,9 @@ class GreyIQRuntime:
                     seed_dir=SEED_DIR,
                     on_event=on_event,
                 )
+                lesson = coding_learning_bridge.learn_from_verified_run(
+                    RUNTIME_DIR, prompt=request.message, result=result
+                )
                 snapshot_meta = self._persist_snapshot(request.workspace, result.get("snapshot") or [])
                 payload = {
                     "ok": True,
@@ -2012,6 +2027,7 @@ class GreyIQRuntime:
                     "snapshot_count": snapshot_meta["count"],
                     "model_name": f"{result['provider']}:{result['model']}",
                     "provider": result["provider"],
+                    "tinygpt_lesson": lesson,
                 }
             except coding_agent.AgentError as exc:
                 snap = self._persist_snapshot(request.workspace, getattr(exc, "agent_snapshot", None) or [])
@@ -4290,18 +4306,12 @@ class GreyIQRuntime:
             active=active, live=live, deep=deep, max_pages=max_pages,
         ))
 
-    def _operator_submit(self, run_id: str, ref: str) -> dict[str, Any]:
-        """The operator's submit_fn — the SAME hard-gated runtime.submit_finding (confirm
-        + server-recomputed proof_status=='confirmed' + creds). Unforgeable by the loop."""
-        return self.submit_finding(SubmitRequest(run_id=run_id, ref=ref, confirm=True, platform="hackerone"))
-
     def _get_operator(self) -> "OperatorLoop":
         with self.lock:
             if self._operator is None:
                 self._operator = OperatorLoop(
                     str(RUNTIME_DIR),
                     run_campaign_fn=self._operator_run_campaign,
-                    submit_fn=self._operator_submit,
                 )
             return self._operator
 
@@ -4610,10 +4620,12 @@ class GreyIQRuntime:
     def operator_start(self, request: "OperatorStartRequest") -> dict[str, Any]:
         if not request.authorized:
             return {"ok": False, "error": "Confirm you are authorized to run the portfolio's programs (set authorized)."}
-        started = self._get_operator().start(allow_submit=bool(request.allow_submit))
-        return {"ok": True, "started": started, "allow_submit": bool(request.allow_submit),
-                "note": "auto-submit ARMED — confirmed, non-duplicate findings will be filed within each program's daily cap." if request.allow_submit
-                        else "review-only — findings are hunted and queued; nothing is auto-filed."}
+        if request.allow_submit:
+            return {"ok": False, "started": False, "allow_submit": False,
+                    "error": "Automatic submission is disabled. Review findings and submit manually."}
+        started = self._get_operator().start()
+        return {"ok": True, "started": started, "allow_submit": False,
+                "note": "Review-only — findings are hunted and queued; nothing is auto-filed."}
 
     def operator_stop(self) -> dict[str, Any]:
         if self._operator is not None:
@@ -4730,10 +4742,20 @@ class GreyIQRuntime:
             return None
         cfg = coder.coder_config(raw)
         messages = self._build_coder_messages(request, int(cfg.get("history_turns") or 12))
+        student = ""
+        try:
+            # TinyGPT speaks first. The stronger brain sees this only as an
+            # untrusted draft to critique, never as authoritative code.
+            student = coding_learning_bridge.student_draft(self.get_engine(), request.message)
+        except Exception as exc:  # noqa: BLE001 - teacher remains usable without TinyGPT
+            self.log(f"TinyGPT coding dialogue unavailable: {exc}")
         # The coding brain runs with a coding-focused system prompt; bot persona,
         # style, and stored preferences are layered on top.
         cfg = dict(cfg)
         cfg["system_prompt"] = self._coder_system_prompt(request, cfg)
+        bridge_block = coding_learning_bridge.teacher_prompt_block(student)
+        if bridge_block:
+            cfg["system_prompt"] += "\n\n" + bridge_block
         # Chat is interactive: responsiveness matters as much as depth, so it gets its own reasoning
         # profile instead of inheriting whatever the deepest brain needed. Only fills values the
         # operator left at the shipped defaults — an explicit setting still wins.
@@ -4756,11 +4778,23 @@ class GreyIQRuntime:
                 "citations": [],
                 "ai_core": self.store.load(),
             }
+        lesson = coding_learning_bridge.record_teacher_exchange(
+            RUNTIME_DIR,
+            prompt=request.message,
+            student=student,
+            teacher=str(result.get("text") or ""),
+            model_version=f"{result['provider']}:{result['model']}",
+        )
         return {
             "request_id": uuid4().hex,
             "message": friendly_branding(result["text"]),
             "used_fallback": False,
             "captured_for_training": False,
+            "brain_dialogue": {
+                "tinygpt_draft_used": bool(student),
+                "lesson_status": lesson.get("outcome"),
+                "verification_reason": lesson.get("verification_reason"),
+            },
             "model_name": f"{result['provider']}:{result['model']}",
             "device": "remote" if result["provider"] == "anthropic" else "local-model",
             "citations": [],

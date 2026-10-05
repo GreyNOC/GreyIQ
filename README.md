@@ -45,6 +45,12 @@ executable or project directory for any other layout.
 
 ## Check
 
+Install the Python runtime and test dependencies before running the full check:
+
+```powershell
+python -m pip install -r requirements.txt -r requirements-test.txt
+```
+
 ```powershell
 npm run check
 ```

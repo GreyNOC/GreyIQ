@@ -176,7 +176,7 @@ into public issues or chats.
 ```bash
 git pull
 npm ci
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.txt -r requirements-test.txt
 npm run check
 npm run check:devops
 pm2 reload ecosystem.config.cjs --update-env
@@ -190,7 +190,7 @@ dependencies and reloading PM2.
 
 1. Check the previous Git revision or release tag.
 2. Restore the previous `ecosystem.config.cjs`, `.env.example`, or Nginx config if changed.
-3. Reinstall dependencies if `package-lock.json` or `requirements.txt` changed.
+3. Reinstall dependencies if `package-lock.json`, `requirements.txt`, or `requirements-test.txt` changed.
 4. Run `npm run check` and `npm run check:devops`.
 5. Restart PM2:
 

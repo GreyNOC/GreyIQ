@@ -1,29 +1,11 @@
-"""GreyIQ BugHunter — the autonomous operator loop.
+"""GreyIQ BugHunter — portfolio hunt scheduler.
 
-Runs the full money loop UNATTENDED over a portfolio of programs: for each due,
-enabled program it hunts every seed target (recon -> scan -> active proof ->
-consolidate -> dedup -> rank -> submission packages), records the pipeline in the
-ledger, and — only when explicitly armed — auto-FILES confirmed, non-duplicate
-findings, throttled per program. Then it reschedules and moves on.
+Runs due, enabled programs through the injected campaign function and leaves
+findings and local submission packages for human review. No submission callback
+is accepted: an unattended loop must never contact a reporting platform.
 
-SAFETY (this is where a bounty tool could become a weapon or a spam-cannon — it does
-not):
-  * ZERO new network/scanning code. It calls the injected ``run_campaign_fn`` (the
-    runtime's run_campaign, which fails closed on authorized=False and keeps recon
-    same-origin + active probing scope-bound via host_in_active_scope) and the
-    injected ``submit_fn`` (the runtime's hard-gated submit, which re-requires confirm
-    + server-recomputed proof_status=='confirmed' + real creds). It cannot bypass any
-    gate it doesn't touch.
-  * Auto-submit is TRIPLE-gated: the loop must be started with allow_submit=True
-    (operator-wide arm) AND the program must have auto_submit=True AND the finding must
-    be proof_status=='confirmed' AND not already reported/submitted (ledger dedup) AND
-    within the program's max_submits_per_day. Default everywhere is OFF / review-only.
-  * A stop_event KILL SWITCH is checked between every program and before every submit.
-  * Sequential cycles (no concurrent store writes) — no read-modify-write race on the
-    portfolio/ledger.
-
-Pure / frozen-safe: stdlib threading + the existing portfolio/ledger stores. The API
-or the `gn operator` CLI owns one OperatorLoop and injects the two callables.
+The campaign owns scope and authorization checks. A stop event is checked
+between targets and programs; cycles run sequentially to avoid store races.
 """
 
 from __future__ import annotations
@@ -33,7 +15,7 @@ from collections import deque
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
-from bughunter import campaign, ledger, portfolio
+from bughunter import campaign, portfolio
 
 
 def _emit(on_event: Callable[[str], None] | None, message: str) -> None:
@@ -49,25 +31,19 @@ def run_program_cycle(
     program: dict[str, Any],
     *,
     run_campaign_fn: Callable[..., dict[str, Any]],
-    submit_fn: Callable[[str, str], dict[str, Any]] | None,
     on_event: Callable[[str], None] | None = None,
     stop: threading.Event | None = None,
 ) -> dict[str, Any]:
-    """Hunt every seed target of one program and (if submit_fn is provided AND the
-    program opts in) auto-file confirmed, non-duplicate findings within budget.
+    """Hunt every seed target of one program for operator review.
 
     ``run_campaign_fn(target, *, scope, program, active, live, deep, max_pages)`` must
-    return the runtime.run_campaign result (with run_id + findings + proof_of_impact).
-    ``submit_fn(run_id, ref) -> {ok, report_id, url} | {ok: False, error}`` is the
-    runtime's hard-gated submit; None => review-only (never submits)."""
+    return the runtime.run_campaign result (with findings + proof_of_impact)."""
     pid = program["id"]
     # Uses hand-typed seed_targets plus opted-in source repositories; falls back to
     # deriving one target per eligible structured_scope entry so an imported program
     # still gets hunted, not silently skipped.
     targets = campaign.program_campaign_targets(program)
     summary = {"program": pid, "targets_run": 0, "findings": 0, "confirmed": 0, "submitted": 0, "errors": []}
-    auto = bool(submit_fn) and bool(program.get("auto_submit"))
-    budget = _remaining_submit_budget(runtime_dir, program) if auto else 0
 
     for target in targets:
         if stop is not None and stop.is_set():
@@ -91,44 +67,16 @@ def run_program_cycle(
         summary["findings"] += len(findings)
         confirmed = [f for f in findings if str((proof.get(f.get("ref"), {}) or {}).get("status")) == "confirmed"]
         summary["confirmed"] += len(confirmed)
-        run_id = result.get("run_id")
-
-        if not (auto and run_id):
-            continue
-        for finding in confirmed:
-            if budget <= 0 or (stop is not None and stop.is_set()):
-                break
-            if ledger.is_submitted(runtime_dir, pid, target, finding):
-                continue  # already FILED in a prior run — never re-file (a 'reported' finding,
-                          # i.e. one this run just built a package for, must still be fileable)
-            res = submit_fn(run_id, finding["ref"])  # hard-gated server-side
-            if res.get("ok"):
-                ledger.record_submission(runtime_dir, pid, target, ledger.dedup_key(finding),
-                                         str(res.get("report_id", "")), str(res.get("url", "")))
-                summary["submitted"] += 1
-                budget -= 1
-                _emit(on_event, f"submitted {pid}: {str(finding.get('title', ''))[:48]} -> {res.get('url', '')}")
-            else:
-                summary["errors"].append(f"submit {finding.get('ref')}: {res.get('error')}")
     return summary
-
-
-def _remaining_submit_budget(runtime_dir: str, program: dict[str, Any]) -> int:
-    cap = int(program.get("max_submits_per_day") or 0)
-    if cap <= 0:
-        return 0
-    return max(0, cap - ledger.count_recent_submissions(runtime_dir, program["id"], within_hours=24))
 
 
 class OperatorLoop:
     """A single background supervisor that runs due programs sequentially until
     stopped. Owns the kill switch and a bounded event ring buffer the UI polls."""
 
-    def __init__(self, runtime_dir: str, *, run_campaign_fn: Callable[..., dict[str, Any]],
-                 submit_fn: Callable[[str, str], dict[str, Any]]) -> None:
+    def __init__(self, runtime_dir: str, *, run_campaign_fn: Callable[..., dict[str, Any]]) -> None:
         self.runtime_dir = runtime_dir
         self.run_campaign_fn = run_campaign_fn
-        self.submit_fn = submit_fn
         self.stop_event = threading.Event()
         self.events: deque[dict[str, Any]] = deque(maxlen=500)
         self._lock = threading.Lock()
@@ -148,18 +96,18 @@ class OperatorLoop:
                 "events": evs[after:], "count": len(evs)}
 
     def start(self, *, allow_submit: bool = False) -> bool:
+        if allow_submit:
+            raise ValueError("Automatic submission is disabled; review findings and submit manually.")
         # The check-then-act on self.running must be atomic: each API request runs on
         # its own asyncio.to_thread worker, so two concurrent /api/operator/start calls
-        # (a UI double-click, a client retry, two tabs) could otherwise both observe
-        # running=False before either sets it True, spawning two supervisor threads
-        # that independently hunt the same programs and can double-submit the same
-        # confirmed finding to HackerOne.
+        # (a UI double-click, a client retry, two tabs) could otherwise spawn two
+        # supervisor threads that independently hunt the same programs.
         with self._lock:
             if self.running:
                 return False
             self.running = True
         self.stop_event.clear()
-        self.allow_submit = bool(allow_submit)
+        self.allow_submit = False
         self.started_at = datetime.now(UTC).isoformat()
         self._thread = threading.Thread(target=self._supervise, daemon=True, name="greyiq-operator")
         self._thread.start()
@@ -185,7 +133,7 @@ class OperatorLoop:
             return True
 
     def _supervise(self) -> None:
-        self._emit("operator started" + (" — AUTO-SUBMIT ARMED" if self.allow_submit else " — review-only (no auto-submit)"))
+        self._emit("operator started — review-only (no auto-submit)")
         try:
             while not self.stop_event.is_set():
                 due = [p for p in portfolio.list_programs(self.runtime_dir) if p.get("enabled") and self._is_due(p)]
@@ -203,14 +151,13 @@ class OperatorLoop:
     def _run_one(self, program: dict[str, Any]) -> None:
         pid = program["id"]
         self._emit(f"cycle start: {pid}")
-        submit = self.submit_fn if (self.allow_submit and program.get("auto_submit")) else None
         try:
             summary = run_program_cycle(self.runtime_dir, program, run_campaign_fn=self.run_campaign_fn,
-                                        submit_fn=submit, on_event=self._emit, stop=self.stop_event)
+                                        on_event=self._emit, stop=self.stop_event)
         except Exception as exc:  # noqa: BLE001
             self._emit(f"cycle error {pid}: {type(exc).__name__}: {exc}")
             summary = {"findings": 0, "confirmed": 0, "submitted": 0}
         next_run = (datetime.now(UTC) + timedelta(minutes=int(program.get("interval_minutes") or 1440))).isoformat()
         portfolio.touch_run(self.runtime_dir, pid, next_run_at=next_run)
         self._emit(f"cycle done: {pid} — {summary.get('findings', 0)} findings, "
-                   f"{summary.get('confirmed', 0)} confirmed, {summary.get('submitted', 0)} submitted")
+                   f"{summary.get('confirmed', 0)} confirmed for review")
