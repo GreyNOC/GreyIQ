@@ -199,7 +199,7 @@ if (-not $SkipSmokeTest) {
     $env:GREYIQ_HOST = "127.0.0.1"
     $env:GREYIQ_PORT = "$smokePort"
     $env:GREYIQ_RUNTIME_DIR = Join-Path $env:TEMP "greyiq-build-smoke"
-    $proc = Start-Process -FilePath $BackendExe -PassThru -NoNewWindow
+    $proc = Start-Process -FilePath $BackendExe -PassThru -WindowStyle Hidden
     $ok = $false
     for ($i = 0; $i -lt 60; $i++) {
         Start-Sleep -Seconds 3

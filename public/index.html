@@ -166,6 +166,18 @@
               <button class="text-button" type="button" id="brainDownload">Download model</button>
             </div>
             <div class="model-list" id="brainModelList" hidden></div>
+            <section class="hf-import" id="brainHfImportSection" aria-labelledby="brainHfImportTitle" hidden>
+              <h3 id="brainHfImportTitle">Import from Hugging Face</h3>
+              <p class="folder-status">Start with a public GGUF model repository. GreyIQ does not manage Hugging Face authentication for gated or private models. Check the model card and license before use. The model downloads through Ollama, then runs locally.</p>
+              <label for="brainHfReference">
+                <span>Model page URL or Ollama reference</span>
+                <input id="brainHfReference" type="text" autocomplete="off" spellcheck="false" maxlength="300" placeholder="https://huggingface.co/owner/model-GGUF or hf.co/owner/model-GGUF:Q4_K_M">
+              </label>
+              <div class="folder-actions">
+                <button class="text-button" type="button" id="brainHfImport">Import and select</button>
+              </div>
+              <p class="folder-status" id="brainHfStatus" role="status" aria-live="polite"></p>
+            </section>
             <label>
               <span>Researcher UA marker</span>
               <input id="brainUaMarker" name="brainUaMarker" type="text" autocomplete="off" spellcheck="false" maxlength="120" placeholder="e.g. h1-greynoc">

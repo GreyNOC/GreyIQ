@@ -229,6 +229,10 @@ const els = {
   brainModelStatus: document.querySelector("#brainModelStatus"),
   brainDownload: document.querySelector("#brainDownload"),
   brainModelList: document.querySelector("#brainModelList"),
+  brainHfImportSection: document.querySelector("#brainHfImportSection"),
+  brainHfReference: document.querySelector("#brainHfReference"),
+  brainHfImport: document.querySelector("#brainHfImport"),
+  brainHfStatus: document.querySelector("#brainHfStatus"),
   brainOpsRefresh: document.querySelector("#brainOpsRefresh"),
   brainTechniqueList: document.querySelector("#brainTechniqueList"),
   brainLiveFeed: document.querySelector("#brainLiveFeed"),
@@ -2646,6 +2650,7 @@ function applyBrainFields(provider, repopulate) {
     els.brainTest.hidden = provider === "off";
   }
   if (els.brainModelList) els.brainModelList.hidden = provider !== "local";
+  if (els.brainHfImportSection) els.brainHfImportSection.hidden = provider !== "local";
   if (els.brainModelRow) {
     els.brainModelRow.hidden = provider !== "local";
     if (provider === "local") {
@@ -2802,25 +2807,62 @@ async function refreshModelStatus() {
   }
 }
 
-// List the installed local models, each with a Remove button.
+// Installed models remain selectable after a reload or an interrupted import poll.
 function renderModelList(installed, configured) {
   if (!els.brainModelList) return;
   els.brainModelList.replaceChildren();
   const models = Array.isArray(installed) ? installed : [];
+  const selected = String(configured || "").toLowerCase();
   for (const name of models) {
     const row = document.createElement("div");
     row.className = "model-row";
     const label = document.createElement("span");
     label.className = "model-name";
-    const inUse = name === configured || name === `${configured}:latest`;
+    const installedName = String(name).toLowerCase();
+    const inUse = Boolean(selected) && (installedName === selected || installedName === `${selected}:latest`);
     label.textContent = inUse ? `${name} (in use)` : name;
+    const actions = document.createElement("div");
+    actions.className = "model-actions";
+    const select = document.createElement("button");
+    select.type = "button";
+    select.className = "text-button";
+    select.textContent = "Select";
+    select.setAttribute("aria-label", `Select ${name}`);
+    select.disabled = inUse;
+    select.addEventListener("click", () => void selectInstalledModel(name, select));
     const del = document.createElement("button");
     del.type = "button";
     del.className = "text-button danger";
     del.textContent = "Remove";
+    del.setAttribute("aria-label", `Remove ${name}`);
     del.addEventListener("click", () => deleteModel(name, del));
-    row.append(label, del);
+    actions.append(select, del);
+    row.append(label, actions);
     els.brainModelList.append(row);
+  }
+}
+
+async function saveLocalModelSelection(model) {
+  coderConfig = await apiFetch("/api/coder", {
+    method: "POST",
+    timeoutMs: 10000,
+    body: JSON.stringify({ config: { enabled: true, provider: "local", local: { model } } })
+  });
+  renderBrainForm();
+  renderAgentBar();
+  await refreshModelStatus();
+}
+
+async function selectInstalledModel(model, button) {
+  button.disabled = true;
+  els.brainStatus.textContent = `Selecting ${model}…`;
+  try {
+    await saveLocalModelSelection(model);
+    els.brainStatus.textContent = `Selected ${model}. Use Test to verify it responds.`;
+  } catch (error) {
+    els.brainStatus.textContent = error.message || "Could not select the model.";
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -2843,31 +2885,58 @@ async function deleteModel(name, btn) {
 
 let modelPullTimer = null;
 
-function pollModelPull() {
+function pollModelPull({ statusEl = els.brainModelStatus, button = els.brainDownload, onSuccess = null } = {}) {
   if (modelPullTimer) {
     clearInterval(modelPullTimer);
   }
-  modelPullTimer = setInterval(async () => {
+  let checking = false;
+  let failures = 0;
+  const check = async () => {
+    if (checking) return;
+    checking = true;
     let status;
     try {
       status = await apiFetch("/api/coder/pull", { timeoutMs: 6000 });
     } catch (_) {
-      return; // transient — keep polling
+      failures += 1;
+      if (failures >= 5) {
+        clearInterval(modelPullTimer);
+        modelPullTimer = null;
+        button.disabled = false;
+        statusEl.textContent = "Could not check the download after five attempts. Check that GreyIQ is running, then refresh the model list.";
+      }
+      checking = false;
+      return;
     }
+    failures = 0;
     if (status.active) {
-      const pct = status.percent ? ` ${status.percent}%` : "";
-      els.brainModelStatus.textContent = `Downloading ${status.model}…${pct} ${status.status || ""}`.trim();
+      const pct = Number.isFinite(Number(status.percent)) && Number(status.percent) > 0
+        ? ` ${status.percent}%` : "";
+      statusEl.textContent = `Downloading ${status.model || "model"}…${pct} ${status.status || ""}`.trim();
+      checking = false;
+      return;
+    }
+    if (!status.done && !status.error) {
+      checking = false;
       return;
     }
     clearInterval(modelPullTimer);
     modelPullTimer = null;
-    els.brainDownload.disabled = false;
     if (status.error) {
-      els.brainModelStatus.textContent = `Download failed: ${status.error}`;
+      statusEl.textContent = `Download failed: ${status.error}`;
     } else {
-      void refreshModelStatus();
+      try {
+        if (onSuccess) await onSuccess(status);
+        else void refreshModelStatus();
+      } catch (error) {
+        statusEl.textContent = error.message || "The model downloaded, but could not be selected.";
+      }
     }
-  }, 2000);
+    button.disabled = false;
+    checking = false;
+  };
+  modelPullTimer = setInterval(() => void check(), 2000);
+  void check();
 }
 
 els.brainDownload?.addEventListener("click", async () => {
@@ -2876,7 +2945,7 @@ els.brainDownload?.addEventListener("click", async () => {
     return;
   }
   els.brainDownload.disabled = true;
-  els.brainModelStatus.textContent = "Starting download… (the 14B model is ~9 GB, downloaded once)";
+  els.brainModelStatus.textContent = "Starting model download…";
   try {
     const res = await apiFetch("/api/coder/pull", { method: "POST", timeoutMs: 10000, body: JSON.stringify({}) });
     if (res.ok === false) {
@@ -2888,6 +2957,103 @@ els.brainDownload?.addEventListener("click", async () => {
   } catch (error) {
     els.brainModelStatus.textContent = error.message || "Download failed to start.";
     els.brainDownload.disabled = false;
+  }
+});
+
+async function selectHuggingFaceModel(model) {
+  els.brainHfStatus.textContent = `Selecting ${model}…`;
+  await saveLocalModelSelection(model);
+  els.brainHfStatus.textContent = `Imported and selected ${model}. Use Test to verify it responds.`;
+}
+
+async function waitForOllamaReady() {
+  let lastError = "Ollama did not become ready. Check that it is running.";
+  for (let attempt = 0; attempt < 15; attempt += 1) {
+    try {
+      const models = await apiFetch("/api/coder/models", { timeoutMs: 2000 });
+      if (models.ok) return;
+      lastError = models.error || lastError;
+    } catch (error) {
+      lastError = error.message || lastError;
+    }
+    if (attempt < 14) await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(lastError);
+}
+
+function isLoopbackOllamaUrl(baseUrl) {
+  try {
+    const url = new URL(baseUrl);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password
+        || url.search || url.hash || !["/", "/v1"].includes(url.pathname)) return false;
+    const host = url.hostname.toLowerCase();
+    if (host === "localhost" || host === "[::1]" || host === "::1") return true;
+    const parts = host.split(".");
+    return parts.length === 4 && parts[0] === "127"
+      && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+  } catch (_) {
+    return false;
+  }
+}
+
+async function importHuggingFaceModel() {
+  const reference = els.brainHfReference?.value.trim() || "";
+  if (!reference) {
+    els.brainHfStatus.textContent = "Paste a Hugging Face GGUF model URL or hf.co reference.";
+    return;
+  }
+  if (modelPullTimer) {
+    els.brainHfStatus.textContent = "Wait for the current model download to finish.";
+    return;
+  }
+  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+    els.brainHfStatus.textContent = "Local GreyIQ service is not running.";
+    return;
+  }
+  els.brainHfImport.disabled = true;
+  try {
+    const savedConfig = await apiFetch("/api/coder", { timeoutMs: 4000 });
+    const savedUrl = savedConfig?.local?.base_url || "http://127.0.0.1:11434/v1";
+    if (!isLoopbackOllamaUrl(savedUrl)) {
+      throw new Error("Hugging Face imports require a loopback Ollama Server URL. Set and save http://127.0.0.1:11434/v1 first.");
+    }
+    els.brainHfStatus.textContent = "Preparing Ollama…";
+    if (window.greyiqDesktop && typeof window.greyiqDesktop.ensureOllama === "function") {
+      const runtime = await window.greyiqDesktop.ensureOllama();
+      if (!runtime?.ok) throw new Error(runtime?.error || "Ollama could not start.");
+    }
+    els.brainHfStatus.textContent = "Waiting for Ollama to be ready…";
+    await waitForOllamaReady();
+    els.brainHfStatus.textContent = "Starting Hugging Face GGUF download…";
+    const result = await apiFetch("/api/coder/huggingface/import", {
+      method: "POST",
+      timeoutMs: 15000,
+      body: JSON.stringify({ reference })
+    });
+    if (result.ok === false) throw new Error(result.error || "Import could not start.");
+    const model = String(result.model || "").trim();
+    if (!model) throw new Error("Import did not return a model name.");
+    if (result.active) {
+      pollModelPull({
+        statusEl: els.brainHfStatus,
+        button: els.brainHfImport,
+        onSuccess: () => selectHuggingFaceModel(model)
+      });
+    } else {
+      await selectHuggingFaceModel(model);
+      els.brainHfImport.disabled = false;
+    }
+  } catch (error) {
+    els.brainHfStatus.textContent = error.message || "Hugging Face import failed.";
+    els.brainHfImport.disabled = false;
+  }
+}
+
+els.brainHfImport?.addEventListener("click", () => void importHuggingFaceModel());
+els.brainHfReference?.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.isComposing) {
+    event.preventDefault();
+    void importHuggingFaceModel();
   }
 });
 

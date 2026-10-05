@@ -66,6 +66,26 @@ In the **Coding brain** panel (training column) pick a provider:
 - **Claude API** — paste an Anthropic key (default model `claude-opus-4-8`).
 - **OpenAI-compatible** — any `/v1/chat/completions` endpoint.
 
+To use a Hugging Face GGUF model, select **Local model (Ollama)** and paste its
+model page URL (for example, `https://huggingface.co/owner/model-GGUF`) or Ollama
+reference (`hf.co/owner/model-GGUF:Q4_K_M`) into **Import from Hugging Face**.
+Choose **Import and select**. GreyIQ downloads the model through Ollama, shows
+progress, then selects it for chat and Agent mode. Use **Test** to confirm the
+model responds. Import requires a loopback Ollama Server URL such as
+`http://127.0.0.1:11434/v1`; save that setting before importing. Downloading
+needs an internet connection; inference runs locally afterward. Start with a public
+GGUF repository. GreyIQ does not manage Hugging Face
+authentication; a gated or private repository requires access already configured
+for Ollama and may fail if that access is missing. Other Hugging Face model formats
+are not supported by this control. If a download completes but is not selected,
+use **Select** beside it in the installed model list. Review each model's license
+and card before use. Agent mode also depends on the
+chosen model's ability to follow tool calls. See the
+[Hugging Face Ollama guide](https://huggingface.co/docs/hub/main/ollama) for GGUF
+references and quantization tags.
+If Ollama reports a blocked Hugging Face download redirect, update Ollama to
+0.34.3 or newer; 0.34.2 has a [known redirect bug](https://github.com/ollama/ollama/issues/18526).
+
 The brain answers chat, drives Agent mode, and writes the analysis in BugHunter reports.
 For security and root-cause work, Agent mode can call a shared evidence-grounded
 investigator that scans code read-only, ranks hypotheses, names the proof still needed,

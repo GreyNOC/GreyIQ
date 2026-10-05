@@ -2,6 +2,12 @@
 
 Notable changes to GreyIQ.
 
+## v4.7.0 - Hugging Face GGUF models in the local brain
+
+- Import compatible Hugging Face GGUF repositories into GreyIQ's local Ollama model library.
+- Select an imported model as the local coding brain for chat and agent work. Model retrieval is
+  operator initiated, and inference runs through the local Ollama runtime.
+
 ## v4.6.0 - the investigation queue, in the app
 
 ### The lead queue is readable in the cockpit, and reachable at all

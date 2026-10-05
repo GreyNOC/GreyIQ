@@ -651,7 +651,11 @@ class DeleteCoreRequest(BaseModel):
 
 
 class DeleteModelRequest(BaseModel):
-    model: str = Field(min_length=1, max_length=200)
+    model: str = Field(min_length=1, max_length=300)
+
+
+class HuggingFaceImportRequest(BaseModel):
+    reference: str = Field(min_length=1, max_length=300)
 
 
 class ScanCodeRequest(BaseModel):
@@ -1798,6 +1802,20 @@ class GreyIQRuntime:
     def model_pull_status(self) -> dict[str, Any]:
         with self.lock:
             return dict(self.model_pull)
+
+    def start_huggingface_import(self, reference: str) -> dict[str, Any]:
+        """Import a Hugging Face GGUF through a loopback Ollama service."""
+        try:
+            model = coder.normalize_huggingface_model_ref(reference)
+        except coder.CoderError as exc:
+            return {"ok": False, "error": str(exc)}
+        host, _ = self._local_brain()
+        if not coder.ollama_host_is_loopback(host):
+            return {"ok": False, "error": (
+                "Hugging Face import requires a local Ollama Server URL. "
+                "Set it to http://127.0.0.1:11434/v1 and save the brain first."
+            )}
+        return self.start_model_pull(model)
 
     def start_model_pull(self, model: str = "") -> dict[str, Any]:
         host, configured = self._local_brain()
@@ -6413,6 +6431,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             body = await read_json_body(receive)
             model = str((body or {}).get("model") or "")
             await send_json(send, await asyncio.to_thread(runtime.start_model_pull, model))
+            return
+        if method == "POST" and path == "/api/coder/huggingface/import":
+            request = validate_payload(HuggingFaceImportRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.start_huggingface_import, request.reference))
             return
         if method == "GET" and path == "/api/coder/pull":
             await send_json(send, runtime.model_pull_status())
