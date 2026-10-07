@@ -469,8 +469,10 @@ Confirmed (and reportable candidate) findings appear in the **Submissions** tab:
   explicit local OSINT command (`crt.sh`, Cert Spotter, Google DNS, and Cloudflare DNS;
   read-only public-index queries), and
   polling your own OOB collaborator server (a host you configured). An explicit
-  local-model setup also checks the public Hugging Face model metadata and asks
-  Ollama to download the selected model. The direct Hugging Face import runs chat
+  local-model picker reads Ollama's public catalog (`ollama.com`, read-only)
+  when opened or refreshed. Selecting a model asks the chosen Ollama server to
+  download it. Hugging Face setup also checks public model metadata and asks
+  local Ollama to download the selected model. The direct Hugging Face import runs chat
   and agent-tool readiness checks before selecting it for chat or hunt planning;
   the packaged desktop starts its saved local Ollama runtime again after restart.
 - **Only you submit reports.** The Operator queues findings and report packages locally.

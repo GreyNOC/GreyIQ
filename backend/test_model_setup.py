@@ -134,6 +134,18 @@ class SetupJobTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail("model setup worker did not finish")
 
+    def test_active_model_cannot_be_deleted_under_latest_alias(self) -> None:
+        instance, _ = self._runtime()
+        instance._coder_config = lambda: {
+            "enabled": True, "provider": "local",
+            "local": {"model": "qwen3", "base_url": ""},
+        }
+        with patch.object(coder, "ollama_delete") as delete:
+            result = instance.delete_model("qwen3:latest")
+        self.assertFalse(result["ok"])
+        self.assertIn("active brain", result["error"])
+        delete.assert_not_called()
+
     def test_success_selects_model_only_after_pull_and_probes(self) -> None:
         instance, saved = self._runtime()
         installed = []

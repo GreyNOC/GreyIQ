@@ -224,7 +224,10 @@ const els = {
   brainForm: document.querySelector("#brainForm"),
   brainProvider: document.querySelector("#brainProvider"),
   brainModel: document.querySelector("#brainModel"),
-  brainModelHelp: document.querySelector("#brainModelHelp"),
+  brainOllamaPicker: document.querySelector("#brainOllamaPicker"),
+  brainOllamaModel: document.querySelector("#brainOllamaModel"),
+  brainCatalogStatus: document.querySelector("#brainCatalogStatus"),
+  brainCatalogRefresh: document.querySelector("#brainCatalogRefresh"),
   brainBaseUrl: document.querySelector("#brainBaseUrl"),
   brainApiKey: document.querySelector("#brainApiKey"),
   brainUaMarker: document.querySelector("#brainUaMarker"),
@@ -235,7 +238,6 @@ const els = {
   brainStatus: document.querySelector("#brainStatus"),
   brainModelRow: document.querySelector("#brainModelRow"),
   brainModelStatus: document.querySelector("#brainModelStatus"),
-  brainDownload: document.querySelector("#brainDownload"),
   brainModelList: document.querySelector("#brainModelList"),
   brainHfImportSection: document.querySelector("#brainHfImportSection"),
   brainHfReference: document.querySelector("#brainHfReference"),
@@ -2753,6 +2755,7 @@ const BRAIN_FIELDS = {
   anthropic: ["model", "api_key"],
   openai: ["model", "base_url", "api_key"]
 };
+const ollamaCatalog = { models: [], installed: [], installedBaseUrl: null, loaded: false, loading: false, requestId: 0 };
 
 function brainBlockFor(provider) {
   if (!coderConfig || provider === "off") return {};
@@ -2764,22 +2767,27 @@ function applyBrainFields(provider, repopulate) {
   if (repopulate) {
     const block = brainBlockFor(provider);
     els.brainModel.value = block.model || "";
+    if (els.brainOllamaModel) els.brainOllamaModel.value = provider === "local" ? (block.model || "") : "";
     els.brainBaseUrl.value = block.base_url || "";
     els.brainApiKey.value = "";
     els.brainApiKey.placeholder = block.has_api_key ? "saved — leave blank to keep" : "paste API key";
   }
   els.brainForm.querySelectorAll("[data-brain-field]").forEach((row) => {
-    row.hidden = !fields.includes(row.dataset.brainField);
+    row.hidden = !fields.includes(row.dataset.brainField)
+      || (provider === "local" && row.dataset.brainField === "model");
   });
   if (els.brainTest) {
-    els.brainTest.hidden = provider === "off";
+    els.brainTest.hidden = provider === "off" || provider === "local";
   }
+  if (els.brainSave) els.brainSave.textContent = provider === "local" ? "Save settings" : "Save brain";
+  if (els.brainOllamaPicker) els.brainOllamaPicker.hidden = provider !== "local";
   if (els.brainModelList) els.brainModelList.hidden = provider !== "local";
-  if (els.brainModelHelp) els.brainModelHelp.hidden = provider !== "local";
   if (els.brainHfImportSection) els.brainHfImportSection.hidden = provider !== "local";
   if (els.brainModelRow) {
     els.brainModelRow.hidden = provider !== "local";
     if (provider === "local") {
+      renderOllamaOptions();
+      if (!ollamaCatalog.loaded && !ollamaCatalog.loading) void refreshOllamaCatalog();
       void refreshModelStatus();
     }
   }
@@ -2810,6 +2818,88 @@ function buildBrainBlock(provider) {
   return block;
 }
 
+function renderOllamaOptions() {
+  const picker = els.brainOllamaModel;
+  if (!picker) return;
+  const configured = String(coderConfig?.local?.model || "").trim();
+  const wanted = picker.value || configured;
+  const installed = ollamaCatalog.installed.filter((name) => name && !String(name).toLowerCase().endsWith(":cloud"));
+  const seen = new Map();
+  picker.replaceChildren();
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = ollamaCatalog.loading ? "Loading Ollama models…" : "Choose a model…";
+  picker.append(placeholder);
+  const addOption = (parent, name, label, title = "") => {
+    const key = String(name).toLowerCase();
+    if (!name || seen.has(key)) return;
+    seen.set(key, name);
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = label;
+    if (title) option.title = title;
+    parent.append(option);
+  };
+  if (configured && !installed.some((name) => name.toLowerCase() === configured.toLowerCase())
+      && !ollamaCatalog.models.some((model) => model.name?.toLowerCase() === configured.toLowerCase())) {
+    const group = document.createElement("optgroup");
+    group.label = "Saved model";
+    addOption(group, configured, configured.endsWith(":cloud")
+      ? `${configured} (cloud; choose a local model)` : configured);
+    if (configured.endsWith(":cloud")) group.firstChild.disabled = true;
+    picker.append(group);
+  }
+  if (installed.length) {
+    const group = document.createElement("optgroup");
+    group.label = "Installed on this Ollama server";
+    for (const name of installed) addOption(group, name, name);
+    picker.append(group);
+  }
+  if (ollamaCatalog.models.length) {
+    const group = document.createElement("optgroup");
+    group.label = "Free local downloads from Ollama · agent tools";
+    for (const model of ollamaCatalog.models) {
+      const sizes = Array.isArray(model.sizes) ? model.sizes.slice(0, 5).join(", ") : "";
+      addOption(group, model.name, sizes ? `${model.name} · ${sizes}` : model.name,
+        String(model.description || "").slice(0, 240));
+    }
+    picker.append(group);
+  }
+  picker.value = seen.get(wanted.toLowerCase()) || "";
+}
+
+async function refreshOllamaCatalog() {
+  if (!els.brainOllamaModel) return;
+  const requestId = ++ollamaCatalog.requestId;
+  ollamaCatalog.loading = true;
+  els.brainCatalogRefresh.disabled = true;
+  els.brainCatalogStatus.textContent = "Loading free local models from Ollama…";
+  renderOllamaOptions();
+  try {
+    const result = await apiFetch("/api/coder/catalog", { timeoutMs: 30000 });
+    if (requestId !== ollamaCatalog.requestId) return;
+    if (result.ok === false || !Array.isArray(result.models) || !result.models.length) {
+      throw new Error(result.error || "Ollama returned no local models with agent tools.");
+    }
+    ollamaCatalog.models = result.models.filter((model) => typeof model?.name === "string"
+      && model.name && !model.name.toLowerCase().endsWith(":cloud"));
+    ollamaCatalog.loaded = true;
+    const note = result.partial ? ` Partial list: ${result.warning || "Ollama did not return every page."}` : "";
+    els.brainCatalogStatus.textContent = `${ollamaCatalog.models.length} free local models from Ollama. Choose one to set it up.${note}`;
+  } catch (error) {
+    if (requestId !== ollamaCatalog.requestId) return;
+    ollamaCatalog.loaded = true;
+    ollamaCatalog.models = [];
+    els.brainCatalogStatus.textContent = `Ollama catalog unavailable: ${error.message || "try Refresh list"}. Installed models remain available.`;
+  } finally {
+    if (requestId === ollamaCatalog.requestId) {
+      ollamaCatalog.loading = false;
+      els.brainCatalogRefresh.disabled = false;
+      renderOllamaOptions();
+    }
+  }
+}
+
 async function loadCoderConfig() {
   if (!els.brainForm) return;
   try {
@@ -2834,7 +2924,7 @@ async function loadCoderConfig() {
         // runtime was starting. Do not replace that result with startup text.
         if (els.brainStatus.textContent === startupStatus) {
           els.brainStatus.textContent = runtime?.ok
-            ? "Saved local model runtime ready. Use Test to verify the model."
+            ? "Saved local model runtime ready."
             : (runtime?.error || "Could not start Ollama for the saved model.");
         }
         if (runtime?.ok) void refreshModelStatus();
@@ -2847,7 +2937,7 @@ async function loadCoderConfig() {
     }
     const pull = await apiFetch("/api/coder/pull", { timeoutMs: 4000 });
     if (pull.active && pull.setup) {
-      els.brainDownload.disabled = true;
+      if (els.brainOllamaModel) els.brainOllamaModel.disabled = true;
       els.brainSave.disabled = true;
       pollModelPull();
     }
@@ -2858,6 +2948,17 @@ async function loadCoderConfig() {
 
 els.brainProvider?.addEventListener("change", () => {
   applyBrainFields(els.brainProvider.value, true);
+});
+
+els.brainCatalogRefresh?.addEventListener("click", async () => {
+  void refreshOllamaCatalog();
+  void refreshModelStatus();
+  try {
+    const pull = await apiFetch("/api/coder/pull", { timeoutMs: 4000 });
+    if (pull.active && pull.setup && !modelPullTimer) pollModelPull();
+  } catch (_) {
+    // Catalog and installed-model refreshes show their own connection errors.
+  }
 });
 
 const BRAIN_LABELS = { local: "local model", anthropic: "Claude", openai: "OpenAI" };
@@ -2901,6 +3002,34 @@ els.brainForm?.addEventListener("submit", async (event) => {
     return;
   }
   const provider = els.brainProvider.value;
+  if (provider === "local") {
+    const model = els.brainOllamaModel?.value || "";
+    if (!model || model.toLowerCase().endsWith(":cloud")) {
+      els.brainStatus.textContent = "Choose a free local Ollama model first.";
+      return;
+    }
+    els.brainSave.disabled = true;
+    try {
+      if (els.brainUaMarker) {
+        coderConfig = await apiFetch("/api/coder", {
+          method: "POST", timeoutMs: 10000,
+          body: JSON.stringify({ config: { researcher_ua_marker: els.brainUaMarker.value.trim() } })
+        });
+      }
+      const saved = coderConfig?.local || {};
+      if (coderConfig?.enabled && coderConfig?.provider === "local"
+          && saved.model === model && String(saved.base_url || "") === els.brainBaseUrl.value.trim()) {
+        els.brainStatus.textContent = "Settings saved.";
+      } else {
+        await setupSelectedOllamaModel();
+      }
+    } catch (error) {
+      els.brainStatus.textContent = error.message || "Could not save settings.";
+    } finally {
+      if (!modelPullTimer) els.brainSave.disabled = false;
+    }
+    return;
+  }
   const update = provider === "off"
     ? { enabled: false }
     : { enabled: true, provider, [provider]: buildBrainBlock(provider) };
@@ -2917,18 +3046,8 @@ els.brainForm?.addEventListener("submit", async (event) => {
     });
     renderBrainForm();
     els.brainStatus.textContent = provider === "off"
-      ? "Coding brain off — using the local model."
+      ? "Coding brain off."
       : `Saved. Brain: ${provider}. Use Test to verify.`;
-    // The local (Ollama) runtime is downloaded on first use to keep the app small —
-    // provision + start it now that the user picked the local model.
-    if (provider === "local" && window.greyiqDesktop && typeof window.greyiqDesktop.ensureOllama === "function") {
-      els.brainStatus.textContent = "Saved. Preparing the local model runtime (first time downloads ~1 GB)…";
-      window.greyiqDesktop.ensureOllama().then((res) => {
-        els.brainStatus.textContent = res && res.ok
-          ? "Local model runtime ready. Use Test to verify."
-          : "Saved, but the local runtime could not start — install Ollama, or use the Claude/OpenAI brain.";
-      }).catch(() => {});
-    }
   } catch (error) {
     els.brainStatus.textContent = error.message || "Could not save brain settings.";
   } finally {
@@ -2936,46 +3055,53 @@ els.brainForm?.addEventListener("submit", async (event) => {
   }
 });
 
+let modelStatusRequestId = 0;
 async function refreshModelStatus() {
   if (!els.brainModelStatus) return;
+  const requestId = ++modelStatusRequestId;
+  const baseUrl = els.brainBaseUrl.value.trim();
+  if (ollamaCatalog.installedBaseUrl !== baseUrl) {
+    ollamaCatalog.installed = [];
+    ollamaCatalog.installedBaseUrl = baseUrl;
+    renderModelList([], "");
+    renderOllamaOptions();
+  }
   if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
     els.brainModelStatus.textContent = "Local service not running.";
     return;
   }
   try {
-    const info = await apiFetch("/api/coder/models", { timeoutMs: 6000 });
+    const info = await apiFetch(`/api/coder/models?base_url=${encodeURIComponent(baseUrl)}`, { timeoutMs: 6000 });
+    if (requestId !== modelStatusRequestId || els.brainProvider.value !== "local"
+        || baseUrl !== els.brainBaseUrl.value.trim()) return;
     if (info.ok === false) {
       els.brainModelStatus.textContent = info.error || "Ollama not reachable — is it running?";
-      els.brainDownload.hidden = false;
+      ollamaCatalog.installed = [];
       renderModelList([], "");
+      renderOllamaOptions();
       return;
     }
-    const typedModel = els.brainModel.value.trim();
-    if (typedModel && typedModel !== info.configured) {
-      els.brainModelStatus.textContent = "New model entered. Download and use checks it before changing your current brain.";
-      els.brainDownload.hidden = false;
-    } else if (info.present) {
+    ollamaCatalog.installed = (Array.isArray(info.installed) ? info.installed : [])
+      .filter((name) => typeof name === "string" && name && !name.toLowerCase().endsWith(":cloud"));
+    const savedBaseUrl = String(coderConfig?.local?.base_url || "");
+    if (info.present && baseUrl === savedBaseUrl) {
       els.brainModelStatus.textContent = `Model installed: ${info.configured} ✓`;
-      els.brainDownload.hidden = true;
     } else {
-      els.brainModelStatus.textContent = `${info.configured || "Model"} not installed.`;
-      els.brainDownload.hidden = false;
+      els.brainModelStatus.textContent = `${ollamaCatalog.installed.length} installed local models on this server.`;
     }
-    renderModelList(info.installed, info.configured);
+    renderModelList(ollamaCatalog.installed, baseUrl === savedBaseUrl ? info.configured : "", baseUrl === savedBaseUrl);
+    renderOllamaOptions();
   } catch (error) {
-    els.brainModelStatus.textContent = error.message || "Could not check the model.";
+    if (requestId === modelStatusRequestId) els.brainModelStatus.textContent = error.message || "Could not check the model.";
   }
 }
 
-els.brainModel?.addEventListener("input", () => {
-  if (els.brainProvider.value !== "local") return;
-  els.brainDownload.hidden = false;
-  els.brainModelStatus.textContent = "Download and use checks this model before changing your current brain.";
+els.brainBaseUrl?.addEventListener("change", () => {
+  if (els.brainProvider.value === "local") void refreshModelStatus();
 });
 
-// List the installed local models, each with a Remove button.
-// Installed models remain selectable after a reload or an interrupted import poll.
-function renderModelList(installed, configured) {
+// Installed models are chosen through the same readiness-checked dropdown.
+function renderModelList(installed, configured, canDelete = false) {
   if (!els.brainModelList) return;
   els.brainModelList.replaceChildren();
   const models = Array.isArray(installed) ? installed : [];
@@ -2990,46 +3116,18 @@ function renderModelList(installed, configured) {
     label.textContent = inUse ? `${name} (in use)` : name;
     const actions = document.createElement("div");
     actions.className = "model-actions";
-    const select = document.createElement("button");
-    select.type = "button";
-    select.className = "text-button";
-    select.textContent = "Select";
-    select.setAttribute("aria-label", `Select ${name}`);
-    select.disabled = inUse;
-    select.addEventListener("click", () => void selectInstalledModel(name, select));
     const del = document.createElement("button");
     del.type = "button";
     del.className = "text-button danger";
     del.textContent = "Remove";
     del.setAttribute("aria-label", `Remove ${name}`);
+    del.disabled = !canDelete || inUse;
+    if (inUse) del.title = "Select another model before removing this one.";
+    else if (!canDelete) del.title = "Select a model on this server before removing its installed models.";
     del.addEventListener("click", () => deleteModel(name, del));
-    actions.append(select, del);
+    actions.append(del);
     row.append(label, actions);
     els.brainModelList.append(row);
-  }
-}
-
-async function saveLocalModelSelection(model) {
-  coderConfig = await apiFetch("/api/coder", {
-    method: "POST",
-    timeoutMs: 10000,
-    body: JSON.stringify({ config: { enabled: true, provider: "local", local: { model } } })
-  });
-  renderBrainForm();
-  renderAgentBar();
-  await refreshModelStatus();
-}
-
-async function selectInstalledModel(model, button) {
-  button.disabled = true;
-  els.brainStatus.textContent = `Selecting ${model}…`;
-  try {
-    await saveLocalModelSelection(model);
-    els.brainStatus.textContent = `Selected ${model}. Use Test to verify it responds.`;
-  } catch (error) {
-    els.brainStatus.textContent = error.message || "Could not select the model.";
-  } finally {
-    button.disabled = false;
   }
 }
 
@@ -3051,11 +3149,14 @@ async function deleteModel(name, btn) {
 }
 
 let modelPullTimer = null;
+let modelSetupStarting = false;
 
-function pollModelPull({ statusEl = els.brainModelStatus, button = els.brainDownload } = {}) {
+function pollModelPull({ statusEl = els.brainModelStatus, button = els.brainOllamaModel } = {}) {
   if (modelPullTimer) {
     clearInterval(modelPullTimer);
   }
+  if (els.brainOllamaModel) els.brainOllamaModel.disabled = true;
+  els.brainSave.disabled = true;
   let checking = false;
   let failures = 0;
   const check = async () => {
@@ -3070,7 +3171,8 @@ function pollModelPull({ statusEl = els.brainModelStatus, button = els.brainDown
         clearInterval(modelPullTimer);
         modelPullTimer = null;
         button.disabled = false;
-        statusEl.textContent = "Could not check the download after five attempts. Check that GreyIQ is running, then refresh the model list.";
+        els.brainSave.disabled = false;
+        statusEl.textContent = "Could not check model setup. Check that GreyIQ is running, then choose Refresh list to resume status checks.";
       }
       checking = false;
       return;
@@ -3094,16 +3196,18 @@ function pollModelPull({ statusEl = els.brainModelStatus, button = els.brainDown
       statusEl.textContent = `${status.model} is ready for chat and agent tools.`;
       els.brainStatus.textContent = `${status.model} is ready for chat and agent tools.`;
     } else if (status.chat_only) {
-      els.brainModel.value = status.model || els.brainModel.value;
       statusEl.textContent = `Downloaded ${status.model}; chat works, but agent tools did not pass.`;
-      els.brainStatus.textContent = `${status.error} Your previous brain is still active. You may save this model for chat only.`;
+      els.brainStatus.textContent = `${status.error} Your previous brain is still active.`;
+      if (els.brainOllamaModel) els.brainOllamaModel.value = coderConfig?.local?.model || "";
     } else if (status.error) {
       statusEl.textContent = `Model setup failed: ${status.error} Your brain setting is unchanged.`;
       els.brainStatus.textContent = "Your brain setting is unchanged.";
+      if (els.brainOllamaModel) els.brainOllamaModel.value = coderConfig?.local?.model || "";
     } else {
       void refreshModelStatus();
     }
     button.disabled = false;
+    if (els.brainOllamaModel) els.brainOllamaModel.disabled = false;
     els.brainSave.disabled = false;
     checking = false;
   };
@@ -3111,31 +3215,27 @@ function pollModelPull({ statusEl = els.brainModelStatus, button = els.brainDown
   void check();
 }
 
-els.brainDownload?.addEventListener("click", async () => {
-  const selectedModel = els.brainModel.value.trim();
+async function setupSelectedOllamaModel() {
+  const selectedModel = els.brainOllamaModel?.value.trim() || "";
   const selectedBaseUrl = els.brainBaseUrl.value.trim();
-  if (!selectedModel) {
-    els.brainModelStatus.textContent = "Enter an Ollama model name or Hugging Face GGUF model link.";
+  if (!selectedModel || selectedModel.toLowerCase().endsWith(":cloud")) {
+    els.brainModelStatus.textContent = "Choose a free local Ollama model.";
     return;
   }
-  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
-    els.brainModelStatus.textContent = "Local service not running.";
+  if (modelSetupStarting || modelPullTimer) {
+    els.brainModelStatus.textContent = "Wait for the current model setup to finish.";
     return;
   }
-  let localOllama = !selectedBaseUrl;
-  if (selectedBaseUrl) {
-    try {
-      const host = new URL(selectedBaseUrl).hostname.toLowerCase().replace(/^\[|\]$/g, "");
-      localOllama = host === "localhost" || host === "::1" || /^127\./.test(host);
-    } catch {
-      // Let the backend return its precise invalid-server-URL error.
-      localOllama = false;
-    }
-  }
-  els.brainDownload.disabled = true;
+  modelSetupStarting = true;
+  const localOllama = !selectedBaseUrl || isLoopbackOllamaUrl(selectedBaseUrl);
+  els.brainOllamaModel.disabled = true;
   els.brainSave.disabled = true;
   els.brainModelStatus.textContent = localOllama ? "Preparing the local model runtime…" : "Checking Ollama server…";
   try {
+    if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+      els.brainModelStatus.textContent = "Local service not running.";
+      return;
+    }
     if (localOllama && typeof window.greyiqDesktop?.ensureOllama === "function") {
       const runtime = await window.greyiqDesktop.ensureOllama();
       if (!runtime?.ok) throw new Error(runtime?.error || "Local model runtime could not start.");
@@ -3147,16 +3247,22 @@ els.brainDownload?.addEventListener("click", async () => {
     });
     if (res.ok === false) {
       els.brainModelStatus.textContent = res.error || "Could not start the download.";
-      els.brainDownload.disabled = false;
-      els.brainSave.disabled = false;
       return;
     }
     pollModelPull();
   } catch (error) {
     els.brainModelStatus.textContent = error.message || "Download failed to start.";
-    els.brainDownload.disabled = false;
-    els.brainSave.disabled = false;
+  } finally {
+    modelSetupStarting = false;
+    if (!modelPullTimer) {
+      els.brainOllamaModel.disabled = false;
+      els.brainSave.disabled = false;
+    }
   }
+}
+
+els.brainOllamaModel?.addEventListener("change", () => {
+  if (els.brainProvider.value === "local" && els.brainOllamaModel.value) void setupSelectedOllamaModel();
 });
 
 function isLoopbackOllamaUrl(baseUrl) {
@@ -3180,16 +3286,19 @@ async function importHuggingFaceModel() {
     els.brainHfStatus.textContent = "Paste a Hugging Face GGUF model URL or hf.co reference.";
     return;
   }
-  if (modelPullTimer) {
-    els.brainHfStatus.textContent = "Wait for the current model download to finish.";
+  if (modelSetupStarting || modelPullTimer) {
+    els.brainHfStatus.textContent = "Wait for the current model setup to finish.";
     return;
   }
-  if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
-    els.brainHfStatus.textContent = "Local GreyIQ service is not running.";
-    return;
-  }
+  modelSetupStarting = true;
   els.brainHfImport.disabled = true;
+  if (els.brainOllamaModel) els.brainOllamaModel.disabled = true;
+  let polling = false;
   try {
+    if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
+      els.brainHfStatus.textContent = "Local GreyIQ service is not running.";
+      return;
+    }
     els.brainHfStatus.textContent = "Preparing Ollama…";
     if (window.greyiqDesktop && typeof window.greyiqDesktop.ensureOllama === "function") {
       const runtime = await window.greyiqDesktop.ensureOllama();
@@ -3204,9 +3313,15 @@ async function importHuggingFaceModel() {
     if (result.ok === false) throw new Error(result.error || "Import could not start.");
     if (!result.active || !result.model) throw new Error("Model setup did not start.");
     pollModelPull({ statusEl: els.brainHfStatus, button: els.brainHfImport });
+    polling = true;
   } catch (error) {
     els.brainHfStatus.textContent = error.message || "Hugging Face import failed.";
-    els.brainHfImport.disabled = false;
+  } finally {
+    modelSetupStarting = false;
+    if (!polling) {
+      els.brainHfImport.disabled = false;
+      if (els.brainOllamaModel) els.brainOllamaModel.disabled = false;
+    }
   }
 }
 

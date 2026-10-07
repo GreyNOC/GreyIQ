@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from html.parser import HTMLParser
 from typing import Any
 
 # Transient HTTP statuses worth retrying: rate limiting and server-side errors.
@@ -130,6 +131,175 @@ class CoderError(RuntimeError):
 _MODEL_PART = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9])?\Z")
 _MODEL_TAG = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?\Z")
 _HF_HOSTS = {"hf.co", "huggingface.co"}
+
+# Ollama's public search is server-rendered. These filters select downloadable
+# local models with tool support; /api/tags is only the operator's installed list.
+OLLAMA_CATALOG_URL = "https://ollama.com/search?c=local&c=tools&o=popular"
+_OLLAMA_CATALOG_PAGE_LIMIT = 10
+_OLLAMA_CATALOG_PAGE_BYTES = 512_000
+_OLLAMA_CATALOG_SIZE = re.compile(r"(?:e?\d+(?:\.\d+)?|\d+x\d+(?:\.\d+)?)[bmt]\Z", re.IGNORECASE)
+
+
+class _OllamaCatalogParser(HTMLParser):
+    """Read model cards from Ollama's public search HTML without executing it."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.models: list[dict[str, Any]] = []
+        self.next_page: int | None = None
+        self._card: dict[str, Any] | None = None
+        self._spans: list[tuple[str, list[str]]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        fields = dict(attrs)
+        if tag == "li" and self._card is None:
+            match = re.fullmatch(r"/search\?page=(\d+)", fields.get("hx-get") or "")
+            if match:
+                self.next_page = int(match.group(1))
+        if tag == "a" and self._card is None:
+            path = fields.get("href") or ""
+            match = re.fullmatch(r"/library/([A-Za-z0-9._/-]+)", path)
+            if match:
+                self._card = {
+                    "name": match.group(1), "description": "", "sizes": [],
+                    "capabilities": set(), "local": False, "downloads": None,
+                }
+                self._spans = []
+            return
+        if self._card is None:
+            return
+        if tag == "h2":
+            self._card["heading"] = fields.get("title") or ""
+        elif tag == "p" and not self._card["description"]:
+            self._card["description"] = (fields.get("title") or "")[:400]
+        elif tag == "span":
+            classes = set((fields.get("class") or "").split())
+            kind = ""
+            if fields.get("role") == "tooltip":
+                kind = "tooltip"
+            elif {"font-medium", "text-black"} <= classes and "group/tip" not in classes:
+                kind = "size"
+            elif {"inline-flex", "items-center"} <= classes:
+                kind = "capability"
+            download_match = re.fullmatch(r"([\d,]+) downloads", fields.get("title") or "")
+            if download_match:
+                self._card["downloads"] = int(download_match.group(1).replace(",", ""))
+            self._spans.append((kind, []))
+
+    def handle_data(self, data: str) -> None:
+        if self._card is not None and self._spans:
+            kind, parts = self._spans[-1]
+            if kind:
+                parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._card is None:
+            return
+        if tag == "span" and self._spans:
+            kind, parts = self._spans.pop()
+            value = " ".join(" ".join(parts).split())
+            if kind == "tooltip" and value == "Runs on your computer":
+                self._card["local"] = True
+            elif kind == "size" and _OLLAMA_CATALOG_SIZE.fullmatch(value):
+                self._card["sizes"].append(value)
+            elif kind == "capability" and value in {"Tools", "Thinking", "Vision", "Embedding", "Decision", "Cloud"}:
+                self._card["capabilities"].add(value)
+        elif tag == "a":
+            card = self._card
+            self._card = None
+            self._spans = []
+            name = card["name"]
+            try:
+                normalized, is_hf = normalize_local_model_reference(name)
+            except CoderError:
+                return
+            if (is_hf or normalized != name or card.get("heading") != name
+                    or not card["local"] or "Tools" not in card["capabilities"]):
+                return
+            capabilities = card["capabilities"]
+            self.models.append({
+                "name": name,
+                "description": card["description"],
+                "sizes": list(dict.fromkeys(card["sizes"])),
+                "tools": True,
+                "thinking": "Thinking" in capabilities,
+                "vision": "Vision" in capabilities,
+                "downloads": card["downloads"],
+                "url": f"https://ollama.com/library/{name}",
+            })
+
+
+class _OllamaCatalogRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        parsed = urllib.parse.urlsplit(newurl)
+        if parsed.scheme != "https" or parsed.netloc != "ollama.com":
+            raise CoderError("Ollama's catalog redirected away from its official server.")
+        return super().redirect_request(request, fp, code, msg, headers, newurl)
+
+
+def ollama_public_catalog(*, timeout_s: float = 5.0, deadline_s: float = 20.0) -> dict[str, Any]:
+    """Fetch current free, locally downloadable tool models from ollama.com.
+
+    Search pagination is an HTMX endpoint: page=2 silently repeats page one
+    unless HX-Request is set. Keep both per-page and overall time/size limits.
+    A failed later page returns an explicitly partial list, never a stale cache.
+    """
+    opener = urllib.request.build_opener(_OllamaCatalogRedirects())
+    started = time.monotonic()
+    page = 1
+    seen: set[str] = set()
+    models: list[dict[str, Any]] = []
+    warning = ""
+    while page <= _OLLAMA_CATALOG_PAGE_LIMIT:
+        remaining = deadline_s - (time.monotonic() - started)
+        if remaining <= 0:
+            warning = "Ollama's catalog request timed out before all pages loaded."
+            break
+        url = f"{OLLAMA_CATALOG_URL}&page={page}"
+        request = urllib.request.Request(
+            url, headers={"Accept": "text/html", "HX-Request": "true", "User-Agent": "GreyIQ/1.0"},
+        )
+        try:
+            with opener.open(request, timeout=min(timeout_s, remaining)) as response:
+                if "text/html" not in (response.headers.get("Content-Type") or "").lower():
+                    raise CoderError("Ollama returned an unexpected catalog format.")
+                raw = response.read(_OLLAMA_CATALOG_PAGE_BYTES + 1)
+            if len(raw) > _OLLAMA_CATALOG_PAGE_BYTES:
+                raise CoderError("Ollama's catalog page is too large to read safely.")
+            parser = _OllamaCatalogParser()
+            parser.feed(raw.decode("utf-8"))
+            parser.close()
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, UnicodeDecodeError, ValueError) as exc:
+            message = f"Could not load Ollama's model catalog ({type(exc).__name__}). Retry later."
+            if not models:
+                raise CoderError(message) from exc
+            warning = message
+            break
+        except CoderError as exc:
+            if not models:
+                raise
+            warning = str(exc)
+            break
+        added = 0
+        for model in parser.models:
+            if model["name"] not in seen:
+                seen.add(model["name"])
+                models.append(model)
+                added += 1
+        if not added:
+            if not models:
+                raise CoderError("Ollama's catalog has no readable local tool models. Retry later.")
+            warning = "Ollama's catalog pagination repeated or changed; only part of the list loaded."
+            break
+        if parser.next_page is None:
+            break
+        if parser.next_page != page + 1:
+            warning = "Ollama's catalog pagination changed; only part of the list loaded."
+            break
+        page = parser.next_page
+    else:
+        warning = "Ollama's catalog contains more pages than the current limit; only part of the list loaded."
+    return {"models": models, "partial": bool(warning), "warning": warning}
 
 
 def normalize_local_model_reference(reference: str) -> tuple[str, bool]:
@@ -696,7 +866,7 @@ def ollama_chat(
 
 
 def ollama_list_models(host: str, timeout: float = 10.0) -> list[str]:
-    """Names of models already pulled into the local Ollama store (/api/tags)."""
+    """Names of locally stored model weights (/api/tags), excluding cloud stubs."""
     endpoint = host.rstrip("/") + "/api/tags"
     try:
         with _ollama_open(endpoint, timeout=timeout) as response:
@@ -707,7 +877,15 @@ def ollama_list_models(host: str, timeout: float = 10.0) -> list[str]:
         ) from exc
     except Exception as exc:  # noqa: BLE001
         raise CoderError(f"Ollama request failed: {exc}") from exc
-    return [str(m.get("name") or m.get("model") or "") for m in (body.get("models") or []) if isinstance(m, dict)]
+    installed = []
+    for model in (body.get("models") or []):
+        if not isinstance(model, dict):
+            continue
+        name = str(model.get("name") or model.get("model") or "")
+        if not name or name.casefold().endswith(":cloud") or model.get("size") == 0:
+            continue
+        installed.append(name)
+    return installed
 
 
 def ollama_delete(host: str, model: str, timeout: float = 20.0) -> None:

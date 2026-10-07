@@ -24,7 +24,7 @@ test('saved loopback model starts its runtime once when the renderer loads', asy
   async function exercise(config) {
     let starts = 0;
     let refreshes = 0;
-    const els = { brainForm: {}, brainStatus: { textContent: '' }, brainDownload: {}, brainSave: {} };
+    const els = { brainForm: {}, brainStatus: { textContent: '' }, brainOllamaModel: {}, brainSave: {} };
     const context = {
       coderConfig: null, savedLocalRuntimeBootAttempted: false, els,
       isLoopbackOllamaUrl: loopback,
@@ -56,7 +56,7 @@ test('late runtime startup does not replace a newer model setup result', async (
   const loadSource = functionSource('async function loadCoderConfig(', 'els.brainProvider?.addEventListener(');
   let resolveRuntime;
   const runtime = new Promise((resolve) => { resolveRuntime = resolve; });
-  const els = { brainForm: {}, brainStatus: { textContent: '' }, brainDownload: {}, brainSave: {} };
+  const els = { brainForm: {}, brainStatus: { textContent: '' }, brainOllamaModel: {}, brainSave: {} };
   const context = {
     coderConfig: null, savedLocalRuntimeBootAttempted: false, els,
     isLoopbackOllamaUrl: loopback,
@@ -83,7 +83,7 @@ test('Hugging Face import starts setup without a premature model selection', asy
     brainHfStatus: { textContent: '' }, brainHfImport: { disabled: false },
   };
   const context = {
-    els, modelPullTimer: null, service: { available: true },
+    els, modelPullTimer: null, modelSetupStarting: false, service: { available: true },
     refreshServiceStatus: async () => true,
     window: { greyiqDesktop: { ensureOllama: async () => ({ ok: true }) } },
     apiFetch: async (url, options) => {
@@ -102,17 +102,16 @@ test('Hugging Face import starts setup without a premature model selection', asy
 });
 
 test('model setup status selects only when chat and tool readiness passed', async () => {
-  const pollSource = functionSource('function pollModelPull(', 'els.brainDownload?.addEventListener(');
+  const pollSource = functionSource('function pollModelPull(', 'async function setupSelectedOllamaModel(');
   async function exercise(status) {
     let loads = 0;
     const els = {
-      brainModelStatus: { textContent: '' }, brainDownload: { disabled: true },
+      brainModelStatus: { textContent: '' }, brainOllamaModel: { disabled: true, value: 'previous-model' },
       brainSave: { disabled: true }, brainStatus: { textContent: '' },
-      brainModel: { value: 'previous-model' },
       brainHfStatus: { textContent: '' }, brainHfImport: { disabled: true },
     };
     const context = {
-      els, modelPullTimer: null,
+      els, modelPullTimer: null, coderConfig: { local: { model: 'previous-model' } },
       apiFetch: async (url) => {
         assert.equal(url, '/api/coder/pull');
         return status;
@@ -144,7 +143,7 @@ test('model setup status selects only when chat and tool readiness passed', asyn
     const failed = await exercise({ done: true, selected: false,
       model: 'hf.co/acme/Code-GGUF', error });
     assert.equal(failed.loads, 0, 'a failed import must not load or select the new brain');
-    assert.equal(failed.els.brainModel.value, 'previous-model');
+    assert.equal(failed.els.brainOllamaModel.value, 'previous-model');
     assert.equal(failed.els.brainHfImport.disabled, false, 'retry must be available');
     assert.match(failed.els.brainHfStatus.textContent, /Your brain setting is unchanged\./);
     assert.ok(failed.els.brainHfStatus.textContent.includes(error));

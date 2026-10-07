@@ -1876,9 +1876,13 @@ class GreyIQRuntime:
         block = cfg.get("local") or {}
         return coder.ollama_host(block.get("base_url")), str(block.get("model") or "").strip()
 
-    def list_local_models(self) -> dict[str, Any]:
+    def list_local_models(self, base_url: str | None = None) -> dict[str, Any]:
         host, model = self._local_brain()
         try:
+            # An unsaved server field in Settings should show that server's
+            # installed models, using the same URL validation as setup.
+            if base_url is not None:
+                host = coder.ollama_setup_host(base_url)
             installed = coder.ollama_list_models(host)
             return {
                 "ok": True,
@@ -1888,6 +1892,20 @@ class GreyIQRuntime:
             }
         except coder.CoderError as exc:
             return {"ok": False, "error": str(exc), "configured": model, "installed": [], "present": False}
+
+    def list_public_ollama_models(self) -> dict[str, Any]:
+        """Live Ollama-owned catalog for the one-click local coding brain."""
+        try:
+            catalog = coder.ollama_public_catalog()
+            return {
+                "ok": True, "source": coder.OLLAMA_CATALOG_URL,
+                "fetched_at": datetime.now(UTC).isoformat(), **catalog,
+            }
+        except coder.CoderError as exc:
+            return {
+                "ok": False, "source": coder.OLLAMA_CATALOG_URL,
+                "models": [], "error": str(exc),
+            }
 
     def model_pull_status(self) -> dict[str, Any]:
         with self.lock:
@@ -2093,6 +2111,12 @@ class GreyIQRuntime:
         with self.lock:
             if self.model_pull.get("active") and self.model_pull.get("model") == target:
                 return {"ok": False, "error": "That model is still downloading."}
+            config = self._coder_config()
+            active = str((config.get("local") or {}).get("model") or "")
+            if (config.get("enabled") and config.get("provider") == "local"
+                    and active and (coder.model_installed([target], active)
+                                    or coder.model_installed([active], target))):
+                return {"ok": False, "error": "Select another local model before removing the active brain."}
         host, _ = self._local_brain()
         try:
             coder.ollama_delete(host, target)
@@ -7199,7 +7223,14 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             await send_json(send, await asyncio.to_thread(runtime.coder_test))
             return
         if method == "GET" and path == "/api/coder/models":
-            await send_json(send, await asyncio.to_thread(runtime.list_local_models))
+            params = parse_qs(scope.get("query_string", b"").decode("utf-8", "replace"), keep_blank_values=True)
+            urls = params.get("base_url", [])
+            if len(urls) > 1:
+                raise HTTPError(422, "Supply one Ollama server URL.")
+            await send_json(send, await asyncio.to_thread(runtime.list_local_models, urls[0] if urls else None))
+            return
+        if method == "GET" and path == "/api/coder/catalog":
+            await send_json(send, await asyncio.to_thread(runtime.list_public_ollama_models))
             return
         if method == "POST" and path == "/api/coder/pull":
             body = await read_json_body(receive)

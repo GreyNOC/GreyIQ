@@ -1123,9 +1123,22 @@ label {
   font-size: 0.7rem;
 }
 
-.hf-import {
+.ollama-picker {
   display: grid;
   gap: 0.5rem;
+  min-width: 0;
+}
+
+.ollama-picker label {
+  min-width: 0;
+}
+
+.ollama-picker select {
+  width: 100%;
+}
+
+.hf-import {
+  display: block;
   border: 1px solid var(--line);
   background: var(--surface);
   padding: 0.7rem;
@@ -1136,14 +1149,19 @@ label {
   display: none;
 }
 
-.hf-import h3,
-.hf-import p {
-  margin: 0;
+.hf-import summary {
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--ink);
 }
 
-.hf-import h3 {
-  font-size: 0.82rem;
-  color: var(--ink);
+.hf-import > :not(summary) {
+  margin-top: 0.5rem;
+}
+
+.hf-import p {
+  margin: 0;
 }
 
 .hf-import input {

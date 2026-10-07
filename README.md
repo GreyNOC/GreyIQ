@@ -124,23 +124,18 @@ npm run check:devops
 In the **Coding brain** panel (training column) pick a provider:
 
 - **Off** — bundled, source-labelled offline playbooks; the character-level TinyGPT experiment runs only in development builds.
-- **Local model (Ollama)** — e.g. `qwen2.5-coder:14b`. The Ollama runtime isn't shipped in the installer — GreyIQ fetches it (with its bundled NVIDIA/CUDA runner) the first time you select the local model, offers one-click model download, and uses your GPU automatically: NVIDIA works out of the box; on an AMD box GreyIQ fetches Ollama's ROCm runtime separately on first run. No supported GPU → it runs on CPU.
+- **Local model (Ollama)** — choose from a live dropdown of free, locally downloadable models with tool support from [Ollama's catalog](https://ollama.com/search?c=local&c=tools). GreyIQ also lists weights already installed on the selected Ollama server. Picking a model starts download and chat/tool readiness checks, then selects it automatically when both pass. The Ollama runtime isn't shipped in the installer — GreyIQ fetches it (with its bundled NVIDIA/CUDA runner) on first local setup. On AMD, GreyIQ fetches Ollama's ROCm runtime separately; without a supported GPU, it runs on CPU.
 - **Claude API** — paste an Anthropic key (default model `claude-opus-4-8`).
 - **OpenAI-compatible** — any `/v1/chat/completions` endpoint.
 
-For a local Hugging Face model, paste a **public GGUF model page** such as
-`https://huggingface.co/owner/model-GGUF`, an `hf.co/owner/model-GGUF:quant`
-reference, or its `ollama run ...` command into the model field. Click
-**Download and use** once. GreyIQ starts Ollama if needed, downloads the selected
-model, checks that it appears locally, and tests chat and structured tool calls
-before switching the active brain. A model that only supports chat stays
-available for manual selection; the previous brain remains active. Private,
-gated, and non-GGUF repositories need their own access or conversion steps.
-
-The dedicated **Import from Hugging Face** control also accepts a GGUF model
-page URL or `hf.co/owner/model-GGUF:Q4_K_M` reference. Choose **Import and select**
-to download through local Ollama and run the same chat and agent-tool checks as
-**Download and use**. GreyIQ selects it only when those checks pass; the model
+For a Hugging Face model, expand **Import a Hugging Face GGUF model**, paste a
+public GGUF model page such as `https://huggingface.co/owner/model-GGUF` or an
+`hf.co/owner/model-GGUF:Q4_K_M` reference, and choose **Import and select**.
+GreyIQ starts local Ollama if needed, downloads the weights, checks that they
+appear locally, and tests chat and structured tool calls before switching the
+active brain. A model that only supports chat leaves the previous brain active.
+Private, gated, and non-GGUF repositories need separate access or conversion.
+Once selected, the model
 then also drives BugHunter's hunt planning when the brain is enabled. If a model
 is unavailable during a hunt, the bounded offline planner still runs. The
 packaged desktop starts the saved local runtime again after app restart. For
