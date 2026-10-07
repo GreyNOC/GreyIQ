@@ -59,7 +59,9 @@ from bughunter.bounty import (
     _classify,
     _deterministic_attack_plan,
     _infer_kind,
+    _repository_scope_preflight,
     _safe_slug,
+    _url_scope_preflight,
     build_findings_har,
     build_replay_script,
     run_bounty_hunt,
@@ -259,6 +261,24 @@ def _bind_unknown_issuer_to_target(auth: dict[str, Any] | None, target: str) -> 
     return {**auth, "issuer_host": host} if host else None
 
 
+def _campaign_preflight_error(target: str, scope: str, authorized: bool, settings: Any) -> str:
+    """Apply the per-hunt target grant before campaign login, recon, or output."""
+    clean_target = str(target or "").strip()
+    if not clean_target:
+        return "No target provided."
+    if not authorized:
+        return "Confirm you're authorized and in scope before running a campaign."
+    kind = _infer_kind(clean_target)
+    if kind == "unknown":
+        return "Could not tell if the target is a URL or a repo/path."
+    if kind == "url":
+        _, error = _url_scope_preflight(clean_target, scope, settings)
+        return error
+    if kind == "git":
+        return _repository_scope_preflight(clean_target, scope, settings)
+    return ""  # Explicitly authorized local source paths do not use network scope.
+
+
 def run_campaign(target: str, *, account_access: dict[str, Any] | None = None,
                  user_agent_suffix: str = "", external_mcp_hunt: bool = False,
                  mcp_manager: Any = None, **kwargs: Any) -> dict[str, Any]:
@@ -274,6 +294,15 @@ def run_campaign(target: str, *, account_access: dict[str, Any] | None = None,
     requirement plumbing (a login + a contextvar with a guaranteed reset) out of the long body."""
     scope = str(kwargs.get("scope") or "")
     on_progress = kwargs.get("on_progress")
+
+    preflight_settings = dataclasses.replace(
+        get_settings(), excluded_hosts=tuple(kwargs.get("excluded_hosts") or ()),
+    )
+    preflight_error = _campaign_preflight_error(
+        target, scope, bool(kwargs.get("authorized")), preflight_settings,
+    )
+    if preflight_error:
+        return {"ok": False, "error": preflight_error}
 
     def _emit(msg: str) -> None:
         if callable(on_progress):
@@ -371,6 +400,11 @@ def _run_campaign_body(
         excluded_hosts=tuple(excluded_hosts or ()),
         recon_osint_enabled=bool(osint or base_settings.recon_osint_enabled),
     )
+    # Keep direct callers of this internal function behind the same grant as
+    # the public wrapper. This must precede the output folder and recon crawl.
+    preflight_error = _campaign_preflight_error(clean_target, scope, authorized, campaign_settings)
+    if preflight_error:
+        return {"ok": False, "error": preflight_error}
 
     rt = runtime_dir
     payout_priors = learning.learned_priors(rt, program, clean_target) if rt is not None else {}
@@ -1479,6 +1513,21 @@ def run_campaign_over_targets(
     if not authorized:
         return {"ok": False, "error": "Confirm you're authorized and in scope before running a campaign."}
 
+    # Validate every named target before the span's one-time research-account
+    # login. Invalid targets remain individual errors; eligible targets still run.
+    preflight_settings = dataclasses.replace(
+        get_settings(), excluded_hosts=tuple(excluded_hosts or ()),
+    )
+    preflight_errors = {
+        target: error
+        for target in capped
+        if (error := _campaign_preflight_error(target, scope, authorized, preflight_settings))
+    }
+    eligible_targets = [target for target in capped if target not in preflight_errors]
+    if not eligible_targets:
+        return {"ok": False, "error": "Every target in this program's scope failed preflight: "
+                + "; ".join(f"{target}: {error}" for target, error in list(preflight_errors.items())[:5])}
+
     def _emit(msg: str) -> None:
         if callable(on_progress):
             try:
@@ -1491,10 +1540,10 @@ def run_campaign_over_targets(
     # domains. That includes request-level auth and saved pasted cookies whose
     # login_url is absent or outside the program's scope.
     try:
-        hosts = [(urlparse(target).hostname or "") for target in capped]
+        hosts = [(urlparse(target).hostname or "") for target in eligible_targets]
     except ValueError:
         hosts = []
-    cross_site_span = (len(capped) > 1 and
+    cross_site_span = (len(eligible_targets) > 1 and
                        (not hosts or not hosts[0] or
                         any(not scan_auth.same_registrable_site(host, hosts[0]) for host in hosts[1:])))
     account_access_for_targets = account_access
@@ -1573,6 +1622,12 @@ def run_campaign_over_targets(
         # run (progress_unit set) — in portfolio mode the portfolio owns the program unit, so
         # we don't mark per-target here; findings still stream to the program unit below.
         unit = progress_unit or target
+        if target in preflight_errors:
+            error = preflight_errors[target]
+            if progress_unit is None:
+                progress.mark_target(progress_run_id, target, "error", error=error)
+            _target_emit(f"skipped — {error}")
+            return (target, {"ok": False, "error": error}, None)
         if progress.is_stopped(progress_run_id):
             if progress_unit is None:
                 progress.mark_target(progress_run_id, target, "skipped")

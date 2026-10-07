@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
@@ -52,6 +53,30 @@ class CampaignTests(unittest.TestCase):
         )
         self.assertFalse(result["ok"])
         self.assertIn("authorized", result["error"].lower())
+
+    def test_url_scope_preflight_blocks_login_recon_and_output(self) -> None:
+        target = "https://app.example.com/"
+        cases = (
+            ("", (), "scope"),
+            ("other.example.com", (), "not explicitly named"),
+            ("https://app.example.com/", (), "host"),
+            ("app.example.com", ("app.example.com",), "excluded"),
+        )
+        with (patch.object(campaign.account_login_service, "login") as login,
+              patch.object(campaign.recon, "discover") as discover):
+            for scope, excluded, message in cases:
+                with self.subTest(scope=scope, excluded=excluded):
+                    result = campaign.run_campaign(
+                        target, scope=scope, authorized=True, coder_cfg={},
+                        default_reports_dir=self.reports, runtime_dir=self.runtime,
+                        account_access={"login_url": "https://app.example.com/login"},
+                        excluded_hosts=excluded,
+                    )
+                    self.assertFalse(result["ok"])
+                    self.assertIn(message, result["error"].lower())
+            login.assert_not_called()
+            discover.assert_not_called()
+        self.assertFalse(self.reports.exists())
 
     def test_osint_opt_in_settings_reach_recon(self) -> None:
         target = "https://app.example.com/"
@@ -1181,6 +1206,39 @@ class RunCampaignOverTargetsTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("authorized", result["error"].lower())
 
+    def test_all_invalid_targets_stop_before_shared_login_or_output(self) -> None:
+        with (patch.object(campaign, "_login_auth") as login,
+              patch.object(campaign.recon, "discover") as discover):
+            result = campaign.run_campaign_over_targets(
+                ["https://outside.example.com/"], scope="app.example.com",
+                authorized=True, coder_cfg={}, default_reports_dir=self.reports,
+                account_access={"login_url": "https://app.example.com/login"},
+            )
+            self.assertFalse(result["ok"])
+            self.assertIn("preflight", result["error"].lower())
+            login.assert_not_called()
+            discover.assert_not_called()
+        self.assertFalse(self.reports.exists())
+
+    def test_span_skips_invalid_target_and_runs_valid_target(self) -> None:
+        valid = "https://app.example.com/"
+        invalid = "https://outside.example.com/"
+        fake_result = {
+            "ok": True, "campaign_path": "", "json_path": "", "urls_scanned": 1,
+            "urls_discovered": 1, "finding_count": 0, "confirmed_count": 0,
+            "submission_paths": [], "findings": [], "proof_of_impact": {},
+            "cvss": {}, "attack_plans": {}, "surface": {}, "risk": "clean",
+        }
+        with patch.object(campaign, "run_campaign", return_value=fake_result) as run:
+            result = campaign.run_campaign_over_targets(
+                [invalid, valid], scope="app.example.com", authorized=True,
+                coder_cfg={}, default_reports_dir=self.reports,
+            )
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual([row["ok"] for row in result["per_target"]], [False, True])
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], valid)
+
     def test_attack_map_option_is_forwarded_to_each_target(self) -> None:
         # QAQC regression: the span path must HONOR the attack-map opt-out (it was silently defaulting
         # to True). Prove the per-target run_campaign receives whatever include_attack_map the span got.
@@ -1270,10 +1328,10 @@ class RunCampaignOverTargetsTests(unittest.TestCase):
         # ref numbers than target B's, regardless of which target's worker thread
         # happens to finish first.
         original = campaign.run_campaign
-        # Target "slow" finishes AFTER target "fast" despite being submitted first
-        # (it's index 1) -- if aggregation used completion order instead of target
-        # order, "fast"'s finding would get C1 instead of C2.
-        order = {"slow": 0.25, "fast": 0.0}
+        # The first local source target finishes after the second. These are
+        # valid targets even though the per-target campaign is mocked below.
+        slow, fast = str(self.src_a), str(self.src_b)
+        order = {slow: 0.25, fast: 0.0}
 
         def fake_run_campaign(target, **kw):
             time.sleep(order.get(target, 0.0))
@@ -1285,13 +1343,13 @@ class RunCampaignOverTargetsTests(unittest.TestCase):
 
         campaign.run_campaign = fake_run_campaign
         try:
-            result = self._run(["slow", "fast"])
+            result = self._run([slow, fast])
         finally:
             campaign.run_campaign = original
         self.assertTrue(result["ok"], result.get("error"))
         titles_by_ref = {f["ref"]: f["title"] for f in result["findings"]}
-        self.assertEqual(titles_by_ref["C1"], "finding for slow")
-        self.assertEqual(titles_by_ref["C2"], "finding for fast")
+        self.assertEqual(titles_by_ref["C1"], f"finding for {slow}")
+        self.assertEqual(titles_by_ref["C2"], f"finding for {fast}")
 
     def test_writes_a_span_index_and_a_bundleable_output_dir(self) -> None:
         result = self._run([str(self.src_a), str(self.src_b)])
