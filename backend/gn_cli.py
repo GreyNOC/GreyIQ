@@ -896,6 +896,13 @@ def _cmd_operator(args: argparse.Namespace) -> int:
         except KeyboardInterrupt:
             loop.stop()
             print(_c("\nKill switch — stopping…", "33"))
+        finally:
+            # The supervisor is a daemon thread. Wait for its audit and lease
+            # cleanup before the CLI process can exit (also on poll errors).
+            if loop.running and not loop.stop_event.is_set():
+                loop.stop()
+            if loop._thread is not None:
+                loop._thread.join()
         return 0
 
     return _err(f"unknown operator action: {action}")

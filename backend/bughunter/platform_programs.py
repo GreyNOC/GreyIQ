@@ -1,14 +1,13 @@
-"""Read-only previews of programs visible to a researcher on Bugcrowd or Intigriti.
+"""Read-only previews of Intigriti programs visible to a researcher.
 
 This adapter never writes portfolio records or grants testing authority. It uses
-only the platforms' documented researcher-readable GET endpoints, pins each
+only the platform's documented researcher-readable GET endpoints, pins each
 credentialed request to its API host, refuses redirects, and bounds both network
 responses and fan-out. A preview is evidence for operator review, not a scope
 authorization. In particular, free-text exclusions are not converted to targets.
 
-Schemas: Bugcrowd API 1.1.0 (program -> engagement -> engagement brief/target
-groups/targets); Intigriti researcher API v1.0 (program domains and rules of
-engagement). Both can expose less than the complete human-facing program policy.
+Schema: Intigriti researcher API v1.0 (program domains and rules of engagement).
+It can expose less than the complete human-facing program policy.
 """
 
 from __future__ import annotations
@@ -22,7 +21,6 @@ from datetime import UTC, datetime
 from typing import Any, Callable
 
 _BASE = {
-    "bugcrowd": "https://api.bugcrowd.com",
     "intigriti": "https://api.intigriti.com/external/researcher",
 }
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
@@ -30,7 +28,6 @@ _HANDLE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}\Z")
 _MAX_LIST = 100
 _PAGE_SIZE = 25
 _MAX_PAGES = 4
-_MAX_ENGAGEMENTS = 8
 _MAX_SCOPE = 300
 _MAX_RESPONSE_BYTES = 4_000_000
 _TIMEOUT = 15.0
@@ -79,29 +76,15 @@ def _safe_api_url(platform: str, url: str) -> bool:
         if any(len(values) != 1 for values in query.values()):
             return False
         path = parts.path
-        if platform == "bugcrowd":
-            if path == "/programs":
-                allowed = {"page[limit]", "page[offset]"}
-            elif re.fullmatch(r"/programs/" + _UUID.pattern[:-2], path):
-                allowed = {"include"}
-                if query.get("include", ["engagements"])[0] != "engagements":
-                    return False
-            elif re.fullmatch(r"/engagements/" + _UUID.pattern[:-2], path):
-                allowed = {"include"}
-                if query.get("include", ["engagement_brief.engagement_brief_target_groups.targets"])[0] != "engagement_brief.engagement_brief_target_groups.targets":
-                    return False
-            else:
-                return False
+        if path == "/external/researcher/v1/programs":
+            allowed = {"limit", "offset"}
+        elif re.fullmatch(r"/external/researcher/v1/programs/" + _UUID.pattern[:-2], path):
+            allowed = set()
         else:
-            if path == "/external/researcher/v1/programs":
-                allowed = {"limit", "offset"}
-            elif re.fullmatch(r"/external/researcher/v1/programs/" + _UUID.pattern[:-2], path):
-                allowed = set()
-            else:
-                return False
+            return False
         if not set(query) <= allowed:
             return False
-        for key in ({"page[limit]", "page[offset]", "limit", "offset"} & set(query)):
+        for key in ({"limit", "offset"} & set(query)):
             if not query[key][0].isdigit():
                 return False
         return True
@@ -121,18 +104,17 @@ def _fetch_json(url: str, *, headers: dict[str, str], timeout: float) -> Any:
 def _request(platform: str, url: str, credential: str, fetch: Callable[..., Any] | None) -> Any:
     if not _safe_api_url(platform, url):
         raise ValueError("Unsafe platform API URL")
-    auth = "Token " if platform == "bugcrowd" else "Bearer "
-    accept = "application/vnd.bugcrowd+json" if platform == "bugcrowd" else "application/json"
-    return (fetch or _fetch_json)(url, headers={"Authorization": auth + credential, "Accept": accept,
+    return (fetch or _fetch_json)(url, headers={"Authorization": "Bearer " + credential,
+                                          "Accept": "application/json",
                                           "User-Agent": _UA}, timeout=_TIMEOUT)
 
 
 def _valid_credential(platform: str, credential: Any) -> bool:
-    if not isinstance(credential, str) or len(credential) > 2000 or not credential:
+    if platform not in _BASE or not isinstance(credential, str) or len(credential) > 2000 or not credential:
         return False
     if any(ord(ch) < 33 or ord(ch) > 126 for ch in credential):
         return False
-    return platform != "bugcrowd" or credential.count(":") == 1 and all(credential.split(":"))
+    return True
 
 
 def _error(platform: str, exc: Exception) -> dict[str, Any]:
@@ -155,23 +137,14 @@ def _error(platform: str, exc: Exception) -> dict[str, Any]:
 def _candidate(platform: str, row: Any) -> dict[str, str] | None:
     if not isinstance(row, dict):
         return None
-    if platform == "bugcrowd":
-        if row.get("type") != "program":
-            return None
-        program_id = _uuid(row.get("id"))
-        attrs = _mapping(row.get("attributes"))
-        handle = _plain(attrs.get("code"), 100)
-        name = _plain(attrs.get("name"), 200)
-        status = "unknown"  # State lives on the program's engagements, not the program.
-    else:
-        program_id = _uuid(row.get("id"))
-        handle = _plain(row.get("handle"), 100)
-        name = _plain(row.get("name"), 200)
-        status = _plain(_mapping(row.get("status")).get("value"), 60) or "unknown"
+    program_id = _uuid(row.get("id"))
+    handle = _plain(row.get("handle"), 100)
+    name = _plain(row.get("name"), 200)
+    status = _plain(_mapping(row.get("status")).get("value"), 60) or "unknown"
     if not program_id or not _HANDLE.fullmatch(handle) or not name:
         return None
     return {"id": program_id, "handle": handle, "name": name, "status": status,
-            "source_url": f"{_BASE[platform]}{'/programs/' if platform == 'bugcrowd' else '/v1/programs/'}{program_id}"}
+            "source_url": f"{_BASE[platform]}/v1/programs/{program_id}"}
 
 
 def list_programs(platform: str, credential: str, *, fetch: Callable[..., Any] | None = None,
@@ -194,9 +167,8 @@ def list_programs(platform: str, credential: str, *, fetch: Callable[..., Any] |
         size = min(_PAGE_SIZE, cap - len(programs))
         if size <= 0:
             break
-        query = urllib.parse.urlencode({("page[limit]" if platform == "bugcrowd" else "limit"): size,
-                                         ("page[offset]" if platform == "bugcrowd" else "offset"): offset})
-        url = f"{_BASE[platform]}{'/programs' if platform == 'bugcrowd' else '/v1/programs'}?{query}"
+        query = urllib.parse.urlencode({"limit": size, "offset": offset})
+        url = f"{_BASE[platform]}/v1/programs?{query}"
         try:
             payload = _request(platform, url, credential, fetch)
         except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
@@ -209,7 +181,7 @@ def list_programs(platform: str, credential: str, *, fetch: Callable[..., Any] |
                 return {"ok": False, "programs": [], "warnings": [], "error": "Unexpected program-list response."}
             warnings.append("Program listing stopped at a malformed page; results may be incomplete.")
             break
-        rows = payload.get("data") if platform == "bugcrowd" else payload.get("records")
+        rows = payload.get("records")
         if not isinstance(rows, list):
             if not programs:
                 return {"ok": False, "programs": [], "warnings": [], "error": "Unexpected program-list response."}
@@ -227,8 +199,7 @@ def list_programs(platform: str, credential: str, *, fetch: Callable[..., Any] |
             warnings.append(f"Skipped {bad_rows} malformed program row(s) on page {page_no + 1}.")
         if len(rows) > size:
             warnings.append("API returned more rows than requested; extra rows were ignored.")
-        total = (_mapping(payload.get("meta")).get("total_hits") if platform == "bugcrowd"
-                 else payload.get("maxCount"))
+        total = payload.get("maxCount")
         offset += size
         if isinstance(total, int) and not isinstance(total, bool) and total <= offset:
             break
@@ -242,148 +213,10 @@ def list_programs(platform: str, credential: str, *, fetch: Callable[..., Any] |
     return {"ok": True, "programs": programs, "warnings": warnings, "count": len(programs)}
 
 
-def _relation_refs(resource: dict[str, Any], name: str, expected_type: str) -> list[str] | None:
-    relation = _mapping(_mapping(resource.get("relationships")).get(name))
-    data = relation.get("data")
-    if not isinstance(data, list):
-        return None
-    refs: list[str] = []
-    for item in data:
-        if not isinstance(item, dict) or item.get("type") != expected_type or not _uuid(item.get("id")):
-            return None
-        refs.append(_uuid(item["id"]))
-    meta = _mapping(_mapping(relation.get("links")).get("related")).get("meta")
-    total = _mapping(meta).get("total_hits")
-    if isinstance(total, int) and total > len(refs):
-        return None
-    return refs
-
-
-def _included_index(payload: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
-    included = payload.get("included")
-    if not isinstance(included, list):
-        return {}
-    out = {}
-    for row in included[:_MAX_SCOPE * 3]:
-        if isinstance(row, dict) and isinstance(row.get("type"), str) and _uuid(row.get("id")):
-            out[(row["type"], _uuid(row["id"]))] = row
-    return out
-
-
 def _scope_row(identifier: str, asset_type: str, included: bool, instruction: str = "") -> dict[str, Any]:
     return {"identifier": identifier[:500], "asset_type": asset_type[:60],
             "eligible_for_submission": included, "eligible_for_bounty": False,
             "instruction": instruction[:2000], "max_severity": ""}
-
-
-def _preview_bugcrowd(program_id: str, credential: str, fetch: Callable[..., Any] | None) -> dict[str, Any]:
-    source_url = f"{_BASE['bugcrowd']}/programs/{program_id}"
-    payload = _request("bugcrowd", source_url + "?include=engagements", credential, fetch)
-    row = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(row, dict) or row.get("type") != "program" or _uuid(row.get("id")) != program_id:
-        raise ValueError("Malformed program detail")
-    attrs = _mapping(row.get("attributes"))
-    handle = _plain(attrs.get("code"), 100)
-    name = _plain(attrs.get("name"), 200)
-    if not _HANDLE.fullmatch(handle) or not name:
-        raise ValueError("Malformed program detail")
-    warnings: list[str] = []
-    entries: list[dict[str, Any]] = []
-    excerpts: list[str] = []
-    statuses: set[str] = set()
-    complete = True
-    engagement_ids = _relation_refs(row, "engagements", "engagement")
-    if engagement_ids is None or not engagement_ids:
-        complete = False
-        warnings.append("Bugcrowd did not provide a complete engagement relation; no scope can be confirmed.")
-        engagement_ids = []
-    if len(engagement_ids) > _MAX_ENGAGEMENTS:
-        complete = False
-        warnings.append(f"Only the first {_MAX_ENGAGEMENTS} engagements were previewed.")
-    for engagement_id in engagement_ids[:_MAX_ENGAGEMENTS]:
-        url = (f"{_BASE['bugcrowd']}/engagements/{engagement_id}"
-               "?include=engagement_brief.engagement_brief_target_groups.targets")
-        try:
-            detail = _request("bugcrowd", url, credential, fetch)
-        except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError, TimeoutError):
-            complete = False
-            warnings.append("An engagement could not be read; scope preview is incomplete.")
-            continue
-        engagement = detail.get("data") if isinstance(detail, dict) else None
-        if (not isinstance(engagement, dict) or engagement.get("type") != "engagement"
-                or _uuid(engagement.get("id")) != engagement_id):
-            complete = False
-            warnings.append("Bugcrowd returned a malformed engagement; scope preview is incomplete.")
-            continue
-        state = _plain(_mapping(engagement.get("attributes")).get("state"), 60)
-        if state:
-            statuses.add(state)
-        brief_ref = _mapping(_mapping(engagement.get("relationships")).get("engagement_brief")).get("data")
-        included = _included_index(detail)
-        if not isinstance(brief_ref, dict) or brief_ref.get("type") != "engagement_brief":
-            complete = False
-            warnings.append("An engagement brief is missing; scope preview is incomplete.")
-            continue
-        brief = included.get(("engagement_brief", _uuid(brief_ref.get("id"))))
-        if not brief:
-            complete = False
-            warnings.append("An engagement brief was not included; scope preview is incomplete.")
-            continue
-        brief_attrs = _mapping(brief.get("attributes"))
-        for key in ("description", "targets_overview"):
-            excerpt = _excerpt(brief_attrs.get(key), 2000)
-            if excerpt and excerpt not in excerpts:
-                excerpts.append(excerpt)
-        groups = _relation_refs(brief, "engagement_brief_target_groups", "target_group")
-        if groups is None:
-            complete = False
-            warnings.append("Target-group relation is incomplete; no scope was inferred from it.")
-            continue
-        for group_id in groups:
-            group = included.get(("target_group", group_id))
-            if not group:
-                complete = False
-                warnings.append("A target group was omitted from the API response.")
-                continue
-            group_attrs = _mapping(group.get("attributes"))
-            in_scope = group_attrs.get("in_scope")
-            if not isinstance(in_scope, bool):
-                complete = False
-                warnings.append("A target group has no explicit in-scope flag; its targets were ignored.")
-                continue
-            targets = _relation_refs(group, "targets", "target")
-            if targets is None:
-                complete = False
-                warnings.append("A target relation is incomplete; no scope was inferred from it.")
-                continue
-            instruction = _excerpt(group_attrs.get("description"), 1800)
-            for target_id in targets:
-                target = included.get(("target", target_id))
-                target_attrs = _mapping(target.get("attributes")) if target else {}
-                identifier = _plain(target_attrs.get("name"), 500)
-                if not identifier:
-                    complete = False
-                    warnings.append("A target was missing its identifier and was ignored.")
-                    continue
-                entries.append(_scope_row(identifier, _plain(target_attrs.get("category"), 60), in_scope,
-                                          instruction))
-                if len(entries) >= _MAX_SCOPE:
-                    complete = False
-                    warnings.append(f"Scope preview is capped at {_MAX_SCOPE} targets.")
-                    break
-            if len(entries) >= _MAX_SCOPE:
-                break
-        if len(entries) >= _MAX_SCOPE:
-            break
-    if not any(entry["eligible_for_submission"] for entry in entries):
-        complete = False
-        warnings.append("No explicitly in-scope targets were returned.")
-    warnings.append("Review the current Bugcrowd brief and free-text exclusions before saving or testing.")
-    return {"ok": True, "platform": "bugcrowd", "program_id": program_id, "program_name": name,
-            "handle": handle, "structured_scope": entries, "scope_complete": complete,
-            "policy_excerpt": "\n\n".join(excerpts)[:4000], "source_url": source_url,
-            "fetched_at": datetime.now(UTC).isoformat(), "warnings": warnings,
-            "status": next(iter(statuses)) if len(statuses) == 1 else "unknown"}
 
 
 def _preview_intigriti(program_id: str, credential: str, fetch: Callable[..., Any] | None) -> dict[str, Any]:
@@ -457,6 +290,6 @@ def preview_program(platform: str, program_id: str, credential: str, *,
     if not _valid_credential(platform, credential):
         return {"ok": False, "warnings": [], "error": f"Enter a valid {platform.title()} API credential."}
     try:
-        return (_preview_bugcrowd if platform == "bugcrowd" else _preview_intigriti)(safe_id, credential, fetch)
+        return _preview_intigriti(safe_id, credential, fetch)
     except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
         return {"ok": False, "warnings": [], **_error(platform, exc)}

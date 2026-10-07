@@ -158,7 +158,7 @@ and the (separately gated) HackerOne report submission described in
 ### Browse platform APIs
 
 In **Programs → Add program → Browse platform APIs**, choose HackerOne, YesWeHack,
-Bugcrowd, or Intigriti. **Browse programs** reads a bounded list visible to the API
+or Intigriti. **Browse programs** reads a bounded list visible to the API
 identity; select a result or enter its program ID/handle and choose **Preview selected
 program**. Review the scope rows, exclusions, policy excerpt, status, and warnings before
 continuing to the Program form. Every program saved through this path starts **paused**.
@@ -166,13 +166,16 @@ The listing and preview are evidence to review, not permission to test. The oper
 still needs a current authorization record and policy check before scheduled work.
 
 HackerOne uses the credentials in Submissions. YesWeHack can list public programs
-anonymously; private access may require its sign-in. Bugcrowd uses a researcher API
-token in `id:secret` form; Intigriti uses a researcher bearer token. Save either in the
-Browse step. GreyIQ keeps the token in its local owner-only secrets store and returns
-only whether one is saved. Credentialed requests are read-only, HTTPS host-pinned,
+anonymously; private access may require its sign-in. Intigriti uses a researcher
+bearer token saved in the Browse step. GreyIQ keeps the token in its local
+owner-only secrets store and returns only whether one is saved. Credentialed requests are read-only, HTTPS host-pinned,
 redirect-refusing, and bounded. These APIs may omit free-text exclusions or other
 policy details, so always check the current human-facing program page. If your account
 cannot access a program through its API, use manual or CSV intake.
+
+Bugcrowd researcher programs are entered manually or through CSV intake. The
+Bugcrowd organization API is not used for researcher program discovery or scope
+preview; review the current Bugcrowd brief before recording authorization or scope.
 
 ### YesWeHack credentials
 
@@ -433,8 +436,8 @@ Confirmed (and reportable candidate) findings appear in the **Submissions** tab:
   HackerOne scope import described above (`api.hackerone.com`, read-only, manual), the
   YesWeHack program search / scope import and sign-in (`api.yeswehack.com`, read-only apart
   from the sign-in exchange itself, manual),
-  Bugcrowd (`api.bugcrowd.com`) and Intigriti (`api.intigriti.com`) program
-  discovery and scope preview (read-only, manual), and optional
+  Intigriti (`api.intigriti.com`) program discovery and scope preview
+  (read-only, manual), and optional
   repo-draft enrichment (`api.github.com` or `gitlab.com`, unauthenticated read-only, one GET
   per repository, explicit click only), an
   optional certificate-transparency lookup for subdomain seeding (`crt.sh`, read-only), the

@@ -4355,14 +4355,20 @@ class GreyIQRuntime:
         return {"ok": True, "platforms": {
             "hackerone": self.hackerone_creds_status(),
             "yeswehack": self.yeswehack_creds_status(),
-            "bugcrowd": {"has_token": bool(stored.get("platform.bugcrowd.credential"))},
             "intigriti": {"has_token": bool(stored.get("platform.intigriti.credential"))},
         }}
 
     def save_platform_credential(self, request: "PlatformCredentialRequest") -> dict[str, Any]:
         platform = request.platform.strip().lower()
-        if platform not in ("bugcrowd", "intigriti"):
-            return {"ok": False, "error": "This credential form supports Bugcrowd and Intigriti only."}
+        if platform == "bugcrowd":
+            # Older builds stored Bugcrowd platform tokens. Permit explicit removal,
+            # but do not offer the customer API as researcher program discovery.
+            if request.clear_token:
+                _store_secret("platform.bugcrowd.credential", "")
+                return {"ok": True, "platform": platform, "has_token": False}
+            return {"ok": False, "error": "Bugcrowd researcher API discovery is unavailable; use manual or CSV intake."}
+        if platform != "intigriti":
+            return {"ok": False, "error": "This credential form supports Intigriti only."}
         if request.clear_token:
             _store_secret(f"platform.{platform}.credential", "")
         elif request.credential:
@@ -4392,10 +4398,13 @@ class GreyIQRuntime:
                      "status": "disabled" if p.get("disabled") else "visible",
                      "source_url": f"https://api.yeswehack.com/programs/{p['slug']}"}
                     for p in result.get("programs", [])]
-        elif platform in ("bugcrowd", "intigriti"):
+        elif platform == "intigriti":
             credential = stored.get(f"platform.{platform}.credential", "")
             result = bounty_platform_programs.list_programs(platform, credential, limit=request.limit)
             rows = list(result.get("programs", []))
+        elif platform == "bugcrowd":
+            return {"ok": False, "platform": platform, "programs": [],
+                    "error": "Bugcrowd researcher API discovery is unavailable; use manual or CSV intake."}
         else:
             return {"ok": False, "programs": [], "error": "Unsupported platform."}
         if not result.get("ok"):
@@ -4417,9 +4426,11 @@ class GreyIQRuntime:
             result = self.import_hackerone_scope(HackerOneImportRequest(handle=identifier))
         elif platform == "yeswehack":
             result = self.import_yeswehack_scope(YesWeHackImportRequest(slug=identifier))
-        elif platform in ("bugcrowd", "intigriti"):
+        elif platform == "intigriti":
             credential = _load_secrets().get(f"platform.{platform}.credential", "")
             result = bounty_platform_programs.preview_program(platform, identifier, credential)
+        elif platform == "bugcrowd":
+            return {"ok": False, "error": "Bugcrowd researcher API preview is unavailable; review the current program brief and use manual or CSV intake."}
         else:
             return {"ok": False, "error": "Unsupported platform."}
         if not result.get("ok"):

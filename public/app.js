@@ -8012,8 +8012,8 @@ function ckProgramSetupForm(prefill) {
   // equivalent, so it is the one thing that hides.
   const syncFetchBar = () => {
     const isYwh = platSelect.value === "yeswehack";
-    const isOtherApi = platSelect.value === "bugcrowd" || platSelect.value === "intigriti";
-    fetchBtn.textContent = `Fetch scope from ${isYwh ? "YesWeHack" : isOtherApi ? (platSelect.value === "bugcrowd" ? "Bugcrowd" : "Intigriti") : "HackerOne"}`;
+    const isOtherApi = platSelect.value === "intigriti";
+    fetchBtn.textContent = `Fetch scope from ${isYwh ? "YesWeHack" : isOtherApi ? "Intigriti" : "HackerOne"}`;
     hacktivityBtn.hidden = isYwh || isOtherApi;
   };
   platSelect.addEventListener("change", syncFetchBar);
@@ -8104,7 +8104,7 @@ function ckProgramSetupForm(prefill) {
   fetchBtn.addEventListener("click", async () => {
     const h = handle.input.value.trim();
     const isYwh = platSelect.value === "yeswehack";
-    const isOtherApi = platSelect.value === "bugcrowd" || platSelect.value === "intigriti";
+    const isOtherApi = platSelect.value === "intigriti";
     if (isOtherApi && (!intakeSource.provider_id || intakeSource.platform !== platSelect.value)) {
       fetchNote.className = "ck-status is-error";
       fetchNote.textContent = "Choose this program from Browse platform APIs first; its API program ID is required.";
@@ -8516,7 +8516,7 @@ function ckWizardStart() {
     mk("repo", "🔗", "From a repo link", "Paste a public repo. We check it, then set up a source-only draft you can hunt right away."),
     mk("hackerone", "🎯", "From HackerOne", "Enter a program handle to pull real scope from the API, or paste its scope table."),
     mk("yeswehack", "🐝", "From YesWeHack", "Search or paste a program slug. Pulls scope, rules and the required user-agent marker — no sign-in needed for public programs."),
-    mk("platform_api", "🌐", "Browse platform APIs", "Find programs visible to your HackerOne, YesWeHack, Bugcrowd, or Intigriti account and review a scope preview."),
+    mk("platform_api", "🌐", "Browse platform APIs", "Find programs visible to your HackerOne, YesWeHack, or Intigriti account and review a scope preview."),
     mk("manual", "✎", "Manually", "Name it and add scope yourself — full control."),
   );
   box.append(grid);
@@ -8831,21 +8831,21 @@ function ckWizardIdentifyPlatformApi(nav) {
   const platformLabel = cel("label");
   platformLabel.append(cel("span", null, "Platform"));
   const platform = cel("select");
-  for (const [id, name] of [["hackerone", "HackerOne"], ["yeswehack", "YesWeHack"], ["bugcrowd", "Bugcrowd"], ["intigriti", "Intigriti"]]) {
+  for (const [id, name] of [["hackerone", "HackerOne"], ["yeswehack", "YesWeHack"], ["intigriti", "Intigriti"]]) {
     const option = cel("option", null, name); option.value = id; platform.append(option);
   }
   platformLabel.append(platform);
   box.append(platformLabel);
   const cred = ckField("API credential", "password", "");
   cred.input.autocomplete = "off";
-  cred.input.placeholder = "Bugcrowd id:secret or Intigriti bearer token";
+  cred.input.placeholder = "Intigriti bearer token";
   const saveCred = cel("button", "ck-btn", "Save API credential"); saveCred.type = "button";
   const clearCred = cel("button", "ck-btn", "Clear saved credential"); clearCred.type = "button";
   const credentialNote = cel("p", "ck-status");
   box.append(cred.wrap, saveCred, clearCred, credentialNote);
   const syncCredentialUi = async () => {
     const p = platform.value;
-    const localCred = p === "bugcrowd" || p === "intigriti";
+    const localCred = p === "intigriti";
     cred.wrap.hidden = !localCred; saveCred.hidden = !localCred; clearCred.hidden = !localCred;
     if (!localCred) {
       credentialNote.textContent = p === "hackerone"

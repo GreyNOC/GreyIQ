@@ -7,7 +7,9 @@ import io
 import json
 import sys
 import tempfile
+import threading
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -287,6 +289,79 @@ class GnCliTests(unittest.TestCase):
                 self.assertEqual(_run(["operator", "remove", "acme"])[0], 0)
             finally:
                 gn_cli.RUNTIME_DIR = original
+
+    def test_operator_ctrl_c_waits_for_stopped_audit_before_returning(self) -> None:
+        from bughunter import operator as operator_mod, portfolio
+
+        with tempfile.TemporaryDirectory() as tmp:
+            portfolio.upsert_program(tmp, {
+                "id": "example", "name": "Example", "scope_text": "example.com",
+                "seed_targets": ["https://example.com"],
+            })
+            now = datetime.now(UTC)
+            grant_path = Path(tmp) / "grants.json"
+            grant_path.write_text(json.dumps([{
+                "program_id": "example", "authorization_ref": "test engagement",
+                "policy_source": "https://example.com/policy", "policy_checked_at": now.isoformat(),
+                "expires_at": (now + timedelta(days=1)).isoformat(), "max_cycles": 1,
+            }]), encoding="utf-8")
+
+            campaign_entered = threading.Event()
+            release_campaign = threading.Event()
+            cli_done = threading.Event()
+            loops = []
+            results = []
+            real_loop_type = operator_mod.OperatorLoop
+
+            def run_campaign(*args, **kwargs):
+                campaign_entered.set()
+                release_campaign.wait(timeout=10)
+                return {"ok": True, "findings": [], "proof_of_impact": {}}
+
+            def loop_factory(*args, **kwargs):
+                loop = real_loop_type(*args, **kwargs)
+
+                def interrupt_during_poll(*, after=0):
+                    if not campaign_entered.wait(timeout=5):
+                        raise AssertionError("the campaign never started")
+                    raise KeyboardInterrupt
+
+                loop.event_tail = interrupt_during_poll
+                loops.append(loop)
+                return loop
+
+            def run_cli():
+                try:
+                    results.append(_run(["operator", "run", "-y", "--grant-file", str(grant_path)]))
+                finally:
+                    cli_done.set()
+
+            with mock.patch.object(gn_cli, "RUNTIME_DIR", Path(tmp)), \
+                 mock.patch.object(gn_cli, "_operator_campaign_fn", return_value=run_campaign), \
+                 mock.patch.object(operator_mod, "OperatorLoop", side_effect=loop_factory):
+                cli_thread = threading.Thread(target=run_cli)
+                cli_thread.start()
+                try:
+                    self.assertTrue(campaign_entered.wait(timeout=5))
+                    self.assertTrue(loops[0].stop_event.wait(timeout=5))
+                    self.assertFalse(cli_done.wait(timeout=0.25),
+                                     "the CLI returned while the campaign and audit were still running")
+                finally:
+                    release_campaign.set()
+                    cli_thread.join(timeout=10)
+                    for loop in loops:
+                        if loop._thread is not None and loop._thread.is_alive():
+                            loop.stop()
+                            loop._thread.join(timeout=10)
+
+            self.assertFalse(cli_thread.is_alive())
+            self.assertEqual(results[0][0], 0)
+            self.assertIn("Kill switch", results[0][1])
+            self.assertFalse(loops[0].running)
+            self.assertIsNone(loops[0]._lease_fd)
+            audit = Path(tmp, "operator_authorization_audit.jsonl").read_text(encoding="utf-8")
+            self.assertEqual([json.loads(line)["event"] for line in audit.splitlines()],
+                             ["armed", "cycle_started", "cycle_finished", "stopped"])
 
     def test_operator_cli_cloud_brain_is_disabled(self) -> None:
         run_fn = gn_cli._operator_campaign_fn({"enabled": True, "provider": "openai"})

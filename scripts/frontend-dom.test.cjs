@@ -140,7 +140,7 @@ test('platform API browse, preview, and Save keep an imported program paused', a
     setTimeout,
     apiFetch: async (url, options = {}) => {
       calls.push({ url, options });
-      if (url === '/api/platforms/credentials') return { ok: true, platforms: { bugcrowd: { has_token: true } } };
+      if (url === '/api/platforms/credentials') return { ok: true, platforms: { intigriti: { has_token: true } } };
       if (url === '/api/platforms/programs') return { ok: true, programs: [
         { id: 'program-uuid', handle: 'example', name: 'Example', status: 'open' },
       ] };
@@ -148,9 +148,9 @@ test('platform API browse, preview, and Save keep an imported program paused', a
         return { ok: false, error: 'Program unavailable' };
       }
       if (url === '/api/platforms/preview') return {
-        ok: true, platform: 'bugcrowd', program_id: 'program-uuid', handle: 'example',
+        ok: true, platform: 'intigriti', program_id: 'program-uuid', handle: 'example',
         program_name: 'Example', structured_scope: [{ identifier: 'https://example.test', eligible_for_submission: true }],
-        source_url: 'https://api.bugcrowd.com/programs/program-uuid', fetched_at: '2026-10-06T00:00:00Z',
+        source_url: 'https://api.intigriti.com/external/researcher/v1/programs/program-uuid', fetched_at: '2026-10-06T00:00:00Z',
         status: 'open', scope_complete: false, warnings: ['Review exclusions'],
       };
       if (url === '/api/operator/programs') return { ok: true, program: { id: 'saved-program' } };
@@ -165,7 +165,9 @@ test('platform API browse, preview, and Save keep an imported program paused', a
   const nav = element('div');
   const wizardBox = wizard(nav);
   const platform = find(wizardBox, (node) => node.tag === 'select');
-  platform.value = 'bugcrowd';
+  assert.equal(platform.children.some((option) => option.value === 'bugcrowd'), false,
+    'the browse flow must not offer the Bugcrowd organization API to researchers');
+  platform.value = 'intigriti';
   await platform.dispatch('change');
   const continueButton = find(nav, (node) => node.textContent === 'Review and save →');
   assert.equal(continueButton.disabled, true);
@@ -181,9 +183,9 @@ test('platform API browse, preview, and Save keep an imported program paused', a
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(continueButton.disabled, false, 'Save remains locked until preview succeeds');
   assert.deepEqual(JSON.parse(calls.find((call) => call.url === '/api/platforms/programs').options.body),
-    { platform: 'bugcrowd', query: '', limit: 100 });
+    { platform: 'intigriti', query: '', limit: 100 });
   assert.deepEqual(JSON.parse(calls.filter((call) => call.url === '/api/platforms/preview').at(-1).options.body),
-    { platform: 'bugcrowd', program_id: 'program-uuid' });
+    { platform: 'intigriti', program_id: 'program-uuid' });
   await continueButton.click();
   assert.equal(context.ckFlow.view, 'form');
   assert.equal(context.ckFlow.prefill.intake_source.provider_id, 'program-uuid');
@@ -196,7 +198,7 @@ test('platform API browse, preview, and Save keep an imported program paused', a
   assert.ok(save, 'Save should submit the reviewed program');
   const payload = JSON.parse(save.options.body);
   assert.equal(payload.name, 'Example');
-  assert.equal(payload.platform, 'bugcrowd');
+  assert.equal(payload.platform, 'intigriti');
   assert.equal(payload.intake_source.provider_id, 'program-uuid');
   assert.equal(payload.structured_scope[0].identifier, 'https://example.test');
   for (const flag of ['enabled', 'active', 'live', 'deep']) assert.equal(payload[flag], false, flag);

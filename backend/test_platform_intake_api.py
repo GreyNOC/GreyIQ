@@ -77,7 +77,7 @@ class PlatformIntakeRuntimeTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(set(result["platforms"]),
-                         {"hackerone", "yeswehack", "bugcrowd", "intigriti"})
+                         {"hackerone", "yeswehack", "intigriti"})
         self.assertTrue(all(p["has_token"] for p in result["platforms"].values()))
         serialized = json.dumps(result)
         for secret in ("H1-SECRET-123", "YWH-SECRET-123", "BC-SECRET-123", "INT-SECRET-123"):
@@ -86,18 +86,20 @@ class PlatformIntakeRuntimeTests(unittest.TestCase):
     def test_save_clear_and_reject_invalid_credentials_without_echo(self) -> None:
         bc = self.runtime.save_platform_credential(
             api.PlatformCredentialRequest(platform=" BUGCROWD ", credential="bc-id:bc-secret"))
-        self.assertEqual(bc, {"ok": True, "platform": "bugcrowd", "has_token": True})
-        self.assertEqual(api._load_secrets()["platform.bugcrowd.credential"], "bc-id:bc-secret")
+        self.assertFalse(bc["ok"])
+        self.assertIn("manual or CSV", bc["error"])
+        self.assertNotIn("platform.bugcrowd.credential", api._load_secrets())
 
         invalid = self.runtime.save_platform_credential(
-            api.PlatformCredentialRequest(platform="bugcrowd", credential="bad\nsecret"))
+            api.PlatformCredentialRequest(platform="intigriti", credential="bad\nsecret"))
         self.assertFalse(invalid["ok"])
         self.assertNotIn("bad\nsecret", json.dumps(invalid))
-        self.assertEqual(api._load_secrets()["platform.bugcrowd.credential"], "bc-id:bc-secret")
+        self.assertNotIn("platform.intigriti.credential", api._load_secrets())
 
         it = self.runtime.save_platform_credential(
             api.PlatformCredentialRequest(platform="intigriti", credential="bearer-secret"))
         self.assertTrue(it["has_token"])
+        api._store_secret("platform.bugcrowd.credential", "legacy:secret")
         cleared = self.runtime.save_platform_credential(
             api.PlatformCredentialRequest(platform="bugcrowd", clear_token=True))
         self.assertFalse(cleared["has_token"])
@@ -110,7 +112,6 @@ class PlatformIntakeRuntimeTests(unittest.TestCase):
         secrets = {
             "hackerone.api_username": "h1-id", "hackerone.api_token": "h1-token",
             "yeswehack.api_token": "ywh-token", "yeswehack.token_kind": "jwt",
-            "platform.bugcrowd.credential": "bc-id:bc-token",
             "platform.intigriti.credential": "int-token",
         }
         self.secrets_path.write_text(json.dumps(secrets), encoding="utf-8")
@@ -127,18 +128,15 @@ class PlatformIntakeRuntimeTests(unittest.TestCase):
                 api.PlatformProgramsRequest(platform="HACKERONE", query="Alp", limit=12))
             ywh_rows = self.runtime.discover_platform_programs(
                 api.PlatformProgramsRequest(platform="yeswehack", query="Alp", limit=12))
-            bc_rows = self.runtime.discover_platform_programs(
-                api.PlatformProgramsRequest(platform="bugcrowd", query="alp", limit=12))
             int_rows = self.runtime.discover_platform_programs(
                 api.PlatformProgramsRequest(platform="intigriti", query="alp", limit=12))
             upsert.assert_not_called()
 
         h1.assert_called_once_with("h1-id", "h1-token", max_entries=12)
         ywh.assert_called_once_with(token="ywh-token", token_kind="jwt", query="Alp", max_entries=12)
-        self.assertEqual(generic.call_args_list[0].args, ("bugcrowd", "bc-id:bc-token"))
-        self.assertEqual(generic.call_args_list[1].args, ("intigriti", "int-token"))
+        self.assertEqual(generic.call_args_list[0].args, ("intigriti", "int-token"))
         self.assertTrue(all(call.kwargs == {"limit": 12} for call in generic.call_args_list))
-        for result in (h1_rows, ywh_rows, bc_rows, int_rows):
+        for result in (h1_rows, ywh_rows, int_rows):
             self.assertTrue(result["ok"])
             self.assertEqual(result["count"], 1)
             self.assertEqual(result["programs"][0]["name"], "Alpha")
@@ -150,14 +148,13 @@ class PlatformIntakeRuntimeTests(unittest.TestCase):
         failure = {"ok": False, "error": "API unavailable", "programs": [{"name": "stale"}]}
         with patch.object(api.bounty_platform_programs, "list_programs", return_value=failure):
             result = self.runtime.discover_platform_programs(
-                api.PlatformProgramsRequest(platform="bugcrowd"))
+                api.PlatformProgramsRequest(platform="intigriti"))
         self.assertFalse(result["ok"])
         self.assertEqual(result["programs"], [])
         self.assertEqual(result["error"], "API unavailable")
 
     def test_preview_delegates_all_platforms_and_stays_review_only(self) -> None:
         self.secrets_path.write_text(json.dumps({
-            "platform.bugcrowd.credential": "bc-id:bc-token",
             "platform.intigriti.credential": "int-token"}), encoding="utf-8")
         adapter_result = {"ok": True, "name": "Example", "scope_complete": True,
                           "authorized": True, "enabled": True, "warnings": ["partial API record"]}
@@ -167,14 +164,13 @@ class PlatformIntakeRuntimeTests(unittest.TestCase):
               patch.object(api.bounty_portfolio, "upsert_program") as upsert):
             previews = [self.runtime.preview_platform_program(
                 api.PlatformPreviewRequest(platform=p, program_id="example"))
-                for p in ("hackerone", "yeswehack", "bugcrowd", "intigriti")]
+                for p in ("hackerone", "yeswehack", "intigriti")]
             upsert.assert_not_called()
 
         self.assertEqual(h1.call_args.args[0].handle, "example")
         self.assertEqual(ywh.call_args.args[0].slug, "example")
-        self.assertEqual(generic.call_args_list[0].args, ("bugcrowd", "example", "bc-id:bc-token"))
-        self.assertEqual(generic.call_args_list[1].args, ("intigriti", "example", "int-token"))
-        for platform, preview in zip(("hackerone", "yeswehack", "bugcrowd", "intigriti"), previews):
+        self.assertEqual(generic.call_args_list[0].args, ("intigriti", "example", "int-token"))
+        for platform, preview in zip(("hackerone", "yeswehack", "intigriti"), previews):
             self.assertTrue(preview["ok"])
             self.assertEqual(preview["platform"], platform)
             self.assertEqual(preview["program_id"], "example")
@@ -188,10 +184,13 @@ class PlatformIntakeRuntimeTests(unittest.TestCase):
     def test_unsupported_platform_does_not_call_any_adapter(self) -> None:
         with (patch.object(api.bounty_platform_programs, "list_programs") as listing,
               patch.object(api.bounty_platform_programs, "preview_program") as preview):
-            self.assertFalse(self.runtime.discover_platform_programs(
-                api.PlatformProgramsRequest(platform="unknown"))["ok"])
-            self.assertFalse(self.runtime.preview_platform_program(
-                api.PlatformPreviewRequest(platform="unknown", program_id="x"))["ok"])
+            for platform in ("bugcrowd", "unknown"):
+                discovered = self.runtime.discover_platform_programs(
+                    api.PlatformProgramsRequest(platform=platform))
+                self.assertFalse(discovered["ok"])
+                self.assertEqual(discovered["programs"], [])
+                self.assertFalse(self.runtime.preview_platform_program(
+                    api.PlatformPreviewRequest(platform=platform, program_id="x"))["ok"])
         listing.assert_not_called()
         preview.assert_not_called()
 
@@ -204,11 +203,11 @@ class PlatformIntakeRouteTests(unittest.TestCase):
             self.assertEqual((status, body), (200, {"ok": True, "platforms": {}}))
             status_fn.assert_called_once_with()
             status, body = _call_route("POST", "/api/platforms/credentials",
-                                       {"platform": "bugcrowd", "credential": "id:secret"})
+                                       {"platform": "intigriti", "credential": "secret"})
             self.assertEqual(status, 200)
             self.assertTrue(body["has_token"])
-            self.assertEqual(save_fn.call_args.args[0].platform, "bugcrowd")
-            self.assertEqual(save_fn.call_args.args[0].credential, "id:secret")
+            self.assertEqual(save_fn.call_args.args[0].platform, "intigriti")
+            self.assertEqual(save_fn.call_args.args[0].credential, "secret")
 
             status, _ = _call_route("POST", "/api/platforms/credentials", {"platform": ""})
             self.assertEqual(status, 422)
