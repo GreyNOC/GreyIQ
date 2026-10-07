@@ -186,7 +186,7 @@ class MultiTargetCredentialBoundaryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp, patch.object(campaign, "run_campaign", side_effect=fake_campaign):
             result = campaign.run_campaign_over_targets(
-                targets, scope="acme-a.com acme-b.com", authorized=True, coder_cfg={},
+                targets, scope="*.acme-a.com *.acme-b.com", authorized=True, coder_cfg={},
                 default_reports_dir=Path(tmp) / "reports", runtime_dir=Path(tmp) / "runtime",
                 **kwargs,
             )
@@ -233,7 +233,7 @@ class MultiTargetCredentialBoundaryTests(unittest.TestCase):
              patch.object(campaign, "run_bounty_hunt", side_effect=fake_hunt), \
              patch.object(campaign.cve_service, "scan_known_cves", return_value={"ok": True, "findings": []}):
             result = campaign.run_campaign(
-                target, scope="acme-a.com acme-b.com", authorized=True, coder_cfg={},
+                target, scope="*.acme-a.com *.acme-b.com", authorized=True, coder_cfg={},
                 default_reports_dir=Path(tmp) / "reports", auth={"cookie": "sid=SECRET"},
             )
 

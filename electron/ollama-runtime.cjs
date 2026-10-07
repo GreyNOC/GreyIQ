@@ -43,7 +43,9 @@ function findLinuxOllama(env = process.env, fileSystem = fs) {
 }
 
 async function selectOllamaBinary({ platform, packaged, ensureBase, env = process.env, fileSystem = fs }) {
-  const external = platform === 'linux'
+  // Packaged macOS installs have no GreyIQ-managed archive. Use an operator
+  // override or an executable on PATH just as packaged Linux does.
+  const external = (platform === 'linux' || platform === 'darwin')
     ? (findLinuxOllama(env, fileSystem) || (!packaged ? 'ollama' : null))
     : (!packaged ? (env.GREYIQ_OLLAMA_PATH || 'ollama') : null);
   if (external) return { binary: external, external: true };

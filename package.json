@@ -1,6 +1,6 @@
 {
   "name": "greyiq",
-  "version": "4.9.2",
+  "version": "4.9.3",
   "private": true,
   "type": "module",
   "description": "GreyIQ local-first AI chat UI with editable bots, personal preference training, an Ollama/Claude/OpenAI coding brain with out-of-the-box GPU acceleration (NVIDIA bundled, AMD auto-provisioned), and a browser CPU/WebGPU fallback.",
@@ -66,6 +66,22 @@
       "uninstallerIcon": "build/icon.ico",
       "installerHeaderIcon": "build/icon.ico",
       "artifactName": "GreyIQ-Setup-${version}.exe"
+    },
+    "mac": {
+      "icon": "build/icon.icns",
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "artifactName": "GreyIQ-${version}-mac-${arch}.${ext}",
+      "hardenedRuntime": true,
+      "notarize": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.inherit.plist",
+      "binaries": [
+        "Contents/Resources/backend/greyiq-backend"
+      ]
     },
     "linux": {
       "icon": "build/icon.png",

@@ -160,9 +160,10 @@ cat <<EOF
 
 Next, if you are publishing:
   git tag -a v$VERSION -m "Release v$VERSION" && git push origin v$VERSION
-The pushed tag triggers .github/workflows/release.yml, which builds Windows + Linux,
-checks the tagged commit, and uploads the assets to a DRAFT release. This script
-never tags, pushes, or publishes a release. After both platform jobs pass and you
-verify the draft assets and checksums, a human operator can publish it with:
+The pushed tag triggers .github/workflows/release.yml, which checks the tagged
+commit, builds Windows, Linux, and both native macOS architectures, and uploads
+the assets to a DRAFT release. This local script builds only Windows and never
+tags, pushes, or publishes. After every platform job passes and a human operator
+verifies the draft assets, signatures, and checksums, they can publish it with:
   gh release edit v$VERSION --repo GreyNOC/GreyIQ --draft=false --latest
 EOF

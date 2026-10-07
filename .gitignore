@@ -18,6 +18,9 @@ build/*
 !build/build-portable.ps1
 !build/icon.ico
 !build/icon.png
+!build/icon.icns
+!build/entitlements.mac.plist
+!build/entitlements.mac.inherit.plist
 !build/greyiq-cli
 !build/portable-cli/
 *.log
