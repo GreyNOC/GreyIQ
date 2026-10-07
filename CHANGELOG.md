@@ -4,7 +4,13 @@ Notable changes to GreyIQ.
 
 ## Unreleased
 
-## v4.9.3 - hunt learning and Apple release
+## v4.9.4 - macOS headless browser packaging
+
+- Bundle only Playwright's Chromium headless shell in macOS releases so
+  PyInstaller can sign the frozen backend and the browser smoke test can run.
+  Windows and Linux retain both Chromium builds.
+
+## v4.9.3 - hunt learning and release workflow
 
 - Record completed verifier suites and confirmed outcomes as evidence for hunt
   learning. Filtered findings and interrupted checks cannot create false

@@ -191,20 +191,26 @@ def _playwright_browsers_cache():
 _pw_cache = _playwright_browsers_cache()
 # Playwright resolves exact revisions from its installed driver manifest. A shared cache
 # can contain newer browsers from another venv; choosing the newest would produce a bundle
-# that passes the API smoke test but cannot launch a browser. Include only the two builds
-# required by this venv. The release build installs them immediately before freezing.
+# that passes the API smoke test but cannot launch a browser. On macOS, the full
+# Chromium .app contains nested frameworks that PyInstaller cannot ad-hoc sign
+# during COLLECT; every bundled caller launches headless Chromium, so ship only
+# Playwright's headless shell there. The release build installs the browsers
+# immediately before freezing.
 _pw_spec = importlib.util.find_spec("playwright")
 if not _pw_spec or not _pw_spec.origin:
     raise RuntimeError("Playwright is not installed in the build environment")
 _pw_manifest = os.path.join(os.path.dirname(_pw_spec.origin), "driver", "package", "browsers.json")
 with open(_pw_manifest, encoding="utf-8") as _pw_handle:
     _pw_browsers = json.load(_pw_handle)["browsers"]
+_pw_names = {"chromium-headless-shell"} if sys.platform == "darwin" else {
+    "chromium", "chromium-headless-shell"
+}
 _pw_required = {
     _browser["name"]: str(_browser["revision"])
     for _browser in _pw_browsers
-    if _browser["name"] in ("chromium", "chromium-headless-shell")
+    if _browser["name"] in _pw_names
 }
-if set(_pw_required) != {"chromium", "chromium-headless-shell"}:
+if set(_pw_required) != _pw_names:
     raise RuntimeError(f"Playwright manifest lacks Chromium builds: {_pw_manifest}")
 _pw_shipped = []
 for _name, _revision in _pw_required.items():
