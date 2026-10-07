@@ -167,9 +167,9 @@ hiddenimports += ["pydantic_core._pydantic_core"]
 #   2) the Chromium browser itself, which lives OUTSIDE the package in a per-user cache
 #      that an end-user machine never populates (it never runs `playwright install`).
 # We ship Chromium under <bundle>/playwright-browsers and screenshot_service points
-# PLAYWRIGHT_BROWSERS_PATH at it at runtime. Degrades gracefully: if the browser cache is
-# absent at freeze time (e.g. `playwright install chromium` was not run), the build still
-# succeeds — screenshots are simply unavailable, exactly as before this change.
+# PLAYWRIGHT_BROWSERS_PATH at it at runtime. The build requires the exact revision
+# pinned by Playwright. macOS copies its headless shell after PyInstaller finishes so
+# PyInstaller cannot modify the browser's Mach-O libraries during COLLECT.
 pw_datas, pw_binaries, pw_hidden = collect_all("playwright")
 datas += pw_datas
 binaries += pw_binaries
@@ -193,9 +193,9 @@ _pw_cache = _playwright_browsers_cache()
 # can contain newer browsers from another venv; choosing the newest would produce a bundle
 # that passes the API smoke test but cannot launch a browser. On macOS, the full
 # Chromium .app contains nested frameworks that PyInstaller cannot ad-hoc sign
-# during COLLECT; every bundled caller launches headless Chromium, so ship only
-# Playwright's headless shell there. The release build installs the browsers
-# immediately before freezing.
+# during COLLECT; even the headless shell has libraries with too little Mach-O
+# padding for install_name_tool. All bundled callers launch headless Chromium.
+# The macOS release script copies the exact headless shell after freezing.
 _pw_spec = importlib.util.find_spec("playwright")
 if not _pw_spec or not _pw_spec.origin:
     raise RuntimeError("Playwright is not installed in the build environment")
@@ -217,14 +217,16 @@ for _name, _revision in _pw_required.items():
     _entry = f"{_name.replace('-', '_')}-{_revision}"
     _source = os.path.join(_pw_cache, _entry)
     if os.path.isfile(os.path.join(_source, "INSTALLATION_COMPLETE")):
-        datas.append((_source, os.path.join("playwright-browsers", _entry)))
+        if sys.platform != "darwin":
+            datas.append((_source, os.path.join("playwright-browsers", _entry)))
         _pw_shipped.append(_entry)
     else:
         raise RuntimeError(
             f"Playwright requires {_entry}, but it is missing from {_pw_cache}. "
             "Run `python -m playwright install chromium` in the build environment."
         )
-print(f"[greyiq-backend.spec] bundling Playwright browsers from {_pw_cache}: "
+_pw_action = "staging after freeze" if sys.platform == "darwin" else "bundling"
+print(f"[greyiq-backend.spec] {_pw_action} Playwright browsers from {_pw_cache}: "
       + ", ".join(sorted(_pw_shipped)))
 
 block_cipher = None

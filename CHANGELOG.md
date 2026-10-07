@@ -4,6 +4,12 @@ Notable changes to GreyIQ.
 
 ## Unreleased
 
+## v4.9.5 - macOS browser staging
+
+- Stage Playwright's exact Chromium headless shell revision after freezing the
+  macOS backend so PyInstaller cannot rewrite its Mach-O libraries. Verify the
+  staged browser launches before packaging Apple Silicon and Intel desktop apps.
+
 ## v4.9.4 - macOS headless browser packaging
 
 - Bundle only Playwright's Chromium headless shell in macOS releases so
