@@ -4,8 +4,10 @@ and rides in-scope requests, and the login service is scope-gated and fails clos
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
@@ -13,6 +15,8 @@ if str(BACKEND_DIR) not in sys.path:
 
 import greyiq_api  # noqa: E402
 from bughunter import account_login_service, campaign, portfolio, web_ingest, web_scan_service  # noqa: E402
+from bughunter import scan_auth  # noqa: E402
+from bughunter.settings import ScannerSettings  # noqa: E402
 
 
 class SchemaTests(unittest.TestCase):
@@ -52,6 +56,31 @@ class UserAgentSuffixTests(unittest.TestCase):
 
 
 class LoginServiceTests(unittest.TestCase):
+    def test_browser_login_requests_are_scope_and_issuer_bound(self) -> None:
+        settings = ScannerSettings()
+        check = account_login_service._login_request_allowed
+        with patch.object(account_login_service, "playwright_request_allowed", return_value=True):
+            self.assertTrue(check("https://login.acme.com/", "login.acme.com", "acme.com", settings))
+            self.assertTrue(check("https://api.acme.com/session", "login.acme.com", "acme.com", settings))
+            self.assertFalse(check("https://evil.test/collect", "login.acme.com", "acme.com", settings))
+            # Even a second scoped domain cannot receive this login's credentials.
+            self.assertFalse(check("https://brand-b.com/collect", "login.acme.com",
+                                   "acme.com brand-b.com", settings))
+            self.assertTrue(check("data:text/plain,local", "login.acme.com", "acme.com", settings))
+        with patch.object(account_login_service, "playwright_request_allowed", return_value=False):
+            self.assertFalse(check("https://login.acme.com/", "login.acme.com", "acme.com", settings))
+
+    def test_cookie_export_respects_host_only_and_domain_cookie_boundaries(self) -> None:
+        cookies = [
+            {"domain": "login.acme.com", "name": "own", "value": "1"},
+            {"domain": ".acme.com", "name": "shared", "value": "2"},
+            {"domain": "acme.com", "name": "apex_host_only", "value": "3"},
+            {"domain": "child.login.acme.com", "name": "child", "value": "4"},
+            {"domain": ".evil.com", "name": "foreign", "value": "5"},
+        ]
+        self.assertEqual(account_login_service._cookie_header_for_host(cookies, "login.acme.com"),
+                         "own=1; shared=2")
+
     def test_pasted_cookie_is_the_direct_path(self) -> None:
         out = account_login_service.login({"cookie": "sid=abc123"}, scope="app.example")
         self.assertTrue(out["ok"])
@@ -143,6 +172,78 @@ class LoginAuthPlumbingTests(unittest.TestCase):
         finally:
             campaign.account_login_service.login = orig
         self.assertIsNone(auth)
+
+
+class MultiTargetCredentialBoundaryTests(unittest.TestCase):
+    def _span(self, targets: list[str], **kwargs):
+        seen: list[dict] = []
+
+        def fake_campaign(target, **options):
+            seen.append({"target": target, **options})
+            return {"ok": True, "campaign_path": "", "json_path": "", "findings": [],
+                    "proof_of_impact": {}, "cvss": {}, "attack_plans": {}, "surface": {},
+                    "submission_paths": [], "urls_scanned": 0, "urls_discovered": 0, "risk": "clean"}
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(campaign, "run_campaign", side_effect=fake_campaign):
+            result = campaign.run_campaign_over_targets(
+                targets, scope="acme-a.com acme-b.com", authorized=True, coder_cfg={},
+                default_reports_dir=Path(tmp) / "reports", runtime_dir=Path(tmp) / "runtime",
+                **kwargs,
+            )
+        self.assertTrue(result["ok"], result)
+        return seen
+
+    def test_unissued_saved_cookie_is_withheld_across_domains(self) -> None:
+        seen = self._span(
+            ["https://app.acme-a.com/", "https://app.acme-b.com/"],
+            account_access={"cookie": "sid=SECRET"},
+            admin_account_access={"cookie": "admin=SECRET"},
+        )
+        self.assertEqual(len(seen), 2)
+        self.assertTrue(all(item["auth"] is None for item in seen))
+        self.assertTrue(all(item["account_access"] is None for item in seen))
+        self.assertTrue(all(item["admin_account_access"] is None for item in seen))
+
+    def test_unissued_request_cookie_is_withheld_across_domains(self) -> None:
+        seen = self._span(["https://app.acme-a.com/", "https://app.acme-b.com/"],
+                          auth={"cookie": "sid=SECRET"})
+        self.assertTrue(all(item["auth"] is None for item in seen))
+
+    def test_same_domain_and_single_target_keep_direct_paste(self) -> None:
+        access = {"cookie": "sid=SECRET"}
+        same_domain = self._span(["https://app.acme-a.com/", "https://api.acme-a.com/"],
+                                 account_access=access)
+        self.assertTrue(all(item["auth"]["cookie"] == "sid=SECRET" for item in same_domain))
+        single = self._span(["https://app.acme-a.com/"], account_access=access)
+        self.assertEqual(single[0]["auth"]["cookie"], "sid=SECRET")
+
+    def test_single_target_recon_cannot_rebind_paste_to_other_domain(self) -> None:
+        target = "https://app.acme-a.com/"
+        other = "https://app.acme-b.com/"
+        seen: dict[str, dict] = {}
+
+        def fake_hunt(url, *args, **kwargs):
+            seen[url] = kwargs["auth"]
+            return {"ok": True, "json_path": "", "report_path": ""}
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(campaign.recon, "discover", return_value={
+                 "urls": [target, other], "notes": [], "sources": {}, "js_secrets": [],
+                 "tech": [], "params": [], "forms": []}), \
+             patch.object(campaign, "run_bounty_hunt", side_effect=fake_hunt), \
+             patch.object(campaign.cve_service, "scan_known_cves", return_value={"ok": True, "findings": []}):
+            result = campaign.run_campaign(
+                target, scope="acme-a.com acme-b.com", authorized=True, coder_cfg={},
+                default_reports_dir=Path(tmp) / "reports", auth={"cookie": "sid=SECRET"},
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn(other, seen, "negative control must be an in-scope discovered URL")
+        self.assertEqual(seen[target]["issuer_host"], "app.acme-a.com")
+        self.assertIsNotNone(scan_auth.build_auth(target, cookie="sid=SECRET",
+                                                 issuer_host=seen[target]["issuer_host"]))
+        self.assertIsNone(scan_auth.build_auth(other, cookie="sid=SECRET",
+                                              issuer_host=seen[other]["issuer_host"]))
 
 
 class ApiRedactionTests(unittest.TestCase):

@@ -7,6 +7,9 @@ const http = require('node:http');
 const https = require('node:https');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
+const { probeHealth } = require('./health.cjs');
+const { ollamaAssets, selectOllamaBinary, extractArchive } = require('./ollama-runtime.cjs');
+const { resolveRuntimeDir, migrateLegacyRuntime } = require('./runtime-path.cjs');
 
 const APP_NAME = 'GreyIQ';
 const HOST = '127.0.0.1';
@@ -22,24 +25,26 @@ const PROJECT_ROOT = app.isPackaged ? path.join(process.resourcesPath, 'app') : 
 // The PyInstaller-frozen backend is shipped as an extraResource at
 // <resources>/backend/greyiq-backend(.exe). Present only in packaged builds.
 const BACKEND_RESOURCE_DIR = app.isPackaged ? path.join(process.resourcesPath, 'backend') : null;
-const RUNTIME_DIR = path.join(app.getPath('userData'), 'runtime');
+const RUNTIME_DIR = resolveRuntimeDir({
+  platform: process.platform,
+  packaged: app.isPackaged,
+  userDataDir: app.getPath('userData'),
+  projectRoot: PROJECT_ROOT,
+});
 // Ollama runtime (zero-setup LOCAL brain). It is NO LONGER bundled — it was ~1.4 GB
 // (86% of the old portable) and the bug-hunting engine + the Claude/OpenAI brains
 // never use it. It is downloaded ON DEMAND to a writable userData dir the first time
 // the operator actually selects the local model, so the default app stays small/fast.
-const OLLAMA_BASE_DIR = path.join(app.getPath('userData'), 'ollama');
+// Keep ARM64's cache separate from older amd64 downloads in the same profile.
+const OLLAMA_BASE_DIR = path.join(app.getPath('userData'),
+  process.platform === 'linux' && process.arch === 'arm64' ? 'ollama-arm64' : 'ollama');
 const OLLAMA_BIN = process.platform === 'win32'
   ? path.join(OLLAMA_BASE_DIR, 'ollama.exe')
   : path.join(OLLAMA_BASE_DIR, 'bin', 'ollama');
 const OLLAMA_PORT = 11434;
-const OLLAMA_BASE_URL = process.platform === 'win32'
-  ? 'https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64.zip'
-  : 'https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64.tar.zst';
+const OLLAMA_ASSETS = ollamaAssets(process.platform, process.arch);
 // AMD GPUs need Ollama's ROCm runner (a separate ~1 GB package); fetched once on
-// first run when an AMD GPU is detected, overlaid onto the base runtime.
-const OLLAMA_ROCM_URL = process.platform === 'win32'
-  ? 'https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64-rocm.zip'
-  : 'https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64-rocm.tar.zst';
+// first run when an AMD GPU is detected on a supported architecture.
 
 // extraResources can drop the executable bit on non-Windows; restore it
 // best-effort before we spawn a bundled binary.
@@ -194,6 +199,7 @@ function launchTacnoc() {
 let mainWindow = null;
 let backendProcess = null;
 let ollamaProcess = null;
+let ollamaStartPromise = null;
 let backendPort = DEFAULT_PORT;
 let backendReady = false;
 let backendExited = false;
@@ -294,28 +300,6 @@ function resolveBackendCommand() {
   return { exe: py.exe, args: py.args, cwd: PROJECT_ROOT };
 }
 
-function probeHealth(port) {
-  return new Promise((resolve) => {
-    const req = http.get(
-      {
-        host: HOST,
-        port,
-        path: '/api/health',
-        timeout: 2000,
-      },
-      (res) => {
-        res.resume();
-        resolve(res.statusCode >= 200 && res.statusCode < 500);
-      },
-    );
-    req.on('error', () => resolve(false));
-    req.on('timeout', () => {
-      req.destroy();
-      resolve(false);
-    });
-  });
-}
-
 async function waitForBackend(port) {
   const deadline = Date.now() + STARTUP_TIMEOUT_MS;
   while (Date.now() < deadline) {
@@ -323,7 +307,7 @@ async function waitForBackend(port) {
     // the whole timeout — the error page should appear right away.
     if (backendExited) return false;
     // eslint-disable-next-line no-await-in-loop
-    if (await probeHealth(port)) return true;
+    if (await probeHealth(HOST, port)) return true;
     // eslint-disable-next-line no-await-in-loop
     await new Promise((resolve) => setTimeout(resolve, HEALTH_POLL_MS));
   }
@@ -375,7 +359,7 @@ async function startBackend() {
     ...process.env,
     GREYIQ_HOST: HOST,
     GREYIQ_PORT: String(backendPort),
-    GREYIQ_RUNTIME_DIR: process.env.GREYIQ_RUNTIME_DIR || RUNTIME_DIR,
+    GREYIQ_RUNTIME_DIR: RUNTIME_DIR,
     PYTHONUTF8: '1',
   };
 
@@ -579,7 +563,7 @@ function ollamaResponding() {
       { host: '127.0.0.1', port: OLLAMA_PORT, path: '/api/tags', timeout: 1500 },
       (res) => {
         res.resume();
-        resolve(true);
+        resolve(res.statusCode === 200 && String(res.headers['content-type'] || '').includes('application/json'));
       },
     );
     req.on('error', () => resolve(false));
@@ -595,7 +579,8 @@ function ollamaResponding() {
 // (ROCm) is fetched on first run. Everything here is best-effort: any failure
 // falls back to the bundled runtime so the app never breaks over GPU setup.
 let detectedGpu = 'unknown';         // 'nvidia' | 'amd' | 'other' | 'unknown'
-let activeOllamaRuntime = 'bundled'; // 'bundled' | 'rocm'
+let activeOllamaRuntime = 'bundled'; // 'bundled' | 'rocm' | 'system'
+let lastOllamaError = '';
 let gpuVendorCache = null;
 
 function logGpu(message) {
@@ -645,8 +630,13 @@ async function gpuVendor() {
 
 function downloadFile(url, dest, redirects = 5) {
   return new Promise((resolve, reject) => {
-    const lib = url.startsWith('https:') ? https : http;
-    const req = lib.get(url, { timeout: 60000 }, (res) => {
+    // This archive is executed after extraction. A release redirect must never
+    // downgrade its transport to HTTP.
+    if (parseUrl(url)?.protocol !== 'https:') {
+      reject(new Error('runtime download requires HTTPS'));
+      return;
+    }
+    const req = https.get(url, { timeout: 60000 }, (res) => {
       const status = res.statusCode || 0;
       if (status >= 300 && status < 400 && res.headers.location) {
         res.resume();
@@ -665,32 +655,20 @@ function downloadFile(url, dest, redirects = 5) {
   });
 }
 
-function extractArchive(archivePath, destDir) {
-  return new Promise((resolve, reject) => {
-    // Linux ships a .tar.zst (tar --zstd); Windows ships a .zip (bundled bsdtar reads zip).
-    const args = process.platform === 'win32'
-      ? ['-xf', archivePath, '-C', destDir]
-      : ['--zstd', '-xf', archivePath, '-C', destDir];
-    const child = spawn('tar', args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
-    let err = '';
-    child.stderr.on('data', (chunk) => { err += chunk; });
-    child.on('error', reject);
-    child.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`tar exit ${code}: ${String(err).slice(0, 200)}`))));
-  });
-}
-
 async function ensureBaseOllama() {
   // Provision (once) the base Ollama runtime to a writable userData dir, downloading
-  // it on demand (it is no longer bundled). Returns the binary path, or null if the
-  // download/extract fails. Only ever called when the user actually wants the local
+  // it on demand (it is no longer bundled). Only ever called when the user wants the local
   // model — never at boot — so the default app never pays for it.
   if (!app.isPackaged) return null;  // dev: use a system-installed ollama if present
+  if (!OLLAMA_ASSETS) {
+    throw new Error(`Automatic Ollama download is unavailable for ${process.platform}/${process.arch}. Install Ollama and set GREYIQ_OLLAMA_PATH.`);
+  }
   if (fs.existsSync(OLLAMA_BIN)) return OLLAMA_BIN;
   logGpu('Local model selected — downloading the Ollama runtime (one-time ~1 GB)…');
   const archive = path.join(app.getPath('userData'), process.platform === 'win32' ? 'ollama-base.zip' : 'ollama-base.tar.zst');
   try {
     fs.mkdirSync(OLLAMA_BASE_DIR, { recursive: true });
-    await downloadFile(OLLAMA_BASE_URL, archive);
+    await downloadFile(OLLAMA_ASSETS.base, archive);
     await extractArchive(archive, OLLAMA_BASE_DIR);
     fs.rmSync(archive, { force: true });
     if (!fs.existsSync(OLLAMA_BIN)) throw new Error('Ollama binary missing after extraction');
@@ -700,13 +678,15 @@ async function ensureBaseOllama() {
   } catch (err) {
     logGpu(`Ollama provisioning failed (${err.message}).`);
     try { fs.rmSync(archive, { force: true }); } catch (_) { /* ignore */ }
-    return null;
+    try { fs.rmSync(OLLAMA_BASE_DIR, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+    throw err;
   }
 }
 
 async function ensureRocmRuntime() {
   // Provision (once) and return the path to a ROCm-capable ollama binary, or null.
   // Needs the base runtime first (it's overlaid onto a copy of it).
+  if (!OLLAMA_ASSETS?.rocm) return null;
   if (!fs.existsSync(OLLAMA_BIN)) return null;
   const rocmDir = path.join(app.getPath('userData'), 'ollama-rocm');
   const rocmBin = process.platform === 'win32'
@@ -726,7 +706,7 @@ async function ensureRocmRuntime() {
       recursive: true,
       filter: (src) => !/[\\/]lib[\\/]ollama[\\/]cuda/i.test(src),
     });
-    await downloadFile(OLLAMA_ROCM_URL, archive);
+    await downloadFile(OLLAMA_ASSETS.rocm, archive);
     await extractArchive(archive, rocmDir);
     fs.rmSync(archive, { force: true });
     if (!fs.existsSync(rocmBin)) throw new Error('ROCm runtime binary missing after extraction');
@@ -745,7 +725,7 @@ async function resolveOllamaRuntime() {
   try {
     detectedGpu = await gpuVendor();
     logGpu(`GPU vendor: ${detectedGpu}`);
-    if (detectedGpu === 'amd') {
+    if (detectedGpu === 'amd' && OLLAMA_ASSETS?.rocm) {
       const rocmBin = await ensureRocmRuntime();
       if (rocmBin && fs.existsSync(rocmBin)) {
         activeOllamaRuntime = 'rocm';
@@ -760,25 +740,47 @@ async function resolveOllamaRuntime() {
 }
 
 async function startOllama() {
+  if (ollamaStartPromise) return ollamaStartPromise;
+  ollamaStartPromise = startOllamaOnce();
+  try {
+    return await ollamaStartPromise;
+  } finally {
+    ollamaStartPromise = null;
+  }
+}
+
+async function startOllamaOnce() {
   // On-demand local brain: provision the Ollama runtime (downloaded on first use),
   // then start it — unless a system Ollama is already serving on the port. Triggered
   // by the renderer when the user selects the local model, NEVER at boot.
+  lastOllamaError = '';
   if (await ollamaResponding()) return true;
-  const baseBin = await ensureBaseOllama();
-  if (!baseBin || !fs.existsSync(baseBin)) return false;
+  // A Linux install can supply Ollama through PATH or an explicit override, even
+  // when GreyIQ itself is packaged. Use that installation's model directory too.
+  const selected = await selectOllamaBinary({
+    platform: process.platform,
+    packaged: app.isPackaged,
+    ensureBase: ensureBaseOllama,
+  });
+  const baseBin = selected.binary;
+  if (!baseBin || (app.isPackaged && !selected.external && !fs.existsSync(baseBin))) {
+    lastOllamaError = 'Ollama runtime was not found. Install Ollama or set GREYIQ_OLLAMA_PATH.';
+    return false;
+  }
   // Pick a GPU-capable runtime (NVIDIA works on the base runner; AMD ROCm is fetched
-  // once), always falling back to the base binary.
-  const ollamaBin = (await resolveOllamaRuntime()) || OLLAMA_BIN;
-  ensureExecutable(ollamaBin);
+  // once). A system install manages its own GPU runners.
+  const ollamaBin = app.isPackaged && !selected.external ? ((await resolveOllamaRuntime()) || baseBin) : baseBin;
+  if (selected.external) activeOllamaRuntime = 'system';
+  if (app.isPackaged && !selected.external) ensureExecutable(ollamaBin);
   const modelsDir = path.join(app.getPath('userData'), 'ollama-models');
-  try {
+  const ollamaEnv = { ...process.env, OLLAMA_HOST: `127.0.0.1:${OLLAMA_PORT}` };
+  if (app.isPackaged && !selected.external) {
     fs.mkdirSync(modelsDir, { recursive: true });
-  } catch (_) {
-    // ignore
+    ollamaEnv.OLLAMA_MODELS = modelsDir;
   }
   try {
     ollamaProcess = spawn(ollamaBin, ['serve'], {
-      env: { ...process.env, OLLAMA_HOST: `127.0.0.1:${OLLAMA_PORT}`, OLLAMA_MODELS: modelsDir },
+      env: ollamaEnv,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
       // POSIX group leader so killTree reaps Ollama's model-runner grandchildren.
@@ -786,9 +788,32 @@ async function startOllama() {
     });
     ollamaProcess.stdout.on('data', (chunk) => process.stdout.write(`[Ollama] ${chunk}`));
     ollamaProcess.stderr.on('data', (chunk) => process.stdout.write(`[Ollama] ${chunk}`));
-    ollamaProcess.on('error', (err) => process.stderr.write(`[Ollama] failed to start: ${err.message}\n`));
-    return true;
+    let exited = false;
+    ollamaProcess.once('exit', () => { exited = true; });
+    const spawned = await new Promise((resolve) => {
+      ollamaProcess.once('spawn', () => resolve(true));
+      ollamaProcess.once('error', (err) => {
+        lastOllamaError = `Ollama could not start (${err.message}). Check GREYIQ_OLLAMA_PATH or install Ollama.`;
+        process.stderr.write(`[Ollama] failed to start: ${err.message}\n`);
+        resolve(false);
+      });
+    });
+    if (!spawned || exited || ollamaProcess.exitCode !== null) {
+      if (!lastOllamaError) lastOllamaError = 'Ollama exited before it was ready. Check the Ollama logs.';
+      return false;
+    }
+    const deadline = Date.now() + 30000;
+    while (!exited && Date.now() < deadline) {
+      // eslint-disable-next-line no-await-in-loop
+      if (await ollamaResponding()) return true;
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    killTree(ollamaProcess);
+    lastOllamaError = 'Ollama did not answer on 127.0.0.1:11434 within 30 seconds. Check the Ollama logs.';
+    return false;
   } catch (err) {
+    lastOllamaError = `Ollama could not start (${err.message}).`;
     process.stderr.write(`[Ollama] spawn error: ${err.message}\n`);
     return false;
   }
@@ -800,7 +825,7 @@ function registerIpcHandlers() {
   ipcMain.handle('greyiq:ensure-ollama', async () => {
     try {
       const ok = await startOllama();
-      return { ok: Boolean(ok), runtime: activeOllamaRuntime };
+      return { ok: Boolean(ok), runtime: activeOllamaRuntime, ...(ok ? {} : { error: lastOllamaError }) };
     } catch (err) {
       return { ok: false, error: String(err && err.message || err) };
     }
@@ -840,6 +865,13 @@ async function boot() {
   // Always swap to the app (or the error page) even if startup throws — otherwise an
   // unhandled rejection leaves the window stuck on the loading spinner forever.
   try {
+    if (process.platform === 'linux' && app.isPackaged && !process.env.GREYIQ_RUNTIME_DIR) {
+      const migrated = migrateLegacyRuntime({
+        legacyDir: path.join(app.getPath('userData'), 'runtime'),
+        targetDir: RUNTIME_DIR,
+      });
+      if (migrated) process.stdout.write(`[GreyIQ] Copied previous runtime data to ${RUNTIME_DIR}.\n`);
+    }
     await startBackend();
   } catch (err) {
     if (!startupError) startupError = `Startup failed: ${err && err.message ? err.message : err}`;

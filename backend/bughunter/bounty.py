@@ -32,6 +32,7 @@ from bughunter import brain_narrative
 from bughunter import brain_safety
 from bughunter import credential_validation
 from bughunter import oob_service
+from bughunter import operator_guard
 from bughunter import fsutil
 from bughunter import hunt_loop
 from bughunter import hunt_brain
@@ -1499,8 +1500,12 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
     end = text.rfind("}")
     if start < 0 or end <= start:
         return None
+    from bughunter.json_safety import exceeds_json_depth
+    candidate = text[start : end + 1]
+    if exceeds_json_depth(candidate):
+        return None
     try:
-        obj = json.loads(text[start : end + 1])
+        obj = json.loads(candidate)
         return obj if isinstance(obj, dict) else None
     except (json.JSONDecodeError, ValueError, RecursionError):
         # The brain text is untrusted (it can reflect a prompt-injection from scanned target
@@ -2478,7 +2483,7 @@ def _run_bounty_hunt_body(
         # fresh, unguessable callback token per candidate param, probes, and polls the collaborator;
         # a hit that appears ONLY after the probe (fresh-token negative control) is a confirmed blind
         # SSRF, with the token as the reproducible "sheriff flag". Best-effort; never breaks a hunt.
-        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+        if operator_guard.current() is None and str(oob_base or "").strip() and str(oob_secret or "").strip():
             try:
                 _emit("running blind-SSRF OOB probe (collaborator configured)…")
                 ssrf = oob_service.confirm_blind_ssrf(clean_target, base=oob_base, secret=oob_secret,
@@ -2501,7 +2506,7 @@ def _run_bounty_hunt_body(
         # DNS-pinned target and polls; the entity fetches ONLY the collaborator callback (no target file
         # is ever read), and a hit that appears solely after the probe (fresh-token negative control)
         # confirms blind XXE. Best-effort; a target that doesn't parse XML is a clean no-op; never breaks a hunt.
-        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+        if operator_guard.current() is None and str(oob_base or "").strip() and str(oob_secret or "").strip():
             try:
                 _emit("running blind-XXE OOB probe (collaborator configured)…")
                 xxe = oob_service.confirm_blind_xxe(clean_target, base=oob_base, secret=oob_secret,
@@ -2524,7 +2529,7 @@ def _run_bounty_hunt_body(
         # request headers that reach a shell without any parameter existing, and confirms only on a
         # collaborator hit whose MATCHED bare-URL control stayed silent — so an application that merely
         # fetches URLs it finds (an unfurler, a plain SSRF) is reported as that, never as a CRITICAL RCE.
-        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+        if operator_guard.current() is None and str(oob_base or "").strip() and str(oob_secret or "").strip():
             try:
                 _emit("running blind-RCE OOB probe (collaborator configured)…")
                 rce = oob_service.confirm_blind_rce(clean_target, base=oob_base, secret=oob_secret,
@@ -2549,7 +2554,7 @@ def _run_bounty_hunt_body(
         # rejects the token answers exactly like one that never fetched), so the fetch is the only
         # observable and it is only observable out of band. Uses the token the app hands an ANONYMOUS
         # visitor, so no session is needed; a target that issues none is a clean no-op.
-        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+        if operator_guard.current() is None and str(oob_base or "").strip() and str(oob_secret or "").strip():
             try:
                 _emit("running JWT key-URL injection OOB probe (collaborator configured)…")
                 jwtk = oob_service.confirm_jwt_key_injection(clean_target, base=oob_base, secret=oob_secret,
@@ -2569,7 +2574,10 @@ def _run_bounty_hunt_body(
     # Gated by ``authorized`` — it sends ONE benign, read-only GET to the credential's OWN issuer
     # (Google, never the target), carrying only the found key, to prove liveness + name the project.
     # Best-effort; an error never breaks a hunt.
-    if authorized:
+    # Unattended grants authorize only target-scoped, budgeted reads. Issuer
+    # validation transmits recovered credentials to third-party services and
+    # bypasses those request controls, so leave detections for human review.
+    if authorized and operator_guard.current() is None:
         exposure_findings: list[dict[str, Any]] = []
         # AWS keys need the access-key-id AND its paired secret to sign a SigV4 request, but the two are
         # detected as SEPARATE findings. Index each file's secret access key (the 40-char tail of the

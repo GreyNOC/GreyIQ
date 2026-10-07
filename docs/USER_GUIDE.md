@@ -153,10 +153,31 @@ rail (which the Program picker can autofill):
   findings, and (in **Deep** mode) auto-captures a screenshot + writes a research dossier
   for every confirmed lead.
 - **Autonomous operator** (Operator tab) — works your whole **portfolio** of programs
-  unattended on a schedule: recon → hunt → prove → dedup → report, repeated per program at
-  its configured interval. Auto-submit is off by default and, when armed, is gated by
-  confirmed-proof + non-duplicate + a per-program daily cap — review-only until you
-  explicitly arm it, and the kill switch stops it immediately.
+  on a schedule: recon → hunt → prove → dedup → local report, repeated per program at
+  its configured interval. It queues findings for human review and never submits them.
+  To start, enter the authorization record and current policy source for each enabled
+  program, confirm its scope and restrictions, and choose a 24-hour or seven-day
+  authorization window. The operator stops at expiry or its cycle limit; re-arm it
+  only after checking the current policy again. Verified hunt outcomes inform later
+  priority; this is local feedback, not automatic model-weight training. The kill
+  switch requests cancellation and prevents further cycles. Automated hunts use
+  only a loopback local model or the offline fallback; a cloud or remote model
+  remains available for deliberate manual work.
+
+The CLI's continuous `gn operator run` uses the same grant validation. Pass
+`-y --grant-file path/to/grants.json`; the file must contain one entry for each
+enabled program:
+
+```json
+{"grants":[{"program_id":"saved-program-id","authorization_ref":"engagement record","policy_source":"current program policy URL","policy_checked_at":"UTC ISO-8601 timestamp","expires_at":"UTC ISO-8601 timestamp within seven days","max_cycles":7}]}
+```
+
+The `--once` legacy shortcut is disabled because it lacked the guard and audit
+path. Active grants are held in process memory and must be re-armed after a
+restart. The authorization audit is stored locally as
+`runtime/operator_authorization_audit.jsonl` (or under the configured runtime
+directory); it records the governing references and cycle outcomes without
+making old grants executable.
 
 All three default to **passive-only**. Ticking **"Test for proof of impact (active)"** turns
 on benign, in-scope-only active probes that can mark a finding **Confirmed** instead of just
@@ -241,8 +262,9 @@ Confirmed (and reportable candidate) findings appear in the **Submissions** tab:
   optional certificate-transparency lookup for subdomain seeding (`crt.sh`, read-only), the
   explicit local OSINT command (`crt.sh`, Cert Spotter, Google DNS, and Cloudflare DNS;
   read-only public-index queries), and
-  polling your own OOB collaborator server (a host you configured). Nothing else leaves the
-  machine.
-- **Nothing auto-submits without you arming it.** The Operator's auto-submit is
-  quadruple-gated (explicitly armed + per-program opt-in + server-recomputed confirmed proof
-  + a daily cap), and the kill switch stops the whole loop immediately.
+  polling your own OOB collaborator server (a host you configured). An explicit
+  local-model setup also checks the public Hugging Face model metadata and asks
+  Ollama to download the selected model.
+- **Only you submit reports.** The Operator queues findings and report packages locally.
+  Review the evidence and use the manual submission action if you decide to file a report.
+  The kill switch requests cancellation and prevents further scheduled work.

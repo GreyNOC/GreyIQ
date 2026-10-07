@@ -18,6 +18,8 @@ build/*
 !build/build-portable.ps1
 !build/icon.ico
 !build/icon.png
+!build/greyiq-cli
+!build/portable-cli/
 *.log
 .env
 .env.*

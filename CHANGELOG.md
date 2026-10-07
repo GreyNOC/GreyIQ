@@ -2,6 +2,19 @@
 
 Notable changes to GreyIQ.
 
+## Unreleased — Debian 13 and guarded operator updates
+
+- Added a Debian 13 package, AppImage, and headless CLI archive with a relocatable
+  `greyiq-cli` launcher. `greyiq-cli path` prints the runtime location and PATH
+  setup syntax; `dashboard` provides a read-only terminal monitor.
+- Added one-click setup for public Hugging Face GGUF models through Ollama, with
+  chat and tool-call readiness checks before selecting a model. Clearing a
+  previous remote server URL now selects the default local Ollama server.
+- Scheduled operator runs now require expiring per-program authorization grants,
+  enforce scope and request budgets, and queue findings for human review.
+  Local outcome feedback reprioritizes later authorized cycles.
+
+
 ## v4.4.0 - hunting what an unauthenticated attacker actually gets
 
 A QA/QC pass over the hunt engine, its technique and its reporting, aimed at the two classes the
@@ -753,6 +766,12 @@ each cycle starts blind. So GreyIQ could not notice the highest-signal event in 
 
 This release also carries the work that landed on `main` while the audit ran:
 
+- Removed unattended HackerOne submission from the portfolio operator, API, and CLI.
+  Scheduled hunts now queue findings for human review; legacy auto-submit flags are ignored.
+- The account-login browser now checks program scope before sending credentials on
+  redirects and subrequests.
+- The standard Python check now runs pytest, including tests previously skipped by
+  unittest discovery, and validates literal frontend API paths against backend routes.
 - Added a local-first `gn osint` campaign engine. It queries two certificate-transparency
   indexes and two independent DNS-over-HTTPS resolvers, retains timestamped source provenance
   for every claim, labels single-source and historical observations honestly, and writes a

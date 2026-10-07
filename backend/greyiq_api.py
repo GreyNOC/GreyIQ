@@ -42,7 +42,23 @@ else:
     PROJECT_ROOT = BACKEND_DIR.parent
     PUBLIC_DIR = PROJECT_ROOT / "public"
     SEED_DIR = BACKEND_DIR / "seed"
-RUNTIME_DIR = Path(os.getenv("GREYIQ_RUNTIME_DIR", PROJECT_ROOT / "runtime")).resolve()
+
+
+def _resolve_runtime_dir(project_root: Path) -> Path:
+    """Keep frozen Linux API data outside the read-only application bundle."""
+    explicit = os.getenv("GREYIQ_RUNTIME_DIR")
+    if explicit is not None:
+        return Path(explicit).resolve()
+    if getattr(sys, "frozen", False) and sys.platform == "linux":
+        xdg_home = os.getenv("XDG_DATA_HOME")
+        data_home = Path(xdg_home) if xdg_home else Path.home() / ".local" / "share"
+        if not data_home.is_absolute():
+            data_home = Path.home() / ".local" / "share"
+        return (data_home / "greyiq" / "runtime").resolve()
+    return (project_root / "runtime").resolve()
+
+
+RUNTIME_DIR = _resolve_runtime_dir(PROJECT_ROOT)
 # One rollback snapshot per workspace (the last agent run), keyed by a hash of the
 # resolved workspace path. Powers "Undo last agent run".
 SNAPSHOT_DIR = RUNTIME_DIR / "agent_snapshots"
@@ -271,6 +287,7 @@ if str(BACKEND_DIR) not in sys.path:
 import agent as coding_agent  # noqa: E402
 import brain_profiles  # noqa: E402
 import brain_techniques  # noqa: E402
+import coding_learning_bridge  # noqa: E402
 import coder  # noqa: E402
 import project_memory  # noqa: E402
 import workspace as workspace_fs  # noqa: E402
@@ -390,6 +407,7 @@ from bughunter import forge_metadata as bounty_forge_metadata  # noqa: E402
 from bughunter import taxonomy as bounty_taxonomy  # noqa: E402
 from bughunter import fsutil as bounty_fsutil  # noqa: E402
 from bughunter import progress as bounty_progress  # noqa: E402
+from bughunter import operator_guard as bounty_operator_guard  # noqa: E402
 from bughunter.operator import OperatorLoop  # noqa: E402
 from bughunter import toolkit as toolkit_lib  # noqa: E402
 from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E402
@@ -434,6 +452,7 @@ SEED_FILES = (
 )
 SEED_DATA_FILES = (
     "greyiq_starter_knowledge.txt",
+    "greyiq_coding_knowledge.txt",
     "greyiq_bug_bounty_knowledge.txt",
     # Native-text extract of the Manual_pdfs library, bundled so the local model
     # trains on it on first run (copied into RUNTIME_DIR/data by ensure_runtime).
@@ -595,6 +614,11 @@ class DeleteCoreRequest(BaseModel):
 
 class DeleteModelRequest(BaseModel):
     model: str = Field(min_length=1, max_length=200)
+
+
+class ModelSetupRequest(BaseModel):
+    model: str = Field(min_length=1, max_length=350)
+    base_url: str = Field(default="", max_length=400)
 
 
 class ScanCodeRequest(BaseModel):
@@ -1179,7 +1203,8 @@ class HackerOneSyncRequest(BaseModel):
 
 class OperatorStartRequest(BaseModel):
     authorized: bool = False
-    allow_submit: bool = False  # ARM auto-submit (still per-program opt-in + confirmed-only + dedup'd)
+    allow_submit: bool = False  # legacy clients: explicitly refused by operator_start
+    grants: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
 
 
 class OperatorEventsRequest(BaseModel):
@@ -1354,8 +1379,7 @@ class GreyIQRuntime:
         # In-memory only (drop-oldest); the on-disk report/JSON sidecar is the durable
         # copy. Lets the cockpit fetch a canonical build_submission package per finding.
         self.bounty_runs: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
-        # The autonomous operator loop (lazy — created on first start so its callables
-        # bind to this runtime's hard-gated run_campaign + submit_finding).
+        # The portfolio hunt scheduler (lazy — created on first start).
         self._operator: "OperatorLoop | None" = None
         self.store = AICoreStore(RUNTIME_DIR)
         ensure_runtime()
@@ -1546,7 +1570,14 @@ class GreyIQRuntime:
     def brain_status(self, workspace: str | None = None) -> dict[str, Any]:
         """Public metadata only: technique names/counts, aggregate outcomes, and guardrails."""
         root = workspace or str(PROJECT_ROOT)
-        return brain_techniques.status_snapshot(RUNTIME_DIR, SEED_DIR, root)
+        status = brain_techniques.status_snapshot(RUNTIME_DIR, SEED_DIR, root)
+        try:
+            from learning_engine import LearningEngine
+
+            status["recursive_learning"] = LearningEngine(RUNTIME_DIR).status()
+        except Exception:  # noqa: BLE001 - learning telemetry is advisory
+            status["recursive_learning"] = {"available": False}
+        return status
 
     def coder_test(self) -> dict[str, Any]:
         try:
@@ -1587,7 +1618,7 @@ class GreyIQRuntime:
             return {"ok": False, "error": "No local model is configured."}
         with self.lock:
             if self.model_pull.get("active"):
-                return {"ok": False, "error": "A model download is already in progress.", **self.model_pull}
+                return {**self.model_pull, "ok": False, "error": "A model download is already in progress."}
             self.model_pull = {
                 "active": True, "model": target, "status": "starting", "percent": 0,
                 "completed": 0, "total": 0, "done": False, "error": "",
@@ -1615,6 +1646,113 @@ class GreyIQRuntime:
                     self.model_pull.update({"active": False, "done": True, "error": str(exc), "status": "error"})
 
         threading.Thread(target=worker, name="ollama-pull", daemon=True).start()
+        return {"ok": True, "active": True, "model": target}
+
+    def start_model_setup(self, reference: str, base_url: str = "") -> dict[str, Any]:
+        """Download, verify, then select a model without disrupting the active brain.
+
+        A failed download or failed readiness probe leaves the previous provider
+        and model selected. The shared pull-status endpoint reports each phase.
+        """
+        try:
+            target, is_hf = coder.normalize_local_model_reference(reference)
+        except coder.CoderError as exc:
+            return {"ok": False, "error": str(exc)}
+        with self.lock:
+            if self.model_pull.get("active"):
+                return {**self.model_pull, "ok": False, "error": "A model download is already in progress."}
+            previous = self._coder_config()
+            try:
+                # The setup request carries the server field explicitly. An empty
+                # field means the default local Ollama host, even when the saved
+                # brain previously pointed at a remote server.
+                host = coder.ollama_setup_host(base_url)
+            except coder.CoderError as exc:
+                return {"ok": False, "error": str(exc)}
+            previous_selection = (
+                bool(previous.get("enabled")), str(previous.get("provider") or ""),
+                str((previous.get("local") or {}).get("model") or ""),
+                str((previous.get("local") or {}).get("base_url") or ""),
+            )
+            self.model_pull = {
+                "active": True, "setup": True, "model": target, "status": "checking local models",
+                "percent": 0, "completed": 0, "total": 0, "done": False,
+                "chat_ready": False, "tool_ready": False, "selected": False,
+                "chat_only": False, "error": "",
+            }
+
+        def progress(event: dict[str, Any]) -> None:
+            with self.lock:
+                if event.get("status"):
+                    self.model_pull["status"] = str(event["status"])
+                total = int(event.get("total") or 0)
+                completed = int(event.get("completed") or 0)
+                if total > 0:
+                    self.model_pull["total"] = total
+                    self.model_pull["completed"] = completed
+                    self.model_pull["percent"] = min(100, int(completed * 100 / total))
+
+        def worker() -> None:
+            try:
+                installed = coder.ollama_list_models(host)
+                if not coder.model_installed(installed, target):
+                    if is_hf:
+                        with self.lock:
+                            self.model_pull["status"] = "checking Hugging Face GGUF repository"
+                        coder.check_public_hf_gguf(target)
+                    with self.lock:
+                        self.model_pull["status"] = "downloading model"
+                    coder.ollama_pull(host, target, timeout=3600.0, progress_cb=progress)
+                    installed = coder.ollama_list_models(host)
+                    if not coder.model_installed(installed, target):
+                        raise coder.CoderError("Ollama reported success, but the model is absent from its installed list.")
+                with self.lock:
+                    self.model_pull.update({"status": "checking chat and agent tool calls", "percent": 100})
+                readiness = coder.ollama_probe_readiness(host, target)
+                with self.lock:
+                    self.model_pull.update({
+                        "chat_ready": bool(readiness.get("chat_ready")),
+                        "tool_ready": bool(readiness.get("tool_ready")),
+                    })
+                if not readiness.get("chat_ready"):
+                    raise coder.CoderError(str(readiness.get("reason") or "Downloaded model failed the chat check."))
+                if not readiness.get("tool_ready"):
+                    with self.lock:
+                        self.model_pull.update({
+                            "active": False, "done": True, "chat_only": True,
+                            "status": "chat only; previous brain unchanged",
+                            "error": str(readiness.get("reason") or "Agent tool-call check failed."),
+                        })
+                    return
+                with self.lock:
+                    current = self._coder_config()
+                    current_selection = (
+                        bool(current.get("enabled")), str(current.get("provider") or ""),
+                        str((current.get("local") or {}).get("model") or ""),
+                        str((current.get("local") or {}).get("base_url") or ""),
+                    )
+                    if current_selection != previous_selection:
+                        self.model_pull.update({
+                            "active": False, "done": True,
+                            "status": "ready; brain changed during setup",
+                            "error": "The model is ready, but brain settings changed during setup. Select it manually if still wanted.",
+                        })
+                        return
+                    local_update = {"model": target, "base_url": base_url.strip()}
+                    self.save_coder_config({"enabled": True, "provider": "local", "local": local_update})
+                    self.model_pull.update({
+                        "active": False, "done": True, "selected": True,
+                        "status": "ready for chat and agent tools", "percent": 100,
+                    })
+            except Exception as exc:  # noqa: BLE001 - report failure to the operator
+                self.log(f"Model setup failed: {exc}")
+                with self.lock:
+                    self.model_pull.update({
+                        "active": False, "done": True, "status": "error",
+                        "error": str(exc),
+                    })
+
+        threading.Thread(target=worker, name="ollama-model-setup", daemon=True).start()
         return {"ok": True, "active": True, "model": target}
 
     def delete_model(self, model: str) -> dict[str, Any]:
@@ -1669,6 +1807,9 @@ class GreyIQRuntime:
                 runtime_dir=RUNTIME_DIR,
                 seed_dir=SEED_DIR,
             )
+            lesson = coding_learning_bridge.learn_from_verified_run(
+                RUNTIME_DIR, prompt=request.message, result=result
+            )
             snapshot_meta = self._persist_snapshot(request.workspace, result.get("snapshot") or [])
             return {
                 "ok": True,
@@ -1687,6 +1828,7 @@ class GreyIQRuntime:
                 "snapshot_count": snapshot_meta["count"],
                 "model_name": f"{result['provider']}:{result['model']}",
                 "provider": result["provider"],
+                "tinygpt_lesson": lesson,
             }
         except coding_agent.AgentError as exc:
             # A mid-run failure may have partially written files; persist the snapshot the run
@@ -1757,6 +1899,9 @@ class GreyIQRuntime:
                     seed_dir=SEED_DIR,
                     on_event=on_event,
                 )
+                lesson = coding_learning_bridge.learn_from_verified_run(
+                    RUNTIME_DIR, prompt=request.message, result=result
+                )
                 snapshot_meta = self._persist_snapshot(request.workspace, result.get("snapshot") or [])
                 payload = {
                     "ok": True,
@@ -1775,6 +1920,7 @@ class GreyIQRuntime:
                     "snapshot_count": snapshot_meta["count"],
                     "model_name": f"{result['provider']}:{result['model']}",
                     "provider": result["provider"],
+                    "tinygpt_lesson": lesson,
                 }
             except coding_agent.AgentError as exc:
                 snap = self._persist_snapshot(request.workspace, getattr(exc, "agent_snapshot", None) or [])
@@ -2522,11 +2668,14 @@ class GreyIQRuntime:
         # stored research-account credentials (account_access) drive an auto-login in run_campaign.
         req_auth = ({"cookie": request.auth_cookie, "headers": request.auth_headers}
                     if (request.auth_cookie or request.auth_headers) else None)
+        brain_config = self._coder_config()
+        if bounty_operator_guard.current() is not None:
+            brain_config = coder.unattended_config(brain_config)
         result = bounty_campaign.run_campaign(
             request.target,
             scope=request.scope,
             authorized=request.authorized,
-            coder_cfg=self._coder_config(),
+            coder_cfg=brain_config,
             default_reports_dir=RUNTIME_DIR / "reports",
             seed_dir=SEED_DIR,
             runtime_dir=RUNTIME_DIR,
@@ -3879,7 +4028,8 @@ class GreyIQRuntime:
 
     # ---- Autonomous operator ------------------------------------------------------
     def _operator_run_campaign(self, target: str, *, scope: str, program: str, active: bool, live: bool,
-                               deep: bool = False, max_pages: int = 12) -> dict[str, Any]:
+                               deep: bool = False, max_pages: int = 12,
+                               run_id: str = "") -> dict[str, Any]:
         """The operator's run_campaign_fn — goes through runtime.run_campaign so the
         run is cached (run_id) and the submit path can resolve it. authorized=True
         because the operator only runs after the user explicitly armed it (the start
@@ -3888,13 +4038,8 @@ class GreyIQRuntime:
         lead) through unchanged."""
         return self.run_campaign(CampaignRequest(
             target=target, scope=scope, authorized=True, program=program,
-            active=active, live=live, deep=deep, max_pages=max_pages,
+            active=active, live=live, deep=deep, max_pages=max_pages, run_id=run_id,
         ))
-
-    def _operator_submit(self, run_id: str, ref: str) -> dict[str, Any]:
-        """The operator's submit_fn — the SAME hard-gated runtime.submit_finding (confirm
-        + server-recomputed proof_status=='confirmed' + creds). Unforgeable by the loop."""
-        return self.submit_finding(SubmitRequest(run_id=run_id, ref=ref, confirm=True, platform="hackerone"))
 
     def _get_operator(self) -> "OperatorLoop":
         with self.lock:
@@ -3902,7 +4047,6 @@ class GreyIQRuntime:
                 self._operator = OperatorLoop(
                     str(RUNTIME_DIR),
                     run_campaign_fn=self._operator_run_campaign,
-                    submit_fn=self._operator_submit,
                 )
             return self._operator
 
@@ -4211,10 +4355,15 @@ class GreyIQRuntime:
     def operator_start(self, request: "OperatorStartRequest") -> dict[str, Any]:
         if not request.authorized:
             return {"ok": False, "error": "Confirm you are authorized to run the portfolio's programs (set authorized)."}
-        started = self._get_operator().start(allow_submit=bool(request.allow_submit))
-        return {"ok": True, "started": started, "allow_submit": bool(request.allow_submit),
-                "note": "auto-submit ARMED — confirmed, non-duplicate findings will be filed within each program's daily cap." if request.allow_submit
-                        else "review-only — findings are hunted and queued; nothing is auto-filed."}
+        if request.allow_submit:
+            return {"ok": False, "started": False, "allow_submit": False,
+                    "error": "Automatic submission is disabled. Review findings and submit manually."}
+        try:
+            started = self._get_operator().start(grants=request.grants)
+        except (ValueError, OSError) as exc:
+            return {"ok": False, "started": False, "allow_submit": False, "error": str(exc)}
+        return {"ok": True, "started": started, "allow_submit": False,
+                "note": "Review-only — findings are hunted and queued; nothing is auto-filed."}
 
     def operator_stop(self) -> dict[str, Any]:
         if self._operator is not None:
@@ -4227,12 +4376,14 @@ class GreyIQRuntime:
         return {"ok": True, **self._operator.event_tail(after=after)}
 
     def operator_pipeline(self) -> dict[str, Any]:
+        operator_status = self._operator.event_tail(after=0) if self._operator else {}
         return {
             "ok": True,
             "funnel": bounty_ledger.funnel(RUNTIME_DIR),
             "programs": bounty_portfolio.list_programs(RUNTIME_DIR),
             "learning": bounty_learning.program_summary(RUNTIME_DIR),
             "running": bool(self._operator and self._operator.running),
+            "grants": operator_status.get("grants", []),
         }
 
     def record_outcome(self, request: "LearnRequest") -> dict[str, Any]:
@@ -4331,10 +4482,20 @@ class GreyIQRuntime:
             return None
         cfg = coder.coder_config(raw)
         messages = self._build_coder_messages(request, int(cfg.get("history_turns") or 12))
+        student = ""
+        try:
+            # TinyGPT speaks first. The stronger brain sees this only as an
+            # untrusted draft to critique, never as authoritative code.
+            student = coding_learning_bridge.student_draft(self.get_engine(), request.message)
+        except Exception as exc:  # noqa: BLE001 - teacher remains usable without TinyGPT
+            self.log(f"TinyGPT coding dialogue unavailable: {exc}")
         # The coding brain runs with a coding-focused system prompt; bot persona,
         # style, and stored preferences are layered on top.
         cfg = dict(cfg)
         cfg["system_prompt"] = self._coder_system_prompt(request, cfg)
+        bridge_block = coding_learning_bridge.teacher_prompt_block(student)
+        if bridge_block:
+            cfg["system_prompt"] += "\n\n" + bridge_block
         # Chat is interactive: responsiveness matters as much as depth, so it gets its own reasoning
         # profile instead of inheriting whatever the deepest brain needed. Only fills values the
         # operator left at the shipped defaults — an explicit setting still wins.
@@ -4357,11 +4518,23 @@ class GreyIQRuntime:
                 "citations": [],
                 "ai_core": self.store.load(),
             }
+        lesson = coding_learning_bridge.record_teacher_exchange(
+            RUNTIME_DIR,
+            prompt=request.message,
+            student=student,
+            teacher=str(result.get("text") or ""),
+            model_version=f"{result['provider']}:{result['model']}",
+        )
         return {
             "request_id": uuid4().hex,
             "message": friendly_branding(result["text"]),
             "used_fallback": False,
             "captured_for_training": False,
+            "brain_dialogue": {
+                "tinygpt_draft_used": bool(student),
+                "lesson_status": lesson.get("outcome"),
+                "verification_reason": lesson.get("verification_reason"),
+            },
             "model_name": f"{result['provider']}:{result['model']}",
             "device": "remote" if result["provider"] == "anthropic" else "local-model",
             "citations": [],
@@ -5898,6 +6071,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             body = await read_json_body(receive)
             model = str((body or {}).get("model") or "")
             await send_json(send, await asyncio.to_thread(runtime.start_model_pull, model))
+            return
+        if method == "POST" and path == "/api/coder/setup":
+            request = validate_payload(ModelSetupRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.start_model_setup, request.model, request.base_url))
             return
         if method == "GET" and path == "/api/coder/pull":
             await send_json(send, runtime.model_pull_status())

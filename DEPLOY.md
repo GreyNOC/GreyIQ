@@ -5,13 +5,103 @@ Nginx or another reverse proxy in front when exposing it on a server.
 
 ## Prerequisites
 
-- Node.js 18 or newer
+- Node.js 22.12 or newer for the desktop build (Debian 13's `nodejs` package is Node 20)
 - Python 3.10 or newer recommended
 - npm
 - PM2 for process persistence when running as a server: `npm install -g pm2`
 - Nginx and Certbot only when exposing GreyIQ through a domain
 
 ## Install
+
+### Debian 13 desktop package
+
+Use the `amd64.deb` release asset on Debian 13 amd64. `apt` installs the desktop
+libraries and `zstd`, which the on-demand Ollama download needs:
+
+```bash
+sudo apt install ./GreyIQ-*-amd64.deb
+greyiq
+```
+
+The package also installs `greyiq-cli`. Its btop-style local monitor is:
+
+```bash
+greyiq-cli dashboard
+```
+
+The dashboard is read-only. It reports API health, system load, programs,
+findings, reports, and recent activity. Press `q` to quit, `r` to refresh, and
+Tab or arrow keys to move between panels. It only probes `127.0.0.1` and does
+not start hunts. Other CLI verbs remain available through `greyiq-cli --help`.
+For a headless install without the desktop package, extract the Linux CLI
+tarball. Keep the launcher and `greyiq-backend/` directory together:
+
+```bash
+tar -xzf GreyIQ-*-linux-cli.tar.gz
+./greyiq-cli path
+./greyiq-cli dashboard
+```
+
+`path` prints the runtime data directory and optional shell PATH syntax without
+changing your profile. The archive includes `INSTALL.txt` with these commands.
+To make `greyiq-cli` available from any directory without root access, run from
+the extracted directory:
+
+```bash
+mkdir -p "$HOME/.local/opt/greyiq" "$HOME/.local/bin"
+cp -a greyiq-cli greyiq-backend "$HOME/.local/opt/greyiq/"
+ln -sfn "$HOME/.local/opt/greyiq/greyiq-cli" "$HOME/.local/bin/greyiq-cli"
+export PATH="$HOME/.local/bin:$PATH"
+greyiq-cli dashboard
+```
+
+If `~/.local/bin` is not already on your PATH, add
+`export PATH="$HOME/.local/bin:$PATH"` to `~/.profile` for future login shells.
+The Debian `.deb` installs `greyiq-cli` in `/usr/bin`, so this setup is only
+for the headless archive.
+
+The desktop and CLI share `$XDG_DATA_HOME/greyiq/runtime` (default
+`~/.local/share/greyiq/runtime`); `GREYIQ_RUNTIME_DIR` overrides both. When that
+directory is absent, the packaged desktop copies data from an older AppImage's
+`~/.config/GreyIQ/runtime` on first launch and leaves the old copy in place.
+Launch the desktop once before using CLI commands that write runtime data after
+an upgrade.
+
+For the portable AppImage, install `libfuse2t64` and `zstd`, then use `chmod +x`
+and launch it. A desktop session with working unprivileged user namespaces is
+required for Electron's sandbox; keep the sandbox enabled.
+
+### Debian 13 source checkout
+
+Debian 13 supplies Python 3.13. Use a virtual environment for Python packages:
+Install [Node.js 22.12 or newer](https://nodejs.org/en/download) before `npm ci`;
+Debian 13's `nodejs` package does not meet Electron's build requirement.
+
+```bash
+sudo apt update
+sudo apt install python3-venv tesseract-ocr poppler-utils zstd xz-utils binutils
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install "torch>=2.13,<3.0" --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements.txt -r requirements-test.txt
+npm ci
+npm run check
+npm run desktop
+```
+
+Use `./gn dashboard` for the interactive source CLI. On Linux, it and
+`npm run desktop` share the checkout's `runtime/` directory. The desktop uses a system
+`ollama` command or `GREYIQ_OLLAMA_PATH` when set; packaged Linux builds do the
+same before offering an on-demand runtime download. If a desktop package is
+needed from source, install `build/requirements-build.txt`, run
+`python -m playwright install --with-deps chromium`, then run
+`npm run build:linux`. This creates the Debian package and AppImage in `release/`.
+The build must run on Linux; the release workflow freezes on Ubuntu 24.04 and
+smoke-tests the `.deb` in Debian 13.
+
+The optional OCR tools are `tesseract-ocr` and `poppler-utils`. `TESSERACT_CMD`
+and `POPPLER_PATH` can override discovery when installed outside normal paths.
 
 ```powershell
 npm ci
@@ -176,7 +266,7 @@ into public issues or chats.
 ```bash
 git pull
 npm ci
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.txt -r requirements-test.txt
 npm run check
 npm run check:devops
 pm2 reload ecosystem.config.cjs --update-env
@@ -190,7 +280,7 @@ dependencies and reloading PM2.
 
 1. Check the previous Git revision or release tag.
 2. Restore the previous `ecosystem.config.cjs`, `.env.example`, or Nginx config if changed.
-3. Reinstall dependencies if `package-lock.json` or `requirements.txt` changed.
+3. Reinstall dependencies if `package-lock.json`, `requirements.txt`, or `requirements-test.txt` changed.
 4. Run `npm run check` and `npm run check:devops`.
 5. Restart PM2:
 

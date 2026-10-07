@@ -5,6 +5,7 @@
   "type": "module",
   "description": "GreyIQ local-first AI chat UI with editable bots, personal preference training, an Ollama/Claude/OpenAI coding brain with out-of-the-box GPU acceleration (NVIDIA bundled, AMD auto-provisioned), and a browser CPU/WebGPU fallback.",
   "author": "GreyNOC",
+  "homepage": "https://github.com/GreyNOC/GreyIQ",
   "main": "electron/main.cjs",
   "scripts": {
     "start": "node server.mjs",
@@ -13,9 +14,10 @@
     "desktop": "electron .",
     "freeze:backend": "pyinstaller --noconfirm --clean build/greyiq-backend.spec",
     "dist": "electron-builder --win portable nsis",
+    "build:linux": "pyinstaller --noconfirm --clean build/greyiq-backend.spec && chmod +x build/greyiq-cli && electron-builder --linux AppImage deb --publish never",
     "build:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File build/build-portable.ps1",
-    "check:js": "node --check server.mjs && node --check public/app.js && node --check electron/main.cjs && node --check electron/preload.cjs",
-    "check:python": "python -B -c \"from pathlib import Path; p=Path('backend/greyiq_api.py'); compile(p.read_text(encoding='utf-8'), str(p), 'exec')\" && python -B -m unittest discover -s backend -t backend",
+    "check:js": "node --check server.mjs && node --check public/app.js && node --check electron/main.cjs && node --check electron/preload.cjs && node --check electron/health.cjs && node --check electron/ollama-runtime.cjs && node --check electron/runtime-path.cjs && node --test electron/health.test.cjs electron/ollama-runtime.test.cjs electron/runtime-path.test.cjs scripts/frontend-dom.test.cjs",
+    "check:python": "python -B -c \"from pathlib import Path; p=Path('backend/greyiq_api.py'); compile(p.read_text(encoding='utf-8'), str(p), 'exec')\" && python -B -m pytest -q backend",
     "check:devops": "node scripts/check-devops.cjs",
     "check": "npm run check:js && npm run check:python && npm run check:devops"
   },
@@ -24,7 +26,7 @@
     "electron-builder": "^26.15.3"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.12.0"
   },
   "build": {
     "appId": "com.greynoc.greyiq",
@@ -67,10 +69,31 @@
     "linux": {
       "icon": "build/icon.png",
       "target": [
-        "AppImage"
+        "AppImage",
+        "deb"
       ],
       "category": "Development",
       "artifactName": "GreyIQ-${version}-${arch}.${ext}"
+    },
+    "deb": {
+      "maintainer": "GreyNOC",
+      "fpm": [
+        "build/greyiq-cli=/usr/bin/greyiq-cli"
+      ],
+      "depends": [
+        "libgtk-3-0",
+        "libnotify4",
+        "libnss3",
+        "libxss1",
+        "libxtst6",
+        "xdg-utils",
+        "libatspi2.0-0",
+        "libasound2t64",
+        "libgbm1",
+        "libuuid1",
+        "libsecret-1-0",
+        "zstd"
+      ]
     }
   }
 }

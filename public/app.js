@@ -176,6 +176,7 @@ const els = {
   brainForm: document.querySelector("#brainForm"),
   brainProvider: document.querySelector("#brainProvider"),
   brainModel: document.querySelector("#brainModel"),
+  brainModelHelp: document.querySelector("#brainModelHelp"),
   brainBaseUrl: document.querySelector("#brainBaseUrl"),
   brainApiKey: document.querySelector("#brainApiKey"),
   brainUaMarker: document.querySelector("#brainUaMarker"),
@@ -2143,6 +2144,13 @@ function brainBlockFor(provider) {
 
 function applyBrainFields(provider, repopulate) {
   const fields = BRAIN_FIELDS[provider] || [];
+  if (repopulate) {
+    const block = brainBlockFor(provider);
+    els.brainModel.value = block.model || "";
+    els.brainBaseUrl.value = block.base_url || "";
+    els.brainApiKey.value = "";
+    els.brainApiKey.placeholder = block.has_api_key ? "saved — leave blank to keep" : "paste API key";
+  }
   els.brainForm.querySelectorAll("[data-brain-field]").forEach((row) => {
     row.hidden = !fields.includes(row.dataset.brainField);
   });
@@ -2150,6 +2158,7 @@ function applyBrainFields(provider, repopulate) {
     els.brainTest.hidden = provider === "off";
   }
   if (els.brainModelList) els.brainModelList.hidden = provider !== "local";
+  if (els.brainModelHelp) els.brainModelHelp.hidden = provider !== "local";
   if (els.brainModelRow) {
     els.brainModelRow.hidden = provider !== "local";
     if (provider === "local") {
@@ -2163,11 +2172,6 @@ function applyBrainFields(provider, repopulate) {
   }
   // Derived from the stored state, so it stays right after a save or a clear too.
   els.brainApiKey.placeholder = block.has_api_key ? "saved — leave blank to keep" : "paste API key";
-  if (repopulate) {
-    els.brainModel.value = block.model || "";
-    els.brainBaseUrl.value = block.base_url || "";
-    els.brainApiKey.value = "";
-  }
 }
 
 function renderBrainForm() {
@@ -2194,6 +2198,12 @@ async function loadCoderConfig() {
     coderConfig = await apiFetch("/api/coder", { timeoutMs: 4000 });
     renderBrainForm();
     renderAgentBar(); // refresh the command-policy trust label now the config is known
+    const pull = await apiFetch("/api/coder/pull", { timeoutMs: 4000 });
+    if (pull.active && pull.setup) {
+      els.brainDownload.disabled = true;
+      els.brainSave.disabled = true;
+      pollModelPull();
+    }
   } catch (_) {
     // Local service not up yet; the form keeps its defaults.
   }
@@ -2293,7 +2303,11 @@ async function refreshModelStatus() {
       renderModelList([], "");
       return;
     }
-    if (info.present) {
+    const typedModel = els.brainModel.value.trim();
+    if (typedModel && typedModel !== info.configured) {
+      els.brainModelStatus.textContent = "New model entered. Download and use checks it before changing your current brain.";
+      els.brainDownload.hidden = false;
+    } else if (info.present) {
       els.brainModelStatus.textContent = `Model installed: ${info.configured} ✓`;
       els.brainDownload.hidden = true;
     } else {
@@ -2305,6 +2319,12 @@ async function refreshModelStatus() {
     els.brainModelStatus.textContent = error.message || "Could not check the model.";
   }
 }
+
+els.brainModel?.addEventListener("input", () => {
+  if (els.brainProvider.value !== "local") return;
+  els.brainDownload.hidden = false;
+  els.brainModelStatus.textContent = "Download and use checks this model before changing your current brain.";
+});
 
 // List the installed local models, each with a Remove button.
 function renderModelList(installed, configured) {
@@ -2360,38 +2380,72 @@ function pollModelPull() {
     }
     if (status.active) {
       const pct = status.percent ? ` ${status.percent}%` : "";
-      els.brainModelStatus.textContent = `Downloading ${status.model}…${pct} ${status.status || ""}`.trim();
+      els.brainModelStatus.textContent = `Setting up ${status.model}…${pct} ${status.status || ""}`.trim();
       return;
     }
     clearInterval(modelPullTimer);
     modelPullTimer = null;
     els.brainDownload.disabled = false;
-    if (status.error) {
-      els.brainModelStatus.textContent = `Download failed: ${status.error}`;
-    } else {
-      void refreshModelStatus();
+    els.brainSave.disabled = false;
+    if (status.selected) {
+      await loadCoderConfig();
+      els.brainStatus.textContent = `${status.model} is ready for chat and agent tools.`;
+    } else if (status.chat_only) {
+      els.brainModel.value = status.model || els.brainModel.value;
+      els.brainModelStatus.textContent = `Downloaded ${status.model}; chat works, but agent tools did not pass.`;
+      els.brainStatus.textContent = `${status.error} Your previous brain is still active. You may save this model for chat only.`;
+    } else if (status.error) {
+      els.brainModelStatus.textContent = `Setup failed: ${status.error}`;
+      els.brainStatus.textContent = "Your previous brain is still active.";
     }
   }, 2000);
 }
 
 els.brainDownload?.addEventListener("click", async () => {
+  const selectedModel = els.brainModel.value.trim();
+  const selectedBaseUrl = els.brainBaseUrl.value.trim();
+  if (!selectedModel) {
+    els.brainModelStatus.textContent = "Enter an Ollama model name or Hugging Face GGUF model link.";
+    return;
+  }
   if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
     els.brainModelStatus.textContent = "Local service not running.";
     return;
   }
+  let localOllama = !selectedBaseUrl;
+  if (selectedBaseUrl) {
+    try {
+      const host = new URL(selectedBaseUrl).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+      localOllama = host === "localhost" || host === "::1" || /^127\./.test(host);
+    } catch {
+      // Let the backend return its precise invalid-server-URL error.
+      localOllama = false;
+    }
+  }
   els.brainDownload.disabled = true;
-  els.brainModelStatus.textContent = "Starting download… (the 14B model is ~9 GB, downloaded once)";
+  els.brainSave.disabled = true;
+  els.brainModelStatus.textContent = localOllama ? "Preparing the local model runtime…" : "Checking Ollama server…";
   try {
-    const res = await apiFetch("/api/coder/pull", { method: "POST", timeoutMs: 10000, body: JSON.stringify({}) });
+    if (localOllama && typeof window.greyiqDesktop?.ensureOllama === "function") {
+      const runtime = await window.greyiqDesktop.ensureOllama();
+      if (!runtime?.ok) throw new Error(runtime?.error || "Local model runtime could not start.");
+    }
+    els.brainModelStatus.textContent = "Checking model and starting download…";
+    const res = await apiFetch("/api/coder/setup", {
+      method: "POST", timeoutMs: 10000,
+      body: JSON.stringify({ model: selectedModel, base_url: selectedBaseUrl })
+    });
     if (res.ok === false) {
       els.brainModelStatus.textContent = res.error || "Could not start the download.";
       els.brainDownload.disabled = false;
+      els.brainSave.disabled = false;
       return;
     }
     pollModelPull();
   } catch (error) {
     els.brainModelStatus.textContent = error.message || "Download failed to start.";
     els.brainDownload.disabled = false;
+    els.brainSave.disabled = false;
   }
 });
 
@@ -6454,27 +6508,26 @@ const CK_WALKTHROUGHS = {
   },
   "operator": {
     summary: "How the autonomous operator works — walkthrough",
-    intro: "The operator works a PORTFOLIO of programs unattended: for each enabled program it runs the full loop on a schedule — recon → hunt → prove → dedup → report. It only files findings when you've armed auto-submit, and the kill switch stops it instantly. (Programs are shared with the Program tab — add/import scope there, tune automation here; both edit the same record.)",
+    intro: "The operator works a PORTFOLIO of programs on a schedule: recon → hunt → prove → dedup → report. Findings are queued for your review and only you can submit them. The kill switch stops the scheduled work. (Programs are shared with the Program tab — add/import scope there, tune automation here; both edit the same record.)",
     sections: [
       { h4: "Add a program", list: [
         "Name + Scope — the hosts/wildcards you're authorized to test (the fail-closed gate; active and deep modes need a non-empty scope).",
         "Seed targets — the URLs/hosts to hunt each cycle (each within scope).",
         "Program source repositories — optional public repository roots; enable clone + scan to include them in each scheduled cycle alongside web targets.",
-        "Cadence + daily cap — how often it re-runs, and the most it may auto-submit per day.",
-        "HackerOne handle — required only if you want auto-submit.",
+        "Cadence — how often it re-runs.",
+        "Platform handle — identifies the program for reports and manual submission.",
       ] },
       { h4: "Pick how hard it works each program", list: [
         ["Active. ", "Capture proof of impact with benign crafted probes."],
         ["Deep auto-work. ", "Adds time-based SQLi plus an auto proof-screenshot + research dossier per confirmed lead — needs the host in Scope."],
-        ["Auto-submit. ", "FILE confirmed, non-duplicate findings automatically — per-program opt-in, needs a handle, capped per day. Default off (review-only)."],
+        ["Review findings. ", "Inspect the evidence and reporting draft before you decide whether to submit manually."],
       ] },
       { h4: "Run it", ordered: true, list: [
-        ["Arm (optional). ", "Tick “Arm auto-submit” only if you want hands-off filing — every other gate still applies."],
         ["Start. ", "It runs due programs sequentially; watch the Activity log and the Money pipeline funnel fill in."],
         ["Kill switch. ", "Stop immediately at any time — it halts after the current step."],
       ] },
     ],
-    safety: "Auto-submit is triple-gated (armed + per-program opt-in + confirmed & non-duplicate + daily cap) and defaults to review-only. Starting confirms you're authorized to test every enabled program's scope.",
+    safety: "Starting confirms you're authorized to test every enabled program's scope. Only the human operator decides whether to submit a report.",
   },
   "surface": {
     summary: "What the Surface tab does — walkthrough",
@@ -6974,15 +7027,14 @@ function ckProgramSetupForm(prefill) {
   const seed = (!editing && prefill && typeof prefill === "object") ? prefill : null;
   const form = cel("form", "ck-prog-setup-form");
   const name = ckField("Program name", "text", editing ? (editing.name || "") : (seed && seed.name) || "");
-  // Platform tag: picks the report format and display. Only HackerOne (with a handle) can
-  // auto-submit over its API; HackenProof and the rest are export-only — GreyIQ formats the
-  // report for that platform's form and you submit it on the platform's dashboard.
+  // Platform tag picks the report format and display. GreyIQ formats the report
+  // for that platform; the human operator decides whether to submit it.
   const platWrap = cel("label");
   platWrap.append(cel("span", null, "Platform"));
   const platSelect = cel("select");
   // Every supported report-format platform (HackerOne, YesWeHack, Bugcrowd, Intigriti,
   // HackenProof) plus a catch-all — sourced from CK_PLATFORMS so this list can't drift from
-  // the backend registry. HackerOne can auto-submit via its API; the rest are export-only.
+  // the backend registry.
   const platformOptions = [...CK_PLATFORMS.map((p) => [p.id, p.name]), ["manual", "Other / manual"]];
   for (const [pid, pname] of platformOptions) {
     const o = cel("option", null, pname); o.value = pid; platSelect.append(o);
@@ -7222,10 +7274,10 @@ function ckProgramSetupForm(prefill) {
     .filter((p) => p && p.url_a && p.url_b);
 
   // Cross-link: this gentle form owns identity, structured scope, and account access; a saved
-  // program's run schedule, activation, and auto-submit live on the Operator tab. Say so, since
+  // program's run schedule and activation live on the Operator tab. Say so, since
   // neither editor is complete on its own.
   form.append(cel("p", "ck-hint ck-crosslink",
-    "Scheduling, activation (active/paused), and auto-submit for a saved program are set on the Operator tab."));
+    "Scheduling and activation (active/paused) for a saved program are set on the Operator tab."));
 
   const submit = cel("button", "ck-btn primary", editing ? "Update program" : "Save program");
   submit.type = "submit";
@@ -7631,7 +7683,7 @@ const CK_WIZARD_STEPS = [
   { title: "SSRF/OOB setup (optional)", body: "If the program's policy allows out-of-band/collaborator testing, tick that on its form, then use “Set up SSRF/OOB →” on the program row to land here with scope pre-filled. Skip this step if you don't need it.", view: "idor" },
   { title: "Run your first hunt", body: "Back in the launch rail: pick your program (fills in Target/Scope), tick “I'm authorized to test this target”, and click Run hunt. Start with a Single hunt before a full campaign.", view: "program", focusSelector: "#ckActiveProgram" },
   { title: "Read the results", body: "Findings land here with a proof-status column — Confirmed means GreyIQ actually proved it with a benign probe, not just flagged a pattern. Click any row for the evidence.", view: "findings" },
-  { title: "Generate a report", body: "Confirmed findings show up in Submissions — copy the Markdown, download it, or (once you've saved HackerOne API creds) submit it directly. Nothing is ever auto-filed without you arming it.", view: "submissions" },
+  { title: "Generate a report", body: "Confirmed findings show up in Submissions — review the evidence, copy or download the Markdown, and submit manually if you decide to file it.", view: "submissions" },
 ];
 
 function ckDismissWizard() {
@@ -10472,7 +10524,7 @@ async function ckRenderOperator() {
   const host = ck.views.operator;
   host.replaceChildren();
   host.append(cel("h2", "ck-section-title", "Autonomous operator"));
-  host.append(cel("p", "ck-hint", "Add the programs you're authorized to hunt, then arm the operator. It runs each program on its schedule — recon, hunt, prove, dedup, report — and (only when you explicitly arm auto-submit per program) files confirmed, non-duplicate findings within a daily cap. The kill switch stops it immediately."));
+  host.append(cel("p", "ck-hint", "Save programs with documented testing permission, then arm each enabled program for a limited period. The operator rechecks scope before each cycle, learns from verified results, and queues findings for your review. You decide whether to submit a report. The kill switch requests an immediate stop."));
   host.append(ckWalkthrough("operator"));
 
   let data = null;
@@ -10481,22 +10533,55 @@ async function ckRenderOperator() {
   }
   if (!data || data.ok === false) { host.append(cel("p", "ck-status is-error", "Local engine not running.")); return; }
 
-  // --- Control bar: start / stop / arm auto-submit ---
+  // --- Control bar: start / stop scheduled review-only work ---
   const ctl = cel("div", "ck-op-ctl");
   const running = Boolean(data.running);
   const statusPill = cel("span", `ck-pill ${running ? "is-armed" : ""}`);
   statusPill.append(cel("span", null, "Operator: "), cel("strong", null, running ? "running" : "stopped"));
   ctl.append(statusPill);
 
-  const armWrap = cel("label", "ck-switch ck-auth");
-  const arm = cel("input"); arm.type = "checkbox"; arm.id = "ckOpArm";
-  armWrap.append(arm, ckArmLabel());
-  ctl.append(armWrap);
-
   if (!running) {
-    const startBtn = cel("button", "ck-btn primary", "Start operator");
+    const enabled = (data.programs || []).filter(p => p.enabled);
+    ckOpGrantInputs = [];
+    if (enabled.length) {
+      const grants = cel("div", "ck-op-arming");
+      grants.append(cel("h3", "ck-section-title", "Arm authorized testing"));
+      grants.append(cel("p", "ck-hint", "For each enabled program, identify the authorization record and current testing policy. Check its scope and restrictions before arming. Each grant allows at most seven scheduled cycles and 200 requests per cycle. Automatic hunts use a local model or the offline fallback."));
+      for (const prog of enabled) {
+        const row = cel("div", "ck-op-grant");
+        row.append(cel("strong", null, prog.name || prog.id));
+        row.append(cel("div", "ck-hint", prog.scope_text || "No saved scope"));
+        const authLabel = cel("label");
+        authLabel.append(cel("span", null, "Authorization record"));
+        const auth = cel("input"); auth.type = "text"; auth.maxLength = 500;
+        auth.placeholder = "Engagement ID or operator approval record";
+        authLabel.append(auth);
+        const policyLabel = cel("label");
+        policyLabel.append(cel("span", null, "Current policy source"));
+        const policy = cel("input"); policy.type = "text"; policy.maxLength = 500;
+        policy.placeholder = "Program policy URL or internal rules reference";
+        policyLabel.append(policy);
+        const checkedLabel = cel("label", "ck-op-attest");
+        const checked = cel("input"); checked.type = "checkbox";
+        checkedLabel.append(checked, document.createTextNode(" I checked this program's current scope and testing restrictions"));
+        row.append(authLabel, policyLabel, checkedLabel);
+        grants.append(row);
+        ckOpGrantInputs.push({ programId: prog.id, auth, policy, checked });
+      }
+      const durationLabel = cel("label");
+      durationLabel.append(cel("span", null, "Authorization window"));
+      const duration = cel("select"); duration.id = "ckOpGrantHours";
+      for (const [hours, label] of [[24, "24 hours"], [168, "7 days"]]) {
+        const option = cel("option", null, label); option.value = String(hours); duration.append(option);
+      }
+      durationLabel.append(duration);
+      grants.append(durationLabel);
+      host.append(grants);
+    }
+    const startBtn = cel("button", "ck-btn primary", "Start authorized testing");
     startBtn.type = "button";
-    startBtn.addEventListener("click", () => ckOperatorStart(arm.checked));
+    startBtn.disabled = enabled.length === 0;
+    startBtn.addEventListener("click", ckOperatorStart);
     ctl.append(startBtn);
   } else {
     const stopBtn = cel("button", "ck-btn", "■ Kill switch — stop");
@@ -10506,6 +10591,16 @@ async function ckRenderOperator() {
     ctl.append(stopBtn);
   }
   host.append(ctl);
+  if (running && Array.isArray(data.grants) && data.grants.length) {
+    const grantStatus = cel("p", "ck-hint");
+    const parts = data.grants.map(grant => {
+      const expires = new Date(grant.expires_at);
+      const deadline = Number.isNaN(expires.getTime()) ? "unknown" : expires.toLocaleString();
+      return `${grant.program_id}: ${grant.cycles_used}/${grant.max_cycles} cycles, expires ${deadline}`;
+    });
+    grantStatus.textContent = `Armed: ${parts.join(" · ")}`;
+    host.append(grantStatus);
+  }
 
   // --- Money pipeline funnel ---
   const pf = (data.funnel && data.funnel.portfolio) || { stages: {}, total: 0, bounty_total: 0 };
@@ -10568,24 +10663,34 @@ async function ckRenderOperator() {
   host.append(ckProgramForm());
 }
 
-function ckArmLabel() {
-  const span = cel("span");
-  span.append(cel("strong", null, "Arm auto-submit"));
-  span.append(document.createTextNode(" — file confirmed, non-duplicate findings to HackerOne automatically (per-program opt-in + daily cap still apply). Off = review-only."));
-  return span;
-}
-
 // Guards against a double Start (two /operator/start calls) and a Start racing a Stop —
-// important because the operator can auto-submit to live bounty programs.
+// important because the scheduled work can make authorized test requests.
 let ckOperatorBusy = false;
+let ckOpGrantInputs = [];
 
-async function ckOperatorStart(allowSubmit) {
+async function ckOperatorStart() {
   if (ckOperatorBusy) return;
-  if (allowSubmit && !window.confirm("ARM AUTO-SUBMIT?\n\nThe operator will FILE confirmed findings to your HackerOne programs automatically (only programs you set auto-submit on, only confirmed + non-duplicate findings, within each program's daily cap). Only do this for authorized, in-scope programs.")) return;
-  if (!window.confirm("Start the operator on your portfolio? You confirm you are AUTHORIZED to test every enabled program's scope.")) return;
+  if (!ckOpGrantInputs.length) { window.alert("Enable and save at least one program first."); return; }
+  const now = new Date();
+  const durationHours = Number(document.querySelector("#ckOpGrantHours")?.value || 24);
+  const expiresAt = new Date(now.getTime() + durationHours * 3600000).toISOString();
+  const grants = [];
+  for (const entry of ckOpGrantInputs) {
+    const authorizationRef = entry.auth.value.trim();
+    const policySource = entry.policy.value.trim();
+    if (!authorizationRef || !policySource || !entry.checked.checked) {
+      window.alert("Enter the authorization record and current policy source, then check the scope and restrictions for every enabled program.");
+      return;
+    }
+    grants.push({ program_id: entry.programId, authorization_ref: authorizationRef,
+      policy_source: policySource, policy_checked_at: now.toISOString(), expires_at: expiresAt,
+      max_cycles: 7 });
+  }
+  if (!window.confirm(`Start review-only testing for ${grants.length} program(s) until ${expiresAt}? Findings remain for your review; the app will not submit them.`)) return;
   ckOperatorBusy = true;
   try {
-    await apiFetch("/api/operator/start", { method: "POST", body: JSON.stringify({ authorized: true, allow_submit: Boolean(allowSubmit) }) });
+    const res = await apiFetch("/api/operator/start", { method: "POST", body: JSON.stringify({ authorized: true, allow_submit: false, grants }) });
+    if (!res?.ok) throw new Error(res?.error || "The operator did not start.");
     void ckRenderOperator();
   } catch (err) { window.alert(err.message || "Could not start."); }
   finally { ckOperatorBusy = false; }
@@ -10594,8 +10699,7 @@ async function ckOperatorStart(allowSubmit) {
 async function ckOperatorStop() {
   if (ckOperatorBusy) return;
   ckOperatorBusy = true;
-  // A failed Stop must NOT be silent — an operator that thinks it stopped (but is still
-  // auto-submitting) is the worst outcome here.
+  // A failed Stop must not be silent: authorized testing may still be running.
   try { await apiFetch("/api/operator/stop", { method: "POST", body: JSON.stringify({}) }); }
   catch (err) { window.alert((err.message || "Could not reach the engine") + "\n\nAutomation may still be running — reopen Automation to check its status."); }
   finally { ckOperatorBusy = false; setTimeout(() => void ckRenderOperator(), 400); }
@@ -10610,13 +10714,6 @@ async function ckOperatorPollEvents() {
     const row = cel("div", "ck-op-event");
     row.append(cel("span", "ck-op-time", (ev.at || "").slice(11, 19)), cel("span", null, ev.message || ""));
     log.append(row);
-    // "submitted <pid>: <title> -> <url>" (operator.py's own _emit prefix) is the
-    // single most important background event in the app -- a confirmed finding was
-    // just auto-filed to a live bounty program while nobody was necessarily watching.
-    if (String(ev.message || "").startsWith("submitted ") && document.hidden) {
-      ckBumpTitleBadge(1);
-      void ckNotify("GreyIQ — finding submitted", ev.message);
-    }
   }
   if (res.events && res.events.length) { ckOpEventCount = res.count || (ckOpEventCount + res.events.length); log.scrollTop = log.scrollHeight; }
   if (!log.childNodes.length) log.append(cel("p", "ck-hint", "No activity yet. Start the operator to see live progress."));
@@ -10626,7 +10723,6 @@ function ckProgramRow(prog, funnel) {
   const li = cel("li"); li.style.flexWrap = "wrap";
   const left = cel("div"); left.style.flex = "1";
   left.append(cel("span", "ck-ftitle", prog.name || prog.id));
-  if (prog.auto_submit) left.append(document.createTextNode(" "), cel("span", "ck-tag", "auto-submit"));
   if (!prog.enabled) left.append(document.createTextNode(" "), cel("span", "ck-tag", "disabled"));
   const fp = (funnel && funnel.programs && funnel.programs[prog.id]) || null;
   const meta = `${prog.scope_text || "(no scope)"} · ${ckEstimateSpanTargets(prog).length} target(s)` + (fp ? ` · ${fp.stages.submitted || 0} submitted · $${fp.bounty_total || 0}` : "");
@@ -10649,7 +10745,7 @@ function ckProgramRow(prog, funnel) {
   toggle.type = "button";
   toggle.addEventListener("click", async () => {
     try {
-      await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify({ id: prog.id, name: prog.name, scope_text: prog.scope_text, seed_targets: prog.seed_targets, active: prog.active, live: prog.live, auto_submit: prog.auto_submit, platform: prog.platform, platform_handle: prog.platform_handle, interval_minutes: prog.interval_minutes, max_submits_per_day: prog.max_submits_per_day, max_pages: prog.max_pages, enabled: !prog.enabled }) });
+      await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify({ id: prog.id, name: prog.name, scope_text: prog.scope_text, seed_targets: prog.seed_targets, active: prog.active, live: prog.live, auto_submit: false, platform: prog.platform, platform_handle: prog.platform_handle, interval_minutes: prog.interval_minutes, max_submits_per_day: prog.max_submits_per_day, max_pages: prog.max_pages, enabled: !prog.enabled }) });
       await ckRefreshProgramsEverywhere();
       void ckRenderOperator();
     } catch (err) { window.alert(err.message || "Could not update the program — the engine may be unreachable, so the change may not have applied."); }
@@ -10680,10 +10776,9 @@ function ckProgramForm() {
   repositories.input.value = editing ? (editing.repository_urls || []).join("\n") : "";
   repositories.input.rows = 3;
   repositories.input.placeholder = "https://github.com/program/repository";
-  const handle = ckField("Program handle — HackerOne team handle (auto-submit) or HackenProof slug", "text", editing ? (editing.platform_handle || "") : "");
+  const handle = ckField("Program handle — platform team handle or slug", "text", editing ? (editing.platform_handle || "") : "");
   const interval = ckField("Re-run every (minutes)", "number", editing ? String(editing.interval_minutes || 1440) : "1440");
-  const cap = ckField("Max auto-submits / day", "number", editing ? String(editing.max_submits_per_day ?? 3) : "3");
-  form.append(name.wrap, scope.wrap, targets.wrap, repositories.wrap, handle.wrap, interval.wrap, cap.wrap);
+  form.append(name.wrap, scope.wrap, targets.wrap, repositories.wrap, handle.wrap, interval.wrap);
   form.append(ckTargetImport(targets, scope));
 
   const toggles = cel("div", "ck-toggles");
@@ -10691,8 +10786,7 @@ function ckProgramForm() {
   const active = ckToggle("Capture proof of impact (active)", editing ? !!editing.active : true);
   const live = ckToggle("Dynamic Playwright pass", editing ? !!editing.live : false);
   const deep = ckToggle("Deep auto-work (time-based SQLi + screenshot + research per confirmed lead)", editing ? !!editing.deep : false);
-  const auto = ckToggle("Auto-submit confirmed findings (per-program opt-in)", editing ? !!editing.auto_submit : false);
-  toggles.append(cloneRepositories.wrap, active.wrap, live.wrap, deep.wrap, auto.wrap);
+  toggles.append(cloneRepositories.wrap, active.wrap, live.wrap, deep.wrap);
   form.append(toggles);
 
   const submit = cel("button", "ck-btn primary", editing ? "Update program" : "Save program");
@@ -10724,8 +10818,9 @@ function ckProgramForm() {
       platform: editing ? (editing.platform || (handle.input.value.trim() ? "hackerone" : "manual"))
                         : (handle.input.value.trim() ? "hackerone" : "manual"),
       platform_handle: handle.input.value.trim(),
-      active: active.input.checked, live: live.input.checked, deep: deep.input.checked, auto_submit: auto.input.checked,
-      interval_minutes: Number(interval.input.value) || 1440, max_submits_per_day: Number(cap.input.value) || 3
+      active: active.input.checked, live: live.input.checked, deep: deep.input.checked, auto_submit: false,
+      interval_minutes: Number(interval.input.value) || 1440,
+      max_submits_per_day: editing ? Number(editing.max_submits_per_day ?? 3) : 3
     };
     if (editing) {
       // Update the existing record: carry its id + the fields the form doesn't expose so
@@ -11727,10 +11822,8 @@ async function ckDrawerReport(f) {
   else setState({ state: "error", error: (res && res.error) || "Report could not be built." });
 }
 
-// --- Completion alerts: a hunt/campaign can run for minutes, and the autonomous
-// operator auto-submitting a confirmed bounty is arguably the most important event
-// in the app -- both need to reach an operator who has tabbed away, not just whoever
-// happens to be staring at the launch rail when it finishes. Two independent,
+// --- Completion alerts: a hunt/campaign can run for minutes, so results should
+// reach an operator who has tabbed away. Two independent,
 // stacking signals: a tab-title badge (works everywhere, zero permissions) and a
 // native OS notification (louder, but needs a one-time permission grant). Both are
 // gated on document.hidden so a focused, watching operator never gets spammed with

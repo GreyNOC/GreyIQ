@@ -3664,19 +3664,32 @@ class SolinEngine:
         lowered = response.lower()
         return not any(pattern in lowered for pattern in low_confidence_patterns)
 
-    def append_chat_training_example(self, user_input: str, response: str) -> Path:
-        """Queue a good exchange for later offline retraining. This does not update weights live."""
-        data_dir = self.base_dir / DEFAULT_DATA_FOLDER
-        data_dir.mkdir(parents=True, exist_ok=True)
-        output_path = data_dir / CHAT_TRAIN_FILE
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        block = (
-            f"### AUTO CHAT TRAINING {timestamp} ###\n"
-            f"<START_CONVO>\n<USER>\n{user_input.strip()}\n<ASSISTANT>\n{response.strip()}\n<END_CONVO>\n\n"
+    def append_chat_training_example(
+        self, user_input: str, response: str, *, confidence: float = 0.0, grounded: bool = False
+    ) -> Path:
+        """Record an experience for offline verification; never update weights live."""
+        from learning_engine import Experience, ExperienceScore, LearningEngine, is_security_sensitive
+
+        engine = LearningEngine(self.base_dir)
+        score = ExperienceScore(
+            knowledge_confidence=confidence,
+            source_confidence=0.95 if grounded else 0.0,
+            answer_confidence=confidence,
+            tool_verification=0.95 if grounded else 0.0,
+            critic_score=confidence,
+            novelty_score=0.75,
         )
-        with output_path.open("a", encoding="utf-8") as handle:
-            handle.write(block)
-        return output_path
+        experience = Experience(
+            prompt=user_input.strip(),
+            response=response.strip(),
+            source="GreyIQ grounded retrieval" if grounded else "GreyIQ conversation",
+            model_version=self.model_path.stem if self.model_path else "untrained",
+            security_sensitive=is_security_sensitive(user_input),
+            score=score,
+        )
+        record = engine.record(experience)
+        pool = "verified" if record["outcome"] == "verified" else "failures"
+        return engine.pools[pool] / "experiences.jsonl"
 
     def _generation_settings(
         self,
@@ -3894,8 +3907,13 @@ class SolinEngine:
         ):
             self.chat_memory.add_exchange(user_input, response)
         if auto_capture and self._should_capture_training_example(user_input, response, diagnostics.used_fallback):
-            self.append_chat_training_example(user_input, response)
-            diagnostics.captured_for_training = True
+            capture_path = self.append_chat_training_example(
+                user_input,
+                response,
+                confidence=diagnostics.confidence,
+                grounded=bool(matches),
+            )
+            diagnostics.captured_for_training = "verified" in capture_path.parts
         return response, matches, diagnostics
 
     def generate_reply(

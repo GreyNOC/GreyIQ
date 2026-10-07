@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -31,6 +32,37 @@ class GnCliTests(unittest.TestCase):
         self.assertIn(gn_cli.VERSION, out)
         # No args prints help, exit 0.
         self.assertEqual(_run([])[0], 0)
+
+    def test_path_command_prints_copyable_setup_without_changing_environment(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="GreyIQ CLI ") as tmp:
+            launcher = Path(tmp) / "greyiq-cli"
+            before = dict(gn_cli.os.environ)
+            with mock.patch.object(gn_cli, "_cli_launcher", return_value=(launcher, "greyiq-cli")), \
+                 mock.patch.object(gn_cli.shutil, "which", return_value=None):
+                code, out, err = _run(["path"])
+            self.assertEqual(code, 0, err)
+            self.assertIn(str(launcher), out)
+            self.assertIn(str(gn_cli.RUNTIME_DIR), out)
+            self.assertIn("GREYIQ_RUNTIME_DIR", out)
+            self.assertIn("PATH", out)
+            if gn_cli.os.name == "nt":
+                self.assertIn("$env:Path", out)
+            else:
+                self.assertIn("export PATH=", out)
+                self.assertIn("'", out, "a launcher directory with spaces must be shell-quoted")
+            self.assertEqual(dict(gn_cli.os.environ), before)
+
+    def test_path_command_does_not_confuse_current_directory_with_path(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="GreyIQ CLI ") as tmp:
+            launcher = Path(tmp) / "greyiq-cli"
+            # Windows command lookup searches the current directory even when
+            # it is absent from PATH. That is not a persistent CLI install.
+            with mock.patch.object(gn_cli, "_cli_launcher", return_value=(launcher, "greyiq-cli")), \
+                 mock.patch.object(gn_cli.shutil, "which", return_value=str(launcher)), \
+                 mock.patch.dict(gn_cli.os.environ, {"PATH": str(launcher.parent.parent)}):
+                code, out, err = _run(["path"])
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("already on PATH", out)
 
     def test_profiles_classes_tools(self) -> None:
         self.assertEqual(_run(["profiles"])[0], 0)
@@ -80,7 +112,7 @@ class GnCliTests(unittest.TestCase):
         # build_parser() but absent from the hand-written CLI_COMMANDS tuple, so
         # `greyiq-backend.exe takeover ...` fell through and booted the API server.
         for verb in ("hunt", "campaign", "osint", "scan", "learn", "stats", "traces", "operator",
-                     "profiles", "classes", "tools", "version",
+                     "dashboard", "path", "leads", "profiles", "classes", "tools", "version",
                      "platforms", "bundle", "takeover", "cve", "idor", "bfla", "idor-probe"):
             self.assertIn(verb, gn_cli.CLI_COMMANDS)
 
@@ -211,11 +243,46 @@ class GnCliTests(unittest.TestCase):
                 code, _, err = _run(["operator", "run"])
                 self.assertEqual(code, 2)
                 self.assertIn("authorize", err.lower())
-                # auto-submit without a handle is dropped fail-closed.
+                with mock.patch("bughunter.campaign.run_campaign") as run:
+                    code, _, err = _run(["operator", "run", "--once", "-y", "--allow-submit"])
+                self.assertEqual(code, 2)
+                self.assertIn("automatic submission is disabled", err.lower())
+                run.assert_not_called()
+                with mock.patch("bughunter.campaign.run_campaign") as run:
+                    code, _, err = _run(["operator", "run", "--once", "-y"])
+                self.assertEqual(code, 2)
+                self.assertIn("--once is unavailable", err)
+                run.assert_not_called()
+                code, _, err = _run(["operator", "run", "-y"])
+                self.assertEqual(code, 2)
+                self.assertIn("--grant-file", err)
+                grant_path = Path(tmp) / "operator-grants.json"
+                grants = [{"program_id": "acme", "authorization_ref": "engagement-1"}]
+                grant_path.write_text(json.dumps({"grants": grants}), encoding="utf-8")
+                with mock.patch("bughunter.operator.OperatorLoop") as loop_type:
+                    loop_type.return_value.running = False
+                    code, _, _ = _run(["operator", "run", "-y", "--grant-file", str(grant_path)])
+                self.assertEqual(code, 0)
+                loop_type.return_value.start.assert_called_once_with(grants=grants)
+                # Legacy program flag is accepted but normalized off.
                 _run(["operator", "add", "--name", "NoHandle", "--scope", "x.com", "--auto-submit"])
                 self.assertEqual(_run(["operator", "remove", "acme"])[0], 0)
             finally:
                 gn_cli.RUNTIME_DIR = original
+
+    def test_operator_cli_cloud_brain_is_disabled(self) -> None:
+        run_fn = gn_cli._operator_campaign_fn({"enabled": True, "provider": "openai"})
+        saved = {"user_agent_suffix": " -Policy-Marker", "policy_profile": "example",
+                 "out_of_scope_hosts": ["excluded.example.com"], "disclose_automation": True}
+        with mock.patch("bughunter.portfolio.get_program", return_value=saved), \
+                mock.patch("bughunter.campaign.run_campaign", return_value={"ok": False}) as run:
+            run_fn("https://example.com", scope="example.com", program="p",
+                   active=False, live=False)
+        self.assertEqual(run.call_args.kwargs["coder_cfg"], {"enabled": False, "provider": "off"})
+        self.assertEqual(run.call_args.kwargs["user_agent_suffix"], " -Policy-Marker")
+        self.assertEqual(run.call_args.kwargs["policy_profile"], "example")
+        self.assertEqual(run.call_args.kwargs["excluded_hosts"], ("excluded.example.com",))
+        self.assertTrue(run.call_args.kwargs["disclose_automation"])
 
 
 _PLUGIN_MODULES = ("gn_stub_ok_plugin", "gn_stub_broken_plugin", "gn_stub_raising_plugin")

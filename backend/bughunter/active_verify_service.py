@@ -52,9 +52,9 @@ import time
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-from bughunter import digest_builder, impact_model, sensitive_data
+from bughunter import digest_builder, impact_model, operator_guard, sensitive_data
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.prover_classes import PROVER_CLASSES
 from bughunter.rate_limit import HostRateGovernor
@@ -361,15 +361,22 @@ class _Http:
         self.max_requests = max(1, int(max_requests))
         self.auth = auth  # operator session, attached SAME-SITE only (never to a foreign bucket)
         self.sent = 0
-        self.opener = build_opener(_NoRedirect())
+        self._operator_direct = operator_guard.current() is not None
+        self.opener = build_opener(_NoRedirect(), ProxyHandler({})) if self._operator_direct else build_opener(_NoRedirect())
 
     def fetch(self, url: str, *, method: str = "GET", extra_headers: dict[str, str] | None = None,
               read_body: bool = True) -> dict[str, Any]:
+        # An injected/reused _Http built before the guard was bound must still
+        # switch to direct transport before it can issue an unattended request.
+        if operator_guard.current() is not None and not self._operator_direct:
+            self.opener = build_opener(_NoRedirect(), ProxyHandler({}))
+            self._operator_direct = True
         method = method.upper()
         if method not in _SAFE_METHODS:  # belt-and-suspenders; callers never pass others
             raise _ActiveError(f"refused non-idempotent method {method}")
         if self.sent >= self.max_requests:  # per-hunt budget, independent of the host bucket
             raise _RateLimited()
+        operator_guard.before_request(url, method=method, reserve=False)
         # guarded_dns_scope() covers guard-check through the real connect so the DNS
         # pin _guard_url() installs is still in effect when the actual HTTP connect
         # (a few lines down) independently re-resolves the same hostname — closing the
@@ -380,6 +387,9 @@ class _Http:
             host = urlparse(sanitized).hostname or ""
             if not self.governor.throttle(host):
                 raise _RateLimited()
+            # A governor may sleep while an operator presses Stop or a policy is
+            # edited. Recheck immediately before the socket opens.
+            operator_guard.before_request(sanitized, method=method, reserve=True)
             self.sent += 1
             headers = {"User-Agent": current_user_agent(_USER_AGENT), "Accept": "*/*", "Accept-Encoding": "identity"}
             # Operator auth is attached ONLY when this request's host is same-site as the
@@ -399,10 +409,14 @@ class _Http:
                 started = time.monotonic()
                 try:
                     with self.opener.open(request, timeout=self.settings.web_fetch_timeout_seconds) as resp:
+                        pre_status = getattr(resp, "status", None) or getattr(resp, "code", 0)
+                        operator_guard.observe_response({"status": pre_status, "headers": dict(resp.headers),
+                                                         "body": "", "final_url": resp.geturl()}, stage="headers")
                         consumed = _consume(resp, self.settings, read_body=read_body)
                         consumed["final_url"] = resp.geturl()
                         consumed["location"] = resp.headers.get("Location") if resp.headers else None
                         consumed["elapsed"] = time.monotonic() - started
+                        operator_guard.observe_response(consumed, stage="body" if pre_status else "complete")
                         return consumed
                 except HTTPError as exc:
                     # A 3xx (captured, not followed) or 4xx/5xx is a valid observation
@@ -411,15 +425,22 @@ class _Http:
                     # path/debug probes, error-SQLi, alg:none control), so close it or every
                     # errored probe leaks an FD until GC.
                     try:
+                        pre_status = getattr(exc, "status", None) or getattr(exc, "code", 0)
+                        operator_guard.observe_response({"status": pre_status, "headers": dict(exc.headers),
+                                                         "body": "", "final_url": sanitized}, stage="headers")
                         consumed = _consume(exc, self.settings, read_body=read_body)
                         consumed["final_url"] = sanitized
                         consumed["location"] = exc.headers.get("Location") if exc.headers else None
                         consumed["elapsed"] = time.monotonic() - started
+                        operator_guard.observe_response(consumed, stage="body" if pre_status else "complete")
                         return consumed
                     finally:
                         exc.close()
                 except (URLError, TimeoutError, OSError) as exc:
-                    if attempt >= _MAX_FETCH_ATTEMPTS:
+                    # A retry is a second real socket send. In unattended mode
+                    # it would need a fresh authorization/budget/Stop check, so
+                    # fail closed after the first transport failure instead.
+                    if operator_guard.current() is not None or attempt >= _MAX_FETCH_ATTEMPTS:
                         raise _ActiveError(str(exc)) from exc
                     time.sleep(_FETCH_RETRY_BACKOFF_S * attempt)
 

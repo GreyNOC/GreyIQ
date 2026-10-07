@@ -3697,6 +3697,13 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
 .ck-advanced .ck-subsection { margin-top: 0.6rem; }
 
 .ck-op-ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; margin: 0.4rem 0 1.2rem; }
+.ck-op-arming { border: 1px solid var(--border); border-radius: 0; padding: 0.8rem; margin: 0.6rem 0; background: var(--surface-2); }
+.ck-op-arming .ck-section-title { margin-top: 0; }
+.ck-op-arming > label, .ck-op-grant label { display: flex; flex-direction: column; gap: 0.25rem; margin: 0.45rem 0; font-size: 0.8rem; color: var(--muted); }
+.ck-op-grant { padding: 0.65rem 0; border-top: 1px solid var(--border); }
+.ck-op-grant .ck-hint { overflow-wrap: anywhere; }
+.ck-op-arming input[type="text"], .ck-op-arming select { box-sizing: border-box; width: 100%; max-width: 45rem; font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 0; padding: 0.45rem 0.55rem; }
+.ck-op-grant .ck-op-attest { flex-direction: row; align-items: center; color: var(--text); }
 .ck-op-log { max-height: 14rem; overflow-y: auto; border: 1px solid var(--border); border-radius: 0; background: var(--surface-2); padding: 0.5rem 0.7rem; margin-bottom: 1.2rem; }
 .ck-op-event { display: flex; gap: 0.6rem; font-size: 0.78rem; line-height: 1.6; font-family: var(--code-font); color: var(--text); }
 .ck-op-time { color: var(--muted); flex: none; }

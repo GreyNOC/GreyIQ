@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -269,8 +270,16 @@ def _save_manifest(manifest: dict[str, dict[str, Any]], manifest_path: str | Pat
 
 def _find_tesseract_cmd() -> str | None:
     env_value = os.environ.get("TESSERACT_CMD")
-    if env_value and Path(env_value).exists():
-        return env_value
+    if env_value:
+        if Path(env_value).is_file():
+            return env_value
+        configured = shutil.which(env_value)
+        if configured:
+            return configured
+
+    on_path = shutil.which("tesseract")
+    if on_path:
+        return on_path
 
     for candidate in WINDOWS_TESSERACT_CANDIDATES:
         if candidate.exists():

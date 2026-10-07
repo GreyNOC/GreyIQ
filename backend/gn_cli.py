@@ -38,6 +38,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
+import shutil
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
@@ -49,7 +51,23 @@ if getattr(sys, "frozen", False):
 else:
     BACKEND_DIR = Path(__file__).resolve().parent
     PROJECT_ROOT, SEED_DIR = BACKEND_DIR.parent, BACKEND_DIR / "seed"
-RUNTIME_DIR = Path(os.getenv("GREYIQ_RUNTIME_DIR", PROJECT_ROOT / "runtime")).resolve()
+
+
+def _resolve_runtime_dir(project_root: Path) -> Path:
+    """Keep frozen Linux CLI data outside the read-only application bundle."""
+    explicit = os.getenv("GREYIQ_RUNTIME_DIR")
+    if explicit is not None:
+        return Path(explicit).resolve()
+    if getattr(sys, "frozen", False) and sys.platform == "linux":
+        xdg_home = os.getenv("XDG_DATA_HOME")
+        data_home = Path(xdg_home) if xdg_home else Path.home() / ".local" / "share"
+        if not data_home.is_absolute():
+            data_home = Path.home() / ".local" / "share"
+        return (data_home / "greyiq" / "runtime").resolve()
+    return (project_root / "runtime").resolve()
+
+
+RUNTIME_DIR = _resolve_runtime_dir(PROJECT_ROOT)
 
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
@@ -481,60 +499,48 @@ def _print_lead_queue(queue: dict) -> None:
           f"{_c('--json', '2')} for the machine queue.\n")
 
 
-def _operator_callables(coder_cfg: dict):
-    """Build the operator's run_campaign_fn + submit_fn directly over the torch-free
-    bughunter engine (no API). The submit path goes through the SAME hard-gated
-    submission.submit_to_hackerone (confirm + proof_status=='confirmed' + creds)."""
-    from datetime import UTC, datetime
-
+def _operator_campaign_fn(coder_cfg: dict):
+    """Build the portfolio scheduler's campaign callable over the bughunter engine."""
     from bughunter import campaign as campaign_mod
-    from bughunter import submission as submission_mod
+    from bughunter import portfolio as portfolio_mod
+    from bughunter import progress as progress_mod
+    from coder import unattended_config
 
-    last: dict = {}
+    safe_brain = unattended_config(coder_cfg)
 
-    def run_campaign_fn(target, *, scope, program, active, live, deep=False, max_pages=12):
+    def run_campaign_fn(target, *, scope, program, active, live, deep=False, max_pages=12,
+                        run_id=""):
+        if run_id:
+            progress_mod.start_run(run_id)
+        saved = portfolio_mod.get_program(RUNTIME_DIR, program) or {}
         result = campaign_mod.run_campaign(
-            target, scope=scope, authorized=True, coder_cfg=coder_cfg,
+            target, scope=scope, authorized=True, coder_cfg=safe_brain,
             default_reports_dir=RUNTIME_DIR / "reports", seed_dir=SEED_DIR, runtime_dir=RUNTIME_DIR,
             version=VERSION, active=active, live=live, deep=deep, program=program, max_pages=max_pages,
+            progress_run_id=run_id or None,
+            user_agent_suffix=str(saved.get("user_agent_suffix") or ""),
+            policy_profile=str(saved.get("policy_profile") or ""),
+            excluded_hosts=tuple(str(host) for host in (saved.get("out_of_scope_hosts") or [])),
+            disclose_automation=bool(saved.get("disclose_automation")),
         )
-        last["result"], last["target"], last["scope"] = result, target, scope
         return result
 
-    def submit_fn(_run_id, ref):
-        result = last.get("result") or {}
-        finding = next((f for f in (result.get("findings") or []) if f.get("ref") == ref), None)
-        if finding is None:
-            return {"ok": False, "error": "finding not found in the last run"}
-        ctx = {
-            "tool": "GreyIQ BugHunter", "version": VERSION,
-            "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
-            "target": last.get("target", ""), "scope": last.get("scope", ""),
-            "attack_plans": result.get("attack_plans") or {},
-        }
-        package = submission_mod.build_submission(ctx, finding)
-        if package is None:
-            return {"ok": False, "error": "finding is not reportable"}
-        handle, username, token = _hackerone_creds()
-        try:
-            return {"ok": True, **submission_mod.submit_to_hackerone(
-                package, team_handle=handle, api_username=username, api_token=token, confirm=True)}
-        except submission_mod.SubmissionError as exc:
-            return {"ok": False, "error": str(exc)}
-
-    return run_campaign_fn, submit_fn
+    return run_campaign_fn
 
 
-def _hackerone_creds() -> tuple[str, str, str]:
-    """Read the HackerOne creds the desktop app stored in the shared secrets file."""
+def _read_operator_grants(path: str) -> list[dict]:
+    """Read a bounded, local grant manifest; the operator validates its contents."""
+    grant_path = Path(path).expanduser()
+    if not grant_path.is_file() or grant_path.stat().st_size > 256 * 1024:
+        raise ValueError("grant file is missing or exceeds 256 KiB")
     try:
-        secrets = json.loads((RUNTIME_DIR / "secrets.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        secrets = {}
-    if not isinstance(secrets, dict):
-        secrets = {}
-    return (str(secrets.get("hackerone.team_handle", "")), str(secrets.get("hackerone.api_username", "")),
-            str(secrets.get("hackerone.api_token", "")))
+        payload = json.loads(grant_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError(f"could not read the grant file: {exc}") from exc
+    grants = payload.get("grants") if isinstance(payload, dict) else payload
+    if not isinstance(grants, list):
+        raise ValueError("grant file must contain a JSON list or an object with a grants list")
+    return grants
 
 
 def _cmd_operator(args: argparse.Namespace) -> int:
@@ -552,7 +558,7 @@ def _cmd_operator(args: argparse.Namespace) -> int:
         print(_c(f"Portfolio ({len(progs)} program(s)):", "1"))
         for p in progs:
             flags = " ".join(f for f, on in (("active", p["active"]), ("live", p["live"]), ("deep", p.get("deep")),
-                                             ("auto-submit", p["auto_submit"]), ("enabled", p["enabled"])) if on) or "disabled"
+                                             ("enabled", p["enabled"])) if on) or "disabled"
             print(f"  {_c(p['id'], '36'):<24} {p['name']}  [{flags}]  scope: {p['scope_text'] or '(none)'}  "
                   f"targets: {len(p['seed_targets'])}  every {p['interval_minutes']}m")
         return 0
@@ -561,10 +567,10 @@ def _cmd_operator(args: argparse.Namespace) -> int:
         prog = portfolio.upsert_program(rt, {
             "name": args.name, "scope_text": args.scope, "seed_targets": args.targets or [],
             "platform": "hackerone" if args.handle else "manual", "platform_handle": args.handle or "",
-            "active": args.active, "live": args.live, "deep": getattr(args, "deep", False), "auto_submit": args.auto_submit,
+            "active": args.active, "live": args.live, "deep": getattr(args, "deep", False),
             "interval_minutes": args.interval, "max_submits_per_day": args.max_submits, "max_pages": args.max_pages,
         })
-        warn = "" if (not args.auto_submit or prog["auto_submit"]) else _c("  (auto-submit ignored — needs a HackerOne handle + non-empty scope)", "33")
+        warn = _c("  (automatic submission is disabled)", "33") if args.auto_submit else ""
         print(_c(f"Saved program: {prog['id']}", "32") + warn)
         return 0
 
@@ -584,23 +590,23 @@ def _cmd_operator(args: argparse.Namespace) -> int:
     if action == "run":
         if not args.authorize:
             return _err("the operator runs live campaigns — pass -y/--authorize to confirm you're authorized on every enabled program.")
-        run_campaign_fn, submit_fn = _operator_callables(_load_coder_config(args.brain))
-        loop = operator_mod.OperatorLoop(rt, run_campaign_fn=run_campaign_fn, submit_fn=submit_fn)
         if args.allow_submit:
-            print(_c("AUTO-SUBMIT ARMED — confirmed, non-duplicate findings will be filed (per-program opt-in + daily cap apply).", "1;31"))
+            return _err("automatic submission is disabled; review findings and submit manually.")
         if args.once:
-            progs = [p for p in portfolio.list_programs(rt) if p.get("enabled")]
-            if not progs:
-                return _err("no enabled programs to run.")
-            for p in progs:
-                print(_c(f"· cycle: {p['id']}", "2"))
-                submit = submit_fn if (args.allow_submit and p.get("auto_submit")) else None
-                summary = operator_mod.run_program_cycle(rt, p, run_campaign_fn=run_campaign_fn, submit_fn=submit,
-                                                         on_event=lambda m: print(_c(f"    {m}", "2")))
-                print(f"  {p['id']}: {summary['findings']} findings, {summary['confirmed']} confirmed, {summary['submitted']} submitted")
-            return 0
+            return _err("--once is unavailable until it can use the same grant and audit controls; use the Operator tab or continuous run with --grant-file")
+        if not args.grant_file:
+            return _err("pass --grant-file with a current authorization and policy record for every enabled program")
+        try:
+            grants = _read_operator_grants(args.grant_file)
+        except (OSError, ValueError) as exc:
+            return _err(str(exc))
+        run_campaign_fn = _operator_campaign_fn(_load_coder_config(args.brain))
+        loop = operator_mod.OperatorLoop(rt, run_campaign_fn=run_campaign_fn)
         # Continuous: run the loop, stream events, Ctrl+C to stop.
-        loop.start(allow_submit=args.allow_submit)
+        try:
+            loop.start(grants=grants)
+        except (ValueError, OSError) as exc:
+            return _err(str(exc))
         print(_c("Operator running — Ctrl+C to stop.", "1"))
         seen = 0
         try:
@@ -617,6 +623,12 @@ def _cmd_operator(args: argparse.Namespace) -> int:
         return 0
 
     return _err(f"unknown operator action: {action}")
+
+
+def _cmd_dashboard(args: argparse.Namespace) -> int:
+    from terminal_dashboard import run_dashboard
+
+    return run_dashboard(RUNTIME_DIR, port=args.port, interval=args.interval, version=VERSION)
 
 
 def _cmd_scan(args: argparse.Namespace) -> int:
@@ -902,6 +914,60 @@ def _register_plugin_verbs(sub: argparse._SubParsersAction) -> None:
             register(sub)
         except Exception:  # noqa: BLE001 - same contract: a bad registration costs one verb, not the CLI
             continue
+def _cli_launcher() -> tuple[Path, str]:
+    """Return the launcher users can add to PATH for this source or frozen build."""
+    if getattr(sys, "frozen", False):
+        binary = Path(sys.executable).resolve()
+        if sys.platform == "linux":
+            portable = binary.parent.parent / "greyiq-cli"
+            if portable.is_file() and os.access(portable, os.X_OK):
+                return portable, "greyiq-cli"
+            debian = Path("/usr/bin/greyiq-cli")
+            if debian.is_file() and os.access(debian, os.X_OK):
+                return debian, "greyiq-cli"
+        return binary, binary.name
+    launcher = PROJECT_ROOT / ("gn.cmd" if os.name == "nt" else "gn")
+    return launcher.resolve(), "gn"
+
+
+def _cmd_path(_args: argparse.Namespace) -> int:
+    """Show current data path and a copyable command for exposing this CLI."""
+    launcher, command = _cli_launcher()
+    print(f"CLI launcher: {launcher}")
+    print(f"Runtime data: {RUNTIME_DIR}")
+    found = shutil.which(command)
+    # Windows command lookup also searches the current directory, which does not
+    # make the command available after the user changes directories. Require the
+    # discovered launcher (or a symlink to it) to live in an actual PATH entry.
+    path_dirs = {
+        os.path.normcase(str(Path(os.path.expandvars(entry.strip('"'))).resolve()))
+        for entry in os.getenv("PATH", "").split(os.pathsep)
+        if entry.strip('"') and Path(os.path.expandvars(entry.strip('"'))).is_absolute()
+    }
+    on_path = bool(
+        found and Path(found).is_absolute()
+        and Path(found).resolve() == launcher.resolve()
+        and os.path.normcase(str(Path(found).parent.resolve())) in path_dirs
+    )
+    if on_path:
+        print(f"{command} is already on PATH. Try: {command} dashboard")
+    elif os.name == "nt":
+        directory = str(launcher.parent).replace("'", "''")
+        quoted_launcher = str(launcher).replace("'", "''")
+        print(f"Run now: & '{quoted_launcher}' dashboard")
+        print("PowerShell, current session: ")
+        print(f"$env:Path = '{directory};' + $env:Path")
+        print("For future sessions, add that directory to your user PATH in Windows Environment Variables.")
+    else:
+        export = f'export PATH={shlex.quote(str(launcher.parent))}:"$PATH"'
+        print(f"Run now: {shlex.quote(str(launcher))} dashboard")
+        print(f"Current shell: {export}")
+        print("For future shells, add that export line to ~/.profile (or your shell startup file).")
+    if os.name == "nt":
+        print("Optional data override before launch: $env:GREYIQ_RUNTIME_DIR = 'C:\\path\\to\\runtime'")
+    else:
+        print('Optional data override before launch: export GREYIQ_RUNTIME_DIR="/absolute/path/to/runtime"')
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1007,7 +1073,7 @@ def build_parser() -> argparse.ArgumentParser:
     leads.add_argument("--min-confidence", type=int, default=None, dest="min_confidence", help="only leads with confidence_score >= N")
     leads.set_defaults(func=_cmd_leads)
 
-    op = sub.add_parser("operator", help="autonomous operator — run a portfolio of programs unattended")
+    op = sub.add_parser("operator", help="schedule portfolio hunts for human review")
     op.set_defaults(func=_cmd_operator, op_action=None)
     opsub = op.add_subparsers(dest="op_action", metavar="<action>")
     opsub.add_parser("list", help="list portfolio programs").set_defaults(func=_cmd_operator)
@@ -1015,27 +1081,36 @@ def build_parser() -> argparse.ArgumentParser:
     opa.add_argument("--name", required=True)
     opa.add_argument("--scope", required=True, help="scope hosts/wildcards (the fail-closed active gate)")
     opa.add_argument("--targets", nargs="+", default=[], help="seed target URLs (each in scope)")
-    opa.add_argument("--handle", default="", help="HackerOne team handle (required to auto-submit)")
+    opa.add_argument("--handle", default="", help="HackerOne team handle for report routing")
     opa.add_argument("--interval", type=int, default=1440, help="re-run cadence in minutes (default 1440)")
-    opa.add_argument("--max-submits", dest="max_submits", type=int, default=3, help="max auto-submits/day (default 3)")
+    opa.add_argument("--max-submits", dest="max_submits", type=int, default=3, help="legacy stored setting; automatic submission is disabled")
     opa.add_argument("--max-pages", dest="max_pages", type=int, default=12)
     opa.add_argument("--active", action="store_true", help="capture proof of impact")
     opa.add_argument("--live", action="store_true", help="dynamic Playwright pass")
     opa.add_argument("--deep", action="store_true",
                      help="aggressive auto-work (implies --active): time-based SQLi + a screenshot + a researched dossier per confirmed lead")
-    opa.add_argument("--auto-submit", dest="auto_submit", action="store_true", help="opt this program into auto-submission")
+    opa.add_argument("--auto-submit", dest="auto_submit", action="store_true", help="legacy flag; automatic submission is disabled")
     opa.set_defaults(func=_cmd_operator)
     opr = opsub.add_parser("remove", help="remove a program")
     opr.add_argument("id")
     opr.set_defaults(func=_cmd_operator)
     oprun = opsub.add_parser("run", help="run the operator loop")
-    oprun.add_argument("--once", action="store_true", help="run each due program one cycle, then exit")
-    oprun.add_argument("--allow-submit", dest="allow_submit", action="store_true", help="ARM auto-submission (per-program opt-in still applies)")
+    oprun.add_argument("--once", action="store_true", help="reserved; currently refused until guarded one-shot auditing is available")
+    oprun.add_argument("--grant-file", default="", help="JSON grants for every enabled program, including policy source and expiry")
+    oprun.add_argument("--allow-submit", dest="allow_submit", action="store_true", help="legacy flag; refused because automatic submission is disabled")
     oprun.add_argument("--brain", action="store_true", help="use the configured LLM brain to enrich")
     oprun.add_argument("-y", "--authorize", action="store_true", help="confirm you're AUTHORIZED on every enabled program (required)")
     oprun.set_defaults(func=_cmd_operator)
     opp = opsub.add_parser("pipeline", help="show the money pipeline funnel")
     opp.set_defaults(func=_cmd_operator)
+
+    dashboard = sub.add_parser("dashboard", help="read-only live terminal dashboard for local health and reports")
+    dashboard.add_argument("--port", type=int, default=8766, help="local backend health port (default: 8766)")
+    dashboard.add_argument("--interval", type=float, default=2.0, help="refresh seconds, 0.2-60 (default: 2)")
+    dashboard.set_defaults(func=_cmd_dashboard)
+
+    path = sub.add_parser("path", help="show the CLI PATH setup command and runtime data directory")
+    path.set_defaults(func=_cmd_path)
 
     scan = sub.add_parser("scan", help="quick code/web scan with a triage summary")
     scan.add_argument("target", help="https:// URL or local path")

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import sys
+import json
 import tempfile
 import threading
 import time
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
@@ -15,6 +18,18 @@ if str(BACKEND_DIR) not in sys.path:
 
 from bughunter import ledger, operator, portfolio, ranking  # noqa: E402
 from bughunter.operator import OperatorLoop  # noqa: E402
+
+
+def _operator_grant(program_id: str, *, max_cycles: int = 7) -> dict[str, object]:
+    now = datetime.now(UTC)
+    return {
+        "program_id": program_id,
+        "authorization_ref": "operator-owned test authorization record",
+        "policy_source": "internal engagement rules of engagement",
+        "policy_checked_at": now.isoformat(),
+        "expires_at": (now + timedelta(days=1)).isoformat(),
+        "max_cycles": max_cycles,
+    }
 
 
 class PortfolioTests(unittest.TestCase):
@@ -57,12 +72,13 @@ class PortfolioTests(unittest.TestCase):
         self.assertEqual(p["interval_minutes"], 1440)
         self.assertEqual(p["max_submits_per_day"], 3)
 
-    def test_auto_submit_requires_handle(self) -> None:
+    def test_auto_submit_is_disabled_even_with_handle(self) -> None:
         p = portfolio.upsert_program(self.rt, {"name": "X", "scope_text": "x.com", "auto_submit": True, "platform": "manual"})
-        self.assertFalse(p["auto_submit"])  # no hackerone handle -> can't auto-submit
+        self.assertFalse(p["auto_submit"])
         p2 = portfolio.upsert_program(self.rt, {"name": "Y", "scope_text": "y.com", "auto_submit": True,
                                                 "platform": "hackerone", "platform_handle": "yteam"})
-        self.assertTrue(p2["auto_submit"])
+        self.assertFalse(p2["auto_submit"])
+        self.assertFalse(portfolio.get_program(self.rt, p2["id"])["auto_submit"])
 
 
 def _finding(ref, cls, rule, loc, sev="high", proof="confirmed", cvss=8.0):
@@ -403,15 +419,14 @@ class IsDueTests(unittest.TestCase):
     scheduled), not just the one malformed program."""
 
     def setUp(self) -> None:
-        self.loop = OperatorLoop("unused", run_campaign_fn=lambda *a, **k: {}, submit_fn=lambda *a, **k: {})
+        self.loop = OperatorLoop("unused", run_campaign_fn=lambda *a, **k: {})
 
-    def test_naive_timestamp_does_not_raise_and_counts_as_due(self) -> None:
-        # No timezone offset -> comparing to datetime.now(UTC) raises TypeError, not
-        # ValueError -- must be caught and treated as due (fail toward scheduling it).
-        self.assertTrue(self.loop._is_due({"next_run_at": "2026-07-01T10:00:00"}))
+    def test_naive_timestamp_does_not_raise_or_schedule(self) -> None:
+        # A corrupt schedule must not turn into an immediate unattended hunt.
+        self.assertFalse(self.loop._is_due({"next_run_at": "2026-07-01T10:00:00"}))
 
-    def test_garbage_string_does_not_raise_and_counts_as_due(self) -> None:
-        self.assertTrue(self.loop._is_due({"next_run_at": "not-a-date"}))
+    def test_garbage_string_does_not_raise_or_schedule(self) -> None:
+        self.assertFalse(self.loop._is_due({"next_run_at": "not-a-date"}))
 
     def test_missing_next_run_at_is_due(self) -> None:
         self.assertTrue(self.loop._is_due({}))
@@ -474,13 +489,11 @@ class RankingTests(unittest.TestCase):
 
 
 class OperatorCycleTests(unittest.TestCase):
-    """The submit safety gates: review-only never submits; armed+opt-in+confirmed does;
-    dedup blocks re-file; the per-day throttle caps; the kill switch halts."""
+    """Scheduled cycles count findings and leave all external filing to a human."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.rt = self._tmp.name
-        self.submits: list[tuple[str, str]] = []
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -501,77 +514,48 @@ class OperatorCycleTests(unittest.TestCase):
                                                            "proof_status": "confirmed", "cvss": {"base_score": 6.1}}])
         return {"ok": True, "run_id": "run-1", "findings": [f], "proof_of_impact": {"C1": {"status": "confirmed"}}}
 
-    def _submit_fn(self, run_id, ref):
-        self.submits.append((run_id, ref))
-        return {"ok": True, "report_id": f"R{len(self.submits)}", "url": "https://h1/r"}
-
-    def test_review_only_never_submits(self) -> None:
-        # submit_fn=None => review-only, even though the program opts into auto_submit.
-        s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=self._run_campaign_fn, submit_fn=None)
-        self.assertEqual(self.submits, [])
+    def test_legacy_auto_submit_flag_never_files(self) -> None:
+        # A legacy saved program can still contain auto_submit=True. The cycle has
+        # no submission callback or reporting-platform dependency to invoke.
+        s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=self._run_campaign_fn)
         self.assertEqual(s["confirmed"], 1)
+        self.assertEqual(s["submitted"], 0)
+        self.assertFalse(ledger.is_submitted(self.rt, "acme", "https://acme.com",
+                         _finding("C1", "xss", "active.reflected-xss", "https://acme.com/?q=")))
 
     def test_deep_flag_is_threaded_to_the_campaign(self) -> None:
         self.last_deep = None
-        operator.run_program_cycle(self.rt, self._program(deep=True), run_campaign_fn=self._run_campaign_fn, submit_fn=None)
+        operator.run_program_cycle(self.rt, self._program(deep=True), run_campaign_fn=self._run_campaign_fn)
         self.assertTrue(self.last_deep)   # the program's deep flag reached run_campaign_fn
         self.last_deep = None
-        operator.run_program_cycle(self.rt, self._program(deep=False), run_campaign_fn=self._run_campaign_fn, submit_fn=None)
+        operator.run_program_cycle(self.rt, self._program(deep=False), run_campaign_fn=self._run_campaign_fn)
         self.assertFalse(self.last_deep)
 
-    def test_armed_auto_submit_files_confirmed(self) -> None:
-        s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=self._run_campaign_fn, submit_fn=self._submit_fn)
-        self.assertEqual(len(self.submits), 1)
-        self.assertEqual(s["submitted"], 1)
-
-    def test_armed_auto_submit_files_even_after_campaign_marks_reported(self) -> None:
-        # The REAL campaign.py marks a confirmed finding 'reported' (ledger.mark_reported)
-        # the SAME cycle it builds a local submission package — before run_program_cycle
-        # ever gets to check the ledger. The auto-submit gate must key off is_submitted
-        # (stage >= submitted), not is_duplicate (stage >= reported, which mark_reported
-        # alone already satisfies) — otherwise auto-submit could never file anything.
+    def test_report_package_remains_queued_for_human(self) -> None:
         def run_fn(target, *, scope, program, active, live, deep=False, max_pages=12):
             f = _finding("C1", "xss", "active.reflected-xss", f"{target}/?q=", proof="confirmed")
             ledger.upsert_findings(self.rt, program, target, [{"finding": f, "source_url": f["location"],
                                                                "proof_status": "confirmed", "cvss": {"base_score": 6.1}}])
-            ledger.mark_reported(self.rt, program, target, f)  # simulates building the submission package
+            ledger.mark_reported(self.rt, program, target, f)
             return {"ok": True, "run_id": "run-1", "findings": [f], "proof_of_impact": {"C1": {"status": "confirmed"}}}
-        s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=run_fn, submit_fn=self._submit_fn)
-        self.assertEqual(len(self.submits), 1)
-        self.assertEqual(s["submitted"], 1)
-
-    def test_dedup_blocks_refile_on_second_cycle(self) -> None:
-        op = dict(self._program())
-        operator.run_program_cycle(self.rt, op, run_campaign_fn=self._run_campaign_fn, submit_fn=self._submit_fn)
-        operator.run_program_cycle(self.rt, op, run_campaign_fn=self._run_campaign_fn, submit_fn=self._submit_fn)
-        self.assertEqual(len(self.submits), 1)  # the second cycle's identical finding is a dup -> not re-filed
-
-    def test_throttle_caps_per_day(self) -> None:
-        # Five distinct confirmed findings, cap of 2/day -> only 2 filed.
-        calls = {"n": 0}
-        def many_fn(target, *, scope, program, active, live, deep=False, max_pages=12):
-            calls["n"] += 1
-            f = _finding(f"C{calls['n']}", "xss", "active.reflected-xss", f"{target}/p{calls['n']}", proof="confirmed")
-            ledger.upsert_findings(self.rt, program, target, [{"finding": f, "source_url": f["location"], "proof_status": "confirmed", "cvss": {"base_score": 6.1}}])
-            return {"ok": True, "run_id": "r", "findings": [f], "proof_of_impact": {f["ref"]: {"status": "confirmed"}}}
-        prog = self._program(max_submits_per_day=2, seed_targets=["https://a", "https://b", "https://c", "https://d", "https://e"])
-        operator.run_program_cycle(self.rt, prog, run_campaign_fn=many_fn, submit_fn=self._submit_fn)
-        self.assertEqual(len(self.submits), 2)
+        s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=run_fn)
+        self.assertEqual(s["submitted"], 0)
+        self.assertFalse(ledger.is_submitted(self.rt, "acme", "https://acme.com",
+                         _finding("C1", "xss", "active.reflected-xss", "https://acme.com/?q=")))
 
     def test_run_campaign_fn_raising_is_recorded_and_does_not_kill_the_cycle(self) -> None:
         def boom(target, *, scope, program, active, live, deep=False, max_pages=12):
             raise RuntimeError("simulated campaign crash")
         prog = self._program(seed_targets=["https://a", "https://b"])
-        s = operator.run_program_cycle(self.rt, prog, run_campaign_fn=boom, submit_fn=self._submit_fn)
+        s = operator.run_program_cycle(self.rt, prog, run_campaign_fn=boom)
         self.assertEqual(s["targets_run"], 0)
         self.assertEqual(len(s["errors"]), 2)  # one error per target, both recorded
         self.assertIn("RuntimeError", s["errors"][0])
-        self.assertEqual(self.submits, [])
 
     def test_campaign_ok_false_is_recorded_as_an_error_not_raised(self) -> None:
         def failing(target, *, scope, program, active, live, deep=False, max_pages=12):
             return {"ok": False, "error": "not authorized"}
-        s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=failing, submit_fn=self._submit_fn)
+        s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=failing)
         self.assertEqual(s["targets_run"], 0)
         self.assertEqual(len(s["errors"]), 1)
         self.assertIn("not authorized", s["errors"][0])
@@ -580,31 +564,17 @@ class OperatorCycleTests(unittest.TestCase):
         def run_fn(target, *, scope, program, active, live, deep=False, max_pages=12):
             f = {"class_id": "xss", "rule_id": "r", "location": target, "severity": "high", "title": "x"}  # no 'ref'
             return {"ok": True, "run_id": "run-1", "findings": [f], "proof_of_impact": {}}
-        s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=run_fn, submit_fn=self._submit_fn)
+        s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=run_fn)
         self.assertEqual(s["targets_run"], 1)
         self.assertEqual(s["findings"], 1)
         self.assertEqual(s["confirmed"], 0)  # proof_of_impact.get(None) -> not confirmed, no crash
-        self.assertEqual(self.submits, [])
 
     def test_empty_seed_targets_is_a_clean_no_op(self) -> None:
         prog = self._program(seed_targets=[])
-        s = operator.run_program_cycle(self.rt, prog, run_campaign_fn=self._run_campaign_fn, submit_fn=self._submit_fn)
+        s = operator.run_program_cycle(self.rt, prog, run_campaign_fn=self._run_campaign_fn)
         self.assertEqual(s["targets_run"], 0)
         self.assertEqual(s["findings"], 0)
         self.assertEqual(s["errors"], [])
-        self.assertEqual(self.submits, [])
-
-    def test_submit_fn_failure_is_recorded_without_advancing_the_ledger(self) -> None:
-        def failing_submit(run_id, ref):
-            return {"ok": False, "error": "HackerOne rejected the report"}
-        s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=self._run_campaign_fn, submit_fn=failing_submit)
-        self.assertEqual(s["submitted"], 0)
-        self.assertEqual(len(s["errors"]), 1)
-        self.assertIn("HackerOne rejected", s["errors"][0])
-        # A failed submit must NOT mark the finding submitted -- it must still be
-        # eligible to retry on the next cycle.
-        self.assertFalse(ledger.is_submitted(self.rt, "acme", "https://acme.com",
-                          _finding("C1", "xss", "active.reflected-xss", "https://acme.com/?q=", proof="confirmed")))
 
 
 class SupervisorLoopTests(unittest.TestCase):
@@ -620,20 +590,58 @@ class SupervisorLoopTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_idle_tick_wait_responds_to_the_stop_event_not_the_full_timeout(self) -> None:
-        # Zero programs -> due=[] every pass -> _supervise calls
+        # One authorized program is not due -> _supervise calls
         # self.stop_event.wait(timeout=15). Setting the event from another thread must
         # wake it well before the 15s timeout, proving the idle tick is responsive.
-        loop = OperatorLoop(self.rt, run_campaign_fn=lambda *a, **k: {}, submit_fn=lambda *a, **k: {})
-        thread = threading.Thread(target=loop._supervise, daemon=True)
+        portfolio.upsert_program(self.rt, {"id": "idle", "name": "Idle", "scope_text": "example.com",
+                                           "seed_targets": ["https://example.com"],
+                                           "next_run_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat()})
+        loop = OperatorLoop(self.rt, run_campaign_fn=lambda *a, **k: {})
         start = time.monotonic()
-        thread.start()
+        self.assertTrue(loop.start(grants=[_operator_grant("idle")]))
         time.sleep(0.05)  # let it enter the idle wait
-        loop.stop_event.set()
-        thread.join(timeout=5)
+        loop.stop()
+        loop._thread.join(timeout=5)
         elapsed = time.monotonic() - start
-        self.assertFalse(thread.is_alive())
+        self.assertFalse(loop._thread.is_alive())
         self.assertLess(elapsed, 5.0)  # nowhere near the 15s idle-wait timeout
         self.assertFalse(loop.running)
+
+    def test_start_refuses_auto_submit_before_launching_thread(self) -> None:
+        loop = OperatorLoop(self.rt, run_campaign_fn=lambda *a, **k: {})
+        with self.assertRaisesRegex(ValueError, "Automatic submission is disabled"):
+            loop.start(allow_submit=True)
+        self.assertFalse(loop.running)
+        self.assertIsNone(loop._thread)
+
+    def test_restart_with_legacy_persisted_flag_stays_review_only(self) -> None:
+        prog = portfolio.upsert_program(self.rt, {
+            "id": "legacy", "name": "Legacy", "scope_text": "example.com",
+            "seed_targets": ["https://example.com"], "platform": "hackerone",
+            "platform_handle": "legacy",
+        })
+        # Simulate a portfolio.json written by an older release that had this armed.
+        raw = portfolio._load(self.rt)
+        raw["programs"][prog["id"]]["auto_submit"] = True
+        portfolio._save(self.rt, raw)
+        self.assertTrue(json.loads((Path(self.rt) / portfolio._STORE_NAME).read_text(encoding="utf-8"))
+                        ["programs"][prog["id"]]["auto_submit"])
+        self.assertFalse(portfolio.get_program(self.rt, prog["id"])["auto_submit"])
+
+        called = threading.Event()
+        def run_fn(target, **kwargs):
+            called.set()
+            return {"ok": True, "run_id": "r", "findings": [_finding("F1", "xss", "r", target)],
+                    "proof_of_impact": {"F1": {"status": "confirmed"}}}
+
+        with patch("bughunter.submission.submit_to_hackerone") as submit:
+            restarted = OperatorLoop(self.rt, run_campaign_fn=run_fn)
+            self.assertTrue(restarted.start(grants=[_operator_grant("legacy")]))
+            self.assertTrue(called.wait(timeout=5))
+            restarted.stop()
+            restarted._thread.join(timeout=5)
+            submit.assert_not_called()
+        self.assertFalse(restarted.allow_submit)
 
     def test_kill_switch_stops_before_a_second_due_program(self) -> None:
         portfolio.upsert_program(self.rt, {"id": "p1", "name": "P1", "scope_text": "a.com",
@@ -644,7 +652,7 @@ class SupervisorLoopTests(unittest.TestCase):
         started = threading.Event()
         kill_engaged = threading.Event()
 
-        def run_campaign_fn(target, *, scope, program, active, live, deep=False, max_pages=12):
+        def run_campaign_fn(target, *, scope, program, active, live, deep=False, max_pages=12, run_id=""):
             calls.append(program)
             started.set()
             # HOLD the supervisor inside the first program's campaign until the test has actually
@@ -657,17 +665,16 @@ class SupervisorLoopTests(unittest.TestCase):
             self.assertTrue(kill_engaged.wait(timeout=5), "the test must engage the kill switch first")
             return {"ok": True, "run_id": "r", "findings": [], "proof_of_impact": {}}
 
-        loop = OperatorLoop(self.rt, run_campaign_fn=run_campaign_fn, submit_fn=lambda *a, **k: {})
-        thread = threading.Thread(target=loop._supervise, daemon=True)
-        thread.start()
+        loop = OperatorLoop(self.rt, run_campaign_fn=run_campaign_fn)
+        self.assertTrue(loop.start(grants=[_operator_grant("p1"), _operator_grant("p2")]))
         # The moment the FIRST program's campaign fires, engage the kill switch — the
         # per-program loop's `if self.stop_event.is_set(): break` must stop it before
         # ever reaching the second due program.
         self.assertTrue(started.wait(timeout=5))
-        loop.stop_event.set()
+        loop.stop()
         kill_engaged.set()
-        thread.join(timeout=5)
-        self.assertFalse(thread.is_alive())
+        loop._thread.join(timeout=5)
+        self.assertFalse(loop._thread.is_alive())
         self.assertEqual(calls, ["p1"])  # p2 never ran
 
     def test_concurrent_start_calls_spawn_only_one_supervisor(self) -> None:
@@ -675,16 +682,21 @@ class SupervisorLoopTests(unittest.TestCase):
         # API request runs on its own asyncio.to_thread worker), so two concurrent
         # /api/operator/start calls -- a UI double-click, a client retry, two tabs --
         # could both observe running=False before either set it True, spawning TWO
-        # independent supervisor loops that hunt the same programs and can
-        # double-submit the same confirmed finding to HackerOne.
-        loop = OperatorLoop(self.rt, run_campaign_fn=lambda *a, **k: {}, submit_fn=lambda *a, **k: {})
+        # independent supervisor loops that hunt the same programs.
+        portfolio.upsert_program(self.rt, {"id": "one", "name": "One", "scope_text": "example.com",
+                                           "seed_targets": ["https://example.com"]})
+        release = threading.Event()
+        def run_campaign_fn(*args, **kwargs):
+            release.wait(timeout=5)
+            return {"ok": True, "findings": [], "proof_of_impact": {}}
+        loop = OperatorLoop(self.rt, run_campaign_fn=run_campaign_fn)
         results: list[bool] = []
         results_lock = threading.Lock()
         barrier = threading.Barrier(8)
 
         def race() -> None:
             barrier.wait(timeout=5)
-            won = loop.start()
+            won = loop.start(grants=[_operator_grant("one")])
             with results_lock:
                 results.append(won)
 
@@ -696,6 +708,7 @@ class SupervisorLoopTests(unittest.TestCase):
         self.assertEqual(results.count(True), 1, "exactly one concurrent start() call must win the race")
         self.assertEqual(results.count(False), 7)
         loop.stop()
+        release.set()
         loop._thread.join(timeout=5)
         self.assertFalse(loop.running)
 

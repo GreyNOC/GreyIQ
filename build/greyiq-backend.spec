@@ -55,6 +55,7 @@ hiddenimports = [
     "workspace",
     "_version",
     "gn_cli",  # run_frozen imports it at function level (CLI dispatch) — force-include
+    "terminal_dashboard",  # gn dashboard is imported lazily by the frozen CLI
     "yaml",    # api_discovery_service parses YAML OpenAPI specs; import is guarded, force-include so it's bundled
 ]
 

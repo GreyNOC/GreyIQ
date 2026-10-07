@@ -147,8 +147,9 @@
             </label>
             <label data-brain-field="model">
               <span>Model</span>
-              <input id="brainModel" name="brainModel" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. qwen2.5-coder:14b">
+              <input id="brainModel" name="brainModel" type="text" autocomplete="off" spellcheck="false" placeholder="Ollama name or Hugging Face GGUF model URL">
             </label>
+            <p class="folder-status" id="brainModelHelp" data-brain-local-help hidden>For Hugging Face, paste a public GGUF model page, hf.co/owner/repo:quant, or its ollama run command.</p>
             <label data-brain-field="base_url">
               <span>Server URL</span>
               <input id="brainBaseUrl" name="brainBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:11434/v1">
@@ -163,7 +164,7 @@
             </div>
             <div class="folder-actions" id="brainModelRow" hidden>
               <span class="folder-status" id="brainModelStatus">checking model…</span>
-              <button class="text-button" type="button" id="brainDownload">Download model</button>
+              <button class="text-button" type="button" id="brainDownload">Download and use</button>
             </div>
             <div class="model-list" id="brainModelList" hidden></div>
             <label>

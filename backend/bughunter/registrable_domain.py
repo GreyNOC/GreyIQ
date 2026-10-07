@@ -53,21 +53,28 @@ _SHARED_HOSTING = frozenset({
 })
 
 _KNOWN_MULTI_LABEL_SUFFIXES = _CC_SECOND_LEVEL | _SHARED_HOSTING
+_SUFFIXES_LONGEST_FIRST = tuple(sorted(_KNOWN_MULTI_LABEL_SUFFIXES, key=len, reverse=True))
 
 
 def registrable_domain(host: str) -> str:
-    """Best-effort eTLD+1: the last two dotted labels, EXCEPT when those two labels are
-    themselves a known multi-label public suffix (a ccSLD like ``co.uk`` or a shared
-    PaaS host like ``herokuapp.com``) — then one more label is included so a real owned
-    domain under that suffix (``foo.co.uk``, ``myapp.herokuapp.com``) resolves to
-    itself, not to the bare suffix. Never resolves a host to FEWER labels than it has."""
-    labels = (host or "").strip(".").lower().split(".")
+    """Best-effort eTLD+1 using the longest known suffix plus one owner label.
+
+    Some shared hosts have more than two labels (``s3.amazonaws.com`` and
+    ``blob.core.windows.net``). Checking only the last two labels collapses
+    unrelated tenants to the same registrable site and can replay a session
+    between them. Bare suffixes return themselves for callers to reject.
+    """
+    cleaned = (host or "").strip(".").lower()
+    labels = cleaned.split(".")
     if len(labels) < 2:
         return host or ""
-    two = ".".join(labels[-2:])
-    if two in _KNOWN_MULTI_LABEL_SUFFIXES and len(labels) >= 3:
-        return ".".join(labels[-3:])
-    return two
+    for suffix in _SUFFIXES_LONGEST_FIRST:
+        if cleaned == suffix:
+            return cleaned
+        if cleaned.endswith("." + suffix):
+            owner = cleaned[:-(len(suffix) + 1)].rsplit(".", 1)[-1]
+            return owner + "." + suffix
+    return ".".join(labels[-2:])
 
 
 def is_bare_public_suffix(token: str) -> bool:

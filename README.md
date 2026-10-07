@@ -43,7 +43,57 @@ detects standard TACNOC installs and the normal `GreyNOC Belcher` development
 checkout on the current user's Desktop; set `GREYIQ_TACNOC_PATH` to a TACNOC
 executable or project directory for any other layout.
 
+## Debian 13
+
+The Linux release includes a Debian package, an AppImage, and a headless CLI
+tarball for amd64. On a Debian 13 desktop, install the package with:
+
+```bash
+sudo apt install ./GreyIQ-*-amd64.deb
+greyiq-cli dashboard
+```
+
+`greyiq` opens the desktop app. `greyiq-cli` runs the same frozen backend's
+command-line interface; `dashboard` is an interactive, read-only terminal view
+of local health, system load, programs, findings, reports, and activity. Press
+`q` to quit, `r` to refresh, and Tab or the arrow keys to change panels. The
+dashboard requires a terminal and only probes the API on `127.0.0.1`. Both the
+installed desktop and CLI use `$XDG_DATA_HOME/greyiq/runtime` (or
+`~/.local/share/greyiq/runtime`) unless `GREYIQ_RUNTIME_DIR` is set. On first
+launch after upgrading an older AppImage, the desktop copies existing data from
+its previous Electron runtime directory when the new location is still absent.
+Launch the desktop once before running CLI hunts after an upgrade so that copy
+can complete.
+
+For the headless CLI archive, extract it and run `./greyiq-cli path` for local
+PATH guidance, then `./greyiq-cli dashboard`.
+The included `INSTALL.txt` and [deployment guide](DEPLOY.md) show the exact
+optional `~/.local/bin` PATH setup; the Debian package needs no PATH change.
+
+For the AppImage, install its FUSE and local-model extraction dependencies,
+then make it executable:
+
+```bash
+sudo apt install libfuse2t64 zstd
+chmod +x GreyIQ-*-x86_64.AppImage
+./GreyIQ-*-x86_64.AppImage
+```
+
+From a source checkout, install [Node.js 22.12 or newer](https://nodejs.org/en/download),
+plus Debian's `python3-venv`, `tesseract-ocr`, and `poppler-utils` packages.
+Debian 13's own `nodejs` package is Node 20, which is too old for the Electron
+version used here. Then run `npm ci`, create and
+activate a Python virtual environment, and install `requirements.txt`.
+`./gn dashboard` opens the terminal view. See [DEPLOY.md](DEPLOY.md) for exact
+commands, build steps, and optional OCR and model setup.
+
 ## Check
+
+Install the Python runtime and test dependencies before running the full check:
+
+```powershell
+python -m pip install -r requirements.txt -r requirements-test.txt
+```
 
 ```powershell
 npm run check
@@ -65,6 +115,15 @@ In the **Coding brain** panel (training column) pick a provider:
 - **Local model (Ollama)** — e.g. `qwen2.5-coder:14b`. The Ollama runtime isn't shipped in the installer — GreyIQ fetches it (with its bundled NVIDIA/CUDA runner) the first time you select the local model, offers one-click model download, and uses your GPU automatically: NVIDIA works out of the box; on an AMD box GreyIQ fetches Ollama's ROCm runtime separately on first run. No supported GPU → it runs on CPU.
 - **Claude API** — paste an Anthropic key (default model `claude-opus-4-8`).
 - **OpenAI-compatible** — any `/v1/chat/completions` endpoint.
+
+For a local Hugging Face model, paste a **public GGUF model page** such as
+`https://huggingface.co/owner/model-GGUF`, an `hf.co/owner/model-GGUF:quant`
+reference, or its `ollama run ...` command into the model field. Click
+**Download and use** once. GreyIQ starts Ollama if needed, downloads the selected
+model, checks that it appears locally, and tests chat and structured tool calls
+before switching the active brain. A model that only supports chat stays
+available for manual selection; the previous brain remains active. Private,
+gated, and non-GGUF repositories need their own access or conversion steps.
 
 The brain answers chat, drives Agent mode, and writes the analysis in BugHunter reports.
 For security and root-cause work, Agent mode can call a shared evidence-grounded

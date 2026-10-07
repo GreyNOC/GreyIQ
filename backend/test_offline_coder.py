@@ -32,6 +32,21 @@ import offline_coder  # noqa: E402
 _SEED = BACKEND_DIR / "seed"
 
 
+@contextlib.contextmanager
+def _available_parser_for_plan(name: str):
+    """Exercise recipe selection without requiring that parser on the CI host.
+
+    The separate parser test runs the real binary when installed; production
+    planner gating remains covered by its unavailable-parser regressions.
+    """
+    actual = offline_coder._gate_available
+    with mock.patch.object(
+        offline_coder, "_gate_available",
+        side_effect=lambda hint: True if str(hint).lower() == name.lower() else actual(hint),
+    ):
+        yield
+
+
 def _repo(td: str, files: dict[str, str]) -> str:
     """Materialize a fixture repo. Retrieval reads real files, so a fixture must be real files."""
     for name, body in files.items():
@@ -356,7 +371,8 @@ class RecipeGatingTests(unittest.TestCase):
             _repo(fast, {"requirements.txt": _FASTAPI_REQS})
             _repo(node, {"package.json": _PKG_EXPRESS})
             fast_plan = offline_coder.plan_edits(message, fast, seed_dir=_SEED)
-            node_plan = offline_coder.plan_edits(message, node, seed_dir=_SEED)
+            with _available_parser_for_plan("node --check"):
+                node_plan = offline_coder.plan_edits(message, node, seed_dir=_SEED)
             bare_plan = offline_coder.plan_edits(message, bare, seed_dir=_SEED)
 
             self.assertEqual(fast_plan["ops"][0]["path"], "users_profile_router.py")
@@ -385,7 +401,8 @@ class RecipeGatingTests(unittest.TestCase):
                 "add an express middleware named audit", td, seed_dir=_SEED)["needs_brain"],
                 "a package.json without express must not unlock the Express template")
             _repo(td, {"package.json": _PKG_EXPRESS})
-            plan = offline_coder.plan_edits("add an express middleware named audit", td, seed_dir=_SEED)
+            with _available_parser_for_plan("node --check"):
+                plan = offline_coder.plan_edits("add an express middleware named audit", td, seed_dir=_SEED)
             self.assertFalse(plan["needs_brain"])
             self.assertEqual(plan["ops"][0]["path"], "audit_middleware.js")
 
@@ -637,7 +654,8 @@ class TemplateLibraryTests(unittest.TestCase):
             self.assertTrue(line.startswith("\t"), f"space-indented recipe line breaks make: {line!r}")
 
     def test_powershell_script_sets_strict_mode_before_any_work(self) -> None:
-        op = self._plan("write a powershell script to rotate logs")
+        with _available_parser_for_plan("PowerShell parser"):
+            op = self._plan("write a powershell script to rotate logs")
         self.assertEqual(op["path"], "scripts/rotate-logs.ps1")
         lines = [line.strip() for line in op["content"].splitlines()]
         strict = lines.index("Set-StrictMode -Version Latest")
@@ -674,7 +692,8 @@ class TemplateLibraryTests(unittest.TestCase):
 
     def test_pm2_config_uses_cjs_in_an_esm_package(self) -> None:
         esm = json.dumps({"name": "api", "type": "module", "dependencies": {"express": "^4"}})
-        op = self._plan("add a pm2 ecosystem config", {"package.json": esm})
+        with _available_parser_for_plan("node --check"):
+            op = self._plan("add a pm2 ecosystem config", {"package.json": esm})
         self.assertEqual(op["path"], "ecosystem.config.cjs",
                          "PM2 require()s this file; .js in an ESM package fails to load")
 

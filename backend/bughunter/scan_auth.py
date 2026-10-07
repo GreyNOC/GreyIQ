@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
-from bughunter.registrable_domain import registrable_domain
+from bughunter.registrable_domain import is_bare_public_suffix, registrable_domain
 from bughunter.web_ingest import WebsiteFetchError, _ascii_hostname
 
 # Header names an operator may not inject — hop-by-hop / framing headers whose
@@ -97,6 +97,11 @@ def same_registrable_site(request_host: str, issuer_host: str) -> bool:
     """
     rh, ih = _host(request_host), _host(issuer_host)
     if not rh or not ih:
+        return False
+    # A provider/public suffix is not an issuer-owned site. The parent/child
+    # short-circuit below must not allow a tenant cookie onto the provider root
+    # (or from the root to every tenant).
+    if is_bare_public_suffix(rh) or is_bare_public_suffix(ih):
         return False
     if same_site(rh, ih) or same_site(ih, rh):  # exact, subdomain either way, or IP-exact
         return True

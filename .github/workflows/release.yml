@@ -149,11 +149,13 @@ jobs:
             release/GreyIQ-Setup-*.exe
 
   linux:
-    name: Build Linux GUI (AppImage) + headless CLI
+    name: Build Linux GUI (AppImage + Debian package) + headless CLI
     # Runs after windows so the DRAFT release already exists; this job appends the
     # Linux assets to that draft (the `publish` job publishes it once both finish).
     needs: windows
-    runs-on: ubuntu-latest
+    # Build native libraries against an older glibc than Debian 13. A rolling
+    # ubuntu-latest runner can otherwise produce binaries too new for Trixie.
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -229,16 +231,25 @@ jobs:
       # (electron/main.cjs ensureBaseOllama). This also frees the ~1.4 GB that
       # previously contributed to the runner's "No space left on device" pressure.
 
-      - name: Build Linux GUI (electron-builder AppImage)
-        run: npx electron-builder --linux AppImage --publish never
+      - name: Ensure Debian packaging compressor
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xz-utils binutils
+
+      - name: Build Linux GUI (electron-builder AppImage + deb)
+        run: |
+          chmod +x build/greyiq-cli
+          npx electron-builder --linux AppImage deb --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Smoke-test Debian 13 package and desktop
+        run: bash scripts/smoke-debian13.sh
+
       - name: Package headless CLI (frozen backend tarball)
         run: |
-          VERSION=$(node -p "require('./package.json').version")
-          tar -czf "release/GreyIQ-${VERSION}-linux-cli.tar.gz" -C dist greyiq-backend
-          echo "CLI tarball: release/GreyIQ-${VERSION}-linux-cli.tar.gz ($(du -h release/GreyIQ-${VERSION}-linux-cli.tar.gz | cut -f1))"
+          bash scripts/package-linux-cli.sh
+
+      - name: Smoke-test headless CLI archive
+        run: bash scripts/smoke-cli-archive.sh
 
       - name: List build artifacts
         run: ls -lh release || true
@@ -253,6 +264,7 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             release/GreyIQ-*.AppImage
+            release/GreyIQ-*.deb
             release/GreyIQ-*-linux-cli.tar.gz
 
   publish:

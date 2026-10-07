@@ -100,14 +100,17 @@ class ParseOpenApiTests(unittest.TestCase):
 
 class ParseSpecBodyTests(unittest.TestCase):
     def test_deeply_nested_json_returns_none_not_recursionerror(self) -> None:
-        # json.loads raises RecursionError (a RuntimeError, NOT ValueError) on deeply nested brackets.
-        # parse_spec_body promises "never raises" — a hostile /openapi.json must degrade to None, not
-        # crash recon for the whole target.
+        # JSON recursion thresholds differ by Python build; a hostile spec must
+        # be rejected at a fixed depth before it reaches the parser.
         hostile = "[" * 6000 + "]" * 6000
         self.assertIsNone(api.parse_spec_body(hostile))
 
     def test_valid_json_still_parses(self) -> None:
         self.assertEqual(api.parse_spec_body('{"a": 1}'), {"a": 1})
+
+    def test_brackets_inside_a_json_string_do_not_count_as_nesting(self) -> None:
+        self.assertEqual(api.parse_spec_body('{"a": "' + '[' * 300 + '"}'),
+                         {"a": '[' * 300})
 
 
 class GraphQLTests(unittest.TestCase):

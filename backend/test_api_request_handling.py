@@ -14,6 +14,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
@@ -61,6 +62,37 @@ def _run_post_route(path: str, payload: dict) -> _Capture:
     scope = {"method": "POST", "path": path, "headers": headers, "scheme": "http", "query_string": b""}
     asyncio.run(g.route_http(scope, _receive_once(body), cap.send))
     return cap
+
+
+class OperatorStartGateTests(unittest.TestCase):
+    def test_legacy_allow_submit_payload_is_rejected_without_starting(self) -> None:
+        with patch.object(g.runtime, "_get_operator") as get_operator:
+            response = _run_post_route("/api/operator/start", {"authorized": True, "allow_submit": True})
+        self.assertEqual(response.status, 200)
+        body = json.loads(response.body)
+        self.assertFalse(body["ok"])
+        self.assertFalse(body["started"])
+        self.assertFalse(body["allow_submit"])
+        self.assertIn("disabled", body["error"].lower())
+        get_operator.assert_not_called()
+
+    def test_authorized_flag_without_program_grants_is_rejected(self) -> None:
+        response = _run_post_route("/api/operator/start", {"authorized": True})
+        self.assertEqual(response.status, 200)
+        body = json.loads(response.body)
+        self.assertFalse(body["ok"])
+        self.assertFalse(body["started"])
+
+    def test_start_passes_program_grants_to_operator(self) -> None:
+        grant = {"program_id": "program-1", "authorization_ref": "engagement-1",
+                 "policy_source": "policy-1", "policy_checked_at": "2026-10-06T12:00:00Z",
+                 "expires_at": "2026-10-07T12:00:00Z"}
+        with patch.object(g.runtime, "_get_operator") as get_operator:
+            get_operator.return_value.start.return_value = True
+            response = _run_post_route("/api/operator/start", {"authorized": True, "grants": [grant]})
+        self.assertEqual(response.status, 200)
+        self.assertTrue(json.loads(response.body)["started"])
+        get_operator.return_value.start.assert_called_once_with(grants=[grant])
 
 
 class ReadJsonBodyTests(unittest.TestCase):

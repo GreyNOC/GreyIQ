@@ -23,9 +23,9 @@ import re
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse, urlunparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-from bughunter import attack_chain, secret_classification
+from bughunter import attack_chain, operator_guard, secret_classification
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.code_scanner.rules import SECRET_RULES
 from bughunter.rate_limit import HostRateGovernor
@@ -180,6 +180,11 @@ def _guard_url(url: str, allow_private: bool, allowed_ports: frozenset[int]) -> 
     private/loopback/reserved hosts (unless opted in), and restrict ports for
     public hosts. Returns the URL with an ASCII (punycoded) host so the actual
     connection target matches exactly what was validated."""
+    # The process-wide local-app switch belongs to manual testing. An armed
+    # unattended grant never inherits it, including redirects, recon, and active
+    # verification, all of which reach this same guard before a socket opens.
+    if operator_guard.current() is not None:
+        allow_private = False
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         raise WebsiteFetchError("Only http and https URLs can be scanned.")
@@ -226,9 +231,12 @@ def playwright_request_allowed(url: str, allow_private: bool, allowed_ports: fro
     if not url.startswith(("http://", "https://")):
         return True
     try:
+        # In unattended mode this also enforces the exact saved program scope,
+        # cancellation, and the shared cycle request budget on browser resources.
+        operator_guard.before_request(url, reserve=True)
         _guard_url(url, allow_private, allowed_ports)
         return True
-    except WebsiteFetchError:
+    except (WebsiteFetchError, operator_guard.GuardHalt):
         return False
 
 
@@ -247,10 +255,17 @@ class _GuardedRedirect(HTTPRedirectHandler):
         self.count = 0
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, N802
+        # urllib follows 30x before _fetch_raw can inspect the intermediate
+        # response. Observe its defensive headers before authorizing a hop.
+        operator_guard.observe_response({"status": code, "headers": dict(headers or {}),
+                                         "body": "", "final_url": req.full_url})
         self.count += 1
         if self.count > _MAX_REDIRECTS:
             raise WebsiteFetchError("Website redirected too many times.")
-        target = _guard_url(urljoin(req.full_url, newurl), self.allow_private, self.allowed_ports)
+        raw_target = urljoin(req.full_url, newurl)
+        operator_guard.before_request(raw_target, reserve=False)
+        target = _guard_url(raw_target, self.allow_private, self.allowed_ports)
+        operator_guard.before_request(target, reserve=True)
         new = super().redirect_request(req, fp, code, msg, headers, target)
         if new is not None and self.auth is not None:
             target_host = urlparse(target).hostname or ""
@@ -268,12 +283,14 @@ class _GuardedRedirect(HTTPRedirectHandler):
 def _fetch_raw(url: str, *, auth: AuthContext | None = None) -> dict[str, Any]:
     settings = get_settings()
     normalized = normalize_website_url(url)
+    operator_guard.before_request(normalized, reserve=False)
     # guarded_dns_scope() covers the whole guarded fetch (initial URL through every
     # redirect hop _GuardedRedirect follows) so the DNS pin each _guard_url() call
     # installs for its hop's hostname is still in effect when the real connection to
     # that hop is made a moment later — see web_ingest.py for why this matters.
     with guarded_dns_scope():
         sanitized = _guard_url(normalized, settings.allow_private_urls, settings.web_allowed_ports)
+        operator_guard.before_request(sanitized, reserve=True)
         headers = {
             "Accept": "*/*",
             "Accept-Encoding": "identity",
@@ -283,11 +300,19 @@ def _fetch_raw(url: str, *, auth: AuthContext | None = None) -> dict[str, Any]:
         # (see _GuardedRedirect), so it never leaves the target's host.
         headers.update(auth_headers_for(urlparse(sanitized).hostname or "", auth))
         request = Request(sanitized, headers=headers, method="GET")
-        opener = build_opener(_GuardedRedirect(settings.allow_private_urls, settings.web_allowed_ports, auth=auth))
+        handlers = [_GuardedRedirect(settings.allow_private_urls, settings.web_allowed_ports, auth=auth)]
+        if operator_guard.current() is not None:
+            # urllib otherwise inherits HTTP_PROXY/HTTPS_PROXY and lets that
+            # ungranted proxy resolve the hostname outside our DNS pin.
+            handlers.insert(0, ProxyHandler({}))
+        opener = build_opener(*handlers)
         try:
             with opener.open(request, timeout=settings.web_fetch_timeout_seconds) as response:
                 final_url = response.geturl()
                 _guard_url(final_url, settings.allow_private_urls, settings.web_allowed_ports)
+                pre_status = getattr(response, "status", None) or getattr(response, "code", 0)
+                operator_guard.observe_response({"status": pre_status, "headers": dict(response.headers),
+                                                 "body": "", "final_url": final_url}, stage="headers")
                 consumed = _consume(response, settings)
         except HTTPError as error:
             # An error response is still worth analyzing (stack traces, headers). Unlike the
@@ -299,6 +324,9 @@ def _fetch_raw(url: str, *, auth: AuthContext | None = None) -> dict[str, Any]:
                 # a redirect chain ending in an error response could still terminate at a
                 # malformed/private host even though each hop was guarded along the way.
                 _guard_url(final_url, settings.allow_private_urls, settings.web_allowed_ports)
+                pre_status = getattr(error, "status", None) or getattr(error, "code", 0)
+                operator_guard.observe_response({"status": pre_status, "headers": dict(error.headers),
+                                                 "body": "", "final_url": final_url}, stage="headers")
                 consumed = _consume(error, settings)
             finally:
                 error.close()
@@ -310,6 +338,7 @@ def _fetch_raw(url: str, *, auth: AuthContext | None = None) -> dict[str, Any]:
             raise WebsiteFetchError(f"the response body was truncated or malformed: {exc}") from exc
     consumed["final_url"] = final_url
     consumed["requested_url"] = normalized
+    operator_guard.observe_response(consumed, stage="body" if pre_status else "complete")
     return consumed
 
 
@@ -569,9 +598,15 @@ def _probe_sensitive_paths(base_url: str, governor: HostRateGovernor, *, auth: A
             fetched = _fetch_raw(url, auth=auth)
         except (WebsiteFetchError, URLError, TimeoutError, ValueError, OSError):
             continue
+        guard = operator_guard.current()
+        paused = bool(guard and guard.halt_reason)
         if int(fetched.get("status") or 0) != 200:
+            if paused:
+                break
             continue
         if not _sensitive_path_matches(kind, fetched.get("body") or "", fetched.get("headers") or {}, 200):
+            if paused:
+                break
             continue
         name = re.sub(r"[^a-z0-9]+", "-", path.lower()).strip("-")
         out.append(
@@ -590,6 +625,14 @@ def _probe_sensitive_paths(base_url: str, governor: HostRateGovernor, *, auth: A
                 },
             )
         )
+        # A real exposed .env is sensitive even when its variable names do not
+        # match a vendor-specific credential rule. Preserve the finding above,
+        # then halt unattended work before the next path in the wordlist.
+        if guard is not None and kind == "dotenv":
+            guard.note_sensitive_response(fetched, ["an exposed environment file"])
+            break
+        if paused:
+            break
     return out
 
 
@@ -624,7 +667,7 @@ def run_web_scan(
         }
 
     findings = _analyze(fetched)
-    if probe_paths:
+    if probe_paths and not (operator_guard.current() and operator_guard.current().halt_reason):
         # Best-effort: a probe failure must never sink the whole scan.
         try:
             settings = get_settings()
