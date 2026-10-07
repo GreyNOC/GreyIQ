@@ -32,3 +32,10 @@ backend/shots/
 # committed — not even sealed, since the metadata columns are cleartext.
 *.gnbproj/
 *.tacnocproj/
+
+# Per-engagement hunt workspaces (see VETERAN-HUNTER.md). These carry signed
+# scope, live findings, and raw request/response evidence for a named target, so
+# they must never be committed. The cross-hunt brain (hunt-brain/) is NOT ignored
+# on purpose: it is the accumulated method and must be target-agnostic by the
+# time a lesson is promoted into it.
+.hunt/

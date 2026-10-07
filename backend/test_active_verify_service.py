@@ -34,9 +34,20 @@ if str(BACKEND_DIR) not in sys.path:
 
 from bughunter import active_verify_service as av  # noqa: E402
 from bughunter import hunt_brain, offline_hunt, web_ingest  # noqa: E402
-from bughunter.prover_classes import CLASS_ALIASES, PROVER_CLASSES  # noqa: E402
+from bughunter import rate_limit  # noqa: E402
+from bughunter.prover_classes import CLASS_ALIASES, PROVER_CLASSES, check_tags_for_impact  # noqa: E402
 from bughunter.rate_limit import HostRateGovernor  # noqa: E402
 from bughunter.settings import get_settings  # noqa: E402
+
+
+def setUpModule() -> None:
+    """Start from a full per-host active-request budget — see rate_limit.reset_shared_governors().
+
+    This module spends 72 of the shared 127.0.0.1 bucket's 700 tokens. It is the prover's own test
+    file, so a drained bucket here would quietly turn the suite's core active-layer coverage into
+    assertions about probes that were never sent.
+    """
+    rate_limit.reset_shared_governors()
 
 
 class _Stub:
@@ -616,6 +627,93 @@ class ActiveCheckTests(unittest.TestCase):
         self.assertIsNone(f)
 
 
+class ExposureCvssTests(unittest.TestCase):
+    """A confirmed read exposure must be scored from what it disclosed, not a flat class default.
+
+    _DEBUG_ENDPOINTS grades each entry itself (heapdump "critical", the actuator index "medium") and
+    _check_sensitive_paths captures the served file, but both passed cvss=None — so bounty.py stamped
+    impact_model.cvss_for_class('disclosure'), a flat C:L / 5.3 Medium. Since the report resolves
+    severity from the CVSS rather than the raw label, a confirmed full JVM heap dump was SUBMITTED as
+    "Medium, low confidentiality impact", contradicting its own severity field.
+    """
+
+    def test_grade_sizes_the_vector_and_never_claims_integrity_or_availability(self) -> None:
+        critical = av._exposure_cvss("critical", "a heap dump at /actuator/heapdump")
+        high = av._exposure_cvss("high", "actuator env at /actuator/env")
+        medium = av._exposure_cvss("medium", "the actuator index at /actuator")
+        self.assertEqual(critical["vector"], "AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N")
+        self.assertEqual(high["vector"], "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N")
+        self.assertEqual(medium["vector"], "AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N")
+        self.assertGreater(critical["base_score"], high["base_score"])
+        self.assertGreater(high["base_score"], medium["base_score"])
+        for block in (critical, high, medium):
+            # GET-only evidence proves no write and no execution, however serious the disclosure.
+            self.assertIn("I:N/A:N", block["vector"])
+            self.assertFalse(block["estimated"])          # derived from captured evidence, not a template
+            self.assertTrue(block["justification"].strip())
+            # A read-only exposure can never reach the Critical band: 9.0+ needs impact this cannot show.
+            self.assertNotEqual(block["base_severity"], "Critical")
+
+    def test_an_unknown_grade_falls_back_to_the_class_vector(self) -> None:
+        self.assertIsNone(av._exposure_cvss("", "x"))
+        self.assertIsNone(av._exposure_cvss("bogus", "x"))
+
+    def test_a_served_secret_file_outranks_a_served_config_file(self) -> None:
+        # _check_sensitive_paths grades from the EVIDENCE: a body that classifies as real secret
+        # material is a credential exposure reaching other systems; one that does not stays High/S:U.
+        with_secrets = av._exposure_cvss("critical", "an .env at /.env")
+        without = av._exposure_cvss("high", "a .git/config at /.git/config")
+        self.assertIn("S:C", with_secrets["vector"])
+        self.assertIn("S:U", without["vector"])
+
+
+class SensitiveDataNamingTests(unittest.TestCase):
+    """Every captured body gets its disclosed data NAMED, not just the CORS one.
+
+    sensitive_data's contract is "classify the RAW body, before redact_text runs" — redaction rewrites
+    tokens to [REDACTED_…] markers the classifier can no longer match. Only _cors_impact_tier obeyed
+    it, so a served .env, an actuator dump, a GraphQL schema or a traversal read left
+    sensitive_data_labels unset: report.py printed no "Sensitive data exposed:" line and
+    bounty._write_sensitive_data_files skipped the finding, losing a disclosure's strongest impact
+    evidence. _finding now classifies at the one choke point all 15 producers pass through.
+    """
+
+    def test_a_served_dotenv_capture_names_its_secrets_while_the_excerpt_stays_redacted(self) -> None:
+        body = ("AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n"
+                "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n")
+        f = av._finding("active.exposed-file", "Sensitive file exposed: /.env", "high", "disclosure",
+                        "disclosure", "https://t/", av._proof("confirmed", observed_result="served"),
+                        {"request_line": "GET https://t/.env", "read_data": body})
+        labels = f["proof_evidence"].get("sensitive_data_labels", "")
+        self.assertIn("AWS access key ID", labels)
+        self.assertIn("AWS secret access key", labels)
+        # The naming must not come at the cost of the redaction guarantee.
+        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", f["proof_evidence"]["read_data"])
+
+    def test_a_captured_session_token_body_is_named(self) -> None:
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.abcdefghijklmnop"
+        f = av._finding("active.graphql-introspection", "GraphQL introspection", "low", "disclosure",
+                        "graphql", "https://t/graphql", av._proof("confirmed"),
+                        {"read_data": '{"access_token":"%s"}' % jwt})
+        self.assertIn("JWT", f["proof_evidence"].get("sensitive_data_labels", ""))
+
+    def test_a_producer_that_already_classified_is_left_alone(self) -> None:
+        # _cors_impact_tier classifies with its own richer summary; the choke point must not overwrite it.
+        f = av._finding("active.cors", "CORS", "high", "", "cors", "https://t/", av._proof("confirmed"),
+                        {"read_data": '{"email":"victim@acme.com"}', "sensitive_data_labels": "preset label"})
+        self.assertEqual(f["proof_evidence"]["sensitive_data_labels"], "preset label")
+
+    def test_a_finding_with_no_captured_body_gains_no_label(self) -> None:
+        f = av._finding("active.clickjacking", "framable", "low", "headers", "headers", "https://t/",
+                        av._proof("candidate"), {"request_line": "GET https://t/"})
+        self.assertNotIn("sensitive_data_labels", f["proof_evidence"])
+
+    def test_an_unclassifiable_body_gains_no_label(self) -> None:
+        f = av._finding("active.path-traversal", "traversal", "high", "disclosure", "path-traversal",
+                        "https://t/", av._proof("confirmed"), {"read_data": "root:x:0:0:root:/root:/bin/bash"})
+        self.assertNotIn("sensitive_data_labels", f["proof_evidence"])
+
+
 class WithOperatorTests(unittest.TestCase):
     """_with_operator's URL transformation (param -> param[$ne]=value, plain param
     dropped) -- only ever exercised indirectly through _check_nosqli before this."""
@@ -681,6 +779,75 @@ class ProverClassVocabularyTests(unittest.TestCase):
         tags = self._tags_from_source()
         self.assertTrue(tags, "parsed zero check tags -- the ast anchor has moved, fix this test")
         self.assertEqual(tags, set(PROVER_CLASSES))
+
+    def _tag_to_impacts_from_source(self) -> dict[str, set[str]]:
+        """Re-derive, from this module's own source, which IMPACT class each check tag can report.
+
+        A check is tagged with what it PROBES; its finding is stamped with what the result MEANS,
+        via the 5th positional argument to `_finding`. Anything that joins a plan (tags) to an
+        outcome (impacts) has to know where those two disagree.
+        """
+        source = (BACKEND_DIR / "bughunter" / "active_verify_service.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        fn_hints: dict[str, set[str]] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            hints: set[str] = set()
+            for sub in ast.walk(node):
+                if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+                        and sub.func.id == "_finding" and len(sub.args) >= 5):
+                    arg = sub.args[4]
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        hints.add(arg.value)
+                    else:
+                        hints.add("<dynamic>")
+            if hints:
+                fn_hints[node.name] = hints
+
+        out: dict[str, set[str]] = {}
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+                    and node.target.id == "checks" and isinstance(node.value, ast.List)):
+                continue
+            for element in node.value.elts:
+                tag = element.elts[0].value
+                called = {n.func.id for n in ast.walk(element.elts[1])
+                          if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+                for fn in called:
+                    if fn.startswith("_check_"):
+                        out.setdefault(tag, set()).update(fn_hints.get(fn, set()))
+        return out
+
+    def test_every_impact_a_check_reports_folds_back_to_its_tag(self) -> None:
+        """The plan/outcome vocabulary join must stay complete.
+
+        negative_knowledge matches a PLANNED (endpoint, check-tag) against a CONFIRMED
+        (endpoint, impact-class). Five checks report an impact under a different name than their
+        tag, and when that fold was missing those five could never be immunised — a route whose
+        CRLF check had confirmed a real bug still accrued misses under `crlf` and was cooled after
+        two clean runs. A new check reporting a novel impact must fail here, not silently in a
+        store nobody reads."""
+        derived = self._tag_to_impacts_from_source()
+        self.assertTrue(derived, "parsed zero check tags -- the ast anchor has moved, fix this test")
+        for tag, impacts in sorted(derived.items()):
+            for impact in impacts:
+                if impact == "<dynamic>" or impact == tag:
+                    continue  # a dynamic hint is covered by the explicit entries asserted below
+                self.assertIn(
+                    tag, check_tags_for_impact(impact),
+                    f"check {tag!r} reports impact {impact!r}, but that impact does not fold back "
+                    f"to {tag!r} — negative knowledge can never immunise this pair",
+                )
+
+    def test_the_dynamic_debug_impacts_are_covered(self) -> None:
+        """`_check_debug_endpoints` picks its class hint per row of `_DEBUG_ENDPOINTS`, so ast sees
+        only `<dynamic>`. Pin the real values so the fold cannot rot silently."""
+        hints = {row[4] for row in av._DEBUG_ENDPOINTS}
+        self.assertTrue(hints <= {"disclosure", "rce", "secrets"}, f"new debug impact: {hints}")
+        for impact in hints:
+            self.assertIn("debug", check_tags_for_impact(impact),
+                          f"debug endpoints report {impact!r} but it does not fold back to 'debug'")
 
     def test_the_planners_cannot_propose_a_class_the_prover_cannot_confirm(self) -> None:
         # offline_hunt gates its rule suggestions on this set; hunt_brain gates the LLM's on it.

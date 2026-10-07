@@ -10,12 +10,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from bughunter import portfolio as pf  # noqa: E402
+from bughunter import active_verify_service, campaign, portfolio as pf  # noqa: E402
 
 
 class TempRuntimeMixin:
@@ -87,6 +88,42 @@ class StructuredScopeDerivationTests(TempRuntimeMixin, unittest.TestCase):
         self.assertIn("*.acme.com", prog["scope_text"])
         self.assertEqual(prog["in_scope_hosts"], ["*.acme.com"])
         self.assertEqual(prog["out_of_scope_hosts"], ["legacy.acme.com"])
+
+    def test_url_shaped_exclusion_blocks_wildcard_scope_and_seed_target(self) -> None:
+        excluded_url = "https://admin.example.test/private"
+        # Bugcrowd-style API scope rows use a full URL as the identifier. Keep
+        # that original row for review, but enforce its hostname at both gates.
+        prog = pf.upsert_program(self.runtime_dir, {
+            "name": "Bugcrowd-style program",
+            "platform": "bugcrowd",
+            "structured_scope": [
+                {"identifier": "*.example.test", "asset_type": "wildcard",
+                 "eligible_for_submission": True},
+                {"identifier": excluded_url, "asset_type": "url",
+                 "eligible_for_submission": False, "eligible_for_bounty": False,
+                 "instruction": "Excluded administrative endpoint"},
+            ],
+            "seed_targets": [excluded_url, "https://app.example.test"],
+        })
+        self.assertEqual(prog["structured_scope"][1]["identifier"], excluded_url)
+        self.assertEqual(prog["out_of_scope_hosts"], ["admin.example.test"])
+        settings = SimpleNamespace(excluded_hosts=prog["out_of_scope_hosts"],
+                                   active_scan_allowlist=(), allow_private_urls=False)
+        self.assertFalse(active_verify_service.host_in_active_scope(
+            "admin.example.test", prog["scope_text"], settings))
+        self.assertTrue(active_verify_service.host_in_active_scope(
+            "app.example.test", prog["scope_text"], settings))
+        self.assertEqual(campaign.program_campaign_targets(prog), ["https://app.example.test"])
+
+        # Old saved records with a URL in the derived host list must normalize
+        # the same way on read, without rewriting the raw structured row.
+        store = self.runtime_dir / "portfolio.json"
+        saved = json.loads(store.read_text(encoding="utf-8"))
+        saved["programs"][prog["id"]]["out_of_scope_hosts"] = [excluded_url]
+        store.write_text(json.dumps(saved), encoding="utf-8")
+        reread = pf.get_program(self.runtime_dir, prog["id"])
+        self.assertEqual(reread["out_of_scope_hosts"], ["admin.example.test"])
+        self.assertEqual(reread["structured_scope"][1]["identifier"], excluded_url)
 
     def test_hand_typed_scope_text_never_overridden(self) -> None:
         prog = pf.upsert_program(self.runtime_dir, {
@@ -258,6 +295,51 @@ class FailClosedCouplingStillHoldsTests(TempRuntimeMixin, unittest.TestCase):
     def test_h1_program_stats_non_dict_is_ignored(self) -> None:
         prog = pf.upsert_program(self.runtime_dir, {"name": "Acme", "h1_program_stats": "not-a-dict"})
         self.assertEqual(prog["h1_program_stats"], {})
+
+    def test_ywh_program_stats_round_trip_and_unknown_keys_dropped(self) -> None:
+        prog = pf.upsert_program(self.runtime_dir, {
+            "name": "Acme", "scope_text": "acme.com",
+            "ywh_program_stats": {
+                "public": True, "vpn_required": True, "offers_bounty": 1,
+                "currency": "EUR", "business_unit": "Acme Corp",
+                "user_agent_marker": "-ywh-bugbounty-acme",
+                "bounty_reward_max": "7000", "reports_count": 12,
+                "totally_unexpected_field": "should be dropped",
+            },
+        })
+        stats = prog["ywh_program_stats"]
+        self.assertTrue(stats["public"])
+        self.assertTrue(stats["vpn_required"])
+        self.assertTrue(stats["offers_bounty"])          # coerced to bool
+        self.assertEqual(stats["currency"], "EUR")
+        self.assertEqual(stats["business_unit"], "Acme Corp")
+        self.assertEqual(stats["user_agent_marker"], "-ywh-bugbounty-acme")
+        self.assertEqual(stats["bounty_reward_max"], 7000)   # coerced to int
+        self.assertNotIn("totally_unexpected_field", stats)
+        reloaded = pf.get_program(self.runtime_dir, prog["id"])
+        self.assertEqual(reloaded["ywh_program_stats"]["currency"], "EUR")
+
+    def test_ywh_program_stats_non_dict_is_ignored(self) -> None:
+        prog = pf.upsert_program(self.runtime_dir, {"name": "Acme", "ywh_program_stats": "not-a-dict"})
+        self.assertEqual(prog["ywh_program_stats"], {})
+
+    def test_ywh_marker_copy_is_sanitized_like_the_ua_suffix(self) -> None:
+        # user_agent_marker is a COPY of the value that drives the outbound User-Agent, so
+        # a CR/LF from a compromised API response must not be persisted here either.
+        prog = pf.upsert_program(self.runtime_dir, {
+            "name": "Acme",
+            "ywh_program_stats": {"user_agent_marker": "-ywh-acme\r\nX-Injected: 1"},
+        })
+        marker = prog["ywh_program_stats"]["user_agent_marker"]
+        self.assertNotIn("\r", marker)
+        self.assertNotIn("\n", marker)
+
+    def test_ywh_marker_keeps_the_leading_space_the_importer_adds(self) -> None:
+        # The suffix is appended VERBATIM with no separator, so the space is load-bearing.
+        prog = pf.upsert_program(self.runtime_dir, {
+            "name": "Acme", "user_agent_suffix": " -ywh-bugbounty-acme",
+        })
+        self.assertEqual(prog["user_agent_suffix"], " -ywh-bugbounty-acme")
 
     def test_oob_allowed_is_not_coupled_to_the_scope_fail_closed_gate(self) -> None:
         # oob_allowed is a policy-confirmation flag surfaced in the UI (a confirm-dialog

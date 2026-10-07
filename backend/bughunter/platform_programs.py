@@ -413,8 +413,14 @@ def _preview_intigriti(program_id: str, credential: str, fetch: Callable[..., An
         instruction = _excerpt(domain.get("description"), 1800)
         if tier:
             instruction = (instruction + f"\nBounty tier: {tier}").strip()
+        # Intigriti labels excluded assets as the explicit "Out of scope" tier.
+        # A missing tier is ambiguous and therefore cannot become actionable.
+        normalized_tier = " ".join(tier.casefold().replace("-", " ").split())
+        eligible = bool(tier) and normalized_tier != "out of scope"
+        if not tier:
+            warnings.append("A domain had no scope tier and was not treated as in-scope.")
         entries.append(_scope_row(identifier, _plain(_mapping(domain.get("type")).get("value"), 60),
-                                  True, instruction))
+                                  eligible, instruction))
     if len(domains) > _MAX_SCOPE:
         warnings.append(f"Scope preview is capped at {_MAX_SCOPE} domains.")
     rules = _mapping(_mapping(row.get("rulesOfEngagement")).get("content"))

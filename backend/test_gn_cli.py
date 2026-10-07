@@ -1,6 +1,7 @@
 """Tests for the `gn` bug-bounty CLI."""
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
@@ -414,6 +415,394 @@ class VerbPluginsAreFrozenSafeTests(unittest.TestCase):
         for verb in ("wardrive", "train-brain"):
             if verb in registered:
                 self.assertIn(verb, gn_cli.CLI_COMMANDS)
+
+
+class DashVerbTests(unittest.TestCase):
+    """``gn dash`` — registration, the superset property, and every degradation path.
+
+    The superset test is the load-bearing one. Every way the dashboard can decline (``--json``, a
+    redirected stream, ``NO_COLOR``, ``GN_NO_DASH``, a pipe on stdin) is a one-line delegation to
+    ``_cmd_hunt`` with the SAME namespace, so the moment ``hunt`` grows an option ``dash`` does not
+    have, that delegation stops hunting and starts raising ``AttributeError``.
+    """
+
+    @staticmethod
+    def _dests(verb: str) -> set[str]:
+        parser = gn_cli.build_parser()
+        action = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))  # noqa: SLF001
+        return {act.dest for act in action.choices[verb]._actions} - {"help"}  # noqa: SLF001
+
+    def test_dash_is_registered_as_a_core_verb_and_dispatchable(self) -> None:
+        # Not via _VERB_PLUGINS: that loader is fail-closed, so a dashboard that failed to import
+        # would silently cost the verb and `greyiq-backend.exe dash` would boot the API server.
+        self.assertIn("dash", gn_cli.CLI_COMMANDS)
+        parsed = gn_cli.build_parser().parse_args(["dash", "https://t.example", "-y"])
+        self.assertIs(parsed.func, gn_cli._cmd_dash)
+
+    def test_the_dash_namespace_is_a_strict_superset_of_hunts(self) -> None:
+        missing = self._dests("hunt") - self._dests("dash")
+        self.assertEqual(missing, set(),
+                         "every `hunt` option must exist on `dash` — the --json and non-tty paths "
+                         "hand the dash namespace straight to _cmd_hunt")
+        self.assertTrue(self._dests("dash") - self._dests("hunt"),
+                        "…and `dash` is expected to add its own (--attach, --self-test, …)")
+
+    def test_json_delegates_to_the_real_hunt_with_the_same_namespace(self) -> None:
+        with mock.patch.object(gn_cli, "_cmd_hunt", return_value=0) as hunt:
+            code = gn_cli._cmd_dash(gn_cli.build_parser().parse_args(
+                ["dash", "https://t.example", "-y", "--json"]))
+        self.assertEqual(code, 0)
+        hunt.assert_called_once()
+        self.assertEqual(hunt.call_args[0][0].target, "https://t.example")
+
+    def test_a_redirected_stream_runs_the_plain_hunt_and_writes_no_escape_sequence(self) -> None:
+        # test_gn_fx's "a non-terminal gets not one byte", extended to the whole screen: the
+        # alt-screen enter sequence must never reach a captured stream.
+        with mock.patch.object(gn_cli, "_cmd_hunt", return_value=0) as hunt:
+            code, out, err = _run(["dash", str(BACKEND_DIR / "bughunter"), "-p", "source-code", "-y"])
+        self.assertEqual(code, 0)
+        hunt.assert_called_once()
+        self.assertNotIn("\033[?1049h", out + err)
+
+    def test_attach_refuses_a_machine_feed_instead_of_silently_hunting(self) -> None:
+        # There is no hunt to fall back to here, and delegating would start one against a target
+        # the operator did not name.
+        code, _, err = _run(["dash", "--attach", "--json"])
+        self.assertEqual(code, 2)
+        self.assertIn("/api/bounty/progress", err)
+
+    def test_attach_and_a_target_are_refused_together(self) -> None:
+        code, _, err = _run(["dash", "--attach", "https://t.example"])
+        self.assertEqual(code, 2)
+        self.assertIn("takes no target", err)
+
+    def test_dash_needs_a_target_or_attach(self) -> None:
+        code, _, err = _run(["dash"])
+        self.assertEqual(code, 2)
+        self.assertIn("--attach", err)
+
+    def test_authorization_is_refused_in_hunts_own_words(self) -> None:
+        # Same sentence from both verbs: two wordings read as two rules.
+        _, _, dash_err = _run(["dash", str(BACKEND_DIR / "bughunter"), "-p", "source-code"])
+        _, _, hunt_err = _run(["hunt", str(BACKEND_DIR / "bughunter"), "-p", "source-code"])
+        self.assertEqual(dash_err, hunt_err)
+        self.assertIn(gn_cli._HUNT_AUTHORIZE, dash_err)
+
+    def test_self_test_reports_its_picks_even_when_it_cannot_draw(self) -> None:
+        # The gn fx lesson: a verb that prints nothing is indistinguishable from a broken one. Off
+        # a terminal it still names the tier, the size and WHY it refused, and exits 2.
+        code, out, _ = _run(["dash", "--self-test"])
+        self.assertEqual(code, 2)
+        for expected in ("gn dash self-test", "glyph tier", "terminal size", "host counters",
+                         "refused"):
+            self.assertIn(expected, out)
+
+
+class DashHomeTests(unittest.TestCase):
+    """``gn dash --home`` — the idle cockpit and the relaunch handoff `GreyNOC Start` depends on."""
+
+    def _args(self, *extra: str) -> argparse.Namespace:
+        return gn_cli.build_parser().parse_args(["dash", "--home", *extra])
+
+    def test_home_is_registered_and_routes_to_the_home_driver(self) -> None:
+        self.assertTrue(self._args().home)
+        with mock.patch.object(gn_cli, "_cmd_dash_home", return_value=0) as home:
+            gn_cli._cmd_dash(self._args())
+        home.assert_called_once()
+
+    def test_quitting_home_launches_nothing(self) -> None:
+        # /quit leaves no pending action; the driver must not relaunch anything.
+        with mock.patch.object(gn_cli, "_dash_subcommand"), \
+             mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_dash.size_refusal", return_value=""), \
+             mock.patch("gn_dash.run", return_value=0) as run, \
+             mock.patch.object(gn_cli, "_cmd_dash") as dash:
+            code = gn_cli._cmd_dash_home(self._args())
+        self.assertEqual(code, 0)
+        run.assert_called_once()
+        dash.assert_not_called()
+
+    def test_hunt_relaunches_with_the_target_and_carries_the_consent(self) -> None:
+        def _run(source: object, **_kw: object) -> int:
+            source.pending = {"action": "hunt", "target": "https://t.example"}  # type: ignore[attr-defined]
+            return 0
+
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_dash.size_refusal", return_value=""), \
+             mock.patch("gn_dash.run", side_effect=_run), \
+             mock.patch.object(gn_cli, "_cmd_dash", return_value=7) as dash:
+            code = gn_cli._cmd_dash_home(self._args())
+        self.assertEqual(code, 7)
+        nxt = dash.call_args[0][0]
+        self.assertEqual(nxt.target, "https://t.example")
+        self.assertTrue(nxt.authorize, "the cockpit demanded -y; that consent must carry through")
+        self.assertFalse(nxt.attach)
+        self.assertFalse(nxt.home, "leaving --home set would recurse straight back into the driver")
+
+    def test_attach_relaunches_in_attach_mode_with_no_target_and_no_consent(self) -> None:
+        def _run(source: object, **_kw: object) -> int:
+            source.pending = {"action": "attach"}  # type: ignore[attr-defined]
+            return 0
+
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_dash.size_refusal", return_value=""), \
+             mock.patch("gn_dash.run", side_effect=_run), \
+             mock.patch.object(gn_cli, "_cmd_dash", return_value=0) as dash:
+            gn_cli._cmd_dash_home(self._args())
+        nxt = dash.call_args[0][0]
+        self.assertTrue(nxt.attach)
+        self.assertEqual(nxt.target, "")
+        self.assertFalse(nxt.authorize, "attaching watches someone else's run; it authorizes nothing")
+        self.assertFalse(nxt.home)
+
+    def test_an_unknown_pending_action_launches_nothing(self) -> None:
+        def _run(source: object, **_kw: object) -> int:
+            source.pending = {"action": "sudo-rm-rf"}  # type: ignore[attr-defined]
+            return 0
+
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_dash.size_refusal", return_value=""), \
+             mock.patch("gn_dash.run", side_effect=_run), \
+             mock.patch.object(gn_cli, "_cmd_dash") as dash:
+            gn_cli._cmd_dash_home(self._args())
+        dash.assert_not_called()
+
+    def test_the_relaunch_namespace_carries_every_field_the_hunt_path_reads(self) -> None:
+        # _dash_hunt reads these straight off the namespace; a missing one is an AttributeError
+        # in the middle of a live hunt rather than a refusal up front.
+        def _run(source: object, **_kw: object) -> int:
+            source.pending = {"action": "hunt", "target": "https://t.example"}  # type: ignore[attr-defined]
+            return 0
+
+        with mock.patch("gn_tui.refusal", return_value=""), \
+             mock.patch("gn_dash.size_refusal", return_value=""), \
+             mock.patch("gn_dash.run", side_effect=_run), \
+             mock.patch.object(gn_cli, "_cmd_dash", return_value=0) as dash:
+            gn_cli._cmd_dash_home(self._args())
+        nxt = dash.call_args[0][0]
+        for field in ("profile", "vuln_class", "out", "scope", "brain", "live", "active",
+                      "time_based", "per_finding", "cookie", "header", "json", "refresh"):
+            self.assertTrue(hasattr(nxt, field), f"_dash_hunt reads {field} off this namespace")
+
+    def test_a_non_tty_refuses_instead_of_silently_hunting(self) -> None:
+        # Unlike `gn dash <target>`, home has no target to fall back to, so it must say why.
+        code, _out, err = _run(["dash", "--home"])
+        self.assertEqual(code, 2)
+        self.assertIn("terminal", err.lower())
+
+
+class DepthVariableTests(unittest.TestCase):
+    """The -Th/-Tn/-Ch depth flags: each must move a REAL setting, or it is a lie."""
+
+    def _settings(self, *flags: str) -> object:
+        args = gn_cli.build_parser().parse_args(["hunt", "https://t.example", "-y", *flags])
+        return gn_cli.depth_settings(args)
+
+    def test_no_depth_flag_leaves_the_engine_on_its_own_settings(self) -> None:
+        # None, not a snapshot: handing down a parse-time copy would freeze any env var the engine
+        # would otherwise re-read.
+        self.assertIsNone(self._settings())
+
+    def test_theorize_enables_BOTH_halves_of_the_loop(self) -> None:
+        # hunt_loop_enabled alone makes the planner return an empty done=True plan with no brain,
+        # so the loop would switch on and die at turn 0 - a flag that appears to work and does not.
+        s = self._settings("-Th")
+        self.assertTrue(s.hunt_loop_enabled)
+        self.assertTrue(s.hunt_loop_offline_enabled)
+        self.assertFalse(s.hunt_replan_enabled, "-Th must not silently turn on the chain wave")
+
+    def test_chain_enables_the_replan_wave_only(self) -> None:
+        s = self._settings("-Ch")
+        self.assertTrue(s.hunt_replan_enabled)
+        self.assertFalse(s.hunt_loop_enabled)
+
+    def test_turns_is_clamped_exactly_as_the_env_var_is(self) -> None:
+        # hunt_loop reads this back with NO clamp of its own, so an unclamped 9999 would be
+        # honoured as 9999 turns against a live host.
+        self.assertEqual(self._settings("-Th", "-Tn", "5").hunt_loop_max_iters, 5)
+        self.assertEqual(self._settings("-Th", "-Tn", "99").hunt_loop_max_iters, 6)
+        self.assertEqual(self._settings("-Th", "-Tn", "0").hunt_loop_max_iters, 1)
+        self.assertEqual(self._settings("-Th", "-Tn", "-7").hunt_loop_max_iters, 1)
+
+    def test_the_flags_are_registered_on_both_hunt_and_dash(self) -> None:
+        # A test already pins dash's namespace as a superset of hunt's; this pins that these
+        # specific four are on both, so `/hunt ... -Th` can relaunch through the dash namespace.
+        for verb in ("hunt", "dash"):
+            dests = DashVerbTests._dests(verb)
+            for flag in ("theorize", "chain", "turns", "variables"):
+                self.assertIn(flag, dests, f"{flag} missing from `{verb}`")
+
+    def test_a_depth_flag_implies_active_or_it_would_do_nothing(self) -> None:
+        # Both branches live inside `if (active or time_based) and authorized and kind == "url"`.
+        captured: dict = {}
+
+        def _fake(*a: object, **kw: object) -> dict:
+            captured.update(kw)
+            return {"ok": True, "findings": [], "report_path": "", "target": "https://t.example"}
+
+        for flag in ("-Th", "-Ch"):
+            captured.clear()
+            with mock.patch("bughunter.bounty.run_bounty_hunt", _fake), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                gn_cli._cmd_hunt(gn_cli.build_parser().parse_args(
+                    ["hunt", "https://t.example", "-y", flag]))
+            self.assertTrue(captured.get("active"), f"{flag} must imply --active")
+            self.assertIsNotNone(captured.get("settings"), f"{flag} must hand down a settings object")
+
+    def test_turns_without_theorize_is_refused_on_the_shell_path_too(self) -> None:
+        # -Tn alone sets hunt_loop_max_iters while the loop stays off, so the hunt would succeed
+        # while silently ignoring the depth asked for. The cockpit already refuses this pair; the
+        # same command must not mean two different things depending on where it was typed.
+        for verb in ("hunt", "dash"):
+            with self.subTest(verb=verb):
+                args = gn_cli.build_parser().parse_args(
+                    [verb, "https://t.example", "-y", "-Tn", "5"])
+                self.assertIn("only has an effect with -Th", gn_cli.depth_refusal(args))
+
+    def test_turns_with_theorize_is_accepted(self) -> None:
+        args = gn_cli.build_parser().parse_args(
+            ["hunt", "https://t.example", "-y", "-Th", "-Tn", "5"])
+        self.assertEqual(gn_cli.depth_refusal(args), "")
+
+    def test_the_shell_refuses_before_running_the_hunt_at_all(self) -> None:
+        with mock.patch("bughunter.bounty.run_bounty_hunt") as hunt, \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            code = gn_cli._cmd_hunt(gn_cli.build_parser().parse_args(
+                ["hunt", "https://t.example", "-y", "-Tn", "5"]))
+        self.assertEqual(code, 2)
+        hunt.assert_not_called()
+        self.assertIn("-Tn", err.getvalue())
+
+    def test_dash_refuses_before_entering_the_alternate_screen(self) -> None:
+        # A refusal printed into a screen about to be discarded is one the operator never sees.
+        with mock.patch("gn_dash.run") as run, mock.patch.object(gn_cli, "_cmd_dash_home") as home, \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            code = gn_cli._cmd_dash(gn_cli.build_parser().parse_args(
+                ["dash", "--home", "-Tn", "5"]))
+        self.assertEqual(code, 2)
+        run.assert_not_called()
+        home.assert_not_called()
+        self.assertIn("-Tn", err.getvalue())
+
+    def test_variables_prints_the_table_without_needing_a_target(self) -> None:
+        # `hunt`'s target is a required positional, so this is answered before parse_args.
+        for argv in (["hunt", "--variables"], ["hunt", "-v"], ["dash", "-v"]):
+            with self.subTest(argv=argv), contextlib.redirect_stdout(io.StringIO()) as out:
+                code = gn_cli.main(argv)
+            self.assertEqual(code, 0)
+            self.assertIn("hunt depth variables", out.getvalue())
+
+    def test_every_row_names_its_engine_knob_and_its_bound(self) -> None:
+        text = "\n".join(gn_cli.variables_lines())
+        for row in gn_cli.DEPTH_VARIABLES:
+            self.assertIn(row["flag"], text)
+            self.assertIn(row["knob"], text)
+            self.assertIn(row["bound"], text)
+        self.assertIn("only a captured artifact", text.lower().replace("NEVER", "never"),
+                      "the table must say depth buys tested leads, not claimed bugs")
+
+
+class DashIsFrozenSafeTests(unittest.TestCase):
+    """The three cockpit modules must be force-included in the PyInstaller spec.
+
+    ``gn_cli`` imports ``gn_dash`` inside ``_cmd_dash`` (unguarded, exactly as ``_cmd_fx`` imports
+    ``gn_fx``) to keep the renderer off every other verb's startup path — which is precisely the
+    function-level import PyInstaller's static analysis cannot see. They are NOT ``_VERB_PLUGINS``,
+    so the fail-closed loader and the test above never look at them: without the spec line the verb
+    parses in the shipped exe and then dies on the import, and nothing else here would notice."""
+
+    @staticmethod
+    def _spec_optional_modules() -> list[str]:
+        """The literal tuple the spec's ``for _opt in (...)`` loop walks — read from the real spec
+        with ast, not re-typed here, so a rename on either side fails this test."""
+        import ast
+
+        spec_src = (BACKEND_DIR.parent / "build" / "greyiq-backend.spec").read_text(encoding="utf-8")
+        for node in ast.walk(ast.parse(spec_src)):
+            if isinstance(node, ast.For) and getattr(node.target, "id", "") == "_opt":
+                return [str(name) for name in ast.literal_eval(node.iter)]
+        return []
+
+    def test_the_cockpit_modules_are_force_included(self) -> None:
+        optional = self._spec_optional_modules()
+        for module_name in ("gn_dash", "gn_tui", "gn_sysmon"):
+            with self.subTest(module=module_name):
+                self.assertTrue((BACKEND_DIR / f"{module_name}.py").is_file(),
+                                f"{module_name} must be a FLAT module — the spec's isfile guard "
+                                "does not match a package, so a package would silently not ship")
+                self.assertIn(module_name, optional,
+                              f"{module_name} exists but the spec would not force-include it — "
+                              "`gn dash` would work in dev and die on import in the frozen exe")
+
+
+class AutoPathCreationTests(unittest.TestCase):
+    """The CLI creates the directories it chose, and only those.
+
+    A clean checkout has no ``runtime/``: the API server makes it at boot and nothing on the CLI
+    path ever did, so the first `gn hunt` on a fresh clone died inside
+    ``bounty._resolve_output_dir`` — ``mkdir(parents=False)`` — with a bare ``FileNotFoundError``
+    naming a reports directory the operator had never asked for. The containment guard on a
+    caller-supplied ``-o`` is deliberately NOT relaxed by any of this.
+    """
+
+    def test_ensure_dir_creates_parents_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            deep = Path(tmp) / "a" / "b" / "c"
+            self.assertEqual(gn_cli._ensure_dir(deep), deep)
+            self.assertTrue(deep.is_dir())
+            self.assertEqual(gn_cli._ensure_dir(deep), deep)  # second call is a no-op, not an error
+            self.assertTrue(deep.is_dir())
+
+    def test_ensure_dir_is_total_when_the_path_cannot_exist(self) -> None:
+        # Total by design: the verb must fail at its write, with the real error about the real
+        # file, rather than here with a second error about a directory.
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "a-file"
+            blocker.write_text("not a directory", encoding="utf-8")
+            target = blocker / "under-a-file"
+            self.assertEqual(gn_cli._ensure_dir(target), target)
+            self.assertFalse(target.exists())
+
+    def test_a_hunt_creates_its_reports_tree_on_a_fresh_runtime_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "never-created" / "runtime"
+            target = Path(tmp) / "src"
+            target.mkdir()
+            (target / "leak.py").write_text("AWS_KEY = 'AKIA" + "A" * 16 + "'\n", encoding="utf-8")
+            with mock.patch.object(gn_cli, "RUNTIME_DIR", runtime):
+                code, out, err = _run(["hunt", str(target), "-p", "source-code", "-y"])
+            self.assertEqual(code, 0, err)
+            self.assertIn("GreyIQ hunt", out)
+            self.assertTrue(list((runtime / "reports").glob("*.md")),
+                            "the report has to land somewhere the operator was told about")
+
+    def test_an_operator_named_out_dir_is_still_not_auto_vivified(self) -> None:
+        # The CLI must not pre-create the operator's -o path: doing so would defeat
+        # bounty._resolve_output_dir's containment guard from the outside. A multi-level path is
+        # refused there and the run lands in the (created) default instead.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            requested = Path(tmp) / "no-1" / "no-2" / "no-3"
+            target = Path(tmp) / "src"
+            target.mkdir()
+            (target / "clean.py").write_text("x = 1\n", encoding="utf-8")
+            with mock.patch.object(gn_cli, "RUNTIME_DIR", runtime):
+                code, _, err = _run(["hunt", str(target), "-p", "source-code", "-y", "-o", str(requested)])
+            self.assertEqual(code, 0, err)
+            self.assertFalse((Path(tmp) / "no-1").exists())
+            self.assertTrue((runtime / "reports").is_dir())
+
+    def test_the_osint_evidence_root_is_created_before_the_engine_is_called(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "fresh" / "runtime"
+            payload = {"ok": True, "apex": "t.example", "hunt_targets": [],
+                       "report_path": "", "assets": [], "claims": [], "sources": []}
+            with mock.patch.object(gn_cli, "RUNTIME_DIR", runtime), \
+                 mock.patch("bughunter.osint.run_campaign", return_value=payload) as run:
+                code, _, err = _run(["osint", "t.example", "--json"])
+            self.assertEqual(code, 0, err)
+            self.assertEqual(Path(run.call_args.kwargs["output_dir"]), runtime / "osint")
+            self.assertTrue((runtime / "osint").is_dir())
 
 
 if __name__ == "__main__":

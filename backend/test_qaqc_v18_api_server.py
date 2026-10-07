@@ -67,6 +67,37 @@ def test_null_byte_path_returns_404_not_500():
     assert _status(sent) == 404
 
 
+def test_null_byte_path_is_refused_even_where_resolve_tolerates_it(monkeypatch):
+    """The same 404 on a platform whose .resolve() does not raise on a NUL.
+
+    The test above only sees the intended 404 where the OS does the rejecting for it: on POSIX
+    .resolve() raises ValueError('embedded null byte'). Windows returns the path unchanged, then
+    Path.exists() answers False for the same unraisable reason, and the request fell through to
+    the SPA fallback -- GET /%00 was served index.html with a 200. Stubbing .resolve() to the
+    identity reproduces that platform here, so this pins the rejection rather than the OS.
+    """
+    greyiq_api.GREYIQ_ACCESS_KEY = ""
+    monkeypatch.setattr(Path, "resolve", lambda self, strict=False: self)
+    scope = {
+        "type": "http", "method": "GET", "path": "/\x00", "scheme": "http",
+        "headers": [(b"host", b"127.0.0.1:8766")],
+    }
+    assert _status(_drive_route(scope)) == 404
+
+
+def test_static_target_refuses_nulls_and_traversal_but_passes_ordinary_names():
+    target = greyiq_api._static_target
+    public = greyiq_api.PUBLIC_DIR.resolve()
+    # Refused: a NUL anywhere in the name, and any name that leaves PUBLIC_DIR.
+    assert target("\x00") is None
+    assert target("assets/app\x00.js") is None, "a NUL past the first character is still a NUL"
+    assert target("../backend/greyiq_api.py") is None
+    # Served: the SPA and its assets, whether or not the file happens to exist -- a name that
+    # simply is not there falls through to send_index(), which is how client-side routes work.
+    assert target("index.html") == public / "index.html"
+    assert target("dashboard/findings") == public / "dashboard" / "findings"
+
+
 # --- Host-header allowlist: DNS rebinding refused ------------------------------
 
 def test_host_header_allowed_matrix():
@@ -110,8 +141,12 @@ def test_get_report_ready_not_persisted_returns_not_ok_and_no_event(monkeypatch)
                         lambda *a, **k: False)
     monkeypatch.setattr(greyiq_api.bounty_ledger, "upsert_findings",
                         lambda *a, **k: None)
-    monkeypatch.setattr(greyiq_api, "bounty_build_replay", lambda items: ("", 0))
-    monkeypatch.setattr(greyiq_api, "bounty_build_har", lambda items, version=None: (None, 0))
+    # Mirror the real signatures, including confirmed_only, so these fakes can't silently pass while
+    # the production call shape drifts.
+    monkeypatch.setattr(greyiq_api, "bounty_build_replay",
+                        lambda items, confirmed_only=True: ("", 0))
+    monkeypatch.setattr(greyiq_api, "bounty_build_har",
+                        lambda items, version=None, confirmed_only=True: (None, 0))
 
     fake_self = types.SimpleNamespace(
         build_finding_report=lambda request: {
@@ -140,8 +175,14 @@ def test_get_report_ready_persisted_returns_ok_and_fires_event(monkeypatch):
                         lambda *a, **k: events.append((a, k)))
     monkeypatch.setattr(greyiq_api.bounty_ledger, "mark_report_ready",
                         lambda *a, **k: True)
-    monkeypatch.setattr(greyiq_api, "bounty_build_replay", lambda items: ("", 0))
-    monkeypatch.setattr(greyiq_api, "bounty_build_har", lambda items, version=None: (None, 0))
+    # This is the READINESS PREVIEW, not the download bundle: it must opt out of the confirmed-only
+    # replay guard, or a candidate finding the operator is still assembling would report no POC at
+    # all. Record the kwarg rather than ignoring it — that opt-out is only wired here.
+    artifact_calls = []
+    monkeypatch.setattr(greyiq_api, "bounty_build_replay",
+                        lambda items, confirmed_only=True: (artifact_calls.append(("replay", confirmed_only)), ("", 0))[1])
+    monkeypatch.setattr(greyiq_api, "bounty_build_har",
+                        lambda items, version=None, confirmed_only=True: (artifact_calls.append(("har", confirmed_only)), (None, 0))[1])
 
     fake_self = types.SimpleNamespace(
         build_finding_report=lambda request: {
@@ -160,3 +201,6 @@ def test_get_report_ready_persisted_returns_ok_and_fires_event(monkeypatch):
     assert result["persisted"] is True
     assert result["ok"] is True
     assert len(events) == 1
+    # The finding above is a CANDIDATE. Both artifact builders must have been asked to skip the
+    # confirmed-only guard, or the readiness panel would report no POC for anything unconfirmed.
+    assert artifact_calls == [("replay", False), ("har", False)], artifact_calls

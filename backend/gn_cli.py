@@ -42,6 +42,7 @@ import shlex
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 # --- Resolve seed/runtime dirs exactly like greyiq_api (frozen vs dev). ---
@@ -93,22 +94,125 @@ _ALWAYS_DISPATCH: tuple[str, ...] = ("gn",)
 # import light — it runs on every `import gn_cli`, and pulling torch/pandas in at
 # registration time would break test_boot_no_torch.py and CLI startup. Import the engine
 # inside the command function, exactly like the _cmd_* handlers below.
-_VERB_PLUGINS: tuple[str, ...] = ("bughunter.hunt_train", "bughunter.wardrive.cli", "edit_mine")
+_VERB_PLUGINS: tuple[str, ...] = ("bughunter.hunt_train", "coder_train",
+                                  "bughunter.wardrive.cli", "edit_mine")
 
 _SEV_COLOR = {"critical": "1;31", "high": "31", "medium": "33", "low": "36", "info": "2"}
 
 
 def _color_enabled() -> bool:
-    return sys.stdout.isatty() and os.getenv("NO_COLOR") is None and os.getenv("TERM") != "dumb"
+    # The stdout half of the pair documented on ``gn_fx.enabled``. ``TERM=dumb`` wins here too,
+    # and it is normalised before comparing: the bare ``!= "dumb"`` let ``TERM=DUMB`` and a
+    # trailing space through, while gn_fx lower()s and strip()s, so one shell could get colour
+    # and no motion from the same request. An empty TERM still keeps colour here: one SGR code
+    # needs no terminfo entry, where the cursor control gn_fx uses is the stricter ask.
+    return (sys.stdout.isatty() and os.getenv("NO_COLOR") is None
+            and str(os.getenv("TERM") or "").strip().lower() != "dumb")
 
 
 def _c(text: str, code: str) -> str:
     return f"\033[{code}m{text}\033[0m" if _color_enabled() else text
 
 
+def _pad(text: str, code: str, width: int) -> str:
+    """Colour ``text`` and pad it to ``width`` VISIBLE characters.
+
+    Every column in this file used to be written ``f"{_c(name, '36'):<28}"``, which pads the
+    ANSI-WRAPPED string — so with colour on, the nine invisible bytes of the escape sequence were
+    counted as content and every column was nine characters short. `gn classes`, `gn profiles`,
+    `gn tools`, `gn stats` and the operator listing all rendered as a ragged mess on a real terminal
+    and looked perfect in the tests, which capture through StringIO and so never colour at all.
+    Pad on the plain text, then wrap.
+    """
+    body = str(text)
+    filler = " " * max(0, int(width) - len(body))
+    return _c(body, code) + filler
+
+
+def _fx(args: argparse.Namespace, title: str) -> Any:
+    """The live animated status line for a long verb — see ``gn_fx``.
+
+    Inert (not one byte written) unless stderr is a terminal a human is watching, and never under
+    ``--json`` even on a terminal: a caller redirecting stdout to a file is still a machine consumer
+    and the phase lines would confuse a log. ``--no-fx`` and ``GN_NO_FX=1`` both turn it off.
+    """
+    import gn_fx
+
+    off = bool(getattr(args, "no_fx", False)) or bool(getattr(args, "json", False))
+    return gn_fx.scanner(title, active=False if off else None)
+
+
+def _progress(args: argparse.Namespace, fx: Any) -> Any:
+    """The ``on_progress`` sink the engines take.
+
+    Three modes, in priority order: nothing under ``--json`` (stdout must stay one parseable
+    document); the live line when a human is watching stderr; otherwise the historical dim stdout
+    line, byte-identical to what this printed before the animation existed — which is what a pipe,
+    a CI log and the whole test suite get.
+    """
+    import gn_fx
+
+    if getattr(args, "json", False):
+        return None
+    return gn_fx.progress_sink(fx, fallback=(lambda m: print(_c(f"  - {m}", "2"))))
+
+
+def _fx_report(fx: Any, result: dict) -> None:
+    """Flash the live line once per CONFIRMED finding, in its own severity colour.
+
+    Confirmed only, and read from the engine's own proof status rather than the severity field: the
+    whole point of this program is that a candidate is not a finding, so a passive header lead must
+    not flash Critical across the operator's terminal. A run that confirms nothing leaves the line
+    showing the phase and nothing else, which is the honest outcome.
+    """
+    if fx is None or not getattr(fx, "active", False):
+        return
+    try:
+        for finding in (result.get("findings") or []):
+            if not isinstance(finding, dict):
+                continue
+            status = str(finding.get("proof_status") or (finding.get("proof_of_impact") or {}).get("status") or "")
+            if status.strip().lower() != "confirmed":
+                continue
+            fx.hit(str(finding.get("severity") or "info"), str(finding.get("title") or ""))
+    except Exception:  # noqa: BLE001 - a decoration must never break a completed hunt
+        pass
+
+
 def _err(message: str) -> int:
     print(_c(f"gn: {message}", "31"), file=sys.stderr)
     return 2
+
+
+def _ensure_dir(path: Path | str) -> Path:
+    """Create an output directory THIS PROGRAM chose, parents and all, idempotently.
+
+    A clean checkout has no ``runtime/``. The API server makes it at boot
+    (``greyiq_api``: ``RUNTIME_DIR.mkdir(parents=True)``) and nothing on the CLI path ever did, so
+    the first `gn hunt` on a fresh clone died inside ``bounty._resolve_output_dir`` — which calls
+    ``mkdir(parents=False)`` — with a bare ``FileNotFoundError`` naming a reports directory the
+    operator had not asked for and could not place. The same hole swallowed `gn osint`, `gn bfla`
+    and `gn idor` whenever ``GREYIQ_RUNTIME_DIR`` pointed somewhere not yet created.
+
+    Only for paths this program chose (``RUNTIME_DIR`` and its subdirectories). A directory the
+    OPERATOR named with ``-o`` is handed to the engine untouched: ``bounty._resolve_output_dir``
+    deliberately refuses to conjure a brand-new multi-level tree at an arbitrary path, and
+    pre-creating it here would quietly defeat that containment guard from the outside.
+
+    Total. An unwritable path is returned unchanged so the verb fails at the write, with the real
+    error about the real file, instead of here with a second error about a directory.
+    """
+    target = Path(path)
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return target
+
+
+def _reports_dir() -> Path:
+    """``runtime/reports``, created on demand — the default every report-writing verb falls back to."""
+    return _ensure_dir(RUNTIME_DIR / "reports")
 
 
 def _load_coder_config(use_brain: bool) -> dict:
@@ -139,30 +243,187 @@ def _load_coder_config(use_brain: bool) -> dict:
     return coder_cfg
 
 
+def _oob_config() -> tuple[str, str]:
+    """The operator's OOB collaborator (url, secret) from the runtime secrets store.
+
+    Same file and same keys ``greyiq_api._oob_config`` reads, so a collaborator configured in the
+    desktop app is honoured by the CLI too. Without this, ``gn hunt`` and ``gn campaign`` had the four
+    out-of-band provers -- blind SSRF, blind XXE, blind RCE and JWT key-URL injection -- permanently
+    disabled, because run_bounty_hunt gates each one on a configured collaborator. Read directly
+    rather than through greyiq_api so the CLI keeps its import-light, torch-free startup.
+
+    Total: an unreadable or malformed store means "no collaborator", which disables the provers —
+    exactly the behaviour before this existed. It never invents one.
+    """
+    try:
+        stored = json.loads((RUNTIME_DIR / "secrets.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ("", "")
+    if not isinstance(stored, dict):
+        return ("", "")
+    base = str(stored.get("oob.collaborator_url") or "").strip()
+    secret = str(stored.get("oob.secret") or "").strip()
+    # Both or neither: a base with no secret cannot mint a token, and the provers require both.
+    return (base, secret) if base and secret else ("", "")
+
+
+#: One sentence, one place. `gn hunt` and `gn dash` gate on the same thing and must refuse in the
+#: same words: an operator who learns the wording from one verb and gets a different sentence from
+#: the other has been told there are two different rules.
+_HUNT_AUTHORIZE = ("a hunt tests a live/owned target — pass -y/--authorize to confirm you're "
+                   "authorized and in scope.")
+
+
+#: The depth variables, in one place because `hunt` and `dash` must register the SAME set (a test
+#: pins dash's namespace as a superset of hunt's) and `/help -v` renders this exact table.
+#: Every row names the real setting it moves and what bounds the extra spend — a flag whose
+#: "effect" is behaviour the engine already performs unconditionally is not a flag, it is a lie,
+#: and several candidates were dropped for exactly that.
+DEPTH_VARIABLES: tuple[dict[str, str], ...] = (
+    {"flag": "-Th, --theorize", "knob": "hunt_loop_enabled + hunt_loop_offline_enabled",
+     "means": "iterative theorize -> probe -> re-plan on the seed URL",
+     "bound": "<=400 requests total, <=6 turns, stops early on no progress",
+     "note": "implies --active. Trades the 4-endpoint fan-out for depth on ONE url."},
+    {"flag": "-Tn, --turns N", "knob": "hunt_loop_max_iters",
+     "means": "how many theorize turns -Th may take, 1-6",
+     "bound": "clamped to 1..6; the 400-request budget still binds first",
+     "note": "no effect without -Th. Default 3."},
+    {"flag": "-Ch, --chain", "knob": "hunt_replan_enabled",
+     "means": "after the active pass, re-probe the step that blocks the best chain",
+     "bound": "<=3 endpoints, <=3 classes, <=8 requests, once",
+     "note": "implies --active. One bounded wave, not a second hunt."},
+    {"flag": "-v, --variables", "knob": "(help only)",
+     "means": "print this table",
+     "bound": "no engine call, no requests",
+     "note": "`/help -v` in the cockpit, `gn hunt --variables` in a shell."},
+)
+
+
+def variables_lines() -> list[str]:
+    """``/help -v`` and ``gn hunt --variables``: the depth table with its real knobs and bounds."""
+    lines = ["hunt depth variables", ""]
+    for row in DEPTH_VARIABLES:
+        lines.append(f"  {row['flag']:<18} {row['means']}")
+        lines.append(f"  {'':<18}   engine knob : {row['knob']}")
+        lines.append(f"  {'':<18}   bounded by  : {row['bound']}")
+        lines.append(f"  {'':<18}   {row['note']}")
+        lines.append("")
+    lines.extend([
+        "  Stop is honoured between turns and before the chain wave - a turn already in flight",
+        "  finishes first, exactly as `stop` promises everywhere else.",
+        "",
+        "  Theorizing and chaining NEVER promote a theory to a finding: only a captured artifact",
+        "  confirms. More depth buys more tested leads, not more claimed bugs.",
+    ])
+    return lines
+
+
+def _register_depth_flags(parser: argparse.ArgumentParser) -> None:
+    """The same four options on `hunt` and `dash`. Short forms are case-sensitive on purpose:
+    -Th/-Tn/-Ch read as words, and argparse would otherwise collide -t with --time-based."""
+    parser.add_argument("-Th", "--theorize", action="store_true",
+                        help="iterative theorize -> probe -> re-plan on the seed URL "
+                             "(implies --active; <=400 requests, <=6 turns)")
+    parser.add_argument("-Tn", "--turns", type=int, default=None, metavar="N",
+                        help="how many theorize turns -Th may take, 1-6 (default 3)")
+    parser.add_argument("-Ch", "--chain", action="store_true",
+                        help="after the active pass, re-probe the step blocking the best chain "
+                             "(implies --active; <=3 endpoints, <=8 requests)")
+    parser.add_argument("-v", "--variables", action="store_true",
+                        help="print the depth-variable table and exit")
+
+
+def depth_refusal(args: argparse.Namespace) -> str:
+    """``""`` when the depth flags are coherent, else why they are not.
+
+    ``-Tn`` moves ``hunt_loop_max_iters``, which the engine reads ONLY when the loop is on. Without
+    ``-Th`` the hunt therefore succeeds while silently ignoring the depth that was asked for, and an
+    operator reads a normal-looking summary as the result of a deeper experiment. The cockpit's
+    ``/hunt`` already refuses this exact pair; the shell path must agree, or the same command means
+    two different things depending on where it was typed.
+    """
+    if getattr(args, "turns", None) is not None and not getattr(args, "theorize", False):
+        return ("-Tn/--turns only has an effect with -Th/--theorize (it sets the loop's iteration "
+                "count, and the loop is off) - add -Th, or drop -Tn.")
+    return ""
+
+
+def depth_settings(args: argparse.Namespace) -> Any:
+    """The ``settings`` object for this hunt, or None when no depth flag was passed.
+
+    Returns None rather than a default-valued copy so an untouched hunt keeps taking the engine's
+    own ``get_settings()`` — handing down a snapshot taken at parse time would silently freeze any
+    env var the engine would otherwise re-read.
+    """
+    import dataclasses
+
+    from bughunter.active_verify_service import get_settings
+
+    theorize = bool(getattr(args, "theorize", False))
+    chain = bool(getattr(args, "chain", False))
+    turns = getattr(args, "turns", None)
+    if not (theorize or chain or turns is not None):
+        return None
+    changes: dict[str, Any] = {}
+    if theorize:
+        # BOTH, or the loop enables and then dies at turn 0: without a reasoning brain the planner
+        # returns an empty done=True plan unless the offline half is on too (hunt_loop.py).
+        changes["hunt_loop_enabled"] = True
+        changes["hunt_loop_offline_enabled"] = True
+    if chain:
+        changes["hunt_replan_enabled"] = True
+    if turns is not None:
+        # The same clamp settings.py applies to the env var. hunt_loop reads this back with no
+        # clamp of its own, so an unclamped 9999 here would be honoured as 9999 turns.
+        changes["hunt_loop_max_iters"] = max(1, min(int(turns), 6))
+    return dataclasses.replace(get_settings(), **changes)
+
+
 def _cmd_hunt(args: argparse.Namespace) -> int:
     from bughunter.bounty import run_bounty_hunt
 
+    if getattr(args, "variables", False):
+        for line in variables_lines():
+            print(line)
+        return 0
+    refusal = depth_refusal(args)
+    if refusal:
+        return _err(refusal)
     if not args.authorize:
-        return _err("a hunt tests a live/owned target — pass -y/--authorize to confirm you're authorized and in scope.")
-    out_dir = args.out or str(RUNTIME_DIR / "reports")
-    result = run_bounty_hunt(
-        args.target,
-        args.profile,
-        args.vuln_class,
-        out_dir,
-        args.scope or "",
-        True,  # authorized — gated by --authorize above
-        _load_coder_config(args.brain),
-        default_reports_dir=RUNTIME_DIR / "reports",
-        seed_dir=SEED_DIR,
-        runtime_dir=RUNTIME_DIR,
-        version=VERSION,
-        run_live=args.live,
-        active=args.active or getattr(args, "time_based", False) or getattr(args, "deep", False),  # --time-based/--deep imply --active
-        time_based=getattr(args, "time_based", False),
-        auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
-        per_finding=args.per_finding,
-    )
+        return _err(_HUNT_AUTHORIZE)
+    reports = _reports_dir()
+    out_dir = args.out or str(reports)
+    # A direct hunt used to pass no on_progress at ALL, so nothing printed between the command and the
+    # summary -- minutes of silence in which a working hunt and a hung one look identical.
+    fx = _fx(args, args.target)
+    with fx:
+        fx.phase("starting hunt")
+        result = run_bounty_hunt(
+            args.target,
+            args.profile,
+            args.vuln_class,
+            out_dir,
+            args.scope or "",
+            True,  # authorized — gated by --authorize above
+            _load_coder_config(args.brain),
+            default_reports_dir=reports,
+            seed_dir=SEED_DIR,
+            runtime_dir=RUNTIME_DIR,
+            version=VERSION,
+            run_live=args.live,
+            # -Th/-Ch imply --active for the same reason --time-based does: both branches live
+            # inside `if (active or time_based) and authorized and kind == "url"`, so without it
+            # the flag would be accepted and then quietly do nothing.
+            active=(args.active or getattr(args, "time_based", False) or getattr(args, "deep", False)
+                    or getattr(args, "theorize", False) or getattr(args, "chain", False)),
+            time_based=getattr(args, "time_based", False),
+            auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
+            per_finding=args.per_finding,
+            on_progress=_progress(args, fx),
+            settings=depth_settings(args),
+            oob_base=_oob_config()[0], oob_secret=_oob_config()[1],
+        )
+        _fx_report(fx, result)
     if not result.get("ok"):
         return _err(result.get("error", "the hunt could not run."))
     if args.json:
@@ -200,26 +461,31 @@ def _cmd_campaign(args: argparse.Namespace) -> int:
 
     if not args.authorize:
         return _err("a campaign tests a live/owned target end-to-end — pass -y/--authorize to confirm scope.")
-    result = run_campaign(
-        args.target,
-        scope=args.scope or "",
-        authorized=True,
-        coder_cfg=_load_coder_config(args.brain),
-        default_reports_dir=RUNTIME_DIR / "reports",
-        seed_dir=SEED_DIR,
-        runtime_dir=RUNTIME_DIR,
-        version=VERSION,
-        active=args.active or getattr(args, "time_based", False) or getattr(args, "deep", False),  # --time-based/--deep imply --active
-        time_based=getattr(args, "time_based", False),
-        auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
-        live=args.live,
-        program=args.program,
-        max_pages=args.max_pages,
-        osint=getattr(args, "osint", False),
-        platform=getattr(args, "platform", "hackerone") or "hackerone",
-        deep=getattr(args, "deep", False),
-        on_progress=(lambda m: print(_c(f"  - {m}", "2"))) if not args.json else None,
-    )
+    fx = _fx(args, args.target)
+    with fx:
+        fx.phase("starting campaign")
+        result = run_campaign(
+            args.target,
+            scope=args.scope or "",
+            authorized=True,
+            coder_cfg=_load_coder_config(args.brain),
+            default_reports_dir=_reports_dir(),
+            seed_dir=SEED_DIR,
+            runtime_dir=RUNTIME_DIR,
+            version=VERSION,
+            active=args.active or getattr(args, "time_based", False) or getattr(args, "deep", False),  # --time-based/--deep imply --active
+            time_based=getattr(args, "time_based", False),
+            auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
+            live=args.live,
+            program=args.program,
+            max_pages=args.max_pages,
+            osint=getattr(args, "osint", False),
+            platform=getattr(args, "platform", "hackerone") or "hackerone",
+            deep=getattr(args, "deep", False),
+            on_progress=_progress(args, fx),
+            oob_base=_oob_config()[0], oob_secret=_oob_config()[1],
+        )
+        _fx_report(fx, result)
     if not result.get("ok"):
         return _err(result.get("error", "the campaign could not run."))
     if args.json:
@@ -247,9 +513,14 @@ def _cmd_osint(args: argparse.Namespace) -> int:
     if args.active and not args.hunt:
         return _err("--active is valid only with --hunt.")
 
+    # Started, not `with`-wrapped: this function has five early `return _err(...)` exits below, and
+    # gn_fx.stop_all() in main()'s finally clears the line on every one of them.
+    fx = _fx(args, args.target)
+    fx.start()
+    fx.phase("passive OSINT collection")
     result = osint_engine.run_campaign(
         args.target,
-        output_dir=args.out or (RUNTIME_DIR / "osint"),
+        output_dir=args.out or _ensure_dir(RUNTIME_DIR / "osint"),
         max_hosts=args.max_hosts,
         timeout=args.timeout,
     )
@@ -281,7 +552,7 @@ def _cmd_osint(args: argparse.Namespace) -> int:
             scope=args.scope,
             authorized=True,
             coder_cfg=_load_coder_config(args.brain),
-            default_reports_dir=RUNTIME_DIR / "reports",
+            default_reports_dir=_reports_dir(),
             seed_dir=SEED_DIR,
             runtime_dir=RUNTIME_DIR,
             version=VERSION,
@@ -290,11 +561,13 @@ def _cmd_osint(args: argparse.Namespace) -> int:
             program=args.program or result.get("apex"),
             max_pages=args.max_pages,
             platform=args.platform,
-            on_progress=(lambda m: print(_c(f"  - {m}", "2"))) if not args.json else None,
+            on_progress=_progress(args, fx),
         )
         if not hunt_result.get("ok"):
             return _err(hunt_result.get("error", "the verified-host hunt could not run."))
+        _fx_report(fx, hunt_result)
 
+    fx.stop()
     if args.json:
         payload = dict(result)
         if hunt_result is not None:
@@ -354,7 +627,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
             return 0
         print(_c("Bounty learning — by program:", "1"))
         for key, summary in sorted(progs.items(), key=lambda kv: -kv[1]["bounty_total"]):
-            print(f"  {_c(key, '36'):<28} submitted {summary['submitted']}, rewarded {summary['rewarded']}, ${summary['bounty_total']:g}")
+            print(f"  {_pad(key, '36', 28)} submitted {summary['submitted']}, rewarded {summary['rewarded']}, ${summary['bounty_total']:g}")
         print("\nRun `gn stats --program <key>` for the class breakdown.")
         return 0
     print(_c(f"Program: {data['program']}", "1"))
@@ -515,7 +788,7 @@ def _operator_campaign_fn(coder_cfg: dict):
         saved = portfolio_mod.get_program(RUNTIME_DIR, program) or {}
         result = campaign_mod.run_campaign(
             target, scope=scope, authorized=True, coder_cfg=safe_brain,
-            default_reports_dir=RUNTIME_DIR / "reports", seed_dir=SEED_DIR, runtime_dir=RUNTIME_DIR,
+            default_reports_dir=_reports_dir(), seed_dir=SEED_DIR, runtime_dir=RUNTIME_DIR,
             version=VERSION, active=active, live=live, deep=deep, program=program, max_pages=max_pages,
             progress_run_id=run_id or None,
             user_agent_suffix=str(saved.get("user_agent_suffix") or ""),
@@ -547,7 +820,9 @@ def _cmd_operator(args: argparse.Namespace) -> int:
     from bughunter import operator as operator_mod
     from bughunter import portfolio
 
-    rt = str(RUNTIME_DIR)
+    # The portfolio, the ledger and the operator's state all land under the runtime dir; the verb
+    # writes on nearly every action, so it is created up front rather than at each write site.
+    rt = str(_ensure_dir(RUNTIME_DIR))
     action = getattr(args, "op_action", None)
 
     if action == "list" or action is None:
@@ -559,7 +834,7 @@ def _cmd_operator(args: argparse.Namespace) -> int:
         for p in progs:
             flags = " ".join(f for f, on in (("active", p["active"]), ("live", p["live"]), ("deep", p.get("deep")),
                                              ("enabled", p["enabled"])) if on) or "disabled"
-            print(f"  {_c(p['id'], '36'):<24} {p['name']}  [{flags}]  scope: {p['scope_text'] or '(none)'}  "
+            print(f"  {_pad(p['id'], '36', 24)} {p['name']}  [{flags}]  scope: {p['scope_text'] or '(none)'}  "
                   f"targets: {len(p['seed_targets'])}  every {p['interval_minutes']}m")
         return 0
 
@@ -729,7 +1004,7 @@ def _cmd_bfla(args: argparse.Namespace) -> int:
     print(_c("BFLA / broken function-level authorization CONFIRMED", "32") + f" at {finding['title']}")
     print(f"  differential: {res.get('detail')}")
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    out = args.out or str(RUNTIME_DIR / "reports" / f"bfla-{stamp}.md")
+    out = args.out or str(_reports_dir() / f"bfla-{stamp}.md")
     try:
         Path(out).parent.mkdir(parents=True, exist_ok=True)
         Path(out).write_text(md, encoding="utf-8")
@@ -792,7 +1067,7 @@ def _cmd_idor(args: argparse.Namespace) -> int:
     print(_c("IDOR / broken access control CONFIRMED", "32") + f" at {finding['title']}")
     print(f"  differential: {res.get('detail')}")
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    out = args.out or str(RUNTIME_DIR / "reports" / f"idor-{stamp}.md")
+    out = args.out or str(_reports_dir() / f"idor-{stamp}.md")
     try:
         Path(out).parent.mkdir(parents=True, exist_ok=True)
         Path(out).write_text(md, encoding="utf-8")
@@ -833,7 +1108,7 @@ def _cmd_platforms(args: argparse.Namespace) -> int:
     print(_c("Report formats (use --platform <id> on a campaign):", "1"))
     for p in platforms:
         default = "  (default)" if p["id"] == report_formats.DEFAULT_PLATFORM else ""
-        print(f"  {_c(p['id'], '36'):<28} {p['name']}{default}")
+        print(f"  {_pad(p['id'], '36', 28)} {p['name']}{default}")
         print(f"      {p['blurb']}")
     return 0
 
@@ -848,7 +1123,7 @@ def _cmd_profiles(args: argparse.Namespace) -> int:
     print(_c("Hunt profiles:", "1"))
     for profile in data["profiles"]:
         kinds = ", ".join(profile.get("kinds") or [])
-        print(f"  {_c(profile['id'], '36'):<28} {profile['name']}  ({kinds})")
+        print(f"  {_pad(profile['id'], '36', 28)} {profile['name']}  ({kinds})")
         print(f"      {profile['description']}")
     return 0
 
@@ -862,7 +1137,7 @@ def _cmd_classes(args: argparse.Namespace) -> int:
         return 0
     print(_c(f"Vuln classes ({len(classes)}):", "1"))
     for cls in classes:
-        print(f"  {_c(cls['id'], '36'):<28} {cls['name']}")
+        print(f"  {_pad(cls['id'], '36', 28)} {cls['name']}")
     return 0
 
 
@@ -878,12 +1153,272 @@ def _cmd_tools(args: argparse.Namespace) -> int:
             return 0
         print(_c(f"Tools for {', '.join(args.classes)}:", "1"))
         for tool in tools:
-            print(f"  {_c(tool.get('name', ''), '36'):<24} {tool.get('description', '')}")
+            print(f"  {_pad(tool.get('name', ''), '36', 24)} {tool.get('description', '')}")
             print(f"      {tool.get('url', '')}")
         return 0
     payload = toolkit_lib.catalog_payload(SEED_DIR, RUNTIME_DIR)
     print(f"{payload.get('count', 0)} curated tools. Pass a class id (see `gn classes`), e.g. `gn tools xss ssrf`.")
     return 0
+
+
+def _cmd_fx(args: argparse.Namespace) -> int:
+    """`gn fx` — draw the live status line for a few seconds, so a terminal can be checked without
+    committing to a real hunt. Exits 2 with an explanation when motion is not appropriate here."""
+    import gn_fx
+
+    return gn_fx.demo(getattr(args, "seconds", 6.0))
+
+
+def _dash_subcommand(argv: list[str], sink: Any = None) -> tuple[int, str]:
+    """Run one real ``gn`` verb typed into the dashboard pane; hand back ``(exit code, output)``.
+
+    The body lives in ``gn_dash`` because it owns what the pane needs around the call — the refusal
+    vocabulary and the ``OutputTail`` the OUTPUT pane reads WHILE a slow verb is still writing — and
+    a second copy here is exactly the hand-maintained duplicate that made ``CLI_COMMANDS`` wrong for
+    seven verbs. This name exists so the wiring reads in one direction: ``_cmd_dash`` hands the
+    dashboard a CLI-owned dispatcher, rather than the dashboard reaching back for one.
+    """
+    import gn_dash
+
+    return gn_dash._dash_subcommand(argv, sink)  # noqa: SLF001 - one feature, three modules
+
+
+def _dash_hunt(args: argparse.Namespace, run_id: str, into: dict) -> int:
+    """The hunt ``gn dash <target>`` watches, as the callable ``gn_dash.run`` drives on its worker.
+
+    The same engine call ``_cmd_hunt`` makes, with two differences, both forced by the terminal now
+    belonging to the renderer:
+
+      * Progress goes to ``bughunter.progress``, not ``gn_fx``. A status line written onto a screen
+        the dashboard is row-diffing punches a hole in the frame that never repairs, and the store
+        is where the panels read from anyway — the same store the API route writes, so a
+        dash-launched hunt and an app-launched one produce identical snapshots.
+      * ``should_stop`` is wired to the flag the pane's ``stop`` verb sets. Without it that verb
+        would set something nothing reads, and the ``STOPPING`` pill would be a lie on screen.
+
+    The result is stashed in ``into`` instead of returned, so ``_cmd_dash`` can print the ordinary
+    hunt summary onto the RESTORED terminal: the report path is the one thing the operator still
+    needs after the panels are gone, and it would otherwise die with the alternate screen.
+    """
+    from bughunter import progress as bounty_progress
+    from bughunter.bounty import run_bounty_hunt
+
+    import gn_dash
+
+    target = str(args.target)
+    reports = _reports_dir()
+    # Register the single work unit exactly as the API route does, or the TARGETS panel stays empty
+    # through a run that is working and the header reads 0/0 for its whole life.
+    bounty_progress.start_run(run_id)
+    bounty_progress.set_targets(run_id, [target])
+    bounty_progress.mark_target(run_id, target, "running")
+    result = run_bounty_hunt(
+        target,
+        args.profile,
+        args.vuln_class,
+        args.out or str(reports),
+        args.scope or "",
+        True,  # authorized — gated by --authorize in _cmd_dash, before the screen is entered
+        _load_coder_config(args.brain),
+        default_reports_dir=reports,
+        seed_dir=SEED_DIR,
+        runtime_dir=RUNTIME_DIR,
+        version=VERSION,
+        run_live=args.live,
+        active=(args.active or getattr(args, "time_based", False) or getattr(args, "deep", False)
+                or getattr(args, "theorize", False) or getattr(args, "chain", False)),
+        time_based=getattr(args, "time_based", False),
+        auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
+        per_finding=args.per_finding,
+        on_progress=bounty_progress.sink(run_id),
+        should_stop=(lambda rid=run_id: bounty_progress.is_stopped(rid)),
+        settings=depth_settings(args),
+        oob_base=_oob_config()[0], oob_secret=_oob_config()[1],
+    )
+    gn_dash.stream_result(run_id, target, result)
+    into["result"] = result
+    return 0 if result.get("ok") else 2
+
+
+def _dash_source(args: argparse.Namespace) -> Any:
+    """The ``--attach`` source, discovering the run id when the operator did not name one.
+
+    Run ids are minted by whoever launched the run (``crypto.randomUUID()`` in the desktop app) and
+    written down nowhere, so requiring ``--run-id`` would make ``--attach`` unusable by the operator
+    who is most likely to want it. The picker takes the newest run that has NOT been asked to stop;
+    ``progress.list_runs`` cannot report "finished", so this deliberately does not pretend to skip
+    completed runs — it skips the one signal that is real.
+    """
+    import gn_dash
+
+    host = str(getattr(args, "host", "") or "127.0.0.1")
+    port = getattr(args, "port", None)
+    token = str(getattr(args, "token", "") or "")
+    run_id = str(getattr(args, "run_id", "") or "").strip()
+    probe = gn_dash.AttachedSource(run_id, host=host, port=port, token=token)
+    if run_id:
+        return probe
+    live = [row for row in probe.list_runs() if not row.get("stopped")]
+    if not live:
+        raise gn_dash.SourceError(
+            "the backend is holding no un-stopped run to attach to — start one in the app, or pass "
+            "--run-id.", fatal=True)
+    chosen = live[0]
+    # probe.port, so naming the run does not cost a second 8766..8845 walk.
+    return gn_dash.AttachedSource(str(chosen.get("run_id") or ""), host=host, port=probe.port,
+                                  token=token, label=str(chosen.get("target") or ""))
+
+
+def _cmd_dash_home(args: argparse.Namespace) -> int:
+    """`gn dash --home` (what `GreyNOC Start` runs) — the idle cockpit, and the loop around it.
+
+    The cockpit itself starts nothing. It hands back what the operator asked for in
+    ``source.pending`` and this relaunches ``_cmd_dash`` in the real mode. ``/quit`` leaves no
+    pending action, which is how it ends.
+
+    It does NOT come back to home afterwards, tempting as a resident shell is. ``_cmd_dash`` prints
+    the hunt summary onto the restored terminal on its way out, and the report path in it is the one
+    thing the operator still needs once the panels are gone — re-entering the alternate screen would
+    wipe it. Handing the terminal back is worth more than staying resident.
+
+    Relaunching rather than swapping the source under the running poller is deliberate: the poller
+    owns a socket and a thread, and tearing those down underneath a repaint to graft a new source on
+    buys nothing an operator can see, at the cost of the one race this module has stayed free of.
+    """
+    import gn_dash
+    import gn_tui
+
+    refusal = gn_tui.refusal()
+    if refusal:
+        # No hunt to fall back to here, so — like --attach — it says why instead of doing nothing.
+        return _err(refusal)
+    small = gn_dash.size_refusal(gn_tui.terminal_size(sys.stdout))
+    if small:
+        return _err(small)
+    if getattr(args, "braille", False):
+        os.environ["GN_DASH_GLYPHS"] = "braille"
+
+    source = gn_dash.HomeSource()
+    code = gn_dash.run(source, run_subcommand=_dash_subcommand,
+                       refresh_hz=getattr(args, "refresh", 4.0))
+    pending = getattr(source, "pending", None)
+    if not isinstance(pending, dict):
+        return code
+    action = str(pending.get("action") or "")
+    # A FRESH namespace: mutating `args` would leave --home set, and _cmd_dash would recurse
+    # straight back into this function.
+    nxt = argparse.Namespace(**vars(args))
+    nxt.home = False
+    if action == "hunt":
+        nxt.target, nxt.attach = str(pending.get("target") or ""), False
+        # The cockpit demanded -y before it recorded the ask; this carries that consent through
+        # rather than re-asking on a terminal the operator has already answered on.
+        nxt.authorize = True
+        # The depth variables the operator typed after the target. Only the three the cockpit
+        # parses are read, by name, so nothing else in `pending` can reach the namespace.
+        depth = pending.get("depth")
+        if isinstance(depth, dict):
+            nxt.theorize = bool(depth.get("theorize"))
+            nxt.chain = bool(depth.get("chain"))
+            turns = depth.get("turns")
+            nxt.turns = int(turns) if isinstance(turns, int) else None
+    elif action == "attach":
+        nxt.target, nxt.attach, nxt.authorize = "", True, False
+    else:
+        return code
+    return _cmd_dash(nxt)
+
+
+def _cmd_dash(args: argparse.Namespace) -> int:
+    """`gn dash` — the full-screen cockpit over a hunt this process runs, or one it attaches to.
+
+    The dash namespace is a strict SUPERSET of ``hunt``'s, which is what lets every degradation be a
+    one-line delegation to :func:`_cmd_hunt` instead of a second hunt path that can drift: ``--json``,
+    a redirected stdout, ``NO_COLOR``, ``TERM=dumb``, ``GN_NO_FX``, ``GN_NO_DASH``, a pipe on stdin.
+    All of them run the identical hunt and print the identical summary, byte for byte. A test pins
+    the superset property, because the day it stops holding the delegation starts raising
+    ``AttributeError`` on a namespace instead of hunting.
+
+    A terminal that is merely TOO SMALL refuses rather than delegating. That asymmetry is deliberate:
+    a redirected stream means nobody is watching and a hunt is what was wanted, while a 40-column
+    window means somebody IS watching and asked for panels — running the hunt silently instead would
+    be a different command from the one they typed.
+
+    ``import gn_dash`` is inside the function and unguarded, exactly as ``_cmd_fx`` imports gn_fx: at
+    module scope it would put the renderer and gn_sysmon's ctypes probe on the startup path of every
+    `gn version`, and wrapped in a try/except it would be invisible to PyInstaller's analysis — the
+    verb would work in dev and vanish from the frozen exe.
+    """
+    from uuid import uuid4
+
+    import gn_dash
+    import gn_tui
+
+    if getattr(args, "self_test", False):
+        return gn_dash.self_test()
+
+    # Before the home branch AND before the alternate screen: a refusal printed into a screen that
+    # is about to be discarded is a refusal the operator never sees.
+    refusal = depth_refusal(args)
+    if refusal:
+        return _err(refusal)
+
+    if bool(getattr(args, "home", False)):
+        return _cmd_dash_home(args)
+
+    attach = bool(getattr(args, "attach", False))
+    target = str(getattr(args, "target", "") or "").strip()
+    if attach and target:
+        return _err("--attach watches a run the backend is already holding; it takes no target.")
+    if not attach and not target:
+        return _err("`gn dash` needs a target to hunt, or --attach to watch a run already in flight.")
+    if args.json:
+        if attach:
+            return _err("--attach needs an interactive terminal; POST /api/bounty/progress directly "
+                        "for a machine feed.")
+        return _cmd_hunt(args)
+
+    refusal = gn_tui.refusal()
+    if refusal:
+        # Attaching has no hunt to fall back to, so it must say why instead of doing nothing.
+        return _err(refusal) if attach else _cmd_hunt(args)
+    small = gn_dash.size_refusal(gn_tui.terminal_size(sys.stdout))
+    if small:
+        return _err(small)
+    if not attach and not args.authorize:
+        # Before the alternate screen: a refusal printed into a screen that is about to be discarded
+        # is a refusal the operator never sees.
+        return _err(_HUNT_AUTHORIZE)
+    if getattr(args, "braille", False):
+        # Written into the environment rather than passed down, so the flag reaches gn_tui.tier()
+        # through the same door GN_DASH_GLYPHS does and there is exactly one place glyphs get
+        # chosen. Assignment, not setdefault: an argument typed on this command outranks the shell
+        # it was typed in. Set only once every refusal is behind us, so a delegated `gn hunt` never
+        # inherits an environment this verb edited on its way out.
+        os.environ["GN_DASH_GLYPHS"] = "braille"
+
+    holder: dict = {}
+    try:
+        if attach:
+            source, launch = _dash_source(args), None
+        else:
+            run_id = str(getattr(args, "run_id", "") or "").strip() or f"gn-dash-{uuid4().hex[:12]}"
+            source = gn_dash.LocalSource(run_id, target)
+
+            def launch() -> int:  # type: ignore[misc]
+                return _dash_hunt(args, run_id, holder)
+
+        code = gn_dash.run(source, run_subcommand=_dash_subcommand, launch=launch,
+                           refresh_hz=getattr(args, "refresh", 4.0))
+    except gn_dash.SourceError as exc:
+        return _err(exc.message)
+
+    result = holder.get("result")
+    if isinstance(result, dict) and not result.get("ok"):
+        return _err(result.get("error", "the hunt could not run."))
+    if isinstance(result, dict):
+        _print_hunt_summary(result)
+    return code
 
 
 def _cmd_version(_args: argparse.Namespace) -> int:
@@ -995,6 +1530,9 @@ def build_parser() -> argparse.ArgumentParser:
     hunt.add_argument("--per-finding", action="store_true", help="also write one submission-ready file per finding")
     hunt.add_argument("-y", "--authorize", action="store_true", help="confirm you are AUTHORIZED to test the target (required)")
     hunt.add_argument("--json", action="store_true", help="print the machine-readable result")
+    hunt.add_argument("--no-fx", action="store_true",
+                       help="no live animated status line (also: GN_NO_FX=1, NO_COLOR, or a non-tty)")
+    _register_depth_flags(hunt)
     hunt.set_defaults(func=_cmd_hunt)
 
     camp = sub.add_parser("campaign", help="end-to-end: recon -> hunt every URL -> prove -> submission packages -> learn")
@@ -1018,6 +1556,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="aggressive: implies --active + time-based blind SQLi, and auto-captures a screenshot + writes a brain-researched dossier for each confirmed lead")
     camp.add_argument("-y", "--authorize", action="store_true", help="confirm you are AUTHORIZED + in scope (required)")
     camp.add_argument("--json", action="store_true")
+    camp.add_argument("--no-fx", action="store_true",
+                       help="no live animated status line (also: GN_NO_FX=1, NO_COLOR, or a non-tty)")
     camp.set_defaults(func=_cmd_campaign)
 
     osint = sub.add_parser("osint", help="passive multi-source domain research with evidence provenance")
@@ -1040,6 +1580,8 @@ def build_parser() -> argparse.ArgumentParser:
     osint.add_argument("-y", "--authorize", action="store_true",
                        help="confirm authorization for --hunt (not required for passive OSINT)")
     osint.add_argument("--json", action="store_true", help="print the machine-readable campaign result")
+    osint.add_argument("--no-fx", action="store_true",
+                       help="no live animated status line (also: GN_NO_FX=1, NO_COLOR, or a non-tty)")
     osint.set_defaults(func=_cmd_osint)
 
     learn = sub.add_parser("learn", help="record a finding's bounty outcome (teaches the engine)")
@@ -1187,6 +1729,52 @@ def build_parser() -> argparse.ArgumentParser:
     tools.add_argument("--json", action="store_true")
     tools.set_defaults(func=_cmd_tools)
 
+    fxdemo = sub.add_parser("fx", help="preview the live status animation in this terminal")
+    fxdemo.add_argument("--seconds", type=float, default=6.0, help="how long to run the preview")
+    fxdemo.set_defaults(func=_cmd_fx)
+
+    # A CORE verb, registered here beside `fx` and never through _VERB_PLUGINS: that loader is
+    # fail-closed (see _register_plugin_verbs), so a dashboard that failed to import would silently
+    # cost the verb and `gn dash` would fall through run_frozen's dispatch and boot the API server.
+    # Every option `hunt` defines is repeated here on purpose — the namespace has to be a strict
+    # superset for the --json / non-tty delegation to _cmd_hunt to be total.
+    dash = sub.add_parser("dash", help="full-screen cockpit: run a hunt, or attach to one, with live panels")
+    dash.add_argument("target", nargs="?", default="", help="https:// URL, repo URL, or local path (omit with --attach)")
+    dash.add_argument("-p", "--profile", default="full-sweep", help="hunt profile (default: full-sweep; see `gn profiles`)")
+    dash.add_argument("-c", "--class", dest="vuln_class", default=None, help="focus vuln class (see `gn classes`)")
+    dash.add_argument("-s", "--scope", default="", help="program/scope notes (name the host here to allow active checks)")
+    dash.add_argument("--active", action="store_true", help="active verification: send benign probes to PROVE findings (URL targets)")
+    dash.add_argument("--time-based", dest="time_based", action="store_true",
+                      help="opt-in: add the bounded-SLEEP blind-SQLi probe (implies --active)")
+    dash.add_argument("--cookie", default="", help="scan behind a login: a Cookie header value, sent to the target host + subdomains ONLY")
+    dash.add_argument("--header", action="append", metavar="'Name: value'",
+                      help="extra auth header (repeatable); sent same-site only")
+    dash.add_argument("--live", action="store_true", help="dynamic Playwright browser pass (URL targets)")
+    dash.add_argument("--brain", action="store_true", help="use the configured LLM brain to enrich (default: deterministic)")
+    dash.add_argument("-o", "--out", default=None, help="report output folder (default: runtime/reports)")
+    dash.add_argument("--per-finding", action="store_true", help="also write one submission-ready file per finding")
+    dash.add_argument("-y", "--authorize", action="store_true", help="confirm you are AUTHORIZED to test the target (required to hunt)")
+    dash.add_argument("--json", action="store_true", help="no dashboard: run the hunt and print the machine-readable result")
+    dash.add_argument("--no-fx", action="store_true",
+                      help="no live animation; with a redirected stream this runs exactly like `gn hunt`")
+    dash.add_argument("--home", action="store_true",
+                      help="open the idle HOME cockpit with nothing running; drive it with /hunt, "
+                           "/attach, /usage (this is what `GreyNOC Start` runs)")
+    dash.add_argument("--attach", action="store_true",
+                      help="watch a run the local backend is already holding instead of starting one")
+    dash.add_argument("--run-id", dest="run_id", default="",
+                      help="the run to watch with --attach (default: the newest un-stopped run)")
+    dash.add_argument("--host", default="127.0.0.1", help="--attach host; loopback only (127.0.0.1, ::1, localhost)")
+    dash.add_argument("--port", type=int, default=None, help="--attach port (default: $GREYIQ_PORT, else probe 8766-8845)")
+    dash.add_argument("--token", default="", help="--attach session token (default: $GREYIQ_SESSION_TOKEN, else runtime/session.token)")
+    dash.add_argument("--refresh", type=float, default=4.0, help="repaints per second, clamped to 0.5-20 (default 4)")
+    dash.add_argument("--braille", action="store_true",
+                      help="braille sparklines — off by default because the encode probe cannot see whether your FONT has U+28xx (also: GN_DASH_GLYPHS=braille|rich|box|ascii)")
+    dash.add_argument("--self-test", dest="self_test", action="store_true",
+                      help="draw one frame, tear it down, and report the glyph tier, key reader, console VT state, size and host counters")
+    _register_depth_flags(dash)
+    dash.set_defaults(func=_cmd_dash)
+
     version = sub.add_parser("version", help="print the version")
     version.set_defaults(func=_cmd_version)
 
@@ -1220,6 +1808,14 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "gn":  # tolerate `greyiq-backend.exe gn hunt ...`
         argv = argv[1:]
+    # `--variables` is answered BEFORE parse_args, because `hunt`'s target is a required positional
+    # and argparse enforces that first: `gn hunt --variables` would otherwise exit 2 demanding a
+    # target for a flag that describes flags and runs nothing. Scoped to the verbs that own the
+    # table so it cannot shadow another verb's -v.
+    if argv and argv[0] in ("hunt", "dash") and {"-v", "--variables"} & set(argv[1:]):
+        for line in variables_lines():
+            print(line)
+        return 0
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):
@@ -1231,7 +1827,44 @@ def main(argv: list[str] | None = None) -> int:
         return _err("interrupted.")
     except Exception as exc:  # noqa: BLE001 - the CLI must report, not traceback-dump
         return _err(f"{type(exc).__name__}: {exc}")
+    finally:
+        # Clear any live status line before the shell prompt comes back, on EVERY exit: a clean
+        # return, an early `return _err(...)`, a Ctrl-C, or an engine exception. Without this a
+        # half-drawn frame is the last thing on the operator's terminal, and on Ctrl-C the cursor is
+        # left mid-line. Guarded because a missing or broken decoration must never change the exit
+        # code the operator's script reads.
+        try:
+            import gn_fx
+
+            gn_fx.stop_all()
+        except Exception:  # noqa: BLE001
+            pass
+        # And give the whole terminal back, for the same reason and with the same guard. A separate
+        # registry from gn_fx's on purpose (see gn_tui._LIVE): a pane command calls gn_fx.stop_all()
+        # because the verb it ran started a Scanner, and that must not tear down the dashboard the
+        # operator is looking at. gn_dash.run unwinds its own ExitStack first, so on a normal exit
+        # this finds nothing left to do — it is here for the paths that skipped that unwind, where a
+        # live alternate screen would otherwise swallow the message main() just printed.
+        #
+        # Looked up in sys.modules rather than imported: nothing can be holding the terminal if the
+        # module that takes it was never loaded, and importing it here would put ctypes/termios on
+        # the exit path of every `gn version`.
+        try:
+            tui = sys.modules.get("gn_tui")
+            if tui is not None:
+                tui.teardown_all()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 if __name__ == "__main__":
+    # `python backend/gn_cli.py …` (which is what `npm run gn` does) loads this file as __main__,
+    # so `sys.modules["gn_cli"]` is absent — and two modules look for RUNTIME_DIR exactly there
+    # rather than importing this one: gn_dash.runtime_dirs, which is how `--attach` finds
+    # session.token, and gn_sysmon._runtime_dir, which is how the system strip knows WHICH volume
+    # its disk percentage is about. Neither may import gn_cli (it reconfigures stdout/stderr at
+    # import, and a sampler is not allowed to have opinions about the caller's streams), so the
+    # alias is published here instead. setdefault, never assignment: if a real `gn_cli` is already
+    # imported, that one is the module those lookups should see.
+    sys.modules.setdefault("gn_cli", sys.modules[__name__])
     raise SystemExit(main())

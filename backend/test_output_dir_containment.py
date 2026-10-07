@@ -62,6 +62,25 @@ class ResolveOutputDirTests(unittest.TestCase):
         self.assertFalse(deeply_nested.parent.exists())
         self.assertFalse((self.root / "does-not-exist-1").exists())
 
+    def test_a_missing_default_tree_is_created_instead_of_raising(self) -> None:
+        # The other half of the rule, and the reason `gn hunt` died on a clean checkout: the
+        # DEFAULT is a path this program chose (runtime/reports), and on a fresh clone no part of
+        # it exists. mkdir(parents=False) turned the very first hunt into a FileNotFoundError
+        # naming a directory the operator had never heard of and could not place.
+        default = self.root / "fresh" / "runtime" / "reports"
+        self.assertFalse(default.parent.exists())
+        self.assertEqual(_resolve_output_dir(None, default), default.resolve())
+        self.assertTrue(default.is_dir())
+
+    def test_a_refused_output_dir_still_lands_in_a_created_default(self) -> None:
+        # Both halves at once: the caller's multi-level path is still refused (nothing is created
+        # there), and the default it falls back to is brought into existence rather than exploding.
+        default = self.root / "also-fresh" / "runtime" / "reports"
+        deeply_nested = self.root / "nope-a" / "nope-b" / "nope-c"
+        self.assertEqual(_resolve_output_dir(str(deeply_nested), default), default.resolve())
+        self.assertTrue(default.is_dir())
+        self.assertFalse((self.root / "nope-a").exists())
+
     def test_agent_redteam_reuses_the_same_containment(self) -> None:
         deeply_nested = self.root / "nope-1" / "nope-2"
         result = redteam_resolve_output_dir(str(deeply_nested), self.default_reports_dir)

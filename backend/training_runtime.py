@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import re
+import shutil
 import time
 import traceback
 from collections.abc import Callable
@@ -25,6 +27,10 @@ SOURCE_TEXT_FILES = {
     "src_preferred_examples": ["greyiq_preferred_examples.txt"],
     "src_local_notes": ["greyiq_local_notes.txt"],
     "src_imported_docs": ["greyiq_imported_docs.txt"],
+    # The bundled manual/PDF extract ensure_runtime already copies into data/. It is the largest
+    # corpus that ships (~6.3 MB) and had no source id, so no Studio-initiated run could select it —
+    # the one thing a bigger model most needs was unreachable from the UI that asks you to pick sources.
+    "src_manuals": ["greyiq_manual_pdfs.txt"],
 }
 GENERATED_TEXT_FILES = {
     "combined_train.txt",
@@ -41,16 +47,69 @@ MIN_ARCHIVE_INTERVAL_SECONDS = 60.0
 MANIFEST_FILE = "pdf_manifest.json"
 
 # Cap dataset loaded into RAM; 275 MB encodes to ~2.2 GB of long tensors and OOMs on CPU.
-MAX_TRAINING_CHARS = 8_000_000  # 8 MB is plenty for block_size=64 training
+MAX_TRAINING_CHARS = 16_000_000  # 16 MB gives the larger block_size=256 model real headroom
 MAX_GRAD_NORM = 1.0
 
-MODEL_CONFIG = {
-    "block_size": 64,
-    "n_embd": 128,
-    "n_head": 4,
-    "n_layer": 4,
-    "dropout": 0.1,
+# TinyGPT ("Solin"), the local offline fallback brain — SELECTABLE capacity.
+#
+# The brain used to be one fixed 0.84M-parameter shape (block_size=64, n_embd=128, n_head=4,
+# n_layer=4). Capacity is now a training CHOICE, because architecture and lineage are the same
+# decision: a model can only continue improving while its shape stays the same, and a different
+# shape is necessarily a new model trained from scratch.
+#
+#   compact  — the shape the shipped seed checkpoint was trained at, so a run RESUMES and improves
+#              the model the operator already has. The safe default: clicking "Train the local
+#              model" must not throw away a working brain.
+#   standard — ~6.5M params: 4x the context window and ~8x the capacity, still CPU/WebGPU-friendly.
+#              A deliberate upgrade that starts a NEW lineage from random weights.
+#   large    — ~19M params. Wants a GPU and a real corpus; on CPU expect a long run.
+#
+# Even at 'large' this stays far below the scale of a real reasoning LLM, so every invariant the rest
+# of the codebase rests on is unchanged: it still never reasons about vuln classes or authors security
+# claims on its own (see offline_hunt.py / solin_domain.py).
+#
+# SAFETY around a size change, since it always means new random weights:
+#  * ``load_checkpoint_if_possible`` compares a resumed checkpoint's embedded config against the
+#    run's effective config and cleanly starts fresh on any mismatch rather than attempting an
+#    incompatible ``load_state_dict``.
+#  * ``save_best_model`` ARCHIVES the outgoing best_model.pt into StableModels/ before the first
+#    publish of a different architecture, so the previous lineage is always recoverable.
+#  * ``solin_vocab.json``/``solin_config.json`` are written next to the weights they describe, not
+#    ahead of them, so a run that dies early cannot leave metadata that makes the existing
+#    best_model.pt unloadable.
+#  * A brand-new install's CHAT engine loads the SHIPPED, already-trained ``seed/best_model.pt``
+#    against ``seed/solin_config.json``. That seed pair stays at the compact shape (re-shaping it
+#    would mean retraining and reshipping the checkpoint), which is exactly why compact is the
+#    default: first-run chat keeps working and a bigger brain is an explicit opt-in.
+MODEL_PRESETS: dict[str, dict[str, Any]] = {
+    "compact": {"block_size": 64, "n_embd": 128, "n_head": 4, "n_layer": 4, "dropout": 0.1},
+    "standard": {"block_size": 256, "n_embd": 256, "n_head": 8, "n_layer": 8, "dropout": 0.1},
+    "large": {"block_size": 512, "n_embd": 384, "n_head": 12, "n_layer": 12, "dropout": 0.1},
 }
+DEFAULT_MODEL_SIZE = "compact"
+# Kept as the module-level name the rest of the codebase reads; it is the DEFAULT preset, and a run
+# resolves its own effective config from settings.model_size via ``model_config_for``.
+MODEL_CONFIG = MODEL_PRESETS[DEFAULT_MODEL_SIZE]
+
+
+def model_config_for(model_size: str | None) -> dict[str, Any]:
+    """The architecture for ``model_size``, falling back to the default preset on anything unknown."""
+    key = str(model_size or "").strip().lower()
+    return dict(MODEL_PRESETS.get(key) or MODEL_PRESETS[DEFAULT_MODEL_SIZE])
+
+
+def approx_parameter_count(config: dict[str, Any], vocab_size: int) -> int:
+    """Parameter count for ``config`` without building the model — for the Studio's size picker.
+
+    Mirrors TinyGPT's structure (tied output embedding, 4x FFN): embeddings, then per block the four
+    attention projections, the two feed-forward layers, two LayerNorms."""
+    n_embd = int(config.get("n_embd") or 0)
+    n_layer = int(config.get("n_layer") or 0)
+    block_size = int(config.get("block_size") or 0)
+    hidden = max(n_embd, int(round(n_embd * float(config.get("ffn_mult", 4.0)))))
+    per_block = 3 * n_embd * n_embd + (n_embd * n_embd + n_embd) + (n_embd * hidden + hidden) + (hidden * n_embd + n_embd) + 4 * n_embd
+    return max(0, vocab_size * n_embd + block_size * n_embd + per_block * n_layer + 2 * n_embd + vocab_size)
+
 
 DEFAULT_MAX_ITERS = 1000
 DEFAULT_EVAL_INTERVAL = 100
@@ -131,6 +190,10 @@ class TrainingSettings:
     dataset_char_cap: int = MAX_TRAINING_CHARS
     source_ids: list[str] = field(default_factory=list)
     fresh_start: bool = False
+    # Which MODEL_PRESETS architecture this run trains. Changing it always starts a new lineage from
+    # random weights (a different shape cannot resume old weights), so the default stays 'compact' —
+    # the shipped checkpoint's shape — and a bigger brain is an explicit choice.
+    model_size: str = DEFAULT_MODEL_SIZE
     validation: ValidationMonitorSettings = field(default_factory=ValidationMonitorSettings)
 
 
@@ -376,7 +439,7 @@ def load_all_text(
     return combined
 
 
-def build_dataset(text: str, base_dir: Path | None = None):
+def build_dataset(text: str, base_dir: Path | None = None, block_size: int | None = None):
     """Encode the training corpus and split into train/val tensors.
 
     If ``solin_vocab.json`` already exists on disk and is a BPE vocab
@@ -387,6 +450,10 @@ def build_dataset(text: str, base_dir: Path | None = None):
     Returns ``(vocab_size, stoi, itos, train_data, val_data, tok_meta)``
     where ``tok_meta`` is ``{"kind": "char"}`` or
     ``{"kind": "bpe", "merges": [...]}``."""
+    # The window each training sample spans — from the RUN's architecture, not the module default.
+    # Both splits must exceed it or get_batch's randint(len(source) - block_size) has an empty range,
+    # and a 'large' preset needs 512-token windows where the old check only proved the corpus beat 64.
+    min_tokens = int(block_size if block_size else MODEL_CONFIG["block_size"])
     base = base_dir if base_dir is not None else Path.cwd()
     vocab_path = base / "solin_vocab.json"
 
@@ -405,8 +472,10 @@ def build_dataset(text: str, base_dir: Path | None = None):
             split_at = int(0.9 * len(data))
             train_data = data[:split_at]
             val_data = data[split_at:]
-            if len(train_data) <= MODEL_CONFIG["block_size"] or len(val_data) <= MODEL_CONFIG["block_size"]:
-                raise ValueError("Dataset too small after BPE encoding. Add more text " "or lower block_size.")
+            if len(train_data) <= min_tokens or len(val_data) <= min_tokens:
+                raise ValueError(
+                    f"Dataset too small after BPE encoding for a {min_tokens}-token context. "
+                    "Add more text, or train at a smaller model size.")
             tok_meta = {"kind": "bpe", "merges": [list(p) for p in tok.merges]}
             return tok.vocab_size, tok.stoi, tok.itos, train_data, val_data, tok_meta
 
@@ -423,16 +492,38 @@ def build_dataset(text: str, base_dir: Path | None = None):
     train_data = data[:split_at]
     val_data = data[split_at:]
 
-    if len(train_data) <= MODEL_CONFIG["block_size"] or len(val_data) <= MODEL_CONFIG["block_size"]:
-        raise ValueError("Dataset too small. Add more text or lower block_size.")
+    if len(train_data) <= min_tokens or len(val_data) <= min_tokens:
+        raise ValueError(
+            f"Dataset too small for a {min_tokens}-token context. Add more text, or train at a "
+            "smaller model size.")
 
     return len(chars), stoi, itos, train_data, val_data, {"kind": "char"}
 
 
-def batch_size_for(device_name: str, override: int = 0) -> int:
+# Tokens per optimizer step we are willing to hold activations for, per device. Activation memory
+# scales with batch * block_size * n_embd * n_layer, so a flat batch that was fine for the compact
+# preset (64-token context, 4 layers) is ~30x the work at 'standard' and ~180x at 'large' — enough to
+# OOM an 8 GB laptop on the CPU path, which is the default. Budgeting TOKENS instead of rows keeps the
+# step size roughly constant as the context grows.
+# Chosen so the DEFAULT preset keeps its historical batch exactly: compact has a 64-token context, so
+# cpu = min(64, 2048//64) = 32 and gpu = min(64, 8192//64) = 64 — the two values that were hardcoded.
+# The bigger presets then step down instead of multiplying the work per step.
+_CPU_TOKEN_BUDGET = 2048
+_GPU_TOKEN_BUDGET = 8192
+_MAX_ROWS_PER_STEP = 64
+
+
+def batch_size_for(device_name: str, override: int = 0, config: dict[str, Any] | None = None) -> int:
+    """Rows per step for ``device_name``, scaled to the architecture's context length.
+
+    An explicit ``override`` always wins (the Studio exposes it for operators tuning a run). Without
+    one, the batch is sized so batch * block_size stays within the device's token budget, clamped to
+    at least 4 rows so a long-context preset still trains rather than failing outright."""
     if override and override > 0:
-        return override
-    return 32 if device_name == "cpu" else 64
+        return int(override)
+    block_size = int((config or MODEL_CONFIG).get("block_size") or 64)
+    budget = _CPU_TOKEN_BUDGET if device_name == "cpu" else _GPU_TOKEN_BUDGET
+    return max(4, min(_MAX_ROWS_PER_STEP, budget // max(1, block_size)))
 
 
 def get_batch(source, block_size: int, batch_size: int, device_name: str):
@@ -442,12 +533,68 @@ def get_batch(source, block_size: int, batch_size: int, device_name: str):
     return x.to(device_name), y.to(device_name)
 
 
-def save_checkpoint(base_dir: Path, model, optimizer, best_loss, stoi, itos, tok_meta: dict | None = None) -> None:
+def _published_model_config(base_dir: Path, run_config: dict[str, Any]) -> dict[str, Any] | None:
+    """The architecture of the best_model.pt already on disk, when it DIFFERS from ``run_config``.
+
+    Returns None when there is nothing to supersede — no published model, no readable metadata, or the
+    same shape (an ordinary resume). best_model.pt is a bare state_dict, so its shape is described by
+    the sibling solin_config.json; that is what solin_core._load_model_artifacts reads to rebuild it.
+    Used to archive the outgoing lineage exactly once before a differently-shaped model replaces it."""
+    if not (base_dir / BEST_MODEL_FILE).exists():
+        return None
+    try:
+        on_disk = json.loads((base_dir / "solin_config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # Metadata missing or unreadable: we cannot prove the shapes match, so treat the outgoing file
+        # as worth keeping. Archiving a copy we did not need to is cheap; losing a trained model is not.
+        return dict(run_config)
+    if not isinstance(on_disk, dict):
+        return dict(run_config)
+    keys = ("block_size", "n_embd", "n_head", "n_layer")
+    if all(on_disk.get(k) == run_config.get(k) for k in keys):
+        return None
+    return {k: on_disk.get(k) for k in keys}
+
+
+@torch.no_grad()
+def estimate_loss(model, source, block_size: int, batch_size: int, device_name: str, batches: int = 20) -> float:
+    """Mean loss over ``batches`` random windows, in eval mode.
+
+    The trainer used to read validation loss from ONE random batch with dropout still active. On this
+    corpus consecutive single-batch losses on identical weights differ by ~0.1-0.3 nats — orders of
+    magnitude above the 1e-4 ``min_delta`` they are compared against — so "no improvement" was mostly
+    sampling noise: a still-improving run could early-stop after three unlucky draws, and best-model
+    selection could publish a worse model that happened to draw an easy batch. Averaging several
+    batches with ``model.eval()`` (dropout off) makes the number something min_delta and patience can
+    meaningfully compare. Restores training mode before returning."""
+    was_training = model.training
+    model.eval()
+    try:
+        total = 0.0
+        taken = 0
+        for _ in range(max(1, batches)):
+            xb, yb = get_batch(source, block_size, batch_size, device_name)
+            _, loss = model(xb, yb)
+            value = float(loss.item())
+            if not math.isfinite(value):
+                return value  # diverged — report it rather than averaging a NaN away
+            total += value
+            taken += 1
+        return total / max(1, taken)
+    finally:
+        if was_training:
+            model.train()
+
+
+def save_checkpoint(base_dir: Path, model, optimizer, best_loss, stoi, itos, tok_meta: dict | None = None,
+                    config: dict[str, Any] | None = None) -> None:
     payload = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "best_loss": best_loss,
-        "config": MODEL_CONFIG,
+        # The run's EFFECTIVE architecture, not the module default — a checkpoint has to describe the
+        # weights it carries so load_checkpoint_if_possible can refuse an incompatible resume.
+        "config": dict(config or MODEL_CONFIG),
         "stoi": stoi,
         "itos": {str(index): value for index, value in itos.items()},
     }
@@ -464,6 +611,7 @@ def save_best_model(
     model,
     last_archive_time: float = 0.0,
     min_archive_interval: float = MIN_ARCHIVE_INTERVAL_SECONDS,
+    supersedes: dict[str, Any] | None = None,
 ) -> tuple[Path, float]:
     """Persist the best weights.
 
@@ -476,8 +624,25 @@ def save_best_model(
 
     Returns the path of the most-recently-written file (latest alias when no
     archive snapshot was taken this call) and the updated archive timestamp.
+
+    ``supersedes`` is the outgoing model's own config when this publish REPLACES a different
+    architecture. best_model.pt is a bare state_dict, so once it is overwritten by weights of another
+    shape the previous lineage is gone — and the first publish of a fresh lineage happens on the very
+    first eval that improves on ``inf``, i.e. after a handful of steps. An operator who clicked "Train"
+    once would have traded a fully-trained brain for a few-step one with nothing to roll back to. So
+    the outgoing file is copied aside first, under a name that says what it was.
     """
     latest_path = base_dir / BEST_MODEL_FILE
+    if supersedes and latest_path.exists():
+        try:
+            retired_dir = base_dir / STABLE_MODELS_DIR / "superseded"
+            retired_dir.mkdir(parents=True, exist_ok=True)
+            shape = "x".join(str(supersedes.get(k) or "?") for k in ("n_layer", "n_embd", "block_size"))
+            retired = retired_dir / f"best_model_{shape}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
+            if not retired.exists():
+                shutil.copy2(latest_path, retired)
+        except Exception:  # noqa: BLE001 - archiving must never block publishing a better model
+            pass
     state_dict = model.state_dict()
     safe_torch_save(state_dict, latest_path)
 
@@ -512,7 +677,9 @@ def load_checkpoint_if_possible(
     logger: Logger | None = None,
     fresh_start: bool = False,
     requested_learning_rate: float | None = None,
+    config: dict[str, Any] | None = None,
 ):
+    effective_config = dict(config or MODEL_CONFIG)
     checkpoint_path = base_dir / CHECKPOINT_FILE
 
     if fresh_start:
@@ -525,8 +692,9 @@ def load_checkpoint_if_possible(
 
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device_name)
-        if checkpoint.get("config") != MODEL_CONFIG:
-            _log(logger, "Checkpoint config mismatch. Starting fresh.")
+        if checkpoint.get("config") != effective_config:
+            _log(logger, "Checkpoint architecture differs from this run's model size — starting a new "
+                         "model from scratch (the previous one is kept and archived, not overwritten).")
             return float("inf")
         if checkpoint.get("stoi") != stoi:
             _log(logger, "Checkpoint vocab mismatch. Starting fresh.")
@@ -623,19 +791,24 @@ def train_cycle(
     logger: Logger | None = None,
     should_stop: Predicate | None = None,
     status_callback: StatusCallback | None = None,
+    should_pause: Predicate | None = None,
 ) -> None:
     device_info = detect_best_device(settings.device_preference)
     device_name = device_info.name
-    batch_size = batch_size_for(device_name, settings.batch_size_override)
+    model_config = model_config_for(settings.model_size)
+    batch_size = batch_size_for(device_name, settings.batch_size_override, model_config)
 
     # If CUDA OOMs mid-cycle, retry transparently on CPU.
     if device_name == "cuda":
         try:
-            _train_cycle_inner(base_dir, settings, logger, should_stop, device_name, batch_size, status_callback)
+            _train_cycle_inner(base_dir, settings, logger, should_stop, device_name, batch_size,
+                               status_callback, should_pause)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             _log(logger, "CUDA out of memory — retrying on CPU.")
-            _train_cycle_inner(base_dir, settings, logger, should_stop, "cpu", batch_size_for("cpu"), status_callback)
+            _train_cycle_inner(base_dir, settings, logger, should_stop, "cpu",
+                               batch_size_for("cpu", settings.batch_size_override, model_config),
+                               status_callback, should_pause)
         except Exception as exc:
             if _is_retryable_cuda_failure(exc):
                 try:
@@ -644,13 +817,26 @@ def train_cycle(
                     pass
                 _log(logger, f"CUDA runtime is not usable on this system ({exc}) — retrying on CPU.")
                 _train_cycle_inner(
-                    base_dir, settings, logger, should_stop, "cpu", batch_size_for("cpu"), status_callback
+                    base_dir, settings, logger, should_stop, "cpu",
+                    batch_size_for("cpu", settings.batch_size_override, model_config),
+                    status_callback, should_pause,
                 )
             else:
                 raise
         return
 
-    _train_cycle_inner(base_dir, settings, logger, should_stop, device_name, batch_size, status_callback)
+    # A CPU run that cannot fit the chosen architecture halves the batch once rather than failing the
+    # whole cycle: the default device IS cpu, and the larger presets raise activation memory sharply.
+    try:
+        _train_cycle_inner(base_dir, settings, logger, should_stop, device_name, batch_size,
+                           status_callback, should_pause)
+    except MemoryError:
+        retry_batch = max(1, batch_size // 2)
+        if retry_batch >= batch_size:
+            raise
+        _log(logger, f"Out of memory at batch {batch_size} — retrying once at {retry_batch}.")
+        _train_cycle_inner(base_dir, settings, logger, should_stop, device_name, retry_batch,
+                           status_callback, should_pause)
 
 
 def _train_cycle_inner(
@@ -661,9 +847,14 @@ def _train_cycle_inner(
     device_name: str,
     batch_size: int,
     status_callback: StatusCallback | None = None,
+    should_pause: Predicate | None = None,
 ) -> None:
+    model_config = model_config_for(settings.model_size)
+    block_size = int(model_config["block_size"])
     _log(logger, f"Training device: {device_name}")
     _log(logger, f"Batch size: {batch_size}")
+    _log(logger, f"Model size: {settings.model_size} "
+                 f"({model_config['n_layer']} layers, {model_config['n_embd']} embd, {block_size} ctx)")
     _emit_runtime_status(
         status_callback,
         status="preparing",
@@ -690,15 +881,28 @@ def _train_cycle_inner(
         batch_size=batch_size,
         dataset_chars=len(text),
     )
-    vocab_size, stoi, itos, train_data, val_data, tok_meta = build_dataset(text, base_dir=base_dir)
+    vocab_size, stoi, itos, train_data, val_data, tok_meta = build_dataset(
+        text, base_dir=base_dir, block_size=block_size)
     _raise_if_stopping(should_stop)
 
     # For char vocab we (re)write solin_vocab.json from the corpus. For BPE
     # we leave the user's pre-trained vocab file untouched — overwriting it
     # with char-style stoi/itos would corrupt the BPE merges.
-    if tok_meta.get("kind") == "char":
-        save_vocab(stoi, itos, base_dir / "solin_vocab.json")
-    save_config(MODEL_CONFIG, base_dir / "solin_config.json")
+    # NOT written yet. solin_vocab.json/solin_config.json describe the shape of best_model.pt, which is
+    # a bare state_dict — so writing them up front means a run that dies before producing any weights
+    # (a MemoryError building a larger model, a stop, a Ctrl-C) leaves metadata describing an
+    # architecture no file on disk has, and the EXISTING best_model.pt plus every StableModels archive
+    # becomes unloadable. They are written by _publish_metadata below, next to the first weights.
+    metadata_written = False
+
+    def _publish_metadata() -> None:
+        nonlocal metadata_written
+        if metadata_written:
+            return
+        if tok_meta.get("kind") == "char":
+            save_vocab(stoi, itos, base_dir / "solin_vocab.json")
+        save_config(model_config, base_dir / "solin_config.json")
+        metadata_written = True
 
     _emit_runtime_status(
         status_callback,
@@ -709,7 +913,7 @@ def _train_cycle_inner(
         batch_size=batch_size,
         dataset_chars=len(text),
     )
-    model = TinyGPT(vocab_size, MODEL_CONFIG).to(device_name)
+    model = TinyGPT(vocab_size, model_config).to(device_name)
     optimizer = torch.optim.AdamW(model.parameters(), lr=settings.learning_rate)
     best_loss = load_checkpoint_if_possible(
         base_dir=base_dir,
@@ -720,7 +924,11 @@ def _train_cycle_inner(
         logger=logger,
         fresh_start=settings.fresh_start,
         requested_learning_rate=settings.learning_rate,
+        config=model_config,
     )
+    # Did the on-disk best model belong to a DIFFERENT architecture? If so this run starts a new
+    # lineage, and the first publish must archive the outgoing file instead of overwriting it.
+    superseded_config = _published_model_config(base_dir, model_config)
 
     val_settings = settings.validation or ValidationMonitorSettings()
     # Early-stopping tracks improvement WITHIN this cycle so a pre-existing
@@ -757,8 +965,10 @@ def _train_cycle_inner(
     live_emit_interval = max(1, min(max(1, settings.eval_interval), 10))
 
     for step in range(total_steps):
+        _wait_while_paused(should_pause, should_stop, logger)
         if should_stop and should_stop():
-            save_checkpoint(base_dir, model, optimizer, best_loss, stoi, itos, tok_meta)
+            _publish_metadata()
+            save_checkpoint(base_dir, model, optimizer, best_loss, stoi, itos, tok_meta, config=model_config)
             status.status = "stopped"
             status.stage = "stopped"
             status.stop_reason = "user_stop"
@@ -767,12 +977,7 @@ def _train_cycle_inner(
             _log(logger, "Stop requested mid-cycle. Saved checkpoint before exiting.")
             raise InterruptedError("Training stop requested.")
 
-        xb, yb = get_batch(
-            train_data,
-            int(MODEL_CONFIG["block_size"]),
-            batch_size,
-            device_name,
-        )
+        xb, yb = get_batch(train_data, block_size, batch_size, device_name)
         _, loss = model(xb, yb)
 
         optimizer.zero_grad(set_to_none=True)
@@ -789,18 +994,26 @@ def _train_cycle_inner(
 
         is_eval_step = step % max(1, settings.eval_interval) == 0 or step == total_steps - 1
         if is_eval_step:
-            with torch.no_grad():
-                vx, vy = get_batch(
-                    val_data,
-                    int(MODEL_CONFIG["block_size"]),
-                    batch_size,
-                    device_name,
-                )
-                _, vloss = model(vx, vy)
-
-            train_loss_val = train_loss_live
-            val_loss_val = float(vloss.item())
+            # Averaged, dropout-free estimates on BOTH sides — a single noisy batch cannot drive
+            # early stopping or best-model selection (see estimate_loss).
+            train_loss_val = estimate_loss(model, train_data, block_size, batch_size, device_name)
+            val_loss_val = estimate_loss(model, val_data, block_size, batch_size, device_name)
             _log(logger, f"step {step}: train {train_loss_val:.4f}, val {val_loss_val:.4f}")
+
+            # A diverged run must not be persisted. Writing NaN weights into solin_checkpoint.pt
+            # poisons every later resume (the NaNs load back and no step can recover them) and,
+            # published as best_model.pt, leaves the chat engine emitting nothing.
+            if not (math.isfinite(train_loss_val) and math.isfinite(val_loss_val)):
+                status.status = "error"
+                status.stage = "diverged"
+                status.stop_reason = "diverged"
+                status.detail = ("Loss diverged (NaN/Inf) — nothing was saved. Lower the learning rate "
+                                 "and train again; the previous model is untouched.")
+                status.train_loss = train_loss_val
+                status.val_loss = val_loss_val
+                emit_status()
+                _log(logger, "Loss diverged (NaN/Inf) — checkpoint NOT written; the existing model is kept.")
+                return
 
             status.train_loss = train_loss_val
             status.val_loss = val_loss_val
@@ -815,10 +1028,14 @@ def _train_cycle_inner(
                 if val_loss_val < best_loss:
                     best_loss = val_loss_val
                     if val_settings.save_best_only:
+                        _publish_metadata()
                         saved_best_path, last_archive_time = save_best_model(
-                            base_dir, model, last_archive_time=last_archive_time
+                            base_dir, model, last_archive_time=last_archive_time,
+                            supersedes=superseded_config,
                         )
-                        save_checkpoint(base_dir, model, optimizer, best_loss, stoi, itos, tok_meta)
+                        superseded_config = None  # archived once; later publishes are the same lineage
+                        save_checkpoint(base_dir, model, optimizer, best_loss, stoi, itos, tok_meta,
+                                        config=model_config)
                         status.last_checkpoint = saved_best_path.name
                         _log(logger, f"Saved best model -> {saved_best_path.name} (latest alias: {BEST_MODEL_FILE})")
                 status.best_val_loss = best_loss if best_loss != float("inf") else val_loss_val
@@ -851,7 +1068,8 @@ def _train_cycle_inner(
         model.load_state_dict(best_state)
         _log(logger, "Restored best model weights at end of cycle.")
 
-    save_checkpoint(base_dir, model, optimizer, best_loss, stoi, itos, tok_meta)
+    _publish_metadata()
+    save_checkpoint(base_dir, model, optimizer, best_loss, stoi, itos, tok_meta, config=model_config)
     if not early_stopped:
         status.status = "completed"
         status.stage = "completed"
@@ -1005,6 +1223,7 @@ def run_training_loop(
                     logger=logger,
                     should_stop=should_stop,
                     status_callback=status_callback,
+                    should_pause=should_pause,
                 )
                 last_snapshot = current_snapshot
                 cycles_completed += 1

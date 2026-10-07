@@ -189,6 +189,19 @@ def test_intigriti_preview_is_explicitly_incomplete_because_exclusions_are_not_e
     assert any("out-of-scope" in warning for warning in result["warnings"])
 
 
+def test_intigriti_explicit_out_of_scope_tier_and_missing_tier_are_not_eligible():
+    detail = _intigriti_detail()
+    detail["domains"]["content"].extend([
+        {"id": OUT_TARGET, "type": {"value": "Website"}, "endpoint": "excluded.example.test",
+         "tier": {"value": "Out of scope"}, "description": "Do not test"},
+        {"id": OUT_GROUP, "type": {"value": "Website"}, "endpoint": "unknown.example.test",
+         "tier": None, "description": "Unclear"},
+    ])
+    result = pp.preview_program("intigriti", PROGRAM, "my-token", fetch=lambda url, **kw: detail)
+    assert [row["eligible_for_submission"] for row in result["structured_scope"]] == [True, False, False]
+    assert any("no scope tier" in warning for warning in result["warnings"])
+
+
 def test_strict_uuid_and_api_host_pinning_prevent_credential_leaks():
     calls = []
     fetch = lambda url, **kwargs: calls.append((url, kwargs))

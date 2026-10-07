@@ -2,7 +2,7 @@
 
 Notable changes to GreyIQ.
 
-## Unreleased — Debian 13 and guarded operator updates
+## v4.9.0 - Debian 13, guarded operator, and platform program intake
 
 - Added a Debian 13 package, AppImage, and headless CLI archive with a relocatable
   `greyiq-cli` launcher. `greyiq-cli path` prints the runtime location and PATH
@@ -13,7 +13,217 @@ Notable changes to GreyIQ.
 - Scheduled operator runs now require expiring per-program authorization grants,
   enforce scope and request budgets, and queue findings for human review.
   Local outcome feedback reprioritizes later authorized cycles.
+- Added read-only program discovery and scope previews for HackerOne, Bugcrowd,
+  and Intigriti. YesWeHack program search and scope import arrived in v4.5.0.
+  API results remain drafts until the operator reviews and saves a program.
 
+## v4.8.0 - verified learning and safer operator controls
+
+- Record coding-brain exchanges in a local learning log, with verified replay limited to
+  code changes that pass workspace verification. TinyGPT drafts require the optional offline
+  runtime, which is not bundled in the portable app.
+- Remove unattended HackerOne submission from portfolio operations. Scheduled hunts queue
+  findings for human review, and legacy auto-submit requests are refused.
+- Recheck program scope on account-login redirects and subrequests before sending credentials.
+- Harden desktop backend and Ollama startup checks, and expand API, CLI, and frontend wiring tests.
+
+## v4.7.0 - Hugging Face GGUF models in the local brain
+
+- Import compatible Hugging Face GGUF repositories into GreyIQ's local Ollama model library.
+- Select an imported model as the local coding brain for chat and agent work. Model retrieval is
+  operator initiated, and inference runs through the local Ollama runtime.
+
+## v4.6.0 - the investigation queue, in the app
+
+### The lead queue is readable in the cockpit, and reachable at all
+
+The **Download leads (.md)** button shipped in v4.2.1 was documented as being in the Hunt cockpit.
+It was not. It lives in the AI Studio surface (`#panelSecurity`, inside `.app-shell`), and
+`body[data-app-mode="hunt"] .app-shell { display: none }` with `appMode: "hunt"` as the default -
+so an operator who works in the cockpit, which is where a hunt is actually launched, could not
+reach it at all. README and CHANGELOG both asserted otherwise; both are corrected.
+
+The cockpit's export row now carries a **Leads** button that renders the queue *in the app*: each
+lead with its status, severity, confidence, the gaps still open, anything the engine says
+contradicts it, which chains it participates in, and - the line an operator actually acts on - the
+exact artifact that would confirm it. Untested chain leads render in their own section, labelled as
+probes rather than results. The same panel still downloads the Markdown brief.
+
+`export_leads` now returns the structured `report` alongside `markdown`. It was already building
+that object and discarding it, which is why the in-app operator had a file download and no way to
+READ the queue while the CLI had `--json`. This cannot widen what crosses the API boundary: the
+brief is *rendered from* this same object, so anything reachable in `report` was already reachable
+in `markdown` - and the redaction tests now assert against both.
+
+No `/api/bounty/investigate` route was added. The endpoint half already exists as
+`POST /api/bounty/leads`, and "investigate" is this codebase's established name for the per-finding
+active re-probe drawer (`/api/bounty/finding/reverify`); a second route by that name would leave
+two differently-shaped endpoints called the same thing.
+
+## v4.5.0 - YesWeHack becomes a place you set a program up from, not just a report format
+
+YesWeHack has been in the platform registry since the report formats landed, but only as an output
+shape: you could render a finding for its form, and that was the whole relationship. Setting the
+program up was still manual - retype the scope, retype the exclusions, and find the user-agent tag
+the program requires somewhere in its rules. This release makes it a source. `From YesWeHack` in the
+program wizard (and `Fetch scope from YesWeHack` in the form) pulls the program from
+`api.yeswehack.com` and fills in the record.
+
+**No credential is needed for a public program, and that is the default.** Verified against the live
+API, not assumed: `GET /programs?page=N` and `GET /programs/{slug}` both answer 200 unauthenticated,
+so the Submissions bar starts at *anonymous - public programs only* and the common case needs no
+secret at all. Sign-in exists for private/invited programs and exchanges email+password (plus TOTP)
+for a session token via `POST /login` / `POST /account/totp`; only the returned token is stored - the
+password is never written to the secrets file, never logged, and never read back. A Personal Access
+Token (`X-AUTH-TOKEN`) works too, for the manager-role accounts YesWeHack issues them to. The fetcher
+carries the same posture as the HackerOne one: host-pinned, redirects captured rather than followed
+so a credential cannot hop off-host, bounded reads, and a retry policy that never retries a
+deterministic 401/403/404.
+
+One fetch fills scope, out-of-scope, rules of engagement, qualifying and non-qualifying classes, the
+per-tier reward grid, test-account instructions, VPN and source-IP constraints - and the marker.
+**The marker is the part that makes the import worth having.** Most YesWeHack programs require a
+per-program tag on the User-Agent of every request so they can attribute the traffic; GreyIQ already
+had exactly that field (`portfolio.user_agent_suffix`, appended verbatim by
+`web_ingest.set_ua_suffix`), so the import writes the program's own value straight into it and an
+imported program is in-policy without further setup. A re-fetch never overwrites a marker or Notes
+the operator has edited.
+
+**An adversarial review caught a scope-safety bug before this shipped, and it is worth recording
+because the tests had certified the broken behaviour.** YesWeHack's out-of-scope list is free text
+that mixes real host patterns with prose, so the importer classified each line and stored the
+host-shaped ones as exclusions. The classifier accepted `https://shop.acme.example/checkout` and
+`api.acme.example:8443` - but both scope matchers (`campaign._target_host_excluded` and the
+equivalent check in `active_verify_service`) parse the *candidate* host and compare the exclusion
+token **verbatim**. A URL- or port-shaped token therefore matched nothing: the host stayed huntable
+while the UI reported the exclusion as captured. Three of four exclusions in the reproduction were
+inert, and the test suite asserted those two forms were "enforceable", so 54 green tests locked it
+in. The fix normalises each line to the bare host token the matchers actually honour, at the
+importer, where the data arrives - and the regression test now runs end-to-end through
+`portfolio._normalize` into the real matcher rather than asserting on the classifier alone.
+
+Two smaller decisions came out of the same review. **Exclusions are budgeted before in-scope rows**:
+when the 500-entry cap has to drop something, losing an in-scope row costs an opportunity, while
+losing an out-of-scope row would leave a forbidden host looking merely un-listed - so the cap now
+drops in the direction that hunts less. And **a prose exclusion is never dropped silently**: a rule
+the host matcher cannot enforce is surfaced in the fetch result and in Notes, because a count that
+implied every exclusion was captured is worse than no count.
+
+YesWeHack stays **export-only**. There is no researcher report-creation endpoint in YesWeHack's own
+client or its Burp extension, so nothing here claims a submit path that does not exist; the one-click
+API submit remains HackerOne-only and YesWeHack reports are filed on the platform.
+
+This release also carries the **v4.4.1 changelog entry, which was published as a tag but never merged
+to main** - `git diff v4.4.1 origin/main` was the version bump and that entry, and nothing else. The
+entry is restored below so the history does not skip a shipped version.
+
+**Six one-directional wiring gaps, where the engine computed something real and nothing collected
+it.** This whole class is invisible at runtime: a response field the client never reads looks exactly
+like a field the server never sent, and a route with no caller looks exactly like a route nobody
+needs. Nothing errors, nothing logs, and the capability simply is not there.
+
+Two were values thrown away on arrival. **`get_report_ready` rebuilds a runnable `replay.sh` and a
+`findings.har`** for the finding being readied - from its captured crafted request, deliberately
+without the confirmed-only filter the bundle path applies, because this is a preview of a finding
+still being assembled. Both ride that one response and are never stored in the ledger, so the Report
+Center dropped them and a history finding had no reproduction artifact at all. It now keeps them on
+the record and offers each as a download, but only when it has one: the server returns `""`/`null`
+when nothing was reconstructable, and an unconditional menu item would hand a triager an empty file
+and call it a reproduction. **`/prove` returns the captured request/response artifact per result**
+(`_compact_active` has carried `proof_evidence` since the Prove flow was built), and every call site
+kept the observed/control prose and discarded the artifact. For a finding proven from the cached run
+that was survivable - the engine persists the same artifact server-side - but a finding re-proven
+from *history* has no cached run to read it back from, so the concrete headers a triager asks for
+were gone. All three prove sites now fold it onto the finding and the campaign drawer's report sends
+it. The selection also moved to the *class-matched* confirmed result - the one
+`_persist_proof_of_impact` picks server-side - so the artifact belongs to the finding it is attached
+to, rather than to whichever check happened to confirm first at the same URL.
+
+Four were routes with nothing on the other end. **`/api/bounty/finding/restore`** existed while both
+delete sites discarded the `dedup_key` the dismiss response returns - and that key is the only handle
+on the suppression a delete records, because the server derives it when the caller has none. An
+accidental delete was therefore permanent. Both sites keep it now and offer *Undo delete*, honestly:
+restore is idempotent, so the bar distinguishes "restored" from "there was nothing to restore", and
+it says that restoring lifts the suppression for future hunts rather than putting the row back on the
+in-memory board. **`/api/oob/poll`** existed while *Mint callback URL* handed the operator a token
+nothing could check; the blind provers poll their own tokens internally, but a payload pasted by hand
+had no read-back at all. The OOB panel gets a poll control that Mint pre-fills. Worth more than it
+was, now that the collaborator config reaches every hunt path and the four blind provers actually
+run.
+
+**`/api/workspace/rollback` was the orphan, but the wired route was the bug.** `/api/agent/undo`
+wrote the pre-run text back over whatever was on disk, with no way to tell "still exactly what the
+run wrote" from "the user has been working in this file for an hour since" - so an undo destroyed
+work the agent had never touched. `workspace.rollback_changes` has always refused that case and
+documented refusing it; the snapshot route had no fingerprint to refuse it with. The snapshot now
+carries the sha256 of what the run last wrote, and restore skips any file matching neither that nor
+the pre-run text, reporting it per-file instead of overwriting it. A file already put back one at a
+time is not a conflict, and a snapshot written before the fingerprint existed still restores exactly
+as it did. The same payload was also dropping `content_unavailable`, so the existing guard against
+blanking a file whose original could not be read had never once fired in the real pipeline - its test
+hand-built the entry the serializer omitted. The orphaned route is wired where it belongs: per-file
+*Revert* in the Changes panel, the conservative sibling of an all-or-nothing undo.
+
+**`/api/bounty/stored-xss-beacon` was unwireable by construction, and the fix is server-side.** It
+took the OOB collaborator base and secret as *request* fields while `oob_config_status` returns only
+`has_secret`, never the secret - so no client could ever fill them in, and making one able to would
+mean weakening the boundary that keeps the secret server-side. Instead the route now reads the saved
+config exactly as `oob-ssrf`, `oob-xxe`, mint and poll do, the two fields are gone from the request
+model, and a client that sends them is ignored. With the secret never leaving the server, the panel
+gets a form.
+
+`backend/test_route_wiring_contracts.py` pins each seam in both directions - the client reads the
+field, *and* every field the route returns is read by something, with the three deliberate exceptions
+named and justified - because a producer with no consumer and a consumer with no producer fail
+identically and silently. It also carries a register of the `/api` routes the app still does not
+call, each with the reason, so a new orphan fails the gate rather than quietly never shipping - and
+the register fails just as loudly when a route on it *becomes* wired, so it can only shrink by
+someone looking at it. Every fix was verified non-vacuous by reverting it and watching its test go
+red.
+
+**And `npm run check` could not run in a Claude Code worktree at all.** `scripts/check-syntax.py`
+matched its skip list against the *absolute* path's `.parts`, which carry every ancestor directory
+name - so a checkout that merely LIVES under a directory named `.claude` / `dist` / `build` /
+`release` / `runtime` skipped every file in itself, found zero modules, and exited on its own "the
+walk is broken" guard. Every Claude Code worktree is `.claude/worktrees/<name>`, so the gate worked
+in CI and refused to start on the machine doing the work. Matching relative to the repo root fixes
+it and gives the same semantics as `check-syntax.mjs`, whose walk descends from the root and was
+never affected; 305 modules compile clean where the gate previously would not begin. Two tests in
+`test_ci_gate.py` had copied the same comparison and failed the same way, and the new test for it
+runs the gate's real walk rather than asserting on its source - a source assertion would have passed
+throughout.
+
+## v4.4.1 - the shipped runtime moves to Electron 44.3.0
+
+No GreyIQ source changed in this release. `git diff v4.4.0..HEAD` touches `package.json` and
+`package-lock.json` and nothing else: the whole content is the Electron devDependency moving 44.0.0
+to 44.3.0 (#175). That is still a change to what ships, which is why it gets a version rather than a
+silent rebuild - electron-builder bundles the Electron runtime into both the portable and the
+installer, so the binary a user runs is not the one v4.4.0 produced.
+
+What the runtime gained across 44.1.0, 44.2.0 and 44.3.0:
+
+- **Chromium 152.0.7977.65 to 152.0.7977.78, Node.js 24.19.0 to 24.20.0**, plus backported fixes from
+  upstream Chromium, V8, ANGLE and Skia. This is the browser engine the cockpit renders in and the
+  Node the main process runs on, so it is the part of the bump that carries the most weight.
+- **An ASAR integrity violation now exits with code 1 instead of an access violation on Windows**
+  (electron#53455). GreyIQ ships asar-packed, so this is the tamper-detection path failing as
+  designed rather than crashing ambiguously.
+- **No main-process crash after a large volume of renderer IPC** (electron#53417), and none when a
+  file dialog is opened on a window that is closing at the same time (electron#53583). Both are
+  reachable from ordinary cockpit use.
+
+Most of the renderer hardening in 44.3.0 does not change GreyIQ's posture, and this entry does not
+claim it: the window runs `contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`,
+`webSecurity: true` (`electron/main.cjs:519`) and enables no `<webview>`, so the `<webview>` popup
+and `nodeIntegrationInWorker` subframe fixes have no surface here. The AppX/MSIX WebGPU/SwiftShader
+fix in 44.1.0 does not apply either - GreyIQ ships portable and NSIS, not MSIX.
+
+`npm audit` reports six advisories (one critical, five high). None reach the artifact: the production
+dependency tree is empty, every advisory is transitive under `app-builder-lib` or `@electron/get`,
+and `build.files` packages only `electron/**/*` and `package.json`. That is build-machine exposure,
+not shipped exposure, and it is recorded here so the distinction is on the record rather than
+assumed.
 
 ## v4.4.0 - hunting what an unauthenticated attacker actually gets
 
@@ -337,12 +547,17 @@ the filtering being extended to it.
 
 ### Download leads (.md)
 
-The Hunt cockpit gains a **Download leads (.md)** button beside *Copy report*. It renders the
-finished hunt's whole investigation queue as ONE Markdown brief - every lead with its evidence
-state, the contradictions against it, and the exact artifact that would confirm it - ready to hand
-to an analyst or paste to a model. It is the in-app face of `gn leads --brief`, built through the
-same redaction-safe bridge, and the new `/api/bounty/leads` route resolves the sidecar from the
-**cached run id only**, so no client-supplied path is ever read.
+A **Download leads (.md)** button renders the finished hunt's whole investigation queue as ONE
+Markdown brief - every lead with its evidence state, the contradictions against it, and the exact
+artifact that would confirm it - ready to hand to an analyst or paste to a model. It is the in-app
+face of `gn leads --brief`, built through the same redaction-safe bridge, and the new
+`/api/bounty/leads` route resolves the sidecar from the **cached run id only**, so no
+client-supplied path is ever read.
+
+> **Correction (v4.6.0):** this entry originally said the button was in the Hunt cockpit beside
+> *Copy report*. It was not — it shipped in the AI Studio surface, which is `display: none` in the
+> cockpit's default hunt mode, so a cockpit-only operator could not reach it. v4.6.0 puts the queue
+> in the cockpit for real, as a rendered view rather than only a download.
 
 ### Review fixes
 

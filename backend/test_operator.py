@@ -80,6 +80,38 @@ class PortfolioTests(unittest.TestCase):
         self.assertFalse(p2["auto_submit"])
         self.assertFalse(portfolio.get_program(self.rt, p2["id"])["auto_submit"])
 
+    def test_intake_source_is_bounded_provenance_not_authorization(self) -> None:
+        source = {
+            "platform": "Bugcrowd\r\n", "provider_id": "p" * 250,
+            "source_url": "https://bugcrowd.com/example", "fetched_at": "2026-10-06T12:00:00Z",
+            "status": "open\r\nfor testing", "scope_complete": True,
+            "warnings": ["w" * 300] * 12, "untrusted_extra": {"secret": "discard"},
+        }
+        program = portfolio.upsert_program(self.rt, {
+            "name": "Imported", "active": True, "intake_source": source,
+        })
+        intake = program["intake_source"]
+        self.assertEqual(intake["platform"], "bugcrowd")
+        self.assertEqual(len(intake["provider_id"]), 200)
+        self.assertEqual(intake["source_url"], "https://bugcrowd.com/example")
+        self.assertEqual(intake["fetched_at"], "2026-10-06T12:00:00+00:00")
+        self.assertEqual(intake["status"], "openfor testing")
+        self.assertTrue(intake["scope_complete"])
+        self.assertEqual(len(intake["warnings"]), 8)
+        self.assertTrue(all(len(w) == 240 for w in intake["warnings"]))
+        self.assertNotIn("untrusted_extra", intake)
+        self.assertFalse(program["active"])
+        self.assertEqual(program["scope_text"], "")
+        self.assertEqual(portfolio.get_program(self.rt, program["id"])["intake_source"], intake)
+
+        unsafe = portfolio._clean_intake_source({
+            "source_url": "https://user:token@bugcrowd.com/example",
+            "fetched_at": "2026-10-06", "scope_complete": "true",
+        })
+        self.assertEqual(unsafe["source_url"], "")
+        self.assertEqual(unsafe["fetched_at"], "")
+        self.assertFalse(unsafe["scope_complete"])
+
 
 def _finding(ref, cls, rule, loc, sev="high", proof="confirmed", cvss=8.0):
     return {"ref": ref, "class_id": cls, "rule_id": rule, "location": loc, "severity": sev,

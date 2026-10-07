@@ -159,6 +159,117 @@ class CoolingTests(unittest.TestCase):
             self.assertEqual(nk.cooled_pairs(tmp, program=None, target=_TARGET), set())
 
 
+class ParamLevelTests(unittest.TestCase):
+    """Parameter-level negatives come ONLY from a prover that reports what it actually sent.
+
+    The main in-pass prover computes its candidate list locally, returns early on the first hit,
+    and skips a parameter whose fetch raised — so re-deriving that list yields an upper bound on
+    what was tried, not what was tried. The out-of-band provers are different: each parameter
+    carried a unique collaborator token and the poll window closed with no callback, which is a
+    real negative observation. Only that reaches this store."""
+
+    EP = "https://app.example.com/fetch"
+
+    def test_a_probed_parameter_cools_after_repetition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for _ in range(2):
+                nk.record_param_misses(tmp, program=None, target=_TARGET, endpoint=self.EP,
+                                       class_id="ssrf", params=["url", "next"])
+            cooled = nk.cooled_params(tmp, program=None, target=_TARGET,
+                                      endpoint=self.EP, class_id="ssrf")
+            self.assertEqual(cooled, {"url", "next"})
+
+    def test_one_probe_is_below_the_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            nk.record_param_misses(tmp, program=None, target=_TARGET, endpoint=self.EP,
+                                   class_id="ssrf", params=["url"])
+            self.assertEqual(nk.cooled_params(tmp, program=None, target=_TARGET,
+                                              endpoint=self.EP, class_id="ssrf"), set())
+
+    def test_params_are_scoped_to_their_class_and_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for _ in range(2):
+                nk.record_param_misses(tmp, program=None, target=_TARGET, endpoint=self.EP,
+                                       class_id="ssrf", params=["url"])
+            # Same parameter name, different class -> not cooled.
+            self.assertEqual(nk.cooled_params(tmp, program=None, target=_TARGET,
+                                              endpoint=self.EP, class_id="rce"), set())
+            # Same parameter and class, different endpoint -> not cooled.
+            self.assertEqual(nk.cooled_params(tmp, program=None, target=_TARGET,
+                                              endpoint="https://app.example.com/other",
+                                              class_id="ssrf"), set())
+
+    def test_param_rows_never_leak_into_the_endpoint_cooled_set(self) -> None:
+        """A parameter row carries a third key segment. Returned from cooled_pairs it could never
+        match a probe_priority pair, but it would inflate every count built from that set."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for _ in range(2):
+                nk.record_param_misses(tmp, program=None, target=_TARGET, endpoint=self.EP,
+                                       class_id="ssrf", params=["url", "next", "dest"])
+            self.assertEqual(nk.cooled_pairs(tmp, program=None, target=_TARGET), set())
+
+    def test_a_confirming_parameter_clears_its_cooled_state(self) -> None:
+        """Without this the parameter half had the immunity hole the endpoint half was fixed for
+        twice: a sink could carry two earlier misses, then prove a bug, and still be ordered behind
+        untried names for the whole TTL."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for _ in range(2):
+                nk.record_param_misses(tmp, program=None, target=_TARGET, endpoint=self.EP,
+                                       class_id="ssrf", params=["url"])
+            self.assertEqual(nk.cooled_params(tmp, program=None, target=_TARGET,
+                                              endpoint=self.EP, class_id="ssrf"), {"url"})
+            nk.record_param_confirmation(tmp, program=None, target=_TARGET, endpoint=self.EP,
+                                         class_id="ssrf", param="url")
+            self.assertEqual(nk.cooled_params(tmp, program=None, target=_TARGET,
+                                              endpoint=self.EP, class_id="ssrf"), set())
+            # And it stays immune through later inconclusive runs.
+            for _ in range(3):
+                nk.record_param_misses(tmp, program=None, target=_TARGET, endpoint=self.EP,
+                                       class_id="ssrf", params=["url"])
+            self.assertEqual(nk.cooled_params(tmp, program=None, target=_TARGET,
+                                              endpoint=self.EP, class_id="ssrf"), set())
+
+    def test_deprioritise_reaches_url_local_params_before_the_cap(self) -> None:
+        """The caller cannot get this right by reordering its own extra list: names parsed from the
+        target URL are merged AHEAD of it, so on an already-parametered target two cooled URL-local
+        names consume the entire per-check cap and a fresh name is never probed."""
+        from bughunter.active_verify_service import _candidate_params
+
+        url = "https://app.example.com/?old1=x&old2=x"
+        self.assertEqual(_candidate_params(url, ["fresh"], ("cmd",), 2), ["old1", "old2"])
+        capped = _candidate_params(url, ["fresh"], ("cmd",), 2, deprioritise={"old1", "old2"})
+        self.assertEqual(capped[0], "fresh")
+        # Reorder, never remove — the full set survives when the cap allows it.
+        full = _candidate_params(url, ["fresh"], ("cmd",), 9, deprioritise={"old1", "old2"})
+        self.assertEqual(full, ["fresh", "old1", "old2"])
+
+    def test_prioritise_untried_reorders_and_never_drops(self) -> None:
+        """Dropping would risk blinding a re-scan; the provers cap their walk, so order alone
+        decides what gets a token."""
+        params = ["url", "image", "next", "callback"]
+        out = nk.prioritise_untried(params, {"url", "next"})
+        self.assertEqual(sorted(out), sorted(params), "a parameter was dropped")
+        self.assertEqual(out, ["image", "callback", "url", "next"])
+        self.assertEqual(nk.prioritise_untried(params, set()), params)
+
+    def test_empty_and_disabled_paths_are_noops(self) -> None:
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(nk.record_param_misses(tmp, program=None, target=_TARGET,
+                                                    endpoint=self.EP, class_id="ssrf", params=[]), 0)
+            self.assertEqual(nk.record_param_misses(None, program=None, target=_TARGET,
+                                                    endpoint=self.EP, class_id="ssrf", params=["url"]), 0)
+            os.environ[nk._ENV_DISABLE] = "1"
+            try:
+                self.assertEqual(nk.record_param_misses(tmp, program=None, target=_TARGET,
+                                                        endpoint=self.EP, class_id="ssrf",
+                                                        params=["url"]), 0)
+                self.assertEqual(nk.cooled_params(tmp, program=None, target=_TARGET,
+                                                  endpoint=self.EP, class_id="ssrf"), set())
+            finally:
+                del os.environ[nk._ENV_DISABLE]
+
+
 class SuppressionTests(unittest.TestCase):
     def test_cold_classes_are_downranked_within_an_endpoint(self) -> None:
         cooled = {nk._pair_id("app.example.com/login", "sqli")}
@@ -289,6 +400,45 @@ class EndToEndTests(unittest.TestCase):
             self.assertNotIn(nk._pair_id("app.example.com/pay", "idor"), cooled)
             out, _ = nk.apply_suppression(_plan(probe), cooled)
             self.assertEqual(out["probe_priority"][0]["classes"], ["idor", "xss"])  # idor stays first, endpoint kept
+
+
+class VocabularyFoldTests(unittest.TestCase):
+    """A plan speaks CHECK TAGS; an outcome speaks the IMPACT the finding carries. Five checks
+    report an impact under a different name than their tag, so without a fold the two halves of a
+    pair id could never meet — and the store cooled the exact checks that had proven bugs."""
+
+    # (check tag the plan carries, impact class the finding reports)
+    DIVERGENT = (("crlf", "redirect"), ("host-header", "redirect"),
+                 ("clickjacking", "headers"), ("sensitive", "disclosure"), ("debug", "rce"))
+
+    def test_a_confirmed_impact_immunises_the_tag_that_produced_it(self) -> None:
+        for tag, impact in self.DIVERGENT:
+            with self.subTest(tag=tag):
+                with tempfile.TemporaryDirectory() as tmp:
+                    probe = ("https://app.example.com/download", [tag])
+                    # Two clean runs that CONFIRM the bug. The check reports its impact class.
+                    for _ in range(2):
+                        nk.record_hunt(tmp, program=None, target=_TARGET, plan=_plan(probe),
+                                       complete=True,
+                                       outcomes=[_outcome("https://app.example.com/download",
+                                                          impact, "confirmed")])
+                    cooled = nk.cooled_pairs(tmp, program=None, target=_TARGET)
+                    self.assertNotIn(
+                        nk._pair_id("app.example.com/download", tag), cooled,
+                        f"{tag!r} confirmed as {impact!r} twice and was still cooled")
+
+    def test_an_unrelated_class_on_the_same_route_still_cools(self) -> None:
+        """The fold must not become blanket route-level immunity — a class that really is inert
+        on a productive route is still what the capped probe budget should skip."""
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = ("https://app.example.com/download", ["crlf", "xss"])
+            for _ in range(2):
+                nk.record_hunt(tmp, program=None, target=_TARGET, plan=_plan(probe), complete=True,
+                               outcomes=[_outcome("https://app.example.com/download",
+                                                  "redirect", "confirmed")])
+            cooled = nk.cooled_pairs(tmp, program=None, target=_TARGET)
+            self.assertIn(nk._pair_id("app.example.com/download", "xss"), cooled)
+            self.assertNotIn(nk._pair_id("app.example.com/download", "crlf"), cooled)
 
 
 if __name__ == "__main__":

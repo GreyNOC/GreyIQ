@@ -103,6 +103,12 @@ def _pair_id(ep_key: str, class_id: str) -> str:
     return f"{ep_key}{_KEY_SEP}{str(class_id or '').strip().lower()}"
 
 
+def _param_pair_id(ep_key: str, class_id: str, param: str) -> str:
+    """A pair id carrying a PARAMETER. Same store, one more field — a param row can never collide
+    with an endpoint row because an endpoint row has no third segment."""
+    return f"{_pair_id(ep_key, class_id)}{_KEY_SEP}{str(param or '').strip().lower()}"
+
+
 def _split_pair(pair_id: str) -> tuple[str, str]:
     ep, _, cls = str(pair_id or "").partition(_KEY_SEP)
     return ep, cls
@@ -150,7 +156,24 @@ def _parse_ts(value: Any) -> datetime | None:
 
 def _confirmed_pairs(outcomes: Any) -> set[str]:
     """Pair ids that reached a confirmed proof status this hunt — from the SAME outcome rows the hunt
-    trace records (``proof_status == 'confirmed'``)."""
+    trace records (``proof_status == 'confirmed'``).
+
+    An outcome's ``class`` is the IMPACT the finding carries, while a planned pair's class is the
+    prover's CHECK TAG, and for five checks those differ (see
+    ``prover_classes.IMPACT_TO_CHECK_TAGS``). Immunity is therefore recorded under every tag that
+    could have produced the impact, not just the impact's own name. Without the fold the two halves
+    could never meet for those checks: a confirmed CRLF injection banked immunity under ``redirect``
+    while the plan accrued misses under ``crlf``, and after two clean runs the engine cooled the one
+    check that had proven a submittable bug on that route — the exact opposite of this module's
+    promise that anything ever confirmed is immune.
+
+    Folding widens immunity slightly (a confirmed open redirect also immunises ``crlf`` and
+    ``host-header`` on that route). That is the safe direction, and the direction this module already
+    chooses elsewhere: a false re-enable costs a little budget, a false suppression silently removes
+    coverage.
+    """
+    from bughunter.prover_classes import check_tags_for_impact
+
     confirmed: set[str] = set()
     for row in outcomes if isinstance(outcomes, list) else []:
         if not isinstance(row, dict):
@@ -159,8 +182,11 @@ def _confirmed_pairs(outcomes: Any) -> set[str]:
             continue
         ep = endpoint_key(row.get("endpoint"))
         cls = str(row.get("class") or "").strip().lower()
-        if ep and cls:
-            confirmed.add(_pair_id(ep, cls))
+        if not ep or not cls:
+            continue
+        confirmed.add(_pair_id(ep, cls))
+        for tag in check_tags_for_impact(cls):
+            confirmed.add(_pair_id(ep, tag))
     return confirmed
 
 
@@ -242,6 +268,138 @@ def record_hunt(runtime_dir: str | Path | None, *, program: str | None, target: 
         return False
 
 
+def record_param_misses(runtime_dir: str | Path | None, *, program: str | None, target: str,
+                        endpoint: str, class_id: str, params: Any, now: str | None = None) -> int:
+    """Record that these PARAMETERS were probed on this endpoint for this class and produced nothing.
+
+    Unlike the endpoint-level half, this is NOT derived from the plan. It is only ever called with
+    the parameter list a prover reports having ACTUALLY SENT a probe through — today that is the
+    out-of-band provers' ``params_tried`` on a ``no-callback`` result, where each parameter carried a
+    unique collaborator token and no callback arrived within the poll window. That is a real negative
+    observation: the request went out and the thing did not happen.
+
+    The main in-pass prover has no equivalent signal — it computes its candidate list locally, walks
+    it, and discards it, and it returns early on the first hit and skips a parameter whose fetch
+    raised. Re-deriving that list would produce an UPPER BOUND on what was tried, not what was tried,
+    so no parameter from it is recorded here. Precision this store does not have is worse than none:
+    it would cool parameters nothing ever probed.
+
+    Returns how many parameter rows were written. Fail-closed like the rest of the module.
+    """
+    if runtime_dir is None or not enabled():
+        return 0
+    try:
+        ep = endpoint_key(endpoint)
+        cls = str(class_id or "").strip().lower()
+        names = [str(p).strip().lower() for p in (params or []) if str(p or "").strip()]
+        if not ep or not cls or not names:
+            return 0
+        stamp = _now_iso(now)
+        key = program_key(program, target)
+        written = 0
+        with _LOCK:
+            data = _load(runtime_dir)
+            prog = data.setdefault("programs", {}).setdefault(key, {"pairs": {}, "updated_at": None})
+            pairs = prog.setdefault("pairs", {})
+            for name in dict.fromkeys(names):  # order-preserving dedupe
+                pid = _param_pair_id(ep, cls, name)
+                row = pairs.setdefault(pid, {"miss": 0, "last_ts": stamp, "confirmed": False})
+                if row.get("confirmed"):
+                    continue  # a parameter that has ever produced a callback is never cooled
+                row["miss"] = int(row.get("miss") or 0) + 1
+                row["last_ts"] = stamp
+                written += 1
+            _evict_if_full(pairs)
+            prog["updated_at"] = stamp
+            data["updated_at"] = stamp
+            _save(runtime_dir, data)
+        return written
+    except Exception:  # noqa: BLE001 - bookkeeping must never break a hunt
+        return 0
+
+
+def record_param_confirmation(runtime_dir: str | Path | None, *, program: str | None, target: str,
+                              endpoint: str, class_id: str, param: str,
+                              now: str | None = None) -> bool:
+    """Immunize ONE parameter that produced a real callback: clear its misses, mark it confirmed.
+
+    Without this the parameter half had the immunity hole the endpoint half was fixed for twice: a
+    parameter could accumulate two misses, then confirm, and still be read back as cooled for the
+    whole TTL — so the next capped run would order the sink that just proved a bug behind untried
+    names. Nothing else writes ``confirmed`` for a parameter row, so a confirmation has to be
+    recorded where it happens."""
+    if runtime_dir is None or not enabled():
+        return False
+    try:
+        ep = endpoint_key(endpoint)
+        cls = str(class_id or "").strip().lower()
+        name = str(param or "").strip().lower()
+        if not ep or not cls or not name:
+            return False
+        stamp = _now_iso(now)
+        with _LOCK:
+            data = _load(runtime_dir)
+            prog = data.setdefault("programs", {}).setdefault(
+                program_key(program, target), {"pairs": {}, "updated_at": None})
+            row = prog.setdefault("pairs", {}).setdefault(
+                _param_pair_id(ep, cls, name), {"miss": 0, "last_ts": stamp, "confirmed": False})
+            row["confirmed"] = True
+            row["miss"] = 0
+            row["last_ts"] = stamp
+            prog["updated_at"] = stamp
+            data["updated_at"] = stamp
+            _save(runtime_dir, data)
+        return True
+    except Exception:  # noqa: BLE001 - bookkeeping must never break a hunt
+        return False
+
+
+def cooled_params(runtime_dir: str | Path | None, *, program: str | None, target: str,
+                  endpoint: str, class_id: str, min_misses: int = MIN_MISSES,
+                  ttl_days: int = TTL_DAYS, now: str | None = None) -> set[str]:
+    """Parameter names probed on this endpoint/class ``>= min_misses`` times, never confirming,
+    within the TTL. Empty when the layer is off or has no memory."""
+    if runtime_dir is None or not enabled():
+        return set()
+    prog = _load(runtime_dir).get("programs", {}).get(program_key(program, target))
+    if not isinstance(prog, dict):
+        return set()
+    ep = endpoint_key(endpoint)
+    cls = str(class_id or "").strip().lower()
+    if not ep or not cls:
+        return set()
+    prefix = f"{_pair_id(ep, cls)}{_KEY_SEP}"
+    cutoff = (_parse_ts(_now_iso(now)) or datetime.now(UTC)) - timedelta(days=max(0, ttl_days))
+    out: set[str] = set()
+    for pid, row in (prog.get("pairs") or {}).items():
+        if not isinstance(row, dict) or row.get("confirmed") or not str(pid).startswith(prefix):
+            continue
+        if int(row.get("miss") or 0) < max(1, min_misses):
+            continue
+        ts = _parse_ts(row.get("last_ts"))
+        if ts is None or ts < cutoff:
+            continue
+        out.add(str(pid)[len(prefix):])
+    return out
+
+
+def prioritise_untried(params: Any, cooled: set[str]) -> list[str]:
+    """Reorder ``params`` so the ones not already probed-without-result come FIRST.
+
+    REORDER, never remove. The provers walk their candidate list under a hard per-check cap, so the
+    order decides what actually gets probed — putting untried names first spends the budget on new
+    ground without reducing the set, which keeps this a pure recall change. Dropping them would risk
+    blinding a re-scan: a parameter can start being interesting after a deploy, and the TTL alone
+    should decide when to look again."""
+    names = [str(p) for p in (params or []) if str(p or "").strip()]
+    if not cooled:
+        return names
+    low = {c.strip().lower() for c in cooled}
+    fresh = [p for p in names if p.strip().lower() not in low]
+    stale = [p for p in names if p.strip().lower() in low]
+    return fresh + stale
+
+
 def _evict_if_full(pairs: dict[str, Any]) -> None:
     """Keep the per-program store bounded by dropping the least-recently-touched pairs."""
     if len(pairs) <= _MAX_PAIRS_PER_PROGRAM:
@@ -266,6 +424,11 @@ def cooled_pairs(runtime_dir: str | Path | None, *, program: str | None, target:
     cooled: set[str] = set()
     for pid, row in (prog.get("pairs") or {}).items():
         if not isinstance(row, dict) or row.get("confirmed"):
+            continue
+        # Endpoint-level rows only. A parameter row carries a third segment and belongs to
+        # cooled_params(); returning it here would inflate this set with ids that can never match
+        # a probe_priority pair, and mis-count every summary built from it.
+        if str(pid).count(_KEY_SEP) != 1:
             continue
         if int(row.get("miss") or 0) < max(1, min_misses):
             continue

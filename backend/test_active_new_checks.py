@@ -594,6 +594,92 @@ class ConcreteReproAllClassesTests(unittest.TestCase):
         curl = next(s for s in steps if "curl -i" in s)
         self.assertNotIn("<forged>", curl)
 
+    def test_each_jwt_class_gets_its_own_real_mechanism_not_the_weak_secret_recipe(self) -> None:
+        # Only active.jwt-weak-secret recovers a secret. The other three prove a DIFFERENT acceptance
+        # flaw, and used to ship the weak-secret HMAC script signed with the literal string
+        # "<recovered-secret>" plus a step telling the triager to use a secret that does not exist —
+        # the wrong technique, not runnable, and it makes a real Critical look false.
+        cases = {
+            "active.jwt-alg-none": ("alg: none", "unsigned token accepted as authenticated"),
+            "active.jwt-alg-confusion": ("PUBLIC key", "RS256->HS256 algorithm-confusion forgery accepted"),
+            "active.jwt-jwk-embedded": ("`jwk` header", "embedded jwk accepted"),
+        }
+        for rid, (needle, matched) in cases.items():
+            with self.subTest(rule=rid):
+                steps, poc = self._repro("jwt", rid, "GET https://app.example.com/account", matched,
+                                         request_header="Authorization: <forged token>")
+                joined = " ".join(steps)
+                self.assertIn(needle, joined, "the class's real mechanism is not described")
+                self.assertNotIn("recovered-secret", joined + poc)  # no phantom secret, anywhere
+                self.assertNotIn("recovered-secret", poc)
+                self.assertEqual(poc, "", "no secret was recovered, so no forging script may be emitted")
+
+    def test_a_placeholder_header_finding_names_the_bare_request_as_the_control(self) -> None:
+        # The bare curl cannot reproduce a forged-token finding, so calling it "the exact request
+        # GreyIQ used to confirm this" made the report disprove itself. It must be labelled the
+        # negative control, and the confirming request must show the header is required.
+        steps, _poc = self._repro("jwt", "active.jwt-alg-none", "GET https://app.example.com/account",
+                                  "unsigned token accepted", request_header="Authorization: <forged token>")
+        joined = " ".join(steps)
+        self.assertIn("Negative control", joined)
+        self.assertIn("Authorization", steps[0])
+        self.assertNotIn("the exact request GreyIQ used to confirm this", joined)
+        # Nothing pasteable may contain a placeholder token.
+        for step in steps:
+            if "curl -i" in step:
+                self.assertNotIn("<forged", step)
+
+    def test_a_literal_header_finding_keeps_the_plain_exact_request_step(self) -> None:
+        # host-header/Origin findings capture a REAL header, so their curl reproduces as-is and the
+        # original wording stays correct — the rewrite must not leak into that path.
+        steps, _poc = self._repro("redirect", "active.host-header-injection", "GET https://app.example.com/",
+                                  "marker in Location", request_header="X-Forwarded-Host: greyiq-marker.example")
+        self.assertIn("the exact request GreyIQ used to confirm this", " ".join(steps))
+        self.assertNotIn("Negative control", " ".join(steps))
+
+    def test_firebase_storage_exposure_reproduces_over_https_not_gs(self) -> None:
+        # The probe's `endpoint` for Cloud Storage is the canonical bucket NAME (gs://…), which no HTTP
+        # client can fetch — it used to become the report's step-1 curl AND the replay.sh/HAR line, so a
+        # confirmed High shipped `curl -sSiL gs://…`, which errors on any machine. The probe already
+        # built the working HTTPS listing command in `repro`; that is what must be reproduced.
+        from bughunter.bounty import _curl_from_evidence, _firebase_exposure_finding
+
+        f = _firebase_exposure_finding({
+            "service": "Firebase Cloud Storage", "endpoint": "gs://acme-prod.appspot.com",
+            "severity": "high", "detail": "bucket lists objects unauthenticated", "evidence": '{"items":[]}',
+            "repro": "curl -s 'https://firebasestorage.googleapis.com/v0/b/acme-prod.appspot.com/o'",
+        }, "acme-prod")
+        self.assertTrue(f["proof_evidence"]["request_line"].startswith("GET https://"))
+        self.assertNotIn("gs://", f["proof_evidence"]["request_line"])
+        self.assertNotIn("gs://", f["location"])
+        curl, _t = _curl_from_evidence(f["proof_evidence"], f["location"])
+        self.assertTrue(curl, "a runnable curl must be reconstructable")
+        self.assertNotIn("gs://", curl)
+        # The bucket name is still NAMED — it is the affected asset, just not the request target.
+        self.assertIn("gs://acme-prod.appspot.com", f["_active_proof"]["affected_asset"])
+
+    def test_firebase_rtdb_exposure_endpoint_is_unchanged(self) -> None:
+        from bughunter.bounty import _firebase_exposure_finding
+
+        f = _firebase_exposure_finding({
+            "service": "Firebase Realtime Database", "endpoint": "https://acme.firebaseio.com/.json",
+            "severity": "high", "detail": "db readable", "evidence": "{}",
+            "repro": "curl -s 'https://acme.firebaseio.com/.json?shallow=true'",
+        }, "acme")
+        self.assertEqual(f["location"], "https://acme.firebaseio.com/.json")
+        self.assertEqual(f["proof_evidence"]["request_line"], "GET https://acme.firebaseio.com/.json")
+
+    def test_csrf_poc_is_an_explicit_template_that_does_not_auto_submit(self) -> None:
+        # _check_csrf captures neither the form's action nor its field names, so a finished-looking
+        # auto-submitting PoC against the PAGE url with an invented field changes nothing on a real
+        # form — a filled Proof of concept section that silently does not work.
+        _steps, poc = self._repro("csrf", "active.csrf-missing-token", "GET https://app.example.com/settings",
+                                  "POST form with no anti-CSRF token")
+        self.assertIn("REPLACE_WITH_REAL_FIELD_NAME", poc)
+        self.assertNotIn("example_param", poc)
+        self.assertNotIn("document.forms[0].submit()", poc)     # no auto-submit
+        self.assertIn("Template, not a finished PoC", poc)
+
     def test_host_header_and_crlf_get_no_misleading_browser_poc(self) -> None:
         # Class "redirect" covers open-redirect (browser PoC) but ALSO host-header/CRLF, whose
         # crafted part is a header the browser can't set — those must not emit an open-URL PoC.

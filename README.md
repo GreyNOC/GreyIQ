@@ -125,6 +125,16 @@ before switching the active brain. A model that only supports chat stays
 available for manual selection; the previous brain remains active. Private,
 gated, and non-GGUF repositories need their own access or conversion steps.
 
+The dedicated **Import from Hugging Face** control also accepts a GGUF model
+page URL or `hf.co/owner/model-GGUF:Q4_K_M` reference. Choose **Import and select**
+to download through Ollama and select it for chat and Agent mode. Use **Test**
+to confirm it responds. The import control requires a loopback Ollama server
+URL such as `http://127.0.0.1:11434/v1`; inference then runs locally. Review
+each model's license and card before use. Agent mode requires a model that can
+follow tool calls. See the [Hugging Face Ollama guide](https://huggingface.co/docs/hub/main/ollama).
+If Ollama reports a blocked Hugging Face download redirect, update Ollama to
+0.34.3 or newer; 0.34.2 has a [known redirect bug](https://github.com/ollama/ollama/issues/18526).
+
 The brain answers chat, drives Agent mode, and writes the analysis in BugHunter reports.
 For security and root-cause work, Agent mode can call a shared evidence-grounded
 investigator that scans code read-only, ranks hypotheses, names the proof still needed,
@@ -142,7 +152,10 @@ gets it on every run), a **Workflow** tab that lays each run out as
 **Plan → Change → Verify → Explain**, plus a file tree, a read-only preview with line
 numbers + light syntax highlighting, a Changes/diff tab, Agent Steps, and a Verify
 panel. **Undo last agent run** rolls the workspace back to its exact state before the
-run. Drag the divider to resize, or slide it to the top to
+run, and each card in the Changes tab can **Revert** just that one file. Neither will
+overwrite a file you have edited since the run — it is reported and left alone, because
+an undo that destroys work the agent never touched is worse than no undo.
+Drag the divider to resize, or slide it to the top to
 **dock** the workbench (chat moves to a 1/3 side panel). A light/dark theme toggle is in
 the header.
 
@@ -171,7 +184,8 @@ as commands to execute.
 
 See [docs/USER_GUIDE.md](docs/USER_GUIDE.md) for the full Hunt-cockpit walkthrough —
 Program setup (including starting an inactive draft from only a public forge repository link,
-or pulling real scope from HackerOne's API or a CSV/paste import),
+or browsing visible programs through HackerOne, YesWeHack, Bugcrowd, and Intigriti APIs,
+previewing their scope and rules, or importing a CSV/paste table),
 opt-in shallow cloning/adversarial scanning of program-provided public source repositories,
 per-program SSRF/OOB setup, running a hunt, and reports & submission. The cockpit also opens
 a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the top bar).
@@ -186,10 +200,12 @@ a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the
   cracked weak HMAC secret and a self-signed `jwk` embedded key against the token the site hands an
   ANONYMOUS visitor (no session needed), and the collaborator additionally proves `jku`/`x5u`
   key-source injection — the verifier fetching a signing key the token itself named.
-- **Download leads (.md)** — after a hunt finishes, the button beside *Copy report* in the Hunt
-  cockpit downloads the whole investigation queue as one Markdown brief: every lead with its
-  evidence state, the contradictions against it, and the exact artifact that would confirm it.
-  That file is what you hand to an analyst (or paste to Claude) to work the leads.
+- **Leads** — after a hunt finishes, the **Leads** button in the Hunt cockpit's export row renders
+  the whole investigation queue in the app: every lead with its evidence state, the exact artifact
+  that would confirm it, the gaps still open, and anything the engine says contradicts it. The same
+  panel downloads it as one Markdown brief — that file is what you hand to an analyst (or paste to
+  Claude) to work the leads. (A *Download leads (.md)* button also exists in the AI Studio surface;
+  the cockpit is where a hunt actually runs, which is why the queue is rendered there.)
 - **Investigate leads with Claude**: `gn leads <bounty-*.json | engagement-folder>` exports a
   finished hunt's ranked investigation queue — the cortex's hypotheses, ordered attack chains,
   contradictions, and the exact proof obligation for each lead — as a stable, **redaction-safe**
@@ -284,7 +300,13 @@ and removes it after the scan. Web/live scans refuse private/loopback hosts unle
 `GREYIQ_SCAN_ALLOW_PRIVATE_URLS=1`.
 
 Fixed third-party egress is narrow and documented. HackerOne import/submission uses
-`api.hackerone.com` only on its corresponding operator action. The optional **Enrich from
+`api.hackerone.com` only on its corresponding operator action. YesWeHack program search,
+scope import and sign-in use `api.yeswehack.com` the same way — read-only apart from the
+sign-in exchange, on an explicit click only, host-pinned, and with redirects refused so a
+credential can never follow a hop off that host. Bugcrowd and Intigriti program intake
+uses `api.bugcrowd.com` and `api.intigriti.com`, respectively, for explicit read-only
+program discovery and previews. Imported programs are saved paused until you review
+the current policy and authorize testing. The optional **Enrich from
 forge (read-only)** action uses one unauthenticated GET per selected repository to
 `api.github.com` (GitHub) or `gitlab.com` (GitLab); it has a hard timeout, never runs in the
 background, and only returns homepage/web domains as **unticked** scope suggestions. Enrichment

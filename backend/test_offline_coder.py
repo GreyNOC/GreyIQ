@@ -653,6 +653,13 @@ class TemplateLibraryTests(unittest.TestCase):
         for line in recipe_lines:
             self.assertTrue(line.startswith("\t"), f"space-indented recipe line breaks make: {line!r}")
 
+    # The offline coder refuses to emit text it cannot verify, so this recipe is only reachable where
+    # a PowerShell parser exists. The guard asks offline_coder's OWN predicate rather than
+    # re-implementing `shutil.which`, so the skip can never disagree with what the coder will do.
+    # Without it `npm run check` -- the release gate -- is red on every Linux and macOS machine, for
+    # a correct refusal rather than a defect, which trains everyone to ignore a red gate.
+    @unittest.skipUnless(offline_coder._gate_available("powershell parser"),
+                         "no PowerShell parser on this machine, so the coder correctly refuses the recipe")
     def test_powershell_script_sets_strict_mode_before_any_work(self) -> None:
         with _available_parser_for_plan("PowerShell parser"):
             op = self._plan("write a powershell script to rotate logs")

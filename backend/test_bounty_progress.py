@@ -4,11 +4,14 @@ technical progress while a scan/campaign blocks on asyncio.to_thread."""
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -17,9 +20,20 @@ REPO_ROOT = BACKEND_DIR.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from bughunter import progress  # noqa: E402
+import greyiq_api as g  # noqa: E402
+from bughunter import progress, rate_limit  # noqa: E402
 from bughunter.bounty import run_bounty_hunt  # noqa: E402
 from bughunter.campaign import run_campaign  # noqa: E402
+
+
+def setUpModule() -> None:
+    """Start from a full per-host active-request budget — see rate_limit.reset_shared_governors().
+
+    This module is the suite's heaviest consumer of the process-wide 127.0.0.1 bucket (573 of its
+    700 tokens), so without a module-boundary reset it both inherits an already-drained bucket and
+    starves every active-layer module that runs after it.
+    """
+    rate_limit.reset_shared_governors()
 
 
 class ProgressBufferTests(unittest.TestCase):
@@ -477,3 +491,282 @@ class StructuredSnapshotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KillSwitchReachesADirectHuntTests(unittest.TestCase):
+    """Stop must halt a SINGLE hunt's probing, not just relabel the UI.
+
+    campaign.py polls progress.is_stopped between targets and between URLs, but a direct hunt only
+    ever received ``on_progress`` — a one-way message sink. So clicking Stop flipped the pill to
+    "Stopped" and disabled the button while the active fan-out, the re-plan wave and all four OOB
+    provers kept sending requests at a host the operator had just realised was out of scope. That is
+    the one control in an authorized-testing tool that has to work.
+
+    These tests assert the wiring rather than driving a live hunt: the predicate exists, every probe
+    launch site consults it, and a broken predicate cannot abort a legitimate run.
+    """
+
+    def test_the_hunt_body_accepts_and_consults_a_stop_predicate(self) -> None:
+        import inspect
+
+        from bughunter import bounty
+
+        signature = inspect.signature(bounty._run_bounty_hunt_body)
+        self.assertIn("should_stop", signature.parameters,
+                      "the hunt body cannot be told to stop")
+        source = inspect.getsource(bounty._run_bounty_hunt_body)
+        self.assertIn("def _stopped()", source)
+        # Every place that starts sending must check it: the per-target active fan-out, the re-plan
+        # wave, and each of the four OOB provers (which inject callback tokens and then poll).
+        self.assertGreaterEqual(source.count("_stopped()"), 6,
+                                "a probe launch site is not gated on the kill switch")
+
+    def test_a_raising_predicate_does_not_abort_the_hunt(self) -> None:
+        # A broken kill switch must fail OPEN — aborting a legitimate, authorized hunt because a
+        # status lookup raised would be its own bug.
+        import inspect
+
+        from bughunter import bounty
+
+        source = inspect.getsource(bounty._run_bounty_hunt_body)
+        start = source.index("def _stopped()")
+        # The helper's own body: from its def to the first line at the enclosing indent that follows it.
+        body = source[start:start + 700]
+        self.assertIn("except Exception", body,
+                      "_stopped() does not swallow a raising predicate, so a broken status lookup "
+                      "would abort an authorized hunt")
+        self.assertIn("return False", body)
+
+    def test_both_entry_points_pass_the_predicate(self) -> None:
+        api = (BACKEND_DIR / "greyiq_api.py").read_text(encoding="utf-8")
+        self.assertIn("should_stop=(lambda rid=run_id: bounty_progress.is_stopped(rid))", api,
+                      "the direct-hunt route does not pass the kill switch")
+        campaign_src = (BACKEND_DIR / "bughunter" / "campaign.py").read_text(encoding="utf-8")
+        self.assertIn("should_stop=(lambda rid=progress_run_id: progress.is_stopped(rid))", campaign_src,
+                      "a campaign's per-URL hunt does not pass the kill switch, so Stop waits out the URL")
+
+    def test_the_flag_itself_round_trips(self) -> None:
+        run_id = "killswitch-contract-test"
+        progress.start_run(run_id)
+        self.assertFalse(progress.is_stopped(run_id))
+        progress.request_stop(run_id)
+        self.assertTrue(progress.is_stopped(run_id))
+
+
+class StopFlagLifetimeTests(unittest.TestCase):
+    """The stop flag has to outlive its run's BUFFER, and still be bounded.
+
+    Buffer eviction is driven only by how many OTHER runs have since started — it says nothing about
+    whether this one is still probing someone's production host. The long campaign an operator just
+    cancelled is precisely the run most likely to still be going when eight newer ones begin, so
+    clearing its flag on eviction silently un-cancelled it: the loops in campaign.py/bounty.py poll
+    is_stopped and would have carried straight on with the pill still reading "Stopped".
+    """
+
+    def setUp(self) -> None:
+        # These assert on the FIFO's exact contents, so never inherit (or leave) other tests' flags.
+        self._clear_stop_state()
+        self.addCleanup(self._clear_stop_state)
+
+    @staticmethod
+    def _clear_stop_state() -> None:
+        with progress._lock:
+            progress._stopped.clear()
+            progress._stopped_order.clear()
+
+    def test_a_stop_request_survives_the_eviction_of_eight_newer_runs(self) -> None:
+        progress.start_run("long-campaign")
+        progress.request_stop("long-campaign")
+        for i in range(progress._MAX_RUNS):
+            progress.start_run(f"newer-{i}")
+        # The buffer is gone -- that half of eviction is intended and unchanged.
+        self.assertEqual(progress.tail("long-campaign"), {"events": [], "count": 0})
+        self.assertNotIn("long-campaign", progress._run_order)
+        # The kill switch is not.
+        self.assertTrue(progress.is_stopped("long-campaign"))
+
+    def test_start_run_on_the_same_id_still_clears_the_flag(self) -> None:
+        # The one event that genuinely means "this id is a new run" -- and the only place the flag
+        # may be dropped. A sticky flag here would pre-cancel a legitimate restart.
+        progress.request_stop("recycled")
+        self.assertTrue(progress.is_stopped("recycled"))
+        progress.start_run("recycled")
+        self.assertFalse(progress.is_stopped("recycled"))
+
+    def test_start_run_clears_the_flag_from_both_the_set_and_its_fifo(self) -> None:
+        # A discard that forgot the FIFO would leave a ghost entry, and the bound would then trim a
+        # LIVE stop request to make room for it: the same silent revocation, one step removed.
+        progress.request_stop("recycled-2")
+        progress.start_run("recycled-2")
+        self.assertNotIn("recycled-2", progress._stopped_order)
+        self.assertEqual(len(progress._stopped), len(progress._stopped_order))
+
+    def test_the_stop_flag_set_is_bounded(self) -> None:
+        # It no longer rides on eviction, so it needs its own bound or it grows for the life of the
+        # process. Oldest requests are the ones dropped.
+        original = progress._MAX_STOPPED
+        progress._MAX_STOPPED = 3
+        try:
+            for i in range(5):
+                progress.request_stop(f"bound-{i}")
+            self.assertEqual(progress._stopped_order, ["bound-2", "bound-3", "bound-4"])
+            self.assertEqual(progress._stopped, {"bound-2", "bound-3", "bound-4"})
+            self.assertFalse(progress.is_stopped("bound-0"))
+            self.assertTrue(progress.is_stopped("bound-4"))
+        finally:
+            progress._MAX_STOPPED = original
+
+    def test_repeating_a_stop_request_never_evicts_an_older_one(self) -> None:
+        # An operator leaning on Stop must not be able to push another run's live cancellation out
+        # of the bound.
+        original = progress._MAX_STOPPED
+        progress._MAX_STOPPED = 2
+        try:
+            progress.request_stop("first")
+            progress.request_stop("second")
+            for _ in range(10):
+                progress.request_stop("second")
+            self.assertEqual(progress._stopped_order, ["first", "second"])
+            self.assertTrue(progress.is_stopped("first"))
+        finally:
+            progress._MAX_STOPPED = original
+
+
+class ListRunsTests(unittest.TestCase):
+    """``list_runs`` is the discovery step that makes attaching to somebody else's run possible.
+
+    A run_id is minted by whichever client launched the run and written down nowhere a second
+    process can read it, so without this a shell can only watch runs it started itself.
+    """
+
+    def _row(self, run_id: str) -> dict:
+        row = next((r for r in progress.list_runs() if r["run_id"] == run_id), None)
+        self.assertIsNotNone(row, f"{run_id} is not listed")
+        return row  # type: ignore[return-value]
+
+    def test_lists_live_runs_newest_first_with_a_real_started_at(self) -> None:
+        progress.start_run("lr-old")
+        progress.start_run("lr-new")
+        ids = [r["run_id"] for r in progress.list_runs()]
+        self.assertLess(ids.index("lr-new"), ids.index("lr-old"))
+        # A parseable ISO stamp, not "" -- it is the only wall-clock fact about a run with no
+        # events yet, so an attaching client has nothing else to order or date by.
+        datetime.fromisoformat(self._row("lr-new")["started_at"])
+
+    def test_reports_the_stop_request_and_a_restart_clears_it(self) -> None:
+        progress.start_run("lr-stop")
+        self.assertFalse(self._row("lr-stop")["stopped"])
+        progress.request_stop("lr-stop")
+        self.assertTrue(self._row("lr-stop")["stopped"])
+        progress.start_run("lr-stop")
+        self.assertFalse(self._row("lr-stop")["stopped"])
+
+    def test_carries_the_first_work_unit_and_the_live_counts(self) -> None:
+        progress.start_run("lr-counts")
+        progress.set_targets("lr-counts", ["acme.com", "beta.example"])
+        progress.add_findings("lr-counts", "acme.com",
+                              [{"ref": "F1", "severity": "high", "proof_status": "missing"}])
+        progress.log("lr-counts", "recon")
+        row = self._row("lr-counts")
+        self.assertEqual(row["target"], "acme.com")
+        self.assertEqual((row["targets_total"], row["findings_total"], row["events"]), (2, 1, 1))
+
+    def test_the_label_is_empty_rather_than_guessed_before_units_are_registered(self) -> None:
+        # A direct hunt that has not reached set_targets has no work unit to name. Empty says so;
+        # inventing a label from the run id would read as a target.
+        progress.start_run("lr-bare")
+        self.assertEqual(self._row("lr-bare")["target"], "")
+
+    def test_an_evicted_run_disappears_from_the_listing(self) -> None:
+        original = progress._MAX_RUNS
+        progress._MAX_RUNS = 2
+        try:
+            progress.start_run("lr-e1")
+            progress.start_run("lr-e2")
+            progress.start_run("lr-e3")
+            self.assertEqual([r["run_id"] for r in progress.list_runs()], ["lr-e3", "lr-e2"])
+        finally:
+            progress._MAX_RUNS = original
+
+
+class _Capture:
+    """A minimal in-process ASGI client -- no socket, the real route_http entry point."""
+
+    def __init__(self, body: bytes = b"{}") -> None:
+        self.status: int | None = None
+        self.body = b""
+        self._request_body = body
+
+    async def send(self, message: dict) -> None:
+        if message["type"] == "http.response.start":
+            self.status = message["status"]
+        elif message["type"] == "http.response.body":
+            self.body += message.get("body", b"")
+
+    async def receive(self) -> dict:
+        return {"type": "http.request", "body": self._request_body, "more_body": False}
+
+
+def _post_runs(headers: dict | None = None, body: bytes = b"{}") -> _Capture:
+    hdrs = {"Host": "127.0.0.1:8791"}
+    hdrs.update(headers or {})
+    cap = _Capture(body)
+    scope = {
+        "method": "POST", "path": "/api/bounty/runs", "scheme": "http", "query_string": b"",
+        "headers": [(k.lower().encode("ascii"), v.encode("latin-1")) for k, v in hdrs.items()],
+    }
+    asyncio.run(g.route_http(scope, cap.receive, cap.send))
+    return cap
+
+
+class BountyRunsRouteTests(unittest.TestCase):
+    """POST /api/bounty/runs -- the HTTP face of list_runs, for `gn dash --attach`.
+
+    It is session-gated exactly like its neighbours: the run ids it hands out are the keys to
+    /api/bounty/progress and /api/bounty/campaign/stop, so an unauthenticated caller must not be
+    able to enumerate them.
+    """
+
+    def test_the_route_403s_without_the_session_token_header(self) -> None:
+        progress.start_run("route-secret-run")
+        cap = _post_runs()
+        self.assertEqual(cap.status, 403)
+        self.assertNotIn(b"route-secret-run", cap.body)  # and leaks no id on the way out
+
+    def test_a_wrong_token_is_refused_too(self) -> None:
+        cap = _post_runs(headers={"X-GreyIQ-Token": "not-the-token"})
+        self.assertEqual(cap.status, 403)
+
+    def test_with_the_token_it_returns_the_live_runs(self) -> None:
+        progress.start_run("route-run")
+        progress.set_targets("route-run", ["acme.com"])
+        cap = _post_runs(headers={"X-GreyIQ-Token": g.SESSION_TOKEN})
+        self.assertEqual(cap.status, 200)
+        payload = json.loads(cap.body)
+        self.assertTrue(payload["ok"])
+        row = next(r for r in payload["runs"] if r["run_id"] == "route-run")
+        self.assertEqual(set(row), {"run_id", "started_at", "stopped", "target",
+                                    "targets_total", "findings_total", "events"})
+        self.assertEqual((row["target"], row["stopped"]), ("acme.com", False))
+
+    def test_the_route_is_read_only_and_takes_no_steering_input(self) -> None:
+        # The request model is field-free, so a body cannot start, stop or name anything. Pinned
+        # because this route's whole job is handing out ids that unlock the other bounty routes.
+        self.assertEqual(set(g.BountyRunsRequest.model_fields), set())
+        cap = _post_runs(headers={"X-GreyIQ-Token": g.SESSION_TOKEN},
+                         body=b'{"run_id": "route-ghost", "stopped": true}')
+        self.assertEqual(cap.status, 200)
+        self.assertNotIn("route-ghost", [r["run_id"] for r in json.loads(cap.body)["runs"]])
+        self.assertFalse(progress.is_stopped("route-ghost"))
+
+    def test_the_accessor_does_not_shadow_the_cached_run_store(self) -> None:
+        # `runtime.bounty_runs` is the finished-run artifact cache several routes read. A METHOD of
+        # that name is silently shadowed by it -- the attribute simply wins -- so every call here
+        # 500s. That is how this was found; the name stays distinct.
+        self.assertIsInstance(g.runtime.bounty_runs, dict)
+        self.assertTrue(callable(g.runtime.list_bounty_runs))
+
+    def test_an_empty_body_is_accepted(self) -> None:
+        # The attaching client has nothing to say; it must not have to send "{}" to be understood.
+        cap = _post_runs(headers={"X-GreyIQ-Token": g.SESSION_TOKEN}, body=b"")
+        self.assertEqual(cap.status, 200)

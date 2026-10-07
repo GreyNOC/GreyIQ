@@ -1111,9 +1111,52 @@ label {
   word-break: break-all;
 }
 
-/* label rows use display:grid, which overrides the [hidden] attribute */
-.brain-form [data-brain-field][hidden] {
+.model-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0.3rem;
+}
+
+.model-actions .text-button {
+  width: auto;
+  padding: 0.35rem 0.55rem;
+  font-size: 0.7rem;
+}
+
+.hf-import {
+  display: grid;
+  gap: 0.5rem;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  padding: 0.7rem;
+  min-width: 0;
+}
+
+.hf-import[hidden] {
   display: none;
+}
+
+.hf-import h3,
+.hf-import p {
+  margin: 0;
+}
+
+.hf-import h3 {
+  font-size: 0.82rem;
+  color: var(--ink);
+}
+
+.hf-import input {
+  min-width: 0;
+}
+
+.hf-import #brainHfStatus {
+  overflow-wrap: anywhere;
+}
+
+/* Explicit component display rules must not override hidden form controls. */
+.brain-form [hidden] {
+  display: none !important;
 }
 
 .project-brief,
@@ -3477,6 +3520,18 @@ body.ck-resizing { cursor: col-resize; user-select: none; }
 .ck-list .ck-floc { flex: 1; }
 .ck-tag { font-size: 0.7rem; color: var(--muted); padding: 0.12rem 0.45rem; border: 1px solid var(--border); border-radius: 0; white-space: nowrap; }
 
+/* Investigation queue — the cockpit's in-app lead view. Information-dense on purpose: an
+   operator scans it to decide what to work next, so each lead shows its evidence state, the
+   proof it still needs, and anything the engine says contradicts it. */
+.ck-leads-panel { margin-top: 0.9rem; display: flex; flex-direction: column; gap: 0.55rem; }
+.ck-lead { border: 1px solid var(--border); border-left-width: 3px; padding: 0.6rem 0.7rem; background: var(--panel-2); }
+.ck-lead-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.45rem; margin-bottom: 0.3rem; }
+.ck-lead-head strong { font-size: 0.85rem; }
+/* The single most useful line per lead: the exact artifact that would confirm it. */
+.ck-lead-obligation { font-size: 0.78rem; margin: 0.3rem 0 0; color: var(--text); }
+/* The engine's own evidence disagreeing with itself — never rendered as a quiet hint. */
+.ck-lead-contra { font-size: 0.76rem; margin: 0.3rem 0 0; color: var(--danger, #b3261e); }
+
 /* Report Center — "report ready" badge + POC/POI/POE presence dots. */
 .ck-ready-badge {
   font-size: 0.68rem; font-weight: 700; letter-spacing: 0.02em; white-space: nowrap;
@@ -4636,4 +4691,111 @@ body[data-app-mode="studio"] .panel-mode-btn.is-active {
   body[data-app-mode="studio"] .composer {
     margin-inline: 0.7rem;
   }
+}
+
+/* ---------------------------------------------------------------------------
+   Studio · Train panel: the primary CTA, the live run readout, and the
+   settings toggles. Reuses the existing tokens (--teal accent, --line borders,
+   --muted secondary text) and the flat-edge, zero-radius language the rest of
+   the panel uses, so nothing here introduces a second visual system.
+   --------------------------------------------------------------------------- */
+
+/* .primary-action was applied to the Train button in markup but had no rule at
+   all, so the panel's main call to action rendered as an ordinary button. */
+.text-button.primary-action {
+  border-color: var(--teal);
+  background: var(--teal);
+  color: var(--on-accent);
+  font-weight: 800;
+  letter-spacing: 0.01em;
+}
+
+.text-button.primary-action:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+/* A labelled checkbox row: the same shape as .source-option (which the source
+   picker builds), so a toggle and a source read as the same kind of control. */
+.toggle-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.toggle-row input {
+  width: 1rem;
+  height: 1rem;
+  flex: 0 0 auto;
+  margin-top: 0.1rem;
+}
+
+.toggle-row span {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.toggle-row small {
+  color: var(--muted);
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+/* Disabled dependants (patience/min-delta when early stopping is off) stay
+   visible but clearly inert, rather than disappearing and reflowing the panel. */
+.is-inert {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.train-progress {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.7rem;
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.train-progress-bar {
+  position: relative;
+  height: 0.4rem;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.train-progress-bar > span {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--teal);
+  transition: width 220ms ease-out;
+}
+
+/* The loss curve. Stroked inline SVG on a viewBox, so it scales with the panel
+   and needs no canvas sizing logic. */
+.train-curve {
+  width: 100%;
+  height: 60px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.train-curve .curve-train {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.2;
+  vector-effect: non-scaling-stroke;
+}
+
+.train-curve .curve-val {
+  fill: none;
+  stroke: var(--teal);
+  stroke-width: 1.6;
+  vector-effect: non-scaling-stroke;
 }

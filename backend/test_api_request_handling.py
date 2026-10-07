@@ -274,6 +274,122 @@ class ImportScopeRouteTests(unittest.TestCase):
         self.assertEqual(cap.status, 404)
 
 
+class YesWeHackRouteTests(unittest.TestCase):
+    """The YesWeHack routes through the real ASGI dispatch. Mirrors ImportScopeRouteTests,
+    with the differences that matter for this platform: a credential is OPTIONAL (public
+    programs import anonymously), and the creds save is partial-field."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_secrets = g.SECRETS_PATH
+        g.SECRETS_PATH = Path(self._tmp.name) / "secrets.json"
+        self._orig_fetch = g.bounty_ywh_import.fetch_program_scope
+        self._orig_login = g.bounty_ywh_import.login
+
+    def tearDown(self) -> None:
+        g.SECRETS_PATH = self._orig_secrets
+        g.bounty_ywh_import.fetch_program_scope = self._orig_fetch
+        g.bounty_ywh_import.login = self._orig_login
+        self._tmp.cleanup()
+
+    def test_import_scope_works_with_no_credential_saved(self) -> None:
+        # The whole point of the anonymous path: no secret, still a real import.
+        seen = {}
+
+        def fake(slug, **kw):
+            seen["slug"] = slug
+            seen["token"] = kw.get("token")
+            return {"ok": True, "slug": slug, "program_name": "Acme", "structured_scope": [], "warnings": []}
+
+        g.bounty_ywh_import.fetch_program_scope = fake
+        cap = _run_post_route("/api/yeswehack/import-scope", {"slug": "acme"})
+        self.assertEqual(cap.status, 200)
+        self.assertTrue(json.loads(cap.body)["ok"])
+        self.assertEqual(seen["slug"], "acme")
+        self.assertEqual(seen["token"], "")
+
+    def test_missing_slug_is_a_clean_422_not_500(self) -> None:
+        self.assertEqual(_run_post_route("/api/yeswehack/import-scope", {}).status, 422)
+
+    def test_saved_token_reaches_the_fetch_with_its_kind(self) -> None:
+        g._store_secret("yeswehack.api_token", "pat-123")
+        g._store_secret("yeswehack.token_kind", "pat")
+        seen = {}
+
+        def fake(slug, **kw):
+            seen.update(kw)
+            return {"ok": True, "slug": slug, "program_name": "Acme", "structured_scope": [], "warnings": []}
+
+        g.bounty_ywh_import.fetch_program_scope = fake
+        _run_post_route("/api/yeswehack/import-scope", {"slug": "acme"})
+        self.assertEqual(seen["token"], "pat-123")
+        self.assertEqual(seen["token_kind"], "pat")
+
+    def test_token_is_never_echoed_in_the_response(self) -> None:
+        g._store_secret("yeswehack.api_token", "TOP-SECRET-YWH-XYZ")
+        g.bounty_ywh_import.fetch_program_scope = lambda *a, **k: {
+            "ok": True, "slug": "acme", "program_name": "Acme", "structured_scope": [], "warnings": []}
+        cap = _run_post_route("/api/yeswehack/import-scope", {"slug": "acme"})
+        self.assertNotIn(b"TOP-SECRET-YWH-XYZ", cap.body)
+
+    def test_creds_status_never_returns_the_token(self) -> None:
+        g._store_secret("yeswehack.api_token", "TOP-SECRET-YWH-XYZ")
+        cap = _Capture()
+        headers = [(b"host", b"127.0.0.1:8791"), (b"x-greyiq-token", g.SESSION_TOKEN.encode("ascii"))]
+        scope = {"method": "GET", "path": "/api/bounty/yeswehack/creds", "headers": headers,
+                 "scheme": "http", "query_string": b""}
+        asyncio.run(g.route_http(scope, _receive_once(b""), cap.send))
+        self.assertEqual(cap.status, 200)
+        self.assertNotIn(b"TOP-SECRET-YWH-XYZ", cap.body)
+        self.assertTrue(json.loads(cap.body)["has_token"])
+
+    def test_a_partial_save_does_not_wipe_the_other_stored_fields(self) -> None:
+        # The PAT box posts no email, and sign-out posts only clear_token -- neither may
+        # clear the saved email, since _store_secret("") is a delete.
+        _run_post_route("/api/bounty/yeswehack/creds",
+                        {"email": "me@example.test", "api_token": "jwt-1", "token_kind": "jwt"})
+        _run_post_route("/api/bounty/yeswehack/creds", {"api_token": "pat-2", "token_kind": "pat"})
+        stored = g._load_secrets()
+        self.assertEqual(stored.get("yeswehack.email"), "me@example.test")
+        self.assertEqual(stored.get("yeswehack.api_token"), "pat-2")
+        self.assertEqual(stored.get("yeswehack.token_kind"), "pat")
+
+    def test_sign_out_clears_the_token_but_keeps_the_email(self) -> None:
+        _run_post_route("/api/bounty/yeswehack/creds", {"email": "me@example.test", "api_token": "jwt-1"})
+        cap = _run_post_route("/api/bounty/yeswehack/creds", {"clear_token": True})
+        data = json.loads(cap.body)
+        self.assertFalse(data["has_token"])
+        self.assertEqual(data["email"], "me@example.test")
+        self.assertNotIn("yeswehack.api_token", g._load_secrets())
+
+    def test_an_empty_token_field_never_clears_a_saved_one(self) -> None:
+        _run_post_route("/api/bounty/yeswehack/creds", {"api_token": "jwt-1"})
+        _run_post_route("/api/bounty/yeswehack/creds", {"email": "me@example.test", "api_token": ""})
+        self.assertEqual(g._load_secrets().get("yeswehack.api_token"), "jwt-1")
+
+    def test_login_stores_only_the_returned_token_never_the_password(self) -> None:
+        g.bounty_ywh_import.login = lambda email, password, **kw: {
+            "ok": True, "token": "jwt-from-ywh", "token_kind": "jwt", "message": "Signed in."}
+        cap = _run_post_route("/api/bounty/yeswehack/login",
+                              {"email": "me@example.test", "password": "hunter2-SECRET"})
+        self.assertEqual(cap.status, 200)
+        self.assertNotIn(b"hunter2-SECRET", cap.body)
+        self.assertNotIn(b"jwt-from-ywh", cap.body)      # the token isn't echoed either
+        stored = g._load_secrets()
+        self.assertEqual(stored.get("yeswehack.api_token"), "jwt-from-ywh")
+        self.assertNotIn("hunter2-SECRET", json.dumps(stored))
+
+    def test_login_totp_required_is_carried_through_without_storing_anything(self) -> None:
+        g.bounty_ywh_import.login = lambda email, password, **kw: {
+            "ok": False, "totp_required": True, "error": "2FA needed"}
+        cap = _run_post_route("/api/bounty/yeswehack/login",
+                              {"email": "me@example.test", "password": "pw"})
+        data = json.loads(cap.body)
+        self.assertFalse(data["ok"])
+        self.assertTrue(data["totp_required"])
+        self.assertNotIn("yeswehack.api_token", g._load_secrets())
+
+
 class HackerOneActivityRouteTests(unittest.TestCase):
     """The new hacktivity/my-reports/report-status/earnings/sync-submitted routes each
     reach the real g.route_http dispatch (route match, session-token gate, JSON parsing,

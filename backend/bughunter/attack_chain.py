@@ -80,11 +80,22 @@ _MAX_RECON_SIGNALS_PER_KIND = 8
 
 # Mirrors investigator's unproven ceiling: a projected chain must stay a lead.
 _PROJECTED_CEILING = 54
+# A chain whose prerequisite was TESTED AND REFUTED is below every untested lead. Mirrors the
+# clamp investigator applies to a chain citing a contradicted finding, so the two layers agree.
+_BROKEN_CEILING = 24
+# The broken chain still renders (an operator needs to see WHY the ladder stops), but it must not
+# compete for a slot with a live lead. Low enough to sort last, never negative.
+_BROKEN_SCORE_CEILING = 5
 
 # Selection must rank by proof band FIRST, everywhere. The per-impact bucket used to rank
 # on score alone and the final sort on (proven, score), so the bucket threw a fully proven
 # chain away before the proven-first sort could ever see it.
-_STATUS_RANK = {"proven": 2, "partial": 1, "projected": 0}
+#
+# `broken` is BELOW projected on purpose, and it must be present in this table: `_rank` reads it
+# with `.get(status, 0)`, so a status the table does not know silently ranks EQUAL to projected —
+# which would leave a refuted chain sitting level with every untested one, the exact failure the
+# broken state exists to remove.
+_STATUS_RANK = {"proven": 2, "partial": 1, "projected": 0, "broken": -1}
 
 # --------------------------------------------------------------------------------------
 # Capability vocabulary
@@ -1114,12 +1125,23 @@ def _same_trust_boundary(left: str, right: str) -> bool:
 
 
 def _finding_clue(finding: dict[str, Any], plan: dict[str, Any], index: int) -> dict[str, Any]:
-    """Normalize one finding into a clue with its PROVEN state taken from the confirm gate."""
+    """Normalize one finding into a clue with its evidence state taken from the confirm authority.
+
+    A clue carries a TRI-STATE, not a boolean. ``proven`` and ``disproven`` are both False for a
+    lead nobody has tested — which is the common case and must stay a viable lead. ``disproven`` is
+    True only when the engine ran the differential and it came back negative (see
+    ``investigator.has_refuting_artifact``); that is the one thing that makes the steps depending on
+    this clue unreachable rather than merely unproven."""
     ref = _text(finding.get("ref"), 40) or f"F{index}"
     try:
         proven = bool(investigator.has_confirming_artifact(finding, plan))
     except Exception:  # noqa: BLE001 - a gate error must never break the chain build
         proven = False
+    try:
+        # Never both: a clue the confirm gate accepted is not refuted by its own evidence.
+        disproven = False if proven else bool(investigator.has_refuting_artifact(finding, plan))
+    except Exception:  # noqa: BLE001 - same contract as the gate above
+        disproven = False
     location = _text(finding.get("location") or finding.get("file_path"), 400)
     return {
         "ref": ref,
@@ -1134,12 +1156,47 @@ def _finding_clue(finding: dict[str, Any], plan: dict[str, Any], index: int) -> 
         "host": _host_of(location),
         "severity": _text(finding.get("severity"), 20).lower() or "info",
         "proven": proven,
+        "disproven": disproven,
     }
 
 
 def _step_confidence(proven: bool) -> int:
     """A proven step is worth real confidence; an unproven evidence-backed step is a lead."""
     return 82 if proven else 34
+
+
+def _mark_unreachable(steps: list[dict[str, Any]]) -> None:
+    """Mark every step that depends on a REFUTED prerequisite ``state="unreachable"``, in place.
+
+    A chain is a ladder: each step consumes capabilities earlier steps granted. When a step's own
+    differential came back negative, the capabilities it was to grant were never obtained, so the
+    steps waiting on them cannot be attempted as written. Presenting those as ordinary projected
+    leads — which is what happened before, since every non-proven step looked alike — invites an
+    operator to spend a request budget on work whose precondition the engine has already failed to
+    establish.
+
+    The walk is capability-based, not positional: a step is unreachable only when a capability it
+    REQUIRES is supplied exclusively by dead steps. A requirement satisfied by the chain's entry
+    condition (never granted by any step in the path) is untouched, and so is one that some live
+    step also grants. ``proven`` is deliberately left alone so every existing reader keeps its
+    meaning; the new state rides alongside it.
+    """
+    live_grants: set[str] = set()
+    all_grants: set[str] = set()
+    for step in steps:
+        dead = bool(step.get("disproven"))
+        if not dead:
+            needs = [cap for cap in (step.get("requires_ids") or [])
+                     # Only a capability some earlier step was supposed to supply can be broken;
+                     # anything the entry condition satisfies was never this ladder's to grant.
+                     if cap in all_grants and cap not in live_grants]
+            if needs:
+                dead = True
+                step["state"] = "unreachable"
+                step["blocked_by"] = sorted(needs)[:4]
+        all_grants.update(step.get("grants_ids") or [])
+        if not dead:
+            live_grants.update(step.get("grants_ids") or [])
 
 
 _MAX_CLUES_PER_CLASS = 3
@@ -1363,12 +1420,23 @@ def _score_path(path: list[dict[str, Any]], impact: str) -> tuple[int, int, str]
                    if step["clue"] is not None or step["signal"] is not None]
     confidence = min(confidences) if confidences else 24
     proven_count = sum(1 for step in path if step["proven"])
-    if proven_count == len(path) and path:
+    # A chain resting on a clue whose own differential came back NEGATIVE is not a weaker lead
+    # than an untested one — it is a chain whose prerequisite the engine has tried and failed to
+    # establish. Ranked as "projected" it sat level with every untested chain, which is exactly
+    # the "presented as equally viable" problem. `broken` ranks BELOW projected (_STATUS_RANK).
+    broken = any(step["clue"] and step["clue"].get("disproven") for step in path)
+    if broken:
+        status = "broken"
+    elif proven_count == len(path) and path:
         status = "proven"
     elif proven_count:
         status = "partial"
     else:
         status = "projected"
+    if broken:
+        # Downgrade only, and to the same floor the cortex clamps a contradicted chain to, so a
+        # broken chain can never out-rank a live lead on confidence either.
+        confidence = min(confidence, _BROKEN_CEILING)
     if status != "proven":
         # A chain that is not fully proven must not reach the supported band, exactly like an
         # unproven hypothesis. Otherwise a five-step guess out-ranks a one-step captured bug.
@@ -1378,6 +1446,9 @@ def _score_path(path: list[dict[str, Any]], impact: str) -> tuple[int, int, str]
     # Prefer: real impact, actually proven, then short over long (a 2-step chain is a better
     # report than a 5-step one reaching the same place), then technique quality.
     score = int(impact_weight * 1.4 + proven_count * 24 + technique_weight - len(path) * 6)
+    if broken:
+        # Never an assignment: the downgrade may only ever lower what the model produced.
+        score = min(score, _BROKEN_SCORE_CEILING)
     if any("net.mitm-position" in step["technique"]["grants"] for step in path):
         # The chain needs the attacker sitting on the victim's network. Real, but a much
         # higher bar than a remote request, and most programs price it accordingly.
@@ -1559,12 +1630,22 @@ def build_attack_chains(
                     # fact needed to catch a bad composition by reading the report.
                     "signal_host": _text(signal.get("host"), 200) if signal else "",
                     "proven": bool(step["proven"]),
+                    # `disproven` is NOT the negation of `proven`: an untested step is neither.
+                    # It means this step's own evidence was captured and refuted it.
+                    "disproven": bool(clue and clue.get("disproven")),
                     "state": "proven" if step["proven"] else "projected",
                     "next_action": technique.get("action", ""),
                     "note": technique.get("note", ""),
                 })
+            _mark_unreachable(steps)
             impact_weight, impact_label = _IMPACTS.get(candidate["impact"], (0, candidate["impact"]))
-            unproven = [step for step in steps if not step["proven"]]
+            # The blocking step is the first step that is not PROVEN and is still reachable — the
+            # thing an operator could actually go and do. Advancing past a refuted prerequisite onto
+            # a step that cannot be attempted would point the next turn's request budget, and
+            # surface_drift's stored re-open probe, at work that cannot help.
+            unproven = [step for step in steps
+                        if not step["proven"] and step["state"] != "unreachable"]
+            blocked = [step for step in steps if step["disproven"]]
             chains.append({
                 "id": f"AC{position}",
                 "title": f"{_ENTRIES[candidate['entry']].capitalize()} → {impact_label.lower()}",
@@ -1582,9 +1663,17 @@ def build_attack_chains(
                 "steps": steps,
                 "narrative": _narrate(candidate["entry"], candidate["path"], candidate["impact"]),
                 # The single most useful line: what to do next to close the chain.
-                "next_action": (unproven[0]["next_action"] if unproven
-                                else "Every step is backed by a captured artifact — package the chain as one report."),
-                "blocking_step": unproven[0]["n"] if unproven else 0,
+                "next_action": (
+                    f"Step {blocked[0]['n']} was tested and its differential came back negative — "
+                    "re-establish that prerequisite or drop this chain; the steps after it cannot be "
+                    "attempted as written."
+                    if blocked else
+                    unproven[0]["next_action"] if unproven
+                    else "Every step is backed by a captured artifact — package the chain as one report."),
+                # Point at the REFUTED step when there is one: that is where the ladder actually
+                # stops, and it is what an operator has to fix before anything downstream matters.
+                "blocking_step": (blocked[0]["n"] if blocked
+                                  else unproven[0]["n"] if unproven else 0),
             })
 
         # Only the signals a chain actually consumed are worth surfacing; the rest stay noise.

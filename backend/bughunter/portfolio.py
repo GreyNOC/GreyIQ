@@ -25,6 +25,7 @@ import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from bughunter.learning import program_key
@@ -57,8 +58,8 @@ def execution_fingerprint(program: dict[str, Any]) -> str:
 # Field defaults — every automation flag defaults to the SAFE/off value.
 _DEFAULTS: dict[str, Any] = {
     "name": "",
-    "platform": "manual",          # 'hackerone' | 'hackenproof' | 'manual' — report-format + display tag.
-    "platform_handle": "",         # HackerOne team handle for manual report routing / HackenProof program slug
+    "platform": "manual",          # 'hackerone' | 'yeswehack' | 'hackenproof' | 'manual' — report-format + display tag; only the human operator submits.
+    "platform_handle": "",         # HackerOne team handle for manual routing / YesWeHack or HackenProof program slug
     "scope_text": "",              # free-text, passed verbatim to run_campaign(scope=)
     "in_scope_hosts": [],
     "out_of_scope_hosts": [],
@@ -74,6 +75,8 @@ _DEFAULTS: dict[str, Any] = {
     "oob_allowed": False,          # operator-confirmed: this program's policy permits out-of-band/collaborator testing
     "disclose_automation": False,  # operator-confirmed: this program's terms require disclosing automated-tool assistance in submitted reports
     "h1_program_stats": {},        # real signals from HackerOne's program resource (offers_bounties, fast_payments, etc.) — see hackerone_import.fetch_structured_scope
+    "ywh_program_stats": {},       # the same, for YesWeHack (reward range, VPN/IP constraints, the required UA marker) — see yeswehack_import.fetch_program_scope
+    "intake_source": {},           # bounded API provenance only; never grants scope or authorization
     "notes": "",                   # free text — policy excerpt, reward table, anything pasted in
     "account_access": {},          # program research-account access (email/password/login_url/cookie) — see _clean_account_access. SENSITIVE: only ever sent to the program's OWN login page / in-scope hosts, never logged, password redacted in API responses.
     "admin_account_access": {},    # OPTIONAL second, HIGHER-privilege research account (same shape as account_access). When set, unlocks the autonomous BFLA / cross-tenant checks — the low-priv account_access is the "attacker" session, this is the ground-truth admin session. SENSITIVE, same handling.
@@ -205,6 +208,107 @@ def _clean_h1_program_stats(stats: Any) -> dict[str, Any]:
     return out
 
 
+_YWH_STATS_BOOL_FIELDS = ("public", "vdp", "disabled", "offers_bounty", "offers_gift",
+                          "vpn_required", "ip_restricted", "hall_of_fame")
+_YWH_STATS_STR_FIELDS = ("program_type", "status", "currency", "business_unit", "user_agent_marker")
+_YWH_STATS_INT_FIELDS = ("bounty_reward_min", "bounty_reward_max", "reports_count",
+                         "average_reward", "max_reward", "average_first_response_days")
+
+
+def _clean_ywh_program_stats(stats: Any) -> dict[str, Any]:
+    """Coerce YesWeHack program-resource stats to a fixed known-key shape — same rule as
+    _clean_h1_program_stats: never store an unbounded blob straight from a third-party API."""
+    if not isinstance(stats, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for field in _YWH_STATS_BOOL_FIELDS:
+        if field in stats:
+            out[field] = bool(stats.get(field))
+    for field in _YWH_STATS_STR_FIELDS:
+        if field in stats:
+            # Same sanitizer as user_agent_suffix, not just a length clamp:
+            # user_agent_marker is a copy of the value that drives the outbound UA header,
+            # so a CR/LF from a compromised API response must not be persisted here either
+            # — even though the live UA path sanitizes again downstream. 120 chars matches
+            # user_agent_suffix's bound; the other strings are short labels.
+            out[field] = _clean_ua_suffix(stats.get(field))
+    for field in _YWH_STATS_INT_FIELDS:
+        if field in stats:
+            out[field] = _safe_int(stats.get(field), 0)
+    return out
+
+
+def _clean_intake_source(value: Any) -> dict[str, Any]:
+    """Retain a small, inert provenance record from a reviewed platform import.
+
+    This metadata never participates in scope derivation or authorization. It is
+    deliberately a known-key shape, with no credential-bearing URL components or
+    unbounded platform response fields copied into the portfolio store.
+    """
+    if not isinstance(value, dict):
+        return {}
+
+    def clean_text(item: Any, limit: int) -> str:
+        return "".join(ch for ch in str(item or "") if ch.isprintable()).strip()[:limit]
+
+    platform = "".join(ch for ch in clean_text(value.get("platform"), 40).lower()
+                       if ch.isascii() and (ch.isalnum() or ch in "_-"))[:40]
+    provider_id = clean_text(value.get("provider_id"), 200)
+    status = clean_text(value.get("status"), 40)
+    source_url = ""
+    raw_url = clean_text(value.get("source_url"), 1000)
+    if raw_url:
+        try:
+            parsed = urlsplit(raw_url)
+            if (parsed.scheme.lower() == "https" and parsed.hostname and not parsed.username
+                    and not parsed.password and parsed.port is None and not parsed.query
+                    and not parsed.fragment):
+                source_url = f"https://{parsed.hostname}{parsed.path or ''}"[:500]
+        except ValueError:
+            pass
+
+    fetched_at = ""
+    raw_time = clean_text(value.get("fetched_at"), 40)
+    if raw_time:
+        try:
+            stamp = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+            if stamp.tzinfo is not None:
+                fetched_at = stamp.isoformat()
+        except ValueError:
+            pass
+
+    raw_warnings = value.get("warnings")
+    warnings = ([clean_text(item, 240) for item in raw_warnings[:8]]
+                if isinstance(raw_warnings, list) else [])
+    return {
+        "platform": platform,
+        "provider_id": provider_id,
+        "source_url": source_url,
+        "fetched_at": fetched_at,
+        "status": status,
+        "scope_complete": value.get("scope_complete") is True,
+        "warnings": [item for item in warnings if item],
+    }
+
+
+def _excluded_host(identifier: Any) -> str:
+    """Turn a URL-shaped exclusion into the host both network gates compare.
+
+    Structured scope keeps its original identifier for operator review. The
+    derived ``out_of_scope_hosts`` list is a host exclusion, so preserving a
+    full URL there would silently fail to block a broader wildcard scope.
+    Existing bare-host and wildcard exclusions retain their prior spelling.
+    """
+    raw = str(identifier or "").strip()
+    if not raw or "://" not in raw:
+        return raw
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return raw
+    return parsed.hostname or raw
+
+
 # The program research-account block: the operator's OWN credentials for THIS program's authorized
 # research account (email + password to auto-login, or a pasted session cookie / auth headers as a
 # fallback), plus the login/register URLs. Sent ONLY to the program's own login page (same-site,
@@ -295,6 +399,8 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     out["oob_allowed"] = bool(out.get("oob_allowed"))
     out["disclose_automation"] = bool(out.get("disclose_automation"))
     out["h1_program_stats"] = _clean_h1_program_stats(out.get("h1_program_stats"))
+    out["ywh_program_stats"] = _clean_ywh_program_stats(out.get("ywh_program_stats"))
+    out["intake_source"] = _clean_intake_source(out.get("intake_source"))
     out["notes"] = str(out.get("notes") or "")[:4000]
     out["account_access"] = _clean_account_access(out.get("account_access"))
     out["admin_account_access"] = _clean_account_access(out.get("admin_account_access"))
@@ -309,7 +415,8 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     # hand-edited scope_text -- structured_scope is a source to pull FROM, not a mirror.
     if out["structured_scope"] and not str(out.get("scope_text") or "").strip():
         in_ids = [e["identifier"] for e in out["structured_scope"] if e["eligible_for_submission"]]
-        out_ids = [e["identifier"] for e in out["structured_scope"] if not e["eligible_for_submission"]]
+        out_ids = [_excluded_host(e["identifier"]) for e in out["structured_scope"]
+                   if not e["eligible_for_submission"]]
         out["scope_text"] = " ".join(in_ids)
         if not out.get("in_scope_hosts"):
             out["in_scope_hosts"] = in_ids
@@ -337,7 +444,8 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     # Keep the legacy cap for storage compatibility; it no longer controls filing.
     out["max_submits_per_day"] = max(0, min(_safe_int(out.get("max_submits_per_day", 3), 3), 25))
     out["in_scope_hosts"] = [str(h).strip() for h in (out.get("in_scope_hosts") or []) if str(h).strip()]
-    out["out_of_scope_hosts"] = [str(h).strip() for h in (out.get("out_of_scope_hosts") or []) if str(h).strip()]
+    out["out_of_scope_hosts"] = [_excluded_host(h) for h in (out.get("out_of_scope_hosts") or [])
+                                 if str(h or "").strip()]
     out["seed_targets"] = [str(t).strip() for t in (out.get("seed_targets") or []) if str(t).strip()]
     return out
 

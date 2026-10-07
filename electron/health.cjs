@@ -3,8 +3,10 @@
 const http = require('node:http');
 
 // A free loopback port can be claimed by another process between allocation and
-// backend launch. Accept only GreyIQ's exact liveness response before loading the UI.
-function probeHealth(host, port, timeoutMs = 2000) {
+// backend launch. The child receives a random launch ID through its environment;
+// the probe never sends it to the server that may have claimed the port.
+function probeHealth(host, port, expectedLaunchId, timeoutMs = 2000) {
+  if (typeof expectedLaunchId !== 'string' || !expectedLaunchId) return Promise.resolve(false);
   return new Promise((resolve) => {
     const req = http.get({ host, port, path: '/api/health', timeout: timeoutMs }, (res) => {
       if (res.statusCode !== 200 || !String(res.headers['content-type'] || '').includes('application/json')) {
@@ -23,7 +25,8 @@ function probeHealth(host, port, timeoutMs = 2000) {
       });
       res.on('end', () => {
         try {
-          resolve(JSON.parse(body)?.status === 'ok');
+          const health = JSON.parse(body);
+          resolve(health?.status === 'ok' && health.launchId === expectedLaunchId);
         } catch (_) {
           resolve(false);
         }

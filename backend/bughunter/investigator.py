@@ -173,6 +173,31 @@ def has_confirming_artifact(finding: dict[str, Any], plan: dict[str, Any] | None
     return report._has_captured_artifact(finding, _canonical_proof(finding, _dict(plan)))
 
 
+def has_refuting_artifact(finding: dict[str, Any], plan: dict[str, Any] | None = None) -> bool:
+    """True only when this finding's captured evidence REFUTES the claim it was captured for.
+
+    The counterpart to :func:`has_confirming_artifact`, and deliberately much narrower. Absence of
+    proof is not refutation: a lead nobody has tested yet, and a lead whose test came back negative,
+    both fail the confirm gate, and treating them alike is what would let "not yet demonstrated" be
+    presented as "shown impossible".
+
+    The ONE thing the engine observes that genuinely refutes is a captured observed/control pair
+    that does not differ: the differential was run and it failed. ``report.proof_is_non_differential``
+    is that predicate, and it requires BOTH sides to be non-empty, so an untested lead (empty pair)
+    can never reach it.
+
+    Explicitly NOT sourced from the cortex's other contradiction codes.
+    ``confirmation-without-artifact`` and ``secret-severity-conflict`` are claim-vs-evidence
+    bookkeeping — a label was wrong — and a wrong label is not evidence that an attack step is
+    impossible. Wiring those in would overstate in the opposite direction from the overstatements
+    this module exists to prevent.
+    """
+    from bughunter import report  # local: report sits above this module
+
+    proof = _canonical_proof(finding, _dict(plan))
+    return bool(report.proof_is_non_differential(proof))
+
+
 def _canonical_proof(finding: dict[str, Any], plan: dict[str, Any]) -> Any:
     """The proof the confirm gate would be applied to — same precedence as ``report._proof_value``.
 
@@ -235,8 +260,17 @@ def _artifact_types(finding: dict[str, Any], plan: dict[str, Any]) -> list[str]:
     evidence = _dict(finding.get("proof_evidence"))
     if _text(evidence.get("matched_value") or evidence.get("set_cookie"), 1000):
         artifacts.append("captured-matched-value")
+    # ``read_data`` is the proof_evidence schema's key for a captured response body — it is what all
+    # 15 in-module producers in active_verify_service write, plus api_discovery_service and the
+    # access-control/stored-XSS services. The four names read here before it
+    # (response_body/response_body_excerpt/body_excerpt/sensitive_data) have NO producer anywhere in
+    # the repo, so this branch never fired and the 22-point "captured-response-body" weight below was
+    # dead: a GraphQL introspection or .env disclosure that captured the whole body scored as if it
+    # had captured nothing, and also lost the per-extra-artifact breadth bonus. The dead names are
+    # kept as trailing fallbacks (harmless, and they document the shapes this once accepted).
     body = _text(
-        evidence.get("response_body") or evidence.get("response_body_excerpt")
+        evidence.get("read_data") or evidence.get("sensitive_data_labels")
+        or evidence.get("response_body") or evidence.get("response_body_excerpt")
         or evidence.get("body_excerpt") or evidence.get("sensitive_data"), 2000
     )
     if body:
@@ -356,7 +390,11 @@ def _evidence_score(
 # the cortex's is the evidence layer's. Map rather than let two vocabularies leak into one
 # report: a chain whose every step is backed by an accepted artifact IS confirmed, a chain
 # with at least one such step is supported, and a chain of pure leads stays a candidate.
-_CHAIN_STATE_TO_CORTEX = {"proven": "confirmed", "partial": "supported", "projected": "candidate"}
+# `broken` MUST be listed. The lookup below defaults an unknown status to "candidate", which is
+# clamped only to the unproven ceiling (54) — so a chain the engine has declared refuted would read
+# as an ordinary lead here and keep more than double the confidence a contradicted chain is allowed.
+_CHAIN_STATE_TO_CORTEX = {"proven": "confirmed", "partial": "supported", "projected": "candidate",
+                          "broken": "blocked"}
 
 
 def _chain_next_action(chain: dict[str, Any], status: str, refs: list[str],

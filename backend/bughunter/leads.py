@@ -302,6 +302,14 @@ def _project_chain(chain: dict[str, Any]) -> dict[str, Any]:
             "evidence_ref": _s(step.get("evidence_ref"), 40),
             "evidence_location": _redacted(step.get("evidence_location"), 500),
             "proven": bool(step.get("proven")),
+            # NOT the negation of `proven`. An untested step is neither proven nor disproven;
+            # `disproven` means this step's own differential was captured and came back negative,
+            # and `state == "unreachable"` marks the steps waiting on what it failed to grant.
+            # Both are on the allowlist deliberately: this projection is what the operator brief,
+            # `gn leads` and the cockpit all read, so a step dropped here is a ladder that still
+            # looks uniformly viable to every consumer outside the engine.
+            "disproven": bool(step.get("disproven")),
+            "blocked_by": [_s(x, 60) for x in (step.get("blocked_by") or [])][:4],
             "state": _s(step.get("state"), 20),
             # Inherits the same plan-sourced obligation text as a lead's proof_obligation.
             "next_action": _redacted(step.get("next_action"), 600),

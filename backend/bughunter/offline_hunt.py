@@ -1,6 +1,6 @@
 """Offline hunt intelligence — the no-LLM hunt brain.
 
-TinyGPT (the 0.8M-param char-level model) is far too small to reason about vulnerability classes or
+TinyGPT (the tiny, well-under-10M-param char-level model) is far too small to reason about vulnerability classes or
 emit the structured guidance the hunt needs, so the OFFLINE path (no Claude/Ollama configured) used to
 get an EMPTY plan — it hunted blind. ``offline_plan`` fills that: it produces the SAME plan shape
 ``hunt_brain.plan_hunt`` does (param_hypotheses / probe_priority / ssrf_params / xss_params /
@@ -30,18 +30,21 @@ from bughunter.prover_classes import PROVER_CLASSES
 # param-name substring -> the vuln class it most likely feeds. Ordered by specificity in _classify.
 _SSRF_HINTS = ("url", "uri", "dest", "target", "callback", "webhook", "image", "avatar", "photo", "feed",
                "rss", "proxy", "fetch", "load", "site", "link", "source", "remote", "xml", "endpoint",
-               "redirect_uri", "return_to", "continue", "domain", "host", "server", "upload")
+               "redirect_uri", "return_to", "continue", "domain", "host", "server", "upload",
+               "notify", "connect")
 _XSS_HINTS = ("q", "s", "query", "search", "keyword", "term", "name", "title", "message", "comment",
-              "text", "body", "content", "desc", "subject", "error", "msg", "lang", "return", "ref")
+              "text", "body", "content", "desc", "subject", "error", "msg", "lang", "return", "ref",
+              "html", "note", "reply")
 _REDIRECT_HINTS = ("redirect", "next", "return", "url", "goto", "dest", "continue", "target", "back", "callback")
 _RCE_HINTS = ("cmd", "exec", "command", "ping", "host", "ip", "run", "shell", "exe", "system", "func")
 _TRAVERSAL_HINTS = ("file", "path", "page", "include", "doc", "document", "download", "attachment", "dir",
-                    "folder", "load", "read", "view", "template", "img")
+                    "folder", "load", "read", "view", "template", "img", "export", "resource")
 _SSTI_HINTS = ("template", "tpl", "render", "theme", "view", "layout", "format", "pattern")
 _SQLI_HINTS = ("id", "user", "uid", "order", "sort", "filter", "category", "cat", "product", "item",
-               "search", "query", "num", "page", "select", "where", "column", "field")
+               "search", "query", "num", "page", "select", "where", "column", "field", "code")
 _IDOR_PARAM_HINTS = ("id", "user_id", "userid", "uid", "account", "account_id", "order", "order_id",
-                     "invoice", "customer", "profile", "doc_id", "file_id", "record", "object")
+                     "invoice", "customer", "profile", "doc_id", "file_id", "record", "object",
+                     "uuid", "guid", "reference")
 
 # tech fingerprint -> classes to boost (a rendering/interpreter stack implies its injection surface).
 _TECH_CLASS = {
@@ -350,8 +353,28 @@ def offline_plan(surface: dict[str, Any], priors: dict[str, float] | None = None
     # analogue of the LLM proposing param_hypotheses. Only NEW names (not already discovered) are added.
     for url in endpoints[:60]:
         names = _endpoint_params(url) or []
-        alln = names + sorted(recon_params)
-        candidates = _classes_for_endpoint(url, alln, tech_boost)
+        # Match the parameter cues against THIS endpoint's own inputs — its query names plus, when it is
+        # a form action, that form's fields. It used to be `names + sorted(recon_params)`: the whole
+        # HOST's recon params, the same list for every endpoint. That made the per-endpoint ranking
+        # meaningless, and because _classes_for_endpoint caps at six classes and appends the
+        # newly-reachable ones LAST, the shared params saturated every slot and truncated them away.
+        #
+        # Measured on a surface of ten /ws/room-N plus fifteen /download?file= endpoints with twelve
+        # ordinary host params: all twenty rows collapsed to just TWO distinct class-sets, `websocket`
+        # never appeared on the websocket endpoints at all, and because every score was identical the
+        # _MAX_PRIORITY cap broke the tie by discovery order — evicting five /download?file= endpoints
+        # in favour of ws rooms. Own-params only restores path-traversal as the top class on the
+        # download endpoints and keeps all fifteen.
+        #
+        # The host-wide list is NOT lost, and no coverage is dropped. _rank still receives it
+        # separately, so the learned ranker keeps that feature; and the prover gets the same list as
+        # `extra_params`, where active_verify_service._candidate_params unions it into EVERY
+        # param-keyed check on EVERY endpoint. So a name discovered on one endpoint is still TRIED on
+        # the others — it just no longer votes on which CLASS that other endpoint looks like. Only the
+        # ORDER the prover spends its budget in changes, which is the one thing this ranking is for.
+        _own_form = forms_by_action.get(url) or {}
+        own = names + [str(field) for field in (_own_form.get("params") or []) if str(field or "").strip()]
+        candidates = _classes_for_endpoint(url, own, tech_boost)
         classes = _rank(candidates, priors, model, url, names, sorted(recon_params), tech,
                         forms_by_action.get(url))
         if classes and url not in seen_pri:

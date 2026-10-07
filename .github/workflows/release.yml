@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Tag/version label for the release (e.g. v0.3.0)'
-        required: true
-        default: 'v0.0.0-dev'
 
 permissions:
   contents: write
@@ -19,8 +13,55 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # A tag push used to go straight from `pip install` to PyInstaller, so a
+  # SIGNED release could be published from a commit whose tests had never run anywhere — the CI
+  # workflow only triggers on push-to-main and pull_request, neither of which a tag is. This gate
+  # runs the suite against the exact commit being shipped, and every build job depends on it, so a
+  # failure stops the release before any asset or draft exists.
+  #
+  # ubuntu-latest deliberately: the 1x minute multiplier keeps a release affordable, and the
+  # Windows-only PowerShell recipe case is already covered by the windows build job's own platform.
+  gate:
+    name: Quality gate (must pass before anything is built)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Verify tag names the version in this exact checkout
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF_TYPE" != tag ] || [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "Release ref $GITHUB_REF_NAME does not match package version v$version" >&2
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch, for the same asset-size reason the build jobs use it below.
+          pip install "torch>=2.13,<3.0" --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+          npm ci
+
+      - name: Run the quality gate
+        run: npm run check
+
   windows:
     name: Build Windows portable + installer
+    needs: gate
     runs-on: windows-latest
     steps:
       - name: Check out repository
@@ -31,11 +72,36 @@ jobs:
         with:
           node-version: '22'
 
+      # electron 44.x ships no install script, so `npm ci` never downloads the ~150 MB
+      # Electron binary; electron-builder fetches it at the final step through got with a
+      # 600 s TOTAL request deadline. A clean windows-latest runner therefore re-downloads
+      # it every run, and a slow mirror can blow that deadline after the whole freeze is
+      # done. Cache @electron/get's store so the fetch is a cache hit on every run but the
+      # first, and pull it explicitly (below) BEFORE the expensive freeze either way.
+      - name: Cache the Electron binary (@electron/get store)
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\electron\Cache
+          key: electron-cache-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-cache-${{ runner.os }}-
+
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
           python-version: '3.11'
           cache: pip
+
+      - name: Install npm dependencies + the Electron binary
+        shell: pwsh
+        # Ahead of the freeze on purpose: install.js has no got deadline and warms the cache
+        # electron-builder reads, so a slow or failed download costs seconds here instead of a
+        # discarded twenty-minute build at the last step. Mirrors build/build-portable.ps1.
+        run: |
+          npm ci
+          node "node_modules/electron/install.js"
+          if (-not (Test-Path "node_modules/electron/dist")) {
+            throw "Electron not installed: node_modules/electron/dist is missing after install.js."
+          }
 
       - name: Install Python runtime + build dependencies
         run: |
@@ -84,12 +150,10 @@ jobs:
           if (-not $ok) { throw "Frozen backend did not answer /api/health within 180s." }
           Write-Output "Frozen backend launched and answered /api/health."
 
-      - name: Install npm dependencies
-        run: npm ci
-
-      # Ollama is NO LONGER bundled (it was ~1.4 GB / 86% of the old portable). The
-      # app downloads it on demand to userData the first time the local model is
-      # selected — see electron/main.cjs ensureBaseOllama.
+      # npm ci + the Electron binary were installed before the freeze (above), so nothing
+      # to do here. Ollama is NO LONGER bundled (it was ~1.4 GB / 86% of the old portable);
+      # the app downloads it on demand to userData at first local-model use — see
+      # electron/main.cjs ensureBaseOllama.
 
       - name: Build portable + installer (electron-builder)
         run: npx electron-builder --win portable nsis --publish never
@@ -132,15 +196,14 @@ jobs:
       # redundant cost. Re-add a `continue-on-error` upload only if you ever
       # need the binaries on the run page for debugging.
 
-      # Upload to a DRAFT release. GitHub releases become immutable once published,
-      # which blocks the linux job from appending its assets afterward. So both
-      # platform jobs upload while the release is still a draft, and a final
-      # `publish` job flips it to published once every asset is attached.
+      # Upload to a DRAFT release. GitHub releases may become immutable once published,
+      # which would block the Linux job from appending its assets afterward. Publication
+      # is a separate human operator action after reviewing every build and asset.
       - name: Upload Windows assets to the draft release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
-          name: GreyIQ ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          tag_name: ${{ github.ref_name }}
+          name: GreyIQ ${{ github.ref_name }}
           draft: true
           prerelease: false
           fail_on_unmatched_files: true
@@ -151,7 +214,7 @@ jobs:
   linux:
     name: Build Linux GUI (AppImage + Debian package) + headless CLI
     # Runs after windows so the DRAFT release already exists; this job appends the
-    # Linux assets to that draft (the `publish` job publishes it once both finish).
+    # Linux assets to that draft. Only a human operator may publish it.
     needs: windows
     # Build native libraries against an older glibc than Debian 13. A rolling
     # ubuntu-latest runner can otherwise produce binaries too new for Trixie.
@@ -176,11 +239,30 @@ jobs:
         with:
           node-version: '22'
 
+      # See the Windows job: electron 44.x ships no install script, so the Electron binary
+      # is downloaded lazily by electron-builder unless we pull it first. Cache the
+      # @electron/get store (~/.cache/electron on Linux) and fetch explicitly before the freeze.
+      - name: Cache the Electron binary (@electron/get store)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/electron
+          key: electron-cache-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-cache-${{ runner.os }}-
+
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
           python-version: '3.11'
           cache: pip
+
+      - name: Install npm dependencies + the Electron binary
+        # Ahead of the freeze on purpose: install.js has no got deadline and warms the cache
+        # electron-builder reads, so a slow or failed download costs seconds here instead of a
+        # discarded build at the last step.
+        run: |
+          npm ci
+          node node_modules/electron/install.js
+          test -d node_modules/electron/dist || { echo "Electron not installed: node_modules/electron/dist missing after install.js."; exit 1; }
 
       - name: Install Python runtime + build dependencies
         run: |
@@ -224,12 +306,10 @@ jobs:
           if [ "$ok" -ne 1 ]; then echo "Frozen backend did not answer /api/health within 180s."; exit 1; fi
           echo "Frozen backend launched and answered /api/health."
 
-      - name: Install npm dependencies
-        run: npm ci
-
-      # Ollama is NO LONGER bundled — downloaded on demand at first local-model use
-      # (electron/main.cjs ensureBaseOllama). This also frees the ~1.4 GB that
-      # previously contributed to the runner's "No space left on device" pressure.
+      # npm ci + the Electron binary were installed before the freeze (above). Ollama is NO
+      # LONGER bundled — downloaded on demand at first local-model use (electron/main.cjs
+      # ensureBaseOllama), which also frees the ~1.4 GB that previously contributed to the
+      # runner's "No space left on device" pressure.
 
       - name: Ensure Debian packaging compressor
         run: sudo apt-get update -qq && sudo apt-get install -y -qq xz-utils binutils
@@ -257,8 +337,8 @@ jobs:
       - name: Append Linux assets to the draft release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
-          name: GreyIQ ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          tag_name: ${{ github.ref_name }}
+          name: GreyIQ ${{ github.ref_name }}
           draft: true
           prerelease: false
           fail_on_unmatched_files: true
@@ -266,20 +346,3 @@ jobs:
             release/GreyIQ-*.AppImage
             release/GreyIQ-*.deb
             release/GreyIQ-*-linux-cli.tar.gz
-
-  publish:
-    name: Publish the release (flip draft -> published)
-    # Runs only after BOTH platform builds have uploaded their assets to the draft,
-    # so the single publish event freezes an immutable release carrying every asset.
-    needs: [windows, linux]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Flip the draft release to published
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
-        run: |
-          gh release edit "$TAG" \
-            --repo "${{ github.repository }}" \
-            --draft=false \
-            --latest

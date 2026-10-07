@@ -6,7 +6,8 @@ is accepted: an unattended loop must never contact a reporting platform.
 
 Each start requires a short-lived grant for every enabled program. The grant
 binds its exact saved scope, policy, targets, and testing settings; request
-hooks recheck that binding before network activity. Cycles run sequentially.
+hooks recheck that binding before network activity. A stop event is checked
+between targets and programs; cycles run sequentially to avoid store races.
 """
 
 from __future__ import annotations

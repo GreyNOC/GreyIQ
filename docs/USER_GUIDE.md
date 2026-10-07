@@ -58,6 +58,37 @@ Many programs restrict structured-scope visibility to invited or paid researcher
 403/404 here is common and is *not* a bug — GreyIQ tells you plainly and points at the CSV
 fallback instead of failing silently.
 
+**Fetch from YesWeHack (API).** Pick **From YesWeHack** in the program wizard, or set the
+Platform to YesWeHack and click **Fetch scope from YesWeHack**. Search by name, or paste the
+program slug (or the full `yeswehack.com/programs/…` URL). GreyIQ calls YesWeHack's own API —
+`GET /programs?page=N` to search, then `GET /programs/{slug}` for the program itself.
+
+Unlike HackerOne's, **no credential is needed for a public program**: YesWeHack serves public
+programs' scope, rules and marker anonymously, so the common case works with an empty
+Submissions bar. Sign in only for a private or invited program (a 403 says so). Like every
+other non-target call, this fires only on your explicit click.
+
+One fetch fills in everything the hunt needs:
+
+- **Scope** — every `scopes[]` entry becomes a structured-scope row, with its asset type, its
+  value tier (`asset_value`) as Max severity, and the reward range that tier actually pays
+  (YesWeHack prices assets per tier via `reward_grid_*`, falling back to the default grid).
+- **Out of scope** — YesWeHack's out-of-scope list mixes real host patterns with prose. Host-
+  shaped lines become **unticked** scope rows, which is what GreyIQ turns into enforced
+  out-of-scope hosts; the prose stays readable in Notes rather than being pushed into the host
+  matcher as a fake hostname.
+- **Rules of engagement** — the program's rules text, qualifying and non-qualifying
+  vulnerability classes, test-account instructions, VPN requirement and source-IP restrictions
+  are written into **Notes**, binding constraints first.
+- **The required user-agent marker** — most YesWeHack programs require a per-program tag on
+  every request so they can attribute your traffic. GreyIQ puts it straight into **Required
+  user-agent suffix**, the same field the hunt engine appends verbatim to every in-scope
+  request, so an imported program is in-policy without extra setup. A re-fetch never
+  overwrites a marker or Notes you have edited by hand.
+
+A program that is disabled on YesWeHack, requires the VPN, or restricts testing to specific
+source IPs is called out in the fetch result *and* tagged on the saved program row.
+
 - Your **API token**: hackerone.com → Settings → **API Token** (this is a token, not your
   account password).
 - Your **API username**: shown right next to the token on that same settings page.
@@ -111,6 +142,42 @@ username, and API token. The token field is write-only — GreyIQ never reads it
 UI once saved. These same credentials power both the read-only scope import described above
 and the (separately gated) HackerOne report submission described in
 [Reports & submission](#4-reports--submission).
+
+### Browse platform APIs
+
+In **Programs → Add program → Browse platform APIs**, choose HackerOne, YesWeHack,
+Bugcrowd, or Intigriti. **Browse programs** reads a bounded list visible to the API
+identity; select a result or enter its program ID/handle and choose **Preview selected
+program**. Review the scope rows, exclusions, policy excerpt, status, and warnings before
+continuing to the Program form. Every program saved through this path starts **paused**.
+The listing and preview are evidence to review, not permission to test. The operator
+still needs a current authorization record and policy check before scheduled work.
+
+HackerOne uses the credentials in Submissions. YesWeHack can list public programs
+anonymously; private access may require its sign-in. Bugcrowd uses a researcher API
+token in `id:secret` form; Intigriti uses a researcher bearer token. Save either in the
+Browse step. GreyIQ keeps the token in its local owner-only secrets store and returns
+only whether one is saved. Credentialed requests are read-only, HTTPS host-pinned,
+redirect-refusing, and bounded. These APIs may omit free-text exclusions or other
+policy details, so always check the current human-facing program page. If your account
+cannot access a program through its API, use manual or CSV intake.
+
+### YesWeHack credentials
+
+Optional — the **YesWeHack** bar in **Submissions** starts at *anonymous · public programs
+only*, and that is a fully working state. Sign in only to reach a private or invited program.
+
+Signing in posts your email and password once to the local backend, which exchanges them with
+YesWeHack for a session token (`POST /login`, then `POST /account/totp` when your account has
+2FA). **Only the returned token is stored — the password is never written to disk, never
+logged, and never read back to the UI.** YesWeHack tokens are short-lived; when one expires
+the fetch says so and you sign in again. **Sign out** clears the stored token.
+
+A Personal Access Token can be pasted instead (tucked under *Use a Personal Access Token*) —
+YesWeHack issues those to program-manager and business-unit roles rather than hunter accounts.
+
+There is no YesWeHack submit API for researchers, so YesWeHack stays **export-only**: GreyIQ
+formats the report for YesWeHack's form and you file it on the platform.
 
 ## 2. SSRF / OOB setup, per program
 
@@ -215,6 +282,76 @@ explicitly selected U.S. federal VDP profiles (currently NASA); a `.gov` domain 
 does not silently activate a profile. Authorization, scope, private-address, rate, and evidence gates
 remain universal because they prevent false attribution and out-of-scope traffic.
 
+### The terminal cockpit — `gn dash`
+
+`gn dash` is `gn hunt` with the whole terminal: live panels for targets, findings over time,
+per-host rate limiting and the activity log, plus a command line you can type other `gn` verbs
+into while the run continues.
+
+```text
+gn dash https://example.com --scope "*.example.com" --active -y
+gn dash --attach                       # watch a run the desktop app is already running
+gn dash --attach --run-id <id>         # ...or a specific one
+gn dash --self-test                    # check this terminal without starting a hunt
+```
+
+It takes every option `gn hunt` takes, and **anything that makes panels inappropriate falls back
+to running exactly `gn hunt`** — `--json`, a redirected stdout, a pipe on stdin, `NO_COLOR`,
+`TERM=dumb`, `GN_NO_FX=1` or `GN_NO_DASH=1`. `gn dash … --json | jq` is one clean JSON document,
+and `gn dash … > report.txt` is byte-for-byte what `gn hunt` would have written. A terminal
+smaller than 60×18 is the one exception: it refuses and says so, because you clearly wanted the
+panels, and quietly hunting without them would be a different command from the one you typed.
+
+**Keys.** `Tab` cycles LOG / OUTPUT / TARGETS, `PgUp`/`PgDn` scroll whichever has focus, `Up`/`Down`
+walk the command history, `Ctrl-L` repaints, `q` quits. Type `help` in the pane for the verb table
+— it lists each control verb with its **real** latency, and greys out the ones this run does not
+offer.
+
+**`--attach`** watches a run another process is already holding, over loopback only
+(`127.0.0.1`, `::1`, `localhost`) and only after `GET /api/health` has answered on the port —
+nothing sends the session token to a port that has not identified itself. It finds the port from
+`$GREYIQ_PORT`, then `--port`, then a walk of 8766–8845, and the token from `--token`, then
+`$GREYIQ_SESSION_TOKEN`, then `session.token` under `$GREYIQ_RUNTIME_DIR` or the desktop app's own
+runtime folder. With no `--run-id` it attaches to the newest run that has not been asked to stop.
+If the backend restarts, the header pill goes `NO BACKEND` and the panels **freeze on the last
+good snapshot** behind a `stale Ns` badge — they are never cleared to zeros, because an empty
+panel reads as "nothing found", which is a different claim from "we lost contact".
+
+**`--self-test`** enters the alternate screen, draws one frame, hands the terminal back, and
+prints what it picked: glyph tier, key reader, console VT state, measured size, and which host
+counters answered. Run it first on an unfamiliar terminal — it is the fastest way to find out why
+a console is showing a wall of empty boxes.
+
+**Glyphs.** Block-bar sparklines by default, dropping to `░▒▓` on a cp437/cp850 console and to
+`_.:|` on an ASCII-only one. Braille is **off by default even on UTF-8**: `gn` forces both streams
+to UTF-8 at startup, so the encoding probe always says yes and cannot tell that your font has no
+U+28xx glyphs. Override with `GN_DASH_GLYPHS=braille|rich|box|ascii`, or `--braille` for that one
+run. `GN_NO_DASH=1` turns the cockpit off for a shell (same vocabulary as `GN_NO_FX`: `1`, `true`,
+`yes`, `on`).
+
+**What the panels claim, exactly.** The dashboard is deliberately pedantic about the difference
+between a measurement and a guess:
+
+- **`probe rate ~N/s (est, local)`** — *estimated*, derived from per-host token-bucket deltas, not
+  counted requests. Nothing in the engine counts requests per second, so this is labelled `est`
+  rather than presented as a reading.
+- **`n/a — local only`** — the rate panel and the host buckets in `--attach` mode. Those numbers
+  exist only inside the hunting process and are not exposed over HTTP, so they are reported as
+  unavailable rather than as zero.
+- **`--`** — any host counter (CPU, memory, disk) this machine would not answer. Never `0`: zero
+  is a claim.
+- **`total 400 (cap)`** — the findings stream is capped at 400 per run. A flat line that is really
+  a truncation is labelled as one.
+- **`stopping — after the current step`** — what the `stop` verb actually promises. The engine
+  checks the stop flag *between* probes, so a stop can take a full active pass (up to ~80s per
+  ranked endpoint) to take effect. The pill turns `DONE` only when the run itself returns. It is
+  never reported as "stopped" on request.
+- **Completion (`done/total`) counts skipped targets.** A stopped campaign marks its remaining
+  targets `skipped`, and a percentage that ignored them would sit below 100% forever.
+
+The dashboard writes **no files** — no frame log, no panel capture. Reports come from the hunt,
+exactly as they do without it.
+
 ## 4. Reading results
 
 The **Findings** board shows every finding with a proof-status pill:
@@ -239,7 +376,7 @@ Confirmed (and reportable candidate) findings appear in the **Submissions** tab:
   behalf. It's hard-gated: only enabled once proof status is Confirmed *and* your HackerOne
   creds are saved, requires an explicit confirmation dialog, and the server independently
   re-checks the confirmed status (a forged client request can't push an unproven finding).
-  Every other platform — including HackenProof — is **export-only**: HackenProof publishes no
+  Every other platform — including HackenProof — is **export-only for submission**: HackenProof publishes no
   researcher API for scope, submission, or metrics (its programmatic surface is a triage-side
   MCP server, not a hunter API), so GreyIQ formats the report and you submit it on the
   platform's own dashboard.
@@ -256,7 +393,11 @@ Confirmed (and reportable candidate) findings appear in the **Submissions** tab:
   bounded non-GET request, always explicitly opted into per-call.
 - **Egress is deliberately narrow.** Everything talks to your authorized target, except:
   the HackerOne report submission (`api.hackerone.com`, write, hard-gated, manual), the
-  HackerOne scope import described above (`api.hackerone.com`, read-only, manual), optional
+  HackerOne scope import described above (`api.hackerone.com`, read-only, manual), the
+  YesWeHack program search / scope import and sign-in (`api.yeswehack.com`, read-only apart
+  from the sign-in exchange itself, manual),
+  Bugcrowd (`api.bugcrowd.com`) and Intigriti (`api.intigriti.com`) program
+  discovery and scope preview (read-only, manual), and optional
   repo-draft enrichment (`api.github.com` or `gitlab.com`, unauthenticated read-only, one GET
   per repository, explicit click only), an
   optional certificate-transparency lookup for subdomain seeding (`crt.sh`, read-only), the

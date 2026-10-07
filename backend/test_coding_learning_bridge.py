@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
@@ -42,6 +43,7 @@ class CodingLearningBridgeTests(unittest.TestCase):
                 "text": "Added bounded input validation.",
                 "plan": ["Inspect", "Patch", "Test"],
                 "touched_files": ["app.py", "test_app.py"],
+                "transcript": [{"tool": "verify", "output": "VERIFY PASSED\nOK app.py", "is_error": False}],
                 "provider": "local",
                 "model": "coder",
             },
@@ -57,6 +59,56 @@ class CodingLearningBridgeTests(unittest.TestCase):
             self.root, prompt="Change code", result={"completed": True, "verified": False, "text": "Done"}
         )
         self.assertIsNone(row)
+        self.assertFalse((self.root / "data/greyiq_verified_replay.txt").exists())
+
+    def test_no_edit_answer_is_not_learned_despite_verified_flag(self) -> None:
+        # agent._finalize marks an unedited run verified by vacuity. That does not
+        # prove the model's answer or authorize it as a verified training target.
+        row = learn_from_verified_run(
+            self.root,
+            prompt="Explain an authentication bypass",
+            result={
+                "completed": True,
+                "verified": True,
+                "text": "The model's untested explanation.",
+                "touched_files": [],
+                "transcript": [{"tool": "verify", "output": "VERIFY PASSED", "is_error": False}],
+            },
+        )
+        self.assertIsNone(row)
+        self.assertFalse((self.root / "data/greyiq_verified_replay.txt").exists())
+
+    def test_passing_verifier_entry_is_required(self) -> None:
+        base = {
+            "completed": True,
+            "verified": True,
+            "text": "Changed the parser and reviewed it.",
+            "touched_files": ["parser.py"],
+        }
+        for transcript in ([], [{"tool": "verify", "output": "VERIFY FAILED", "is_error": True}]):
+            with self.subTest(transcript=transcript):
+                row = learn_from_verified_run(self.root, prompt="Fix the parser", result={**base, "transcript": transcript})
+                self.assertIsNone(row)
+        self.assertFalse((self.root / "data/greyiq_verified_replay.txt").exists())
+
+    def test_redactor_failure_does_not_store_raw_dialogue_or_replay(self) -> None:
+        with patch("brain_techniques.redact_text", side_effect=RuntimeError("redactor unavailable")):
+            dialogue = record_teacher_exchange(
+                self.root, prompt="secret prompt", student="secret draft",
+                teacher="secret response", model_version="teacher:1",
+            )
+            replay = learn_from_verified_run(
+                self.root,
+                prompt="secret code request",
+                result={
+                    "completed": True, "verified": True, "text": "secret output",
+                    "touched_files": ["app.py"],
+                    "transcript": [{"tool": "verify", "output": "VERIFY PASSED", "is_error": False}],
+                },
+            )
+        self.assertEqual(dialogue, {"outcome": "unavailable", "verification_reason": "redaction_unavailable"})
+        self.assertIsNone(replay)
+        self.assertFalse((self.root / "datasets").exists())
         self.assertFalse((self.root / "data/greyiq_verified_replay.txt").exists())
 
 

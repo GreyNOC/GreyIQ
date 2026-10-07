@@ -1,7 +1,7 @@
 """GreyIQ coding brain — routes chat to a capable model when one is configured.
 
 This is what makes GreyIQ able to actually code. The tiny local TinyGPT model
-(0.8M params, char-level) stays only as the offline last-resort fallback; when a
+(well under 10M params, char-level) stays only as the offline last-resort fallback; when a
 "brain" is configured here, coding/serious chat is answered by it instead.
 
 Providers (OpenAI-compatible ones share a client; Claude uses its official SDK):
@@ -18,8 +18,8 @@ an update means "keep the stored one"; deleting a key needs the explicit
 """
 from __future__ import annotations
 
-import json
 import ipaddress
+import json
 import re
 import socket
 import time
@@ -206,6 +206,69 @@ def check_public_hf_gguf(model: str, timeout: float = 15.0) -> None:
     files = metadata.get("siblings") or []
     if not any(isinstance(item, dict) and str(item.get("rfilename") or "").lower().endswith(".gguf") for item in files):
         raise CoderError("This Hugging Face repository has no GGUF model file. Choose a GGUF version of the model for Ollama.")
+_HF_ID_PART = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9])?$")
+_HF_QUANT = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$")
+
+
+def normalize_huggingface_model_ref(reference: str) -> str:
+    """Accept a public Hugging Face GGUF repo reference for Ollama's hf.co registry.
+
+    Ollama resolves the GGUF file and quantization during /api/pull. This parser
+    deliberately accepts only repository roots and optional quantization tags;
+    arbitrary URLs and file paths must never become model registry references.
+    """
+    raw = str(reference or "").strip()
+    if not raw or len(raw) > 300:
+        raise CoderError("Enter a Hugging Face GGUF repository URL or hf.co/owner/repo[:quant].")
+    if "://" in raw:
+        try:
+            parsed = urllib.parse.urlsplit(raw)
+            hostname, port = parsed.hostname, parsed.port
+        except ValueError as exc:
+            raise CoderError("Invalid Hugging Face repository URL.") from exc
+        if (parsed.scheme.lower() != "https" or hostname not in {"huggingface.co", "hf.co"}
+                or parsed.username or parsed.password or port is not None
+                or parsed.query or parsed.fragment):
+            raise CoderError("Use a public https://huggingface.co repository URL without a query or fragment.")
+        repo_ref = parsed.path.strip("/")
+    elif raw.startswith("hf.co/"):
+        repo_ref = raw[len("hf.co/"):].strip("/")
+    else:
+        raise CoderError("Enter a Hugging Face GGUF repository URL or hf.co/owner/repo[:quant].")
+    parts = repo_ref.split("/")
+    if len(parts) != 2:
+        raise CoderError("Use a repository root: owner/repo, with an optional :quant tag.")
+    owner, repo_and_quant = parts
+    repo, separator, quant = repo_and_quant.partition(":")
+    if (not _HF_ID_PART.fullmatch(owner) or not _HF_ID_PART.fullmatch(repo)
+            or ".." in owner or ".." in repo or (separator and not _HF_QUANT.fullmatch(quant))):
+        raise CoderError("Invalid Hugging Face repository or quantization tag.")
+    return f"hf.co/{owner}/{repo}{':' + quant if separator else ''}"
+
+
+def ollama_host_is_loopback(host: str) -> bool:
+    """Keep user-initiated Hugging Face imports on the local Ollama service."""
+    try:
+        parsed = urllib.parse.urlsplit(str(host or ""))
+        hostname = parsed.hostname
+        _ = parsed.port  # Reject malformed ports before making a network request.
+        if (parsed.scheme not in {"http", "https"} or not hostname
+                or parsed.username or parsed.password or parsed.path not in {"", "/"}
+                or parsed.query or parsed.fragment):
+            return False
+        if hostname == "localhost":
+            return True
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _safe_ollama_pull_error(detail: str) -> str:
+    """Keep signed CDN download URLs out of logs and the model import UI."""
+    if "blocked redirect to a different host" in detail.lower():
+        return ("Ollama blocked a Hugging Face download redirect. Update Ollama to "
+                "0.34.3 or newer, then retry the import.")
+    return re.sub(r'https?://[^\s"\']+', "[download URL]", detail)[:500]
 
 
 def chat_completion_token_limit_field(base_url: str, model: str) -> str:
@@ -675,7 +738,8 @@ def ollama_delete(host: str, model: str, timeout: float = 20.0) -> None:
 
 def model_installed(installed: list[str], model: str) -> bool:
     """Match a configured model name against installed names, tolerating the
-    implicit ':latest' tag Ollama adds and case-insensitive quantization tags."""
+    implicit ':latest' tag Ollama adds and case-insensitive quantization tags.
+    Ollama may lowercase Hugging Face repository and quantization names."""
     wanted = str(model or "").casefold()
     have = {str(name or "").casefold() for name in installed}
     if wanted in have:
@@ -693,6 +757,7 @@ def ollama_pull(host: str, model: str, timeout: float, progress_cb) -> None:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    succeeded = False
     try:
         with _ollama_open(request, timeout=timeout) as response:
             for raw in response:
@@ -704,15 +769,19 @@ def ollama_pull(host: str, model: str, timeout: float, progress_cb) -> None:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(event, dict) and event.get("error"):
-                    raise CoderError(f"Ollama pull failed: {event['error']}")
+                    raise CoderError(f"Ollama pull failed: {_safe_ollama_pull_error(str(event['error']))}")
                 progress_cb(event)
+                if isinstance(event, dict) and event.get("status") == "success":
+                    succeeded = True
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "ignore") if hasattr(exc, "read") else ""
-        raise CoderError(f"Ollama pull HTTP {exc.code}: {detail[:300] or exc.reason}") from exc
+        raise CoderError(f"Ollama pull HTTP {exc.code}: {_safe_ollama_pull_error(detail) or exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise CoderError(
             f"Could not reach Ollama at {host} ({exc.reason}). Start it with `ollama serve`."
         ) from exc
+    if not succeeded:
+        raise CoderError("Ollama ended the model download without confirming success.")
 
 
 def ollama_probe_readiness(host: str, model: str, timeout: float = 120.0) -> dict[str, Any]:

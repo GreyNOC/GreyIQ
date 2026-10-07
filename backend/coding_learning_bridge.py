@@ -7,13 +7,26 @@ from typing import Any, Callable
 from learning_engine import Experience, ExperienceScore, LearningEngine, is_security_sensitive
 
 
+class _RedactionUnavailable(RuntimeError):
+    """Refuse to store learning data when secret redaction cannot run."""
+
+
 def _redact(value: str, limit: int = 4000) -> str:
     try:
         from brain_techniques import redact_text
 
         return str(redact_text(value)[0])[:limit]
-    except Exception:
-        return value[:limit]
+    except Exception as exc:
+        raise _RedactionUnavailable from exc
+
+
+def _has_passing_verifier(result: dict[str, Any]) -> bool:
+    """Require an actual verify tool result, not a vacuous no-edit `verified` flag."""
+    transcript = result.get("transcript")
+    if not isinstance(transcript, list):
+        return False
+    verifiers = [step for step in transcript if isinstance(step, dict) and step.get("tool") == "verify"]
+    return bool(verifiers) and verifiers[-1].get("is_error") is False
 
 
 def student_draft(engine: Any, prompt: str) -> str:
@@ -52,10 +65,16 @@ def record_teacher_exchange(
     model_version: str,
 ) -> dict[str, Any]:
     """Store the dialogue for analysis, but do not admit an unverified teacher answer."""
+    try:
+        safe_prompt = _redact(prompt, 2000)
+        safe_teacher = _redact(teacher)
+        safe_context = f"TinyGPT student draft:\n{_redact(student, 2000)}" if student else ""
+    except _RedactionUnavailable:
+        return {"outcome": "unavailable", "verification_reason": "redaction_unavailable"}
     experience = Experience(
-        prompt=_redact(prompt, 2000),
-        response=_redact(teacher),
-        context=f"TinyGPT student draft:\n{_redact(student, 2000)}" if student else "",
+        prompt=safe_prompt,
+        response=safe_teacher,
+        context=safe_context,
         source="coding brain teacher dialogue",
         model_version=model_version,
         security_sensitive=is_security_sensitive(prompt),
@@ -81,11 +100,17 @@ def learn_from_verified_run(
     result: dict[str, Any],
 ) -> dict[str, Any] | None:
     """Turn only completed, verification-passing code work into replay data."""
-    if not (result.get("completed") and result.get("verified")):
+    touched_files = result.get("touched_files")
+    if not (result.get("completed") and result.get("verified")
+            and isinstance(touched_files, list) and touched_files and _has_passing_verifier(result)):
         return None
-    touched = [str(value) for value in (result.get("touched_files") or [])[:20]]
-    plan = [_redact(str(value), 500) for value in (result.get("plan") or [])[:10]]
-    summary = _redact(str(result.get("text") or "").strip())
+    try:
+        safe_prompt = _redact(prompt, 2000)
+        touched = [_redact(str(value), 500) for value in touched_files[:20]]
+        plan = [_redact(str(value), 500) for value in (result.get("plan") or [])[:10]]
+        summary = _redact(str(result.get("text") or "").strip())
+    except _RedactionUnavailable:
+        return None
     if not summary:
         summary = "Completed the requested code change and passed the workspace verification suite."
     evidence = ["Verified coding workflow completed successfully."]
@@ -95,7 +120,7 @@ def learn_from_verified_run(
         evidence.append("Touched files: " + ", ".join(touched))
     target = summary + "\n\nVerification evidence:\n" + "\n".join(f"- {line}" for line in evidence)
     experience = Experience(
-        prompt=_redact(prompt, 2000),
+        prompt=safe_prompt,
         response=summary,
         verified_answer=target,
         context="Workspace-bound coding agent run with a passing verification gate.",
