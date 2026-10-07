@@ -28,6 +28,40 @@ temp_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
 python -m playwright install chromium
 pyinstaller --noconfirm --clean build/greyiq-backend.spec
 test -x "$backend"
+
+# PyInstaller rewrites Mach-O load commands in files listed as datas. Playwright's
+# headless shell includes libEGL.dylib without enough header padding for that
+# rewrite, so stage the exact browser revision only after the frozen build exists.
+pw_revision="$(python - <<'PY'
+import importlib.util
+import json
+from pathlib import Path
+
+spec = importlib.util.find_spec("playwright")
+if not spec or not spec.origin:
+    raise SystemExit("Playwright is missing from the build environment")
+manifest = Path(spec.origin).parent / "driver" / "package" / "browsers.json"
+for browser in json.loads(manifest.read_text(encoding="utf-8"))["browsers"]:
+    if browser["name"] == "chromium-headless-shell":
+        print(browser["revision"])
+        break
+else:
+    raise SystemExit(f"Playwright manifest lacks chromium-headless-shell: {manifest}")
+PY
+)"
+if [[ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" && -d "$PLAYWRIGHT_BROWSERS_PATH" ]]; then
+  pw_cache="$PLAYWRIGHT_BROWSERS_PATH"
+else
+  pw_cache="$HOME/Library/Caches/ms-playwright"
+fi
+pw_source="$pw_cache/chromium_headless_shell-$pw_revision"
+test -f "$pw_source/INSTALLATION_COMPLETE" || {
+  echo "Playwright headless shell $pw_revision is missing from $pw_cache." >&2
+  exit 1
+}
+pw_destination="dist/greyiq-backend/_internal/playwright-browsers/$(basename "$pw_source")"
+mkdir -p "$(dirname "$pw_destination")"
+ditto "$pw_source" "$pw_destination"
 "$backend" --self-test-browser
 expected="GreyIQ gn $version"
 actual="$("$backend" --version)"
@@ -83,9 +117,17 @@ else
     --config.mac.hardenedRuntime=false --config.mac.notarize=false --publish never
 fi
 
-app="$(find release -maxdepth 2 -type d -name GreyIQ.app -print -quit)"
-test -n "$app" && test -x "$app/Contents/Resources/backend/greyiq-backend"
-test "$("$app/Contents/Resources/backend/greyiq-backend" --version)" = "$expected"
+# Bash glob works on the native macOS runner; BSD find has no portable -quit.
+apps=(release/mac*/GreyIQ.app)
+if [[ "${#apps[@]}" -ne 1 || ! -d "${apps[0]}" ]]; then
+  echo "Expected exactly one packaged GreyIQ.app under release/mac*." >&2
+  exit 1
+fi
+app="${apps[0]}"
+test -x "$app/Contents/Resources/backend/greyiq-backend"
+packaged_backend="$app/Contents/Resources/backend/greyiq-backend"
+test "$("$packaged_backend" --version)" = "$expected"
+"$packaged_backend" --self-test-browser
 for ext in dmg zip; do
   test -s "release/GreyIQ-$version-mac-$arch.$ext"
 done
