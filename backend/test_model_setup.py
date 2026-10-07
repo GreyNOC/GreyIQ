@@ -17,6 +17,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 import coder  # noqa: E402
 import greyiq_api as api  # noqa: E402
+import hf_gguf_import  # noqa: E402
 
 
 class ReferenceTests(unittest.TestCase):
@@ -235,6 +236,51 @@ class SetupJobTests(unittest.TestCase):
         self.assertFalse(status["selected"])
         self.assertEqual(saved, [])
         pull.assert_not_called()
+
+    def test_sharded_hf_fallback_selects_created_model_after_readiness(self) -> None:
+        instance, saved = self._runtime()
+        alias = "greyiq-hf/acme-code-1234:q4_k_m"
+        installed = []
+
+        def import_shards(host, ref, cache_root, progress_cb, models_root=None):
+            self.assertEqual(host, "http://127.0.0.1:11434")
+            self.assertEqual(ref, "hf.co/acme/Code-GGUF")
+            self.assertEqual(cache_root, api.RUNTIME_DIR / "hf-gguf-cache")
+            progress_cb({"status": "downloading split GGUF", "completed": 50, "total": 100})
+            installed.append(alias)
+            return alias
+
+        with patch.object(coder, "ollama_list_models", side_effect=lambda _host: list(installed)), \
+                patch.object(coder, "check_public_hf_gguf"), \
+                patch.object(coder, "ollama_pull", side_effect=coder.CoderError(
+                    'Ollama pull failed: This repository only contains sharded GGUF files.')), \
+                patch.object(hf_gguf_import, "import_sharded_hf_model", side_effect=import_shards) as fallback, \
+                patch.object(coder, "ollama_probe_readiness", return_value={
+                    "chat_ready": True, "tool_ready": True,
+                }) as probe:
+            instance.start_huggingface_import("https://huggingface.co/acme/Code-GGUF")
+            status = self._wait_done(instance)
+        fallback.assert_called_once()
+        probe.assert_called_once_with("http://127.0.0.1:11434", alias)
+        self.assertEqual(status["model"], alias)
+        self.assertTrue(status["selected"])
+        self.assertEqual(saved[0]["local"]["model"], alias)
+
+    def test_sharded_hf_fallback_failure_preserves_previous_brain(self) -> None:
+        instance, saved = self._runtime()
+        with patch.object(coder, "ollama_list_models", return_value=[]), \
+                patch.object(coder, "check_public_hf_gguf"), \
+                patch.object(coder, "ollama_pull", side_effect=coder.CoderError(
+                    'Ollama pull failed: This repository only contains sharded GGUF files.')), \
+                patch.object(hf_gguf_import, "import_sharded_hf_model", side_effect=coder.CoderError(
+                    "This quantization needs 66.4 GB; only 7.5 GB is free.")), \
+                patch.object(coder, "ollama_probe_readiness") as probe:
+            instance.start_huggingface_import("https://huggingface.co/acme/Code-GGUF")
+            status = self._wait_done(instance)
+        self.assertIn("66.4 GB", status["error"])
+        self.assertFalse(status["selected"])
+        self.assertEqual(saved, [])
+        probe.assert_not_called()
 
     def test_changing_brain_during_download_does_not_get_overwritten(self) -> None:
         instance, saved = self._runtime()

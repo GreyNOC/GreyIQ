@@ -134,6 +134,49 @@ is unavailable during a hunt, the bounded offline planner still runs. The
 packaged desktop starts the saved local runtime again after app restart. For
 source and headless CLI use, install and start Ollama locally; CLI hunts use
 the saved model with `--brain`. Review each model's license and card before use.
+
+If Ollama's repository pull rejects a model because it contains only **split
+GGUF shards**, GreyIQ checks the complete quantization set, reports its size,
+checks that local Ollama is version 0.35.0 or newer, and checks download space
+before fetching the shards. An explicit `:quant` tag
+selects that quantization; otherwise GreyIQ chooses the smallest complete one.
+It verifies the downloaded files, reuses saved shards or Ollama blobs on retry,
+and creates a local Ollama model from the original filenames, then runs the
+same readiness checks. Large split models
+need room for both the download cache and Ollama's model store, and still need
+an Ollama version that supports their architecture. The status panel explains
+preflight or model-creation failures without changing the previous brain.
+Set `GREYIQ_RUNTIME_DIR` to move the download cache and `OLLAMA_MODELS` to move
+the bundled Ollama model store before starting GreyIQ if the default volume is
+too small. The latter also works for a separately installed Ollama when set in
+that server's environment. For example, in PowerShell before opening the
+portable app:
+
+```powershell
+$env:GREYIQ_RUNTIME_DIR = 'D:\GreyIQ\runtime'
+$env:OLLAMA_MODELS = 'D:\GreyIQ\ollama-models'
+```
+
+For split GGUF shards larger than 4 GiB, both locations must use NTFS or
+exFAT on Windows. FAT32 cannot store a single file that large even when the
+drive has enough free space; GreyIQ checks this before downloading.
+
+Launch GreyIQ from that PowerShell session so it inherits both settings.
+
+On Linux, export both variables before starting the app and its Ollama server:
+
+```bash
+export GREYIQ_RUNTIME_DIR=/mnt/models/greyiq-runtime
+export OLLAMA_MODELS=/mnt/models/ollama-models
+```
+
+For split imports, stop an already-running Ollama server before launching
+GreyIQ. GreyIQ must launch Ollama with `OLLAMA_MODELS` set so it can verify the
+model store's free space; a server started elsewhere has an unknown store and
+the split download stops before transferring weights. Ordinary Ollama pulls
+can use an existing server. Existing models in a former store are not moved
+automatically.
+
 See the [Hugging Face Ollama guide](https://huggingface.co/docs/hub/main/ollama).
 If Ollama reports a blocked Hugging Face download redirect, update Ollama to
 0.34.3 or newer; 0.34.2 has a [known redirect bug](https://github.com/ollama/ollama/issues/18526).
@@ -192,6 +235,10 @@ previewing their scope and rules, or importing a CSV/paste table),
 opt-in shallow cloning/adversarial scanning of program-provided public source repositories,
 per-program SSRF/OOB setup, running a hunt, and reports & submission. The cockpit also opens
 a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the top bar).
+When adding a HackerOne program, enter and save the API identifier and token in
+the Program wizard's **Identify** step. You can test the saved connection there
+before browsing programs or fetching scope; the token field is masked and cleared
+after saving.
 
 - **Scan** from chat: `scan code <path|repo>`, `scan web <url>`, `scan live <url>`.
 - **Unauthenticated ATO and RCE, including the blind half.** The active prover confirms command

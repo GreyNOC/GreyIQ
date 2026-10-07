@@ -2982,8 +2982,8 @@ function pollModelPull({ statusEl = els.brainModelStatus, button = els.brainDown
       statusEl.textContent = `Downloaded ${status.model}; chat works, but agent tools did not pass.`;
       els.brainStatus.textContent = `${status.error} Your previous brain is still active. You may save this model for chat only.`;
     } else if (status.error) {
-      statusEl.textContent = `Model setup failed: ${status.error}`;
-      els.brainStatus.textContent = "Your previous brain is still active.";
+      statusEl.textContent = `Model setup failed: ${status.error} Your brain setting is unchanged.`;
+      els.brainStatus.textContent = "Your brain setting is unchanged.";
     } else {
       void refreshModelStatus();
     }
@@ -8607,32 +8607,99 @@ function ckWizardIdentifyRepo(nav) {
   return box;
 }
 
+function ckWizardH1Credentials() {
+  const wrap = cel("div", "ck-creds ck-wiz-crednote");
+  wrap.append(cel("strong", null, "HackerOne API credentials"));
+  wrap.append(cel("p", "ck-hint", "Enter the API identifier and token shown by HackerOne when you generate an API token. Save them here before fetching or browsing programs. The token stays in GreyIQ's local secret store."));
+  const form = cel("form", "ck-learn-form");
+  const username = ckField("HackerOne API identifier", "text", ckState.h1?.api_username || "");
+  const token = ckField("HackerOne API token", "password", "");
+  token.input.autocomplete = "new-password";
+  token.input.placeholder = ckState.h1?.has_token ? "Saved; enter a new token to replace it" : "Paste API token";
+  const save = cel("button", "ck-btn primary", "Save HackerOne credentials"); save.type = "submit";
+  const test = cel("button", "ck-btn", "Test saved connection"); test.type = "button";
+  const note = cel("p", "ck-status"); note.setAttribute("role", "status");
+  form.append(username.wrap, token.wrap, save, test, note);
+  wrap.append(form);
+
+  const showSavedState = (status) => {
+    if (status?.api_username && !username.input.value.trim()) username.input.value = status.api_username;
+    if (status?.has_token && status?.api_username) {
+      note.className = "ck-status";
+      note.textContent = "HackerOne credentials are saved locally. You can browse or fetch scope now.";
+      token.input.placeholder = "Saved; enter a new token to replace it";
+    } else {
+      note.className = "ck-status is-warn";
+      note.textContent = "Save your HackerOne API identifier and token to use its API.";
+    }
+  };
+  showSavedState(ckState.h1);
+  let savedHere = null;
+  void ckFetchCreds().then((status) => {
+    // A slow status response must not undo a credential saved in this wizard.
+    if (savedHere) { ckState.h1 = savedHere; return; }
+    showSavedState(status);
+  });
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const apiUsername = username.input.value.trim();
+    const apiToken = token.input.value.trim();
+    if (!apiUsername || !apiToken) {
+      note.className = "ck-status is-error";
+      note.textContent = "Enter both the HackerOne API identifier and token before saving.";
+      return;
+    }
+    save.disabled = true;
+    note.className = "ck-status";
+    note.textContent = "Saving HackerOne credentials locally…";
+    try {
+      // This endpoint clears team_handle when omitted. Read its current value so
+      // saving API access in the wizard does not change the submission target.
+      const current = await apiFetch("/api/bounty/hackerone/creds", { timeoutMs: 6000 });
+      if (!current?.ok) throw new Error("Credential status unavailable.");
+      const result = await apiFetch("/api/bounty/hackerone/creds", {
+        method: "POST", timeoutMs: 8000,
+        body: JSON.stringify({ team_handle: current.team_handle || "", api_username: apiUsername, api_token: apiToken }),
+      });
+      if (!result?.ok || !result.has_token || !result.api_username) throw new Error("Credential save failed.");
+      savedHere = result;
+      ckState.h1 = result;
+      token.input.value = "";
+      showSavedState(result);
+    } catch (_) {
+      note.className = "ck-status is-error";
+      note.textContent = "Could not save HackerOne credentials. Check that GreyIQ is running, then retry.";
+    } finally { save.disabled = false; }
+  });
+  test.addEventListener("click", async () => {
+    if (!ckState.h1?.has_token || !ckState.h1?.api_username) {
+      note.className = "ck-status is-error";
+      note.textContent = "Save the API identifier and token first.";
+      return;
+    }
+    test.disabled = true;
+    note.className = "ck-status";
+    note.textContent = "Testing saved HackerOne credentials…";
+    try {
+      const result = await apiFetch("/api/bounty/hackerone/test", { method: "POST", timeoutMs: 20000 });
+      note.className = result?.ok ? "ck-status" : "ck-status is-error";
+      note.textContent = result?.ok
+        ? "HackerOne accepted the saved credentials."
+        : "HackerOne did not accept the saved credentials. Check the API identifier and token.";
+    } catch (_) {
+      note.className = "ck-status is-error";
+      note.textContent = "Could not test the HackerOne connection. Retry when the service is available.";
+    } finally { test.disabled = false; }
+  });
+  return { wrap, clearToken: () => { token.input.value = ""; } };
+}
+
 function ckWizardIdentifyH1(nav) {
   const box = cel("div");
   box.append(cel("h3", "ck-wiz-title", "Pull scope from HackerOne"));
-  box.append(cel("p", "ck-hint", "Enter the program’s team handle. We call HackerOne’s API with the credentials you saved in Submissions. Many programs restrict this to invited researchers — a 403/404 is common, not a bug; you can still continue and add scope by hand."));
-  // Pull-scope needs saved HackerOne API creds. Pre-check them so a brand-new user (the tour
-  // reaches Program before Submissions) isn't dead-ended on a fetch that can't work, with no
-  // pointer to where the creds live. Refreshed once the creds status is known.
-  const credNote = cel("div", "ck-wiz-crednote");
-  box.append(credNote);
-  const paintCredNote = () => {
-    credNote.replaceChildren();
-    if (ckState.h1 && ckState.h1.has_token) return;  // creds present — nothing to warn about
-    credNote.append(cel("p", "ck-status is-warn",
-      "No HackerOne API credentials saved yet — the fetch below needs them. Save them first, or continue and add scope by hand."));
-    const go = cel("button", "ck-btn", "Save HackerOne credentials →"); go.type = "button";
-    go.addEventListener("click", () => {
-      ckSetView("submissions");
-      setTimeout(() => {
-        const bar = ck.views.submissions?.querySelector(".ck-creds-h1");
-        if (bar) { bar.scrollIntoView({ behavior: "smooth", block: "start" }); bar.querySelector("input")?.focus(); }
-      }, 60);
-    });
-    credNote.append(go);
-  };
-  paintCredNote();
-  void ckFetchCreds().then(paintCredNote);
+  box.append(cel("p", "ck-hint", "Enter the program’s team handle and fetch its scope. Many programs restrict API access to invited researchers — a 403/404 is common, not a bug; you can still continue and add scope by hand."));
+  box.append(ckWizardH1Credentials().wrap);
   const handle = ckField("HackerOne team handle", "text", "");
   box.append(handle.wrap);
   const fetchBtn = cel("button", "ck-btn", "Fetch scope"); fetchBtn.type = "button";
@@ -8824,25 +8891,44 @@ function ckWizardIdentifyPlatformApi(nav) {
   const saveCred = cel("button", "ck-btn", "Save API credential"); saveCred.type = "button";
   const clearCred = cel("button", "ck-btn", "Clear saved credential"); clearCred.type = "button";
   const credentialNote = cel("p", "ck-status");
-  box.append(cred.wrap, saveCred, clearCred, credentialNote);
+  const h1Creds = ckWizardH1Credentials();
+  box.append(cred.wrap, saveCred, clearCred, credentialNote, h1Creds.wrap);
+  let platformGeneration = 0;
   const syncCredentialUi = async () => {
     const p = platform.value;
+    const generation = platformGeneration;
     const localCred = p === "bugcrowd" || p === "intigriti";
     cred.wrap.hidden = !localCred; saveCred.hidden = !localCred; clearCred.hidden = !localCred;
+    h1Creds.wrap.hidden = p !== "hackerone";
+    if (p !== "hackerone") h1Creds.clearToken();
+    credentialNote.className = "ck-status";
+    credentialNote.hidden = p === "hackerone";
     if (!localCred) {
-      credentialNote.textContent = p === "hackerone"
-        ? "Use the HackerOne API username and token saved in Submissions."
-        : "Public YesWeHack programs can be browsed anonymously; private programs may require sign-in in Submissions.";
+      credentialNote.textContent = p === "yeswehack"
+        ? "Public YesWeHack programs can be browsed anonymously; private programs may require sign-in in Submissions."
+        : "";
       return;
     }
     try {
       const status = await apiFetch("/api/platforms/credentials", { timeoutMs: 6000 });
+      if (generation !== platformGeneration || p !== platform.value) return;
       credentialNote.textContent = status.platforms?.[p]?.has_token
         ? "A credential is saved locally. Paste a new one only to replace it."
         : "Save your researcher API credential before browsing.";
-    } catch (err) { credentialNote.textContent = err.message || "Could not check credential status."; }
+    } catch (err) {
+      if (generation === platformGeneration && p === platform.value) {
+        credentialNote.textContent = err.message || "Could not check credential status.";
+      }
+    }
   };
-  platform.addEventListener("change", () => { results.replaceChildren(); preview.replaceChildren(); selected = null; cont.disabled = true; void syncCredentialUi(); });
+  platform.addEventListener("change", () => {
+    platformGeneration += 1;
+    results.replaceChildren(); preview.replaceChildren();
+    programId.input.value = "";
+    selected = null; cont.disabled = true;
+    browse.disabled = false; fetch.disabled = false;
+    void syncCredentialUi();
+  });
   void syncCredentialUi();
   saveCred.addEventListener("click", async () => {
     saveCred.disabled = true;
@@ -8876,10 +8962,23 @@ function ckWizardIdentifyPlatformApi(nav) {
   const cont = cel("button", "ck-btn primary", "Review and save →"); cont.type = "button"; cont.disabled = true;
   let selected = null;
   browse.addEventListener("click", async () => {
+    const requestPlatform = platform.value;
+    const requestGeneration = platformGeneration;
+    const stillCurrent = () => requestGeneration === platformGeneration && requestPlatform === platform.value;
+    const query = search.input.value.trim();
+    const credentialLike = /^[^\s:]+:[^\s:]{12,}$/.test(query)
+      || (query.length >= 24 && /^[A-Za-z0-9+/_=-]+$/.test(query)
+        && query.includes("/") && query.includes("="));
+    if (credentialLike) {
+      search.input.value = "";
+      results.replaceChildren(cel("p", "ck-status is-error", "That looks like an API credential. Enter it in the credential fields above; search accepts program names only."));
+      return;
+    }
     browse.disabled = true; results.replaceChildren(cel("p", "ck-status", "Loading visible programs…"));
     try {
       const res = await apiFetch("/api/platforms/programs", { method: "POST", timeoutMs: 45000,
-        body: JSON.stringify({ platform: platform.value, query: search.input.value.trim(), limit: 100 }) });
+        body: JSON.stringify({ platform: requestPlatform, query, limit: 100 }) });
+      if (!stillCurrent()) return;
       results.replaceChildren();
       if (!res?.ok) throw new Error(res?.error || "Could not list programs.");
       for (const warning of res.warnings || []) results.append(cel("p", "ck-status is-warn", warning));
@@ -8890,31 +8989,36 @@ function ckWizardIdentifyPlatformApi(nav) {
         pick.addEventListener("click", () => { programId.input.value = row.id; fetch.click(); });
         const line = cel("div"); line.append(pick); results.append(line);
       }
-    } catch (err) { results.replaceChildren(cel("p", "ck-status is-error", err.message || "Could not list programs.")); }
-    finally { browse.disabled = false; }
+    } catch (err) {
+      if (stillCurrent()) results.replaceChildren(cel("p", "ck-status is-error", err.message || "Could not list programs."));
+    } finally { if (stillCurrent()) browse.disabled = false; }
   });
   search.input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); browse.click(); } });
   fetch.addEventListener("click", async () => {
+    const requestPlatform = platform.value;
+    const requestGeneration = platformGeneration;
+    const stillCurrent = () => requestGeneration === platformGeneration && requestPlatform === platform.value;
     const id = programId.input.value.trim();
     if (!id) { preview.replaceChildren(cel("p", "ck-status is-error", "Select a program or enter its ID or handle.")); return; }
     fetch.disabled = true; selected = null; cont.disabled = true;
     preview.replaceChildren(cel("p", "ck-status", "Reading program preview…"));
     try {
       const res = await apiFetch("/api/platforms/preview", { method: "POST", timeoutMs: 45000,
-        body: JSON.stringify({ platform: platform.value, program_id: id }) });
+        body: JSON.stringify({ platform: requestPlatform, program_id: id }) });
+      if (!stillCurrent()) return;
       preview.replaceChildren();
       if (!res?.ok) throw new Error(res?.error || "Could not preview program.");
       const rows = Array.isArray(res.structured_scope) ? res.structured_scope : [];
       const notes = [res.notes_digest || res.policy_excerpt || "", ...((res.warnings || []).map((w) => `Review: ${w}`))].filter(Boolean).join("\n\n").slice(0, 4000);
-      selected = platform.value === "yeswehack" ? ckYwhPrefill(res, id) : {
-        name: res.program_name || res.handle || id, platform: platform.value,
+      selected = requestPlatform === "yeswehack" ? ckYwhPrefill(res, id) : {
+        name: res.program_name || res.handle || id, platform: requestPlatform,
         platform_handle: res.handle || id, structured_scope: rows,
         repository_urls: ckRepositoryUrlsFromScope(rows),
-        h1_program_stats: platform.value === "hackerone" ? (res.program_stats || {}) : {},
+        h1_program_stats: requestPlatform === "hackerone" ? (res.program_stats || {}) : {},
         notes,
       };
-      if (platform.value === "yeswehack") selected.notes = notes;
-      selected.intake_source = { platform: platform.value, provider_id: res.program_id || id,
+      if (requestPlatform === "yeswehack") selected.notes = notes;
+      selected.intake_source = { platform: requestPlatform, provider_id: res.program_id || id,
         source_url: res.source_url || "", fetched_at: res.fetched_at || "",
         status: res.status || "unknown", scope_complete: res.scope_complete === true,
         warnings: res.warnings || [] };
@@ -8922,8 +9026,9 @@ function ckWizardIdentifyPlatformApi(nav) {
       if (res.policy_excerpt) preview.append(cel("p", "ck-hint", res.policy_excerpt.slice(0, 1000)));
       for (const warning of res.warnings || []) preview.append(cel("p", "ck-status is-warn", warning));
       cont.disabled = false;
-    } catch (err) { preview.replaceChildren(cel("p", "ck-status is-error", err.message || "Could not preview program.")); }
-    finally { fetch.disabled = false; }
+    } catch (err) {
+      if (stillCurrent()) preview.replaceChildren(cel("p", "ck-status is-error", err.message || "Could not preview program."));
+    } finally { if (stillCurrent()) fetch.disabled = false; }
   });
   cont.addEventListener("click", () => {
     if (!selected) return;

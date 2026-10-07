@@ -104,6 +104,9 @@ SESSION_TOKEN_PATH = RUNTIME_DIR / "session.token"
 # else is served, closing the gap where SESSION_TOKEN could be harvested
 # without ever presenting a real credential.
 GREYIQ_ACCESS_KEY = os.getenv("GREYIQ_ACCESS_KEY", "").strip()
+# Electron and the backend share this per-launch secret only through the backend
+# process environment. It never reaches the renderer or the public health route.
+INTERNAL_MODEL_STORE_TOKEN = os.getenv("GREYIQ_INTERNAL_MODEL_STORE_TOKEN", "")
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 
@@ -289,6 +292,7 @@ import brain_profiles  # noqa: E402
 import brain_techniques  # noqa: E402
 import coding_learning_bridge  # noqa: E402
 import coder  # noqa: E402
+import hf_gguf_import  # noqa: E402
 import project_memory  # noqa: E402
 import workspace as workspace_fs  # noqa: E402
 from ai_core.core_store import AICoreStore, DEFAULT_CORE_ID, slugify  # noqa: E402
@@ -1504,6 +1508,7 @@ class GreyIQRuntime:
             "active": False, "model": "", "status": "", "percent": 0,
             "completed": 0, "total": 0, "done": False, "error": "",
         }
+        self.managed_ollama_models_dir: Path | None = None
         # Live agent runs, keyed by request_id: each holds a growing event list the
         # UI polls (start_agent_run / agent_run_events) so a run streams instead of
         # blocking on one big response.
@@ -1854,6 +1859,17 @@ class GreyIQRuntime:
         with self.lock:
             return dict(self.model_pull)
 
+    def set_managed_ollama_models_dir(self, value: object) -> None:
+        """Accept Electron's authenticated, in-memory Ollama store update."""
+        if value is None:
+            models_dir = None
+        elif isinstance(value, str) and 0 < len(value) <= 4000 and Path(value).is_absolute():
+            models_dir = Path(value).resolve()
+        else:
+            raise HTTPError(422, "models_dir must be an absolute path or null.")
+        with self.lock:
+            self.managed_ollama_models_dir = models_dir
+
     def start_huggingface_import(self, reference: str) -> dict[str, Any]:
         """Import, verify, and select a public GGUF through local Ollama."""
         try:
@@ -1948,21 +1964,48 @@ class GreyIQRuntime:
 
         def worker() -> None:
             try:
+                selected_model = target
                 installed = coder.ollama_list_models(host)
-                if not coder.model_installed(installed, target):
+                if not coder.model_installed(installed, selected_model):
                     if is_hf:
                         with self.lock:
                             self.model_pull["status"] = "checking Hugging Face GGUF repository"
                         coder.check_public_hf_gguf(target)
                     with self.lock:
                         self.model_pull["status"] = "downloading model"
-                    coder.ollama_pull(host, target, timeout=3600.0, progress_cb=progress)
+                    try:
+                        coder.ollama_pull(host, target, timeout=3600.0, progress_cb=progress)
+                    except coder.CoderError as exc:
+                        if not is_hf or "sharded gguf" not in str(exc).casefold():
+                            raise
+                        with self.lock:
+                            self.model_pull.update({
+                                "status": "preparing split GGUF import", "percent": 0,
+                                "completed": 0, "total": 0,
+                            })
+                        with self.lock:
+                            managed_models_dir = getattr(self, "managed_ollama_models_dir", None)
+                        # Only an Electron-verified Ollama child is tied to its
+                        # reported model directory. A pre-existing server may
+                        # use a different store, even on loopback.
+                        models_root = managed_models_dir if host == "http://127.0.0.1:11434" else None
+                        # A pre-existing Ollama server can have a different
+                        # environment from GreyIQ. Even an operator-set
+                        # OLLAMA_MODELS here does not prove where that server
+                        # stores blobs, so use the conservative unknown-store
+                        # preflight unless Electron started the managed server.
+                        selected_model = hf_gguf_import.import_sharded_hf_model(
+                            host, target, RUNTIME_DIR / "hf-gguf-cache", progress,
+                            models_root=models_root,
+                        )
+                        with self.lock:
+                            self.model_pull["model"] = selected_model
                     installed = coder.ollama_list_models(host)
-                    if not coder.model_installed(installed, target):
+                    if not coder.model_installed(installed, selected_model):
                         raise coder.CoderError("Ollama reported success, but the model is absent from its installed list.")
                 with self.lock:
                     self.model_pull.update({"status": "checking chat and agent tool calls", "percent": 100})
-                readiness = coder.ollama_probe_readiness(host, target)
+                readiness = coder.ollama_probe_readiness(host, selected_model)
                 with self.lock:
                     self.model_pull.update({
                         "chat_ready": bool(readiness.get("chat_ready")),
@@ -1992,7 +2035,7 @@ class GreyIQRuntime:
                             "error": "The model is ready, but brain settings changed during setup. Select it manually if still wanted.",
                         })
                         return
-                    local_update = {"model": target, "base_url": base_url.strip()}
+                    local_update = {"model": selected_model, "base_url": base_url.strip()}
                     self.save_coder_config({"enabled": True, "provider": "local", "local": local_update})
                     self.model_pull.update({
                         "active": False, "done": True, "selected": True,
@@ -6094,6 +6137,18 @@ def _header(scope: dict[str, Any] | None, name: str) -> str:
     return ""
 
 
+def _internal_model_store_authorized(scope: dict[str, Any]) -> bool:
+    """The Electron main process alone may identify its own Ollama store."""
+    client = scope.get("client")
+    return (bool(INTERNAL_MODEL_STORE_TOKEN)
+            and isinstance(client, (tuple, list)) and bool(client)
+            and _is_loopback_bind(str(client[0]))
+            and hmac.compare_digest(
+                _header(scope, "x-greyiq-internal-model-store-token"),
+                INTERNAL_MODEL_STORE_TOKEN,
+            ))
+
+
 def _normalize_origin(value: str) -> str:
     raw = value.strip()
     if not raw or raw == "null":
@@ -6345,11 +6400,26 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
 
     # Session-token gate: /api/* (except liveness) requires the per-session token,
     # so other local processes can't drive the API over 127.0.0.1.
-    if path.startswith("/api/") and path != "/api/health" and not _session_authorized(scope):
+    if (path.startswith("/api/")
+            and path not in {"/api/health", "/api/internal/ollama-model-store"}
+            and not _session_authorized(scope)):
         await send_json(send, {"error": "missing or invalid session token"}, 403)
         return
 
     try:
+        if path == "/api/internal/ollama-model-store":
+            if method != "POST":
+                await send_json(send, {"error": "method not allowed"}, 405)
+                return
+            if not _internal_model_store_authorized(scope):
+                await send_json(send, {"error": "internal model-store authentication required"}, 403)
+                return
+            body = await read_json_body(receive)
+            if set(body) != {"models_dir"}:
+                raise HTTPError(422, "models_dir is required.")
+            runtime.set_managed_ollama_models_dir(body["models_dir"])
+            await send_json(send, {"ok": True})
+            return
         if method == "GET" and path in {"/", "/app"}:
             await send_index(send)
             return

@@ -2,6 +2,28 @@
 
 Notable changes to GreyIQ.
 
+## v4.9.1 - split GGUF import and desktop setup
+
+- Import public Hugging Face repositories containing only split GGUF files by
+  selecting a complete quantization set, checking Ollama 0.35.0+ and available
+  download space, verifying each shard, and creating a local Ollama model from
+  the original filenames. Reuse downloaded shards and Ollama blobs on retry;
+  report download and model creation failures in the import panel.
+- Keep the previous coding brain selected unless the new model passes both
+  chat and agent tool-call readiness checks. Allow `OLLAMA_MODELS` to place the
+  packaged Ollama model store on a volume with sufficient capacity. Split imports
+  stop before download if an external server's store cannot be verified or if a
+  FAT32 volume cannot hold an individual shard. A GreyIQ-launched system Ollama
+  can use an explicit `OLLAMA_MODELS` path after GreyIQ confirms that child owns
+  the server port.
+- Let operators save and test HackerOne API credentials directly in the Program
+  wizard before browsing programs or fetching scope. Credential-shaped text in
+  the program search box is stopped locally instead of sent as a query. Late
+  browse and preview responses are discarded after switching platforms, so
+  scope from one platform cannot be saved under another.
+- Use a frameless desktop window with in-app minimize, maximize, and close
+  controls, including on backend startup and error screens.
+
 ## v4.9.0 - Debian 13, guarded operator, and platform program intake
 
 - Added a Debian 13 package, AppImage, and headless CLI archive with a relocatable

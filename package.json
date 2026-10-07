@@ -1,6 +1,6 @@
 {
   "name": "greyiq",
-  "version": "4.9.0",
+  "version": "4.9.1",
   "private": true,
   "type": "module",
   "description": "GreyIQ local-first AI chat UI with editable bots, personal preference training, an Ollama/Claude/OpenAI coding brain with out-of-the-box GPU acceleration (NVIDIA bundled, AMD auto-provisioned), and a browser CPU/WebGPU fallback.",
@@ -16,7 +16,7 @@
     "dist": "electron-builder --win portable nsis",
     "build:linux": "pyinstaller --noconfirm --clean build/greyiq-backend.spec && chmod +x build/greyiq-cli && electron-builder --linux AppImage deb --publish never",
     "build:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File build/build-portable.ps1",
-    "check:js": "node scripts/check-syntax.mjs && node --test electron/health.test.cjs electron/ollama-runtime.test.cjs electron/runtime-path.test.cjs scripts/frontend-dom.test.cjs scripts/hf-import-dom.test.cjs",
+    "check:js": "node scripts/check-syntax.mjs && node --test electron/health.test.cjs electron/managed-ollama-store.test.cjs electron/ollama-runtime.test.cjs electron/runtime-path.test.cjs scripts/frontend-dom.test.cjs scripts/hf-import-dom.test.cjs",
     "check:syntax": "python -B scripts/check-syntax.py",
     "check:python": "python -B scripts/check-syntax.py && python -B -m pytest -q",
     "check:devops": "node scripts/check-devops.cjs",

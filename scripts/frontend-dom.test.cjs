@@ -68,7 +68,7 @@ test('platform API browse, preview, and Save keep an imported program paused', a
       addEventListener(name, fn) { (this.listeners[name] ||= []).push(fn); },
       querySelector(selector) { return find(this, (child) => child.tag === selector); },
       remove() {},
-      focus() {},
+      focus() {}, setAttribute() {},
       async dispatch(name) {
         const event = { preventDefault() {}, key: '' };
         for (const fn of this.listeners[name] || []) await fn(event);
@@ -85,10 +85,10 @@ test('platform API browse, preview, and Save keep an imported program paused', a
     }
     return null;
   }
-  function field(label, _type, value = '') {
+  function field(label, type, value = '') {
     const wrap = element('label');
     const caption = element('span', '', label);
-    const input = element('input'); input.value = value || '';
+    const input = element('input'); input.type = type; input.value = value || '';
     wrap.append(caption, input);
     return { wrap, input };
   }
@@ -111,6 +111,8 @@ test('platform API browse, preview, and Save keep an imported program paused', a
     CK_MAX_SCOPE_ENTRIES: 500,
     ckProgEdit: null,
     ckFlow: { view: 'wizard', prefill: null },
+    ckState: { h1: null },
+    ckFetchCreds: async () => null,
     ck: { activeProgram: { value: '' } },
     ckProgReset() { context.ckFlow = { view: 'list', prefill: null }; },
     ckRenderProgram() {},
@@ -121,6 +123,13 @@ test('platform API browse, preview, and Save keep an imported program paused', a
     setTimeout,
     apiFetch: async (url, options = {}) => {
       calls.push({ url, options });
+      if (url === '/api/bounty/hackerone/creds' && options.method === 'POST') return {
+        ok: true, team_handle: 'saved-submission-team', api_username: 'researcher-id', has_token: true,
+      };
+      if (url === '/api/bounty/hackerone/creds') return {
+        ok: true, team_handle: 'saved-submission-team', api_username: '', has_token: false,
+      };
+      if (url === '/api/bounty/hackerone/test') return { ok: true };
       if (url === '/api/platforms/credentials') return { ok: true, platforms: { bugcrowd: { has_token: true } } };
       if (url === '/api/platforms/programs') return { ok: true, programs: [
         { id: 'program-uuid', handle: 'example', name: 'Example', status: 'open' },
@@ -139,15 +148,63 @@ test('platform API browse, preview, and Save keep an imported program paused', a
     },
   };
   const { wizard, setupForm } = vm.runInNewContext(
-    `${source.slice(formStart, formEnd)}\n${source.slice(browseStart, browseEnd)}\n` +
+    `${source.slice(formStart, formEnd)}\n` +
+    `${source.slice(source.indexOf('function ckWizardH1Credentials() {'), source.indexOf('function ckWizardIdentifyH1(nav) {'))}\n` +
+    `${source.slice(browseStart, browseEnd)}\n` +
     '({ wizard: ckWizardIdentifyPlatformApi, setupForm: ckProgramSetupForm })', context,
   );
 
   const nav = element('div');
   const wizardBox = wizard(nav);
   const platform = find(wizardBox, (node) => node.tag === 'select');
+  const h1Identifier = find(wizardBox, (node) => node.tag === 'label'
+    && node.children[0]?.textContent === 'HackerOne API identifier')?.querySelector('input');
+  const h1Token = find(wizardBox, (node) => node.tag === 'label'
+    && node.children[0]?.textContent === 'HackerOne API token')?.querySelector('input');
+  assert.ok(h1Identifier && h1Token, 'HackerOne credentials are editable in Identify');
+  assert.equal(h1Token.type, 'password');
+  h1Identifier.value = 'researcher-id';
+  h1Token.value = 'test-token';
+  const h1Form = find(wizardBox, (node) => node.tag === 'form' && node.className === 'ck-learn-form');
+  await h1Form.dispatch('submit');
+  const h1Save = calls.find((call) => call.url === '/api/bounty/hackerone/creds' && call.options.method === 'POST');
+  assert.ok(h1Save, 'the wizard saves H1 credentials without leaving Identify');
+  assert.deepEqual(JSON.parse(h1Save.options.body), {
+    team_handle: 'saved-submission-team', api_username: 'researcher-id', api_token: 'test-token',
+  });
+  assert.equal(h1Token.value, '', 'the token field clears after saving');
+  assert.equal(h1Form.children.at(-1).textContent.includes('test-token'), false,
+    'the wizard status must not echo the token');
+  assert.equal(context.ckFlow.view, 'wizard');
+  assert.equal(platform.value, 'hackerone');
+  await find(wizardBox, (node) => node.textContent === 'Test saved connection').click();
+  assert.equal(calls.filter((call) => call.url === '/api/bounty/hackerone/test').length, 1);
+  const searchLabel = find(wizardBox, (node) => node.tag === 'label'
+    && node.children[0]?.textContent === 'Search visible programs');
+  for (const accidentalCredential of [
+    'researcher-id:accidental-secret-token',
+    'QWxhZGRpbjpvcGVuIHNlc2FtZQ/ABCD==',
+  ]) {
+    searchLabel.querySelector('input').value = accidentalCredential;
+    await find(wizardBox, (node) => node.textContent === 'Browse programs').click();
+    assert.equal(searchLabel.querySelector('input').value, '');
+    assert.equal(calls.some((call) => call.url === '/api/platforms/programs'), false,
+      'a credential-shaped search must not be sent as a query');
+    const browseError = find(wizardBox, (node) => node.className === 'ck-status is-error'
+      && node.textContent.includes('search accepts program names'));
+    assert.ok(browseError);
+    assert.equal(browseError.textContent.includes(accidentalCredential), false);
+  }
+  searchLabel.querySelector('input').value = 'Acme Security';
+  await find(wizardBox, (node) => node.textContent === 'Browse programs').click();
+  assert.deepEqual(JSON.parse(calls.find((call) => call.url === '/api/platforms/programs').options.body),
+    { platform: 'hackerone', query: 'Acme Security', limit: 100 });
+  searchLabel.querySelector('input').value = '';
+  h1Token.value = 'unsaved-rotation';
   platform.value = 'bugcrowd';
   await platform.dispatch('change');
+  assert.equal(h1Token.value, '', 'leaving HackerOne clears an unsaved token');
+  assert.equal(find(wizardBox, (node) => node.className.includes('ck-wiz-crednote')).hidden, true);
   const continueButton = find(nav, (node) => node.textContent === 'Review and save →');
   assert.equal(continueButton.disabled, true);
   const programIdLabel = find(wizardBox, (node) => node.tag === 'label'
@@ -161,7 +218,8 @@ test('platform API browse, preview, and Save keep an imported program paused', a
   await row.click();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(continueButton.disabled, false, 'Save remains locked until preview succeeds');
-  assert.deepEqual(JSON.parse(calls.find((call) => call.url === '/api/platforms/programs').options.body),
+  assert.deepEqual(JSON.parse(calls.find((call) => call.url === '/api/platforms/programs'
+    && JSON.parse(call.options.body).platform === 'bugcrowd').options.body),
     { platform: 'bugcrowd', query: '', limit: 100 });
   assert.deepEqual(JSON.parse(calls.filter((call) => call.url === '/api/platforms/preview').at(-1).options.body),
     { platform: 'bugcrowd', program_id: 'program-uuid' });
@@ -182,6 +240,69 @@ test('platform API browse, preview, and Save keep an imported program paused', a
   assert.equal(payload.structured_scope[0].identifier, 'https://example.test');
   for (const flag of ['enabled', 'active', 'live', 'deep']) assert.equal(payload[flag], false, flag);
   assert.equal(launched, 0, 'an imported program must not auto-launch after Save');
+
+  // A previous platform's late API response must not populate the new
+  // platform's results or unlock Save with the wrong scope and policy.
+  let finishH1Browse;
+  let finishH1Preview;
+  const regularApiFetch = context.apiFetch;
+  context.apiFetch = (url, options = {}) => {
+    const body = options.body ? JSON.parse(options.body) : {};
+    if (url === '/api/platforms/programs' && body.platform === 'hackerone') {
+      return new Promise((resolve) => { finishH1Browse = resolve; });
+    }
+    if (url === '/api/platforms/preview' && body.platform === 'hackerone') {
+      return new Promise((resolve) => { finishH1Preview = resolve; });
+    }
+    return regularApiFetch(url, options);
+  };
+  context.ckFlow = { view: 'wizard', prefill: null };
+  const raceNav = element('div');
+  const raceWizard = wizard(raceNav);
+  const racePlatform = find(raceWizard, (node) => node.tag === 'select');
+  const raceBrowse = find(raceWizard, (node) => node.textContent === 'Browse programs');
+  const raceFetch = find(raceWizard, (node) => node.textContent === 'Preview selected program');
+  const raceResults = find(raceWizard, (node) => node.className === 'ck-hacktivity-panel');
+  const racePreview = find(raceWizard, (node) => node.className === 'ck-hacktivity-panel' && node !== raceResults);
+  const raceContinue = find(raceNav, (node) => node.textContent === 'Review and save →');
+  const raceProgramId = find(raceWizard, (node) => node.tag === 'label'
+    && node.children[0]?.textContent === 'Program ID or handle')?.querySelector('input');
+  assert.ok(raceResults && racePreview && raceProgramId);
+
+  const staleBrowse = raceBrowse.click();
+  assert.equal(typeof finishH1Browse, 'function');
+  racePlatform.value = 'bugcrowd';
+  await racePlatform.dispatch('change');
+  assert.equal(raceBrowse.disabled, false, 'platform change permits a new browse');
+  await raceBrowse.click();
+  assert.ok(find(raceResults, (node) => node.textContent.startsWith('Example — example')));
+  finishH1Browse({ ok: true, programs: [{ id: 'old-h1', handle: 'old-h1', name: 'Old H1', status: 'open' }] });
+  await staleBrowse;
+  assert.equal(find(raceResults, (node) => node.textContent.includes('Old H1')), null,
+    'late HackerOne browse cannot replace Bugcrowd results');
+  assert.equal(raceBrowse.disabled, false);
+
+  racePlatform.value = 'hackerone';
+  await racePlatform.dispatch('change');
+  raceProgramId.value = 'old-h1';
+  const stalePreview = raceFetch.click();
+  assert.equal(typeof finishH1Preview, 'function');
+  racePlatform.value = 'bugcrowd';
+  await racePlatform.dispatch('change');
+  finishH1Preview({ ok: true, platform: 'hackerone', program_id: 'old-h1', handle: 'old-h1',
+    program_name: 'Old H1', structured_scope: [{ identifier: 'https://old-h1.example' }] });
+  await stalePreview;
+  assert.equal(raceContinue.disabled, true, 'late HackerOne preview cannot unlock Save');
+  assert.equal(raceProgramId.value, '', 'switching platforms clears the previous program ID');
+  assert.equal(find(racePreview, (node) => node.textContent.includes('Old H1')), null);
+  await raceContinue.click();
+  assert.equal(context.ckFlow.view, 'wizard');
+  raceProgramId.value = 'program-uuid';
+  await raceFetch.click();
+  assert.equal(raceContinue.disabled, false, 'a fresh Bugcrowd preview can unlock Save');
+  await raceContinue.click();
+  assert.equal(context.ckFlow.prefill.platform, 'bugcrowd');
+  assert.equal(context.ckFlow.prefill.intake_source.provider_id, 'program-uuid');
 });
 
 test('lead cards show hypothesis controls as text and hide them after confirmation', () => {
@@ -288,9 +409,9 @@ function programIntakeHarness(apiResponse) {
       focus() {}, scrollIntoView() {}, setAttribute() {},
     };
   }
-  function field(label, _type, value = '') {
+  function field(label, type, value = '') {
     const wrap = element('label');
-    const input = element('input'); input.value = value || '';
+    const input = element('input'); input.type = type; input.value = value || '';
     wrap.append(element('span', '', label), input);
     return { wrap, input };
   }
@@ -314,6 +435,12 @@ function programIntakeHarness(apiResponse) {
     document: { querySelector() { return null; } }, setTimeout,
     apiFetch: async (url, options = {}) => {
       calls.push({ url, options });
+      if (url === '/api/bounty/hackerone/creds' && options.method === 'POST') return {
+        ok: true, team_handle: 'submission-team', api_username: 'researcher-id', has_token: true,
+      };
+      if (url === '/api/bounty/hackerone/creds') return {
+        ok: true, team_handle: 'submission-team', api_username: '', has_token: false,
+      };
       if (url === '/api/operator/programs') return { ok: true, program: { id: 'saved' } };
       if (url === '/api/hackerone/import-scope' || url === '/api/yeswehack/import-scope') {
         return typeof apiResponse === 'function' ? apiResponse(url) : apiResponse;
@@ -325,7 +452,7 @@ function programIntakeHarness(apiResponse) {
     slice('function ckScopeRowEl(entry', '// Mirrors the backend\'s cap'),
     slice('const CK_MAX_SCOPE_ENTRIES = 500;', 'function ckProgramWithCandidateHosts'),
     slice('function ckProgramSetupForm(prefill) {', '\nlet ckProgramRenderGen'),
-    slice('function ckWizardIdentifyH1(nav) {', '// The YesWeHack path'),
+    slice('function ckWizardH1Credentials() {', '// The YesWeHack path'),
     slice('function ckWizardIdentifyYWH(nav) {', 'function ckWizardIdentifyPlatformApi'),
     slice('function ckYwhPrefill(res, slug) {', 'function ckWizardIdentifyManual'),
     '({ setupForm: ckProgramSetupForm, h1Wizard: ckWizardIdentifyH1, ywhWizard: ckWizardIdentifyYWH, mergeFetched: ckMergeFetchedScopeRows })',
@@ -333,6 +460,36 @@ function programIntakeHarness(apiResponse) {
   const actions = vm.runInNewContext(code, context);
   return { ...actions, context, calls, element, find, launched: () => launched };
 }
+
+test('direct HackerOne Identify saves API credentials in place without changing the program handle', async () => {
+  const h = programIntakeHarness({ ok: true, handle: 'target-team', program_name: 'Target', structured_scope: [] });
+  h.context.ckState.h1 = null;
+  h.context.ckSetView = () => { throw new Error('wizard must stay on Identify'); };
+  const nav = h.element('div');
+  const box = h.h1Wizard(nav);
+  const input = (caption) => h.find(box, (node) => node.tag === 'label'
+    && node.children[0]?.textContent === caption)?.querySelector('input');
+  input('HackerOne team handle').value = 'target-team';
+  input('HackerOne API identifier').value = 'researcher-id';
+  const token = input('HackerOne API token');
+  assert.equal(token.type, 'password');
+  const form = h.find(box, (node) => node.tag === 'form' && node.className === 'ck-learn-form');
+  await form.dispatch('submit');
+  assert.equal(h.calls.some((call) => call.url === '/api/bounty/hackerone/creds' && call.options.method === 'POST'), false,
+    'both fields are required');
+  token.value = 'test-token';
+  await form.dispatch('submit');
+  const save = h.calls.find((call) => call.url === '/api/bounty/hackerone/creds' && call.options.method === 'POST');
+  assert.deepEqual(JSON.parse(save.options.body), {
+    team_handle: 'submission-team', api_username: 'researcher-id', api_token: 'test-token',
+  });
+  assert.equal(token.value, '');
+  assert.equal(input('HackerOne team handle').value, 'target-team');
+  assert.equal(h.context.ckFlow.view, 'wizard');
+  assert.equal(form.children.at(-1).textContent.includes('test-token'), false);
+  await h.find(box, (node) => node.tag === 'button' && node.textContent === 'Fetch scope').click();
+  assert.ok(h.calls.some((call) => call.url === '/api/hackerone/import-scope'));
+});
 
 test('legacy HackerOne and YesWeHack wizard imports carry bounded provenance and save paused', async () => {
   for (const [platform, endpoint, response] of [

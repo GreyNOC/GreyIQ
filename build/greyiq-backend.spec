@@ -51,6 +51,7 @@ hiddenimports = [
     "document_ingest",
     "ai_core.core_store",
     "coder",
+    "hf_gguf_import",
     "agent",
     "skills",
     "repomap",
