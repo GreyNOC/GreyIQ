@@ -215,11 +215,15 @@ class CockpitQaqcV25ContractTests(unittest.TestCase):
     def test_findings_empty_state_points_to_report_center(self) -> None:
         self.assertIn("Open Report Center", JS)
 
-    # --- The HackerOne scope-import wizard pre-checks credentials with a jump ---
+    # --- Both HackerOne intake paths expose the inline credential form ---
     def test_hackerone_scope_wizard_prechecks_creds(self) -> None:
         h1 = self._fn("ckWizardIdentifyH1")
-        self.assertIn("ck-wiz-crednote", h1)
-        self.assertIn("Save HackerOne credentials", h1)
+        platform = self._fn("ckWizardIdentifyPlatformApi")
+        credentials = self._fn("ckWizardH1Credentials")
+        self.assertIn("ckWizardH1Credentials().wrap", h1)
+        self.assertIn("ckWizardH1Credentials()", platform)
+        self.assertIn("ck-wiz-crednote", credentials)
+        self.assertIn("Save HackerOne credentials", credentials)
 
     # --- Program save reports a server-side rejection instead of a false "Saved." ---
     def test_program_save_checks_the_result(self) -> None:

@@ -471,6 +471,7 @@ class NoNewOrphanRoutesTests(unittest.TestCase):
     # route -> why it has no app.js caller today
     KNOWN = {
         "/api/health": "the readiness gate the Electron shell and the release smoke tests poll",
+        "/api/internal/ollama-model-store": "the Electron shell reports the managed model-store path after starting Ollama",
         "/api/bounty/finding/reverify": "superseded in the UI by /finding/prove; still served for API clients",
         "/api/bounty/platforms": "the app ships the same list as CK_PLATFORMS and renders it offline",
         "/api/bounty/runs": "the run picker for `gn dash --attach`; the app mints its own run ids, so it has nothing to discover",
@@ -492,6 +493,10 @@ class NoNewOrphanRoutesTests(unittest.TestCase):
         self.assertFalse(wired, f"KNOWN still lists route(s) the app now calls: {wired}")
         gone = sorted(r for r in self.KNOWN if r not in _handled_routes())
         self.assertFalse(gone, f"KNOWN lists route(s) the server no longer serves: {gone}")
+
+    def test_electron_reports_the_managed_ollama_model_store(self) -> None:
+        electron = (ROOT / "electron" / "main.cjs").read_text(encoding="utf-8")
+        self.assertIn("'/api/internal/ollama-model-store'", electron)
 
 
 if __name__ == "__main__":
