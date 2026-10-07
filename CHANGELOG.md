@@ -4,6 +4,18 @@ Notable changes to GreyIQ.
 
 ## Unreleased
 
+## v4.9.7 - live Ollama model intake
+
+- Load the local, tool-capable model list directly from Ollama's public catalog
+  and offer installed weights in one dropdown. Selecting a model starts local
+  setup, verifies chat and structured tool calls, and activates it only after
+  both checks pass. Cloud-only entries are excluded.
+- Keep Hugging Face GGUF import in an advanced section with the same readiness
+  gate. Match installed models to the currently entered server, prevent setup
+  races, and protect the active model from deletion.
+- Show catalog outages and partial results explicitly; update the setup guide
+  and add parser, route, and frontend flow coverage.
+
 ## v4.9.6 - unsigned macOS packaging
 
 - Clear absent Apple signing secrets before unsigned macOS packaging, so

@@ -150,7 +150,7 @@
             <label>
               <span>Coding brain</span>
               <select id="brainProvider" name="brainProvider">
-                <option value="off">Off — local TinyGPT only</option>
+                <option value="off">Off — no coding brain</option>
                 <option value="local">Local model (Ollama)</option>
                 <option value="anthropic">Claude API</option>
                 <option value="openai">OpenAI / ChatGPT</option>
@@ -158,11 +158,23 @@
             </label>
             <label data-brain-field="model">
               <span>Model</span>
-              <input id="brainModel" name="brainModel" type="text" autocomplete="off" spellcheck="false" placeholder="Ollama name or Hugging Face GGUF model URL">
+              <input id="brainModel" name="brainModel" type="text" autocomplete="off" spellcheck="false" placeholder="Provider model name">
             </label>
-            <p class="folder-status" id="brainModelHelp" data-brain-local-help hidden>For Hugging Face, paste a public GGUF model page, hf.co/owner/repo:quant, or its ollama run command.</p>
+            <div class="ollama-picker" id="brainOllamaPicker" hidden>
+              <label for="brainOllamaModel">
+                <span>Free local Ollama model</span>
+                <select id="brainOllamaModel" name="brainOllamaModel" aria-describedby="brainCatalogStatus">
+                  <option value="">Loading Ollama models…</option>
+                </select>
+              </label>
+              <div class="folder-actions">
+                <span class="folder-status" id="brainCatalogStatus" role="status" aria-live="polite">Loading Ollama's local models…</span>
+                <button class="text-button" type="button" id="brainCatalogRefresh">Refresh list</button>
+              </div>
+              <p class="folder-status">Choose a model to download, check for chat and agent tools, and use automatically. Downloads use your Ollama server and may require several GB of disk space. Review each model's license on <a href="https://ollama.com/search?c=local&amp;c=tools" target="_blank" rel="noopener noreferrer">Ollama</a>.</p>
+            </div>
             <label data-brain-field="base_url">
-              <span>Server URL</span>
+              <span>Server URL (optional)</span>
               <input id="brainBaseUrl" name="brainBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:11434/v1">
             </label>
             <label data-brain-field="api_key">
@@ -175,11 +187,10 @@
             </div>
             <div class="folder-actions" id="brainModelRow" hidden>
               <span class="folder-status" id="brainModelStatus">checking model…</span>
-              <button class="text-button" type="button" id="brainDownload">Download and use</button>
             </div>
             <div class="model-list" id="brainModelList" hidden></div>
-            <section class="hf-import" id="brainHfImportSection" aria-labelledby="brainHfImportTitle" hidden>
-              <h3 id="brainHfImportTitle">Import from Hugging Face</h3>
+            <details class="hf-import" id="brainHfImportSection" hidden>
+              <summary id="brainHfImportTitle">Import a Hugging Face GGUF model</summary>
               <p class="folder-status">Use a public GGUF model repository. GreyIQ desktop downloads and starts Ollama on first use, then checks chat and agent tool support before selecting the model. Browser use requires Ollama running locally. Private or gated models need separate access; check the model card and license before use.</p>
               <label for="brainHfReference">
                 <span>Model page URL or Ollama reference</span>
@@ -189,7 +200,7 @@
                 <button class="text-button" type="button" id="brainHfImport">Import and select</button>
               </div>
               <p class="folder-status" id="brainHfStatus" role="status" aria-live="polite"></p>
-            </section>
+            </details>
             <label>
               <span>Researcher UA marker</span>
               <input id="brainUaMarker" name="brainUaMarker" type="text" autocomplete="off" spellcheck="false" maxlength="120" placeholder="e.g. h1-greynoc">
