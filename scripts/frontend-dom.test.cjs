@@ -355,6 +355,25 @@ test('renderer bootstrap selectors exist in the shipped HTML', () => {
   }
 });
 
+test('verified replay joins only the old default training selection once', () => {
+  const source = fs.readFileSync(path.resolve(__dirname, '..', 'public', 'app.js'), 'utf8');
+  const constants = source.slice(source.indexOf('const TRAINING_SOURCE_REVISION'),
+    source.indexOf('const DEFAULT_TRAIN_SETTINGS'));
+  const helpers = source.slice(source.indexOf('function normalizeSelectedTrainingSources'),
+    source.indexOf('function trainingSourceName'));
+  const { migrateSelectedTrainingSources, revision } = vm.runInNewContext(
+    `${constants}\n${helpers}\n({ migrateSelectedTrainingSources, revision: TRAINING_SOURCE_REVISION })`
+  );
+  const oldDefault = ['src_starter_knowledge', 'src_bug_bounty',
+    'src_personal_choices', 'src_preferred_examples'];
+  assert.deepEqual(Array.from(migrateSelectedTrainingSources(oldDefault, 0)),
+    [...oldDefault, 'src_verified_replay']);
+  assert.deepEqual(Array.from(migrateSelectedTrainingSources(['src_bug_bounty'], 0)),
+    ['src_bug_bounty'], 'custom selections must stay unchanged');
+  assert.deepEqual(Array.from(migrateSelectedTrainingSources(oldDefault, revision)), oldDefault,
+    'removing verified replay after migration must be respected');
+});
+
 test('structured-scope row retains its HackerOne asset id only for the original identifier', () => {
   const source = fs.readFileSync(path.resolve(__dirname, '..', 'public', 'app.js'), 'utf8');
   const start = source.indexOf('function ckScopeRowEl(entry, onOperatorChange) {');
@@ -463,7 +482,7 @@ test('platform API browse, preview, and Save keep an imported program paused', a
         ok: true, team_handle: 'saved-submission-team', api_username: '', has_token: false,
       };
       if (url === '/api/bounty/hackerone/test') return { ok: true };
-      if (url === '/api/platforms/credentials') return { ok: true, platforms: { bugcrowd: { has_token: true } } };
+      if (url === '/api/platforms/credentials') return { ok: true, platforms: { intigriti: { has_token: true } } };
       if (url === '/api/platforms/programs') return { ok: true, programs: [
         { id: 'program-uuid', handle: 'example', name: 'Example', status: 'open' },
       ] };
@@ -471,9 +490,9 @@ test('platform API browse, preview, and Save keep an imported program paused', a
         return { ok: false, error: 'Program unavailable' };
       }
       if (url === '/api/platforms/preview') return {
-        ok: true, platform: 'bugcrowd', program_id: 'program-uuid', handle: 'example',
+        ok: true, platform: 'intigriti', program_id: 'program-uuid', handle: 'example',
         program_name: 'Example', structured_scope: [{ identifier: 'https://example.test', eligible_for_submission: true }],
-        source_url: 'https://api.bugcrowd.com/programs/program-uuid', fetched_at: '2026-10-06T00:00:00Z',
+        source_url: 'https://api.intigriti.com/external/researcher/v1/programs/program-uuid', fetched_at: '2026-10-06T00:00:00Z',
         status: 'open', scope_complete: false, warnings: ['Review exclusions'],
       };
       if (url === '/api/operator/programs') return { ok: true, program: { id: 'saved-program' } };
@@ -490,6 +509,8 @@ test('platform API browse, preview, and Save keep an imported program paused', a
   const nav = element('div');
   const wizardBox = wizard(nav);
   const platform = find(wizardBox, (node) => node.tag === 'select');
+  assert.equal(platform.children.some((option) => option.value === 'bugcrowd'), false,
+    'the browse flow must not offer the Bugcrowd organization API to researchers');
   const h1Identifier = find(wizardBox, (node) => node.tag === 'label'
     && node.children[0]?.textContent === 'HackerOne API identifier')?.querySelector('input');
   const h1Token = find(wizardBox, (node) => node.tag === 'label'
@@ -534,7 +555,7 @@ test('platform API browse, preview, and Save keep an imported program paused', a
     { platform: 'hackerone', query: 'Acme Security', limit: 100 });
   searchLabel.querySelector('input').value = '';
   h1Token.value = 'unsaved-rotation';
-  platform.value = 'bugcrowd';
+  platform.value = 'intigriti';
   await platform.dispatch('change');
   assert.equal(h1Token.value, '', 'leaving HackerOne clears an unsaved token');
   assert.equal(find(wizardBox, (node) => node.className.includes('ck-wiz-crednote')).hidden, true);
@@ -552,10 +573,10 @@ test('platform API browse, preview, and Save keep an imported program paused', a
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(continueButton.disabled, false, 'Save remains locked until preview succeeds');
   assert.deepEqual(JSON.parse(calls.find((call) => call.url === '/api/platforms/programs'
-    && JSON.parse(call.options.body).platform === 'bugcrowd').options.body),
-    { platform: 'bugcrowd', query: '', limit: 100 });
+    && JSON.parse(call.options.body).platform === 'intigriti').options.body),
+    { platform: 'intigriti', query: '', limit: 100 });
   assert.deepEqual(JSON.parse(calls.filter((call) => call.url === '/api/platforms/preview').at(-1).options.body),
-    { platform: 'bugcrowd', program_id: 'program-uuid' });
+    { platform: 'intigriti', program_id: 'program-uuid' });
   await continueButton.click();
   assert.equal(context.ckFlow.view, 'form');
   assert.equal(context.ckFlow.prefill.intake_source.provider_id, 'program-uuid');
@@ -568,7 +589,7 @@ test('platform API browse, preview, and Save keep an imported program paused', a
   assert.ok(save, 'Save should submit the reviewed program');
   const payload = JSON.parse(save.options.body);
   assert.equal(payload.name, 'Example');
-  assert.equal(payload.platform, 'bugcrowd');
+  assert.equal(payload.platform, 'intigriti');
   assert.equal(payload.intake_source.provider_id, 'program-uuid');
   assert.equal(payload.structured_scope[0].identifier, 'https://example.test');
   for (const flag of ['enabled', 'active', 'live', 'deep']) assert.equal(payload[flag], false, flag);
@@ -604,7 +625,7 @@ test('platform API browse, preview, and Save keep an imported program paused', a
 
   const staleBrowse = raceBrowse.click();
   assert.equal(typeof finishH1Browse, 'function');
-  racePlatform.value = 'bugcrowd';
+  racePlatform.value = 'intigriti';
   await racePlatform.dispatch('change');
   assert.equal(raceBrowse.disabled, false, 'platform change permits a new browse');
   await raceBrowse.click();
@@ -612,7 +633,7 @@ test('platform API browse, preview, and Save keep an imported program paused', a
   finishH1Browse({ ok: true, programs: [{ id: 'old-h1', handle: 'old-h1', name: 'Old H1', status: 'open' }] });
   await staleBrowse;
   assert.equal(find(raceResults, (node) => node.textContent.includes('Old H1')), null,
-    'late HackerOne browse cannot replace Bugcrowd results');
+    'late HackerOne browse cannot replace Intigriti results');
   assert.equal(raceBrowse.disabled, false);
 
   racePlatform.value = 'hackerone';
@@ -620,7 +641,7 @@ test('platform API browse, preview, and Save keep an imported program paused', a
   raceProgramId.value = 'old-h1';
   const stalePreview = raceFetch.click();
   assert.equal(typeof finishH1Preview, 'function');
-  racePlatform.value = 'bugcrowd';
+  racePlatform.value = 'intigriti';
   await racePlatform.dispatch('change');
   finishH1Preview({ ok: true, platform: 'hackerone', program_id: 'old-h1', handle: 'old-h1',
     program_name: 'Old H1', structured_scope: [{ identifier: 'https://old-h1.example' }] });
@@ -632,9 +653,9 @@ test('platform API browse, preview, and Save keep an imported program paused', a
   assert.equal(context.ckFlow.view, 'wizard');
   raceProgramId.value = 'program-uuid';
   await raceFetch.click();
-  assert.equal(raceContinue.disabled, false, 'a fresh Bugcrowd preview can unlock Save');
+  assert.equal(raceContinue.disabled, false, 'a fresh Intigriti preview can unlock Save');
   await raceContinue.click();
-  assert.equal(context.ckFlow.prefill.platform, 'bugcrowd');
+  assert.equal(context.ckFlow.prefill.platform, 'intigriti');
   assert.equal(context.ckFlow.prefill.intake_source.provider_id, 'program-uuid');
 });
 

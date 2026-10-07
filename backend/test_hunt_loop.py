@@ -239,6 +239,32 @@ class HuntLoopTests(unittest.TestCase):
         # ...and the loop's own snapshot is built AFTER the override, so it carries the same number
         self.assertEqual(meta["investigation"]["coverage"]["requests_used"], 8)
 
+    def test_checked_classes_union_completed_suites_from_partial_turns(self) -> None:
+        # A later turn can hit the budget after completing some checks. The loop must
+        # retain those completed suite tags from both turns, without adding classes
+        # the verifier did not actually mark as checked.
+        turn_meta = iter([
+            {"requests_used": 2, "rate_limited": False,
+             "checked_classes": ["cors", "xss"], "verified_classes": ["xss"]},
+            {"requests_used": 3, "rate_limited": True,
+             "checked_classes": ["sqli"], "verified_classes": []},
+        ])
+
+        def fake(target, findings, *, requests_budget=12, **kw):
+            self.turn += 1
+            return [], {"in_scope": True, "host": "t", **next(turn_meta)}
+
+        active_verify_service.verify_active = fake
+        self._brain(done=False)
+        _, meta = hunt_loop.run_iterative_verify(
+            "https://t/", [], scope="t", requests_budget=100,
+            settings=self._settings(max_iters=5), coder_cfg={"provider": "x"})
+        self.assertEqual(self.turn, 2)
+        self.assertTrue(meta["rate_limited"])
+        self.assertEqual(meta["checked_classes"], ["cors", "sqli", "xss"])
+        self.assertEqual(meta["verified_classes"], ["xss"])
+        self.assertEqual(meta["requests_used"], 5)
+
 
 class OfflineReactPlanTests(unittest.TestCase):
     """The DETERMINISTIC re-planner: with no brain configured the loop must still refine from the real

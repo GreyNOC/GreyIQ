@@ -2,6 +2,23 @@
 
 Notable changes to GreyIQ.
 
+## Unreleased
+
+- Record completed verifier suites and confirmed outcomes as evidence for hunt
+  learning. Filtered findings and interrupted checks cannot create false
+  negative labels; check identity remains distinct from reported impact.
+- Retrain the local hunt ranker after new traces and promote weights only when
+  held-out recall matches or beats both the rules and the active model.
+- Update one learning outcome per finding as platform verdicts change, so
+  repeated syncs and rescans do not distort priorities.
+- Make verified coding lessons available to TinyGPT training and live retrieval.
+  Local Windows builds can opt in to bundle TinyGPT, CPU torch, and a seed model;
+  the frozen build checks that the model loads.
+- Remove unsupported Bugcrowd researcher API discovery and scope preview. Manual
+  and CSV intake and Bugcrowd report formatting remain available.
+- Wait for the operator worker to record its stopped audit and release its lease
+  before the CLI exits after interruption.
+
 ## v4.9.2 - authorized assessment and MCP hunt review
 
 - Expand the local security knowledge and hunt workflow with scope-bound active

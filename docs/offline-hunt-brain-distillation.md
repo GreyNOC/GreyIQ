@@ -155,33 +155,31 @@ Unchanged from today, and it's the whole reason this is low-risk:
   `offline_hunt` docstring's existing invariant). A 70%-good student wastes a little
   probe budget at worst. **Ship early, improve continuously.**
 
-## 7. Phased build plan
+## 7. Implemented learning loop
 
-- **Phase 0 — trace logging. ✅ SHIPPED.** `backend/bughunter/hunt_trace.py` appends
-  one `hunt_traces.jsonl` line per hunt (recon surface + plan + confirm outcomes), an
-  immutable append-only corpus with a lazy ledger join (`training_examples`) for the
-  final stage/bounty. Wired into BOTH hunt paths: `campaign._run_campaign_body` (covers
-  `run_campaign`, spans, portfolios) and the standalone `bounty.run_bounty_hunt` (the
-  guard `hunt_trace_plan is not None` avoids double-logging the campaign-driven per-URL
-  path). Fail-closed (a trace write never breaks a hunt) and payload/secret-free by
-  construction. Visible via `gn traces` (+ `--json`). Tests: `test_hunt_trace.py`,
-  `test_campaign.py::test_url_campaign_writes_hunt_trace`, `test_gn_cli.py`. *Deferred:
-  the iterative re-plan loop (`hunt_loop._react_plan`) is not yet traced — it has no
-  `runtime_dir`/program in scope; tracing per-turn refinements is a later enhancement.*
-- **Phase 1 — teacher corpus + feature extractor.** A deterministic
-  `surface → feature-vector` function (reuse the existing hint tables *as features*).
-  Generate teacher plans from the rules and (optionally) Claude. ~2–3 days.
-- **Phase 2 — endpoint→class ranker (3a).** Train, calibrate, and wire it behind a
-  `use_learned_ranker` flag inside `offline_plan`; fall back to rules if the model
-  file is absent (frozen-safe, offline-safe). First measurable capability win.
-- **Phase 3 — param-name model (3b) + selectors (3c).** Complete the learned plan.
-- **Phase 4 — outcome fine-tuning loop.** Retrain on `hunt_traces.jsonl`; add an
-  offline eval (recall@k of confirmed classes vs. the current rules) as the metric.
-- **Phase 5 (optional).** Tiny generative param-name fallback (3d) only if evals show
-  a novel-name gap.
+- Direct hunts and campaigns append a local trace containing the recon surface,
+  first plan, completed verifier suites, and proof outcomes. An iterative hunt
+  aggregates completed suites across turns. The trace contains no request bodies
+  or payloads; URLs are secret-redacted. `gn traces` shows corpus statistics.
+- The trainer derives endpoint features from each saved surface. Confirmed findings
+  teach positives even on a partial hunt. A missing finding teaches a negative only
+  for a suite the verifier recorded as completed. Old traces without that coverage
+  remain useful for positives but never invent missed checks.
+- The local ranker, parameter-name model, and selectors are trained from this corpus.
+  After five new traces, GreyIQ attempts an offline retrain. It requires at least
+  200 labeled rows and a held-out program split with confirmed findings. A candidate
+  must match or beat both the rules and the active model on the same held-out set
+  before it replaces the runtime weight file. `gn train-brain` remains available for
+  an explicit dry run or retrain; `GREYIQ_NO_AUTO_TRAIN_BRAIN=1` disables automatic
+  attempts.
+- The next authorized hunt loads promoted local weights and applies outcome priors
+  to reorder existing deterministic checks. The scope gate and proof requirements
+  still decide what may run and what counts as a finding. A rejected model leaves
+  the current model in place.
 
-**First shippable milestone:** Phase 0 + Phase 2 — trace logging plus a learned
-class ranker that beats the hand-tuned ordering on held-out confirmed outcomes.
+The remaining gap is per-turn re-plan intent in the trace: completed checks are
+recorded, but the revised hypothesis text and priority order from each iterative
+turn are not yet stored as separate training examples.
 
 ### Phase 0 known limitation — program keying across paths
 

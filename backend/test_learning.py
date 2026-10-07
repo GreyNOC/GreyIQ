@@ -89,6 +89,58 @@ class RecordAndPriorsTests(unittest.TestCase):
             learning.record_outcome(self.rt, program="acme", class_id="ssrf", status="submitted")
         self.assertEqual(learning.learned_priors(self.rt, "acme")["ssrf"], baseline)
 
+    def test_one_report_transition_counts_once_and_latest_bounty_wins(self) -> None:
+        for status, bounty in (("submitted", 0), ("accepted", 250), ("resolved", 500),
+                               ("resolved", 500)):
+            learning.record_outcome(self.rt, program="acme", class_id="ssrf", status=status,
+                                    bounty=bounty, finding_id="ledger:one")
+        summary = learning.program_summary(self.rt, "acme")
+        self.assertEqual(summary["findings"], 1)
+        self.assertEqual(summary["class_stats"]["ssrf"],
+                         {"submitted": 1, "rewarded": 1, "noise": 0, "bounty_total": 500.0})
+        self.assertGreater(learning.learned_priors(self.rt, "acme")["ssrf"], 1.0)
+
+    def test_repeated_sync_and_later_submission_cannot_dilute_verdict(self) -> None:
+        learning.record_outcome(self.rt, program="acme", class_id="xss", status="submitted",
+                                finding_id="ledger:one")
+        for _ in range(3):
+            learning.record_outcome(self.rt, program="acme", class_id="xss", status="duplicate",
+                                    finding_id="ledger:one")
+        baseline = learning.learned_priors(self.rt, "acme")["xss"]
+        learning.record_outcome(self.rt, program="acme", class_id="xss", status="submitted",
+                                finding_id="ledger:one")
+        summary = learning.program_summary(self.rt, "acme")
+        self.assertEqual(summary["findings"], 1)
+        self.assertEqual(summary["class_stats"]["xss"]["noise"], 1)
+        self.assertEqual(learning.learned_priors(self.rt, "acme")["xss"], baseline)
+
+    def test_distinct_ids_and_legacy_rows_remain_distinct(self) -> None:
+        learning.record_outcome(self.rt, program="acme", class_id="xss", status="duplicate")
+        learning.record_outcome(self.rt, program="acme", class_id="xss", status="duplicate",
+                                finding_id="ledger:a")
+        learning.record_outcome(self.rt, program="acme", class_id="xss", status="accepted",
+                                finding_id="ledger:b")
+        summary = learning.program_summary(self.rt, "acme")
+        self.assertEqual(summary["findings"], 3)
+        self.assertEqual(summary["class_stats"]["xss"]["noise"], 2)
+        self.assertEqual(summary["class_stats"]["xss"]["rewarded"], 1)
+
+    def test_corrected_class_moves_one_report_between_class_stats(self) -> None:
+        learning.record_outcome(self.rt, program="acme", class_id="xss", status="duplicate",
+                                finding_id="ledger:a")
+        learning.record_outcome(self.rt, program="acme", class_id="sqli", status="accepted",
+                                finding_id="ledger:a")
+        summary = learning.program_summary(self.rt, "acme")
+        self.assertEqual(summary["findings"], 1)
+        self.assertEqual(summary["class_stats"]["xss"]["noise"], 0)
+        self.assertEqual(summary["class_stats"]["sqli"]["rewarded"], 1)
+
+    def test_nonfinite_bounty_is_rejected_before_persisting(self) -> None:
+        with self.assertRaises(ValueError):
+            learning.record_outcome(self.rt, program="acme", class_id="xss", status="accepted",
+                                    bounty=float("nan"), finding_id="ledger:a")
+        self.assertEqual(learning.program_summary(self.rt, "acme")["findings"], 0)
+
     def test_intelligence_notes(self) -> None:
         learning.record_outcome(self.rt, program="acme", class_id="ssrf", status="resolved", bounty=1000.0)
         learning.record_outcome(self.rt, program="acme", class_id="clickjacking", status="duplicate")

@@ -182,7 +182,7 @@ and the (separately gated) HackerOne report submission described in
 ### Browse platform APIs
 
 In **Programs → Add program → Browse platform APIs**, choose HackerOne, YesWeHack,
-Bugcrowd, or Intigriti. **Browse programs** reads a bounded list visible to the API
+or Intigriti. **Browse programs** reads a bounded list visible to the API
 identity; select a result or enter its program ID/handle and choose **Preview selected
 program**. Review the scope rows, exclusions, policy excerpt, status, and warnings before
 continuing to the Program form. Every program saved through this path starts **paused**.
@@ -190,13 +190,16 @@ The listing and preview are evidence to review, not permission to test. The oper
 still needs a current authorization record and policy check before scheduled work.
 
 HackerOne uses the credentials in Submissions. YesWeHack can list public programs
-anonymously; private access may require its sign-in. Bugcrowd uses a researcher API
-token in `id:secret` form; Intigriti uses a researcher bearer token. Save either in the
-Browse step. GreyIQ keeps the token in its local owner-only secrets store and returns
-only whether one is saved. Credentialed requests are read-only, HTTPS host-pinned,
+anonymously; private access may require its sign-in. Intigriti uses a researcher
+bearer token saved in the Browse step. GreyIQ keeps the token in its local
+owner-only secrets store and returns only whether one is saved. Credentialed requests are read-only, HTTPS host-pinned,
 redirect-refusing, and bounded. These APIs may omit free-text exclusions or other
 policy details, so always check the current human-facing program page. If your account
 cannot access a program through its API, use manual or CSV intake.
+
+Bugcrowd researcher programs are entered manually or through CSV intake. The
+Bugcrowd organization API is not used for researcher program discovery or scope
+preview; review the current Bugcrowd brief before recording authorization or scope.
 
 ### YesWeHack credentials
 
@@ -262,10 +265,25 @@ rail (which the Program picker can autofill):
   program, confirm its scope and restrictions, and choose a 24-hour or seven-day
   authorization window. The operator stops at expiry or its cycle limit; re-arm it
   only after checking the current policy again. Verified hunt outcomes inform later
-  priority; this is local feedback, not automatic model-weight training. The kill
+  priority. After five new local hunt traces, GreyIQ tries a bounded offline ranker
+  retrain; it promotes weights only when at least 200 checked/confirmed examples
+  exist and held-out recall matches or beats both rules and the active model. Set
+  `GREYIQ_NO_AUTO_TRAIN_BRAIN=1` to disable these automatic retrain attempts. The kill
   switch requests cancellation and prevents further cycles. Automated hunts use
   only a loopback local model or the offline fallback; a cloud or remote model
   remains available for deliberate manual work.
+
+**TinyGPT / AI Studio.** The **Verified Lessons** source contains local coding
+experiences admitted by the verification gate. It is selected for new Studio
+training setups and available to the BugHunter core's source-filtered retrieval,
+including migrated default setups. A running TinyGPT engine refreshes this source
+on its next retrieval after a verified lesson is admitted. Starting a TinyGPT
+weight-training run remains an operator action. Bounty verdicts and hunt traces
+feed the separate local hunt priorities and ranker described above; they are
+not inserted into TinyGPT's
+verified coding replay.
+For a local Windows release that runs TinyGPT, build with
+`scripts/release.sh --include-tinygpt`; the build verifies the frozen checkpoint.
 
 The CLI's continuous `gn operator run` uses the same grant validation. Pass
 `-y --grant-file path/to/grants.json`; the file must contain one entry for each
@@ -443,8 +461,8 @@ Confirmed (and reportable candidate) findings appear in the **Submissions** tab:
   HackerOne scope import described above (`api.hackerone.com`, read-only, manual), the
   YesWeHack program search / scope import and sign-in (`api.yeswehack.com`, read-only apart
   from the sign-in exchange itself, manual),
-  Bugcrowd (`api.bugcrowd.com`) and Intigriti (`api.intigriti.com`) program
-  discovery and scope preview (read-only, manual), and optional
+  Intigriti (`api.intigriti.com`) program discovery and scope preview
+  (read-only, manual), and optional
   repo-draft enrichment (`api.github.com` or `gitlab.com`, unauthenticated read-only, one GET
   per repository, explicit click only), an
   optional certificate-transparency lookup for subdomain seeding (`crt.sh`, read-only), the

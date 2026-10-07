@@ -13,9 +13,8 @@ route stays fully hunted on every other.
 
 Honest and self-limiting by construction — negative knowledge must never blind the hunt:
 
-  * A pair is recorded a MISS only from the same ``(plan, outcomes)`` the hunt trace already stores:
-    an ``(endpoint, class)`` that was PLANNED but is absent from the confirmed outcomes. No finer
-    signal is invented than the engine actually observed.
+  * A pair is recorded a MISS only when the active verifier certified that its
+    ``(endpoint, check tag)`` suite completed and no finding from that suite confirmed.
   * ``ever_confirmed`` immunizes a pair permanently — a route that has ever yielded a real bug is
     never suppressed.
   * Misses DECAY. A pair not re-missed within ``TTL_DAYS`` is dropped from the cooled set and probed
@@ -158,21 +157,11 @@ def _confirmed_pairs(outcomes: Any) -> set[str]:
     """Pair ids that reached a confirmed proof status this hunt — from the SAME outcome rows the hunt
     trace records (``proof_status == 'confirmed'``).
 
-    An outcome's ``class`` is the IMPACT the finding carries, while a planned pair's class is the
-    prover's CHECK TAG, and for five checks those differ (see
-    ``prover_classes.IMPACT_TO_CHECK_TAGS``). Immunity is therefore recorded under every tag that
-    could have produced the impact, not just the impact's own name. Without the fold the two halves
-    could never meet for those checks: a confirmed CRLF injection banked immunity under ``redirect``
-    while the plan accrued misses under ``crlf``, and after two clean runs the engine cooled the one
-    check that had proven a submittable bug on that route — the exact opposite of this module's
-    promise that anything ever confirmed is immune.
-
-    Folding widens immunity slightly (a confirmed open redirect also immunises ``crlf`` and
-    ``host-header`` on that route). That is the safe direction, and the direction this module already
-    chooses elsewhere: a false re-enable costs a little budget, a false suppression silently removes
-    coverage.
+    A known active rule identifies its producing CHECK TAG exactly. For legacy
+    outcomes without that identity, retain broad impact-based immunity rather
+    than risk cooling the check that produced a genuine confirmation.
     """
-    from bughunter.prover_classes import check_tags_for_impact
+    from bughunter.prover_classes import confirmed_learning_tag, uncertain_check_tags
 
     confirmed: set[str] = set()
     for row in outcomes if isinstance(outcomes, list) else []:
@@ -184,15 +173,24 @@ def _confirmed_pairs(outcomes: Any) -> set[str]:
         cls = str(row.get("class") or "").strip().lower()
         if not ep or not cls:
             continue
-        confirmed.add(_pair_id(ep, cls))
-        for tag in check_tags_for_impact(cls):
+        rule_id = str(row.get("rule_id") or "")
+        exact_tag = confirmed_learning_tag(cls, rule_id)
+        # A contradictory or unknown rule cannot establish an exact source.
+        # Broad immunity is safer than recording a false miss. Preserve the
+        # historical impact-class pair for legacy plans as well.
+        tags = {exact_tag} if exact_tag else (set(uncertain_check_tags(cls, rule_id)) | {cls})
+        for tag in tags:
             confirmed.add(_pair_id(ep, tag))
     return confirmed
 
 
 def _planned_pairs(plan: Any) -> set[str]:
-    """Every ``(endpoint, class)`` the plan set out to probe — the attempt side, exactly as
-    ``learned_hunt_priors`` reads it, so the two negative-knowledge layers agree on what an attempt is."""
+    """Every ``(endpoint, class)`` the caller certifies as checked.
+
+    Hunt callers now pass verifier-completed suites in the historical
+    ``probe_priority`` shape. A planner's proposed priorities are insufficient
+    evidence for a miss.
+    """
     planned: set[str] = set()
     rows = (plan or {}).get("probe_priority") if isinstance(plan, dict) else None
     for row in rows if isinstance(rows, list) else []:
@@ -216,18 +214,14 @@ def record_hunt(runtime_dir: str | Path | None, *, program: str | None, target: 
     fail-closed — returns False and changes nothing on ``runtime_dir is None`` or any error, so a
     bookkeeping write can never break a hunt.
 
-    ``plan`` and ``outcomes`` are the SAME objects the hunt trace records, so this adds a durable,
-    cross-run memory without observing anything the engine did not already log.
+    ``plan`` is a compatibility-shaped list of completed verifier suites; ``outcomes``
+    are the findings observed in that run. Both also feed the hunt trace.
 
-    ``complete`` asserts the run actually WORKED ITS WAY THROUGH the plan — no scanner error, active
-    verification in scope, not rate-limited or cut short. It defaults to False, and misses are
-    recorded ONLY when it is True, because "never executed" and "executed and inert" are different
-    facts and only the second is negative knowledge. The prover walks ``probe_priority`` in order and
-    stops when its request budget is gone, so the TAIL of every truncated run would otherwise accrue
-    misses for pairs nothing ever probed — a systematic bias that would cool exactly the endpoints
-    that never got a fair chance. Confirmations are always recorded (they only ever GRANT immunity,
-    so they are safe on a partial run); the default is conservative so a caller that cannot vouch for
-    completeness can never poison the store."""
+    ``complete`` asserts that every pair in ``plan`` is known to have run. It
+    defaults to False, and misses are recorded ONLY when it is True, because
+    "never executed" and "executed and inert" are different facts. Confirmations
+    are always recorded (they only grant immunity); callers without verifier
+    coverage can still retain positives without poisoning this memory."""
     if runtime_dir is None or not enabled():
         return False
     try:

@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
@@ -47,14 +48,16 @@ class RecordAndLoadTests(unittest.TestCase):
 
     def test_record_writes_one_jsonl_line_with_expected_shape(self) -> None:
         ok = hunt_trace.record_trace(self.rt, program="acme", target="https://app.example.com/",
-                                     surface=_SURFACE, plan=_PLAN, consolidated=_consolidated())
+                                     surface=_SURFACE, plan=_PLAN, consolidated=_consolidated(),
+                                     execution=[{"endpoint": "https://app.example.com/search",
+                                                 "classes": ["xss"]}])
         self.assertTrue(ok)
         path = self.rt / "hunt_traces.jsonl"
         self.assertTrue(path.exists())
         lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
         self.assertEqual(len(lines), 1)
         rec = json.loads(lines[0])
-        self.assertEqual(rec["v"], 1)
+        self.assertEqual(rec["v"], 2)
         self.assertEqual(rec["program"], "acme")
         self.assertEqual(rec["target"], "https://app.example.com/")
         self.assertIsInstance(rec["ts"], str)
@@ -62,6 +65,8 @@ class RecordAndLoadTests(unittest.TestCase):
         self.assertEqual(rec["surface"]["tech"], ["flask", "jinja"])
         self.assertEqual(rec["plan"]["param_hypotheses"], ["redirect", "callback"])
         self.assertEqual(rec["plan"]["probe_priority"][0]["classes"], ["xss", "sqli"])
+        self.assertEqual(rec["execution"], [{"endpoint": "https://app.example.com/search",
+                                              "classes": ["xss"]}])
         # Two consolidated findings -> two outcome rows, carrying the confirm status.
         self.assertEqual(len(rec["outcomes"]), 2)
         statuses = {(o["class"], o["proof_status"]) for o in rec["outcomes"]}
@@ -81,6 +86,36 @@ class RecordAndLoadTests(unittest.TestCase):
         rec = hunt_trace.load_traces(self.rt)[0]
         self.assertEqual(rec["outcomes"][0]["class"], "redirect")
         self.assertEqual(rec["outcomes"][0]["proof_status"], "candidate")
+
+    def test_execution_requires_verifier_coverage_and_redacts_urls(self) -> None:
+        meta = {"in_scope": True, "targets": [
+            {"target": "https://t.example/search?token=topsecret", "in_scope": True,
+             "checked_classes": ["xss", "xss", "sqli"]},
+            {"target": "https://out.example/", "in_scope": False,
+             "checked_classes": ["rce"]},
+        ]}
+        execution = hunt_trace.execution_from_active_meta(meta, "https://t.example/")
+        self.assertEqual(len(execution), 1)
+        hunt_trace.record_trace(self.rt, program="p", target="https://t.example/",
+                                surface=_SURFACE, plan=_PLAN, outcomes=[], execution=execution)
+        checked = hunt_trace.load_traces(self.rt)[0]["execution"]
+        self.assertEqual(checked[0]["classes"], ["xss", "sqli"])
+        self.assertNotIn("topsecret", json.dumps(checked))
+        self.assertEqual(hunt_trace.execution_from_active_meta({"in_scope": True}, "https://t.example/"), [])
+
+    def test_redaction_failure_drops_urls_instead_of_storing_secrets(self) -> None:
+        secret = "https://app.example.com/reset?token=topsecret"
+        with mock.patch.object(hunt_trace, "redact_text", side_effect=RuntimeError("unavailable")):
+            self.assertTrue(hunt_trace.record_trace(
+                self.rt, program="p", target=secret,
+                surface={"endpoints": [secret]},
+                plan={"probe_priority": [{"endpoint": secret, "classes": ["xss"]}]},
+                outcomes=[{"endpoint": secret, "class": "xss", "proof_status": "candidate"}],
+                execution=[{"endpoint": secret, "classes": ["xss"]}],
+            ))
+        record = hunt_trace.load_traces(self.rt)[0]
+        self.assertNotIn("topsecret", json.dumps(record))
+        self.assertEqual(record["execution"], [])
 
     def test_appends_accumulate_in_order(self) -> None:
         hunt_trace.record_trace(self.rt, program="a", target="https://a/", surface=_SURFACE, plan=_PLAN, outcomes=[])

@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
@@ -52,6 +53,30 @@ class CampaignTests(unittest.TestCase):
         )
         self.assertFalse(result["ok"])
         self.assertIn("authorized", result["error"].lower())
+
+    def test_url_scope_preflight_blocks_login_recon_and_output(self) -> None:
+        target = "https://app.example.com/"
+        cases = (
+            ("", (), "scope"),
+            ("other.example.com", (), "not explicitly named"),
+            ("https://app.example.com/", (), "host"),
+            ("app.example.com", ("app.example.com",), "excluded"),
+        )
+        with (patch.object(campaign.account_login_service, "login") as login,
+              patch.object(campaign.recon, "discover") as discover):
+            for scope, excluded, message in cases:
+                with self.subTest(scope=scope, excluded=excluded):
+                    result = campaign.run_campaign(
+                        target, scope=scope, authorized=True, coder_cfg={},
+                        default_reports_dir=self.reports, runtime_dir=self.runtime,
+                        account_access={"login_url": "https://app.example.com/login"},
+                        excluded_hosts=excluded,
+                    )
+                    self.assertFalse(result["ok"])
+                    self.assertIn(message, result["error"].lower())
+            login.assert_not_called()
+            discover.assert_not_called()
+        self.assertFalse(self.reports.exists())
 
     def test_osint_opt_in_settings_reach_recon(self) -> None:
         target = "https://app.example.com/"
@@ -150,7 +175,11 @@ class CampaignTests(unittest.TestCase):
         campaign.recon.discover = lambda t, **k: {
             "urls": [t, t + "search?q=1"], "notes": [], "sources": {}, "js_secrets": [],
             "tech": ["flask"], "params": ["q", "file"], "forms": [], "hints": {}}
-        campaign.run_bounty_hunt = lambda *a, **k: {"ok": True, "json_path": "", "report_path": ""}
+        campaign.run_bounty_hunt = lambda *a, **k: {
+            "ok": True, "json_path": "", "report_path": "",
+            "active_authorization": {"in_scope": True, "checked_classes": ["xss"],
+                                     "target": a[0]},
+        }
         campaign.cve_service.scan_known_cves = lambda t, **k: {
             "ok": True, "host": "app.example.com", "target": target,
             "components": [comp], "count": 1, "findings": [dict(cve_finding)]}
@@ -171,6 +200,9 @@ class CampaignTests(unittest.TestCase):
         self.assertIn("q", trace["surface"]["params"])
         self.assertIn("flask", trace["surface"]["tech"])
         self.assertEqual(trace["plan"]["provider"], "offline")
+        self.assertEqual({r["endpoint"] for r in trace["execution"]},
+                         {target, target + "search?q=1"})
+        self.assertTrue(all(r["classes"] == ["xss"] for r in trace["execution"]))
         # The injected CVE candidate flows through as an outcome row with its confirm status.
         classes = {o["class"] for o in trace["outcomes"]}
         self.assertIn(str(cve_finding.get("class_id")), classes)
@@ -590,14 +622,16 @@ class CampaignSteeringAndMemoryTests(unittest.TestCase):
             return {"ok": True, "findings": list(cve_findings or [])}
         campaign.cve_service.scan_known_cves = fake_cve
 
-        # A per-URL hunt whose active pass ran cleanly to completion. The shape matters: the
-        # campaign reads active_authorization to decide whether it may learn a MISS from this run.
+        # The per-URL verifier certifies its completed XSS suite. The campaign
+        # must use this coverage rather than assuming every planned class ran.
         clean = {"ok": True, "report_path": "", "scan_errors": [],
                  "active_authorization": {"in_scope": True, "rate_limited": False,
                                           "skipped_reason": "", "verified_classes": []}}
 
         def fake_hunt(url, *a, **k):
             self.seen.append({"url": url, "class_priority": list(k.get("class_priority") or [])})
+            covered = {**clean, "active_authorization": {
+                **clean["active_authorization"], "target": url, "checked_classes": ["xss"]}}
             if confirm_on and url == confirm_on:
                 doc = {"findings": [{"ref": "F1", "class_id": "xss", "rule_id": "active.xss",
                                      "title": "Reflected XSS", "severity": "medium",
@@ -606,8 +640,8 @@ class CampaignSteeringAndMemoryTests(unittest.TestCase):
                                                   "observed_result": "o", "control_result": "c"}}}
                 path = self.root / f"hunt-{abs(hash(url))}.json"
                 path.write_text(json.dumps(doc), encoding="utf-8")
-                return {**clean, "json_path": str(path)}
-            return {**clean, "json_path": ""}
+                return {**covered, "json_path": str(path)}
+            return {**covered, "json_path": ""}
         campaign.run_bounty_hunt = fake_hunt
 
     def _run(self, **kw):
@@ -809,6 +843,33 @@ class CampaignSteeringAndMemoryTests(unittest.TestCase):
             if pair_id.endswith("\txss"):
                 self.assertEqual(row["miss"], 0, f"{pair_id} was cooled despite being confirmed")
                 self.assertTrue(row["confirmed"], f"{pair_id} lost its immunity")
+
+    def test_filtered_confirmation_stays_positive_in_training_trace(self) -> None:
+        from bughunter import hunt_trace, hunt_train
+
+        self._stub()
+        previous = campaign.run_bounty_hunt
+
+        def filtered_hunt(url, *args, **kwargs):
+            # The per-URL report excluded this confirmed item, but the verifier
+            # still completed and proved the XSS suite on this URL.
+            kwargs["on_learning_outcomes"]([{
+                "endpoint": url, "class": "xss", "rule_id": "active.reflected-xss",
+                "proof_status": "confirmed", "severity": "medium", "dedup_key": "",
+            }])
+            result = previous(url, *args, **kwargs)
+            return {**result, "json_path": "", "active_authorization": {
+                "in_scope": True, "target": url, "checked_classes": ["xss"],
+                "verified_classes": ["xss"], "rate_limited": False}}
+
+        campaign.run_bounty_hunt = filtered_hunt
+        self._run()
+        trace = hunt_trace.load_traces(self.runtime)[0]
+        self.assertTrue(any(row["class"] == "xss" and row["proof_status"] == "confirmed"
+                            for row in trace["outcomes"]))
+        labels = [(row[1], row[2]) for row in hunt_train.build_dataset(self.runtime)]
+        self.assertIn(("xss", 1), labels)
+        self.assertNotIn(("xss", 0), labels)
 
     def test_the_snapshot_carries_the_chains_it_found(self) -> None:
         """A chains-empty snapshot tells reopened_chains that nothing is blocked any more, which
@@ -1145,6 +1206,39 @@ class RunCampaignOverTargetsTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("authorized", result["error"].lower())
 
+    def test_all_invalid_targets_stop_before_shared_login_or_output(self) -> None:
+        with (patch.object(campaign, "_login_auth") as login,
+              patch.object(campaign.recon, "discover") as discover):
+            result = campaign.run_campaign_over_targets(
+                ["https://outside.example.com/"], scope="app.example.com",
+                authorized=True, coder_cfg={}, default_reports_dir=self.reports,
+                account_access={"login_url": "https://app.example.com/login"},
+            )
+            self.assertFalse(result["ok"])
+            self.assertIn("preflight", result["error"].lower())
+            login.assert_not_called()
+            discover.assert_not_called()
+        self.assertFalse(self.reports.exists())
+
+    def test_span_skips_invalid_target_and_runs_valid_target(self) -> None:
+        valid = "https://app.example.com/"
+        invalid = "https://outside.example.com/"
+        fake_result = {
+            "ok": True, "campaign_path": "", "json_path": "", "urls_scanned": 1,
+            "urls_discovered": 1, "finding_count": 0, "confirmed_count": 0,
+            "submission_paths": [], "findings": [], "proof_of_impact": {},
+            "cvss": {}, "attack_plans": {}, "surface": {}, "risk": "clean",
+        }
+        with patch.object(campaign, "run_campaign", return_value=fake_result) as run:
+            result = campaign.run_campaign_over_targets(
+                [invalid, valid], scope="app.example.com", authorized=True,
+                coder_cfg={}, default_reports_dir=self.reports,
+            )
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual([row["ok"] for row in result["per_target"]], [False, True])
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], valid)
+
     def test_attack_map_option_is_forwarded_to_each_target(self) -> None:
         # QAQC regression: the span path must HONOR the attack-map opt-out (it was silently defaulting
         # to True). Prove the per-target run_campaign receives whatever include_attack_map the span got.
@@ -1234,10 +1328,10 @@ class RunCampaignOverTargetsTests(unittest.TestCase):
         # ref numbers than target B's, regardless of which target's worker thread
         # happens to finish first.
         original = campaign.run_campaign
-        # Target "slow" finishes AFTER target "fast" despite being submitted first
-        # (it's index 1) -- if aggregation used completion order instead of target
-        # order, "fast"'s finding would get C1 instead of C2.
-        order = {"slow": 0.25, "fast": 0.0}
+        # The first local source target finishes after the second. These are
+        # valid targets even though the per-target campaign is mocked below.
+        slow, fast = str(self.src_a), str(self.src_b)
+        order = {slow: 0.25, fast: 0.0}
 
         def fake_run_campaign(target, **kw):
             time.sleep(order.get(target, 0.0))
@@ -1249,13 +1343,13 @@ class RunCampaignOverTargetsTests(unittest.TestCase):
 
         campaign.run_campaign = fake_run_campaign
         try:
-            result = self._run(["slow", "fast"])
+            result = self._run([slow, fast])
         finally:
             campaign.run_campaign = original
         self.assertTrue(result["ok"], result.get("error"))
         titles_by_ref = {f["ref"]: f["title"] for f in result["findings"]}
-        self.assertEqual(titles_by_ref["C1"], "finding for slow")
-        self.assertEqual(titles_by_ref["C2"], "finding for fast")
+        self.assertEqual(titles_by_ref["C1"], f"finding for {slow}")
+        self.assertEqual(titles_by_ref["C2"], f"finding for {fast}")
 
     def test_writes_a_span_index_and_a_bundleable_output_dir(self) -> None:
         result = self._run([str(self.src_a), str(self.src_b)])

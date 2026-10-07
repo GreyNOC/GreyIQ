@@ -603,6 +603,7 @@ def _cmd_learn(args: argparse.Namespace) -> int:
         prog = learning.record_outcome(
             RUNTIME_DIR, program=args.program, target=args.target or "", class_id=args.vuln_class,
             title=args.title or "", status=args.status, bounty=args.bounty, severity=args.severity or "", notes=args.notes or "",
+            finding_id=getattr(args, "finding_id", "") or "",
         )
     except ValueError as exc:
         return _err(str(exc))
@@ -896,6 +897,13 @@ def _cmd_operator(args: argparse.Namespace) -> int:
         except KeyboardInterrupt:
             loop.stop()
             print(_c("\nKill switch — stopping…", "33"))
+        finally:
+            # The supervisor is a daemon thread. Wait for its audit and lease
+            # cleanup before the CLI process can exit (also on poll errors).
+            if loop.running and not loop.stop_event.is_set():
+                loop.stop()
+            if loop._thread is not None:
+                loop._thread.join()
         return 0
 
     return _err(f"unknown operator action: {action}")
@@ -1616,6 +1624,7 @@ def build_parser() -> argparse.ArgumentParser:
     learn.add_argument("--severity", default="", help="severity, e.g. high")
     learn.add_argument("--title", default="", help="short finding title")
     learn.add_argument("--notes", default="", help="free-text notes")
+    learn.add_argument("--finding-id", default="", help="stable report ID; updates the same report on retries/status changes")
     learn.set_defaults(func=_cmd_learn)
 
     stats = sub.add_parser("stats", help="show what the engine has learned per program")

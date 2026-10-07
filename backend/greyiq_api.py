@@ -484,6 +484,7 @@ SEED_DATA_FILES = (
 TRAINING_SOURCE_FILES = {
     "src_starter_knowledge": "greyiq_starter_knowledge.txt",
     "src_bug_bounty": "greyiq_bug_bounty_knowledge.txt",
+    "src_verified_replay": "greyiq_verified_replay.txt",
     "src_personal_choices": "greyiq_personal_choices.txt",
     "src_preferred_examples": "greyiq_preferred_examples.txt",
     "src_local_notes": "greyiq_local_notes.txt",
@@ -496,6 +497,7 @@ TRAINING_SOURCE_FILES = {
 BUGHUNTER_CORE_ID = "core_greyiq_bughunter"
 BUGHUNTER_CORE: dict[str, Any] = {
     "id": BUGHUNTER_CORE_ID,
+    "_verified_replay_source_v1": True,
     "name": "GreyIQ BugHunter",
     "mode": "Find, Prove, Fix",
     "type": "security_auditor",
@@ -538,6 +540,7 @@ BUGHUNTER_CORE: dict[str, Any] = {
     ],
     "sourceIds": [
         "src_bug_bounty",
+        "src_verified_replay",
         "src_starter_knowledge",
         "src_local_notes",
         "src_imported_docs",
@@ -950,6 +953,7 @@ class LearnRequest(BaseModel):
     severity: str = Field(default="", max_length=20)
     title: str = Field(default="", max_length=200)
     notes: str = Field(default="", max_length=500)
+    finding_id: str = Field(default="", max_length=200)
 
 
 class SubmissionPackageRequest(BaseModel):
@@ -1575,7 +1579,17 @@ class GreyIQRuntime:
 
     def _ensure_bughunter_core(self) -> None:
         state = self.store.load()
-        if any(core.get("id") == BUGHUNTER_CORE_ID for core in state.get("cores", [])):
+        existing = next((core for core in state.get("cores", [])
+                         if core.get("id") == BUGHUNTER_CORE_ID), None)
+        if existing is not None:
+            # Upgrade existing installs once, then respect later operator source edits.
+            if not existing.get("_verified_replay_source_v1"):
+                source_ids = list(existing.get("sourceIds") or [])
+                if "src_verified_replay" not in source_ids:
+                    source_ids.append("src_verified_replay")
+                existing["sourceIds"] = source_ids
+                existing["_verified_replay_source_v1"] = True
+                self.store.save(state)
             return
         self.store.save_core(dict(BUGHUNTER_CORE), who="greyiq")
 
@@ -4216,12 +4230,14 @@ class GreyIQRuntime:
         # Record the submission to the learning store + ledger from the PRE-resolved finding/run.
         if finding is not None:
             program, target = (run or {}).get("program"), (run or {}).get("target", "")
+            dedup_key = bounty_ledger.dedup_key(finding)
             try:
                 bounty_learning.record_outcome(
                     RUNTIME_DIR, program=program, target=target,
                     class_id=str(finding.get("class_id") or "other"), title=str(finding.get("title") or ""),
                     status="submitted", severity=str(finding.get("severity") or ""),
                     notes=f"HackerOne report {outcome.get('report_id', '')}",
+                    finding_id=f"ledger:{dedup_key}",
                 )
             except ValueError:
                 pass
@@ -4231,7 +4247,6 @@ class GreyIQRuntime:
             # (e.g. a single-hunt or confirm-route finding, which unlike a campaign run
             # never goes through ledger.upsert_findings at discovery time); it's a no-op
             # merge if the record already exists.
-            dedup_key = bounty_ledger.dedup_key(finding)
             bounty_ledger.upsert_findings(RUNTIME_DIR, program, target, [
                 {"finding": finding, "source_url": finding.get("location", ""), "proof_status": "confirmed"}
             ])
@@ -4411,14 +4426,20 @@ class GreyIQRuntime:
         return {"ok": True, "platforms": {
             "hackerone": self.hackerone_creds_status(),
             "yeswehack": self.yeswehack_creds_status(),
-            "bugcrowd": {"has_token": bool(stored.get("platform.bugcrowd.credential"))},
             "intigriti": {"has_token": bool(stored.get("platform.intigriti.credential"))},
         }}
 
     def save_platform_credential(self, request: "PlatformCredentialRequest") -> dict[str, Any]:
         platform = request.platform.strip().lower()
-        if platform not in ("bugcrowd", "intigriti"):
-            return {"ok": False, "error": "This credential form supports Bugcrowd and Intigriti only."}
+        if platform == "bugcrowd":
+            # Older builds stored Bugcrowd platform tokens. Permit explicit removal,
+            # but do not offer the customer API as researcher program discovery.
+            if request.clear_token:
+                _store_secret("platform.bugcrowd.credential", "")
+                return {"ok": True, "platform": platform, "has_token": False}
+            return {"ok": False, "error": "Bugcrowd researcher API discovery is unavailable; use manual or CSV intake."}
+        if platform != "intigriti":
+            return {"ok": False, "error": "This credential form supports Intigriti only."}
         if request.clear_token:
             _store_secret(f"platform.{platform}.credential", "")
         elif request.credential:
@@ -4448,10 +4469,13 @@ class GreyIQRuntime:
                      "status": "disabled" if p.get("disabled") else "visible",
                      "source_url": f"https://api.yeswehack.com/programs/{p['slug']}"}
                     for p in result.get("programs", [])]
-        elif platform in ("bugcrowd", "intigriti"):
+        elif platform == "intigriti":
             credential = stored.get(f"platform.{platform}.credential", "")
             result = bounty_platform_programs.list_programs(platform, credential, limit=request.limit)
             rows = list(result.get("programs", []))
+        elif platform == "bugcrowd":
+            return {"ok": False, "platform": platform, "programs": [],
+                    "error": "Bugcrowd researcher API discovery is unavailable; use manual or CSV intake."}
         else:
             return {"ok": False, "programs": [], "error": "Unsupported platform."}
         if not result.get("ok"):
@@ -4473,9 +4497,11 @@ class GreyIQRuntime:
             result = self.import_hackerone_scope(HackerOneImportRequest(handle=identifier))
         elif platform == "yeswehack":
             result = self.import_yeswehack_scope(YesWeHackImportRequest(slug=identifier))
-        elif platform in ("bugcrowd", "intigriti"):
+        elif platform == "intigriti":
             credential = _load_secrets().get(f"platform.{platform}.credential", "")
             result = bounty_platform_programs.preview_program(platform, identifier, credential)
+        elif platform == "bugcrowd":
+            return {"ok": False, "error": "Bugcrowd researcher API preview is unavailable; review the current program brief and use manual or CSV intake."}
         else:
             return {"ok": False, "error": "Unsupported platform."}
         if not result.get("ok"):
@@ -4920,6 +4946,12 @@ class GreyIQRuntime:
                                          resolved_with_reward=resolved_with_reward, bounty=reward_amount)
             updated += 1
             learning_status = _H1_STATE_TO_LEARNING_OUTCOME.get(state)
+            # HackerOne may award a bounty while the report is still triaged. The ledger
+            # then advances to paid and leaves submitted_records(), so there will be no
+            # later sync opportunity to teach the learning store about that real award.
+            # "accepted" records the reward without claiming the report was resolved.
+            if learning_status is None and resolved_with_reward:
+                learning_status = "accepted"
             if learning_status:
                 try:
                     # rec["program"] is the ledger's already-slugified pid; passing it as
@@ -4934,6 +4966,7 @@ class GreyIQRuntime:
                         # The freshly-fetched amount (rec['bounty'] is the pre-sync copy, still 0.0).
                         bounty=reward_amount if resolved_with_reward else 0.0,
                         notes=f"HackerOne report {rec.get('h1_report_id')} synced to '{state}'",
+                        finding_id=f"ledger:{rec['key']}",
                     )
                 except ValueError:
                     pass
@@ -5011,6 +5044,7 @@ class GreyIQRuntime:
                 bounty=request.bounty,
                 severity=request.severity,
                 notes=request.notes,
+                finding_id=request.finding_id,
             )
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
@@ -5916,6 +5950,8 @@ def active_core_for_request(store: AICoreStore, request: ChatRequest) -> dict[st
 
 def source_training_file(source_id: str | None) -> str:
     clean = str(source_id or "src_local_notes").strip()
+    if clean == "src_verified_replay":
+        raise HTTPError(422, "Verified Lessons is generated from verified experiences and cannot be edited as a preference.")
     if clean in TRAINING_SOURCE_FILES and clean != "src_starter_knowledge":
         return TRAINING_SOURCE_FILES[clean]
     safe = "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in clean).strip("_")

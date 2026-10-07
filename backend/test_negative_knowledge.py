@@ -411,6 +411,24 @@ class VocabularyFoldTests(unittest.TestCase):
     DIVERGENT = (("crlf", "redirect"), ("host-header", "redirect"),
                  ("clickjacking", "headers"), ("sensitive", "disclosure"), ("debug", "rce"))
 
+    def test_known_rule_immunizes_only_its_producing_suite(self) -> None:
+        cases = (
+            ("active.debug-endpoint", "rce", "debug", "rce"),
+            ("active.open-redirect", "redirect", "redirect", "crlf"),
+            ("active.crlf", "redirect", "crlf", "host-header"),
+        )
+        for rule_id, impact, confirmed_tag, missed_tag in cases:
+            with self.subTest(rule_id=rule_id), tempfile.TemporaryDirectory() as tmp:
+                endpoint = "https://app.example.com/download"
+                outcome = {**_outcome(endpoint, impact, "confirmed"), "rule_id": rule_id}
+                for _ in range(2):
+                    nk.record_hunt(tmp, program=None, target=_TARGET,
+                                   plan=_plan((endpoint, [confirmed_tag, missed_tag])),
+                                   outcomes=[outcome], complete=True)
+                cooled = nk.cooled_pairs(tmp, program=None, target=_TARGET)
+                self.assertNotIn(nk._pair_id("app.example.com/download", confirmed_tag), cooled)
+                self.assertIn(nk._pair_id("app.example.com/download", missed_tag), cooled)
+
     def test_a_confirmed_impact_immunises_the_tag_that_produced_it(self) -> None:
         for tag, impact in self.DIVERGENT:
             with self.subTest(tag=tag):

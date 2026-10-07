@@ -276,8 +276,8 @@ as commands to execute.
 ## BugHunter
 
 See [docs/USER_GUIDE.md](docs/USER_GUIDE.md) for the full Hunt-cockpit walkthrough —
-Program setup (including browsing visible programs through HackerOne, YesWeHack, Bugcrowd, and Intigriti APIs,
-previewing their scope and rules, or importing a CSV/paste table),
+Program setup (including browsing visible programs through HackerOne, YesWeHack, and Intigriti APIs,
+previewing their scope and rules, or importing a CSV/paste table; Bugcrowd uses manual or CSV intake),
 local-clone source scanning (remote Git cloning currently refuses to run),
 per-program SSRF/OOB setup, running a hunt, and reports & submission. The cockpit also opens
 a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the top bar).
@@ -403,9 +403,9 @@ Fixed third-party egress is narrow and documented. HackerOne import/submission u
 `api.hackerone.com` only on its corresponding operator action. YesWeHack program search,
 scope import and sign-in use `api.yeswehack.com` the same way — read-only apart from the
 sign-in exchange, on an explicit click only, host-pinned, and with redirects refused so a
-credential can never follow a hop off that host. Bugcrowd and Intigriti program intake
-uses `api.bugcrowd.com` and `api.intigriti.com`, respectively, for explicit read-only
-program discovery and previews. Imported programs are saved paused until you review
+credential can never follow a hop off that host. Intigriti program intake uses
+`api.intigriti.com` for explicit read-only program discovery and previews. Bugcrowd
+programs use manual or CSV intake. Imported programs are saved paused until you review
 the current policy and authorize testing. The optional **Enrich from
 forge (read-only)** action uses one unauthenticated GET per selected repository to
 `api.github.com` (GitHub) or `gitlab.com` (GitLab); it has a hard timeout, never runs in the
