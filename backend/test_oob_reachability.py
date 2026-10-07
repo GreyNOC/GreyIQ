@@ -20,11 +20,12 @@ that *is* the opt-in.
 """
 from __future__ import annotations
 
+import ast
 import inspect
 import json
-import re
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -53,16 +54,38 @@ class TheGateIsWhatWeThinkItIsTests(unittest.TestCase):
     def test_all_four_provers_exist_and_are_gated_on_a_collaborator(self) -> None:
         from bughunter import bounty
 
-        source = inspect.getsource(bounty._run_bounty_hunt_body)
-        for label, call in PROVERS.items():
-            with self.subTest(prover=label):
-                self.assertIn(call, source, f"{label} is no longer run from the hunt body")
-        # Each call site sits behind a truthiness check on BOTH values.
-        gates = re.findall(r'if str\(oob_base or ""\)\.strip\(\) and str\(oob_secret or ""\)\.strip\(\)',
-                           source)
-        self.assertEqual(len(gates), len(PROVERS),
-                         f"expected {len(PROVERS)} collaborator gates, found {len(gates)} — the "
-                         "prover set changed, so re-check what this test is protecting")
+        source = textwrap.dedent(inspect.getsource(bounty._run_bounty_hunt_body))
+        tree = ast.parse(source)
+
+        def prover_calls(nodes: list[ast.stmt]) -> list[ast.Call]:
+            return [call for statement in nodes for call in ast.walk(statement)
+                    if isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr in PROVERS.values()]
+
+        all_calls = prover_calls(tree.body)
+        self.assertEqual({call.func.attr for call in all_calls}, set(PROVERS.values()),
+                         "the set of OOB provers in the hunt body changed")
+        self.assertEqual(len(all_calls), len(PROVERS), "an OOB prover moved or is called twice")
+
+        # Inspect the actual enclosing `if` expressions. Each prover must be
+        # inside an AND gate that independently requires both collaborator values,
+        # refuses unattended operator mode, and respects Stop. This stays valid
+        # when another safety condition is added before the credential checks.
+        gated: set[int] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If) or not isinstance(node.test, ast.BoolOp) \
+                    or not isinstance(node.test.op, ast.And):
+                continue
+            operands = node.test.values
+            def names(expr: ast.AST) -> set[str]:
+                return {part.id for part in ast.walk(expr) if isinstance(part, ast.Name)}
+            if not all(any(required in names(operand) for operand in operands)
+                       for required in ("oob_base", "oob_secret", "operator_guard", "_stopped")):
+                continue
+            gated.update(id(call) for call in prover_calls(node.body))
+        self.assertEqual(gated, {id(call) for call in all_calls},
+                         "each OOB prover must remain behind collaborator, operator, and Stop gates")
 
     def test_the_hunt_body_takes_the_collaborator_as_a_parameter(self) -> None:
         from bughunter import bounty

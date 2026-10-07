@@ -48,7 +48,12 @@ class OnlyForAHumanTests(unittest.TestCase):
     def setUp(self) -> None:
         for var in ("NO_COLOR", "GN_NO_FX"):
             self._restore(var)
-        os.environ.setdefault("TERM", "xterm")
+        # CI can deliberately start with TERM=dumb, including on Windows. These
+        # tests supply their own fake TTY, so make its terminal capability explicit.
+        old_term = os.environ.get("TERM")
+        os.environ["TERM"] = "xterm"
+        self.addCleanup(lambda: os.environ.__setitem__("TERM", old_term)
+                        if old_term is not None else os.environ.pop("TERM", None))
 
     def _restore(self, var: str) -> None:
         old = os.environ.pop(var, None)

@@ -2630,6 +2630,7 @@ if (els.huntBrainTrain) els.huntBrainTrain.addEventListener("click", () => void 
 
 // ---- Coding brain (local model / Claude / OpenAI-compatible) ----
 let coderConfig = null;
+let savedLocalRuntimeBootAttempted = false;
 const BRAIN_FIELDS = {
   off: [],
   local: ["model", "base_url"],
@@ -2699,6 +2700,35 @@ async function loadCoderConfig() {
     coderConfig = await apiFetch("/api/coder", { timeoutMs: 4000 });
     renderBrainForm();
     renderAgentBar(); // refresh the command-policy trust label now the config is known
+    // A previously selected local brain needs its runtime again after an app
+    // restart. The selection already authorized local setup; only do this once
+    // per renderer boot, and never provision for a remote Ollama URL.
+    const local = coderConfig?.local || {};
+    if (!savedLocalRuntimeBootAttempted && coderConfig?.enabled && coderConfig?.provider === "local"
+        && String(local.model || "").trim()
+        && isLoopbackOllamaUrl(local.base_url || "http://127.0.0.1:11434/v1")
+        && typeof window.greyiqDesktop?.ensureOllama === "function") {
+      savedLocalRuntimeBootAttempted = true;
+      const selectedModel = local.model;
+      const startupStatus = "Starting the saved local model runtime…";
+      els.brainStatus.textContent = startupStatus;
+      void window.greyiqDesktop.ensureOllama().then((runtime) => {
+        if (coderConfig?.provider !== "local" || coderConfig?.local?.model !== selectedModel) return;
+        // A concurrent setup/test may have shown a newer result while the
+        // runtime was starting. Do not replace that result with startup text.
+        if (els.brainStatus.textContent === startupStatus) {
+          els.brainStatus.textContent = runtime?.ok
+            ? "Saved local model runtime ready. Use Test to verify the model."
+            : (runtime?.error || "Could not start Ollama for the saved model.");
+        }
+        if (runtime?.ok) void refreshModelStatus();
+      }).catch((error) => {
+        if (coderConfig?.provider === "local" && coderConfig?.local?.model === selectedModel
+            && els.brainStatus.textContent === startupStatus) {
+          els.brainStatus.textContent = error?.message || "Could not start Ollama for the saved model.";
+        }
+      });
+    }
     const pull = await apiFetch("/api/coder/pull", { timeoutMs: 4000 });
     if (pull.active && pull.setup) {
       els.brainDownload.disabled = true;
@@ -2906,7 +2936,7 @@ async function deleteModel(name, btn) {
 
 let modelPullTimer = null;
 
-function pollModelPull({ statusEl = els.brainModelStatus, button = els.brainDownload, onSuccess = null } = {}) {
+function pollModelPull({ statusEl = els.brainModelStatus, button = els.brainDownload } = {}) {
   if (modelPullTimer) {
     clearInterval(modelPullTimer);
   }
@@ -2943,26 +2973,22 @@ function pollModelPull({ statusEl = els.brainModelStatus, button = els.brainDown
     }
     clearInterval(modelPullTimer);
     modelPullTimer = null;
-    if (status.selected && !onSuccess) {
+    if (status.selected) {
       await loadCoderConfig();
+      statusEl.textContent = `${status.model} is ready for chat and agent tools.`;
       els.brainStatus.textContent = `${status.model} is ready for chat and agent tools.`;
-    } else if (status.chat_only && !onSuccess) {
+    } else if (status.chat_only) {
       els.brainModel.value = status.model || els.brainModel.value;
       statusEl.textContent = `Downloaded ${status.model}; chat works, but agent tools did not pass.`;
       els.brainStatus.textContent = `${status.error} Your previous brain is still active. You may save this model for chat only.`;
     } else if (status.error) {
-      statusEl.textContent = `Download failed: ${status.error}`;
-      if (!onSuccess) els.brainStatus.textContent = "Your previous brain is still active.";
+      statusEl.textContent = `Model setup failed: ${status.error}`;
+      els.brainStatus.textContent = "Your previous brain is still active.";
     } else {
-      try {
-        if (onSuccess) await onSuccess(status);
-        else void refreshModelStatus();
-      } catch (error) {
-        statusEl.textContent = error.message || "The model downloaded, but could not be selected.";
-      }
+      void refreshModelStatus();
     }
     button.disabled = false;
-    if (!onSuccess) els.brainSave.disabled = false;
+    els.brainSave.disabled = false;
     checking = false;
   };
   modelPullTimer = setInterval(() => void check(), 2000);
@@ -3017,27 +3043,6 @@ els.brainDownload?.addEventListener("click", async () => {
   }
 });
 
-async function selectHuggingFaceModel(model) {
-  els.brainHfStatus.textContent = `Selecting ${model}…`;
-  await saveLocalModelSelection(model);
-  els.brainHfStatus.textContent = `Imported and selected ${model}. Use Test to verify it responds.`;
-}
-
-async function waitForOllamaReady() {
-  let lastError = "Ollama did not become ready. Check that it is running.";
-  for (let attempt = 0; attempt < 15; attempt += 1) {
-    try {
-      const models = await apiFetch("/api/coder/models", { timeoutMs: 2000 });
-      if (models.ok) return;
-      lastError = models.error || lastError;
-    } catch (error) {
-      lastError = error.message || lastError;
-    }
-    if (attempt < 14) await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  throw new Error(lastError);
-}
-
 function isLoopbackOllamaUrl(baseUrl) {
   try {
     const url = new URL(baseUrl);
@@ -3069,37 +3074,20 @@ async function importHuggingFaceModel() {
   }
   els.brainHfImport.disabled = true;
   try {
-    const savedConfig = await apiFetch("/api/coder", { timeoutMs: 4000 });
-    const savedUrl = savedConfig?.local?.base_url || "http://127.0.0.1:11434/v1";
-    if (!isLoopbackOllamaUrl(savedUrl)) {
-      throw new Error("Hugging Face imports require a loopback Ollama Server URL. Set and save http://127.0.0.1:11434/v1 first.");
-    }
     els.brainHfStatus.textContent = "Preparing Ollama…";
     if (window.greyiqDesktop && typeof window.greyiqDesktop.ensureOllama === "function") {
       const runtime = await window.greyiqDesktop.ensureOllama();
       if (!runtime?.ok) throw new Error(runtime?.error || "Ollama could not start.");
     }
-    els.brainHfStatus.textContent = "Waiting for Ollama to be ready…";
-    await waitForOllamaReady();
-    els.brainHfStatus.textContent = "Starting Hugging Face GGUF download…";
+    els.brainHfStatus.textContent = "Checking the Hugging Face GGUF model…";
     const result = await apiFetch("/api/coder/huggingface/import", {
       method: "POST",
       timeoutMs: 15000,
       body: JSON.stringify({ reference })
     });
     if (result.ok === false) throw new Error(result.error || "Import could not start.");
-    const model = String(result.model || "").trim();
-    if (!model) throw new Error("Import did not return a model name.");
-    if (result.active) {
-      pollModelPull({
-        statusEl: els.brainHfStatus,
-        button: els.brainHfImport,
-        onSuccess: () => selectHuggingFaceModel(model)
-      });
-    } else {
-      await selectHuggingFaceModel(model);
-      els.brainHfImport.disabled = false;
-    }
+    if (!result.active || !result.model) throw new Error("Model setup did not start.");
+    pollModelPull({ statusEl: els.brainHfStatus, button: els.brainHfImport });
   } catch (error) {
     els.brainHfStatus.textContent = error.message || "Hugging Face import failed.";
     els.brainHfImport.disabled = false;
@@ -7699,7 +7687,7 @@ function ckUpdateAuthorizedLabel() {
   ckUpdateLaunchReadiness();
 }
 
-function ckScopeRowEl(entry) {
+function ckScopeRowEl(entry, onOperatorChange) {
   const row = cel("div", "ck-scope-row");
   const id = cel("input"); id.type = "text"; id.placeholder = "*.example.com"; id.value = entry.identifier || "";
   const importedIdentifier = id.value.trim();
@@ -7707,6 +7695,7 @@ function ckScopeRowEl(entry) {
   const type = cel("input"); type.type = "text"; type.placeholder = "URL"; type.value = entry.asset_type || "";
   const sub = cel("label", "ck-scope-check");
   const subInput = cel("input"); subInput.type = "checkbox"; subInput.checked = entry.eligible_for_submission !== false;
+  subInput.addEventListener("change", () => onOperatorChange?.("eligibility", importedIdentifier, subInput.checked));
   sub.append(subInput, cel("span", null, "In scope"));
   const bounty = cel("label", "ck-scope-check");
   const bountyInput = cel("input"); bountyInput.type = "checkbox"; bountyInput.checked = Boolean(entry.eligible_for_bounty);
@@ -7714,7 +7703,10 @@ function ckScopeRowEl(entry) {
   const sev = cel("input"); sev.type = "text"; sev.placeholder = "max severity"; sev.value = entry.max_severity || "";
   const note = cel("input"); note.type = "text"; note.placeholder = "instruction (optional)"; note.value = entry.instruction || "";
   const rm = cel("button", "ck-btn ck-scope-rm", "✕"); rm.type = "button"; rm.title = "Remove row";
-  rm.addEventListener("click", () => row.remove());
+  rm.addEventListener("click", () => {
+    onOperatorChange?.("remove", importedIdentifier, null);
+    row.remove();
+  });
   row.append(id, type, sub, bounty, sev, note, rm);
   row._ckGet = () => ({
     identifier: id.value.trim(), asset_type: type.value.trim(),
@@ -7732,10 +7724,33 @@ function ckScopeRowEl(entry) {
 // instead of the whole "Save program" request hard-failing with a generic 422.
 const CK_MAX_SCOPE_ENTRIES = 500;
 
+// The older platform-specific fetch routes return a scope preview without the
+// provenance envelope used by Browse platform APIs. Build only inert, bounded
+// metadata here; even a successful fetch never establishes authorization.
+function ckLegacyIntakeSource(platform, identifier, response) {
+  const providerId = String(identifier || "").replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 200);
+  const fetched = response && response.ok !== false;
+  const safeId = /^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/.test(providerId);
+  const base = platform === "hackerone" ? "https://api.hackerone.com/v1/hackers/programs/"
+    : platform === "yeswehack" ? "https://api.yeswehack.com/programs/" : "";
+  const rawWarnings = Array.isArray(response?.warnings) ? response.warnings : [];
+  const warnings = rawWarnings.slice(0, 7)
+    .map((warning) => String(warning || "").replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 240))
+    .filter(Boolean);
+  warnings.push(fetched
+    ? "Review current policy, exclusions, and authorization before enabling tests."
+    : "Scope was not fetched; enter and verify it manually before enabling tests.");
+  return {
+    platform, provider_id: providerId,
+    source_url: fetched && safeId ? base + providerId : "",
+    fetched_at: fetched ? new Date().toISOString() : "",
+    status: fetched ? String(response?.status || "unknown").replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 40) : "fetch_failed",
+    scope_complete: false, warnings,
+  };
+}
+
 // Dedupe-by-identifier merge of `incoming` rows into `existing`, capped at
-// CK_MAX_SCOPE_ENTRIES. Returns { rows, truncated } — used by both the CSV/paste importer
-// and the HackerOne fetch button so neither can silently grow the table past what a save
-// can actually accept.
+// CK_MAX_SCOPE_ENTRIES. Returns { rows, truncated } for the CSV/paste importer.
 function ckMergeScopeRows(existing, incoming) {
   const seen = new Set(existing.map((e) => e.identifier.toLowerCase()));
   const merged = existing.slice();
@@ -7748,19 +7763,47 @@ function ckMergeScopeRows(existing, incoming) {
   return { rows: merged, truncated };
 }
 
-function ckScopeTable(initialRows) {
+// A re-fetch gives current platform rows priority among eligible assets, but
+// cannot turn an existing exclusion into an eligible row or evict it at the cap.
+// If exclusions alone exceed the cap, leave the table unchanged and block Save.
+function ckMergeFetchedScopeRows(existing, fetched) {
+  const selected = new Map();
+  const add = (rows, preserveExclusion) => {
+    for (const row of rows) {
+      const key = String(row?.identifier || "").trim().toLowerCase();
+      if (!key) continue;
+      const previous = selected.get(key);
+      if (!previous || (!row.eligible_for_submission && (preserveExclusion || previous.eligible_for_submission))) {
+        selected.set(key, row);
+      }
+    }
+  };
+  add(fetched, false);
+  add(existing, true);
+  const values = [...selected.values()];
+  const exclusions = values.filter((row) => !row.eligible_for_submission);
+  if (exclusions.length > CK_MAX_SCOPE_ENTRIES) {
+    return { rows: existing, blocked: true, truncated: true, dropped: 0 };
+  }
+  const eligible = values.filter((row) => row.eligible_for_submission);
+  const rows = [...exclusions, ...eligible.slice(0, CK_MAX_SCOPE_ENTRIES - exclusions.length)];
+  return { rows, blocked: false, truncated: rows.length < values.length,
+    dropped: values.length - rows.length };
+}
+
+function ckScopeTable(initialRows, onOperatorChange) {
   const wrap = cel("div", "ck-scope-table");
   const header = cel("div", "ck-scope-row ck-scope-head");
   for (const label of ["Identifier", "Asset type", "", "", "Max severity", "Instruction", ""]) header.append(cel("span", null, label));
   wrap.append(header);
   const body = cel("div", "ck-scope-body");
-  for (const entry of (initialRows || [])) body.append(ckScopeRowEl(entry));
+  for (const entry of (initialRows || [])) body.append(ckScopeRowEl(entry, onOperatorChange));
   wrap.append(body);
   const addRow = cel("button", "ck-btn", "+ Add scope row"); addRow.type = "button";
-  addRow.addEventListener("click", () => body.append(ckScopeRowEl({})));
+  addRow.addEventListener("click", () => body.append(ckScopeRowEl({}, onOperatorChange)));
   wrap.append(addRow);
   wrap.ckCollect = () => [...body.querySelectorAll(".ck-scope-row")].map((r) => r._ckGet()).filter((e) => e.identifier);
-  wrap.ckReplace = (rows) => { body.replaceChildren(); for (const e of rows) body.append(ckScopeRowEl(e)); };
+  wrap.ckReplace = (rows) => { body.replaceChildren(); for (const e of rows) body.append(ckScopeRowEl(e, onOperatorChange)); };
   return wrap;
 }
 
@@ -7934,6 +7977,8 @@ function ckProgramSetupForm(prefill) {
   // marker, carried so a Save persists them even though the form has no fields for them.
   let fetchedYwhStats = editing ? (editing.ywh_program_stats || {}) : ((seed && seed.ywh_program_stats) || {});
   let intakeSource = editing ? (editing.intake_source || {}) : ((seed && seed.intake_source) || {});
+  let fetchedScopeThisSession = false;
+  let scopeMergeBlocked = false;
 
   const fetchBar = cel("div", "ck-import-row");
   const fetchBtn = cel("button", "ck-btn", "Fetch scope from HackerOne"); fetchBtn.type = "button";
@@ -8004,7 +8049,20 @@ function ckProgramSetupForm(prefill) {
     form.append(cel("p", "ck-status ck-candidate-scope-note",
       "Forge metadata suggested the unticked host rows below. Confirm you're authorized to test each host before ticking In scope; leaving a row unticked never authorizes it."));
   }
-  const scopeTable = ckScopeTable(editing ? (editing.structured_scope || []) : ((seed && seed.structured_scope) || []));
+  // Only a direct click on a saved excluded row's Remove button or In scope
+  // checkbox can request removal of its persisted host exclusion. A platform
+  // re-fetch, cap, or dedupe never creates that intent.
+  const savedExclusions = new Map((editing?.structured_scope || [])
+    .filter((row) => row && row.eligible_for_submission === false && row.identifier)
+    .map((row) => [String(row.identifier).trim().toLowerCase(), String(row.identifier).trim()]));
+  const operatorRemovedExclusions = new Set();
+  const recordScopeChange = (action, identifier, isEligible) => {
+    const key = String(identifier || "").trim().toLowerCase();
+    if (!savedExclusions.has(key)) return;
+    if (action === "remove" || (action === "eligibility" && isEligible)) operatorRemovedExclusions.add(key);
+    else if (action === "eligibility") operatorRemovedExclusions.delete(key);
+  };
+  const scopeTable = ckScopeTable(editing ? (editing.structured_scope || []) : ((seed && seed.structured_scope) || []), recordScopeChange);
   form.append(scopeTable);
 
   const existingRepositoryUrls = editing
@@ -8053,6 +8111,16 @@ function ckProgramSetupForm(prefill) {
         fetchNote.textContent = (res && res.error) || "Could not fetch scope.";
         return;
       }
+      const entries = Array.isArray(res.structured_scope) ? res.structured_scope : [];
+      const merge = entries.length ? ckMergeFetchedScopeRows(scopeTable.ckCollect(), entries) : null;
+      if (merge?.blocked) {
+        scopeMergeBlocked = true;
+        fetchNote.className = "ck-status is-error";
+        fetchNote.textContent = `Scope re-fetch has more than ${CK_MAX_SCOPE_ENTRIES} exclusions. No rows changed; Save is blocked until a later fetch fits the limit.`;
+        return;
+      }
+      scopeMergeBlocked = false;
+      fetchedScopeThisSession = true;
       if (isYwh) {
         fetchedYwhStats = res.program_stats || {};
         // The program's required user-agent marker and its rules digest only OVERWRITE an
@@ -8067,28 +8135,14 @@ function ckProgramSetupForm(prefill) {
           source_url: res.source_url, fetched_at: res.fetched_at, status: res.status,
           scope_complete: res.scope_complete === true, warnings: res.warnings || [] };
         if (res.policy_excerpt && !notes.input.value.trim()) notes.input.value = res.policy_excerpt;
+      } else {
+        intakeSource = ckLegacyIntakeSource(isYwh ? "yeswehack" : "hackerone",
+          (isYwh ? res.slug : res.handle) || h, res);
       }
-      const entries = res.structured_scope || [];
       let mergeNote = "";
-      if (entries.length) {
-        // Merge (dedupe by identifier, fetched rows win on a match) rather than replace —
-        // a fetch must never silently discard hand-typed or CSV-merged rows already in
-        // the table.
-        // Fetched rows go FIRST. ckMergeScopeRows fills up to the cap in order, so putting
-        // existing rows first meant a nearly-full table silently discarded the rows just
-        // fetched — including out-of-scope exclusions, which is the one direction that
-        // must never be lost. Within the fetched set, exclusions lead for the same reason.
-        const fetchedFirst = [
-          ...entries.filter((e) => !e.eligible_for_submission),
-          ...entries.filter((e) => e.eligible_for_submission),
-        ];
-        const keptExisting = scopeTable.ckCollect()
-          .filter((e) => !entries.some((f) => f.identifier.toLowerCase() === e.identifier.toLowerCase()));
-        const { rows: merged, truncated } = ckMergeScopeRows(fetchedFirst, keptExisting);
-        scopeTable.ckReplace(merged);
-        // Say which rows actually went — it used to claim "existing rows were dropped"
-        // while it was in fact dropping the fetched ones.
-        if (truncated) mergeNote = ` Capped at ${CK_MAX_SCOPE_ENTRIES} scope entries — ${keptExisting.length - (merged.length - fetchedFirst.length)} existing row(s) did not fit; every fetched row was kept.`;
+      if (merge) {
+        scopeTable.ckReplace(merge.rows);
+        if (merge.truncated) mergeNote = ` Capped at ${CK_MAX_SCOPE_ENTRIES} scope entries — all exclusions were kept; ${merge.dropped} eligible row(s) did not fit.`;
       }
       const fetchedRepositories = ckRepositoryUrlsFromScope(entries);
       if (fetchedRepositories.length) {
@@ -8225,6 +8279,11 @@ function ckProgramSetupForm(prefill) {
   const saveNote = cel("p", "ck-status");
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
+    if (scopeMergeBlocked) {
+      saveNote.className = "ck-status is-error";
+      saveNote.textContent = "Save is blocked because the latest scope re-fetch could not retain every exclusion.";
+      return;
+    }
     const structuredScope = scopeTable.ckCollect();
     if (!name.input.value.trim()) { saveNote.className = "ck-status is-error"; saveNote.textContent = "Program name is required."; return; }
     const repositoryUrls = ckParseRepositoryUrls(repoUrls.input.value);
@@ -8269,18 +8328,30 @@ function ckProgramSetupForm(prefill) {
       policy_profile: editing ? (editing.policy_profile || "") : "",
       user_agent_suffix: uaSuffix.input.value,
       // This form owns the structured-scope table and repository selection, so a save here
-      // should always re-derive scope_text/in_scope_hosts/out_of_scope_hosts from whatever
-      // the form currently holds — never echo back a stale value from before this edit.
+      // should refresh derived scope_text/in_scope_hosts/out_of_scope_hosts from whatever
+      // the form currently holds, without echoing back a stale derived value.
       // The server recognizes and preserves scope text hand-typed in the Operator tab.
       resync_scope: true,
     };
+    if (editing && operatorRemovedExclusions.size) {
+      const removals = [...operatorRemovedExclusions]
+        .filter((key) => !structuredScope.some((row) => String(row.identifier || "").trim().toLowerCase() === key
+          && row.eligible_for_submission === false))
+        .map((key) => savedExclusions.get(key));
+      if (removals.length) payload.remove_out_of_scope_hosts = removals;
+    }
     if (editing) {
       payload.id = editing.id;
       // Fields this form doesn't expose (seed targets, automation toggles) are simply
       // omitted — the server preserves the existing stored value for anything not present
       // in the request instead of resetting it to that field's bare default.
-      payload.enabled = editing.enabled;
-    } else if (seed && seed.intake_source) {
+      payload.enabled = fetchedScopeThisSession ? false : editing.enabled;
+      if (fetchedScopeThisSession) {
+        payload.active = false;
+        payload.live = false;
+        payload.deep = false;
+      }
+    } else if (fetchedScopeThisSession || intakeSource.provider_id) {
       // API discovery is not authorization. Save every imported program paused.
       payload.enabled = false;
       payload.active = false;
@@ -8305,7 +8376,7 @@ function ckProgramSetupForm(prefill) {
       await ckRefreshProgramsEverywhere();
       // A new program should flow straight into its first run. Select it, hydrate Target/Scope,
       // open the launch panel, and focus the first remaining requirement (usually authorization).
-      if (created && !seed?.intake_source && savedProgram?.id && ck.activeProgram) {
+      if (created && !fetchedScopeThisSession && !intakeSource.provider_id && savedProgram?.id && ck.activeProgram) {
         ck.activeProgram.value = savedProgram.id;
         ckApplyActiveProgram(savedProgram.id);
         document.querySelector("#ckSetupFold")?.setAttribute("open", "");
@@ -8573,19 +8644,29 @@ function ckWizardIdentifyH1(nav) {
   fetchBtn.addEventListener("click", async () => {
     const h = handle.input.value.trim();
     if (!h) { note.className = "ck-status is-error"; note.textContent = "Enter a HackerOne team handle first."; return; }
+    fetched = null; cont.disabled = true;
     fetchBtn.disabled = true; fetchBtn.textContent = "Fetching…"; note.className = "ck-status"; note.textContent = "";
     try {
       const res = await apiFetch("/api/hackerone/import-scope", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ handle: h }) });
       if (!res || res.ok === false) {
         note.className = "ck-status is-error"; note.textContent = (res && res.error) || "Could not fetch scope. You can still continue and add scope by hand.";
-        fetched = { name: h, platform_handle: h }; cont.disabled = false; cont.textContent = "Continue anyway →"; return;
+        fetched = { name: h, platform: "hackerone", platform_handle: h,
+          intake_source: ckLegacyIntakeSource("hackerone", h, res || { ok: false }) };
+        cont.disabled = false; cont.textContent = "Continue anyway →"; return;
       }
       const entries = res.structured_scope || [];
-      fetched = { name: res.program_name || h, platform_handle: h, structured_scope: entries,
-        repository_urls: ckRepositoryUrlsFromScope(entries), h1_program_stats: res.program_stats || {} };
+      fetched = { name: res.program_name || h, platform: "hackerone", platform_handle: h,
+        structured_scope: entries, repository_urls: ckRepositoryUrlsFromScope(entries),
+        h1_program_stats: res.program_stats || {},
+        intake_source: ckLegacyIntakeSource("hackerone", res.handle || h, res) };
       note.className = "ck-status"; note.textContent = `Fetched ${entries.length} scope entr${entries.length === 1 ? "y" : "ies"} for "${fetched.name}". Review and save on the next step.`;
       cont.disabled = false; cont.textContent = "Continue →";
-    } catch (err) { note.className = "ck-status is-error"; note.textContent = err.message || "Fetch failed."; }
+    } catch (err) {
+      note.className = "ck-status is-error"; note.textContent = err.message || "Fetch failed.";
+      fetched = { name: h, platform: "hackerone", platform_handle: h,
+        intake_source: ckLegacyIntakeSource("hackerone", h, { ok: false }) };
+      cont.disabled = false; cont.textContent = "Continue anyway →";
+    }
     finally { fetchBtn.disabled = false; if (fetchBtn.textContent === "Fetching…") fetchBtn.textContent = "Fetch scope"; }
   });
   cont.addEventListener("click", () => {
@@ -8676,6 +8757,7 @@ function ckWizardIdentifyYWH(nav) {
   fetchBtn.addEventListener("click", async () => {
     const s = slug.input.value.trim();
     if (!s) { note.className = "ck-status is-error"; note.textContent = "Enter or pick a YesWeHack program slug first."; return; }
+    fetched = null; cont.disabled = true;
     fetchBtn.disabled = true; fetchBtn.textContent = "Fetching…";
     note.className = "ck-status"; note.textContent = ""; signin.replaceChildren();
     try {
@@ -8686,7 +8768,9 @@ function ckWizardIdentifyYWH(nav) {
         // 401 too, not just 403 — an expired JWT is the ONE failure where signing in again
         // is literally the fix, and it was the one case that got no button.
         if (res && /\b401\b|403|private|invited|expired/i.test(String(res.error || ""))) offerSignin();
-        fetched = { name: s, platform: "yeswehack", platform_handle: s }; cont.disabled = false; cont.textContent = "Continue anyway →"; return;
+        fetched = { name: s, platform: "yeswehack", platform_handle: s,
+          intake_source: ckLegacyIntakeSource("yeswehack", s, res || { ok: false }) };
+        cont.disabled = false; cont.textContent = "Continue anyway →"; return;
       }
       fetched = ckYwhPrefill(res, s);
       const entries = fetched.structured_scope || [];
@@ -8701,7 +8785,12 @@ function ckWizardIdentifyYWH(nav) {
         + ((res.warnings || []).length ? " " + res.warnings.join(" ") : "")
         + " Review and save on the next step.";
       cont.disabled = false; cont.textContent = "Continue →";
-    } catch (err) { note.className = "ck-status is-error"; note.textContent = err.message || "Fetch failed."; }
+    } catch (err) {
+      note.className = "ck-status is-error"; note.textContent = err.message || "Fetch failed.";
+      fetched = { name: s, platform: "yeswehack", platform_handle: s,
+        intake_source: ckLegacyIntakeSource("yeswehack", s, { ok: false }) };
+      cont.disabled = false; cont.textContent = "Continue anyway →";
+    }
     finally { fetchBtn.disabled = false; if (fetchBtn.textContent === "Fetching…") fetchBtn.textContent = "Fetch scope"; }
   });
   slug.input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); fetchBtn.click(); } });
@@ -8860,6 +8949,7 @@ function ckYwhPrefill(res, slug) {
     ywh_program_stats: res.program_stats || {},
     user_agent_suffix: res.user_agent_suffix || "",
     notes: res.notes_digest || "",
+    intake_source: ckLegacyIntakeSource("yeswehack", res.slug || slug, res),
   };
 }
 
@@ -10804,6 +10894,23 @@ function ckRenderLeadQueue(panel, res) {
         ob.append(document.createTextNode(String(lead.proof_obligation)));
         row.append(ob);
       }
+      // Show the hypothesis and its stopping rule beside the proof obligation.
+      // Confirmed leads already have an observed proof, so these planning fields
+      // belong only on leads that still need validation.
+      if (lead.status !== "confirmed" && (
+        lead.predicted_positive_signal || lead.negative_control || lead.falsifier_stop_condition
+      )) {
+        for (const [label, value] of [
+          ["Expected signal", lead.predicted_positive_signal],
+          ["Negative control", lead.negative_control],
+          ["Stop if", lead.falsifier_stop_condition],
+        ]) {
+          const plan = cel("p", "ck-hint");
+          plan.append(cel("strong", null, `${label}: `));
+          plan.append(document.createTextNode(String(value || "—")));
+          row.append(plan);
+        }
+      }
       for (const gap of (lead.gaps || [])) row.append(cel("p", "ck-hint", `Gap: ${gap}`));
       // A contradiction is the engine saying its own evidence disagrees — never hide it.
       for (const c of (lead.contradictions || [])) {
@@ -12323,7 +12430,7 @@ function ckProgramRow(prog, funnel) {
   toggle.type = "button";
   toggle.addEventListener("click", async () => {
     try {
-      await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify({ id: prog.id, name: prog.name, scope_text: prog.scope_text, seed_targets: prog.seed_targets, active: prog.active, live: prog.live, auto_submit: false, platform: prog.platform, platform_handle: prog.platform_handle, interval_minutes: prog.interval_minutes, max_submits_per_day: prog.max_submits_per_day, max_pages: prog.max_pages, enabled: !prog.enabled }) });
+      await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify({ id: prog.id, name: prog.name, seed_targets: prog.seed_targets, active: prog.active, live: prog.live, auto_submit: false, platform: prog.platform, platform_handle: prog.platform_handle, interval_minutes: prog.interval_minutes, max_submits_per_day: prog.max_submits_per_day, max_pages: prog.max_pages, enabled: !prog.enabled }) });
       await ckRefreshProgramsEverywhere();
       void ckRenderOperator();
     } catch (err) { window.alert(err.message || "Could not update the program — the engine may be unreachable, so the change may not have applied."); }
@@ -12348,7 +12455,9 @@ function ckProgramForm() {
   form.append(cel("p", "ck-hint ck-crosslink",
     "Structured scope, platform, account access, IDOR pairs, and OOB are edited in the Program tab’s setup form. This editor owns the run schedule and automation toggles below; the scope field here is a plain-text gate."));
   const name = ckField("Program name", "text", editing ? (editing.name || "") : "");
-  const scope = ckField("Scope (hosts/wildcards — the active gate)", "text", editing ? (editing.scope_text || "") : "");
+  const scope = ckTextareaField("Scope (hosts/wildcards — the active gate)", "");
+  scope.input.value = editing ? String(editing.scope_text ?? "") : "";
+  scope.input.rows = 3;
   const targets = ckField("Seed targets (comma/space separated URLs)", "text", editing ? (editing.seed_targets || []).join(", ") : "");
   const repositories = ckTextareaField("Program source repositories (public HTTPS roots, one per line)", "");
   repositories.input.value = editing ? (editing.repository_urls || []).join("\n") : "";
@@ -12379,7 +12488,10 @@ function ckProgramForm() {
   const note = cel("p", "ck-status");
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
-    if (!name.input.value.trim() || !scope.input.value.trim()) { note.textContent = "Name and scope are required."; note.classList.add("is-error"); return; }
+    if (!name.input.value.trim() || (!editing && !scope.input.value.trim())) {
+      note.textContent = editing ? "Name is required." : "Name and scope are required.";
+      note.classList.add("is-error"); return;
+    }
     const seeds = targets.input.value.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
     const repositoryUrls = ckParseRepositoryUrls(repositories.input.value);
     if (cloneRepositories.input.checked && repositories.input.value.trim() && !repositoryUrls.length) {
@@ -12388,7 +12500,7 @@ function ckProgramForm() {
       return;
     }
     const payload = {
-      name: name.input.value.trim(), scope_text: scope.input.value.trim(), seed_targets: seeds,
+      name: name.input.value.trim(), seed_targets: seeds,
       repository_urls: repositoryUrls, clone_repositories: cloneRepositories.input.checked,
       // Preserve an existing platform tag (e.g. HackenProof, set in the Program tab) instead of
       // re-deriving it from the handle — this compact Operator editor has no platform picker, and
@@ -12400,6 +12512,11 @@ function ckProgramForm() {
       interval_minutes: Number(interval.input.value) || 1440,
       max_submits_per_day: editing ? Number(editing.max_submits_per_day ?? 3) : 3
     };
+    // A schedule-only edit must not reclassify an auto-derived scope as hand-entered.
+    // Send the literal field only when it was entered or changed in this editor.
+    if (!editing || scope.input.value !== String(editing.scope_text ?? "")) {
+      payload.scope_text = scope.input.value;
+    }
     if (editing) {
       // Update the existing record: carry its id + the fields the form doesn't expose so
       // they're preserved (enabled state, recon depth) rather than reset to defaults.

@@ -72,12 +72,19 @@ if [ "$(uname -s 2>/dev/null)" != "Linux" ] || [ -n "${WINDIR:-}" ]; then
       info "(dry run) would: git worktree add --detach $SHORT_WT HEAD && $SHORT_WT/scripts/release.sh --here"
       exit 0
     fi
-    git worktree remove "$SHORT_WT" --force 2>/dev/null || true
+    # A detached worktree only contains committed files. Refuse to silently
+    # build yesterday's commit when the source checkout has local release edits.
+    [ -z "$(git status --porcelain --untracked-files=all)" ] ||
+      die "the checkout has uncommitted files; commit them before a short-path release build"
+    [ ! -e "$SHORT_WT" ] || die "short-path build directory already exists: $SHORT_WT"
     git worktree add --detach "$SHORT_WT" HEAD >/dev/null
     info "created; building there"
     # --here in the short worktree: it is already short enough, and this guard must not recurse.
-    ( cd "$SHORT_WT" && bash scripts/release.sh --here ${PURGE_VENV:+--purge-venv} \
-        $( [ "$SKIP_CHECK" = "1" ] && echo --skip-check ) $( [ "$ASSUME_YES" = "1" ] && echo --yes ) )
+    SHORT_ARGS=(--here)
+    [ "$PURGE_VENV" = "1" ] && SHORT_ARGS+=(--purge-venv)
+    [ "$SKIP_CHECK" = "1" ] && SHORT_ARGS+=(--skip-check)
+    [ "$ASSUME_YES" = "1" ] && SHORT_ARGS+=(--yes)
+    ( cd "$SHORT_WT" && bash scripts/release.sh "${SHORT_ARGS[@]}" )
     say "Artifacts are in $SHORT_WT/release"
     ls -lh "$SHORT_WT/release" 2>/dev/null | sed 's/^/    /' || true
     info "remove the build worktree with: git worktree remove $SHORT_WT --force"
@@ -127,7 +134,7 @@ fi
 # -------------------------------------------------------------------------------- build
 say "Building the portable + installer"
 info "this freezes the backend from an isolated .venv-build; the first run downloads CPU torch + Chromium"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File build/build-portable.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File build/build-portable.ps1 -Installer
 
 # ---------------------------------------------------------------------------- checksums
 say "Checksums"

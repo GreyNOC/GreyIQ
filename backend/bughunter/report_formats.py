@@ -16,6 +16,7 @@ the finding carries it. Pure / frozen-safe.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from bughunter import report as R
@@ -54,6 +55,28 @@ PLATFORMS: tuple[dict[str, str], ...] = (
 )
 _PLATFORM_IDS = {p["id"] for p in PLATFORMS}
 DEFAULT_PLATFORM = "hackerone"
+_NESTED_REDACTION = re.compile(
+    r"\[REDACTED_SECRET:\[REDACTED_SECRET:sha256:[0-9a-f]{12}\]:([0-9a-f]{12})\]"
+)
+
+
+def _safe_report_text(text: str, finding: dict[str, Any]) -> str:
+    """Redact the complete rendered surface, including fields added by callers."""
+    secret = str(finding.get("secret_value") or "")
+    if secret:
+        # Replace the known value before the generic pass, even for short keys.
+        # A neutral marker is not mistaken for a fresh Bearer token, and the
+        # single generic pass still catches unrelated credentials.
+        text = text.replace(secret, "<redacted>")
+    redacted = R.redact_text(text)[0]
+    # The generic redactor can match the word "SECRET" inside a marker it
+    # created earlier in the same pass. Flatten that display artifact without
+    # applying another redaction pass or revealing the original value.
+    while True:
+        flattened = _NESTED_REDACTION.sub(r"[REDACTED_SECRET:sha256:\1]", redacted)
+        if flattened == redacted:
+            return redacted
+        redacted = flattened
 
 
 def list_platforms() -> list[dict[str, str]]:
@@ -289,9 +312,12 @@ def _section_retest(out: list[str]) -> None:
 
 
 def render_finding(ctx: dict[str, Any], finding: dict[str, Any], platform: str = DEFAULT_PLATFORM) -> str:
-    """A self-contained, submission-ready Markdown report for one finding, framed for the
-    chosen platform. Returns '' if the finding isn't reportable (mirrors
-    report.build_finding_markdown)."""
+    """Detailed analyst report for one finding, framed for the chosen platform.
+
+    This keeps the metadata, proof gates, retest checklist, and every evidence
+    section for local review. ``render_submission_body`` is the shorter text the
+    operator pastes into a platform's description field.
+    """
     platform = normalize_platform(platform)
     if not R._reportable_findings([finding]):
         return ""
@@ -336,4 +362,143 @@ def render_finding(ctx: dict[str, Any], finding: dict[str, Any], platform: str =
             f"_Disclosure: this finding was identified and validated with the assistance of {tool}{suffix}. "
             "All results were manually reviewed before submission._"
         )
-    return "\n".join(out)
+    return _safe_report_text("\n".join(out), finding)
+
+
+def render_submission_body(ctx: dict[str, Any], finding: dict[str, Any], platform: str = DEFAULT_PLATFORM) -> str:
+    """Render the operator-facing description field from captured, redacted data.
+
+    Platform forms carry title, severity, asset, CWE/VRT, and CVSS separately.
+    Keeping those fields and internal QA prose out of this body makes the finding
+    easier to read without discarding them from the submission package. A candidate
+    remains explicitly unconfirmed; narrative text cannot promote it to proof.
+    """
+    platform = normalize_platform(platform)
+    if not R._reportable_findings([finding]):
+        return ""
+    plan = (ctx.get("attack_plans") or {}).get(finding.get("ref"), {}) or {}
+    proof = R._proof_of_impact_detail(finding, plan)
+    confirmed = proof.get("status") == "confirmed"
+    out: list[str] = ["**Summary**", ""]
+
+    location = str(R._location(finding) or ctx.get("target") or "").strip()
+    # The paste body uses deterministic source text. Model-written prose remains in
+    # the analyst report, where the operator can compare it with the artifacts.
+    summary = str(finding.get("description") or "").strip()
+    if not confirmed:
+        # Candidate titles and descriptions can themselves say "confirmed" or
+        # assert an impact. The platform form carries the title separately.
+        out.append("This location was flagged for review. The behavior and impact have not been confirmed.")
+    elif summary:
+        out.append(R.redact_text(summary)[0])
+    else:
+        out.append(R.redact_text(str(finding.get("title") or "Finding under review"))[0] + ".")
+    if location:
+        out.append(f"Affected location: {R.redact_text(location)[0]}")
+    if str(finding.get("secret_classification") or "") == R.secret_classification.PUBLIC_CLIENT_KEY:
+        out.append("Informational only: this is a public client key. Unauthorized access has not been confirmed.")
+
+    grouped = R._grouped_locations(finding)
+    if grouped:
+        out.extend(["", "Affected locations sharing this finding:"])
+        out.extend(f"- {R.redact_text(loc)[0]}" for loc in grouped)
+
+    out.extend(["", "**Proof of Concept**", ""])
+    steps = R.normalize_steps(plan.get("steps"))
+    poc = str(plan.get("poc") or "").strip()
+    if steps:
+        out.extend(f"{index}. {R.redact_text(step)[0]}" for index, step in enumerate(steps, 1))
+        out.append("")
+    elif poc:
+        out.extend(["1. Run the reproduction artifact below within the authorized scope.", ""])
+    else:
+        out.append("Reproduction steps have not been captured yet.")
+        out.append("")
+
+    if poc:
+        poc = R.redact_text(poc)[0]
+        fence = R._fence(poc)
+        out.extend(["Reproduction artifact:", f"{fence}{R._poc_lang(poc)}", poc, fence, ""])
+
+    pe = finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {}
+    captured_parts: list[str] = []
+    request = [str(pe.get(key) or "").strip() for key in ("request_line", "request_header")]
+    response = [str(pe.get(key) or "").strip() for key in
+                ("response_status", "response_header", "set_cookie", "matched_value", "read_data")]
+    captured_parts.extend(part for part in request if part)
+    if any(request) and any(response):
+        captured_parts.append("")
+    captured_parts.extend(part for part in response if part)
+    if captured_parts:
+        capture = R.redact_text("\n".join(captured_parts))[0]
+        fence = R._fence(capture)
+        out.extend(["Captured request/response fields:", f"{fence}http", capture, fence, ""])
+    elif not poc:
+        out.extend(["No request or runnable command was captured in this report.", ""])
+
+    snippet = str(finding.get("snippet") or "").strip()
+    if snippet:
+        snippet = R.redact_text(snippet)[0]
+        fence = R._fence(snippet)
+        out.extend(["Captured source or response excerpt:", fence, snippet, fence, ""])
+
+    observed = R.redact_text(str(proof.get("observed_result") or proof.get("evidence") or ""))[0].strip()
+    control = R.redact_text(str(proof.get("control_result") or ""))[0].strip()
+    if observed:
+        out.extend(["Confirmed result:" if confirmed else "Observed result (unconfirmed):", observed, ""])
+    if control:
+        out.extend(["Control result:", control, ""])
+    else:
+        out.extend(["No negative-control result was captured.", ""])
+    limitations = R.redact_text(str(proof.get("limitations") or ""))[0].strip()
+    if limitations:
+        out.extend(["Limitations: " + limitations, ""])
+    if not confirmed:
+        out.extend(["Impact has not been confirmed. Verify the result and its control before filing.", ""])
+
+    screenshots = [name for name in R._screenshot_names(finding) if R.redact_text(name)[0] == name]
+    if screenshots:
+        out.extend(["**Screenshots**", ""])
+        out.extend(f"![Captured screenshot]({name})" for name in screenshots)
+        out.append("")
+
+    out.extend(["## Impact", ""])
+    impact = str(plan.get("impact") or finding.get("impact") or "").strip()
+    if confirmed and impact:
+        out.append("Assessed impact: " + R.redact_text(impact)[0])
+    elif confirmed:
+        # The observed result is already proof-gated, but a business consequence
+        # should not be invented when no impact statement was supplied.
+        out.append("The captured result above is the demonstrated effect. Further impact has not been established.")
+    else:
+        out.append("The available evidence does not yet establish security impact.")
+    investigation = ctx.get("investigation") if isinstance(ctx.get("investigation"), dict) else {}
+    chains = investigation.get("attack_chains") if isinstance(investigation.get("attack_chains"), list) else []
+    for chain in chains:
+        if not isinstance(chain, dict):
+            continue
+        steps_in_chain = chain.get("steps") if isinstance(chain.get("steps"), list) else []
+        for step in steps_in_chain:
+            if not isinstance(step, dict) or str(step.get("evidence_ref") or "") != str(finding.get("ref") or ""):
+                continue
+            title = R.redact_text(str(chain.get("title") or chain.get("id") or "the related chain"))[0]
+            projected = R.redact_text(str(chain.get("projected_impact") or ""))[0]
+            if confirmed and str(step.get("state") or "").lower() == "proven":
+                out.append(f"This is a proven step in {title}.")
+            else:
+                note = f"This is a projected step in {title}."
+                if projected:
+                    note += f" The projected impact, {projected}, has not been demonstrated here."
+                out.append(note)
+    out.append("")
+
+    remediation = str(finding.get("remediation") or plan.get("remediation") or "").strip()
+    required = ctx.get("required_report_sections") or []
+    if remediation and (platform != "hackerone" or ctx.get("include_remediation") or "remediation" in required):
+        out.extend(["## Remediation", "", R.redact_text(remediation)[0], ""])
+    if ctx.get("disclose_automation"):
+        tool = str(ctx.get("tool") or "an automated testing tool").strip()
+        version = str(ctx.get("version") or "").strip()
+        version = R.redact_text(version)[0]
+        out.append(f"Automated testing assistance: {R.redact_text(tool)[0]}{(' v' + version) if version else ''}.")
+    return _safe_report_text("\n".join(out).strip() + "\n", finding)

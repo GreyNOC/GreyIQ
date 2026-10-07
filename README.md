@@ -127,11 +127,14 @@ gated, and non-GGUF repositories need their own access or conversion steps.
 
 The dedicated **Import from Hugging Face** control also accepts a GGUF model
 page URL or `hf.co/owner/model-GGUF:Q4_K_M` reference. Choose **Import and select**
-to download through Ollama and select it for chat and Agent mode. Use **Test**
-to confirm it responds. The import control requires a loopback Ollama server
-URL such as `http://127.0.0.1:11434/v1`; inference then runs locally. Review
-each model's license and card before use. Agent mode requires a model that can
-follow tool calls. See the [Hugging Face Ollama guide](https://huggingface.co/docs/hub/main/ollama).
+to download through local Ollama and run the same chat and agent-tool checks as
+**Download and use**. GreyIQ selects it only when those checks pass; the model
+then also drives BugHunter's hunt planning when the brain is enabled. If a model
+is unavailable during a hunt, the bounded offline planner still runs. The
+packaged desktop starts the saved local runtime again after app restart. For
+source and headless CLI use, install and start Ollama locally; CLI hunts use
+the saved model with `--brain`. Review each model's license and card before use.
+See the [Hugging Face Ollama guide](https://huggingface.co/docs/hub/main/ollama).
 If Ollama reports a blocked Hugging Face download redirect, update Ollama to
 0.34.3 or newer; 0.34.2 has a [known redirect bug](https://github.com/ollama/ollama/issues/18526).
 
@@ -202,7 +205,9 @@ a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the
   key-source injection — the verifier fetching a signing key the token itself named.
 - **Leads** — after a hunt finishes, the **Leads** button in the Hunt cockpit's export row renders
   the whole investigation queue in the app: every lead with its evidence state, the exact artifact
-  that would confirm it, the gaps still open, and anything the engine says contradicts it. The same
+  that would confirm it, the predicted result, a matched negative control, a stop condition,
+  the gaps still open, and anything the engine says contradicts it. These predictions do not
+  grant permission or count as proof. The same
   panel downloads it as one Markdown brief — that file is what you hand to an analyst (or paste to
   Claude) to work the leads. (A *Download leads (.md)* button also exists in the AI Studio surface;
   the cockpit is where a hunt actually runs, which is why the queue is rendered there.)
@@ -227,6 +232,10 @@ a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the
   reproduction steps + attack plans, and a Markdown report (+ JSON sidecar, optional
   per-finding files) is written to a folder you choose. **Authorized testing only** —
   a hunt won't run unless you confirm the target is in scope.
+- Submission packages include a concise, plain-language `.md` body for the platform's
+  description field. The `.details.md` analyst report and `.json` sidecar retain the
+  metadata, proof state, limitations, and evidence for review. The operator checks
+  captured artifacts and the current program policy before submitting.
 - Bounty reports now add triage, class mix, submission-readiness checks, and an
   **Investigation intelligence** brief: calibrated confidence, typed evidence state,
   explicit proof gaps, contradiction detection, a ranked hypothesis queue, and

@@ -700,7 +700,8 @@ class ConcreteReproAllClassesTests(unittest.TestCase):
 class DisclosureDemonstratedImpactTests(unittest.TestCase):
     """The disclosure/read checks capture an excerpt of the retrieved content as demonstrated
     impact (like CORS read_data), so the report shows the actual data, not just 'contents
-    disclosed'. The report renders it under a generic 'Demonstrated impact' heading."""
+    disclosed'. The report labels the captured body without claiming impact
+    before the required control is captured."""
 
     def test_path_traversal_captures_disclosed_file(self) -> None:
         class LfiStub:
@@ -730,7 +731,7 @@ class DisclosureDemonstratedImpactTests(unittest.TestCase):
         # The secret VALUE is redacted, but the disclosed structure is proof of exposure.
         self.assertIn("SECRET_KEY", f["proof_evidence"]["read_data"])
 
-    def test_disclosure_report_uses_generic_impact_heading(self) -> None:
+    def test_disclosure_report_labels_capture_without_claiming_impact(self) -> None:
         from bughunter.bounty import _deterministic_attack_plan
         from bughunter import report_formats as RF
         finding = {
@@ -744,7 +745,8 @@ class DisclosureDemonstratedImpactTests(unittest.TestCase):
         ctx = {"tool": "g", "version": "t", "generated_at": "now", "target": "", "scope": "",
                "attack_plans": {"F1": plan}}
         body = RF.render_finding(ctx, finding, "hackerone")
-        self.assertIn("Demonstrated impact", body)
+        self.assertIn("Captured response body", body)
+        self.assertNotIn("Demonstrated impact", body)
         self.assertNotIn("cross-origin", body.lower())  # generic heading, not the CORS one
         self.assertIn("root:x:0:0", body)
 

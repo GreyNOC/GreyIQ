@@ -179,19 +179,30 @@ def _registrable(host: str) -> str:
     return registrable_domain(host)
 
 
+_HOST_ONLY_SCOPE_TOKEN = re.compile(r"(?:\*\.)?(?:[\w-]+\.)+[\w-]+\Z")
+
+
 def _scope_hosts(scope: str) -> set[str]:
-    """Extract dotted host tokens from free-text scope, normalizing pasted URLs and
-    `*.`-wildcards to bare hosts. Used for EXACT / proper-suffix matching — never a
-    substring test (so 'example.com' can't match scope text 'notexample.com')."""
+    """Extract host-only tokens; never widen a URL/path/port policy to its host.
+
+    A bare host retains the established exact/proper-subdomain semantics below.
+    URL-shaped scope (including a scheme-only URL) cannot prove permission for
+    another scheme or path, so it contributes no active-scan authority. A separate
+    host-only token can still grant the wider host explicitly.
+    """
     hosts: set[str] = set()
-    for raw in re.split(r"[\s,;]+", (scope or "").lower()):
-        token = raw.strip().strip("()<>[]\"'")
-        if not token:
-            continue
-        token = (urlparse(token).hostname or "") if "://" in token else token.split("/", 1)[0]
-        token = token.lstrip("*").lstrip(".")
-        if token and "." in token:  # require a dotted host, not a bare word
-            hosts.add(token)
+    for word in re.split(r"\s+", (scope or "").lower()):
+        # A comma/semicolon inside a URL path or query is not a separator that
+        # creates an independent host grant. Stop examining this whole word once
+        # any segment is URL-shaped; whitespace can begin a new, explicit token.
+        for raw in re.split(r"[,;]+", word):
+            token = raw.strip().strip("()<>[]\"'")
+            if not token:
+                continue
+            if any(ch in token for ch in "/?:#@%\\"):
+                break
+            if _HOST_ONLY_SCOPE_TOKEN.fullmatch(token):
+                hosts.add(token.removeprefix("*."))
     return hosts
 
 

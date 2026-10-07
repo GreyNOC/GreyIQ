@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+import re
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,6 +36,7 @@ _STORE_NAME = "portfolio.json"
 _LOCK = threading.Lock()  # serialize read-modify-write (os.replace is atomic but not RMW-safe)
 _MAX_SCOPE_ENTRIES = 500  # bound a program's structured scope (an imported program is a convenience, never an unbounded loader)
 _MAX_REPOSITORIES = 25    # each repository becomes a full source campaign; keep program fan-out bounded
+_HOST_ONLY_SCOPE = re.compile(r"(?:\*\.)?(?:[a-z0-9-]+\.)+[a-z0-9-]+\Z", re.IGNORECASE)
 
 # A scheduled operator grant binds to the executable program configuration, not to
 # mutable run timestamps. Any change to scope, targets, credentials, policy notes,
@@ -61,6 +63,7 @@ _DEFAULTS: dict[str, Any] = {
     "platform": "manual",          # 'hackerone' | 'yeswehack' | 'hackenproof' | 'manual' — report-format + display tag; only the human operator submits.
     "platform_handle": "",         # HackerOne team handle for manual routing / YesWeHack or HackenProof program slug
     "scope_text": "",              # free-text, passed verbatim to run_campaign(scope=)
+    "scope_text_user_entered": False,  # preserve an explicit free-text edit across structured-scope resync
     "in_scope_hosts": [],
     "out_of_scope_hosts": [],
     "seed_targets": [],            # URLs/hosts to hunt (each within scope)
@@ -309,6 +312,50 @@ def _excluded_host(identifier: Any) -> str:
     return parsed.hostname or raw
 
 
+def manual_web_scope_error(program: dict[str, Any]) -> str:
+    """Refuse saved web scope whose URL restrictions the host-only gate cannot enforce.
+
+    The manual campaign and active-proof paths use ``host_in_active_scope``, which
+    reduces URL tokens to hostnames. An imported ``https://host/allowed`` would
+    therefore authorize other paths (and an ``https://`` asset could permit HTTP).
+    A separate positive host-only token is an explicit grant for that wider host;
+    repository roots are source targets and do not authorize web traffic.
+    """
+    rows = [str(row.get("identifier") or "")
+            for row in (program.get("structured_scope") or [])
+            if isinstance(row, dict) and row.get("eligible_for_submission", True)]
+    hosts = [str(item) for item in (program.get("in_scope_hosts") or [])]
+    # A host string obtained by splitting a URL's path/query at a semicolon or comma
+    # is not an independent host grant. Neither is a stale in_scope_hosts value left
+    # behind by an earlier edit. Require a current, positive structured-scope row.
+    host_only = [value.strip().lower() for value in rows
+                 if _HOST_ONLY_SCOPE.fullmatch(value.strip())]
+    positive = rows + hosts + re.split(r"[\s,;]+", str(program.get("scope_text") or ""))
+    selected_repositories = ({url.lower() for url in _clean_repository_urls(program.get("repository_urls"))}
+                             if program.get("clone_repositories") else set())
+    for value in positive:
+        token = value.strip()
+        if not token or _HOST_ONLY_SCOPE.fullmatch(token) or token.lower().rstrip("/") in selected_repositories:
+            continue
+        if "://" not in token and not any(char in token for char in "/?:#"):
+            continue  # a non-web asset label cannot authorize a web host
+        try:
+            parsed = urlsplit(token if "://" in token else "//" + token)
+            host = (parsed.hostname or "").lower().lstrip("*.")
+        except ValueError:
+            host = ""
+        if not host or "." not in host:
+            continue
+        if any((host.endswith("." + allowed[2:]) and host != allowed[2:])
+               if allowed.startswith("*.") else host == allowed
+               for allowed in host_only):
+            continue
+        return ("Saved program contains a URL, path, query, or port scoped web asset that this "
+                "hunt cannot enforce. Review the current policy; replace it with a host-only "
+                "scope row only if the entire host is authorized before running tests.")
+    return ""
+
+
 # The program research-account block: the operator's OWN credentials for THIS program's authorized
 # research account (email + password to auto-login, or a pasted session cookie / auth headers as a
 # fallback), plus the login/register URLs. Sent ONLY to the program's own login page (same-site,
@@ -381,6 +428,7 @@ def _clean_ua_suffix(value: Any) -> str:
 
 def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     out = {**_DEFAULTS, **{k: v for k, v in record.items() if k in _DEFAULTS or k == "id"}}
+    out["scope_text_user_entered"] = bool(out.get("scope_text_user_entered"))
     out["structured_scope"] = [
         e for e in (_clean_scope_entry(x) for x in (out.get("structured_scope") or [])) if e
     ][:_MAX_SCOPE_ENTRIES]
@@ -413,7 +461,8 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     # Convenience default ONLY: derive scope_text/in_scope_hosts/out_of_scope_hosts from
     # structured_scope when the caller hasn't already typed a scope. Never overrides a
     # hand-edited scope_text -- structured_scope is a source to pull FROM, not a mirror.
-    if out["structured_scope"] and not str(out.get("scope_text") or "").strip():
+    if (out["structured_scope"] and not out["scope_text_user_entered"]
+            and not str(out.get("scope_text") or "").strip()):
         in_ids = [e["identifier"] for e in out["structured_scope"] if e["eligible_for_submission"]]
         out_ids = [_excluded_host(e["identifier"]) for e in out["structured_scope"]
                    if not e["eligible_for_submission"]]
@@ -425,7 +474,8 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
     # A manually entered source repository is itself the saved authorization scope.
     # This keeps repository-only programs usable without inventing a live web host.
     if (out["clone_repositories"] and out["repository_urls"]
-            and not out["repo_draft_pending"] and not str(out.get("scope_text") or "").strip()):
+            and not out["repo_draft_pending"] and not out["scope_text_user_entered"]
+            and not str(out.get("scope_text") or "").strip()):
         out["scope_text"] = "\n".join(out["repository_urls"])
     # Fail-closed coupling: active/live/deep require a non-empty scope.
     if not str(out.get("scope_text") or "").strip():
@@ -471,14 +521,11 @@ def upsert_program(runtime_dir: str | Path, record: dict[str, Any]) -> dict[str,
 
     ``record["resync_scope"]`` (not a stored field — read here, never persisted) is an
     explicit signal from a caller that owns the structured/repository scope controls (the
-    Program-setup UI) that scope_text/in_scope_hosts/out_of_scope_hosts should be RE-derived
-    from whatever structured/repository scope this call carries, even if scope_text already
-    exists from a prior save. Without it, ``_normalize``'s derivation only ever fires once (when
-    scope_text starts out empty) -- a later edit that changes structured_scope would
-    otherwise leave the stale, previously-derived scope_text in place forever, since a
-    caller that doesn't expose a scope_text field of its own has no other way to ask for
-    a refresh without risking clobbering a scope some OTHER caller (e.g. the Operator
-    tab's plain-text scope field) hand-typed on purpose."""
+    Program-setup UI) that derived scope_text/in_scope_hosts/out_of_scope_hosts should be
+    refreshed from its structured/repository scope. A scope_text explicitly supplied by
+    another editor is preserved byte-for-byte. Existing exclusions survive
+    a resync unless ``remove_out_of_scope_hosts`` explicitly names the host to remove;
+    this prevents a capped/stale UI table from silently dropping a prior exclusion."""
     name = str(record.get("name") or "").strip()
     handle = str(record.get("platform_handle") or "").strip()
     seed = str((record.get("seed_targets") or [""])[0] if record.get("seed_targets") else "")
@@ -488,24 +535,66 @@ def upsert_program(runtime_dir: str | Path, record: dict[str, Any]) -> dict[str,
         programs = data.setdefault("programs", {})
         existing = programs.get(pid, {})
         merge_source = {**existing, **record, "id": pid}
+        if "scope_text" in record:
+            # The Operator editor owns free text. The Program form omits this field.
+            # An explicit empty string is also intentional: it clears active scope.
+            merge_source["scope_text_user_entered"] = True
+        elif "scope_text_user_entered" not in existing and existing:
+            # Older records have no origin marker. Preserve any text that differs
+            # from what their structured/repository inputs would have generated.
+            old_rows = [entry for entry in (_clean_scope_entry(row) for row in
+                        (existing.get("structured_scope") or [])) if entry]
+            old_derived = " ".join(row["identifier"] for row in old_rows
+                                   if row["eligible_for_submission"])
+            if not old_derived and existing.get("clone_repositories") and not existing.get("repo_draft_pending"):
+                old_derived = "\n".join(_clean_repository_urls(existing.get("repository_urls")))
+            current_scope = str(existing.get("scope_text") or "")
+            merge_source["scope_text_user_entered"] = bool(current_scope.strip()) and current_scope != old_derived
         if record.get("resync_scope"):
             # A Save from the full Program form is the explicit review action that
             # finalizes a repo-link draft. Once cleared, _normalize may derive the
             # repository-only source scope exactly as it did before this onboarding path.
             merge_source["repo_draft_pending"] = False
-            should_clear_scope = bool(merge_source.get("structured_scope"))
+            should_resync_scope = bool(merge_source.get("structured_scope")) or (
+                "structured_scope" in record and bool(existing.get("structured_scope")))
             # The Program form also owns repository-only scope. If the existing scope
             # was auto-derived from its old repository selection, clear it before
             # normalizing so changing/removing that selection cannot leave a stale repo
             # URL behind. A hand-typed Operator scope is preserved.
-            if not should_clear_scope and ("repository_urls" in record or "clone_repositories" in record):
+            if not should_resync_scope and ("repository_urls" in record or "clone_repositories" in record):
                 old_repository_scope = "\n".join(_clean_repository_urls(existing.get("repository_urls")))
                 current_scope = str(existing.get("scope_text") or "").strip()
-                should_clear_scope = not current_scope or current_scope == old_repository_scope.strip()
-            if should_clear_scope:
-                merge_source["scope_text"] = ""
+                should_resync_scope = not current_scope or current_scope == old_repository_scope.strip()
+            if should_resync_scope:
+                # A UI merge may have truncated an old excluded row at its 500-row
+                # budget. Keep prior exclusions even when that row is absent from the
+                # submitted table. Removal requires a separate, explicit host list.
+                removal_values = record.get("remove_out_of_scope_hosts") or []
+                if not isinstance(removal_values, list):
+                    raise ValueError("remove_out_of_scope_hosts must be a list of host identifiers")
+                removals = {_excluded_host(value).lower() for value in removal_values[:_MAX_SCOPE_ENTRIES]
+                            if _HOST_ONLY_SCOPE.fullmatch(_excluded_host(value))}
+                old_rows = existing.get("structured_scope") or []
+                new_rows = merge_source.get("structured_scope") or []
+                prior = list(existing.get("out_of_scope_hosts") or []) + [
+                    row.get("identifier") for row in old_rows
+                    if isinstance(row, dict) and not row.get("eligible_for_submission", True)]
+                incoming = list(record.get("out_of_scope_hosts") or []) + [
+                    row.get("identifier") for row in new_rows
+                    if isinstance(row, dict) and not row.get("eligible_for_submission", True)]
+                exclusions: list[str] = []
+                seen_exclusions: set[str] = set()
+                for raw in [*(_excluded_host(item) for item in prior
+                              if _excluded_host(item).lower() not in removals),
+                            *(_excluded_host(item) for item in incoming)]:
+                    key = raw.lower()
+                    if raw and key not in seen_exclusions:
+                        seen_exclusions.add(key)
+                        exclusions.append(raw)
+                if not merge_source.get("scope_text_user_entered"):
+                    merge_source["scope_text"] = ""
                 merge_source["in_scope_hosts"] = []
-                merge_source["out_of_scope_hosts"] = []
+                merge_source["out_of_scope_hosts"] = exclusions
         merged = _normalize(merge_source)
         merged["name"] = name or existing.get("name") or pid
         merged["created_at"] = existing.get("created_at") or _now()

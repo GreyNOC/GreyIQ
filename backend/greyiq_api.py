@@ -1176,7 +1176,8 @@ class ProgramUpsertRequest(BaseModel):
     idor_pairs: list[dict[str, Any]] = Field(default_factory=list, max_length=50)  # operator-supplied cross-tenant IDOR test pairs [{url_a, url_b, label}] — object URLs only, no secrets (portfolio._clean_idor_pairs bounds/dedups/caps)
     policy_profile: str = Field(default="", max_length=40)  # OPTIONAL VDP profile id (e.g. "nasa") binding this program to a program's rules of engagement (scope + excluded endpoints/classes + confirmed-only + no-DoS); validated in portfolio._normalize against bughunter.vdp_policy
     user_agent_suffix: str = Field(default="", max_length=120)    # a mandatory UA tag some programs require appended to every in-scope request
-    resync_scope: bool = False  # re-derive scope_text/hosts from Program-form structured/repository scope even if scope_text is already set
+    resync_scope: bool = False  # refresh derived scope/hosts from Program-form rows; preserve explicitly entered scope_text
+    remove_out_of_scope_hosts: list[str] = Field(default_factory=list, max_length=500)  # transient: explicit operator removal only; a re-fetch never clears prior exclusions
     active: bool = False
     live: bool = False
     deep: bool = False
@@ -1854,18 +1855,15 @@ class GreyIQRuntime:
             return dict(self.model_pull)
 
     def start_huggingface_import(self, reference: str) -> dict[str, Any]:
-        """Import a Hugging Face GGUF through a loopback Ollama service."""
+        """Import, verify, and select a public GGUF through local Ollama."""
         try:
             model = coder.normalize_huggingface_model_ref(reference)
         except coder.CoderError as exc:
             return {"ok": False, "error": str(exc)}
-        host, _ = self._local_brain()
-        if not coder.ollama_host_is_loopback(host):
-            return {"ok": False, "error": (
-                "Hugging Face import requires a local Ollama Server URL. "
-                "Set it to http://127.0.0.1:11434/v1 and save the brain first."
-            )}
-        return self.start_model_pull(model)
+        # The dedicated import route must use the same readiness gate as the
+        # one-click setup route. An empty URL selects loopback Ollama even when
+        # the previously saved brain used a remote server.
+        return self.start_model_setup(model, base_url="")
 
     def start_model_pull(self, model: str = "") -> dict[str, Any]:
         host, configured = self._local_brain()
@@ -2422,6 +2420,12 @@ class GreyIQRuntime:
         url = str(request.url or "").strip()
         if not url:
             return {"ok": False, "error": "This finding has no URL to re-verify."}
+        if request.program_id:
+            program = bounty_portfolio.get_program(RUNTIME_DIR, request.program_id)
+            if program:
+                scope_error = bounty_portfolio.manual_web_scope_error(program)
+                if scope_error:
+                    return {"ok": False, "error": scope_error}
         scope, settings, _excluded = self._active_scope_for(request.scope, request.program_id)
         auth = bounty_scan_auth.build_auth(url, cookie=request.auth_cookie, headers=request.auth_headers)
         passes = max(1, min(int(request.stability_passes or 1), 3))
@@ -2533,6 +2537,12 @@ class GreyIQRuntime:
         url = str(request.url or "").strip()
         if not url:
             return {"ok": False, "error": "This finding has no URL to probe."}
+        if request.program_id:
+            program = bounty_portfolio.get_program(RUNTIME_DIR, request.program_id)
+            if program:
+                scope_error = bounty_portfolio.manual_web_scope_error(program)
+                if scope_error:
+                    return {"ok": False, "error": scope_error}
         scope, settings, _excluded = self._active_scope_for(request.scope, request.program_id)
         auth = bounty_scan_auth.build_auth(url, cookie=request.auth_cookie, headers=request.auth_headers)
         results, meta = bounty_active_verify.verify_active(
@@ -2939,6 +2949,10 @@ class GreyIQRuntime:
                        if request.active_program_id else None)
         if program_obj is None and request.program:
             program_obj = bounty_portfolio.get_program(RUNTIME_DIR, request.program)
+        if program_obj:
+            scope_error = bounty_portfolio.manual_web_scope_error(program_obj)
+            if scope_error:
+                return {"ok": False, "error": scope_error}
         disclose_automation = bool(program_obj.get("disclose_automation")) if program_obj else False
         excluded_hosts = tuple(str(h) for h in (program_obj.get("out_of_scope_hosts") or [])) if program_obj else ()
         account_access = program_obj.get("account_access") if program_obj else None
@@ -3014,6 +3028,9 @@ class GreyIQRuntime:
         program = bounty_portfolio.get_program(RUNTIME_DIR, request.program_id)
         if not program:
             return {"ok": False, "error": "Program not found — it may have been deleted."}
+        scope_error = bounty_portfolio.manual_web_scope_error(program)
+        if scope_error:
+            return {"ok": False, "error": scope_error}
         targets = bounty_campaign.program_campaign_targets(program)
         if not targets:
             return {"ok": False, "error": "This program has no huntable targets — add seed targets, opt in a source repository, or import/build its structured scope in the Program tab."}
@@ -3088,6 +3105,11 @@ class GreyIQRuntime:
             chosen = [p for p in all_progs if str(p.get("id")) in wanted]
         if not chosen:
             return {"ok": False, "error": "No programs selected — pick at least one saved program (or none exist yet; add one in the Program tab)."}
+        for program in chosen:
+            scope_error = bounty_portfolio.manual_web_scope_error(program)
+            if scope_error:
+                label = str(program.get("name") or program.get("id") or "selected program")[:200]
+                return {"ok": False, "error": f"{label}: {scope_error}"}
         specs: list[dict[str, Any]] = []
         skipped: list[str] = []
         for program in chosen:
@@ -3412,6 +3434,9 @@ class GreyIQRuntime:
         if program_id:
             prog = bounty_portfolio.get_program(RUNTIME_DIR, program_id)
             if prog:
+                scope_error = bounty_portfolio.manual_web_scope_error(prog)
+                if scope_error:
+                    return {"ok": False, "error": scope_error}
                 scope_sources.append(str(prog.get("scope_text") or ""))
         if request.scope.strip():
             scope_sources.append(request.scope)
@@ -4729,7 +4754,6 @@ class GreyIQRuntime:
                 "auto_submit": False,
                 "enabled": False,
                 "structured_scope": [],
-                "scope_text": "",
                 "in_scope_hosts": [],
                 "out_of_scope_hosts": [],
                 "seed_targets": [],

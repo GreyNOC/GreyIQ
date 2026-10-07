@@ -64,10 +64,13 @@ class ReportIntegrationTests(unittest.TestCase):
         return "\n".join(out)
 
     def test_disclosure_class_names_exposed_data(self) -> None:
-        # A genuine server-side disclosure (the data IS returned to any reader) names it as exposed.
+        # The capture names the data, while access and impact remain tied to
+        # the actual request and any control rather than presumed universal access.
         body = self._render("disclosure", f"{{\"email\":\"victim@acme.com\",\"session\":\"{_JWT}\"}}")
-        self.assertIn("Sensitive data exposed", body)
+        self.assertIn("Sensitive data in the response", body)
         self.assertIn("a JWT (session/bearer token)", body)   # the concrete data, named
+        self.assertNotIn(_JWT, body)
+        self.assertNotIn("[REDACTED_SECRET:[REDACTED_SECRET:", body)
 
     def test_cors_names_data_but_does_not_claim_completed_theft(self) -> None:
         # A CORS capture is SAME-SITE (curl-equivalent): the data must be NAMED as at-risk, but the
@@ -78,6 +81,8 @@ class ReportIntegrationTests(unittest.TestCase):
         self.assertIn("Sensitive data present in the captured response", body)
         self.assertNotIn("Sensitive data exposed", body)            # no completed-theft claim
         self.assertIn("browser-hosted PoC", body)                   # names the missing evidence
+        self.assertNotIn(_JWT, body)
+        self.assertNotIn("[REDACTED_SECRET:[REDACTED_SECRET:", body)
 
     def test_injection_class_does_not_claim_data_exfiltration(self) -> None:
         # for an XSS/SSTI/SQLi proof the body is the payload's own effect, NOT data exfiltrated to an

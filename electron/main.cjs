@@ -755,7 +755,8 @@ async function startOllama() {
 async function startOllamaOnce() {
   // On-demand local brain: provision the Ollama runtime (downloaded on first use),
   // then start it — unless a system Ollama is already serving on the port. Triggered
-  // by the renderer when the user selects the local model, NEVER at boot.
+  // by the renderer when the user selects a local model or reopens the app
+  // with an already selected local model.
   lastOllamaError = '';
   if (await ollamaResponding()) return true;
   // A Linux install can supply Ollama through PATH or an explicit override, even
@@ -860,10 +861,9 @@ function registerIpcHandlers() {
 
 async function boot() {
   registerIpcHandlers();
-  // Ollama is NOT started at boot — it's downloaded + started on demand (greyiq:
-  // ensure-ollama) only when the operator selects the local model, so the default
-  // app stays small and fast. If a system Ollama is already serving, the backend
-  // uses it directly.
+  // The renderer requests Ollama when the operator selects a local model or
+  // reopens the app with one already saved. Other setups avoid provisioning it.
+  // If a system Ollama is already serving, the backend uses it directly.
   createWindow();
   // Always swap to the app (or the error page) even if startup throws — otherwise an
   // unhandled rejection leaves the window stuck on the loading spinner forever.

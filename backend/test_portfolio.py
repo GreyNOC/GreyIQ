@@ -181,6 +181,60 @@ class EditPathDerivationTests(TempRuntimeMixin, unittest.TestCase):
         self.assertEqual(second["scope_text"], "b.acme.com")
         self.assertEqual(second["in_scope_hosts"], ["b.acme.com"])
 
+    def test_program_form_resync_preserves_operator_free_text_byte_for_byte(self) -> None:
+        first = pf.upsert_program(self.runtime_dir, {
+            "name": "Acme", "structured_scope": [
+                {"identifier": "app.acme.test", "eligible_for_submission": True}],
+        })
+        typed_scope = "https://app.acme.test/login?flow=1\n  Only /login is listed; no sibling paths.  "
+        edited = pf.upsert_program(self.runtime_dir, {
+            "id": first["id"], "name": "Acme", "scope_text": typed_scope,
+        })
+        self.assertTrue(edited["scope_text_user_entered"])
+        saved = pf.upsert_program(self.runtime_dir, {
+            "id": first["id"], "name": "Acme", "resync_scope": True,
+            "structured_scope": [
+                {"identifier": "other.acme.test", "eligible_for_submission": True}],
+        })
+        self.assertEqual(saved["scope_text"], typed_scope)
+        self.assertEqual(pf.get_program(self.runtime_dir, first["id"])["scope_text"], typed_scope)
+        self.assertEqual(saved["in_scope_hosts"], [])
+
+    def test_legacy_hand_typed_scope_survives_structured_resync(self) -> None:
+        store = self.runtime_dir / "portfolio.json"
+        typed_scope = "https://app.acme.test/only-this-path\nmanual note"
+        store.write_text(json.dumps({"programs": {"acme": {
+            "id": "acme", "name": "Acme", "scope_text": typed_scope,
+            "structured_scope": [{"identifier": "app.acme.test", "eligible_for_submission": True}],
+        }}}), encoding="utf-8")
+        saved = pf.upsert_program(self.runtime_dir, {
+            "id": "acme", "name": "Acme", "resync_scope": True,
+            "structured_scope": [{"identifier": "other.acme.test", "eligible_for_submission": True}],
+        })
+        self.assertEqual(saved["scope_text"], typed_scope)
+        self.assertTrue(saved["scope_text_user_entered"])
+
+    def test_explicit_empty_operator_scope_stays_empty_and_disables_testing(self) -> None:
+        first = pf.upsert_program(self.runtime_dir, {
+            "name": "Acme", "active": True, "live": True,
+            "structured_scope": [{"identifier": "app.acme.test", "eligible_for_submission": True}],
+        })
+        cleared = pf.upsert_program(self.runtime_dir, {
+            "id": first["id"], "name": "Acme", "scope_text": "",
+            "active": True, "live": True, "deep": True,
+        })
+        self.assertEqual(cleared["scope_text"], "")
+        self.assertTrue(cleared["scope_text_user_entered"])
+        self.assertFalse(cleared["active"])
+        self.assertFalse(cleared["live"])
+        self.assertFalse(cleared["deep"])
+        resynced = pf.upsert_program(self.runtime_dir, {
+            "id": first["id"], "name": "Acme", "resync_scope": True,
+            "structured_scope": [{"identifier": "other.acme.test", "eligible_for_submission": True}],
+        })
+        self.assertEqual(resynced["scope_text"], "")
+        self.assertFalse(resynced["active"])
+
     def test_resync_scope_can_shrink_scope_to_empty_and_forces_active_off(self) -> None:
         first = pf.upsert_program(self.runtime_dir, {
             "name": "Acme", "active": True,

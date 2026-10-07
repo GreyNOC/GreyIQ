@@ -128,6 +128,18 @@ Whichever way scope arrived, review the table before saving:
 - A program with **no** in-scope rows (and no hand-typed Scope text) can never be marked
   active — this is the same fail-closed gate the launch rail and Operator already use, just
   applied one level up: an empty structured scope can't silently become "active everywhere."
+- A URL asset limited to a path, port, or scheme does not authorize the whole host.
+  GreyIQ stops manual program hunts and proof requests when its host-only probe
+  guard cannot enforce that narrower asset. Add a separate host or wildcard row
+  only if the current program policy explicitly permits testing the whole host.
+- For an ad hoc active hunt, enter a bare host or explicit wildcard in Scope only
+  when the published policy permits that host. A pasted URL or path by itself
+  cannot be widened into host authorization by the active probe gate.
+- Re-fetching program scope keeps existing exclusions. If all excluded rows cannot
+  fit within the bounded scope table, review and narrow the rows before saving.
+- Scope text you enter in the Operator tab stays exactly as entered when you
+  refresh the structured scope table, including line breaks and spacing. Clearing
+  that text turns active testing off until you enter a new scope.
 - Click **Save program**.
 - For a source-code hunt, click **Hunt repository** on the saved program or pick the repository
   from the launch rail's Target suggestions. GreyIQ makes a depth-1, single-branch temporary
@@ -364,14 +376,24 @@ Click any row for the evidence pane: the captured request/response, the differen
 proved it, CVSS, CWE/OWASP mapping, remediation guidance, and (when available) a proof
 screenshot.
 
+The **Leads** view and `gn leads` brief also show each proposed probe's predicted
+confirming result, a matched negative control, and the condition that leaves it
+unconfirmed or stops testing. These are planning notes. Check the current program
+scope and authorization before any active probe, and treat only captured evidence
+as proof.
+
 ## 5. Reports & submission
 
 Confirmed (and reportable candidate) findings appear in the **Submissions** tab:
 
-- **Copy report** / **Download .md** — a self-contained, submission-ready Markdown package,
-  reshaped per platform (HackerOne, YesWeHack, Bugcrowd, Intigriti, **HackenProof** — pick the
-  format at the top of the tab). HackenProof's format leads with Target + Vulnerability category
-  and uses its four-band Critical–Low severity (web/mobile and smart-contract classes).
+- **Copy report** / **Download .md** — a concise, plain-language description with
+  Summary, numbered Proof of Concept steps, captured result and control, and Impact.
+  Choose the platform format at the top of the tab (HackerOne, YesWeHack,
+  Bugcrowd, Intigriti, or HackenProof). Fill the platform's title, asset,
+  severity, and classification fields separately. The per-finding package also
+  keeps a detailed `.details.md` analyst report and `.json` sidecar with the
+  evidence and review context. Check every claim and attachment against the
+  saved capture before submitting.
 - **Submit to HackerOne** — the one place GreyIQ pushes a report over the network on your
   behalf. It's hard-gated: only enabled once proof status is Confirmed *and* your HackerOne
   creds are saved, requires an explicit confirmation dialog, and the server independently
@@ -405,7 +427,9 @@ Confirmed (and reportable candidate) findings appear in the **Submissions** tab:
   read-only public-index queries), and
   polling your own OOB collaborator server (a host you configured). An explicit
   local-model setup also checks the public Hugging Face model metadata and asks
-  Ollama to download the selected model.
+  Ollama to download the selected model. The direct Hugging Face import runs chat
+  and agent-tool readiness checks before selecting it for chat or hunt planning;
+  the packaged desktop starts its saved local Ollama runtime again after restart.
 - **Only you submit reports.** The Operator queues findings and report packages locally.
   Review the evidence and use the manual submission action if you decide to file a report.
   The kill switch requests cancellation and prevents further scheduled work.

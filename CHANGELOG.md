@@ -8,14 +8,25 @@ Notable changes to GreyIQ.
   `greyiq-cli` launcher. `greyiq-cli path` prints the runtime location and PATH
   setup syntax; `dashboard` provides a read-only terminal monitor.
 - Added one-click setup for public Hugging Face GGUF models through Ollama, with
-  chat and tool-call readiness checks before selecting a model. Clearing a
-  previous remote server URL now selects the default local Ollama server.
+  chat and tool-call readiness checks before selecting a model. Direct Hugging
+  Face import uses the same gate, starts the packaged desktop's local runtime,
+  and makes a ready model available to the hunt planner. Clearing a previous
+  remote server URL selects the default local Ollama server; a failed model call
+  leaves the bounded offline hunt planner available.
 - Scheduled operator runs now require expiring per-program authorization grants,
   enforce scope and request budgets, and queue findings for human review.
   Local outcome feedback reprioritizes later authorized cycles.
 - Added read-only program discovery and scope previews for HackerOne, Bugcrowd,
   and Intigriti. YesWeHack program search and scope import arrived in v4.5.0.
   API results remain drafts until the operator reviews and saves a program.
+- Hardened platform imports so existing exclusions survive a scope re-fetch and
+  URL-limited assets cannot silently widen to whole-host manual testing.
+- Investigation leads and suggested probes now state the predicted confirming
+  result, a matched negative control, and a condition that leaves the lead
+  unconfirmed or stops testing. These are planning aids, not proof or permission.
+- Submission packages now provide a short, plain-language report body for a
+  platform description field, plus a detailed analyst report and JSON sidecar
+  that retain metadata, evidence, limitations, and review context.
 
 ## v4.8.0 - verified learning and safer operator controls
 

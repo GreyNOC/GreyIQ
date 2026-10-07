@@ -171,6 +171,14 @@ jobs:
         shell: pwsh
         run: Get-ChildItem release -Filter *.exe | Select-Object Name, Length
 
+      - name: Record Windows SHA-256 checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem release -Filter *.exe | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content release/SHA256SUMS-Windows.txt -Encoding ascii
+
       - name: Report Authenticode signing status
         shell: pwsh
         env:
@@ -210,6 +218,7 @@ jobs:
           files: |
             release/GreyIQ-*-portable.exe
             release/GreyIQ-Setup-*.exe
+            release/SHA256SUMS-Windows.txt
 
   linux:
     name: Build Linux GUI (AppImage + Debian package) + headless CLI
@@ -334,6 +343,11 @@ jobs:
       - name: List build artifacts
         run: ls -lh release || true
 
+      - name: Record Linux SHA-256 checksums
+        run: |
+          cd release
+          sha256sum GreyIQ-*.AppImage GreyIQ-*.deb GreyIQ-*-linux-cli.tar.gz > SHA256SUMS-Linux.txt
+
       - name: Append Linux assets to the draft release
         uses: softprops/action-gh-release@v3
         with:
@@ -346,3 +360,4 @@ jobs:
             release/GreyIQ-*.AppImage
             release/GreyIQ-*.deb
             release/GreyIQ-*-linux-cli.tar.gz
+            release/SHA256SUMS-Linux.txt

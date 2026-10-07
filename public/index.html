@@ -169,7 +169,7 @@
             <div class="model-list" id="brainModelList" hidden></div>
             <section class="hf-import" id="brainHfImportSection" aria-labelledby="brainHfImportTitle" hidden>
               <h3 id="brainHfImportTitle">Import from Hugging Face</h3>
-              <p class="folder-status">Start with a public GGUF model repository. GreyIQ does not manage Hugging Face authentication for gated or private models. Check the model card and license before use. The model downloads through Ollama, then runs locally.</p>
+              <p class="folder-status">Use a public GGUF model repository. GreyIQ desktop downloads and starts Ollama on first use, then checks chat and agent tool support before selecting the model. Browser use requires Ollama running locally. Private or gated models need separate access; check the model card and license before use.</p>
               <label for="brainHfReference">
                 <span>Model page URL or Ollama reference</span>
                 <input id="brainHfReference" type="text" autocomplete="off" spellcheck="false" maxlength="300" placeholder="https://huggingface.co/owner/model-GGUF or hf.co/owner/model-GGUF:Q4_K_M">

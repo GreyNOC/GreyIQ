@@ -200,6 +200,30 @@ class SetupJobTests(unittest.TestCase):
         self.assertFalse(status["selected"])
         self.assertEqual(saved, [])
 
+    def test_huggingface_import_keeps_previous_brain_when_agent_tools_fail(self) -> None:
+        instance, saved = self._runtime()
+        instance._coder_config = lambda: {
+            "enabled": True, "provider": "local",
+            "local": {"model": "previous-model", "base_url": "https://remote.example/v1"},
+        }
+        hosts = []
+
+        def list_models(host):
+            hosts.append(host)
+            return ["hf.co/acme/Code-GGUF:latest"]
+
+        with patch.object(coder, "ollama_list_models", side_effect=list_models), \
+                patch.object(coder, "ollama_probe_readiness", return_value={
+                    "chat_ready": True, "tool_ready": False, "reason": "No structured tool call.",
+                }):
+            started = instance.start_huggingface_import("https://huggingface.co/acme/Code-GGUF")
+            status = self._wait_done(instance)
+        self.assertTrue(started["ok"])
+        self.assertEqual(hosts, ["http://127.0.0.1:11434"])
+        self.assertTrue(status["chat_only"])
+        self.assertFalse(status["selected"])
+        self.assertEqual(saved, [])
+
     def test_invalid_hf_repo_does_not_pull_or_select(self) -> None:
         instance, saved = self._runtime()
         with patch.object(coder, "ollama_list_models", return_value=[]), \
