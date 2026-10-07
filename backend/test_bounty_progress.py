@@ -14,6 +14,7 @@ import unittest
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 BACKEND_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BACKEND_DIR.parent
@@ -113,6 +114,27 @@ class ProgressBufferTests(unittest.TestCase):
 class _EchoHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         body = b"<html>hello</html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args: object) -> None:
+        return
+
+
+class _LearningHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+        redirect = (query.get("next") or [""])[0]
+        if "greyiq-marker.example" in redirect:
+            self.send_response(302)
+            self.send_header("Location", redirect)
+            self.end_headers()
+            return
+        body = ("<html>echo " + " ".join(v for values in query.values() for v in values)
+                + "</html>").encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.send_header("Content-Length", str(len(body)))
@@ -342,6 +364,37 @@ class RunBountyHuntProgressTests(unittest.TestCase):
             self.assertIn("127.0.0.1", trace["target"])
             self.assertIn("endpoints", trace["surface"])
             self.assertIsInstance(trace["outcomes"], list)
+            self.assertTrue(any(row["endpoint"] == url and row["classes"]
+                                for row in trace["execution"]))
+
+    def test_focus_filter_does_not_turn_proven_suites_into_training_misses(self) -> None:
+        from bughunter import hunt_trace, hunt_train
+
+        site = ThreadingHTTPServer(("127.0.0.1", 0), _LearningHandler)
+        threading.Thread(target=site.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{site.server_port}/?q=x&next=/home"
+            with tempfile.TemporaryDirectory() as output, tempfile.TemporaryDirectory() as rt:
+                report = run_bounty_hunt(
+                    url, "web-app", "sqli", output, "127.0.0.1", True, {}, active=True,
+                    default_reports_dir=Path(output), seed_dir=BACKEND_DIR / "seed",
+                    runtime_dir=Path(rt))
+                self.assertTrue(report["ok"], report.get("error"))
+                self.assertFalse(any(row.get("class_id") in {"xss", "redirect"}
+                                     for row in report["findings"]))
+                trace = hunt_trace.load_traces(rt)[0]
+                confirmed = {(row["class"], row["rule_id"]) for row in trace["outcomes"]
+                             if row["proof_status"] == "confirmed"}
+                self.assertIn(("xss", "active.reflected-xss"), confirmed)
+                self.assertIn(("redirect", "active.open-redirect"), confirmed)
+                labels = [(row[1], row[2]) for row in hunt_train.build_dataset(rt)]
+                self.assertIn(("xss", 1), labels)
+                self.assertIn(("redirect", 1), labels)
+                self.assertNotIn(("xss", 0), labels)
+                self.assertNotIn(("redirect", 0), labels)
+        finally:
+            site.shutdown()
+            site.server_close()
 
 
 class RunCampaignProgressChainTests(unittest.TestCase):

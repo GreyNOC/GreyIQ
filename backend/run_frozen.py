@@ -45,6 +45,26 @@ def main() -> None:
         print("GreyIQ bundled Chromium self-test passed")
         return
 
+    # Opt-in local release QA: use an empty runtime so an old user checkpoint
+    # cannot hide a missing bundled seed. Loading weights exercises torch and the
+    # frozen TinyGPT imports without generating output or contacting a service.
+    if sys.argv[1:] == ["--self-test-tinygpt"]:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="greyiq-tinygpt-smoke-") as smoke_dir:
+            os.environ["GREYIQ_RUNTIME_DIR"] = smoke_dir
+            import greyiq_api
+
+            if not (greyiq_api.SEED_DIR / "best_model.pt").is_file():
+                raise RuntimeError("Bundled TinyGPT seed checkpoint is missing")
+            if not greyiq_api._ensure_ml_runtime():
+                raise RuntimeError(greyiq_api._ML_RUNTIME_ERROR)
+            engine = greyiq_api.runtime.get_engine()
+            if engine.model is None or engine.model_path is None:
+                raise RuntimeError(f"Bundled TinyGPT checkpoint did not load: {engine.model_error}")
+        print("GreyIQ bundled TinyGPT self-test passed")
+        return
+
     # Dual-purpose binary: with a CLI verb as the first argument, dispatch to the
     # `gn` CLI (importing ONLY the torch-free bughunter engine — no uvicorn/API);
     # with no arguments, run the API server. So the shipped backend exe is also the

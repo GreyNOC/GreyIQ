@@ -24,6 +24,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 
@@ -108,6 +109,31 @@ class _AuthCorsStub:
 
 class ActiveCheckTests(unittest.TestCase):
     URL = "https://app.example.com/?q=x&next=/home"
+
+    def test_later_confirmed_candidate_survives_an_earlier_failed_probe(self) -> None:
+        class FlakyRedirect(_Stub):
+            sent = 0
+            failed = 0
+
+            def fetch(self, url: str, *, method: str = "GET", extra_headers=None) -> dict:
+                self.sent += 1
+                query = parse_qs(urlparse(url).query, keep_blank_values=True)
+                if av._MARKER_HOST in (query.get("next") or [""])[0]:
+                    self.failed += 1
+                    raise av._ActiveError("first redirect candidate reset")
+                response = super().fetch(url, method=method, extra_headers=extra_headers)
+                if av._MARKER_HOST in (query.get("redirect") or [""])[0]:
+                    response["status"] = 302
+                    response["location"] = av._MARKER_ORIGIN + "/"
+                return response
+
+        url = "https://app.example.com/?next=/home&redirect=/home"
+        with patch.object(av, "_guard_url", side_effect=lambda value, *_: value):
+            findings, meta = av.verify_active(
+                url, [], scope="app.example.com", http=FlakyRedirect(), only_classes=["redirect"])
+        self.assertTrue(any(f.get("rule_id") == "active.open-redirect" for f in findings))
+        self.assertIn("redirect", meta["verified_classes"])
+        self.assertNotIn("redirect", meta["checked_classes"])
 
     def test_cors_credentialed_reflection_confirms(self) -> None:
         f = av._check_cors(_Stub(), self.URL)
@@ -1189,6 +1215,7 @@ class ScopeBindingTests(unittest.TestCase):
         findings, meta = av.verify_active("https://evil.test/", [], scope="example.com")
         self.assertEqual(findings, [])
         self.assertFalse(meta["in_scope"])
+        self.assertEqual(meta["checked_classes"], [])
         self.assertIn("not named", meta["skipped_reason"])
 
 
@@ -1246,6 +1273,9 @@ class ActiveE2ETests(unittest.TestCase):
         url = f"http://127.0.0.1:{self.port}/?q=x&next=/home"
         findings, meta = av.verify_active(url, [], scope="127.0.0.1")
         self.assertTrue(meta["in_scope"])
+        # A completed suite is recorded even when its outcome is merely a candidate;
+        # these are execution facts, separate from confirmed finding classes.
+        self.assertTrue({"clickjacking", "cors", "redirect", "xss"} <= set(meta["checked_classes"]))
         status = {f["_active_class_hint"]: f["_active_proof"]["status"] for f in findings}
         # CORS / reflected-XSS (html) / open-redirect have real control differentials -> confirmed.
         self.assertEqual(status.get("cors"), "confirmed")
@@ -1275,12 +1305,33 @@ class ActiveE2ETests(unittest.TestCase):
         finally:
             av._check_cors = original
         self.assertTrue(meta["in_scope"])
+        self.assertNotIn("cors", meta["checked_classes"])
+        self.assertIn("redirect", meta["checked_classes"])
         status = {f["_active_class_hint"]: f["_active_proof"]["status"] for f in findings}
         self.assertNotIn("cors", status)  # the check that raised produced no finding
         # LATER checks in the list must still have run to completion instead of the
         # whole pass silently aborting.
         self.assertEqual(status.get("xss"), "confirmed")
         self.assertEqual(status.get("redirect"), "confirmed")
+
+    def test_partial_multi_check_suite_is_not_marked_checked(self) -> None:
+        url = f"http://127.0.0.1:{self.port}/?q=x&next=/home"
+        original = av._check_reflected_xss_context
+
+        def fail_context(*a, **k):
+            raise av.WebsiteFetchError("context check did not complete")
+
+        av._check_reflected_xss_context = fail_context
+        try:
+            findings, meta = av.verify_active(url, [], scope="127.0.0.1")
+        finally:
+            av._check_reflected_xss_context = original
+        self.assertTrue(any(f.get("_active_class_hint") == "xss" and
+                            f.get("_active_proof", {}).get("status") == "confirmed"
+                            for f in findings))
+        self.assertIn("xss", meta["verified_classes"])
+        self.assertNotIn("xss", meta["checked_classes"])
+        self.assertIn("cors", meta["checked_classes"])
 
     def test_governor_exhaustion_returns_partial_not_raise(self) -> None:
         url = f"http://127.0.0.1:{self.port}/?q=x&next=/home"
@@ -1297,10 +1348,44 @@ class ActiveE2ETests(unittest.TestCase):
         findings, meta = av.verify_active(url, [], scope="127.0.0.1", governor=gov, requests_budget=1)
         self.assertTrue(meta["rate_limited"])
         self.assertEqual(meta["requests_used"], 1)
+        # Landing-only checks completed; the first network check was budget-starved,
+        # and everything after it was never attempted.
+        self.assertTrue({"clickjacking", "csrf"} <= set(meta["checked_classes"]))
+        self.assertFalse({"cors", "redirect", "xss", "sqli"} & set(meta["checked_classes"]))
         # No finding needing a SECOND fetch (cors/xss/redirect/etc.) could possibly
         # have run once the sole request slot was spent on the landing page.
         classes = {f["_active_class_hint"] for f in findings}
         self.assertFalse(classes & {"cors", "xss", "redirect", "sqli", "nosqli"})
+
+    def test_class_restriction_marks_only_the_executed_suite(self) -> None:
+        url = f"http://127.0.0.1:{self.port}/?q=x&next=/home"
+        findings, meta = av.verify_active(
+            url, [], scope="127.0.0.1", only_classes=["cors"], requests_budget=20)
+        self.assertTrue(meta["in_scope"])
+        self.assertFalse(meta["rate_limited"])
+        self.assertEqual(meta["checked_classes"], ["cors"])
+        self.assertEqual({finding["_active_class_hint"] for finding in findings}, {"cors"})
+
+    def test_swallowed_fetch_failure_does_not_create_negative_coverage(self) -> None:
+        url = f"http://127.0.0.1:{self.port}/?q=x"
+        original = av._check_ssti
+
+        def partial(http, target, params):
+            http.fetch(target)  # one probe got a response
+            try:
+                http.fetch("http://")  # later control cannot be sent
+            except av.WebsiteFetchError:
+                pass  # same local catch pattern as a differential check
+            return None
+
+        av._check_ssti = partial
+        try:
+            _, meta = av.verify_active(url, [], scope="127.0.0.1",
+                                       only_classes=["ssti"], requests_budget=10)
+        finally:
+            av._check_ssti = original
+        self.assertGreaterEqual(meta["requests_used"], 2)
+        self.assertNotIn("ssti", meta["checked_classes"])
 
     def test_bounty_hunt_active_renders_confirmed(self) -> None:
         from bughunter.bounty import run_bounty_hunt

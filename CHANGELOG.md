@@ -2,6 +2,19 @@
 
 Notable changes to GreyIQ.
 
+## v4.9.1-hunt.1 - verified hunt learning and local TinyGPT bundle
+
+- Record completed verifier suites and confirmed outcomes as the evidence for
+  hunt learning. Filtered findings and interrupted checks cannot create false
+  negative labels. Check identity remains distinct from reported impact.
+- Retrain the local hunt ranker after new traces and promote weights only when
+  held-out recall matches or beats both the rules and the active model.
+- Update one learning outcome per finding as platform verdicts change, so
+  repeated syncs and rescans do not distort priorities.
+- Make verified coding lessons available to TinyGPT training and live retrieval.
+  Local Windows builds can opt in to bundle TinyGPT, CPU torch, and a seed model;
+  the frozen build checks that the model loads.
+
 ## v4.9.0 - Debian 13, guarded operator, and platform program intake
 
 - Added a Debian 13 package, AppImage, and headless CLI archive with a relocatable

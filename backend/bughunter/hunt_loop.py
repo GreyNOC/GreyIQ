@@ -637,6 +637,7 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
 
     merged: dict[str, dict[str, Any]] = {}
     verified: set[str] = set()
+    checked: set[str] = set()
     observations: list[str] = []
     # The SAME per-turn structure, kept machine-readable for the offline re-planner. `observations`
     # holds the trust-wrapped STRING an LLM reads; this holds the digest dict behind it, so the
@@ -716,6 +717,7 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
         for f in results:
             merged.setdefault(_dedup_key(f), f)
         verified |= set(meta.get("verified_classes") or [])
+        checked |= set(meta.get("checked_classes") or [])
         budget_remaining -= int(meta.get("requests_used") or 0)
         total_requests += int(meta.get("requests_used") or 0)
         # Turn 0 not in scope / guard-refused: return immediately (nothing to iterate on).
@@ -774,6 +776,7 @@ def run_iterative_verify(target_url: str, findings: list[dict[str, Any]], *, sco
 
     out_meta = dict(last_meta)
     out_meta["verified_classes"] = sorted(verified)
+    out_meta["checked_classes"] = sorted(checked)
     # A turn cut short by Stop never ran, so it is not counted: `turn + 1` would report a turn's
     # worth of work that produced no requests and no findings.
     out_meta["loop_turns"] = stopped_at if stopped_at is not None else turn + 1

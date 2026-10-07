@@ -150,7 +150,11 @@ class CampaignTests(unittest.TestCase):
         campaign.recon.discover = lambda t, **k: {
             "urls": [t, t + "search?q=1"], "notes": [], "sources": {}, "js_secrets": [],
             "tech": ["flask"], "params": ["q", "file"], "forms": [], "hints": {}}
-        campaign.run_bounty_hunt = lambda *a, **k: {"ok": True, "json_path": "", "report_path": ""}
+        campaign.run_bounty_hunt = lambda *a, **k: {
+            "ok": True, "json_path": "", "report_path": "",
+            "active_authorization": {"in_scope": True, "checked_classes": ["xss"],
+                                     "target": a[0]},
+        }
         campaign.cve_service.scan_known_cves = lambda t, **k: {
             "ok": True, "host": "app.example.com", "target": target,
             "components": [comp], "count": 1, "findings": [dict(cve_finding)]}
@@ -171,6 +175,9 @@ class CampaignTests(unittest.TestCase):
         self.assertIn("q", trace["surface"]["params"])
         self.assertIn("flask", trace["surface"]["tech"])
         self.assertEqual(trace["plan"]["provider"], "offline")
+        self.assertEqual({r["endpoint"] for r in trace["execution"]},
+                         {target, target + "search?q=1"})
+        self.assertTrue(all(r["classes"] == ["xss"] for r in trace["execution"]))
         # The injected CVE candidate flows through as an outcome row with its confirm status.
         classes = {o["class"] for o in trace["outcomes"]}
         self.assertIn(str(cve_finding.get("class_id")), classes)
@@ -590,14 +597,16 @@ class CampaignSteeringAndMemoryTests(unittest.TestCase):
             return {"ok": True, "findings": list(cve_findings or [])}
         campaign.cve_service.scan_known_cves = fake_cve
 
-        # A per-URL hunt whose active pass ran cleanly to completion. The shape matters: the
-        # campaign reads active_authorization to decide whether it may learn a MISS from this run.
+        # The per-URL verifier certifies its completed XSS suite. The campaign
+        # must use this coverage rather than assuming every planned class ran.
         clean = {"ok": True, "report_path": "", "scan_errors": [],
                  "active_authorization": {"in_scope": True, "rate_limited": False,
                                           "skipped_reason": "", "verified_classes": []}}
 
         def fake_hunt(url, *a, **k):
             self.seen.append({"url": url, "class_priority": list(k.get("class_priority") or [])})
+            covered = {**clean, "active_authorization": {
+                **clean["active_authorization"], "target": url, "checked_classes": ["xss"]}}
             if confirm_on and url == confirm_on:
                 doc = {"findings": [{"ref": "F1", "class_id": "xss", "rule_id": "active.xss",
                                      "title": "Reflected XSS", "severity": "medium",
@@ -606,8 +615,8 @@ class CampaignSteeringAndMemoryTests(unittest.TestCase):
                                                   "observed_result": "o", "control_result": "c"}}}
                 path = self.root / f"hunt-{abs(hash(url))}.json"
                 path.write_text(json.dumps(doc), encoding="utf-8")
-                return {**clean, "json_path": str(path)}
-            return {**clean, "json_path": ""}
+                return {**covered, "json_path": str(path)}
+            return {**covered, "json_path": ""}
         campaign.run_bounty_hunt = fake_hunt
 
     def _run(self, **kw):
@@ -809,6 +818,33 @@ class CampaignSteeringAndMemoryTests(unittest.TestCase):
             if pair_id.endswith("\txss"):
                 self.assertEqual(row["miss"], 0, f"{pair_id} was cooled despite being confirmed")
                 self.assertTrue(row["confirmed"], f"{pair_id} lost its immunity")
+
+    def test_filtered_confirmation_stays_positive_in_training_trace(self) -> None:
+        from bughunter import hunt_trace, hunt_train
+
+        self._stub()
+        previous = campaign.run_bounty_hunt
+
+        def filtered_hunt(url, *args, **kwargs):
+            # The per-URL report excluded this confirmed item, but the verifier
+            # still completed and proved the XSS suite on this URL.
+            kwargs["on_learning_outcomes"]([{
+                "endpoint": url, "class": "xss", "rule_id": "active.reflected-xss",
+                "proof_status": "confirmed", "severity": "medium", "dedup_key": "",
+            }])
+            result = previous(url, *args, **kwargs)
+            return {**result, "json_path": "", "active_authorization": {
+                "in_scope": True, "target": url, "checked_classes": ["xss"],
+                "verified_classes": ["xss"], "rate_limited": False}}
+
+        campaign.run_bounty_hunt = filtered_hunt
+        self._run()
+        trace = hunt_trace.load_traces(self.runtime)[0]
+        self.assertTrue(any(row["class"] == "xss" and row["proof_status"] == "confirmed"
+                            for row in trace["outcomes"]))
+        labels = [(row[1], row[2]) for row in hunt_train.build_dataset(self.runtime)]
+        self.assertIn(("xss", 1), labels)
+        self.assertNotIn(("xss", 0), labels)
 
     def test_the_snapshot_carries_the_chains_it_found(self) -> None:
         """A chains-empty snapshot tells reopened_chains that nothing is blocked any more, which

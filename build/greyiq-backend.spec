@@ -2,7 +2,7 @@
 #
 # Freezes backend/run_frozen.py into a self-contained backend the Electron shell
 # launches when packaged. onedir (COLLECT) is used rather than onefile because it
-# is far more reliable for a torch-heavy app and avoids slow per-launch unpacking.
+# is far more reliable for a large backend and avoids slow per-launch unpacking.
 #
 # Invoke from the repo root:  pyinstaller build/greyiq-backend.spec
 # Output:  dist/greyiq-backend/greyiq-backend.exe (+ supporting libraries)
@@ -17,36 +17,24 @@ from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs, collect_s
 # repo root is one level up.
 ROOT = os.path.dirname(os.path.abspath(SPECPATH))  # noqa: F821 (SPECPATH injected)
 BACKEND = os.path.join(ROOT, "backend")
+BUNDLE_TINYGPT = os.environ.get("GREYIQ_BUNDLE_TINYGPT", "0") == "1"
 
 datas = [
     (os.path.join(ROOT, "public"), "public"),
 ]
-# Bundle the seed tree, but EXCLUDE the TinyGPT torch checkpoints (*.pt). torch is excluded
-# from this build (see the excludes list below), so solin_core can never load them — shipping
-# and first-launch-copying ~13.6 MB of *.pt is pure dead weight. Everything else under seed/
-# (bounty playbooks, skills, corpora, configs) is kept. Walk the tree so each surviving file
-# lands under the right seed/ subdir.
+# Keep the ordinary release lean. The opt-in local TinyGPT build also carries the seed
+# checkpoint so a fresh install can load its model before any operator training.
 _SEED_SRC = os.path.join(BACKEND, "seed")
 for _root, _dirs, _files in os.walk(_SEED_SRC):
     _rel = os.path.relpath(_root, _SEED_SRC)
     _dest = "seed" if _rel == os.curdir else os.path.join("seed", _rel)
     for _fn in _files:
-        # HARD CONSTRAINT: no bundled model/weight/data file may use the ".pt" extension.
-        # This skip is unconditional, so a ".pt" under seed/ is dropped SILENTLY and the
-        # feature that reads it degrades in the shipped app while working perfectly in
-        # dev. Ship learned weights as ".json" (or any non-.pt extension) instead.
-        if _fn.lower().endswith(".pt"):
+        if _fn.lower().endswith(".pt") and not BUNDLE_TINYGPT:
             continue
         datas.append((os.path.join(_root, _fn), _dest))
 binaries = []
-# NOTE: the offline TinyGPT brain (solin_core / solin_typo / solin_bpe /
-# training_runtime) is intentionally NOT bundled. It depends on PyTorch (~1.2 GB),
-# which dominated the portable download + the ~200 s first-launch unpack while the
-# bug-hunting engine and the Ollama/Claude brain never touch it. The backend imports
-# that runtime lazily (greyiq_api._ensure_ml_runtime) and degrades to a clear
-# "local model unavailable" message when it is absent — so the shipped app is a lean
-# bug-bounty tool. Re-add the modules here + torch to the collect_all list below to
-# restore the in-binary local model.
+# The ordinary build omits the PyTorch-backed TinyGPT runtime. A local build may
+# opt in with GREYIQ_BUNDLE_TINYGPT=1; CI release builds leave it unset.
 hiddenimports = [
     "document_ingest",
     "ai_core.core_store",
@@ -78,6 +66,21 @@ for _opt in ("edit_ops", "offline_repair", "edit_mine", "solin_domain",
              "gn_dash", "gn_tui", "gn_sysmon"):
     if os.path.isfile(os.path.join(BACKEND, _opt + ".py")):
         hiddenimports.append(_opt)
+
+if BUNDLE_TINYGPT:
+    if importlib.util.find_spec("torch") is None:
+        raise RuntimeError("TinyGPT bundle requested, but torch is missing from the build Python")
+    if not os.path.isfile(os.path.join(_SEED_SRC, "best_model.pt")):
+        raise RuntimeError("TinyGPT bundle requested, but seed/best_model.pt is missing")
+    # greyiq_api imports these lazily, so PyInstaller cannot discover them from
+    # run_frozen.py. collect_all carries torch's compiled CPU DLLs and metadata.
+    hiddenimports += ["solin_core", "solin_typo", "solin_bpe", "solin_persona",
+                      "solin_intent_learn", "training_runtime"]
+    torch_datas, torch_binaries, torch_hidden = collect_all("torch")
+    datas += torch_datas
+    binaries += torch_binaries
+    hiddenimports += torch_hidden
+    print("[greyiq-backend.spec] bundling TinyGPT, CPU torch, and seed checkpoint")
 
 # --- gn CLI verb plugins -----------------------------------------------------------
 # Every module in gn_cli._VERB_PLUGINS is loaded by NAME through importlib at
@@ -212,6 +215,11 @@ print(f"[greyiq-backend.spec] bundling Playwright browsers from {_pw_cache}: "
 
 block_cipher = None
 
+_excludes = ["tkinter", "matplotlib", "pytest",
+             "PyQt5", "PySide2", "PyQt6", "PySide6", "shiboken6", "qtpy"]
+if not BUNDLE_TINYGPT:
+    _excludes += ["torch", "torchvision", "torchaudio", "torchgen", "functorch"]
+
 a = Analysis(  # noqa: F821
     [os.path.join(BACKEND, "run_frozen.py")],
     pathex=[BACKEND],
@@ -221,17 +229,9 @@ a = Analysis(  # noqa: F821
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # Hard-exclude the PyTorch family so nothing drags it back in transitively — it is
-    # the offline-model dependency we deliberately drop to keep the app lean/fast.
-    excludes=["tkinter", "matplotlib", "pytest",
-              # Qt bindings: Pillow's ImageQt references BOTH 6-series bindings, and
-              # PyInstaller refuses to collect two Qt binding packages -- it aborts the
-              # whole build. A clean CI runner has none installed so this never fired
-              # there, but any dev machine carrying PyQt6+PySide6 could not freeze at
-              # all, which matters because the local build is the ONLY path while
-              # Actions is unavailable. GreyIQ itself never imports Qt.
-              "PyQt5", "PySide2", "PyQt6", "PySide6", "shiboken6", "qtpy",
-              "torch", "torchvision", "torchaudio", "torchgen", "functorch"],
+    # Qt bindings are unused and PyInstaller refuses to collect two families.
+    # The ordinary release also excludes PyTorch; the explicit local opt-in keeps it.
+    excludes=_excludes,
     noarchive=False,
     cipher=block_cipher,
 )

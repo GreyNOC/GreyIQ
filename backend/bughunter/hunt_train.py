@@ -27,9 +27,10 @@ THE PROMOTION GATE IS A WRITE GATE, NOT A REPORT. The corpus is split BY PROGRAM
 row — two rows off one hunt share a surface, so a row split leaks the answer across it), and
 recall@3 of the confirmed classes is computed on the held-out programs for BOTH the learned
 ranker and the rules baseline (``offline_hunt._reorder_by_priors`` over the same candidate
-lists). The file is written ONLY if the model is at least as good as the rules. Otherwise
-nothing is written, any previously promoted model is left untouched, and the command says so
-and exits 1. Below ``min_rows`` it refuses outright, and if the held-out split contains no
+lists). The file is written ONLY if the model is at least as good as the rules and the
+currently loaded model on those same held-out programs. Otherwise nothing is written,
+any previously promoted model is left untouched, and the command says so and exits 1.
+Below ``min_rows`` it refuses outright, and if the held-out split contains no
 confirmed outcome at all it reports UNDETERMINED rather than inventing a number — there is
 no metric to report, and a fabricated one would defeat the only safeguard here.
 
@@ -55,6 +56,7 @@ import math
 import os
 import random
 import sys
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -72,6 +74,10 @@ _WEIGHT_BASE = 1.0
 _ROUND = 6                # weight precision on disk: enough to reproduce a score, small enough to diff
 _TOP_K = 3                # the k of recall@k — a probe_priority row's realistic attention budget
 _MAX_PARAM_SUGGESTIONS = 12
+_AUTO_STATE_NAME = "auto_train_state.json"
+_AUTO_MIN_NEW_TRACES = 5
+_AUTO_DISABLE_ENV = "GREYIQ_NO_AUTO_TRAIN_BRAIN"
+_AUTO_LOCK = threading.Lock()
 
 # rule_id prefixes that discriminate the two access-control selectors. Both IDOR and BFLA
 # land under the single ``access-control`` class_id, so the CLASS cannot tell them apart —
@@ -122,21 +128,50 @@ def _collect(runtime_dir: str | Path) -> list[dict[str, Any]]:
     ``build_dataset`` is the narrow public projection of this; the evaluator additionally
     needs the endpoint URL and its surface context so it can reconstruct the RULES ordering
     for the same endpoint and compare like with like."""
-    from bughunter import hunt_features, hunt_trace
+    from bughunter import hunt_features, hunt_trace, ledger
+    from bughunter.prover_classes import confirmed_learning_tag, uncertain_check_tags
 
-    # LABEL side: hunt_trace.training_examples has already re-joined the ledger, so a bounty
-    # that landed weeks after the hunt is reflected without ever rewriting the append-only
-    # log. OR-merged across traces: a class that confirmed on an endpoint ONCE is a positive
-    # for that endpoint, even in a hunt where the probe happened to miss it.
+    # A payout belongs to one ledger finding, not every rule sharing its impact
+    # class at the same endpoint (debug and command injection can both be `rce`).
+    # Join by program plus the trace outcome's exact dedup key.
+    paid_findings: set[tuple[str, str]] = set()
+    try:
+        for rec in ledger.list_all(runtime_dir, limit=100000):
+            if not isinstance(rec, dict):
+                continue
+            try:
+                paid = float(rec.get("bounty") or 0.0) > 0.0
+            except (TypeError, ValueError):
+                paid = False
+            if paid and rec.get("dedup_key"):
+                paid_findings.add((str(rec.get("program") or ""), str(rec["dedup_key"])))
+    except Exception:  # noqa: BLE001 - missing/corrupt ledger means no paid weights
+        pass
+    traces = hunt_trace.load_traces(runtime_dir)
     labels: dict[tuple[str, str, str], list[bool]] = {}
-    for row in hunt_trace.training_examples(runtime_dir):
-        key = (str(row.get("program") or ""), str(row.get("endpoint") or ""),
-               str(row.get("class") or "").strip().lower())
-        prev = labels.get(key) or [False, False]
-        labels[key] = [prev[0] or bool(row.get("confirmed")), prev[1] or bool(row.get("paid"))]
+    uncertain: set[tuple[str, str, str]] = set()
+    for trace in traces:
+        program = str(trace.get("program") or "")
+        for outcome in trace.get("outcomes") or []:
+            if not isinstance(outcome, dict) or str(outcome.get("proof_status") or "").strip().lower() != "confirmed":
+                continue
+            endpoint = str(outcome.get("endpoint") or "").strip()
+            impact = str(outcome.get("class") or "").strip().lower()
+            if not endpoint or not impact:
+                continue
+            rule_id = str(outcome.get("rule_id") or "").strip().lower()
+            tag = confirmed_learning_tag(impact, rule_id)
+            if tag:
+                key = (program, endpoint, tag)
+                prev = labels.get(key) or [False, False]
+                dedup_key = str(outcome.get("dedup_key") or "")
+                labels[key] = [True, prev[1] or (program, dedup_key) in paid_findings]
+            else:
+                uncertain.update((program, endpoint, candidate)
+                                 for candidate in uncertain_check_tags(impact, rule_id))
 
     out: list[dict[str, Any]] = []
-    for trace in hunt_trace.load_traces(runtime_dir):
+    for trace in traces:
         program = str(trace.get("program") or "")
         surface = trace.get("surface") if isinstance(trace.get("surface"), dict) else {}
         # Lowercased + sorted + unique, exactly like offline_plan's `sorted(recon_params)`, so
@@ -158,13 +193,12 @@ def _collect(runtime_dir: str | Path) -> list[dict[str, Any]]:
             if endpoint and class_id and rule_id:
                 rule_ids.setdefault((endpoint, class_id), []).append(rule_id)
 
-        # PROBED pairs first (the plan's own order), then any outcome pair the plan never
-        # listed — a class that confirmed without being planned is the sharpest signal there
-        # is, and dropping it would teach the model the rules' blind spots.
+        # Completed verifier suites provide negative labels. A plan is only intent, and
+        # a candidate/missing outcome is not proof that its class was tested. Confirmed
+        # outcomes remain positive even if they came from outside the active suite.
         pairs: list[tuple[str, str]] = []
         seen: set[tuple[str, str]] = set()
-        plan = trace.get("plan") if isinstance(trace.get("plan"), dict) else {}
-        for prow in plan.get("probe_priority") or []:
+        for prow in trace.get("execution") or []:
             if not isinstance(prow, dict):
                 continue
             endpoint = str(prow.get("endpoint") or "").strip()
@@ -175,20 +209,21 @@ def _collect(runtime_dir: str | Path) -> list[dict[str, Any]]:
                 if class_id and (endpoint, class_id) not in seen:
                     seen.add((endpoint, class_id))
                     pairs.append((endpoint, class_id))
-        for endpoint, class_id in rule_ids:
-            if (endpoint, class_id) not in seen:
-                seen.add((endpoint, class_id))
-                pairs.append((endpoint, class_id))
         for outcome in trace.get("outcomes") or []:
             if not isinstance(outcome, dict):
                 continue
             endpoint = str(outcome.get("endpoint") or "").strip()
-            class_id = str(outcome.get("class") or "").strip().lower()
-            if endpoint and class_id and (endpoint, class_id) not in seen:
-                seen.add((endpoint, class_id))
-                pairs.append((endpoint, class_id))
+            if str(outcome.get("proof_status") or "").strip().lower() != "confirmed":
+                continue
+            tag = confirmed_learning_tag(outcome.get("class"), outcome.get("rule_id"))
+            if endpoint and tag and (endpoint, tag) not in seen:
+                seen.add((endpoint, tag))
+                pairs.append((endpoint, tag))
 
         for endpoint, class_id in pairs:
+            label_key = (program, endpoint, class_id)
+            if label_key in uncertain and not labels.get(label_key, [False])[0]:
+                continue  # ambiguous confirm: neither a proven tag nor a safe miss
             names = hunt_features.query_names(endpoint)
             feats = hunt_features.endpoint_features(endpoint, names, recon, tech, forms.get(endpoint))
             confirmed, paid = labels.get((program, endpoint, class_id), (False, False))
@@ -341,22 +376,22 @@ def _param_model(rows: list[dict[str, Any]]) -> dict[str, list[list[Any]]]:
 # --- evaluation ---------------------------------------------------------------------------
 
 
-def _rules_order(row: dict[str, Any], observed: list[str]) -> list[str]:
-    """The candidate list in the RULES' own order — the baseline the model must beat.
+def _rules_order(row: dict[str, Any]) -> list[str]:
+    """The full production rules candidate list in its original order.
 
-    ``offline_hunt._classes_for_endpoint`` decides the order for the classes it proposes;
-    every other observed class is appended in sorted order, because the rules genuinely never
-    proposed it and "last" is the honest position for a suggestion that was never made."""
+    Unexecuted checks carry no negative label, but still compete for the top-three
+    slots at inference. Restricting evaluation to observed rows makes any endpoint
+    with at most three checked classes score a meaningless automatic 1.0. A
+    confirmed class absent from this list cannot be promoted by a production
+    ranker, which only permutes the planner's candidates.
+    """
     from bughunter import offline_hunt
 
     names = list(row["query_names"]) + list(row["recon_params"])
     tech = row["tech"]
     boost = tuple(dict.fromkeys(c for key, classes in offline_hunt._TECH_CLASS.items()
                                 if key in tech for c in classes))
-    ruled = offline_hunt._classes_for_endpoint(row["endpoint"], names, boost)
-    order = [c for c in ruled if c in observed]
-    order += sorted(c for c in observed if c not in order)
-    return order
+    return offline_hunt._classes_for_endpoint(row["endpoint"], names, boost)
 
 
 def _recall_at_k(order: list[str], relevant: set[str], k: int = _TOP_K) -> float:
@@ -366,13 +401,14 @@ def _recall_at_k(order: list[str], relevant: set[str], k: int = _TOP_K) -> float
     return len(set(order[:k]) & relevant) / len(relevant)
 
 
-def _evaluate(model: Any, rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _evaluate(model: Any, rows: list[dict[str, Any]], *, round_scores: bool = True) -> dict[str, Any]:
     """Mean recall@3 on the held-out programs, for the model AND for the rules baseline.
 
     Grouped by (program, endpoint): one endpoint is one ranking decision, so scoring per row
     would silently weight endpoints by how many classes happened to be probed on them. Groups
-    with no confirmed class are skipped — there is no recall to measure — and if that leaves
-    NOTHING, both numbers come back None (undetermined), never 0.0."""
+    with no planner-proposed confirmed class are skipped: a ranker cannot add a
+    class the planner omitted. If that leaves NOTHING, both numbers come back
+    None (undetermined), never 0.0."""
     from bughunter import offline_hunt
 
     groups: dict[tuple[str, str], dict[str, Any]] = {}
@@ -380,9 +416,7 @@ def _evaluate(model: Any, rows: list[dict[str, Any]]) -> dict[str, Any]:
         key = (row["program"], row["endpoint"])
         group = groups.get(key)
         if group is None:
-            group = groups[key] = {"ctx": row, "classes": [], "relevant": set()}
-        if row["class_id"] not in group["classes"]:
-            group["classes"].append(row["class_id"])
+            group = groups[key] = {"ctx": row, "relevant": set()}
         if row["label"] == 1:
             group["relevant"].add(row["class_id"])
 
@@ -393,7 +427,10 @@ def _evaluate(model: Any, rows: list[dict[str, Any]]) -> dict[str, Any]:
         if not relevant:
             continue
         ctx = group["ctx"]
-        candidates = _rules_order(ctx, group["classes"])
+        candidates = _rules_order(ctx)
+        proposed_relevant = relevant.intersection(candidates)
+        if not proposed_relevant:
+            continue
         # priors=None: the baseline is the hand-tuned knowledge ordering itself. With no
         # priors _reorder_by_priors is the identity, which is exactly the intent — it is
         # called explicitly so the baseline is literally the shipped rules function.
@@ -401,14 +438,16 @@ def _evaluate(model: Any, rows: list[dict[str, Any]]) -> dict[str, Any]:
         learned = model.rank_endpoint_classes(
             ctx["endpoint"], ctx["query_names"], ctx["recon_params"], ctx["tech"], candidates, None,
             form=ctx.get("form"))
-        rules_scores.append(_recall_at_k(rules, relevant))
-        model_scores.append(_recall_at_k(learned, relevant))
+        rules_scores.append(_recall_at_k(rules, proposed_relevant))
+        model_scores.append(_recall_at_k(learned, proposed_relevant))
 
     if not model_scores:
         return {"recall_at_3_model": None, "recall_at_3_rules": None, "scored_endpoints": 0}
+    model_recall = sum(model_scores) / len(model_scores)
+    rules_recall = sum(rules_scores) / len(rules_scores)
     return {
-        "recall_at_3_model": round(sum(model_scores) / len(model_scores), 4),
-        "recall_at_3_rules": round(sum(rules_scores) / len(rules_scores), 4),
+        "recall_at_3_model": round(model_recall, 4) if round_scores else model_recall,
+        "recall_at_3_rules": round(rules_recall, 4) if round_scores else rules_recall,
         "scored_endpoints": len(model_scores),
     }
 
@@ -445,7 +484,7 @@ def train(
     dry_run: bool = False,
     now: str | None = None,
 ) -> dict[str, Any]:
-    """Train, evaluate against the rules baseline, and promote ONLY on a win.
+    """Train, evaluate against the rules and incumbent, and promote ONLY on a win.
 
     Returns a result dict in every case — this function never raises on a refusal, because a
     refusal is a normal, expected outcome of an honest gate. ``ok`` is True only when the
@@ -481,6 +520,7 @@ def train(
         "classes": [],
         "recall_at_3_model": None,
         "recall_at_3_rules": None,
+        "recall_at_3_incumbent": None,
         "scored_endpoints": 0,
     }
 
@@ -527,21 +567,44 @@ def train(
         # than write a file the loader would silently reject at the next hunt.
         base["reason"] = "internal: the trained model failed its own on-disk validation; nothing written"
         return base
-    scores = _evaluate(hunt_model.Ranker(coerced), hold_rows)
-    base.update(scores)
+    # Compare full-precision scores so a small regression cannot disappear under
+    # the four-decimal display rounding used by the CLI and model metadata.
+    scores = _evaluate(hunt_model.Ranker(coerced), hold_rows, round_scores=False)
+    base.update({
+        "recall_at_3_model": (round(scores["recall_at_3_model"], 4)
+                              if scores["recall_at_3_model"] is not None else None),
+        "recall_at_3_rules": (round(scores["recall_at_3_rules"], 4)
+                              if scores["recall_at_3_rules"] is not None else None),
+        "scored_endpoints": scores["scored_endpoints"],
+    })
 
     if scores["recall_at_3_model"] is None:
-        base["reason"] = ("undetermined: no held-out endpoint has a confirmed class, so the model "
+        base["reason"] = ("undetermined: no held-out endpoint has a planner-proposed confirmed class, so the model "
                           "cannot be compared to the rules — nothing written")
         return base
     if scores["recall_at_3_model"] < scores["recall_at_3_rules"]:
-        base["reason"] = (f"model did not beat the rules (recall@3 {scores['recall_at_3_model']} vs "
-                          f"{scores['recall_at_3_rules']}); the existing model is untouched")
+        base["reason"] = (f"model did not beat the rules (recall@3 {base['recall_at_3_model']} vs "
+                          f"{base['recall_at_3_rules']}); the existing model is untouched")
         return base
 
+    # A retrain can clear the rules gate while still being worse than the model already
+    # serving hunts. Score the validated incumbent on the SAME held-out programs; its
+    # stored historical eval was measured against a different corpus and cannot be used
+    # for this decision. An absent or invalid incumbent leaves the rules as the only gate.
+    incumbent = hunt_model.load_model(seed_dir, runtime_dir)
+    if incumbent is not None:
+        incumbent_score = _evaluate(incumbent, hold_rows, round_scores=False)["recall_at_3_model"]
+        base["recall_at_3_incumbent"] = round(incumbent_score, 4) if incumbent_score is not None else None
+        if incumbent_score is not None and scores["recall_at_3_model"] < incumbent_score:
+            base["reason"] = (f"model regressed against the active model (recall@3 "
+                              f"{base['recall_at_3_model']} vs {base['recall_at_3_incumbent']}); "
+                              "the existing model is untouched")
+            return base
+
     payload["eval"] = {
-        "recall_at_3_model": scores["recall_at_3_model"],
-        "recall_at_3_rules": scores["recall_at_3_rules"],
+        "recall_at_3_model": base["recall_at_3_model"],
+        "recall_at_3_rules": base["recall_at_3_rules"],
+        "recall_at_3_incumbent": base["recall_at_3_incumbent"],
         "scored_endpoints": scores["scored_endpoints"],
         "held_out_rows": base["held_out_rows"],
         "held_out_programs": base["held_out_programs"],
@@ -556,6 +619,79 @@ def train(
     base["active_model"] = str(out_path)
     base["reason"] = "promoted"
     return base
+
+
+def _auto_state_path(runtime_dir: str | Path) -> Path:
+    return Path(runtime_dir) / _OUT_SUBDIR / _AUTO_STATE_NAME
+
+
+def _new_trace_lines(path: Path, offset: int) -> tuple[int, int]:
+    """Count newly appended JSONL lines from a persisted byte cursor, with bounded memory."""
+    count = 0
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        while chunk := handle.read(1024 * 1024):
+            count += chunk.count(b"\n")
+        return count, handle.tell()
+
+
+def maybe_auto_train(runtime_dir: str | Path | None, *, seed_dir: str | Path | None = None,
+                     min_rows: int = _DEFAULT_MIN_ROWS,
+                     min_new_traces: int = _AUTO_MIN_NEW_TRACES) -> dict[str, Any]:
+    """Occasionally retrain after a successfully persisted hunt trace.
+
+    The cooldown is measured in NEW local trace lines using a persisted byte cursor,
+    so each call reads only appended bytes. The attempt is persisted before training,
+    so a refused or interrupted fit cannot retry on every following hunt. This is
+    local bookkeeping only: ``train`` owns the minimum-row and rules/incumbent gates,
+    and its promoted weight file is picked up by the next hunt's model loader.
+    Neither this function nor the trainer contacts a target or any outside service.
+    """
+    if runtime_dir is None:
+        return {"attempted": False, "reason": "no runtime directory"}
+    if os.getenv(_AUTO_DISABLE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}:
+        return {"attempted": False, "reason": "disabled"}
+
+    attempted = False
+    try:
+        from bughunter import hunt_trace
+
+        trace_path = hunt_trace._store_path(runtime_dir)
+        state_path = _auto_state_path(runtime_dir)
+        with _AUTO_LOCK:
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                if not isinstance(state, dict):
+                    state = {}
+            except (OSError, ValueError):
+                state = {}
+            try:
+                seen_bytes = max(0, int(state.get("seen_bytes") or 0))
+                pending = max(0, int(state.get("pending_traces") or 0))
+                trace_count = max(0, int(state.get("trace_count") or 0))
+            except (TypeError, ValueError):
+                seen_bytes, pending, trace_count = 0, 0, 0
+            stat = trace_path.stat()
+            file_id = f"{stat.st_dev}:{stat.st_ino}"
+            if seen_bytes > stat.st_size or (state.get("trace_file_id") and state["trace_file_id"] != file_id):
+                seen_bytes, pending, trace_count = 0, 0, 0
+            added, seen_bytes = _new_trace_lines(trace_path, seen_bytes)
+            pending += added
+            trace_count += added
+            next_state = {"v": 1, "trace_file_id": file_id, "seen_bytes": seen_bytes,
+                          "trace_count": trace_count, "pending_traces": pending,
+                          "last_attempt_at": state.get("last_attempt_at")}
+            if pending < max(1, int(min_new_traces)):
+                _write_atomic(state_path, next_state)
+                return {"attempted": False, "reason": "new-trace cooldown", "new_traces": pending}
+            next_state["pending_traces"] = 0
+            next_state["last_attempt_at"] = _now()
+            _write_atomic(state_path, next_state)
+            attempted = True
+            result = train(runtime_dir, seed_dir=seed_dir, min_rows=max(_DEFAULT_MIN_ROWS, int(min_rows)))
+            return {"attempted": True, "trace_count": trace_count, **result}
+    except Exception as exc:  # noqa: BLE001 - learning must never break a completed hunt
+        return {"attempted": attempted, "reason": f"auto training unavailable: {type(exc).__name__}"}
 
 
 # --- CLI (`gn train-brain`, registered through gn_cli's plugin hook) --------------------------
@@ -713,6 +849,8 @@ def _cmd_train_brain(args: Any) -> int:
     else:
         print(f"recall@3: model {model_recall} vs rules {rules_recall} "
               f"over {result['scored_endpoints']} held-out endpoint(s)")
+        if result["recall_at_3_incumbent"] is not None:
+            print(f"           active model {result['recall_at_3_incumbent']} on the same holdout")
     if result["ok"] and result["written"]:
         print(f"promoted: {result['path']}")
         return 0

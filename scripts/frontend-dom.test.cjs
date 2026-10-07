@@ -22,6 +22,25 @@ test('renderer bootstrap selectors exist in the shipped HTML', () => {
   }
 });
 
+test('verified replay joins only the old default training selection once', () => {
+  const source = fs.readFileSync(path.resolve(__dirname, '..', 'public', 'app.js'), 'utf8');
+  const constants = source.slice(source.indexOf('const TRAINING_SOURCE_REVISION'),
+    source.indexOf('const DEFAULT_TRAIN_SETTINGS'));
+  const helpers = source.slice(source.indexOf('function normalizeSelectedTrainingSources'),
+    source.indexOf('function trainingSourceName'));
+  const { migrateSelectedTrainingSources, revision } = vm.runInNewContext(
+    `${constants}\n${helpers}\n({ migrateSelectedTrainingSources, revision: TRAINING_SOURCE_REVISION })`
+  );
+  const oldDefault = ['src_starter_knowledge', 'src_bug_bounty',
+    'src_personal_choices', 'src_preferred_examples'];
+  assert.deepEqual(Array.from(migrateSelectedTrainingSources(oldDefault, 0)),
+    [...oldDefault, 'src_verified_replay']);
+  assert.deepEqual(Array.from(migrateSelectedTrainingSources(['src_bug_bounty'], 0)),
+    ['src_bug_bounty'], 'custom selections must stay unchanged');
+  assert.deepEqual(Array.from(migrateSelectedTrainingSources(oldDefault, revision)), oldDefault,
+    'removing verified replay after migration must be respected');
+});
+
 test('structured-scope row retains its HackerOne asset id only for the original identifier', () => {
   const source = fs.readFileSync(path.resolve(__dirname, '..', 'public', 'app.js'), 'utf8');
   const start = source.indexOf('function ckScopeRowEl(entry, onOperatorChange) {');

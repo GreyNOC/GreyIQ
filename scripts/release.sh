@@ -2,7 +2,7 @@
 #
 # GreyIQ — one-command local release build.
 #
-#   scripts/release.sh [--dry-run] [--here] [--purge-venv] [--skip-check] [--yes]
+#   scripts/release.sh [--dry-run] [--here] [--purge-venv] [--skip-check] [--include-tinygpt] [--yes]
 #
 # What it does, in order:
 #   1. Verifies package.json and backend/_version.py agree (the same drift check CI runs).
@@ -22,13 +22,14 @@
 
 set -euo pipefail
 
-DRY_RUN=0; BUILD_HERE=0; PURGE_VENV=0; SKIP_CHECK=0; ASSUME_YES=0
+DRY_RUN=0; BUILD_HERE=0; PURGE_VENV=0; SKIP_CHECK=0; INCLUDE_TINYGPT=0; ASSUME_YES=0
 for arg in "$@"; do
   case "$arg" in
     --dry-run)    DRY_RUN=1 ;;
     --here)       BUILD_HERE=1 ;;
     --purge-venv) PURGE_VENV=1 ;;
     --skip-check) SKIP_CHECK=1 ;;
+    --include-tinygpt) INCLUDE_TINYGPT=1 ;;
     --yes|-y)     ASSUME_YES=1 ;;
     -h|--help)    sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "unknown option: $arg (try --help)" >&2; exit 2 ;;
@@ -83,6 +84,7 @@ if [ "$(uname -s 2>/dev/null)" != "Linux" ] || [ -n "${WINDIR:-}" ]; then
     SHORT_ARGS=(--here)
     [ "$PURGE_VENV" = "1" ] && SHORT_ARGS+=(--purge-venv)
     [ "$SKIP_CHECK" = "1" ] && SHORT_ARGS+=(--skip-check)
+    [ "$INCLUDE_TINYGPT" = "1" ] && SHORT_ARGS+=(--include-tinygpt)
     [ "$ASSUME_YES" = "1" ] && SHORT_ARGS+=(--yes)
     ( cd "$SHORT_WT" && bash scripts/release.sh "${SHORT_ARGS[@]}" )
     say "Artifacts are in $SHORT_WT/release"
@@ -134,7 +136,12 @@ fi
 # -------------------------------------------------------------------------------- build
 say "Building the portable + installer"
 info "this freezes the backend from an isolated .venv-build; the first run downloads CPU torch + Chromium"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File build/build-portable.ps1 -Installer
+BUILD_ARGS=()
+if [ "$INCLUDE_TINYGPT" = "1" ]; then
+  info "including TinyGPT and CPU torch; this local build will be substantially larger"
+  BUILD_ARGS+=(-IncludeTinyGPT)
+fi
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File build/build-portable.ps1 -Installer "${BUILD_ARGS[@]}"
 
 # ---------------------------------------------------------------------------- checksums
 say "Checksums"
