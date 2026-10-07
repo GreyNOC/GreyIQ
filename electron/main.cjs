@@ -839,7 +839,7 @@ async function startOllamaOnce() {
     return true;
   }
   managedOllamaModelsDir = null;
-  // A Linux install can supply Ollama through PATH or an explicit override, even
+  // A Linux or macOS install can supply Ollama through PATH or an explicit override, even
   // when GreyIQ itself is packaged. Use that installation's model directory too.
   const selected = await selectOllamaBinary({
     platform: process.platform,

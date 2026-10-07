@@ -67,6 +67,39 @@ test('packaged Linux provisions only when no system binary is available', async 
   assert.equal(provisions, 1);
 });
 
+test('packaged macOS honors GREYIQ_OLLAMA_PATH without unsupported provisioning', async () => {
+  let provisions = 0;
+  const selected = await selectOllamaBinary({
+    platform: 'darwin',
+    packaged: true,
+    env: { GREYIQ_OLLAMA_PATH: '/Applications/Ollama.app/Contents/Resources/ollama', PATH: '' },
+    ensureBase: async () => { provisions += 1; throw new Error('macOS archive unavailable'); },
+  });
+  assert.deepEqual(selected, {
+    binary: '/Applications/Ollama.app/Contents/Resources/ollama', external: true,
+  });
+  assert.equal(provisions, 0);
+});
+
+test('packaged macOS finds an executable on PATH before provisioning', async () => {
+  const command = path.join('/opt/homebrew/bin', 'ollama');
+  const fakeFs = {
+    statSync(candidate) {
+      if (candidate !== command) throw new Error('missing');
+      return { isFile: () => true };
+    },
+    accessSync(candidate) { assert.equal(candidate, command); },
+  };
+  const selected = await selectOllamaBinary({
+    platform: 'darwin',
+    packaged: true,
+    env: { PATH: ['/missing', '/opt/homebrew/bin'].join(path.delimiter) },
+    fileSystem: fakeFs,
+    ensureBase: async () => { throw new Error('macOS archive unavailable'); },
+  });
+  assert.deepEqual(selected, { binary: command, external: true });
+});
+
 test('Linux tar/zstd failures explain the dependency and retry action', async () => {
   let args;
   const spawnProcess = (command, commandArgs) => {

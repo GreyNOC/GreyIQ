@@ -87,6 +87,18 @@ activate a Python virtual environment, and install `requirements.txt`.
 `./gn dashboard` opens the terminal view. See [DEPLOY.md](DEPLOY.md) for exact
 commands, build steps, and optional OCR and model setup.
 
+## macOS
+
+The tagged release workflow builds native Apple Silicon (`arm64`) and Intel
+(`x64`) DMG and ZIP archives. Choose the archive matching your Mac. The app
+contains its own frozen backend and Chromium for proof screenshots. Ollama is
+installed on demand by the operator for local coding models; it is not bundled.
+
+Apple Developer signing and notarization require the repository secrets in
+[CODE_SIGNING.md](docs/CODE_SIGNING.md). Without them, the draft assets are
+unsigned and macOS Gatekeeper may block a normal first launch. A human operator
+reviews the draft and decides whether to publish it.
+
 ## Check
 
 Install the Python runtime and test dependencies before running the full check:

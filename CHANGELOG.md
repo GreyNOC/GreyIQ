@@ -4,6 +4,8 @@ Notable changes to GreyIQ.
 
 ## Unreleased
 
+## v4.9.3 - hunt learning and Apple release
+
 - Record completed verifier suites and confirmed outcomes as evidence for hunt
   learning. Filtered findings and interrupted checks cannot create false
   negative labels; check identity remains distinct from reported impact.
@@ -18,6 +20,10 @@ Notable changes to GreyIQ.
   and CSV intake and Bugcrowd report formatting remain available.
 - Wait for the operator worker to record its stopped audit and release its lease
   before the CLI exits after interruption.
+- Validate campaign targets before login or reconnaissance, including every
+  target in a multi-target campaign.
+- Add native Apple Silicon and Intel desktop release builds alongside the Linux
+  CLI tar archive and Windows desktop builds.
 
 ## v4.9.2 - authorized assessment and MCP hunt review
 
