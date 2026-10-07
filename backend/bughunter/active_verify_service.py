@@ -3139,7 +3139,10 @@ def verify_active(
         # that finding, while withholding negative coverage for the incomplete suite.
         if int(getattr(http, "failed", 0) or 0) == failures_before:
             suite_done[_cls] = suite_done.get(_cls, 0) + 1
-            if int(getattr(http, "sent", 0) or 0) > before or result or (
+            # A passive candidate is still a finding, but it cannot teach the
+            # planner that this class was tested. Only a sent probe or a check
+            # explicitly satisfied by the landing response counts as observed.
+            if int(getattr(http, "sent", 0) or 0) > before or (
                     landing is not None and _cls in {"clickjacking", "csrf"}):
                 suite_observed.add(_cls)
         if result:

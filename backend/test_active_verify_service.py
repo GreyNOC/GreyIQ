@@ -1366,6 +1366,20 @@ class ActiveE2ETests(unittest.TestCase):
         self.assertEqual(meta["checked_classes"], ["cors"])
         self.assertEqual({finding["_active_class_hint"] for finding in findings}, {"cors"})
 
+    def test_out_of_scope_bucket_candidate_does_not_mark_cloud_suite_checked(self) -> None:
+        # The local landing page references a bucket that is not in the scope.
+        # Reporting the passive candidate must not train a negative for an
+        # unprobed cloud-exposure suite.
+        bucket = "https://thirdparty.s3.amazonaws.com/asset.js"
+        url = f"http://127.0.0.1:{self.port}/?bucket={bucket}"
+        findings, meta = av.verify_active(
+            url, [], scope="127.0.0.1", only_classes=["cloud-exposure"], requests_budget=10)
+        self.assertEqual(meta["requests_used"], 1)  # landing page only
+        self.assertNotIn("cloud-exposure", meta["checked_classes"])
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["_active_proof"]["method"], "page reference (not probed)")
+        self.assertEqual(findings[0]["_active_proof"]["status"], "candidate")
+
     def test_swallowed_fetch_failure_does_not_create_negative_coverage(self) -> None:
         url = f"http://127.0.0.1:{self.port}/?q=x"
         original = av._check_ssti
