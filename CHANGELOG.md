@@ -2,6 +2,18 @@
 
 Notable changes to GreyIQ.
 
+## v4.9.2 - authorized assessment and MCP hunt review
+
+- Expand the local security knowledge and hunt workflow with scope-bound active
+  checks, source review, evidence grading, and privacy-aware reporting. Remote
+  repository and local source scans now apply explicit preflight controls.
+- Add operator-managed MCP servers for manual chat commands and a built-in,
+  in-memory MCP evidence review that runs automatically after authorized hunts.
+- Let operators approve exact external evidence-only MCP tools and opt in to
+  their use for one hunt. Calls are bounded by run permits and saved server
+  fingerprints; results remain untrusted advisory data and cannot alter proof
+  or launch target requests.
+
 ## v4.9.1 - split GGUF import and desktop setup
 
 - Import public Hugging Face repositories containing only split GGUF files by

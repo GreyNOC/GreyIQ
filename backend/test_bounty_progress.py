@@ -143,7 +143,7 @@ class RunBountyHuntProgressTests(unittest.TestCase):
         lines: list[str] = []
         with tempfile.TemporaryDirectory() as tmp:
             report = run_bounty_hunt(
-                url, "web-app", None, tmp, "local QA fixture", True, {},
+                url, "web-app", None, tmp, "127.0.0.1", True, {},
                 default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
                 runtime_dir=REPO_ROOT / "runtime", on_progress=lines.append,
             )
@@ -162,7 +162,7 @@ class RunBountyHuntProgressTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             report = run_bounty_hunt(
-                url, "web-app", None, tmp, "local QA fixture", True, {},
+                url, "web-app", None, tmp, "127.0.0.1", True, {},
                 default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
                 runtime_dir=REPO_ROOT / "runtime", on_progress=boom,
             )
@@ -288,7 +288,7 @@ class RunBountyHuntProgressTests(unittest.TestCase):
         progress.start_run("hunt-run-1")
         with tempfile.TemporaryDirectory() as tmp:
             report = run_bounty_hunt(
-                url, "web-app", None, tmp, "local QA fixture", True, {},
+                url, "web-app", None, tmp, "127.0.0.1", True, {},
                 default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
                 runtime_dir=REPO_ROOT / "runtime", on_progress=progress.sink("hunt-run-1"),
             )
@@ -307,11 +307,11 @@ class RunBountyHuntProgressTests(unittest.TestCase):
         url = f"http://127.0.0.1:{self.server.server_port}/"
         with tempfile.TemporaryDirectory() as tmp:
             first = run_bounty_hunt(
-                url, "web-app", None, tmp, "local QA fixture", True, {},
+                url, "web-app", None, tmp, "127.0.0.1", True, {},
                 default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed", runtime_dir=REPO_ROOT / "runtime",
             )
             second = run_bounty_hunt(
-                url, "web-app", None, tmp, "local QA fixture", True, {},
+                url, "web-app", None, tmp, "127.0.0.1", True, {},
                 default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed", runtime_dir=REPO_ROOT / "runtime",
             )
             self.assertTrue(first["ok"])
@@ -367,7 +367,7 @@ class RunCampaignProgressChainTests(unittest.TestCase):
         lines: list[str] = []
         with tempfile.TemporaryDirectory() as tmp:
             result = run_campaign(
-                url, scope="local QA fixture", authorized=True, coder_cfg={},
+                url, scope="127.0.0.1", authorized=True, coder_cfg={},
                 default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
                 runtime_dir=REPO_ROOT / "runtime", max_pages=1, on_progress=lines.append,
             )
@@ -387,7 +387,7 @@ class RunCampaignProgressChainTests(unittest.TestCase):
         progress.set_targets("span-run", ["tiktok.com"])  # the span registers the named target
         with tempfile.TemporaryDirectory() as tmp:
             result = run_campaign(
-                url, scope="local QA fixture", authorized=True, coder_cfg={},
+                url, scope="127.0.0.1", authorized=True, coder_cfg={},
                 default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
                 runtime_dir=REPO_ROOT / "runtime", max_pages=1,
                 progress_run_id="span-run", progress_unit="tiktok.com",
@@ -411,7 +411,7 @@ class RunCampaignProgressChainTests(unittest.TestCase):
         progress.request_stop("halt-run")  # pre-cancel: the loop checks this before each URL
         with tempfile.TemporaryDirectory() as tmp:
             result = run_campaign(
-                url, scope="local QA fixture", authorized=True, coder_cfg={},
+                url, scope="127.0.0.1", authorized=True, coder_cfg={},
                 default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
                 runtime_dir=REPO_ROOT / "runtime", max_pages=3, progress_run_id="halt-run",
             )

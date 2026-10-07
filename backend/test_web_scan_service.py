@@ -137,7 +137,7 @@ class WebScanRedactionTests(unittest.TestCase):
                     "web-app",
                     "secrets",
                     tmp,
-                    "local QA fixture",
+                    "127.0.0.1",
                     True,
                     {},
                     default_reports_dir=Path(tmp),

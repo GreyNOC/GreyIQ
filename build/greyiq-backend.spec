@@ -135,7 +135,7 @@ for _plugin in _verb_plugin_modules():
 
 # The ASGI stack + clients load a lot dynamically; pull everything in. numpy stays
 # (document_ingest's pandas path uses it). anthropic is the Claude coding-brain client.
-for package in ("numpy", "anthropic", "uvicorn", "pydantic", "pydantic_core", "pypdf", "cryptography"):
+for package in ("numpy", "anthropic", "uvicorn", "pydantic", "pydantic_core", "pypdf", "cryptography", "mcp"):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(package)
     datas += pkg_datas
     binaries += pkg_binaries

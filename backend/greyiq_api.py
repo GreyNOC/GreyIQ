@@ -387,6 +387,9 @@ from bughunter.live_scan_service import run_live_scan  # noqa: E402
 from bughunter.triage import triage  # noqa: E402
 from bughunter.chat_commands import (  # noqa: E402
     detect_scan_command,
+    dispatch_authorized_scan_command,
+    parse_active_chat_command,
+    validate_scoped_network_target,
     detect_wardrive_command,
     run_scan,
     run_wardrive,
@@ -398,6 +401,7 @@ from bughunter.chat_commands import (  # noqa: E402
 # install and fallback_reply()'s single canned sentence. Safe to import at boot — it pulls
 # nothing heavier than re/difflib/math/pathlib.
 import solin_domain  # noqa: E402
+from mcp_servers import MCPServerManager  # noqa: E402
 from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names, _deterministic_attack_plan, cwe_for_class, owasp_for_class, build_replay_script as bounty_build_replay, build_findings_har as bounty_build_har  # noqa: E402
 from bughunter import campaign as bounty_campaign  # noqa: E402
 from bughunter import learning as bounty_learning  # noqa: E402
@@ -690,6 +694,8 @@ class ModelSetupRequest(BaseModel):
 class ScanCodeRequest(BaseModel):
     target: str = Field(min_length=1, max_length=4000)
     target_type: str = Field(default="path", max_length=20)
+    authorized: bool = False
+    scope_repository: str = Field(default="", max_length=2048)
     max_files: int = Field(default=5000, ge=1, le=100_000)
     include_globs: list[str] = Field(default_factory=list)
     exclude_globs: list[str] = Field(default_factory=list)
@@ -697,11 +703,15 @@ class ScanCodeRequest(BaseModel):
 
 class WebScanRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
+    authorized: bool = False
+    scope_host: str = Field(default="", max_length=253)
 
 
 class LiveScanRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
     wait_seconds: float = Field(default=6.0, ge=0.0, le=30.0)
+    authorized: bool = False
+    scope_host: str = Field(default="", max_length=253)
 
 
 class BountyScanRequest(BaseModel):
@@ -713,6 +723,7 @@ class BountyScanRequest(BaseModel):
     authorized: bool = False
     run_live: bool = False
     active: bool = False
+    external_mcp_hunt: bool = False  # separate opt-in for approved evidence-only MCP tools
     time_based: bool = False
     auth_cookie: str = Field(default="", max_length=8000)
     auth_headers: list[str] = Field(default_factory=list, max_length=20)
@@ -733,6 +744,7 @@ class CampaignRequest(BaseModel):
     program_id: str | None = Field(default=None, max_length=120)  # "span this program's whole scope" mode
     active_program_id: str | None = Field(default=None, max_length=120)  # the saved program bound to a single-target (non-span) cockpit run — used ONLY to look up that program's policy/scope/creds; does NOT trigger span mode (that's program_id)
     active: bool = False
+    external_mcp_hunt: bool = False
     time_based: bool = False
     auth_cookie: str = Field(default="", max_length=8000)
     auth_headers: list[str] = Field(default_factory=list, max_length=20)
@@ -784,6 +796,7 @@ class PortfolioRequest(BaseModel):
     all_programs: bool = False   # run every saved program (ignores program_ids)
     authorized: bool = False
     active: bool = False
+    external_mcp_hunt: bool = False
     time_based: bool = False
     deep: bool = False           # GPU-brain deep AI write-ups + screenshots + research per confirmed lead
     attack_map: bool = True      # render a graphical attack-plan map (.png) per confirmed finding
@@ -809,6 +822,10 @@ class ReverifyRequest(BaseModel):
     # how consistently each finding confirmed (a flaky WAF/timing false-positive won't confirm
     # every pass). 1 = the classic single probe. Capped server-side so it can't fan out.
     stability_passes: int = Field(default=1, ge=1, le=3)
+
+
+class ActiveChatStatusRequest(BaseModel):
+    run_id: str = Field(min_length=1, max_length=80)
 
 
 class ProveRequest(BaseModel):
@@ -1497,6 +1514,8 @@ def _names_concrete_target(message: str) -> bool:
 class GreyIQRuntime:
     def __init__(self) -> None:
         self.lock = threading.RLock()
+        self._active_chat_runs: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        self._active_chat_running_id = ""
         # One agent run at a time per resolved workspace: concurrent runs race on the same files and
         # clobber each other's single per-workspace rollback snapshot. Keyed by resolved path; the
         # dict itself is guarded by self.lock, each value is held for a run's duration.
@@ -1522,6 +1541,7 @@ class GreyIQRuntime:
         self._operator: "OperatorLoop | None" = None
         self.store = AICoreStore(RUNTIME_DIR)
         ensure_runtime()
+        self.mcp_servers = MCPServerManager(RUNTIME_DIR / "mcp_servers.json")
         self._rewrite_core_defaults()
         self._ensure_bughunter_core()
         # The operator's researcher UA marker is install-wide, so it must be live BEFORE the first
@@ -2363,6 +2383,8 @@ class GreyIQRuntime:
             version=VERSION,
             run_live=request.run_live,
             active=request.active,
+            external_mcp_hunt=request.external_mcp_hunt,
+            mcp_manager=getattr(self, "mcp_servers", None),
             time_based=request.time_based,
             auth={"cookie": request.auth_cookie, "headers": request.auth_headers},
             max_files=request.max_files,
@@ -3034,6 +3056,8 @@ class GreyIQRuntime:
             runtime_dir=RUNTIME_DIR,
             version=VERSION,
             active=request.active,
+            external_mcp_hunt=request.external_mcp_hunt,
+            mcp_manager=getattr(self, "mcp_servers", None),
             time_based=request.time_based,
             auth=req_auth,
             account_access=account_access,
@@ -3094,6 +3118,8 @@ class GreyIQRuntime:
             runtime_dir=RUNTIME_DIR,
             version=VERSION,
             active=request.active,
+            external_mcp_hunt=request.external_mcp_hunt,
+            mcp_manager=getattr(self, "mcp_servers", None),
             time_based=request.time_based,
             auth=req_auth,
             account_access=program.get("account_access"),
@@ -3188,6 +3214,8 @@ class GreyIQRuntime:
             runtime_dir=RUNTIME_DIR,
             version=VERSION,
             active=request.active,
+            external_mcp_hunt=request.external_mcp_hunt,
+            mcp_manager=getattr(self, "mcp_servers", None),
             time_based=request.time_based,
             # An explicit request-level cookie/header wins; otherwise pass auth=None (NOT an empty dict)
             # so each program's own stored account_access drives a per-program auto-login. A non-None
@@ -5078,6 +5106,18 @@ class GreyIQRuntime:
         # style, and stored preferences are layered on top.
         cfg = dict(cfg)
         cfg["system_prompt"] = self._coder_system_prompt(request, cfg)
+        # The bundled expert cards also inform a configured reasoning brain. Keep
+        # operator-editable runtime overrides out of this higher-priority prompt;
+        # the excerpts are short, source-labelled reference data, never proof or
+        # permission to act on a target.
+        try:
+            knowledge_context = solin_domain.build_reasoning_context(
+                request.message, solin_domain.load_pack(SEED_DIR, None)
+            )
+        except Exception:  # noqa: BLE001 - retrieval must never break configured chat
+            knowledge_context = ""
+        if knowledge_context:
+            cfg["system_prompt"] += "\n\n" + knowledge_context
         bridge_block = coding_learning_bridge.teacher_prompt_block(student)
         if bridge_block:
             cfg["system_prompt"] += "\n\n" + bridge_block
@@ -5117,6 +5157,7 @@ class GreyIQRuntime:
             "captured_for_training": False,
             "brain_dialogue": {
                 "tinygpt_draft_used": bool(student),
+                "knowledge_context_used": bool(knowledge_context),
                 "lesson_status": lesson.get("outcome"),
                 "verification_reason": lesson.get("verification_reason"),
             },
@@ -5126,12 +5167,118 @@ class GreyIQRuntime:
             "ai_core": self.store.load(),
         }
 
+    def _start_active_chat_scan(self, target: str, scope_host: str) -> dict[str, Any]:
+        """Start one bounded active verification without holding the chat HTTP reply open."""
+        with self.lock:
+            if self._active_chat_running_id:
+                return {"ok": False, "error": "An active chat assessment is already running. Wait for its result before starting another."}
+            run_id = "active-" + uuid4().hex
+            self._active_chat_runs[run_id] = {"status": "running", "message": "Active assessment is running."}
+            while len(self._active_chat_runs) > 8:
+                self._active_chat_runs.popitem(last=False)
+            self._active_chat_running_id = run_id
+            worker = threading.Thread(
+                target=self._run_active_chat_scan,
+                args=(run_id, target, scope_host),
+                name="greyiq-active-chat",
+                daemon=True,
+            )
+            try:
+                worker.start()
+            except RuntimeError:
+                self._active_chat_runs.pop(run_id, None)
+                self._active_chat_running_id = ""
+                return {"ok": False, "error": "Could not start the active assessment worker."}
+        return {
+            "ok": True, "run_id": run_id, "status": "running",
+            "message": (
+                f"Active assessment started for {scope_host}. I will use up to 16 bounded "
+                "GET/HEAD/OPTIONS requests and report observed results with controls. "
+                "Keep this chat open to see the result."
+            ),
+        }
+
+    def _run_active_chat_scan(self, run_id: str, target: str, scope_host: str) -> None:
+        """One-host active proof pass; only a short, redacted summary reaches chat."""
+        status = "error"
+        message = "Active assessment failed before producing a result."
+        try:
+            results, meta = bounty_active_verify.verify_active(
+                target, [], scope=scope_host, settings=_bounty_get_settings(),
+                requests_budget=16, time_based=False, scope_host=scope_host,
+            )
+            if not meta.get("in_scope") or meta.get("skipped_reason"):
+                reason = redact_text(str(meta.get("skipped_reason") or "Target was outside the permitted scope."))[0]
+                message = f"Active assessment stopped before proof: {reason[:400]}"
+            else:
+                compact = [self._compact_active(item) for item in results]
+                confirmed = sum(item.get("status") == "confirmed" for item in compact)
+                candidate = len(compact) - confirmed
+                used = max(0, min(16, int(meta.get("requests_used") or 0)))
+                lines = [
+                    f"Active assessment of {scope_host}: {used}/16 requests used; "
+                    f"{confirmed} confirmed, {candidate} candidate findings."
+                ]
+                if meta.get("halt_reason"):
+                    lines.append(str(meta["halt_reason"])[:200])
+                elif meta.get("rate_limited"):
+                    lines.append("The request budget or host rate limit ended this pass early.")
+                for item in compact[:5]:
+                    title = redact_text(str(item.get("title") or "Finding"))[0][:150]
+                    severity = str(item.get("severity") or "info").lower()
+                    if severity not in {"critical", "high", "medium", "low", "info"}:
+                        severity = "info"
+                    state = "confirmed" if item.get("status") == "confirmed" else "candidate"
+                    lines.append(f"- {title} [{severity}; {state}]")
+                    for label, key in (("Observed", "observed"), ("Control", "control"), ("Limit", "limitations")):
+                        value = redact_text(str(item.get(key) or ""))[0].replace("\r", " ").replace("\n", " ").strip()
+                        if value:
+                            lines.append(f"  {label}: {value[:240]}")
+                if len(compact) > 5:
+                    lines.append(f"{len(compact) - 5} additional findings omitted from this chat summary.")
+                lines.append("This bounded sample does not prove the host is free of other vulnerabilities.")
+                status = "done"
+                message = "\n".join(lines)[:3500]
+        except Exception as exc:  # noqa: BLE001 - background worker must release the single-flight gate
+            self.log(f"Active chat assessment failed ({exc.__class__.__name__}).")
+            message = f"Active assessment failed ({exc.__class__.__name__}); no finding was confirmed."
+        finally:
+            with self.lock:
+                if run_id in self._active_chat_runs:
+                    self._active_chat_runs[run_id] = {"status": status, "message": message}
+                if self._active_chat_running_id == run_id:
+                    self._active_chat_running_id = ""
+
+    def active_chat_status(self, run_id: str) -> dict[str, Any]:
+        with self.lock:
+            current = self._active_chat_runs.get(run_id)
+            if current is None:
+                return {"ok": False, "status": "unavailable", "error": "That active run is no longer available in this session."}
+            return {"ok": True, "run_id": run_id, **current}
+
     def _maybe_scan_reply(self, request: ChatRequest) -> dict[str, Any] | None:
-        command = detect_scan_command(request.message)
-        if command is None:
+        active_command = parse_active_chat_command(request.message)
+        if active_command is not None:
+            if active_command.get("ok"):
+                result = self._start_active_chat_scan(
+                    str(active_command["target"]), str(active_command["scope_host"])
+                )
+            else:
+                result = active_command
+            return {
+                "request_id": uuid4().hex,
+                "message": result.get("message") or result.get("error") or "Active assessment could not start.",
+                "used_fallback": not bool(result.get("ok")),
+                "captured_for_training": False,
+                "model_name": "bughunter:active",
+                "device": "scanner",
+                "citations": [],
+                "ai_core": self.store.load(),
+                "active_scan": {"run_id": result.get("run_id", ""), "status": result.get("status", "error")},
+            }
+        result = dispatch_authorized_scan_command(request.message)
+        if result is None:
             return None
-        kind, target = command
-        result = run_scan(kind, target)
         triaged = triage(result, self._code_router_config())
         return {
             "request_id": uuid4().hex,
@@ -5186,6 +5333,114 @@ class GreyIQRuntime:
                 )
             },
         }
+
+    def _maybe_mcp_reply(self, request: ChatRequest) -> dict[str, Any] | None:
+        """Dispatch only a complete, operator-typed MCP command.
+
+        MCP descriptions and results are untrusted server data. They are displayed as
+        bounded text, never passed to a model or interpreted as a new instruction.
+        Connecting and calling tools require the explicit ``-y`` marker; registration
+        and ordinary chat can never start a server on their own.
+        """
+        raw = request.message.strip()
+        if not re.match(r"^/?mcp(?:\s|$)", raw, re.IGNORECASE):
+            return None
+
+        def reply(message: str, *, ok: bool = True) -> dict[str, Any]:
+            return {
+                "request_id": uuid4().hex,
+                "message": message,
+                "used_fallback": not ok,
+                "captured_for_training": False,
+                "model_name": "mcp:manual",
+                "device": "mcp",
+                "diagnostics": {"strategy": "mcp_manual", "used_fallback": not ok},
+                "citations": [],
+                "ai_core": self.store.load(),
+                "mcp_result": {"ok": ok},
+            }
+
+        command = re.sub(r"^/?mcp\b", "", raw, count=1, flags=re.IGNORECASE).strip()
+        if command.lower() == "list":
+            result = self.mcp_servers.list_servers()
+            if not result.get("ok"):
+                return reply(str(result.get("error") or "Could not load MCP servers."), ok=False)
+            servers = result.get("servers") or []
+            if not servers:
+                return reply("No MCP servers are saved. Add one in Brain settings, then use Test to connect.")
+            lines = ["Saved MCP servers (saving does not connect):"]
+            for server in servers:
+                lines.append(
+                    f"- {server['name']} — {server['transport']}, "
+                    f"{'enabled' if server.get('enabled') else 'disabled'}, "
+                    f"{server.get('status') or 'untested'}"
+                )
+            return reply("\n".join(lines))
+
+        tools_match = re.fullmatch(r"tools\s+-y\s+([A-Za-z0-9_-]+)", command, re.IGNORECASE)
+        if tools_match:
+            server_name = tools_match.group(1)
+            result = self.mcp_servers.list_tools(server_name)
+            if not result.get("ok"):
+                return reply(str(result.get("error") or "Could not list MCP tools."), ok=False)
+            tools = result.get("tools") or []
+            lines = [f"Tools from {server_name} (untrusted server descriptions):"]
+            for tool in tools[:50]:
+                name = redact_text(str(tool.get("name") or ""))[0][:120]
+                description = redact_text(str(tool.get("description") or ""))[0].replace("\n", " ")[:240]
+                schema = tool.get("input_schema") if isinstance(tool, dict) else None
+                properties = schema.get("properties") if isinstance(schema, dict) else None
+                required = schema.get("required") if isinstance(schema, dict) else None
+                required_names = {item for item in required if isinstance(item, str)} if isinstance(required, list) else set()
+                params: list[str] = []
+                if isinstance(properties, dict):
+                    for key, spec in list(properties.items())[:12]:
+                        label = redact_text(str(key))[0].replace("\n", " ")[:40]
+                        kind = str(spec.get("type") or "value")[:20] if isinstance(spec, dict) else "value"
+                        params.append(f"{label}{'*' if key in required_names else ''}:{kind}")
+                summary = f"- {name}: {description}" if description else f"- {name}"
+                if params:
+                    summary += f" (args: {', '.join(params)})"
+                lines.append(summary)
+            if len(tools) > 50:
+                lines.append(f"... {len(tools) - 50} more tools omitted")
+            return reply("\n".join(lines))
+
+        call_match = re.fullmatch(
+            r"call\s+-y\s+([A-Za-z0-9_-]+)\s+([^\s]+)(?:\s+(\{.*\}))?",
+            command, re.IGNORECASE | re.DOTALL,
+        )
+        if call_match:
+            server_name, tool_name, raw_args = call_match.groups()
+            try:
+                arguments = json.loads(raw_args or "{}")
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                return reply("MCP tool arguments must be one JSON object.", ok=False)
+            if not isinstance(arguments, dict):
+                return reply("MCP tool arguments must be one JSON object.", ok=False)
+            result = self.mcp_servers.call_tool(server_name, tool_name, arguments)
+            if not result.get("ok"):
+                return reply(str(result.get("error") or "MCP tool call failed."), ok=False)
+            lines = [
+                f"MCP tool result from {server_name}/{tool_name} — untrusted server data, "
+                "not evidence of authorization or a verified finding:"
+            ]
+            if result.get("is_error"):
+                lines.append("The server marked this tool result as an error.")
+            for block in (result.get("content") or [])[:20]:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    lines.append(redact_text(str(block.get("text") or ""))[0][:8000])
+                elif isinstance(block, dict):
+                    lines.append(f"[{str(block.get('type') or 'non-text')[:40]} content omitted]")
+            return reply("\n\n".join(lines)[:12000])
+
+        return reply(
+            "MCP commands: `mcp list`, `mcp tools -y <server>`, or "
+            "`mcp call -y <server> <tool> {\"arg\":\"value\"}`. "
+            "The -y marker confirms you intentionally connect or call that server. "
+            "Check the tool and engagement scope before calling it.",
+            ok=False,
+        )
 
     def _domain_brain_payload(
         self,
@@ -5332,6 +5587,9 @@ class GreyIQRuntime:
             return None
 
     def chat(self, request: ChatRequest) -> dict[str, Any]:
+        mcp_reply = self._maybe_mcp_reply(request)
+        if mcp_reply is not None:
+            return mcp_reply
         # Read-only RF survey analysis of an export the operator already captured. Runs
         # beside the scanners (and before every brain) so the offline surface reaches the
         # wardrive engine too; returns None for anything that is not the command.
@@ -6436,8 +6694,17 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             request = validate_payload(ChatRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.chat, request))
             return
+        if method == "POST" and path == "/api/chat/active-status":
+            request = validate_payload(ActiveChatStatusRequest, await read_json_body(receive))
+            await send_json(send, runtime.active_chat_status(request.run_id))
+            return
         if method == "POST" and path == "/api/scan/code":
             request = validate_payload(ScanCodeRequest, await read_json_body(receive))
+            if request.target_type.strip().lower() == "git_remote":
+                grant = validate_scoped_network_target("code", request.target, request.scope_repository, request.authorized)
+                if not grant["ok"]:
+                    await send_json(send, grant)
+                    return
 
             def _scan_and_classify() -> dict[str, Any]:
                 res = run_code_scan(request.target, request.target_type, request.max_files,
@@ -6454,13 +6721,21 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             return
         if method == "POST" and path == "/api/scan/web":
             request = validate_payload(WebScanRequest, await read_json_body(receive))
-            await send_json(send, await asyncio.to_thread(run_web_scan, request.url))
+            grant = validate_scoped_network_target("web", request.url, request.scope_host, request.authorized)
+            if not grant["ok"]:
+                await send_json(send, grant)
+                return
+            await send_json(send, await asyncio.to_thread(run_web_scan, request.url, scope_host=grant["scope_host"]))
             return
         if method == "POST" and path == "/api/scan/live":
             request = validate_payload(LiveScanRequest, await read_json_body(receive))
+            grant = validate_scoped_network_target("live", request.url, request.scope_host, request.authorized)
+            if not grant["ok"]:
+                await send_json(send, grant)
+                return
             await send_json(
                 send,
-                await asyncio.to_thread(run_live_scan, request.url, request.wait_seconds),
+                await asyncio.to_thread(run_live_scan, request.url, request.wait_seconds, scope_host=grant["scope_host"]),
             )
             return
         if method == "GET" and path == "/api/bounty/types":
@@ -6818,6 +7093,64 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/runtime/device":
             request = validate_payload(DeviceRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.set_device, request.preference))
+            return
+        if path == "/api/mcp/hunt-approvals":
+            if method == "GET":
+                await send_json(send, await asyncio.to_thread(runtime.mcp_servers.list_hunt_approvals))
+                return
+            if method == "POST":
+                body = await read_json_body(receive)
+                if not isinstance(body, dict) or set(body) != {"server", "tool", "evidence_only"}:
+                    await send_json(send, {"ok": False, "error": "Server, tool, and evidence_only are required."}, 400)
+                    return
+                await send_json(send, await asyncio.to_thread(
+                    runtime.mcp_servers.approve_hunt_tool, body["server"], body["tool"],
+                    evidence_only=body["evidence_only"]))
+                return
+            await send_json(send, {"error": "method not allowed"}, 405)
+            return
+        if path.startswith("/api/mcp/hunt-approvals/"):
+            tail = unquote(path[len("/api/mcp/hunt-approvals/"):])
+            parts = tail.split("/", 1)
+            if len(parts) != 2 or not all(parts):
+                await send_json(send, {"error": "not found"}, 404)
+                return
+            if method == "DELETE":
+                await send_json(send, await asyncio.to_thread(
+                    runtime.mcp_servers.revoke_hunt_tool, parts[0], parts[1]))
+                return
+            await send_json(send, {"error": "method not allowed"}, 405)
+            return
+        if path == "/api/mcp/servers":
+            if method == "GET":
+                await send_json(send, await asyncio.to_thread(runtime.mcp_servers.list_servers))
+                return
+            if method == "POST":
+                body = await read_json_body(receive)
+                await send_json(send, await asyncio.to_thread(runtime.mcp_servers.add_server, body))
+                return
+            await send_json(send, {"error": "method not allowed"}, 405)
+            return
+        if path.startswith("/api/mcp/servers/"):
+            tail = unquote(path[len("/api/mcp/servers/"):])
+            if tail.endswith("/test") and method == "POST":
+                name = tail[:-len("/test")]
+                if not name or "/" in name:
+                    await send_json(send, {"error": "not found"}, 404)
+                    return
+                await send_json(send, await asyncio.to_thread(runtime.mcp_servers.test_server, name))
+                return
+            if not tail or "/" in tail:
+                await send_json(send, {"error": "not found"}, 404)
+                return
+            if method == "PUT":
+                body = await read_json_body(receive)
+                await send_json(send, await asyncio.to_thread(runtime.mcp_servers.update_server, tail, body))
+                return
+            if method == "DELETE":
+                await send_json(send, await asyncio.to_thread(runtime.mcp_servers.delete_server, tail))
+                return
+            await send_json(send, {"error": "method not allowed"}, 405)
             return
         if method == "GET" and path == "/api/coder":
             await send_json(send, await asyncio.to_thread(runtime.coder_status))

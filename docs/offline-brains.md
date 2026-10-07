@@ -15,10 +15,32 @@ This document is the map of what answers you in that state, and the rules every 
 | Coding | `offline_coder.py` + `edit_ops.py` + `offline_repair.py` | `agent._run_offline` |
 | RF / wardriving | `bughunter/wardrive/` | `gn wardrive`, `wardrive -y <path>` in chat |
 
-`GreyIQRuntime.chat()` is the router. In order: **wardrive command → scan commands** → a configured
+`GreyIQRuntime.chat()` is the router. In order: **wardrive command → authorized scan commands** → a configured
 coding brain → the codegen honesty short-circuit → the domain brain → TinyGPT (dev only) → and, if
 the engine raised (which is *always* the case in a frozen install), one last domain-brain attempt
 before the canned fallback.
+
+The assessment cards in `seed/domain/assessment.md` add a fixed, cited reasoning workflow:
+choose a falsifiable hypothesis, design a matched negative control, check authorization
+and stop conditions, distinguish candidates from confirmed findings, and verify a fix.
+When a reasoning brain is configured, chat supplies at most two short, source-labelled
+excerpts from the bundled cards as untrusted reference data. The model still needs
+observed evidence before it can claim a target finding.
+
+Chat web scans require `-y --scope <exact-host>`; the scope is checked
+before the first network request and again on redirects. Scoped live browser
+scans currently refuse to run because Chromium's DNS connection cannot yet be
+pinned to the address checked by the Python scope guard.
+Remote code scan requests check `-y --scope <exact-repository-root-URL>` so a
+shared forge host cannot authorize unrelated repositories. The clone itself
+currently refuses to run because the Git transport cannot be kept within that
+repository; scan a local clone instead.
+`scan active -y --scope <exact-host> <url>` runs a single background proof pass,
+bounded to 16 GET/HEAD/OPTIONS requests with time-based probes disabled. Its
+result appears in chat with observed and control evidence; the command itself
+does not supply evidence or certify the operator's authorization.
+The short command is suitable only when the whole host is permitted. Use a saved
+program hunt for path exclusions, required request markers, and other policy limits.
 
 The first two are ordered deliberately and must not be swapped: the wardrive trigger is the more
 specific one, and `scan wardrive -y ./capture` also satisfies `detect_scan_command` (unknown

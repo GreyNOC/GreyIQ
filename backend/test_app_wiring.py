@@ -26,12 +26,15 @@ class AppWiringTests(unittest.TestCase):
         backend_paths = set(
             re.findall(r"\bpath\s*==\s*['\"](/api/[A-Za-z0-9_/-]+)['\"]", BACKEND)
         )
+        backend_prefixes = set(
+            re.findall(r"\bpath\.startswith\(\s*['\"](/api/[A-Za-z0-9_/-]+)['\"]", BACKEND)
+        )
 
         self.assertIn("/api/status", frontend_paths)
         self.assertIn("/api/bounty/campaign", frontend_paths)
         self.assertFalse(
-            frontend_paths - backend_paths,
-            f"Frontend API paths have no backend route: {sorted(frontend_paths - backend_paths)}",
+            frontend_paths - backend_paths - backend_prefixes,
+            f"Frontend API paths have no backend route: {sorted(frontend_paths - backend_paths - backend_prefixes)}",
         )
 
 

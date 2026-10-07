@@ -73,6 +73,7 @@ from bughunter.web_scan_service import (
     _USER_AGENT,
     _consume,
     _guard_url,
+    _require_exact_scope_host,
     current_user_agent,
 )
 
@@ -379,27 +380,45 @@ class _Http:
     and a process-wide per-host token bucket (the governor)."""
 
     def __init__(self, settings: Any, governor: HostRateGovernor, max_requests: int = 12,
-                 auth: AuthContext | None = None) -> None:
+                 auth: AuthContext | None = None, scope_host: str = "") -> None:
         self.settings = settings
         self.governor = governor
         self.max_requests = max(1, int(max_requests))
         self.auth = auth  # operator session, attached SAME-SITE only (never to a foreign bucket)
+        self.scope_host = scope_host  # optional exact host for chat-initiated verification
         self.sent = 0
-        self._operator_direct = operator_guard.current() is not None
+        self.halt_reason = ""
+        self._operator_direct = operator_guard.current() is not None or bool(scope_host)
         self.opener = build_opener(_NoRedirect(), ProxyHandler({})) if self._operator_direct else build_opener(_NoRedirect())
 
     def fetch(self, url: str, *, method: str = "GET", extra_headers: dict[str, str] | None = None,
               read_body: bool = True) -> dict[str, Any]:
         # An injected/reused _Http built before the guard was bound must still
         # switch to direct transport before it can issue an unattended request.
-        if operator_guard.current() is not None and not self._operator_direct:
+        if (operator_guard.current() is not None or self.scope_host) and not self._operator_direct:
             self.opener = build_opener(_NoRedirect(), ProxyHandler({}))
             self._operator_direct = True
         method = method.upper()
         if method not in _SAFE_METHODS:  # belt-and-suspenders; callers never pass others
             raise _ActiveError(f"refused non-idempotent method {method}")
+        if self.halt_reason:
+            raise _RateLimited()
+        if self.scope_host and extra_headers and any(
+            str(name).lower() in {"host", "x-forwarded-host", "x-original-host", "x-host", "forwarded", "x-forwarded-server"}
+            for name in extra_headers
+        ):
+            # An HTTP Host override can route the request to another virtual
+            # host even though the URL, DNS answer, and socket IP are in scope.
+            raise _ActiveError("Exact-host verification refuses virtual-host routing headers.")
         if self.sent >= self.max_requests:  # per-hunt budget, independent of the host bucket
             raise _RateLimited()
+        # The normal hunt scope permits named subdomains and selected bucket hosts.
+        # A chat command authorizes only ONE exact host, so check every generated
+        # URL here, before DNS, the governor, or a socket can be reached.
+        try:
+            _require_exact_scope_host(url, self.scope_host)
+        except WebsiteFetchError as exc:
+            raise _ActiveError(str(exc)) from exc
         operator_guard.before_request(url, method=method, reserve=False)
         # guarded_dns_scope() covers guard-check through the real connect so the DNS
         # pin _guard_url() installs is still in effect when the actual HTTP connect
@@ -423,10 +442,11 @@ class _Http:
             if extra_headers:
                 headers.update(extra_headers)
             request = Request(sanitized, headers=headers, method=method)
-            # This retry loop is still ONE logical probe -- self.sent and the governor
-            # token were already spent once above, and are never spent again here, no
-            # matter how many attempts a single fetch() call takes.
-            for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
+            # An exact-host chat run promises a physical request ceiling, so it
+            # cannot retry a failed send without spending a second budget slot.
+            # Legacy hunt runs retain their existing one-retry behavior.
+            max_attempts = 1 if self.scope_host else _MAX_FETCH_ATTEMPTS
+            for attempt in range(1, max_attempts + 1):
                 # Time ONLY the request (not the governor throttle, and not a prior
                 # attempt's backoff sleep), so a time-based check measures the server,
                 # not our own rate-limit/retry delay.
@@ -441,6 +461,7 @@ class _Http:
                         consumed["location"] = resp.headers.get("Location") if resp.headers else None
                         consumed["elapsed"] = time.monotonic() - started
                         operator_guard.observe_response(consumed, stage="body" if pre_status else "complete")
+                        self._observe_scoped_block(consumed)
                         return consumed
                 except HTTPError as exc:
                     # A 3xx (captured, not followed) or 4xx/5xx is a valid observation
@@ -457,6 +478,7 @@ class _Http:
                         consumed["location"] = exc.headers.get("Location") if exc.headers else None
                         consumed["elapsed"] = time.monotonic() - started
                         operator_guard.observe_response(consumed, stage="body" if pre_status else "complete")
+                        self._observe_scoped_block(consumed)
                         return consumed
                     finally:
                         exc.close()
@@ -464,9 +486,25 @@ class _Http:
                     # A retry is a second real socket send. In unattended mode
                     # it would need a fresh authorization/budget/Stop check, so
                     # fail closed after the first transport failure instead.
-                    if operator_guard.current() is not None or attempt >= _MAX_FETCH_ATTEMPTS:
+                    if operator_guard.current() is not None or attempt >= max_attempts:
                         raise _ActiveError(str(exc)) from exc
                     time.sleep(_FETCH_RETRY_BACKOFF_S * attempt)
+
+    def _observe_scoped_block(self, response: dict[str, Any]) -> None:
+        """Stop a chat run after rate limiting or an explicit anti-bot challenge."""
+        if not self.scope_host:
+            return
+        status = int(response.get("status") or 0)
+        headers = response.get("headers") or {}
+        header_text = " ".join(f"{key}: {value}" for key, value in headers.items()).lower()
+        if status == 429:
+            self.halt_reason = "The host rate limited the assessment."
+        elif "cf-mitigated: challenge" in header_text or (
+            status in {301, 302, 303, 307, 308, 403, 503}
+            and any(marker in (header_text + " " + str(response.get("body") or "")[:1000].lower())
+                    for marker in ("cf-chl", "challenge-platform", "verify you are human", "checking your browser", "bot challenge", "captcha"))
+        ):
+            self.halt_reason = "The host presented an anti-bot challenge."
 
 
 def _redact(value: str) -> str:
@@ -2929,6 +2967,7 @@ def verify_active(
     class_priority: list[str] | None = None,
     xss_params: list[str] | None = None,
     only_classes: list[str] | None = None,
+    scope_host: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run the active checks against an in-scope target. Returns
     ``(active_findings, meta)``. ``active_findings`` are confirmed/candidate finding
@@ -2953,6 +2992,12 @@ def verify_active(
         return [], {"in_scope": False, "skipped_reason": str(exc), "host": "", "requests_used": 0, "rate_limited": False, "verified_classes": []}
     host = urlparse(normalized).hostname or ""
 
+    try:
+        _require_exact_scope_host(normalized, scope_host)
+    except WebsiteFetchError as exc:
+        return [], {"in_scope": False, "host": host, "requests_used": 0,
+                    "rate_limited": False, "verified_classes": [], "skipped_reason": str(exc)}
+
     # Scope binding FIRST (no DNS, fail-closed): an unnamed host never gets probed.
     if not host_in_active_scope(host, scope, settings):
         return [], {
@@ -2971,7 +3016,17 @@ def verify_active(
         capacity=settings.active_max_requests_per_host,
         min_interval_s=settings.active_min_interval_ms / 1000.0,
     )
-    http = http or _Http(settings, governor, max_requests=requests_budget, auth=auth)
+    if http is None:
+        http = _Http(settings, governor, max_requests=requests_budget, auth=auth,
+                     scope_host=scope_host)
+    elif scope_host:
+        # A caller injecting its own transport cannot weaken a chat exact-host
+        # grant. Only the guarded implementation can enforce it on *every* URL.
+        if not isinstance(http, _Http):
+            return [], {"in_scope": False, "host": host, "requests_used": 0,
+                        "rate_limited": False, "verified_classes": [],
+                        "skipped_reason": "Exact-host verification requires the guarded HTTP transport."}
+        http.scope_host = scope_host
 
     # Fetch the landing page once so header-only checks (clickjacking) reuse it.
     landing: dict[str, Any] | None = None
@@ -3072,6 +3127,10 @@ def verify_active(
         # explicitly requested cannot be starved by this heavier file-read sweep.
         ("path-traversal", lambda: _check_path_traversal(http, sanitized, discovered_params)),
     ]
+    if scope_host:
+        # A one-host chat grant covers the URL host, not alternate virtual hosts
+        # reachable by overriding Host or X-Forwarded-Host at a shared ingress.
+        checks = [check for check in checks if check[0] != "host-header"]
     # Reasoning-steered SELECTION, then ordering. The restriction runs first so the priority sort
     # ranks only what will actually run; both are pure and neither can add a check the list above
     # does not already define.
@@ -3121,6 +3180,7 @@ def verify_active(
     meta = {
         "in_scope": True, "host": host, "requests_used": getattr(http, "sent", 0),
         "rate_limited": rate_limited, "verified_classes": verified,
+        "halt_reason": getattr(http, "halt_reason", ""),
         "discovered_params_used": len(discovered_params),
         # Deterministic, redacted STRUCTURAL digest of the landing response (JSON key names, form
         # fields, security headers, cookie flag gaps, JWT header shape, error family) — built from a

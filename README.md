@@ -111,7 +111,7 @@ npm run check:devops
 
 In the **Coding brain** panel (training column) pick a provider:
 
-- **Off** — local TinyGPT only (offline fallback).
+- **Off** — bundled, source-labelled offline playbooks; the character-level TinyGPT experiment runs only in development builds.
 - **Local model (Ollama)** — e.g. `qwen2.5-coder:14b`. The Ollama runtime isn't shipped in the installer — GreyIQ fetches it (with its bundled NVIDIA/CUDA runner) the first time you select the local model, offers one-click model download, and uses your GPU automatically: NVIDIA works out of the box; on an AMD box GreyIQ fetches Ollama's ROCm runtime separately on first run. No supported GPU → it runs on CPU.
 - **Claude API** — paste an Anthropic key (default model `claude-opus-4-8`).
 - **OpenAI-compatible** — any `/v1/chat/completions` endpoint.
@@ -187,6 +187,53 @@ investigator that scans code read-only, ranks hypotheses, names the proof still 
 and detects contradictions before proposing a fix. Raw credential values are never
 included in the brief sent to a configured model.
 
+## MCP servers
+
+Open **Brain → MCP servers** to save more than one trusted server. Choose an
+absolute native executable path with one argument per line for a local stdio
+server, or an HTTP URL on literal loopback such as
+`http://127.0.0.1:3000/mcp`. HTTP servers on other hosts, redirects, proxy
+settings, custom headers, and stored environment variables are not supported.
+For a Python or Node server, select the full path to `python.exe` or `node.exe`
+as the command and put the server script's full path in Arguments. The form
+does not download or install a server for you. Do not put credentials in
+Arguments; they are saved as plaintext and may appear in process listings.
+
+**Save** records the configuration without connecting. A new server is
+disabled. **Test** explicitly starts a connection and lists available tools;
+enable the server after you review it. Chat uses exact, one-shot commands:
+
+```text
+mcp list
+mcp tools -y my-server
+mcp call -y my-server tool_name {"argument":"value"}
+```
+
+`-y` confirms this chat connection or call is intentional. The chat model does
+not choose or invoke MCP tools on its own. Server output is shown as untrusted text and
+excluded from later model chat history. MCP commands and results stay visible
+until reload but are not saved in browser chat storage. GreyIQ cannot enforce target scope,
+rate limits, or request markers inside an external MCP server, so use a server
+for target testing only when that server can enforce the engagement's rules.
+Adding a server alone does not authorize any target activity.
+
+Every authorized hunt automatically calls GreyIQ's built-in, in-memory MCP
+evidence-review tool after the scan. It receives bounded categories and indexes
+from the captured surface and findings, makes no target requests, and writes an
+advisory review to the report and JSON sidecar. Its output cannot confirm a
+finding, change severity, or schedule a probe.
+
+For external analysis during a hunt, first enable and test a server, then approve
+an exact advertised tool under **Brain → MCP servers** as evidence-only. This
+approval is bound to the saved server configuration and becomes invalid after
+the configuration changes. At hunt launch, separately check **External MCP
+evidence analysis** for that run. GreyIQ passes only bounded, redacted hunt
+metadata to at most three approved tools, one call
+each. Their responses are labeled as untrusted advisory data. External servers
+execute outside GreyIQ's
+network guard: approve only tools you have verified do not make target requests.
+No external tool runs automatically from server enablement alone.
+
 ## Agent mode & the Workbench
 
 Toggle **Agent** and pick a workspace folder. The agent plans, then reads/searches/edits
@@ -229,10 +276,9 @@ as commands to execute.
 ## BugHunter
 
 See [docs/USER_GUIDE.md](docs/USER_GUIDE.md) for the full Hunt-cockpit walkthrough —
-Program setup (including starting an inactive draft from only a public forge repository link,
-or browsing visible programs through HackerOne, YesWeHack, Bugcrowd, and Intigriti APIs,
+Program setup (including browsing visible programs through HackerOne, YesWeHack, Bugcrowd, and Intigriti APIs,
 previewing their scope and rules, or importing a CSV/paste table),
-opt-in shallow cloning/adversarial scanning of program-provided public source repositories,
+local-clone source scanning (remote Git cloning currently refuses to run),
 per-program SSRF/OOB setup, running a hunt, and reports & submission. The cockpit also opens
 a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the top bar).
 When adding a HackerOne program, enter and save the API identifier and token in
@@ -240,7 +286,8 @@ the Program wizard's **Identify** step. You can test the saved connection there
 before browsing programs or fetching scope; the token field is masked and cleared
 after saving.
 
-- **Scan** from chat: `scan code <path|repo>`, `scan web <url>`, `scan live <url>`.
+- **Assess from chat:** `scan code <local-path>` runs a local source scan. Network scans require an explicit authorization assertion and exact scope. `scan web -y --scope app.example.com https://app.example.com/` runs a scoped passive web pass. `scan active -y --scope app.example.com https://app.example.com/` starts a background proof pass with at most 16 GET/HEAD/OPTIONS requests and reports observations alongside controls. Missing or mismatched scope is refused before a request, and scoped web redirects cannot leave the host. These short web commands require whole-host permission for the methods used. For narrower policies, use the saved program workflow in the Hunt cockpit; hunts refuse restrictions the engine cannot enforce. Remote Git scans currently refuse to run because Git can fetch alternate object stores outside the named repository; scan a local clone instead. Scoped live browser scans currently refuse to run until browser DNS egress can be pinned.
+- **Expert knowledge in chat:** bundled assessment cards teach hypothesis selection, differential controls, evidence calibration, stop conditions, and fix verification. Offline replies quote source-labelled excerpts. A configured reasoning brain receives at most two brief, source-labelled excerpts as reference data; they never count as target evidence or testing authorization.
 - **Unauthenticated ATO and RCE, including the blind half.** The active prover confirms command
   injection the target echoes back or delays; with an OOB collaborator configured, a hunt also
   proves the blind kind — a shell-wrapped callback in parameters *and* in the request headers that
@@ -304,8 +351,7 @@ after saving.
   HackerOne, YesWeHack, Bugcrowd, Intigriti, and **HackenProof** (web3: exchanges, protocols,
   smart contracts) — pick the format in Submissions. HackerOne is the only live-API submit;
   the rest, HackenProof included, are export-only (HackenProof has no researcher API — you
-  submit on its dashboard). URL targets can
-  opt into the live browser pass, and focus classes also cover CSRF, CORS, open
+  submit on its dashboard). Focus classes also cover CSRF, CORS, open
   redirect, unsafe file upload, business logic, and supply-chain/dependency risk.
 - **Negative knowledge** — GreyIQ remembers what it already probed and did **not** confirm. A
   planned `(endpoint, class)` that yields nothing becomes a *miss*; after two misses the pair is
@@ -350,10 +396,8 @@ refuses catastrophic commands (`rm -rf`, disk formats, pipe-to-shell, power cont
 privilege escalation, …).
 
 Local code scans can be restricted to one folder with
-`GREYIQ_CODE_SCAN_BASE_PATH`. Remote repository scans require public HTTPS repository-root
-URLs from the built-in forge allowlist; GreyIQ shallow-clones them into a temporary directory
-and removes it after the scan. Web/live scans refuse private/loopback hosts unless
-`GREYIQ_SCAN_ALLOW_PRIVATE_URLS=1`.
+`GREYIQ_CODE_SCAN_BASE_PATH`. Remote repository URLs are recognized but refuse to clone until the Git transport can be constrained to the authorized source; provide a local clone. Web scans refuse private/loopback hosts unless
+`GREYIQ_SCAN_ALLOW_PRIVATE_URLS=1`; scoped browser scans currently refuse to run.
 
 Fixed third-party egress is narrow and documented. HackerOne import/submission uses
 `api.hackerone.com` only on its corresponding operator action. YesWeHack program search,

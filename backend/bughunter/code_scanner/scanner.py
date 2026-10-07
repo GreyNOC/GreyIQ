@@ -17,6 +17,7 @@ from bughunter.code_scanner.rules import ALL_RULES
 from bughunter.code_scanner.sources import resolve_source
 from bughunter.code_scanner.sources.git_local import LocalGitSource
 from bughunter.code_scanner.sources.local import LocalPathSource
+from bughunter.code_scanner.sources.local_guard import resolve_local_scan_path
 from bughunter.code_scanner.suppression import is_suppressed
 from bughunter.code_scanner.walker import detect_language, walk_collect
 from bughunter.settings import get_settings
@@ -47,8 +48,8 @@ def scan_target(request: ScanRequest) -> ScanResult:
         # exempt (their root is never an operator-chosen host path).
         base = get_settings().code_scan_base_path
         if base and isinstance(source, (LocalPathSource, LocalGitSource)):
-            base_path = Path(base).expanduser().resolve()
-            resolved_root = root.resolve()
+            base_path = resolve_local_scan_path(base)
+            resolved_root = resolve_local_scan_path(root)
             if not (
                 resolved_root == base_path
                 or resolved_root.is_relative_to(base_path)

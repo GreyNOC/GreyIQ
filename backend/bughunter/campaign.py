@@ -259,7 +259,8 @@ def _bind_unknown_issuer_to_target(auth: dict[str, Any] | None, target: str) -> 
 
 
 def run_campaign(target: str, *, account_access: dict[str, Any] | None = None,
-                 user_agent_suffix: str = "", **kwargs: Any) -> dict[str, Any]:
+                 user_agent_suffix: str = "", external_mcp_hunt: bool = False,
+                 mcp_manager: Any = None, **kwargs: Any) -> dict[str, Any]:
     """Run a campaign, first honoring this program's HUNTING REQUIREMENTS:
 
     - ``account_access`` (the program's research-account block): when set and the caller passed no
@@ -291,7 +292,9 @@ def run_campaign(target: str, *, account_access: dict[str, Any] | None = None,
     # The program's required UA tag rides every in-scope request for the duration of this hunt.
     ua_token = web_ingest.set_ua_suffix(user_agent_suffix or "")
     try:
-        return _run_campaign_body(target, **kwargs)
+        return _run_campaign_body(
+            target, external_mcp_hunt=external_mcp_hunt, mcp_manager=mcp_manager, **kwargs,
+        )
     finally:
         web_ingest.reset_ua_suffix(ua_token)
 
@@ -335,6 +338,8 @@ def _run_campaign_body(
     # Settings, which is the opt-in.
     oob_base: str = "",
     oob_secret: str = "",
+    external_mcp_hunt: bool = False,
+    mcp_manager: Any = None,
 ) -> dict[str, Any]:
     """Run a full campaign. Returns {ok, campaign_path, json_path, urls_scanned,
     finding_count, confirmed_count, submission_paths, ...} or {ok: False, error}.
@@ -722,6 +727,7 @@ def _run_campaign_body(
             # for a long time — so without this the operator waits out the current URL after hitting Stop.
             should_stop=(lambda rid=progress_run_id: progress.is_stopped(rid)) if progress_run_id else None,
             oob_base=oob_base, oob_secret=oob_secret,
+            external_mcp_hunt=external_mcp_hunt, mcp_manager=mcp_manager,
         )
         per_target.append({"target": url, "ok": result.get("ok", False),
                            "report_path": result.get("report_path", ""), "error": result.get("error", "")})
@@ -1429,6 +1435,8 @@ def run_campaign_over_targets(
     # out-of-band provers were otherwise unreachable from any autonomous path.
     oob_base: str = "",
     oob_secret: str = "",
+    external_mcp_hunt: bool = False,
+    mcp_manager: Any = None,
 ) -> dict[str, Any]:
     """Run one full ``run_campaign`` per target (bounded, deduped, best-effort — one
     bad target never aborts the rest) and merge the results into a single combined
@@ -1567,6 +1575,7 @@ def run_campaign_over_targets(
                 progress_run_id=progress_run_id, progress_unit=unit,
                 submission_claim=submission_claim,  # dedup identical findings across concurrent targets
                 oob_base=oob_base, oob_secret=oob_secret,
+                external_mcp_hunt=external_mcp_hunt, mcp_manager=mcp_manager,
             )
             if progress_unit is None:
                 if result.get("ok"):
@@ -1718,6 +1727,8 @@ def run_portfolio_campaign(
     # one where an unreachable prover costs the most: it runs unattended, for hours.
     oob_base: str = "",
     oob_secret: str = "",
+    external_mcp_hunt: bool = False,
+    mcp_manager: Any = None,
 ) -> dict[str, Any]:
     # (policy_profile is per-program here; read from each spec below, not a portfolio-wide arg.)
     """Run a full campaign across MULTIPLE saved programs CONCURRENTLY (bounded), merged into
@@ -1811,6 +1822,7 @@ def run_portfolio_campaign(
                 excluded_hosts=spec["excluded_hosts"], include_attack_map=include_attack_map, on_progress=_p_emit,
                 progress_run_id=progress_run_id, progress_unit=label,
                 oob_base=oob_base, oob_secret=oob_secret,
+                external_mcp_hunt=external_mcp_hunt, mcp_manager=mcp_manager,
             )
             progress.mark_target(progress_run_id, label, "done" if result.get("ok") else "error",
                                  error="" if result.get("ok") else str(result.get("error") or ""))

@@ -248,10 +248,11 @@ class _GuardedRedirect(HTTPRedirectHandler):
     can never carry the session off-target."""
 
     def __init__(self, allow_private: bool, allowed_ports: frozenset[int],
-                 auth: AuthContext | None = None) -> None:
+                 auth: AuthContext | None = None, scope_host: str = "") -> None:
         self.allow_private = allow_private
         self.allowed_ports = allowed_ports
         self.auth = auth
+        self.scope_host = scope_host
         self.count = 0
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, N802
@@ -263,6 +264,7 @@ class _GuardedRedirect(HTTPRedirectHandler):
         if self.count > _MAX_REDIRECTS:
             raise WebsiteFetchError("Website redirected too many times.")
         raw_target = urljoin(req.full_url, newurl)
+        _require_exact_scope_host(raw_target, self.scope_host)
         operator_guard.before_request(raw_target, reserve=False)
         target = _guard_url(raw_target, self.allow_private, self.allowed_ports)
         operator_guard.before_request(target, reserve=True)
@@ -280,9 +282,26 @@ class _GuardedRedirect(HTTPRedirectHandler):
         return new
 
 
-def _fetch_raw(url: str, *, auth: AuthContext | None = None) -> dict[str, Any]:
+def _require_exact_scope_host(url: str, scope_host: str) -> None:
+    """Bind an explicitly scoped scan to one host before any socket opens."""
+    if not scope_host:
+        return
+    try:
+        parsed = urlparse(url)
+        host = _ascii_hostname(parsed.hostname or "").rstrip(".")
+    except ValueError as exc:
+        raise WebsiteFetchError("Request URL has an invalid host.") from exc
+    allowed = _ascii_hostname(scope_host).rstrip(".")
+    if not host or host != allowed:
+        raise WebsiteFetchError(
+            f"Request host '{host or '(missing)'}' is outside the exact authorized scope '{allowed}'."
+        )
+
+
+def _fetch_raw(url: str, *, auth: AuthContext | None = None, scope_host: str = "") -> dict[str, Any]:
     settings = get_settings()
     normalized = normalize_website_url(url)
+    _require_exact_scope_host(normalized, scope_host)
     operator_guard.before_request(normalized, reserve=False)
     # guarded_dns_scope() covers the whole guarded fetch (initial URL through every
     # redirect hop _GuardedRedirect follows) so the DNS pin each _guard_url() call
@@ -300,8 +319,9 @@ def _fetch_raw(url: str, *, auth: AuthContext | None = None) -> dict[str, Any]:
         # (see _GuardedRedirect), so it never leaves the target's host.
         headers.update(auth_headers_for(urlparse(sanitized).hostname or "", auth))
         request = Request(sanitized, headers=headers, method="GET")
-        handlers = [_GuardedRedirect(settings.allow_private_urls, settings.web_allowed_ports, auth=auth)]
-        if operator_guard.current() is not None:
+        handlers = [_GuardedRedirect(settings.allow_private_urls, settings.web_allowed_ports,
+                                     auth=auth, scope_host=scope_host)]
+        if operator_guard.current() is not None or scope_host:
             # urllib otherwise inherits HTTP_PROXY/HTTPS_PROXY and lets that
             # ungranted proxy resolve the hostname outside our DNS pin.
             handlers.insert(0, ProxyHandler({}))
@@ -581,7 +601,8 @@ def _sensitive_path_matches(kind: str, body: str, headers: dict[str, Any], statu
     return False
 
 
-def _probe_sensitive_paths(base_url: str, governor: HostRateGovernor, *, auth: AuthContext | None = None) -> list[dict[str, Any]]:
+def _probe_sensitive_paths(base_url: str, governor: HostRateGovernor, *, auth: AuthContext | None = None,
+                           scope_host: str = "") -> list[dict[str, Any]]:
     """Probe the small constant wordlist on the target's own origin, content-validate
     each 200, and emit a redacted disclosure finding for real hits. Same-origin,
     GET-only via _fetch_raw (so the SSRF/redirect/port guards apply identically),
@@ -595,7 +616,8 @@ def _probe_sensitive_paths(base_url: str, governor: HostRateGovernor, *, auth: A
             break  # per-host budget exhausted -> stop (fail closed, no bursting)
         url = base + path
         try:
-            fetched = _fetch_raw(url, auth=auth)
+            fetched = (_fetch_raw(url, auth=auth, scope_host=scope_host) if scope_host
+                       else _fetch_raw(url, auth=auth))
         except (WebsiteFetchError, URLError, TimeoutError, ValueError, OSError):
             continue
         guard = operator_guard.current()
@@ -638,7 +660,7 @@ def _probe_sensitive_paths(base_url: str, governor: HostRateGovernor, *, auth: A
 
 def run_web_scan(
     url: str, max_findings: int = _MAX_FINDINGS_RETURNED, *, probe_paths: bool = False,
-    auth: AuthContext | None = None,
+    auth: AuthContext | None = None, scope_host: str = "",
 ) -> dict[str, Any]:
     """Passively scan a single URL. Returns a JSON-serializable result, or
     ``{"ok": False, "error": ...}`` on a fetch failure instead of raising.
@@ -651,7 +673,8 @@ def run_web_scan(
         return {"ok": False, "scan_type": "web", "error": "No URL provided."}
 
     try:
-        fetched = _fetch_raw(target, auth=auth)
+        fetched = (_fetch_raw(target, auth=auth, scope_host=scope_host) if scope_host
+                   else _fetch_raw(target, auth=auth))
     except WebsiteFetchError as exc:
         return {"ok": False, "scan_type": "web", "target": target, "error": str(exc)}
     # http.client.HTTPException (incl. IncompleteRead -> a truncated/short-closed response
@@ -675,7 +698,8 @@ def run_web_scan(
                 capacity=len(_SENSITIVE_PATHS) + 2,
                 min_interval_s=settings.active_min_interval_ms / 1000.0,
             )
-            findings.extend(_probe_sensitive_paths(fetched["final_url"], governor, auth=auth))
+            findings.extend(_probe_sensitive_paths(fetched["final_url"], governor,
+                                                   auth=auth, scope_host=scope_host))
         except Exception:  # noqa: BLE001 - probing is additive, never fatal
             pass
     # Strict secret classification for the standalone web scan too: a page-source Google/Firebase key,

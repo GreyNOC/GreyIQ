@@ -2,9 +2,10 @@
 
 Short, scriptable commands over the same engine the desktop app uses:
 
-    gn hunt https://example.com -s "acme — *.example.com" --active -y
+    gn hunt https://example.com -s "example.com" --active -y
     gn hunt ./path/to/repo -p source-code -y
-    gn scan https://example.com
+    gn scan https://example.com --scope example.com -y
+    gn scan ./path/to/repo
     gn osint example.com
     gn osint example.com --hunt -s "*.example.com" -y
     gn profiles | gn classes | gn tools xss ssrf
@@ -907,21 +908,43 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
 
 
 def _cmd_scan(args: argparse.Namespace) -> int:
-    from bughunter.chat_commands import _code_target_type, _looks_like_path, _looks_like_url
+    from bughunter.chat_commands import (
+        _code_target_type, _looks_like_path, _looks_like_url,
+        validate_scoped_network_target,
+    )
+    from bughunter.code_scanner.sources.git_remote import is_supported_remote_git_url
     from bughunter.scan_service import run_code_scan
     from bughunter.triage import summarize_findings
     from bughunter.web_scan_service import run_web_scan
 
     target = args.target.strip()
-    if _looks_like_url(target):
-        result = run_web_scan(target)
+    lowered = target.lower()
+    remote_repo = is_supported_remote_git_url(target) or (
+        lowered.startswith(("http://", "https://", "ssh://", "git@"))
+        and (lowered.rstrip("/").endswith(".git") or lowered.startswith(("ssh://", "git@")))
+    )
+    if remote_repo:
+        gate = validate_scoped_network_target("code", target, args.scope, args.authorize)
+        if not gate["ok"]:
+            return _err(str(gate["error"]))
+        result = run_code_scan(target, "git_remote")
+    elif _looks_like_url(target):
+        gate = validate_scoped_network_target("web", target, args.scope, args.authorize)
+        if not gate["ok"]:
+            return _err(str(gate["error"]))
+        result = run_web_scan(target, scope_host=str(gate["scope_host"]))
     elif _looks_like_path(target):
-        result = run_code_scan(target, _code_target_type(target))
+        target_type = _code_target_type(target)
+        if target_type == "git_remote":
+            gate = validate_scoped_network_target("code", target, args.scope, args.authorize)
+            if not gate["ok"]:
+                return _err(str(gate["error"]))
+        result = run_code_scan(target, target_type)
     else:
         return _err("couldn't tell if that's a URL or a path. Use a full http(s):// URL or a folder/repo path.")
     if args.json:
         print(json.dumps(result, indent=2, default=str))
-        return 0
+        return 0 if result.get("ok") else 1
     print(summarize_findings(result))
     return 0 if result.get("ok") else 1
 
@@ -1517,7 +1540,7 @@ def build_parser() -> argparse.ArgumentParser:
     hunt.add_argument("target", help="https:// URL, repo URL, or local path")
     hunt.add_argument("-p", "--profile", default="full-sweep", help="hunt profile (default: full-sweep; see `gn profiles`)")
     hunt.add_argument("-c", "--class", dest="vuln_class", default=None, help="focus vuln class (see `gn classes`)")
-    hunt.add_argument("-s", "--scope", default="", help="program/scope notes (name the host here to allow active checks)")
+    hunt.add_argument("-s", "--scope", default="", help="explicit exact hosts or *.domain grants for URL hunts")
     hunt.add_argument("--active", action="store_true", help="active verification: send benign probes to PROVE findings (URL targets)")
     hunt.add_argument("--time-based", dest="time_based", action="store_true",
                       help="opt-in: add the bounded-SLEEP blind-SQLi probe (implies --active; off by default — it executes a fixed SLEEP)")
@@ -1537,7 +1560,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     camp = sub.add_parser("campaign", help="end-to-end: recon -> hunt every URL -> prove -> submission packages -> learn")
     camp.add_argument("target", help="https:// URL (recon-crawled) or repo/folder path")
-    camp.add_argument("-s", "--scope", default="", help="program/scope notes (name the host to allow active checks)")
+    camp.add_argument("-s", "--scope", default="", help="explicit exact hosts or *.domain grants for URL hunts")
     camp.add_argument("--program", default=None, help="program handle for the learning store (default: target domain)")
     camp.add_argument("--active", action="store_true", help="capture proof of impact on each URL (recommended)")
     camp.add_argument("--time-based", dest="time_based", action="store_true",
@@ -1654,8 +1677,10 @@ def build_parser() -> argparse.ArgumentParser:
     path = sub.add_parser("path", help="show the CLI PATH setup command and runtime data directory")
     path.set_defaults(func=_cmd_path)
 
-    scan = sub.add_parser("scan", help="quick code/web scan with a triage summary")
-    scan.add_argument("target", help="https:// URL or local path")
+    scan = sub.add_parser("scan", help="quick code/web scan; network targets require -y and exact --scope")
+    scan.add_argument("target", help="HTTP(S) URL or local path (remote Git currently unavailable)")
+    scan.add_argument("-s", "--scope", default="", help="exact host for web; exact HTTPS repository-root URL for remote code (no wildcard)")
+    scan.add_argument("-y", "--authorize", action="store_true", help="confirm the network target is authorized and in scope (required for web and remote repository scans)")
     scan.add_argument("--json", action="store_true", help="print the raw scan result")
     scan.set_defaults(func=_cmd_scan)
 
