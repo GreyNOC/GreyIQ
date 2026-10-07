@@ -4799,3 +4799,89 @@ body[data-app-mode="studio"] .panel-mode-btn.is-active {
   stroke-width: 1.6;
   vector-effect: non-scaling-stroke;
 }
+
+/* Electron's frame replacement. The preload reveals this only in the desktop app;
+   the browser UI retains its normal full-height layout. */
+.desktop-titlebar[hidden] { display: none !important; }
+.desktop-titlebar {
+  position: relative;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 38px;
+  background: var(--sidebar-bg);
+  color: var(--ink);
+  border-bottom: 1px solid var(--line);
+  -webkit-user-select: none;
+  user-select: none;
+}
+.desktop-titlebar-drag {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  gap: 0.5rem;
+  height: 100%;
+  min-width: 0;
+  padding: 0 0.85rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  -webkit-app-region: drag;
+}
+.desktop-titlebar-mark { width: 18px; height: 22px; }
+.desktop-titlebar-controls { display: flex; height: 100%; -webkit-app-region: no-drag; }
+.desktop-titlebar-button {
+  position: relative;
+  width: 46px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  -webkit-app-region: no-drag;
+}
+.desktop-titlebar-button:hover { background: var(--surface-2); }
+.desktop-titlebar-button:focus-visible { outline: 2px solid var(--focus); outline-offset: -3px; box-shadow: none; }
+.desktop-titlebar-button[data-window-control="close"]:hover { background: #c62828; color: #fff; }
+.desktop-titlebar-button[data-window-control="minimize"]::before {
+  content: "";
+  position: absolute;
+  left: 18px;
+  top: 19px;
+  width: 10px;
+  height: 1px;
+  background: currentColor;
+}
+.desktop-titlebar-button[data-window-control="maximize"]::before {
+  content: "";
+  position: absolute;
+  left: 18px;
+  top: 14px;
+  width: 10px;
+  height: 9px;
+  border: 1px solid currentColor;
+  box-sizing: border-box;
+}
+.desktop-titlebar-button[data-window-control="maximize"].is-maximized::before {
+  left: 20px;
+  top: 13px;
+  box-shadow: -3px 3px 0 -1px var(--sidebar-bg), -3px 3px 0 0 currentColor;
+}
+.desktop-titlebar-button[data-window-control="close"]::before {
+  content: "×";
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font: 22px/1 system-ui, sans-serif;
+}
+body.desktop-window .ck-splash { top: 38px; }
+body.desktop-window[data-app-mode="hunt"] .cockpit { height: calc(100vh - 38px); }
+@media (min-width: 1181px) {
+  body.desktop-window .app-shell { height: calc(100vh - 38px); }
+}
+@media (max-width: 820px) {
+  body.desktop-window[data-app-mode="hunt"] .cockpit { height: auto; min-height: calc(100vh - 38px); }
+}

@@ -79,7 +79,7 @@ jobs:
       # done. Cache @electron/get's store so the fetch is a cache hit on every run but the
       # first, and pull it explicitly (below) BEFORE the expensive freeze either way.
       - name: Cache the Electron binary (@electron/get store)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~\AppData\Local\electron\Cache
           key: electron-cache-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
@@ -264,7 +264,7 @@ jobs:
       # is downloaded lazily by electron-builder unless we pull it first. Cache the
       # @electron/get store (~/.cache/electron on Linux) and fetch explicitly before the freeze.
       - name: Cache the Electron binary (@electron/get store)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/electron
           key: electron-cache-${{ runner.os }}-${{ hashFiles('package-lock.json') }}

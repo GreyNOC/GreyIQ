@@ -108,7 +108,8 @@ test('model setup status selects only when chat and tool readiness passed', asyn
     const els = {
       brainModelStatus: { textContent: '' }, brainDownload: { disabled: true },
       brainSave: { disabled: true }, brainStatus: { textContent: '' },
-      brainModel: { value: '' },
+      brainModel: { value: 'previous-model' },
+      brainHfStatus: { textContent: '' }, brainHfImport: { disabled: true },
     };
     const context = {
       els, modelPullTimer: null,
@@ -120,15 +121,32 @@ test('model setup status selects only when chat and tool readiness passed', asyn
       refreshModelStatus() {}, setInterval: () => 1, clearInterval() {},
     };
     const poll = vm.runInNewContext(`${pollSource}\npollModelPull`, context);
-    poll();
+    poll({ statusEl: els.brainHfStatus, button: els.brainHfImport });
     await new Promise((resolve) => setImmediate(resolve));
     return { loads, els };
   }
   const selected = await exercise({ done: true, selected: true, model: 'hf.co/acme/Code-GGUF' });
   assert.equal(selected.loads, 1);
-  assert.match(selected.els.brainModelStatus.textContent, /ready for chat and agent tools/);
+  assert.match(selected.els.brainHfStatus.textContent, /ready for chat and agent tools/);
   const chatOnly = await exercise({ done: true, chat_only: true, selected: false,
     model: 'hf.co/acme/Code-GGUF', error: 'No structured tool call.' });
   assert.equal(chatOnly.loads, 0);
   assert.match(chatOnly.els.brainStatus.textContent, /previous brain is still active/);
+  const shardedProgress = await exercise({ active: true, done: false,
+    model: 'hf.co/acme/Code-GGUF', percent: 41, status: 'downloading GGUF part 2 of 4' });
+  assert.match(shardedProgress.els.brainHfStatus.textContent, /41% downloading GGUF part 2 of 4/);
+  assert.equal(shardedProgress.els.brainHfImport.disabled, true);
+  assert.equal(shardedProgress.loads, 0);
+  for (const error of [
+    'Not enough free disk space for this GGUF model. Free space and retry.',
+    'This GGUF model architecture is unsupported by the local Ollama runtime. Choose a compatible model.',
+  ]) {
+    const failed = await exercise({ done: true, selected: false,
+      model: 'hf.co/acme/Code-GGUF', error });
+    assert.equal(failed.loads, 0, 'a failed import must not load or select the new brain');
+    assert.equal(failed.els.brainModel.value, 'previous-model');
+    assert.equal(failed.els.brainHfImport.disabled, false, 'retry must be available');
+    assert.match(failed.els.brainHfStatus.textContent, /Your brain setting is unchanged\./);
+    assert.ok(failed.els.brainHfStatus.textContent.includes(error));
+  }
 });

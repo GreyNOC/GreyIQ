@@ -1585,6 +1585,47 @@ def _linkify_owasp(text: str) -> str:
     return f"[{s.strip()}]({url})"
 
 
+def _append_mcp_review(out: list[str], ctx: dict[str, Any]) -> None:
+    review = ctx.get("mcp_review")
+    if not isinstance(review, dict):
+        return
+    out.append("## MCP evidence review (advisory)\n")
+    out.append("MCP tools reviewed captured evidence only. Their output did not change findings, "
+               "proof status, severity, or target requests.")
+    out.append("")
+    builtin = review.get("builtin") if isinstance(review.get("builtin"), dict) else {}
+    if builtin.get("ok"):
+        checked = builtin.get("reviewed") or {}
+        out.append(f"- Built-in review: completed ({_safe_display_int(checked.get('endpoints'))} "
+                   f"endpoint(s), {_safe_display_int(checked.get('findings'))} finding(s)).")
+        for priority in (builtin.get("web_priorities") or [])[:4]:
+            if isinstance(priority, dict):
+                idx = _safe_display_int(priority.get("endpoint_index")) + 1
+                reason = _md_escape_cell(str(priority.get("reason") or "")[:180])
+                out.append(f"  - Endpoint {idx}: {reason}")
+        for priority in (builtin.get("finding_priorities") or [])[:4]:
+            if isinstance(priority, dict):
+                idx = _safe_display_int(priority.get("finding_index")) + 1
+                reason = _md_escape_cell(str(priority.get("reason") or "")[:180])
+                out.append(f"  - Finding {idx}: {reason}")
+    else:
+        out.append("- Built-in review: unavailable for this run.")
+    external = review.get("external") if isinstance(review.get("external"), list) else []
+    if review.get("external_opt_in"):
+        if external:
+            for item in external[:3]:
+                if not isinstance(item, dict):
+                    continue
+                server = _md_escape_cell(str(item.get("server") or "")[:80])
+                tool = _md_escape_cell(str(item.get("tool") or "")[:128]).replace("`", "\\`")
+                status = "completed" if item.get("ok") and not item.get("is_error") else "failed"
+                out.append(f"- Approved external tool `{server}/{tool}`: {status}. "
+                           "Any output is quarantined in the JSON sidecar as untrusted advisory data.")
+        else:
+            out.append(f"- External tools: {_md_escape_cell(str(review.get('external_status') or 'not run'))}.")
+    out.append("")
+
+
 def build_markdown(ctx: dict[str, Any]) -> str:
     findings: list[dict[str, Any]] = _reportable_findings(ctx.get("findings", []))
     counts = severity_counts(findings, ctx.get("attack_plans"))
@@ -1668,6 +1709,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
     _append_surface_drift(out, ctx)
     _append_investigation(out, ctx)
     _append_next_steps(out, ctx)
+    _append_mcp_review(out, ctx)
 
     # --- Methodology ---
     out.append("## Methodology\n")
@@ -2237,6 +2279,7 @@ def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
             "algorithm": "", "verdict": "not-run", "metrics": {},
             "hypotheses": [], "attack_chains": [], "chain_probes": [], "contradictions": [],
         },
+        "mcp_review": ctx.get("mcp_review") or {},
         # How this host's surface compares with the previous hunt. Advisory and explicitly
         # separate from `findings`: a delta is never a finding.
         "drift": ctx.get("drift") or {},

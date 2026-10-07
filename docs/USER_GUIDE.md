@@ -10,11 +10,39 @@ and a first-time launch opens a short guided tour automatically (reopen it anyti
 ## Before anything else: authorization
 
 GreyIQ is built for **authorized testing only** — your own assets, an engagement you're
-contracted for, or a bug-bounty program you're enrolled in. Every active probe requires
-you to tick an authorization checkbox *and* name the exact host in **Scope**; both are
-enforced server-side, fail-closed. A host you never named in Scope is never touched, no
-matter what the UI lets you type into Target. Nothing here authorizes you to test anything
-— that authorization has to already exist before you open the app.
+contracted for, or a bug-bounty program you're enrolled in. In the Hunt cockpit, active
+probes require an authorization checkbox and an enforceable host in **Scope**. In chat,
+network probes require `-y` and an exact host through `--scope`. Both paths fail closed
+before probing a host that the operator has not named. Nothing here authorizes you to
+test anything — that authorization has to already exist before you open the app.
+
+Optional MCP servers are configured under **Brain → MCP servers**. Chat tool calls
+still require explicit `mcp tools -y` or `mcp call -y` commands; the chat model
+does not choose tools. During an authorized hunt, GreyIQ automatically calls a
+built-in, in-memory MCP tool to review captured evidence without making target
+requests. To include an external evidence-only tool, enable and test its server,
+approve its exact advertised tool, and check **External MCP evidence analysis**
+for that run. The automatic payload contains fixed categories and counts, not
+the target URL, scope text, or raw evidence. The external server controls its
+own network requests outside GreyIQ's guard, so approve only tools verified to
+avoid target requests. MCP
+review is advisory and cannot promote a finding or change a probe. The built-in
+chat scan commands below enforce GreyIQ's exact-host gate.
+
+Chat network scans also require an explicit assertion and exact host: `scan web -y
+--scope app.example.com https://app.example.com/`. Local source scans use
+`scan code <local-path>`. The short chat command
+assumes the entire named host is permitted; use a saved program hunt when the
+policy has path limits, exclusions, time windows, or required request markers.
+Remote source URLs are recognized but cloning is currently disabled because
+Git can fetch alternate object stores beyond the named repository. Scan a
+local clone with `scan code <local-path>`.
+For a bounded active proof pass, use `scan active -y --scope app.example.com
+https://app.example.com/`. It runs in the background, uses up to 16 GET/HEAD/OPTIONS
+requests, and updates the chat bubble with observed results and negative controls.
+Time-based probes are disabled in this command.
+Scoped live browser scans refuse to run until the browser's DNS connection can
+be pinned to the address checked by the scope guard.
 
 ## 1. Program setup
 
@@ -27,23 +55,12 @@ A program record has: a name, an optional HackerOne team handle, a **structured 
 table (one row per in-scope/out-of-scope asset), optional program-provided source repository
 links, an `oob_allowed` flag, and free-text notes.
 
-### Getting a program and scope in — four ways
+### Getting a program and scope in
 
-**Start from a repository link.** At the top of the Program tab, paste one or more public
-HTTPS repository-root links and click **Create draft program →**. GreyIQ validates the same
-GitHub, GitLab, Bitbucket, Codeberg, and SourceHut roots accepted by the source scanner,
-derives a program name from the repository owner, and opens the existing review form with
-**Clone and adversarially scan** already selected. The new record is inactive, disabled for
-autonomous scheduling, and has no web scope until you review and save it. Issue, blob, tree,
-pull-request, credential-bearing, and non-allowlisted URLs are rejected.
-
-The optional **Enrich from forge (read-only)** checkbox is off by default. On the explicit
-create click, it makes at most one unauthenticated GET per repository to GitHub's public API
-(`api.github.com`) or GitLab's public API (`gitlab.com`); other forges are skipped. A returned
-description is added to Notes. Homepage/web domains appear only as **unticked** suggested
-scope rows with a reminder to confirm authorization. They are never written into the draft's
-scope by the backend and never become in-scope unless you deliberately tick **In scope** and
-save. Failures are best-effort and do not prevent the local draft from being created.
+**Repository-link setup is paused.** The Program wizard disables **From a repo link**
+while remote Git transport cannot be constrained to the authorized repository.
+Create the program manually if its scope includes source code, and scan an
+operator-supplied local clone through the local-path scanner.
 
 **Fetch from HackerOne (API).** If you have a HackerOne API username + token saved (see
 [HackerOne credentials](#hackerone-credentials) below), enter the program's team handle and
@@ -109,12 +126,13 @@ plain list of hosts.
 required field. Everything else (asset type, bounty eligibility, severity cap, instructions)
 is optional metadata.
 
-**Add a program-provided source repository.** Paste each public HTTPS repository-root link
-into **Program-provided source repositories**, then explicitly enable **Clone and adversarially
-scan**. HackerOne/CSV imports that contain supported GitHub, GitLab, Bitbucket, Codeberg, or
-SourceHut repository roots are detected and copied into this review list, but cloning remains
-off until you opt in. Issue, pull-request, blob, and tree pages are not accepted as repositories.
-Private-repository credentials are intentionally not accepted in repository URLs.
+**Record a program-provided source repository.** Paste each public HTTPS repository-root link
+into **Program-provided source repositories**. HackerOne/CSV imports that contain supported
+GitHub, GitLab, Bitbucket, Codeberg, or SourceHut roots are detected and copied into this
+review list. The **Clone and adversarially scan** control is currently fail closed even when
+enabled: Git cannot yet guarantee that every fetch stays at the authorized repository. To
+scan source, supply a local clone under the local-path scanner instead. Issue, pull-request,
+blob, and tree pages are not accepted as repository roots; embedded credentials are refused.
 
 ### Review before you hunt
 
@@ -132,9 +150,15 @@ Whichever way scope arrived, review the table before saving:
   GreyIQ stops manual program hunts and proof requests when its host-only probe
   guard cannot enforce that narrower asset. Add a separate host or wildcard row
   only if the current program policy explicitly permits testing the whole host.
-- For an ad hoc active hunt, enter a bare host or explicit wildcard in Scope only
+- For an ad hoc URL hunt, enter only bare hosts or explicit wildcards in Scope,
+  separated by spaces, commas, or semicolons. Keep policy prose in program Notes.
+  Enter a host grant only
   when the published policy permits that host. A pasted URL or path by itself
-  cannot be widened into host authorization by the active probe gate.
+  cannot be widened into host authorization by the preflight gate, and an
+  out-of-scope host is refused before the initial passive request.
+- For a remote repository hunt, name the exact supported HTTPS repository-root
+  URL in Scope. A forge hostname does not grant every repository on that service.
+  Remote cloning currently refuses to run; use a local clone for source analysis.
 - Re-fetching program scope keeps existing exclusions. If all excluded rows cannot
   fit within the bounded scope table, review and narrow the rows before saving.
 - Scope text you enter in the Operator tab stays exactly as entered when you
@@ -278,8 +302,9 @@ making old grants executable.
 
 All three default to **passive-only**. Ticking **"Test for proof of impact (active)"** turns
 on benign, in-scope-only active probes that can mark a finding **Confirmed** instead of just
-flagged; it (and every other active/opt-in mode — deep SQLi, live browser pass, deep
-auto-work) still only ever fires against a host actually named in Scope.
+flagged; deep SQLi and deep auto-work still only ever fire against a host
+actually named in Scope. The live browser option is disabled until its DNS
+egress can be pinned to the same checked host.
 
 ### Passive OSINT campaigns (local CLI)
 

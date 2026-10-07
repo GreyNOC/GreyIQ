@@ -2,11 +2,11 @@
 
 Notable changes to GreyIQ.
 
-## v4.9.1-hunt.1 - verified hunt learning and local TinyGPT bundle
+## Unreleased
 
-- Record completed verifier suites and confirmed outcomes as the evidence for
-  hunt learning. Filtered findings and interrupted checks cannot create false
-  negative labels. Check identity remains distinct from reported impact.
+- Record completed verifier suites and confirmed outcomes as evidence for hunt
+  learning. Filtered findings and interrupted checks cannot create false
+  negative labels; check identity remains distinct from reported impact.
 - Retrain the local hunt ranker after new traces and promote weights only when
   held-out recall matches or beats both the rules and the active model.
 - Update one learning outcome per finding as platform verdicts change, so
@@ -14,6 +14,44 @@ Notable changes to GreyIQ.
 - Make verified coding lessons available to TinyGPT training and live retrieval.
   Local Windows builds can opt in to bundle TinyGPT, CPU torch, and a seed model;
   the frozen build checks that the model loads.
+- Remove unsupported Bugcrowd researcher API discovery and scope preview. Manual
+  and CSV intake and Bugcrowd report formatting remain available.
+- Wait for the operator worker to record its stopped audit and release its lease
+  before the CLI exits after interruption.
+
+## v4.9.2 - authorized assessment and MCP hunt review
+
+- Expand the local security knowledge and hunt workflow with scope-bound active
+  checks, source review, evidence grading, and privacy-aware reporting. Remote
+  repository and local source scans now apply explicit preflight controls.
+- Add operator-managed MCP servers for manual chat commands and a built-in,
+  in-memory MCP evidence review that runs automatically after authorized hunts.
+- Let operators approve exact external evidence-only MCP tools and opt in to
+  their use for one hunt. Calls are bounded by run permits and saved server
+  fingerprints; results remain untrusted advisory data and cannot alter proof
+  or launch target requests.
+
+## v4.9.1 - split GGUF import and desktop setup
+
+- Import public Hugging Face repositories containing only split GGUF files by
+  selecting a complete quantization set, checking Ollama 0.35.0+ and available
+  download space, verifying each shard, and creating a local Ollama model from
+  the original filenames. Reuse downloaded shards and Ollama blobs on retry;
+  report download and model creation failures in the import panel.
+- Keep the previous coding brain selected unless the new model passes both
+  chat and agent tool-call readiness checks. Allow `OLLAMA_MODELS` to place the
+  packaged Ollama model store on a volume with sufficient capacity. Split imports
+  stop before download if an external server's store cannot be verified or if a
+  FAT32 volume cannot hold an individual shard. A GreyIQ-launched system Ollama
+  can use an explicit `OLLAMA_MODELS` path after GreyIQ confirms that child owns
+  the server port.
+- Let operators save and test HackerOne API credentials directly in the Program
+  wizard before browsing programs or fetching scope. Credential-shaped text in
+  the program search box is stopped locally instead of sent as a query. Late
+  browse and preview responses are discarded after switching platforms, so
+  scope from one platform cannot be saved under another.
+- Use a frameless desktop window with in-app minimize, maximize, and close
+  controls, including on backend startup and error screens.
 
 ## v4.9.0 - Debian 13, guarded operator, and platform program intake
 

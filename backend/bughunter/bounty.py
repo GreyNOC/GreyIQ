@@ -7,13 +7,16 @@ scanner(s), classify and prioritize findings, ask the configured coding brain
 Markdown report + JSON sidecar to a chosen folder.
 
 Authorization: bug-bounty testing is authorized testing. A hunt refuses to run
-unless the caller confirms the target is in scope (``authorized=True``). The
+unless the caller confirms authorization (``authorized=True``); URL hunts also
+require an explicit host grant, and remote repository hunts require the exact
+repository root in ``scope`` before any request. The
 underlying scanners are static (source) or passive (one GET) and keep their own
 SSRF / base-path guards — nothing here exploits a live target.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import shlex
@@ -42,6 +45,7 @@ from bughunter import impact_model
 from bughunter import investigator
 from bughunter import ledger
 from bughunter import learning
+from bughunter import mcp_hunt
 from bughunter import negative_knowledge
 from bughunter import next_steps as next_steps_lib
 from bughunter import recon
@@ -53,9 +57,10 @@ from bughunter import surface_drift
 from bughunter import toolkit as toolkit_lib
 from bughunter import web_ingest
 from bughunter.code_scanner.redaction import redact_text
-from bughunter.code_scanner.sources.git_remote import is_supported_remote_git_url
+from bughunter.code_scanner.sources.git_remote import canonical_repo_root, is_supported_remote_git_url
 from bughunter.live_scan_service import run_live_scan
 from bughunter.rate_limit import HostRateGovernor, shared_governor
+from bughunter.registrable_domain import is_bare_public_suffix
 from bughunter.scan_service import run_code_scan
 from bughunter.scan_auth import AuthContext, build_auth
 from bughunter.web_scan_service import run_web_scan
@@ -560,6 +565,127 @@ def _infer_kind(target: str) -> str:
     if " " not in raw and re.match(r"^[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?(?:/.*)?$", lowered):
         return "url"
     return "unknown"
+
+
+_SCOPE_DNS_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_SCOPE_DNS_HOST = re.compile(rf"{_SCOPE_DNS_LABEL}(?:\.{_SCOPE_DNS_LABEL})*")
+
+
+def _canonical_scope_host(value: str) -> str:
+    """Normalize one literal host without resolving it or broadening its meaning."""
+    raw = str(value or "").strip().lower().rstrip(".")
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    try:
+        return ipaddress.ip_address(raw).compressed
+    except ValueError:
+        pass
+    try:
+        ascii_host = raw.encode("idna").decode("ascii")
+    except UnicodeError:
+        return ""
+    return ascii_host if _SCOPE_DNS_HOST.fullmatch(ascii_host) else ""
+
+
+def _url_scope_preflight(target: str, scope: str, settings: Any = None) -> tuple[str, str]:
+    """Return (exact target host, error) before any URL hunt network activity.
+
+    Scope is a list of *host-only* grants. An exact host grants only itself;
+    ``*.domain`` grants proper subdomains, never the apex. Prose, URL/path/port
+    policies, and malformed tokens are ambiguous here and grant nothing.
+    """
+    if any(ch.isspace() for ch in target) or "\\" in target:
+        return "", "Use a valid http(s) URL with no whitespace or backslashes."
+    try:
+        parsed = urlparse(target if "://" in target else f"https://{target}")
+        host = _canonical_scope_host(parsed.hostname or "")
+        _port = parsed.port  # malformed ports must fail before a scanner sees the URL
+    except ValueError:
+        return "", "Use a valid http(s) URL with a host and no embedded credentials."
+    if parsed.scheme not in {"http", "https"} or not host or "@" in parsed.netloc:
+        return "", "Use a valid http(s) URL with a host and no embedded credentials."
+
+    raw_scope = str(scope or "").strip()
+    if not raw_scope:
+        return "", "URL hunts require explicit scope: the exact target host or a *.domain wildcard."
+    grants: list[tuple[str, bool]] = []
+    for token in re.split(r"[\s,;]+", raw_scope):
+        if not token:
+            continue
+        # A saved program may list a public source repository next to its web
+        # hosts. That URL is a separate code asset, never a web-host grant.
+        if is_supported_remote_git_url(token):
+            continue
+        wildcard = token.startswith("*.")
+        named_host = _canonical_scope_host(token[2:] if wildcard else token)
+        if (
+            not named_host
+            or is_bare_public_suffix(named_host)
+            or ("." not in named_host and ":" not in named_host and named_host != "localhost")
+            or (wildcard and ("." not in named_host or ":" in named_host))
+        ):
+            return "", "Scope must list only exact hosts or *.domain wildcards; prose, URLs, paths, and ports are ambiguous."
+        grants.append((named_host, wildcard))
+    if not grants:
+        return "", "URL hunts require explicit scope: the exact target host or a *.domain wildcard."
+
+    for excluded in getattr(settings, "excluded_hosts", ()) or ():
+        excluded_host = _canonical_scope_host(str(excluded).removeprefix("*."))
+        if excluded_host and (host == excluded_host or host.endswith("." + excluded_host)):
+            return "", f"Target host {host} is excluded from this program's scope."
+
+    if not any(
+        (host.endswith("." + grant) and host != grant) if wildcard else host == grant
+        for grant, wildcard in grants
+    ):
+        return "", f"Target host {host} is not explicitly named by the scope."
+    return host, ""
+
+
+def _canonical_repository_root(value: str) -> str:
+    """Use the clone transport's parser for the same repository identity."""
+    return canonical_repo_root(value)
+
+
+def _repository_scope_preflight(target: str, scope: str, settings: Any = None) -> str:
+    """Return an error unless scope names this exact public repository root.
+
+    Host grants are valid *other* assets in a saved program, but never grant a
+    repository clone. Every non-host, non-repository token makes the scope
+    ambiguous and fails closed, even when a matching repository appears later.
+    """
+    root = _canonical_repository_root(target)
+    if not root:
+        return "Use a supported public HTTPS repository-root URL without a branch, path expansion, port, or credentials."
+    if not str(scope or "").strip():
+        return "Remote repository hunts require the exact repository-root URL in scope."
+
+    repositories: set[str] = set()
+    for token in re.split(r"[\s,;]+", str(scope).strip()):
+        if not token:
+            continue
+        repository = _canonical_repository_root(token)
+        if repository:
+            repositories.add(repository)
+            continue
+        wildcard = token.startswith("*.")
+        named_host = _canonical_scope_host(token[2:] if wildcard else token)
+        if (
+            not named_host
+            or is_bare_public_suffix(named_host)
+            or ("." not in named_host and ":" not in named_host and named_host != "localhost")
+            or (wildcard and ("." not in named_host or ":" in named_host))
+        ):
+            return "Repository scope must list exact public repository roots or host-only grants, without prose or path expansions."
+
+    host = urlparse(root).hostname or ""
+    for excluded in getattr(settings, "excluded_hosts", ()) or ():
+        excluded_host = _canonical_scope_host(str(excluded).removeprefix("*."))
+        if excluded_host and (host == excluded_host or host.endswith("." + excluded_host)):
+            return f"Repository host {host} is excluded from this program's scope."
+    if root not in repositories:
+        return f"Repository {root} is not explicitly named by the saved scope."
+    return ""
 
 
 def _classify(finding: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -1502,7 +1628,7 @@ def _resolve_output_dir(output_dir: str | None, default_reports_dir: Path) -> Pa
     return target
 
 
-def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: int, run_live: bool, auth: AuthContext | None = None) -> tuple[list[dict[str, Any]], list[str], dict[str, Any], str, float, list[dict[str, Any]]]:
+def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: int, run_live: bool, auth: AuthContext | None = None, *, scope_host: str = "") -> tuple[list[dict[str, Any]], list[str], dict[str, Any], str, float, list[dict[str, Any]]]:
     """Run the profile's scanners for the inferred target kind. Returns
     (raw_findings, scanners_run, scan_meta, risk, score, chain_signals)."""
     scanners = profile["scanners"]
@@ -1520,7 +1646,7 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
         if scanner == "code":
             result = run_code_scan(target, "git_remote" if kind == "git" else "path", max_files=max_files)
         elif scanner == "web":
-            result = run_web_scan(target, probe_paths=True, auth=auth)
+            result = run_web_scan(target, probe_paths=True, auth=auth, scope_host=scope_host)
         else:
             continue
         ran.append(scanner)
@@ -1541,7 +1667,7 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
             meta[scanner] = {"error": result.get("error", "scan failed")}
 
     if run_live and kind == "url":
-        live = run_live_scan(target)
+        live = run_live_scan(target, scope_host=scope_host)
         ran.append("live")
         if live.get("ok"):
             raw.extend(live.get("findings", []))
@@ -2456,6 +2582,133 @@ def _write_sensitive_data_files(display: list[dict[str, Any]], base_dir: Path) -
     return paths
 
 
+def _run_hunt_mcp_review(
+    kind: str,
+    target: str,
+    scope: str,
+    surface: dict[str, Any],
+    findings: list[dict[str, Any]],
+    *,
+    risk: str,
+    score: int,
+    scanners_run: list[str],
+    external_mcp_hunt: bool,
+    mcp_manager: Any,
+    stopped: Any,
+    emit: Any,
+    blocked: bool = False,
+) -> dict[str, Any]:
+    """Run evidence-only MCP reviews after the hunt's authorization and proof gates.
+
+    MCP data is quarantined in this advisory result. In particular, no returned
+    text is allowed to select probes, promote findings, or alter the proof map.
+    """
+    review: dict[str, Any] = {
+        "advisory": True, "builtin": {}, "external_opt_in": bool(external_mcp_hunt),
+        "external": [],
+    }
+    if stopped():
+        review["status"] = "stopped"
+        return review
+    try:
+        review["builtin"] = mcp_hunt.run_builtin_hunt_review(kind, target, scope, surface, findings)
+        if review["builtin"].get("ok"):
+            emit("MCP: reviewed captured hunt evidence")
+    except Exception:  # noqa: BLE001 - advisory analysis cannot break a completed hunt
+        review["builtin"] = {"ok": False, "error": "Built-in MCP evidence review failed."}
+
+    if not external_mcp_hunt:
+        review["external_status"] = "not-requested"
+        return review
+    if blocked or stopped():
+        review["external_status"] = "stopped"
+        return review
+    if not str(scope or "").strip() or mcp_manager is None:
+        review["external_status"] = "unavailable"
+        return review
+    try:
+        listed = mcp_manager.list_hunt_approvals()
+        if not listed.get("ok"):
+            review["external_status"] = "approval-store-error"
+            return review
+        approvals = listed.get("approvals")
+        approved = [a for a in (approvals or [])
+                    if isinstance(a, dict) and a.get("valid") and a.get("evidence_only")]
+        if not approved:
+            review["external_status"] = "no-approved-tools"
+            return review
+        counts = {level: 0 for level in ("critical", "high", "medium", "low", "info")}
+        for finding in findings:
+            level = str(finding.get("severity") or "").lower()
+            if level in counts:
+                counts[level] += 1
+        safe_findings: list[dict[str, str]] = []
+        for index, finding in enumerate(findings[:20], 1):
+            level = str(finding.get("severity") or "").lower()
+            class_id = str(finding.get("class_id") or "")
+            safe_findings.append({
+                "ref": f"M{index}",
+                # Only fixed taxonomy is shared. A scanner title/category can
+                # contain a user URL, identifier, or arbitrary target text that
+                # a secret detector cannot reliably recognize.
+                "title": "",
+                "category": class_id if class_id in VULN_CLASSES else "",
+                "severity": level if level in counts else "unknown",
+                "proof_status": "unknown",
+                "observation": "",
+                "negative_control": "",
+                "limitations": "",
+            })
+        snapshot = {
+            "summary": {
+                "risk": str(risk or "")[:20], "score": int(score),
+                "finding_count": len(findings), "severity_counts": counts,
+                "scanners_run": [str(name)[:40] for name in scanners_run[:12]],
+            },
+            "findings": safe_findings,
+        }
+        for approval in approved[:3]:
+            if stopped():
+                review["external_status"] = "stopped"
+                break
+            server = str(approval.get("server") or "")
+            tool = str(approval.get("tool") or "")
+            run_id = uuid4().hex
+            permit = mcp_manager.create_hunt_permit(
+                run_id, target, scope, authorized=True, server=server, tool=tool, max_calls=1)
+            if not permit.get("ok") or not permit.get("token"):
+                review["external"].append({"server": server, "tool": tool, "ok": False,
+                                           "error": str(permit.get("error") or "Permit denied.")[:200]})
+                continue
+            token = str(permit["token"])
+            try:
+                result = mcp_manager.call_approved_hunt_tool(
+                    server, tool, snapshot, permit_token=token, target=target,
+                    scope=scope, run_id=run_id, stopped=stopped())
+            finally:
+                mcp_manager.revoke_hunt_permit(token)
+            item: dict[str, Any] = {
+                "server": server, "tool": tool, "ok": bool(result.get("ok")),
+                "is_error": bool(result.get("is_error")),
+                "truncated": bool(result.get("truncated")),
+            }
+            if result.get("ok") and not result.get("is_error"):
+                excerpt = "\n".join(str(block.get("text") or "")
+                                    for block in (result.get("content") or [])
+                                    if isinstance(block, dict) and block.get("type") == "text")
+                excerpt = redact_text(excerpt[:1600])[0]
+                item["untrusted_output_excerpt"] = "".join(
+                    ch for ch in excerpt if ch in "\n\t" or ord(ch) >= 32)[:1200]
+                emit(f"MCP: {server}/{tool} reviewed captured evidence")
+            else:
+                item["error"] = str(result.get("error") or "MCP tool returned an error.")[:200]
+            review["external"].append(item)
+        review.setdefault("external_status", "complete")
+    except Exception:  # noqa: BLE001 - external analysis cannot block report export
+        review["external_status"] = "error"
+    return review
+
+
 def run_bounty_hunt(
     target: str,
     profile_id: str,
@@ -2466,6 +2719,7 @@ def run_bounty_hunt(
     coder_cfg: dict[str, Any] | None,
     *,
     user_agent_suffix: str = "",
+    validate_credential_issuers: bool = False,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Run one hunt, first honoring the program's HUNTING REQUIREMENT for a user-agent tag.
@@ -2485,7 +2739,8 @@ def run_bounty_hunt(
     ua_token = web_ingest.set_ua_suffix(user_agent_suffix) if str(user_agent_suffix or "").strip() else None
     try:
         return _run_bounty_hunt_body(
-            target, profile_id, vuln_class, output_dir, scope, authorized, coder_cfg, **kwargs
+            target, profile_id, vuln_class, output_dir, scope, authorized, coder_cfg,
+            validate_credential_issuers=validate_credential_issuers, **kwargs
         )
     finally:
         # try/finally so a raise or an early return can never leak one program's tag into the next
@@ -2511,6 +2766,7 @@ def _run_bounty_hunt_body(
     active: bool = False,
     time_based: bool = False,
     auth: dict[str, Any] | None = None,
+    validate_credential_issuers: bool = False,
     max_files: int = 5000,
     per_finding: bool = False,
     extra_params: list[str] | None = None,
@@ -2529,6 +2785,8 @@ def _run_bounty_hunt_body(
     class_priority: list[str] | None = None,
     ssrf_params: list[str] | None = None,
     xss_params: list[str] | None = None,
+    external_mcp_hunt: bool = False,
+    mcp_manager: Any = None,
 ) -> dict[str, Any]:
     """Run a bounty hunt end to end and write a Markdown + JSON report.
 
@@ -2580,6 +2838,16 @@ def _run_bounty_hunt_body(
         }
     if kind == "git" and not clean_target.lower().startswith("https://"):
         return {"ok": False, "error": "Point git hunts at a full https:// URL (e.g. https://github.com/org/repo). SSH/SCP git URLs aren't supported."}
+    if kind == "git":
+        repository_scope_error = _repository_scope_preflight(clean_target, scope, settings)
+        if repository_scope_error:
+            return {"ok": False, "error": repository_scope_error}
+
+    scope_host = ""
+    if kind == "url":
+        scope_host, scope_error = _url_scope_preflight(clean_target, scope, settings)
+        if scope_error:
+            return {"ok": False, "error": scope_error}
 
     # Optional authenticated scanning: bind the operator's cookie/headers to the
     # target host. Attached SAME-SITE only (see scan_auth) so the session reaches
@@ -2596,7 +2864,9 @@ def _run_bounty_hunt_body(
     if kind == "git":
         _emit("cloning authorized repository (shallow, single branch)…")
     _emit("running adversarial source scan…" if kind in {"git", "path"} else "running scanner(s)…")
-    raw_findings, scanners_run, scan_meta, risk, score, chain_signals = _run_scanners(profile, kind, clean_target, max_files, run_live, auth_ctx)
+    raw_findings, scanners_run, scan_meta, risk, score, chain_signals = _run_scanners(
+        profile, kind, clean_target, max_files, run_live, auth_ctx, scope_host=scope_host,
+    )
     _emit(f"scan complete — {', '.join(scanners_run) or 'no'} scanner(s) ran, {len(raw_findings)} raw finding(s), risk={risk}")
     # Surface scanner failures instead of letting a failed scan read as a clean
     # target (the worst failure mode for a bug-finding tool). If every scanner
@@ -3089,14 +3359,12 @@ def _run_bounty_hunt_body(
             except Exception as exc:  # noqa: BLE001
                 _emit(f"JWT key-URL OOB probe error: {exc}")
 
-    # Credential validation: a leaked Firebase/Google API key is only a REAL finding if it's live.
-    # Gated by ``authorized`` — it sends ONE benign, read-only GET to the credential's OWN issuer
-    # (Google, never the target), carrying only the found key, to prove liveness + name the project.
-    # Best-effort; an error never breaks a hunt.
-    # Unattended grants authorize only target-scoped, budgeted reads. Issuer
-    # validation transmits recovered credentials to third-party services and
-    # bypasses those request controls, so leave detections for human review.
-    if authorized and operator_guard.current() is None:
+    # Issuer validation transmits recovered credentials to third-party services,
+    # which a target's general authorization does not cover. Require a separate
+    # explicit opt-in; normal UI/CLI hunts leave detections for human review.
+    # Unattended grants authorize only target-scoped, budgeted reads, so they
+    # never enable issuer checks even when this opt-in was provided.
+    if authorized and validate_credential_issuers and operator_guard.current() is None:
         exposure_findings: list[dict[str, Any]] = []
         # AWS keys need the access-key-id AND its paired secret to sign a SigV4 request, but the two are
         # detected as SEPARATE findings. Index each file's secret access key (the 40-char tail of the
@@ -3512,6 +3780,20 @@ def _run_bounty_hunt_body(
     ctx["next_steps"] = next_steps_lib.build_next_steps(ctx, brain.get("next_steps"))
     ctx["coverage"] = next_steps_lib.coverage_summary(ctx)
 
+    # Review the completed, reportable evidence through the built-in MCP tool.
+    # It has no network capability and returns only advisory priorities. An
+    # external tool requires an additional per-run opt-in and a persisted,
+    # fingerprint-bound approval for that exact evidence-only tool. Neither
+    # response is fed back into proof, severity, active requests, or the brain.
+    ctx["mcp_review"] = _run_hunt_mcp_review(
+        kind, clean_target, scope, investigation_surface,
+        report_lib._reportable_findings(display),
+        risk=risk, score=score, scanners_run=scanners_run,
+        external_mcp_hunt=external_mcp_hunt, mcp_manager=mcp_manager,
+        stopped=_stopped, emit=_emit,
+        blocked=bool(active_meta.get("rate_limited")),
+    )
+
     _emit("writing report…")
     markdown = report_lib.build_markdown(ctx)
     json_doc = report_lib.build_json(ctx)
@@ -3655,6 +3937,7 @@ def _run_bounty_hunt_body(
         "brain_model": f"{brain.get('provider')}:{brain.get('model')}" if brain.get("used") else "",
         "next_steps": ctx["next_steps"],
         "coverage": ctx["coverage"],
+        "mcp_review": ctx["mcp_review"],
         "investigation": json_doc["investigation"],
         # Sub-finding escalation clues. Returned so a CAMPAIGN can chain across targets — a
         # session cookie scoped to the parent domain here and a claimable subdomain there is

@@ -292,6 +292,7 @@ class OperatorGuardTests(unittest.TestCase):
             pass
         finding = {"rule_id": "secret.github-pat", "secret_value": "ghp_" + "x" * 36,
                    "file_path": "https://example.com"}
+        issuer_calls: list[str] = []
         guard = operator_guard.RunGuard(self.rt, self._grant(), threading.Event())
         with operator_guard.bind(guard), \
              patch.object(bounty, "_run_scanners", return_value=([finding], ["web"], {"web": {}}, "low", 0.1, [])), \
@@ -301,7 +302,7 @@ class OperatorGuardTests(unittest.TestCase):
              patch.object(bounty.oob_service, "confirm_blind_xxe") as xxe, \
              patch.object(bounty.oob_service, "confirm_blind_rce") as rce, \
              patch.object(bounty.oob_service, "confirm_jwt_key_injection") as jwt_key, \
-             patch.dict(bounty._TOKEN_ISSUER_VALIDATORS, {"secret.github-pat": lambda key: (_ for _ in ()).throw(AssertionError("issuer called"))}), \
+             patch.dict(bounty._TOKEN_ISSUER_VALIDATORS, {"secret.github-pat": lambda key: issuer_calls.append(key)}), \
              patch.object(bounty.credential_validation, "validate_aws_key") as aws, \
              patch.object(bounty.credential_validation, "validate_firebase_key") as firebase, \
              patch.object(bounty.credential_validation, "probe_firebase_exposure") as exposure, \
@@ -310,12 +311,14 @@ class OperatorGuardTests(unittest.TestCase):
                 bounty._run_bounty_hunt_body(
                     "https://example.com", "web-app", None, None, "example.com", True, None,
                     default_reports_dir=Path(self.rt), active=True, extra_params=[], class_priority=[],
+                    validate_credential_issuers=True,
                     oob_base="https://collaborator.example", oob_secret="configured",
                 )
             ssrf.assert_not_called()
             xxe.assert_not_called()
             rce.assert_not_called()
             jwt_key.assert_not_called()
+            self.assertEqual(issuer_calls, [])
             aws.assert_not_called()
             firebase.assert_not_called()
             exposure.assert_not_called()
