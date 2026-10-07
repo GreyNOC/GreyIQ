@@ -4,6 +4,11 @@ Notable changes to GreyIQ.
 
 ## Unreleased
 
+## v4.9.6 - unsigned macOS packaging
+
+- Clear absent Apple signing secrets before unsigned macOS packaging, so
+  electron-builder does not interpret an empty certificate value as a path.
+
 ## v4.9.5 - macOS browser staging
 
 - Stage Playwright's exact Chromium headless shell revision after freezing the

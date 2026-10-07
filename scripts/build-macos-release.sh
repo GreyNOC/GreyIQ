@@ -112,6 +112,9 @@ if [[ "$signed" -eq 1 ]]; then
   trap 'rm -f "$key_file"; rmdir "$key_dir"' EXIT
   npx electron-builder --mac dmg zip "--$arch" --publish never
 else
+  # GitHub Actions exports absent secrets as empty strings. electron-builder treats
+  # even an empty CSC_LINK as a certificate path and rejects the project directory.
+  unset CSC_LINK CSC_KEY_PASSWORD APPLE_API_KEY APPLE_API_KEY_ID APPLE_API_ISSUER APPLE_TEAM_ID
   echo "::warning::Apple Developer secrets absent; macOS draft assets are unsigned and unnotarized."
   CSC_IDENTITY_AUTO_DISCOVERY=false npx electron-builder --mac dmg zip "--$arch" \
     --config.mac.hardenedRuntime=false --config.mac.notarize=false --publish never
