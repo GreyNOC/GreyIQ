@@ -35,6 +35,7 @@ from bughunter import (
     cve_service,
     fsutil,
     hunt_brain,
+    hunt_train,
     hunt_trace,
     investigator,
     ledger,
@@ -685,18 +686,14 @@ def _run_campaign_body(
     # registered by the span); here we just stream that target's findings as URLs finish.
     if progress_unit is None:
         progress.set_targets(progress_run_id, urls)
-    # Negative knowledge may only learn a MISS from a run that finished its plan: "never executed"
-    # and "executed and inert" are different facts, and only the second is knowledge. Two ways this
-    # run can fall short — the fan-out stopping early, and any single URL's active pass being
-    # rate-limited, refused, or cut off by its budget (the per-URL mirror of run_bounty_hunt's own
-    # condition for a direct hunt).
-    stopped_early = False
-    active_clean = True
+    # Track completed per-URL verifier suites for the trace and negative-knowledge
+    # store. The fan-out may stop early without turning its unvisited URLs into misses.
     # IMMUNITY IS DECIDED ON WHAT THE ENGINE PROVED, NOT ON WHAT THE REPORT SHOWED. `consolidated`
     # is later narrowed by dismissals and the VDP filter, and deduped across urls on a location
     # that collapses digits anywhere — so a confirmed pair can vanish from it while still sitting
     # in the plan, and would be written down as a miss. Bank every confirmation unfiltered here.
     nk_confirmed: list[dict[str, Any]] = []
+    hunt_execution: list[dict[str, Any]] = []
     # Chains from each per-target investigation, pooled for the drift snapshot: an empty `chains`
     # list reads as "nothing is blocked any more" and resets reopened_chains' blocked-run streak.
     campaign_chains: list[dict[str, Any]] = []
@@ -705,17 +702,19 @@ def _run_campaign_body(
         # in flight finishes its current url, then we bail with whatever's been found).
         if progress.is_stopped(progress_run_id):
             _emit("stop requested — halting this target after the current URL")
-            stopped_early = True
             break
         _emit(f"hunt {index}/{len(urls)}: {url}")
         if progress_unit is None:
             progress.mark_target(progress_run_id, url, "running")
         profile = "source-code" if kind in {"path", "git"} else "web-app"
+        url_confirmations: list[dict[str, Any]] = []
         result = run_bounty_hunt(
             url, profile, None, str(out_root / "targets"), scope, True, coder_cfg,
             default_reports_dir=out_root / "targets", seed_dir=seed_dir, runtime_dir=runtime_dir,
             version=version, run_live=live, active=effective_active, time_based=(time_based or deep), auth=auth, per_finding=False,
-            extra_params=recon_params, on_progress=_emit, settings=campaign_settings, class_priority=hunt_priority.get(url),
+            extra_params=recon_params, on_progress=_emit,
+            on_learning_outcomes=url_confirmations.extend,
+            settings=campaign_settings, class_priority=hunt_priority.get(url),
             ssrf_params=brain_ssrf_params, xss_params=brain_xss_params,
             # Make Stop responsive WITHIN a URL, not only between them. The loop above already breaks on
             # progress.is_stopped, but a single URL's active fan-out, re-plan wave and OOB provers can run
@@ -723,18 +722,23 @@ def _run_campaign_body(
             should_stop=(lambda rid=progress_run_id: progress.is_stopped(rid)) if progress_run_id else None,
             oob_base=oob_base, oob_secret=oob_secret,
         )
+        hunt_execution.extend(hunt_trace.execution_from_active_meta(
+            result.get("active_authorization"), url))
         per_target.append({"target": url, "ok": result.get("ok", False),
                            "report_path": result.get("report_path", ""), "error": result.get("error", "")})
         if not result.get("ok"):
             if progress_unit is None:
                 progress.mark_target(progress_run_id, url, "error", error=str(result.get("error") or ""))
             continue
-        # Did THIS url's pass get through its plan? Anything less and no miss may be learned.
-        _am = result.get("active_authorization")
-        _am = _am if isinstance(_am, dict) else {}
-        if (result.get("scan_errors") or _am.get("in_scope") is not True
-                or _am.get("rate_limited") or str(_am.get("skipped_reason") or "").strip()):
-            active_clean = False
+        # The per-URL report can hide a verified finding because the operator
+        # dismissed it. Preserve the unfiltered proof before aggregate filtering
+        # and attribute it to the URL whose verifier suite actually ran.
+        for row in url_confirmations:
+            if not isinstance(row, dict) or row.get("proof_status") != "confirmed":
+                continue
+            nk_confirmed.append({**row, "endpoint": url})
+            if row.get("endpoint") != url:
+                nk_confirmed.append(row)
         if isinstance(result.get("chain_signals"), list):
             campaign_signals.extend(result["chain_signals"])
         doc = _read_json(result.get("json_path", ""))
@@ -761,6 +765,8 @@ def _run_campaign_body(
                 for _ep in dict.fromkeys([url, str(finding.get("location") or "")]):
                     if _ep and _cls:
                         nk_confirmed.append({"endpoint": _ep, "class": _cls,
+                                             "rule_id": str(finding.get("rule_id") or ""),
+                                             "dedup_key": ledger.dedup_key(finding),
                                              "proof_status": "confirmed"})
             item = {
                 "finding": finding,
@@ -1109,32 +1115,47 @@ def _run_campaign_body(
     # which were ALREADY reported in a prior run (so a re-run never re-files them). ---
     if rt is not None:
         ledger.upsert_findings(rt, program, clean_target, consolidated)
-        # Append this hunt to the trace log (offline-brain distillation corpus): the recon
-        # surface + the plan the brain produced + what actually confirmed. upsert_findings
-        # ran first so each consolidated item now carries its dedup_key (for the later ledger
-        # join in hunt_trace.training_examples). Best-effort + fail-closed inside record_trace.
+        # Append this hunt to the trace log (offline-brain distillation corpus):
+        # the recon surface, brain plan, and what actually confirmed. Ledger
+        # keys on reportable findings support later award joins; unfiltered
+        # confirmations preserve proof that report filters may have removed.
         if hunt_trace_surface is not None and hunt_trace_plan is not None:
-            hunt_trace.record_trace(rt, program=program, target=clean_target,
-                                    surface=hunt_trace_surface, plan=hunt_trace_plan,
-                                    consolidated=consolidated)
+            # Unfiltered confirmations must lead the trace, before the outcome cap
+            # and before auto-training. Otherwise a completed suite whose finding
+            # was dismissed, deduped, or excluded by policy becomes a false miss.
+            report_outcomes = hunt_trace.outcomes_from_findings(consolidated)
+            confirmation_keys: set[tuple[str, str, str]] = set()
+            trace_confirmed: list[dict[str, Any]] = []
+            for row in nk_confirmed:
+                key = (str(row.get("endpoint") or ""), str(row.get("class") or ""),
+                       str(row.get("rule_id") or ""))
+                if key not in confirmation_keys:
+                    confirmation_keys.add(key)
+                    trace_confirmed.append(row)
+            trace_outcomes = trace_confirmed + [
+                row for row in report_outcomes
+                if (str(row.get("endpoint") or ""), str(row.get("class") or ""),
+                    str(row.get("rule_id") or "")) not in confirmation_keys
+            ]
+            trace_written = hunt_trace.record_trace(
+                rt, program=program, target=clean_target,
+                surface=hunt_trace_surface, plan=hunt_trace_plan,
+                outcomes=trace_outcomes, execution=hunt_execution)
+            if trace_written:
+                hunt_train.maybe_auto_train(rt, seed_dir=seed_dir)
         # The two memories bounty writes only on the branch a campaign skips, so the steering added
         # before the fan-out has something to read next run.
         if kind == "url":
             try:
-                # The plan as it was actually spent, in the probe_priority shape the store reads.
-                nk_plan = {"probe_priority": [{"endpoint": u, "classes": list(cs)}
-                                              for u, cs in hunt_priority.items()]}
-                # Gates MISSES only — confirmations are always recorded, since they only grant
-                # immunity. See stopped_early / active_clean where they are declared.
-                nk_complete = bool(
-                    effective_active and per_target and not stopped_early and active_clean
-                    and all(t.get("ok") for t in per_target))
+                # Only verifier-certified completed suites may become misses. This
+                # remains true when the fan-out stops midway through its URL list.
+                nk_plan = {"probe_priority": hunt_execution}
                 negative_knowledge.record_hunt(
                     rt, program=program, target=clean_target, plan=nk_plan,
                     # Report-shaped outcomes PLUS the unfiltered confirmations banked above —
                     # without the second half a filtered-out confirm is recorded as a miss.
                     outcomes=hunt_trace.outcomes_from_findings(consolidated) + nk_confirmed,
-                    complete=nk_complete)
+                    complete=bool(hunt_execution))
                 # This run becomes the next run's baseline — unless it saw too little of the host
                 # to be compared, when storing it would make the next run call everything new.
                 if drift.get("status") != "degraded-run" and drift_observations:
@@ -1215,6 +1236,7 @@ def _run_campaign_body(
                 learning.record_outcome(
                     rt, program=program, target=clean_target, class_id=str(finding.get("class_id") or "other"),
                     title=str(finding.get("title") or ""), status="submitted", severity=str(finding.get("severity") or ""),
+                    finding_id=f"ledger:{item['dedup_key']}" if item.get("dedup_key") else "",
                 )
 
     # --- Campaign index report + JSON. ---

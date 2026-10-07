@@ -22,6 +22,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 import greyiq_api as g  # noqa: E402
 from bughunter import ledger as bounty_ledger  # noqa: E402
+from bughunter import learning as bounty_learning  # noqa: E402
 
 
 def _receive_once(body: bytes):
@@ -483,9 +484,12 @@ class HackerOneActivityRouteTests(unittest.TestCase):
         pid = bounty_ledger.program_key("acme", "https://x")
         bounty_ledger.record_submission(g.RUNTIME_DIR, "acme", "https://x", key, "555", "u")
         bounty_ledger.record_h1_sync(g.RUNTIME_DIR, pid, key, state="triaged", resolved_with_reward=False)
+        bounty_learning.record_outcome(g.RUNTIME_DIR, program="acme", class_id="xss",
+                                       status="submitted", finding_id=f"ledger:{key}")
 
         g.bounty_h1_activity.fetch_report_status = lambda rid, u, t, **kw: {
             "ok": True, "state": "triaged", "bounty_awarded_at": "2026-02-01T00:00:00Z",
+            "total_awarded_amount": 300,
         }
         cap = _run_post_route("/api/hackerone/sync-submitted", {})
         self.assertEqual(cap.status, 200)
@@ -494,6 +498,35 @@ class HackerOneActivityRouteTests(unittest.TestCase):
         stored = bounty_ledger._load(g.RUNTIME_DIR)["programs"][pid]["findings"][key]
         self.assertEqual(stored["stage"], "paid")
         self.assertEqual(stored["h1_state"], "triaged")
+        learned = bounty_learning.program_summary(g.RUNTIME_DIR, "acme")
+        self.assertEqual(learned["findings"], 1)
+        self.assertEqual(learned["rewarded"], 1)
+        self.assertEqual(learned["bounty_total"], 300)
+        self.assertEqual(bounty_learning._load(g.RUNTIME_DIR)["programs"]["acme"]["findings"][0]["status"],
+                         "accepted")
+        again = _run_post_route("/api/hackerone/sync-submitted", {})
+        self.assertEqual(json.loads(again.body)["checked"], 0)
+        self.assertEqual(bounty_learning.program_summary(g.RUNTIME_DIR, "acme")["findings"], 1)
+
+    def test_sync_terminal_outcome_updates_existing_learning_report(self) -> None:
+        finding = {"ref": "F1", "class_id": "xss", "rule_id": "active.reflected-xss",
+                   "location": "https://x/a"}
+        bounty_ledger.upsert_findings(g.RUNTIME_DIR, "acme", "https://x",
+                                      [{"finding": finding, "proof_status": "confirmed"}])
+        key = bounty_ledger.dedup_key(finding)
+        bounty_ledger.record_submission(g.RUNTIME_DIR, "acme", "https://x", key, "555", "u")
+        bounty_learning.record_outcome(g.RUNTIME_DIR, program="acme", class_id="xss",
+                                       status="submitted", finding_id=f"ledger:{key}")
+        g.bounty_h1_activity.fetch_report_status = lambda rid, u, t, **kw: {
+            "ok": True, "state": "resolved", "bounty_awarded_at": "2026-02-01T00:00:00Z",
+            "total_awarded_amount": 500,
+        }
+        cap = _run_post_route("/api/hackerone/sync-submitted", {})
+        self.assertTrue(json.loads(cap.body)["ok"])
+        learned = bounty_learning.program_summary(g.RUNTIME_DIR, "acme")
+        self.assertEqual(learned["findings"], 1)
+        self.assertEqual(learned["rewarded"], 1)
+        self.assertEqual(learned["bounty_total"], 500)
 
     def test_token_never_echoed_by_any_new_route(self) -> None:
         g._store_secret("hackerone.api_token", "TOP-SECRET-TOKEN-XYZ")

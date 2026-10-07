@@ -385,11 +385,21 @@ class _Http:
         self.max_requests = max(1, int(max_requests))
         self.auth = auth  # operator session, attached SAME-SITE only (never to a foreign bucket)
         self.sent = 0
+        self.failed = 0  # failed fetches, including those swallowed inside a check
         self._operator_direct = operator_guard.current() is not None
         self.opener = build_opener(_NoRedirect(), ProxyHandler({})) if self._operator_direct else build_opener(_NoRedirect())
 
     def fetch(self, url: str, *, method: str = "GET", extra_headers: dict[str, str] | None = None,
               read_body: bool = True) -> dict[str, Any]:
+        try:
+            return self._fetch_impl(url, method=method, extra_headers=extra_headers,
+                                    read_body=read_body)
+        except (_ActiveError, _RateLimited, WebsiteFetchError):
+            self.failed += 1
+            raise
+
+    def _fetch_impl(self, url: str, *, method: str = "GET", extra_headers: dict[str, str] | None = None,
+                    read_body: bool = True) -> dict[str, Any]:
         # An injected/reused _Http built before the guard was bound must still
         # switch to direct transport before it can issue an unattended request.
         if operator_guard.current() is not None and not self._operator_direct:
@@ -2950,13 +2960,13 @@ def verify_active(
     try:
         normalized = normalize_website_url(target_url)
     except WebsiteFetchError as exc:
-        return [], {"in_scope": False, "skipped_reason": str(exc), "host": "", "requests_used": 0, "rate_limited": False, "verified_classes": []}
+        return [], {"in_scope": False, "skipped_reason": str(exc), "host": "", "requests_used": 0, "rate_limited": False, "verified_classes": [], "checked_classes": []}
     host = urlparse(normalized).hostname or ""
 
     # Scope binding FIRST (no DNS, fail-closed): an unnamed host never gets probed.
     if not host_in_active_scope(host, scope, settings):
         return [], {
-            "in_scope": False, "host": host, "requests_used": 0, "rate_limited": False, "verified_classes": [],
+            "in_scope": False, "host": host, "requests_used": 0, "rate_limited": False, "verified_classes": [], "checked_classes": [],
             "skipped_reason": f"'{host}' was not named in the hunt scope, so active verification was skipped (passive only). "
                               "Name the host in Scope, set GREYIQ_ACTIVE_SCAN_ALLOWLIST, or scan your own infra with GREYIQ_SCAN_ALLOW_PRIVATE_URLS=1.",
         }
@@ -2964,7 +2974,7 @@ def verify_active(
     try:
         sanitized = _guard_url(normalized, settings.allow_private_urls, settings.web_allowed_ports)
     except WebsiteFetchError as exc:
-        return [], {"in_scope": True, "host": host, "requests_used": 0, "rate_limited": False, "verified_classes": [], "skipped_reason": f"target refused by the URL guard: {exc}"}
+        return [], {"in_scope": True, "host": host, "requests_used": 0, "rate_limited": False, "verified_classes": [], "checked_classes": [], "skipped_reason": f"target refused by the URL guard: {exc}"}
     host = urlparse(sanitized).hostname or host
 
     governor = governor or HostRateGovernor(
@@ -3095,9 +3105,20 @@ def verify_active(
     # check emits "rce"/"secrets"), while the re-planner needs the name of the CHECK to promote or
     # restrict. Keeping them side by side here avoids stamping another key onto the finding dicts.
     tagged: list[tuple[str, dict[str, Any]]] = []
+    # A plan is an ordering, not proof of execution. Track a class only when every
+    # applicable check in its suite completed and at least one check observed the
+    # landing response or sent a request. The trainer may use these as negatives;
+    # skipped, failed, and budget-starved checks must never become misses.
+    suite_size: dict[str, int] = {}
+    suite_done: dict[str, int] = {}
+    suite_observed: set[str] = set()
+    for suite_class, _check in checks:
+        suite_size[suite_class] = suite_size.get(suite_class, 0) + 1
     for _cls, check in checks:
         if rate_limited:
             break
+        before = int(getattr(http, "sent", 0) or 0)
+        failures_before = int(getattr(http, "failed", 0) or 0)
         try:
             result = check()
         except _RateLimited:
@@ -3113,14 +3134,28 @@ def verify_active(
             # as any other per-request failure -- it must never abort every check
             # ordered after it.
             result = None
+            continue
+        # A check may skip one failed candidate and still prove a later one. Keep
+        # that finding, while withholding negative coverage for the incomplete suite.
+        if int(getattr(http, "failed", 0) or 0) == failures_before:
+            suite_done[_cls] = suite_done.get(_cls, 0) + 1
+            # A passive candidate is still a finding, but it cannot teach the
+            # planner that this class was tested. Only a sent probe or a check
+            # explicitly satisfied by the landing response counts as observed.
+            if int(getattr(http, "sent", 0) or 0) > before or (
+                    landing is not None and _cls in {"clickjacking", "csrf"}):
+                suite_observed.add(_cls)
         if result:
             results.append(result)
             tagged.append((_cls, result))
 
     verified = sorted({r["_active_class_hint"] for r in results if r.get("_active_proof", {}).get("status") == "confirmed"})
+    checked = sorted(cls for cls, count in suite_size.items()
+                     if suite_done.get(cls, 0) == count and cls in suite_observed)
     meta = {
         "in_scope": True, "host": host, "requests_used": getattr(http, "sent", 0),
         "rate_limited": rate_limited, "verified_classes": verified,
+        "checked_classes": checked,
         "discovered_params_used": len(discovered_params),
         # Deterministic, redacted STRUCTURAL digest of the landing response (JSON key names, form
         # fields, security headers, cookie flag gaps, JWT header shape, error family) — built from a

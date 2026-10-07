@@ -95,6 +95,75 @@ def check_tags_for_impact(class_id: str) -> frozenset[str]:
     return IMPACT_TO_CHECK_TAGS.get(key, frozenset({key}))
 
 
+# Exact rule IDs emitted by active_verify_service's checks. An impact class is not
+# enough to recover the producing suite: debug and command injection both report
+# rce; redirect, CRLF and host-header findings can all report redirect. Keep this
+# table explicit so a new rule cannot silently inherit a misleading positive label.
+ACTIVE_RULE_CHECK_TAGS: dict[str, str] = {
+    "active.clickjacking": "clickjacking",
+    "active.csrf-missing-token": "csrf",
+    "active.jwt-alg-none": "jwt",
+    "active.jwt-alg-confusion": "jwt",
+    "active.jwt-weak-secret": "jwt",
+    "active.jwt-jwk-embedded": "jwt",
+    "active.graphql-introspection": "graphql",
+    "active.graphql-field-suggestions": "graphql",
+    "active.cors-reflection": "cors",
+    "active.open-redirect": "redirect",
+    "active.host-header-injection": "host-header",
+    "active.reflected-xss": "xss",
+    "active.ssti": "ssti",
+    "active.rce-command-injection": "rce",
+    "active.rce-time": "rce",
+    "active.sqli-error": "sqli",
+    "active.sqli-boolean": "sqli",
+    "active.sqli-time": "sqli",
+    "active.nosqli-error": "nosqli",
+    "active.crlf": "crlf",
+    "active.open-bucket": "cloud-exposure",
+    "active.exposed-file": "sensitive",
+    "active.debug-endpoint": "debug",
+    "active.cswsh-origin": "websocket",
+    "active.path-traversal": "path-traversal",
+}
+
+
+def check_tag_for_rule(rule_id: str) -> str | None:
+    """The exact active verifier suite for a known rule, or None if unknown."""
+    return ACTIVE_RULE_CHECK_TAGS.get(str(rule_id or "").strip().lower())
+
+
+def confirmed_learning_tag(class_id: str, rule_id: str) -> str | None:
+    """One evidence-backed class for a confirmed outcome, never a guessed suite.
+
+    A recognized rule identifies its producing check exactly and must agree with
+    the impact. For unknown rules, only a canonical, unambiguous impact can teach
+    the same class. Access-control is kept for the separate IDOR/BFLA selectors.
+    Ambiguous impacts such as rce, redirect and disclosure yield no positive
+    without a recognized rule.
+    """
+    impact = str(class_id or "").strip().lower()
+    rule = str(rule_id or "").strip().lower()
+    tag = check_tag_for_rule(rule)
+    if tag is not None:
+        return tag if tag in check_tags_for_impact(impact) else None
+    if impact == "access-control":
+        return impact
+    if impact in PROVER_CLASSES and check_tags_for_impact(impact) == frozenset({impact}):
+        return impact
+    return None
+
+
+def uncertain_check_tags(class_id: str, rule_id: str) -> frozenset[str]:
+    """Suites that must not learn a miss from an unresolved confirmed impact."""
+    impact = str(class_id or "").strip().lower()
+    plausible = set(check_tags_for_impact(impact) & PROVER_CLASSES)
+    known = check_tag_for_rule(rule_id)
+    if known:
+        plausible.add(known)  # contradictory rule/impact data is not a safe negative
+    return frozenset(plausible)
+
+
 CLASS_ALIASES: dict[str, str] = {
     "open-redirect": "redirect",
     "command-injection": "rce",

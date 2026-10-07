@@ -210,6 +210,23 @@ class GnCliTests(unittest.TestCase):
             finally:
                 gn_cli.RUNTIME_DIR = original
 
+    def test_learn_finding_id_updates_one_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            original = gn_cli.RUNTIME_DIR
+            gn_cli.RUNTIME_DIR = Path(tmp)
+            try:
+                for status in ("submitted", "accepted", "accepted"):
+                    code, _, err = _run(["learn", "-c", "xss", "--status", status,
+                                         "--program", "acme", "--finding-id", "h1:42"])
+                    self.assertEqual(code, 0, err)
+                code, out, err = _run(["stats", "--program", "acme", "--json"])
+                self.assertEqual(code, 0, err)
+                stats = json.loads(out)
+                self.assertEqual(stats["findings"], 1)
+                self.assertEqual(stats["rewarded"], 1)
+            finally:
+                gn_cli.RUNTIME_DIR = original
+
     def test_campaign_requires_authorization(self) -> None:
         code, _, err = _run(["campaign", str(BACKEND_DIR / "bughunter")])
         self.assertEqual(code, 2)

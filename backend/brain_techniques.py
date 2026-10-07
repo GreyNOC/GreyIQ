@@ -301,25 +301,42 @@ def learned_hunt_priors(runtime_dir: str | Path, program: str | None, target: st
         wanted = program_key(program, target)
     except Exception:
         wanted = str(program or target or "")
+    from bughunter.prover_classes import confirmed_learning_tag, uncertain_check_tags
+
     counts: dict[str, list[int]] = {}
     for trace in _hunt_trace_rows(runtime_dir):
         if wanted and str(trace.get("program") or "") != wanted:
             continue
         outcomes = trace.get("outcomes") or []
-        confirmed = {
-            (str(row.get("endpoint") or ""), str(row.get("class") or "").lower())
-            for row in outcomes if isinstance(row, dict) and str(row.get("proof_status") or "").lower() == "confirmed"
-        }
-        plan = trace.get("plan") or {}
-        for row in plan.get("probe_priority") or []:
+        confirmed: set[tuple[str, str]] = set()
+        uncertain: set[tuple[str, str]] = set()
+        for row in outcomes:
+            if not isinstance(row, dict) or str(row.get("proof_status") or "").strip().lower() != "confirmed":
+                continue
+            endpoint = str(row.get("endpoint") or "").strip()
+            if not endpoint:
+                continue
+            tag = confirmed_learning_tag(row.get("class"), row.get("rule_id"))
+            if tag:
+                confirmed.add((endpoint, tag))
+            else:
+                uncertain.update((endpoint, candidate) for candidate in
+                                 uncertain_check_tags(row.get("class"), row.get("rule_id")))
+        attempted = set(confirmed)
+        for row in trace.get("execution") or []:
             if not isinstance(row, dict):
                 continue
             endpoint = str(row.get("endpoint") or "")
-            for class_id in [str(v).lower() for v in (row.get("classes") or [])[:4]]:
-                attempts, successes = counts.setdefault(class_id, [0, 0])
-                counts[class_id][0] = attempts + 1
-                if (endpoint, class_id) in confirmed:
-                    counts[class_id][1] = successes + 1
+            for value in row.get("classes") or []:
+                class_id = str(value or "").strip().lower()
+                if endpoint and class_id:
+                    attempted.add((endpoint, class_id))
+        attempted.difference_update(uncertain - confirmed)
+        for endpoint, class_id in attempted:
+            attempts, successes = counts.setdefault(class_id, [0, 0])
+            counts[class_id][0] = attempts + 1
+            if (endpoint, class_id) in confirmed:
+                counts[class_id][1] = successes + 1
     priors: dict[str, float] = {}
     for class_id, (attempts, successes) in counts.items():
         if attempts <= 0:

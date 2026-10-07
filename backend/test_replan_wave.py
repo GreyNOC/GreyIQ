@@ -16,7 +16,7 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from bughunter import active_verify_service, bounty, investigator  # noqa: E402
+from bughunter import active_verify_service, bounty, hunt_trace, investigator  # noqa: E402
 from bughunter.settings import ScannerSettings  # noqa: E402
 
 
@@ -40,7 +40,8 @@ class ReplanWaveTests(unittest.TestCase):
         return ScannerSettings(active_max_requests_per_host=20, active_min_interval_ms=0)
 
     def _stub(self, *, confirmed: bool = False, used: int = 2, boom: bool = False,
-              rate_limited: bool = False) -> None:
+              rate_limited: bool = False, checked_classes: list[str] | None = None,
+              in_scope: bool = True) -> None:
         def fake(target, findings, *, requests_budget=12, class_priority=None, only_classes=None,
                  governor=None, **kw):
             self.calls.append({"target": target, "budget": requests_budget,
@@ -56,9 +57,10 @@ class ReplanWaveTests(unittest.TestCase):
                                                             "control_result": "c"}}]
             # Honour the allotment, exactly as the real prover's _Http does — the wave's own
             # accounting is what decides how much is offered, and that is asserted separately.
-            return found, {"in_scope": True, "host": "app.example",
+            return found, {"in_scope": in_scope, "host": "app.example",
                            "requests_used": min(used, requests_budget),
-                           "rate_limited": rate_limited, "verified_classes": []}
+                           "rate_limited": rate_limited, "verified_classes": [],
+                           "checked_classes": list(checked_classes if checked_classes is not None else ["cors"])}
         active_verify_service.verify_active = fake
 
     def _run(self, findings=None, already_swept=None):
@@ -102,6 +104,38 @@ class ReplanWaveTests(unittest.TestCase):
         self.calls.clear()
         _out2, info2 = self._run()
         self.assertEqual(info2["confirmed"], 0)
+
+    def test_completed_replan_suites_join_first_pass_execution(self) -> None:
+        self._stub(checked_classes=["cors"])
+        _out, info = self._run()
+        seed = "https://app.example/"
+        first_pass = {"in_scope": True, "checked_classes": ["csrf"],
+                      "targets": [{"target": seed, "in_scope": True,
+                                   "checked_classes": ["csrf"]}]}
+        merged = bounty._with_replan_execution(first_pass, seed, info["execution"])
+        self.assertEqual(hunt_trace.execution_from_active_meta(merged, seed), [
+            {"endpoint": seed, "classes": ["csrf"]},
+            {"endpoint": "https://app.example/api/me", "classes": ["cors"]},
+            {"endpoint": "https://app.example/search", "classes": ["cors"]},
+        ])
+        self.assertEqual(merged["checked_classes"], ["cors", "csrf"])
+
+    def test_iterative_seed_coverage_survives_replan_merge(self) -> None:
+        self._stub(checked_classes=["xss"])
+        _out, info = self._run()
+        seed = "https://app.example/"
+        merged = bounty._with_replan_execution(
+            {"in_scope": True, "checked_classes": ["clickjacking"]}, seed, info["execution"])
+        checked = hunt_trace.execution_from_active_meta(merged, seed)
+        self.assertEqual(checked[0], {"endpoint": seed, "classes": ["clickjacking"]})
+        self.assertEqual(checked[1], {"endpoint": "https://app.example/api/me", "classes": ["xss"]})
+
+    def test_replan_excludes_suites_the_verifier_did_not_complete(self) -> None:
+        self._stub(checked_classes=[])
+        _out, info = self._run()
+        self.assertEqual(info["execution"], [])
+        seed_meta = {"in_scope": True, "checked_classes": ["csrf"]}
+        self.assertIs(bounty._with_replan_execution(seed_meta, "https://app.example/", info["execution"]), seed_meta)
 
     # --- bounds -----------------------------------------------------------------------
 

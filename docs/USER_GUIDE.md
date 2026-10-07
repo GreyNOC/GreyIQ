@@ -238,10 +238,25 @@ rail (which the Program picker can autofill):
   program, confirm its scope and restrictions, and choose a 24-hour or seven-day
   authorization window. The operator stops at expiry or its cycle limit; re-arm it
   only after checking the current policy again. Verified hunt outcomes inform later
-  priority; this is local feedback, not automatic model-weight training. The kill
+  priority. After five new local hunt traces, GreyIQ tries a bounded offline ranker
+  retrain; it promotes weights only when at least 200 checked/confirmed examples
+  exist and held-out recall matches or beats both rules and the active model. Set
+  `GREYIQ_NO_AUTO_TRAIN_BRAIN=1` to disable these automatic retrain attempts. The kill
   switch requests cancellation and prevents further cycles. Automated hunts use
   only a loopback local model or the offline fallback; a cloud or remote model
   remains available for deliberate manual work.
+
+**TinyGPT / AI Studio.** The **Verified Lessons** source contains local coding
+experiences admitted by the verification gate. It is selected for new Studio
+training setups and available to the BugHunter core's source-filtered retrieval,
+including migrated default setups. A running TinyGPT engine refreshes this source
+on its next retrieval after a verified lesson is admitted. Starting a TinyGPT
+weight-training run remains an operator action. Bounty verdicts and hunt traces
+feed the separate local hunt priorities and ranker described above; they are
+not inserted into TinyGPT's
+verified coding replay.
+For a local Windows release that runs TinyGPT, build with
+`scripts/release.sh --include-tinygpt`; the build verifies the frozen checkpoint.
 
 The CLI's continuous `gn operator run` uses the same grant validation. Pass
 `-y --grant-file path/to/grants.json`; the file must contain one entry for each

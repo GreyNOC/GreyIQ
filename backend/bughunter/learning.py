@@ -17,6 +17,7 @@ written atomically. No network, no ML — just bookkeeping the engine reads back
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
@@ -35,6 +36,7 @@ _LOCK = threading.Lock()  # serialize read-modify-write (os.replace is atomic bu
 OUTCOMES = ("submitted", "triaged", "accepted", "resolved", "duplicate", "informative", "not-applicable", "spam")
 _REWARDING = {"accepted", "resolved"}          # the program valued it
 _NOISE = {"duplicate", "informative", "not-applicable", "spam"}  # don't keep filing these
+_ADJUDICATED = _REWARDING | _NOISE
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -97,6 +99,19 @@ def _blank_program() -> dict[str, Any]:
     return {"findings": [], "class_stats": {}, "updated_at": None}
 
 
+def _adjust_stats(prog: dict[str, Any], row: dict[str, Any], direction: int) -> None:
+    """Apply one report's current state, preserving legacy aggregate-only stores."""
+    cls = str(row.get("class_id") or "other").strip().lower() or "other"
+    stats = prog["class_stats"].setdefault(
+        cls, {"submitted": 0, "rewarded": 0, "noise": 0, "bounty_total": 0.0})
+    status = str(row.get("status") or "").strip().lower()
+    stats["submitted"] = max(0, _safe_int(stats.get("submitted")) + direction)
+    stats["rewarded"] = max(0, _safe_int(stats.get("rewarded")) + direction * (status in _REWARDING))
+    stats["noise"] = max(0, _safe_int(stats.get("noise")) + direction * (status in _NOISE))
+    stats["bounty_total"] = round(max(
+        0.0, _safe_float(stats.get("bounty_total")) + direction * _safe_float(row.get("bounty"))), 2)
+
+
 def record_outcome(
     runtime_dir: str | Path,
     *,
@@ -108,30 +123,55 @@ def record_outcome(
     bounty: float = 0.0,
     severity: str = "",
     notes: str = "",
+    finding_id: str = "",
     now: str | None = None,
 ) -> dict[str, Any]:
-    """Record one finding outcome. Returns the updated program stats."""
+    """Record one report's latest outcome. An optional stable ID makes retries and
+    status transitions update that report instead of teaching from it repeatedly.
+    Rows without an ID keep the legacy append-only behavior."""
     status = str(status or "").strip().lower()
     if status not in OUTCOMES:
         raise ValueError(f"unknown status '{status}'. Use one of: {', '.join(OUTCOMES)}.")
+    amount = float(bounty or 0.0)
+    if not math.isfinite(amount) or amount < 0:
+        raise ValueError("bounty must be a finite, non-negative amount")
+    amount = round(amount, 2)
     key = program_key(program, target)
     cls = str(class_id or "other").strip().lower() or "other"
+    identity = str(finding_id or "").strip()
+    if len(identity) > 200:
+        raise ValueError("finding_id must be at most 200 characters")
     stamp = now or datetime.now(UTC).isoformat()
     with _LOCK:
         data = _load(runtime_dir)
         programs = data.setdefault("programs", {})
         prog = programs.setdefault(key, _blank_program())
-        prog["findings"].append({
+        findings = prog.setdefault("findings", [])
+        previous = next((row for row in findings if identity and isinstance(row, dict)
+                         and row.get("finding_id") == identity), None)
+        # An automatic re-scan can log "submitted" after HackerOne already gave a
+        # terminal verdict. It must not erase the adjudicated signal.
+        if previous and str(previous.get("status") or "").lower() in _ADJUDICATED and status not in _ADJUDICATED:
+            return prog
+        row = {
             "class_id": cls, "title": str(title)[:200], "status": status,
-            "bounty": float(bounty or 0.0), "severity": str(severity or "").lower(), "notes": str(notes)[:500], "at": stamp,
-        })
-        stats = prog["class_stats"].setdefault(cls, {"submitted": 0, "rewarded": 0, "noise": 0, "bounty_total": 0.0})
-        stats["submitted"] += 1
-        if status in _REWARDING:
-            stats["rewarded"] += 1
-        if status in _NOISE:
-            stats["noise"] += 1
-        stats["bounty_total"] = round(stats["bounty_total"] + float(bounty or 0.0), 2)
+            "bounty": amount, "severity": str(severity or "").lower(), "notes": str(notes)[:500], "at": stamp,
+        }
+        if identity:
+            row["finding_id"] = identity
+        if previous:
+            # Keep useful metadata when an automated sync only knows the new state.
+            for field in ("title", "severity", "notes"):
+                if not row[field]:
+                    row[field] = previous.get(field, "")
+            if all(previous.get(field) == row.get(field) for field in
+                   ("class_id", "title", "status", "bounty", "severity", "notes", "finding_id")):
+                return prog
+            _adjust_stats(prog, previous, -1)
+            previous.update(row)
+        else:
+            findings.append(row)
+        _adjust_stats(prog, row, 1)
         prog["updated_at"] = stamp
         data["updated_at"] = stamp
         _save(runtime_dir, data)

@@ -36,6 +36,7 @@ from bughunter import operator_guard
 from bughunter import fsutil
 from bughunter import hunt_loop
 from bughunter import hunt_brain
+from bughunter import hunt_train
 from bughunter import hunt_trace
 from bughunter import impact_model
 from bughunter import investigator
@@ -1979,6 +1980,12 @@ def _aggregate_active_meta(metas: list[dict[str, Any]]) -> dict[str, Any]:
         for cls in (meta.get("verified_classes") or [])
         if str(cls or "").strip()
     })
+    checked = sorted({
+        str(cls)
+        for meta in metas
+        for cls in (meta.get("checked_classes") or [])
+        if str(cls or "").strip()
+    })
     skipped = [
         str(meta.get("skipped_reason") or "").strip()
         for meta in metas
@@ -1991,6 +1998,7 @@ def _aggregate_active_meta(metas: list[dict[str, Any]]) -> dict[str, Any]:
         "requests_used": sum(int(meta.get("requests_used") or 0) for meta in metas),
         "rate_limited": any(bool(meta.get("rate_limited")) for meta in metas),
         "verified_classes": verified,
+        "checked_classes": checked,
         "skipped_reason": "; ".join(dict.fromkeys(skipped[:4])),
         "targets_checked": len(metas),
         # Carry a structural response digest through the aggregate (the FIRST target that produced one).
@@ -2005,11 +2013,45 @@ def _aggregate_active_meta(metas: list[dict[str, Any]]) -> dict[str, Any]:
                 "requests_used": int(meta.get("requests_used") or 0),
                 "rate_limited": bool(meta.get("rate_limited")),
                 "verified_classes": list(meta.get("verified_classes") or []),
+                "checked_classes": list(meta.get("checked_classes") or []),
                 "skipped_reason": str(meta.get("skipped_reason") or ""),
             }
             for meta in metas
         ],
     }
+
+
+def _confirmed_learning_outcomes(findings: list[dict[str, Any]], target: str) -> list[dict[str, Any]]:
+    """Keep proof-backed outcomes before report focus and dismissal filters run.
+
+    Only compact classification metadata crosses the campaign callback. The trace
+    writer redacts and bounds it before persistence; no proof bodies or payloads
+    are included here.
+    """
+    rows: list[dict[str, Any]] = []
+    for finding in findings:
+        if not isinstance(finding, dict) or not finding.get("class_id"):
+            continue
+        try:
+            # The report's proof reader expects the active verifier's carrier in
+            # a plan; filtered findings never received an attack plan of their
+            # own, so provide only that captured carrier to the same status gate.
+            active_proof = finding.get("_active_proof")
+            proof_plan = ({"proof_of_impact": active_proof}
+                          if isinstance(active_proof, dict) else {})
+            if report_lib._proof_of_impact_detail(finding, proof_plan).get("status") != "confirmed":
+                continue
+            rows.append({
+                "endpoint": str(finding.get("location") or finding.get("source_url") or target),
+                "class": str(finding.get("class_id") or ""),
+                "rule_id": str(finding.get("rule_id") or ""),
+                "proof_status": "confirmed",
+                "severity": str(finding.get("severity") or ""),
+                "dedup_key": ledger.dedup_key(finding),
+            })
+        except Exception:  # noqa: BLE001 - learning bookkeeping must never break a hunt
+            continue
+    return rows
 
 
 def _rank_active_targets(seed: str, urls: list[str] | tuple[str, ...] | set[str] | None, *, limit: int = 4) -> list[str]:
@@ -2170,7 +2212,8 @@ def _replan_wave(target_url: str, findings: list[dict[str, Any]], *, scope: str,
 
     Returns ``(new_findings, info)``; fail-open to ``([], {...})`` on any error.
     """
-    info: dict[str, Any] = {"ran": False, "targets": 0, "requests_used": 0, "confirmed": 0}
+    info: dict[str, Any] = {"ran": False, "targets": 0, "requests_used": 0,
+                            "confirmed": 0, "execution": []}
     try:
         graph = investigator.build_investigation(findings, surface=surface)
         plan = investigator.build_probe_plan(graph)
@@ -2225,6 +2268,10 @@ def _replan_wave(target_url: str, findings: list[dict[str, Any]], *, scope: str,
             budget -= spent
             info["requests_used"] += spent
             info["targets"] += 1
+            # Keep only verifier-certified completed suites. The wave probes URLs
+            # outside the first pass, so dropping this metadata loses their clean
+            # results from the trace and negative-knowledge stores.
+            info["execution"].extend(hunt_trace.execution_from_active_meta(meta, endpoint))
             out.extend(results)
             if meta.get("rate_limited"):
                 break
@@ -2239,6 +2286,30 @@ def _replan_wave(target_url: str, findings: list[dict[str, Any]], *, scope: str,
         return out, info
     except Exception:  # noqa: BLE001 - an optimizer pass must never break a hunt
         return [], info
+
+
+def _with_replan_execution(active_meta: dict[str, Any], target_url: str,
+                           execution: list[dict[str, Any]]) -> dict[str, Any]:
+    """Expose completed replan suites through the normal per-target meta shape."""
+    if not execution:
+        return active_meta
+    merged = dict(active_meta)
+    existing = merged.get("targets")
+    if isinstance(existing, list):
+        targets = list(existing)
+    else:
+        # The iterative verifier returns one seed-target meta, whereas the
+        # fan-out verifier already has `targets`. Preserve the seed's coverage.
+        targets = [{"target": target_url, "in_scope": active_meta.get("in_scope") is True,
+                    "checked_classes": list(active_meta.get("checked_classes") or [])}]
+    checked = set(active_meta.get("checked_classes") or [])
+    for row in execution:
+        targets.append({"target": row["endpoint"], "in_scope": True,
+                        "checked_classes": list(row["classes"])})
+        checked.update(row["classes"])
+    merged["targets"] = targets
+    merged["checked_classes"] = sorted(checked)
+    return merged
 
 
 def _proof_capture_highlight(finding: dict[str, Any]) -> str:
@@ -2444,6 +2515,7 @@ def _run_bounty_hunt_body(
     per_finding: bool = False,
     extra_params: list[str] | None = None,
     on_progress: Any = None,
+    on_learning_outcomes: Any = None,
     # The operator's kill switch, as a predicate the caller owns (greyiq_api passes
     # ``lambda: progress.is_stopped(run_id)``). A DIRECT hunt previously had no way to hear Stop at
     # all: campaign.py checks progress.is_stopped between targets and between URLs, but a single hunt
@@ -2838,8 +2910,12 @@ def _run_bounty_hunt_body(
                     raw_findings = list(raw_findings) + replan_findings
                     if "active" not in scanners_run:
                         scanners_run = list(scanners_run) + ["active"]
-                active_meta = dict(active_meta)
-                active_meta["replan"] = replan_info
+                # The wave can check URLs that the first pass did not reach.
+                # Retain those certified suites alongside the first pass so
+                # trace learning and negative knowledge can see both.
+                wave_execution = list(replan_info.get("execution") or [])
+                active_meta = _with_replan_execution(active_meta, clean_target, wave_execution)
+                active_meta["replan"] = {k: v for k, v in replan_info.items() if k != "execution"}
                 # The wave's spend is part of THIS hunt's coverage; reporting only the first pass
                 # would understate what the target actually received.
                 active_meta["requests_used"] = (int(active_meta.get("requests_used") or 0)
@@ -3439,6 +3515,10 @@ def _run_bounty_hunt_body(
     _emit("writing report…")
     markdown = report_lib.build_markdown(ctx)
     json_doc = report_lib.build_json(ctx)
+    # The report may hide an engine-confirmed finding because of a focus class or
+    # operator dismissal. Its evidence still matters to the completed-suite label:
+    # otherwise the trainer would turn that very suite into a false negative.
+    learning_confirmations = _confirmed_learning_outcomes(annotated, clean_target)
 
     # Append this DIRECT hunt to the trace log (offline-brain distillation corpus). Only when this
     # run did its OWN recon+plan (hunt_trace_plan set): a campaign's per-URL call passes
@@ -3453,10 +3533,9 @@ def _run_bounty_hunt_body(
         try:
             _poi = json_doc.get("proof_of_impact") if isinstance(json_doc, dict) else {}
             _poi = _poi if isinstance(_poi, dict) else {}
-            # Iterate the REPORTABLE findings (json_doc["findings"] — the same list proof_of_impact is
-            # keyed from) rather than the pre-filter `display`. A finding dropped from the report then
-            # has no _poi entry and would be mislabeled proof_status='missing'; this also matches the
-            # campaign path's grain (it records only reportable, consolidated findings).
+            # Start with REPORTABLE findings (json_doc["findings"] — the same list
+            # proof_of_impact is keyed from). Then add proof-backed confirmations
+            # from before report filters; a filtered finding has no _poi entry.
             _report_findings = json_doc.get("findings") if isinstance(json_doc, dict) else []
             _trace_outcomes: list[dict[str, Any]] = []
             for _f in (_report_findings or []):
@@ -3471,52 +3550,35 @@ def _run_bounty_hunt_body(
                     "severity": str(_f.get("severity") or ""),
                     "dedup_key": ledger.dedup_key(_f) if _f.get("class_id") else "",
                 })
-            hunt_trace.record_trace(runtime_dir, program=None, target=clean_target,
-                                    surface=hunt_trace_surface, plan=hunt_trace_plan,
-                                    outcomes=_trace_outcomes)
+            # Confirmations first so a large report cannot push them past the trace
+            # outcome cap. Add report rows after them for candidate/missing context.
+            _confirmed_keys = {(r["endpoint"], r["class"], r["rule_id"])
+                               for r in learning_confirmations}
+            _trace_outcomes = learning_confirmations + [
+                r for r in _trace_outcomes
+                if (r["endpoint"], r["class"], r["rule_id"]) not in _confirmed_keys
+            ]
+            checked_execution = hunt_trace.execution_from_active_meta(active_meta, clean_target)
+            trace_written = hunt_trace.record_trace(
+                runtime_dir, program=None, target=clean_target,
+                surface=hunt_trace_surface, plan=hunt_trace_plan, outcomes=_trace_outcomes,
+                execution=checked_execution)
+            if trace_written:
+                hunt_train.maybe_auto_train(runtime_dir, seed_dir=seed_dir)
             # Fold the same (plan, outcomes) into the endpoint-scoped negative-knowledge memory: a
             # planned (endpoint, class) that did not confirm becomes a miss, a confirmed one is
             # immunized. This is what the NEXT run's cooled_pairs() reads to deprioritise inert ground.
             # record_hunt is internally fail-closed; it also honours the GREYIQ_NO_NEGATIVE_KNOWLEDGE
             # kill switch and runtime_dir is None.
             #
-            # `complete` decides whether MISSES may be recorded at all. The prover walks
-            # probe_priority in order and stops when its request budget is gone, so on a truncated run
-            # the TAIL of the plan was never probed — recording those as misses would conflate "never
-            # executed" with "executed and inert" and would systematically cool exactly the endpoints
-            # that never got a fair chance. Only a run that errored nowhere, was in scope, was not
-            # rate-limited and was not skipped may teach a negative; confirmations are recorded either
-            # way, since they only ever grant immunity.
-            _nk_complete = (
-                not scan_errors
-                and active_meta.get("in_scope") is True
-                and not active_meta.get("rate_limited")
-                and not str(active_meta.get("skipped_reason") or "").strip()
-            )
-            # IMMUNITY MUST BE DECIDED ON WHAT THE ENGINE PROVED, NOT ON WHAT THIS REPORT SHOWED.
-            # `_trace_outcomes` is built from the REPORTABLE findings, which the report-side filters
-            # above already narrowed: the focus class (`-c xss` shows only xss — it never restricts
-            # what the prover probed), duplicate-lead grouping, and operator dismissals. A pair that
-            # genuinely confirmed can therefore be missing from those outcomes, and would then be
-            # written down as a MISS — cooling a route the engine actually proved, which is exactly
-            # the ever_confirmed immunity this store promises. So fold in every UNFILTERED finding the
-            # confirm gate accepts before recording.
-            _nk_outcomes = list(_trace_outcomes)
-            for _f in annotated:
-                if not isinstance(_f, dict) or not _f.get("class_id"):
-                    continue
-                try:
-                    if investigator.has_confirming_artifact(_f, {}):
-                        _nk_outcomes.append({
-                            "endpoint": str(_f.get("location") or _f.get("source_url") or clean_target),
-                            "class": str(_f.get("class_id") or ""),
-                            "proof_status": "confirmed",
-                        })
-                except Exception:  # noqa: BLE001 - immunity bookkeeping must never break a hunt
-                    continue
+            # Negative knowledge sees the same verifier-certified coverage as the
+            # trainer. A global clean flag cannot prove the plan's tail was checked.
+            _nk_plan = {"probe_priority": checked_execution}
+            # The same unfiltered confirmations immunize negative knowledge.
+            _nk_outcomes = _trace_outcomes
             negative_knowledge.record_hunt(runtime_dir, program=None, target=clean_target,
-                                           plan=hunt_trace_plan, outcomes=_nk_outcomes,
-                                           complete=bool(_nk_complete))
+                                           plan=_nk_plan, outcomes=_nk_outcomes,
+                                           complete=bool(checked_execution))
             # This run becomes the next run's baseline. Recorded here, beside the trace, and on
             # the same condition — only a direct hunt does its own recon, so only a direct hunt
             # observed a surface to remember. The blocked chains travel with it: that is what
@@ -3541,6 +3603,14 @@ def _run_bounty_hunt_body(
         fsutil.write_text_safe(json_path, json.dumps(json_doc, indent=2, default=str))
     except OSError as exc:
         return {"ok": False, "error": f"Could not write the report: {exc}"}
+
+    # A campaign owns the aggregate trace. Deliver only proof-backed class metadata
+    # after the per-URL report succeeded; this stays local and out of the API result.
+    if callable(on_learning_outcomes):
+        try:
+            on_learning_outcomes(learning_confirmations)
+        except Exception:  # noqa: BLE001 - an advisory callback must never break a hunt
+            pass
 
     # Optional: one self-contained, submission-ready file per finding.
     per_finding_paths: list[str] = []

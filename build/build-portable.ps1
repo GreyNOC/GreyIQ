@@ -25,12 +25,16 @@
     `node node_modules/electron/install.js` has no such deadline.
 
     Heavy build: it downloads CPU torch (~200 MB, into the build venv), Chromium
-    (~170 MB) and Electron (~150 MB); the finished portable .exe is ~345 MB
-    (torch-free backend + bundled Chromium; Ollama is downloaded on demand, not
-    bundled). Allow plenty of disk + time.
+    (~170 MB) and Electron (~150 MB); the ordinary portable is torch-free.
+    -IncludeTinyGPT bundles CPU torch and the shipped TinyGPT checkpoint into a
+    larger local build. Ollama remains on-demand. Allow plenty of disk + time.
 
 .PARAMETER Installer
     Also build the NSIS installer (release/GreyIQ-Setup-<version>.exe).
+
+.PARAMETER IncludeTinyGPT
+    Bundle the CPU TinyGPT runtime and seed checkpoint in this local build. The
+    ordinary release and CI build remain lean unless this switch is supplied.
 
 .PARAMETER SkipOllama
     Accepted and ignored. Ollama has not been bundled since it was ~1.4 GB / 86% of
@@ -52,12 +56,13 @@
 
 .EXAMPLE
     # Portable + installer, reusing an already-downloaded Ollama runtime:
-    powershell -NoProfile -ExecutionPolicy Bypass -File build/build-portable.ps1 -Installer
+    powershell -NoProfile -ExecutionPolicy Bypass -File build/build-portable.ps1 -Installer -IncludeTinyGPT
 #>
 #requires -Version 5.1
 [CmdletBinding()]
 param(
     [switch]$Installer,
+    [switch]$IncludeTinyGPT,
     [switch]$SkipOllama,
     [switch]$SkipSmokeTest,
     [switch]$UseSystemPython,
@@ -178,8 +183,17 @@ Write-Host "    work:    $WorkDir"
 
 # --- Freeze the backend ---
 Write-Step "Freezing the backend with PyInstaller"
-& $Py -m PyInstaller --noconfirm --clean --distpath $DistDir --workpath $WorkDir build/greyiq-backend.spec
-Assert-LastExit "PyInstaller freeze"
+$previousTinyGptBundle = [Environment]::GetEnvironmentVariable("GREYIQ_BUNDLE_TINYGPT", "Process")
+try {
+    # Set explicitly in both modes so an inherited flag cannot change an ordinary build.
+    if ($IncludeTinyGPT) { $env:GREYIQ_BUNDLE_TINYGPT = "1" }
+    else { $env:GREYIQ_BUNDLE_TINYGPT = "0" }
+    & $Py -m PyInstaller --noconfirm --clean --distpath $DistDir --workpath $WorkDir build/greyiq-backend.spec
+    Assert-LastExit "PyInstaller freeze"
+} finally {
+    if ($null -eq $previousTinyGptBundle) { Remove-Item Env:\GREYIQ_BUNDLE_TINYGPT -ErrorAction SilentlyContinue }
+    else { $env:GREYIQ_BUNDLE_TINYGPT = $previousTinyGptBundle }
+}
 
 $BackendExe = Join-Path $DistDir "greyiq-backend\greyiq-backend.exe"
 if (-not (Test-Path $BackendExe)) {
@@ -230,6 +244,12 @@ if (-not $SkipSmokeTest) {
     Write-Step "Smoke-testing bundled headless Chromium"
     & $BackendExe --self-test-browser
     Assert-LastExit "Bundled Chromium launch"
+
+    if ($IncludeTinyGPT) {
+        Write-Step "Smoke-testing bundled TinyGPT checkpoint"
+        & $BackendExe --self-test-tinygpt
+        Assert-LastExit "Bundled TinyGPT checkpoint load"
+    }
 
     Write-Step "Checking frozen CLI version"
     $expectedVersion = (Get-Content (Join-Path $RepoRoot "package.json") -Raw | ConvertFrom-Json).version

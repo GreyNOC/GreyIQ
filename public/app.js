@@ -1,5 +1,6 @@
 const STORE_KEY = "greyiq.local.ai.v1";
 const BOT_DEFAULT_REVISION = 2;
+const TRAINING_SOURCE_REVISION = 1;
 const DIMENSIONS = 384;
 const MAX_MEMORY_ITEMS = 32;
 const API_TIMEOUT_MS = 45000;
@@ -28,6 +29,7 @@ function inkOn(color) {
 const DEFAULT_SELECTED_TRAINING_SOURCES = [
   "src_starter_knowledge",
   "src_bug_bounty",
+  "src_verified_replay",
   "src_personal_choices",
   "src_preferred_examples"
 ];
@@ -42,6 +44,11 @@ const TRAINING_SOURCES = [
     id: "src_bug_bounty",
     name: "Bug Bounty",
     description: "Authorized hunt tactics, proof standards, and report-writing patterns."
+  },
+  {
+    id: "src_verified_replay",
+    name: "Verified Lessons",
+    description: "Local lessons admitted by verification gates; model training still requires an operator run."
   },
   {
     id: "src_personal_choices",
@@ -510,6 +517,7 @@ function loadState() {
     memories: {},
     backendPreference: "cpu",
     botDefaultRevision: BOT_DEFAULT_REVISION,
+    trainingSourceRevision: TRAINING_SOURCE_REVISION,
     selectedTrainingSources: [...DEFAULT_SELECTED_TRAINING_SOURCES],
     trainSettings: { ...DEFAULT_TRAIN_SETTINGS },
     agentMode: false,
@@ -563,7 +571,8 @@ function loadState() {
       ...fallback,
       ...saved,
       botDefaultRevision: BOT_DEFAULT_REVISION,
-      selectedTrainingSources: normalizeSelectedTrainingSources(saved.selectedTrainingSources),
+      trainingSourceRevision: TRAINING_SOURCE_REVISION,
+      selectedTrainingSources: migrateSelectedTrainingSources(saved.selectedTrainingSources, saved.trainingSourceRevision),
       // Merge over the defaults so a settings object saved by an older build (missing the newer
       // fields) still yields a complete, valid form rather than undefined inputs.
       trainSettings: { ...DEFAULT_TRAIN_SETTINGS, ...(saved.trainSettings || {}) },
@@ -605,6 +614,15 @@ function normalizeSelectedTrainingSources(value) {
     ? value.filter((sourceId) => valid.has(sourceId))
     : [];
   return selected.length > 0 ? selected : [...DEFAULT_SELECTED_TRAINING_SOURCES];
+}
+
+function migrateSelectedTrainingSources(value, revision) {
+  const selected = normalizeSelectedTrainingSources(value);
+  if (Number(revision || 0) >= TRAINING_SOURCE_REVISION || !Array.isArray(value)) return selected;
+  const oldDefault = DEFAULT_SELECTED_TRAINING_SOURCES.filter((id) => id !== "src_verified_replay");
+  return selected.length === oldDefault.length && oldDefault.every((id) => selected.includes(id))
+    ? [...selected, "src_verified_replay"]
+    : selected;
 }
 
 function trainingSourceName(sourceId) {
