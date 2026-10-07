@@ -28,6 +28,23 @@ def main() -> None:
     except Exception:  # noqa: BLE001 - never let a browser-path hint block startup
         pass
 
+    # Release QA: launch the bundled browser without visiting any site. This proves
+    # the selected Chromium revision matches the frozen Playwright driver.
+    if sys.argv[1:] == ["--self-test-browser"]:
+        if getattr(sys, "frozen", False):
+            bundled = Path(getattr(sys, "_MEIPASS", "") or Path(sys.executable).parent) / "playwright-browsers"
+            if not bundled.is_dir():
+                raise RuntimeError(f"Bundled Chromium directory is missing: {bundled}")
+            # A developer's shared cache or inherited override must not mask a broken bundle.
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(bundled)
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            browser.close()
+        print("GreyIQ bundled Chromium self-test passed")
+        return
+
     # Dual-purpose binary: with a CLI verb as the first argument, dispatch to the
     # `gn` CLI (importing ONLY the torch-free bughunter engine — no uvicorn/API);
     # with no arguments, run the API server. So the shipped backend exe is also the

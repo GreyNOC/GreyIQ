@@ -136,7 +136,7 @@ jobs:
           $env:GREYIQ_HOST = "127.0.0.1"
           $env:GREYIQ_PORT = "8799"
           $env:GREYIQ_RUNTIME_DIR = "$env:RUNNER_TEMP/greyiq-smoke"
-          $proc = Start-Process -FilePath "dist/greyiq-backend/greyiq-backend.exe" -PassThru -NoNewWindow
+          $proc = Start-Process -FilePath "dist/greyiq-backend/greyiq-backend.exe" -PassThru -WindowStyle Hidden
           $ok = $false
           for ($i = 0; $i -lt 60; $i++) {
             Start-Sleep -Seconds 3
@@ -149,6 +149,18 @@ jobs:
           if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
           if (-not $ok) { throw "Frozen backend did not answer /api/health within 180s." }
           Write-Output "Frozen backend launched and answered /api/health."
+
+      - name: Smoke-test bundled browser and frozen CLI version
+        shell: pwsh
+        run: |
+          $backend = "dist/greyiq-backend/greyiq-backend.exe"
+          & $backend --self-test-browser
+          if ($LASTEXITCODE -ne 0) { throw "Bundled Chromium could not launch." }
+          $expected = "GreyIQ gn $((Get-Content package.json -Raw | ConvertFrom-Json).version)"
+          $actual = (& $backend --version) -join "`n"
+          if ($LASTEXITCODE -ne 0 -or $actual.Trim() -ne $expected) {
+            throw "Frozen CLI version mismatch: expected $expected, got $actual"
+          }
 
       # npm ci + the Electron binary were installed before the freeze (above), so nothing
       # to do here. Ollama is NO LONGER bundled (it was ~1.4 GB / 86% of the old portable);
@@ -288,7 +300,7 @@ jobs:
         # Fetches the Chromium build that build/greyiq-backend.spec bundles under the app,
         # so screenshot capture works in the shipped release on a machine that never ran
         # `playwright install`. Must run before the freeze step.
-        run: python -m playwright install chromium
+        run: python -m playwright install --with-deps chromium
 
       - name: Freeze backend (PyInstaller)
         run: pyinstaller --noconfirm --clean build/greyiq-backend.spec
@@ -314,6 +326,13 @@ jobs:
           kill "$PID" 2>/dev/null || true
           if [ "$ok" -ne 1 ]; then echo "Frozen backend did not answer /api/health within 180s."; exit 1; fi
           echo "Frozen backend launched and answered /api/health."
+
+      - name: Smoke-test bundled browser and frozen CLI version
+        run: |
+          ./dist/greyiq-backend/greyiq-backend --self-test-browser
+          expected="GreyIQ gn $(node -p "require('./package.json').version")"
+          actual="$(./dist/greyiq-backend/greyiq-backend --version)"
+          test "$actual" = "$expected" || { echo "Frozen CLI version mismatch: $actual" >&2; exit 1; }
 
       # npm ci + the Electron binary were installed before the freeze (above). Ollama is NO
       # LONGER bundled — downloaded on demand at first local-model use (electron/main.cjs
