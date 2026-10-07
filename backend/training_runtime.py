@@ -24,7 +24,9 @@ SOURCE_TEXT_FILES = {
     "src_starter_knowledge": ["greyiq_starter_knowledge.txt", "greyiq_coding_knowledge.txt"],
     "src_bug_bounty": ["greyiq_bug_bounty_knowledge.txt"],
     "src_personal_choices": ["greyiq_personal_choices.txt", "greyiq_profile.txt"],
-    "src_preferred_examples": ["greyiq_preferred_examples.txt"],
+    # Verified corrections and coding runs are materialized by LearningEngine into
+    # the replay file; the default Studio core selects Preferred Examples.
+    "src_preferred_examples": ["greyiq_preferred_examples.txt", "greyiq_verified_replay.txt"],
     "src_local_notes": ["greyiq_local_notes.txt"],
     "src_imported_docs": ["greyiq_imported_docs.txt"],
     # The bundled manual/PDF extract ensure_runtime already copies into data/. It is the largest

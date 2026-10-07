@@ -46,6 +46,25 @@ class LearningEngineTests(unittest.TestCase):
         self.assertEqual(replay.count("HTTPS normally uses TCP port 443."), 1)
         self.assertEqual(replay, (self.root / "data/greyiq_verified_replay.txt").read_text(encoding="utf-8"))
 
+    def test_verified_replay_reaches_selected_preferred_examples_training(self) -> None:
+        from training_runtime import load_all_text
+
+        self.engine.record_correction(
+            "What service normally uses TCP port 443?",
+            "HTTPS normally uses TCP port 443.",
+            source="GreyNOC manual",
+            tool_verified=True,
+        )
+        (self.root / "data/greyiq_local_notes.txt").write_text("Local notes only", encoding="utf-8")
+
+        selected = load_all_text(self.root, source_ids=["src_preferred_examples"])
+        self.assertIn("### FILE: greyiq_verified_replay.txt ###", selected)
+        self.assertIn("HTTPS normally uses TCP port 443.", selected)
+
+        unrelated = load_all_text(self.root, source_ids=["src_local_notes"])
+        self.assertIn("Local notes only", unrelated)
+        self.assertNotIn("HTTPS normally uses TCP port 443.", unrelated)
+
     def test_security_requires_explicit_verified_answer(self) -> None:
         score = ExperienceScore(1, 1, 1, 0, 1, 1, 1)
         exp = Experience(

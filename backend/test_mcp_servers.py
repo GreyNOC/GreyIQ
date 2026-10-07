@@ -47,9 +47,50 @@ def test_save_is_inert_and_private(manager: MCPServerManager, tmp_path: Path, mo
         assert stat.S_IMODE(manager.config_path.stat().st_mode) == 0o600
     persisted = json.loads(manager.config_path.read_text(encoding="utf-8"))
     assert persisted == {"version": 1, "servers": [{
-        "name": "local1", "transport": "stdio", "command": str(Path(sys.executable).resolve()),
+        "name": "local1", "transport": "stdio", "command": os.path.abspath(sys.executable),
+        "command_target": str(Path(sys.executable).resolve()),
         "args": ["-B", str(tmp_path / "missing_server.py")], "enabled": False,
     }]}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix executable symlinks")
+def test_stdio_symlink_launch_path_keeps_bound_target(
+    manager: MCPServerManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    link = tmp_path / "python-link"
+    link.symlink_to(sys.executable)
+    added = manager.add_server({
+        "name": "linked", "transport": "stdio", "command": str(link), "args": [],
+    })
+    assert added["ok"]
+    assert added["server"]["command"] == str(link)
+    assert "command_target" not in added["server"]
+    stored = json.loads(manager.config_path.read_text(encoding="utf-8"))["servers"][0]
+    assert stored["command_target"] == str(link.resolve())
+    assert manager.update_server("linked", {"enabled": True})["ok"]
+    monkeypatch.setattr(manager, "list_tools", lambda _name: {
+        "ok": True, "tools": [{"name": "review"}],
+    })
+    assert manager.approve_hunt_tool("linked", "review", evidence_only=True)["ok"]
+
+    # Retargeting the same symlink cannot silently change an approved server.
+    link.unlink()
+    link.symlink_to("/bin/sh")
+    tested = manager.test_server("linked")
+    assert tested["ok"] is False
+    assert tested["error"] == "MCP server command is unavailable or not executable."
+    assert manager.list_hunt_approvals()["approvals"][0]["valid"] is False
+    assert manager.create_hunt_permit(
+        "run1", "https://example.test", "example.test", authorized=True,
+        server="linked", tool="review",
+    )["ok"] is False
+
+    rebound = manager.update_server("linked", {"command": str(link)})
+    assert rebound["ok"]
+    stored = json.loads(manager.config_path.read_text(encoding="utf-8"))["servers"][0]
+    assert stored["command_target"] == str(link.resolve())
+    assert manager._launch_target_is_current(stored)
+    assert manager.list_hunt_approvals()["approvals"] == []
 
 
 def test_crud_name_identity_casefold_limit_and_disappearing_executable(manager: MCPServerManager, tmp_path: Path) -> None:

@@ -235,7 +235,7 @@ class LearningEngine:
         replay_path = self.pools["replay"] / "verified_replay.txt"
         self._atomic_write(replay_path, payload + ("\n" if payload else ""))
 
-        # Compatibility bridge for the existing trainer, which reads data/*.txt.
+        # The trainer includes this file when the default Preferred Examples source is selected.
         trainer_path = self.base_dir / "data" / "greyiq_verified_replay.txt"
         trainer_path.parent.mkdir(parents=True, exist_ok=True)
         self._atomic_write(trainer_path, payload + ("\n" if payload else ""))

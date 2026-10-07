@@ -41,6 +41,7 @@ _MAX_RESULT_CHARS = 12_000
 _MAX_ARGUMENT_BYTES = 16_384
 _CONNECT_TIMEOUT_S = 12.0
 _ALLOWED_FIELDS = frozenset({"name", "transport", "command", "args", "url", "enabled"})
+_STORED_FIELDS = _ALLOWED_FIELDS | {"command_target"}
 _MAX_HUNT_APPROVALS = 64
 _MAX_HUNT_CALLS = 8
 _HUNT_PERMIT_TTL_S = 60 * 60
@@ -92,7 +93,7 @@ class MCPServerManager:
 
     @classmethod
     def _normalize(cls, payload: dict[str, Any], *, check_executable: bool = True) -> dict[str, Any]:
-        if not isinstance(payload, dict) or set(payload) - _ALLOWED_FIELDS:
+        if not isinstance(payload, dict) or set(payload) - _STORED_FIELDS:
             raise ValueError("Unsupported MCP server settings.")
         name = payload.get("name")
         if not cls._valid_name(name):
@@ -113,8 +114,12 @@ class MCPServerManager:
             path = Path(command).expanduser()
             if not path.is_absolute() or (sys.platform == "win32" and str(path).startswith("\\\\")):
                 raise ValueError("Command must be an absolute local executable path.")
+            # Keep the launch path's symlink. Unix virtual environments commonly
+            # use bin/python -> the system interpreter; executing the resolved
+            # target loses pyvenv.cfg discovery and the environment's packages.
+            launch_path = Path(os.path.abspath(path))
             try:
-                resolved = path.resolve(strict=check_executable)
+                resolved = launch_path.resolve(strict=check_executable)
                 mode = resolved.stat().st_mode if check_executable else None
             except (OSError, RuntimeError):
                 raise ValueError("Command executable does not exist.") from None
@@ -131,9 +136,17 @@ class MCPServerManager:
             if (not isinstance(args, list) or len(args) > _MAX_ARGS
                     or any(not cls._valid_text(arg, max_chars=_MAX_ARG_CHARS) for arg in args)):
                 raise ValueError("Arguments must be an array of at most 32 bounded strings.")
-            record.update(command=str(resolved), args=list(args))
+            target = str(resolved)
+            bound_target = payload.get("command_target", target)
+            if (not isinstance(bound_target, str) or not Path(bound_target).is_absolute()
+                    or len(bound_target) > 2048):
+                raise ValueError("Saved MCP server command target is invalid.")
+            if check_executable and bound_target != target:
+                raise ValueError("MCP server command target changed since registration.")
+            record.update(command=str(launch_path), command_target=bound_target, args=list(args))
         else:
-            if payload.get("command") not in (None, "") or payload.get("args") not in (None, []):
+            if (payload.get("command") not in (None, "") or payload.get("args") not in (None, [])
+                    or payload.get("command_target") is not None):
                 raise ValueError("An HTTP server cannot include a command or arguments.")
             url = payload.get("url")
             if not cls._valid_text(url, max_chars=2048) or not url or "?" in url or "#" in url or "\\" in url:
@@ -198,6 +211,16 @@ class MCPServerManager:
         # Include enablement so toggling a server requires a fresh approval.
         encoded = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _launch_target_is_current(cls, record: dict[str, Any]) -> bool:
+        if record["transport"] != "stdio":
+            return True
+        try:
+            cls._normalize(record, check_executable=True)
+        except ValueError:
+            return False
+        return True
 
     @staticmethod
     def _valid_tool_name(name: Any) -> bool:
@@ -269,6 +292,7 @@ class MCPServerManager:
 
     def _public(self, record: dict[str, Any]) -> dict[str, Any]:
         item = dict(record)
+        item.pop("command_target", None)
         item.update(self._status.get(record["name"], {"status": "untested", "tool_count": 0}))
         return item
 
@@ -281,6 +305,8 @@ class MCPServerManager:
 
     def add_server(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
+            if not isinstance(payload, dict) or set(payload) - _ALLOWED_FIELDS:
+                raise ValueError("Unsupported MCP server settings.")
             record = self._normalize(payload, check_executable=False)
             with self._lock:
                 servers = self._load()
@@ -316,6 +342,10 @@ class MCPServerManager:
                     merged = {"name": name, "enabled": old["enabled"]}
                 merged.update(payload)
                 merged["name"] = name
+                if "command" in payload:
+                    # Explicitly saving the command also rebinds an intentionally
+                    # retargeted symlink; changed bindings drop approvals below.
+                    merged.pop("command_target", None)
                 record = self._normalize(merged, check_executable=False)
                 servers[index] = record
                 # The exact server configuration reviewed by the operator has
@@ -362,6 +392,7 @@ class MCPServerManager:
                     rows.append({
                         **item,
                         "valid": bool(record and record["enabled"]
+                                      and self._launch_target_is_current(record)
                                       and self._server_fingerprint(record) == item["server_fingerprint"]),
                     })
                 return {"ok": True, "approvals": rows}
@@ -446,6 +477,8 @@ class MCPServerManager:
                 record = next((item for item in self._load() if item["name"] == server), None)
                 if not record or not record["enabled"]:
                     return self._error("Enable this MCP server before automatic hunt analysis.")
+                if not self._launch_target_is_current(record):
+                    return self._error("MCP server command changed since registration.")
                 fingerprint = self._server_fingerprint(record)
                 approved = any(
                     item["server"] == server and item["tool"] == tool
@@ -790,6 +823,7 @@ class MCPServerManager:
                     return self._error("MCP hunt permit is expired, exhausted, or does not match this run.")
                 record = next((item for item in self._load() if item["name"] == server), None)
                 if (not record or not record["enabled"]
+                        or not self._launch_target_is_current(record)
                         or self._server_fingerprint(record) != permit["server_fingerprint"]):
                     return self._error("MCP server settings changed; approval is no longer valid.")
                 approved = any(
