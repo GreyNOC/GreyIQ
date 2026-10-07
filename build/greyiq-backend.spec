@@ -135,7 +135,7 @@ for _plugin in _verb_plugin_modules():
 
 # The ASGI stack + clients load a lot dynamically; pull everything in. numpy stays
 # (document_ingest's pandas path uses it). anthropic is the Claude coding-brain client.
-for package in ("numpy", "anthropic", "uvicorn", "pydantic", "pydantic_core", "pypdf", "cryptography", "mcp"):
+for package in ("numpy", "anthropic", "uvicorn", "pydantic", "pydantic_core", "pypdf", "cryptography"):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(package)
     datas += pkg_datas
     binaries += pkg_binaries
@@ -143,6 +143,13 @@ for package in ("numpy", "anthropic", "uvicorn", "pydantic", "pydantic_core", "p
 
 hiddenimports += collect_submodules("uvicorn")
 hiddenimports += collect_submodules("bughunter")
+# Bundle the MCP SDK modules GreyIQ uses. collect_all("mcp") also imports the
+# optional mcp.cli package, whose Typer extra is intentionally not installed
+# and aborts PyInstaller's isolated module scan.
+hiddenimports += [
+    "mcp.client.stdio", "mcp.client.streamable_http",
+    "mcp.server.fastmcp", "mcp.shared.memory",
+]
 
 # pydantic_core ships a compiled extension (_pydantic_core). collect_all does not
 # reliably place it for newer versions (pulled in by anthropic), which crashes the
