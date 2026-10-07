@@ -1,0 +1,85 @@
+GreyIQ Verified Coding Foundation
+
+<START_CONVO>
+<USER>
+How should I fix a coding bug?
+<ASSISTANT>
+Reproduce the bug first. Identify the smallest failing boundary, add a test that fails for the right reason, make the smallest focused change, then run the relevant test suite and report what was actually verified.
+<END_CONVO>
+
+<START_CONVO>
+<USER>
+What makes a safe code change?
+<ASSISTANT>
+A safe change preserves unrelated behavior, validates inputs at the boundary, handles expected failures explicitly, avoids exposing secrets, and includes a regression test. Inspect existing conventions before editing and keep rollback possible.
+<END_CONVO>
+
+<START_CONVO>
+<USER>
+How should a Python function validate an integer limit?
+<ASSISTANT>
+Reject booleans and non-integers, define an allowed range, and raise a clear exception before using the value. For example: if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100: raise ValueError("limit must be an integer from 1 to 100").
+<END_CONVO>
+
+<START_CONVO>
+<USER>
+When should I catch Exception in Python?
+<ASSISTANT>
+Catch specific exceptions when you can recover or add useful context. A broad Exception catch is appropriate only at a deliberate process boundary where failure must be logged or converted without hiding it. Never silently swallow an unexpected exception.
+<END_CONVO>
+
+<START_CONVO>
+<USER>
+How do I write a useful regression test?
+<ASSISTANT>
+Arrange the smallest state that triggered the bug, perform one observable action, and assert the security or behavior invariant. Include a negative control when it distinguishes the fix from unrelated success.
+<END_CONVO>
+
+<START_CONVO>
+<USER>
+How should I modify a repository I do not know?
+<ASSISTANT>
+Read its instructions and nearby code first. Find the call sites and tests, follow local naming and error-handling conventions, make a focused edit, and run the narrow test before broader checks.
+<END_CONVO>
+
+<START_CONVO>
+<USER>
+How should code handle filesystem paths from a user?
+<ASSISTANT>
+Resolve the intended root and candidate path, require the candidate to remain inside that root, avoid string-built shell commands, and use literal path APIs. Check the exact target before delete, move, or overwrite operations.
+<END_CONVO>
+
+<START_CONVO>
+<USER>
+How should an API return errors?
+<ASSISTANT>
+Use a stable status code and a concise public error message. Log diagnostic context privately, exclude credentials and sensitive internals, and keep the response shape consistent so clients can handle it safely.
+<END_CONVO>
+
+<START_CONVO>
+<USER>
+What should I check in concurrent code?
+<ASSISTANT>
+Identify shared mutable state and protect the whole read-modify-write operation. Test overlapping operations, define lock ownership, avoid holding locks across slow external calls, and make retries idempotent.
+<END_CONVO>
+
+<START_CONVO>
+<USER>
+How do I review generated code?
+<ASSISTANT>
+Treat it as an untrusted proposal. Check requirements, data flow, boundary validation, failure behavior, security assumptions, and compatibility with the repository. Run formatting, static checks, and tests before accepting it.
+<END_CONVO>
+
+<START_CONVO>
+<USER>
+How should secrets be handled in code?
+<ASSISTANT>
+Load secrets from an approved secret store or environment boundary, never hard-code or log them, redact them from traces, restrict where they are forwarded, and fail clearly when required secrets are missing.
+<END_CONVO>
+
+<START_CONVO>
+<USER>
+What is a good implementation plan?
+<ASSISTANT>
+State the expected behavior, inspect the relevant interfaces, name the smallest files likely to change, define the test that proves success, implement one focused change, verify it, and summarize remaining uncertainty.
+<END_CONVO>

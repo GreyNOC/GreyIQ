@@ -81,39 +81,40 @@ class HuggingFaceReferenceTests(unittest.TestCase):
 
 
 class OllamaWiringTests(unittest.TestCase):
-    def test_import_route_pulls_the_normalized_model(self):
+    def test_import_route_starts_readiness_gated_setup_for_the_normalized_model(self):
         model = "hf.co/Example/Code-Model-GGUF:Q4_K_M"
-        with (patch.object(api.runtime, "_local_brain", return_value=("http://127.0.0.1:11434", "")),
-              patch.object(api.runtime, "start_model_pull", return_value={"ok": True, "active": True, "model": model}) as pull):
+        with (patch.object(api.runtime, "start_model_setup", return_value={"ok": True, "active": True, "model": model}) as setup,
+              patch.object(api.runtime, "start_model_pull") as pull):
             status, response = post_route(
                 "/api/coder/huggingface/import",
                 {"reference": "https://huggingface.co/Example/Code-Model-GGUF:Q4_K_M"},
             )
         self.assertEqual(status, 200)
         self.assertEqual(response["model"], model)
-        pull.assert_called_once_with(model)
+        setup.assert_called_once_with(model, base_url="")
+        pull.assert_not_called()
 
-    def test_import_route_rejects_non_huggingface_url_without_pull(self):
-        with patch.object(api.runtime, "start_model_pull") as pull:
+    def test_import_route_rejects_non_huggingface_url_without_setup(self):
+        with patch.object(api.runtime, "start_model_setup") as setup:
             status, response = post_route(
                 "/api/coder/huggingface/import",
                 {"reference": "https://evil.example/Example/Code-Model-GGUF"},
             )
         self.assertEqual(status, 200)
         self.assertFalse(response["ok"])
-        pull.assert_not_called()
+        setup.assert_not_called()
 
-    def test_import_route_refuses_remote_ollama(self):
+    def test_import_route_uses_local_default_even_if_saved_server_is_remote(self):
+        model = "hf.co/Example/Code-Model-GGUF"
         with (patch.object(api.runtime, "_local_brain", return_value=("https://models.example.com", "")),
-              patch.object(api.runtime, "start_model_pull") as pull):
+              patch.object(api.runtime, "start_model_setup", return_value={"ok": True, "active": True, "model": model}) as setup):
             status, response = post_route(
                 "/api/coder/huggingface/import",
-                {"reference": "hf.co/Example/Code-Model-GGUF"},
+                {"reference": model},
             )
         self.assertEqual(status, 200)
-        self.assertFalse(response["ok"])
-        self.assertIn("local Ollama", response["error"])
-        pull.assert_not_called()
+        self.assertTrue(response["ok"])
+        setup.assert_called_once_with(model, base_url="")
 
     def test_loopback_check_covers_ipv4_ipv6_and_rejects_remote_hosts(self):
         self.assertTrue(coder.ollama_host_is_loopback("http://127.0.0.1:11434"))
@@ -131,12 +132,12 @@ class OllamaWiringTests(unittest.TestCase):
             sent.append(json.loads(request.data))
             return io.BytesIO(b'{"status":"pulling manifest"}\n{"status":"success"}\n')
 
-        with patch.object(coder.urllib.request, "urlopen", side_effect=open_success):
+        with patch.object(coder, "_ollama_open", side_effect=open_success):
             coder.ollama_pull("http://127.0.0.1:11434", model, 30, events.append)
         self.assertEqual(sent, [{"model": model, "stream": True}])
         self.assertEqual(events[-1]["status"], "success")
 
-        with patch.object(coder.urllib.request, "urlopen", return_value=io.BytesIO(b'{"status":"pulling manifest"}\n')):
+        with patch.object(coder, "_ollama_open", return_value=io.BytesIO(b'{"status":"pulling manifest"}\n')):
             with self.assertRaisesRegex(coder.CoderError, "without confirming success"):
                 coder.ollama_pull("http://127.0.0.1:11434", model, 30, lambda _event: None)
 
@@ -144,7 +145,7 @@ class OllamaWiringTests(unittest.TestCase):
         error = ('Head "https://us.aws.cdn.hf.co/file?Signature=secret": '
                  'blocked redirect to a different host')
         response = io.BytesIO((json.dumps({"error": error}) + "\n").encode())
-        with patch.object(coder.urllib.request, "urlopen", return_value=response):
+        with patch.object(coder, "_ollama_open", return_value=response):
             with self.assertRaises(coder.CoderError) as caught:
                 coder.ollama_pull("http://127.0.0.1:11434", "hf.co/Example/Repo:Q4_0", 30, lambda _: None)
         self.assertIn("0.34.3", str(caught.exception))

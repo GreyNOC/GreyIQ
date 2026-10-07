@@ -11,6 +11,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
@@ -323,6 +324,38 @@ class AwsPairingIntegrationTests(unittest.TestCase):
     """AWS keys are detected as two SEPARATE findings (id + secret); the hunt must pair the two from the
     same file and hand the SigV4 validator BOTH, since a single value cannot sign a request."""
 
+    def test_hunt_does_not_contact_issuer_without_separate_opt_in(self) -> None:
+        import tempfile
+        from bughunter import bounty
+
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as out:
+            (Path(src) / "creds.env").write_text(
+                "aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n"
+                "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY\n"
+                "github_token = ghp_" + "A" * 36 + "\n"
+                "google_api_key = AIza" + "B" * 35 + "\n",
+                encoding="utf-8",
+            )
+            detections = bounty.run_code_scan(src, "path")
+            self.assertTrue({"secret.aws-access-key-id", "secret.github-pat", "secret.google-api-key"}
+                            <= {finding["rule_id"] for finding in detections["findings"]})
+            token_issuer = Mock()
+            with patch.object(bounty.credential_validation, "validate_aws_key") as aws_issuer, \
+                    patch.object(bounty.credential_validation, "validate_firebase_key") as google_issuer, \
+                    patch.object(bounty.credential_validation, "probe_firebase_exposure") as google_probe, \
+                    patch.dict(bounty._TOKEN_ISSUER_VALIDATORS, {"secret.github-pat": token_issuer}):
+                report = bounty.run_bounty_hunt(
+                    src, "source-code", None, out, "local", True, {},
+                    default_reports_dir=Path(out), seed_dir=BACKEND_DIR / "seed",
+                )
+            aws_issuer.assert_not_called()
+            token_issuer.assert_not_called()
+            google_issuer.assert_not_called()
+            google_probe.assert_not_called()
+
+        self.assertTrue(report.get("ok"), report.get("error"))
+        self.assertGreater(report.get("finding_count", 0), 0)
+
     def test_hunt_pairs_the_access_key_id_with_its_file_secret(self) -> None:
         import tempfile
         from bughunter import bounty
@@ -341,7 +374,8 @@ class AwsPairingIntegrationTests(unittest.TestCase):
                     "aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n"
                     "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY\n", encoding="utf-8")
                 report = run_bounty_hunt(src, "source-code", None, out, "local", True, {},
-                                         default_reports_dir=Path(out), seed_dir=BACKEND_DIR / "seed")
+                                         default_reports_dir=Path(out), seed_dir=BACKEND_DIR / "seed",
+                                         validate_credential_issuers=True)
         finally:
             bounty.credential_validation.validate_aws_key = orig
 

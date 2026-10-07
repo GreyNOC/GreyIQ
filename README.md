@@ -43,7 +43,57 @@ detects standard TACNOC installs and the normal `GreyNOC Belcher` development
 checkout on the current user's Desktop; set `GREYIQ_TACNOC_PATH` to a TACNOC
 executable or project directory for any other layout.
 
+## Debian 13
+
+The Linux release includes a Debian package, an AppImage, and a headless CLI
+tarball for amd64. On a Debian 13 desktop, install the package with:
+
+```bash
+sudo apt install ./GreyIQ-*-amd64.deb
+greyiq-cli dashboard
+```
+
+`greyiq` opens the desktop app. `greyiq-cli` runs the same frozen backend's
+command-line interface; `dashboard` is an interactive, read-only terminal view
+of local health, system load, programs, findings, reports, and activity. Press
+`q` to quit, `r` to refresh, and Tab or the arrow keys to change panels. The
+dashboard requires a terminal and only probes the API on `127.0.0.1`. Both the
+installed desktop and CLI use `$XDG_DATA_HOME/greyiq/runtime` (or
+`~/.local/share/greyiq/runtime`) unless `GREYIQ_RUNTIME_DIR` is set. On first
+launch after upgrading an older AppImage, the desktop copies existing data from
+its previous Electron runtime directory when the new location is still absent.
+Launch the desktop once before running CLI hunts after an upgrade so that copy
+can complete.
+
+For the headless CLI archive, extract it and run `./greyiq-cli path` for local
+PATH guidance, then `./greyiq-cli dashboard`.
+The included `INSTALL.txt` and [deployment guide](DEPLOY.md) show the exact
+optional `~/.local/bin` PATH setup; the Debian package needs no PATH change.
+
+For the AppImage, install its FUSE and local-model extraction dependencies,
+then make it executable:
+
+```bash
+sudo apt install libfuse2t64 zstd
+chmod +x GreyIQ-*-x86_64.AppImage
+./GreyIQ-*-x86_64.AppImage
+```
+
+From a source checkout, install [Node.js 22.12 or newer](https://nodejs.org/en/download),
+plus Debian's `python3-venv`, `tesseract-ocr`, and `poppler-utils` packages.
+Debian 13's own `nodejs` package is Node 20, which is too old for the Electron
+version used here. Then run `npm ci`, create and
+activate a Python virtual environment, and install `requirements.txt`.
+`./gn dashboard` opens the terminal view. See [DEPLOY.md](DEPLOY.md) for exact
+commands, build steps, and optional OCR and model setup.
+
 ## Check
+
+Install the Python runtime and test dependencies before running the full check:
+
+```powershell
+python -m pip install -r requirements.txt -r requirements-test.txt
+```
 
 ```powershell
 npm run check
@@ -61,28 +111,73 @@ npm run check:devops
 
 In the **Coding brain** panel (training column) pick a provider:
 
-- **Off** — local TinyGPT only (offline fallback).
+- **Off** — bundled, source-labelled offline playbooks; the character-level TinyGPT experiment runs only in development builds.
 - **Local model (Ollama)** — e.g. `qwen2.5-coder:14b`. The Ollama runtime isn't shipped in the installer — GreyIQ fetches it (with its bundled NVIDIA/CUDA runner) the first time you select the local model, offers one-click model download, and uses your GPU automatically: NVIDIA works out of the box; on an AMD box GreyIQ fetches Ollama's ROCm runtime separately on first run. No supported GPU → it runs on CPU.
 - **Claude API** — paste an Anthropic key (default model `claude-opus-4-8`).
 - **OpenAI-compatible** — any `/v1/chat/completions` endpoint.
 
-To use a Hugging Face GGUF model, select **Local model (Ollama)** and paste its
-model page URL (for example, `https://huggingface.co/owner/model-GGUF`) or Ollama
-reference (`hf.co/owner/model-GGUF:Q4_K_M`) into **Import from Hugging Face**.
-Choose **Import and select**. GreyIQ downloads the model through Ollama, shows
-progress, then selects it for chat and Agent mode. Use **Test** to confirm the
-model responds. Import requires a loopback Ollama Server URL such as
-`http://127.0.0.1:11434/v1`; save that setting before importing. Downloading
-needs an internet connection; inference runs locally afterward. Start with a public
-GGUF repository. GreyIQ does not manage Hugging Face
-authentication; a gated or private repository requires access already configured
-for Ollama and may fail if that access is missing. Other Hugging Face model formats
-are not supported by this control. If a download completes but is not selected,
-use **Select** beside it in the installed model list. Review each model's license
-and card before use. Agent mode also depends on the
-chosen model's ability to follow tool calls. See the
-[Hugging Face Ollama guide](https://huggingface.co/docs/hub/main/ollama) for GGUF
-references and quantization tags.
+For a local Hugging Face model, paste a **public GGUF model page** such as
+`https://huggingface.co/owner/model-GGUF`, an `hf.co/owner/model-GGUF:quant`
+reference, or its `ollama run ...` command into the model field. Click
+**Download and use** once. GreyIQ starts Ollama if needed, downloads the selected
+model, checks that it appears locally, and tests chat and structured tool calls
+before switching the active brain. A model that only supports chat stays
+available for manual selection; the previous brain remains active. Private,
+gated, and non-GGUF repositories need their own access or conversion steps.
+
+The dedicated **Import from Hugging Face** control also accepts a GGUF model
+page URL or `hf.co/owner/model-GGUF:Q4_K_M` reference. Choose **Import and select**
+to download through local Ollama and run the same chat and agent-tool checks as
+**Download and use**. GreyIQ selects it only when those checks pass; the model
+then also drives BugHunter's hunt planning when the brain is enabled. If a model
+is unavailable during a hunt, the bounded offline planner still runs. The
+packaged desktop starts the saved local runtime again after app restart. For
+source and headless CLI use, install and start Ollama locally; CLI hunts use
+the saved model with `--brain`. Review each model's license and card before use.
+
+If Ollama's repository pull rejects a model because it contains only **split
+GGUF shards**, GreyIQ checks the complete quantization set, reports its size,
+checks that local Ollama is version 0.35.0 or newer, and checks download space
+before fetching the shards. An explicit `:quant` tag
+selects that quantization; otherwise GreyIQ chooses the smallest complete one.
+It verifies the downloaded files, reuses saved shards or Ollama blobs on retry,
+and creates a local Ollama model from the original filenames, then runs the
+same readiness checks. Large split models
+need room for both the download cache and Ollama's model store, and still need
+an Ollama version that supports their architecture. The status panel explains
+preflight or model-creation failures without changing the previous brain.
+Set `GREYIQ_RUNTIME_DIR` to move the download cache and `OLLAMA_MODELS` to move
+the bundled Ollama model store before starting GreyIQ if the default volume is
+too small. The latter also works for a separately installed Ollama when set in
+that server's environment. For example, in PowerShell before opening the
+portable app:
+
+```powershell
+$env:GREYIQ_RUNTIME_DIR = 'D:\GreyIQ\runtime'
+$env:OLLAMA_MODELS = 'D:\GreyIQ\ollama-models'
+```
+
+For split GGUF shards larger than 4 GiB, both locations must use NTFS or
+exFAT on Windows. FAT32 cannot store a single file that large even when the
+drive has enough free space; GreyIQ checks this before downloading.
+
+Launch GreyIQ from that PowerShell session so it inherits both settings.
+
+On Linux, export both variables before starting the app and its Ollama server:
+
+```bash
+export GREYIQ_RUNTIME_DIR=/mnt/models/greyiq-runtime
+export OLLAMA_MODELS=/mnt/models/ollama-models
+```
+
+For split imports, stop an already-running Ollama server before launching
+GreyIQ. GreyIQ must launch Ollama with `OLLAMA_MODELS` set so it can verify the
+model store's free space; a server started elsewhere has an unknown store and
+the split download stops before transferring weights. Ordinary Ollama pulls
+can use an existing server. Existing models in a former store are not moved
+automatically.
+
+See the [Hugging Face Ollama guide](https://huggingface.co/docs/hub/main/ollama).
 If Ollama reports a blocked Hugging Face download redirect, update Ollama to
 0.34.3 or newer; 0.34.2 has a [known redirect bug](https://github.com/ollama/ollama/issues/18526).
 
@@ -91,6 +186,53 @@ For security and root-cause work, Agent mode can call a shared evidence-grounded
 investigator that scans code read-only, ranks hypotheses, names the proof still needed,
 and detects contradictions before proposing a fix. Raw credential values are never
 included in the brief sent to a configured model.
+
+## MCP servers
+
+Open **Brain → MCP servers** to save more than one trusted server. Choose an
+absolute native executable path with one argument per line for a local stdio
+server, or an HTTP URL on literal loopback such as
+`http://127.0.0.1:3000/mcp`. HTTP servers on other hosts, redirects, proxy
+settings, custom headers, and stored environment variables are not supported.
+For a Python or Node server, select the full path to `python.exe` or `node.exe`
+as the command and put the server script's full path in Arguments. The form
+does not download or install a server for you. Do not put credentials in
+Arguments; they are saved as plaintext and may appear in process listings.
+
+**Save** records the configuration without connecting. A new server is
+disabled. **Test** explicitly starts a connection and lists available tools;
+enable the server after you review it. Chat uses exact, one-shot commands:
+
+```text
+mcp list
+mcp tools -y my-server
+mcp call -y my-server tool_name {"argument":"value"}
+```
+
+`-y` confirms this chat connection or call is intentional. The chat model does
+not choose or invoke MCP tools on its own. Server output is shown as untrusted text and
+excluded from later model chat history. MCP commands and results stay visible
+until reload but are not saved in browser chat storage. GreyIQ cannot enforce target scope,
+rate limits, or request markers inside an external MCP server, so use a server
+for target testing only when that server can enforce the engagement's rules.
+Adding a server alone does not authorize any target activity.
+
+Every authorized hunt automatically calls GreyIQ's built-in, in-memory MCP
+evidence-review tool after the scan. It receives bounded categories and indexes
+from the captured surface and findings, makes no target requests, and writes an
+advisory review to the report and JSON sidecar. Its output cannot confirm a
+finding, change severity, or schedule a probe.
+
+For external analysis during a hunt, first enable and test a server, then approve
+an exact advertised tool under **Brain → MCP servers** as evidence-only. This
+approval is bound to the saved server configuration and becomes invalid after
+the configuration changes. At hunt launch, separately check **External MCP
+evidence analysis** for that run. GreyIQ passes only bounded, redacted hunt
+metadata to at most three approved tools, one call
+each. Their responses are labeled as untrusted advisory data. External servers
+execute outside GreyIQ's
+network guard: approve only tools you have verified do not make target requests.
+No external tool runs automatically from server enablement alone.
 
 ## Agent mode & the Workbench
 
@@ -134,15 +276,18 @@ as commands to execute.
 ## BugHunter
 
 See [docs/USER_GUIDE.md](docs/USER_GUIDE.md) for the full Hunt-cockpit walkthrough —
-Program setup (including starting an inactive draft from only a public forge repository link,
-or pulling real scope from HackerOne's API, from YesWeHack's API — scope, rules of engagement
-and the program's required user-agent marker, no sign-in needed for a public program — or from
-a CSV/paste import),
-opt-in shallow cloning/adversarial scanning of program-provided public source repositories,
+Program setup (including browsing visible programs through HackerOne, YesWeHack, Bugcrowd, and Intigriti APIs,
+previewing their scope and rules, or importing a CSV/paste table),
+local-clone source scanning (remote Git cloning currently refuses to run),
 per-program SSRF/OOB setup, running a hunt, and reports & submission. The cockpit also opens
 a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the top bar).
+When adding a HackerOne program, enter and save the API identifier and token in
+the Program wizard's **Identify** step. You can test the saved connection there
+before browsing programs or fetching scope; the token field is masked and cleared
+after saving.
 
-- **Scan** from chat: `scan code <path|repo>`, `scan web <url>`, `scan live <url>`.
+- **Assess from chat:** `scan code <local-path>` runs a local source scan. Network scans require an explicit authorization assertion and exact scope. `scan web -y --scope app.example.com https://app.example.com/` runs a scoped passive web pass. `scan active -y --scope app.example.com https://app.example.com/` starts a background proof pass with at most 16 GET/HEAD/OPTIONS requests and reports observations alongside controls. Missing or mismatched scope is refused before a request, and scoped web redirects cannot leave the host. These short web commands require whole-host permission for the methods used. For narrower policies, use the saved program workflow in the Hunt cockpit; hunts refuse restrictions the engine cannot enforce. Remote Git scans currently refuse to run because Git can fetch alternate object stores outside the named repository; scan a local clone instead. Scoped live browser scans currently refuse to run until browser DNS egress can be pinned.
+- **Expert knowledge in chat:** bundled assessment cards teach hypothesis selection, differential controls, evidence calibration, stop conditions, and fix verification. Offline replies quote source-labelled excerpts. A configured reasoning brain receives at most two brief, source-labelled excerpts as reference data; they never count as target evidence or testing authorization.
 - **Unauthenticated ATO and RCE, including the blind half.** The active prover confirms command
   injection the target echoes back or delays; with an OOB collaborator configured, a hunt also
   proves the blind kind — a shell-wrapped callback in parameters *and* in the request headers that
@@ -154,7 +299,9 @@ a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the
   key-source injection — the verifier fetching a signing key the token itself named.
 - **Leads** — after a hunt finishes, the **Leads** button in the Hunt cockpit's export row renders
   the whole investigation queue in the app: every lead with its evidence state, the exact artifact
-  that would confirm it, the gaps still open, and anything the engine says contradicts it. The same
+  that would confirm it, the predicted result, a matched negative control, a stop condition,
+  the gaps still open, and anything the engine says contradicts it. These predictions do not
+  grant permission or count as proof. The same
   panel downloads it as one Markdown brief — that file is what you hand to an analyst (or paste to
   Claude) to work the leads. (A *Download leads (.md)* button also exists in the AI Studio surface;
   the cockpit is where a hunt actually runs, which is why the queue is rendered there.)
@@ -179,6 +326,10 @@ a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the
   reproduction steps + attack plans, and a Markdown report (+ JSON sidecar, optional
   per-finding files) is written to a folder you choose. **Authorized testing only** —
   a hunt won't run unless you confirm the target is in scope.
+- Submission packages include a concise, plain-language `.md` body for the platform's
+  description field. The `.details.md` analyst report and `.json` sidecar retain the
+  metadata, proof state, limitations, and evidence for review. The operator checks
+  captured artifacts and the current program policy before submitting.
 - Bounty reports now add triage, class mix, submission-readiness checks, and an
   **Investigation intelligence** brief: calibrated confidence, typed evidence state,
   explicit proof gaps, contradiction detection, a ranked hypothesis queue, and
@@ -200,8 +351,7 @@ a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the
   HackerOne, YesWeHack, Bugcrowd, Intigriti, and **HackenProof** (web3: exchanges, protocols,
   smart contracts) — pick the format in Submissions. HackerOne is the only live-API submit;
   the rest, HackenProof included, are export-only (HackenProof has no researcher API — you
-  submit on its dashboard). URL targets can
-  opt into the live browser pass, and focus classes also cover CSRF, CORS, open
+  submit on its dashboard). Focus classes also cover CSRF, CORS, open
   redirect, unsafe file upload, business logic, and supply-chain/dependency risk.
 - **Negative knowledge** — GreyIQ remembers what it already probed and did **not** confirm. A
   planned `(endpoint, class)` that yields nothing becomes a *miss*; after two misses the pair is
@@ -246,16 +396,17 @@ refuses catastrophic commands (`rm -rf`, disk formats, pipe-to-shell, power cont
 privilege escalation, …).
 
 Local code scans can be restricted to one folder with
-`GREYIQ_CODE_SCAN_BASE_PATH`. Remote repository scans require public HTTPS repository-root
-URLs from the built-in forge allowlist; GreyIQ shallow-clones them into a temporary directory
-and removes it after the scan. Web/live scans refuse private/loopback hosts unless
-`GREYIQ_SCAN_ALLOW_PRIVATE_URLS=1`.
+`GREYIQ_CODE_SCAN_BASE_PATH`. Remote repository URLs are recognized but refuse to clone until the Git transport can be constrained to the authorized source; provide a local clone. Web scans refuse private/loopback hosts unless
+`GREYIQ_SCAN_ALLOW_PRIVATE_URLS=1`; scoped browser scans currently refuse to run.
 
 Fixed third-party egress is narrow and documented. HackerOne import/submission uses
 `api.hackerone.com` only on its corresponding operator action. YesWeHack program search,
 scope import and sign-in use `api.yeswehack.com` the same way — read-only apart from the
 sign-in exchange, on an explicit click only, host-pinned, and with redirects refused so a
-credential can never follow a hop off that host. The optional **Enrich from
+credential can never follow a hop off that host. Bugcrowd and Intigriti program intake
+uses `api.bugcrowd.com` and `api.intigriti.com`, respectively, for explicit read-only
+program discovery and previews. Imported programs are saved paused until you review
+the current policy and authorize testing. The optional **Enrich from
 forge (read-only)** action uses one unauthenticated GET per selected repository to
 `api.github.com` (GitHub) or `gitlab.com` (GitLab); it has a hard timeout, never runs in the
 background, and only returns homepage/web domains as **unticked** scope suggestions. Enrichment

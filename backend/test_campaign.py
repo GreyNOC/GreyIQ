@@ -250,7 +250,7 @@ class CampaignTests(unittest.TestCase):
 
         self.assertTrue(result["ok"], result.get("error"))
         self.assertEqual(calls[0][0], orders)                      # the prover ran on the brain-selected endpoint
-        self.assertEqual(calls[0][1], {"cookie": "sid=abc"})       # ...with the operator's authenticated session
+        self.assertEqual(calls[0][1], {"cookie": "sid=abc", "issuer_host": "app.example.com"})
         idor_refs = [f["ref"] for f in result["findings"] if "IDOR" in f["title"]]
         self.assertEqual(len(idor_refs), 1)                        # the lead was folded into the board
         self.assertEqual(result["proof_of_impact"][idor_refs[0]]["status"], "candidate")  # never confirmed
@@ -290,7 +290,8 @@ class CampaignTests(unittest.TestCase):
         self.assertTrue(result["ok"], result.get("error"))
         self.assertEqual(calls[0][0], admin_ep)                    # prover ran on the brain-selected privileged endpoint
         self.assertEqual(calls[0][1].get("cookie"), "sid=admin")   # admin session = high-privilege ground truth
-        self.assertEqual(calls[0][2], {"cookie": "sid=user"})      # user session = the low-privilege attacker
+        self.assertEqual(calls[0][1].get("issuer_host"), "app.example.com")
+        self.assertEqual(calls[0][2], {"cookie": "sid=user", "issuer_host": "app.example.com"})
         bfla_refs = [f["ref"] for f in result["findings"] if "function-level" in f["title"]]
         self.assertEqual(len(bfla_refs), 1)                        # folded into the board
         self.assertEqual(result["proof_of_impact"][bfla_refs[0]]["status"], "confirmed")  # prover's differential confirms
@@ -390,8 +391,9 @@ class CampaignTests(unittest.TestCase):
         self.assertTrue(result["ok"], result.get("error"))
         self.assertEqual(calls[0][0], obj_a)                       # A's object URL
         self.assertEqual(calls[0][1], obj_b)                       # B's own object URL
-        self.assertEqual(calls[0][2], {"cookie": "sid=A"})         # account_a = the PRIMARY (owns obj_a)
+        self.assertEqual(calls[0][2], {"cookie": "sid=A", "issuer_host": "app.example.com"})
         self.assertEqual(calls[0][3].get("cookie"), "sid=B")       # account_b = the SECOND account (owns obj_b)
+        self.assertEqual(calls[0][3].get("issuer_host"), "app.example.com")
         xidor_refs = [f["ref"] for f in result["findings"] if f.get("rule_id") == "active.idor"]
         self.assertEqual(len(xidor_refs), 1)                       # the confirmed cross-tenant read was folded in
         self.assertEqual(result["proof_of_impact"][xidor_refs[0]]["status"], "confirmed")  # prover's differential confirms

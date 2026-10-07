@@ -226,6 +226,19 @@ if (-not $SkipSmokeTest) {
         throw "The frozen backend could not run 'dash --self-test' - gn_dash/gn_tui/gn_sysmon are missing from the bundle. Output: $dashOut"
     }
     Write-Host "    Dash modules present in the frozen bundle."
+
+    Write-Step "Smoke-testing bundled headless Chromium"
+    & $BackendExe --self-test-browser
+    Assert-LastExit "Bundled Chromium launch"
+
+    Write-Step "Checking frozen CLI version"
+    $expectedVersion = (Get-Content (Join-Path $RepoRoot "package.json") -Raw | ConvertFrom-Json).version
+    $actualVersion = (& $BackendExe --version) -join "`n"
+    Assert-LastExit "Frozen CLI version"
+    if ($actualVersion.Trim() -ne "GreyIQ gn $expectedVersion") {
+        throw "Frozen CLI version mismatch: expected $expectedVersion, got $actualVersion"
+    }
+    Write-Host "    Frozen CLI version: $expectedVersion"
 }
 
 # --- Ollama is no longer bundled (downloaded on demand at first local-model use;

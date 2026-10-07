@@ -6,6 +6,8 @@
 #
 # Invoke from the repo root:  pyinstaller build/greyiq-backend.spec
 # Output:  dist/greyiq-backend/greyiq-backend.exe (+ supporting libraries)
+import importlib.util
+import json
 import os
 import sys
 
@@ -49,12 +51,14 @@ hiddenimports = [
     "document_ingest",
     "ai_core.core_store",
     "coder",
+    "hf_gguf_import",
     "agent",
     "skills",
     "repomap",
     "workspace",
     "_version",
     "gn_cli",  # run_frozen imports it at function level (CLI dispatch) — force-include
+    "terminal_dashboard",  # gn dashboard is imported lazily by the frozen CLI
     "yaml",    # api_discovery_service parses YAML OpenAPI specs; import is guarded, force-include so it's bundled
 ]
 
@@ -139,6 +143,13 @@ for package in ("numpy", "anthropic", "uvicorn", "pydantic", "pydantic_core", "p
 
 hiddenimports += collect_submodules("uvicorn")
 hiddenimports += collect_submodules("bughunter")
+# Bundle the MCP SDK modules GreyIQ uses. collect_all("mcp") also imports the
+# optional mcp.cli package, whose Typer extra is intentionally not installed
+# and aborts PyInstaller's isolated module scan.
+hiddenimports += [
+    "mcp.client.stdio", "mcp.client.streamable_http",
+    "mcp.server.fastmcp", "mcp.shared.memory",
+]
 
 # pydantic_core ships a compiled extension (_pydantic_core). collect_all does not
 # reliably place it for newer versions (pulled in by anthropic), which crashes the
@@ -175,37 +186,37 @@ def _playwright_browsers_cache():
 
 
 _pw_cache = _playwright_browsers_cache()
-# Ship ONLY the newest revision of each chromium family (never firefox/webkit, and not
-# ffmpeg/winldd — video/dep-check, unused). A dev machine that has run `playwright install`
-# across upgrades accumulates STALE revisions in the shared cache (e.g. chromium-1223 next to
-# chromium-1228); bundling all of them doubles the payload and — with the per-exe signing
-# electron-builder does — broke the portable packaging. CI runners are clean (one revision
-# each), so this is a no-op there. `launch(headless=True)` uses the full chromium build; the
-# headless-shell build is kept too so an explicit shell channel also works. Each folder carries
-# its own INSTALLATION_COMPLETE marker (copied along) so Playwright recognizes it offline.
-_pw_newest = {}  # family ("chromium" / "chromium_headless_shell") -> (revision:int, dir_name)
-if os.path.isdir(_pw_cache):
-    for _entry in os.listdir(_pw_cache):
-        if not _entry.startswith(("chromium-", "chromium_headless_shell-")):
-            continue
-        if not os.path.isdir(os.path.join(_pw_cache, _entry)):
-            continue
-        _family, _, _rev = _entry.rpartition("-")
-        try:
-            _rev_n = int(_rev)
-        except ValueError:
-            continue
-        if _family not in _pw_newest or _rev_n > _pw_newest[_family][0]:
-            _pw_newest[_family] = (_rev_n, _entry)
-for _rev_n, _entry in _pw_newest.values():
-    datas.append((os.path.join(_pw_cache, _entry), os.path.join("playwright-browsers", _entry)))
-_pw_shipped = len(_pw_newest)
-if _pw_shipped:
-    print(f"[greyiq-backend.spec] bundling {_pw_shipped} Playwright chromium build(s) from {_pw_cache}: "
-          + ", ".join(sorted(e for _, e in _pw_newest.values())))
-else:
-    print(f"[greyiq-backend.spec] WARNING: no Playwright chromium build in {_pw_cache}; screenshots will be "
-          "unavailable in this build. Run `python -m playwright install chromium` before freezing to include it.")
+# Playwright resolves exact revisions from its installed driver manifest. A shared cache
+# can contain newer browsers from another venv; choosing the newest would produce a bundle
+# that passes the API smoke test but cannot launch a browser. Include only the two builds
+# required by this venv. The release build installs them immediately before freezing.
+_pw_spec = importlib.util.find_spec("playwright")
+if not _pw_spec or not _pw_spec.origin:
+    raise RuntimeError("Playwright is not installed in the build environment")
+_pw_manifest = os.path.join(os.path.dirname(_pw_spec.origin), "driver", "package", "browsers.json")
+with open(_pw_manifest, encoding="utf-8") as _pw_handle:
+    _pw_browsers = json.load(_pw_handle)["browsers"]
+_pw_required = {
+    _browser["name"]: str(_browser["revision"])
+    for _browser in _pw_browsers
+    if _browser["name"] in ("chromium", "chromium-headless-shell")
+}
+if set(_pw_required) != {"chromium", "chromium-headless-shell"}:
+    raise RuntimeError(f"Playwright manifest lacks Chromium builds: {_pw_manifest}")
+_pw_shipped = []
+for _name, _revision in _pw_required.items():
+    _entry = f"{_name.replace('-', '_')}-{_revision}"
+    _source = os.path.join(_pw_cache, _entry)
+    if os.path.isfile(os.path.join(_source, "INSTALLATION_COMPLETE")):
+        datas.append((_source, os.path.join("playwright-browsers", _entry)))
+        _pw_shipped.append(_entry)
+    else:
+        raise RuntimeError(
+            f"Playwright requires {_entry}, but it is missing from {_pw_cache}. "
+            "Run `python -m playwright install chromium` in the build environment."
+        )
+print(f"[greyiq-backend.spec] bundling Playwright browsers from {_pw_cache}: "
+      + ", ".join(sorted(_pw_shipped)))
 
 block_cipher = None
 

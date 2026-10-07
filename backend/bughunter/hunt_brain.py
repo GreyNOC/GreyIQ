@@ -23,8 +23,8 @@ SAFETY invariants:
     names (never a URL, value, or payload); classes must be ones the active prover can actually
     confirm; a prioritised endpoint MUST be copied verbatim from the in-scope discovered set (the
     brain can never introduce a new host/URL — scope is decided by recon, not the model).
-  * Best-effort + fail-closed: no brain configured, a CoderError, a timeout, or unparseable output
-    all degrade to an empty plan == the engine's current behaviour.
+  * Best-effort + scope-safe: no brain configured or a failed model call uses the bounded offline
+    planner; unparseable output contributes no model suggestions.
 
 Frozen-safe (stdlib + the existing ``coder`` and ``trust`` modules only)."""
 
@@ -621,22 +621,16 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
     learned ``priors``) produces the same
     shape — so an offline hunt is steered too, no longer flying blind. All outputs (names + verbatim
     in-scope endpoints + class orderings) pass through _validate_plan either way; a name can't carry a
-    payload, so this only raises recall. Best-effort: any failure returns an empty plan.
+    payload, so this only raises recall. If the reasoning provider fails, the bounded offline
+    planner remains available; a failure in that planner returns an empty plan.
 
     ``seed_dir``/``runtime_dir`` are keyword-only and optional so every existing 4/5-positional-arg
     caller is untouched. They locate the OPTIONAL learned offline ranker's weight file; with no file
     (or no hunt_model module) the plan is byte-identical to the rules-only plan."""
     plan = _empty_plan()
-    # Gate on REASONING availability, not on "is a coder selected". The deterministic (offline)
-    # coder is a real, selectable provider that ``coder_enabled`` answers True for, but it cannot
-    # answer a planning prompt at all — ``coder.generate`` raises CoderError for it by design. Gating
-    # on ``coder_enabled`` therefore sent that configuration down the LLM branch, where the raise
-    # fail-closed to an EMPTY plan: no probe_priority, no param hypotheses, no idor/privileged
-    # candidates. The hunt flew blind, strictly worse than provider "off". See
-    # coder.reasoning_brain_enabled for the full rationale.
-    if not coder.reasoning_brain_enabled(coder_cfg):
-        # Offline hunt intelligence: knowledge rules + what the program has confirmed before,
-        # optionally re-ordered by the learned ranker (permutation-only; None == rules).
+    def offline_fallback() -> dict[str, Any]:
+        # Offline rules never introduce an endpoint, payload, request, or finding;
+        # the same scope/shape validator gates them when the model is unavailable.
         try:
             model = _load_ranker(seed_dir, runtime_dir)
             raw = offline_hunt.offline_plan(surface, priors, model=model)
@@ -648,6 +642,15 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
         except Exception:  # noqa: BLE001 - the offline planner must never break a hunt
             pass
         return _with_hypotheses(plan)
+    # Gate on REASONING availability, not on "is a coder selected". The deterministic (offline)
+    # coder is a real, selectable provider that ``coder_enabled`` answers True for, but it cannot
+    # answer a planning prompt at all — ``coder.generate`` raises CoderError for it by design. Gating
+    # on ``coder_enabled`` therefore sent that configuration down the LLM branch, where the raise
+    # fail-closed to an EMPTY plan: no probe_priority, no param hypotheses, no idor/privileged
+    # candidates. The hunt flew blind, strictly worse than provider "off". See
+    # coder.reasoning_brain_enabled for the full rationale.
+    if not coder.reasoning_brain_enabled(coder_cfg):
+        return offline_fallback()
     target = str(target or "").strip()
     if not target:
         return _with_hypotheses(plan)
@@ -659,8 +662,8 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
     cfg["response_schema"] = PLAN_RESPONSE_SCHEMA
     # The WHOLE brain interaction — the network call, JSON parsing, AND validation of the
     # model's (untrusted, possibly hijacked) output — is inside one guard so the module itself
-    # honours its fail-closed contract: any failure returns the empty plan, independent of whether
-    # a given caller happens to wrap plan_hunt in its own try/except.
+    # honours its scope-safe contract: a model failure uses the same bounded
+    # offline plan, independent of whether a caller wraps plan_hunt itself.
     try:
         prompt = _build_prompt(target, scope, surface)
         if str(technique_context or "").strip():
@@ -670,9 +673,9 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
         parsed = _parse_json_object(str(result.get("text") or ""))
         params, priority, idor_candidates, ssrf_params, xss_params, privileged_endpoints = _validate_plan(parsed, surface)
     except coder.CoderError:
-        return _with_hypotheses(plan)
+        return offline_fallback()
     except Exception:  # noqa: BLE001 - the reasoning layer must never break a hunt
-        return _with_hypotheses(plan)
+        return offline_fallback()
     plan.update({
         "used": True, "provider": str(result.get("provider") or ""), "model": str(result.get("model") or ""),
         "param_hypotheses": params, "probe_priority": priority, "idor_candidates": idor_candidates,

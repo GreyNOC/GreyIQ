@@ -10,12 +10,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from bughunter import portfolio as pf  # noqa: E402
+from bughunter import active_verify_service, campaign, portfolio as pf  # noqa: E402
 
 
 class TempRuntimeMixin:
@@ -88,6 +89,42 @@ class StructuredScopeDerivationTests(TempRuntimeMixin, unittest.TestCase):
         self.assertEqual(prog["in_scope_hosts"], ["*.acme.com"])
         self.assertEqual(prog["out_of_scope_hosts"], ["legacy.acme.com"])
 
+    def test_url_shaped_exclusion_blocks_wildcard_scope_and_seed_target(self) -> None:
+        excluded_url = "https://admin.example.test/private"
+        # Bugcrowd-style API scope rows use a full URL as the identifier. Keep
+        # that original row for review, but enforce its hostname at both gates.
+        prog = pf.upsert_program(self.runtime_dir, {
+            "name": "Bugcrowd-style program",
+            "platform": "bugcrowd",
+            "structured_scope": [
+                {"identifier": "*.example.test", "asset_type": "wildcard",
+                 "eligible_for_submission": True},
+                {"identifier": excluded_url, "asset_type": "url",
+                 "eligible_for_submission": False, "eligible_for_bounty": False,
+                 "instruction": "Excluded administrative endpoint"},
+            ],
+            "seed_targets": [excluded_url, "https://app.example.test"],
+        })
+        self.assertEqual(prog["structured_scope"][1]["identifier"], excluded_url)
+        self.assertEqual(prog["out_of_scope_hosts"], ["admin.example.test"])
+        settings = SimpleNamespace(excluded_hosts=prog["out_of_scope_hosts"],
+                                   active_scan_allowlist=(), allow_private_urls=False)
+        self.assertFalse(active_verify_service.host_in_active_scope(
+            "admin.example.test", prog["scope_text"], settings))
+        self.assertTrue(active_verify_service.host_in_active_scope(
+            "app.example.test", prog["scope_text"], settings))
+        self.assertEqual(campaign.program_campaign_targets(prog), ["https://app.example.test"])
+
+        # Old saved records with a URL in the derived host list must normalize
+        # the same way on read, without rewriting the raw structured row.
+        store = self.runtime_dir / "portfolio.json"
+        saved = json.loads(store.read_text(encoding="utf-8"))
+        saved["programs"][prog["id"]]["out_of_scope_hosts"] = [excluded_url]
+        store.write_text(json.dumps(saved), encoding="utf-8")
+        reread = pf.get_program(self.runtime_dir, prog["id"])
+        self.assertEqual(reread["out_of_scope_hosts"], ["admin.example.test"])
+        self.assertEqual(reread["structured_scope"][1]["identifier"], excluded_url)
+
     def test_hand_typed_scope_text_never_overridden(self) -> None:
         prog = pf.upsert_program(self.runtime_dir, {
             "name": "Acme",
@@ -143,6 +180,60 @@ class EditPathDerivationTests(TempRuntimeMixin, unittest.TestCase):
         })
         self.assertEqual(second["scope_text"], "b.acme.com")
         self.assertEqual(second["in_scope_hosts"], ["b.acme.com"])
+
+    def test_program_form_resync_preserves_operator_free_text_byte_for_byte(self) -> None:
+        first = pf.upsert_program(self.runtime_dir, {
+            "name": "Acme", "structured_scope": [
+                {"identifier": "app.acme.test", "eligible_for_submission": True}],
+        })
+        typed_scope = "https://app.acme.test/login?flow=1\n  Only /login is listed; no sibling paths.  "
+        edited = pf.upsert_program(self.runtime_dir, {
+            "id": first["id"], "name": "Acme", "scope_text": typed_scope,
+        })
+        self.assertTrue(edited["scope_text_user_entered"])
+        saved = pf.upsert_program(self.runtime_dir, {
+            "id": first["id"], "name": "Acme", "resync_scope": True,
+            "structured_scope": [
+                {"identifier": "other.acme.test", "eligible_for_submission": True}],
+        })
+        self.assertEqual(saved["scope_text"], typed_scope)
+        self.assertEqual(pf.get_program(self.runtime_dir, first["id"])["scope_text"], typed_scope)
+        self.assertEqual(saved["in_scope_hosts"], [])
+
+    def test_legacy_hand_typed_scope_survives_structured_resync(self) -> None:
+        store = self.runtime_dir / "portfolio.json"
+        typed_scope = "https://app.acme.test/only-this-path\nmanual note"
+        store.write_text(json.dumps({"programs": {"acme": {
+            "id": "acme", "name": "Acme", "scope_text": typed_scope,
+            "structured_scope": [{"identifier": "app.acme.test", "eligible_for_submission": True}],
+        }}}), encoding="utf-8")
+        saved = pf.upsert_program(self.runtime_dir, {
+            "id": "acme", "name": "Acme", "resync_scope": True,
+            "structured_scope": [{"identifier": "other.acme.test", "eligible_for_submission": True}],
+        })
+        self.assertEqual(saved["scope_text"], typed_scope)
+        self.assertTrue(saved["scope_text_user_entered"])
+
+    def test_explicit_empty_operator_scope_stays_empty_and_disables_testing(self) -> None:
+        first = pf.upsert_program(self.runtime_dir, {
+            "name": "Acme", "active": True, "live": True,
+            "structured_scope": [{"identifier": "app.acme.test", "eligible_for_submission": True}],
+        })
+        cleared = pf.upsert_program(self.runtime_dir, {
+            "id": first["id"], "name": "Acme", "scope_text": "",
+            "active": True, "live": True, "deep": True,
+        })
+        self.assertEqual(cleared["scope_text"], "")
+        self.assertTrue(cleared["scope_text_user_entered"])
+        self.assertFalse(cleared["active"])
+        self.assertFalse(cleared["live"])
+        self.assertFalse(cleared["deep"])
+        resynced = pf.upsert_program(self.runtime_dir, {
+            "id": first["id"], "name": "Acme", "resync_scope": True,
+            "structured_scope": [{"identifier": "other.acme.test", "eligible_for_submission": True}],
+        })
+        self.assertEqual(resynced["scope_text"], "")
+        self.assertFalse(resynced["active"])
 
     def test_resync_scope_can_shrink_scope_to_empty_and_forces_active_off(self) -> None:
         first = pf.upsert_program(self.runtime_dir, {

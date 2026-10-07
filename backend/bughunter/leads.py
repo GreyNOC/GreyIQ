@@ -267,6 +267,11 @@ def build_lead_queue(doc: dict[str, Any], *, source_path: str = "") -> dict[str,
             "gaps": [g for g in (_redacted(x, 400) for x in (row.get("gaps") or [])) if g][:6],
             # THE single most useful field for an analyst: the exact artifact that would confirm it.
             "proof_obligation": _redacted(row.get("next_action"), 800),
+            # Predicted observations are advisory only. They are generated before any
+            # suggested active probe and cannot turn a lead into a confirmed finding.
+            "predicted_positive_signal": _redacted(row.get("predicted_positive_signal"), 400),
+            "negative_control": _redacted(row.get("negative_control"), 400),
+            "falsifier_stop_condition": _redacted(row.get("falsifier_stop_condition"), 400),
             "contradictions": contradictions_by_ref.get(ref, []),
             "in_chains": chains_by_ref.get(ref, []),
             "chain_candidate": bool(row.get("chain_candidate")),
@@ -341,6 +346,9 @@ def _project_probe(probe: dict[str, Any]) -> dict[str, Any]:
         "hypothesis": _redacted(probe.get("hypothesis"), 600),
         "impact": _redacted(probe.get("impact"), 400),
         "next_action": _s(probe.get("next_action"), 600),
+        "predicted_positive_signal": _redacted(probe.get("predicted_positive_signal"), 400),
+        "negative_control": _redacted(probe.get("negative_control"), 400),
+        "falsifier_stop_condition": _redacted(probe.get("falsifier_stop_condition"), 400),
         "status": _s(probe.get("status"), 30),
         "signals": [_s(s, 120) for s in (probe.get("signals") or []) if _s(s, 120)][:8],
     }
@@ -489,6 +497,10 @@ def _render_lead(lead: dict[str, Any]) -> list[str]:
         out.append(f"- **Gap:** {gap}")
     if lead.get("proof_obligation"):
         out.append(f"- **To confirm →** {lead['proof_obligation']}")
+    if lead.get("status") != "confirmed" and lead.get("predicted_positive_signal"):
+        out.append(f"- **Predicted positive signal:** {lead['predicted_positive_signal']}")
+        out.append(f"- **Negative control:** {lead.get('negative_control') or '—'}")
+        out.append(f"- **Falsifier / stop:** {lead.get('falsifier_stop_condition') or '—'}")
     for con in lead.get("contradictions") or []:
         flag = "BLOCKING" if con.get("blocking") else "soft"
         out.append(f"- **Contradiction ({flag}, {con.get('code')}):** {con.get('message')}")
@@ -515,6 +527,10 @@ def _render_probes(probes: list[dict[str, Any]] | None) -> list[str]:
             f"- **[{probe.get('id')}] {probe.get('title') or 'Chain lead'}** ({probe.get('status') or 'untested'}{age})"
             f" — {probe.get('hypothesis') or ''} {probe.get('next_action') or ''}".rstrip()
         )
+        if probe.get("predicted_positive_signal"):
+            out.append(f"  - **Predicted positive signal:** {probe['predicted_positive_signal']}")
+            out.append(f"  - **Negative control:** {probe.get('negative_control') or '—'}")
+            out.append(f"  - **Falsifier / stop:** {probe.get('falsifier_stop_condition') or '—'}")
     out.append("")
     return out
 

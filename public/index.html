@@ -10,6 +10,17 @@
     <link rel="stylesheet" href="./styles.css">
   </head>
   <body data-theme="dark" data-app-mode="hunt">
+    <header class="desktop-titlebar" data-window-titlebar hidden>
+      <div class="desktop-titlebar-drag" data-window-drag-region>
+        <span class="desktop-titlebar-mark gn-owl" aria-hidden="true"></span>
+        <span class="desktop-titlebar-name">GreyIQ</span>
+      </div>
+      <div class="desktop-titlebar-controls">
+        <button class="desktop-titlebar-button" type="button" data-window-control="minimize" aria-label="Minimize GreyIQ" title="Minimize GreyIQ"></button>
+        <button class="desktop-titlebar-button" type="button" data-window-control="maximize" aria-label="Maximize GreyIQ" title="Maximize GreyIQ"></button>
+        <button class="desktop-titlebar-button" type="button" data-window-control="close" aria-label="Close GreyIQ" title="Close GreyIQ"></button>
+      </div>
+    </header>
     <div class="ck-splash" id="ckSplash">
       <span class="ck-splash-globe gn-owl" aria-hidden="true"></span>
       <div class="ck-splash-name">GreyIQ</div>
@@ -147,8 +158,9 @@
             </label>
             <label data-brain-field="model">
               <span>Model</span>
-              <input id="brainModel" name="brainModel" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. qwen2.5-coder:14b">
+              <input id="brainModel" name="brainModel" type="text" autocomplete="off" spellcheck="false" placeholder="Ollama name or Hugging Face GGUF model URL">
             </label>
+            <p class="folder-status" id="brainModelHelp" data-brain-local-help hidden>For Hugging Face, paste a public GGUF model page, hf.co/owner/repo:quant, or its ollama run command.</p>
             <label data-brain-field="base_url">
               <span>Server URL</span>
               <input id="brainBaseUrl" name="brainBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:11434/v1">
@@ -163,12 +175,12 @@
             </div>
             <div class="folder-actions" id="brainModelRow" hidden>
               <span class="folder-status" id="brainModelStatus">checking model…</span>
-              <button class="text-button" type="button" id="brainDownload">Download model</button>
+              <button class="text-button" type="button" id="brainDownload">Download and use</button>
             </div>
             <div class="model-list" id="brainModelList" hidden></div>
             <section class="hf-import" id="brainHfImportSection" aria-labelledby="brainHfImportTitle" hidden>
               <h3 id="brainHfImportTitle">Import from Hugging Face</h3>
-              <p class="folder-status">Start with a public GGUF model repository. GreyIQ does not manage Hugging Face authentication for gated or private models. Check the model card and license before use. The model downloads through Ollama, then runs locally.</p>
+              <p class="folder-status">Use a public GGUF model repository. GreyIQ desktop downloads and starts Ollama on first use, then checks chat and agent tool support before selecting the model. Browser use requires Ollama running locally. Private or gated models need separate access; check the model card and license before use.</p>
               <label for="brainHfReference">
                 <span>Model page URL or Ollama reference</span>
                 <input id="brainHfReference" type="text" autocomplete="off" spellcheck="false" maxlength="300" placeholder="https://huggingface.co/owner/model-GGUF or hf.co/owner/model-GGUF:Q4_K_M">
@@ -190,6 +202,68 @@
             <p class="folder-status" id="brainStatus" aria-live="polite"></p>
             <p class="folder-status" id="brainAccel"></p>
           </form>
+          <details class="mode-fold" id="mcpServersFold">
+            <summary><span>MCP servers</span><svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></summary>
+            <div class="choice-form" style="padding: 0.85rem">
+              <p class="mode-intro">Add trusted MCP tools for explicit chat commands. Only absolute local executables and loopback HTTP URLs are supported. Saving a server is inert; testing, approving a tool, or using a command connects to it. No environment variables or HTTP headers are stored yet. Do not put credentials in Arguments; they are saved as plaintext and can appear in process listings. Adding a server does not authorize testing a target.</p>
+              <div class="folder-actions">
+                <button class="text-button" type="button" id="mcpServersRefresh">Refresh status</button>
+              </div>
+              <div class="model-list" id="mcpServersList" aria-live="polite"></div>
+              <section class="hf-import" id="mcpHuntApprovals" aria-labelledby="mcpHuntApprovalTitle" hidden>
+                <h3 id="mcpHuntApprovalTitle">External hunt evidence tools</h3>
+                <p class="folder-status">Enable the server, then approve an exact tool name. Approval contacts the server to verify the name. You are asserting the tool is evidence-only; GreyIQ cannot prove its behavior or constrain the server to a program's target scope.</p>
+                <p class="folder-status" id="mcpHuntApprovalServer"></p>
+                <div class="model-list" id="mcpHuntApprovalList"></div>
+                <form class="choice-form" id="mcpHuntApprovalForm">
+                  <label>
+                    <span>Exact tool name</span>
+                    <input id="mcpHuntToolName" type="text" maxlength="128" autocomplete="off" spellcheck="false" required placeholder="As advertised by the MCP server">
+                  </label>
+                  <div class="folder-actions">
+                    <button class="text-button" type="submit" id="mcpHuntApprove">Approve evidence tool</button>
+                    <button class="text-button" type="button" id="mcpHuntClose">Close</button>
+                  </div>
+                </form>
+                <p class="folder-status" id="mcpHuntStatus" role="status" aria-live="polite"></p>
+              </section>
+              <form class="choice-form brain-form" id="mcpServerForm">
+                <label>
+                  <span>Server name</span>
+                  <input id="mcpServerName" type="text" maxlength="40" autocomplete="off" spellcheck="false" required placeholder="e.g. local-files">
+                </label>
+                <label>
+                  <span>Connection</span>
+                  <select id="mcpServerTransport">
+                    <option value="stdio">Local command (stdio)</option>
+                    <option value="http">Loopback URL (HTTP)</option>
+                  </select>
+                </label>
+                <label data-mcp-field="stdio">
+                  <span>Command</span>
+                  <input id="mcpServerCommand" type="text" autocomplete="off" spellcheck="false" placeholder="Absolute executable path">
+                </label>
+                <label data-mcp-field="stdio">
+                  <span>Arguments (one per line)</span>
+                  <textarea id="mcpServerArgs" rows="3" spellcheck="false" placeholder="--directory&#10;C:\path\to\workspace"></textarea>
+                </label>
+                <label data-mcp-field="http" hidden>
+                  <span>Server URL</span>
+                  <input id="mcpServerUrl" type="url" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:3000/mcp">
+                </label>
+                <label class="check-row">
+                  <input id="mcpServerEnabled" type="checkbox">
+                  <span>Enable manual commands and approved hunt evidence tools</span>
+                </label>
+                <div class="folder-actions">
+                  <button class="text-button" type="submit" id="mcpServerSave">Add server</button>
+                  <button class="text-button" type="button" id="mcpServerCancel" hidden>Cancel edit</button>
+                </div>
+              </form>
+              <p class="folder-status">Chat commands: <code>mcp list</code>, <code>mcp tools -y &lt;server&gt;</code>, and <code>mcp call -y &lt;server&gt; &lt;tool&gt; {"arg":"value"}</code>. Tool output is untrusted data.</p>
+              <p class="folder-status" id="mcpServersStatus" role="status" aria-live="polite"></p>
+            </div>
+          </details>
         </div>
 
         <div class="panel-mode brain-ops" id="panelOps" data-mode="ops" role="tabpanel" aria-labelledby="pmode-ops" tabindex="0" hidden>
@@ -458,8 +532,8 @@
                 <input id="bountyTarget" name="bountyTarget" type="text" autocomplete="off" spellcheck="false" placeholder="https://example.com  or  C:\path\to\repo">
               </label>
               <label>
-                <span>Scope / program notes</span>
-                <input id="bountyScope" name="bountyScope" type="text" autocomplete="off" placeholder="e.g. HackerOne acme — *.example.com in scope">
+                <span>Authorized scope (host or repository root)</span>
+                <input id="bountyScope" name="bountyScope" type="text" autocomplete="off" placeholder="app.example.com  or  https://github.com/org/repo">
               </label>
               <label>
                 <span>Report output folder</span>
@@ -475,6 +549,10 @@
               <label class="bounty-auth" for="bountyActive">
                 <input id="bountyActive" type="checkbox">
                 <span><strong>Test for proof of impact</strong> (active, URL targets) — send a few <strong>benign</strong> probes to <em>capture proof</em> that marks findings <em>Confirmed</em> (reflected XSS, CORS, open-redirect, host-header, SQL-error; clickjacking as a candidate). Rate-limited; runs only against a host you name in Scope.</span>
+              </label>
+              <label class="bounty-auth" for="bountyExternalMcp">
+                <input id="bountyExternalMcp" type="checkbox">
+                <span>External MCP evidence analysis <em>— approved evidence tools only; off for each new run</em>.</span>
               </label>
               <label class="bounty-auth" for="bountyAuthorized">
                 <input id="bountyAuthorized" type="checkbox">
@@ -617,9 +695,9 @@
             <div class="ck-target-fields" data-ck-when="hunt campaign">
             <label><span>Asset or repository</span>
               <select id="ckTargetPick" hidden aria-label="Target — pick from the program's scope"></select>
-              <input id="ckTarget" type="text" autocomplete="off" spellcheck="false" aria-label="Asset or repository" placeholder="https://example.com  ·  https://github.com/org/repo  ·  C:\path\to\repo"></label>
-            <label><span>Authorized scope</span>
-              <input id="ckScope" type="text" autocomplete="off" placeholder="acme — *.example.com in scope"></label>
+              <input id="ckTarget" type="text" autocomplete="off" spellcheck="false" aria-label="Asset or repository" placeholder="https://example.com  ·  C:\path\to\repo"></label>
+            <label><span>Authorized scope (hosts or repository roots)</span>
+              <input id="ckScope" type="text" autocomplete="off" placeholder="app.example.com  or  https://github.com/org/repo"></label>
             </div>
 
             <div class="ck-grid2">
@@ -645,10 +723,12 @@
                 <span>Test for <strong>proof of impact</strong> <em>— benign in-scope probes that mark findings Confirmed</em></span></label>
               <label class="ck-switch"><input id="ckTimeBased" type="checkbox">
                 <span>Deep SQLi probe <em>— opt-in time-based blind SQLi (sends a bounded SLEEP; in-scope only, implies proof-of-impact)</em></span></label>
-              <label class="ck-switch"><input id="ckLive" type="checkbox">
-                <span>Dynamic browser pass <em>(Playwright)</em></span></label>
+              <label class="ck-switch"><input id="ckLive" type="checkbox" disabled>
+                <span>Dynamic browser pass <em>— unavailable until browser DNS egress is pinned</em></span></label>
               <label class="ck-switch" data-ck-when="campaign portfolio" hidden><input id="ckDeep" type="checkbox">
                 <span>Deep auto-work <em>— (campaign) implies proof-of-impact + time-based SQLi, then auto-captures a screenshot and writes a researched dossier for each confirmed lead</em></span></label>
+              <label class="ck-switch"><input id="ckExternalMcpHunt" type="checkbox">
+                <span>External MCP evidence analysis <em>— approved evidence tools only; off for each new run</em></span></label>
               <label class="ck-switch" data-ck-when="campaign portfolio" hidden><input id="ckAttackMap" type="checkbox" checked>
                 <span>Attack-plan map <em>— render a graphical .png of the attack flow for each confirmed finding into the POC download &amp; submission report (campaign/portfolio runs)</em></span></label>
             </div>

@@ -36,7 +36,7 @@ jobs:
           cache: pip
 
       - name: Install Python dependencies
-        run: python -m pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt -r requirements-test.txt
 
       # Separate file, and separate step, so the pip-audit gate below keeps auditing exactly the
       # runtime install list. pytest is the test RUNNER: `unittest discover` cannot collect the
@@ -53,3 +53,33 @@ jobs:
 
       - name: Run project checks
         run: npm run check
+
+  debian-13:
+    name: Debian 13 / system Python 3.13
+    runs-on: ubuntu-24.04
+    container: debian:13-slim
+    steps:
+      - name: Install Debian test prerequisites
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            ca-certificates git python3 python3-venv python3-pip >/dev/null
+
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Verify distribution Python
+        run: python3 -c 'import sys; assert sys.version_info[:2] == (3, 13), sys.version'
+
+      - name: Install runtime and test dependencies
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install "torch>=2.13,<3.0" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt -r requirements-test.txt
+
+      - name: Run Python tests on Debian 13
+        run: |
+          . .venv/bin/activate
+          python -B -m pytest -q backend

@@ -10,11 +10,39 @@ and a first-time launch opens a short guided tour automatically (reopen it anyti
 ## Before anything else: authorization
 
 GreyIQ is built for **authorized testing only** — your own assets, an engagement you're
-contracted for, or a bug-bounty program you're enrolled in. Every active probe requires
-you to tick an authorization checkbox *and* name the exact host in **Scope**; both are
-enforced server-side, fail-closed. A host you never named in Scope is never touched, no
-matter what the UI lets you type into Target. Nothing here authorizes you to test anything
-— that authorization has to already exist before you open the app.
+contracted for, or a bug-bounty program you're enrolled in. In the Hunt cockpit, active
+probes require an authorization checkbox and an enforceable host in **Scope**. In chat,
+network probes require `-y` and an exact host through `--scope`. Both paths fail closed
+before probing a host that the operator has not named. Nothing here authorizes you to
+test anything — that authorization has to already exist before you open the app.
+
+Optional MCP servers are configured under **Brain → MCP servers**. Chat tool calls
+still require explicit `mcp tools -y` or `mcp call -y` commands; the chat model
+does not choose tools. During an authorized hunt, GreyIQ automatically calls a
+built-in, in-memory MCP tool to review captured evidence without making target
+requests. To include an external evidence-only tool, enable and test its server,
+approve its exact advertised tool, and check **External MCP evidence analysis**
+for that run. The automatic payload contains fixed categories and counts, not
+the target URL, scope text, or raw evidence. The external server controls its
+own network requests outside GreyIQ's guard, so approve only tools verified to
+avoid target requests. MCP
+review is advisory and cannot promote a finding or change a probe. The built-in
+chat scan commands below enforce GreyIQ's exact-host gate.
+
+Chat network scans also require an explicit assertion and exact host: `scan web -y
+--scope app.example.com https://app.example.com/`. Local source scans use
+`scan code <local-path>`. The short chat command
+assumes the entire named host is permitted; use a saved program hunt when the
+policy has path limits, exclusions, time windows, or required request markers.
+Remote source URLs are recognized but cloning is currently disabled because
+Git can fetch alternate object stores beyond the named repository. Scan a
+local clone with `scan code <local-path>`.
+For a bounded active proof pass, use `scan active -y --scope app.example.com
+https://app.example.com/`. It runs in the background, uses up to 16 GET/HEAD/OPTIONS
+requests, and updates the chat bubble with observed results and negative controls.
+Time-based probes are disabled in this command.
+Scoped live browser scans refuse to run until the browser's DNS connection can
+be pinned to the address checked by the scope guard.
 
 ## 1. Program setup
 
@@ -27,23 +55,12 @@ A program record has: a name, an optional HackerOne team handle, a **structured 
 table (one row per in-scope/out-of-scope asset), optional program-provided source repository
 links, an `oob_allowed` flag, and free-text notes.
 
-### Getting a program and scope in — four ways
+### Getting a program and scope in
 
-**Start from a repository link.** At the top of the Program tab, paste one or more public
-HTTPS repository-root links and click **Create draft program →**. GreyIQ validates the same
-GitHub, GitLab, Bitbucket, Codeberg, and SourceHut roots accepted by the source scanner,
-derives a program name from the repository owner, and opens the existing review form with
-**Clone and adversarially scan** already selected. The new record is inactive, disabled for
-autonomous scheduling, and has no web scope until you review and save it. Issue, blob, tree,
-pull-request, credential-bearing, and non-allowlisted URLs are rejected.
-
-The optional **Enrich from forge (read-only)** checkbox is off by default. On the explicit
-create click, it makes at most one unauthenticated GET per repository to GitHub's public API
-(`api.github.com`) or GitLab's public API (`gitlab.com`); other forges are skipped. A returned
-description is added to Notes. Homepage/web domains appear only as **unticked** suggested
-scope rows with a reminder to confirm authorization. They are never written into the draft's
-scope by the backend and never become in-scope unless you deliberately tick **In scope** and
-save. Failures are best-effort and do not prevent the local draft from being created.
+**Repository-link setup is paused.** The Program wizard disables **From a repo link**
+while remote Git transport cannot be constrained to the authorized repository.
+Create the program manually if its scope includes source code, and scan an
+operator-supplied local clone through the local-path scanner.
 
 **Fetch from HackerOne (API).** If you have a HackerOne API username + token saved (see
 [HackerOne credentials](#hackerone-credentials) below), enter the program's team handle and
@@ -109,12 +126,13 @@ plain list of hosts.
 required field. Everything else (asset type, bounty eligibility, severity cap, instructions)
 is optional metadata.
 
-**Add a program-provided source repository.** Paste each public HTTPS repository-root link
-into **Program-provided source repositories**, then explicitly enable **Clone and adversarially
-scan**. HackerOne/CSV imports that contain supported GitHub, GitLab, Bitbucket, Codeberg, or
-SourceHut repository roots are detected and copied into this review list, but cloning remains
-off until you opt in. Issue, pull-request, blob, and tree pages are not accepted as repositories.
-Private-repository credentials are intentionally not accepted in repository URLs.
+**Record a program-provided source repository.** Paste each public HTTPS repository-root link
+into **Program-provided source repositories**. HackerOne/CSV imports that contain supported
+GitHub, GitLab, Bitbucket, Codeberg, or SourceHut roots are detected and copied into this
+review list. The **Clone and adversarially scan** control is currently fail closed even when
+enabled: Git cannot yet guarantee that every fetch stays at the authorized repository. To
+scan source, supply a local clone under the local-path scanner instead. Issue, pull-request,
+blob, and tree pages are not accepted as repository roots; embedded credentials are refused.
 
 ### Review before you hunt
 
@@ -128,6 +146,24 @@ Whichever way scope arrived, review the table before saving:
 - A program with **no** in-scope rows (and no hand-typed Scope text) can never be marked
   active — this is the same fail-closed gate the launch rail and Operator already use, just
   applied one level up: an empty structured scope can't silently become "active everywhere."
+- A URL asset limited to a path, port, or scheme does not authorize the whole host.
+  GreyIQ stops manual program hunts and proof requests when its host-only probe
+  guard cannot enforce that narrower asset. Add a separate host or wildcard row
+  only if the current program policy explicitly permits testing the whole host.
+- For an ad hoc URL hunt, enter only bare hosts or explicit wildcards in Scope,
+  separated by spaces, commas, or semicolons. Keep policy prose in program Notes.
+  Enter a host grant only
+  when the published policy permits that host. A pasted URL or path by itself
+  cannot be widened into host authorization by the preflight gate, and an
+  out-of-scope host is refused before the initial passive request.
+- For a remote repository hunt, name the exact supported HTTPS repository-root
+  URL in Scope. A forge hostname does not grant every repository on that service.
+  Remote cloning currently refuses to run; use a local clone for source analysis.
+- Re-fetching program scope keeps existing exclusions. If all excluded rows cannot
+  fit within the bounded scope table, review and narrow the rows before saving.
+- Scope text you enter in the Operator tab stays exactly as entered when you
+  refresh the structured scope table, including line breaks and spacing. Clearing
+  that text turns active testing off until you enter a new scope.
 - Click **Save program**.
 - For a source-code hunt, click **Hunt repository** on the saved program or pick the repository
   from the launch rail's Target suggestions. GreyIQ makes a depth-1, single-branch temporary
@@ -142,6 +178,25 @@ username, and API token. The token field is write-only — GreyIQ never reads it
 UI once saved. These same credentials power both the read-only scope import described above
 and the (separately gated) HackerOne report submission described in
 [Reports & submission](#4-reports--submission).
+
+### Browse platform APIs
+
+In **Programs → Add program → Browse platform APIs**, choose HackerOne, YesWeHack,
+Bugcrowd, or Intigriti. **Browse programs** reads a bounded list visible to the API
+identity; select a result or enter its program ID/handle and choose **Preview selected
+program**. Review the scope rows, exclusions, policy excerpt, status, and warnings before
+continuing to the Program form. Every program saved through this path starts **paused**.
+The listing and preview are evidence to review, not permission to test. The operator
+still needs a current authorization record and policy check before scheduled work.
+
+HackerOne uses the credentials in Submissions. YesWeHack can list public programs
+anonymously; private access may require its sign-in. Bugcrowd uses a researcher API
+token in `id:secret` form; Intigriti uses a researcher bearer token. Save either in the
+Browse step. GreyIQ keeps the token in its local owner-only secrets store and returns
+only whether one is saved. Credentialed requests are read-only, HTTPS host-pinned,
+redirect-refusing, and bounded. These APIs may omit free-text exclusions or other
+policy details, so always check the current human-facing program page. If your account
+cannot access a program through its API, use manual or CSV intake.
 
 ### YesWeHack credentials
 
@@ -201,15 +256,37 @@ rail (which the Program picker can autofill):
   findings, and (in **Deep** mode) auto-captures a screenshot + writes a research dossier
   for every confirmed lead.
 - **Autonomous operator** (Operator tab) — works your whole **portfolio** of programs
-  unattended on a schedule: recon → hunt → prove → dedup → report, repeated per program at
-  its configured interval. Auto-submit is off by default and, when armed, is gated by
-  confirmed-proof + non-duplicate + a per-program daily cap — review-only until you
-  explicitly arm it, and the kill switch stops it immediately.
+  on a schedule: recon → hunt → prove → dedup → local report, repeated per program at
+  its configured interval. It queues findings for human review and never submits them.
+  To start, enter the authorization record and current policy source for each enabled
+  program, confirm its scope and restrictions, and choose a 24-hour or seven-day
+  authorization window. The operator stops at expiry or its cycle limit; re-arm it
+  only after checking the current policy again. Verified hunt outcomes inform later
+  priority; this is local feedback, not automatic model-weight training. The kill
+  switch requests cancellation and prevents further cycles. Automated hunts use
+  only a loopback local model or the offline fallback; a cloud or remote model
+  remains available for deliberate manual work.
+
+The CLI's continuous `gn operator run` uses the same grant validation. Pass
+`-y --grant-file path/to/grants.json`; the file must contain one entry for each
+enabled program:
+
+```json
+{"grants":[{"program_id":"saved-program-id","authorization_ref":"engagement record","policy_source":"current program policy URL","policy_checked_at":"UTC ISO-8601 timestamp","expires_at":"UTC ISO-8601 timestamp within seven days","max_cycles":7}]}
+```
+
+The `--once` legacy shortcut is disabled because it lacked the guard and audit
+path. Active grants are held in process memory and must be re-armed after a
+restart. The authorization audit is stored locally as
+`runtime/operator_authorization_audit.jsonl` (or under the configured runtime
+directory); it records the governing references and cycle outcomes without
+making old grants executable.
 
 All three default to **passive-only**. Ticking **"Test for proof of impact (active)"** turns
 on benign, in-scope-only active probes that can mark a finding **Confirmed** instead of just
-flagged; it (and every other active/opt-in mode — deep SQLi, live browser pass, deep
-auto-work) still only ever fires against a host actually named in Scope.
+flagged; deep SQLi and deep auto-work still only ever fire against a host
+actually named in Scope. The live browser option is disabled until its DNS
+egress can be pinned to the same checked host.
 
 ### Passive OSINT campaigns (local CLI)
 
@@ -324,19 +401,29 @@ Click any row for the evidence pane: the captured request/response, the differen
 proved it, CVSS, CWE/OWASP mapping, remediation guidance, and (when available) a proof
 screenshot.
 
+The **Leads** view and `gn leads` brief also show each proposed probe's predicted
+confirming result, a matched negative control, and the condition that leaves it
+unconfirmed or stops testing. These are planning notes. Check the current program
+scope and authorization before any active probe, and treat only captured evidence
+as proof.
+
 ## 5. Reports & submission
 
 Confirmed (and reportable candidate) findings appear in the **Submissions** tab:
 
-- **Copy report** / **Download .md** — a self-contained, submission-ready Markdown package,
-  reshaped per platform (HackerOne, YesWeHack, Bugcrowd, Intigriti, **HackenProof** — pick the
-  format at the top of the tab). HackenProof's format leads with Target + Vulnerability category
-  and uses its four-band Critical–Low severity (web/mobile and smart-contract classes).
+- **Copy report** / **Download .md** — a concise, plain-language description with
+  Summary, numbered Proof of Concept steps, captured result and control, and Impact.
+  Choose the platform format at the top of the tab (HackerOne, YesWeHack,
+  Bugcrowd, Intigriti, or HackenProof). Fill the platform's title, asset,
+  severity, and classification fields separately. The per-finding package also
+  keeps a detailed `.details.md` analyst report and `.json` sidecar with the
+  evidence and review context. Check every claim and attachment against the
+  saved capture before submitting.
 - **Submit to HackerOne** — the one place GreyIQ pushes a report over the network on your
   behalf. It's hard-gated: only enabled once proof status is Confirmed *and* your HackerOne
   creds are saved, requires an explicit confirmation dialog, and the server independently
   re-checks the confirmed status (a forged client request can't push an unproven finding).
-  Every other platform — including HackenProof — is **export-only**: HackenProof publishes no
+  Every other platform — including HackenProof — is **export-only for submission**: HackenProof publishes no
   researcher API for scope, submission, or metrics (its programmatic surface is a triage-side
   MCP server, not a hunter API), so GreyIQ formats the report and you submit it on the
   platform's own dashboard.
@@ -355,14 +442,19 @@ Confirmed (and reportable candidate) findings appear in the **Submissions** tab:
   the HackerOne report submission (`api.hackerone.com`, write, hard-gated, manual), the
   HackerOne scope import described above (`api.hackerone.com`, read-only, manual), the
   YesWeHack program search / scope import and sign-in (`api.yeswehack.com`, read-only apart
-  from the sign-in exchange itself, manual), optional
+  from the sign-in exchange itself, manual),
+  Bugcrowd (`api.bugcrowd.com`) and Intigriti (`api.intigriti.com`) program
+  discovery and scope preview (read-only, manual), and optional
   repo-draft enrichment (`api.github.com` or `gitlab.com`, unauthenticated read-only, one GET
   per repository, explicit click only), an
   optional certificate-transparency lookup for subdomain seeding (`crt.sh`, read-only), the
   explicit local OSINT command (`crt.sh`, Cert Spotter, Google DNS, and Cloudflare DNS;
   read-only public-index queries), and
-  polling your own OOB collaborator server (a host you configured). Nothing else leaves the
-  machine.
-- **Nothing auto-submits without you arming it.** The Operator's auto-submit is
-  quadruple-gated (explicitly armed + per-program opt-in + server-recomputed confirmed proof
-  + a daily cap), and the kill switch stops the whole loop immediately.
+  polling your own OOB collaborator server (a host you configured). An explicit
+  local-model setup also checks the public Hugging Face model metadata and asks
+  Ollama to download the selected model. The direct Hugging Face import runs chat
+  and agent-tool readiness checks before selecting it for chat or hunt planning;
+  the packaged desktop starts its saved local Ollama runtime again after restart.
+- **Only you submit reports.** The Operator queues findings and report packages locally.
+  Review the evidence and use the manual submission action if you decide to file a report.
+  The kill switch requests cancellation and prevents further scheduled work.

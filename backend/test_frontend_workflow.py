@@ -82,7 +82,7 @@ class CockpitWorkflowContractTests(unittest.TestCase):
         self.assertIn(".ck-scope-row { grid-template-columns: minmax(0, 1fr)", CSS)
         self.assertIn("@media (prefers-reduced-motion: reduce)", CSS)
 
-    def test_repo_onboarding_preflights_and_stays_review_only(self) -> None:
+    def test_repo_onboarding_is_paused_and_stays_review_only(self) -> None:
         flow = JS.split("function ckWizardIdentifyRepo(", 1)[1].split(
             "function ckWizardIdentifyH1", 1
         )[0]
@@ -90,8 +90,7 @@ class CockpitWorkflowContractTests(unittest.TestCase):
             "function ckProgramSetupRow", 1
         )[0]
 
-        # Preflight runs BEFORE any draft is created, so a typo'd/private/missing repo is caught
-        # up front with an actionable message instead of failing deep in a clone mid-hunt.
+        # A restored pre-update wizard still checks before attempting draft creation.
         self.assertIn('apiFetch("/api/repos/preflight"', flow)
         self.assertIn('apiFetch("/api/programs/from-repo"', flow)
         self.assertLess(flow.index("/api/repos/preflight"), flow.index("/api/programs/from-repo"))
@@ -102,13 +101,12 @@ class CockpitWorkflowContractTests(unittest.TestCase):
         self.assertIn("confirm you're authorized to test this host", suggestions)
         self.assertIn("leaving a row unticked never authorizes it", JS)
         self.assertIn('repositories.length && String(p.scope_text || "").trim()', JS)
-        # A repository hunt is also preflighted at launch, so a bad repo typed straight into the
-        # rail can't fire a doomed run either — but ONLY a definitive negative blocks it. A
-        # transient/indeterminate preflight (timeout, unreachable) must never refuse a hunt the
-        # operator asked for (the real 120s clone is the authoritative attempt).
+        self.assertIn("repoChoice.disabled = true", JS)
+        self.assertIn("cloneRepositories.input.disabled = true", JS)
+        # A typed remote repository is refused in the launch rail before any API call.
         run = JS.split("async function ckRun()", 1)[1]
-        self.assertIn('apiFetch("/api/repos/preflight"', run)
-        self.assertIn('["invalid", "not_found", "private"].includes(pf.status)', run)
+        self.assertIn('if (repositoryHunt) { ckStatus("Remote Git scanning is unavailable.', run)
+        self.assertNotIn('apiFetch("/api/repos/preflight"', run)
 
     def test_every_platform_is_selectable_in_the_program_flow(self) -> None:
         # The report-format mirror lists all five platforms, and the Program-form platform
@@ -215,11 +213,15 @@ class CockpitQaqcV25ContractTests(unittest.TestCase):
     def test_findings_empty_state_points_to_report_center(self) -> None:
         self.assertIn("Open Report Center", JS)
 
-    # --- The HackerOne scope-import wizard pre-checks credentials with a jump ---
+    # --- Both HackerOne intake paths expose the inline credential form ---
     def test_hackerone_scope_wizard_prechecks_creds(self) -> None:
         h1 = self._fn("ckWizardIdentifyH1")
-        self.assertIn("ck-wiz-crednote", h1)
-        self.assertIn("Save HackerOne credentials", h1)
+        platform = self._fn("ckWizardIdentifyPlatformApi")
+        credentials = self._fn("ckWizardH1Credentials")
+        self.assertIn("ckWizardH1Credentials().wrap", h1)
+        self.assertIn("ckWizardH1Credentials()", platform)
+        self.assertIn("ck-wiz-crednote", credentials)
+        self.assertIn("Save HackerOne credentials", credentials)
 
     # --- Program save reports a server-side rejection instead of a false "Saved." ---
     def test_program_save_checks_the_result(self) -> None:

@@ -101,6 +101,25 @@ class ExportLeadsTests(unittest.TestCase):
             self.assertIn(key, lead)
         self.assertTrue(lead["proof_obligation"])
 
+    def test_api_exports_pre_probe_discriminator_for_an_unconfirmed_lead(self) -> None:
+        run_id = self._cache_run()
+        doc = _sidecar("https://app.example.com")
+        doc["findings"] = [{
+            "ref": "F1", "title": "Reflected input", "class_id": "xss",
+            "severity": "medium", "location": "https://app.example.com/search",
+        }]
+        doc["attack_plans"] = {}
+        doc["investigation"] = investigator.build_investigation(doc["findings"])
+        self.json_path.write_text(json.dumps(doc), encoding="utf-8")
+        res = self.rt.export_leads(g.LeadsRequest(run_id=run_id))
+        self.assertTrue(res["ok"], res)
+        lead = res["report"]["hunts"][0]["leads"][0]
+        self.assertTrue(lead["predicted_positive_signal"])
+        self.assertTrue(lead["negative_control"])
+        self.assertIn("authorization", lead["falsifier_stop_condition"])
+        self.assertIn("Predicted positive signal", res["markdown"])
+        self.assertIn("Falsifier / stop", res["markdown"])
+
     def test_credential_in_the_target_never_reaches_the_download(self) -> None:
         run_id = self._cache_run(target=f"https://app.example.com/cb?token={_SECRET}")
         res = self.rt.export_leads(g.LeadsRequest(run_id=run_id))

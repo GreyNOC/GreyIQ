@@ -12,6 +12,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from bughunter import investigator, report  # noqa: E402
+from bughunter.prover_classes import PROVER_CLASSES  # noqa: E402
 
 
 class InvestigationCortexTests(unittest.TestCase):
@@ -346,6 +347,8 @@ class InvestigationCortexTests(unittest.TestCase):
         self.assertEqual(graph["attack_chains"], [])
         self.assertTrue(graph["chain_probes"])
         self.assertTrue(all(p["status"] == "untested" for p in graph["chain_probes"]))
+        self.assertTrue(all(p["predicted_positive_signal"] and p["negative_control"]
+                            and p["falsifier_stop_condition"] for p in graph["chain_probes"]))
         self.assertEqual(graph["metrics"]["chain_probes"], len(graph["chain_probes"]))
 
     def test_chain_never_reads_stronger_than_the_findings_it_cites(self) -> None:
@@ -393,7 +396,29 @@ class InvestigationCortexTests(unittest.TestCase):
         self.assertEqual(first[0]["endpoint"], plan["probe_priority"][0]["endpoint"])
         self.assertEqual(first[0]["status"], "untested")
         self.assertTrue(first[0]["evidence_required"])
+        for hypothesis in first:
+            self.assertTrue(hypothesis["predicted_positive_signal"])
+            self.assertTrue(hypothesis["negative_control"])
+            self.assertIn("Leave unconfirmed", hypothesis["falsifier_stop_condition"])
+            self.assertIn("scope", hypothesis["falsifier_stop_condition"])
         self.assertGreater(first[0]["likelihood_score"], first[1]["likelihood_score"])
+
+    def test_probe_hypothesis_predictions_are_class_specific_and_advisory(self) -> None:
+        rows = investigator.build_probe_hypotheses({"probe_priority": [{
+            "endpoint": "https://app.example.test/objects/1",
+            "classes": ["idor", "xss", "other-class"], "why": "observed object route",
+        }]})
+        by_class = {row["class_id"]: row for row in rows}
+        self.assertIn("lower-privilege test actor", by_class["access-control"]["predicted_positive_signal"])
+        self.assertIn("remains inert", by_class["xss"]["negative_control"])
+        self.assertIn("proof obligation", by_class["other-class"]["predicted_positive_signal"])
+        for row in rows:
+            self.assertEqual(row["status"], "untested")
+            self.assertNotIn("proof_of_impact", row)
+            self.assertIn("Stop on missing or changed authorization", row["falsifier_stop_condition"])
+
+    def test_every_active_prover_class_has_a_specific_pre_probe_discriminator(self) -> None:
+        self.assertEqual(set(PROVER_CLASSES) - set(investigator._PROBE_DISCRIMINATORS), set())
 
     def test_malformed_input_is_bounded_and_safe(self) -> None:
         graph = investigator.build_investigation([None, "bad", {"severity": {"x": 1}}], {"H3": 7})
@@ -612,6 +637,9 @@ class ActiveTheorizingTests(unittest.TestCase):
         self.assertEqual(row["status"], "untested")
         self.assertEqual(row["source"], "unconfirmed-hypothesis")
         self.assertTrue(row["obligation"])
+        self.assertIn("controlled browser context", row["predicted_positive_signal"])
+        self.assertIn("safely encoded", row["negative_control"])
+        self.assertIn("rate limit", row["falsifier_stop_condition"])
 
     def test_probe_plan_omits_what_the_prover_cannot_confirm(self) -> None:
         """A class the differential prover has no check for could only ever return another

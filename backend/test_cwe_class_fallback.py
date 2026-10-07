@@ -40,7 +40,8 @@ class OnDemandReportCweTests(unittest.TestCase):
         pkg = self._pkg(class_id="cors", cwe="")
         self.assertEqual(pkg.get("cwe"), "CWE-284")
         self.assertEqual(pkg.get("weakness"), "284")
-        self.assertIn("CWE-284", pkg.get("vulnerability_information", ""))
+        self.assertIn("CWE-284", pkg.get("analyst_report", ""))
+        self.assertNotIn("CWE-284", pkg.get("vulnerability_information", ""))
 
     def test_explicit_client_cwe_is_preserved(self) -> None:
         # A deliberately-supplied CWE is never overridden by the class fallback.

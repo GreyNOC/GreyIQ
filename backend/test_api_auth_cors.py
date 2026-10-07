@@ -7,6 +7,7 @@ import asyncio
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
@@ -172,12 +173,20 @@ class RouteHttpAsgiTests(unittest.TestCase):
         # /api/health is the one /api/* path reachable with no credentials at all (it's
         # the liveness check Electron polls before a session exists) -- it must never
         # hand a scanner the exact app/version string to fingerprint.
-        cap = _run_route("GET", "/api/health")
+        with patch.dict(g.os.environ, {}, clear=False):
+            g.os.environ.pop("GREYIQ_LAUNCH_ID", None)
+            cap = _run_route("GET", "/api/health")
         self.assertEqual(cap.status, 200)
         body = g.json.loads(cap.body)
         self.assertEqual(body, {"status": "ok"})
         self.assertNotIn("version", body)
         self.assertNotIn("app", body)
+
+    def test_api_health_echoes_launch_id_only_when_configured(self) -> None:
+        with patch.dict(g.os.environ, {"GREYIQ_LAUNCH_ID": "launch-nonce-123"}):
+            cap = _run_route("GET", "/api/health")
+        self.assertEqual(cap.status, 200)
+        self.assertEqual(g.json.loads(cap.body), {"status": "ok", "launchId": "launch-nonce-123"})
 
     def test_protected_api_path_without_token_is_refused(self) -> None:
         cap = _run_route("GET", "/api/status")

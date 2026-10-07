@@ -66,6 +66,23 @@ _NEXT_STEP_TAG = {
 }
 
 _JWT_CREDENTIAL_RULE_IDS = {"secret.jwt", "web.exposed.secret.jwt"}
+_NESTED_REDACTION_MARKER = re.compile(
+    r"\[REDACTED_SECRET:\[REDACTED_SECRET:sha256:[0-9a-f]{12}\]:([0-9a-f]{12})\]"
+)
+
+
+def _redact_captured_text(value: Any) -> str:
+    """Redact caller-supplied proof text and keep its markers readable.
+
+    The generic redactor can match part of a marker it generated earlier in
+    the same pass. Collapsing that display artifact never restores a secret.
+    """
+    redacted = redact_text(str(value or ""))[0]
+    while True:
+        flattened = _NESTED_REDACTION_MARKER.sub(r"[REDACTED_SECRET:sha256:\1]", redacted)
+        if flattened == redacted:
+            return redacted
+        redacted = flattened
 
 
 def normalize_steps(raw: Any) -> list[str]:
@@ -699,6 +716,14 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
     # raw key itself lives only in the dedicated credential section, never here.
     cred = finding.get("_credential_proof")
     if isinstance(cred, dict) and cred.get("live") is True and secret_classification.has_confirmed_secret_proof(finding):
+        raw_secret = str(finding.get("secret_value") or "")
+
+        def _safe_credential_text(value: Any) -> str:
+            text = str(value or "")
+            if raw_secret:
+                text = secret_classification.redact_value_in(text, raw_secret)
+            return redact_text(text)[0]
+
         project = str(cred.get("project_id") or "").strip()
         domains = [str(d) for d in (cred.get("authorized_domains") or []) if str(d).strip()]
         principal = str(cred.get("principal") or "").strip()
@@ -710,20 +735,23 @@ def _proof_of_impact_detail(finding: dict[str, Any], plan: dict[str, Any]) -> di
             asset = f"the account/workspace the token controls: {principal}" + (f" (scopes: {scopes})" if scopes else "")
         else:
             asset = "the account/project the credential authenticates to"
-        poc = redact_text(str(cred.get("poc") or "").strip())[0]
-        response = redact_text(str(cred.get("response_excerpt") or cred.get("detail") or "").strip())[0]
+        poc = _safe_credential_text(cred.get("poc")).strip()
+        response = _safe_credential_text(cred.get("response_excerpt") or cred.get("detail")).strip()
         return {
             "status": "confirmed", "ready": True,
-            "method": f"benign read-only GET to the credential's issuer ({endpoint}), carrying only the found credential",
+            "method": _safe_credential_text(f"benign read-only GET to the credential's issuer ({endpoint}), carrying only the found credential"),
             "actor": "an unauthenticated attacker holding the leaked credential",
-            "affected_asset": asset,
-            "observed_result": f"the leaked credential authenticated successfully (HTTP {cred.get('http_status', '?')})"
-                               + (f" to Firebase project '{project}'" if project else (f" as {principal}" if principal else "")),
-            "control_result": "an invalid/revoked credential is rejected by the same endpoint — this credential is genuinely live",
-            "evidence": str(cred.get("detail") or "").strip(),
+            "affected_asset": _safe_credential_text(asset),
+            "observed_result": _safe_credential_text(
+                f"the leaked credential authenticated successfully (HTTP {cred.get('http_status', '?')})"
+                + (f" to Firebase project '{project}'" if project else (f" as {principal}" if principal else ""))),
+            # Do not invent a negative control: liveness can confirm this route
+            # without a separate invalid-token request.
+            "control_result": _safe_credential_text(cred.get("control_result")).strip(),
+            "evidence": _safe_credential_text(cred.get("detail")).strip(),
             "authenticated_read_request": poc,
             "authenticated_read_response": response,
-            "blast_radius": asset,
+            "blast_radius": _safe_credential_text(asset),
             "limitations": "", "proof_obligation": "",
         }
     proof = _proof_value(finding, plan)
@@ -924,7 +952,7 @@ def _captured_request_response_text(finding: dict[str, Any], *, include_read_dat
         if read_data:
             if lines:
                 lines.append("")
-            lines.append("Exploit output / response body excerpt:")
+            lines.append("Captured response body excerpt:")
             lines.append(read_data[:1500])
     return redact_text("\n".join(lines).strip())[0]
 
@@ -1181,61 +1209,65 @@ _CREDENTIAL_WARNING = ("The credential above is shown REDACTED (prefix…suffix)
 
 
 def _append_credential_proof(out: list[str], finding: dict[str, Any]) -> None:
-    """Render the exact-location + real-key + live-validation block a triager demands for a leaked
-    credential: the precise file:line and variable, the ACTUAL (un-redacted) key, and — when the
-    engine validated it — whether it is live plus the Firebase project/data it grants. Only fires
-    for a secret finding that carried a raw ``secret_value`` and/or a ``_credential_proof``."""
+    """Render credential classification and validation without a usable secret."""
     secret = str(finding.get("secret_value") or "").strip()
     proof = finding.get("_credential_proof") if isinstance(finding.get("_credential_proof"), dict) else {}
     ev = finding.get("secret_evidence") if isinstance(finding.get("secret_evidence"), dict) else {}
     if not secret and not proof and not ev:
         return
+
+    def _safe(value: Any) -> str:
+        text = str(value or "")
+        if secret:
+            text = secret_classification.redact_value_in(text, secret)
+        return redact_text(text)[0]
+
     cls = str(finding.get("secret_classification") or ev.get("secret_classification") or "")
     confirmed = cls == secret_classification.CONFIRMED_SECRET
     out.append("## Credential — classification, evidence, and validation\n")
-    var = str(finding.get("variable_name") or "").strip()
-    out.append(f"- **Exact location:** {_code(_location(finding))}" + (f" — variable {_code(var)}" if var else ""))
+    var = _safe(finding.get("variable_name")).strip()
+    out.append(f"- **Exact location:** {_code(_safe(_location(finding)))}" + (f" — variable {_code(var)}" if var else ""))
     # NEVER print the full key — always a safe prefix…suffix redaction, whatever the classification.
-    redacted = str(ev.get("redacted_secret") or (redact_secret(secret) if secret else "")).strip()
+    redacted = (redact_secret(secret) if secret else _safe(ev.get("redacted_secret"))).strip()
     if redacted:
         out.append(f"- **Credential (redacted — prefix…suffix, never the full key):** {_code(redacted)}")
     # The strict-classification evidence block: the fields a triager needs to trust — or correctly
     # discount — this finding, so an unproven key is never dressed up as an exploited secret.
     if ev:
-        out.append(f"- **Classification:** {_code(cls or secret_classification.CANDIDATE_UNVERIFIED)} — {ev.get('impact_summary', '')}")
-        out.append(f"- **Evidence status:** {ev.get('evidence_status', 'unverified')} · "
+        out.append(f"- **Classification:** {_code(cls or secret_classification.CANDIDATE_UNVERIFIED)} — {_safe(ev.get('impact_summary'))}")
+        out.append(f"- **Evidence status:** {_safe(ev.get('evidence_status', 'unverified'))} · "
                    f"proof required: {'yes' if ev.get('proof_required') else 'no'} · "
                    f"proof present: {'yes' if ev.get('proof_present') else 'no'} · "
                    f"impact proven: {'yes' if ev.get('impact_proven') else 'no'}")
-        out.append(f"- **Reportability:** {ev.get('reportability', 'not_reportable_yet')} — {ev.get('not_reportable_note', '')}")
-        out.append(f"- **Validation method:** {ev.get('validation_method', '')}")
-        out.append(f"- **Request evidence:** {_code(str(ev.get('request_evidence', '')))}")
-        out.append(f"- **Response evidence:** {ev.get('response_evidence', '')}")
+        out.append(f"- **Reportability:** {_safe(ev.get('reportability', 'not_reportable_yet'))} — {_safe(ev.get('not_reportable_note'))}")
+        out.append(f"- **Validation method:** {_safe(ev.get('validation_method'))}")
+        out.append(f"- **Request evidence:** {_code(_safe(ev.get('request_evidence')))}")
+        out.append(f"- **Response evidence:** {_safe(ev.get('response_evidence'))}")
         missing = ev.get("missing_proof") or []
         if missing and not confirmed:
             out.append("- **Missing proof — required before this is reportable:**")
             for m in missing:
-                out.append(f"  - {m}")
+                out.append(f"  - {_safe(m)}")
     if proof and proof.get("checked"):
         live = proof.get("live")
         label = "**LIVE** (validated)" if live is True else "not live / revoked" if live is False else "inconclusive"
-        out.append(f"- **Validation:** {label} — {proof.get('detail', '')}")
+        out.append(f"- **Validation:** {label} — {_safe(proof.get('detail'))}")
         if proof.get("project_id"):
-            out.append(f"- **Firebase project:** {_code(str(proof['project_id']))}")
+            out.append(f"- **Firebase project:** {_code(_safe(proof['project_id']))}")
         domains = proof.get("authorized_domains") or []
         if domains:
-            out.append(f"- **Authorized domains:** {_code(', '.join(str(d) for d in domains))}")
+            out.append(f"- **Authorized domains:** {_code(_safe(', '.join(str(d) for d in domains)))}")
         if str(proof.get("principal") or "").strip():  # GitHub account / Slack workspace the token controls
-            out.append(f"- **Account / workspace:** {_code(str(proof['principal']))}")
+            out.append(f"- **Account / workspace:** {_code(_safe(proof['principal']))}")
         if str(proof.get("scopes") or "").strip():
-            out.append(f"- **Granted scopes:** {_code(str(proof['scopes']))}")
-        issuer = str(proof.get("endpoint") or "the credential's own issuer").strip()
+            out.append(f"- **Granted scopes:** {_code(_safe(proof['scopes']))}")
+        issuer = _safe(proof.get("endpoint") or "the credential's own issuer").strip()
         no_data = " No account data was read." if proof.get("no_data_read") else ""
         out.append(f"- **Request sent:** one benign, read-only request to the credential's own issuer "
                    f"(`{issuer}`) carrying only the found credential — never the target." + no_data)
         verdict = ("authenticated — the credential is LIVE" if live is True
                    else "rejected — not live / revoked" if live is False else "inconclusive")
-        out.append(f"- **Return code:** HTTP {proof.get('http_status', '?')} ({verdict}).")
+        out.append(f"- **Return code:** HTTP {_safe(proof.get('http_status', '?'))} ({verdict}).")
     # A runnable liveness PoC + issuer response ONLY for a CONFIRMED secret — and with the key redacted
     # even there (the report must never carry a usable key). A public/unverified key gets an explicit
     # not-reportable banner instead of a polished PoC that would make it read as exploited.
@@ -1243,13 +1275,13 @@ def _append_credential_proof(out: list[str], finding: dict[str, Any]) -> None:
         out.append("")
         out.append("**Proof of concept — reproduce liveness (one benign, read-only request to the issuer; key redacted):**\n")
         out.append("```bash")
-        out.append(secret_classification.redact_value_in(str(proof.get("poc")), secret))
+        out.append(_safe(proof.get("poc")))
         out.append("```")
         excerpt = str(proof.get("response_excerpt") or "").strip()
         if excerpt:
             out.append("Issuer response — proof the key is live and what it grants (redacted):\n")
             out.append("```json")
-            out.append(secret_classification.redact_value_in(excerpt, secret)[:900])
+            out.append(_safe(excerpt)[:900])
             out.append("```")
     elif not confirmed:
         if cls == secret_classification.PUBLIC_CLIENT_KEY:
@@ -1257,7 +1289,7 @@ def _append_credential_proof(out: list[str], finding: dict[str, Any]) -> None:
                        "browser key, OAuth client id, or analytics/CDN config is designed to be public — it is NOT a "
                        "reportable secret without proof of unauthorized access or real security impact (see missing proof above).")
         else:
-            out.append(f"\n> **{ev.get('not_reportable_note') or 'Not reportable yet: candidate secret without confirmed impact.'}**")
+            out.append(f"\n> **{_safe(ev.get('not_reportable_note') or 'Not reportable yet: candidate secret without confirmed impact.')}**")
     out.append("")
     if secret and confirmed:
         out.append(f"> {_CREDENTIAL_WARNING}")
@@ -1265,37 +1297,38 @@ def _append_credential_proof(out: list[str], finding: dict[str, Any]) -> None:
 
 
 def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
-    """Render the captured passive proof artifacts (request line + crafted header,
-    response status, offending header/cookie) a web finding carries — the strongest
-    passive proof. When a crafted request line is present (active probes), also emit
-    a copy-pasteable raw request->response block reconstructed purely from the
-    already-redacted captured fields (no request is synthesized)."""
+    """Render captured request and response fields without adding proof claims.
+
+    Redact again at this boundary because a caller can supply a finding whose
+    fields did not pass through the scanner's earlier redaction step.
+    """
     pe = finding.get("proof_evidence")
     if not isinstance(pe, dict) or not pe:
         return
-    rows = [(label, str(pe.get(key) or "").strip()) for key, label in _PROOF_EVIDENCE_LABELS]
+    safe_pe = {key: _redact_captured_text(value).strip() for key, value in pe.items()}
+    rows = [(label, safe_pe.get(key, "")) for key, label in _PROOF_EVIDENCE_LABELS]
     rows = [(label, value) for label, value in rows if value]
     if not rows:
         return
-    out.append("**Captured proof (passive — already redacted):**\n")
+    out.append("**Captured evidence (redacted):**\n")
     for label, value in rows:
         out.append(f"- **{label}:** {_code(value)}")
     out.append("")
     # A reconstructed raw request/response is the single most convincing artifact for
     # a triager. Only render it when a crafted request line was captured (active
     # probes); passive header-only findings legitimately have no request to show.
-    request_line = str(pe.get("request_line") or "").strip()
+    request_line = safe_pe.get("request_line", "")
     if request_line:
         lines = [request_line]
-        request_header = str(pe.get("request_header") or "").strip()
+        request_header = safe_pe.get("request_header", "")
         if request_header:
             lines.append(request_header)
         lines.append("")  # blank line separates request from response
-        status = str(pe.get("response_status") or "").strip()
+        status = safe_pe.get("response_status", "")
         if status:
             lines.append(status)  # already 'HTTP <code>' — do not double-prefix
         for key in ("response_header", "set_cookie", "matched_value"):
-            value = str(pe.get(key) or "").strip()
+            value = safe_pe.get(key, "")
             if not value:
                 continue
             # CORS (and similar) checks pack several response headers into one matched
@@ -1310,7 +1343,7 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
                 lines.append(value)
         body = "\n".join(lines)
         fence = _fence(body)
-        out.append("Captured request/response (reconstructed from redacted artifacts — benign GET probe):\n")
+        out.append("Captured request/response (formatted from redacted fields):\n")
         out.append(f"{fence}http")
         out.append(body)
         out.append(fence)
@@ -1318,7 +1351,7 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
     # The captured readable body. For a disclosure the data IS returned to any reader; for CORS this
     # is a SAME-SITE (curl-equivalent) capture that shows the endpoint returns this data — the browser
     # cross-origin read stays PoC-gated (see the heading below). Already redacted by the capturing check.
-    read_data = str(pe.get("read_data") or "").strip()
+    read_data = safe_pe.get("read_data", "")
     if read_data:
         rd = read_data[:1500]
         rd_fence = _fence(rd)
@@ -1329,28 +1362,15 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
         is_disclosure = False
         if cls == "cors" or "cors" in rid:
             is_disclosure = True
-            heading = (
-                "**Captured authenticated response (same-site read)** — requested with the tool's own "
-                "session, this endpoint returned the body below. The confirmed CORS headers above WOULD "
-                "let an attacker-controlled origin read a response like this, but the capture is same-site "
-                "(curl-equivalent); a browser-hosted PoC on an attacker origin is still required to prove "
-                "the cross-origin read and its sensitive impact:"
-            )
+            heading = ("**Captured response body (same-site read):** The tool's session received this "
+                       "content. A browser PoC is needed to prove a cross-origin read.")
         elif cls in _DISCLOSURE or any(t in rid for t in _DISCLOSURE_RID):
             is_disclosure = True
-            heading = (
-                "**Demonstrated impact — data disclosed** — the request above returned the content "
-                "below, proving the sensitive data is actually retrievable (not merely that the "
-                "endpoint exists). Already redacted; review before sharing:"
-            )
+            heading = "**Captured response body:** The request above returned this content."
         else:
             # Injection / reflection classes (XSS, SSTI, SQLi, RCE): the payload's EFFECT captured
             # verbatim from the live response — the concrete proof a triager wants, not a description.
-            heading = (
-                "**Demonstrated proof — the vulnerable behavior in the live response** — the excerpt "
-                "below is the server's ACTUAL response, showing the injected payload's effect "
-                "(reflected unescaped / evaluated / DB error) exactly as returned. Already redacted:"
-            )
+            heading = "**Captured response body:** This is the recorded response excerpt."
         out.append(heading + "\n")
         out.append(rd_fence)
         out.append(rd)
@@ -1362,7 +1382,10 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
         # (the fallback) silently under-reports. Only for disclosure classes: for injection classes the
         # body is the payload's own effect, not data an attacker reads.
         if is_disclosure:
-            exposed = str(pe.get("sensitive_data_labels") or "").strip() or sensitive_data.summarize(rd)
+            # Classify the original captured body before redaction removes JWT and
+            # token shapes. Only the classifier's generic labels reach the report.
+            exposed = (safe_pe.get("sensitive_data_labels", "")
+                       or sensitive_data.summarize(str(pe.get("read_data") or "")))
             if exposed:
                 out.append("")
                 if cls == "cors" or "cors" in rid:
@@ -1372,8 +1395,8 @@ def _append_proof_evidence(out: list[str], finding: dict[str, Any]) -> None:
                                "A browser-hosted PoC that reads this cross-origin would confirm an attacker "
                                "can obtain it; until then this establishes the data at risk, not a completed theft.")
                 else:
-                    out.append(f"**Sensitive data exposed:** the disclosed content includes {exposed} — "
-                               "directly usable by an attacker, which raises the real-world impact.")
+                    out.append(f"**Sensitive data in the response:** {exposed}. "
+                               "The access conditions and impact must match the captured request and control.")
                 # Point at the separate redacted capture file bundled in the PoC download.
                 sd_path = str(finding.get("sensitive_data_path") or "").strip()
                 if sd_path:
@@ -1562,6 +1585,47 @@ def _linkify_owasp(text: str) -> str:
     return f"[{s.strip()}]({url})"
 
 
+def _append_mcp_review(out: list[str], ctx: dict[str, Any]) -> None:
+    review = ctx.get("mcp_review")
+    if not isinstance(review, dict):
+        return
+    out.append("## MCP evidence review (advisory)\n")
+    out.append("MCP tools reviewed captured evidence only. Their output did not change findings, "
+               "proof status, severity, or target requests.")
+    out.append("")
+    builtin = review.get("builtin") if isinstance(review.get("builtin"), dict) else {}
+    if builtin.get("ok"):
+        checked = builtin.get("reviewed") or {}
+        out.append(f"- Built-in review: completed ({_safe_display_int(checked.get('endpoints'))} "
+                   f"endpoint(s), {_safe_display_int(checked.get('findings'))} finding(s)).")
+        for priority in (builtin.get("web_priorities") or [])[:4]:
+            if isinstance(priority, dict):
+                idx = _safe_display_int(priority.get("endpoint_index")) + 1
+                reason = _md_escape_cell(str(priority.get("reason") or "")[:180])
+                out.append(f"  - Endpoint {idx}: {reason}")
+        for priority in (builtin.get("finding_priorities") or [])[:4]:
+            if isinstance(priority, dict):
+                idx = _safe_display_int(priority.get("finding_index")) + 1
+                reason = _md_escape_cell(str(priority.get("reason") or "")[:180])
+                out.append(f"  - Finding {idx}: {reason}")
+    else:
+        out.append("- Built-in review: unavailable for this run.")
+    external = review.get("external") if isinstance(review.get("external"), list) else []
+    if review.get("external_opt_in"):
+        if external:
+            for item in external[:3]:
+                if not isinstance(item, dict):
+                    continue
+                server = _md_escape_cell(str(item.get("server") or "")[:80])
+                tool = _md_escape_cell(str(item.get("tool") or "")[:128]).replace("`", "\\`")
+                status = "completed" if item.get("ok") and not item.get("is_error") else "failed"
+                out.append(f"- Approved external tool `{server}/{tool}`: {status}. "
+                           "Any output is quarantined in the JSON sidecar as untrusted advisory data.")
+        else:
+            out.append(f"- External tools: {_md_escape_cell(str(review.get('external_status') or 'not run'))}.")
+    out.append("")
+
+
 def build_markdown(ctx: dict[str, Any]) -> str:
     findings: list[dict[str, Any]] = _reportable_findings(ctx.get("findings", []))
     counts = severity_counts(findings, ctx.get("attack_plans"))
@@ -1645,6 +1709,7 @@ def build_markdown(ctx: dict[str, Any]) -> str:
     _append_surface_drift(out, ctx)
     _append_investigation(out, ctx)
     _append_next_steps(out, ctx)
+    _append_mcp_review(out, ctx)
 
     # --- Methodology ---
     out.append("## Methodology\n")
@@ -2214,6 +2279,7 @@ def build_json(ctx: dict[str, Any]) -> dict[str, Any]:
             "algorithm": "", "verdict": "not-run", "metrics": {},
             "hypotheses": [], "attack_chains": [], "chain_probes": [], "contradictions": [],
         },
+        "mcp_review": ctx.get("mcp_review") or {},
         # How this host's surface compares with the previous hunt. Advisory and explicitly
         # separate from `findings`: a delta is never a finding.
         "drift": ctx.get("drift") or {},

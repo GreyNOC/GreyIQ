@@ -3,6 +3,8 @@ numpy>=1.26,<3.0
 anthropic>=0.49,<1.0
 uvicorn>=0.34,<0.35
 pydantic>=2.10,<3.0
+# GreyIQ's opt-in MCP server registry uses the v1 client transport APIs.
+mcp>=1.23,<2.0
 pypdf>=6.14.2,<7.0
 pdf2image>=1.17,<1.18
 pytesseract>=0.3.10,<0.4.0

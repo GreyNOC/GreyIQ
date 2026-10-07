@@ -23,7 +23,7 @@ import re
 from typing import Any
 from urllib.parse import parse_qsl, urldefrag, urljoin, urlparse
 
-from bughunter import api_discovery_service
+from bughunter import api_discovery_service, operator_guard
 from bughunter.fingerprint import fingerprint
 from bughunter.rate_limit import HostRateGovernor
 from bughunter.recon_js import mine_js, mine_source_map, source_map_urls
@@ -207,6 +207,17 @@ def discover(
                 "hints": {}, "websockets": [], "dropped_out_of_scope": 0, "requests_used": 0,
                 "observations": {}}
     host = (urlparse(sanitized).hostname or "").lower()
+    # The seed is a network target too. Previously host_ok() unconditionally
+    # trusted it, so robots/security.txt and the landing page could be fetched
+    # even when the caller's current scope excluded the seed host.
+    op_guard = operator_guard.current()
+    seed_allowed = bool(scope_in(host)) if callable(scope_in) else True
+    if op_guard is not None:
+        seed_allowed = seed_allowed and operator_guard.web_url_allowed(op_guard.check_current(), sanitized)
+    if not seed_allowed:
+        return {"urls": [], "host": host, "sources": {}, "notes": ["recon skipped: seed host outside the current scope"],
+                "endpoints": [], "params": [], "js_secrets": [], "source_maps": [], "tech": [],
+                "hints": {}, "websockets": [], "dropped_out_of_scope": 1, "requests_used": 0}
     governor = governor or HostRateGovernor(
         capacity=max(settings.active_max_requests_per_host, max_pages + 6),
         min_interval_s=settings.active_min_interval_ms / 1000.0,
@@ -215,7 +226,7 @@ def discover(
     observations: dict[str, dict[str, Any]] = {}
 
     def budgeted_fetch(url: str) -> dict[str, Any] | None:
-        if used["n"] >= max_requests:
+        if used["n"] >= max_requests or not in_scope(url):
             return None  # global per-campaign budget — the host-fan-out kill switch
         used["n"] += 1
         fetched = _safe_fetch(url, settings, governor)
@@ -234,12 +245,12 @@ def discover(
         h = (h or "").lower()
         if not h:
             return False
-        if h == host:
-            return True
-        return bool(scope_in(h)) if callable(scope_in) else False
+        return bool(scope_in(h)) if callable(scope_in) else h == host
 
     def in_scope(u: str) -> bool:
-        return host_ok(urlparse(u).hostname or "")
+        if not host_ok(urlparse(u).hostname or ""):
+            return False
+        return bool(operator_guard.web_url_allowed(op_guard.check_current(), u)) if op_guard else True
 
     discovered: list[str] = [sanitized]
     seen = {sanitized}
@@ -366,7 +377,9 @@ def discover(
     # Passive OSINT (opt-in): seed in-scope sibling hosts from certificate transparency (crt.sh) — hosts
     # no link/JS exposed. crt.sh is queried (never the target); every returned host is host_ok()-gated
     # before it becomes a crawl target, so this can only widen discovery WITHIN scope. Best-effort.
-    if getattr(settings, "recon_osint_enabled", False):
+    # Unattended testing never queries a third-party CT service on the
+    # program's behalf. A human-run campaign may still opt into OSINT.
+    if getattr(settings, "recon_osint_enabled", False) and operator_guard.current() is None:
         try:
             from bughunter import takeover_service
             from bughunter.registrable_domain import registrable_domain

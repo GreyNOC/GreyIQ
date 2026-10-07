@@ -144,7 +144,7 @@ class PersistProvenProofTests(unittest.TestCase):
         pkg = self.stub.build_submission_package(api.SubmissionPackageRequest(run_id="run1", ref="F1", platform="hackerone"))
         self.assertTrue(pkg["ok"], pkg)
         self.assertEqual(pkg["package"]["proof_status"], "confirmed")
-        self.assertRegex(pkg["package"]["vulnerability_information"], r"(?i)status:\*\*\s*Confirmed")
+        self.assertIn("Confirmed result:", pkg["package"]["vulnerability_information"])
 
     def test_unrelated_class_confirmed_at_same_url_is_not_persisted(self) -> None:
         api.bounty_active_verify.verify_active = self._fake_confirmed("xss")  # different class than the CORS finding
@@ -172,13 +172,13 @@ class BuildFindingReportTests(unittest.TestCase):
 
     def test_report_always_has_reproduction_steps(self) -> None:
         # Even a bare ledger/dashboard finding (no attack plan of its own) must produce a
-        # report with a populated "Steps to reproduce" section + a benign curl repro.
+        # report with a populated Proof of Concept section + a benign curl repro.
         out = _Stub().build_finding_report(api.FindingReportRequest(
             title="Reflected XSS", severity="high", class_name="xss", class_id="xss",
             location="https://example.com/search?q=1", cwe="CWE-79", target="https://example.com"))
         self.assertTrue(out["ok"], out)
         body = out["package"]["vulnerability_information"]
-        self.assertIn("Steps to reproduce", body)
+        self.assertIn("**Proof of Concept**", body)
         self.assertIn("curl", body.lower())
 
     def test_client_confirmed_without_control_caps_at_candidate(self) -> None:

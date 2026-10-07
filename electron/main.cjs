@@ -1,12 +1,16 @@
 'use strict';
 
-const { app, BrowserWindow, shell, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, Menu, shell, ipcMain, dialog } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const http = require('node:http');
 const https = require('node:https');
 const net = require('node:net');
+const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
+const { probeHealth } = require('./health.cjs');
+const { ollamaAssets, selectOllamaBinary, extractArchive } = require('./ollama-runtime.cjs');
+const { resolveRuntimeDir, migrateLegacyRuntime } = require('./runtime-path.cjs');
 
 const APP_NAME = 'GreyIQ';
 const HOST = '127.0.0.1';
@@ -22,24 +26,28 @@ const PROJECT_ROOT = app.isPackaged ? path.join(process.resourcesPath, 'app') : 
 // The PyInstaller-frozen backend is shipped as an extraResource at
 // <resources>/backend/greyiq-backend(.exe). Present only in packaged builds.
 const BACKEND_RESOURCE_DIR = app.isPackaged ? path.join(process.resourcesPath, 'backend') : null;
-const RUNTIME_DIR = path.join(app.getPath('userData'), 'runtime');
+const RUNTIME_DIR = resolveRuntimeDir({
+  platform: process.platform,
+  packaged: app.isPackaged,
+  userDataDir: app.getPath('userData'),
+  projectRoot: PROJECT_ROOT,
+});
 // Ollama runtime (zero-setup LOCAL brain). It is NO LONGER bundled — it was ~1.4 GB
 // (86% of the old portable) and the bug-hunting engine + the Claude/OpenAI brains
 // never use it. It is downloaded ON DEMAND to a writable userData dir the first time
 // the operator actually selects the local model, so the default app stays small/fast.
-const OLLAMA_BASE_DIR = path.join(app.getPath('userData'), 'ollama');
+// Keep ARM64's cache separate from older amd64 downloads in the same profile.
+const OLLAMA_BASE_DIR = path.join(app.getPath('userData'),
+  process.platform === 'linux' && process.arch === 'arm64' ? 'ollama-arm64' : 'ollama');
 const OLLAMA_BIN = process.platform === 'win32'
   ? path.join(OLLAMA_BASE_DIR, 'ollama.exe')
   : path.join(OLLAMA_BASE_DIR, 'bin', 'ollama');
 const OLLAMA_PORT = 11434;
-const OLLAMA_BASE_URL = process.platform === 'win32'
-  ? 'https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64.zip'
-  : 'https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64.tar.zst';
+const OLLAMA_ASSETS = ollamaAssets(process.platform, process.arch);
+// Separate from GREYIQ_LAUNCH_ID, which the health endpoint intentionally echoes.
+const INTERNAL_MODEL_STORE_TOKEN = crypto.randomBytes(32).toString('hex');
 // AMD GPUs need Ollama's ROCm runner (a separate ~1 GB package); fetched once on
-// first run when an AMD GPU is detected, overlaid onto the base runtime.
-const OLLAMA_ROCM_URL = process.platform === 'win32'
-  ? 'https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64-rocm.zip'
-  : 'https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64-rocm.tar.zst';
+// first run when an AMD GPU is detected on a supported architecture.
 
 // extraResources can drop the executable bit on non-Windows; restore it
 // best-effort before we spawn a bundled binary.
@@ -194,6 +202,9 @@ function launchTacnoc() {
 let mainWindow = null;
 let backendProcess = null;
 let ollamaProcess = null;
+let ollamaStartPromise = null;
+let managedOllamaModelsDir = null;
+let modelStoreSyncQueue = Promise.resolve();
 let backendPort = DEFAULT_PORT;
 let backendReady = false;
 let backendExited = false;
@@ -202,6 +213,41 @@ let quitting = false;
 let logStream = null;
 let logBytes = 0;  // bytes written to the current backend.log since it was (re)opened; drives mid-session rolling
 const LOG_MAX_BYTES = 5 * 1024 * 1024;
+
+function syncManagedOllamaModelsDir() {
+  // Only Electron main knows whether this process actually started bundled
+  // Ollama. Send the store to the backend directly, never through the renderer.
+  const body = JSON.stringify({ models_dir: managedOllamaModelsDir });
+  const headers = {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(body),
+    'X-GreyIQ-Internal-Model-Store-Token': INTERNAL_MODEL_STORE_TOKEN,
+  };
+  if (process.env.GREYIQ_ACCESS_KEY) {
+    headers.Authorization = `Basic ${Buffer.from(`:${process.env.GREYIQ_ACCESS_KEY.trim()}`).toString('base64')}`;
+  }
+  const update = modelStoreSyncQueue.catch(() => {}).then(() => new Promise((resolve, reject) => {
+    const request = http.request({
+      host: HOST,
+      port: backendPort,
+      path: '/api/internal/ollama-model-store',
+      method: 'POST',
+      headers,
+      timeout: 5000,
+    }, (response) => {
+      response.resume();
+      response.on('end', () => {
+        if (response.statusCode === 200) resolve();
+        else reject(new Error(`Backend rejected Ollama storage update (HTTP ${response.statusCode}).`));
+      });
+    });
+    request.on('error', reject);
+    request.on('timeout', () => request.destroy(new Error('Backend Ollama storage update timed out.')));
+    request.end(body);
+  }));
+  modelStoreSyncQueue = update;
+  return update;
+}
 
 function backendLogPath() {
   try {
@@ -294,36 +340,14 @@ function resolveBackendCommand() {
   return { exe: py.exe, args: py.args, cwd: PROJECT_ROOT };
 }
 
-function probeHealth(port) {
-  return new Promise((resolve) => {
-    const req = http.get(
-      {
-        host: HOST,
-        port,
-        path: '/api/health',
-        timeout: 2000,
-      },
-      (res) => {
-        res.resume();
-        resolve(res.statusCode >= 200 && res.statusCode < 500);
-      },
-    );
-    req.on('error', () => resolve(false));
-    req.on('timeout', () => {
-      req.destroy();
-      resolve(false);
-    });
-  });
-}
-
-async function waitForBackend(port) {
+async function waitForBackend(port, launchId) {
   const deadline = Date.now() + STARTUP_TIMEOUT_MS;
   while (Date.now() < deadline) {
     // If the backend process died, stop waiting immediately instead of burning
     // the whole timeout — the error page should appear right away.
     if (backendExited) return false;
     // eslint-disable-next-line no-await-in-loop
-    if (await probeHealth(port)) return true;
+    if (await probeHealth(HOST, port, launchId)) return true;
     // eslint-disable-next-line no-await-in-loop
     await new Promise((resolve) => setTimeout(resolve, HEALTH_POLL_MS));
   }
@@ -371,10 +395,13 @@ async function startBackend() {
     return;  // nothing to spawn or wait for — showApp() will render the error page
   }
   if (app.isPackaged) ensureExecutable(command.exe);
+  const launchId = crypto.randomBytes(32).toString('hex');
   const env = {
     ...process.env,
     GREYIQ_HOST: HOST,
     GREYIQ_PORT: String(backendPort),
+    GREYIQ_LAUNCH_ID: launchId,
+    GREYIQ_INTERNAL_MODEL_STORE_TOKEN: INTERNAL_MODEL_STORE_TOKEN,
     GREYIQ_RUNTIME_DIR: process.env.GREYIQ_RUNTIME_DIR || RUNTIME_DIR,
     PYTHONUTF8: '1',
   };
@@ -433,7 +460,7 @@ async function startBackend() {
     }
   });
 
-  backendReady = await waitForBackend(backendPort);
+  backendReady = await waitForBackend(backendPort, launchId);
   if (!backendReady && !startupError) {
     startupError = `Backend did not become ready within ${Math.round(STARTUP_TIMEOUT_MS / 1000)}s.`;
   }
@@ -452,12 +479,37 @@ const SYSTEM_PAGE_HEAD = `
   <meta charset="utf-8">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:">
   <meta name="color-scheme" content="dark">
+  <style>
+    .desktop-titlebar[hidden]{display:none}
+    .desktop-titlebar{position:fixed;top:0;left:0;right:0;height:38px;z-index:20;display:flex;align-items:center;justify-content:space-between;background:#191c1f;border-bottom:1px solid #3a3f45;color:#e6e8ea;-webkit-user-select:none;user-select:none}
+    .desktop-titlebar-drag{height:100%;flex:1;display:flex;align-items:center;padding:0 14px;font:600 12px system-ui,sans-serif;letter-spacing:.08em;-webkit-app-region:drag}
+    .desktop-titlebar-controls{height:100%;display:flex;-webkit-app-region:no-drag}
+    .desktop-titlebar-button{position:relative;width:46px;height:100%;border:0;background:transparent;color:inherit;cursor:pointer;-webkit-app-region:no-drag}
+    .desktop-titlebar-button:hover{background:#3a3f45}
+    .desktop-titlebar-button:focus-visible{outline:2px solid #ff6633;outline-offset:-3px}
+    .desktop-titlebar-button[data-window-control="close"]:hover{background:#c62828;color:#fff}
+    .desktop-titlebar-button[data-window-control="minimize"]::before{content:"";position:absolute;left:18px;top:19px;width:10px;height:1px;background:currentColor}
+    .desktop-titlebar-button[data-window-control="maximize"]::before{content:"";position:absolute;left:18px;top:14px;width:10px;height:9px;border:1px solid currentColor;box-sizing:border-box}
+    .desktop-titlebar-button[data-window-control="maximize"].is-maximized::before{left:20px;top:13px;box-shadow:-3px 3px 0 -1px #191c1f,-3px 3px 0 0 currentColor}
+    .desktop-titlebar-button[data-window-control="close"]::before{content:"×";position:absolute;inset:0;display:grid;place-items:center;font:22px/1 system-ui,sans-serif}
+  </style>
 `;
+
+const SYSTEM_PAGE_TITLEBAR = `
+  <header class="desktop-titlebar" data-window-titlebar hidden>
+    <div class="desktop-titlebar-drag" data-window-drag-region>GreyNOC / GreyIQ</div>
+    <div class="desktop-titlebar-controls">
+      <button class="desktop-titlebar-button" type="button" data-window-control="minimize" aria-label="Minimize GreyIQ" title="Minimize GreyIQ"></button>
+      <button class="desktop-titlebar-button" type="button" data-window-control="maximize" aria-label="Maximize GreyIQ" title="Maximize GreyIQ"></button>
+      <button class="desktop-titlebar-button" type="button" data-window-control="close" aria-label="Close GreyIQ" title="Close GreyIQ"></button>
+    </div>
+  </header>`;
 
 function loadingHtml() {
   return `data:text/html;charset=utf-8,${encodeURIComponent(`
     <!doctype html>${SYSTEM_PAGE_HEAD}
     <body style="font-family:'IBM Plex Sans',system-ui,-apple-system,Segoe UI,sans-serif;margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#0a0e14;color:#edf1f6">
+      ${SYSTEM_PAGE_TITLEBAR}
       <div style="text-align:center;max-width:440px;padding:24px">
         <div style="font:600 11px 'Cascadia Mono',Consolas,monospace;letter-spacing:.12em;text-transform:uppercase;color:#7e8b9c;margin-bottom:18px">GreyNOC / Operations</div>
         <div style="width:36px;height:36px;border:3px solid #1e2633;border-top-color:#5b8cff;border-radius:50%;margin:0 auto 22px;animation:spin 1s linear infinite"></div>
@@ -474,6 +526,7 @@ function errorHtml() {
   return `data:text/html;charset=utf-8,${encodeURIComponent(`
     <!doctype html>${SYSTEM_PAGE_HEAD}
     <body style="font-family:'IBM Plex Sans',system-ui,-apple-system,Segoe UI,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:#0a0e14;color:#edf1f6">
+      ${SYSTEM_PAGE_TITLEBAR}
       <main style="width:min(620px,calc(100% - 48px));padding:28px;border:1px solid #1e2633;border-radius:6px;background:#10151d">
         <div style="font:600 11px 'Cascadia Mono',Consolas,monospace;letter-spacing:.12em;text-transform:uppercase;color:#f0506e">Engine unavailable</div>
         <h1 style="font-size:20px;font-weight:700;margin:10px 0">GreyIQ did not start</h1>
@@ -489,6 +542,7 @@ function backendStoppedHtml(code, signal) {
   return `data:text/html;charset=utf-8,${encodeURIComponent(`
     <!doctype html>${SYSTEM_PAGE_HEAD}
     <body style="font-family:'IBM Plex Sans',system-ui,-apple-system,Segoe UI,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:#0a0e14;color:#edf1f6">
+      ${SYSTEM_PAGE_TITLEBAR}
       <main style="width:min(620px,calc(100% - 48px));padding:28px;border:1px solid #1e2633;border-radius:6px;background:#10151d">
         <div style="font:600 11px 'Cascadia Mono',Consolas,monospace;letter-spacing:.12em;text-transform:uppercase;color:#f0506e">Engine stopped</div>
         <h1 style="font-size:20px;font-weight:700;margin:10px 0">GreyIQ lost its local engine</h1>
@@ -509,6 +563,7 @@ function createWindow() {
     height: 860,
     minWidth: 980,
     minHeight: 680,
+    frame: false,
     title: APP_NAME,
     backgroundColor: '#0a0e14',
     // GreyNOC owl app icon for the window, taskbar/dock, and dev runs. On packaged
@@ -525,6 +580,10 @@ function createWindow() {
       allowRunningInsecureContent: false,
     },
   });
+
+  // The titlebar below replaces the native frame on Windows and Linux.
+  mainWindow.on('maximize', () => mainWindow.webContents.send('greyiq:window-maximized', true));
+  mainWindow.on('unmaximize', () => mainWindow.webContents.send('greyiq:window-maximized', false));
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (isAllowedExternalUrl(url)) {
@@ -579,7 +638,7 @@ function ollamaResponding() {
       { host: '127.0.0.1', port: OLLAMA_PORT, path: '/api/tags', timeout: 1500 },
       (res) => {
         res.resume();
-        resolve(true);
+        resolve(res.statusCode === 200 && String(res.headers['content-type'] || '').includes('application/json'));
       },
     );
     req.on('error', () => resolve(false));
@@ -595,7 +654,8 @@ function ollamaResponding() {
 // (ROCm) is fetched on first run. Everything here is best-effort: any failure
 // falls back to the bundled runtime so the app never breaks over GPU setup.
 let detectedGpu = 'unknown';         // 'nvidia' | 'amd' | 'other' | 'unknown'
-let activeOllamaRuntime = 'bundled'; // 'bundled' | 'rocm'
+let activeOllamaRuntime = 'bundled'; // 'bundled' | 'rocm' | 'system'
+let lastOllamaError = '';
 let gpuVendorCache = null;
 
 function logGpu(message) {
@@ -645,8 +705,13 @@ async function gpuVendor() {
 
 function downloadFile(url, dest, redirects = 5) {
   return new Promise((resolve, reject) => {
-    const lib = url.startsWith('https:') ? https : http;
-    const req = lib.get(url, { timeout: 60000 }, (res) => {
+    // This archive is executed after extraction. A release redirect must never
+    // downgrade its transport to HTTP.
+    if (parseUrl(url)?.protocol !== 'https:') {
+      reject(new Error('runtime download requires HTTPS'));
+      return;
+    }
+    const req = https.get(url, { timeout: 60000 }, (res) => {
       const status = res.statusCode || 0;
       if (status >= 300 && status < 400 && res.headers.location) {
         res.resume();
@@ -665,32 +730,20 @@ function downloadFile(url, dest, redirects = 5) {
   });
 }
 
-function extractArchive(archivePath, destDir) {
-  return new Promise((resolve, reject) => {
-    // Linux ships a .tar.zst (tar --zstd); Windows ships a .zip (bundled bsdtar reads zip).
-    const args = process.platform === 'win32'
-      ? ['-xf', archivePath, '-C', destDir]
-      : ['--zstd', '-xf', archivePath, '-C', destDir];
-    const child = spawn('tar', args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
-    let err = '';
-    child.stderr.on('data', (chunk) => { err += chunk; });
-    child.on('error', reject);
-    child.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`tar exit ${code}: ${String(err).slice(0, 200)}`))));
-  });
-}
-
 async function ensureBaseOllama() {
   // Provision (once) the base Ollama runtime to a writable userData dir, downloading
-  // it on demand (it is no longer bundled). Returns the binary path, or null if the
-  // download/extract fails. Only ever called when the user actually wants the local
+  // it on demand (it is no longer bundled). Only ever called when the user wants the local
   // model — never at boot — so the default app never pays for it.
   if (!app.isPackaged) return null;  // dev: use a system-installed ollama if present
+  if (!OLLAMA_ASSETS) {
+    throw new Error(`Automatic Ollama download is unavailable for ${process.platform}/${process.arch}. Install Ollama and set GREYIQ_OLLAMA_PATH.`);
+  }
   if (fs.existsSync(OLLAMA_BIN)) return OLLAMA_BIN;
   logGpu('Local model selected — downloading the Ollama runtime (one-time ~1 GB)…');
   const archive = path.join(app.getPath('userData'), process.platform === 'win32' ? 'ollama-base.zip' : 'ollama-base.tar.zst');
   try {
     fs.mkdirSync(OLLAMA_BASE_DIR, { recursive: true });
-    await downloadFile(OLLAMA_BASE_URL, archive);
+    await downloadFile(OLLAMA_ASSETS.base, archive);
     await extractArchive(archive, OLLAMA_BASE_DIR);
     fs.rmSync(archive, { force: true });
     if (!fs.existsSync(OLLAMA_BIN)) throw new Error('Ollama binary missing after extraction');
@@ -700,13 +753,15 @@ async function ensureBaseOllama() {
   } catch (err) {
     logGpu(`Ollama provisioning failed (${err.message}).`);
     try { fs.rmSync(archive, { force: true }); } catch (_) { /* ignore */ }
-    return null;
+    try { fs.rmSync(OLLAMA_BASE_DIR, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+    throw err;
   }
 }
 
 async function ensureRocmRuntime() {
   // Provision (once) and return the path to a ROCm-capable ollama binary, or null.
   // Needs the base runtime first (it's overlaid onto a copy of it).
+  if (!OLLAMA_ASSETS?.rocm) return null;
   if (!fs.existsSync(OLLAMA_BIN)) return null;
   const rocmDir = path.join(app.getPath('userData'), 'ollama-rocm');
   const rocmBin = process.platform === 'win32'
@@ -726,7 +781,7 @@ async function ensureRocmRuntime() {
       recursive: true,
       filter: (src) => !/[\\/]lib[\\/]ollama[\\/]cuda/i.test(src),
     });
-    await downloadFile(OLLAMA_ROCM_URL, archive);
+    await downloadFile(OLLAMA_ASSETS.rocm, archive);
     await extractArchive(archive, rocmDir);
     fs.rmSync(archive, { force: true });
     if (!fs.existsSync(rocmBin)) throw new Error('ROCm runtime binary missing after extraction');
@@ -745,7 +800,7 @@ async function resolveOllamaRuntime() {
   try {
     detectedGpu = await gpuVendor();
     logGpu(`GPU vendor: ${detectedGpu}`);
-    if (detectedGpu === 'amd') {
+    if (detectedGpu === 'amd' && OLLAMA_ASSETS?.rocm) {
       const rocmBin = await ensureRocmRuntime();
       if (rocmBin && fs.existsSync(rocmBin)) {
         activeOllamaRuntime = 'rocm';
@@ -760,47 +815,196 @@ async function resolveOllamaRuntime() {
 }
 
 async function startOllama() {
+  if (ollamaStartPromise) return ollamaStartPromise;
+  ollamaStartPromise = startOllamaOnce();
+  try {
+    return await ollamaStartPromise;
+  } finally {
+    ollamaStartPromise = null;
+  }
+}
+
+async function startOllamaOnce() {
   // On-demand local brain: provision the Ollama runtime (downloaded on first use),
   // then start it — unless a system Ollama is already serving on the port. Triggered
-  // by the renderer when the user selects the local model, NEVER at boot.
-  if (await ollamaResponding()) return true;
-  const baseBin = await ensureBaseOllama();
-  if (!baseBin || !fs.existsSync(baseBin)) return false;
+  // by the renderer when the user selects a local model or reopens the app
+  // with an already selected local model.
+  lastOllamaError = '';
+  if (await ollamaResponding()) {
+    if (!ollamaProcess || ollamaProcess.exitCode !== null) {
+      // An existing server is not our child; its storage location is unknown.
+      managedOllamaModelsDir = null;
+      activeOllamaRuntime = 'system';
+    }
+    return true;
+  }
+  managedOllamaModelsDir = null;
+  // A Linux install can supply Ollama through PATH or an explicit override, even
+  // when GreyIQ itself is packaged. Use that installation's model directory too.
+  const selected = await selectOllamaBinary({
+    platform: process.platform,
+    packaged: app.isPackaged,
+    ensureBase: ensureBaseOllama,
+  });
+  const baseBin = selected.binary;
+  if (!baseBin || (app.isPackaged && !selected.external && !fs.existsSync(baseBin))) {
+    lastOllamaError = 'Ollama runtime was not found. Install Ollama or set GREYIQ_OLLAMA_PATH.';
+    return false;
+  }
   // Pick a GPU-capable runtime (NVIDIA works on the base runner; AMD ROCm is fetched
-  // once), always falling back to the base binary.
-  const ollamaBin = (await resolveOllamaRuntime()) || OLLAMA_BIN;
-  ensureExecutable(ollamaBin);
-  const modelsDir = path.join(app.getPath('userData'), 'ollama-models');
-  try {
+  // once). A system install manages its own GPU runners.
+  const ollamaBin = app.isPackaged && !selected.external ? ((await resolveOllamaRuntime()) || baseBin) : baseBin;
+  if (selected.external) activeOllamaRuntime = 'system';
+  if (app.isPackaged && !selected.external) ensureExecutable(ollamaBin);
+  // Let operators place large Ollama models on a volume with enough space.
+  // The packaged default remains inside GreyIQ's user data directory. A PATH
+  // or override binary inherits a model path only when the operator set one.
+  const hasExplicitModelsDir = Boolean(process.env.OLLAMA_MODELS);
+  const modelsDir = path.resolve(process.env.OLLAMA_MODELS || path.join(app.getPath('userData'), 'ollama-models'));
+  const ollamaEnv = { ...process.env, OLLAMA_HOST: `127.0.0.1:${OLLAMA_PORT}` };
+  let childModelsDir = null;
+  if (app.isPackaged && !selected.external) {
     fs.mkdirSync(modelsDir, { recursive: true });
-  } catch (_) {
-    // ignore
+    childModelsDir = fs.realpathSync(modelsDir);
+    ollamaEnv.OLLAMA_MODELS = childModelsDir;
+  } else if (hasExplicitModelsDir) {
+    // Resolve relative paths against this process's cwd before spawning. If the
+    // directory exists, resolve symlinks so backend disk preflight uses the
+    // same physical volume as the child. Ollama can create a missing directory.
+    try { childModelsDir = fs.realpathSync(modelsDir); } catch (_) { childModelsDir = modelsDir; }
+    ollamaEnv.OLLAMA_MODELS = childModelsDir;
   }
   try {
     ollamaProcess = spawn(ollamaBin, ['serve'], {
-      env: { ...process.env, OLLAMA_HOST: `127.0.0.1:${OLLAMA_PORT}`, OLLAMA_MODELS: modelsDir },
+      env: ollamaEnv,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
       // POSIX group leader so killTree reaps Ollama's model-runner grandchildren.
       detached: process.platform !== 'win32',
     });
-    ollamaProcess.stdout.on('data', (chunk) => process.stdout.write(`[Ollama] ${chunk}`));
-    ollamaProcess.stderr.on('data', (chunk) => process.stdout.write(`[Ollama] ${chunk}`));
-    ollamaProcess.on('error', (err) => process.stderr.write(`[Ollama] failed to start: ${err.message}\n`));
-    return true;
+    // A healthy port alone does not prove our child owns it: a system Ollama can
+    // bind between the first probe and spawn. Only the child can emit this bind
+    // confirmation on its own pipe, so require it before claiming its model store.
+    let childListening = false;
+    let childLogTail = '';
+    const logChildOutput = (chunk) => {
+      const output = String(chunk);
+      process.stdout.write(`[Ollama] ${output}`);
+      childLogTail = (childLogTail + output).slice(-2048);
+      if (/Listening on (?:https?:\/\/)?127\.0\.0\.1:11434\b/.test(childLogTail)) {
+        childListening = true;
+      }
+    };
+    ollamaProcess.stdout.on('data', logChildOutput);
+    ollamaProcess.stderr.on('data', logChildOutput);
+    let exited = false;
+    const child = ollamaProcess;
+    child.once('exit', () => {
+      exited = true;
+      if (ollamaProcess === child) {
+        managedOllamaModelsDir = null;
+        if (!quitting && backendReady) {
+          void syncManagedOllamaModelsDir().catch((err) => {
+            process.stderr.write(`[Ollama] could not clear backend model-store state (${err.message}).\n`);
+          });
+        }
+      }
+    });
+    const spawned = await new Promise((resolve) => {
+      ollamaProcess.once('spawn', () => resolve(true));
+      ollamaProcess.once('error', (err) => {
+        lastOllamaError = `Ollama could not start (${err.message}). Check GREYIQ_OLLAMA_PATH or install Ollama.`;
+        process.stderr.write(`[Ollama] failed to start: ${err.message}\n`);
+        resolve(false);
+      });
+    });
+    if (!spawned || exited || ollamaProcess.exitCode !== null) {
+      if (!lastOllamaError) lastOllamaError = 'Ollama exited before it was ready. Check the Ollama logs.';
+      return false;
+    }
+    const deadline = Date.now() + 30000;
+    while (!exited && Date.now() < deadline) {
+      // eslint-disable-next-line no-await-in-loop
+      if (await ollamaResponding()) {
+        if (exited || child.exitCode !== null) {
+          // Another server may have won the port while our child exited.
+          managedOllamaModelsDir = null;
+          activeOllamaRuntime = 'system';
+        } else if (childModelsDir) {
+          if (!childListening) {
+            // The responding server might be a different process. Give our
+            // child time to bind (or fail) before reporting the model store.
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            continue;
+          }
+          managedOllamaModelsDir = childModelsDir;
+        }
+        return true;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    if (exited && await ollamaResponding()) {
+      managedOllamaModelsDir = null;
+      activeOllamaRuntime = 'system';
+      return true;
+    }
+    if (await ollamaResponding()) {
+      // An unrecognized future Ollama log format should not block a working
+      // server, but its model-store location remains unproven.
+      managedOllamaModelsDir = null;
+      activeOllamaRuntime = 'system';
+      return true;
+    }
+    killTree(ollamaProcess);
+    lastOllamaError = 'Ollama did not answer on 127.0.0.1:11434 within 30 seconds. Check the Ollama logs.';
+    return false;
   } catch (err) {
+    lastOllamaError = `Ollama could not start (${err.message}).`;
     process.stderr.write(`[Ollama] spawn error: ${err.message}\n`);
     return false;
   }
 }
 
 function registerIpcHandlers() {
+  // Window controls are intentionally fixed actions for the one owned renderer.
+  // No arbitrary window ID or IPC channel crosses the preload boundary.
+  const ownedWindow = (event) => mainWindow && !mainWindow.isDestroyed()
+    && event.sender === mainWindow.webContents ? mainWindow : null;
+  ipcMain.handle('greyiq:window-minimize', (event) => {
+    const window = ownedWindow(event);
+    if (!window) return false;
+    window.minimize();
+    return true;
+  });
+  ipcMain.handle('greyiq:window-toggle-maximize', (event) => {
+    const window = ownedWindow(event);
+    if (!window) return false;
+    if (window.isMaximized()) window.unmaximize();
+    else window.maximize();
+    return window.isMaximized();
+  });
+  ipcMain.handle('greyiq:window-is-maximized', (event) => {
+    const window = ownedWindow(event);
+    return window ? window.isMaximized() : false;
+  });
+  ipcMain.handle('greyiq:window-close', (event) => {
+    const window = ownedWindow(event);
+    if (!window) return false;
+    window.close();
+    return true;
+  });
+
   // Provision + start the on-demand Ollama runtime (the renderer calls this when the
   // user selects the local model). Downloads ~1 GB on first use; later launches reuse it.
   ipcMain.handle('greyiq:ensure-ollama', async () => {
     try {
       const ok = await startOllama();
-      return { ok: Boolean(ok), runtime: activeOllamaRuntime };
+      // The renderer waits for this IPC result before posting model setup, so
+      // backend preflight sees either a proven managed path or explicit unknown.
+      await syncManagedOllamaModelsDir();
+      return { ok: Boolean(ok), runtime: activeOllamaRuntime, ...(ok ? {} : { error: lastOllamaError }) };
     } catch (err) {
       return { ok: false, error: String(err && err.message || err) };
     }
@@ -832,14 +1036,21 @@ function registerIpcHandlers() {
 
 async function boot() {
   registerIpcHandlers();
-  // Ollama is NOT started at boot — it's downloaded + started on demand (greyiq:
-  // ensure-ollama) only when the operator selects the local model, so the default
-  // app stays small and fast. If a system Ollama is already serving, the backend
-  // uses it directly.
+  Menu.setApplicationMenu(null);
+  // The renderer requests Ollama when the operator selects a local model or
+  // reopens the app with one already saved. Other setups avoid provisioning it.
+  // If a system Ollama is already serving, the backend uses it directly.
   createWindow();
   // Always swap to the app (or the error page) even if startup throws — otherwise an
   // unhandled rejection leaves the window stuck on the loading spinner forever.
   try {
+    if (process.platform === 'linux' && app.isPackaged && !process.env.GREYIQ_RUNTIME_DIR) {
+      const migrated = migrateLegacyRuntime({
+        legacyDir: path.join(app.getPath('userData'), 'runtime'),
+        targetDir: RUNTIME_DIR,
+      });
+      if (migrated) process.stdout.write(`[GreyIQ] Copied previous runtime data to ${RUNTIME_DIR}.\n`);
+    }
     await startBackend();
   } catch (err) {
     if (!startupError) startupError = `Startup failed: ${err && err.message ? err.message : err}`;

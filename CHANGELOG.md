@@ -2,6 +2,76 @@
 
 Notable changes to GreyIQ.
 
+## v4.9.2 - authorized assessment and MCP hunt review
+
+- Expand the local security knowledge and hunt workflow with scope-bound active
+  checks, source review, evidence grading, and privacy-aware reporting. Remote
+  repository and local source scans now apply explicit preflight controls.
+- Add operator-managed MCP servers for manual chat commands and a built-in,
+  in-memory MCP evidence review that runs automatically after authorized hunts.
+- Let operators approve exact external evidence-only MCP tools and opt in to
+  their use for one hunt. Calls are bounded by run permits and saved server
+  fingerprints; results remain untrusted advisory data and cannot alter proof
+  or launch target requests.
+
+## v4.9.1 - split GGUF import and desktop setup
+
+- Import public Hugging Face repositories containing only split GGUF files by
+  selecting a complete quantization set, checking Ollama 0.35.0+ and available
+  download space, verifying each shard, and creating a local Ollama model from
+  the original filenames. Reuse downloaded shards and Ollama blobs on retry;
+  report download and model creation failures in the import panel.
+- Keep the previous coding brain selected unless the new model passes both
+  chat and agent tool-call readiness checks. Allow `OLLAMA_MODELS` to place the
+  packaged Ollama model store on a volume with sufficient capacity. Split imports
+  stop before download if an external server's store cannot be verified or if a
+  FAT32 volume cannot hold an individual shard. A GreyIQ-launched system Ollama
+  can use an explicit `OLLAMA_MODELS` path after GreyIQ confirms that child owns
+  the server port.
+- Let operators save and test HackerOne API credentials directly in the Program
+  wizard before browsing programs or fetching scope. Credential-shaped text in
+  the program search box is stopped locally instead of sent as a query. Late
+  browse and preview responses are discarded after switching platforms, so
+  scope from one platform cannot be saved under another.
+- Use a frameless desktop window with in-app minimize, maximize, and close
+  controls, including on backend startup and error screens.
+
+## v4.9.0 - Debian 13, guarded operator, and platform program intake
+
+- Added a Debian 13 package, AppImage, and headless CLI archive with a relocatable
+  `greyiq-cli` launcher. `greyiq-cli path` prints the runtime location and PATH
+  setup syntax; `dashboard` provides a read-only terminal monitor.
+- Added one-click setup for public Hugging Face GGUF models through Ollama, with
+  chat and tool-call readiness checks before selecting a model. Direct Hugging
+  Face import uses the same gate, starts the packaged desktop's local runtime,
+  and makes a ready model available to the hunt planner. Clearing a previous
+  remote server URL selects the default local Ollama server; a failed model call
+  leaves the bounded offline hunt planner available.
+- Scheduled operator runs now require expiring per-program authorization grants,
+  enforce scope and request budgets, and queue findings for human review.
+  Local outcome feedback reprioritizes later authorized cycles.
+- Added read-only program discovery and scope previews for HackerOne, Bugcrowd,
+  and Intigriti. YesWeHack program search and scope import arrived in v4.5.0.
+  API results remain drafts until the operator reviews and saves a program.
+- Hardened platform imports so existing exclusions survive a scope re-fetch and
+  URL-limited assets cannot silently widen to whole-host manual testing.
+- Investigation leads and suggested probes now state the predicted confirming
+  result, a matched negative control, and a condition that leaves the lead
+  unconfirmed or stops testing. These are planning aids, not proof or permission.
+- Submission packages now provide a short, plain-language report body for a
+  platform description field, plus a detailed analyst report and JSON sidecar
+  that retain metadata, evidence, limitations, and review context.
+
+## v4.8.0 - verified learning and safer operator controls
+
+- Record coding-brain exchanges in a local learning log, with verified replay limited to
+  code changes that pass workspace verification. TinyGPT drafts require the optional offline
+  runtime, which is not bundled in the portable app.
+- Remove unattended HackerOne submission from portfolio operations. Scheduled hunts queue
+  findings for human review, and legacy auto-submit requests are refused.
+- Recheck program scope on account-login redirects and subrequests before sending credentials.
+- Harden desktop backend and Ollama startup checks, and expand API, CLI, and frontend wiring tests.
+
 ## v4.7.0 - Hugging Face GGUF models in the local brain
 
 - Import compatible Hugging Face GGUF repositories into GreyIQ's local Ollama model library.
@@ -956,6 +1026,12 @@ each cycle starts blind. So GreyIQ could not notice the highest-signal event in 
 
 This release also carries the work that landed on `main` while the audit ran:
 
+- Removed unattended HackerOne submission from the portfolio operator, API, and CLI.
+  Scheduled hunts now queue findings for human review; legacy auto-submit flags are ignored.
+- The account-login browser now checks program scope before sending credentials on
+  redirects and subrequests.
+- The standard Python check now runs pytest, including tests previously skipped by
+  unittest discovery, and validates literal frontend API paths against backend routes.
 - Added a local-first `gn osint` campaign engine. It queries two certificate-transparency
   indexes and two independent DNS-over-HTTPS resolvers, retains timestamped source provenance
   for every claim, labels single-source and historical observations honestly, and writes a

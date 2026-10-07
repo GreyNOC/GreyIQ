@@ -1,10 +1,11 @@
 {
   "name": "greyiq",
-  "version": "4.7.0",
+  "version": "4.9.2",
   "private": true,
   "type": "module",
   "description": "GreyIQ local-first AI chat UI with editable bots, personal preference training, an Ollama/Claude/OpenAI coding brain with out-of-the-box GPU acceleration (NVIDIA bundled, AMD auto-provisioned), and a browser CPU/WebGPU fallback.",
   "author": "GreyNOC",
+  "homepage": "https://github.com/GreyNOC/GreyIQ",
   "main": "electron/main.cjs",
   "scripts": {
     "start": "node server.mjs",
@@ -13,8 +14,9 @@
     "desktop": "electron .",
     "freeze:backend": "pyinstaller --noconfirm --clean build/greyiq-backend.spec",
     "dist": "electron-builder --win portable nsis",
+    "build:linux": "pyinstaller --noconfirm --clean build/greyiq-backend.spec && chmod +x build/greyiq-cli && electron-builder --linux AppImage deb --publish never",
     "build:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File build/build-portable.ps1",
-    "check:js": "node scripts/check-syntax.mjs",
+    "check:js": "node scripts/check-syntax.mjs && node --test electron/health.test.cjs electron/managed-ollama-store.test.cjs electron/ollama-runtime.test.cjs electron/runtime-path.test.cjs scripts/frontend-dom.test.cjs scripts/hf-import-dom.test.cjs",
     "check:syntax": "python -B scripts/check-syntax.py",
     "check:python": "python -B scripts/check-syntax.py && python -B -m pytest -q",
     "check:devops": "node scripts/check-devops.cjs",
@@ -25,7 +27,7 @@
     "electron-builder": "^26.15.3"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.12.0"
   },
   "build": {
     "appId": "com.greynoc.greyiq",
@@ -68,10 +70,31 @@
     "linux": {
       "icon": "build/icon.png",
       "target": [
-        "AppImage"
+        "AppImage",
+        "deb"
       ],
       "category": "Development",
       "artifactName": "GreyIQ-${version}-${arch}.${ext}"
+    },
+    "deb": {
+      "maintainer": "GreyNOC",
+      "fpm": [
+        "build/greyiq-cli=/usr/bin/greyiq-cli"
+      ],
+      "depends": [
+        "libgtk-3-0",
+        "libnotify4",
+        "libnss3",
+        "libxss1",
+        "libxtst6",
+        "xdg-utils",
+        "libatspi2.0-0",
+        "libasound2t64",
+        "libgbm1",
+        "libuuid1",
+        "libsecret-1-0",
+        "zstd"
+      ]
     }
   }
 }

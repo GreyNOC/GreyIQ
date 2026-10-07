@@ -1118,7 +1118,20 @@ class ScopeBindingTests(unittest.TestCase):
         self.assertFalse(av.host_in_active_scope("evilexample.com", "example.com", s))
         # Proper subdomain / wildcard matching still works.
         self.assertTrue(av.host_in_active_scope("app.example.com", "*.example.com", s))
-        self.assertTrue(av.host_in_active_scope("example.com", "https://example.com/login in scope", s))
+        self.assertFalse(av.host_in_active_scope("example.com", "https://example.com/login in scope", s))
+
+    def test_url_path_query_and_port_tokens_do_not_grant_host_wide_active_scope(self) -> None:
+        s = get_settings()
+        for scope in ("https://example.com", "http://example.com/", "https://example.com/login",
+                      "example.com/login", "https://example.com:8443/", "example.com:8443",
+                      "example.com?path=/login", "example.com#fragment",
+                      "https://example.com/login;example.com", "https://example.com/login,example.com"):
+            with self.subTest(scope=scope):
+                self.assertFalse(av.host_in_active_scope("example.com", scope, s))
+        self.assertTrue(av.host_in_active_scope("example.com", "https://example.com/login example.com", s))
+        self.assertTrue(av.host_in_active_scope("app.example.com", "https://example.com/login *.example.com", s))
+        # Bare-host semantics remain compatible, including proper subdomains.
+        self.assertTrue(av.host_in_active_scope("app.example.com", "example.com", s))
 
     def test_excluded_hosts_win_over_a_positive_scope_match(self) -> None:
         # Regression: out_of_scope_hosts was stored on a saved program but never

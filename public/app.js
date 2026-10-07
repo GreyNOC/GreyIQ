@@ -217,6 +217,7 @@ const els = {
   brainForm: document.querySelector("#brainForm"),
   brainProvider: document.querySelector("#brainProvider"),
   brainModel: document.querySelector("#brainModel"),
+  brainModelHelp: document.querySelector("#brainModelHelp"),
   brainBaseUrl: document.querySelector("#brainBaseUrl"),
   brainApiKey: document.querySelector("#brainApiKey"),
   brainUaMarker: document.querySelector("#brainUaMarker"),
@@ -233,6 +234,27 @@ const els = {
   brainHfReference: document.querySelector("#brainHfReference"),
   brainHfImport: document.querySelector("#brainHfImport"),
   brainHfStatus: document.querySelector("#brainHfStatus"),
+  mcpServersFold: document.querySelector("#mcpServersFold"),
+  mcpServersRefresh: document.querySelector("#mcpServersRefresh"),
+  mcpServersList: document.querySelector("#mcpServersList"),
+  mcpServersStatus: document.querySelector("#mcpServersStatus"),
+  mcpHuntApprovals: document.querySelector("#mcpHuntApprovals"),
+  mcpHuntApprovalServer: document.querySelector("#mcpHuntApprovalServer"),
+  mcpHuntApprovalList: document.querySelector("#mcpHuntApprovalList"),
+  mcpHuntApprovalForm: document.querySelector("#mcpHuntApprovalForm"),
+  mcpHuntToolName: document.querySelector("#mcpHuntToolName"),
+  mcpHuntApprove: document.querySelector("#mcpHuntApprove"),
+  mcpHuntClose: document.querySelector("#mcpHuntClose"),
+  mcpHuntStatus: document.querySelector("#mcpHuntStatus"),
+  mcpServerForm: document.querySelector("#mcpServerForm"),
+  mcpServerName: document.querySelector("#mcpServerName"),
+  mcpServerTransport: document.querySelector("#mcpServerTransport"),
+  mcpServerCommand: document.querySelector("#mcpServerCommand"),
+  mcpServerArgs: document.querySelector("#mcpServerArgs"),
+  mcpServerUrl: document.querySelector("#mcpServerUrl"),
+  mcpServerEnabled: document.querySelector("#mcpServerEnabled"),
+  mcpServerSave: document.querySelector("#mcpServerSave"),
+  mcpServerCancel: document.querySelector("#mcpServerCancel"),
   brainOpsRefresh: document.querySelector("#brainOpsRefresh"),
   brainTechniqueList: document.querySelector("#brainTechniqueList"),
   brainLiveFeed: document.querySelector("#brainLiveFeed"),
@@ -316,6 +338,7 @@ const els = {
   bountyAuthorized: document.querySelector("#bountyAuthorized"),
   bountyPerFinding: document.querySelector("#bountyPerFinding"),
   bountyActive: document.querySelector("#bountyActive"),
+  bountyExternalMcp: document.querySelector("#bountyExternalMcp"),
   bountyRun: document.querySelector("#bountyRun"),
   bountyStatus: document.querySelector("#bountyStatus"),
   bountyNextSteps: document.querySelector("#bountyNextSteps"),
@@ -629,6 +652,14 @@ function saveState() {
     projectMemory: _projectMemory,
     ...persist
   } = state;
+  // MCP arguments and server replies can contain engagement data. Keep them
+  // visible for this session without writing either side to localStorage.
+  persist.chats = Object.fromEntries(Object.entries(state.chats || {}).map(([botId, messages]) => [
+    botId,
+    (Array.isArray(messages) ? messages : []).filter((message) =>
+      (message.modelName || message.model_name) !== "mcp:manual"
+      && !(message.role === "user" && /^\s*\/?mcp(?:\s|$)/i.test(message.text || "")))
+  ]));
   try {
     localStorage.setItem(STORE_KEY, JSON.stringify(persist));
   } catch (_) {
@@ -701,7 +732,8 @@ function normalizeReplyPayload(payload, userText) {
       device: diagnostics.device || payload?.device || "local"
     },
     modelName: payload?.model_name || "GreyIQ",
-    device: payload?.device || diagnostics.device || "local"
+    device: payload?.device || diagnostics.device || "local",
+    activeScan: payload?.active_scan && typeof payload.active_scan === "object" ? payload.active_scan : null
   };
 }
 
@@ -1467,17 +1499,32 @@ function makeCandidates(bot, userText, memories) {
   ];
 }
 
+function modelChatHistory() {
+  return (activeChat() || [])
+    .slice(0, -1)
+    // MCP output is untrusted tool data. Keep it visible in chat, but never
+    // promote it into a later model or agent prompt as an assistant turn.
+    .filter((message) => message.role !== "bot"
+      || (message.modelName || message.model_name) !== "mcp:manual")
+    .slice(-12)
+    .map((message) => ({ role: message.role === "bot" ? "assistant" : "user", content: message.text }))
+    .filter((message) => message.content);
+}
+
+function isManualToolCommand(text) {
+  return /^\s*\/?(?:scan|bughunt)\b[:\s]/i.test(text) || /^\s*\/?mcp(?:\s|$)/i.test(text);
+}
+
 async function replyFor(userText) {
+  const scanCommand = /^\s*\/?(?:scan|bughunt)\b[:\s]/i.test(userText);
+  const mcpCommand = /^\s*\/?mcp(?:\s|$)/i.test(userText);
+  let commandRequestFailed = false;
   if (service.available || (await refreshServiceStatus({ silent: true }))) {
     try {
       const bot = activeBot();
       // Prior turns (excluding the message we're about to send) give the coding
       // brain conversation context for multi-turn coding.
-      const history = (activeChat() || [])
-        .slice(0, -1)
-        .slice(-12)
-        .map((message) => ({ role: message.role === "bot" ? "assistant" : "user", content: message.text }))
-        .filter((message) => message.content);
+      const history = modelChatHistory();
       const response = await apiFetch("/api/chat", {
         method: "POST",
         timeoutMs: 120000,
@@ -1496,10 +1543,24 @@ async function replyFor(userText) {
       void refreshServiceStatus({ silent: true });
       return normalizeReplyPayload(response, userText);
     } catch (error) {
+      commandRequestFailed = scanCommand || mcpCommand;
       service.available = false;
       service.lastError = error.message || "GreyIQ service fell back to browser mode";
       renderBackend();
     }
+  }
+  if (scanCommand || mcpCommand) {
+    return {
+      text: commandRequestFailed
+        ? (mcpCommand
+          ? "The MCP response is unavailable; the command may have run. Check the server before retrying."
+          : "The scanner response is unavailable; the scan may have started. Check the backend before retrying.")
+        : (mcpCommand
+          ? "The GreyIQ service is unavailable; no MCP command was started."
+          : "The GreyIQ scanner backend is unavailable; no scan was started."),
+      citations: [], diagnostics: { used_fallback: true, strategy: mcpCommand ? "mcp_unavailable" : "scanner_unavailable" },
+      modelName: mcpCommand ? "mcp:manual" : "bughunter", device: "offline"
+    };
   }
   return browserReplyFor(userText);
 }
@@ -1718,7 +1779,41 @@ function renderEditor() {
   if (els.deleteBotButton) els.deleteBotButton.disabled = state.bots.length <= 1;
 }
 
+const activeChatPolls = new Set();
+
+async function pollActiveChatRun(botId, messageId, runId) {
+  const key = `${botId}:${messageId}`;
+  if (activeChatPolls.has(key)) return;
+  activeChatPolls.add(key);
+  try {
+    while (true) {
+      const message = (state.chats[botId] || []).find((item) => item.id === messageId);
+      if (!message || message.activeScanStatus !== "running") return;
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      let result;
+      try {
+        result = await apiFetch("/api/chat/active-status", {
+          method: "POST", timeoutMs: 6000, body: JSON.stringify({ run_id: runId })
+        });
+      } catch (_) {
+        // A transient backend disconnect does not change the run's result.
+        await new Promise((resolve) => setTimeout(resolve, 4000));
+        continue;
+      }
+      if (result?.status === "running") continue;
+      message.activeScanStatus = result?.status || "unavailable";
+      message.text = result?.message || result?.error || "The active assessment result is unavailable.";
+      saveState();
+      if (state.activeBotId === botId) renderChat();
+      return;
+    }
+  } finally {
+    activeChatPolls.delete(key);
+  }
+}
+
 function renderChat() {
+  const botId = state.activeBotId;
   els.messageStream.replaceChildren();
   for (const message of activeChat()) {
     const fragment = els.messageTemplate.content.cloneNode(true);
@@ -1745,6 +1840,9 @@ function renderChat() {
     like.addEventListener("click", () => rateMessage(message.id, "like"));
     dislike.addEventListener("click", () => rateMessage(message.id, "dislike"));
     els.messageStream.append(fragment);
+    if (message.activeScanRunId && message.activeScanStatus === "running") {
+      void pollActiveChatRun(botId, message.id, message.activeScanRunId);
+    }
   }
   els.messageStream.scrollTop = els.messageStream.scrollHeight;
 }
@@ -2183,10 +2281,9 @@ els.composer.addEventListener("submit", async (event) => {
   els.messageStream.append(pending);
   els.messageStream.scrollTop = els.messageStream.scrollHeight;
   try {
-    // scan/bughunt commands always go to the chat endpoint so BugHunter's scanner
-    // runs — even in Agent mode, where the agent endpoint wouldn't detect them.
-    const isScanCommand = /^\s*\/?(?:scan|bughunt)\b[:\s]/i.test(text);
-    const useAgent = Boolean(state.agentMode && state.agentWorkspace) && !isScanCommand;
+    // Manual scan and MCP commands always go to the chat endpoint, including in
+    // Agent mode; the agent endpoint does not dispatch these commands.
+    const useAgent = Boolean(state.agentMode && state.agentWorkspace) && !isManualToolCommand(text);
     const rawAnswer = useAgent ? await runAgent(text) : await replyFor(text);
     const answer = normalizeAnswerForChat(
       rawAnswer,
@@ -2201,6 +2298,8 @@ els.composer.addEventListener("submit", async (event) => {
       diagnostics: answer.diagnostics,
       modelName: answer.modelName,
       device: answer.device,
+      activeScanRunId: answer.activeScan?.run_id || "",
+      activeScanStatus: answer.activeScan?.status || "",
       createdAt: Date.now()
     });
   } catch (error) {
@@ -2629,6 +2728,7 @@ if (els.huntBrainTrain) els.huntBrainTrain.addEventListener("click", () => void 
 
 // ---- Coding brain (local model / Claude / OpenAI-compatible) ----
 let coderConfig = null;
+let savedLocalRuntimeBootAttempted = false;
 const BRAIN_FIELDS = {
   off: [],
   local: ["model", "base_url"],
@@ -2643,6 +2743,13 @@ function brainBlockFor(provider) {
 
 function applyBrainFields(provider, repopulate) {
   const fields = BRAIN_FIELDS[provider] || [];
+  if (repopulate) {
+    const block = brainBlockFor(provider);
+    els.brainModel.value = block.model || "";
+    els.brainBaseUrl.value = block.base_url || "";
+    els.brainApiKey.value = "";
+    els.brainApiKey.placeholder = block.has_api_key ? "saved — leave blank to keep" : "paste API key";
+  }
   els.brainForm.querySelectorAll("[data-brain-field]").forEach((row) => {
     row.hidden = !fields.includes(row.dataset.brainField);
   });
@@ -2650,6 +2757,7 @@ function applyBrainFields(provider, repopulate) {
     els.brainTest.hidden = provider === "off";
   }
   if (els.brainModelList) els.brainModelList.hidden = provider !== "local";
+  if (els.brainModelHelp) els.brainModelHelp.hidden = provider !== "local";
   if (els.brainHfImportSection) els.brainHfImportSection.hidden = provider !== "local";
   if (els.brainModelRow) {
     els.brainModelRow.hidden = provider !== "local";
@@ -2664,11 +2772,6 @@ function applyBrainFields(provider, repopulate) {
   }
   // Derived from the stored state, so it stays right after a save or a clear too.
   els.brainApiKey.placeholder = block.has_api_key ? "saved — leave blank to keep" : "paste API key";
-  if (repopulate) {
-    els.brainModel.value = block.model || "";
-    els.brainBaseUrl.value = block.base_url || "";
-    els.brainApiKey.value = "";
-  }
 }
 
 function renderBrainForm() {
@@ -2695,6 +2798,41 @@ async function loadCoderConfig() {
     coderConfig = await apiFetch("/api/coder", { timeoutMs: 4000 });
     renderBrainForm();
     renderAgentBar(); // refresh the command-policy trust label now the config is known
+    // A previously selected local brain needs its runtime again after an app
+    // restart. The selection already authorized local setup; only do this once
+    // per renderer boot, and never provision for a remote Ollama URL.
+    const local = coderConfig?.local || {};
+    if (!savedLocalRuntimeBootAttempted && coderConfig?.enabled && coderConfig?.provider === "local"
+        && String(local.model || "").trim()
+        && isLoopbackOllamaUrl(local.base_url || "http://127.0.0.1:11434/v1")
+        && typeof window.greyiqDesktop?.ensureOllama === "function") {
+      savedLocalRuntimeBootAttempted = true;
+      const selectedModel = local.model;
+      const startupStatus = "Starting the saved local model runtime…";
+      els.brainStatus.textContent = startupStatus;
+      void window.greyiqDesktop.ensureOllama().then((runtime) => {
+        if (coderConfig?.provider !== "local" || coderConfig?.local?.model !== selectedModel) return;
+        // A concurrent setup/test may have shown a newer result while the
+        // runtime was starting. Do not replace that result with startup text.
+        if (els.brainStatus.textContent === startupStatus) {
+          els.brainStatus.textContent = runtime?.ok
+            ? "Saved local model runtime ready. Use Test to verify the model."
+            : (runtime?.error || "Could not start Ollama for the saved model.");
+        }
+        if (runtime?.ok) void refreshModelStatus();
+      }).catch((error) => {
+        if (coderConfig?.provider === "local" && coderConfig?.local?.model === selectedModel
+            && els.brainStatus.textContent === startupStatus) {
+          els.brainStatus.textContent = error?.message || "Could not start Ollama for the saved model.";
+        }
+      });
+    }
+    const pull = await apiFetch("/api/coder/pull", { timeoutMs: 4000 });
+    if (pull.active && pull.setup) {
+      els.brainDownload.disabled = true;
+      els.brainSave.disabled = true;
+      pollModelPull();
+    }
   } catch (_) {
     // Local service not up yet; the form keeps its defaults.
   }
@@ -2794,7 +2932,11 @@ async function refreshModelStatus() {
       renderModelList([], "");
       return;
     }
-    if (info.present) {
+    const typedModel = els.brainModel.value.trim();
+    if (typedModel && typedModel !== info.configured) {
+      els.brainModelStatus.textContent = "New model entered. Download and use checks it before changing your current brain.";
+      els.brainDownload.hidden = false;
+    } else if (info.present) {
       els.brainModelStatus.textContent = `Model installed: ${info.configured} ✓`;
       els.brainDownload.hidden = true;
     } else {
@@ -2807,6 +2949,13 @@ async function refreshModelStatus() {
   }
 }
 
+els.brainModel?.addEventListener("input", () => {
+  if (els.brainProvider.value !== "local") return;
+  els.brainDownload.hidden = false;
+  els.brainModelStatus.textContent = "Download and use checks this model before changing your current brain.";
+});
+
+// List the installed local models, each with a Remove button.
 // Installed models remain selectable after a reload or an interrupted import poll.
 function renderModelList(installed, configured) {
   if (!els.brainModelList) return;
@@ -2885,7 +3034,7 @@ async function deleteModel(name, btn) {
 
 let modelPullTimer = null;
 
-function pollModelPull({ statusEl = els.brainModelStatus, button = els.brainDownload, onSuccess = null } = {}) {
+function pollModelPull({ statusEl = els.brainModelStatus, button = els.brainDownload } = {}) {
   if (modelPullTimer) {
     clearInterval(modelPullTimer);
   }
@@ -2912,7 +3061,7 @@ function pollModelPull({ statusEl = els.brainModelStatus, button = els.brainDown
     if (status.active) {
       const pct = Number.isFinite(Number(status.percent)) && Number(status.percent) > 0
         ? ` ${status.percent}%` : "";
-      statusEl.textContent = `Downloading ${status.model || "model"}…${pct} ${status.status || ""}`.trim();
+      statusEl.textContent = `Setting up ${status.model || "model"}…${pct} ${status.status || ""}`.trim();
       checking = false;
       return;
     }
@@ -2922,17 +3071,22 @@ function pollModelPull({ statusEl = els.brainModelStatus, button = els.brainDown
     }
     clearInterval(modelPullTimer);
     modelPullTimer = null;
-    if (status.error) {
-      statusEl.textContent = `Download failed: ${status.error}`;
+    if (status.selected) {
+      await loadCoderConfig();
+      statusEl.textContent = `${status.model} is ready for chat and agent tools.`;
+      els.brainStatus.textContent = `${status.model} is ready for chat and agent tools.`;
+    } else if (status.chat_only) {
+      els.brainModel.value = status.model || els.brainModel.value;
+      statusEl.textContent = `Downloaded ${status.model}; chat works, but agent tools did not pass.`;
+      els.brainStatus.textContent = `${status.error} Your previous brain is still active. You may save this model for chat only.`;
+    } else if (status.error) {
+      statusEl.textContent = `Model setup failed: ${status.error} Your brain setting is unchanged.`;
+      els.brainStatus.textContent = "Your brain setting is unchanged.";
     } else {
-      try {
-        if (onSuccess) await onSuccess(status);
-        else void refreshModelStatus();
-      } catch (error) {
-        statusEl.textContent = error.message || "The model downloaded, but could not be selected.";
-      }
+      void refreshModelStatus();
     }
     button.disabled = false;
+    els.brainSave.disabled = false;
     checking = false;
   };
   modelPullTimer = setInterval(() => void check(), 2000);
@@ -2940,46 +3094,52 @@ function pollModelPull({ statusEl = els.brainModelStatus, button = els.brainDown
 }
 
 els.brainDownload?.addEventListener("click", async () => {
+  const selectedModel = els.brainModel.value.trim();
+  const selectedBaseUrl = els.brainBaseUrl.value.trim();
+  if (!selectedModel) {
+    els.brainModelStatus.textContent = "Enter an Ollama model name or Hugging Face GGUF model link.";
+    return;
+  }
   if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
     els.brainModelStatus.textContent = "Local service not running.";
     return;
   }
+  let localOllama = !selectedBaseUrl;
+  if (selectedBaseUrl) {
+    try {
+      const host = new URL(selectedBaseUrl).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+      localOllama = host === "localhost" || host === "::1" || /^127\./.test(host);
+    } catch {
+      // Let the backend return its precise invalid-server-URL error.
+      localOllama = false;
+    }
+  }
   els.brainDownload.disabled = true;
-  els.brainModelStatus.textContent = "Starting model download…";
+  els.brainSave.disabled = true;
+  els.brainModelStatus.textContent = localOllama ? "Preparing the local model runtime…" : "Checking Ollama server…";
   try {
-    const res = await apiFetch("/api/coder/pull", { method: "POST", timeoutMs: 10000, body: JSON.stringify({}) });
+    if (localOllama && typeof window.greyiqDesktop?.ensureOllama === "function") {
+      const runtime = await window.greyiqDesktop.ensureOllama();
+      if (!runtime?.ok) throw new Error(runtime?.error || "Local model runtime could not start.");
+    }
+    els.brainModelStatus.textContent = "Checking model and starting download…";
+    const res = await apiFetch("/api/coder/setup", {
+      method: "POST", timeoutMs: 10000,
+      body: JSON.stringify({ model: selectedModel, base_url: selectedBaseUrl })
+    });
     if (res.ok === false) {
       els.brainModelStatus.textContent = res.error || "Could not start the download.";
       els.brainDownload.disabled = false;
+      els.brainSave.disabled = false;
       return;
     }
     pollModelPull();
   } catch (error) {
     els.brainModelStatus.textContent = error.message || "Download failed to start.";
     els.brainDownload.disabled = false;
+    els.brainSave.disabled = false;
   }
 });
-
-async function selectHuggingFaceModel(model) {
-  els.brainHfStatus.textContent = `Selecting ${model}…`;
-  await saveLocalModelSelection(model);
-  els.brainHfStatus.textContent = `Imported and selected ${model}. Use Test to verify it responds.`;
-}
-
-async function waitForOllamaReady() {
-  let lastError = "Ollama did not become ready. Check that it is running.";
-  for (let attempt = 0; attempt < 15; attempt += 1) {
-    try {
-      const models = await apiFetch("/api/coder/models", { timeoutMs: 2000 });
-      if (models.ok) return;
-      lastError = models.error || lastError;
-    } catch (error) {
-      lastError = error.message || lastError;
-    }
-    if (attempt < 14) await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  throw new Error(lastError);
-}
 
 function isLoopbackOllamaUrl(baseUrl) {
   try {
@@ -3012,37 +3172,20 @@ async function importHuggingFaceModel() {
   }
   els.brainHfImport.disabled = true;
   try {
-    const savedConfig = await apiFetch("/api/coder", { timeoutMs: 4000 });
-    const savedUrl = savedConfig?.local?.base_url || "http://127.0.0.1:11434/v1";
-    if (!isLoopbackOllamaUrl(savedUrl)) {
-      throw new Error("Hugging Face imports require a loopback Ollama Server URL. Set and save http://127.0.0.1:11434/v1 first.");
-    }
     els.brainHfStatus.textContent = "Preparing Ollama…";
     if (window.greyiqDesktop && typeof window.greyiqDesktop.ensureOllama === "function") {
       const runtime = await window.greyiqDesktop.ensureOllama();
       if (!runtime?.ok) throw new Error(runtime?.error || "Ollama could not start.");
     }
-    els.brainHfStatus.textContent = "Waiting for Ollama to be ready…";
-    await waitForOllamaReady();
-    els.brainHfStatus.textContent = "Starting Hugging Face GGUF download…";
+    els.brainHfStatus.textContent = "Checking the Hugging Face GGUF model…";
     const result = await apiFetch("/api/coder/huggingface/import", {
       method: "POST",
       timeoutMs: 15000,
       body: JSON.stringify({ reference })
     });
     if (result.ok === false) throw new Error(result.error || "Import could not start.");
-    const model = String(result.model || "").trim();
-    if (!model) throw new Error("Import did not return a model name.");
-    if (result.active) {
-      pollModelPull({
-        statusEl: els.brainHfStatus,
-        button: els.brainHfImport,
-        onSuccess: () => selectHuggingFaceModel(model)
-      });
-    } else {
-      await selectHuggingFaceModel(model);
-      els.brainHfImport.disabled = false;
-    }
+    if (!result.active || !result.model) throw new Error("Model setup did not start.");
+    pollModelPull({ statusEl: els.brainHfStatus, button: els.brainHfImport });
   } catch (error) {
     els.brainHfStatus.textContent = error.message || "Hugging Face import failed.";
     els.brainHfImport.disabled = false;
@@ -3080,6 +3223,318 @@ if (els.brainForm) {
   // Sensible initial state before the saved config loads from the backend.
   applyBrainFields(els.brainProvider.value, false);
 }
+
+// ---- MCP servers: saved configurations, explicit connection tests ----
+let mcpServers = [];
+let mcpEditingName = "";
+let mcpHuntApprovalServerName = "";
+
+function mcpServerSetTransport() {
+  if (!els.mcpServerForm) return;
+  const transport = els.mcpServerTransport.value;
+  els.mcpServerForm.querySelectorAll("[data-mcp-field]").forEach((row) => {
+    row.hidden = row.dataset.mcpField !== transport;
+  });
+  els.mcpServerCommand.required = transport === "stdio";
+  els.mcpServerUrl.required = transport === "http";
+}
+
+function mcpServerPayload() {
+  const name = els.mcpServerName.value.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/.test(name)) {
+    throw new Error("Use a server name of 1–40 letters, numbers, underscores, or hyphens.");
+  }
+  const transport = els.mcpServerTransport.value;
+  const enabled = Boolean(els.mcpServerEnabled.checked);
+  if (transport === "stdio") {
+    const command = els.mcpServerCommand.value.trim();
+    if (!command) throw new Error("Enter an absolute executable path.");
+    const args = els.mcpServerArgs.value.split(/\r?\n/).filter((arg) => arg.trim());
+    return { name, transport, command, args, enabled };
+  }
+  if (transport === "http") {
+    const url = els.mcpServerUrl.value.trim();
+    let parsed;
+    try { parsed = new URL(url); } catch (_) { throw new Error("Enter a loopback HTTP URL."); }
+    const literalPort = /^http:\/\/(?:127\.0\.0\.1|\[::1\]):([0-9]{1,5})(?:\/|$)/.exec(url);
+    if (parsed.protocol !== "http:" || !["127.0.0.1", "[::1]"].includes(parsed.hostname)
+        || !literalPort || Number(literalPort[1]) < 1 || Number(literalPort[1]) > 65535
+        || parsed.username || parsed.password || parsed.search || parsed.hash || url.includes("\\")) {
+      throw new Error("Use http://127.0.0.1:<port>/ or http://[::1]:<port>/ without credentials or a fragment.");
+    }
+    return { name, transport, url, enabled };
+  }
+  throw new Error("Choose a supported MCP transport.");
+}
+
+function mcpServerResetForm() {
+  if (!els.mcpServerForm) return;
+  mcpEditingName = "";
+  els.mcpServerForm.reset();
+  els.mcpServerName.readOnly = false;
+  els.mcpServerSave.textContent = "Add server";
+  els.mcpServerCancel.hidden = true;
+  mcpServerSetTransport();
+}
+
+function mcpServerEdit(server) {
+  mcpEditingName = String(server.name || "");
+  els.mcpServerName.value = mcpEditingName;
+  els.mcpServerName.readOnly = true;
+  els.mcpServerTransport.value = server.transport === "http" ? "http" : "stdio";
+  els.mcpServerCommand.value = server.command || "";
+  els.mcpServerArgs.value = Array.isArray(server.args) ? server.args.join("\n") : "";
+  els.mcpServerUrl.value = server.url || "";
+  els.mcpServerEnabled.checked = Boolean(server.enabled);
+  els.mcpServerSave.textContent = "Save changes";
+  els.mcpServerCancel.hidden = false;
+  mcpServerSetTransport();
+  els.mcpServerName.focus();
+}
+
+function mcpServerRender(servers) {
+  if (!els.mcpServersList) return;
+  els.mcpServersList.replaceChildren();
+  if (!servers.length) {
+    const empty = document.createElement("p");
+    empty.className = "folder-status";
+    empty.textContent = "No MCP servers configured.";
+    els.mcpServersList.append(empty);
+    return;
+  }
+  for (const server of servers) {
+    const row = document.createElement("div");
+    row.className = "model-row";
+    const label = document.createElement("span");
+    label.className = "model-name";
+    const status = ["untested", "available", "error"].includes(server.status) ? server.status : "untested";
+    label.textContent = `${server.name} · ${server.transport === "http" ? "loopback HTTP" : "local command"} · ${server.enabled ? "enabled" : "disabled"} · ${status}`;
+    const actions = document.createElement("div");
+    actions.className = "model-actions";
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "text-button";
+    edit.textContent = "Edit";
+    edit.setAttribute("aria-label", `Edit ${server.name}`);
+    edit.addEventListener("click", () => mcpServerEdit(server));
+    const test = document.createElement("button");
+    test.type = "button";
+    test.className = "text-button";
+    test.textContent = "Test";
+    test.setAttribute("aria-label", `Test ${server.name}`);
+    test.addEventListener("click", () => void mcpServerTest(server, test));
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "text-button danger";
+    remove.textContent = "Remove";
+    remove.setAttribute("aria-label", `Remove ${server.name}`);
+    remove.addEventListener("click", () => void mcpServerRemove(server.name, remove));
+    const huntTools = document.createElement("button");
+    huntTools.type = "button";
+    huntTools.className = "text-button";
+    huntTools.textContent = "Hunt tools";
+    huntTools.setAttribute("aria-label", `Manage external hunt evidence tools for ${server.name}`);
+    huntTools.addEventListener("click", () => mcpHuntApprovalOpen(server.name));
+    actions.append(edit, test, remove, huntTools);
+    row.append(label, actions);
+    els.mcpServersList.append(row);
+  }
+}
+
+async function loadMcpServers() {
+  if (!els.mcpServersList) return;
+  els.mcpServersRefresh.disabled = true;
+  try {
+    const result = await apiFetch("/api/mcp/servers", { timeoutMs: 6000 });
+    if (result.ok === false) throw new Error(result.error || "Could not load MCP servers.");
+    mcpServers = Array.isArray(result.servers) ? result.servers : [];
+    mcpServerRender(mcpServers);
+    els.mcpServersStatus.textContent = `${mcpServers.length} server${mcpServers.length === 1 ? "" : "s"} configured.`;
+    if (mcpHuntApprovalServerName && !mcpServers.some((server) => server.name === mcpHuntApprovalServerName)) {
+      mcpHuntApprovalClose();
+    } else if (mcpHuntApprovalServerName && !els.mcpHuntApprovals?.hidden) {
+      await loadMcpHuntApprovals();
+    }
+  } catch (error) {
+    els.mcpServersStatus.textContent = error.message || "Could not load MCP servers.";
+  } finally {
+    els.mcpServersRefresh.disabled = false;
+  }
+}
+
+async function mcpServerTest(server, button) {
+  button.disabled = true;
+  els.mcpServersStatus.textContent = `Testing ${server.name}…`;
+  let message;
+  try {
+    const result = await apiFetch(`/api/mcp/servers/${encodeURIComponent(server.name)}/test`, {
+      method: "POST", timeoutMs: 25000
+    });
+    message = result.ok
+      ? `${server.name}: available (${Number(result.tool_count) || 0} tools).`
+      : `${server.name}: connection failed. ${typeof result.error === "string" ? result.error : "Check the server configuration."}`;
+  } catch (error) {
+    message = `${server.name}: ${error.message || "connection failed."}`;
+  } finally {
+    await loadMcpServers();
+    els.mcpServersStatus.textContent = message;
+    button.disabled = false;
+  }
+}
+
+async function mcpServerRemove(name, button) {
+  if (!window.confirm(`Remove the saved MCP server "${name}"?`)) return;
+  button.disabled = true;
+  try {
+    const result = await apiFetch(`/api/mcp/servers/${encodeURIComponent(name)}`, {
+      method: "DELETE", timeoutMs: 10000
+    });
+    if (result.ok === false) throw new Error(result.error || "Could not remove the server.");
+    if (mcpEditingName === name) mcpServerResetForm();
+    if (mcpHuntApprovalServerName === name) mcpHuntApprovalClose();
+    await loadMcpServers();
+    els.mcpServersStatus.textContent = `${name} removed.`;
+  } catch (error) {
+    els.mcpServersStatus.textContent = error.message || "Could not remove the server.";
+    button.disabled = false;
+  }
+}
+
+function mcpHuntApprovalClose() {
+  mcpHuntApprovalServerName = "";
+  if (els.mcpHuntApprovals) els.mcpHuntApprovals.hidden = true;
+  if (els.mcpHuntToolName) els.mcpHuntToolName.value = "";
+}
+
+function mcpHuntApprovalOpen(serverName) {
+  if (!els.mcpHuntApprovals) return;
+  mcpHuntApprovalServerName = serverName;
+  els.mcpHuntApprovals.hidden = false;
+  els.mcpHuntApprovalServer.textContent = `Server: ${serverName}`;
+  els.mcpHuntApprovalList.replaceChildren();
+  els.mcpHuntToolName.value = "";
+  els.mcpHuntStatus.textContent = "Loading evidence tool approvals…";
+  void loadMcpHuntApprovals();
+}
+
+function mcpHuntApprovalRender(approvals) {
+  if (!els.mcpHuntApprovalList) return { active: 0, stale: 0 };
+  els.mcpHuntApprovalList.replaceChildren();
+  const matching = approvals.filter((item) => item && item.server === mcpHuntApprovalServerName);
+  if (!matching.length) {
+    const empty = document.createElement("p");
+    empty.className = "folder-status";
+    empty.textContent = "No evidence tools approved for this server.";
+    els.mcpHuntApprovalList.append(empty);
+    return { active: 0, stale: 0 };
+  }
+  let active = 0;
+  for (const approval of matching) {
+    const row = document.createElement("div");
+    row.className = "model-row";
+    const label = document.createElement("span");
+    label.className = "model-name";
+    const valid = approval.valid === true && approval.evidence_only === true;
+    if (valid) active += 1;
+    label.textContent = `${approval.tool} · ${valid ? "active evidence approval" : "stale — unavailable for hunts"}`;
+    const revoke = document.createElement("button");
+    revoke.type = "button";
+    revoke.className = "text-button danger";
+    revoke.textContent = "Revoke";
+    revoke.setAttribute("aria-label", `Revoke ${approval.tool} for ${approval.server}`);
+    revoke.addEventListener("click", () => void mcpHuntApprovalRevoke(approval.server, approval.tool, revoke));
+    row.append(label, revoke);
+    els.mcpHuntApprovalList.append(row);
+  }
+  return { active, stale: matching.length - active };
+}
+
+async function loadMcpHuntApprovals() {
+  if (!mcpHuntApprovalServerName) return;
+  const requestedServer = mcpHuntApprovalServerName;
+  try {
+    const result = await apiFetch("/api/mcp/hunt-approvals", { timeoutMs: 6000 });
+    if (result.ok === false) throw new Error(result.error || "Could not load tool approvals.");
+    if (mcpHuntApprovalServerName !== requestedServer) return;
+    const counts = mcpHuntApprovalRender(Array.isArray(result.approvals) ? result.approvals : []);
+    els.mcpHuntStatus.textContent = `${counts.active} active evidence approval${counts.active === 1 ? "" : "s"}; ${counts.stale} stale. Only active approvals can run.`;
+  } catch (error) {
+    if (mcpHuntApprovalServerName === requestedServer) {
+      els.mcpHuntStatus.textContent = error.message || "Could not load tool approvals.";
+    }
+  }
+}
+
+async function mcpHuntApprovalRevoke(server, tool, button) {
+  button.disabled = true;
+  try {
+    const result = await apiFetch(`/api/mcp/hunt-approvals/${encodeURIComponent(server)}/${encodeURIComponent(tool)}`, {
+      method: "DELETE", timeoutMs: 10000
+    });
+    if (result.ok === false) throw new Error(result.error || "Could not revoke the approval.");
+    await loadMcpHuntApprovals();
+    els.mcpHuntStatus.textContent = `${tool} approval revoked.`;
+  } catch (error) {
+    els.mcpHuntStatus.textContent = error.message || "Could not revoke the approval.";
+    button.disabled = false;
+  }
+}
+
+els.mcpHuntClose?.addEventListener("click", mcpHuntApprovalClose);
+els.mcpHuntApprovalForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const server = mcpHuntApprovalServerName;
+  const tool = els.mcpHuntToolName.value.trim();
+  if (!server || !tool || tool.length > 128 || /[\x00-\x1f\x7f]/.test(tool)) {
+    els.mcpHuntStatus.textContent = "Enter one exact tool name from the selected server.";
+    return;
+  }
+  els.mcpHuntApprove.disabled = true;
+  try {
+    const result = await apiFetch("/api/mcp/hunt-approvals", {
+      method: "POST", timeoutMs: 10000,
+      body: JSON.stringify({ server, tool, evidence_only: true })
+    });
+    if (result.ok === false) throw new Error(result.error || "Could not approve the tool.");
+    els.mcpHuntToolName.value = "";
+    await loadMcpHuntApprovals();
+    els.mcpHuntStatus.textContent = `${tool} approved for external hunt evidence analysis.`;
+  } catch (error) {
+    els.mcpHuntStatus.textContent = error.message || "Could not approve the tool.";
+  } finally {
+    els.mcpHuntApprove.disabled = false;
+  }
+});
+
+els.mcpServerTransport?.addEventListener("change", mcpServerSetTransport);
+els.mcpServerCancel?.addEventListener("click", mcpServerResetForm);
+els.mcpServersRefresh?.addEventListener("click", () => void loadMcpServers());
+els.mcpServersFold?.addEventListener("toggle", () => {
+  if (els.mcpServersFold.open) void loadMcpServers();
+});
+els.mcpServerForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  let payload;
+  try { payload = mcpServerPayload(); }
+  catch (error) { els.mcpServersStatus.textContent = error.message; return; }
+  els.mcpServerSave.disabled = true;
+  try {
+    const editing = mcpEditingName;
+    const result = await apiFetch(editing
+      ? `/api/mcp/servers/${encodeURIComponent(editing)}` : "/api/mcp/servers", {
+      method: editing ? "PUT" : "POST", timeoutMs: 10000, body: JSON.stringify(payload)
+    });
+    if (result.ok === false) throw new Error(result.error || "Could not save the server.");
+    mcpServerResetForm();
+    await loadMcpServers();
+    els.mcpServersStatus.textContent = `${payload.name} saved. Use Test to check its connection.`;
+  } catch (error) {
+    els.mcpServersStatus.textContent = error.message || "Could not save the server.";
+  } finally {
+    els.mcpServerSave.disabled = false;
+  }
+});
+if (els.mcpServerForm) mcpServerSetTransport();
 
 // ---- Theme (light / dark) ----
 function applyTheme() {
@@ -4507,11 +4962,7 @@ async function runAgent(userText) {
   if (!(service.available || (await refreshServiceStatus({ silent: true })))) {
     return "The local GreyIQ service is not running.";
   }
-  const history = (activeChat() || [])
-    .slice(0, -1)
-    .slice(-12)
-    .map((message) => ({ role: message.role === "bot" ? "assistant" : "user", content: message.text }))
-    .filter((message) => message.content);
+  const history = modelChatHistory();
 
   // Prefer the streamed run so the Workbench shows tool-by-tool progress live;
   // fall back to the one-shot endpoint if streaming isn't available (older backend).
@@ -4989,6 +5440,7 @@ els.bountyForm?.addEventListener("submit", async (event) => {
   state.bountyOutput = (els.bountyOutput?.value || "").trim();
   state.bountyPerFinding = Boolean(els.bountyPerFinding?.checked);
   state.bountyActive = Boolean(els.bountyActive?.checked);
+  const externalMcpHunt = Boolean(els.bountyExternalMcp?.checked);
   saveState();
   els.bountyRun.disabled = true;
   els.bountyStatus.textContent = "Hunting… running scanners and writing the report (this can take a minute).";
@@ -5010,7 +5462,8 @@ els.bountyForm?.addEventListener("submit", async (event) => {
         output_dir: state.bountyOutput || null,
         authorized: true,
         per_finding: state.bountyPerFinding,
-        active: state.bountyActive
+        active: state.bountyActive,
+        external_mcp_hunt: externalMcpHunt
       })
     });
     if (res.ok === false) {
@@ -5059,6 +5512,7 @@ els.bountyForm?.addEventListener("submit", async (event) => {
     els.bountyStatus.textContent = error.message || "The hunt failed.";
   } finally {
     els.bountyRun.disabled = false;
+    if (els.bountyExternalMcp) els.bountyExternalMcp.checked = false;
   }
 });
 
@@ -5494,6 +5948,7 @@ const ck = {
   active: document.querySelector("#ckActive"),
   timeBased: document.querySelector("#ckTimeBased"),
   deep: document.querySelector("#ckDeep"),
+  externalMcpHunt: document.querySelector("#ckExternalMcpHunt"),
   attackMap: document.querySelector("#ckAttackMap"),
   live: document.querySelector("#ckLive"),
   optionsFold: document.querySelector("#ckOptionsFold"),
@@ -7208,16 +7663,16 @@ const CK_WALKTHROUGHS = {
     intro: "Set up an authorized program once, then reuse it everywhere: New run loads its Target/Scope, and the same list backs Automation scheduling. This is step one of Program → Run → Findings → Report.",
     sections: [
       { h4: "Get the scope in", list: [
-        ["Start from a repo link. ", "Paste one or more supported public forge repository roots above to create an inactive source-only draft in this same review form. Optional forge enrichment is read-only; any homepage hosts return unticked and need your authorization confirmation."],
+        ["Repository links. ", "Remote repository setup is currently unavailable because Git transport cannot be constrained to the authorized source. Create a program manually and scan an operator-supplied local clone."],
         ["Fetch from HackerOne. ", "Enter the program's HackerOne team handle and click Fetch — pulls the program's structured scope via HackerOne's own API, using the API username/token you already saved in Submissions. Many programs restrict this to invited researchers, so a 403/404 here is common, not a bug."],
         ["Import a CSV or paste. ", "No API access? Export or copy the program's scope table from its HackerOne page and paste/upload it — GreyIQ recognizes the real column names (identifier, asset type, eligible for submission/bounty, instruction, max severity) and keeps every column."],
         ["Or just type it. ", "Add scope rows by hand with “+ Add scope row” — an identifier is the only required field."],
-        ["Program source repository. ", "Paste a public HTTPS repository-root link supplied by the program. Imported GitHub/GitLab/Bitbucket/Codeberg/SourceHut roots are detected for review; cloning stays off until you explicitly enable clone + scan."],
+        ["Program source repository. ", "Record a public HTTPS repository-root link supplied by the program. Remote cloning is currently unavailable; scan an operator-supplied local clone instead."],
       ] },
       { h4: "Review before you hunt", list: [
         "Untick “In scope” on any row you don't want probed — it becomes an exclusion, never an expansion.",
         "A program with no in-scope rows (and no hand-typed Scope) can never go active — the same fail-closed gate the launch rail and Operator use.",
-        "Repository hunts use a shallow temporary clone, the full adversarial source scanner, hunt-brain red-team triage, and the same report pipeline. Forge issue/blob/tree/pull pages and embedded credentials are rejected.",
+        "Local repository paths use the source scanner and report pipeline. Remote Git URLs currently refuse to scan because Git can fetch outside the authorized repository.",
       ] },
       { h4: "Then", ordered: true, list: [
         ["Save the program. ", "It appears in New run and Automation."],
@@ -7276,7 +7731,7 @@ const CK_WALKTHROUGHS = {
     sections: [
       { h4: "Set the target", list: [
         "Program (optional) — pick a program you set up in the Program tab and it fills in Target/Scope below; still hand-editable after.",
-        "Target — the authorized URL, supported public repository root, or local repo path to hunt. Repository roots are cloned temporarily and routed to the source-code scanner.",
+        "Target — the authorized URL or a local repository path to hunt. Remote Git cloning currently refuses to run.",
         "Scope — name the host(s) you're allowed to probe; this is the fail-closed gate for every active check (an unnamed host stays passive-only).",
         "Profile / Focus class — bias the hunt toward a program's payouts or a single bug class (single hunt only).",
         ["Hunt this program's entire scope (Full campaign only). ", "Appears once you pick a program with more than one derivable target — runs one full campaign per in-scope target (from seed targets, or every eligible row in the program's structured scope) and merges them into one findings board, instead of just the single Target box."],
@@ -7284,7 +7739,7 @@ const CK_WALKTHROUGHS = {
       { h4: "Choose how hard it probes", list: [
         ["Test for proof of impact (active). ", "Fires one benign crafted request per check to turn a lead into a Confirmed proof. Off = passive only."],
         ["Deep SQLi probe. ", "Adds a single bounded, time-based SLEEP check — opt-in, in-scope only."],
-        ["Dynamic browser pass (Playwright). ", "Renders the page in a real browser to catch client-side surface."],
+        ["Dynamic browser pass (Playwright). ", "Currently unavailable until browser DNS egress is constrained."],
         ["Deep auto-work. ", "On a campaign, implies proof of impact + the time-based SQLi probe, then auto-captures a proof screenshot and writes a research dossier for each confirmed lead (needs the host in Scope)."],
       ] },
       { h4: "Run it", ordered: true, list: [
@@ -7297,27 +7752,26 @@ const CK_WALKTHROUGHS = {
   },
   "operator": {
     summary: "How the autonomous operator works — walkthrough",
-    intro: "The operator works a PORTFOLIO of programs unattended: for each enabled program it runs the full loop on a schedule — recon → hunt → prove → dedup → report. It only files findings when you've armed auto-submit, and the kill switch stops it instantly. (Programs are shared with the Program tab — add/import scope there, tune automation here; both edit the same record.)",
+    intro: "The operator works a PORTFOLIO of programs on a schedule: recon → hunt → prove → dedup → report. Findings are queued for your review and only you can submit them. The kill switch stops the scheduled work. (Programs are shared with the Program tab — add/import scope there, tune automation here; both edit the same record.)",
     sections: [
       { h4: "Add a program", list: [
         "Name + Scope — the hosts/wildcards you're authorized to test (the fail-closed gate; active and deep modes need a non-empty scope).",
         "Seed targets — the URLs/hosts to hunt each cycle (each within scope).",
-        "Program source repositories — optional public repository roots; enable clone + scan to include them in each scheduled cycle alongside web targets.",
-        "Cadence + daily cap — how often it re-runs, and the most it may auto-submit per day.",
-        "HackerOne handle — required only if you want auto-submit.",
+        "Program source repositories — record public repository roots for scope review; remote clone + scan is currently unavailable.",
+        "Cadence — how often it re-runs.",
+        "Platform handle — identifies the program for reports and manual submission.",
       ] },
       { h4: "Pick how hard it works each program", list: [
         ["Active. ", "Capture proof of impact with benign crafted probes."],
         ["Deep auto-work. ", "Adds time-based SQLi plus an auto proof-screenshot + research dossier per confirmed lead — needs the host in Scope."],
-        ["Auto-submit. ", "FILE confirmed, non-duplicate findings automatically — per-program opt-in, needs a handle, capped per day. Default off (review-only)."],
+        ["Review findings. ", "Inspect the evidence and reporting draft before you decide whether to submit manually."],
       ] },
       { h4: "Run it", ordered: true, list: [
-        ["Arm (optional). ", "Tick “Arm auto-submit” only if you want hands-off filing — every other gate still applies."],
         ["Start. ", "It runs due programs sequentially; watch the Activity log and the Money pipeline funnel fill in."],
         ["Kill switch. ", "Stop immediately at any time — it halts after the current step."],
       ] },
     ],
-    safety: "Auto-submit is triple-gated (armed + per-program opt-in + confirmed & non-duplicate + daily cap) and defaults to review-only. Starting confirms you're authorized to test every enabled program's scope.",
+    safety: "Starting confirms you're authorized to test every enabled program's scope. Only the human operator decides whether to submit a report.",
   },
   "surface": {
     summary: "What the Surface tab does — walkthrough",
@@ -7643,12 +8097,15 @@ function ckUpdateAuthorizedLabel() {
   ckUpdateLaunchReadiness();
 }
 
-function ckScopeRowEl(entry) {
+function ckScopeRowEl(entry, onOperatorChange) {
   const row = cel("div", "ck-scope-row");
   const id = cel("input"); id.type = "text"; id.placeholder = "*.example.com"; id.value = entry.identifier || "";
+  const importedIdentifier = id.value.trim();
+  const importedScopeId = String(entry.id || "").trim();
   const type = cel("input"); type.type = "text"; type.placeholder = "URL"; type.value = entry.asset_type || "";
   const sub = cel("label", "ck-scope-check");
   const subInput = cel("input"); subInput.type = "checkbox"; subInput.checked = entry.eligible_for_submission !== false;
+  subInput.addEventListener("change", () => onOperatorChange?.("eligibility", importedIdentifier, subInput.checked));
   sub.append(subInput, cel("span", null, "In scope"));
   const bounty = cel("label", "ck-scope-check");
   const bountyInput = cel("input"); bountyInput.type = "checkbox"; bountyInput.checked = Boolean(entry.eligible_for_bounty);
@@ -7656,10 +8113,16 @@ function ckScopeRowEl(entry) {
   const sev = cel("input"); sev.type = "text"; sev.placeholder = "max severity"; sev.value = entry.max_severity || "";
   const note = cel("input"); note.type = "text"; note.placeholder = "instruction (optional)"; note.value = entry.instruction || "";
   const rm = cel("button", "ck-btn ck-scope-rm", "✕"); rm.type = "button"; rm.title = "Remove row";
-  rm.addEventListener("click", () => row.remove());
+  rm.addEventListener("click", () => {
+    onOperatorChange?.("remove", importedIdentifier, null);
+    row.remove();
+  });
   row.append(id, type, sub, bounty, sev, note, rm);
   row._ckGet = () => ({
     identifier: id.value.trim(), asset_type: type.value.trim(),
+    // Preserve HackerOne's asset id for report routing only while this is the same asset.
+    // Editing the identifier must not route a later report to the previous asset id.
+    id: id.value.trim() === importedIdentifier ? importedScopeId : "",
     eligible_for_submission: subInput.checked, eligible_for_bounty: bountyInput.checked,
     max_severity: sev.value.trim(), instruction: note.value.trim(),
   });
@@ -7671,10 +8134,33 @@ function ckScopeRowEl(entry) {
 // instead of the whole "Save program" request hard-failing with a generic 422.
 const CK_MAX_SCOPE_ENTRIES = 500;
 
+// The older platform-specific fetch routes return a scope preview without the
+// provenance envelope used by Browse platform APIs. Build only inert, bounded
+// metadata here; even a successful fetch never establishes authorization.
+function ckLegacyIntakeSource(platform, identifier, response) {
+  const providerId = String(identifier || "").replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 200);
+  const fetched = response && response.ok !== false;
+  const safeId = /^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/.test(providerId);
+  const base = platform === "hackerone" ? "https://api.hackerone.com/v1/hackers/programs/"
+    : platform === "yeswehack" ? "https://api.yeswehack.com/programs/" : "";
+  const rawWarnings = Array.isArray(response?.warnings) ? response.warnings : [];
+  const warnings = rawWarnings.slice(0, 7)
+    .map((warning) => String(warning || "").replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 240))
+    .filter(Boolean);
+  warnings.push(fetched
+    ? "Review current policy, exclusions, and authorization before enabling tests."
+    : "Scope was not fetched; enter and verify it manually before enabling tests.");
+  return {
+    platform, provider_id: providerId,
+    source_url: fetched && safeId ? base + providerId : "",
+    fetched_at: fetched ? new Date().toISOString() : "",
+    status: fetched ? String(response?.status || "unknown").replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 40) : "fetch_failed",
+    scope_complete: false, warnings,
+  };
+}
+
 // Dedupe-by-identifier merge of `incoming` rows into `existing`, capped at
-// CK_MAX_SCOPE_ENTRIES. Returns { rows, truncated } — used by both the CSV/paste importer
-// and the HackerOne fetch button so neither can silently grow the table past what a save
-// can actually accept.
+// CK_MAX_SCOPE_ENTRIES. Returns { rows, truncated } for the CSV/paste importer.
 function ckMergeScopeRows(existing, incoming) {
   const seen = new Set(existing.map((e) => e.identifier.toLowerCase()));
   const merged = existing.slice();
@@ -7687,19 +8173,47 @@ function ckMergeScopeRows(existing, incoming) {
   return { rows: merged, truncated };
 }
 
-function ckScopeTable(initialRows) {
+// A re-fetch gives current platform rows priority among eligible assets, but
+// cannot turn an existing exclusion into an eligible row or evict it at the cap.
+// If exclusions alone exceed the cap, leave the table unchanged and block Save.
+function ckMergeFetchedScopeRows(existing, fetched) {
+  const selected = new Map();
+  const add = (rows, preserveExclusion) => {
+    for (const row of rows) {
+      const key = String(row?.identifier || "").trim().toLowerCase();
+      if (!key) continue;
+      const previous = selected.get(key);
+      if (!previous || (!row.eligible_for_submission && (preserveExclusion || previous.eligible_for_submission))) {
+        selected.set(key, row);
+      }
+    }
+  };
+  add(fetched, false);
+  add(existing, true);
+  const values = [...selected.values()];
+  const exclusions = values.filter((row) => !row.eligible_for_submission);
+  if (exclusions.length > CK_MAX_SCOPE_ENTRIES) {
+    return { rows: existing, blocked: true, truncated: true, dropped: 0 };
+  }
+  const eligible = values.filter((row) => row.eligible_for_submission);
+  const rows = [...exclusions, ...eligible.slice(0, CK_MAX_SCOPE_ENTRIES - exclusions.length)];
+  return { rows, blocked: false, truncated: rows.length < values.length,
+    dropped: values.length - rows.length };
+}
+
+function ckScopeTable(initialRows, onOperatorChange) {
   const wrap = cel("div", "ck-scope-table");
   const header = cel("div", "ck-scope-row ck-scope-head");
   for (const label of ["Identifier", "Asset type", "", "", "Max severity", "Instruction", ""]) header.append(cel("span", null, label));
   wrap.append(header);
   const body = cel("div", "ck-scope-body");
-  for (const entry of (initialRows || [])) body.append(ckScopeRowEl(entry));
+  for (const entry of (initialRows || [])) body.append(ckScopeRowEl(entry, onOperatorChange));
   wrap.append(body);
   const addRow = cel("button", "ck-btn", "+ Add scope row"); addRow.type = "button";
-  addRow.addEventListener("click", () => body.append(ckScopeRowEl({})));
+  addRow.addEventListener("click", () => body.append(ckScopeRowEl({}, onOperatorChange)));
   wrap.append(addRow);
   wrap.ckCollect = () => [...body.querySelectorAll(".ck-scope-row")].map((r) => r._ckGet()).filter((e) => e.identifier);
-  wrap.ckReplace = (rows) => { body.replaceChildren(); for (const e of rows) body.append(ckScopeRowEl(e)); };
+  wrap.ckReplace = (rows) => { body.replaceChildren(); for (const e of rows) body.append(ckScopeRowEl(e, onOperatorChange)); };
   return wrap;
 }
 
@@ -7743,7 +8257,7 @@ function ckProgramSetupRow(p) {
   if (p.oob_allowed) left.append(document.createTextNode(" "), cel("span", "ck-tag", "OOB allowed"));
   if (p.disclose_automation) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Discloses tool use"));
   const repositories = p.clone_repositories ? (p.repository_urls || []).filter(ckIsCloneableGitUrl) : [];
-  if (repositories.length) left.append(document.createTextNode(" "), cel("span", "ck-tag", `${repositories.length} source repo${repositories.length === 1 ? "" : "s"} · clone + scan`));
+  if (repositories.length) left.append(document.createTextNode(" "), cel("span", "ck-tag", `${repositories.length} source repo${repositories.length === 1 ? "" : "s"} · remote scan unavailable`));
   const stats = p.h1_program_stats || {};
   if (stats.offers_bounties) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Offers bounties"));
   if (stats.fast_payments) left.append(document.createTextNode(" "), cel("span", "ck-tag", "Fast payments"));
@@ -7801,7 +8315,8 @@ function ckProgramSetupRow(p) {
   });
   if (repositories.length && String(p.scope_text || "").trim()) {
     const huntRepo = cel("button", "ck-btn ck-btn-primary", "Hunt repository"); huntRepo.type = "button";
-    huntRepo.title = "Load this program's first opted-in repository as a source-code hunt target";
+    huntRepo.title = "Remote Git scanning is unavailable; scan an operator-supplied local clone.";
+    huntRepo.disabled = true;
     huntRepo.addEventListener("click", () => {
       ckApplyActiveProgram(p.id);
       if (ck.activeProgram) ck.activeProgram.value = p.id;
@@ -7836,15 +8351,14 @@ function ckProgramSetupForm(prefill) {
   const seed = (!editing && prefill && typeof prefill === "object") ? prefill : null;
   const form = cel("form", "ck-prog-setup-form");
   const name = ckField("Program name", "text", editing ? (editing.name || "") : (seed && seed.name) || "");
-  // Platform tag: picks the report format and display. Only HackerOne (with a handle) can
-  // auto-submit over its API; HackenProof and the rest are export-only — GreyIQ formats the
-  // report for that platform's form and you submit it on the platform's dashboard.
+  // Platform tag picks the report format and display. GreyIQ formats the report
+  // for that platform; the human operator decides whether to submit it.
   const platWrap = cel("label");
   platWrap.append(cel("span", null, "Platform"));
   const platSelect = cel("select");
   // Every supported report-format platform (HackerOne, YesWeHack, Bugcrowd, Intigriti,
   // HackenProof) plus a catch-all — sourced from CK_PLATFORMS so this list can't drift from
-  // the backend registry. HackerOne can auto-submit via its API; the rest are export-only.
+  // the backend registry.
   const platformOptions = [...CK_PLATFORMS.map((p) => [p.id, p.name]), ["manual", "Other / manual"]];
   for (const [pid, pname] of platformOptions) {
     const o = cel("option", null, pname); o.value = pid; platSelect.append(o);
@@ -7873,6 +8387,9 @@ function ckProgramSetupForm(prefill) {
   // Same idea for YesWeHack: reward range, VPN/source-IP constraints and the required UA
   // marker, carried so a Save persists them even though the form has no fields for them.
   let fetchedYwhStats = editing ? (editing.ywh_program_stats || {}) : ((seed && seed.ywh_program_stats) || {});
+  let intakeSource = editing ? (editing.intake_source || {}) : ((seed && seed.intake_source) || {});
+  let fetchedScopeThisSession = false;
+  let scopeMergeBlocked = false;
 
   const fetchBar = cel("div", "ck-import-row");
   const fetchBtn = cel("button", "ck-btn", "Fetch scope from HackerOne"); fetchBtn.type = "button";
@@ -7888,8 +8405,9 @@ function ckProgramSetupForm(prefill) {
   // equivalent, so it is the one thing that hides.
   const syncFetchBar = () => {
     const isYwh = platSelect.value === "yeswehack";
-    fetchBtn.textContent = `Fetch scope from ${isYwh ? "YesWeHack" : "HackerOne"}`;
-    hacktivityBtn.hidden = isYwh;
+    const isOtherApi = platSelect.value === "bugcrowd" || platSelect.value === "intigriti";
+    fetchBtn.textContent = `Fetch scope from ${isYwh ? "YesWeHack" : isOtherApi ? (platSelect.value === "bugcrowd" ? "Bugcrowd" : "Intigriti") : "HackerOne"}`;
+    hacktivityBtn.hidden = isYwh || isOtherApi;
   };
   platSelect.addEventListener("change", syncFetchBar);
   syncFetchBar();
@@ -7942,7 +8460,20 @@ function ckProgramSetupForm(prefill) {
     form.append(cel("p", "ck-status ck-candidate-scope-note",
       "Forge metadata suggested the unticked host rows below. Confirm you're authorized to test each host before ticking In scope; leaving a row unticked never authorizes it."));
   }
-  const scopeTable = ckScopeTable(editing ? (editing.structured_scope || []) : ((seed && seed.structured_scope) || []));
+  // Only a direct click on a saved excluded row's Remove button or In scope
+  // checkbox can request removal of its persisted host exclusion. A platform
+  // re-fetch, cap, or dedupe never creates that intent.
+  const savedExclusions = new Map((editing?.structured_scope || [])
+    .filter((row) => row && row.eligible_for_submission === false && row.identifier)
+    .map((row) => [String(row.identifier).trim().toLowerCase(), String(row.identifier).trim()]));
+  const operatorRemovedExclusions = new Set();
+  const recordScopeChange = (action, identifier, isEligible) => {
+    const key = String(identifier || "").trim().toLowerCase();
+    if (!savedExclusions.has(key)) return;
+    if (action === "remove" || (action === "eligibility" && isEligible)) operatorRemovedExclusions.add(key);
+    else if (action === "eligibility") operatorRemovedExclusions.delete(key);
+  };
+  const scopeTable = ckScopeTable(editing ? (editing.structured_scope || []) : ((seed && seed.structured_scope) || []), recordScopeChange);
   form.append(scopeTable);
 
   const existingRepositoryUrls = editing
@@ -7954,8 +8485,8 @@ function ckProgramSetupForm(prefill) {
   repoWrap.append(cel("h4", "ck-subhead", "Program-provided source repositories"));
   repoWrap.append(cel("p", "ck-hint",
     "Add public HTTPS repository-root links supplied by the bounty program (GitHub, GitLab, Bitbucket, Codeberg, or SourceHut). "
-    + "When clone + scan is enabled, a hunt shallow-clones each selected repo, runs the full adversarial static rule set, "
-    + "passes the leads through the hunt brain for red-team attack planning, validates eligible credentials, and writes the normal reports."));
+    + "Remote clone + scan is currently unavailable because Git cannot guarantee every fetch stays at the authorized repository. "
+    + "Use an operator-supplied local clone for source scanning."));
   const repoUrls = ckTextareaField("Repository URLs (one per line; repository roots only)", "");
   repoUrls.input.value = existingRepositoryUrls.join("\n");
   repoUrls.input.rows = 3;
@@ -7966,7 +8497,13 @@ function ckProgramSetupForm(prefill) {
   fetchBtn.addEventListener("click", async () => {
     const h = handle.input.value.trim();
     const isYwh = platSelect.value === "yeswehack";
-    if (!h) {
+    const isOtherApi = platSelect.value === "bugcrowd" || platSelect.value === "intigriti";
+    if (isOtherApi && (!intakeSource.provider_id || intakeSource.platform !== platSelect.value)) {
+      fetchNote.className = "ck-status is-error";
+      fetchNote.textContent = "Choose this program from Browse platform APIs first; its API program ID is required.";
+      return;
+    }
+    if (!h && !isOtherApi) {
       fetchNote.className = "ck-status is-error";
       fetchNote.textContent = isYwh ? "Enter a YesWeHack program slug first." : "Enter a HackerOne team handle first.";
       return;
@@ -7974,7 +8511,10 @@ function ckProgramSetupForm(prefill) {
     const label = fetchBtn.textContent; fetchBtn.disabled = true; fetchBtn.textContent = "Fetching…";
     fetchNote.className = "ck-status"; fetchNote.textContent = "";
     try {
-      const res = isYwh
+      const res = isOtherApi
+        ? await apiFetch("/api/platforms/preview", { method: "POST", timeoutMs: 45000,
+          body: JSON.stringify({ platform: platSelect.value, program_id: intakeSource.provider_id }) })
+        : isYwh
         ? await apiFetch("/api/yeswehack/import-scope", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ slug: h }) })
         : await apiFetch("/api/hackerone/import-scope", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ handle: h }) });
       if (!res || res.ok === false) {
@@ -7982,43 +8522,45 @@ function ckProgramSetupForm(prefill) {
         fetchNote.textContent = (res && res.error) || "Could not fetch scope.";
         return;
       }
+      const entries = Array.isArray(res.structured_scope) ? res.structured_scope : [];
+      const merge = entries.length ? ckMergeFetchedScopeRows(scopeTable.ckCollect(), entries) : null;
+      if (merge?.blocked) {
+        scopeMergeBlocked = true;
+        fetchNote.className = "ck-status is-error";
+        fetchNote.textContent = `Scope re-fetch has more than ${CK_MAX_SCOPE_ENTRIES} exclusions. No rows changed; Save is blocked until a later fetch fits the limit.`;
+        return;
+      }
+      scopeMergeBlocked = false;
+      fetchedScopeThisSession = true;
       if (isYwh) {
         fetchedYwhStats = res.program_stats || {};
         // The program's required user-agent marker and its rules digest only OVERWRITE an
         // empty field — a re-fetch must never clobber what the operator typed or edited.
         if (res.user_agent_suffix && !uaSuffix.input.value.trim()) uaSuffix.input.value = res.user_agent_suffix;
         if (res.notes_digest && !notes.input.value.trim()) notes.input.value = res.notes_digest;
-      } else {
+      } else if (!isOtherApi) {
         fetchedProgramStats = res.program_stats || {};
       }
-      const entries = res.structured_scope || [];
+      if (isOtherApi) {
+        intakeSource = { platform: platSelect.value, provider_id: res.program_id,
+          source_url: res.source_url, fetched_at: res.fetched_at, status: res.status,
+          scope_complete: res.scope_complete === true, warnings: res.warnings || [] };
+        if (res.policy_excerpt && !notes.input.value.trim()) notes.input.value = res.policy_excerpt;
+      } else {
+        intakeSource = ckLegacyIntakeSource(isYwh ? "yeswehack" : "hackerone",
+          (isYwh ? res.slug : res.handle) || h, res);
+      }
       let mergeNote = "";
-      if (entries.length) {
-        // Merge (dedupe by identifier, fetched rows win on a match) rather than replace —
-        // a fetch must never silently discard hand-typed or CSV-merged rows already in
-        // the table.
-        // Fetched rows go FIRST. ckMergeScopeRows fills up to the cap in order, so putting
-        // existing rows first meant a nearly-full table silently discarded the rows just
-        // fetched — including out-of-scope exclusions, which is the one direction that
-        // must never be lost. Within the fetched set, exclusions lead for the same reason.
-        const fetchedFirst = [
-          ...entries.filter((e) => !e.eligible_for_submission),
-          ...entries.filter((e) => e.eligible_for_submission),
-        ];
-        const keptExisting = scopeTable.ckCollect()
-          .filter((e) => !entries.some((f) => f.identifier.toLowerCase() === e.identifier.toLowerCase()));
-        const { rows: merged, truncated } = ckMergeScopeRows(fetchedFirst, keptExisting);
-        scopeTable.ckReplace(merged);
-        // Say which rows actually went — it used to claim "existing rows were dropped"
-        // while it was in fact dropping the fetched ones.
-        if (truncated) mergeNote = ` Capped at ${CK_MAX_SCOPE_ENTRIES} scope entries — ${keptExisting.length - (merged.length - fetchedFirst.length)} existing row(s) did not fit; every fetched row was kept.`;
+      if (merge) {
+        scopeTable.ckReplace(merge.rows);
+        if (merge.truncated) mergeNote = ` Capped at ${CK_MAX_SCOPE_ENTRIES} scope entries — all exclusions were kept; ${merge.dropped} eligible row(s) did not fit.`;
       }
       const fetchedRepositories = ckRepositoryUrlsFromScope(entries);
       if (fetchedRepositories.length) {
         repoUrls.input.value = [...new Set([
           ...ckParseRepositoryUrls(repoUrls.input.value), ...fetchedRepositories,
         ])].slice(0, 25).join("\n");
-        mergeNote += ` Found ${fetchedRepositories.length} public source repositor${fetchedRepositories.length === 1 ? "y" : "ies"}; review the list and enable clone + scan below to hunt it.`;
+        mergeNote += ` Found ${fetchedRepositories.length} public source repositor${fetchedRepositories.length === 1 ? "y" : "ies"}; remote clone + scan is unavailable, so use a local clone.`;
       }
       fetchNote.className = "ck-status";
       fetchNote.textContent = `Fetched ${entries.length} scope entr${entries.length === 1 ? "y" : "ies"} for "${res.program_name}".`
@@ -8041,7 +8583,8 @@ function ckProgramSetupForm(prefill) {
   form.append(importNote);
 
   const toggles = cel("div", "ck-toggles");
-  const cloneRepositories = ckToggle("Clone and adversarially scan the selected program repositories during program hunts", editing ? Boolean(editing.clone_repositories) : (seed ? Boolean(seed.clone_repositories) : false));
+  const cloneRepositories = ckToggle("Remote clone + scan unavailable — use an operator-supplied local clone", false);
+  cloneRepositories.input.disabled = true;
   toggles.append(cloneRepositories.wrap);
   form.append(toggles);
 
@@ -8132,10 +8675,10 @@ function ckProgramSetupForm(prefill) {
     .filter((p) => p && p.url_a && p.url_b);
 
   // Cross-link: this gentle form owns identity, structured scope, and account access; a saved
-  // program's run schedule, activation, and auto-submit live on the Operator tab. Say so, since
+  // program's run schedule and activation live on the Operator tab. Say so, since
   // neither editor is complete on its own.
   form.append(cel("p", "ck-hint ck-crosslink",
-    "Scheduling, activation (active/paused), and auto-submit for a saved program are set on the Operator tab."));
+    "Scheduling and activation (active/paused) for a saved program are set on the Operator tab."));
 
   const submit = cel("button", "ck-btn primary", editing ? "Update program" : "Save program");
   submit.type = "submit";
@@ -8148,6 +8691,11 @@ function ckProgramSetupForm(prefill) {
   const saveNote = cel("p", "ck-status");
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
+    if (scopeMergeBlocked) {
+      saveNote.className = "ck-status is-error";
+      saveNote.textContent = "Save is blocked because the latest scope re-fetch could not retain every exclusion.";
+      return;
+    }
     const structuredScope = scopeTable.ckCollect();
     if (!name.input.value.trim()) { saveNote.className = "ck-status is-error"; saveNote.textContent = "Program name is required."; return; }
     const repositoryUrls = ckParseRepositoryUrls(repoUrls.input.value);
@@ -8162,11 +8710,12 @@ function ckProgramSetupForm(prefill) {
       platform_handle: handle.input.value.trim(),
       structured_scope: structuredScope,
       repository_urls: repositoryUrls,
-      clone_repositories: cloneRepositories.input.checked,
+      clone_repositories: false,
       oob_allowed: oobAllowed.input.checked,
       disclose_automation: discloseAutomation.input.checked,
       h1_program_stats: fetchedProgramStats,
       ywh_program_stats: fetchedYwhStats,
+      intake_source: intakeSource,
       notes: notes.input.value,
       // A blank password/cookie means "keep the saved one" (the server merge-preserves them, since
       // they're read back redacted); email/URLs/suffix are sent verbatim so clearing them takes effect.
@@ -8191,17 +8740,35 @@ function ckProgramSetupForm(prefill) {
       policy_profile: editing ? (editing.policy_profile || "") : "",
       user_agent_suffix: uaSuffix.input.value,
       // This form owns the structured-scope table and repository selection, so a save here
-      // should always re-derive scope_text/in_scope_hosts/out_of_scope_hosts from whatever
-      // the form currently holds — never echo back a stale value from before this edit.
+      // should refresh derived scope_text/in_scope_hosts/out_of_scope_hosts from whatever
+      // the form currently holds, without echoing back a stale derived value.
       // The server recognizes and preserves scope text hand-typed in the Operator tab.
       resync_scope: true,
     };
+    if (editing && operatorRemovedExclusions.size) {
+      const removals = [...operatorRemovedExclusions]
+        .filter((key) => !structuredScope.some((row) => String(row.identifier || "").trim().toLowerCase() === key
+          && row.eligible_for_submission === false))
+        .map((key) => savedExclusions.get(key));
+      if (removals.length) payload.remove_out_of_scope_hosts = removals;
+    }
     if (editing) {
       payload.id = editing.id;
       // Fields this form doesn't expose (seed targets, automation toggles) are simply
       // omitted — the server preserves the existing stored value for anything not present
       // in the request instead of resetting it to that field's bare default.
-      payload.enabled = editing.enabled;
+      payload.enabled = fetchedScopeThisSession ? false : editing.enabled;
+      if (fetchedScopeThisSession) {
+        payload.active = false;
+        payload.live = false;
+        payload.deep = false;
+      }
+    } else if (fetchedScopeThisSession || intakeSource.provider_id) {
+      // API discovery is not authorization. Save every imported program paused.
+      payload.enabled = false;
+      payload.active = false;
+      payload.live = false;
+      payload.deep = false;
     }
     submit.disabled = true;  // no double upsert on a slow save
     try {
@@ -8221,7 +8788,7 @@ function ckProgramSetupForm(prefill) {
       await ckRefreshProgramsEverywhere();
       // A new program should flow straight into its first run. Select it, hydrate Target/Scope,
       // open the launch panel, and focus the first remaining requirement (usually authorization).
-      if (created && savedProgram?.id && ck.activeProgram) {
+      if (created && !fetchedScopeThisSession && !intakeSource.provider_id && savedProgram?.id && ck.activeProgram) {
         ck.activeProgram.value = savedProgram.id;
         ckApplyActiveProgram(savedProgram.id);
         document.querySelector("#ckSetupFold")?.setAttribute("open", "");
@@ -8273,7 +8840,7 @@ async function ckRenderProgram() {
   } else if (!programs.length) {
     const empty = cel("div", "ck-prog-empty");
     empty.append(cel("p", "ck-prog-empty-title", "No programs yet"));
-    empty.append(cel("p", "ck-hint", "Start your first one — paste a repo link, pull a HackerOne scope, or add it by hand. It takes about a minute."));
+    empty.append(cel("p", "ck-hint", "Start your first one — pull a HackerOne scope or add it by hand. It takes about a minute."));
     const go = cel("button", "ck-btn primary", "Start a program"); go.type = "button";
     go.addEventListener("click", () => { ckFlow = { view: "wizard", step: 0, choice: null, prefill: null }; void ckRenderProgram(); });
     empty.append(go);
@@ -8339,10 +8906,13 @@ function ckWizardStart() {
     c.addEventListener("click", () => { ckFlow.choice = choice; ckFlow.step = 1; void ckRenderProgram(); });
     return c;
   };
+  const repoChoice = mk("repo", "🔗", "From a repo link", "Unavailable until remote Git transport can stay within the authorized repository. Use a local clone.");
+  repoChoice.disabled = true;
   grid.append(
-    mk("repo", "🔗", "From a repo link", "Paste a public repo. We check it, then set up a source-only draft you can hunt right away."),
+    repoChoice,
     mk("hackerone", "🎯", "From HackerOne", "Enter a program handle to pull real scope from the API, or paste its scope table."),
     mk("yeswehack", "🐝", "From YesWeHack", "Search or paste a program slug. Pulls scope, rules and the required user-agent marker — no sign-in needed for public programs."),
+    mk("platform_api", "🌐", "Browse platform APIs", "Find programs visible to your HackerOne, YesWeHack, Bugcrowd, or Intigriti account and review a scope preview."),
     mk("manual", "✎", "Manually", "Name it and add scope yourself — full control."),
   );
   box.append(grid);
@@ -8372,18 +8942,19 @@ function ckWizardIdentify() {
   if (ckFlow.choice === "repo") box.append(ckWizardIdentifyRepo(nav));
   else if (ckFlow.choice === "hackerone") box.append(ckWizardIdentifyH1(nav));
   else if (ckFlow.choice === "yeswehack") box.append(ckWizardIdentifyYWH(nav));
+  else if (ckFlow.choice === "platform_api") box.append(ckWizardIdentifyPlatformApi(nav));
   else box.append(ckWizardIdentifyManual(nav));
   nav.prepend(back);
   box.append(nav);
   return box;
 }
 
-// The repo path — the one that used to fail deep in a hunt. Preflight runs BEFORE anything is
-// created, so a typo'd/private/missing repo is caught here with an actionable message.
+// Kept for an in-progress wizard restored across an app update; remote preflight
+// now refuses before network activity and directs the operator to a local clone.
 function ckWizardIdentifyRepo(nav) {
   const box = cel("div");
   box.append(cel("h3", "ck-wiz-title", "Add the repository"));
-  box.append(cel("p", "ck-hint", "We check the repo is reachable before you commit to a hunt, so a typo can’t waste a run."));
+  box.append(cel("p", "ck-hint", "Remote Git setup is unavailable. Scan an operator-supplied local clone instead."));
   const ta = ckTextareaField("Repository URL(s) — one per line, repository roots only", "");
   ta.input.rows = 3; ta.input.placeholder = "https://github.com/program/repository";
   box.append(ta.wrap);
@@ -8450,32 +9021,99 @@ function ckWizardIdentifyRepo(nav) {
   return box;
 }
 
+function ckWizardH1Credentials() {
+  const wrap = cel("div", "ck-creds ck-wiz-crednote");
+  wrap.append(cel("strong", null, "HackerOne API credentials"));
+  wrap.append(cel("p", "ck-hint", "Enter the API identifier and token shown by HackerOne when you generate an API token. Save them here before fetching or browsing programs. The token stays in GreyIQ's local secret store."));
+  const form = cel("form", "ck-learn-form");
+  const username = ckField("HackerOne API identifier", "text", ckState.h1?.api_username || "");
+  const token = ckField("HackerOne API token", "password", "");
+  token.input.autocomplete = "new-password";
+  token.input.placeholder = ckState.h1?.has_token ? "Saved; enter a new token to replace it" : "Paste API token";
+  const save = cel("button", "ck-btn primary", "Save HackerOne credentials"); save.type = "submit";
+  const test = cel("button", "ck-btn", "Test saved connection"); test.type = "button";
+  const note = cel("p", "ck-status"); note.setAttribute("role", "status");
+  form.append(username.wrap, token.wrap, save, test, note);
+  wrap.append(form);
+
+  const showSavedState = (status) => {
+    if (status?.api_username && !username.input.value.trim()) username.input.value = status.api_username;
+    if (status?.has_token && status?.api_username) {
+      note.className = "ck-status";
+      note.textContent = "HackerOne credentials are saved locally. You can browse or fetch scope now.";
+      token.input.placeholder = "Saved; enter a new token to replace it";
+    } else {
+      note.className = "ck-status is-warn";
+      note.textContent = "Save your HackerOne API identifier and token to use its API.";
+    }
+  };
+  showSavedState(ckState.h1);
+  let savedHere = null;
+  void ckFetchCreds().then((status) => {
+    // A slow status response must not undo a credential saved in this wizard.
+    if (savedHere) { ckState.h1 = savedHere; return; }
+    showSavedState(status);
+  });
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const apiUsername = username.input.value.trim();
+    const apiToken = token.input.value.trim();
+    if (!apiUsername || !apiToken) {
+      note.className = "ck-status is-error";
+      note.textContent = "Enter both the HackerOne API identifier and token before saving.";
+      return;
+    }
+    save.disabled = true;
+    note.className = "ck-status";
+    note.textContent = "Saving HackerOne credentials locally…";
+    try {
+      // This endpoint clears team_handle when omitted. Read its current value so
+      // saving API access in the wizard does not change the submission target.
+      const current = await apiFetch("/api/bounty/hackerone/creds", { timeoutMs: 6000 });
+      if (!current?.ok) throw new Error("Credential status unavailable.");
+      const result = await apiFetch("/api/bounty/hackerone/creds", {
+        method: "POST", timeoutMs: 8000,
+        body: JSON.stringify({ team_handle: current.team_handle || "", api_username: apiUsername, api_token: apiToken }),
+      });
+      if (!result?.ok || !result.has_token || !result.api_username) throw new Error("Credential save failed.");
+      savedHere = result;
+      ckState.h1 = result;
+      token.input.value = "";
+      showSavedState(result);
+    } catch (_) {
+      note.className = "ck-status is-error";
+      note.textContent = "Could not save HackerOne credentials. Check that GreyIQ is running, then retry.";
+    } finally { save.disabled = false; }
+  });
+  test.addEventListener("click", async () => {
+    if (!ckState.h1?.has_token || !ckState.h1?.api_username) {
+      note.className = "ck-status is-error";
+      note.textContent = "Save the API identifier and token first.";
+      return;
+    }
+    test.disabled = true;
+    note.className = "ck-status";
+    note.textContent = "Testing saved HackerOne credentials…";
+    try {
+      const result = await apiFetch("/api/bounty/hackerone/test", { method: "POST", timeoutMs: 20000 });
+      note.className = result?.ok ? "ck-status" : "ck-status is-error";
+      note.textContent = result?.ok
+        ? "HackerOne accepted the saved credentials."
+        : "HackerOne did not accept the saved credentials. Check the API identifier and token.";
+    } catch (_) {
+      note.className = "ck-status is-error";
+      note.textContent = "Could not test the HackerOne connection. Retry when the service is available.";
+    } finally { test.disabled = false; }
+  });
+  return { wrap, clearToken: () => { token.input.value = ""; } };
+}
+
 function ckWizardIdentifyH1(nav) {
   const box = cel("div");
   box.append(cel("h3", "ck-wiz-title", "Pull scope from HackerOne"));
-  box.append(cel("p", "ck-hint", "Enter the program’s team handle. We call HackerOne’s API with the credentials you saved in Submissions. Many programs restrict this to invited researchers — a 403/404 is common, not a bug; you can still continue and add scope by hand."));
-  // Pull-scope needs saved HackerOne API creds. Pre-check them so a brand-new user (the tour
-  // reaches Program before Submissions) isn't dead-ended on a fetch that can't work, with no
-  // pointer to where the creds live. Refreshed once the creds status is known.
-  const credNote = cel("div", "ck-wiz-crednote");
-  box.append(credNote);
-  const paintCredNote = () => {
-    credNote.replaceChildren();
-    if (ckState.h1 && ckState.h1.has_token) return;  // creds present — nothing to warn about
-    credNote.append(cel("p", "ck-status is-warn",
-      "No HackerOne API credentials saved yet — the fetch below needs them. Save them first, or continue and add scope by hand."));
-    const go = cel("button", "ck-btn", "Save HackerOne credentials →"); go.type = "button";
-    go.addEventListener("click", () => {
-      ckSetView("submissions");
-      setTimeout(() => {
-        const bar = ck.views.submissions?.querySelector(".ck-creds-h1");
-        if (bar) { bar.scrollIntoView({ behavior: "smooth", block: "start" }); bar.querySelector("input")?.focus(); }
-      }, 60);
-    });
-    credNote.append(go);
-  };
-  paintCredNote();
-  void ckFetchCreds().then(paintCredNote);
+  box.append(cel("p", "ck-hint", "Enter the program’s team handle and fetch its scope. Many programs restrict API access to invited researchers — a 403/404 is common, not a bug; you can still continue and add scope by hand."));
+  box.append(ckWizardH1Credentials().wrap);
   const handle = ckField("HackerOne team handle", "text", "");
   box.append(handle.wrap);
   const fetchBtn = cel("button", "ck-btn", "Fetch scope"); fetchBtn.type = "button";
@@ -8487,19 +9125,29 @@ function ckWizardIdentifyH1(nav) {
   fetchBtn.addEventListener("click", async () => {
     const h = handle.input.value.trim();
     if (!h) { note.className = "ck-status is-error"; note.textContent = "Enter a HackerOne team handle first."; return; }
+    fetched = null; cont.disabled = true;
     fetchBtn.disabled = true; fetchBtn.textContent = "Fetching…"; note.className = "ck-status"; note.textContent = "";
     try {
       const res = await apiFetch("/api/hackerone/import-scope", { method: "POST", timeoutMs: 30000, body: JSON.stringify({ handle: h }) });
       if (!res || res.ok === false) {
         note.className = "ck-status is-error"; note.textContent = (res && res.error) || "Could not fetch scope. You can still continue and add scope by hand.";
-        fetched = { name: h, platform_handle: h }; cont.disabled = false; cont.textContent = "Continue anyway →"; return;
+        fetched = { name: h, platform: "hackerone", platform_handle: h,
+          intake_source: ckLegacyIntakeSource("hackerone", h, res || { ok: false }) };
+        cont.disabled = false; cont.textContent = "Continue anyway →"; return;
       }
       const entries = res.structured_scope || [];
-      fetched = { name: res.program_name || h, platform_handle: h, structured_scope: entries,
-        repository_urls: ckRepositoryUrlsFromScope(entries), h1_program_stats: res.program_stats || {} };
+      fetched = { name: res.program_name || h, platform: "hackerone", platform_handle: h,
+        structured_scope: entries, repository_urls: ckRepositoryUrlsFromScope(entries),
+        h1_program_stats: res.program_stats || {},
+        intake_source: ckLegacyIntakeSource("hackerone", res.handle || h, res) };
       note.className = "ck-status"; note.textContent = `Fetched ${entries.length} scope entr${entries.length === 1 ? "y" : "ies"} for "${fetched.name}". Review and save on the next step.`;
       cont.disabled = false; cont.textContent = "Continue →";
-    } catch (err) { note.className = "ck-status is-error"; note.textContent = err.message || "Fetch failed."; }
+    } catch (err) {
+      note.className = "ck-status is-error"; note.textContent = err.message || "Fetch failed.";
+      fetched = { name: h, platform: "hackerone", platform_handle: h,
+        intake_source: ckLegacyIntakeSource("hackerone", h, { ok: false }) };
+      cont.disabled = false; cont.textContent = "Continue anyway →";
+    }
     finally { fetchBtn.disabled = false; if (fetchBtn.textContent === "Fetching…") fetchBtn.textContent = "Fetch scope"; }
   });
   cont.addEventListener("click", () => {
@@ -8590,6 +9238,7 @@ function ckWizardIdentifyYWH(nav) {
   fetchBtn.addEventListener("click", async () => {
     const s = slug.input.value.trim();
     if (!s) { note.className = "ck-status is-error"; note.textContent = "Enter or pick a YesWeHack program slug first."; return; }
+    fetched = null; cont.disabled = true;
     fetchBtn.disabled = true; fetchBtn.textContent = "Fetching…";
     note.className = "ck-status"; note.textContent = ""; signin.replaceChildren();
     try {
@@ -8600,7 +9249,9 @@ function ckWizardIdentifyYWH(nav) {
         // 401 too, not just 403 — an expired JWT is the ONE failure where signing in again
         // is literally the fix, and it was the one case that got no button.
         if (res && /\b401\b|403|private|invited|expired/i.test(String(res.error || ""))) offerSignin();
-        fetched = { name: s, platform: "yeswehack", platform_handle: s }; cont.disabled = false; cont.textContent = "Continue anyway →"; return;
+        fetched = { name: s, platform: "yeswehack", platform_handle: s,
+          intake_source: ckLegacyIntakeSource("yeswehack", s, res || { ok: false }) };
+        cont.disabled = false; cont.textContent = "Continue anyway →"; return;
       }
       fetched = ckYwhPrefill(res, s);
       const entries = fetched.structured_scope || [];
@@ -8615,7 +9266,12 @@ function ckWizardIdentifyYWH(nav) {
         + ((res.warnings || []).length ? " " + res.warnings.join(" ") : "")
         + " Review and save on the next step.";
       cont.disabled = false; cont.textContent = "Continue →";
-    } catch (err) { note.className = "ck-status is-error"; note.textContent = err.message || "Fetch failed."; }
+    } catch (err) {
+      note.className = "ck-status is-error"; note.textContent = err.message || "Fetch failed.";
+      fetched = { name: s, platform: "yeswehack", platform_handle: s,
+        intake_source: ckLegacyIntakeSource("yeswehack", s, { ok: false }) };
+      cont.disabled = false; cont.textContent = "Continue anyway →";
+    }
     finally { fetchBtn.disabled = false; if (fetchBtn.textContent === "Fetching…") fetchBtn.textContent = "Fetch scope"; }
   });
   slug.input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); fetchBtn.click(); } });
@@ -8626,6 +9282,171 @@ function ckWizardIdentifyYWH(nav) {
       fetched = { name: s || "New program", platform: "yeswehack", platform_handle: s };
     }
     ckProgEdit = null; ckFlow.prefill = fetched; ckFlow.view = "form"; void ckRenderProgram();
+  });
+  nav.append(cont);
+  return box;
+}
+
+function ckWizardIdentifyPlatformApi(nav) {
+  const box = cel("div");
+  box.append(cel("h3", "ck-wiz-title", "Browse platform programs"));
+  box.append(cel("p", "ck-hint", "Discovery shows programs visible to your API identity. Preview the current policy and exclusions before saving. Imported programs start paused; a listing does not authorize testing."));
+  const platformLabel = cel("label");
+  platformLabel.append(cel("span", null, "Platform"));
+  const platform = cel("select");
+  for (const [id, name] of [["hackerone", "HackerOne"], ["yeswehack", "YesWeHack"], ["bugcrowd", "Bugcrowd"], ["intigriti", "Intigriti"]]) {
+    const option = cel("option", null, name); option.value = id; platform.append(option);
+  }
+  platformLabel.append(platform);
+  box.append(platformLabel);
+  const cred = ckField("API credential", "password", "");
+  cred.input.autocomplete = "off";
+  cred.input.placeholder = "Bugcrowd id:secret or Intigriti bearer token";
+  const saveCred = cel("button", "ck-btn", "Save API credential"); saveCred.type = "button";
+  const clearCred = cel("button", "ck-btn", "Clear saved credential"); clearCred.type = "button";
+  const credentialNote = cel("p", "ck-status");
+  const h1Creds = ckWizardH1Credentials();
+  box.append(cred.wrap, saveCred, clearCred, credentialNote, h1Creds.wrap);
+  let platformGeneration = 0;
+  const syncCredentialUi = async () => {
+    const p = platform.value;
+    const generation = platformGeneration;
+    const localCred = p === "bugcrowd" || p === "intigriti";
+    cred.wrap.hidden = !localCred; saveCred.hidden = !localCred; clearCred.hidden = !localCred;
+    h1Creds.wrap.hidden = p !== "hackerone";
+    if (p !== "hackerone") h1Creds.clearToken();
+    credentialNote.className = "ck-status";
+    credentialNote.hidden = p === "hackerone";
+    if (!localCred) {
+      credentialNote.textContent = p === "yeswehack"
+        ? "Public YesWeHack programs can be browsed anonymously; private programs may require sign-in in Submissions."
+        : "";
+      return;
+    }
+    try {
+      const status = await apiFetch("/api/platforms/credentials", { timeoutMs: 6000 });
+      if (generation !== platformGeneration || p !== platform.value) return;
+      credentialNote.textContent = status.platforms?.[p]?.has_token
+        ? "A credential is saved locally. Paste a new one only to replace it."
+        : "Save your researcher API credential before browsing.";
+    } catch (err) {
+      if (generation === platformGeneration && p === platform.value) {
+        credentialNote.textContent = err.message || "Could not check credential status.";
+      }
+    }
+  };
+  platform.addEventListener("change", () => {
+    platformGeneration += 1;
+    results.replaceChildren(); preview.replaceChildren();
+    programId.input.value = "";
+    selected = null; cont.disabled = true;
+    browse.disabled = false; fetch.disabled = false;
+    void syncCredentialUi();
+  });
+  void syncCredentialUi();
+  saveCred.addEventListener("click", async () => {
+    saveCred.disabled = true;
+    try {
+      const res = await apiFetch("/api/platforms/credentials", { method: "POST", timeoutMs: 8000,
+        body: JSON.stringify({ platform: platform.value, credential: cred.input.value }) });
+      if (!res?.ok) throw new Error(res?.error || "Could not save credential.");
+      cred.input.value = "";
+      await syncCredentialUi();
+    } catch (err) { credentialNote.className = "ck-status is-error"; credentialNote.textContent = err.message || "Could not save credential."; }
+    finally { saveCred.disabled = false; }
+  });
+  clearCred.addEventListener("click", async () => {
+    clearCred.disabled = true;
+    try {
+      const res = await apiFetch("/api/platforms/credentials", { method: "POST", timeoutMs: 8000,
+        body: JSON.stringify({ platform: platform.value, clear_token: true }) });
+      if (!res?.ok) throw new Error(res?.error || "Could not clear credential.");
+      await syncCredentialUi();
+    } catch (err) { credentialNote.className = "ck-status is-error"; credentialNote.textContent = err.message || "Could not clear credential."; }
+    finally { clearCred.disabled = false; }
+  });
+
+  const search = ckField("Search visible programs", "text", "");
+  const browse = cel("button", "ck-btn", "Browse programs"); browse.type = "button";
+  const results = cel("div", "ck-hacktivity-panel");
+  const programId = ckField("Program ID or handle", "text", "");
+  const fetch = cel("button", "ck-btn", "Preview selected program"); fetch.type = "button";
+  const preview = cel("div", "ck-hacktivity-panel");
+  box.append(search.wrap, browse, results, programId.wrap, fetch, preview);
+  const cont = cel("button", "ck-btn primary", "Review and save →"); cont.type = "button"; cont.disabled = true;
+  let selected = null;
+  browse.addEventListener("click", async () => {
+    const requestPlatform = platform.value;
+    const requestGeneration = platformGeneration;
+    const stillCurrent = () => requestGeneration === platformGeneration && requestPlatform === platform.value;
+    const query = search.input.value.trim();
+    const credentialLike = /^[^\s:]+:[^\s:]{12,}$/.test(query)
+      || (query.length >= 24 && /^[A-Za-z0-9+/_=-]+$/.test(query)
+        && query.includes("/") && query.includes("="));
+    if (credentialLike) {
+      search.input.value = "";
+      results.replaceChildren(cel("p", "ck-status is-error", "That looks like an API credential. Enter it in the credential fields above; search accepts program names only."));
+      return;
+    }
+    browse.disabled = true; results.replaceChildren(cel("p", "ck-status", "Loading visible programs…"));
+    try {
+      const res = await apiFetch("/api/platforms/programs", { method: "POST", timeoutMs: 45000,
+        body: JSON.stringify({ platform: requestPlatform, query, limit: 100 }) });
+      if (!stillCurrent()) return;
+      results.replaceChildren();
+      if (!res?.ok) throw new Error(res?.error || "Could not list programs.");
+      for (const warning of res.warnings || []) results.append(cel("p", "ck-status is-warn", warning));
+      if (!res.programs?.length) results.append(cel("p", "ck-status", "No matching program in the bounded API results. You can enter a program ID or handle below."));
+      for (const row of (res.programs || []).slice(0, 100)) {
+        const pick = cel("button", "ck-textlink", `${row.name} — ${row.handle} (${row.status || "visible"})`);
+        pick.type = "button";
+        pick.addEventListener("click", () => { programId.input.value = row.id; fetch.click(); });
+        const line = cel("div"); line.append(pick); results.append(line);
+      }
+    } catch (err) {
+      if (stillCurrent()) results.replaceChildren(cel("p", "ck-status is-error", err.message || "Could not list programs."));
+    } finally { if (stillCurrent()) browse.disabled = false; }
+  });
+  search.input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); browse.click(); } });
+  fetch.addEventListener("click", async () => {
+    const requestPlatform = platform.value;
+    const requestGeneration = platformGeneration;
+    const stillCurrent = () => requestGeneration === platformGeneration && requestPlatform === platform.value;
+    const id = programId.input.value.trim();
+    if (!id) { preview.replaceChildren(cel("p", "ck-status is-error", "Select a program or enter its ID or handle.")); return; }
+    fetch.disabled = true; selected = null; cont.disabled = true;
+    preview.replaceChildren(cel("p", "ck-status", "Reading program preview…"));
+    try {
+      const res = await apiFetch("/api/platforms/preview", { method: "POST", timeoutMs: 45000,
+        body: JSON.stringify({ platform: requestPlatform, program_id: id }) });
+      if (!stillCurrent()) return;
+      preview.replaceChildren();
+      if (!res?.ok) throw new Error(res?.error || "Could not preview program.");
+      const rows = Array.isArray(res.structured_scope) ? res.structured_scope : [];
+      const notes = [res.notes_digest || res.policy_excerpt || "", ...((res.warnings || []).map((w) => `Review: ${w}`))].filter(Boolean).join("\n\n").slice(0, 4000);
+      selected = requestPlatform === "yeswehack" ? ckYwhPrefill(res, id) : {
+        name: res.program_name || res.handle || id, platform: requestPlatform,
+        platform_handle: res.handle || id, structured_scope: rows,
+        repository_urls: ckRepositoryUrlsFromScope(rows),
+        h1_program_stats: requestPlatform === "hackerone" ? (res.program_stats || {}) : {},
+        notes,
+      };
+      if (requestPlatform === "yeswehack") selected.notes = notes;
+      selected.intake_source = { platform: requestPlatform, provider_id: res.program_id || id,
+        source_url: res.source_url || "", fetched_at: res.fetched_at || "",
+        status: res.status || "unknown", scope_complete: res.scope_complete === true,
+        warnings: res.warnings || [] };
+      preview.append(cel("p", "ck-status", `${selected.name}: ${rows.length} candidate scope row(s). Review exclusions, policy, and authorization before enabling tests.`));
+      if (res.policy_excerpt) preview.append(cel("p", "ck-hint", res.policy_excerpt.slice(0, 1000)));
+      for (const warning of res.warnings || []) preview.append(cel("p", "ck-status is-warn", warning));
+      cont.disabled = false;
+    } catch (err) {
+      if (stillCurrent()) preview.replaceChildren(cel("p", "ck-status is-error", err.message || "Could not preview program."));
+    } finally { if (stillCurrent()) fetch.disabled = false; }
+  });
+  cont.addEventListener("click", () => {
+    if (!selected) return;
+    ckProgEdit = null; ckFlow.prefill = selected; ckFlow.view = "form"; void ckRenderProgram();
   });
   nav.append(cont);
   return box;
@@ -8647,6 +9468,7 @@ function ckYwhPrefill(res, slug) {
     ywh_program_stats: res.program_stats || {},
     user_agent_suffix: res.user_agent_suffix || "",
     notes: res.notes_digest || "",
+    intake_source: ckLegacyIntakeSource("yeswehack", res.slug || slug, res),
   };
 }
 
@@ -8679,12 +9501,12 @@ function ckWizardIdentifyManual(nav) {
 const CK_WIZARD_STEPS = [
   { title: "Welcome to GreyIQ", body: "Authorized testing only — your own assets, an authorized engagement, or a bug-bounty program you're enrolled in. Every active probe is scope-bound and fails closed: a host you don't name in Scope is never touched. This tour walks Program → Hunt → Reports." },
   { title: "Optional: connect a coding brain", body: "GreyIQ's scanners, proofs, and reports all work fully offline with no model. To get sharper reproduction steps, richer write-ups, and the chat/agent features, connect a brain — the built-in local model (a one-time ~1 GB download), or your own Claude or OpenAI API key. Open the AI studio with the “Studio ↗” button in the top bar, then set the model in its Coding brain panel; you can do this any time." },
-  { title: "Add your first program", body: "Start with a public repo link to get an inactive source-only draft, or give the program a name and pull in real scope from HackerOne, CSV/paste, or hand-entered rows. Forge-suggested web hosts stay unticked until you confirm authorization.", view: "program" },
+  { title: "Add your first program", body: "Give the program a name and pull in real scope from HackerOne, CSV/paste, or hand-entered rows. Forge-suggested web hosts stay unticked until you confirm authorization.", view: "program" },
   { title: "Review the scope", body: "Check the structured-scope table — untick “In scope” on anything you don't want probed (that's an exclusion, never an expansion). Click Save program when it looks right.", view: "program" },
   { title: "SSRF/OOB setup (optional)", body: "If the program's policy allows out-of-band/collaborator testing, tick that on its form, then use “Set up SSRF/OOB →” on the program row to land here with scope pre-filled. Skip this step if you don't need it.", view: "idor" },
   { title: "Run your first hunt", body: "Back in the launch rail: pick your program (fills in Target/Scope), tick “I'm authorized to test this target”, and click Run hunt. Start with a Single hunt before a full campaign.", view: "program", focusSelector: "#ckActiveProgram" },
   { title: "Read the results", body: "Findings land here with a proof-status column — Confirmed means GreyIQ actually proved it with a benign probe, not just flagged a pattern. Click any row for the evidence.", view: "findings" },
-  { title: "Generate a report", body: "Confirmed findings show up in Submissions — copy the Markdown, download it, or (once you've saved HackerOne API creds) submit it directly. Nothing is ever auto-filed without you arming it.", view: "submissions" },
+  { title: "Generate a report", body: "Confirmed findings show up in Submissions — review the evidence, copy or download the Markdown, and submit manually if you decide to file it.", view: "submissions" },
 ];
 
 function ckDismissWizard() {
@@ -10591,6 +11413,23 @@ function ckRenderLeadQueue(panel, res) {
         ob.append(document.createTextNode(String(lead.proof_obligation)));
         row.append(ob);
       }
+      // Show the hypothesis and its stopping rule beside the proof obligation.
+      // Confirmed leads already have an observed proof, so these planning fields
+      // belong only on leads that still need validation.
+      if (lead.status !== "confirmed" && (
+        lead.predicted_positive_signal || lead.negative_control || lead.falsifier_stop_condition
+      )) {
+        for (const [label, value] of [
+          ["Expected signal", lead.predicted_positive_signal],
+          ["Negative control", lead.negative_control],
+          ["Stop if", lead.falsifier_stop_condition],
+        ]) {
+          const plan = cel("p", "ck-hint");
+          plan.append(cel("strong", null, `${label}: `));
+          plan.append(document.createTextNode(String(value || "—")));
+          row.append(plan);
+        }
+      }
       for (const gap of (lead.gaps || [])) row.append(cel("p", "ck-hint", `Gap: ${gap}`));
       // A contradiction is the engine saying its own evidence disagrees — never hide it.
       for (const c of (lead.contradictions || [])) {
@@ -11889,7 +12728,7 @@ async function ckRenderOperator() {
   const host = ck.views.operator;
   host.replaceChildren();
   host.append(cel("h2", "ck-section-title", "Autonomous operator"));
-  host.append(cel("p", "ck-hint", "Add the programs you're authorized to hunt, then arm the operator. It runs each program on its schedule — recon, hunt, prove, dedup, report — and (only when you explicitly arm auto-submit per program) files confirmed, non-duplicate findings within a daily cap. The kill switch stops it immediately."));
+  host.append(cel("p", "ck-hint", "Save programs with documented testing permission, then arm each enabled program for a limited period. The operator rechecks scope before each cycle, learns from verified results, and queues findings for your review. You decide whether to submit a report. The kill switch requests an immediate stop."));
   host.append(ckWalkthrough("operator"));
 
   let data = null;
@@ -11898,22 +12737,55 @@ async function ckRenderOperator() {
   }
   if (!data || data.ok === false) { host.append(cel("p", "ck-status is-error", "Local engine not running.")); return; }
 
-  // --- Control bar: start / stop / arm auto-submit ---
+  // --- Control bar: start / stop scheduled review-only work ---
   const ctl = cel("div", "ck-op-ctl");
   const running = Boolean(data.running);
   const statusPill = cel("span", `ck-pill ${running ? "is-armed" : ""}`);
   statusPill.append(cel("span", null, "Operator: "), cel("strong", null, running ? "running" : "stopped"));
   ctl.append(statusPill);
 
-  const armWrap = cel("label", "ck-switch ck-auth");
-  const arm = cel("input"); arm.type = "checkbox"; arm.id = "ckOpArm";
-  armWrap.append(arm, ckArmLabel());
-  ctl.append(armWrap);
-
   if (!running) {
-    const startBtn = cel("button", "ck-btn primary", "Start operator");
+    const enabled = (data.programs || []).filter(p => p.enabled);
+    ckOpGrantInputs = [];
+    if (enabled.length) {
+      const grants = cel("div", "ck-op-arming");
+      grants.append(cel("h3", "ck-section-title", "Arm authorized testing"));
+      grants.append(cel("p", "ck-hint", "For each enabled program, identify the authorization record and current testing policy. Check its scope and restrictions before arming. Each grant allows at most seven scheduled cycles and 200 requests per cycle. Automatic hunts use a local model or the offline fallback."));
+      for (const prog of enabled) {
+        const row = cel("div", "ck-op-grant");
+        row.append(cel("strong", null, prog.name || prog.id));
+        row.append(cel("div", "ck-hint", prog.scope_text || "No saved scope"));
+        const authLabel = cel("label");
+        authLabel.append(cel("span", null, "Authorization record"));
+        const auth = cel("input"); auth.type = "text"; auth.maxLength = 500;
+        auth.placeholder = "Engagement ID or operator approval record";
+        authLabel.append(auth);
+        const policyLabel = cel("label");
+        policyLabel.append(cel("span", null, "Current policy source"));
+        const policy = cel("input"); policy.type = "text"; policy.maxLength = 500;
+        policy.placeholder = "Program policy URL or internal rules reference";
+        policyLabel.append(policy);
+        const checkedLabel = cel("label", "ck-op-attest");
+        const checked = cel("input"); checked.type = "checkbox";
+        checkedLabel.append(checked, document.createTextNode(" I checked this program's current scope and testing restrictions"));
+        row.append(authLabel, policyLabel, checkedLabel);
+        grants.append(row);
+        ckOpGrantInputs.push({ programId: prog.id, auth, policy, checked });
+      }
+      const durationLabel = cel("label");
+      durationLabel.append(cel("span", null, "Authorization window"));
+      const duration = cel("select"); duration.id = "ckOpGrantHours";
+      for (const [hours, label] of [[24, "24 hours"], [168, "7 days"]]) {
+        const option = cel("option", null, label); option.value = String(hours); duration.append(option);
+      }
+      durationLabel.append(duration);
+      grants.append(durationLabel);
+      host.append(grants);
+    }
+    const startBtn = cel("button", "ck-btn primary", "Start authorized testing");
     startBtn.type = "button";
-    startBtn.addEventListener("click", () => ckOperatorStart(arm.checked));
+    startBtn.disabled = enabled.length === 0;
+    startBtn.addEventListener("click", ckOperatorStart);
     ctl.append(startBtn);
   } else {
     const stopBtn = cel("button", "ck-btn", "■ Kill switch — stop");
@@ -11923,6 +12795,16 @@ async function ckRenderOperator() {
     ctl.append(stopBtn);
   }
   host.append(ctl);
+  if (running && Array.isArray(data.grants) && data.grants.length) {
+    const grantStatus = cel("p", "ck-hint");
+    const parts = data.grants.map(grant => {
+      const expires = new Date(grant.expires_at);
+      const deadline = Number.isNaN(expires.getTime()) ? "unknown" : expires.toLocaleString();
+      return `${grant.program_id}: ${grant.cycles_used}/${grant.max_cycles} cycles, expires ${deadline}`;
+    });
+    grantStatus.textContent = `Armed: ${parts.join(" · ")}`;
+    host.append(grantStatus);
+  }
 
   // --- Money pipeline funnel ---
   const pf = (data.funnel && data.funnel.portfolio) || { stages: {}, total: 0, bounty_total: 0 };
@@ -11985,24 +12867,34 @@ async function ckRenderOperator() {
   host.append(ckProgramForm());
 }
 
-function ckArmLabel() {
-  const span = cel("span");
-  span.append(cel("strong", null, "Arm auto-submit"));
-  span.append(document.createTextNode(" — file confirmed, non-duplicate findings to HackerOne automatically (per-program opt-in + daily cap still apply). Off = review-only."));
-  return span;
-}
-
 // Guards against a double Start (two /operator/start calls) and a Start racing a Stop —
-// important because the operator can auto-submit to live bounty programs.
+// important because the scheduled work can make authorized test requests.
 let ckOperatorBusy = false;
+let ckOpGrantInputs = [];
 
-async function ckOperatorStart(allowSubmit) {
+async function ckOperatorStart() {
   if (ckOperatorBusy) return;
-  if (allowSubmit && !window.confirm("ARM AUTO-SUBMIT?\n\nThe operator will FILE confirmed findings to your HackerOne programs automatically (only programs you set auto-submit on, only confirmed + non-duplicate findings, within each program's daily cap). Only do this for authorized, in-scope programs.")) return;
-  if (!window.confirm("Start the operator on your portfolio? You confirm you are AUTHORIZED to test every enabled program's scope.")) return;
+  if (!ckOpGrantInputs.length) { window.alert("Enable and save at least one program first."); return; }
+  const now = new Date();
+  const durationHours = Number(document.querySelector("#ckOpGrantHours")?.value || 24);
+  const expiresAt = new Date(now.getTime() + durationHours * 3600000).toISOString();
+  const grants = [];
+  for (const entry of ckOpGrantInputs) {
+    const authorizationRef = entry.auth.value.trim();
+    const policySource = entry.policy.value.trim();
+    if (!authorizationRef || !policySource || !entry.checked.checked) {
+      window.alert("Enter the authorization record and current policy source, then check the scope and restrictions for every enabled program.");
+      return;
+    }
+    grants.push({ program_id: entry.programId, authorization_ref: authorizationRef,
+      policy_source: policySource, policy_checked_at: now.toISOString(), expires_at: expiresAt,
+      max_cycles: 7 });
+  }
+  if (!window.confirm(`Start review-only testing for ${grants.length} program(s) until ${expiresAt}? Findings remain for your review; the app will not submit them.`)) return;
   ckOperatorBusy = true;
   try {
-    await apiFetch("/api/operator/start", { method: "POST", body: JSON.stringify({ authorized: true, allow_submit: Boolean(allowSubmit) }) });
+    const res = await apiFetch("/api/operator/start", { method: "POST", body: JSON.stringify({ authorized: true, allow_submit: false, grants }) });
+    if (!res?.ok) throw new Error(res?.error || "The operator did not start.");
     void ckRenderOperator();
   } catch (err) { window.alert(err.message || "Could not start."); }
   finally { ckOperatorBusy = false; }
@@ -12011,8 +12903,7 @@ async function ckOperatorStart(allowSubmit) {
 async function ckOperatorStop() {
   if (ckOperatorBusy) return;
   ckOperatorBusy = true;
-  // A failed Stop must NOT be silent — an operator that thinks it stopped (but is still
-  // auto-submitting) is the worst outcome here.
+  // A failed Stop must not be silent: authorized testing may still be running.
   try { await apiFetch("/api/operator/stop", { method: "POST", body: JSON.stringify({}) }); }
   catch (err) { window.alert((err.message || "Could not reach the engine") + "\n\nAutomation may still be running — reopen Automation to check its status."); }
   finally { ckOperatorBusy = false; setTimeout(() => void ckRenderOperator(), 400); }
@@ -12027,13 +12918,6 @@ async function ckOperatorPollEvents() {
     const row = cel("div", "ck-op-event");
     row.append(cel("span", "ck-op-time", (ev.at || "").slice(11, 19)), cel("span", null, ev.message || ""));
     log.append(row);
-    // "submitted <pid>: <title> -> <url>" (operator.py's own _emit prefix) is the
-    // single most important background event in the app -- a confirmed finding was
-    // just auto-filed to a live bounty program while nobody was necessarily watching.
-    if (String(ev.message || "").startsWith("submitted ") && document.hidden) {
-      ckBumpTitleBadge(1);
-      void ckNotify("GreyIQ — finding submitted", ev.message);
-    }
   }
   if (res.events && res.events.length) { ckOpEventCount = res.count || (ckOpEventCount + res.events.length); log.scrollTop = log.scrollHeight; }
   if (!log.childNodes.length) log.append(cel("p", "ck-hint", "No activity yet. Start the operator to see live progress."));
@@ -12043,7 +12927,6 @@ function ckProgramRow(prog, funnel) {
   const li = cel("li"); li.style.flexWrap = "wrap";
   const left = cel("div"); left.style.flex = "1";
   left.append(cel("span", "ck-ftitle", prog.name || prog.id));
-  if (prog.auto_submit) left.append(document.createTextNode(" "), cel("span", "ck-tag", "auto-submit"));
   if (!prog.enabled) left.append(document.createTextNode(" "), cel("span", "ck-tag", "disabled"));
   const fp = (funnel && funnel.programs && funnel.programs[prog.id]) || null;
   const meta = `${prog.scope_text || "(no scope)"} · ${ckEstimateSpanTargets(prog).length} target(s)` + (fp ? ` · ${fp.stages.submitted || 0} submitted · $${fp.bounty_total || 0}` : "");
@@ -12066,7 +12949,7 @@ function ckProgramRow(prog, funnel) {
   toggle.type = "button";
   toggle.addEventListener("click", async () => {
     try {
-      await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify({ id: prog.id, name: prog.name, scope_text: prog.scope_text, seed_targets: prog.seed_targets, active: prog.active, live: prog.live, auto_submit: prog.auto_submit, platform: prog.platform, platform_handle: prog.platform_handle, interval_minutes: prog.interval_minutes, max_submits_per_day: prog.max_submits_per_day, max_pages: prog.max_pages, enabled: !prog.enabled }) });
+      await apiFetch("/api/operator/programs", { method: "POST", body: JSON.stringify({ id: prog.id, name: prog.name, seed_targets: prog.seed_targets, active: prog.active, live: prog.live, auto_submit: false, platform: prog.platform, platform_handle: prog.platform_handle, interval_minutes: prog.interval_minutes, max_submits_per_day: prog.max_submits_per_day, max_pages: prog.max_pages, enabled: !prog.enabled }) });
       await ckRefreshProgramsEverywhere();
       void ckRenderOperator();
     } catch (err) { window.alert(err.message || "Could not update the program — the engine may be unreachable, so the change may not have applied."); }
@@ -12091,16 +12974,17 @@ function ckProgramForm() {
   form.append(cel("p", "ck-hint ck-crosslink",
     "Structured scope, platform, account access, IDOR pairs, and OOB are edited in the Program tab’s setup form. This editor owns the run schedule and automation toggles below; the scope field here is a plain-text gate."));
   const name = ckField("Program name", "text", editing ? (editing.name || "") : "");
-  const scope = ckField("Scope (hosts/wildcards — the active gate)", "text", editing ? (editing.scope_text || "") : "");
+  const scope = ckTextareaField("Scope (hosts/wildcards — the active gate)", "");
+  scope.input.value = editing ? String(editing.scope_text ?? "") : "";
+  scope.input.rows = 3;
   const targets = ckField("Seed targets (comma/space separated URLs)", "text", editing ? (editing.seed_targets || []).join(", ") : "");
   const repositories = ckTextareaField("Program source repositories (public HTTPS roots, one per line)", "");
   repositories.input.value = editing ? (editing.repository_urls || []).join("\n") : "";
   repositories.input.rows = 3;
   repositories.input.placeholder = "https://github.com/program/repository";
-  const handle = ckField("Program handle — HackerOne team handle (auto-submit) or HackenProof slug", "text", editing ? (editing.platform_handle || "") : "");
+  const handle = ckField("Program handle — platform team handle or slug", "text", editing ? (editing.platform_handle || "") : "");
   const interval = ckField("Re-run every (minutes)", "number", editing ? String(editing.interval_minutes || 1440) : "1440");
-  const cap = ckField("Max auto-submits / day", "number", editing ? String(editing.max_submits_per_day ?? 3) : "3");
-  form.append(name.wrap, scope.wrap, targets.wrap, repositories.wrap, handle.wrap, interval.wrap, cap.wrap);
+  form.append(name.wrap, scope.wrap, targets.wrap, repositories.wrap, handle.wrap, interval.wrap);
   form.append(ckTargetImport(targets, scope));
 
   const toggles = cel("div", "ck-toggles");
@@ -12108,8 +12992,7 @@ function ckProgramForm() {
   const active = ckToggle("Capture proof of impact (active)", editing ? !!editing.active : true);
   const live = ckToggle("Dynamic Playwright pass", editing ? !!editing.live : false);
   const deep = ckToggle("Deep auto-work (time-based SQLi + screenshot + research per confirmed lead)", editing ? !!editing.deep : false);
-  const auto = ckToggle("Auto-submit confirmed findings (per-program opt-in)", editing ? !!editing.auto_submit : false);
-  toggles.append(cloneRepositories.wrap, active.wrap, live.wrap, deep.wrap, auto.wrap);
+  toggles.append(cloneRepositories.wrap, active.wrap, live.wrap, deep.wrap);
   form.append(toggles);
 
   const submit = cel("button", "ck-btn primary", editing ? "Update program" : "Save program");
@@ -12124,7 +13007,10 @@ function ckProgramForm() {
   const note = cel("p", "ck-status");
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
-    if (!name.input.value.trim() || !scope.input.value.trim()) { note.textContent = "Name and scope are required."; note.classList.add("is-error"); return; }
+    if (!name.input.value.trim() || (!editing && !scope.input.value.trim())) {
+      note.textContent = editing ? "Name is required." : "Name and scope are required.";
+      note.classList.add("is-error"); return;
+    }
     const seeds = targets.input.value.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
     const repositoryUrls = ckParseRepositoryUrls(repositories.input.value);
     if (cloneRepositories.input.checked && repositories.input.value.trim() && !repositoryUrls.length) {
@@ -12133,7 +13019,7 @@ function ckProgramForm() {
       return;
     }
     const payload = {
-      name: name.input.value.trim(), scope_text: scope.input.value.trim(), seed_targets: seeds,
+      name: name.input.value.trim(), seed_targets: seeds,
       repository_urls: repositoryUrls, clone_repositories: cloneRepositories.input.checked,
       // Preserve an existing platform tag (e.g. HackenProof, set in the Program tab) instead of
       // re-deriving it from the handle — this compact Operator editor has no platform picker, and
@@ -12141,9 +13027,15 @@ function ckProgramForm() {
       platform: editing ? (editing.platform || (handle.input.value.trim() ? "hackerone" : "manual"))
                         : (handle.input.value.trim() ? "hackerone" : "manual"),
       platform_handle: handle.input.value.trim(),
-      active: active.input.checked, live: live.input.checked, deep: deep.input.checked, auto_submit: auto.input.checked,
-      interval_minutes: Number(interval.input.value) || 1440, max_submits_per_day: Number(cap.input.value) || 3
+      active: active.input.checked, live: live.input.checked, deep: deep.input.checked, auto_submit: false,
+      interval_minutes: Number(interval.input.value) || 1440,
+      max_submits_per_day: editing ? Number(editing.max_submits_per_day ?? 3) : 3
     };
+    // A schedule-only edit must not reclassify an auto-derived scope as hand-entered.
+    // Send the literal field only when it was entered or changed in this editor.
+    if (!editing || scope.input.value !== String(editing.scope_text ?? "")) {
+      payload.scope_text = scope.input.value;
+    }
     if (editing) {
       // Update the existing record: carry its id + the fields the form doesn't expose so
       // they're preserved (enabled state, recon depth) rather than reset to defaults.
@@ -12317,7 +13209,8 @@ async function ckRunPortfolio() {
   state.ckTimeBased = Boolean(ck.timeBased?.checked);
   state.ckDeep = Boolean(ck.deep?.checked);
   state.ckAttackMap = ck.attackMap ? Boolean(ck.attackMap.checked) : true;  // graphical attack-plan map (default on)
-  state.ckLive = Boolean(ck.live?.checked);
+  state.ckLive = Boolean(ck.live?.checked && !ck.live.disabled);
+  const externalMcpHunt = Boolean(ck.externalMcpHunt?.checked);
   saveState();
   ck.run.disabled = true;
   ckStatus(`Portfolio hunt running — campaigns across ${ids.length} program(s), several at once (this can take a while)…`);
@@ -12333,6 +13226,7 @@ async function ckRunPortfolio() {
       body: JSON.stringify({
         program_ids: ids, authorized: true, active: state.ckActive, time_based: state.ckTimeBased,
         deep: state.ckDeep, attack_map: state.ckAttackMap, live: state.ckLive, max_pages: Number(ck.maxPages?.value) || 12,
+        external_mcp_hunt: externalMcpHunt,
         run_id: progressRunId,
       }),
     });
@@ -12357,6 +13251,7 @@ async function ckRunPortfolio() {
     ckStatus(err.message || "The portfolio hunt failed.", true);
   } finally {
     ck.run.disabled = false;
+    if (ck.externalMcpHunt) ck.externalMcpHunt.checked = false;
     void ckFinishCampaignDashboard();
   }
 }
@@ -12368,6 +13263,7 @@ async function ckRun() {
   const target = (ck.target?.value || "").trim();
   const repositoryHunt = !spanning && ckIsCloneableGitUrl(target);
   if (!spanning && !target) { ckStatus("Enter a target URL or folder/repo path.", true); return; }
+  if (repositoryHunt) { ckStatus("Remote Git scanning is unavailable. Scan an operator-supplied local clone instead.", true); return; }
   if (!ck.authorized?.checked) { ckStatus("Confirm you are authorized to test " + (spanning ? "this program's scope" : "this target") + " (tick the box).", true); return; }
   if (!(service.available || (await refreshServiceStatus({ silent: true })))) { ckStatus("Local GreyIQ engine is not running.", true); return; }
   state.ckTarget = target;
@@ -12377,47 +13273,19 @@ async function ckRun() {
   state.ckTimeBased = Boolean(ck.timeBased?.checked);
   state.ckDeep = Boolean(ck.deep?.checked);
   state.ckAttackMap = ck.attackMap ? Boolean(ck.attackMap.checked) : true;  // graphical attack-plan map (default on)
-  state.ckLive = Boolean(ck.live?.checked);
+  state.ckLive = Boolean(ck.live?.checked && !ck.live.disabled);
+  const externalMcpHunt = Boolean(ck.externalMcpHunt?.checked);
   state.ckAuthCookie = (ck.authCookie?.value || "").trim();
   state.ckAuthHeaders = (ck.authHeaders?.value || "");
   // NOT trimmed: a program dictates the exact tag including its own leading/trailing spaces, and the
   // backend appends it verbatim — trimming here would silently send a different UA than required.
   state.ckUaSuffix = (ck.uaSuffix?.value || "");
-  // A repository root must use a profile that accepts Git targets. If the selected
-  // profile is web-only, switch to the full source audit automatically; profiles
-  // such as Full sweep and Secrets already accept Git and are preserved.
-  if (!isCampaign && repositoryHunt && ck.profile) {
-    const selectedKinds = String(ck.profile.selectedOptions[0]?.dataset.kinds || "").split(",").filter(Boolean);
-    if (!selectedKinds.includes("git") && [...ck.profile.options].some((option) => option.value === "source-code")) {
-      ck.profile.value = "source-code";
-      ckUpdateProfileHint();
-    }
-  }
   state.bountyProfile = ck.profile?.value || state.bountyProfile;
   saveState();
   const authHeaderLines = state.ckAuthHeaders.split("\n").map((s) => s.trim()).filter(Boolean);
-  // Preflight a repository target BEFORE committing to a hunt: catch a typo'd/private/missing
-  // repo here with an actionable message, instead of failing deep in the clone mid-run. Best-effort
-  // — a preflight that can't run (engine hiccup) never blocks a hunt the operator asked for.
-  if (repositoryHunt) {
-    ck.run.disabled = true;
-    ckStatus("Checking the repository is reachable…");
-    try {
-      const pf = await apiFetch("/api/repos/preflight", { method: "POST", timeoutMs: 20000, body: JSON.stringify({ url: target }) });
-      // Only a DEFINITIVE "can't clone this" verdict blocks the launch (bad URL shape, not found,
-      // private). Indeterminate/transient outcomes (timeout, unreachable, no git, error) are
-      // best-effort: the real depth-1 clone (120s) is the authoritative attempt and its own
-      // preflight budget is only 12s — so never refuse a hunt the operator asked for over one.
-      if (pf && pf.ok === false && ["invalid", "not_found", "private"].includes(pf.status)) {
-        ckStatus(pf.message || "That repository isn't reachable.", true); ck.run.disabled = false; return;
-      }
-    } catch (_) { /* preflight unavailable — fall through and let the hunt try */ }
-    ck.run.disabled = false;
-  }
   ck.run.disabled = true;
   ckStatus(
     spanning ? "Campaign running — hunting every target in this program's scope (this can take a while for a large program)…"
-      : repositoryHunt ? "Repository hunt running — shallow-cloning the authorized repo, adversarially scanning the codebase, then running hunt-brain red-team triage and reports…"
       : isCampaign ? "Campaign running — mapping the surface, hunting each URL (this can take a few minutes)…"
       : "Hunting — running scanners and proving findings…"
   );
@@ -12448,6 +13316,7 @@ async function ckRun() {
           active_program_id: state.ckActiveProgramId || null,
           active: state.ckActive, time_based: state.ckTimeBased, live: state.ckLive, deep: state.ckDeep,
           attack_map: state.ckAttackMap,
+          external_mcp_hunt: externalMcpHunt,
           max_pages: Number(ck.maxPages?.value) || 12,
           auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines,
           user_agent_suffix: state.ckUaSuffix, run_id: progressRunId
@@ -12459,6 +13328,7 @@ async function ckRun() {
         body: JSON.stringify({
           target, profile: state.bountyProfile, vuln_class: (ck.klass?.value || null) || null,
           scope: state.ckScope, authorized: true, active: state.ckActive, time_based: state.ckTimeBased, run_live: state.ckLive,
+          external_mcp_hunt: externalMcpHunt,
           auth_cookie: state.ckAuthCookie, auth_headers: authHeaderLines,
           user_agent_suffix: state.ckUaSuffix, run_id: progressRunId
         })
@@ -12493,6 +13363,7 @@ async function ckRun() {
     ckStatus(err.message || "The run failed.", true);
   } finally {
     ck.run.disabled = false;
+    if (ck.externalMcpHunt) ck.externalMcpHunt.checked = false;
     void ckFinishCampaignDashboard();  // stop polling, mark done, final render
   }
 }
@@ -13160,10 +14031,8 @@ async function ckDrawerReport(f) {
   else setState({ state: "error", error: (res && res.error) || "Report could not be built." });
 }
 
-// --- Completion alerts: a hunt/campaign can run for minutes, and the autonomous
-// operator auto-submitting a confirmed bounty is arguably the most important event
-// in the app -- both need to reach an operator who has tabbed away, not just whoever
-// happens to be staring at the launch rail when it finishes. Two independent,
+// --- Completion alerts: a hunt/campaign can run for minutes, so results should
+// reach an operator who has tabbed away. Two independent,
 // stacking signals: a tab-title badge (works everywhere, zero permissions) and a
 // native OS notification (louder, but needs a one-time permission grant). Both are
 // gated on document.hidden so a focused, watching operator never gets spammed with
@@ -13298,8 +14167,10 @@ function bootCockpit() {
   if (ck.active) ck.active.checked = Boolean(state.ckActive);
   if (ck.timeBased) ck.timeBased.checked = Boolean(state.ckTimeBased);
   if (ck.deep) ck.deep.checked = Boolean(state.ckDeep);
+  if (ck.externalMcpHunt) ck.externalMcpHunt.checked = false;
   if (ck.attackMap) ck.attackMap.checked = state.ckAttackMap !== false;  // default on
-  if (ck.live) ck.live.checked = Boolean(state.ckLive);
+  if (ck.live) { ck.live.checked = false; ck.live.disabled = true; }
+  state.ckLive = false;
   if (ck.spanScope) ck.spanScope.checked = Boolean(state.ckSpanScope);
   if (ck.authCookie) ck.authCookie.value = state.ckAuthCookie || "";
   if (ck.authHeaders) ck.authHeaders.value = state.ckAuthHeaders || "";
@@ -13327,6 +14198,7 @@ function bootCockpit() {
 
 async function boot() {
   applyTheme();
+  if (els.bountyExternalMcp) els.bountyExternalMcp.checked = false;
   backend = new AccelerationBackend();
   await backend.setMode(state.backendPreference || "cpu");
 

@@ -24,6 +24,7 @@ import re
 from typing import Any, Callable
 from urllib.parse import quote, urljoin, urlparse
 
+from bughunter.json_safety import exceeds_json_depth
 from bughunter import impact_model
 
 try:  # YAML specs are common (/openapi.yaml). Best-effort: if the parser isn't in this
@@ -79,6 +80,8 @@ def parse_spec_body(body: str, is_yaml_hint: bool = False) -> Any:
     """Parse a spec body as JSON, falling back to YAML (if PyYAML is present). Returns the
     decoded object or ``None``. Pure; never raises."""
     text = body or ""
+    if exceeds_json_depth(text):
+        return None
     s = text.lstrip()
     if not is_yaml_hint and (s.startswith("{") or s.startswith("[")):
         try:

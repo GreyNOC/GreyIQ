@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
@@ -106,13 +107,16 @@ class HuntBrainTests(unittest.TestCase):
         self.assertTrue(plan["used"])                 # the call happened
         self.assertEqual(plan["param_hypotheses"], [])  # but nothing usable -> empty, no crash
 
-    def test_coder_error_is_fail_closed(self) -> None:
+    def test_coder_error_uses_scope_safe_offline_plan(self) -> None:
         def boom(messages, cfg):
             raise coder.CoderError("brain offline")
         coder.generate = boom
         plan = hunt_brain.plan_hunt({}, "https://app.example.com/", "app.example.com", SURFACE)
-        self.assertFalse(plan["used"])
-        self.assertEqual(plan["param_hypotheses"], [])
+        self.assertEqual(plan["provider"], "offline")
+        self.assertTrue(plan["used"])
+        self.assertTrue(plan["probe_priority"])
+        for row in plan["probe_priority"]:
+            self.assertIn(row["endpoint"], SURFACE["endpoints"])
 
     def test_hijacked_nonlist_fields_are_fail_closed(self) -> None:
         # vet finding: a hijacked page could make the model return well-formed JSON whose fields are
@@ -341,6 +345,31 @@ class ReasoningBrainGateTests(unittest.TestCase):
                     {"enabled": True, "provider": "off"}, {"enabled": True, "provider": "none"},
                     {"enabled": True, "provider": "disabled"}, {"enabled": True, "provider": ""}):
             self.assertFalse(coder.reasoning_brain_enabled(cfg), cfg)
+
+
+class HuggingFaceHuntIntegrationTests(unittest.TestCase):
+    def test_selected_gguf_drives_the_hunt_planner_through_ollama(self) -> None:
+        model = "hf.co/acme/Code-GGUF:Q4_K_M"
+        cfg = coder.merge_update(None, {"enabled": True, "provider": "local", "local": {"model": model}})
+        answer = {"content": '{"param_hypotheses": ["returnUrl"], "probe_priority": []}'}
+        with patch.object(coder, "ollama_chat", return_value=answer) as chat:
+            plan = hunt_brain.plan_hunt(cfg, "https://app.example.com/", "app.example.com", SURFACE)
+        self.assertEqual(chat.call_count, 1)
+        self.assertEqual(chat.call_args.args[1], model)
+        self.assertEqual(plan["provider"], "local")
+        self.assertEqual(plan["model"], model)
+        self.assertIn("returnUrl", plan["param_hypotheses"])
+
+    def test_unavailable_local_model_uses_bounded_offline_plan(self) -> None:
+        model = "hf.co/acme/Code-GGUF:Q4_K_M"
+        cfg = coder.merge_update(None, {"enabled": True, "provider": "local", "local": {"model": model}})
+        baseline = hunt_brain.plan_hunt({"enabled": False}, "https://app.example.com/", "app.example.com", SURFACE)
+        with patch.object(coder, "ollama_chat", side_effect=coder.CoderError("Ollama offline")):
+            plan = hunt_brain.plan_hunt(cfg, "https://app.example.com/", "app.example.com", SURFACE)
+        self.assertEqual(plan["provider"], "offline")
+        self.assertEqual(plan["probe_priority"], baseline["probe_priority"])
+        for row in plan["probe_priority"]:
+            self.assertIn(row["endpoint"], SURFACE["endpoints"])
 
 
 class DeterministicVeteranPlannerTests(unittest.TestCase):

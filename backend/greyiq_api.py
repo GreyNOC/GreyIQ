@@ -42,7 +42,23 @@ else:
     PROJECT_ROOT = BACKEND_DIR.parent
     PUBLIC_DIR = PROJECT_ROOT / "public"
     SEED_DIR = BACKEND_DIR / "seed"
-RUNTIME_DIR = Path(os.getenv("GREYIQ_RUNTIME_DIR", PROJECT_ROOT / "runtime")).resolve()
+
+
+def _resolve_runtime_dir(project_root: Path) -> Path:
+    """Keep frozen Linux API data outside the read-only application bundle."""
+    explicit = os.getenv("GREYIQ_RUNTIME_DIR")
+    if explicit is not None:
+        return Path(explicit).resolve()
+    if getattr(sys, "frozen", False) and sys.platform == "linux":
+        xdg_home = os.getenv("XDG_DATA_HOME")
+        data_home = Path(xdg_home) if xdg_home else Path.home() / ".local" / "share"
+        if not data_home.is_absolute():
+            data_home = Path.home() / ".local" / "share"
+        return (data_home / "greyiq" / "runtime").resolve()
+    return (project_root / "runtime").resolve()
+
+
+RUNTIME_DIR = _resolve_runtime_dir(PROJECT_ROOT)
 # One rollback snapshot per workspace (the last agent run), keyed by a hash of the
 # resolved workspace path. Powers "Undo last agent run".
 SNAPSHOT_DIR = RUNTIME_DIR / "agent_snapshots"
@@ -88,6 +104,9 @@ SESSION_TOKEN_PATH = RUNTIME_DIR / "session.token"
 # else is served, closing the gap where SESSION_TOKEN could be harvested
 # without ever presenting a real credential.
 GREYIQ_ACCESS_KEY = os.getenv("GREYIQ_ACCESS_KEY", "").strip()
+# Electron and the backend share this per-launch secret only through the backend
+# process environment. It never reaches the renderer or the public health route.
+INTERNAL_MODEL_STORE_TOKEN = os.getenv("GREYIQ_INTERNAL_MODEL_STORE_TOKEN", "")
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 
@@ -271,7 +290,9 @@ if str(BACKEND_DIR) not in sys.path:
 import agent as coding_agent  # noqa: E402
 import brain_profiles  # noqa: E402
 import brain_techniques  # noqa: E402
+import coding_learning_bridge  # noqa: E402
 import coder  # noqa: E402
+import hf_gguf_import  # noqa: E402
 import project_memory  # noqa: E402
 import workspace as workspace_fs  # noqa: E402
 from ai_core.core_store import AICoreStore, DEFAULT_CORE_ID, slugify  # noqa: E402
@@ -366,6 +387,9 @@ from bughunter.live_scan_service import run_live_scan  # noqa: E402
 from bughunter.triage import triage  # noqa: E402
 from bughunter.chat_commands import (  # noqa: E402
     detect_scan_command,
+    dispatch_authorized_scan_command,
+    parse_active_chat_command,
+    validate_scoped_network_target,
     detect_wardrive_command,
     run_scan,
     run_wardrive,
@@ -377,6 +401,7 @@ from bughunter.chat_commands import (  # noqa: E402
 # install and fallback_reply()'s single canned sentence. Safe to import at boot — it pulls
 # nothing heavier than re/difflib/math/pathlib.
 import solin_domain  # noqa: E402
+from mcp_servers import MCPServerManager  # noqa: E402
 from bughunter.bounty import list_profiles as bounty_profiles, run_bounty_hunt, vuln_class_names, _deterministic_attack_plan, cwe_for_class, owasp_for_class, build_replay_script as bounty_build_replay, build_findings_har as bounty_build_har  # noqa: E402
 from bughunter import campaign as bounty_campaign  # noqa: E402
 from bughunter import learning as bounty_learning  # noqa: E402
@@ -400,10 +425,12 @@ from bughunter import secret_classification as bounty_secret_class  # noqa: E402
 from bughunter import hackerone_import as bounty_h1_import  # noqa: E402
 from bughunter import hackerone_activity as bounty_h1_activity  # noqa: E402
 from bughunter import yeswehack_import as bounty_ywh_import  # noqa: E402
+from bughunter import platform_programs as bounty_platform_programs  # noqa: E402
 from bughunter import forge_metadata as bounty_forge_metadata  # noqa: E402
 from bughunter import taxonomy as bounty_taxonomy  # noqa: E402
 from bughunter import fsutil as bounty_fsutil  # noqa: E402
 from bughunter import progress as bounty_progress  # noqa: E402
+from bughunter import operator_guard as bounty_operator_guard  # noqa: E402
 from bughunter.operator import OperatorLoop  # noqa: E402
 from bughunter import toolkit as toolkit_lib  # noqa: E402
 from bughunter.agent_redteam import run_redteam as run_agent_redteam  # noqa: E402
@@ -448,6 +475,7 @@ SEED_FILES = (
 )
 SEED_DATA_FILES = (
     "greyiq_starter_knowledge.txt",
+    "greyiq_coding_knowledge.txt",
     "greyiq_bug_bounty_knowledge.txt",
     # Native-text extract of the Manual_pdfs library, bundled so the local model
     # trains on it on first run (copied into RUNTIME_DIR/data by ensure_runtime).
@@ -658,9 +686,16 @@ class HuggingFaceImportRequest(BaseModel):
     reference: str = Field(min_length=1, max_length=300)
 
 
+class ModelSetupRequest(BaseModel):
+    model: str = Field(min_length=1, max_length=350)
+    base_url: str = Field(default="", max_length=400)
+
+
 class ScanCodeRequest(BaseModel):
     target: str = Field(min_length=1, max_length=4000)
     target_type: str = Field(default="path", max_length=20)
+    authorized: bool = False
+    scope_repository: str = Field(default="", max_length=2048)
     max_files: int = Field(default=5000, ge=1, le=100_000)
     include_globs: list[str] = Field(default_factory=list)
     exclude_globs: list[str] = Field(default_factory=list)
@@ -668,11 +703,15 @@ class ScanCodeRequest(BaseModel):
 
 class WebScanRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
+    authorized: bool = False
+    scope_host: str = Field(default="", max_length=253)
 
 
 class LiveScanRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
     wait_seconds: float = Field(default=6.0, ge=0.0, le=30.0)
+    authorized: bool = False
+    scope_host: str = Field(default="", max_length=253)
 
 
 class BountyScanRequest(BaseModel):
@@ -684,6 +723,7 @@ class BountyScanRequest(BaseModel):
     authorized: bool = False
     run_live: bool = False
     active: bool = False
+    external_mcp_hunt: bool = False  # separate opt-in for approved evidence-only MCP tools
     time_based: bool = False
     auth_cookie: str = Field(default="", max_length=8000)
     auth_headers: list[str] = Field(default_factory=list, max_length=20)
@@ -704,6 +744,7 @@ class CampaignRequest(BaseModel):
     program_id: str | None = Field(default=None, max_length=120)  # "span this program's whole scope" mode
     active_program_id: str | None = Field(default=None, max_length=120)  # the saved program bound to a single-target (non-span) cockpit run — used ONLY to look up that program's policy/scope/creds; does NOT trigger span mode (that's program_id)
     active: bool = False
+    external_mcp_hunt: bool = False
     time_based: bool = False
     auth_cookie: str = Field(default="", max_length=8000)
     auth_headers: list[str] = Field(default_factory=list, max_length=20)
@@ -755,6 +796,7 @@ class PortfolioRequest(BaseModel):
     all_programs: bool = False   # run every saved program (ignores program_ids)
     authorized: bool = False
     active: bool = False
+    external_mcp_hunt: bool = False
     time_based: bool = False
     deep: bool = False           # GPU-brain deep AI write-ups + screenshots + research per confirmed lead
     attack_map: bool = True      # render a graphical attack-plan map (.png) per confirmed finding
@@ -780,6 +822,10 @@ class ReverifyRequest(BaseModel):
     # how consistently each finding confirmed (a flaky WAF/timing false-positive won't confirm
     # every pass). 1 = the classic single probe. Capped server-side so it can't fan out.
     stability_passes: int = Field(default=1, ge=1, le=3)
+
+
+class ActiveChatStatusRequest(BaseModel):
+    run_id: str = Field(min_length=1, max_length=80)
 
 
 class ProveRequest(BaseModel):
@@ -1144,13 +1190,15 @@ class ProgramUpsertRequest(BaseModel):
     disclose_automation: bool = False  # this program's terms require disclosing automated-tool assistance in submitted reports
     h1_program_stats: dict[str, Any] = Field(default_factory=dict)  # real signals from HackerOne's program resource (offers_bounties, fast_payments, etc.)
     ywh_program_stats: dict[str, Any] = Field(default_factory=dict)  # the same for YesWeHack (reward range, VPN/IP constraints, the required UA marker) — see yeswehack_import.fetch_program_scope
+    intake_source: dict[str, Any] = Field(default_factory=dict)  # API provenance only; never grants testing authority
     notes: str = Field(default="", max_length=4000)
     account_access: dict[str, Any] = Field(default_factory=dict)  # research-account email/password/login_url/cookie — SENSITIVE (portfolio._clean_account_access bounds it; password/cookie redacted on read-back)
     admin_account_access: dict[str, Any] = Field(default_factory=dict)  # SECOND (high-privilege) research account for dual-account BFLA — same shape+redaction as account_access; the low-priv account_access is the "user" session
     idor_pairs: list[dict[str, Any]] = Field(default_factory=list, max_length=50)  # operator-supplied cross-tenant IDOR test pairs [{url_a, url_b, label}] — object URLs only, no secrets (portfolio._clean_idor_pairs bounds/dedups/caps)
     policy_profile: str = Field(default="", max_length=40)  # OPTIONAL VDP profile id (e.g. "nasa") binding this program to a program's rules of engagement (scope + excluded endpoints/classes + confirmed-only + no-DoS); validated in portfolio._normalize against bughunter.vdp_policy
     user_agent_suffix: str = Field(default="", max_length=120)    # a mandatory UA tag some programs require appended to every in-scope request
-    resync_scope: bool = False  # re-derive scope_text/hosts from Program-form structured/repository scope even if scope_text is already set
+    resync_scope: bool = False  # refresh derived scope/hosts from Program-form rows; preserve explicitly entered scope_text
+    remove_out_of_scope_hosts: list[str] = Field(default_factory=list, max_length=500)  # transient: explicit operator removal only; a re-fetch never clears prior exclusions
     active: bool = False
     live: bool = False
     deep: bool = False
@@ -1284,9 +1332,27 @@ class YesWeHackProgramsRequest(BaseModel):
     query: str = Field(default="", max_length=120)
 
 
+class PlatformCredentialRequest(BaseModel):
+    platform: str = Field(min_length=1, max_length=20)
+    credential: str = Field(default="", max_length=2000)
+    clear_token: bool = False
+
+
+class PlatformProgramsRequest(BaseModel):
+    platform: str = Field(min_length=1, max_length=20)
+    query: str = Field(default="", max_length=120)
+    limit: int = Field(default=100, ge=1, le=100)
+
+
+class PlatformPreviewRequest(BaseModel):
+    platform: str = Field(min_length=1, max_length=20)
+    program_id: str = Field(min_length=1, max_length=200)
+
+
 class OperatorStartRequest(BaseModel):
     authorized: bool = False
-    allow_submit: bool = False  # ARM auto-submit (still per-program opt-in + confirmed-only + dedup'd)
+    allow_submit: bool = False  # legacy clients: explicitly refused by operator_start
+    grants: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
 
 
 class OperatorEventsRequest(BaseModel):
@@ -1448,6 +1514,8 @@ def _names_concrete_target(message: str) -> bool:
 class GreyIQRuntime:
     def __init__(self) -> None:
         self.lock = threading.RLock()
+        self._active_chat_runs: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        self._active_chat_running_id = ""
         # One agent run at a time per resolved workspace: concurrent runs race on the same files and
         # clobber each other's single per-workspace rollback snapshot. Keyed by resolved path; the
         # dict itself is guarded by self.lock, each value is held for a run's duration.
@@ -1459,6 +1527,7 @@ class GreyIQRuntime:
             "active": False, "model": "", "status": "", "percent": 0,
             "completed": 0, "total": 0, "done": False, "error": "",
         }
+        self.managed_ollama_models_dir: Path | None = None
         # Live agent runs, keyed by request_id: each holds a growing event list the
         # UI polls (start_agent_run / agent_run_events) so a run streams instead of
         # blocking on one big response.
@@ -1468,11 +1537,11 @@ class GreyIQRuntime:
         # In-memory only (drop-oldest); the on-disk report/JSON sidecar is the durable
         # copy. Lets the cockpit fetch a canonical build_submission package per finding.
         self.bounty_runs: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
-        # The autonomous operator loop (lazy — created on first start so its callables
-        # bind to this runtime's hard-gated run_campaign + submit_finding).
+        # The portfolio hunt scheduler (lazy — created on first start).
         self._operator: "OperatorLoop | None" = None
         self.store = AICoreStore(RUNTIME_DIR)
         ensure_runtime()
+        self.mcp_servers = MCPServerManager(RUNTIME_DIR / "mcp_servers.json")
         self._rewrite_core_defaults()
         self._ensure_bughunter_core()
         # The operator's researcher UA marker is install-wide, so it must be live BEFORE the first
@@ -1769,7 +1838,14 @@ class GreyIQRuntime:
     def brain_status(self, workspace: str | None = None) -> dict[str, Any]:
         """Public metadata only: technique names/counts, aggregate outcomes, and guardrails."""
         root = workspace or str(PROJECT_ROOT)
-        return brain_techniques.status_snapshot(RUNTIME_DIR, SEED_DIR, root)
+        status = brain_techniques.status_snapshot(RUNTIME_DIR, SEED_DIR, root)
+        try:
+            from learning_engine import LearningEngine
+
+            status["recursive_learning"] = LearningEngine(RUNTIME_DIR).status()
+        except Exception:  # noqa: BLE001 - learning telemetry is advisory
+            status["recursive_learning"] = {"available": False}
+        return status
 
     def coder_test(self) -> dict[str, Any]:
         try:
@@ -1803,19 +1879,27 @@ class GreyIQRuntime:
         with self.lock:
             return dict(self.model_pull)
 
+    def set_managed_ollama_models_dir(self, value: object) -> None:
+        """Accept Electron's authenticated, in-memory Ollama store update."""
+        if value is None:
+            models_dir = None
+        elif isinstance(value, str) and 0 < len(value) <= 4000 and Path(value).is_absolute():
+            models_dir = Path(value).resolve()
+        else:
+            raise HTTPError(422, "models_dir must be an absolute path or null.")
+        with self.lock:
+            self.managed_ollama_models_dir = models_dir
+
     def start_huggingface_import(self, reference: str) -> dict[str, Any]:
-        """Import a Hugging Face GGUF through a loopback Ollama service."""
+        """Import, verify, and select a public GGUF through local Ollama."""
         try:
             model = coder.normalize_huggingface_model_ref(reference)
         except coder.CoderError as exc:
             return {"ok": False, "error": str(exc)}
-        host, _ = self._local_brain()
-        if not coder.ollama_host_is_loopback(host):
-            return {"ok": False, "error": (
-                "Hugging Face import requires a local Ollama Server URL. "
-                "Set it to http://127.0.0.1:11434/v1 and save the brain first."
-            )}
-        return self.start_model_pull(model)
+        # The dedicated import route must use the same readiness gate as the
+        # one-click setup route. An empty URL selects loopback Ollama even when
+        # the previously saved brain used a remote server.
+        return self.start_model_setup(model, base_url="")
 
     def start_model_pull(self, model: str = "") -> dict[str, Any]:
         host, configured = self._local_brain()
@@ -1824,7 +1908,7 @@ class GreyIQRuntime:
             return {"ok": False, "error": "No local model is configured."}
         with self.lock:
             if self.model_pull.get("active"):
-                return {"ok": False, "error": "A model download is already in progress.", **self.model_pull}
+                return {**self.model_pull, "ok": False, "error": "A model download is already in progress."}
             self.model_pull = {
                 "active": True, "model": target, "status": "starting", "percent": 0,
                 "completed": 0, "total": 0, "done": False, "error": "",
@@ -1852,6 +1936,140 @@ class GreyIQRuntime:
                     self.model_pull.update({"active": False, "done": True, "error": str(exc), "status": "error"})
 
         threading.Thread(target=worker, name="ollama-pull", daemon=True).start()
+        return {"ok": True, "active": True, "model": target}
+
+    def start_model_setup(self, reference: str, base_url: str = "") -> dict[str, Any]:
+        """Download, verify, then select a model without disrupting the active brain.
+
+        A failed download or failed readiness probe leaves the previous provider
+        and model selected. The shared pull-status endpoint reports each phase.
+        """
+        try:
+            target, is_hf = coder.normalize_local_model_reference(reference)
+        except coder.CoderError as exc:
+            return {"ok": False, "error": str(exc)}
+        with self.lock:
+            if self.model_pull.get("active"):
+                return {**self.model_pull, "ok": False, "error": "A model download is already in progress."}
+            previous = self._coder_config()
+            try:
+                # The setup request carries the server field explicitly. An empty
+                # field means the default local Ollama host, even when the saved
+                # brain previously pointed at a remote server.
+                host = coder.ollama_setup_host(base_url)
+            except coder.CoderError as exc:
+                return {"ok": False, "error": str(exc)}
+            previous_selection = (
+                bool(previous.get("enabled")), str(previous.get("provider") or ""),
+                str((previous.get("local") or {}).get("model") or ""),
+                str((previous.get("local") or {}).get("base_url") or ""),
+            )
+            self.model_pull = {
+                "active": True, "setup": True, "model": target, "status": "checking local models",
+                "percent": 0, "completed": 0, "total": 0, "done": False,
+                "chat_ready": False, "tool_ready": False, "selected": False,
+                "chat_only": False, "error": "",
+            }
+
+        def progress(event: dict[str, Any]) -> None:
+            with self.lock:
+                if event.get("status"):
+                    self.model_pull["status"] = str(event["status"])
+                total = int(event.get("total") or 0)
+                completed = int(event.get("completed") or 0)
+                if total > 0:
+                    self.model_pull["total"] = total
+                    self.model_pull["completed"] = completed
+                    self.model_pull["percent"] = min(100, int(completed * 100 / total))
+
+        def worker() -> None:
+            try:
+                selected_model = target
+                installed = coder.ollama_list_models(host)
+                if not coder.model_installed(installed, selected_model):
+                    if is_hf:
+                        with self.lock:
+                            self.model_pull["status"] = "checking Hugging Face GGUF repository"
+                        coder.check_public_hf_gguf(target)
+                    with self.lock:
+                        self.model_pull["status"] = "downloading model"
+                    try:
+                        coder.ollama_pull(host, target, timeout=3600.0, progress_cb=progress)
+                    except coder.CoderError as exc:
+                        if not is_hf or "sharded gguf" not in str(exc).casefold():
+                            raise
+                        with self.lock:
+                            self.model_pull.update({
+                                "status": "preparing split GGUF import", "percent": 0,
+                                "completed": 0, "total": 0,
+                            })
+                        with self.lock:
+                            managed_models_dir = getattr(self, "managed_ollama_models_dir", None)
+                        # Only an Electron-verified Ollama child is tied to its
+                        # reported model directory. A pre-existing server may
+                        # use a different store, even on loopback.
+                        models_root = managed_models_dir if host == "http://127.0.0.1:11434" else None
+                        # A pre-existing Ollama server can have a different
+                        # environment from GreyIQ. Even an operator-set
+                        # OLLAMA_MODELS here does not prove where that server
+                        # stores blobs, so use the conservative unknown-store
+                        # preflight unless Electron started the managed server.
+                        selected_model = hf_gguf_import.import_sharded_hf_model(
+                            host, target, RUNTIME_DIR / "hf-gguf-cache", progress,
+                            models_root=models_root,
+                        )
+                        with self.lock:
+                            self.model_pull["model"] = selected_model
+                    installed = coder.ollama_list_models(host)
+                    if not coder.model_installed(installed, selected_model):
+                        raise coder.CoderError("Ollama reported success, but the model is absent from its installed list.")
+                with self.lock:
+                    self.model_pull.update({"status": "checking chat and agent tool calls", "percent": 100})
+                readiness = coder.ollama_probe_readiness(host, selected_model)
+                with self.lock:
+                    self.model_pull.update({
+                        "chat_ready": bool(readiness.get("chat_ready")),
+                        "tool_ready": bool(readiness.get("tool_ready")),
+                    })
+                if not readiness.get("chat_ready"):
+                    raise coder.CoderError(str(readiness.get("reason") or "Downloaded model failed the chat check."))
+                if not readiness.get("tool_ready"):
+                    with self.lock:
+                        self.model_pull.update({
+                            "active": False, "done": True, "chat_only": True,
+                            "status": "chat only; previous brain unchanged",
+                            "error": str(readiness.get("reason") or "Agent tool-call check failed."),
+                        })
+                    return
+                with self.lock:
+                    current = self._coder_config()
+                    current_selection = (
+                        bool(current.get("enabled")), str(current.get("provider") or ""),
+                        str((current.get("local") or {}).get("model") or ""),
+                        str((current.get("local") or {}).get("base_url") or ""),
+                    )
+                    if current_selection != previous_selection:
+                        self.model_pull.update({
+                            "active": False, "done": True,
+                            "status": "ready; brain changed during setup",
+                            "error": "The model is ready, but brain settings changed during setup. Select it manually if still wanted.",
+                        })
+                        return
+                    local_update = {"model": selected_model, "base_url": base_url.strip()}
+                    self.save_coder_config({"enabled": True, "provider": "local", "local": local_update})
+                    self.model_pull.update({
+                        "active": False, "done": True, "selected": True,
+                        "status": "ready for chat and agent tools", "percent": 100,
+                    })
+            except Exception as exc:  # noqa: BLE001 - report failure to the operator
+                self.log(f"Model setup failed: {exc}")
+                with self.lock:
+                    self.model_pull.update({
+                        "active": False, "done": True, "status": "error",
+                        "error": str(exc),
+                    })
+
+        threading.Thread(target=worker, name="ollama-model-setup", daemon=True).start()
         return {"ok": True, "active": True, "model": target}
 
     def delete_model(self, model: str) -> dict[str, Any]:
@@ -1906,6 +2124,9 @@ class GreyIQRuntime:
                 runtime_dir=RUNTIME_DIR,
                 seed_dir=SEED_DIR,
             )
+            lesson = coding_learning_bridge.learn_from_verified_run(
+                RUNTIME_DIR, prompt=request.message, result=result
+            )
             snapshot_meta = self._persist_snapshot(request.workspace, result.get("snapshot") or [])
             return {
                 "ok": True,
@@ -1924,6 +2145,7 @@ class GreyIQRuntime:
                 "snapshot_count": snapshot_meta["count"],
                 "model_name": f"{result['provider']}:{result['model']}",
                 "provider": result["provider"],
+                "tinygpt_lesson": lesson,
             }
         except coding_agent.AgentError as exc:
             # A mid-run failure may have partially written files; persist the snapshot the run
@@ -1994,6 +2216,9 @@ class GreyIQRuntime:
                     seed_dir=SEED_DIR,
                     on_event=on_event,
                 )
+                lesson = coding_learning_bridge.learn_from_verified_run(
+                    RUNTIME_DIR, prompt=request.message, result=result
+                )
                 snapshot_meta = self._persist_snapshot(request.workspace, result.get("snapshot") or [])
                 payload = {
                     "ok": True,
@@ -2012,6 +2237,7 @@ class GreyIQRuntime:
                     "snapshot_count": snapshot_meta["count"],
                     "model_name": f"{result['provider']}:{result['model']}",
                     "provider": result["provider"],
+                    "tinygpt_lesson": lesson,
                 }
             except coding_agent.AgentError as exc:
                 snap = self._persist_snapshot(request.workspace, getattr(exc, "agent_snapshot", None) or [])
@@ -2157,6 +2383,8 @@ class GreyIQRuntime:
             version=VERSION,
             run_live=request.run_live,
             active=request.active,
+            external_mcp_hunt=request.external_mcp_hunt,
+            mcp_manager=getattr(self, "mcp_servers", None),
             time_based=request.time_based,
             auth={"cookie": request.auth_cookie, "headers": request.auth_headers},
             max_files=request.max_files,
@@ -2257,6 +2485,12 @@ class GreyIQRuntime:
         url = str(request.url or "").strip()
         if not url:
             return {"ok": False, "error": "This finding has no URL to re-verify."}
+        if request.program_id:
+            program = bounty_portfolio.get_program(RUNTIME_DIR, request.program_id)
+            if program:
+                scope_error = bounty_portfolio.manual_web_scope_error(program)
+                if scope_error:
+                    return {"ok": False, "error": scope_error}
         scope, settings, _excluded = self._active_scope_for(request.scope, request.program_id)
         auth = bounty_scan_auth.build_auth(url, cookie=request.auth_cookie, headers=request.auth_headers)
         passes = max(1, min(int(request.stability_passes or 1), 3))
@@ -2368,6 +2602,12 @@ class GreyIQRuntime:
         url = str(request.url or "").strip()
         if not url:
             return {"ok": False, "error": "This finding has no URL to probe."}
+        if request.program_id:
+            program = bounty_portfolio.get_program(RUNTIME_DIR, request.program_id)
+            if program:
+                scope_error = bounty_portfolio.manual_web_scope_error(program)
+                if scope_error:
+                    return {"ok": False, "error": scope_error}
         scope, settings, _excluded = self._active_scope_for(request.scope, request.program_id)
         auth = bounty_scan_auth.build_auth(url, cookie=request.auth_cookie, headers=request.auth_headers)
         results, meta = bounty_active_verify.verify_active(
@@ -2774,6 +3014,10 @@ class GreyIQRuntime:
                        if request.active_program_id else None)
         if program_obj is None and request.program:
             program_obj = bounty_portfolio.get_program(RUNTIME_DIR, request.program)
+        if program_obj:
+            scope_error = bounty_portfolio.manual_web_scope_error(program_obj)
+            if scope_error:
+                return {"ok": False, "error": scope_error}
         disclose_automation = bool(program_obj.get("disclose_automation")) if program_obj else False
         excluded_hosts = tuple(str(h) for h in (program_obj.get("out_of_scope_hosts") or [])) if program_obj else ()
         account_access = program_obj.get("account_access") if program_obj else None
@@ -2799,16 +3043,21 @@ class GreyIQRuntime:
         # stored research-account credentials (account_access) drive an auto-login in run_campaign.
         req_auth = ({"cookie": request.auth_cookie, "headers": request.auth_headers}
                     if (request.auth_cookie or request.auth_headers) else None)
+        brain_config = self._coder_config()
+        if bounty_operator_guard.current() is not None:
+            brain_config = coder.unattended_config(brain_config)
         result = bounty_campaign.run_campaign(
             request.target,
             scope=request.scope,
             authorized=request.authorized,
-            coder_cfg=self._coder_config(),
+            coder_cfg=brain_config,
             default_reports_dir=RUNTIME_DIR / "reports",
             seed_dir=SEED_DIR,
             runtime_dir=RUNTIME_DIR,
             version=VERSION,
             active=request.active,
+            external_mcp_hunt=request.external_mcp_hunt,
+            mcp_manager=getattr(self, "mcp_servers", None),
             time_based=request.time_based,
             auth=req_auth,
             account_access=account_access,
@@ -2846,6 +3095,9 @@ class GreyIQRuntime:
         program = bounty_portfolio.get_program(RUNTIME_DIR, request.program_id)
         if not program:
             return {"ok": False, "error": "Program not found — it may have been deleted."}
+        scope_error = bounty_portfolio.manual_web_scope_error(program)
+        if scope_error:
+            return {"ok": False, "error": scope_error}
         targets = bounty_campaign.program_campaign_targets(program)
         if not targets:
             return {"ok": False, "error": "This program has no huntable targets — add seed targets, opt in a source repository, or import/build its structured scope in the Program tab."}
@@ -2866,6 +3118,8 @@ class GreyIQRuntime:
             runtime_dir=RUNTIME_DIR,
             version=VERSION,
             active=request.active,
+            external_mcp_hunt=request.external_mcp_hunt,
+            mcp_manager=getattr(self, "mcp_servers", None),
             time_based=request.time_based,
             auth=req_auth,
             account_access=program.get("account_access"),
@@ -2920,6 +3174,11 @@ class GreyIQRuntime:
             chosen = [p for p in all_progs if str(p.get("id")) in wanted]
         if not chosen:
             return {"ok": False, "error": "No programs selected — pick at least one saved program (or none exist yet; add one in the Program tab)."}
+        for program in chosen:
+            scope_error = bounty_portfolio.manual_web_scope_error(program)
+            if scope_error:
+                label = str(program.get("name") or program.get("id") or "selected program")[:200]
+                return {"ok": False, "error": f"{label}: {scope_error}"}
         specs: list[dict[str, Any]] = []
         skipped: list[str] = []
         for program in chosen:
@@ -2955,6 +3214,8 @@ class GreyIQRuntime:
             runtime_dir=RUNTIME_DIR,
             version=VERSION,
             active=request.active,
+            external_mcp_hunt=request.external_mcp_hunt,
+            mcp_manager=getattr(self, "mcp_servers", None),
             time_based=request.time_based,
             # An explicit request-level cookie/header wins; otherwise pass auth=None (NOT an empty dict)
             # so each program's own stored account_access drives a per-program auto-login. A non-None
@@ -3244,6 +3505,9 @@ class GreyIQRuntime:
         if program_id:
             prog = bounty_portfolio.get_program(RUNTIME_DIR, program_id)
             if prog:
+                scope_error = bounty_portfolio.manual_web_scope_error(prog)
+                if scope_error:
+                    return {"ok": False, "error": scope_error}
                 scope_sources.append(str(prog.get("scope_text") or ""))
         if request.scope.strip():
             scope_sources.append(request.scope)
@@ -4139,6 +4403,106 @@ class GreyIQRuntime:
         return (stored.get("yeswehack.api_token", ""),
                 stored.get("yeswehack.token_kind", "") or "jwt")
 
+    # ---- Read-only platform program intake --------------------------------------
+
+    def platform_credentials_status(self) -> dict[str, Any]:
+        """Only credential presence is returned; API secrets stay in the owner-only store."""
+        stored = _load_secrets()
+        return {"ok": True, "platforms": {
+            "hackerone": self.hackerone_creds_status(),
+            "yeswehack": self.yeswehack_creds_status(),
+            "bugcrowd": {"has_token": bool(stored.get("platform.bugcrowd.credential"))},
+            "intigriti": {"has_token": bool(stored.get("platform.intigriti.credential"))},
+        }}
+
+    def save_platform_credential(self, request: "PlatformCredentialRequest") -> dict[str, Any]:
+        platform = request.platform.strip().lower()
+        if platform not in ("bugcrowd", "intigriti"):
+            return {"ok": False, "error": "This credential form supports Bugcrowd and Intigriti only."}
+        if request.clear_token:
+            _store_secret(f"platform.{platform}.credential", "")
+        elif request.credential:
+            if not bounty_platform_programs._valid_credential(platform, request.credential):
+                return {"ok": False, "error": "Enter a valid API credential without whitespace or control characters."}
+            _store_secret(f"platform.{platform}.credential", request.credential)
+        else:
+            return {"ok": False, "error": "Paste an API credential or choose Clear saved credential."}
+        return {"ok": True, "platform": platform,
+                "has_token": bool(_load_secrets().get(f"platform.{platform}.credential"))}
+
+    def discover_platform_programs(self, request: "PlatformProgramsRequest") -> dict[str, Any]:
+        """Explicit, bounded GET of programs visible to an API identity; no persistence."""
+        platform = request.platform.strip().lower()
+        stored = _load_secrets()
+        if platform == "hackerone":
+            _, username, token = self._hackerone_creds()
+            result = bounty_h1_import.list_programs(username, token, max_entries=request.limit)
+            rows = [{"id": p["handle"], "handle": p["handle"], "name": p["name"],
+                     "status": p.get("submission_state") or p.get("state") or "unknown",
+                     "source_url": p.get("source_url", "")} for p in result.get("programs", [])]
+        elif platform == "yeswehack":
+            token, kind = self._yeswehack_creds()
+            result = bounty_ywh_import.list_programs(token=token, token_kind=kind,
+                                                      query=request.query, max_entries=request.limit)
+            rows = [{"id": p["slug"], "handle": p["slug"], "name": p["title"],
+                     "status": "disabled" if p.get("disabled") else "visible",
+                     "source_url": f"https://api.yeswehack.com/programs/{p['slug']}"}
+                    for p in result.get("programs", [])]
+        elif platform in ("bugcrowd", "intigriti"):
+            credential = stored.get(f"platform.{platform}.credential", "")
+            result = bounty_platform_programs.list_programs(platform, credential, limit=request.limit)
+            rows = list(result.get("programs", []))
+        else:
+            return {"ok": False, "programs": [], "error": "Unsupported platform."}
+        if not result.get("ok"):
+            return {"ok": False, "platform": platform, "programs": [],
+                    "error": result.get("error", "Program discovery failed."),
+                    "warnings": result.get("warnings", [])}
+        query = request.query.strip().lower()
+        if query and platform != "yeswehack":
+            rows = [p for p in rows if query in p.get("name", "").lower()
+                    or query in p.get("handle", "").lower()]
+        return {"ok": True, "platform": platform, "programs": rows, "count": len(rows),
+                "warnings": result.get("warnings", [])}
+
+    def preview_platform_program(self, request: "PlatformPreviewRequest") -> dict[str, Any]:
+        """Read one current API record for review. A preview never authorizes a hunt."""
+        platform = request.platform.strip().lower()
+        identifier = request.program_id.strip()
+        if platform == "hackerone":
+            result = self.import_hackerone_scope(HackerOneImportRequest(handle=identifier))
+        elif platform == "yeswehack":
+            result = self.import_yeswehack_scope(YesWeHackImportRequest(slug=identifier))
+        elif platform in ("bugcrowd", "intigriti"):
+            credential = _load_secrets().get(f"platform.{platform}.credential", "")
+            result = bounty_platform_programs.preview_program(platform, identifier, credential)
+        else:
+            return {"ok": False, "error": "Unsupported platform."}
+        if not result.get("ok"):
+            return result
+        # Explicit response contract: provider data can never carry an `authorized`,
+        # `enabled`, or other execution flag into the Program form.
+        allowed = ("program_name", "structured_scope", "policy_excerpt", "offers_bounty",
+                   "program_stats", "notes_digest", "user_agent_suffix", "warnings",
+                   "status", "source_url", "out_of_scope", "fetched_at")
+        preview = {key: result[key] for key in allowed if key in result}
+        preview["ok"] = True
+        preview["platform"] = platform
+        preview["program_id"] = identifier
+        preview["handle"] = result.get("handle") or result.get("slug") or identifier
+        preview["fetched_at"] = result.get("fetched_at") or datetime.now(UTC).isoformat()
+        if not preview.get("source_url") and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}", str(preview["handle"])):
+            if platform == "hackerone":
+                preview["source_url"] = f"https://api.hackerone.com/v1/hackers/programs/{preview['handle']}"
+            elif platform == "yeswehack":
+                preview["source_url"] = f"https://api.yeswehack.com/programs/{preview['handle']}"
+        # An API response alone cannot prove the program's full exclusions and current
+        # testing terms. Even a structurally complete row set remains review-only.
+        preview["scope_complete"] = False
+        preview["warnings"] = list(result.get("warnings") or []) + [
+            "Review the current program policy, exclusions, and your authorization before enabling tests."]
+        return preview
+
     # ---- OOB collaborator (out-of-band blind-bug confirmation) --------------------
     def _oob_config(self) -> tuple[str, str]:
         stored = _load_secrets()
@@ -4278,7 +4642,8 @@ class GreyIQRuntime:
 
     # ---- Autonomous operator ------------------------------------------------------
     def _operator_run_campaign(self, target: str, *, scope: str, program: str, active: bool, live: bool,
-                               deep: bool = False, max_pages: int = 12) -> dict[str, Any]:
+                               deep: bool = False, max_pages: int = 12,
+                               run_id: str = "") -> dict[str, Any]:
         """The operator's run_campaign_fn — goes through runtime.run_campaign so the
         run is cached (run_id) and the submit path can resolve it. authorized=True
         because the operator only runs after the user explicitly armed it (the start
@@ -4287,13 +4652,8 @@ class GreyIQRuntime:
         lead) through unchanged."""
         return self.run_campaign(CampaignRequest(
             target=target, scope=scope, authorized=True, program=program,
-            active=active, live=live, deep=deep, max_pages=max_pages,
+            active=active, live=live, deep=deep, max_pages=max_pages, run_id=run_id,
         ))
-
-    def _operator_submit(self, run_id: str, ref: str) -> dict[str, Any]:
-        """The operator's submit_fn — the SAME hard-gated runtime.submit_finding (confirm
-        + server-recomputed proof_status=='confirmed' + creds). Unforgeable by the loop."""
-        return self.submit_finding(SubmitRequest(run_id=run_id, ref=ref, confirm=True, platform="hackerone"))
 
     def _get_operator(self) -> "OperatorLoop":
         with self.lock:
@@ -4301,7 +4661,6 @@ class GreyIQRuntime:
                 self._operator = OperatorLoop(
                     str(RUNTIME_DIR),
                     run_campaign_fn=self._operator_run_campaign,
-                    submit_fn=self._operator_submit,
                 )
             return self._operator
 
@@ -4466,7 +4825,6 @@ class GreyIQRuntime:
                 "auto_submit": False,
                 "enabled": False,
                 "structured_scope": [],
-                "scope_text": "",
                 "in_scope_hosts": [],
                 "out_of_scope_hosts": [],
                 "seed_targets": [],
@@ -4610,10 +4968,15 @@ class GreyIQRuntime:
     def operator_start(self, request: "OperatorStartRequest") -> dict[str, Any]:
         if not request.authorized:
             return {"ok": False, "error": "Confirm you are authorized to run the portfolio's programs (set authorized)."}
-        started = self._get_operator().start(allow_submit=bool(request.allow_submit))
-        return {"ok": True, "started": started, "allow_submit": bool(request.allow_submit),
-                "note": "auto-submit ARMED — confirmed, non-duplicate findings will be filed within each program's daily cap." if request.allow_submit
-                        else "review-only — findings are hunted and queued; nothing is auto-filed."}
+        if request.allow_submit:
+            return {"ok": False, "started": False, "allow_submit": False,
+                    "error": "Automatic submission is disabled. Review findings and submit manually."}
+        try:
+            started = self._get_operator().start(grants=request.grants)
+        except (ValueError, OSError) as exc:
+            return {"ok": False, "started": False, "allow_submit": False, "error": str(exc)}
+        return {"ok": True, "started": started, "allow_submit": False,
+                "note": "Review-only — findings are hunted and queued; nothing is auto-filed."}
 
     def operator_stop(self) -> dict[str, Any]:
         if self._operator is not None:
@@ -4626,12 +4989,14 @@ class GreyIQRuntime:
         return {"ok": True, **self._operator.event_tail(after=after)}
 
     def operator_pipeline(self) -> dict[str, Any]:
+        operator_status = self._operator.event_tail(after=0) if self._operator else {}
         return {
             "ok": True,
             "funnel": bounty_ledger.funnel(RUNTIME_DIR),
             "programs": bounty_portfolio.list_programs(RUNTIME_DIR),
             "learning": bounty_learning.program_summary(RUNTIME_DIR),
             "running": bool(self._operator and self._operator.running),
+            "grants": operator_status.get("grants", []),
         }
 
     def record_outcome(self, request: "LearnRequest") -> dict[str, Any]:
@@ -4730,10 +5095,32 @@ class GreyIQRuntime:
             return None
         cfg = coder.coder_config(raw)
         messages = self._build_coder_messages(request, int(cfg.get("history_turns") or 12))
+        student = ""
+        try:
+            # TinyGPT speaks first. The stronger brain sees this only as an
+            # untrusted draft to critique, never as authoritative code.
+            student = coding_learning_bridge.student_draft(self.get_engine(), request.message)
+        except Exception as exc:  # noqa: BLE001 - teacher remains usable without TinyGPT
+            self.log(f"TinyGPT coding dialogue unavailable: {exc}")
         # The coding brain runs with a coding-focused system prompt; bot persona,
         # style, and stored preferences are layered on top.
         cfg = dict(cfg)
         cfg["system_prompt"] = self._coder_system_prompt(request, cfg)
+        # The bundled expert cards also inform a configured reasoning brain. Keep
+        # operator-editable runtime overrides out of this higher-priority prompt;
+        # the excerpts are short, source-labelled reference data, never proof or
+        # permission to act on a target.
+        try:
+            knowledge_context = solin_domain.build_reasoning_context(
+                request.message, solin_domain.load_pack(SEED_DIR, None)
+            )
+        except Exception:  # noqa: BLE001 - retrieval must never break configured chat
+            knowledge_context = ""
+        if knowledge_context:
+            cfg["system_prompt"] += "\n\n" + knowledge_context
+        bridge_block = coding_learning_bridge.teacher_prompt_block(student)
+        if bridge_block:
+            cfg["system_prompt"] += "\n\n" + bridge_block
         # Chat is interactive: responsiveness matters as much as depth, so it gets its own reasoning
         # profile instead of inheriting whatever the deepest brain needed. Only fills values the
         # operator left at the shipped defaults — an explicit setting still wins.
@@ -4756,23 +5143,142 @@ class GreyIQRuntime:
                 "citations": [],
                 "ai_core": self.store.load(),
             }
+        lesson = coding_learning_bridge.record_teacher_exchange(
+            RUNTIME_DIR,
+            prompt=request.message,
+            student=student,
+            teacher=str(result.get("text") or ""),
+            model_version=f"{result['provider']}:{result['model']}",
+        )
         return {
             "request_id": uuid4().hex,
             "message": friendly_branding(result["text"]),
             "used_fallback": False,
             "captured_for_training": False,
+            "brain_dialogue": {
+                "tinygpt_draft_used": bool(student),
+                "knowledge_context_used": bool(knowledge_context),
+                "lesson_status": lesson.get("outcome"),
+                "verification_reason": lesson.get("verification_reason"),
+            },
             "model_name": f"{result['provider']}:{result['model']}",
             "device": "remote" if result["provider"] == "anthropic" else "local-model",
             "citations": [],
             "ai_core": self.store.load(),
         }
 
+    def _start_active_chat_scan(self, target: str, scope_host: str) -> dict[str, Any]:
+        """Start one bounded active verification without holding the chat HTTP reply open."""
+        with self.lock:
+            if self._active_chat_running_id:
+                return {"ok": False, "error": "An active chat assessment is already running. Wait for its result before starting another."}
+            run_id = "active-" + uuid4().hex
+            self._active_chat_runs[run_id] = {"status": "running", "message": "Active assessment is running."}
+            while len(self._active_chat_runs) > 8:
+                self._active_chat_runs.popitem(last=False)
+            self._active_chat_running_id = run_id
+            worker = threading.Thread(
+                target=self._run_active_chat_scan,
+                args=(run_id, target, scope_host),
+                name="greyiq-active-chat",
+                daemon=True,
+            )
+            try:
+                worker.start()
+            except RuntimeError:
+                self._active_chat_runs.pop(run_id, None)
+                self._active_chat_running_id = ""
+                return {"ok": False, "error": "Could not start the active assessment worker."}
+        return {
+            "ok": True, "run_id": run_id, "status": "running",
+            "message": (
+                f"Active assessment started for {scope_host}. I will use up to 16 bounded "
+                "GET/HEAD/OPTIONS requests and report observed results with controls. "
+                "Keep this chat open to see the result."
+            ),
+        }
+
+    def _run_active_chat_scan(self, run_id: str, target: str, scope_host: str) -> None:
+        """One-host active proof pass; only a short, redacted summary reaches chat."""
+        status = "error"
+        message = "Active assessment failed before producing a result."
+        try:
+            results, meta = bounty_active_verify.verify_active(
+                target, [], scope=scope_host, settings=_bounty_get_settings(),
+                requests_budget=16, time_based=False, scope_host=scope_host,
+            )
+            if not meta.get("in_scope") or meta.get("skipped_reason"):
+                reason = redact_text(str(meta.get("skipped_reason") or "Target was outside the permitted scope."))[0]
+                message = f"Active assessment stopped before proof: {reason[:400]}"
+            else:
+                compact = [self._compact_active(item) for item in results]
+                confirmed = sum(item.get("status") == "confirmed" for item in compact)
+                candidate = len(compact) - confirmed
+                used = max(0, min(16, int(meta.get("requests_used") or 0)))
+                lines = [
+                    f"Active assessment of {scope_host}: {used}/16 requests used; "
+                    f"{confirmed} confirmed, {candidate} candidate findings."
+                ]
+                if meta.get("halt_reason"):
+                    lines.append(str(meta["halt_reason"])[:200])
+                elif meta.get("rate_limited"):
+                    lines.append("The request budget or host rate limit ended this pass early.")
+                for item in compact[:5]:
+                    title = redact_text(str(item.get("title") or "Finding"))[0][:150]
+                    severity = str(item.get("severity") or "info").lower()
+                    if severity not in {"critical", "high", "medium", "low", "info"}:
+                        severity = "info"
+                    state = "confirmed" if item.get("status") == "confirmed" else "candidate"
+                    lines.append(f"- {title} [{severity}; {state}]")
+                    for label, key in (("Observed", "observed"), ("Control", "control"), ("Limit", "limitations")):
+                        value = redact_text(str(item.get(key) or ""))[0].replace("\r", " ").replace("\n", " ").strip()
+                        if value:
+                            lines.append(f"  {label}: {value[:240]}")
+                if len(compact) > 5:
+                    lines.append(f"{len(compact) - 5} additional findings omitted from this chat summary.")
+                lines.append("This bounded sample does not prove the host is free of other vulnerabilities.")
+                status = "done"
+                message = "\n".join(lines)[:3500]
+        except Exception as exc:  # noqa: BLE001 - background worker must release the single-flight gate
+            self.log(f"Active chat assessment failed ({exc.__class__.__name__}).")
+            message = f"Active assessment failed ({exc.__class__.__name__}); no finding was confirmed."
+        finally:
+            with self.lock:
+                if run_id in self._active_chat_runs:
+                    self._active_chat_runs[run_id] = {"status": status, "message": message}
+                if self._active_chat_running_id == run_id:
+                    self._active_chat_running_id = ""
+
+    def active_chat_status(self, run_id: str) -> dict[str, Any]:
+        with self.lock:
+            current = self._active_chat_runs.get(run_id)
+            if current is None:
+                return {"ok": False, "status": "unavailable", "error": "That active run is no longer available in this session."}
+            return {"ok": True, "run_id": run_id, **current}
+
     def _maybe_scan_reply(self, request: ChatRequest) -> dict[str, Any] | None:
-        command = detect_scan_command(request.message)
-        if command is None:
+        active_command = parse_active_chat_command(request.message)
+        if active_command is not None:
+            if active_command.get("ok"):
+                result = self._start_active_chat_scan(
+                    str(active_command["target"]), str(active_command["scope_host"])
+                )
+            else:
+                result = active_command
+            return {
+                "request_id": uuid4().hex,
+                "message": result.get("message") or result.get("error") or "Active assessment could not start.",
+                "used_fallback": not bool(result.get("ok")),
+                "captured_for_training": False,
+                "model_name": "bughunter:active",
+                "device": "scanner",
+                "citations": [],
+                "ai_core": self.store.load(),
+                "active_scan": {"run_id": result.get("run_id", ""), "status": result.get("status", "error")},
+            }
+        result = dispatch_authorized_scan_command(request.message)
+        if result is None:
             return None
-        kind, target = command
-        result = run_scan(kind, target)
         triaged = triage(result, self._code_router_config())
         return {
             "request_id": uuid4().hex,
@@ -4827,6 +5333,114 @@ class GreyIQRuntime:
                 )
             },
         }
+
+    def _maybe_mcp_reply(self, request: ChatRequest) -> dict[str, Any] | None:
+        """Dispatch only a complete, operator-typed MCP command.
+
+        MCP descriptions and results are untrusted server data. They are displayed as
+        bounded text, never passed to a model or interpreted as a new instruction.
+        Connecting and calling tools require the explicit ``-y`` marker; registration
+        and ordinary chat can never start a server on their own.
+        """
+        raw = request.message.strip()
+        if not re.match(r"^/?mcp(?:\s|$)", raw, re.IGNORECASE):
+            return None
+
+        def reply(message: str, *, ok: bool = True) -> dict[str, Any]:
+            return {
+                "request_id": uuid4().hex,
+                "message": message,
+                "used_fallback": not ok,
+                "captured_for_training": False,
+                "model_name": "mcp:manual",
+                "device": "mcp",
+                "diagnostics": {"strategy": "mcp_manual", "used_fallback": not ok},
+                "citations": [],
+                "ai_core": self.store.load(),
+                "mcp_result": {"ok": ok},
+            }
+
+        command = re.sub(r"^/?mcp\b", "", raw, count=1, flags=re.IGNORECASE).strip()
+        if command.lower() == "list":
+            result = self.mcp_servers.list_servers()
+            if not result.get("ok"):
+                return reply(str(result.get("error") or "Could not load MCP servers."), ok=False)
+            servers = result.get("servers") or []
+            if not servers:
+                return reply("No MCP servers are saved. Add one in Brain settings, then use Test to connect.")
+            lines = ["Saved MCP servers (saving does not connect):"]
+            for server in servers:
+                lines.append(
+                    f"- {server['name']} — {server['transport']}, "
+                    f"{'enabled' if server.get('enabled') else 'disabled'}, "
+                    f"{server.get('status') or 'untested'}"
+                )
+            return reply("\n".join(lines))
+
+        tools_match = re.fullmatch(r"tools\s+-y\s+([A-Za-z0-9_-]+)", command, re.IGNORECASE)
+        if tools_match:
+            server_name = tools_match.group(1)
+            result = self.mcp_servers.list_tools(server_name)
+            if not result.get("ok"):
+                return reply(str(result.get("error") or "Could not list MCP tools."), ok=False)
+            tools = result.get("tools") or []
+            lines = [f"Tools from {server_name} (untrusted server descriptions):"]
+            for tool in tools[:50]:
+                name = redact_text(str(tool.get("name") or ""))[0][:120]
+                description = redact_text(str(tool.get("description") or ""))[0].replace("\n", " ")[:240]
+                schema = tool.get("input_schema") if isinstance(tool, dict) else None
+                properties = schema.get("properties") if isinstance(schema, dict) else None
+                required = schema.get("required") if isinstance(schema, dict) else None
+                required_names = {item for item in required if isinstance(item, str)} if isinstance(required, list) else set()
+                params: list[str] = []
+                if isinstance(properties, dict):
+                    for key, spec in list(properties.items())[:12]:
+                        label = redact_text(str(key))[0].replace("\n", " ")[:40]
+                        kind = str(spec.get("type") or "value")[:20] if isinstance(spec, dict) else "value"
+                        params.append(f"{label}{'*' if key in required_names else ''}:{kind}")
+                summary = f"- {name}: {description}" if description else f"- {name}"
+                if params:
+                    summary += f" (args: {', '.join(params)})"
+                lines.append(summary)
+            if len(tools) > 50:
+                lines.append(f"... {len(tools) - 50} more tools omitted")
+            return reply("\n".join(lines))
+
+        call_match = re.fullmatch(
+            r"call\s+-y\s+([A-Za-z0-9_-]+)\s+([^\s]+)(?:\s+(\{.*\}))?",
+            command, re.IGNORECASE | re.DOTALL,
+        )
+        if call_match:
+            server_name, tool_name, raw_args = call_match.groups()
+            try:
+                arguments = json.loads(raw_args or "{}")
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                return reply("MCP tool arguments must be one JSON object.", ok=False)
+            if not isinstance(arguments, dict):
+                return reply("MCP tool arguments must be one JSON object.", ok=False)
+            result = self.mcp_servers.call_tool(server_name, tool_name, arguments)
+            if not result.get("ok"):
+                return reply(str(result.get("error") or "MCP tool call failed."), ok=False)
+            lines = [
+                f"MCP tool result from {server_name}/{tool_name} — untrusted server data, "
+                "not evidence of authorization or a verified finding:"
+            ]
+            if result.get("is_error"):
+                lines.append("The server marked this tool result as an error.")
+            for block in (result.get("content") or [])[:20]:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    lines.append(redact_text(str(block.get("text") or ""))[0][:8000])
+                elif isinstance(block, dict):
+                    lines.append(f"[{str(block.get('type') or 'non-text')[:40]} content omitted]")
+            return reply("\n\n".join(lines)[:12000])
+
+        return reply(
+            "MCP commands: `mcp list`, `mcp tools -y <server>`, or "
+            "`mcp call -y <server> <tool> {\"arg\":\"value\"}`. "
+            "The -y marker confirms you intentionally connect or call that server. "
+            "Check the tool and engagement scope before calling it.",
+            ok=False,
+        )
 
     def _domain_brain_payload(
         self,
@@ -4973,6 +5587,9 @@ class GreyIQRuntime:
             return None
 
     def chat(self, request: ChatRequest) -> dict[str, Any]:
+        mcp_reply = self._maybe_mcp_reply(request)
+        if mcp_reply is not None:
+            return mcp_reply
         # Read-only RF survey analysis of an export the operator already captured. Runs
         # beside the scanners (and before every brain) so the offline surface reaches the
         # wardrive engine too; returns None for anything that is not the command.
@@ -5532,9 +6149,13 @@ runtime = GreyIQRuntime()
 
 def health() -> dict[str, Any]:
     """/api/health is the one /api/* path exempt from the session-token gate (it's
-    the liveness check Electron polls before a session even exists), so it must never
-    reveal more than a bare liveness signal to an unauthenticated caller — no app name
-    or version string for a scanner to fingerprint."""
+    the liveness check Electron polls before a session even exists). When Electron
+    supplies a per-launch ID, echo it so the shell can distinguish this backend
+    from another process on the port. Standalone servers keep the bare liveness
+    signal; neither mode exposes the app name or version."""
+    launch_id = os.getenv("GREYIQ_LAUNCH_ID", "")
+    if launch_id:
+        return {"status": "ok", "launchId": launch_id}
     return {"status": "ok"}
 
 
@@ -5772,6 +6393,18 @@ def _header(scope: dict[str, Any] | None, name: str) -> str:
         if key.lower() == expected:
             return value.decode("latin-1", errors="replace")
     return ""
+
+
+def _internal_model_store_authorized(scope: dict[str, Any]) -> bool:
+    """The Electron main process alone may identify its own Ollama store."""
+    client = scope.get("client")
+    return (bool(INTERNAL_MODEL_STORE_TOKEN)
+            and isinstance(client, (tuple, list)) and bool(client)
+            and _is_loopback_bind(str(client[0]))
+            and hmac.compare_digest(
+                _header(scope, "x-greyiq-internal-model-store-token"),
+                INTERNAL_MODEL_STORE_TOKEN,
+            ))
 
 
 def _normalize_origin(value: str) -> str:
@@ -6025,11 +6658,26 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
 
     # Session-token gate: /api/* (except liveness) requires the per-session token,
     # so other local processes can't drive the API over 127.0.0.1.
-    if path.startswith("/api/") and path != "/api/health" and not _session_authorized(scope):
+    if (path.startswith("/api/")
+            and path not in {"/api/health", "/api/internal/ollama-model-store"}
+            and not _session_authorized(scope)):
         await send_json(send, {"error": "missing or invalid session token"}, 403)
         return
 
     try:
+        if path == "/api/internal/ollama-model-store":
+            if method != "POST":
+                await send_json(send, {"error": "method not allowed"}, 405)
+                return
+            if not _internal_model_store_authorized(scope):
+                await send_json(send, {"error": "internal model-store authentication required"}, 403)
+                return
+            body = await read_json_body(receive)
+            if set(body) != {"models_dir"}:
+                raise HTTPError(422, "models_dir is required.")
+            runtime.set_managed_ollama_models_dir(body["models_dir"])
+            await send_json(send, {"ok": True})
+            return
         if method == "GET" and path in {"/", "/app"}:
             await send_index(send)
             return
@@ -6046,8 +6694,17 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             request = validate_payload(ChatRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.chat, request))
             return
+        if method == "POST" and path == "/api/chat/active-status":
+            request = validate_payload(ActiveChatStatusRequest, await read_json_body(receive))
+            await send_json(send, runtime.active_chat_status(request.run_id))
+            return
         if method == "POST" and path == "/api/scan/code":
             request = validate_payload(ScanCodeRequest, await read_json_body(receive))
+            if request.target_type.strip().lower() == "git_remote":
+                grant = validate_scoped_network_target("code", request.target, request.scope_repository, request.authorized)
+                if not grant["ok"]:
+                    await send_json(send, grant)
+                    return
 
             def _scan_and_classify() -> dict[str, Any]:
                 res = run_code_scan(request.target, request.target_type, request.max_files,
@@ -6064,13 +6721,21 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             return
         if method == "POST" and path == "/api/scan/web":
             request = validate_payload(WebScanRequest, await read_json_body(receive))
-            await send_json(send, await asyncio.to_thread(run_web_scan, request.url))
+            grant = validate_scoped_network_target("web", request.url, request.scope_host, request.authorized)
+            if not grant["ok"]:
+                await send_json(send, grant)
+                return
+            await send_json(send, await asyncio.to_thread(run_web_scan, request.url, scope_host=grant["scope_host"]))
             return
         if method == "POST" and path == "/api/scan/live":
             request = validate_payload(LiveScanRequest, await read_json_body(receive))
+            grant = validate_scoped_network_target("live", request.url, request.scope_host, request.authorized)
+            if not grant["ok"]:
+                await send_json(send, grant)
+                return
             await send_json(
                 send,
-                await asyncio.to_thread(run_live_scan, request.url, request.wait_seconds),
+                await asyncio.to_thread(run_live_scan, request.url, request.wait_seconds, scope_host=grant["scope_host"]),
             )
             return
         if method == "GET" and path == "/api/bounty/types":
@@ -6279,6 +6944,13 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/bounty/yeswehack/test":
             await send_json(send, await asyncio.to_thread(runtime.test_yeswehack_creds))
             return
+        if method == "GET" and path == "/api/platforms/credentials":
+            await send_json(send, await asyncio.to_thread(runtime.platform_credentials_status))
+            return
+        if method == "POST" and path == "/api/platforms/credentials":
+            request = validate_payload(PlatformCredentialRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.save_platform_credential, request))
+            return
         if method == "GET" and path == "/api/operator/programs":
             await send_json(send, await asyncio.to_thread(runtime.list_programs))
             return
@@ -6316,6 +6988,14 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if method == "POST" and path == "/api/yeswehack/programs":
             request = validate_payload(YesWeHackProgramsRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.yeswehack_programs, request))
+            return
+        if method == "POST" and path == "/api/platforms/programs":
+            request = validate_payload(PlatformProgramsRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.discover_platform_programs, request))
+            return
+        if method == "POST" and path == "/api/platforms/preview":
+            request = validate_payload(PlatformPreviewRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.preview_platform_program, request))
             return
         if method == "POST" and path == "/api/hackerone/hacktivity":
             request = validate_payload(HackerOneHacktivityRequest, await read_json_body(receive))
@@ -6414,6 +7094,64 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             request = validate_payload(DeviceRequest, await read_json_body(receive))
             await send_json(send, await asyncio.to_thread(runtime.set_device, request.preference))
             return
+        if path == "/api/mcp/hunt-approvals":
+            if method == "GET":
+                await send_json(send, await asyncio.to_thread(runtime.mcp_servers.list_hunt_approvals))
+                return
+            if method == "POST":
+                body = await read_json_body(receive)
+                if not isinstance(body, dict) or set(body) != {"server", "tool", "evidence_only"}:
+                    await send_json(send, {"ok": False, "error": "Server, tool, and evidence_only are required."}, 400)
+                    return
+                await send_json(send, await asyncio.to_thread(
+                    runtime.mcp_servers.approve_hunt_tool, body["server"], body["tool"],
+                    evidence_only=body["evidence_only"]))
+                return
+            await send_json(send, {"error": "method not allowed"}, 405)
+            return
+        if path.startswith("/api/mcp/hunt-approvals/"):
+            tail = unquote(path[len("/api/mcp/hunt-approvals/"):])
+            parts = tail.split("/", 1)
+            if len(parts) != 2 or not all(parts):
+                await send_json(send, {"error": "not found"}, 404)
+                return
+            if method == "DELETE":
+                await send_json(send, await asyncio.to_thread(
+                    runtime.mcp_servers.revoke_hunt_tool, parts[0], parts[1]))
+                return
+            await send_json(send, {"error": "method not allowed"}, 405)
+            return
+        if path == "/api/mcp/servers":
+            if method == "GET":
+                await send_json(send, await asyncio.to_thread(runtime.mcp_servers.list_servers))
+                return
+            if method == "POST":
+                body = await read_json_body(receive)
+                await send_json(send, await asyncio.to_thread(runtime.mcp_servers.add_server, body))
+                return
+            await send_json(send, {"error": "method not allowed"}, 405)
+            return
+        if path.startswith("/api/mcp/servers/"):
+            tail = unquote(path[len("/api/mcp/servers/"):])
+            if tail.endswith("/test") and method == "POST":
+                name = tail[:-len("/test")]
+                if not name or "/" in name:
+                    await send_json(send, {"error": "not found"}, 404)
+                    return
+                await send_json(send, await asyncio.to_thread(runtime.mcp_servers.test_server, name))
+                return
+            if not tail or "/" in tail:
+                await send_json(send, {"error": "not found"}, 404)
+                return
+            if method == "PUT":
+                body = await read_json_body(receive)
+                await send_json(send, await asyncio.to_thread(runtime.mcp_servers.update_server, tail, body))
+                return
+            if method == "DELETE":
+                await send_json(send, await asyncio.to_thread(runtime.mcp_servers.delete_server, tail))
+                return
+            await send_json(send, {"error": "method not allowed"}, 405)
+            return
         if method == "GET" and path == "/api/coder":
             await send_json(send, await asyncio.to_thread(runtime.coder_status))
             return
@@ -6431,6 +7169,10 @@ async def route_http(scope: dict[str, Any], receive: Any, send: Any) -> None:
             body = await read_json_body(receive)
             model = str((body or {}).get("model") or "")
             await send_json(send, await asyncio.to_thread(runtime.start_model_pull, model))
+            return
+        if method == "POST" and path == "/api/coder/setup":
+            request = validate_payload(ModelSetupRequest, await read_json_body(receive))
+            await send_json(send, await asyncio.to_thread(runtime.start_model_setup, request.model, request.base_url))
             return
         if method == "POST" and path == "/api/coder/huggingface/import":
             request = validate_payload(HuggingFaceImportRequest, await read_json_body(receive))

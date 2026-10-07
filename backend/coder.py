@@ -127,6 +127,85 @@ class CoderError(RuntimeError):
     """A coding-brain request failed in a way worth showing the user."""
 
 
+_MODEL_PART = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9])?\Z")
+_MODEL_TAG = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?\Z")
+_HF_HOSTS = {"hf.co", "huggingface.co"}
+
+
+def normalize_local_model_reference(reference: str) -> tuple[str, bool]:
+    """Turn a model name, HF model page, or Ollama snippet into an Ollama name.
+
+    Only a public GGUF model's owner/repository page is accepted as a URL. This
+    prevents a pasted file URL, shell text, or unrelated registry from silently
+    becoming a large and unexpected model download.
+    """
+    value = str(reference or "").strip()
+    command = re.fullmatch(r"ollama\s+(?:run|pull)\s+(\S+)", value, re.IGNORECASE)
+    if command:
+        value = command.group(1)
+    if not value or len(value) > 350 or any(char.isspace() for char in value):
+        raise CoderError("Enter one Ollama model name or Hugging Face GGUF model link.")
+
+    if "://" in value:
+        try:
+            parsed = urllib.parse.urlsplit(value)
+            valid_host = (parsed.hostname or "").lower() in _HF_HOSTS
+            has_port = parsed.port is not None
+        except ValueError as exc:
+            raise CoderError("The Hugging Face model URL is invalid.") from exc
+        if (parsed.scheme.lower() != "https" or not valid_host
+                or parsed.username or parsed.password or has_port or parsed.query or parsed.fragment):
+            raise CoderError("Use an HTTPS Hugging Face model page URL without a query or fragment.")
+        value = f"hf.co/{parsed.path.strip('/')}"
+
+    prefix, sep, rest = value.partition("/")
+    if prefix.lower() in _HF_HOSTS:
+        parts = rest.split("/") if sep else []
+        if len(parts) != 2:
+            raise CoderError("Use a Hugging Face model page: https://huggingface.co/owner/GGUF-repo.")
+        owner, repo_tag = parts
+        repo, colon, tag = repo_tag.partition(":")
+        if not (_MODEL_PART.fullmatch(owner) and _MODEL_PART.fullmatch(repo)):
+            raise CoderError("The Hugging Face owner or repository name is invalid.")
+        if any(bad in part for part in (owner, repo) for bad in ("..", "--")):
+            raise CoderError("The Hugging Face owner or repository name is invalid.")
+        if colon and (not _MODEL_TAG.fullmatch(tag) or ".." in tag):
+            raise CoderError("The Hugging Face quantization tag is invalid.")
+        return f"hf.co/{owner}/{repo}{':' + tag if colon else ''}", True
+
+    # Ordinary Ollama library names remain supported by the same one-click UI.
+    name, colon, tag = value.partition(":")
+    pieces = name.split("/")
+    if (len(pieces) > 2 or (len(pieces) == 2 and "." in pieces[0])
+            or not all(_MODEL_PART.fullmatch(piece) for piece in pieces)
+            or any(".." in piece or "--" in piece for piece in pieces)
+            or (colon and not _MODEL_TAG.fullmatch(tag))):
+        raise CoderError("Enter a valid Ollama model name or Hugging Face GGUF model link.")
+    return value, False
+
+
+def check_public_hf_gguf(model: str, timeout: float = 15.0) -> None:
+    """Confirm a public HF repo contains GGUF weights before starting a pull."""
+    name = model.removeprefix("hf.co/").split(":", 1)[0]
+    endpoint = f"https://huggingface.co/api/models/{name}"
+    try:
+        with urllib.request.urlopen(endpoint, timeout=timeout) as response:
+            metadata = json.loads(response.read(2_000_000).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise CoderError("This Hugging Face model requires access. One-step setup supports public GGUF models; open the model page for its access instructions.") from exc
+        if exc.code == 404:
+            raise CoderError("Hugging Face model not found or private. Check the model page and access permissions.") from exc
+        raise CoderError(f"Could not check the Hugging Face model (HTTP {exc.code}). Retry later.") from exc
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise CoderError(f"Could not check the Hugging Face model ({exc}). Retry later.") from exc
+    if not isinstance(metadata, dict):
+        raise CoderError("Hugging Face returned unexpected model information. Retry later.")
+    if metadata.get("private") or metadata.get("gated") not in (None, False):
+        raise CoderError("This Hugging Face model is private or gated. One-step setup supports public GGUF models; open the model page for its access instructions.")
+    files = metadata.get("siblings") or []
+    if not any(isinstance(item, dict) and str(item.get("rfilename") or "").lower().endswith(".gguf") for item in files):
+        raise CoderError("This Hugging Face repository has no GGUF model file. Choose a GGUF version of the model for Ollama.")
 _HF_ID_PART = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9])?$")
 _HF_QUANT = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$")
 
@@ -493,6 +572,63 @@ def ollama_host(base_url: str | None) -> str:
     return host or "http://127.0.0.1:11434"
 
 
+def unattended_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Use only loopback Ollama for unattended target-derived model context."""
+    if not config.get("enabled") or str(config.get("provider") or "").lower() != "local":
+        return {"enabled": False, "provider": "off"}
+    try:
+        base_url = str((config.get("local") or {}).get("base_url") or "")
+        parsed = urllib.parse.urlparse(ollama_host(base_url))
+        host = parsed.hostname or ""
+        local_host = host.lower() == "localhost"
+        if not local_host:
+            local_host = ipaddress.ip_address(host).is_loopback
+        if (parsed.scheme not in ("http", "https") or not local_host
+                or parsed.username or parsed.password or parsed.path not in ("", "/")
+                or parsed.query or parsed.fragment):
+            return {"enabled": False, "provider": "off"}
+        _ = parsed.port
+    except (ValueError, TypeError, AttributeError):
+        return {"enabled": False, "provider": "off"}
+    return config
+
+
+def ollama_setup_host(base_url: str | None) -> str:
+    """Accept only an HTTP(S) Ollama origin for a model setup job."""
+    host = ollama_host(base_url)
+    try:
+        parsed = urllib.parse.urlsplit(host)
+        valid = (parsed.scheme in ("http", "https") and bool(parsed.hostname)
+                 and not parsed.username and not parsed.password
+                 and parsed.path in ("", "/") and not parsed.query and not parsed.fragment)
+        _ = parsed.port  # malformed ports raise ValueError
+    except ValueError as exc:
+        raise CoderError("The Ollama server URL is invalid.") from exc
+    if not valid:
+        raise CoderError("Use an HTTP or HTTPS Ollama server URL, optionally ending in /v1.")
+    return host
+
+
+def _ollama_open(request: str | urllib.request.Request, *, timeout: float):
+    """Keep loopback Ollama traffic on the local socket despite proxy env vars.
+
+    The unattended brain accepts only loopback Ollama; inheriting HTTP_PROXY
+    would disclose target-derived prompts to that proxy. Remote Ollama setups
+    keep their ordinary system proxy behavior.
+    """
+    url = request.full_url if isinstance(request, urllib.request.Request) else str(request)
+    try:
+        hostname = urllib.parse.urlsplit(url).hostname or ""
+        loopback = hostname.lower() == "localhost"
+        if not loopback:
+            loopback = ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        loopback = False
+    if loopback:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=timeout)
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
 def ollama_chat(
     host: str,
     model: str,
@@ -521,7 +657,7 @@ def ollama_chat(
         request.add_header("Authorization", f"Bearer {api_key}")
 
     def _open() -> bytes:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _ollama_open(request, timeout=timeout) as response:
             return response.read()
 
     try:
@@ -563,7 +699,7 @@ def ollama_list_models(host: str, timeout: float = 10.0) -> list[str]:
     """Names of models already pulled into the local Ollama store (/api/tags)."""
     endpoint = host.rstrip("/") + "/api/tags"
     try:
-        with urllib.request.urlopen(endpoint, timeout=timeout) as response:
+        with _ollama_open(endpoint, timeout=timeout) as response:
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.URLError as exc:
         raise CoderError(
@@ -585,7 +721,7 @@ def ollama_delete(host: str, model: str, timeout: float = 20.0) -> None:
         method="DELETE",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _ollama_open(request, timeout=timeout) as response:
             response.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "ignore") if hasattr(exc, "read") else ""
@@ -602,11 +738,13 @@ def ollama_delete(host: str, model: str, timeout: float = 20.0) -> None:
 
 def model_installed(installed: list[str], model: str) -> bool:
     """Match a configured model name against installed names, tolerating the
-    implicit ':latest' tag Ollama adds to untagged names. Ollama may lowercase
-    the Hugging Face repository and quantization tag when storing the model."""
+    implicit ':latest' tag Ollama adds and case-insensitive quantization tags.
+    Ollama may lowercase Hugging Face repository and quantization names."""
     wanted = str(model or "").casefold()
-    have = {str(name).casefold() for name in installed}
-    return wanted in have or (":" not in wanted and f"{wanted}:latest" in have)
+    have = {str(name or "").casefold() for name in installed}
+    if wanted in have:
+        return True
+    return ":" not in wanted and f"{wanted}:latest" in have
 
 
 def ollama_pull(host: str, model: str, timeout: float, progress_cb) -> None:
@@ -621,7 +759,7 @@ def ollama_pull(host: str, model: str, timeout: float, progress_cb) -> None:
     )
     succeeded = False
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _ollama_open(request, timeout=timeout) as response:
             for raw in response:
                 line = raw.decode("utf-8", "ignore").strip()
                 if not line:
@@ -644,6 +782,59 @@ def ollama_pull(host: str, model: str, timeout: float, progress_cb) -> None:
         ) from exc
     if not succeeded:
         raise CoderError("Ollama ended the model download without confirming success.")
+
+
+def ollama_probe_readiness(host: str, model: str, timeout: float = 120.0) -> dict[str, Any]:
+    """Test a downloaded model with harmless chat and structured tool requests.
+
+    No tool is executed. Agent mode needs a structured function call, so a model
+    that merely echoes a tool-shaped string is reported as chat-only.
+    """
+    try:
+        answer = ollama_chat(
+            host, model,
+            [{"role": "user", "content": "Reply with a short greeting."}],
+            options={"num_predict": 64}, timeout=timeout,
+        )
+    except CoderError as exc:
+        return {"chat_ready": False, "tool_ready": False, "reason": f"Chat check failed: {exc}"}
+    if not str(answer.get("content") or "").strip():
+        return {"chat_ready": False, "tool_ready": False, "reason": "Chat check returned no text."}
+
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "greyiq_readiness",
+            "description": "Report the marker given by the user. This check has no side effects.",
+            "parameters": {
+                "type": "object", "required": ["marker"],
+                "properties": {"marker": {"type": "string"}},
+            },
+        },
+    }
+    try:
+        response = ollama_chat(
+            host, model,
+            [{"role": "user", "content": "Call greyiq_readiness with marker READY. Do not answer in text."}],
+            tools=[tool], options={"num_predict": 128}, timeout=timeout,
+        )
+    except CoderError as exc:
+        return {"chat_ready": True, "tool_ready": False, "reason": f"Tool-call check failed: {exc}"}
+    for call in response.get("tool_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") or {}
+        if not isinstance(function, dict) or function.get("name") != "greyiq_readiness":
+            continue
+        args = function.get("arguments") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        if isinstance(args, dict) and args.get("marker") == "READY":
+            return {"chat_ready": True, "tool_ready": True, "reason": ""}
+    return {"chat_ready": True, "tool_ready": False, "reason": "Model answered chat but did not make the required structured tool call."}
 
 
 def _generate_ollama(

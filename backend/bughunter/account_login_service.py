@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 
 from bughunter.active_verify_service import host_in_active_scope
 from bughunter.playwright_env import ensure_bundled_browsers_path
+from bughunter.scan_auth import same_registrable_site
 from bughunter.settings import get_settings
 from bughunter.web_ingest import WebsiteFetchError, current_user_agent, normalize_website_url
 from bughunter.web_scan_service import _guard_url, playwright_request_allowed
@@ -63,13 +64,35 @@ def _cookie_header_for_host(cookies: list[dict[str, Any]], host: str) -> str:
     host = (host or "").lower()
     parts: list[str] = []
     for c in cookies or []:
-        dom = str(c.get("domain") or "").lower().lstrip(".")
+        raw_domain = str(c.get("domain") or "").lower()
+        dom = raw_domain.lstrip(".")
         name = str(c.get("name") or "")
         if not name or not dom:
             continue
-        if host == dom or host.endswith("." + dom) or dom.endswith("." + host):
+        # Playwright retains the leading dot for a domain cookie. Without it,
+        # this is host-only; a sibling or child host must not inherit it. The
+        # reverse suffix test previously copied child-host cookies to the login
+        # host, then replayed them to scan targets.
+        if host == dom or (raw_domain.startswith(".") and host.endswith("." + dom)):
             parts.append(f"{name}={c.get('value', '')}")
     return "; ".join(parts)
+
+
+def _login_request_allowed(url: str, issuer_host: str, scope: str, settings: Any) -> bool:
+    """Constrain every browser request, including redirects and form actions.
+
+    The generic Playwright guard checks SSRF and ports. Login also needs the
+    program's scope and the issuer's domain boundary before any credentials
+    can leave the browser. Local browser-only schemes cause no network egress.
+    """
+    if not playwright_request_allowed(url, settings.allow_private_urls, settings.web_allowed_ports):
+        return False
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return True
+    request_host = parsed.hostname or ""
+    return (host_in_active_scope(request_host, scope, settings)
+            and same_registrable_site(request_host, issuer_host))
 
 
 def _playwright_login(url: str, host: str, email: str, password: str, scope: str, settings: Any) -> dict[str, Any]:
@@ -80,10 +103,10 @@ def _playwright_login(url: str, host: str, email: str, password: str, scope: str
         return {"ok": False, "cookie": "", "headers": [], "note": "Playwright not available — paste a session cookie instead."}
 
     def _guard_route(route: Any) -> None:
-        if playwright_request_allowed(route.request.url, settings.allow_private_urls, settings.web_allowed_ports):
+        if _login_request_allowed(route.request.url, host, scope, settings):
             route.continue_()
         else:
-            route.abort()  # never let the login page pull in a private/OOB resource
+            route.abort()  # no off-scope/issuer request, redirect, or form submission
 
     try:
         with sync_playwright() as pw:

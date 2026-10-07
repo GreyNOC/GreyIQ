@@ -63,7 +63,7 @@ def build_submission(ctx: dict[str, Any], finding: dict[str, Any], platform: str
     (e.g. an unconfirmed JWT credential). ``vulnerability_information`` is the platform-
     shaped Markdown; the gathered evidence is always included when present."""
     platform = report_formats.normalize_platform(platform)
-    body = report_formats.render_finding(ctx, finding, platform)
+    body = report_formats.render_submission_body(ctx, finding, platform)
     if not body.strip():
         return None
     plan = (ctx.get("attack_plans") or {}).get(finding.get("ref"), {}) or {}
@@ -77,27 +77,32 @@ def build_submission(ctx: dict[str, Any], finding: dict[str, Any], platform: str
     # longer lands on the literal "(map to the closest VRT category)" placeholder.
     vrt = str(finding.get("vrt") or "").strip() or (taxonomy.cwe_to_vrt(finding.get("cwe")) or "")
     cvss = plan.get("cvss") if isinstance(plan.get("cvss"), dict) else {}
+    def safe(value: Any) -> str:
+        return report_formats._safe_report_text(str(value or ""), finding)
     return {
-        "ref": finding.get("ref", ""),
-        "title": title[:255],
+        "ref": safe(finding.get("ref", "")),
+        "title": safe(title)[:255],
         "platform": platform,
         "platform_name": report_formats.platform_name(platform),
         # severity_rating stays the HackerOne API vocabulary (used by submit_to_hackerone);
         # platform_severity is the chosen platform's own label for display.
         "severity_rating": severity_rating(finding, plan),
         "platform_severity": report_formats.platform_severity(platform, finding, plan),
-        "cwe": str(finding.get("cwe") or ""),
+        "cwe": safe(finding.get("cwe")),
         "weakness": _cwe_number(finding),
-        "vrt": vrt,  # Bugcrowd VRT category (est.), '' if the CWE is unmapped
-        "cvss_vector": str(cvss.get("vector") or "").strip(),
+        "vrt": safe(vrt),  # Bugcrowd VRT category (est.), '' if the CWE is unmapped
+        "cvss_vector": safe(cvss.get("vector")).strip(),
         "cvss_score": cvss.get("base_score"),
         # The concrete affected asset/endpoint — used to route an H1 submission to its
         # structured_scope entry and to preflight the platforms that require an endpoint.
-        "location": location,
+        "location": safe(location),
         "proof_status": str(proof.get("status") or "missing"),
         "vulnerability_information": body,
-        "impact": impact,
-        "target": ctx.get("target", ""),
+        # Keep the full analyst view with metadata, proof gates, and evidence in
+        # the JSON sidecar while the Markdown description stays readable.
+        "analyst_report": report_formats.render_finding(ctx, finding, platform),
+        "impact": safe(impact),
+        "target": safe(ctx.get("target", "")),
     }
 
 
@@ -228,11 +233,21 @@ def write_submission_package(ctx: dict[str, Any], finding: dict[str, Any], out_d
                 pass
         return None
     md_path = out_dir / f"{stem}.md"
+    details_path = out_dir / f"{stem}.details.md"
     json_path = out_dir / f"{stem}.json"
+    # A failed write must not leave a new paste body or detailed sidecar behind.
+    # Preserve pre-existing files if this stem is being regenerated.
+    new_paths = [path for path in (md_path, details_path, json_path) if not path.exists()]
     try:
         fsutil.write_text_safe(md_path, package["vulnerability_information"])
+        fsutil.write_text_safe(details_path, package["analyst_report"])
         fsutil.write_text_safe(json_path, json.dumps(package, indent=2, default=str))
     except OSError:
+        for path in new_paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
         for path in newly_created:
             try:
                 path.unlink()
@@ -251,7 +266,7 @@ def write_submission_package(ctx: dict[str, Any], finding: dict[str, Any], out_d
                 shutil.copyfile(src, out_dir / src.name)
         except OSError:
             pass
-    return {**package, "markdown_path": str(md_path), "json_path": str(json_path),
+    return {**package, "markdown_path": str(md_path), "details_path": str(details_path), "json_path": str(json_path),
             "screenshot_paths": copied_shots}
 
 
