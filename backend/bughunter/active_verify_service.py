@@ -411,6 +411,12 @@ class _Http:
         method = method.upper()
         if method not in _SAFE_METHODS:  # belt-and-suspenders; callers never pass others
             raise _ActiveError(f"refused non-idempotent method {method}")
+        # An interactively supplied session is HTTPS-only. Check before the
+        # request budget, DNS guard, or any socket use; this also covers JWT
+        # probes whose replacement token arrives in extra_headers below.
+        if (self.auth is not None and getattr(self.auth, "https_only", False)
+                and urlparse(normalize_website_url(url)).scheme.lower() != "https"):
+            raise _ActiveError("Operator session refused on a non-HTTPS active request.")
         if self.halt_reason:
             raise _RateLimited()
         if self.scope_host and extra_headers and any(
@@ -448,7 +454,7 @@ class _Http:
             # Operator auth is attached ONLY when this request's host is same-site as the
             # bound host — so the open-bucket check's foreign-host fetch (and any other
             # off-target host) never receives the session.
-            headers.update(auth_headers_for(host, self.auth))
+            headers.update(auth_headers_for(host, self.auth, request_scheme=urlparse(sanitized).scheme))
             if extra_headers:
                 headers.update(extra_headers)
             request = Request(sanitized, headers=headers, method=method)

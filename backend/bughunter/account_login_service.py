@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import urlparse
 
+from bughunter import operator_guard
 from bughunter.active_verify_service import host_in_active_scope
 from bughunter.playwright_env import ensure_bundled_browsers_path
 from bughunter.scan_auth import same_registrable_site
@@ -78,18 +79,23 @@ def _cookie_header_for_host(cookies: list[dict[str, Any]], host: str) -> str:
     return "; ".join(parts)
 
 
-def _login_request_allowed(url: str, issuer_host: str, scope: str, settings: Any) -> bool:
+def _login_request_allowed(url: str, issuer_host: str, scope: str, settings: Any,
+                           *, method: str = "GET") -> bool:
     """Constrain every browser request, including redirects and form actions.
 
     The generic Playwright guard checks SSRF and ports. Login also needs the
     program's scope and the issuer's domain boundary before any credentials
     can leave the browser. Local browser-only schemes cause no network egress.
     """
-    if not playwright_request_allowed(url, settings.allow_private_urls, settings.web_allowed_ports):
+    if not playwright_request_allowed(url, settings.allow_private_urls,
+                                      settings.web_allowed_ports, method=method):
         return False
     parsed = urlparse(url)
     if parsed.scheme.lower() not in {"http", "https"}:
         return True
+    # A redirect or form action must not downgrade the credential exchange to HTTP.
+    if parsed.scheme.lower() != "https":
+        return False
     request_host = parsed.hostname or ""
     return (host_in_active_scope(request_host, scope, settings)
             and same_registrable_site(request_host, issuer_host))
@@ -97,38 +103,96 @@ def _login_request_allowed(url: str, issuer_host: str, scope: str, settings: Any
 
 def _playwright_login(url: str, host: str, email: str, password: str, scope: str, settings: Any) -> dict[str, Any]:
     ensure_bundled_browsers_path()
+    guard = operator_guard.current()
+    document_status = 0
     try:
         from playwright.sync_api import sync_playwright
     except Exception:  # noqa: BLE001 - optional dependency
         return {"ok": False, "cookie": "", "headers": [], "note": "Playwright not available — paste a session cookie instead."}
 
     def _guard_route(route: Any) -> None:
-        if _login_request_allowed(route.request.url, host, scope, settings):
+        if _login_request_allowed(route.request.url, host, scope, settings,
+                                  method=route.request.method):
             route.continue_()
         else:
             route.abort()  # no off-scope/issuer request, redirect, or form submission
+
+    def _observe_browser_response(response: Any) -> None:
+        nonlocal document_status
+        if guard is None:
+            return
+        try:
+            if response.request.resource_type == "document":
+                document_status = int(response.status)
+        except Exception:  # noqa: BLE001 - response inspection must fail closed
+            try:
+                guard.halt("unable to inspect browser login response")
+            except operator_guard.GuardHalt:
+                pass
+            return
+        operator_guard.observe_playwright_response(response, guard=guard)
+
+    def _inspect_page_body(page: Any) -> None:
+        if guard is None:
+            return
+        operator_guard.inspect_playwright_page(page, status=document_status, guard=guard)
 
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
             # Carry the app signature + the program's mandatory marker (see screenshot_service).
-            context = browser.new_context(ignore_https_errors=True, user_agent=current_user_agent())
+            # A research-account password must never be submitted through an invalid
+            # certificate. Playwright rejects TLS errors before the form can be filled.
+            context = browser.new_context(ignore_https_errors=False, user_agent=current_user_agent())
             context.route("**/*", _guard_route)
+            if guard is not None:
+                context.on("response", _observe_browser_response)
             page = context.new_page()
             try:
                 page.goto(url, wait_until="load", timeout=30000)
+                _inspect_page_body(page)
                 email_sel = _first_selector(page, _EMAIL_SELECTORS)
                 pw_sel = _first_selector(page, ("input[type=password]",))
                 if not email_sel or not pw_sel:
                     return {"ok": False, "cookie": "", "headers": [], "note": "could not find the login form's email/password fields — paste a session cookie instead."}
+                submit_sel = _first_selector(page, _SUBMIT_SELECTORS)
+                if guard is not None:
+                    if not submit_sel:
+                        guard.halt("saved research login needs a visible submit control")
+                    try:
+                        form = page.eval_on_selector(
+                            pw_sel,
+                            """(password, selectors) => {
+                                const form = password.form;
+                                const email = document.querySelector(selectors.email);
+                                const submit = selectors.submit && document.querySelector(selectors.submit);
+                                if (!form || !email || email.form !== form || (submit && submit.form !== form))
+                                    return null;
+                                if (form.hasAttribute('target') && form.target.toLowerCase() !== '_self')
+                                    return {unsafe_submit: true};
+                                if (submit && (submit.type !== 'submit' || submit.hasAttribute('formmethod') ||
+                                               submit.hasAttribute('formaction') || submit.hasAttribute('formtarget')))
+                                    return {unsafe_submit: true};
+                                return {method: form.method, action: form.action};
+                            }""",
+                            {"email": email_sel, "submit": submit_sel},
+                        )
+                    except Exception:  # noqa: BLE001 - do not fill credentials into an unknown form
+                        guard.halt("unable to validate saved research login form")
+                    if not isinstance(form, dict):
+                        guard.halt("saved research login fields must share one form")
+                    if form.get("unsafe_submit"):
+                        guard.halt("saved research login submit override is not allowed")
+                    guard.check_saved_login_form(form.get("method", ""), form.get("action", ""))
                 page.fill(email_sel, email)
                 page.fill(pw_sel, password)
-                submit_sel = _first_selector(page, _SUBMIT_SELECTORS)
-                if submit_sel:
-                    page.click(submit_sel)
-                else:
-                    page.press(pw_sel, "Enter")  # no obvious submit button — submit the form via Enter
+                with operator_guard.saved_login_submission():
+                    if submit_sel:
+                        page.click(submit_sel)
+                    else:
+                        page.press(pw_sel, "Enter")  # no obvious submit button — submit the form via Enter
                 page.wait_for_timeout(_NAV_WAIT_MS)
+                _inspect_page_body(page)
                 final_host = urlparse(page.url).hostname or ""
                 # Re-gate after the login navigation: a login can 302 to an SSO/other host. Only accept
                 # a session that ended on an in-scope host.
@@ -138,7 +202,11 @@ def _playwright_login(url: str, host: str, email: str, password: str, scope: str
                 still_login = page.query_selector("input[type=password]") is not None
             finally:
                 browser.close()
-    except Exception as exc:  # noqa: BLE001 - login is best-effort; never break the hunt
+    except operator_guard.GuardHalt:
+        raise
+    except Exception as exc:  # noqa: BLE001 - manual login remains best-effort
+        if guard is not None and guard.halt_reason:
+            raise operator_guard.GuardHalt(guard.halt_reason) from exc
         return {"ok": False, "cookie": "", "headers": [], "note": f"auto-login failed ({type(exc).__name__}) — paste a session cookie instead."}
 
     if not cookie_str:
@@ -189,6 +257,9 @@ def login(account_access: dict[str, Any] | None, scope: str, settings: Any = Non
     except (WebsiteFetchError, ValueError) as exc:
         return {"ok": False, "cookie": "", "headers": [], "note": f"login URL refused by the URL guard: {exc}"}
     host = (urlparse(sanitized).hostname or "").lower()
+    if urlparse(sanitized).scheme.lower() != "https":
+        return {"ok": False, "cookie": "", "headers": [],
+                "note": "login URL must use HTTPS before account credentials can be submitted."}
     if not host_in_active_scope(host, scope, settings):
         # credentials must go ONLY to an authorized host — never auto-login to an out-of-scope URL
         return {"ok": False, "cookie": "", "headers": [], "note": f"login URL host '{host}' is not in this program's scope — not logging in."}

@@ -117,9 +117,11 @@ def run_idor_check(
         return _err(f"target refused by the URL guard: {exc}")
 
     auth_a = build_auth(sa, cookie=account_a.get("cookie", ""), headers=account_a.get("headers") or [],
-                        issuer_host=str(account_a.get("issuer_host") or ""))
+                        issuer_host=str(account_a.get("issuer_host") or ""),
+                        https_only=bool(account_a.get("https_only")))
     auth_b = build_auth(sb, cookie=account_b.get("cookie", ""), headers=account_b.get("headers") or [],
-                        issuer_host=str(account_b.get("issuer_host") or ""))
+                        issuer_host=str(account_b.get("issuer_host") or ""),
+                        https_only=bool(account_b.get("https_only")))
     if auth_a is None or auth_b is None:
         return _err("IDOR testing needs TWO sessions — supply a cookie and/or auth headers for BOTH account A and account B.")
 
@@ -249,7 +251,8 @@ def run_idor_probe(
     except WebsiteFetchError as exc:
         return _err(f"target refused by the URL guard: {exc}")
     auth = build_auth(su, cookie=account.get("cookie", ""), headers=account.get("headers") or [],
-                      issuer_host=str(account.get("issuer_host") or ""))
+                      issuer_host=str(account.get("issuer_host") or ""),
+                      https_only=bool(account.get("https_only")))
     if auth is None:
         return _err("Provide your authenticated session (a cookie and/or auth headers) so the probe reads YOUR object.")
 
@@ -392,9 +395,11 @@ def run_bfla_check(
         return _err(f"target refused by the URL guard: {exc}")
 
     auth_admin = build_auth(su, cookie=admin_account.get("cookie", ""), headers=admin_account.get("headers") or [],
-                            issuer_host=str(admin_account.get("issuer_host") or ""))
+                            issuer_host=str(admin_account.get("issuer_host") or ""),
+                            https_only=bool(admin_account.get("https_only")))
     auth_user = build_auth(su, cookie=user_account.get("cookie", ""), headers=user_account.get("headers") or [],
-                           issuer_host=str(user_account.get("issuer_host") or ""))
+                           issuer_host=str(user_account.get("issuer_host") or ""),
+                           https_only=bool(user_account.get("https_only")))
     if auth_admin is None or auth_user is None:
         return _err("BFLA testing needs TWO sessions — supply a cookie and/or auth headers for BOTH the high-privilege and the low-privilege account.")
 
@@ -611,8 +616,12 @@ def _json_write(url: str, method: str, payload: dict[str, Any], *, auth: Any, se
     prover interleaves GET reads (each opening/closing its own DNS-pin scope), so a single outer pin is
     already gone by the time a write runs; without this, urllib would re-resolve via live DNS and a
     rebind could point the session-bearing write at an internal/metadata host."""
+    parsed_url = urlparse(url)
+    if auth is not None and getattr(auth, "https_only", False) and parsed_url.scheme.lower() != "https":
+        return {"ok": False, "error": "Operator session requires HTTPS; refusing a cleartext write."}
     headers = {"Content-Type": "application/json", "Accept": "*/*", "User-Agent": current_user_agent(_USER_AGENT)}
-    headers.update(auth_headers_for(urlparse(url).hostname or "", auth))
+    headers.update(auth_headers_for(parsed_url.hostname or "", auth,
+                                    request_scheme=parsed_url.scheme))
     request = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), method=method, headers=headers)
     opener = urllib.request.build_opener(_NoRedirect())
     with guarded_dns_scope():
@@ -683,7 +692,8 @@ def run_mass_assignment_check(
     except WebsiteFetchError as exc:
         return _err(f"target refused by the URL guard: {exc}")
     auth = build_auth(su, cookie=account.get("cookie", ""), headers=account.get("headers") or [],
-                      issuer_host=str(account.get("issuer_host") or ""))
+                      issuer_host=str(account.get("issuer_host") or ""),
+                      https_only=bool(account.get("https_only")))
     if auth is None:
         return _err("Mass-assignment testing needs your session -- supply a cookie and/or auth headers for the account that owns the object.")
 
@@ -854,7 +864,8 @@ def run_session_invalidation_check(
     except WebsiteFetchError as exc:
         return _err(f"target refused by the URL guard: {exc}")
     auth = build_auth(sau, cookie=account.get("cookie", ""), headers=account.get("headers") or [],
-                      issuer_host=str(account.get("issuer_host") or ""))
+                      issuer_host=str(account.get("issuer_host") or ""),
+                      https_only=bool(account.get("https_only")))
     if auth is None:
         return _err("Session testing needs your session -- supply a cookie and/or auth headers for the account.")
 

@@ -184,6 +184,10 @@ class Scanner:
     def active(self) -> bool:
         return self._active
 
+    @property
+    def stopped(self) -> bool:
+        return self._stopped.is_set()
+
     def start(self) -> "Scanner":
         if not self._active or self._thread is not None:
             return self
@@ -208,7 +212,7 @@ class Scanner:
         clean = str(text or "").rstrip()
         if not clean:
             return
-        if not self._active:
+        if not self._active or self.stopped:
             return
         with self._lock:
             self._erase()
@@ -385,11 +389,15 @@ def progress_sink(fx: Any = None, fallback: Any = None) -> Any:
     if fx is None or not fx.active:
         return fallback
     if isinstance(fx, Board):
-        return BoardFeed(fx)
+        return BoardFeed(fx, fallback=fallback)
 
     def _sink(message: str) -> None:
         text = str(message or "").strip()
         if not text:
+            return
+        if fx.stopped:
+            if callable(fallback):
+                fallback(text)
             return
         fx.phase(text)
         fx.note(text)
@@ -1460,12 +1468,17 @@ class BoardFeed:
     they report and when — in particular, why :meth:`report` exists at all.
     """
 
-    def __init__(self, board: "Board") -> None:
+    def __init__(self, board: "Board", fallback: Any = None) -> None:
         self._board = board
+        self._fallback = fallback
 
     def __call__(self, message: str) -> None:
         """One progress line. Total: a sink must never break the hunt feeding it."""
         try:
+            if self._board._done or self._board._stopped.is_set():
+                if callable(self._fallback):
+                    self._fallback(str(message or ""))
+                return
             self._feed(str(message or ""))
         except Exception:  # noqa: BLE001 - an unparseable message costs an arc, never the run
             pass

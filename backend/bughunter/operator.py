@@ -156,7 +156,16 @@ def run_program_cycle(
             summary["stop_reason"] = guard.halt_reason
             break
         if not result.get("ok"):
+            if result.get("needs_operator"):
+                # A protected surface is unfinished work, never a clean cycle.
+                # Unattended runs stop for human input instead of rescheduling
+                # the same missing-session attempt indefinitely.
+                summary["needs_operator"] = True
+                summary["stopped"] = True
+                summary["stop_reason"] = "operator authentication required"
             summary["errors"].append(f"{target}: {result.get('error', 'campaign failed')}")
+            if summary.get("needs_operator"):
+                break
             continue
         summary["targets_run"] += 1
         findings = result.get("findings") or []
@@ -418,6 +427,11 @@ class OperatorLoop:
         except Exception as exc:  # noqa: BLE001
             self._emit(f"cycle error {pid}: {type(exc).__name__}: {exc}")
             summary = {"findings": 0, "confirmed": 0, "submitted": 0}
+        finally:
+            # The per-cycle guard is the only holder of a resolved research
+            # session. Release it as soon as the target loop finishes, including
+            # error and stop paths.
+            guard.research_auth = None
         if guard.halt_reason or summary.get("stopped"):
             reason = guard.halt_reason or summary.get("stop_reason") or "stop requested"
             self._stop_reason = str(reason)

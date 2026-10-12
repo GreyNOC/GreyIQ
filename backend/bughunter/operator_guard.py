@@ -22,13 +22,13 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, unquote_plus, urlparse, urlunparse
 
 from bughunter import portfolio
 from bughunter.code_scanner.sources.git_remote import is_supported_remote_git_url
 from bughunter.registrable_domain import is_bare_public_suffix
 from bughunter.settings import get_settings
-from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
+from bughunter.web_ingest import WebsiteFetchError, _ascii_hostname, normalize_website_url
 
 MAX_GRANT_DAYS = 7
 MAX_CYCLES = 100
@@ -43,6 +43,7 @@ _UNAMBIGUOUS_CHALLENGE_MARKERS = (
 _HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _HOST_TOKEN = re.compile(r"(?:\*\.)?(?:[a-z0-9-]+\.)+[a-z0-9-]+", re.IGNORECASE)
 _CURRENT: ContextVar[RunGuard | None] = ContextVar("greyiq_operator_guard", default=None)
+_LOGIN_SUBMISSION = threading.local()
 _AUDIT_LOCK = threading.Lock()
 _AUDIT_FILE = "operator_authorization_audit.jsonl"
 _MAX_AUDIT_BYTES = 16 * 1024 * 1024
@@ -114,6 +115,7 @@ def audit_event(runtime_dir: str, event: str, *, grant: ProgramGrant,
         "expires_at": grant.expires_at.isoformat(),
         "max_cycles": grant.max_cycles,
         "max_requests_per_cycle": grant.max_requests_per_cycle,
+        "allow_account_access": grant.allow_account_access,
         "cycles_used": max(0, int(cycles_used)),
         "requests_used": max(0, int(requests_used)),
         "stop_reason": str(stop_reason)[:240],
@@ -328,6 +330,47 @@ def target_allowed(program: dict[str, Any], target: str) -> bool:
     return web_url_allowed(program, raw)
 
 
+def _exact_https_login_url(value: Any) -> str:
+    """Canonicalize only a plain HTTPS login URL; never return credential text.
+
+    A query, fragment, unusual port, or ambiguous path would make a broad or
+    unstable POST grant. The saved URL and each attempted POST use this same
+    representation, so a different action path fails closed.
+    """
+    raw = str(value or "").strip()
+    if not raw.startswith("https://"):
+        raise ValueError("saved account access requires an explicit HTTPS login URL")
+    try:
+        parsed = urlparse(normalize_website_url(raw))
+        host = _ascii_hostname(parsed.hostname or "")
+        port = parsed.port
+    except (WebsiteFetchError, ValueError) as exc:
+        raise ValueError("saved account login URL is invalid") from exc
+    path = parsed.path or "/"
+    if (not host or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or parsed.params or port not in (None, 443) or "//" in path
+            or "%" in path or any(part in {".", ".."} for part in path.split("/"))):
+        raise ValueError("saved account login URL must be a plain HTTPS URL without credentials, query, or fragment")
+    return urlunparse(("https", host, path, "", "", ""))
+
+
+def _saved_account_login_url(program: dict[str, Any]) -> str:
+    account = program.get("account_access")
+    if not isinstance(account, dict):
+        raise ValueError("saved research account access is required")
+    if not str(account.get("cookie") or "").strip() and not (
+        str(account.get("email") or "").strip() and str(account.get("password") or "").strip()
+    ):
+        raise ValueError("saved research account needs a cookie or email and password")
+    raw_login_url = str(account.get("login_url") or "").strip()
+    if not raw_login_url:
+        raise ValueError("saved research account needs an exact HTTPS login URL to identify the issuer")
+    login_url = _exact_https_login_url(raw_login_url)
+    if not web_url_allowed(program, login_url):
+        raise ValueError("saved account login URL is outside the exact authorized scope")
+    return login_url
+
+
 @dataclass(frozen=True, slots=True)
 class ProgramGrant:
     program_id: str
@@ -338,6 +381,9 @@ class ProgramGrant:
     expires_at: datetime
     max_cycles: int
     max_requests_per_cycle: int
+    allow_account_access: bool = False
+    allow_login_post: bool = False
+    account_login_url: str = ""
 
     def current_reason(self, program: dict[str, Any] | None, *, now: datetime | None = None) -> str:
         now = now or datetime.now(UTC)
@@ -400,13 +446,30 @@ def create_grants(programs: list[dict[str, Any]], specs: list[dict[str, Any]] | 
         refused = [target for target in targets if not target_allowed(program, target)]
         if refused:
             raise ValueError(f"{pid}: target outside the saved scope or repository selection: {refused[0][:200]}")
-        # The unattended path can safely use the deterministic GET/HEAD/OPTIONS
-        # prover. Browser execution, time-delay probes, and stored login sessions
-        # need separate program rules and per-request controls before auto mode.
+        # Browser research-account login is a narrow exception to the normal
+        # GET/HEAD/OPTIONS posture. Its saved credentials and exact HTTPS login
+        # URL require a separate grant flag; admin accounts and ownership pairs
+        # remain manual because they permit higher-impact access checks.
         if program.get("live") or program.get("deep"):
             raise ValueError(f"{pid}: live browser and deep/time-based testing require a manual run")
-        if program.get("account_access") or program.get("admin_account_access") or program.get("idor_pairs"):
-            raise ValueError(f"{pid}: stored account sessions and IDOR pairs require a manual run")
+        if program.get("admin_account_access") or program.get("idor_pairs"):
+            raise ValueError(f"{pid}: admin account sessions and IDOR pairs require a manual run")
+        opt_in = spec.get("allow_account_access", False)
+        if type(opt_in) is not bool:
+            raise ValueError(f"{pid}: allow_account_access must be true or false")
+        saved_account = bool(program.get("account_access"))
+        if saved_account and not opt_in:
+            raise ValueError(f"{pid}: stored account access needs allow_account_access=true; otherwise use a manual run")
+        if opt_in and not saved_account:
+            raise ValueError(f"{pid}: allow_account_access requires a saved research account")
+        login_url = _saved_account_login_url(program) if opt_in else ""
+        account = program.get("account_access") or {}
+        allow_login_post = bool(opt_in and str(account.get("email") or "").strip()
+                                and str(account.get("password") or "").strip())
+        if opt_in:
+            for target in targets:
+                if urlparse(target).scheme.lower() != "https":
+                    raise ValueError(f"{pid}: account access requires HTTPS seed targets")
         grants[pid] = ProgramGrant(
             program_id=pid,
             fingerprint=portfolio.execution_fingerprint(program),
@@ -419,6 +482,9 @@ def create_grants(programs: list[dict[str, Any]], specs: list[dict[str, Any]] | 
                 spec.get("max_requests_per_cycle"), "max_requests_per_cycle", default=200,
                 maximum=MAX_REQUESTS_PER_CYCLE,
             ),
+            allow_account_access=opt_in,
+            allow_login_post=allow_login_post,
+            account_login_url=login_url,
         )
     return grants
 
@@ -430,8 +496,12 @@ class RunGuard:
     stop_event: threading.Event
     session_id: str = ""
     requests_used: int = 0
+    login_posts_used: int = 0
     consecutive_403: int = 0
     halt_reason: str = ""
+    research_auth: Any = field(default=None, repr=False)
+    research_auth_resolved: bool = False
+    research_auth_program: str = ""
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def halt(self, reason: str) -> None:
@@ -460,17 +530,58 @@ class RunGuard:
 
     def before_request(self, url: str, *, method: str = "GET", reserve: bool = True) -> None:
         program = self.check_current()
-        if method.upper() not in _HTTP_METHODS:
-            self.halt("unattended request used a method outside GET/HEAD/OPTIONS")
+        request_method = str(method or "").upper()
+        if request_method == "GET" and self.grant.allow_login_post:
+            try:
+                query = urlparse(url).query
+            except ValueError:
+                query = ""
+            if query:
+                decoded = unquote_plus(unquote_plus(query))
+                account = program.get("account_access") or {}
+                email = str(account.get("email") or "").strip()
+                password = str(account.get("password") or "").strip()
+                if ((email and email.casefold() in decoded.casefold())
+                        or (password and password in decoded)):
+                    self.halt("saved research account credential appeared in a request URL")
+        login_post = False
+        if request_method not in _HTTP_METHODS:
+            if (request_method == "POST" and self.grant.allow_login_post
+                    and getattr(_LOGIN_SUBMISSION, "guard", None) is self):
+                try:
+                    login_post = _exact_https_login_url(url) == self.grant.account_login_url
+                except ValueError:
+                    pass
+            if not login_post:
+                self.halt("unattended request used a method outside GET/HEAD/OPTIONS or the exact approved login POST")
         if not web_url_allowed(program, url):
             self.halt("request or redirect left the authorized program scope")
-        if reserve:
+        if reserve or login_post:
             with self._lock:
+                if login_post and self.login_posts_used >= 1:
+                    self.halt_reason = "saved research login POST already submitted in this cycle"
+                    self.stop_event.set()
+                    raise GuardHalt(self.halt_reason)
                 if self.requests_used >= self.grant.max_requests_per_cycle:
                     self.halt_reason = "cycle request budget exhausted"
                     self.stop_event.set()
                     raise GuardHalt(self.halt_reason)
-                self.requests_used += 1
+                if reserve:
+                    self.requests_used += 1
+                    if login_post:
+                        self.login_posts_used += 1
+
+    def check_saved_login_form(self, method: str, action: str) -> None:
+        """Check the form before credentials are filled into an unattended browser."""
+        self.check_current()
+        if not self.grant.allow_login_post or str(method or "").upper() != "POST":
+            self.halt("saved research login form must submit by POST")
+        try:
+            exact_action = _exact_https_login_url(action)
+        except ValueError:
+            self.halt("saved research login form action is not the exact approved HTTPS URL")
+        if exact_action != self.grant.account_login_url:
+            self.halt("saved research login form action is not the exact approved HTTPS URL")
 
     def note_sensitive_response(self, response: dict[str, Any], labels: list[str]) -> None:
         """Pause after retaining only non-secret provenance for operator review."""
@@ -552,6 +663,18 @@ def bind(guard: RunGuard) -> Iterator[None]:
         _CURRENT.reset(token)
 
 
+@contextmanager
+def saved_login_submission() -> Iterator[None]:
+    """Permit one exact saved-account form POST from the login service thread."""
+    guard = current()
+    previous = getattr(_LOGIN_SUBMISSION, "guard", None)
+    _LOGIN_SUBMISSION.guard = guard
+    try:
+        yield
+    finally:
+        _LOGIN_SUBMISSION.guard = previous
+
+
 def current() -> RunGuard | None:
     return _CURRENT.get()
 
@@ -566,3 +689,34 @@ def observe_response(response: dict[str, Any], *, stage: str = "complete") -> No
     guard = current()
     if guard is not None:
         guard.observe_response(response, stage=stage)
+
+
+def observe_playwright_response(response: Any, *, guard: RunGuard | None = None) -> None:
+    """Retain a browser header stop even if Playwright swallows event exceptions."""
+    guard = guard or current()
+    if guard is None:
+        return
+    try:
+        guard.observe_response({"status": response.status, "headers": response.headers}, stage="headers")
+    except GuardHalt:
+        pass
+    except Exception:  # noqa: BLE001 - an uninspectable response is not safe to ignore
+        try:
+            guard.halt("unable to inspect browser response")
+        except GuardHalt:
+            pass
+
+
+def inspect_playwright_page(page: Any, *, status: int = 0,
+                            guard: RunGuard | None = None) -> None:
+    """Inspect a bounded primary browser page for body-only challenges in memory."""
+    guard = guard or current()
+    if guard is None:
+        return
+    guard.check_current()
+    try:
+        body = page.evaluate("document.documentElement.outerHTML.slice(0, 65536)")
+    except Exception:  # noqa: BLE001 - unreadable page cannot validate safe continuation
+        guard.halt("unable to inspect browser page")
+    guard.observe_response({"status": status, "headers": {}, "body": body}, stage="body")
+    guard.check_current()

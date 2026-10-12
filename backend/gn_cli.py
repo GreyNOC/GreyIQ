@@ -39,11 +39,13 @@ and CLI startup latency both regress — that convention binds plugins too.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import shlex
 import shutil
 import sys
+import warnings
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -300,6 +302,143 @@ _HUNT_AUTHORIZE = ("a hunt tests a live/owned target — pass -y/--authorize to 
                    "authorized and in scope.")
 
 
+def _hunt_auth(args: argparse.Namespace) -> dict[str, Any]:
+    """Keep prompted credentials in memory and bound to their issuing site."""
+    supplied = getattr(args, "_auth_override", None)
+    if isinstance(supplied, dict):
+        return supplied
+    return {"cookie": getattr(args, "cookie", "") or "",
+            "headers": getattr(args, "header", None) or []}
+
+
+def _can_ask_for_auth(args: argparse.Namespace) -> bool:
+    """Never read a script's stdin or disturb the JSON output contract."""
+    if getattr(args, "json", False) or getattr(args, "no_prompt", False):
+        return False
+    try:
+        return bool(sys.stdin.isatty() and sys.stderr.isatty())
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _operator_line(prompt: str) -> str:
+    print(prompt, end="", file=sys.stderr, flush=True)
+    line = sys.stdin.readline()
+    if not line:
+        raise EOFError
+    return line.strip()
+
+
+def _operator_secret(prompt: str) -> str:
+    # getpass writes the prompt to the terminal and suppresses input echo.
+    # getpass otherwise warns and falls back to a plaintext stdin read when
+    # terminal echo suppression fails; fail closed before that fallback.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        try:
+            return getpass.getpass(prompt, stream=sys.stderr).strip()
+        except getpass.GetPassWarning:
+            print("Hidden input is unavailable in this terminal.", file=sys.stderr)
+            return ""
+
+
+_AUTH_REASONS = {
+    "http_401": "HTTP 401 authentication challenge",
+    "http_403_challenge": "HTTP 403 authentication challenge",
+    "login_redirect": "redirect to a login page",
+    "login_form": "login form on the target page",
+}
+
+
+def _ask_for_hunt_auth(args: argparse.Namespace, context: dict[str, Any]) -> dict[str, Any] | None:
+    """Ask only after the engine's authorization/scope checks observed an auth wall.
+
+    A choice, login URL, and username are read from the terminal; cookies, tokens, and passwords
+    are read without echo. Nothing is saved to config, report, progress, or command history.
+    The engine performs the final same-site binding and verifies the gate with one retry.
+    """
+    if not _can_ask_for_auth(args):
+        return None
+    target_scheme = urlparse(str(getattr(args, "target", "") or "")).scheme.lower()
+    if target_scheme and target_scheme != "https":
+        print("An HTTPS target is required before entering an operator session.", file=sys.stderr)
+        return None
+    from bughunter.scan_auth import same_registrable_site
+
+    target_host = str(context.get("target_host") or "").strip().lower()
+    if not target_host:
+        return None
+    reason = _AUTH_REASONS.get(str(context.get("reason") or ""), "authentication boundary")
+    print(f"\nHunt paused at {target_host}: {reason}.", file=sys.stderr)
+    print("Use only your own authorized research account. Input is not saved; login submits "
+          "credentials to the in-scope site.",
+          file=sys.stderr)
+    try:
+        choice = _operator_line("Provide [c]ookie, [t]oken, [l]ogin credentials, or [s]kip? ").lower()
+        if choice in {"c", "cookie"}:
+            cookie = _operator_secret("Session Cookie value (hidden): ")
+            if cookie.lower().startswith("cookie:"):
+                cookie = cookie.partition(":")[2].strip()
+            return {"cookie": cookie, "headers": [], "issuer_host": target_host,
+                    "https_only": True} if cookie else None
+        if choice in {"t", "token"}:
+            token = _operator_secret("Bearer token (hidden): ")
+            if token.lower().startswith("authorization:"):
+                token = token.partition(":")[2].strip()
+            if token.lower().startswith("bearer "):
+                token = token[7:].strip()
+            return {"cookie": "", "headers": [f"Authorization: Bearer {token}"],
+                    "issuer_host": target_host, "https_only": True} if token else None
+        if choice in {"l", "login"}:
+            from bughunter.active_verify_service import host_in_active_scope
+            from bughunter.account_login_service import login
+            from bughunter.settings import get_settings
+            from bughunter.web_ingest import normalize_website_url
+            from bughunter.web_scan_service import _guard_url
+
+            raw_url = _operator_line("In-scope HTTPS login URL: ")
+            settings = get_settings()
+            try:
+                login_url = _guard_url(normalize_website_url(raw_url), settings.allow_private_urls,
+                                       settings.web_allowed_ports)
+                login_host = (urlparse(login_url).hostname or "").lower()
+            except (ValueError, OSError) as exc:
+                print(f"Login URL refused: {type(exc).__name__}.", file=sys.stderr)
+                return None
+            if (urlparse(login_url).scheme != "https"
+                    or not host_in_active_scope(login_host, str(getattr(args, "scope", "") or ""), settings)
+                    or not same_registrable_site(login_host, target_host)):
+                print("Login URL must be HTTPS, in explicit scope, and on the target's site.",
+                      file=sys.stderr)
+                return None
+            email = _operator_secret("Research account username/email (hidden): ")
+            password = _operator_secret("Research account password (hidden): ")
+            if not (email and password):
+                return None
+            session = login({"login_url": login_url, "email": email, "password": password},
+                            str(getattr(args, "scope", "") or ""), settings)
+            if not session.get("ok") or not session.get("cookie"):
+                print(f"Account login did not produce a session: {session.get('note', 'unknown reason')}",
+                      file=sys.stderr)
+                return None
+            return {"cookie": session["cookie"], "headers": [],
+                    "issuer_host": str(session.get("host") or login_host), "https_only": True}
+    except (EOFError, KeyboardInterrupt):
+        print("\nAuthentication input cancelled.", file=sys.stderr)
+    return None
+
+
+def _hunt_auth_error(result: dict[str, Any], fallback: str) -> str:
+    message = str(result.get("error") or fallback)
+    context = result.get("auth_context") or {}
+    host = str(context.get("target_host") or "") if isinstance(context, dict) else ""
+    if result.get("needs_operator") and host:
+        message += f" Target host: {host}."
+    if result.get("needs_operator") and not result.get("secure_transport_required"):
+        return message + " Re-run in an interactive terminal with your research session."
+    return message
+
+
 #: The depth variables, in one place because `hunt` and `dash` must register the SAME set (a test
 #: pins dash's namespace as a superset of hunt's) and `/help -v` renders this exact table.
 #: Every row names the real setting it moves and what bounds the extra spend — a flag whose
@@ -422,6 +561,13 @@ def _cmd_hunt(args: argparse.Namespace) -> int:
     # A direct hunt used to pass no on_progress at ALL, so nothing printed between the command and the
     # summary -- minutes of silence in which a working hunt and a hung one look identical.
     fx = _fx(args, _BOARD_TITLE, scope=args.scope or "")
+
+    def _auth_needed(context: dict[str, Any]) -> dict[str, Any] | None:
+        if not _can_ask_for_auth(args):
+            return None
+        fx.stop()  # restore the terminal before getpass reads a hidden value
+        return _ask_for_hunt_auth(args, context)
+
     with fx:
         fx.phase("starting hunt")
         result = run_bounty_hunt(
@@ -443,7 +589,8 @@ def _cmd_hunt(args: argparse.Namespace) -> int:
             active=(args.active or getattr(args, "time_based", False) or getattr(args, "deep", False)
                     or getattr(args, "theorize", False) or getattr(args, "chain", False)),
             time_based=getattr(args, "time_based", False),
-            auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
+            auth=_hunt_auth(args),
+            on_auth_needed=_auth_needed if _can_ask_for_auth(args) else None,
             per_finding=args.per_finding,
             on_progress=_progress(args, fx),
             settings=depth_settings(args),
@@ -455,7 +602,9 @@ def _cmd_hunt(args: argparse.Namespace) -> int:
         fx.phase("hunt complete")
         fx.hold(_FX_HOLD_SECONDS if _fx_report(fx, result, default=args.target) else 0.6)
     if not result.get("ok"):
-        return _err(result.get("error", "the hunt could not run."))
+        if args.json and result.get("needs_operator"):
+            print(json.dumps(result, indent=2, default=str))
+        return _err(_hunt_auth_error(result, "the hunt could not run."))
     if args.json:
         result.pop("report_markdown", None)  # the file holds the full report
         print(json.dumps(result, indent=2, default=str))
@@ -491,7 +640,15 @@ def _cmd_campaign(args: argparse.Namespace) -> int:
 
     if not args.authorize:
         return _err("a campaign tests a live/owned target end-to-end — pass -y/--authorize to confirm scope.")
+    supplied_auth = _hunt_auth(args)
     fx = _fx(args, _BOARD_TITLE, scope=args.scope or "")
+
+    def _auth_needed(context: dict[str, Any]) -> dict[str, Any] | None:
+        if not _can_ask_for_auth(args):
+            return None
+        fx.stop()
+        return _ask_for_hunt_auth(args, context)
+
     with fx:
         fx.phase("starting campaign")
         # The one asset known before recon runs. Tracked, not launched: it goes on the map as an
@@ -508,7 +665,8 @@ def _cmd_campaign(args: argparse.Namespace) -> int:
             version=VERSION,
             active=args.active or getattr(args, "time_based", False) or getattr(args, "deep", False),  # --time-based/--deep imply --active
             time_based=getattr(args, "time_based", False),
-            auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
+            auth=supplied_auth if supplied_auth.get("cookie") or supplied_auth.get("headers") else None,
+            on_auth_needed=_auth_needed if _can_ask_for_auth(args) else None,
             live=args.live,
             program=args.program,
             max_pages=args.max_pages,
@@ -521,7 +679,9 @@ def _cmd_campaign(args: argparse.Namespace) -> int:
         fx.phase("campaign complete")
         fx.hold(_FX_HOLD_SECONDS if _fx_report(fx, result, default=args.target) else 0.6)
     if not result.get("ok"):
-        return _err(result.get("error", "the campaign could not run."))
+        if args.json and result.get("needs_operator"):
+            print(json.dumps(result, indent=2, default=str))
+        return _err(_hunt_auth_error(result, "the campaign could not run."))
     if args.json:
         result.pop("report_markdown", None)
         print(json.dumps(result, indent=2, default=str))
@@ -552,6 +712,13 @@ def _cmd_osint(args: argparse.Namespace) -> int:
     fx = _fx(args, args.target)
     fx.start()
     fx.phase("passive OSINT collection")
+
+    def _auth_needed(context: dict[str, Any]) -> dict[str, Any] | None:
+        if not _can_ask_for_auth(args):
+            return None
+        fx.stop()
+        return _ask_for_hunt_auth(args, context)
+
     result = osint_engine.run_campaign(
         args.target,
         output_dir=args.out or _ensure_dir(RUNTIME_DIR / "osint"),
@@ -596,9 +763,12 @@ def _cmd_osint(args: argparse.Namespace) -> int:
             max_pages=args.max_pages,
             platform=args.platform,
             on_progress=_progress(args, fx),
+            on_auth_needed=_auth_needed if _can_ask_for_auth(args) else None,
         )
         if not hunt_result.get("ok"):
-            return _err(hunt_result.get("error", "the verified-host hunt could not run."))
+            if args.json and hunt_result.get("needs_operator"):
+                print(json.dumps({**result, "hunt": hunt_result}, indent=2, default=str))
+            return _err(_hunt_auth_error(hunt_result, "the verified-host hunt could not run."))
         _fx_report(fx, hunt_result)
 
     fx.stop()
@@ -807,7 +977,7 @@ def _print_lead_queue(queue: dict) -> None:
           f"{_c('--json', '2')} for the machine queue.\n")
 
 
-def _operator_campaign_fn(coder_cfg: dict, fx: Any = None):
+def _operator_campaign_fn(coder_cfg: dict, fx: Any = None, *, on_auth_needed: Any = None):
     """Build the portfolio scheduler's campaign callable over the bughunter engine.
 
     ``fx`` is the live surface, when one is running. It is wired in HERE rather than in
@@ -861,6 +1031,7 @@ def _operator_campaign_fn(coder_cfg: dict, fx: Any = None):
             policy_profile=str(saved.get("policy_profile") or ""),
             excluded_hosts=tuple(str(host) for host in (saved.get("out_of_scope_hosts") or [])),
             disclose_automation=bool(saved.get("disclose_automation")),
+            on_auth_needed=on_auth_needed,
             on_progress=sink,
         )
         _fx_report(fx, result, default=str(target))
@@ -1032,6 +1203,10 @@ def _cmd_auto(args: argparse.Namespace) -> int:
         print(_c("  note: active probing was NOT armed — the saved program has no usable scope.", "33"))
     print(_c(f"\nprogram '{pid}' saved. Hunting now…\n", "1"))
 
+    # This one reviewed cycle runs on the calling thread. A scheduled cycle uses
+    # a different callable below and never reads the operator's terminal.
+    auth_args = argparse.Namespace(scope=plan.scope_text, json=False,
+                                   no_prompt=getattr(args, "no_prompt", False))
     sync_fn = _operator_sync_fn()
     # The board for the reviewed cycle. The plan's targets go on the map before anything runs —
     # the operator listed them and hunt_dir resolved them, so they are genuinely in scope — as
@@ -1039,7 +1214,17 @@ def _cmd_auto(args: argparse.Namespace) -> int:
     # shown is the directory's own first scope line, or nothing; never the program name.
     scope_lines = (plan.scope_text or "").splitlines()
     fx = _fx(args, _BOARD_TITLE, scope=scope_lines[0] if scope_lines else "")
-    run_campaign_fn = _operator_campaign_fn(_load_coder_config(args.brain), fx)
+
+    def _auth_needed(context: dict[str, Any]) -> dict[str, Any] | None:
+        if not _can_ask_for_auth(auth_args):
+            return None
+        fx.stop()  # release the board's terminal before hidden input
+        return _ask_for_hunt_auth(auth_args, context)
+
+    run_campaign_fn = _operator_campaign_fn(
+        _load_coder_config(args.brain), fx,
+        on_auth_needed=_auth_needed if _can_ask_for_auth(auth_args) else None,
+    )
     with fx:
         fx.phase("hunting this directory's targets")
         fx.track(list(plan.targets))
@@ -1054,6 +1239,10 @@ def _cmd_auto(args: argparse.Namespace) -> int:
           f"{summary['confirmed']} confirmed, {summary['submitted']} submitted")
     for problem in summary.get("errors") or ():
         print(_c(f"  problem: {problem}", "33"))
+
+    if summary.get("needs_operator"):
+        return _err("auto hunt paused for operator authentication; run it in an interactive "
+                    "terminal with your authorized research session.")
 
     # run_program_cycle deliberately does not stamp the schedule — the loop's _run_one owns
     # that, so it can SKIP the stamp when a guard halts and leave the program due. But this
@@ -1615,7 +1804,7 @@ def _dash_hunt(args: argparse.Namespace, run_id: str, into: dict) -> int:
         active=(args.active or getattr(args, "time_based", False) or getattr(args, "deep", False)
                 or getattr(args, "theorize", False) or getattr(args, "chain", False)),
         time_based=getattr(args, "time_based", False),
-        auth={"cookie": getattr(args, "cookie", "") or "", "headers": getattr(args, "header", None) or []},
+        auth=_hunt_auth(args),
         per_finding=args.per_finding,
         on_progress=bounty_progress.sink(run_id),
         should_stop=(lambda rid=run_id: bounty_progress.is_stopped(rid)),
@@ -1801,8 +1990,19 @@ def _cmd_dash(args: argparse.Namespace) -> int:
         return _err(exc.message)
 
     result = holder.get("result")
+    if (isinstance(result, dict) and result.get("needs_operator") and not attach
+            and not result.get("secure_transport_required")
+            and not getattr(args, "_auth_retry", False) and _can_ask_for_auth(args)):
+        # The worker cannot read stdin while the dashboard owns its key reader. The engine has
+        # stopped before active probes; gn_dash.run has now restored the normal terminal.
+        supplied = _ask_for_hunt_auth(args, result.get("auth_context") or {})
+        if supplied:
+            retry = argparse.Namespace(**vars(args))
+            retry._auth_override = supplied
+            retry._auth_retry = True
+            return _cmd_dash(retry)
     if isinstance(result, dict) and not result.get("ok"):
-        return _err(result.get("error", "the hunt could not run."))
+        return _err(_hunt_auth_error(result, "the hunt could not run."))
     if isinstance(result, dict):
         _print_hunt_summary(result)
     return code
@@ -1911,6 +2111,8 @@ def build_parser() -> argparse.ArgumentParser:
     hunt.add_argument("--cookie", default="", help="scan behind a login: a Cookie header value, sent to the target host + subdomains ONLY")
     hunt.add_argument("--header", action="append", metavar="'Name: value'",
                       help="extra auth header (repeatable), e.g. --header 'Authorization: Bearer ...'; sent same-site only")
+    hunt.add_argument("--no-prompt", action="store_true",
+                      help="never ask for a session at an authentication wall (for unattended runs)")
     hunt.add_argument("--live", action="store_true", help="dynamic Playwright browser pass (URL targets)")
     hunt.add_argument("--brain", action="store_true", help="use the configured LLM brain to enrich (default: deterministic)")
     hunt.add_argument("-o", "--out", default=None, help="report output folder (default: runtime/reports)")
@@ -1932,6 +2134,8 @@ def build_parser() -> argparse.ArgumentParser:
     camp.add_argument("--cookie", default="", help="scan behind a login: a Cookie header value, sent to in-scope hosts + subdomains ONLY")
     camp.add_argument("--header", action="append", metavar="'Name: value'",
                       help="extra auth header (repeatable), e.g. --header 'Authorization: Bearer ...'; sent same-site only")
+    camp.add_argument("--no-prompt", action="store_true",
+                      help="never ask for a session at an authentication wall (for unattended runs)")
     camp.add_argument("--live", action="store_true", help="dynamic Playwright pass per URL")
     camp.add_argument("--brain", action="store_true", help="use the configured LLM brain to enrich")
     camp.add_argument("--osint", action="store_true",
@@ -1964,6 +2168,8 @@ def build_parser() -> argparse.ArgumentParser:
     osint.add_argument("--max-pages", type=int, default=12, help="per-host recon cap during --hunt")
     osint.add_argument("--platform", default="hackerone",
                        help="submission export format for --hunt (default: hackerone)")
+    osint.add_argument("--no-prompt", action="store_true",
+                       help="never ask for a session during --hunt")
     osint.add_argument("-y", "--authorize", action="store_true",
                        help="confirm authorization for --hunt (not required for passive OSINT)")
     osint.add_argument("--json", action="store_true", help="print the machine-readable campaign result")
@@ -2017,6 +2223,8 @@ def build_parser() -> argparse.ArgumentParser:
     auto.add_argument("--grant-file", dest="grant_file", default="", help="JSON authorization grants; required to keep auto-hunting past the first cycle")
     auto.add_argument("--interval", type=int, default=0, help="minutes between re-hunts (default: the directory's, else 1440)")
     auto.add_argument("--brain", action="store_true", help="use the configured LLM brain to enrich")
+    auto.add_argument("--no-prompt", action="store_true",
+                      help="never ask for a session during the reviewed first cycle")
     auto.add_argument("--no-fx", action="store_true",
                       help="no threat board and no status animation (plain progress lines)")
     auto.set_defaults(func=_cmd_auto)
@@ -2164,6 +2372,8 @@ def build_parser() -> argparse.ArgumentParser:
     dash.add_argument("--cookie", default="", help="scan behind a login: a Cookie header value, sent to the target host + subdomains ONLY")
     dash.add_argument("--header", action="append", metavar="'Name: value'",
                       help="extra auth header (repeatable); sent same-site only")
+    dash.add_argument("--no-prompt", action="store_true",
+                      help="never ask for a session at an authentication wall (for unattended runs)")
     dash.add_argument("--live", action="store_true", help="dynamic Playwright browser pass (URL targets)")
     dash.add_argument("--brain", action="store_true", help="use the configured LLM brain to enrich (default: deterministic)")
     dash.add_argument("-o", "--out", default=None, help="report output folder (default: runtime/reports)")

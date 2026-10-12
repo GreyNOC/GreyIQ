@@ -27,6 +27,7 @@ from bughunter import api_discovery_service, operator_guard
 from bughunter.fingerprint import fingerprint
 from bughunter.rate_limit import HostRateGovernor
 from bughunter.recon_js import mine_js, mine_source_map, source_map_urls
+from bughunter.scan_auth import AuthContext
 from bughunter.settings import get_settings
 from bughunter.web_ingest import WebsiteFetchError, normalize_website_url
 from bughunter.web_scan_service import _fetch_raw, _guard_url
@@ -168,13 +169,22 @@ def _qs_param_names(url: str) -> set[str]:
         return set()
 
 
-def _safe_fetch(url: str, settings: Any, governor: HostRateGovernor) -> dict[str, Any] | None:
+def _safe_fetch(url: str, settings: Any, governor: HostRateGovernor,
+                auth: AuthContext | None = None) -> dict[str, Any] | None:
     host = urlparse(url).hostname or ""
     if not governor.throttle(host):
         return None
     try:
-        return _fetch_raw(url)  # full SSRF/redirect guard; GET only
-    except (WebsiteFetchError, OSError, ValueError):
+        # Pin EVERY recon fetch to its named host before a redirect can follow.
+        # A separately discovered in-scope sibling is still fetched on its own.
+        return _fetch_raw(url, auth=auth, scope_host=host)  # guarded, GET only
+    except WebsiteFetchError as exc:
+        if "outside the exact authorized scope" in str(exc):
+            return {"scope_blocked": True, "status": 599}
+        if "Operator session requires HTTPS" in str(exc):
+            return {"auth_transport_blocked": True, "status": 599}
+        return None
+    except (OSError, ValueError):
         return None
 
 
@@ -188,6 +198,10 @@ def discover(
     settings: Any = None,
     governor: HostRateGovernor | None = None,
     observe: bool = False,
+    detect_auth_wall: bool = False,
+    auth: AuthContext | None = None,
+    verify_login_form: bool = False,
+    https_only_auth: bool = False,
 ) -> dict[str, Any]:
     """Map the seed's surface (bounded). Returns {urls, host, sources, notes,
     endpoints, params, js_secrets, source_maps, tech, hints, dropped_out_of_scope, requests_used}.
@@ -197,7 +211,9 @@ def discover(
     fingerprint of the responses this crawl ALREADY fetched, which the surface-drift engine
     diffs against the previous run. It issues no extra request — it keeps what was in memory
     and is otherwise discarded — so the scope gate, the SSRF guard and the request budget are
-    all untouched. Default-off, so no existing caller changes behaviour."""
+    all untouched. ``detect_auth_wall`` checks the seed response before further
+    recon and returns only a redacted ``auth_wall`` signal on a login boundary.
+    A supplied ``auth`` is attached by the scanner's same-site transport guard."""
     settings = settings or get_settings()
     try:
         sanitized = _guard_url(normalize_website_url(seed_url), settings.allow_private_urls, settings.web_allowed_ports)
@@ -223,13 +239,36 @@ def discover(
         min_interval_s=settings.active_min_interval_ms / 1000.0,
     )
     used = {"n": 0}
+    blocked_redirects = 0
+    blocked_transport = False
     observations: dict[str, dict[str, Any]] = {}
+    auth_wall: dict[str, Any] | None = None
 
     def budgeted_fetch(url: str) -> dict[str, Any] | None:
-        if used["n"] >= max_requests or not in_scope(url):
+        nonlocal auth_wall, blocked_redirects, blocked_transport
+        # Once a redirect attempts to leave its named host, stop recon traffic.
+        if blocked_redirects or blocked_transport or used["n"] >= max_requests or not in_scope(url):
             return None  # global per-campaign budget — the host-fan-out kill switch
         used["n"] += 1
-        fetched = _safe_fetch(url, settings, governor)
+        fetch_auth = auth if not (https_only_auth and urlparse(url).scheme.lower() != "https") else None
+        fetched = (_safe_fetch(url, settings, governor, auth=fetch_auth) if fetch_auth is not None
+                   else _safe_fetch(url, settings, governor))
+        if isinstance(fetched, dict) and fetched.get("scope_blocked"):
+            blocked_redirects += 1
+        if isinstance(fetched, dict) and fetched.get("auth_transport_blocked"):
+            blocked_transport = True
+        # The seed page is already fetched for the crawl. When a caller needs an
+        # operator handoff, keep only the shared detector's redacted auth-wall
+        # context; never retain or return the page body, cookies, or headers.
+        if detect_auth_wall and url == sanitized and fetched and in_scope(fetched.get("final_url") or url):
+            try:
+                from bughunter.web_scan_service import auth_wall_context
+
+                auth_wall = auth_wall_context(
+                    fetched, sanitized, allow_form=(auth is None or verify_login_form),
+                )
+            except Exception:  # noqa: BLE001 - detection is advisory; recon still proceeds
+                auth_wall = None
         # Keep a name-only structural fingerprint of what we just fetched, instead of dropping
         # the response the moment its links are mined. No extra request is issued; this is
         # purely a decision not to throw the shape away.
@@ -267,6 +306,56 @@ def discover(
     source_map_done: set[str] = set()
     source_maps_out: list[dict[str, Any]] = []
 
+    # An operator-facing campaign needs the target's own response first. An auth
+    # wall ends recon immediately, before robots, sitemaps, well-known paths, or
+    # linked pages spend requests. A public seed is kept for the BFS below, so
+    # this reordered fetch adds no request to the campaign budget.
+    seed_prefetched: dict[str, Any] | None = None
+    if detect_auth_wall:
+        seed_prefetched = budgeted_fetch(sanitized)
+        if isinstance(seed_prefetched, dict) and seed_prefetched.get("scope_blocked"):
+            return {
+                "urls": [sanitized], "host": host, "sources": {},
+                "notes": ["recon stopped: off-host redirect refused before following it"],
+                "endpoints": [], "params": [], "js_secrets": [], "source_maps": [],
+                "tech": [], "hints": {}, "websockets": [], "forms": [], "api_findings": [],
+                "dropped_out_of_scope": blocked_redirects, "requests_used": used["n"],
+                "observations": observations, "auth_wall": None, "scope_blocked": True,
+            }
+        if isinstance(seed_prefetched, dict) and seed_prefetched.get("auth_transport_blocked"):
+            return {
+                "urls": [sanitized], "host": host, "sources": {},
+                "notes": ["recon stopped: HTTPS session downgrade refused"],
+                "endpoints": [], "params": [], "js_secrets": [], "source_maps": [],
+                "tech": [], "hints": {}, "websockets": [], "forms": [], "api_findings": [],
+                "dropped_out_of_scope": 0, "requests_used": used["n"],
+                "observations": observations, "auth_wall": None,
+                "auth_transport_blocked": True,
+            }
+        if auth_wall is not None:
+            return {
+                "urls": [sanitized], "host": host, "sources": {},
+                "notes": ["recon paused at an authentication boundary"],
+                "endpoints": [], "params": [], "js_secrets": [], "source_maps": [],
+                "tech": [], "hints": {}, "websockets": [], "forms": [], "api_findings": [],
+                "dropped_out_of_scope": 0, "requests_used": used["n"],
+                "observations": observations, "auth_wall": auth_wall,
+            }
+        if auth is not None and (
+            not isinstance(seed_prefetched, dict)
+            or not isinstance(seed_prefetched.get("status"), int)
+            or not 200 <= seed_prefetched["status"] < 400
+        ):
+            return {
+                "urls": [sanitized], "host": host, "sources": {},
+                "notes": ["recon stopped: authenticated seed response could not be verified"],
+                "endpoints": [], "params": [], "js_secrets": [], "source_maps": [],
+                "tech": [], "hints": {}, "websockets": [], "forms": [], "api_findings": [],
+                "dropped_out_of_scope": 0, "requests_used": used["n"],
+                "observations": observations, "auth_wall": None,
+                "auth_seed_unverified": True,
+            }
+
     # --- Passive recon: robots + security.txt seed extra paths; sitemaps handled by the recursive
     # worklist below (which follows sitemap-index children + robots-declared Sitemap: files). ---
     base = f"{urlparse(sanitized).scheme}://{urlparse(sanitized).netloc}"
@@ -302,8 +391,8 @@ def discover(
 
     # Recurse sitemap INDEXES + robots-declared Sitemap: files into their child sitemaps — captures
     # the full published URL inventory large sites split across dozens of child sitemaps. TWO guards:
-    # (1) GATE-BEFORE-FETCH each sitemap URL, (2) RE-GATE the final_url AFTER fetch (an in-scope
-    # sitemap can 302 to an OOS host; the fetch redirect guard is SSRF-only). Bounded by depth,
+    # (1) GATE-BEFORE-FETCH each sitemap URL, (2) RE-GATE the final_url AFTER fetch. The
+    # fetch transport also refuses any redirect away from the named host. Bounded by depth,
     # child count, and the shared request budget.
     sm_seen: set[str] = set()
     sm_children = 0
@@ -399,19 +488,15 @@ def discover(
         url, depth = queue.pop(0)
         if depth > max_depth:
             continue
-        fetched = budgeted_fetch(url)
+        fetched = seed_prefetched if detect_auth_wall and url == sanitized else budgeted_fetch(url)
         crawled += 1
         if not fetched:
             continue
         body = fetched.get("body") or ""
         final = fetched.get("final_url") or url
-        # The QUEUED url was scope-checked before being crawled, but _fetch_raw's redirect
-        # guard only validates SSRF safety per-hop, never SCOPE -- an in-scope page can
-        # still 302 to a public out-of-scope host. Mining params/fingerprinting/links from
-        # that OOS body would leak it into the active prover's surface and the report's
-        # tech fingerprint, so skip ALL body processing for this fetch once it has landed
-        # somewhere out of scope (each extracted link is still independently scope-checked
-        # before being queued, but we must never even look at an OOS page's content).
+        # Keep a final scope check before processing a response. The transport now
+        # refuses a redirect away from the named host; this remains a defense in
+        # depth if a fetch implementation or test double returns a different URL.
         if not in_scope(final):
             dropped_oos += 1
             continue
@@ -591,6 +676,7 @@ def discover(
         notes.append(f"discovery capped at {max_pages} URLs.")
     if used["n"] >= max_requests:
         notes.append(f"recon request budget ({max_requests}) reached — surface may be partial.")
+    dropped_oos += blocked_redirects
     if dropped_oos:
         notes.append(f"{dropped_oos} discovered link(s) skipped as out-of-scope.")
     if source_maps_out:
@@ -603,7 +689,7 @@ def discover(
     if websockets:
         notes.append(f"{len(websockets)} WebSocket endpoint(s) discovered in served JS (real-time surface).")
 
-    return {
+    result = {
         "urls": discovered[:max_pages], "host": host, "sources": sources, "notes": notes,
         "endpoints": [u for u in discovered if u != sanitized][:max_pages],
         "params": sorted(params)[:60], "js_secrets": js_secrets, "source_maps": source_maps_out,
@@ -612,3 +698,8 @@ def discover(
         "dropped_out_of_scope": dropped_oos, "requests_used": used["n"],
         "observations": observations,
     }
+    if detect_auth_wall:
+        result["auth_wall"] = auth_wall
+        result["scope_blocked"] = bool(blocked_redirects)
+        result["auth_transport_blocked"] = blocked_transport
+    return result

@@ -85,6 +85,15 @@ class AuthHeadersForTests(unittest.TestCase):
         out["Cookie"] = "tampered"
         self.assertEqual(self.AUTH.headers["Cookie"], "session=secret")  # source not mutated
 
+    def test_prompted_session_requires_https_even_on_same_host(self) -> None:
+        prompted = sa.build_auth("https://example.com/private", cookie="session=secret",
+                                 https_only=True)
+        self.assertTrue(prompted.https_only)
+        self.assertEqual(sa.auth_headers_for("example.com", prompted, request_scheme="http"), {})
+        self.assertEqual(sa.auth_headers_for("example.com", prompted, request_scheme="https"),
+                         {"Cookie": "session=secret"})
+        self.assertEqual(sa.auth_headers_for("example.com", prompted), {})
+
 
 class BuildAuthTests(unittest.TestCase):
     def test_cookie_and_headers(self) -> None:
@@ -167,6 +176,25 @@ class GuardedRedirectAuthTests(unittest.TestCase):
         new = handler.redirect_request(req, None, 302, "Found", {}, "https://api.example.com/v2")
         self.assertIsNotNone(new)
         self.assertTrue(new.has_header("Cookie"), "session may follow a same-site redirect")
+
+    def test_prompted_session_refuses_https_to_http_redirect_before_request(self) -> None:
+        auth = AuthContext(host="example.com", headers={"Cookie": "session=secret"},
+                           https_only=True)
+        handler = ws._GuardedRedirect(True, self.PORTS, auth=auth)
+        req = Request("https://example.com/private", headers={"Cookie": "session=secret"})
+        with patch.object(ws, "_guard_url") as guard:
+            with self.assertRaisesRegex(ws.WebsiteFetchError, "requires HTTPS"):
+                handler.redirect_request(req, None, 302, "Found", {}, "http://example.com/login")
+        guard.assert_not_called()
+
+    def test_prompted_session_refuses_initial_http_before_socket(self) -> None:
+        auth = AuthContext(host="example.com", headers={"Cookie": "session=secret"},
+                           https_only=True)
+        with patch.object(ws, "_guard_url", side_effect=lambda url, *_: url), \
+             patch.object(ws, "build_opener") as opener:
+            with self.assertRaisesRegex(ws.WebsiteFetchError, "requires HTTPS"):
+                ws._fetch_raw("http://example.com/private", auth=auth)
+        opener.assert_not_called()
 
 
 class SameRegistrableSiteTests(unittest.TestCase):
@@ -296,10 +324,11 @@ class RunBountyHuntIssuerWiringTests(unittest.TestCase):
         class _Stop(Exception):
             pass
 
-        def _spy(target_url, *, cookie="", headers=None, issuer_host=""):
+        def _spy(target_url, *, cookie="", headers=None, issuer_host="", https_only=False):
             captured["target_url"] = target_url
             captured["cookie"] = cookie
             captured["issuer_host"] = issuer_host
+            captured["https_only"] = https_only
             raise _Stop()  # build_auth is called before any scanner runs — abort early, no network
 
         orig = bounty.build_auth

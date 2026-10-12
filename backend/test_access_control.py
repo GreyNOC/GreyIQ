@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import sys
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
+from unittest.mock import patch
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from bughunter import access_control_service as ac  # noqa: E402
+from bughunter.scan_auth import AuthContext  # noqa: E402
 from bughunter.settings import get_settings  # noqa: E402
 
 URL_A = "http://127.0.0.1/api/object/a"
@@ -654,6 +657,31 @@ class SessionInvalidationTests(unittest.TestCase):
         r = ac.run_session_invalidation_check(self.authed, self.logout, account={}, scope="127.0.0.1")
         self.assertFalse(r["ok"])
         self.assertIn("session", r["error"].lower())
+
+
+class PromptedWriteAuthTests(unittest.TestCase):
+    def test_prompted_session_is_used_only_on_https_json_write(self) -> None:
+        requests = []
+
+        class _Opener:
+            def open(self, request, *, timeout):
+                requests.append(request)
+                raise OSError("simulated transport failure")
+
+        auth = AuthContext(host="app.example.com", headers={"Cookie": "sid=secret-value"},
+                           https_only=True)
+        with patch.object(ac.urllib.request, "build_opener", return_value=_Opener()), \
+                patch.object(ac, "guarded_dns_scope", return_value=nullcontext()), \
+                patch.object(ac, "_guard_url", side_effect=lambda url, *_args: url):
+            ac._json_write("https://app.example.com/me", "PATCH", {"label": "test"},
+                           auth=auth, settings=_settings(), timeout=1.0)
+            blocked = ac._json_write("http://app.example.com/me", "PATCH", {"label": "test"},
+                                     auth=auth, settings=_settings(), timeout=1.0)
+
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].get_header("Cookie"), "sid=secret-value")
+        self.assertFalse(blocked["ok"])
+        self.assertIn("HTTPS", blocked["error"])
 
 
 if __name__ == "__main__":

@@ -42,6 +42,7 @@ from bughunter import (
     learning,
     negative_knowledge,
     offline_hunt,
+    operator_guard,
     progress,
     ranking,
     recon,
@@ -237,8 +238,32 @@ def _login_auth(account_access: dict[str, Any] | None, scope: str,
         # for every in-scope target; build_auth uses issuer_host to refuse to replay the
         # cookie to a target on a different registrable domain than the login host.
         return {"cookie": session["cookie"], "headers": session.get("headers") or [],
-                "issuer_host": session.get("host") or ""}
+                "issuer_host": session.get("host") or "", "https_only": True}
     return None
+
+
+def _refresh_login_auth(account_access: dict[str, Any] | None, scope: str,
+                        excluded_hosts: Any, emit: Any) -> dict[str, Any] | None:
+    """Try the saved research login once when its saved cookie fails a wall check.
+
+    The login service validates the HTTPS URL and scope before submitting the
+    stored credentials. Never pass the stale cookie back into its cookie-first
+    resolver, and never expose the password to a model, MCP tool, or report.
+    """
+    if not isinstance(account_access, dict) or not str(account_access.get("cookie") or "").strip() or not all(
+        str(account_access.get(key) or "").strip() for key in ("email", "password", "login_url")
+    ):
+        return None
+    return _login_auth({**account_access, "cookie": ""}, scope, excluded_hosts, emit)
+
+
+def _initial_account_access(account_access: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Use a fresh saved login in unattended mode before a stale cookie can trigger a halt."""
+    if not isinstance(account_access, dict) or operator_guard.current() is None:
+        return account_access
+    if all(str(account_access.get(key) or "").strip() for key in ("email", "password", "login_url")):
+        return {**account_access, "cookie": ""}
+    return account_access
 
 
 def _bind_unknown_issuer_to_target(auth: dict[str, Any] | None, target: str) -> dict[str, Any] | None:
@@ -259,6 +284,74 @@ def _bind_unknown_issuer_to_target(auth: dict[str, Any] | None, target: str) -> 
     except ValueError:
         host = ""
     return {**auth, "issuer_host": host} if host else None
+
+
+def _has_auth(auth: Any) -> bool:
+    """Whether a caller supplied any session material (an empty dict is not auth)."""
+    return isinstance(auth, dict) and bool(str(auth.get("cookie") or "").strip() or auth.get("headers"))
+
+
+def _operator_auth_for_target(candidate: Any, target: str) -> dict[str, Any] | None:
+    """Accept only scanner auth fields and bind an interactive paste to one issuer site.
+
+    The callback's result is transient. In particular, email/password and arbitrary
+    metadata are never forwarded into the scanner or written to campaign artifacts.
+    """
+    if not isinstance(candidate, dict):
+        return None
+    raw_headers = candidate.get("headers") or []
+    if isinstance(raw_headers, dict):
+        headers = [f"{name}: {value}" for name, value in raw_headers.items()]
+    elif isinstance(raw_headers, (list, tuple)):
+        headers = [str(line) for line in raw_headers]
+    else:
+        return None
+    issuer = str(candidate.get("issuer_host") or "").strip()
+    bound = scan_auth.build_auth(
+        target, cookie=str(candidate.get("cookie") or ""), headers=headers, issuer_host=issuer,
+        https_only=True,
+    )
+    if bound is None:
+        return None
+    cookie = ""
+    safe_headers: list[str] = []
+    for name, value in bound.headers.items():
+        if name.lower() == "cookie":
+            cookie = value
+        else:
+            safe_headers.append(f"{name}: {value}")
+    return {"cookie": cookie, "headers": safe_headers,
+            "issuer_host": issuer or bound.host, "https_only": True}
+
+
+def _auth_required_result(context: Any, target: str) -> dict[str, Any]:
+    """A secret-free handoff payload for the CLI and other calling surfaces."""
+    raw = context if isinstance(context, dict) else {}
+    try:
+        status = int(raw.get("status") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    host = urlparse(target).hostname or ""
+    login_host = str(raw.get("login_host") or host).strip().lower()
+    if not login_host or len(login_host) > 253 or any(c in login_host for c in "/\\@?# \r\n\t"):
+        login_host = host
+    reason = str(raw.get("reason") or "")
+    if reason not in {"http_401", "http_403_challenge", "login_redirect", "login_form"}:
+        reason = "http_401" if status == 401 else "login_form"
+    requires_https = urlparse(target).scheme.lower() != "https"
+    result = {
+        "ok": False,
+        "needs_operator": True,
+        "operator_action": "authentication_required",
+        "auth_context": {"reason": reason, "status": status, "target_host": host, "login_host": login_host},
+        "error": ("Operator-provided authentication requires HTTPS; the HTTP target was not sent a new session."
+                  if requires_https else
+                  "The target requires operator-provided authentication before the campaign can continue."),
+    }
+    if requires_https:
+        result["authentication_requires_https"] = True
+        result["secure_transport_required"] = True
+    return result
 
 
 def _campaign_preflight_error(target: str, scope: str, authorized: bool, settings: Any) -> str:
@@ -311,17 +404,45 @@ def run_campaign(target: str, *, account_access: dict[str, Any] | None = None,
             except Exception:  # noqa: BLE001
                 pass
 
-    # Auto-login from the program's stored credentials (unless the caller already supplied a session —
-    # e.g. a multi-target span resolves the login ONCE and passes the session to each target).
-    if kwargs.get("auth") is None and account_access:
-        auth = _login_auth(account_access, scope, kwargs.get("excluded_hosts"), _emit)
-        if auth:
-            kwargs["auth"] = auth
-    if isinstance(kwargs.get("auth"), dict):
-        kwargs["auth"] = _bind_unknown_issuer_to_target(kwargs["auth"], target)
-    # The program's required UA tag rides every in-scope request for the duration of this hunt.
+    # The program's required UA tag must cover the login request too, not just
+    # the later recon and prover requests.
     ua_token = web_ingest.set_ua_suffix(user_agent_suffix or "")
     try:
+        guard = operator_guard.current()
+        if guard is not None:
+            # The grant's saved program is authoritative in unattended work.
+            # Resolve its research session once per RunGuard, then reuse it for
+            # every seed target in the cycle. The guard is discarded and its
+            # session cleared when that cycle ends.
+            saved = guard.check_current()
+            governed_access = saved.get("account_access") if guard.grant.allow_account_access else None
+            if governed_access:
+                if guard.research_auth_program != guard.grant.program_id:
+                    guard.research_auth_program = guard.grant.program_id
+                    guard.research_auth, guard.research_auth_resolved = None, False
+                if not guard.research_auth_resolved:
+                    guard.research_auth = _login_auth(
+                        _initial_account_access(governed_access), scope,
+                        kwargs.get("excluded_hosts"), _emit,
+                    )
+                    if guard.research_auth is not None:
+                        guard.research_auth = _bind_unknown_issuer_to_target(
+                            guard.research_auth, target)
+                    guard.research_auth_resolved = True
+                kwargs["auth"] = guard.research_auth
+            else:
+                kwargs["auth"] = None
+            kwargs["account_access"] = None
+        else:
+            # Attended hunts use their explicit session or saved account and
+            # may refresh a stale saved cookie after an observed auth wall.
+            if not _has_auth(kwargs.get("auth")) and account_access:
+                auth = _login_auth(account_access, scope, kwargs.get("excluded_hosts"), _emit)
+                if auth:
+                    kwargs["auth"] = auth
+            kwargs["account_access"] = account_access
+        if isinstance(kwargs.get("auth"), dict):
+            kwargs["auth"] = _bind_unknown_issuer_to_target(kwargs["auth"], target)
         return _run_campaign_body(
             target, external_mcp_hunt=external_mcp_hunt, mcp_manager=mcp_manager, **kwargs,
         )
@@ -342,6 +463,7 @@ def _run_campaign_body(
     active: bool = False,
     time_based: bool = False,
     auth: dict[str, Any] | None = None,
+    account_access: dict[str, Any] | None = None,
     live: bool = False,
     program: str | None = None,
     max_pages: int = 12,
@@ -350,6 +472,7 @@ def _run_campaign_body(
     deep: bool = False,
     iterate: bool = False,
     on_progress: Any = None,
+    on_auth_needed: Any = None,
     disclose_automation: bool = False,
     excluded_hosts: tuple[str, ...] = (),
     admin_account_access: dict[str, Any] | None = None,
@@ -388,6 +511,7 @@ def _run_campaign_body(
         return {"ok": False, "error": "No target provided."}
     if not authorized:
         return {"ok": False, "error": "Confirm you're authorized and in scope before running a campaign."}
+
     kind = _infer_kind(clean_target)
     if kind == "unknown":
         return {"ok": False, "error": "Could not tell if the target is a URL or a repo/path."}
@@ -434,6 +558,42 @@ def _run_campaign_body(
             except Exception:  # noqa: BLE001
                 pass
 
+    auth_requested = False
+    auth_refresh_attempted = False
+    auth_https_only = bool(isinstance(auth, dict) and auth.get("https_only"))
+
+    def _request_auth(context: dict[str, Any], request_target: str) -> dict[str, Any] | None:
+        """Refresh a saved login first, then ask the operator once if still needed."""
+        nonlocal auth, auth_requested, auth_refresh_attempted, auth_https_only
+        if urlparse(request_target).scheme.lower() != "https":
+            return None
+        if not auth_refresh_attempted and operator_guard.current() is None:
+            auth_refresh_attempted = True
+            refreshed = _refresh_login_auth(account_access, scope, excluded_hosts, _emit)
+            bound = _operator_auth_for_target(refreshed, request_target)
+            if bound is not None:
+                auth = bound
+                auth_https_only = True
+                return {**bound, "_allow_operator_fallback": True}
+        if auth_requested or not callable(on_auth_needed):
+            return None
+        auth_requested = True
+        try:
+            candidate = on_auth_needed(_auth_required_result(context, request_target)["auth_context"])
+        except KeyboardInterrupt:
+            return None
+        except Exception:  # noqa: BLE001 - no callback failure may leak a secret
+            return None
+        bound = _operator_auth_for_target(candidate, request_target)
+        if bound is not None:
+            auth = bound
+            auth_https_only = True
+        return bound
+
+    def _session_allowed(url: str) -> bool:
+        """Never replay a research-account or prompted session on a cleartext URL."""
+        return not auth_https_only or urlparse(url).scheme.lower() == "https"
+
     # A research-account session is minted ONCE per span and reused for every target. When a
     # target is on a DIFFERENT registrable domain than the login host that issued it, build_auth
     # withholds the session (never replays a token off its own issuer); surface that so a target
@@ -452,7 +612,6 @@ def _run_campaign_body(
     # clobber each other's on-disk artifacts.
     target_fp = hashlib.sha1(clean_target.encode("utf-8", "replace")).hexdigest()[:8]
     out_root = Path(default_reports_dir) / f"campaign-{_safe_slug(prog_key)}-{stamp}-{target_fp}"
-    out_root.mkdir(parents=True, exist_ok=True)
 
     # --- Surface mapping (URL targets) → the list of targets to hunt. ---
     rec_js_secrets: list[dict[str, Any]] = []
@@ -497,18 +656,69 @@ def _run_campaign_body(
         # Draw passive recon from the PROCESS-WIDE per-host token bucket, so concurrent span/portfolio
         # workers crawling the same host (a wildcard program whose targets recon-expand to a shared
         # host/CDN) don't each build their own governor and multiply the per-host request rate/burst.
-        rec = recon.discover(
-            clean_target, max_pages=max_pages, scope_in=scope_gate,
-            settings=campaign_settings,
-            governor=shared_governor(
-                capacity=campaign_settings.active_max_requests_per_host,
-                min_interval_s=campaign_settings.active_min_interval_ms / 1000.0,
-                pool="recon",  # a SEPARATE per-host bucket from the active prover — recon must not drain it
-            ),
-            # Name-only response shapes for surface_drift to diff against the last run. No extra
-            # request: they are already in memory and would otherwise be discarded.
-            observe=rt is not None,
+        recon_governor = shared_governor(
+            capacity=campaign_settings.active_max_requests_per_host,
+            min_interval_s=campaign_settings.active_min_interval_ms / 1000.0,
+            pool="recon",  # a SEPARATE per-host bucket from the active prover
         )
+
+        def _discover_with_auth(session: dict[str, Any] | None) -> dict[str, Any]:
+            bound = (scan_auth.build_auth(
+                clean_target, cookie=session.get("cookie", ""), headers=session.get("headers") or [],
+                issuer_host=str(session.get("issuer_host") or ""),
+                https_only=bool(session.get("https_only")),
+            ) if _has_auth(session) else None)
+            return recon.discover(
+                clean_target, max_pages=max_pages, scope_in=scope_gate,
+                settings=campaign_settings, governor=recon_governor,
+                # Name-only shapes use the same existing responses, without extra requests.
+                observe=rt is not None, detect_auth_wall=True, auth=bound,
+                https_only_auth=auth_https_only,
+                # A stale session can receive a 200 login form. Treat it as an
+                # ineffective session before any further campaign work.
+                verify_login_form=True,
+            )
+
+        rec = _discover_with_auth(auth)
+        if rec.get("auth_transport_blocked"):
+            return {"ok": False, "auth_transport_blocked": True,
+                    "authentication_requires_https": True,
+                    "error": "Recon stopped: an operator session would be redirected from HTTPS to HTTP."}
+        if rec.get("scope_blocked"):
+            return {"ok": False, "scope_blocked": True,
+                    "error": "Recon stopped: an off-host redirect was refused before it could be followed."}
+        if rec.get("auth_seed_unverified"):
+            return {"ok": False, "auth_seed_unverified": True,
+                    "error": "Recon could not verify the authenticated seed response."}
+        auth_wall = rec.get("auth_wall") if isinstance(rec, dict) else None
+        if isinstance(auth_wall, dict):
+            # The seed was checked before other recon. A saved-login refresh or
+            # operator session must clear a guarded seed fetch before further
+            # recon or active work. An ineffective refresh may be replaced once.
+            if _request_auth(auth_wall, clean_target) is None:
+                return _auth_required_result(auth_wall, clean_target)
+            # At most one saved-login refresh and one operator replacement. Each
+            # candidate must clear a guarded seed check before further recon.
+            for _ in range(2):
+                rec = _discover_with_auth(auth)
+                if rec.get("auth_transport_blocked"):
+                    return {"ok": False, "auth_transport_blocked": True,
+                            "authentication_requires_https": True,
+                            "error": "Recon stopped: a session would be redirected from HTTPS to HTTP."}
+                if rec.get("scope_blocked"):
+                    return {"ok": False, "scope_blocked": True,
+                            "error": "Recon stopped: an off-host redirect was refused before it could be followed."}
+                if rec.get("auth_seed_unverified"):
+                    return {"ok": False, "auth_seed_unverified": True,
+                            "error": "Recon could not verify the authenticated seed response."}
+                next_wall = rec.get("auth_wall") if isinstance(rec, dict) else None
+                if not isinstance(next_wall, dict):
+                    _emit("account access: session verified by recon")
+                    break
+                if _request_auth(next_wall, clean_target) is None:
+                    return _auth_required_result(next_wall, clean_target)
+            else:
+                return _auth_required_result(rec.get("auth_wall"), clean_target)
         urls = rec.get("urls") or [clean_target]
         recon_notes = rec.get("notes") or []
         recon_sources = rec.get("sources") or {}
@@ -713,6 +923,8 @@ def _run_campaign_body(
         urls = [clean_target]
         recon_notes, recon_sources = [], {}
 
+    out_root.mkdir(parents=True, exist_ok=True)
+
     # A VDP profile with avoid_dos (e.g. NASA) forbids DoS/rate/spam testing — so the executing
     # time-based SLEEP probes and the aggressive deep mode are FORCED OFF for this program, no matter
     # what the request asked for. The rest of the active pass stays benign GET-only.
@@ -771,7 +983,8 @@ def _run_campaign_body(
         result = run_bounty_hunt(
             url, profile, None, str(out_root / "targets"), scope, True, coder_cfg,
             default_reports_dir=out_root / "targets", seed_dir=seed_dir, runtime_dir=runtime_dir,
-            version=version, run_live=live, active=effective_active, time_based=(time_based or deep), auth=auth, per_finding=False,
+            version=version, run_live=live, active=effective_active, time_based=(time_based or deep),
+            auth=auth if _session_allowed(url) else None, per_finding=False,
             extra_params=recon_params, on_progress=_emit,
             on_learning_outcomes=url_confirmations.extend,
             settings=campaign_settings, class_priority=hunt_priority.get(url),
@@ -782,7 +995,14 @@ def _run_campaign_body(
             should_stop=(lambda rid=progress_run_id: progress.is_stopped(rid)) if progress_run_id else None,
             oob_base=oob_base, oob_secret=oob_secret,
             external_mcp_hunt=external_mcp_hunt, mcp_manager=mcp_manager,
+            on_auth_needed=(lambda context, request_target=url: _request_auth(context, request_target))
+            if callable(on_auth_needed) or account_access else None,
         )
+        if result.get("needs_operator"):
+            handoff = _auth_required_result(result.get("auth_context"), url)
+            handoff.update({"partial": bool(per_target), "urls_scanned": len([t for t in per_target if t["ok"]]),
+                            "urls_discovered": len(urls), "output_dir": str(out_root)})
+            return handoff
         hunt_execution.extend(hunt_trace.execution_from_active_meta(
             result.get("active_authorization"), url))
         per_target.append({"target": url, "ok": result.get("ok", False),
@@ -985,6 +1205,8 @@ def _run_campaign_body(
             from bughunter import access_control_service
             idor_n = 0
             for ep in idor_candidates:
+                if not _session_allowed(ep):
+                    continue
                 res = access_control_service.run_idor_probe(ep, account=auth, scope=scope, settings=campaign_settings)
                 fnd = res.get("finding") if isinstance(res, dict) else None
                 if not fnd:
@@ -1034,6 +1256,8 @@ def _run_campaign_body(
             from bughunter import access_control_service
             bfla_n = 0
             for ep in privileged_endpoints:
+                if not _session_allowed(ep):
+                    continue
                 res = access_control_service.run_bfla_check(
                     ep, admin_account=admin_auth, user_account=auth, scope=scope, settings=campaign_settings)
                 if not (isinstance(res, dict) and res.get("status") == "confirmed"):
@@ -1078,6 +1302,8 @@ def _run_campaign_body(
                 url_a = str((pair or {}).get("url_a") or "").strip()
                 url_b = str((pair or {}).get("url_b") or "").strip()
                 if not url_a or not url_b:
+                    continue
+                if not _session_allowed(url_a) or not _session_allowed(url_b):
                     continue
                 if (urlparse(url_a).hostname or "").lower() not in campaign_hosts:
                     continue   # this pair's object isn't on a host this campaign covered — skip (a span re-run tests it under its own target)
@@ -1510,6 +1736,7 @@ def run_campaign_over_targets(
     platform: str = "hackerone",
     deep: bool = False,
     on_progress: Any = None,
+    on_auth_needed: Any = None,
     max_targets: int = _MAX_PROGRAM_TARGETS,
     disclose_automation: bool = False,
     excluded_hosts: tuple[str, ...] = (),
@@ -1544,6 +1771,12 @@ def run_campaign_over_targets(
         return {"ok": False, "error": "No huntable targets found for this program's scope."}
     if not authorized:
         return {"ok": False, "error": "Confirm you're authorized and in scope before running a campaign."}
+
+    if operator_guard.current() is not None:
+        # This helper fans out into worker threads, which do not inherit the
+        # request guard's context variable. Scheduled cycles call run_campaign
+        # sequentially per seed and retain the full guard on every request.
+        return {"ok": False, "error": "Unattended multi-target spans require per-target guarded cycles."}
 
     # Validate every named target before the span's one-time research-account
     # login. Invalid targets remain individual errors; eligible targets still run.
@@ -1588,7 +1821,12 @@ def run_campaign_over_targets(
     # Log in to the program's research account ONCE for the whole span (not once per target), then
     # pass the resulting session to every target's run_campaign (which skips re-login when auth is set).
     if auth is None and account_access_for_targets:
-        auth = _login_auth(account_access_for_targets, scope, excluded_hosts, _emit)
+        ua_token = web_ingest.set_ua_suffix(user_agent_suffix or "")
+        try:
+            auth = _login_auth(_initial_account_access(account_access_for_targets), scope,
+                               excluded_hosts, _emit)
+        finally:
+            web_ingest.reset_ua_suffix(ua_token)
         if cross_site_span:
             account_access_for_targets = None  # never retry an unbound paste once per target
             if auth and not str(auth.get("issuer_host") or "").strip():
@@ -1610,6 +1848,16 @@ def run_campaign_over_targets(
     # inner run_campaign atomically claim a dedup_key before packaging, so exactly one identical
     # submission package is produced across the span instead of a race-duplicated pair.
     submission_claim: tuple[set[str], threading.Lock] = (set(), threading.Lock())
+    auth_prompt_lock = threading.Lock()
+
+    def _span_auth_needed(context: dict[str, Any]) -> dict[str, Any] | None:
+        # Worker hunts run concurrently, while one terminal can accept only one
+        # hidden credential prompt at a time. The returned session remains in the
+        # worker campaign; the span never stores or prints it.
+        if not callable(on_auth_needed):
+            return None
+        with auth_prompt_lock:
+            return on_auth_needed(context)
 
     # One wrapping folder for the whole span; each per-target run_campaign() call nests
     # its OWN campaign-<slug>-<stamp> folder inside it (run_campaign builds that path
@@ -1637,6 +1885,7 @@ def run_campaign_over_targets(
     # see an attack whose halves live on different hosts.
     span_signals: list[dict[str, Any]] = []
     errors: list[str] = []
+    auth_contexts: list[dict[str, Any]] = []
     ref_counter = 0
     ok_count = 0
 
@@ -1678,7 +1927,9 @@ def run_campaign_over_targets(
                 version=version, active=active, time_based=time_based, auth=auth,
                 account_access=account_access_for_targets, user_agent_suffix=user_agent_suffix, live=live,
                 program=program, max_pages=max_pages, osint=osint, platform=platform, deep=deep,
-                disclose_automation=disclose_automation, on_progress=_target_emit, excluded_hosts=excluded_hosts,
+                disclose_automation=disclose_automation, on_progress=_target_emit,
+                on_auth_needed=_span_auth_needed if callable(on_auth_needed) else None,
+                excluded_hosts=excluded_hosts,
                 admin_account_access=admin_access_for_targets, idor_pairs=idor_pairs, include_attack_map=include_attack_map,
                 policy_profile=policy_profile,
                 progress_run_id=progress_run_id, progress_unit=unit,
@@ -1718,8 +1969,15 @@ def run_campaign_over_targets(
         per_target.append({
             "target": target, "ok": bool(result.get("ok")),
             "campaign_path": result.get("campaign_path", ""), "error": result.get("error", ""),
+            "needs_operator": bool(result.get("needs_operator")),
+            "secure_transport_required": bool(result.get("secure_transport_required") or
+                                               result.get("authentication_requires_https")),
         })
         if not result.get("ok"):
+            if result.get("needs_operator"):
+                context = _auth_required_result(result.get("auth_context"), target)["auth_context"]
+                if context not in auth_contexts and len(auth_contexts) < 8:
+                    auth_contexts.append(context)
             # A target skipped because the operator stopped the campaign is not a failure —
             # keep it out of the errors list (it just wasn't run).
             if not result.get("stopped"):
@@ -1753,6 +2011,21 @@ def run_campaign_over_targets(
         for source, count in (surf.get("sources") or {}).items():
             surface_sources[source] = surface_sources.get(source, 0) + (count or 0)
 
+    blocked_auth = [row for row in per_target if row.get("needs_operator")]
+    https_blocked = [row for row in blocked_auth if row.get("secure_transport_required")]
+    all_https_blocked = bool(blocked_auth) and len(https_blocked) == len(blocked_auth)
+    auth_error = ("One or more campaign targets require HTTPS before an operator session can be requested."
+                  if https_blocked else
+                  "Authentication is required to continue one or more campaign targets.")
+    if not ok_count and auth_contexts:
+        return {
+            "ok": False, "needs_operator": True, "operator_action": "authentication_required",
+            "auth_context": auth_contexts[0], "auth_contexts": auth_contexts,
+            "secure_transport_required": all_https_blocked,
+            "partial": False, "targets_total": len(clean_targets), "targets_hunted": 0,
+            "per_target": per_target, "errors": errors,
+            "error": auth_error,
+        }
     if not ok_count:
         return {"ok": False, "error": "Every target in this program's scope failed: " + "; ".join(errors[:5])}
     if len(clean_targets) > len(capped):
@@ -1770,6 +2043,8 @@ def run_campaign_over_targets(
         "version": version, "scope": scope, "targets_total": len(clean_targets), "targets_hunted": ok_count,
         "per_target": per_target, "errors": errors, "finding_count": len(findings_out), "confirmed_count": confirmed_count,
         "submission_count": len(submission_paths),
+        "needs_operator": bool(auth_contexts), "auth_contexts": auth_contexts,
+        "secure_transport_required": all_https_blocked,
         "investigation": span_investigation,
         "chain_locations": _chain_locations(findings_out),
     }
@@ -1779,7 +2054,14 @@ def run_campaign_over_targets(
     fsutil.write_text_safe(span_json_path, json.dumps(span_ctx, indent=2, default=str))
 
     return {
-        "ok": True,
+        "ok": not auth_contexts,
+        "needs_operator": bool(auth_contexts),
+        "operator_action": "authentication_required" if auth_contexts else "",
+        "auth_context": auth_contexts[0] if auth_contexts else {},
+        "auth_contexts": auth_contexts,
+        "secure_transport_required": all_https_blocked,
+        "partial": bool(auth_contexts),
+        "error": auth_error if auth_contexts else "",
         "program": program or "",
         "campaign_path": str(span_md_path),
         "json_path": str(span_json_path),

@@ -20,6 +20,7 @@ from __future__ import annotations
 import http.client
 import json
 import re
+from html.parser import HTMLParser
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -175,6 +176,144 @@ def _consume(response: Any, settings: Any, *, read_body: bool = True) -> dict[st
 _MAX_REDIRECTS = 5
 
 
+_LOGIN_PATH_SEGMENTS = frozenset({"login", "log-in", "signin", "sign-in"})
+
+
+def _is_login_path(path: str) -> bool:
+    """Recognize an actual login route, rather than a URL that mentions login in a query."""
+    return any(segment.lower() in _LOGIN_PATH_SEGMENTS for segment in path.split("/") if segment)
+
+
+class _LoginFormParser(HTMLParser):
+    """Find a login form while distinguishing a login page from a public page widget."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.in_form = False
+        self.password = False
+        self.identifier = False
+        self.found = False
+        self.login_cue = False
+        self.outside_text = ""
+        self.outside_links = 0
+        self._heading = ""
+        self._heading_text = ""
+        self._skip_text = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "form":
+            self.in_form = True
+            self.password = False
+            self.identifier = False
+        elif tag in {"title", "h1", "h2", "h3"}:
+            self._heading = tag
+            self._heading_text = ""
+        elif tag in {"script", "style"}:
+            self._skip_text = True
+        elif tag == "a" and not self.in_form:
+            self.outside_links += 1
+        elif tag == "input" and self.in_form:
+            values = {str(key).lower(): str(value or "").lower() for key, value in attrs}
+            field_type = values.get("type", "text")
+            if field_type == "password":
+                self.password = True
+            elif field_type in {"text", "email", "tel"}:
+                hint = " ".join(values.get(key, "") for key in ("name", "id", "autocomplete", "placeholder"))
+                if field_type == "email" or any(word in hint for word in ("user", "email", "login", "account", "identifier")):
+                    self.identifier = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "form" and self.in_form:
+            self.found |= self.password and self.identifier
+            self.in_form = False
+        elif tag == self._heading:
+            if re.search(r"\b(?:sign[\s-]?in|log[\s-]?in|login|authentication required|welcome back)\b",
+                         self._heading_text, re.IGNORECASE):
+                # A title or primary heading identifies the whole page; a small
+                # sign-in widget's secondary heading does not.
+                self.login_cue |= tag in {"title", "h1"}
+            elif tag != "title" and not self.in_form:
+                self.outside_text += " " + self._heading_text[:160]
+            self._heading = ""
+            self._heading_text = ""
+        elif tag in {"script", "style"}:
+            self._skip_text = False
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_text:
+            return
+        if self._heading:
+            self._heading_text += data[:160]
+        elif not self.in_form and len(self.outside_text) < 512:
+            self.outside_text += " " + data[:160]
+
+    @property
+    def is_wall(self) -> bool:
+        """A 200 form is a wall only when the page lacks other public content."""
+        has_form = self.found or (self.in_form and self.password and self.identifier)
+        if not has_form:
+            return False
+        outside = " ".join(self.outside_text.split())
+        # Footer Terms/Privacy links are common on real login walls. A public
+        # page's substantive title/heading/content keeps its widget from gating.
+        return (not outside and self.outside_links == 0) or (
+            self.login_cue and len(outside) < 80
+        )
+
+
+def auth_wall_context(fetched: dict[str, Any], target: str, *, allow_form: bool = True) -> dict[str, Any] | None:
+    """Classify a credible login wall using response metadata, without returning secrets.
+
+    The returned values are fixed reason codes, an HTTP status, and hostnames. URL
+    paths/queries, response headers, page text, and credentials never cross into an
+    operator prompt or a persisted result. A requested login route is exempt
+    from form-only detection: scanning the login page is a valid unauthenticated
+    objective, though an actual HTTP authentication challenge still pauses it.
+    """
+    try:
+        requested = urlparse(str(target or ""))
+        final = urlparse(str(fetched.get("final_url") or target or ""))
+        status = int(fetched.get("status") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not requested.hostname:
+        return None
+    requested_is_login = _is_login_path(requested.path)
+
+    headers = fetched.get("headers") or {}
+    challenge = bool(isinstance(headers, dict) and any(
+        str(key).lower() == "www-authenticate" and str(value).strip()
+        for key, value in headers.items()
+    ))
+    reason = ""
+    if status == 401:
+        reason = "http_401"
+    elif status == 403 and challenge:
+        reason = "http_403_challenge"
+    elif (not requested_is_login and 200 <= status < 400
+          and final.path != requested.path and _is_login_path(final.path)):
+        reason = "login_redirect"
+    elif allow_form and not requested_is_login and 200 <= status < 400:
+        body = fetched.get("body") or ""
+        if isinstance(body, str) and "<form" in body.lower() and "password" in body.lower():
+            parser = _LoginFormParser()
+            try:
+                parser.feed(body[:131072])
+                parser.close()
+            except (TypeError, ValueError):
+                pass
+            if parser.is_wall:
+                reason = "login_form"
+    if not reason:
+        return None
+    return {
+        "reason": reason,
+        "status": status,
+        "target_host": requested.hostname.lower(),
+        "login_host": (final.hostname or requested.hostname).lower(),
+    }
+
+
 def _guard_url(url: str, allow_private: bool, allowed_ports: frozenset[int]) -> str:
     """SSRF/policy guard: enforce scheme, reject embedded credentials, block
     private/loopback/reserved hosts (unless opted in), and restrict ports for
@@ -218,7 +357,8 @@ def _guard_url(url: str, allow_private: bool, allowed_ports: frozenset[int]) -> 
     return urlunparse(parsed._replace(netloc=netloc))
 
 
-def playwright_request_allowed(url: str, allow_private: bool, allowed_ports: frozenset[int]) -> bool:
+def playwright_request_allowed(url: str, allow_private: bool, allowed_ports: frozenset[int],
+                               *, method: str = "GET") -> bool:
     """True if a Playwright page's request to ``url`` should be allowed through. Shared by
     every module that drives a real browser (screenshot_service, live_scan_service): bind
     this as a ``context.route("**/*", ...)`` handler so the SSRF/private-host/port guard is
@@ -233,7 +373,7 @@ def playwright_request_allowed(url: str, allow_private: bool, allowed_ports: fro
     try:
         # In unattended mode this also enforces the exact saved program scope,
         # cancellation, and the shared cycle request budget on browser resources.
-        operator_guard.before_request(url, reserve=True)
+        operator_guard.before_request(url, method=method, reserve=True)
         _guard_url(url, allow_private, allowed_ports)
         return True
     except (WebsiteFetchError, operator_guard.GuardHalt):
@@ -264,6 +404,8 @@ class _GuardedRedirect(HTTPRedirectHandler):
         if self.count > _MAX_REDIRECTS:
             raise WebsiteFetchError("Website redirected too many times.")
         raw_target = urljoin(req.full_url, newurl)
+        if self.auth is not None and self.auth.https_only and urlparse(raw_target).scheme.lower() != "https":
+            raise WebsiteFetchError("Operator session requires HTTPS; refusing an HTTP redirect.")
         _require_exact_scope_host(raw_target, self.scope_host)
         operator_guard.before_request(raw_target, reserve=False)
         target = _guard_url(raw_target, self.allow_private, self.allowed_ports)
@@ -309,6 +451,9 @@ def _fetch_raw(url: str, *, auth: AuthContext | None = None, scope_host: str = "
     # that hop is made a moment later — see web_ingest.py for why this matters.
     with guarded_dns_scope():
         sanitized = _guard_url(normalized, settings.allow_private_urls, settings.web_allowed_ports)
+        parsed_url = urlparse(sanitized)
+        if auth is not None and auth.https_only and parsed_url.scheme.lower() != "https":
+            raise WebsiteFetchError("Operator session requires HTTPS; refusing an HTTP request.")
         operator_guard.before_request(sanitized, reserve=True)
         headers = {
             "Accept": "*/*",
@@ -317,7 +462,8 @@ def _fetch_raw(url: str, *, auth: AuthContext | None = None, scope_host: str = "
         }
         # Operator session attached SAME-SITE only; a cross-site redirect strips it again
         # (see _GuardedRedirect), so it never leaves the target's host.
-        headers.update(auth_headers_for(urlparse(sanitized).hostname or "", auth))
+        headers.update(auth_headers_for(parsed_url.hostname or "", auth,
+                                        request_scheme=parsed_url.scheme))
         request = Request(sanitized, headers=headers, method="GET")
         handlers = [_GuardedRedirect(settings.allow_private_urls, settings.web_allowed_ports,
                                      auth=auth, scope_host=scope_host)]
@@ -660,14 +806,16 @@ def _probe_sensitive_paths(base_url: str, governor: HostRateGovernor, *, auth: A
 
 def run_web_scan(
     url: str, max_findings: int = _MAX_FINDINGS_RETURNED, *, probe_paths: bool = False,
-    auth: AuthContext | None = None, scope_host: str = "",
+    auth: AuthContext | None = None, scope_host: str = "", verify_login_form: bool = False,
 ) -> dict[str, Any]:
     """Passively scan a single URL. Returns a JSON-serializable result, or
     ``{"ok": False, "error": ...}`` on a fetch failure instead of raising.
 
     ``probe_paths`` adds the bounded, content-validated sensitive-path probe (used by
     the bounty engine for hunts + campaigns); the bare passive scan leaves it off so
-    a quick scan stays a single GET."""
+    a quick scan stays a single GET. ``verify_login_form`` is for the single
+    credential retry after an observed wall: an unchanged login form cannot
+    count as a successful authenticated scan."""
     target = str(url or "").strip()
     if not target:
         return {"ok": False, "scan_type": "web", "error": "No URL provided."}
@@ -687,6 +835,23 @@ def run_web_scan(
             "scan_type": "web",
             "target": target,
             "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    # A general authenticated page can contain an account/password form; do not
+    # infer a wall from that alone. When retrying a page that already showed a
+    # login form, however, the form must disappear or the new session is not
+    # accepted as proof that authentication succeeded.
+    wall = auth_wall_context(fetched, target, allow_form=auth is None or verify_login_form)
+    if wall is not None:
+        # Stop before the sensitive-path wordlist. No status/error-page findings from
+        # an unauthenticated wall should be mistaken for the protected application.
+        return {
+            "ok": False,
+            "scan_type": "web",
+            "needs_operator": True,
+            "operator_action": "authentication_required",
+            "auth_context": wall,
+            "error": "Authentication is required to continue this hunt.",
         }
 
     findings = _analyze(fetched)
