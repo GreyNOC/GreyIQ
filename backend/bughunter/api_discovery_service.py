@@ -24,6 +24,9 @@ import re
 from typing import Any, Callable
 from urllib.parse import quote, urljoin, urlparse
 
+from bughunter.json_safety import exceeds_json_depth
+from bughunter import impact_model
+
 try:  # YAML specs are common (/openapi.yaml). Best-effort: if the parser isn't in this
     import yaml as _yaml  # build we silently skip YAML specs and still handle every JSON one.
 except Exception:  # pragma: no cover - only when PyYAML is unavailable in a stripped build
@@ -77,6 +80,8 @@ def parse_spec_body(body: str, is_yaml_hint: bool = False) -> Any:
     """Parse a spec body as JSON, falling back to YAML (if PyYAML is present). Returns the
     decoded object or ``None``. Pure; never raises."""
     text = body or ""
+    if exceeds_json_depth(text):
+        return None
     s = text.lstrip()
     if not is_yaml_hint and (s.startswith("{") or s.startswith("[")):
         try:
@@ -292,7 +297,7 @@ def _graphql_finding(gql_url: str, info: dict[str, Any]) -> dict[str, Any]:
         "poc": f"GET {gql_url}?query={quote('{__schema{types{name}}}')}\n# -> data.__schema with {info.get('type_count', 0)} types",
         "impact": ("Introspection hands an attacker the complete API schema — every type, field, and mutation — "
                    "greatly accelerating discovery of sensitive or unauthorized operations."),
-        "cvss": {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N", "base_score": 5.3, "base_severity": "low", "estimated": True},
+        "cvss": impact_model.cvss_block("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N", estimated=True),
         "remediation": finding["remediation"],
         "proof_of_impact": {
             "status": "candidate",

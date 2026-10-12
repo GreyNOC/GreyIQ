@@ -65,7 +65,8 @@ class SubmissionApiTests(unittest.TestCase):
         self.assertEqual(pkg["proof_status"], "confirmed")
         self.assertEqual(pkg["severity_rating"], "medium")  # from CVSS base_severity
         self.assertEqual(pkg["weakness"], "79")
-        self.assertIn("Steps", pkg["vulnerability_information"])  # canonical build_finding_markdown
+        self.assertIn("**Proof of Concept**", pkg["vulnerability_information"])
+        self.assertIn("1. Send GET with marker payload", pkg["vulnerability_information"])
 
     def test_unknown_run_or_ref_errors_gracefully(self) -> None:
         self.assertFalse(self.rt.build_submission_package(g.SubmissionPackageRequest(run_id="nope", ref="F1"))["ok"])

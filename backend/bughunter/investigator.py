@@ -74,6 +74,107 @@ _PROOF_OBLIGATIONS = {
     "xxe": "Capture an authorized out-of-band callback or harmless file-read differential and a parser control.",
 }
 
+# These are predictions, not observations or permission to test. Keeping them deterministic
+# prevents a model-supplied rationale from becoming a payload, a new target, or a claim of proof.
+# They travel with every suggested probe so an operator can name the expected distinction
+# BEFORE a scope-gated active check runs.
+_PROBE_DISCRIMINATORS: dict[str, tuple[str, str]] = {
+    "access-control": (
+        "A lower-privilege test actor receives an object or completes an action reserved for the operator's other test role.",
+        "The authorized test role succeeds on the same owned object while an invalid object or disallowed role is denied.",
+    ),
+    "auth": (
+        "The protected action succeeds without the required authentication state and the response shows the resulting capability.",
+        "The same protected action is denied from a clean unauthenticated state.",
+    ),
+    "clickjacking": (
+        "The scoped page can be framed and a controlled test interaction reaches a protected action.",
+        "The same page refuses framing or the controlled interaction cannot reach that action.",
+    ),
+    "cloud-exposure": (
+        "A scoped storage resource returns a nonpublic test object without the permission its policy requires.",
+        "A disallowed test request cannot read that object while an authorized one can.",
+    ),
+    "cors": (
+        "A controlled browser origin reads authenticated sensitive content through the affected endpoint.",
+        "A disallowed controlled origin cannot read the same authenticated content.",
+    ),
+    "crlf": (
+        "The controlled input creates a distinct response header or response boundary.",
+        "A matched benign value leaves the response headers and boundaries unchanged.",
+    ),
+    "csrf": (
+        "A controlled cross-site request changes a test account's state without its required anti-CSRF control.",
+        "The matched request with a missing or invalid control is rejected or leaves state unchanged.",
+    ),
+    "debug": (
+        "A restricted diagnostic route returns protected data or a harmless execution marker.",
+        "An invalid sibling route or unprivileged test role does not return that data or marker.",
+    ),
+    "graphql": (
+        "A lower-privilege test role receives a protected object or field that its role must not see.",
+        "An authorized test role receives it while the lower-privilege role's matched request is denied.",
+    ),
+    "host-header": (
+        "A host-derived link or redirect uses the controlled host in a security-relevant response.",
+        "The matched ordinary host leaves the link or redirect on the expected origin.",
+    ),
+    "jwt": (
+        "A changed or exposed test token is accepted and grants a capability it should not grant.",
+        "A deliberately invalid test token is rejected by the same protected action.",
+    ),
+    "path-traversal": (
+        "A permitted read returns a harmless file outside the intended root.",
+        "The same workflow reads an expected in-root file and rejects an invalid path.",
+    ),
+    "nosqli": (
+        "A repeatable query-result difference follows only the tested condition or object shape.",
+        "The matched false or benign condition returns the baseline result without changing data.",
+    ),
+    "rce": (
+        "A harmless unique marker appears only when the controlled input reaches execution.",
+        "The matched benign input does not produce the marker.",
+    ),
+    "redirect": (
+        "The affected workflow navigates to an off-origin destination when the tested input is supplied.",
+        "The matched same-origin destination stays within the authorized origin.",
+    ),
+    "sqli": (
+        "A repeatable true/false or parser-error response difference follows only the tested input.",
+        "The matched false or benign input returns the baseline response without changing data.",
+    ),
+    "sensitive": (
+        "A scoped route returns a real sensitive artifact rather than a generic page or status.",
+        "A nonsense sibling path and an unauthorized test request do not return that artifact.",
+    ),
+    "ssrf": (
+        "A uniquely correlated permitted callback or response shows that the server fetched the controlled destination.",
+        "The matched benign destination produces no corresponding callback or protected response.",
+    ),
+    "ssti": (
+        "A harmless expression produces its deterministic result in the rendered response.",
+        "A literal-text control remains literal in the same rendering context.",
+    ),
+    "xss": (
+        "A harmless marker executes in a controlled browser context.",
+        "The matched safely encoded value remains inert in that browser context.",
+    ),
+    "websocket": (
+        "A controlled cross-origin WebSocket session receives protected messages or can act in a test account.",
+        "A disallowed origin or unauthenticated test session cannot receive or perform the same action.",
+    ),
+    "xxe": (
+        "A permitted callback or harmless read is uniquely attributable to XML entity processing.",
+        "A parser control without the entity produces no matching callback or read.",
+    ),
+}
+
+_PROBE_FALSIFIER_STOP = (
+    "Leave unconfirmed if the matched control is indistinguishable or the response does not show "
+    "the claimed capability. Stop on missing or changed authorization or scope, a defensive block "
+    "or rate limit, or unexpected sensitive data."
+)
+
 _CLASS_ALIASES = {
     "open-redirect": "redirect", "command-injection": "rce", "cmd-injection": "rce",
     "os-command-injection": "rce", "sql-injection": "sqli", "nosql-injection": "nosqli",
@@ -146,6 +247,24 @@ def proof_obligation(class_id: str) -> str:
     )
 
 
+def probe_discriminator(class_id: str) -> dict[str, str]:
+    """Advisory prediction and controls for a proposed, still-unrun probe.
+
+    This does not select a URL, method, input, payload, or proof status. The caller's
+    existing authorization and scope checks remain the only path to active testing.
+    """
+    normalized = _CLASS_ALIASES.get(str(class_id or "").lower(), str(class_id or "").lower())
+    positive, control = _PROBE_DISCRIMINATORS.get(normalized, (
+        "A captured result meets this class's proof obligation and differs materially from its matched control.",
+        "The same authorized workflow with a benign input or permitted test role shows its baseline result.",
+    ))
+    return {
+        "predicted_positive_signal": positive,
+        "negative_control": control,
+        "falsifier_stop_condition": _PROBE_FALSIFIER_STOP,
+    }
+
+
 def _proof_sources(finding: dict[str, Any], plan: dict[str, Any]) -> list[dict[str, Any]]:
     sources: list[dict[str, Any]] = []
     for value in (finding.get("_active_proof"), plan.get("proof_of_impact"), finding.get("proof_of_impact")):
@@ -171,6 +290,31 @@ def has_confirming_artifact(finding: dict[str, Any], plan: dict[str, Any] | None
     from bughunter import report  # local: report sits above this module
 
     return report._has_captured_artifact(finding, _canonical_proof(finding, _dict(plan)))
+
+
+def has_refuting_artifact(finding: dict[str, Any], plan: dict[str, Any] | None = None) -> bool:
+    """True only when this finding's captured evidence REFUTES the claim it was captured for.
+
+    The counterpart to :func:`has_confirming_artifact`, and deliberately much narrower. Absence of
+    proof is not refutation: a lead nobody has tested yet, and a lead whose test came back negative,
+    both fail the confirm gate, and treating them alike is what would let "not yet demonstrated" be
+    presented as "shown impossible".
+
+    The ONE thing the engine observes that genuinely refutes is a captured observed/control pair
+    that does not differ: the differential was run and it failed. ``report.proof_is_non_differential``
+    is that predicate, and it requires BOTH sides to be non-empty, so an untested lead (empty pair)
+    can never reach it.
+
+    Explicitly NOT sourced from the cortex's other contradiction codes.
+    ``confirmation-without-artifact`` and ``secret-severity-conflict`` are claim-vs-evidence
+    bookkeeping — a label was wrong — and a wrong label is not evidence that an attack step is
+    impossible. Wiring those in would overstate in the opposite direction from the overstatements
+    this module exists to prevent.
+    """
+    from bughunter import report  # local: report sits above this module
+
+    proof = _canonical_proof(finding, _dict(plan))
+    return bool(report.proof_is_non_differential(proof))
 
 
 def _canonical_proof(finding: dict[str, Any], plan: dict[str, Any]) -> Any:
@@ -235,8 +379,17 @@ def _artifact_types(finding: dict[str, Any], plan: dict[str, Any]) -> list[str]:
     evidence = _dict(finding.get("proof_evidence"))
     if _text(evidence.get("matched_value") or evidence.get("set_cookie"), 1000):
         artifacts.append("captured-matched-value")
+    # ``read_data`` is the proof_evidence schema's key for a captured response body — it is what all
+    # 15 in-module producers in active_verify_service write, plus api_discovery_service and the
+    # access-control/stored-XSS services. The four names read here before it
+    # (response_body/response_body_excerpt/body_excerpt/sensitive_data) have NO producer anywhere in
+    # the repo, so this branch never fired and the 22-point "captured-response-body" weight below was
+    # dead: a GraphQL introspection or .env disclosure that captured the whole body scored as if it
+    # had captured nothing, and also lost the per-extra-artifact breadth bonus. The dead names are
+    # kept as trailing fallbacks (harmless, and they document the shapes this once accepted).
     body = _text(
-        evidence.get("response_body") or evidence.get("response_body_excerpt")
+        evidence.get("read_data") or evidence.get("sensitive_data_labels")
+        or evidence.get("response_body") or evidence.get("response_body_excerpt")
         or evidence.get("body_excerpt") or evidence.get("sensitive_data"), 2000
     )
     if body:
@@ -356,7 +509,11 @@ def _evidence_score(
 # the cortex's is the evidence layer's. Map rather than let two vocabularies leak into one
 # report: a chain whose every step is backed by an accepted artifact IS confirmed, a chain
 # with at least one such step is supported, and a chain of pure leads stays a candidate.
-_CHAIN_STATE_TO_CORTEX = {"proven": "confirmed", "partial": "supported", "projected": "candidate"}
+# `broken` MUST be listed. The lookup below defaults an unknown status to "candidate", which is
+# clamped only to the unproven ceiling (54) — so a chain the engine has declared refuted would read
+# as an ordinary lead here and keep more than double the confidence a contradicted chain is allowed.
+_CHAIN_STATE_TO_CORTEX = {"proven": "confirmed", "partial": "supported", "projected": "candidate",
+                          "broken": "blocked"}
 
 
 def _chain_next_action(chain: dict[str, Any], status: str, refs: list[str],
@@ -768,6 +925,7 @@ def build_investigation(
             "artifacts": artifacts,
             "gaps": list(dict.fromkeys(gaps))[:4],
             "next_action": obligation,
+            **probe_discriminator(class_id),
             "decision": decision,
             "report_ready": report_ready,
         })
@@ -791,6 +949,9 @@ def build_investigation(
     for index, row in enumerate(synthesized, 1):
         row["id"] = f"SH{index}"
     chain_probes = list(chain_probes) + synthesized
+    for probe in chain_probes:
+        if isinstance(probe, dict):
+            probe.update(probe_discriminator(probe.get("class_id")))
     _score_information_gain(hypotheses, chains)
     hypotheses.sort(
         key=lambda row: (row["decision"] == "report-now", row["priority_score"], row["confidence_score"]),
@@ -864,6 +1025,7 @@ def build_probe_hypotheses(plan: dict[str, Any] | None) -> list[dict[str, Any]]:
                 "id": "", "endpoint": endpoint, "class_id": class_id, "status": "untested",
                 "likelihood_score": likelihood, "reason": _text(row.get("why"), 300),
                 "evidence_required": proof_obligation(class_id),
+                **probe_discriminator(class_id),
             })
     hypotheses.sort(key=lambda item: item["likelihood_score"], reverse=True)
     hypotheses = hypotheses[:80]
@@ -972,6 +1134,7 @@ def build_probe_plan(investigation: dict[str, Any] | None) -> list[dict[str, Any
             "class_id": class_id,
             "source": source,
             "obligation": _text(item.get("next_action"), 800) or proof_obligation(class_id),
+            **probe_discriminator(class_id),
             "priority": round(priority, 1),
             "status": "untested",
         }

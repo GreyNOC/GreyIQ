@@ -82,3 +82,30 @@ npm run build:portable -- -Installer
 ```
 
 Leave those env vars unset for an ordinary unsigned local build.
+
+## Signing and notarizing macOS releases
+
+The release workflow builds a native Apple Silicon DMG/ZIP and a native Intel
+DMG/ZIP. They use the GreyIQ icon in `build/icon.icns`. The workflow accepts an
+all-or-none set of six Actions secrets:
+
+| Secret | Value |
+|---|---|
+| `MAC_CSC_LINK` | Base64-encoded Developer ID Application `.p12` certificate |
+| `MAC_CSC_KEY_PASSWORD` | Password for the `.p12` |
+| `APPLE_API_KEY` | Base64-encoded App Store Connect API key `.p8` file |
+| `APPLE_API_KEY_ID` | API key identifier |
+| `APPLE_API_ISSUER` | API issuer identifier |
+| `APPLE_TEAM_ID` | Apple Developer team identifier |
+
+The macOS job decodes the API key into a private temporary `.p8` file and passes
+its path to electron-builder. A partial secret set fails the build. With all six
+secrets, electron-builder signs and notarizes the app; CI verifies the code
+signature, stapled ticket, and Gatekeeper assessment before uploading either
+archive to the draft release. See the [electron-builder v26 notarization guide](https://www.electron.build/v26/docs/notarization/).
+
+When the secrets are absent, CI creates unsigned, unnotarized **draft** archives
+and emits a warning. macOS Gatekeeper may block their normal first launch, so
+they should not be presented as ready for public distribution. Only the human
+operator publishes the reviewed release. The macOS build does not bundle Ollama;
+the operator installs it on demand for local coding models.

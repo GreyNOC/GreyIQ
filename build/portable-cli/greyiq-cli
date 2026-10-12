@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+# Keep this launcher beside the extracted greyiq-backend directory. It works
+# from any current working directory and when reached through a PATH symlink.
+launcher=$(readlink -f -- "$0")
+root=$(CDPATH= cd -- "$(dirname -- "$launcher")" && pwd)
+backend="$root/greyiq-backend/greyiq-backend"
+
+if [ ! -x "$backend" ]; then
+  printf 'GreyIQ CLI backend is missing or not executable: %s\n' "$backend" >&2
+  printf 'Extract the complete CLI archive into one directory, then run %s again.\n' "$0" >&2
+  exit 1
+fi
+
+exec "$backend" "$@"

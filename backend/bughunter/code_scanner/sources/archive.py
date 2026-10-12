@@ -15,6 +15,7 @@ import zipfile
 from pathlib import Path
 
 from bughunter.code_scanner.sources.base import ScanSource
+from bughunter.code_scanner.sources.local_guard import resolve_local_scan_path
 
 # Hard cap on extracted bytes. Independent of the per-file cap because
 # an archive could expand to many GB even with small per-file files.
@@ -106,7 +107,7 @@ class ArchiveSource(ScanSource):
                 total += self._stream_to(extracted, target, remaining)
 
     def _prepare(self) -> Path:
-        archive = Path(self.target)
+        archive = resolve_local_scan_path(self.target)
         if not archive.exists():
             raise FileNotFoundError(f"Archive not found: {self.target}")
         self._tempdir = tempfile.TemporaryDirectory(prefix="gn-archive-")

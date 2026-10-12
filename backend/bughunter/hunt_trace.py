@@ -43,7 +43,7 @@ from bughunter.learning import program_key
 
 _STORE_NAME = "hunt_traces.jsonl"
 _LOCK = threading.Lock()  # serialize appends (mirrors ledger.py/learning.py write discipline)
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _MAX_PROGRAM = 120  # cap the program key so a pathological operator-supplied handle can't bloat a line
 
 # Per-record caps so one hunt's line stays bounded even on a huge surface. Training
@@ -56,6 +56,7 @@ _MAX_FORMS = 60
 _MAX_FORM_FIELDS = 30
 _MAX_PLAN_LIST = 60
 _MAX_OUTCOMES = 400
+_MAX_CHECKED = 80
 
 
 def _store_path(runtime_dir: str | Path) -> Path:
@@ -85,14 +86,14 @@ def _redact_url(value: Any) -> str:
     carry from the target's served HTML/JS) out of a URL while keeping its structure and parameter
     NAMES — via the codebase's standard ``redact_text``. Leaves bare numeric/uuid path segments (the
     IDOR training signal) untouched. Redact BEFORE the length cap so a secret spanning the cap boundary
-    can't slip through half-matched. Fail-open to the raw string: redaction must never break a trace."""
+    can't slip through half-matched. On redaction failure, drop the URL rather than store a secret."""
     raw = str(value or "").strip()
     if not raw:
         return ""
     try:
         return redact_text(raw)[0][:600]
-    except Exception:  # noqa: BLE001 - redaction must never break trace recording
-        return raw[:600]
+    except Exception:  # noqa: BLE001 - trace recording must fail closed on privacy
+        return ""
 
 
 def _clip_urls(values: Any, cap: int) -> list[str]:
@@ -165,6 +166,44 @@ def _compact_plan(plan: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def execution_from_active_meta(meta: Any, target: str) -> list[dict[str, Any]]:
+    """Extract per-endpoint completed suite tags from the active verifier.
+
+    The verifier records a class only after its applicable checks ran. A plan's
+    priority list, a candidate finding, or an aggregate success flag is never
+    evidence that a particular check ran. Legacy metadata yields no negatives.
+    """
+    if not isinstance(meta, dict):
+        return []
+    entries = meta.get("targets")
+    if not isinstance(entries, list):
+        entries = [dict(meta, target=target)]
+    rows: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("in_scope") is not True:
+            continue
+        endpoint = str(entry.get("target") or "").strip()
+        classes = entry.get("checked_classes")
+        if endpoint and isinstance(classes, (list, tuple)) and classes:
+            rows.append({"endpoint": endpoint, "classes": classes})
+    return rows
+
+
+def _compact_execution(rows: Any) -> list[dict[str, Any]]:
+    """Retain only bounded URL and class names; no payloads or response data."""
+    out: list[dict[str, Any]] = []
+    for row in rows if isinstance(rows, (list, tuple)) else []:
+        if not isinstance(row, dict):
+            continue
+        endpoint = _redact_url(row.get("endpoint"))
+        classes = list(dict.fromkeys(_clip_strs(row.get("classes"), 32)))
+        if endpoint and classes:
+            out.append({"endpoint": endpoint, "classes": classes})
+        if len(out) >= _MAX_CHECKED:
+            break
+    return out
+
+
 def outcomes_from_findings(items: Any) -> list[dict[str, Any]]:
     """Build the LABEL side — one outcome row per (endpoint, class) with its confirm
     status — from either campaign ``consolidated`` items (each ``{finding, source_url,
@@ -226,6 +265,7 @@ def record_trace(
     plan: dict[str, Any] | None,
     outcomes: list[dict[str, Any]] | None = None,
     consolidated: Any = None,
+    execution: Any = None,
     now: str | None = None,
 ) -> bool:
     """Append ONE hunt trace line and return True if written.
@@ -249,6 +289,7 @@ def record_trace(
             "target": _redact_url(target),  # a full target URL can carry a secret (?access_token=, magic-link) — redact like every other URL in the record
             "surface": _compact_surface(surface),
             "plan": _compact_plan(plan),
+            "execution": _compact_execution(execution),
             "outcomes": rows,
         }
         line = json.dumps(record, default=str, ensure_ascii=False) + "\n"

@@ -210,7 +210,9 @@ class CnameCorrelationTests(unittest.TestCase):
         self.assertEqual(cands[0]["severity"], "medium")
         self.assertEqual(cands[0]["snippet"], "")  # no third-party body embedded
         self.assertEqual(ts.build_plan(cands[0])["proof_of_impact"]["status"], "candidate")
-        self.assertEqual(ts.build_plan(cands[0])["cvss"]["base_severity"], "medium")
+        # 6.1 Medium is what this candidate's vector actually scores; the block used to hardcode 6.5.
+        self.assertEqual(ts.build_plan(cands[0])["cvss"]["base_severity"], "Medium")
+        self.assertEqual(ts.build_plan(cands[0])["cvss"]["base_score"], 6.1)
         self.assertTrue(ts.build_plan(cands[0])["cvss"]["estimated"])  # candidate stays a template estimate
 
     def test_no_cname_match_yields_no_candidate(self) -> None:

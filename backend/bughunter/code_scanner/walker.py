@@ -20,6 +20,11 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Final
 
+from bughunter.code_scanner.sources.local_guard import (
+    is_link_or_reparse,
+    resolve_local_scan_path,
+)
+
 # Directories we never descend into. Vendored deps, build outputs, and
 # VCS internals would explode scan time without adding signal.
 _SKIP_DIRS: Final = frozenset(
@@ -139,7 +144,7 @@ def walk_collect(
     and not the true count. Here we maintain a true ``files_skipped``
     counter alongside a capped examples list.
     """
-    root = root.resolve()
+    root = resolve_local_scan_path(root)
     files: list[WalkedFile] = []
     skipped_examples: list[str] = []
     files_skipped = 0
@@ -160,12 +165,20 @@ def walk_collect(
         if halted:
             break
         # In-place mutation of dirnames prunes the os.walk descent.
-        dirnames[:] = [
-            d
-            for d in dirnames
-            if d not in _SKIP_DIRS
-            and (not d.startswith(".") or d in _DOT_ALLOWLIST)
-        ]
+        allowed_dirs = []
+        for dirname in dirnames:
+            if dirname in _SKIP_DIRS or (dirname.startswith(".") and dirname not in _DOT_ALLOWLIST):
+                continue
+            candidate = Path(current_dir) / dirname
+            try:
+                if is_link_or_reparse(candidate):
+                    _record_skip(candidate.relative_to(root).as_posix(), "symlink or junction")
+                    continue
+            except OSError:
+                _record_skip(candidate.relative_to(root).as_posix(), "directory check failed")
+                continue
+            allowed_dirs.append(dirname)
+        dirnames[:] = allowed_dirs
         for filename in filenames:
             absolute = Path(current_dir) / filename
             try:
@@ -190,6 +203,9 @@ def walk_collect(
                 continue
 
             try:
+                if is_link_or_reparse(absolute):
+                    _record_skip(relative, "symlink or junction")
+                    continue
                 size = absolute.stat().st_size
             except OSError:
                 _record_skip(relative, "stat failed")

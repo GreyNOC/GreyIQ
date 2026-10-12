@@ -239,6 +239,32 @@ class HuntLoopTests(unittest.TestCase):
         # ...and the loop's own snapshot is built AFTER the override, so it carries the same number
         self.assertEqual(meta["investigation"]["coverage"]["requests_used"], 8)
 
+    def test_checked_classes_union_completed_suites_from_partial_turns(self) -> None:
+        # A later turn can hit the budget after completing some checks. The loop must
+        # retain those completed suite tags from both turns, without adding classes
+        # the verifier did not actually mark as checked.
+        turn_meta = iter([
+            {"requests_used": 2, "rate_limited": False,
+             "checked_classes": ["cors", "xss"], "verified_classes": ["xss"]},
+            {"requests_used": 3, "rate_limited": True,
+             "checked_classes": ["sqli"], "verified_classes": []},
+        ])
+
+        def fake(target, findings, *, requests_budget=12, **kw):
+            self.turn += 1
+            return [], {"in_scope": True, "host": "t", **next(turn_meta)}
+
+        active_verify_service.verify_active = fake
+        self._brain(done=False)
+        _, meta = hunt_loop.run_iterative_verify(
+            "https://t/", [], scope="t", requests_budget=100,
+            settings=self._settings(max_iters=5), coder_cfg={"provider": "x"})
+        self.assertEqual(self.turn, 2)
+        self.assertTrue(meta["rate_limited"])
+        self.assertEqual(meta["checked_classes"], ["cors", "sqli", "xss"])
+        self.assertEqual(meta["verified_classes"], ["xss"])
+        self.assertEqual(meta["requests_used"], 5)
+
 
 class OfflineReactPlanTests(unittest.TestCase):
     """The DETERMINISTIC re-planner: with no brain configured the loop must still refine from the real
@@ -456,6 +482,65 @@ class ProbeObservationLoopTests(unittest.TestCase):
                         "digest": {"json_keys": ["same_key"]},          # identical every turn
                         "probe_digest": probe_for_turn(self.turn)}
         active_verify_service.verify_active = fake
+
+    def test_stop_halts_the_loop_between_turns(self) -> None:
+        """The loop was the ONE active path Stop could not reach.
+
+        The fan-out checks ``should_stop`` between targets; this branch replaces the fan-out, had no
+        such check and no parameter for one, so pressing Stop bought nothing until the loop
+        exhausted max-iters or its 400-request budget — up to 200+ seconds of un-cancellable
+        traffic at a live host.
+        """
+        # BASELINE first: how many turns this stub runs when nobody interrupts. Comparing against a
+        # measured baseline is what keeps this from passing against a loop that never iterates.
+        self._stub(lambda t: {"error_families": [f"fam{t}"]})
+        _r, baseline = hunt_loop.run_iterative_verify(
+            self.EP, [], scope="target.example", requests_budget=400,
+            settings=self._settings(), coder_cfg=None)
+        free_turns = self.turn
+        self.assertGreater(free_turns, 1, "the stub must be one that would keep going")
+        self.assertFalse(baseline["stopped"])
+
+        # Now the same stub, stopped after the first turn.
+        self.turn = 0
+        self._stub(lambda t: {"error_families": [f"fam{t}"]})
+        calls = {"n": 0}
+
+        def _should_stop() -> bool:
+            calls["n"] += 1
+            return self.turn >= 1      # true once turn 0 has run
+
+        _r, meta = hunt_loop.run_iterative_verify(
+            self.EP, [], scope="target.example", requests_budget=400,
+            settings=self._settings(), coder_cfg=None, should_stop=_should_stop)
+        self.assertTrue(calls["n"], "the predicate must actually be consulted")
+        self.assertEqual(self.turn, 1, "no turn may start after Stop")
+        self.assertLess(self.turn, free_turns, "Stop must cut the loop short of where it would end")
+        self.assertTrue(meta["stopped"])
+        self.assertEqual(meta["loop_turns"], 1,
+                         "a turn cut short by Stop never ran, so it is not counted")
+
+    def test_a_stop_predicate_that_raises_fails_open(self) -> None:
+        # A broken kill switch read as "stop" would silently truncate every hunt. One extra turn is
+        # the cheaper failure, and the budget still bounds it.
+        self._stub(lambda t: {"error_families": [f"fam{t}"]})
+
+        def _boom() -> bool:
+            raise RuntimeError("predicate is broken")
+
+        _results, meta = hunt_loop.run_iterative_verify(
+            self.EP, [], scope="target.example", requests_budget=40,
+            settings=self._settings(max_iters=2), coder_cfg=None, should_stop=_boom)
+        self.assertFalse(meta["stopped"])
+        self.assertEqual(self.turn, 2, "a raising predicate must not halt the hunt")
+
+    def test_no_stop_predicate_behaves_exactly_as_before(self) -> None:
+        self._stub(lambda t: {"error_families": [f"fam{t}"]})
+        _results, meta = hunt_loop.run_iterative_verify(
+            self.EP, [], scope="target.example", requests_budget=40,
+            settings=self._settings(max_iters=2), coder_cfg=None)
+        self.assertFalse(meta["stopped"])
+        self.assertEqual(meta["loop_turns"], 2)
 
     def test_a_probe_provoked_error_keeps_the_offline_loop_alive(self) -> None:
         """With a constant landing page, a probe that provokes a NEW error family each turn is real

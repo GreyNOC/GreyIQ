@@ -100,14 +100,17 @@ class ParseOpenApiTests(unittest.TestCase):
 
 class ParseSpecBodyTests(unittest.TestCase):
     def test_deeply_nested_json_returns_none_not_recursionerror(self) -> None:
-        # json.loads raises RecursionError (a RuntimeError, NOT ValueError) on deeply nested brackets.
-        # parse_spec_body promises "never raises" — a hostile /openapi.json must degrade to None, not
-        # crash recon for the whole target.
+        # JSON recursion thresholds differ by Python build; a hostile spec must
+        # be rejected at a fixed depth before it reaches the parser.
         hostile = "[" * 6000 + "]" * 6000
         self.assertIsNone(api.parse_spec_body(hostile))
 
     def test_valid_json_still_parses(self) -> None:
         self.assertEqual(api.parse_spec_body('{"a": 1}'), {"a": 1})
+
+    def test_brackets_inside_a_json_string_do_not_count_as_nesting(self) -> None:
+        self.assertEqual(api.parse_spec_body('{"a": "' + '[' * 300 + '"}'),
+                         {"a": '[' * 300})
 
 
 class GraphQLTests(unittest.TestCase):
@@ -132,7 +135,11 @@ class GraphQLTests(unittest.TestCase):
         self.assertEqual(f["category"], "disclosure")
         self.assertEqual(f["rule_id"], "passive.graphql-introspection")
         self.assertEqual(f["_plan"]["proof_of_impact"]["status"], "candidate")
-        self.assertEqual(f["_plan"]["cvss"]["base_severity"], "low")
+        # The drift this fixes: the block hardcoded "low" beside a vector that scores 5.3, which is the
+        # Medium band. A triager pasting the vector into the NVD calculator got a different severity than
+        # the report printed. Both now come from the one vector (impact_model.cvss_block).
+        self.assertEqual(f["_plan"]["cvss"]["base_score"], 5.3)
+        self.assertEqual(f["_plan"]["cvss"]["base_severity"], "Medium")
 
     def test_query_and_mutation_operations_surfaced(self) -> None:
         # The introspection query already fetches fields{name}; the parser now surfaces the actual

@@ -21,6 +21,31 @@ from bughunter import secret_classification
 _TOP = 8
 _CITATION_WEIGHT = {"critical": 0.99, "high": 0.85, "medium": 0.6, "low": 0.4, "info": 0.2}
 
+# Remote triage only needs coarse scanner metadata to order findings. Everything
+# sent here is selected from fixed labels: a scanner finding can contain raw
+# credentials, response bodies, request headers, and token-bearing URLs in any
+# free-text field, including its title and rule ID.
+_REMOTE_SEVERITIES = frozenset({"critical", "high", "medium", "low", "info"})
+_REMOTE_CONFIDENCE = frozenset({"high", "medium", "low"})
+_REMOTE_CLASSES = frozenset({
+    secret_classification.CONFIRMED_SECRET,
+    secret_classification.PUBLIC_CLIENT_KEY,
+    secret_classification.CANDIDATE_UNVERIFIED,
+    secret_classification.FALSE_POSITIVE,
+})
+_REMOTE_SCAN_TYPES = frozenset({"code", "web", "live", "repo", "wardrive", "active"})
+_REMOTE_RISKS = frozenset({"critical", "high", "moderate", "medium", "low", "clean", "info"})
+_REMOTE_RULE_FAMILIES = frozenset({"active", "code", "live", "passive", "secret", "wardrive", "web"})
+_REMOTE_CATEGORIES = frozenset({
+    "access-control", "access_control", "auth", "backdoor", "chrome-extension",
+    "ci", "client_sink", "command_injection", "cors", "crypto", "csrf",
+    "dependency", "deserialization", "disclosure", "graphql", "headers",
+    "injection", "jwt", "mixed_content", "nosqli", "obfuscation",
+    "open_redirect", "path_traversal", "rce", "runtime", "secret",
+    "secret_exposed", "sqli", "ssrf", "ssti", "subdomain-takeover",
+    "vulnerable-component", "wireless-availability", "wireless-client", "xss", "xxe",
+})
+
 _CLASS_NOTE = {
     secret_classification.PUBLIC_CLIENT_KEY: "public client key — informational only, not a reportable secret without proof of impact",
     secret_classification.CANDIDATE_UNVERIFIED: "unverified candidate — regex/source match without validation",
@@ -124,6 +149,43 @@ def _completions_endpoint(url: str) -> str:
     return f"{endpoint}/v1/chat/completions"
 
 
+def _remote_label(value: Any, allowed: frozenset[str]) -> str:
+    """Return a fixed label; never forward untrusted finding text to a model."""
+    label = value.strip().lower() if isinstance(value, str) else ""
+    return label if label in allowed else "unknown"
+
+
+def _remote_triage_view(result: dict[str, Any]) -> dict[str, Any]:
+    """Allowlisted, evidence-free metadata for an optional remote triage model.
+
+    Local summaries and citations retain the full finding. A remote model must
+    not receive paths, URLs, descriptions, snippets, proof, or arbitrary labels.
+    """
+    summaries: list[dict[str, Any]] = []
+    findings = result.get("findings")
+    for finding in (findings if isinstance(findings, list) else [])[:30]:
+        if not isinstance(finding, dict):
+            continue
+        raw_cls = _secret_class(finding)
+        cls = _remote_label(raw_cls, _REMOTE_CLASSES)
+        severity = _remote_label(_display_severity(finding, raw_cls), _REMOTE_SEVERITIES)
+        rule_id = finding.get("rule_id")
+        family = rule_id.split(".", 1)[0] if isinstance(rule_id, str) else ""
+        summaries.append({
+            "index": len(summaries) + 1,
+            "severity": severity,
+            "confidence": _remote_label(finding.get("confidence"), _REMOTE_CONFIDENCE),
+            "category": _remote_label(finding.get("category"), _REMOTE_CATEGORIES),
+            "rule_family": _remote_label(family, _REMOTE_RULE_FAMILIES),
+            "secret_classification": cls,
+        })
+    return {
+        "scan_type": _remote_label(result.get("scan_type"), _REMOTE_SCAN_TYPES),
+        "risk": _remote_label(result.get("risk"), _REMOTE_RISKS),
+        "findings": summaries,
+    }
+
+
 def remote_triage(result: dict[str, Any], remote_config: dict[str, Any] | None) -> str | None:
     if not remote_config or not remote_config.get("remote_enabled"):
         return None
@@ -137,12 +199,12 @@ def remote_triage(result: dict[str, Any], remote_config: dict[str, Any] | None) 
     except (TypeError, ValueError):
         timeout = 60.0
 
-    findings = result.get("findings", [])[:30]
     prompt = (
-        "You are GreyIQ BugHunter, a security triage assistant. Given these scan findings "
-        "(JSON), produce a short prioritized triage: the single most important issue first, "
-        "group duplicates, flag likely false positives, and give the most valuable fix. Be "
-        "concise and concrete.\n\n"
+        "You are GreyIQ BugHunter, a security triage assistant. Given these metadata-only "
+        "finding summaries (JSON), produce a short prioritized triage: the most important "
+        "class first, group similar findings, flag likely false positives, and suggest a "
+        "general fix. Do not invent proof, affected locations, or impact absent from this "
+        "metadata. Be concise and concrete.\n\n"
         "BE STRICT WITH SECRET / API-KEY FINDINGS — do NOT inflate their severity:\n"
         "- A value appearing in page/app source is NOT proof of a vulnerability. A regex match is NOT "
         "proof of a secret.\n"
@@ -155,15 +217,7 @@ def remote_triage(result: dict[str, Any], remote_config: dict[str, Any] | None) 
         "- Group unverified/public API-key findings in a SEPARATE section from confirmed secrets, and "
         "state plainly when a finding is NOT reportable yet (and what proof is missing).\n\n"
         "Findings JSON:\n"
-        + json.dumps(
-            {
-                "scan_type": result.get("scan_type"),
-                "target": result.get("target"),
-                "risk": result.get("risk"),
-                "findings": findings,
-            },
-            default=str,
-        )[:12000]
+        + json.dumps(_remote_triage_view(result))
     )
     payload = {
         "model": model,

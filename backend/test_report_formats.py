@@ -174,14 +174,16 @@ class BuildSubmissionPlatformTests(unittest.TestCase):
         self.assertTrue(pkg["platform_severity"].startswith("P"))
         # severity_rating stays the HackerOne API vocabulary (used by the API submit).
         self.assertEqual(pkg["severity_rating"], "high")
-        self.assertIn("Bugcrowd submission", pkg["vulnerability_information"])
+        self.assertTrue(pkg["vulnerability_information"].startswith("**Summary**"))
+        self.assertIn("Bugcrowd submission", pkg["analyst_report"])
         self.assertIn("unescaped reflection", pkg["vulnerability_information"])  # evidence present
 
     def test_default_platform_is_hackerone(self) -> None:
         ctx, finding = _ctx_finding()
         pkg = sub.build_submission(ctx, finding)
         self.assertEqual(pkg["platform"], "hackerone")
-        self.assertIn("HackerOne submission", pkg["vulnerability_information"])
+        self.assertTrue(pkg["vulnerability_information"].startswith("**Summary**"))
+        self.assertIn("HackerOne submission", pkg["analyst_report"])
 
     def test_unknown_platform_coerced(self) -> None:
         ctx, finding = _ctx_finding()
@@ -271,7 +273,8 @@ class ChainRoleInSubmissionTests(unittest.TestCase):
         ctx, finding = self._chained()
         package = sub.build_submission(ctx, finding, "hackerone")
         self.assertIsNotNone(package)
-        self.assertIn("this step is *projected*", package["vulnerability_information"])
+        self.assertIn("This is a projected step", package["vulnerability_information"])
+        self.assertIn("full account takeover, has not been demonstrated here", package["vulnerability_information"])
 
     def test_a_context_with_no_investigation_renders_no_chain_section(self) -> None:
         ctx, finding = _ctx_finding()
@@ -297,7 +300,7 @@ class ChainRoleInSubmissionTests(unittest.TestCase):
         package = runtime.build_submission_package(
             api.SubmissionPackageRequest(run_id=result["run_id"], ref="F1", platform="hackerone"))
         self.assertTrue(package["ok"])
-        self.assertIn("this step is *projected*", package["package"]["vulnerability_information"])
+        self.assertIn("This is a projected step", package["package"]["vulnerability_information"])
 
     def test_both_renderers_produce_the_same_chain_line(self) -> None:
         # Delegation, not a second implementation: the platform body and the default report must

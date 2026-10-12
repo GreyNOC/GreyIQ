@@ -2,6 +2,356 @@
 
 Notable changes to GreyIQ.
 
+## Unreleased
+
+- Hunt a directory with one command: `gn auto -y` in a repo or a folder that
+  lists its targets resolves them, registers the directory as a saved program so
+  negative knowledge, priors, surface drift and the ledger accumulate across
+  runs, and hunts it. Authorization is never read from the directory — a hunt
+  file that tries to set it is refused out loud — and `-y` buys one reviewed
+  cycle; keeping the scheduler on it needs the same auditable per-program
+  authorization record `gn operator run` requires. The cycle it runs is now
+  stamped, so the scheduler no longer treats a just-hunted program as due and
+  re-hunts it immediately.
+- Close the payout loop without a human in the desktop UI: outcome sync moved
+  into one shared function the HTTP route, the new `gn sync` verb and the
+  operator loop all call. The operator polls real platform verdicts before each
+  pass, so that pass's ranking already sees them, then orders programs by what
+  has actually paid and retrains the offline ranker from the corpus it is
+  growing. Only terminal states teach, and a reward that lands while a report is
+  still triaged is recorded rather than lost.
+- Import a finished Shannon run as candidates: `gn shannon <run-dir|report.sarif>`
+  reads its SARIF and brings findings in as CANDIDATES only. GreyIQ's prover
+  never saw those targets, so none of them can reach a submission — the refusal
+  is enforced in the captured-artifact gate and the submission path, not just in
+  the importer. Severity and CWE are never invented from Shannon's coarse class;
+  a location-level CWE is now mined from the prose that actually carries it.
+- Stop the test suite writing to the operator's real learning stores. Ten call
+  sites across two test files passed the live `runtime/` directory, so every run
+  appended to the offline ranker's own training corpus; a guard now hashes those
+  stores around the suite and fails if one changes.
+- Make `iterate` activate the pass it depends on, so a direct campaign or API
+  caller that sends it without `active` arms the theorize-act re-plan wave
+  instead of setting a flag nothing reads.
+
+## v4.9.7 - live Ollama model intake
+
+- Load the local, tool-capable model list directly from Ollama's public catalog
+  and offer installed weights in one dropdown. Selecting a model starts local
+  setup, verifies chat and structured tool calls, and activates it only after
+  both checks pass. Cloud-only entries are excluded.
+- Keep Hugging Face GGUF import in an advanced section with the same readiness
+  gate. Match installed models to the currently entered server, prevent setup
+  races, and protect the active model from deletion.
+- Show catalog outages and partial results explicitly; update the setup guide
+  and add parser, route, and frontend flow coverage.
+
+## v4.9.6 - unsigned macOS packaging
+
+- Clear absent Apple signing secrets before unsigned macOS packaging, so
+  electron-builder does not interpret an empty certificate value as a path.
+
+## v4.9.5 - macOS browser staging
+
+- Stage Playwright's exact Chromium headless shell revision after freezing the
+  macOS backend so PyInstaller cannot rewrite its Mach-O libraries. Verify the
+  staged browser launches before packaging Apple Silicon and Intel desktop apps.
+
+## v4.9.4 - macOS headless browser packaging
+
+- Bundle only Playwright's Chromium headless shell in macOS releases so
+  PyInstaller can sign the frozen backend and the browser smoke test can run.
+  Windows and Linux retain both Chromium builds.
+
+## v4.9.3 - hunt learning and release workflow
+
+- Record completed verifier suites and confirmed outcomes as evidence for hunt
+  learning. Filtered findings and interrupted checks cannot create false
+  negative labels; check identity remains distinct from reported impact.
+- Retrain the local hunt ranker after new traces and promote weights only when
+  held-out recall matches or beats both the rules and the active model.
+- Update one learning outcome per finding as platform verdicts change, so
+  repeated syncs and rescans do not distort priorities.
+- Make verified coding lessons available to TinyGPT training and live retrieval.
+  Local Windows builds can opt in to bundle TinyGPT, CPU torch, and a seed model;
+  the frozen build checks that the model loads.
+- Remove unsupported Bugcrowd researcher API discovery and scope preview. Manual
+  and CSV intake and Bugcrowd report formatting remain available.
+- Wait for the operator worker to record its stopped audit and release its lease
+  before the CLI exits after interruption.
+- Validate campaign targets before login or reconnaissance, including every
+  target in a multi-target campaign.
+- Add native Apple Silicon and Intel desktop release builds alongside the Linux
+  CLI tar archive and Windows desktop builds.
+
+## v4.9.2 - authorized assessment and MCP hunt review
+
+- Expand the local security knowledge and hunt workflow with scope-bound active
+  checks, source review, evidence grading, and privacy-aware reporting. Remote
+  repository and local source scans now apply explicit preflight controls.
+- Add operator-managed MCP servers for manual chat commands and a built-in,
+  in-memory MCP evidence review that runs automatically after authorized hunts.
+- Let operators approve exact external evidence-only MCP tools and opt in to
+  their use for one hunt. Calls are bounded by run permits and saved server
+  fingerprints; results remain untrusted advisory data and cannot alter proof
+  or launch target requests.
+
+## v4.9.1 - split GGUF import and desktop setup
+
+- Import public Hugging Face repositories containing only split GGUF files by
+  selecting a complete quantization set, checking Ollama 0.35.0+ and available
+  download space, verifying each shard, and creating a local Ollama model from
+  the original filenames. Reuse downloaded shards and Ollama blobs on retry;
+  report download and model creation failures in the import panel.
+- Keep the previous coding brain selected unless the new model passes both
+  chat and agent tool-call readiness checks. Allow `OLLAMA_MODELS` to place the
+  packaged Ollama model store on a volume with sufficient capacity. Split imports
+  stop before download if an external server's store cannot be verified or if a
+  FAT32 volume cannot hold an individual shard. A GreyIQ-launched system Ollama
+  can use an explicit `OLLAMA_MODELS` path after GreyIQ confirms that child owns
+  the server port.
+- Let operators save and test HackerOne API credentials directly in the Program
+  wizard before browsing programs or fetching scope. Credential-shaped text in
+  the program search box is stopped locally instead of sent as a query. Late
+  browse and preview responses are discarded after switching platforms, so
+  scope from one platform cannot be saved under another.
+- Use a frameless desktop window with in-app minimize, maximize, and close
+  controls, including on backend startup and error screens.
+
+## v4.9.0 - Debian 13, guarded operator, and platform program intake
+
+- Added a Debian 13 package, AppImage, and headless CLI archive with a relocatable
+  `greyiq-cli` launcher. `greyiq-cli path` prints the runtime location and PATH
+  setup syntax; `dashboard` provides a read-only terminal monitor.
+- Added one-click setup for public Hugging Face GGUF models through Ollama, with
+  chat and tool-call readiness checks before selecting a model. Direct Hugging
+  Face import uses the same gate, starts the packaged desktop's local runtime,
+  and makes a ready model available to the hunt planner. Clearing a previous
+  remote server URL selects the default local Ollama server; a failed model call
+  leaves the bounded offline hunt planner available.
+- Scheduled operator runs now require expiring per-program authorization grants,
+  enforce scope and request budgets, and queue findings for human review.
+  Local outcome feedback reprioritizes later authorized cycles.
+- Added read-only program discovery and scope previews for HackerOne, Bugcrowd,
+  and Intigriti. YesWeHack program search and scope import arrived in v4.5.0.
+  API results remain drafts until the operator reviews and saves a program.
+- Hardened platform imports so existing exclusions survive a scope re-fetch and
+  URL-limited assets cannot silently widen to whole-host manual testing.
+- Investigation leads and suggested probes now state the predicted confirming
+  result, a matched negative control, and a condition that leaves the lead
+  unconfirmed or stops testing. These are planning aids, not proof or permission.
+- Submission packages now provide a short, plain-language report body for a
+  platform description field, plus a detailed analyst report and JSON sidecar
+  that retain metadata, evidence, limitations, and review context.
+
+## v4.8.0 - verified learning and safer operator controls
+
+- Record coding-brain exchanges in a local learning log, with verified replay limited to
+  code changes that pass workspace verification. TinyGPT drafts require the optional offline
+  runtime, which is not bundled in the portable app.
+- Remove unattended HackerOne submission from portfolio operations. Scheduled hunts queue
+  findings for human review, and legacy auto-submit requests are refused.
+- Recheck program scope on account-login redirects and subrequests before sending credentials.
+- Harden desktop backend and Ollama startup checks, and expand API, CLI, and frontend wiring tests.
+
+## v4.7.0 - Hugging Face GGUF models in the local brain
+
+- Import compatible Hugging Face GGUF repositories into GreyIQ's local Ollama model library.
+- Select an imported model as the local coding brain for chat and agent work. Model retrieval is
+  operator initiated, and inference runs through the local Ollama runtime.
+
+## v4.6.0 - the investigation queue, in the app
+
+### The lead queue is readable in the cockpit, and reachable at all
+
+The **Download leads (.md)** button shipped in v4.2.1 was documented as being in the Hunt cockpit.
+It was not. It lives in the AI Studio surface (`#panelSecurity`, inside `.app-shell`), and
+`body[data-app-mode="hunt"] .app-shell { display: none }` with `appMode: "hunt"` as the default -
+so an operator who works in the cockpit, which is where a hunt is actually launched, could not
+reach it at all. README and CHANGELOG both asserted otherwise; both are corrected.
+
+The cockpit's export row now carries a **Leads** button that renders the queue *in the app*: each
+lead with its status, severity, confidence, the gaps still open, anything the engine says
+contradicts it, which chains it participates in, and - the line an operator actually acts on - the
+exact artifact that would confirm it. Untested chain leads render in their own section, labelled as
+probes rather than results. The same panel still downloads the Markdown brief.
+
+`export_leads` now returns the structured `report` alongside `markdown`. It was already building
+that object and discarding it, which is why the in-app operator had a file download and no way to
+READ the queue while the CLI had `--json`. This cannot widen what crosses the API boundary: the
+brief is *rendered from* this same object, so anything reachable in `report` was already reachable
+in `markdown` - and the redaction tests now assert against both.
+
+No `/api/bounty/investigate` route was added. The endpoint half already exists as
+`POST /api/bounty/leads`, and "investigate" is this codebase's established name for the per-finding
+active re-probe drawer (`/api/bounty/finding/reverify`); a second route by that name would leave
+two differently-shaped endpoints called the same thing.
+
+## v4.5.0 - YesWeHack becomes a place you set a program up from, not just a report format
+
+YesWeHack has been in the platform registry since the report formats landed, but only as an output
+shape: you could render a finding for its form, and that was the whole relationship. Setting the
+program up was still manual - retype the scope, retype the exclusions, and find the user-agent tag
+the program requires somewhere in its rules. This release makes it a source. `From YesWeHack` in the
+program wizard (and `Fetch scope from YesWeHack` in the form) pulls the program from
+`api.yeswehack.com` and fills in the record.
+
+**No credential is needed for a public program, and that is the default.** Verified against the live
+API, not assumed: `GET /programs?page=N` and `GET /programs/{slug}` both answer 200 unauthenticated,
+so the Submissions bar starts at *anonymous - public programs only* and the common case needs no
+secret at all. Sign-in exists for private/invited programs and exchanges email+password (plus TOTP)
+for a session token via `POST /login` / `POST /account/totp`; only the returned token is stored - the
+password is never written to the secrets file, never logged, and never read back. A Personal Access
+Token (`X-AUTH-TOKEN`) works too, for the manager-role accounts YesWeHack issues them to. The fetcher
+carries the same posture as the HackerOne one: host-pinned, redirects captured rather than followed
+so a credential cannot hop off-host, bounded reads, and a retry policy that never retries a
+deterministic 401/403/404.
+
+One fetch fills scope, out-of-scope, rules of engagement, qualifying and non-qualifying classes, the
+per-tier reward grid, test-account instructions, VPN and source-IP constraints - and the marker.
+**The marker is the part that makes the import worth having.** Most YesWeHack programs require a
+per-program tag on the User-Agent of every request so they can attribute the traffic; GreyIQ already
+had exactly that field (`portfolio.user_agent_suffix`, appended verbatim by
+`web_ingest.set_ua_suffix`), so the import writes the program's own value straight into it and an
+imported program is in-policy without further setup. A re-fetch never overwrites a marker or Notes
+the operator has edited.
+
+**An adversarial review caught a scope-safety bug before this shipped, and it is worth recording
+because the tests had certified the broken behaviour.** YesWeHack's out-of-scope list is free text
+that mixes real host patterns with prose, so the importer classified each line and stored the
+host-shaped ones as exclusions. The classifier accepted `https://shop.acme.example/checkout` and
+`api.acme.example:8443` - but both scope matchers (`campaign._target_host_excluded` and the
+equivalent check in `active_verify_service`) parse the *candidate* host and compare the exclusion
+token **verbatim**. A URL- or port-shaped token therefore matched nothing: the host stayed huntable
+while the UI reported the exclusion as captured. Three of four exclusions in the reproduction were
+inert, and the test suite asserted those two forms were "enforceable", so 54 green tests locked it
+in. The fix normalises each line to the bare host token the matchers actually honour, at the
+importer, where the data arrives - and the regression test now runs end-to-end through
+`portfolio._normalize` into the real matcher rather than asserting on the classifier alone.
+
+Two smaller decisions came out of the same review. **Exclusions are budgeted before in-scope rows**:
+when the 500-entry cap has to drop something, losing an in-scope row costs an opportunity, while
+losing an out-of-scope row would leave a forbidden host looking merely un-listed - so the cap now
+drops in the direction that hunts less. And **a prose exclusion is never dropped silently**: a rule
+the host matcher cannot enforce is surfaced in the fetch result and in Notes, because a count that
+implied every exclusion was captured is worse than no count.
+
+YesWeHack stays **export-only**. There is no researcher report-creation endpoint in YesWeHack's own
+client or its Burp extension, so nothing here claims a submit path that does not exist; the one-click
+API submit remains HackerOne-only and YesWeHack reports are filed on the platform.
+
+This release also carries the **v4.4.1 changelog entry, which was published as a tag but never merged
+to main** - `git diff v4.4.1 origin/main` was the version bump and that entry, and nothing else. The
+entry is restored below so the history does not skip a shipped version.
+
+**Six one-directional wiring gaps, where the engine computed something real and nothing collected
+it.** This whole class is invisible at runtime: a response field the client never reads looks exactly
+like a field the server never sent, and a route with no caller looks exactly like a route nobody
+needs. Nothing errors, nothing logs, and the capability simply is not there.
+
+Two were values thrown away on arrival. **`get_report_ready` rebuilds a runnable `replay.sh` and a
+`findings.har`** for the finding being readied - from its captured crafted request, deliberately
+without the confirmed-only filter the bundle path applies, because this is a preview of a finding
+still being assembled. Both ride that one response and are never stored in the ledger, so the Report
+Center dropped them and a history finding had no reproduction artifact at all. It now keeps them on
+the record and offers each as a download, but only when it has one: the server returns `""`/`null`
+when nothing was reconstructable, and an unconditional menu item would hand a triager an empty file
+and call it a reproduction. **`/prove` returns the captured request/response artifact per result**
+(`_compact_active` has carried `proof_evidence` since the Prove flow was built), and every call site
+kept the observed/control prose and discarded the artifact. For a finding proven from the cached run
+that was survivable - the engine persists the same artifact server-side - but a finding re-proven
+from *history* has no cached run to read it back from, so the concrete headers a triager asks for
+were gone. All three prove sites now fold it onto the finding and the campaign drawer's report sends
+it. The selection also moved to the *class-matched* confirmed result - the one
+`_persist_proof_of_impact` picks server-side - so the artifact belongs to the finding it is attached
+to, rather than to whichever check happened to confirm first at the same URL.
+
+Four were routes with nothing on the other end. **`/api/bounty/finding/restore`** existed while both
+delete sites discarded the `dedup_key` the dismiss response returns - and that key is the only handle
+on the suppression a delete records, because the server derives it when the caller has none. An
+accidental delete was therefore permanent. Both sites keep it now and offer *Undo delete*, honestly:
+restore is idempotent, so the bar distinguishes "restored" from "there was nothing to restore", and
+it says that restoring lifts the suppression for future hunts rather than putting the row back on the
+in-memory board. **`/api/oob/poll`** existed while *Mint callback URL* handed the operator a token
+nothing could check; the blind provers poll their own tokens internally, but a payload pasted by hand
+had no read-back at all. The OOB panel gets a poll control that Mint pre-fills. Worth more than it
+was, now that the collaborator config reaches every hunt path and the four blind provers actually
+run.
+
+**`/api/workspace/rollback` was the orphan, but the wired route was the bug.** `/api/agent/undo`
+wrote the pre-run text back over whatever was on disk, with no way to tell "still exactly what the
+run wrote" from "the user has been working in this file for an hour since" - so an undo destroyed
+work the agent had never touched. `workspace.rollback_changes` has always refused that case and
+documented refusing it; the snapshot route had no fingerprint to refuse it with. The snapshot now
+carries the sha256 of what the run last wrote, and restore skips any file matching neither that nor
+the pre-run text, reporting it per-file instead of overwriting it. A file already put back one at a
+time is not a conflict, and a snapshot written before the fingerprint existed still restores exactly
+as it did. The same payload was also dropping `content_unavailable`, so the existing guard against
+blanking a file whose original could not be read had never once fired in the real pipeline - its test
+hand-built the entry the serializer omitted. The orphaned route is wired where it belongs: per-file
+*Revert* in the Changes panel, the conservative sibling of an all-or-nothing undo.
+
+**`/api/bounty/stored-xss-beacon` was unwireable by construction, and the fix is server-side.** It
+took the OOB collaborator base and secret as *request* fields while `oob_config_status` returns only
+`has_secret`, never the secret - so no client could ever fill them in, and making one able to would
+mean weakening the boundary that keeps the secret server-side. Instead the route now reads the saved
+config exactly as `oob-ssrf`, `oob-xxe`, mint and poll do, the two fields are gone from the request
+model, and a client that sends them is ignored. With the secret never leaving the server, the panel
+gets a form.
+
+`backend/test_route_wiring_contracts.py` pins each seam in both directions - the client reads the
+field, *and* every field the route returns is read by something, with the three deliberate exceptions
+named and justified - because a producer with no consumer and a consumer with no producer fail
+identically and silently. It also carries a register of the `/api` routes the app still does not
+call, each with the reason, so a new orphan fails the gate rather than quietly never shipping - and
+the register fails just as loudly when a route on it *becomes* wired, so it can only shrink by
+someone looking at it. Every fix was verified non-vacuous by reverting it and watching its test go
+red.
+
+**And `npm run check` could not run in a Claude Code worktree at all.** `scripts/check-syntax.py`
+matched its skip list against the *absolute* path's `.parts`, which carry every ancestor directory
+name - so a checkout that merely LIVES under a directory named `.claude` / `dist` / `build` /
+`release` / `runtime` skipped every file in itself, found zero modules, and exited on its own "the
+walk is broken" guard. Every Claude Code worktree is `.claude/worktrees/<name>`, so the gate worked
+in CI and refused to start on the machine doing the work. Matching relative to the repo root fixes
+it and gives the same semantics as `check-syntax.mjs`, whose walk descends from the root and was
+never affected; 305 modules compile clean where the gate previously would not begin. Two tests in
+`test_ci_gate.py` had copied the same comparison and failed the same way, and the new test for it
+runs the gate's real walk rather than asserting on its source - a source assertion would have passed
+throughout.
+
+## v4.4.1 - the shipped runtime moves to Electron 44.3.0
+
+No GreyIQ source changed in this release. `git diff v4.4.0..HEAD` touches `package.json` and
+`package-lock.json` and nothing else: the whole content is the Electron devDependency moving 44.0.0
+to 44.3.0 (#175). That is still a change to what ships, which is why it gets a version rather than a
+silent rebuild - electron-builder bundles the Electron runtime into both the portable and the
+installer, so the binary a user runs is not the one v4.4.0 produced.
+
+What the runtime gained across 44.1.0, 44.2.0 and 44.3.0:
+
+- **Chromium 152.0.7977.65 to 152.0.7977.78, Node.js 24.19.0 to 24.20.0**, plus backported fixes from
+  upstream Chromium, V8, ANGLE and Skia. This is the browser engine the cockpit renders in and the
+  Node the main process runs on, so it is the part of the bump that carries the most weight.
+- **An ASAR integrity violation now exits with code 1 instead of an access violation on Windows**
+  (electron#53455). GreyIQ ships asar-packed, so this is the tamper-detection path failing as
+  designed rather than crashing ambiguously.
+- **No main-process crash after a large volume of renderer IPC** (electron#53417), and none when a
+  file dialog is opened on a window that is closing at the same time (electron#53583). Both are
+  reachable from ordinary cockpit use.
+
+Most of the renderer hardening in 44.3.0 does not change GreyIQ's posture, and this entry does not
+claim it: the window runs `contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`,
+`webSecurity: true` (`electron/main.cjs:519`) and enables no `<webview>`, so the `<webview>` popup
+and `nodeIntegrationInWorker` subframe fixes have no surface here. The AppX/MSIX WebGPU/SwiftShader
+fix in 44.1.0 does not apply either - GreyIQ ships portable and NSIS, not MSIX.
+
+`npm audit` reports six advisories (one critical, five high). None reach the artifact: the production
+dependency tree is empty, every advisory is transitive under `app-builder-lib` or `@electron/get`,
+and `build.files` packages only `electron/**/*` and `package.json`. That is build-machine exposure,
+not shipped exposure, and it is recorded here so the distinction is on the record rather than
+assumed.
+
 ## v4.4.0 - hunting what an unauthenticated attacker actually gets
 
 A QA/QC pass over the hunt engine, its technique and its reporting, aimed at the two classes the
@@ -324,12 +674,17 @@ the filtering being extended to it.
 
 ### Download leads (.md)
 
-The Hunt cockpit gains a **Download leads (.md)** button beside *Copy report*. It renders the
-finished hunt's whole investigation queue as ONE Markdown brief - every lead with its evidence
-state, the contradictions against it, and the exact artifact that would confirm it - ready to hand
-to an analyst or paste to a model. It is the in-app face of `gn leads --brief`, built through the
-same redaction-safe bridge, and the new `/api/bounty/leads` route resolves the sidecar from the
-**cached run id only**, so no client-supplied path is ever read.
+A **Download leads (.md)** button renders the finished hunt's whole investigation queue as ONE
+Markdown brief - every lead with its evidence state, the contradictions against it, and the exact
+artifact that would confirm it - ready to hand to an analyst or paste to a model. It is the in-app
+face of `gn leads --brief`, built through the same redaction-safe bridge, and the new
+`/api/bounty/leads` route resolves the sidecar from the **cached run id only**, so no
+client-supplied path is ever read.
+
+> **Correction (v4.6.0):** this entry originally said the button was in the Hunt cockpit beside
+> *Copy report*. It was not — it shipped in the AI Studio surface, which is `display: none` in the
+> cockpit's default hunt mode, so a cockpit-only operator could not reach it. v4.6.0 puts the queue
+> in the cockpit for real, as a rendered view rather than only a download.
 
 ### Review fixes
 
@@ -753,6 +1108,12 @@ each cycle starts blind. So GreyIQ could not notice the highest-signal event in 
 
 This release also carries the work that landed on `main` while the audit ran:
 
+- Removed unattended HackerOne submission from the portfolio operator, API, and CLI.
+  Scheduled hunts now queue findings for human review; legacy auto-submit flags are ignored.
+- The account-login browser now checks program scope before sending credentials on
+  redirects and subrequests.
+- The standard Python check now runs pytest, including tests previously skipped by
+  unittest discovery, and validates literal frontend API paths against backend routes.
 - Added a local-first `gn osint` campaign engine. It queries two certificate-transparency
   indexes and two independent DNS-over-HTTPS resolvers, retains timestamped source provenance
   for every claim, labels single-source and historical observations honestly, and writes a

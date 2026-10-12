@@ -114,6 +114,12 @@ def sync_outcomes(
             continue
 
         learning_status = H1_STATE_TO_LEARNING_OUTCOME.get(state)
+        # A platform can award a bounty while the report is still triaged. The ledger then
+        # advances to paid and drops out of submitted_records(), so there is no LATER sync
+        # that could teach the store about that real award — it would be lost silently.
+        # "accepted" records the reward without claiming the report was resolved.
+        if learning_status is None and resolved_with_reward:
+            learning_status = "accepted"
         if not learning_status:
             continue  # in-progress — real news for the ledger, not yet an outcome to learn
         try:
@@ -127,6 +133,10 @@ def sync_outcomes(
                 # The freshly-fetched amount; rec['bounty'] is the pre-sync copy, still 0.0.
                 bounty=reward_amount if resolved_with_reward else 0.0,
                 notes=f"HackerOne report {rec.get('h1_report_id')} synced to '{state}'",
+                # A stable id makes a later status transition UPDATE this report's row
+                # instead of teaching from it again. Without it every repeat sync of the
+                # same report would add another outcome and double-count what it paid.
+                finding_id=f"ledger:{rec['key']}",
             )
             outcomes += 1
         except (ValueError, OSError) as error:

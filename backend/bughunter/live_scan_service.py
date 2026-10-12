@@ -19,12 +19,13 @@ Install to enable:
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.playwright_env import ensure_bundled_browsers_path
 from bughunter.settings import get_settings
 from bughunter.web_ingest import WebsiteFetchError, current_user_agent, normalize_website_url
-from bughunter.web_scan_service import _guard_url, playwright_request_allowed
+from bughunter.web_scan_service import _guard_url, _require_exact_scope_host, playwright_request_allowed
 
 # Bound runtime capture so a noisy/hostile page can't grow these lists without
 # limit during the wait window (memory-exhaustion guard), and clip each captured
@@ -116,7 +117,8 @@ def _not_installed(target: str) -> dict[str, Any]:
     }
 
 
-def run_live_scan(url: str, wait_seconds: float = 6.0, max_findings: int = 300) -> dict[str, Any]:
+def run_live_scan(url: str, wait_seconds: float = 6.0, max_findings: int = 300,
+                  *, scope_host: str = "") -> dict[str, Any]:
     """Drive a URL in a headless browser and report runtime errors. Returns a
     JSON-serializable result; never raises for the common failure modes
     (missing dependency, bad URL, navigation error)."""
@@ -124,13 +126,37 @@ def run_live_scan(url: str, wait_seconds: float = 6.0, max_findings: int = 300) 
     if not target:
         return {"ok": False, "scan_type": "live", "error": "No URL provided."}
 
-    settings = get_settings()
     try:
-        sanitized = _guard_url(
-            normalize_website_url(target), settings.allow_private_urls, settings.web_allowed_ports
-        )
+        normalized = normalize_website_url(target)
+        if scope_host:
+            # Chromium resolves hosts in its own process, outside Python's DNS
+            # pin. A route callback can validate the URL but cannot guarantee
+            # the IP Chromium connects to, so refuse before any DNS or launch.
+            parsed = urlparse(normalized)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
+                raise WebsiteFetchError("Only http and https URLs with a host can be scanned.")
+            if parsed.username is not None or parsed.password is not None:
+                raise WebsiteFetchError("URLs with embedded credentials are not supported.")
+            if parsed.netloc.endswith(":"):
+                raise WebsiteFetchError("URL contains an invalid port.")
+            try:
+                parsed.port
+            except ValueError as exc:
+                raise WebsiteFetchError("URL contains an invalid port.") from exc
+            _require_exact_scope_host(normalized, scope_host)
+            return {
+                "ok": False,
+                "scan_type": "live",
+                "target": target,
+                "error": "Scoped live scanning is unavailable until browser DNS egress is pinned. "
+                         "Use scoped web scanning or active verification instead.",
+            }
+        settings = get_settings()
+        sanitized = _guard_url(normalized, settings.allow_private_urls, settings.web_allowed_ports)
     except WebsiteFetchError as exc:
         return {"ok": False, "scan_type": "live", "target": target, "error": str(exc)}
+    except ValueError as exc:
+        return {"ok": False, "scan_type": "live", "target": target, "error": f"Invalid URL: {exc}"}
 
     # In a frozen release, point Playwright at the Chromium we bundled before importing it
     # (the packaged app has no ms-playwright cache) — same as capture_screenshot. Without this

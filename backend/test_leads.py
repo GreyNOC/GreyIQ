@@ -70,6 +70,22 @@ def _confirmed_idor() -> tuple[list[dict], dict]:
 
 
 class QueueShapeTests(unittest.TestCase):
+    def test_unconfirmed_lead_shows_prediction_control_and_stop_in_operator_brief(self) -> None:
+        doc = _build_sidecar([{
+            "ref": "F1", "title": "Reflected input", "class_id": "xss",
+            "severity": "medium", "confidence": "medium",
+            "location": "https://app.example.com/search",
+        }], {})
+        report = leads.build_lead_report_from_doc(doc)
+        lead = report["hunts"][0]["leads"][0]
+        self.assertNotEqual(lead["status"], "confirmed")
+        for key in ("predicted_positive_signal", "negative_control", "falsifier_stop_condition"):
+            self.assertTrue(lead[key], key)
+        brief = leads.render_lead_brief(report, wrap=False)
+        self.assertIn("Predicted positive signal", brief)
+        self.assertIn("Negative control", brief)
+        self.assertIn("Falsifier / stop", brief)
+
     def test_confirmed_lead_projects_the_documented_fields(self) -> None:
         findings, plans = _confirmed_idor()
         doc = _build_sidecar(findings, plans)
@@ -224,6 +240,21 @@ class BriefTests(unittest.TestCase):
         self.assertIn("CP1", brief)
         self.assertIn("Mass assignment", brief)
         self.assertIn("nothing here is evidence", brief)
+
+    def test_generated_chain_probe_discriminator_survives_operator_export(self) -> None:
+        doc = _build_sidecar([], {})
+        doc["investigation"] = investigator.build_investigation(
+            [], surface={"forms": [{"action": "https://app.example.com/u", "method": "POST",
+                                   "params": ["email", "is_admin"]}]})
+        report = leads.build_lead_report_from_doc(doc)
+        self.assertTrue(report["hunts"][0]["chain_probes"])
+        probe = report["hunts"][0]["chain_probes"][0]
+        self.assertTrue(probe["predicted_positive_signal"])
+        self.assertTrue(probe["negative_control"])
+        self.assertTrue(probe["falsifier_stop_condition"])
+        brief = leads.render_lead_brief(report, wrap=False)
+        self.assertIn("Predicted positive signal", brief)
+        self.assertIn("Falsifier / stop", brief)
 
     def test_ref_can_select_a_chain_probe(self) -> None:
         """Probes carry their own id namespace (CP*/CR*). Narrowing on leads alone made

@@ -517,6 +517,36 @@ class TitleAndLocationTests(unittest.TestCase):
         self.assertIn("sink", roles)
         self.assertIn("sast-source", roles)
 
+    def test_sast_prose_is_preserved_so_the_cwe_stays_recoverable(self) -> None:
+        """Normalizing the role must not destroy the only copy of the CWE.
+
+        ``message.text`` is the single place the location-level CWE appears. The role is
+        normalized off it, so if the prose is not kept the CWE is simply gone.
+        """
+        run = sarif.parse_sarif_text(
+            _sarif([_result("X-1", "shannon/injection", sast_rule="CWE-89")])
+        )
+        sast = [loc for loc in run.candidates[0].locations if loc.role == "sast-source"]
+        self.assertEqual(len(sast), 1)
+        self.assertEqual(sast[0].message, "Validated SAST source location (CWE-89)")
+
+    def test_cwe_is_mined_from_the_location_when_no_sast_rule_id_is_set(self) -> None:
+        """The 'shannon-sast-location' branch, which was unreachable.
+
+        It mined ``loc.file`` — an artifact URI like "api/scanner/album.go", which carries
+        no CWE — so the branch could never fire and the CWE in the prose was dropped.
+        ``injection`` has no class-level CWE, so with the prose as the only source this
+        either mines it or abstains; abstaining is the regression.
+        """
+        result = _result("X-1", "shannon/injection", sast_rule="CWE-89")
+        # The prose location stays; the properties-level id that short-circuits the
+        # resolver ahead of it does not.
+        result["properties"].pop("sastRuleId")
+        run = sarif.parse_sarif_text(_sarif([result]))
+        candidate = run.candidates[0]
+        self.assertEqual(candidate.cwe, "89")
+        self.assertEqual(candidate.cwe_source, "shannon-sast-location")
+
     def test_code_locations_reach_the_finding(self) -> None:
         run = sarif.parse_sarif_text(_sarif([_result("X-1", "shannon/xss")]))
         finding = ingest.findings_from_run(run)[0]

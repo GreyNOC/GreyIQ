@@ -1,0 +1,3 @@
+#!/bin/sh
+# CLI entry for the Debian package. The frozen backend dispatches CLI verbs.
+exec /opt/GreyIQ/resources/backend/greyiq-backend "$@"

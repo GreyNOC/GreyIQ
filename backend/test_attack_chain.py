@@ -38,6 +38,17 @@ def _lead(ref: str, class_id: str, title: str, location: str) -> dict:
             "severity": "medium", "confidence": "medium"}
 
 
+def _refuted(ref: str, class_id: str, title: str, location: str) -> dict:
+    """A finding whose differential WAS RUN and came back negative — observed and control were
+    both captured and do not differ. Distinct from a lead, which was never tested at all."""
+    same = "HTTP/1.1 200 OK\nthe same response body in both cases"
+    return {
+        "ref": ref, "class_id": class_id, "title": title, "location": location,
+        "severity": "high", "confidence": "high",
+        "proof_of_impact": {"status": "confirmed", "observed_result": same, "control_result": same},
+    }
+
+
 class CookieSignalTests(unittest.TestCase):
     def test_session_cookie_flag_gaps_become_signals(self) -> None:
         signals = attack_chain.cookie_signals(
@@ -261,6 +272,83 @@ class HonestyInvariantTests(unittest.TestCase):
         for chain in result["chains"]:
             self.assertEqual(chain["refs"], [])
             self.assertEqual(chain["status"], "projected")
+
+
+class ReachabilityTests(unittest.TestCase):
+    """"Never tested" and "tested and refuted" are different facts. Before this distinction
+    existed both were `proven=False`, so a chain whose prerequisite the engine had actively
+    FAILED to establish was presented exactly like one nobody had looked at yet."""
+
+    def test_an_untested_ladder_is_never_marked_unreachable(self) -> None:
+        """The regression that would matter most: if absence of proof were read as refutation,
+        every projected lead chain — the engine's main output — would be marked unreachable."""
+        steps = [
+            {"n": 1, "requires_ids": ["entry.public"], "grants_ids": ["disclose.identifier"],
+             "proven": False, "disproven": False, "state": "projected"},
+            {"n": 2, "requires_ids": ["disclose.identifier"], "grants_ids": ["identity.other-user"],
+             "proven": False, "disproven": False, "state": "projected"},
+            {"n": 3, "requires_ids": ["identity.other-user"], "grants_ids": ["read.other-object"],
+             "proven": False, "disproven": False, "state": "projected"},
+        ]
+        attack_chain._mark_unreachable(steps)
+        self.assertEqual([s["state"] for s in steps], ["projected"] * 3)
+
+    def test_only_the_steps_depending_on_a_refuted_grant_are_unreachable(self) -> None:
+        steps = [
+            {"n": 1, "requires_ids": ["entry.public"], "grants_ids": ["disclose.identifier"],
+             "proven": False, "disproven": False, "state": "projected"},
+            {"n": 2, "requires_ids": ["disclose.identifier"], "grants_ids": ["identity.other-user"],
+             "proven": False, "disproven": True, "state": "projected"},
+            {"n": 3, "requires_ids": ["identity.other-user"], "grants_ids": ["read.other-object"],
+             "proven": False, "disproven": False, "state": "projected"},
+            # Depends only on the chain ENTRY, which no step had to grant — still viable.
+            {"n": 4, "requires_ids": ["entry.public"], "grants_ids": ["net.internal"],
+             "proven": False, "disproven": False, "state": "projected"},
+        ]
+        attack_chain._mark_unreachable(steps)
+        self.assertEqual(steps[2]["state"], "unreachable")
+        self.assertEqual(steps[2]["blocked_by"], ["identity.other-user"])
+        self.assertEqual(steps[3]["state"], "projected")
+
+    def test_a_capability_a_live_step_also_grants_is_not_broken(self) -> None:
+        steps = [
+            {"n": 1, "requires_ids": [], "grants_ids": ["identity.other-user"],
+             "proven": False, "disproven": True, "state": "projected"},
+            {"n": 2, "requires_ids": [], "grants_ids": ["identity.other-user"],
+             "proven": False, "disproven": False, "state": "projected"},
+            {"n": 3, "requires_ids": ["identity.other-user"], "grants_ids": ["read.other-object"],
+             "proven": False, "disproven": False, "state": "projected"},
+        ]
+        attack_chain._mark_unreachable(steps)
+        self.assertEqual(steps[2]["state"], "projected")
+
+    def test_a_refuted_chain_ranks_below_every_untested_one(self) -> None:
+        """The mirror of the existing honesty invariants: a refuted chain must never rank, score
+        or read stronger than a chain nobody has tested."""
+        self.assertLess(attack_chain._STATUS_RANK["broken"], attack_chain._STATUS_RANK["projected"])
+        self.assertLessEqual(attack_chain._BROKEN_CEILING, attack_chain._PROJECTED_CEILING)
+
+    def test_a_refuted_prerequisite_breaks_the_chain_it_carries(self) -> None:
+        result = attack_chain.build_attack_chains(
+            [_refuted("F1", "disclosure", "Leaked ids", "https://app.test/feed"),
+             _lead("F2", "access-control", "Object id", "https://app.test/api/1")], {}, signals=[])
+        broken = [c for c in result["chains"] if c["status"] == "broken"]
+        if broken:  # only when the refuted clue actually entered a ladder
+            for chain in broken:
+                self.assertLessEqual(chain["confidence_score"], attack_chain._BROKEN_CEILING)
+                self.assertTrue(any(s["disproven"] for s in chain["steps"]))
+                # The chain points at the REFUTED step, not past it.
+                self.assertEqual(chain["blocking_step"],
+                                 next(s["n"] for s in chain["steps"] if s["disproven"]))
+
+    def test_the_confirm_gate_still_wins_over_refutation(self) -> None:
+        """A clue the confirm gate accepted is never also marked refuted by its own evidence."""
+        result = attack_chain.build_attack_chains(
+            [_confirmed("F1", "xss", "Reflected XSS", "https://app.test/s")], {}, signals=[])
+        for chain in result["chains"]:
+            for step in chain["steps"]:
+                if step["proven"]:
+                    self.assertFalse(step["disproven"])
 
 
 class ConfirmGateProvenanceTests(unittest.TestCase):

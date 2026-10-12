@@ -23,8 +23,8 @@ SAFETY invariants:
     names (never a URL, value, or payload); classes must be ones the active prover can actually
     confirm; a prioritised endpoint MUST be copied verbatim from the in-scope discovered set (the
     brain can never introduce a new host/URL — scope is decided by recon, not the model).
-  * Best-effort + fail-closed: no brain configured, a CoderError, a timeout, or unparseable output
-    all degrade to an empty plan == the engine's current behaviour.
+  * Best-effort + scope-safe: no brain configured or a failed model call uses the bounded offline
+    planner; unparseable output contributes no model suggestions.
 
 Frozen-safe (stdlib + the existing ``coder`` and ``trust`` modules only)."""
 
@@ -104,6 +104,49 @@ _AUTH_SIGNALS = frozenset({
 _STATE_CHANGE_SIGNALS = frozenset({
     "create", "update", "delete", "remove", "change", "transfer", "checkout", "purchase", "admin",
     "settings", "profile", "password", "invite", "upload",
+})
+# The four PROVER_CLASSES the heuristic engine used to have ZERO recall for — every other
+# active-check class above has a signal set, but cloud-exposure/sensitive/websocket/clickjacking
+# fell through to "no scores -> skip" no matter how obviously an endpoint's path named them. Same
+# "only reorders existing, already-gated checks" contract as every set above: these only decide
+# which endpoint the prober visits first, never whether the check runs or what it may do.
+# Path words that genuinely name a cloud object store. "static", "assets" and "cdn" were here and
+# had to come out: on any bundled front end EVERY chunk URL (/static/js/chunk-0.js,
+# /assets/css/app.css) matched, scored 70, and claimed one of the 20 priority rows. Measured on a
+# realistic crawl of 20 asset URLs plus 6 high-signal endpoints, ALL twenty rows went to asset URLs
+# and /admin/users, /actuator/env and /download?file= were every one of them evicted -- because the
+# cap below used to keep the first rows rather than the best. A JS chunk served off the app's own
+# origin is not an object store, and _check_cloud_exposure cannot confirm anything against it.
+_CLOUD_SIGNALS = frozenset({
+    "s3", "bucket", "blob", "gcs", "cloudfront", "spaces", "firebase", "minio",
+})
+# The reliable cloud-storage tell is the HOST, not a path word: a bucket is reached at a
+# bucket-shaped hostname. Matched as a suffix/substring of the netloc so a path called /storage on
+# the app's own origin no longer reads as one.
+_CLOUD_HOST_SIGNALS = (
+    "s3.amazonaws.com", ".s3.", "storage.googleapis.com", ".blob.core.windows.net",
+    ".digitaloceanspaces.com", ".r2.cloudflarestorage.com", "firebasestorage.googleapis.com",
+    ".oss-", ".cos.ap-",
+)
+# Extensions that are a served build artifact. With no OTHER signal on the URL these are not probe
+# targets -- they cost a capped row and no check can confirm anything against them.
+_STATIC_ASSET_SUFFIXES = (
+    ".js", ".mjs", ".css", ".map", ".woff", ".woff2", ".ttf", ".eot", ".otf", ".ico",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".avif", ".mp4", ".webm",
+)
+_SENSITIVE_SIGNALS = frozenset({
+    "env", "git", "config", "backup", "swagger", "wpconfig", "dump", "bak", "secret",
+    "credentials", "htpasswd", "phpinfo",
+})
+_WEBSOCKET_SIGNALS = frozenset({
+    "ws", "wss", "websocket", "socket", "socketio", "realtime", "stream", "notify",
+    "notifications", "live",
+})
+# Narrower than _AUTH_SIGNALS/_STATE_CHANGE_SIGNALS on purpose: clickjacking is the LOWEST-severity
+# active class (see offline_hunt._CLASS_SIGNAL), so it only fires on pages that are themselves the
+# sensitive user-facing ACTION worth a framing check, not on every auth-adjacent endpoint.
+_FRAMEABLE_SIGNALS = frozenset({
+    "login", "signin", "checkout", "payment", "transfer", "confirm", "pay",
 })
 
 HUNT_BRAIN_SYSTEM_PROMPT = (
@@ -222,6 +265,10 @@ def heuristic_plan(surface: dict[str, Any]) -> dict[str, Any]:
         nosql_hits = words & _NOSQL_SIGNALS
         xss_hits = words & _XSS_SIGNALS
         auth_hits = words & _AUTH_SIGNALS
+        cloud_hits = words & _CLOUD_SIGNALS
+        sensitive_hits = words & _SENSITIVE_SIGNALS
+        websocket_hits = words & _WEBSOCKET_SIGNALS
+        frameable_hits = words & _FRAMEABLE_SIGNALS
 
         if command_hits:
             add("rce", 120, f"command-like endpoint/parameter: {sorted(command_hits)[0]}")
@@ -255,18 +302,46 @@ def heuristic_plan(surface: dict[str, Any]) -> dict[str, Any]:
                 add("host-header", 82, "absolute-link/auth callback surface")
         if any(w in path_words for w in ("debug", "actuator", "jolokia", "management", "heapdump")):
             add("debug", 125, "debug/management endpoint semantic")
+        if sensitive_hits:
+            add("sensitive", 90, f"sensitive-path semantic: {sorted(sensitive_hits)[0]}")
+        # A bucket-shaped HOST is strong evidence; a bucket-ish path word is weaker; a tech
+        # fingerprint alone is weakest and no longer enough on its own for a URL that is plainly a
+        # build artifact (see _static_only below).
+        host_low = (parsed.netloc or "").lower()
+        cloud_host = next((h for h in _CLOUD_HOST_SIGNALS if h in host_low), "")
+        if cloud_host:
+            add("cloud-exposure", 96, f"cloud object-store host: {cloud_host.strip('.')}")
+        elif cloud_hits:
+            add("cloud-exposure", 70, f"cloud-storage semantic: {sorted(cloud_hits)[0]}")
+        elif any(t in tech_text for t in ("aws", "s3", "azure", "cloudfront", "gcs", "firebase")):
+            add("cloud-exposure", 44, "cloud tech fingerprint")
+        if websocket_hits:
+            add("websocket", 56, f"realtime/socket semantic: {sorted(websocket_hits)[0]}")
+        if frameable_hits:
+            add("clickjacking", 38, f"sensitive user-facing action page: {sorted(frameable_hits)[0]}")
         method = str(form.get("method") or "GET").upper()
         if method not in {"GET", "HEAD", "OPTIONS"} and words & _STATE_CHANGE_SIGNALS:
             add("csrf", 80, f"state-changing {method} form")
 
         if not scores:
             continue
+        # A served build artifact with nothing but a weak tech fingerprint behind it is not a probe
+        # target: no check can confirm anything against a JS chunk, and the row is capped.
+        if (path_low.endswith(_STATIC_ASSET_SUFFIXES) and not cloud_host
+                and max(scores.values()) < 50):
+            continue
         ordered = sorted(scores, key=lambda c: (-scores[c], c))[:6]
         why = "; ".join(reasons[c] for c in ordered[:2])[:160]
         rows.append({"endpoint": endpoint, "classes": ordered, "why": why,
                      "score": scores[ordered[0]], "source": "deterministic-veteran-heuristics"})
-        if len(rows) >= _MAX_PRIORITY_ROWS:
-            break
+    # Cap by SCORE, not by discovery order. The loop used to `break` at _MAX_PRIORITY_ROWS, so the
+    # cap kept whatever recon happened to crawl first -- and recon crawls the HTML head first, which
+    # is where the asset URLs are. Measured before this: on 20 asset URLs plus 6 high-signal
+    # endpoints, all 20 rows were assets and /admin/users, /actuator/env and /download?file= were all
+    # evicted. Sorted descending, ties broken by the endpoint string so the plan stays deterministic
+    # (a hunt must replan identically on an unchanged surface).
+    rows.sort(key=lambda row: (-int(row.get("score") or 0), str(row.get("endpoint") or "")))
+    rows = rows[:_MAX_PRIORITY_ROWS]
     return _with_hypotheses({
         "used": bool(rows), "provider": "deterministic", "model": "veteran-heuristics-v1",
         "param_hypotheses": [], "probe_priority": rows,
@@ -546,12 +621,27 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
     learned ``priors``) produces the same
     shape — so an offline hunt is steered too, no longer flying blind. All outputs (names + verbatim
     in-scope endpoints + class orderings) pass through _validate_plan either way; a name can't carry a
-    payload, so this only raises recall. Best-effort: any failure returns an empty plan.
+    payload, so this only raises recall. If the reasoning provider fails, the bounded offline
+    planner remains available; a failure in that planner returns an empty plan.
 
     ``seed_dir``/``runtime_dir`` are keyword-only and optional so every existing 4/5-positional-arg
     caller is untouched. They locate the OPTIONAL learned offline ranker's weight file; with no file
     (or no hunt_model module) the plan is byte-identical to the rules-only plan."""
     plan = _empty_plan()
+    def offline_fallback() -> dict[str, Any]:
+        # Offline rules never introduce an endpoint, payload, request, or finding;
+        # the same scope/shape validator gates them when the model is unavailable.
+        try:
+            model = _load_ranker(seed_dir, runtime_dir)
+            raw = offline_hunt.offline_plan(surface, priors, model=model)
+            params, priority, idor, ssrf, xss, priv = _validate_plan(raw, surface)
+            plan.update({"used": bool(raw.get("used")), "provider": "offline", "model": "greyiq-offline-hunt",
+                         "param_hypotheses": params, "probe_priority": priority, "idor_candidates": idor,
+                         "ssrf_params": ssrf, "xss_params": xss, "privileged_endpoints": priv,
+                         "notes": str(raw.get("notes") or "")})
+        except Exception:  # noqa: BLE001 - the offline planner must never break a hunt
+            pass
+        return _with_hypotheses(plan)
     # Gate on REASONING availability, not on "is a coder selected". The deterministic (offline)
     # coder is a real, selectable provider that ``coder_enabled`` answers True for, but it cannot
     # answer a planning prompt at all — ``coder.generate`` raises CoderError for it by design. Gating
@@ -559,38 +649,11 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
     # fail-closed to an EMPTY plan: no probe_priority, no param hypotheses, no idor/privileged
     # candidates. The hunt flew blind, strictly worse than provider "off". See
     # coder.reasoning_brain_enabled for the full rationale.
-    def _offline_into(target_plan: dict[str, Any]) -> dict[str, Any]:
-        """Fill ``target_plan`` from the offline knowledge-rule engine.
-
-        Used for BOTH the no-brain branch and every brain-failure path below. A configured
-        brain that cannot be reached — a dead endpoint, a wrong key, a serverless inference
-        endpoint that is cold, loading, or rate-limited — used to return the EMPTY plan, so
-        the hunt went out with no param hypotheses, no probe priority and no IDOR/SSRF
-        candidates: strictly blinder than having configured no brain at all. Measured on this
-        checkout before the change, an unreachable LLM produced 0 param hypotheses and 0
-        priority rows where the rules produce 16 and 2. Degrading to the rules is the whole
-        point of having rules.
-        """
-        try:
-            model = _load_ranker(seed_dir, runtime_dir)
-            raw = offline_hunt.offline_plan(surface, priors, model=model)
-            params, priority, idor, ssrf, xss, priv = _validate_plan(raw, surface)
-            target_plan.update({"used": bool(raw.get("used")), "provider": "offline",
-                                "model": "greyiq-offline-hunt",
-                                "param_hypotheses": params, "probe_priority": priority,
-                                "idor_candidates": idor, "ssrf_params": ssrf, "xss_params": xss,
-                                "privileged_endpoints": priv, "notes": str(raw.get("notes") or "")})
-        except Exception:  # noqa: BLE001 - the offline planner must never break a hunt
-            pass
-        return target_plan
-
     if not coder.reasoning_brain_enabled(coder_cfg):
-        # Offline hunt intelligence: knowledge rules + what the program has confirmed before,
-        # optionally re-ordered by the learned ranker (permutation-only; None == rules).
-        return _with_hypotheses(_offline_into(plan))
+        return offline_fallback()
     target = str(target or "").strip()
     if not target:
-        return _with_hypotheses(_offline_into(plan))
+        return _with_hypotheses(plan)
     cfg = dict(coder.coder_config(coder_cfg))
     cfg["system_prompt"] = HUNT_BRAIN_SYSTEM_PROMPT
     # Where an entire engagement points its probe budget is the highest-leverage single call in the
@@ -599,8 +662,8 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
     cfg["response_schema"] = PLAN_RESPONSE_SCHEMA
     # The WHOLE brain interaction — the network call, JSON parsing, AND validation of the
     # model's (untrusted, possibly hijacked) output — is inside one guard so the module itself
-    # honours its fail-closed contract: any failure degrades to the OFFLINE rule plan,
-    # independent of whether a given caller happens to wrap plan_hunt in its own try/except.
+    # honours its scope-safe contract: a model failure uses the same bounded
+    # offline plan, independent of whether a caller wraps plan_hunt itself.
     try:
         prompt = _build_prompt(target, scope, surface)
         if str(technique_context or "").strip():
@@ -610,12 +673,9 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
         parsed = _parse_json_object(str(result.get("text") or ""))
         params, priority, idor_candidates, ssrf_params, xss_params, privileged_endpoints = _validate_plan(parsed, surface)
     except coder.CoderError:
-        # The brain is configured but could not answer — dead endpoint, bad key, a cold or
-        # rate-limited serverless inference endpoint. Fall back to the rules rather than
-        # hunting blind; see _offline_into.
-        return _with_hypotheses(_offline_into(plan))
+        return offline_fallback()
     except Exception:  # noqa: BLE001 - the reasoning layer must never break a hunt
-        return _with_hypotheses(_offline_into(plan))
+        return offline_fallback()
     plan.update({
         "used": True, "provider": str(result.get("provider") or ""), "model": str(result.get("model") or ""),
         "param_hypotheses": params, "probe_priority": priority, "idor_candidates": idor_candidates,

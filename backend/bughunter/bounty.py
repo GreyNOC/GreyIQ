@@ -7,13 +7,16 @@ scanner(s), classify and prioritize findings, ask the configured coding brain
 Markdown report + JSON sidecar to a chosen folder.
 
 Authorization: bug-bounty testing is authorized testing. A hunt refuses to run
-unless the caller confirms the target is in scope (``authorized=True``). The
+unless the caller confirms authorization (``authorized=True``); URL hunts also
+require an explicit host grant, and remote repository hunts require the exact
+repository root in ``scope`` before any request. The
 underlying scanners are static (source) or passive (one GET) and keep their own
 SSRF / base-path guards — nothing here exploits a live target.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import shlex
@@ -32,14 +35,17 @@ from bughunter import brain_narrative
 from bughunter import brain_safety
 from bughunter import credential_validation
 from bughunter import oob_service
+from bughunter import operator_guard
 from bughunter import fsutil
 from bughunter import hunt_loop
 from bughunter import hunt_brain
+from bughunter import hunt_train
 from bughunter import hunt_trace
 from bughunter import impact_model
 from bughunter import investigator
 from bughunter import ledger
 from bughunter import learning
+from bughunter import mcp_hunt
 from bughunter import negative_knowledge
 from bughunter import next_steps as next_steps_lib
 from bughunter import recon
@@ -51,9 +57,10 @@ from bughunter import surface_drift
 from bughunter import toolkit as toolkit_lib
 from bughunter import web_ingest
 from bughunter.code_scanner.redaction import redact_text
-from bughunter.code_scanner.sources.git_remote import is_supported_remote_git_url
+from bughunter.code_scanner.sources.git_remote import canonical_repo_root, is_supported_remote_git_url
 from bughunter.live_scan_service import run_live_scan
 from bughunter.rate_limit import HostRateGovernor, shared_governor
+from bughunter.registrable_domain import is_bare_public_suffix
 from bughunter.scan_service import run_code_scan
 from bughunter.scan_auth import AuthContext, build_auth
 from bughunter.web_scan_service import run_web_scan
@@ -99,7 +106,14 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
     },
     "secrets": {
         "name": "Exposed secret / credential",
-        "cwe": "CWE-200",
+        # CWE-798 leads, CWE-200 stays as the fallback. The primary CWE disagreed with everything else
+        # this class declares: its OWASP is A07 (Identification & Authentication Failures), its
+        # reference list cites CWE-798, and its Bugcrowd leaf is sensitive_data_exposure.
+        # disclosure_of_secrets — which taxonomy.cwe_to_vrt resolves from 798, not from 200. Filed under
+        # 200 alone, a validator-confirmed live credential reached HackerOne as "Information Disclosure"
+        # even when the program had "Use of Hard-coded Credentials" enabled and priced it far higher.
+        # cwe_numbers tries 798 first and falls back to 200 for a program that only enables the latter.
+        "cwe": "CWE-798 / CWE-200",
         "owasp": "A07:2021 Identification & Authentication Failures",
         "categories": {"secret", "secret_exposed"},
         "checklist": [
@@ -206,6 +220,25 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
             "Check whether the handshake completes (101) while carrying an attacker-controlled Origin.",
             "If it does, host a browser PoC on an attacker origin and confirm a logged-in victim's socket "
             "serves authenticated data cross-site.",
+        ],
+    },
+    "crlf": {
+        "name": "CRLF / HTTP response-header injection",
+        # CWE-113 (CRLF in an HTTP header) with CWE-93 (improper CRLF neutralization) as the parent. This
+        # class exists because the prover can CONFIRM a header injection (it captures the injected header
+        # on the wire against a no-CRLF control) but had no entry here, so the finding was filed under
+        # `redirect`: weakness CWE-601 "URL Redirection to Untrusted Site", OWASP A01, with remediation
+        # telling the team to allowlist redirect targets — the wrong weakness AND the wrong fix.
+        "cwe": "CWE-113 / CWE-93",
+        "owasp": "A03:2021 Injection",
+        # Empty on purpose: the class only ever arrives via the check's explicit _active_class_hint. The
+        # CRLF check keeps category='disclosure', and claiming that category here would pull every
+        # unrelated disclosure finding into this class (the same reasoning path-traversal documents).
+        "categories": set(),
+        "checklist": [
+            "Find values the response copies into a header: redirect targets (Location), Set-Cookie attributes, custom X- headers, and anything echoed into Content-Disposition.",
+            "Inject an encoded CR/LF (%0d%0a) followed by a marker header and confirm the marker arrives as its OWN header line, with a control request that omits the CR/LF as the comparison.",
+            "Escalate to the concrete impact before reporting: an attacker-set Set-Cookie (session fixation), a poisoned cache entry served to another user, or script execution from an injected body.",
         ],
     },
     "redirect": {
@@ -356,7 +389,11 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
     "request-smuggling": {
         "name": "HTTP request smuggling / desync",
         "cwe": "CWE-444",
-        "owasp": "A06:2021 Vulnerable & Outdated Components",
+        # A04, not A06: CWE-444 is an inconsistent-interpretation/design flaw between a front end and a
+        # back end, and OWASP maps it under Insecure Design. Filing a desync PoC as "Vulnerable &
+        # Outdated Components" on an OWASP-driven submission form (report_formats._meta_table renders
+        # this field verbatim for Intigriti) reads as an outdated-dependency report and gets triaged as one.
+        "owasp": "A04:2021 Insecure Design",
         "categories": set(),
         "checklist": [
             "Identify a front-end/back-end chain (CDN, proxy, LB) and test CL.TE / TE.CL / TE.TE desync with timing probes.",
@@ -390,15 +427,21 @@ VULN_CLASSES: dict[str, dict[str, Any]] = {
 
 # Categories that aren't a core bounty class get a readable label so every
 # finding carries a class in the report.
+#
+# Every VULN_CLASSES entry above carries name + cwe + owasp; this table used to stop at cwe,
+# so any finding that fell through to it (a real, not-uncommon path -- see _classify below)
+# shipped in a report with an EMPTY OWASP field. A platform report form asks for both, so
+# owasp is filled in here the same way, using the standard OWASP Top 10 (2021) root cause for
+# each category.
 _CATEGORY_LABELS: dict[str, dict[str, str]] = {
-    "crypto": {"name": "Weak cryptography", "cwe": "CWE-327"},
-    "dependency": {"name": "Vulnerable dependency", "cwe": "CWE-1104"},
-    "network": {"name": "Insecure network / transport", "cwe": "CWE-295"},
-    "ci": {"name": "Insecure CI/CD workflow", "cwe": "CWE-1395"},
-    "headers": {"name": "Security hardening (headers)", "cwe": "CWE-693"},
-    "mixed_content": {"name": "Mixed content", "cwe": "CWE-311"},
-    "disclosure": {"name": "Information disclosure", "cwe": "CWE-200"},
-    "chrome-extension": {"name": "Browser extension misconfiguration", "cwe": "CWE-272"},
+    "crypto": {"name": "Weak cryptography", "cwe": "CWE-327", "owasp": "A02:2021 Cryptographic Failures"},
+    "dependency": {"name": "Vulnerable dependency", "cwe": "CWE-1104", "owasp": "A06:2021 Vulnerable & Outdated Components"},
+    "network": {"name": "Insecure network / transport", "cwe": "CWE-295", "owasp": "A02:2021 Cryptographic Failures"},
+    "ci": {"name": "Insecure CI/CD workflow", "cwe": "CWE-1395", "owasp": "A08:2021 Software & Data Integrity Failures"},
+    "headers": {"name": "Security hardening (headers)", "cwe": "CWE-693", "owasp": "A05:2021 Security Misconfiguration"},
+    "mixed_content": {"name": "Mixed content", "cwe": "CWE-311", "owasp": "A02:2021 Cryptographic Failures"},
+    "disclosure": {"name": "Information disclosure", "cwe": "CWE-200", "owasp": "A05:2021 Security Misconfiguration"},
+    "chrome-extension": {"name": "Browser extension misconfiguration", "cwe": "CWE-272", "owasp": "A05:2021 Security Misconfiguration"},
 }
 
 
@@ -524,6 +567,127 @@ def _infer_kind(target: str) -> str:
     return "unknown"
 
 
+_SCOPE_DNS_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_SCOPE_DNS_HOST = re.compile(rf"{_SCOPE_DNS_LABEL}(?:\.{_SCOPE_DNS_LABEL})*")
+
+
+def _canonical_scope_host(value: str) -> str:
+    """Normalize one literal host without resolving it or broadening its meaning."""
+    raw = str(value or "").strip().lower().rstrip(".")
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    try:
+        return ipaddress.ip_address(raw).compressed
+    except ValueError:
+        pass
+    try:
+        ascii_host = raw.encode("idna").decode("ascii")
+    except UnicodeError:
+        return ""
+    return ascii_host if _SCOPE_DNS_HOST.fullmatch(ascii_host) else ""
+
+
+def _url_scope_preflight(target: str, scope: str, settings: Any = None) -> tuple[str, str]:
+    """Return (exact target host, error) before any URL hunt network activity.
+
+    Scope is a list of *host-only* grants. An exact host grants only itself;
+    ``*.domain`` grants proper subdomains, never the apex. Prose, URL/path/port
+    policies, and malformed tokens are ambiguous here and grant nothing.
+    """
+    if any(ch.isspace() for ch in target) or "\\" in target:
+        return "", "Use a valid http(s) URL with no whitespace or backslashes."
+    try:
+        parsed = urlparse(target if "://" in target else f"https://{target}")
+        host = _canonical_scope_host(parsed.hostname or "")
+        _port = parsed.port  # malformed ports must fail before a scanner sees the URL
+    except ValueError:
+        return "", "Use a valid http(s) URL with a host and no embedded credentials."
+    if parsed.scheme not in {"http", "https"} or not host or "@" in parsed.netloc:
+        return "", "Use a valid http(s) URL with a host and no embedded credentials."
+
+    raw_scope = str(scope or "").strip()
+    if not raw_scope:
+        return "", "URL hunts require explicit scope: the exact target host or a *.domain wildcard."
+    grants: list[tuple[str, bool]] = []
+    for token in re.split(r"[\s,;]+", raw_scope):
+        if not token:
+            continue
+        # A saved program may list a public source repository next to its web
+        # hosts. That URL is a separate code asset, never a web-host grant.
+        if is_supported_remote_git_url(token):
+            continue
+        wildcard = token.startswith("*.")
+        named_host = _canonical_scope_host(token[2:] if wildcard else token)
+        if (
+            not named_host
+            or is_bare_public_suffix(named_host)
+            or ("." not in named_host and ":" not in named_host and named_host != "localhost")
+            or (wildcard and ("." not in named_host or ":" in named_host))
+        ):
+            return "", "Scope must list only exact hosts or *.domain wildcards; prose, URLs, paths, and ports are ambiguous."
+        grants.append((named_host, wildcard))
+    if not grants:
+        return "", "URL hunts require explicit scope: the exact target host or a *.domain wildcard."
+
+    for excluded in getattr(settings, "excluded_hosts", ()) or ():
+        excluded_host = _canonical_scope_host(str(excluded).removeprefix("*."))
+        if excluded_host and (host == excluded_host or host.endswith("." + excluded_host)):
+            return "", f"Target host {host} is excluded from this program's scope."
+
+    if not any(
+        (host.endswith("." + grant) and host != grant) if wildcard else host == grant
+        for grant, wildcard in grants
+    ):
+        return "", f"Target host {host} is not explicitly named by the scope."
+    return host, ""
+
+
+def _canonical_repository_root(value: str) -> str:
+    """Use the clone transport's parser for the same repository identity."""
+    return canonical_repo_root(value)
+
+
+def _repository_scope_preflight(target: str, scope: str, settings: Any = None) -> str:
+    """Return an error unless scope names this exact public repository root.
+
+    Host grants are valid *other* assets in a saved program, but never grant a
+    repository clone. Every non-host, non-repository token makes the scope
+    ambiguous and fails closed, even when a matching repository appears later.
+    """
+    root = _canonical_repository_root(target)
+    if not root:
+        return "Use a supported public HTTPS repository-root URL without a branch, path expansion, port, or credentials."
+    if not str(scope or "").strip():
+        return "Remote repository hunts require the exact repository-root URL in scope."
+
+    repositories: set[str] = set()
+    for token in re.split(r"[\s,;]+", str(scope).strip()):
+        if not token:
+            continue
+        repository = _canonical_repository_root(token)
+        if repository:
+            repositories.add(repository)
+            continue
+        wildcard = token.startswith("*.")
+        named_host = _canonical_scope_host(token[2:] if wildcard else token)
+        if (
+            not named_host
+            or is_bare_public_suffix(named_host)
+            or ("." not in named_host and ":" not in named_host and named_host != "localhost")
+            or (wildcard and ("." not in named_host or ":" in named_host))
+        ):
+            return "Repository scope must list exact public repository roots or host-only grants, without prose or path expansions."
+
+    host = urlparse(root).hostname or ""
+    for excluded in getattr(settings, "excluded_hosts", ()) or ():
+        excluded_host = _canonical_scope_host(str(excluded).removeprefix("*."))
+        if excluded_host and (host == excluded_host or host.endswith("." + excluded_host)):
+            return f"Repository host {host} is excluded from this program's scope."
+    if root not in repositories:
+        return f"Repository {root} is not explicitly named by the saved scope."
+    return ""
+
+
 def _classify(finding: dict[str, Any]) -> tuple[str, str, str, str]:
     """Return (class_id, class_name, cwe, owasp) for a raw finding."""
     category = str(finding.get("category") or "").lower()
@@ -532,7 +696,7 @@ def _classify(finding: dict[str, Any]) -> tuple[str, str, str, str]:
             return cid, meta["name"], meta["cwe"], meta.get("owasp", "")
     label = _CATEGORY_LABELS.get(category)
     if label:
-        return category, label["name"], label["cwe"], ""
+        return category, label["name"], label["cwe"], label.get("owasp", "")
     return category or "other", (category or "Other").replace("_", " ").title(), "", ""
 
 
@@ -544,6 +708,23 @@ def cwe_for_class(class_id: str) -> str:
     cid = str(class_id or "").strip().lower()
     meta = VULN_CLASSES.get(cid) or _CATEGORY_LABELS.get(cid)
     return str((meta or {}).get("cwe") or "")
+
+
+def owasp_for_class(class_id: str) -> str:
+    """The canonical OWASP Top-10 2021 category for a class id (e.g. 'cors' -> 'A05:2021 ...'), or
+    '' when the class has no vetted mapping.
+
+    The twin of :func:`cwe_for_class`, and it exists for the same reason. ``build_finding_report``
+    filled the CWE from the class but never the OWASP category, while SIX renderers read
+    ``finding["owasp"]`` -- the hunt report's finding block and summary table, and the HackerOne,
+    Bugcrowd and Intigriti submission bodies. So a report rebuilt from a ledger/history finding
+    silently dropped the OWASP row that the same finding showed during its original hunt, on the
+    report AND on the filed submission. The project's own test asserts CWE and OWASP must both be
+    present for the other classification path; this is the path that was exempt.
+    """
+    cid = str(class_id or "").strip().lower()
+    meta = VULN_CLASSES.get(cid) or _CATEGORY_LABELS.get(cid)
+    return str((meta or {}).get("owasp") or "")
 
 
 # Scanner categories / rule prefixes whose finding ALREADY carries a concrete
@@ -627,15 +808,56 @@ def _poi_of(item: dict[str, Any]) -> dict[str, Any]:
     return poi if isinstance(poi, dict) else {}
 
 
-def build_replay_script(items: list[dict[str, Any]]) -> tuple[str, int]:
+def _resolved_proof_status(item: dict[str, Any]) -> str:
+    """An item's proof status as the caller resolved it, or ``""`` when the caller supplied none.
+
+    Reads the same two places ``greyiq_api._run_replay_items`` and ``campaign`` write it: the item's
+    own ``proof_status``, else the observed-vs-control block's ``status``."""
+    status = str(item.get("proof_status") or "").strip().lower()
+    if not status:
+        status = str(_poi_of(item).get("status") or "").strip().lower()
+    return status
+
+
+def _is_replayable(item: dict[str, Any], confirmed_only: bool = True) -> bool:
+    """Whether ``item`` may appear in a ``replay.sh`` / ``findings.har`` that CLAIMS confirmation.
+
+    The bundle artifacts announce themselves as the requests that CONFIRMED a finding — replay.sh says
+    so in its header, the HAR docstring says so, and the bundle INDEX repeats the claim — so a
+    candidate or missing lead riding along makes the whole bundle misrepresent itself. A triager who
+    re-runs a passive ``web.missing-header.*`` curl sees a perfectly ordinary response and reasonably
+    concludes the confirmed findings are noise too. ``campaign`` pre-filters to
+    ``proof_status == "confirmed"`` before calling, but the single-hunt bundle path does not:
+    ``greyiq_api._run_replay_items`` builds an item for EVERY finding in the cached run and hands the
+    lot to both builders.
+
+    ``confirmed_only=False`` is for the one caller whose artifact makes no such claim:
+    ``greyiq_api.get_report_ready`` rebuilds a runnable PREVIEW of a single finding the operator is
+    still assembling a report for, where a runnable request line is useful regardless of whether the
+    differential has been captured yet.
+
+    An item with NO resolved status at all is passed through either way: that caller either
+    pre-filtered or does not track status, and this is a backstop against mislabelling, not a second
+    confirm authority (``report._has_captured_artifact`` remains the only one)."""
+    if not confirmed_only:
+        return True
+    return _resolved_proof_status(item) in ("", "confirmed")
+
+
+def build_replay_script(items: list[dict[str, Any]], confirmed_only: bool = True) -> tuple[str, int]:
     """A runnable ``replay.sh`` reproducing each CONFIRMED finding's crafted benign request as a
     copy-paste ``curl`` (reusing ``_curl_from_evidence``). Every GreyIQ active probe is an idempotent
     GET/HEAD/OPTIONS, so the reproductions are safe to re-run IN SCOPE with the operator's own
     authorization. Any detected secret is redacted as a belt-and-suspenders. Returns
-    ``(script_text, count)``; ``("", 0)`` when no confirmed finding captured a crafted request line."""
+    ``(script_text, count)``; ``("", 0)`` when no confirmed finding captured a crafted request line.
+
+    Items whose resolved proof status is anything other than 'confirmed' are skipped unless
+    ``confirmed_only=False`` — see ``_is_replayable``."""
     body: list[str] = []
     n = 0
     for it in (items or []):
+        if not _is_replayable(it, confirmed_only):
+            continue
         finding = it.get("finding") if isinstance(it.get("finding"), dict) else {}
         pe = finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {}
         url = str(finding.get("location") or it.get("source_url") or "")
@@ -671,15 +893,21 @@ def build_replay_script(items: list[dict[str, Any]]) -> tuple[str, int]:
     return text + "\n", n
 
 
-def build_findings_har(items: list[dict[str, Any]], version: str = "", generated_at: str = "") -> tuple[dict[str, Any], int]:
+def build_findings_har(items: list[dict[str, Any]], version: str = "", generated_at: str = "",
+                       confirmed_only: bool = True) -> tuple[dict[str, Any], int]:
     """A minimal, valid HAR 1.2 log of the crafted requests that confirmed each finding — importable
     into Burp / browser devtools to re-issue. Each entry carries only the benign crafted request line +
     a literal (non-placeholder) crafted header; response BODIES are never embedded (GreyIQ's
     differential-only proof discipline) — only the redacted observed-differential summary. Returns
-    ``(har, count)``."""
+    ``(har, count)``.
+
+    Items whose resolved proof status is anything other than 'confirmed' are skipped unless
+    ``confirmed_only=False`` — see ``_is_replayable``."""
     stamp = str(generated_at or "").strip() or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     entries: list[dict[str, Any]] = []
     for it in (items or []):
+        if not _is_replayable(it, confirmed_only):
+            continue
         finding = it.get("finding") if isinstance(it.get("finding"), dict) else {}
         pe = finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {}
         req_line = str(pe.get("request_line") or "").strip()
@@ -732,15 +960,39 @@ def _html_open_poc(target: str, title: str, lead: str) -> str:
 
 
 def _html_csrf_poc(target: str) -> str:
+    """A CSRF PoC TEMPLATE the operator completes from the real form.
+
+    Deliberately not a finished, auto-submitting PoC. ``_check_csrf`` proves only that the page serves
+    a state-changing POST form with no anti-CSRF token — it captures neither the form's ``action`` nor
+    any field name, so the concrete request cannot be reconstructed here. This used to emit a page that
+    auto-POSTed an invented ``example_param=attacker-controlled`` to the PAGE url: against a real form
+    (``action="/account/email"``, fields ``email``/``confirm``) it changes nothing, so the report
+    presented a filled-in Proof of concept that silently does not work, and the finding's honest
+    'candidate' proof obligation was contradicted by an artifact that looked complete.
+
+    So: the placeholders are loud, the auto-submit is gone (submitting the wrong request is what made
+    this look finished), and the surrounding page states what must be substituted. Capturing the form's
+    action and input names in ``_check_csrf`` is what would let this be emitted complete."""
     a = _hattr(target)
     return (
-        "<!doctype html>\n<meta charset=\"utf-8\">\n<title>CSRF PoC</title>\n"
-        "<p>Open this page while authenticated to the target; it auto-submits the state-changing "
-        "request cross-site with no anti-CSRF token.</p>\n"
+        "<!doctype html>\n<meta charset=\"utf-8\">\n<title>CSRF PoC (template — complete before use)</title>\n"
+        "<p><strong>Template, not a finished PoC.</strong> GreyIQ confirmed this page serves a "
+        "state-changing POST form with no anti-CSRF token, but it did not capture that form's "
+        "<code>action</code> or field names, so they must be filled in from the target's own HTML:</p>\n"
+        "<ol>\n"
+        f"  <li>Replace the form <code>action</code> below with the real form's action (the page is "
+        f"<code>{a}</code>; the action is often a different path).</li>\n"
+        "  <li>Replace the hidden input(s) with the real form's field names and the values that make a "
+        "meaningful change.</li>\n"
+        "  <li>Host this on an origin you control, open it while authenticated to the target, submit, "
+        "and confirm the state actually changed server-side.</li>\n"
+        "</ol>\n"
         f"<form action=\"{a}\" method=\"POST\">\n"
-        "  <input type=\"hidden\" name=\"example_param\" value=\"attacker-controlled\">\n"
+        "  <!-- REPLACE: the real form's field names/values, one hidden input each. -->\n"
+        "  <input type=\"hidden\" name=\"REPLACE_WITH_REAL_FIELD_NAME\" value=\"attacker-controlled\">\n"
         "  <input type=\"submit\" value=\"Submit the cross-site request\">\n</form>\n"
-        "<script>document.forms[0].submit();</script>\n"
+        "<!-- No auto-submit on purpose: firing an unmodified template proves nothing and reads as a\n"
+        "     working PoC in a report. Submit it yourself once the fields above are real. -->\n"
     )
 
 
@@ -755,12 +1007,23 @@ def _html_frame_poc(target: str) -> str:
 
 
 def _jwt_forge_poc(pe: dict[str, Any]) -> str:
-    """A forged-token PoC from the recovered HMAC secret — the demonstrated impact of a weak
-    JWT secret (arbitrary token forgery / privilege escalation)."""
+    """A forged-token PoC from the RECOVERED HMAC secret — the demonstrated impact of a weak JWT
+    secret (arbitrary token forgery / privilege escalation).
+
+    Returns "" unless a secret was actually recovered. Only ``active.jwt-weak-secret`` writes a
+    ``matched_value`` in the ``recovered: '…'`` shape; the other three JWT checks
+    (alg:none, alg-confusion, embedded-jwk) prove a DIFFERENT mechanism and recover no secret. This
+    used to default to the literal string ``<recovered-secret>`` and ``HS256``, so a confirmed Critical
+    alg:none finding shipped a pyjwt script that HMAC-signs with the placeholder text — the wrong
+    technique AND not runnable. A wrong PoC is worse than none: the triager runs it, nothing happens,
+    and the real finding looks false. Those classes now carry their exact recipe in the reproduction
+    STEPS instead (see ``_generic_concrete_repro``) and leave the PoC block to the captured evidence."""
     matched = str(pe.get("matched_value") or "")
     m = re.search(r"recovered:\s*'([^']*)'", matched)
+    if not m:
+        return ""
     alg_m = re.search(r"HMAC-(HS\d+)", matched)
-    secret = m.group(1) if m else "<recovered-secret>"
+    secret = m.group(1)
     alg = alg_m.group(1) if alg_m else "HS256"
     return (
         "# Forge an elevated token with the recovered signing secret, then replay it.\n"
@@ -774,6 +1037,24 @@ def _jwt_forge_poc(pe: dict[str, Any]) -> str:
         "# Replay against an authenticated endpoint; the server accepts your forged token:\n"
         "# curl -i -H \"Authorization: Bearer <forged>\" '<an authenticated endpoint>'\n"
     )
+
+
+def _cors_allow_credentials_header(pe: dict[str, Any]) -> str:
+    """The captured ``Access-Control-Allow-Credentials`` header, or '' when the target returned none."""
+    for part in str((pe or {}).get("matched_value") or "").split(";"):
+        if "allow-credentials" in part.lower():
+            return part.strip()
+    return ""
+
+
+def _cors_is_credentialed(pe: dict[str, Any]) -> bool:
+    """True only when the CAPTURED evidence shows ``Allow-Credentials: true``.
+
+    ONE definition, because three parts of the same submission answer this question and used to
+    answer it differently: the reproduction steps, the PoC, and the impact/CVSS narrative. A single
+    predicate is what keeps the Impact paragraph from promising an authenticated cross-origin read
+    on the page after the steps say no credentials were returned."""
+    return _cors_allow_credentials_header(pe).lower().rstrip().endswith("true")
 
 
 def _cors_concrete_repro(finding: dict[str, Any], url: str, pe: dict[str, Any]) -> tuple[list[str], str]:
@@ -797,36 +1078,81 @@ def _cors_concrete_repro(finding: dict[str, Any], url: str, pe: dict[str, Any]) 
     hdr_parts = [h.strip() for h in matched.split(";") if h.strip()]
     acao = next((h for h in hdr_parts if h.lower().startswith("access-control-allow-origin")),
                 f"Access-Control-Allow-Origin: {origin}")
-    acac = next((h for h in hdr_parts if "allow-credentials" in h.lower()),
-                "Access-Control-Allow-Credentials: true")
+    # Did the target ACTUALLY return Allow-Credentials: true? The prover emits a separate
+    # "reflects arbitrary Origin (no credentials)" finding for the case where it did not, so the
+    # repro must not paper over the difference. It used to: the header fell back to a hard-coded
+    # "Access-Control-Allow-Credentials: true" and step 3 then told the triager to OBSERVE a header
+    # the engine had proved absent, with steps 4-5 building a credentialed-read impact on top of it.
+    # A triager who follows that, sees no such header, and finds the PoC read nothing closes the
+    # report as invalid — and rightly.
+    acac = _cors_allow_credentials_header(pe)
+    credentialed = _cors_is_credentialed(pe)
     # Single-line steps (normalize_steps splits on newline, so keep each on one line).
     curl = f"curl -i -H 'Origin: {origin}' -H 'Cookie: <YOUR authenticated session cookie>' '{url}'"
-    steps = [
-        "Log in to the target as a normal user and copy your session cookie / Authorization header from the browser devtools Network tab.",
-        f"From an origin you control (not the target), replay the request with an attacker Origin plus your credentials: `{curl}`",
-        f"Observe that the response reflects the attacker Origin and permits credentials — the misconfiguration: `{acao}` together with `{acac}`.",
-        "Because credentials are allowed for a reflected/untrusted Origin, a page on the attacker origin can read the authenticated response. Save the Proof of concept below as an .html file, host it on an origin you control, and open it in a browser that is logged in to the target.",
-        "The PoC performs a credentialed `fetch(..., {credentials:'include'})` and prints the victim's authenticated response body — that readable cross-origin data is the demonstrated impact.",
-    ]
-    poc = (
-        "<!doctype html>\n"
-        "<meta charset=\"utf-8\">\n"
-        "<title>CORS PoC — cross-origin read with victim credentials</title>\n"
-        f"<h3>CORS PoC: reading {url} cross-origin with the victim's credentials</h3>\n"
-        "<p>Open this page (hosted on an attacker-controlled origin) in a browser logged in to the target.</p>\n"
-        "<pre id=\"out\">running…</pre>\n"
-        "<script>\n"
-        f"fetch({json.dumps(url)}, {{ credentials: \"include\" }})\n"
-        "  .then(function (r) { return r.text(); })\n"
-        "  .then(function (body) {\n"
-        "    document.getElementById(\"out\").textContent =\n"
-        "      \"VULNERABLE — read \" + body.length + \" bytes of the victim's authenticated response cross-origin:\\n\\n\" + body;\n"
-        "  })\n"
-        "  .catch(function (e) {\n"
-        "    document.getElementById(\"out\").textContent = \"Not vulnerable / blocked by the browser: \" + e;\n"
-        "  });\n"
-        "</script>\n"
-    )
+    if credentialed:
+        steps = [
+            "Log in to the target as a normal user and copy your session cookie / Authorization header from the browser devtools Network tab.",
+            f"From an origin you control (not the target), replay the request with an attacker Origin plus your credentials: `{curl}`",
+            f"Observe that the response reflects the attacker Origin and permits credentials — the misconfiguration: `{acao}` together with `{acac}`.",
+            "Because credentials are allowed for a reflected/untrusted Origin, a page on the attacker origin can read the authenticated response. Save the Proof of concept below as an .html file, host it on an origin you control, and open it in a browser that is logged in to the target.",
+            "The PoC performs a credentialed `fetch(..., {credentials:'include'})` and prints the victim's authenticated response body — that readable cross-origin data is the demonstrated impact.",
+        ]
+    else:
+        # Reflection only. State exactly what was captured, and name the missing precondition
+        # rather than asserting impact the evidence does not support.
+        steps = [
+            f"From an origin you control (not the target), replay the request with an attacker Origin: `curl -i -H 'Origin: {origin}' '{url}'`",
+            f"Observe that the response reflects the attacker Origin back: `{acao}`.",
+            "Confirm what was NOT observed: the response carries no `Access-Control-Allow-Credentials: true`, so a browser will not attach or expose the victim's credentials on this cross-origin read.",
+            "Assess reachable impact before reporting: reflection alone exposes only data the endpoint already serves unauthenticated. Check whether this endpoint returns anything sensitive without a session, or whether another route on the same origin reflects the Origin AND allows credentials.",
+            "Report as a reflected-Origin misconfiguration, not as an authenticated cross-origin read, unless you can capture the credentialed variant.",
+        ]
+    if credentialed:
+        poc = (
+            "<!doctype html>\n"
+            "<meta charset=\"utf-8\">\n"
+            "<title>CORS PoC — cross-origin read with victim credentials</title>\n"
+            f"<h3>CORS PoC: reading {url} cross-origin with the victim's credentials</h3>\n"
+            "<p>Open this page (hosted on an attacker-controlled origin) in a browser logged in to the target.</p>\n"
+            "<pre id=\"out\">running…</pre>\n"
+            "<script>\n"
+            f"fetch({json.dumps(url)}, {{ credentials: \"include\" }})\n"
+            "  .then(function (r) { return r.text(); })\n"
+            "  .then(function (body) {\n"
+            "    document.getElementById(\"out\").textContent =\n"
+            "      \"VULNERABLE — read \" + body.length + \" bytes of the victim's authenticated response cross-origin:\\n\\n\" + body;\n"
+            "  })\n"
+            "  .catch(function (e) {\n"
+            "    document.getElementById(\"out\").textContent = \"Not vulnerable / blocked by the browser: \" + e;\n"
+            "  });\n"
+            "</script>\n"
+        )
+    else:
+        # No Allow-Credentials was observed, so a credentialed fetch would be a claim, not a
+        # demonstration. Show the reflection that WAS captured and say plainly what it does and
+        # does not prove.
+        poc = (
+            "<!doctype html>\n"
+            "<meta charset=\"utf-8\">\n"
+            "<title>CORS PoC — reflected Origin (unauthenticated cross-origin read)</title>\n"
+            f"<h3>CORS PoC: {url} reflects an attacker Origin</h3>\n"
+            "<p>Open this page on an origin you control. The target returned no "
+            "<code>Access-Control-Allow-Credentials: true</code>, so this reads only what the "
+            "endpoint serves WITHOUT a session — it is not an authenticated cross-origin read.</p>\n"
+            "<pre id=\"out\">running…</pre>\n"
+            "<script>\n"
+            f"fetch({json.dumps(url)})\n"
+            "  .then(function (r) { return r.text(); })\n"
+            "  .then(function (body) {\n"
+            "    document.getElementById(\"out\").textContent =\n"
+            "      \"Reflected Origin allowed an UNAUTHENTICATED cross-origin read of \" + body.length +\n"
+            "      \" bytes. Assess whether this data is sensitive:\\n\\n\" + body;\n"
+            "  })\n"
+            "  .catch(function (e) {\n"
+            "    document.getElementById(\"out\").textContent = \"Blocked by the browser: \" + e;\n"
+            "  });\n"
+            "</script>\n"
+        )
     return steps, poc
 
 
@@ -845,10 +1171,33 @@ def _generic_concrete_repro(finding: dict[str, Any], class_id: str, url: str,
     confirm = ("Confirm the response demonstrates the issue"
                + (f": {matched}" if matched else "")
                + (f" (observed {status})" if status else "") + ".")
-    steps = [
-        f"Send the exact request GreyIQ used to confirm this — benign and idempotent: `{curl}`",
-        confirm,
-    ]
+    # A crafted header the report cannot print verbatim (it holds a forged token, so the capture
+    # stores it as "Authorization: <forged alg:none token>") is DROPPED from the curl by
+    # _curl_from_evidence. Calling what is left "the exact request GreyIQ used to confirm this" makes
+    # the report disprove itself: the triager runs a bare unauthenticated GET, sees the ordinary
+    # anonymous page, and concludes the Critical auth-bypass is noise. Say what the request actually
+    # needs, and name the bare one as the control it really is.
+    req_hdr = str(pe.get("request_header") or "").strip()
+    if "<" in req_hdr:
+        # Name the header and hand over a runnable command that takes the token from a shell
+        # variable. The placeholder TEXT itself is never echoed into the command (a triager must
+        # never be able to paste a literal "<forged>" into a shell — test_active_new_checks guards
+        # that), and the bare request is labelled as what it actually is: the negative control.
+        hdr_name = (req_hdr.split(":", 1)[0] or "Authorization").strip() or "Authorization"
+        steps = [
+            f"This was confirmed with a crafted `{hdr_name}` header whose value you mint yourself — the "
+            f"steps below describe exactly how. Put the FULL header value "
+            f"(including any `Bearer ` prefix the app uses) in a shell variable and send: "
+            f"`FORGED='...' && curl -i -H \"{hdr_name}: $FORGED\" {shlex.quote(target)}`",
+            f"Negative control — the SAME request WITHOUT that header must not show the same result: "
+            f"`{curl}`. The difference between the two requests is the finding.",
+            confirm,
+        ]
+    else:
+        steps = [
+            f"Send the exact request GreyIQ used to confirm this — benign and idempotent: `{curl}`",
+            confirm,
+        ]
     poc = ""
     rid = str(finding.get("rule_id") or "")
     if class_id in ("xss", "client_sink"):
@@ -856,7 +1205,9 @@ def _generic_concrete_repro(finding: dict[str, Any], class_id: str, url: str,
                      "Open the crafted URL above in a browser (or the PoC page below) to see it execute.")
         poc = _html_open_poc(target, "Reflected XSS PoC",
                              "Loading the crafted URL executes the injected script in the target's origin.")
-    elif class_id == "redirect" and "crlf" in rid:
+    elif class_id == "crlf" or (class_id == "redirect" and "crlf" in rid):
+        # The `redirect` half is kept for history: a ledger finding recorded before CRLF got its own
+        # class still carries class_id 'redirect' with a crlf rule_id, and must still reproduce.
         steps.append("The injected CR/LF sequence adds an attacker-controlled header to the response "
                      "(HTTP response splitting). Escalate to Set-Cookie injection, web-cache poisoning, or "
                      "reflected XSS carried in the split response.")
@@ -871,17 +1222,46 @@ def _generic_concrete_repro(finding: dict[str, Any], class_id: str, url: str,
         poc = _html_open_poc(target, "Open-redirect PoC",
                              "Following the crafted URL sends the browser to an attacker-controlled host.")
     elif class_id == "csrf":
-        steps.append("Host the PoC form below on an origin you control and open it while authenticated to "
-                     "the target; it performs the state-changing request cross-site with no anti-CSRF token.")
+        steps.append("Read the target's form HTML and note its `action` and field names — the check proves "
+                     "the form carries no anti-CSRF token but does not capture them. Complete the PoC "
+                     "template below with the real action and fields, host it on an origin you control, "
+                     "open it while authenticated to the target, submit it, and confirm the state actually "
+                     "changed server-side. That state change is the proof; the missing token alone is not.")
         poc = _html_csrf_poc(target)
     elif class_id == "headers":
         steps.append("The page can be framed cross-origin. Host the PoC frame below to demonstrate a "
                      "clickjacking overlay that hijacks a victim's clicks.")
         poc = _html_frame_poc(target)
     elif class_id == "jwt":
-        steps.append("Using the signing secret shown in the evidence, forge a token with elevated claims "
-                     "and replay it — the server accepts your forged token as authenticated (arbitrary "
-                     "token forgery / privilege escalation).")
+        # Each JWT check proves a DIFFERENT acceptance flaw, so each needs its own recipe. The single
+        # "use the signing secret shown in the evidence" step was only ever true for weak-secret; for
+        # the other three no secret exists, so it sent the triager looking for evidence that isn't
+        # there and paired it with an HMAC script that cannot reproduce the finding.
+        if "alg-none" in rid:
+            steps.append("The server accepted a token whose header declares `alg: none` with an EMPTY "
+                         "signature — signature verification is effectively disabled. Rebuild it from the "
+                         "captured token: base64url(`{\"alg\":\"none\",\"typ\":\"JWT\"}`) + '.' + "
+                         "base64url(the original payload, with `sub`/`role` changed) + '.' (a trailing dot "
+                         "and no signature bytes), then replay it in the same header. Any claim can be set, "
+                         "so this is full authentication bypass / privilege escalation.")
+        elif "alg-confusion" in rid:
+            steps.append("The server accepted an RS256-issued token re-signed as HMAC using its own RSA "
+                         "PUBLIC key as the shared secret (algorithm confusion): it picks the algorithm from "
+                         "the attacker-controlled header instead of pinning the expected one. Fetch the "
+                         "public key (its JWKS / certificate), then HMAC-sign the modified payload with the "
+                         "public key BYTES as the key. Since that key is public, anyone can mint valid "
+                         "tokens — full authentication bypass.")
+        elif "jwk" in rid:
+            steps.append("The server trusted a public key EMBEDDED in the token's own `jwk` header, so it "
+                         "verifies against a key the attacker supplied. Generate your own keypair, put its "
+                         "public JWK in the header, sign the modified payload with your private key, and "
+                         "replay — the server validates the signature against your key and accepts the "
+                         "forged claims. Full authentication bypass.")
+        else:
+            steps.append("Using the signing secret recovered in the evidence, forge a token with elevated "
+                         "claims and replay it — the server accepts your forged token as authenticated "
+                         "(arbitrary token forgery / privilege escalation).")
+        # Returns "" for every class except weak-secret, where a real secret was recovered.
         poc = _jwt_forge_poc(pe)
     elif class_id == "rce":
         steps.append("The benign `$(expr 111 + 111)` shell substitution was evaluated server-side (→ 222), "
@@ -951,18 +1331,31 @@ def _firebase_exposure_finding(exp: dict[str, Any], project: str) -> dict[str, A
     already READ it unauthenticated), with the default-deny rules as the negative control."""
     service = str(exp.get("service") or "Firebase data store")
     endpoint = str(exp.get("endpoint") or "")
+    # For Cloud Storage the probe's ``endpoint`` is the canonical bucket NAME (gs://<project>.appspot.com),
+    # which no HTTP client can fetch — putting it in request_line/location made the report's step 1
+    # `curl -sSiL gs://…`, which errors out on any machine, and put the same dead line in replay.sh and
+    # findings.har. The probe already built the working HTTPS reproduction in ``repro``
+    # (firebasestorage.googleapis.com/v0/b/<project>.appspot.com/o), so use THAT as the request target
+    # and keep the gs:// name where it belongs: naming the affected asset.
+    reproduce = str(exp.get("repro") or "")
+    http_endpoint = endpoint
+    if not endpoint.lower().startswith(("http://", "https://")):
+        url_m = re.search(r"https?://[^\s'\"]+", reproduce)
+        if url_m:
+            http_endpoint = url_m.group(0)
+    bucket_note = f" ({endpoint})" if endpoint and http_endpoint != endpoint else ""
     proof = {
         "status": "confirmed",
         "method": "benign unauthenticated GET (Realtime DB shallow read / Storage list — no stored values read)",
         "actor": "an unauthenticated attacker (no credentials, no key)",
-        "affected_asset": f"the Firebase project '{project}' {service}",
+        "affected_asset": f"the Firebase project '{project}' {service}{bucket_note}",
         "observed_result": str(exp.get("detail") or f"{service} returned data to an unauthenticated request"),
         "control_result": "Firebase's DEFAULT security rules deny anonymous read; this project's rules allow it — a misconfiguration, not the platform default",
         "evidence": str(exp.get("evidence") or ""),
         "limitations": "", "proof_obligation": "",
     }
     ev = {
-        "request_line": f"GET {endpoint}",
+        "request_line": f"GET {http_endpoint}",
         "request_header": "", "response_status": "HTTP 200",
         "matched_value": f"{service} readable unauthenticated",
         "read_data": str(exp.get("evidence") or ""),
@@ -971,7 +1364,7 @@ def _firebase_exposure_finding(exp: dict[str, Any], project: str) -> dict[str, A
         "rule_id": "active.firebase-exposure",
         "title": f"Open {service} — unauthenticated read (project {project})",
         "severity": str(exp.get("severity") or "high"), "confidence": "high",
-        "category": "disclosure", "file_path": endpoint, "location": endpoint,
+        "category": "disclosure", "file_path": http_endpoint, "location": http_endpoint,
         "line_start": 1, "line_end": 1, "snippet": str(exp.get("detail") or "")[:240],
         "remediation": "Lock the Firebase security rules to require authentication (deny public read) and scope access per authenticated user.",
         "redacted": True, "proof_evidence": ev,
@@ -1060,6 +1453,38 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
         steps = concrete_steps
 
     model = impact_model.impact_for_class(class_id)
+    # A CORS finding whose captured evidence shows NO Allow-Credentials is a different bug from the
+    # one the cors impact model describes. The model speaks throughout of reading AUTHENTICATED
+    # responses with the victim's credentials, and its proof obligation demands a credentialed
+    # browser PoC — so leaving it in place put an Impact paragraph, an affected asset, a proof
+    # obligation and a CVSS justification in the same submission that all contradict the
+    # reproduction steps two sections above, and re-asserted exactly the unsupported claim the
+    # reflection-only steps exist to drop. Restate the model for what was actually captured.
+    _cors_reflection_only = (
+        class_id == "cors"
+        and not _cors_is_credentialed(finding.get("proof_evidence") if isinstance(finding.get("proof_evidence"), dict) else {})
+    )
+    if _cors_reflection_only:
+        model = dict(model)
+        model["attacker_capability"] = (
+            "An attacker-controlled page can read this endpoint's response cross-origin because the "
+            "target reflects its Origin. No Access-Control-Allow-Credentials was returned, so the "
+            "read is UNAUTHENTICATED — it reaches only what the endpoint already serves without a session."
+        )
+        model["affected_asset"] = (
+            "whatever this endpoint returns to an unauthenticated caller; no authenticated response is "
+            "reachable through this finding as captured."
+        )
+        model["business_impact"] = (
+            "cross-origin reading of unauthenticated responses — informational unless this endpoint "
+            "serves sensitive data without a session, or another route on the same origin reflects the "
+            "Origin AND allows credentials."
+        )
+        model["proof_obligation"] = (
+            "Capture what this endpoint returns to an unauthenticated cross-origin read and show that "
+            "data is sensitive — or find a route on the same origin that reflects the Origin WITH "
+            "`Allow-Credentials: true` and prove the authenticated read there. Reflection alone is not impact."
+        )
     impact_text = (
         f"{model['attacker_capability']} "
         f"Affected asset: {model['affected_asset']} "
@@ -1107,6 +1532,30 @@ def _deterministic_attack_plan(finding: dict[str, Any], class_id: str) -> dict[s
                 "Use only one read-only issuer request. Do not perform writes, enumeration, prompt submission, or data extraction."
             )
     cvss = impact_model.cvss_for_class(class_id)
+    # Same reasoning as the impact text above, applied to the vector: the modelled cors C:L estimates
+    # a cross-origin read of AUTHENTICATED data, which this finding's evidence does not support.
+    # Recompute the whole vector rather than only the justification, so score, vector and 'why' agree
+    # — the pattern the secrets branch below already establishes. C:N scores 0.0, which
+    # resolve_severity deliberately does NOT treat as a severity tier, so the finding's own severity
+    # (what the prover assigned to the no-credentials variant) governs instead of a modelled claim.
+    if _cors_reflection_only and isinstance(cvss, dict):
+        _refl_vector = "/".join(
+            ("C:N" if part.upper().startswith("C:") else part)
+            for part in str(cvss.get("vector") or "").split("/")
+        )
+        _refl_scored = impact_model.cvss_base_score(_refl_vector)["score"]
+        cvss = {
+            **cvss,
+            "vector": _refl_vector,
+            "base_score": _refl_scored,
+            "base_severity": impact_model.cvss_severity(_refl_scored),
+            "justification": (
+                "Origin reflection was captured without Allow-Credentials, so no authenticated "
+                "cross-origin read is demonstrated: confidentiality impact is scored N until the "
+                "operator shows the unauthenticated response carries sensitive data."
+            ),
+            "estimated": True,
+        }
     # An UNPROVEN exposed secret (public client key / unverified candidate) must not carry the
     # secrets-class High CVSS: resolve_severity lets a plan CVSS base_severity win over the finding's
     # own (already-downgraded) severity, which would silently re-inflate it. Cap the CVSS base_severity
@@ -1161,18 +1610,25 @@ def _resolve_output_dir(output_dir: str | None, default_reports_dir: Path) -> Pa
     "put my reports in a new subfolder of somewhere I already have" while closing
     off using this as a write-anywhere-including-never-existed-before-paths
     primitive (e.g. a startup/scheduled-task directory that doesn't exist yet).
-    Falls back to ``default_reports_dir`` for anything else."""
+    Falls back to ``default_reports_dir`` for anything else.
+
+    The DEFAULT is created with its parents; a caller-supplied path is not. That asymmetry is the
+    whole rule: ``default_reports_dir`` is a path this program chose (``runtime/reports``), and on a
+    clean checkout no part of it exists yet, so ``parents=False`` turned the very first `gn hunt`
+    into a ``FileNotFoundError`` naming a directory the operator had never heard of. An
+    ``output_dir`` the caller named keeps the one-level rule above — it may create the leaf, never
+    the tree — so this stays unusable as a write-anywhere primitive."""
     if output_dir and str(output_dir).strip():
         target = Path(str(output_dir).strip()).expanduser().resolve()
-        if not target.is_dir() and not target.parent.is_dir():
-            target = Path(default_reports_dir).resolve()
-    else:
-        target = Path(default_reports_dir).resolve()
-    target.mkdir(parents=False, exist_ok=True)
+        if target.is_dir() or target.parent.is_dir():
+            target.mkdir(parents=False, exist_ok=True)
+            return target
+    target = Path(default_reports_dir).resolve()
+    target.mkdir(parents=True, exist_ok=True)
     return target
 
 
-def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: int, run_live: bool, auth: AuthContext | None = None) -> tuple[list[dict[str, Any]], list[str], dict[str, Any], str, float, list[dict[str, Any]]]:
+def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: int, run_live: bool, auth: AuthContext | None = None, *, scope_host: str = "") -> tuple[list[dict[str, Any]], list[str], dict[str, Any], str, float, list[dict[str, Any]]]:
     """Run the profile's scanners for the inferred target kind. Returns
     (raw_findings, scanners_run, scan_meta, risk, score, chain_signals)."""
     scanners = profile["scanners"]
@@ -1190,7 +1646,7 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
         if scanner == "code":
             result = run_code_scan(target, "git_remote" if kind == "git" else "path", max_files=max_files)
         elif scanner == "web":
-            result = run_web_scan(target, probe_paths=True, auth=auth)
+            result = run_web_scan(target, probe_paths=True, auth=auth, scope_host=scope_host)
         else:
             continue
         ran.append(scanner)
@@ -1211,7 +1667,7 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
             meta[scanner] = {"error": result.get("error", "scan failed")}
 
     if run_live and kind == "url":
-        live = run_live_scan(target)
+        live = run_live_scan(target, scope_host=scope_host)
         ran.append("live")
         if live.get("ok"):
             raw.extend(live.get("findings", []))
@@ -1499,8 +1955,12 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
     end = text.rfind("}")
     if start < 0 or end <= start:
         return None
+    from bughunter.json_safety import exceeds_json_depth
+    candidate = text[start : end + 1]
+    if exceeds_json_depth(candidate):
+        return None
     try:
-        obj = json.loads(text[start : end + 1])
+        obj = json.loads(candidate)
         return obj if isinstance(obj, dict) else None
     except (json.JSONDecodeError, ValueError, RecursionError):
         # The brain text is untrusted (it can reflect a prompt-injection from scanned target
@@ -1646,6 +2106,12 @@ def _aggregate_active_meta(metas: list[dict[str, Any]]) -> dict[str, Any]:
         for cls in (meta.get("verified_classes") or [])
         if str(cls or "").strip()
     })
+    checked = sorted({
+        str(cls)
+        for meta in metas
+        for cls in (meta.get("checked_classes") or [])
+        if str(cls or "").strip()
+    })
     skipped = [
         str(meta.get("skipped_reason") or "").strip()
         for meta in metas
@@ -1658,6 +2124,7 @@ def _aggregate_active_meta(metas: list[dict[str, Any]]) -> dict[str, Any]:
         "requests_used": sum(int(meta.get("requests_used") or 0) for meta in metas),
         "rate_limited": any(bool(meta.get("rate_limited")) for meta in metas),
         "verified_classes": verified,
+        "checked_classes": checked,
         "skipped_reason": "; ".join(dict.fromkeys(skipped[:4])),
         "targets_checked": len(metas),
         # Carry a structural response digest through the aggregate (the FIRST target that produced one).
@@ -1672,11 +2139,45 @@ def _aggregate_active_meta(metas: list[dict[str, Any]]) -> dict[str, Any]:
                 "requests_used": int(meta.get("requests_used") or 0),
                 "rate_limited": bool(meta.get("rate_limited")),
                 "verified_classes": list(meta.get("verified_classes") or []),
+                "checked_classes": list(meta.get("checked_classes") or []),
                 "skipped_reason": str(meta.get("skipped_reason") or ""),
             }
             for meta in metas
         ],
     }
+
+
+def _confirmed_learning_outcomes(findings: list[dict[str, Any]], target: str) -> list[dict[str, Any]]:
+    """Keep proof-backed outcomes before report focus and dismissal filters run.
+
+    Only compact classification metadata crosses the campaign callback. The trace
+    writer redacts and bounds it before persistence; no proof bodies or payloads
+    are included here.
+    """
+    rows: list[dict[str, Any]] = []
+    for finding in findings:
+        if not isinstance(finding, dict) or not finding.get("class_id"):
+            continue
+        try:
+            # The report's proof reader expects the active verifier's carrier in
+            # a plan; filtered findings never received an attack plan of their
+            # own, so provide only that captured carrier to the same status gate.
+            active_proof = finding.get("_active_proof")
+            proof_plan = ({"proof_of_impact": active_proof}
+                          if isinstance(active_proof, dict) else {})
+            if report_lib._proof_of_impact_detail(finding, proof_plan).get("status") != "confirmed":
+                continue
+            rows.append({
+                "endpoint": str(finding.get("location") or finding.get("source_url") or target),
+                "class": str(finding.get("class_id") or ""),
+                "rule_id": str(finding.get("rule_id") or ""),
+                "proof_status": "confirmed",
+                "severity": str(finding.get("severity") or ""),
+                "dedup_key": ledger.dedup_key(finding),
+            })
+        except Exception:  # noqa: BLE001 - learning bookkeeping must never break a hunt
+            continue
+    return rows
 
 
 def _rank_active_targets(seed: str, urls: list[str] | tuple[str, ...] | set[str] | None, *, limit: int = 4) -> list[str]:
@@ -1704,6 +2205,28 @@ def _rank_active_targets(seed: str, urls: list[str] | tuple[str, ...] | set[str]
         return [seed]
     if seed not in selected and len(selected) < limit:
         selected.append(seed)
+
+    # ALWAYS keep the origin root in the set. Two of the highest-value active checks are root-ONLY by
+    # construction — _check_sensitive_paths (a served .git/.env, so source and live credentials) and
+    # _check_debug_endpoints (/actuator/heapdump, Jolokia, /.aws/credentials) both return None unless
+    # the URL path is empty, because they probe a fixed list once per host rather than per endpoint.
+    # The ranking above deliberately scores a bare root LOWEST (no query, no hot word, and an explicit
+    # -1), so on any target where recon found `limit` parametered URLs the root was evicted and those
+    # checks silently never ran on a direct hunt: the engine could not find an exposed .env on a site
+    # with four interesting URLs. Reserve the last slot for the root instead of hoping it survives.
+    try:
+        parsed_seed = urlparse(seed)
+        origin_root = f"{parsed_seed.scheme}://{parsed_seed.netloc}/" if parsed_seed.netloc else ""
+    except ValueError:
+        origin_root = ""
+    # limit >= 2 only: with a budget of one target the operator's own URL wins, because swapping it for
+    # the root would mean never probing the thing they actually typed.
+    if (limit >= 2 and origin_root
+            and not any(url.rstrip("/") == origin_root.rstrip("/") for url in selected)):
+        # Evict the LOWEST-ranked entry rather than growing past the cap — the cap is a request-spend
+        # bound, so overflowing it would spend budget the caller did not authorise.
+        selected = selected[: limit - 1]
+        selected.append(origin_root)
     return selected
 
 
@@ -1815,7 +2338,8 @@ def _replan_wave(target_url: str, findings: list[dict[str, Any]], *, scope: str,
 
     Returns ``(new_findings, info)``; fail-open to ``([], {...})`` on any error.
     """
-    info: dict[str, Any] = {"ran": False, "targets": 0, "requests_used": 0, "confirmed": 0}
+    info: dict[str, Any] = {"ran": False, "targets": 0, "requests_used": 0,
+                            "confirmed": 0, "execution": []}
     try:
         graph = investigator.build_investigation(findings, surface=surface)
         plan = investigator.build_probe_plan(graph)
@@ -1870,6 +2394,10 @@ def _replan_wave(target_url: str, findings: list[dict[str, Any]], *, scope: str,
             budget -= spent
             info["requests_used"] += spent
             info["targets"] += 1
+            # Keep only verifier-certified completed suites. The wave probes URLs
+            # outside the first pass, so dropping this metadata loses their clean
+            # results from the trace and negative-knowledge stores.
+            info["execution"].extend(hunt_trace.execution_from_active_meta(meta, endpoint))
             out.extend(results)
             if meta.get("rate_limited"):
                 break
@@ -1884,6 +2412,30 @@ def _replan_wave(target_url: str, findings: list[dict[str, Any]], *, scope: str,
         return out, info
     except Exception:  # noqa: BLE001 - an optimizer pass must never break a hunt
         return [], info
+
+
+def _with_replan_execution(active_meta: dict[str, Any], target_url: str,
+                           execution: list[dict[str, Any]]) -> dict[str, Any]:
+    """Expose completed replan suites through the normal per-target meta shape."""
+    if not execution:
+        return active_meta
+    merged = dict(active_meta)
+    existing = merged.get("targets")
+    if isinstance(existing, list):
+        targets = list(existing)
+    else:
+        # The iterative verifier returns one seed-target meta, whereas the
+        # fan-out verifier already has `targets`. Preserve the seed's coverage.
+        targets = [{"target": target_url, "in_scope": active_meta.get("in_scope") is True,
+                    "checked_classes": list(active_meta.get("checked_classes") or [])}]
+    checked = set(active_meta.get("checked_classes") or [])
+    for row in execution:
+        targets.append({"target": row["endpoint"], "in_scope": True,
+                        "checked_classes": list(row["classes"])})
+        checked.update(row["classes"])
+    merged["targets"] = targets
+    merged["checked_classes"] = sorted(checked)
+    return merged
 
 
 def _proof_capture_highlight(finding: dict[str, Any]) -> str:
@@ -2030,6 +2582,133 @@ def _write_sensitive_data_files(display: list[dict[str, Any]], base_dir: Path) -
     return paths
 
 
+def _run_hunt_mcp_review(
+    kind: str,
+    target: str,
+    scope: str,
+    surface: dict[str, Any],
+    findings: list[dict[str, Any]],
+    *,
+    risk: str,
+    score: int,
+    scanners_run: list[str],
+    external_mcp_hunt: bool,
+    mcp_manager: Any,
+    stopped: Any,
+    emit: Any,
+    blocked: bool = False,
+) -> dict[str, Any]:
+    """Run evidence-only MCP reviews after the hunt's authorization and proof gates.
+
+    MCP data is quarantined in this advisory result. In particular, no returned
+    text is allowed to select probes, promote findings, or alter the proof map.
+    """
+    review: dict[str, Any] = {
+        "advisory": True, "builtin": {}, "external_opt_in": bool(external_mcp_hunt),
+        "external": [],
+    }
+    if stopped():
+        review["status"] = "stopped"
+        return review
+    try:
+        review["builtin"] = mcp_hunt.run_builtin_hunt_review(kind, target, scope, surface, findings)
+        if review["builtin"].get("ok"):
+            emit("MCP: reviewed captured hunt evidence")
+    except Exception:  # noqa: BLE001 - advisory analysis cannot break a completed hunt
+        review["builtin"] = {"ok": False, "error": "Built-in MCP evidence review failed."}
+
+    if not external_mcp_hunt:
+        review["external_status"] = "not-requested"
+        return review
+    if blocked or stopped():
+        review["external_status"] = "stopped"
+        return review
+    if not str(scope or "").strip() or mcp_manager is None:
+        review["external_status"] = "unavailable"
+        return review
+    try:
+        listed = mcp_manager.list_hunt_approvals()
+        if not listed.get("ok"):
+            review["external_status"] = "approval-store-error"
+            return review
+        approvals = listed.get("approvals")
+        approved = [a for a in (approvals or [])
+                    if isinstance(a, dict) and a.get("valid") and a.get("evidence_only")]
+        if not approved:
+            review["external_status"] = "no-approved-tools"
+            return review
+        counts = {level: 0 for level in ("critical", "high", "medium", "low", "info")}
+        for finding in findings:
+            level = str(finding.get("severity") or "").lower()
+            if level in counts:
+                counts[level] += 1
+        safe_findings: list[dict[str, str]] = []
+        for index, finding in enumerate(findings[:20], 1):
+            level = str(finding.get("severity") or "").lower()
+            class_id = str(finding.get("class_id") or "")
+            safe_findings.append({
+                "ref": f"M{index}",
+                # Only fixed taxonomy is shared. A scanner title/category can
+                # contain a user URL, identifier, or arbitrary target text that
+                # a secret detector cannot reliably recognize.
+                "title": "",
+                "category": class_id if class_id in VULN_CLASSES else "",
+                "severity": level if level in counts else "unknown",
+                "proof_status": "unknown",
+                "observation": "",
+                "negative_control": "",
+                "limitations": "",
+            })
+        snapshot = {
+            "summary": {
+                "risk": str(risk or "")[:20], "score": int(score),
+                "finding_count": len(findings), "severity_counts": counts,
+                "scanners_run": [str(name)[:40] for name in scanners_run[:12]],
+            },
+            "findings": safe_findings,
+        }
+        for approval in approved[:3]:
+            if stopped():
+                review["external_status"] = "stopped"
+                break
+            server = str(approval.get("server") or "")
+            tool = str(approval.get("tool") or "")
+            run_id = uuid4().hex
+            permit = mcp_manager.create_hunt_permit(
+                run_id, target, scope, authorized=True, server=server, tool=tool, max_calls=1)
+            if not permit.get("ok") or not permit.get("token"):
+                review["external"].append({"server": server, "tool": tool, "ok": False,
+                                           "error": str(permit.get("error") or "Permit denied.")[:200]})
+                continue
+            token = str(permit["token"])
+            try:
+                result = mcp_manager.call_approved_hunt_tool(
+                    server, tool, snapshot, permit_token=token, target=target,
+                    scope=scope, run_id=run_id, stopped=stopped())
+            finally:
+                mcp_manager.revoke_hunt_permit(token)
+            item: dict[str, Any] = {
+                "server": server, "tool": tool, "ok": bool(result.get("ok")),
+                "is_error": bool(result.get("is_error")),
+                "truncated": bool(result.get("truncated")),
+            }
+            if result.get("ok") and not result.get("is_error"):
+                excerpt = "\n".join(str(block.get("text") or "")
+                                    for block in (result.get("content") or [])
+                                    if isinstance(block, dict) and block.get("type") == "text")
+                excerpt = redact_text(excerpt[:1600])[0]
+                item["untrusted_output_excerpt"] = "".join(
+                    ch for ch in excerpt if ch in "\n\t" or ord(ch) >= 32)[:1200]
+                emit(f"MCP: {server}/{tool} reviewed captured evidence")
+            else:
+                item["error"] = str(result.get("error") or "MCP tool returned an error.")[:200]
+            review["external"].append(item)
+        review.setdefault("external_status", "complete")
+    except Exception:  # noqa: BLE001 - external analysis cannot block report export
+        review["external_status"] = "error"
+    return review
+
+
 def run_bounty_hunt(
     target: str,
     profile_id: str,
@@ -2040,6 +2719,7 @@ def run_bounty_hunt(
     coder_cfg: dict[str, Any] | None,
     *,
     user_agent_suffix: str = "",
+    validate_credential_issuers: bool = False,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Run one hunt, first honoring the program's HUNTING REQUIREMENT for a user-agent tag.
@@ -2059,7 +2739,8 @@ def run_bounty_hunt(
     ua_token = web_ingest.set_ua_suffix(user_agent_suffix) if str(user_agent_suffix or "").strip() else None
     try:
         return _run_bounty_hunt_body(
-            target, profile_id, vuln_class, output_dir, scope, authorized, coder_cfg, **kwargs
+            target, profile_id, vuln_class, output_dir, scope, authorized, coder_cfg,
+            validate_credential_issuers=validate_credential_issuers, **kwargs
         )
     finally:
         # try/finally so a raise or an early return can never leak one program's tag into the next
@@ -2085,16 +2766,27 @@ def _run_bounty_hunt_body(
     active: bool = False,
     time_based: bool = False,
     auth: dict[str, Any] | None = None,
+    validate_credential_issuers: bool = False,
     max_files: int = 5000,
     per_finding: bool = False,
     extra_params: list[str] | None = None,
     on_progress: Any = None,
+    on_learning_outcomes: Any = None,
+    # The operator's kill switch, as a predicate the caller owns (greyiq_api passes
+    # ``lambda: progress.is_stopped(run_id)``). A DIRECT hunt previously had no way to hear Stop at
+    # all: campaign.py checks progress.is_stopped between targets and between URLs, but a single hunt
+    # only received ``on_progress``, a one-way message sink. So clicking Stop flipped the pill to
+    # "Stopped", disabled the button — and the active fan-out, the re-plan wave and the OOB probes all
+    # kept sending requests at a production host the operator had just realised was out of scope.
+    should_stop: Any = None,
     settings: Any = None,
     oob_base: str = "",
     oob_secret: str = "",
     class_priority: list[str] | None = None,
     ssrf_params: list[str] | None = None,
     xss_params: list[str] | None = None,
+    external_mcp_hunt: bool = False,
+    mcp_manager: Any = None,
 ) -> dict[str, Any]:
     """Run a bounty hunt end to end and write a Markdown + JSON report.
 
@@ -2107,6 +2799,17 @@ def _run_bounty_hunt_body(
                 on_progress(msg)
             except Exception:  # noqa: BLE001 - a progress sink must never break the hunt
                 pass
+
+    def _stopped() -> bool:
+        """True once the operator has asked this run to stop. Total: a raising or absent predicate
+        means "keep going", because a broken kill switch must not abort a legitimate hunt — the
+        checks below are placed so that honouring it early is always safe."""
+        if not callable(should_stop):
+            return False
+        try:
+            return bool(should_stop())
+        except Exception:  # noqa: BLE001
+            return False
 
     clean_target = str(target or "").strip()
     if not clean_target:
@@ -2135,6 +2838,16 @@ def _run_bounty_hunt_body(
         }
     if kind == "git" and not clean_target.lower().startswith("https://"):
         return {"ok": False, "error": "Point git hunts at a full https:// URL (e.g. https://github.com/org/repo). SSH/SCP git URLs aren't supported."}
+    if kind == "git":
+        repository_scope_error = _repository_scope_preflight(clean_target, scope, settings)
+        if repository_scope_error:
+            return {"ok": False, "error": repository_scope_error}
+
+    scope_host = ""
+    if kind == "url":
+        scope_host, scope_error = _url_scope_preflight(clean_target, scope, settings)
+        if scope_error:
+            return {"ok": False, "error": scope_error}
 
     # Optional authenticated scanning: bind the operator's cookie/headers to the
     # target host. Attached SAME-SITE only (see scan_auth) so the session reaches
@@ -2151,7 +2864,9 @@ def _run_bounty_hunt_body(
     if kind == "git":
         _emit("cloning authorized repository (shallow, single branch)…")
     _emit("running adversarial source scan…" if kind in {"git", "path"} else "running scanner(s)…")
-    raw_findings, scanners_run, scan_meta, risk, score, chain_signals = _run_scanners(profile, kind, clean_target, max_files, run_live, auth_ctx)
+    raw_findings, scanners_run, scan_meta, risk, score, chain_signals = _run_scanners(
+        profile, kind, clean_target, max_files, run_live, auth_ctx, scope_host=scope_host,
+    )
     _emit(f"scan complete — {', '.join(scanners_run) or 'no'} scanner(s) ran, {len(raw_findings)} raw finding(s), risk={risk}")
     # Surface scanner failures instead of letting a failed scan read as a clean
     # target (the worst failure mode for a bug-finding tool). If every scanner
@@ -2379,7 +3094,9 @@ def _run_bounty_hunt_body(
                     ),
                     xss_params=loop_xss_params, coder_cfg=coder_cfg,
                     surface={"endpoints": active_targets, "params": list(effective_extra_params or [])},
-                    on_progress=_emit)
+                    # The same predicate the fan-out below checks between targets. Without it this
+                    # branch was the one active path Stop could not reach.
+                    on_progress=_emit, should_stop=should_stop)
                 active_swept = {clean_target}  # the loop probes the seed and nothing else
             else:
                 active_findings = []
@@ -2391,6 +3108,9 @@ def _run_bounty_hunt_body(
                     min_interval_s=active_settings.active_min_interval_ms / 1000.0,
                 )
                 for active_target in active_targets:
+                    if _stopped():
+                        _emit("stop requested — halting the active pass before the next target")
+                        break
                     target_priority = _priority_for_active_target(
                         active_target, endpoint_class_priorities, effective_class_priority,
                     )
@@ -2423,7 +3143,20 @@ def _run_bounty_hunt_body(
                     scanners_run = list(scanners_run) + ["active"]
             elif active_meta.get("in_scope"):
                 scanners_run = list(scanners_run) + ["active"]
-            _emit(f"active verification complete — {len(active_findings)} confirmed")
+            # Count the CONFIRMED subset, not the whole list: verify_active returns candidate-grade
+            # findings alongside confirmed ones (clickjacking and CSRF are always 'candidate', so are
+            # the no-credentials CORS variant, body-only host-header reflection, and the denied /
+            # out-of-scope open-bucket notes). Emitting len(active_findings) told the operator
+            # "2 confirmed" for a site that merely lacks X-Frame-Options and serves a tokenless form,
+            # while the report for those same two findings correctly read "Candidate / unverified" —
+            # the progress stream and the report disagreeing on the one word this engine is built on.
+            _confirmed_n = sum(
+                1 for f in active_findings
+                if str((f.get("_active_proof") or {}).get("status") or "").lower() == "confirmed")
+            _emit(
+                f"active verification complete — {_confirmed_n} confirmed"
+                + (f", {len(active_findings) - _confirmed_n} candidate" if len(active_findings) > _confirmed_n else "")
+            )
         except Exception as exc:  # noqa: BLE001 - active layer is best-effort; never break a hunt
             active_meta = {"in_scope": False, "skipped_reason": f"active verification error: {exc}"}
             _emit(f"active verification error: {exc}")
@@ -2433,7 +3166,7 @@ def _run_bounty_hunt_body(
         # rather than the seed URL the iterative loop probes. It runs HERE, before classification /
         # attack planning / the QA gate, so what it captures flows through them like any other
         # active finding — after the final graph it would skip all of them.
-        if active_meta.get("in_scope") and getattr(
+        if active_meta.get("in_scope") and not _stopped() and getattr(
                 settings or active_verify_service.get_settings(), "hunt_replan_enabled", False):
             try:
                 replan_settings = settings or active_verify_service.get_settings()
@@ -2447,8 +3180,12 @@ def _run_bounty_hunt_body(
                     raw_findings = list(raw_findings) + replan_findings
                     if "active" not in scanners_run:
                         scanners_run = list(scanners_run) + ["active"]
-                active_meta = dict(active_meta)
-                active_meta["replan"] = replan_info
+                # The wave can check URLs that the first pass did not reach.
+                # Retain those certified suites alongside the first pass so
+                # trace learning and negative knowledge can see both.
+                wave_execution = list(replan_info.get("execution") or [])
+                active_meta = _with_replan_execution(active_meta, clean_target, wave_execution)
+                active_meta["replan"] = {k: v for k, v in replan_info.items() if k != "execution"}
                 # The wave's spend is part of THIS hunt's coverage; reporting only the first pass
                 # would understate what the target actually received.
                 active_meta["requests_used"] = (int(active_meta.get("requests_used") or 0)
@@ -2478,20 +3215,60 @@ def _run_bounty_hunt_body(
         # fresh, unguessable callback token per candidate param, probes, and polls the collaborator;
         # a hit that appears ONLY after the probe (fresh-token negative control) is a confirmed blind
         # SSRF, with the token as the reproducible "sheriff flag". Best-effort; never breaks a hunt.
-        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+        # Each of the four OOB provers below carries its own ``not _stopped()`` guard: every one injects
+        # callback tokens and then polls the collaborator, so starting one after the operator hit Stop
+        # keeps sending at the target for as long as its poll window lasts.
+        # Unattended grants cover target-scoped reads only, not collaborator traffic.
+        if (operator_guard.current() is None and str(oob_base or "").strip()
+                and str(oob_secret or "").strip() and not _stopped()):
             try:
                 _emit("running blind-SSRF OOB probe (collaborator configured)…")
+                # Spend the OOB budget on parameters this program has NOT already probed without a
+                # callback. The prover walks its candidate list under a hard cap, so order decides
+                # what actually gets a token — this reorders, never drops, so the set is unchanged
+                # and a parameter that becomes interesting after a deploy is still reachable.
+                _ssrf_cooled = negative_knowledge.cooled_params(
+                    runtime_dir, program=None, target=clean_target,
+                    endpoint=clean_target, class_id="ssrf")
+                if _ssrf_cooled:
+                    _emit(f"negative knowledge: {len(_ssrf_cooled)} parameter(s) already probed "
+                          "without a callback — trying fresh ones first")
+                # `deprioritise` is applied inside the prover's candidate builder, after every source
+                # is merged and before the cap. Reordering this list here could not work: names parsed
+                # from the target URL are merged AHEAD of it, so on an already-parametered target two
+                # cooled URL-local names would still consume the whole cap.
                 ssrf = oob_service.confirm_blind_ssrf(clean_target, base=oob_base, secret=oob_secret,
                                                       scope=scope, settings=settings,
                                                       extra_params=effective_extra_params,
-                                                      priority=ssrf_params, governor=_oob_governor())
+                                                      priority=ssrf_params,
+                                                      deprioritise=_ssrf_cooled,
+                                                      governor=_oob_governor())
                 if ssrf.get("ok") and ssrf.get("finding") and ssrf.get("status") in ("confirmed", "candidate"):
                     raw_findings = list(raw_findings) + [ssrf["finding"]]
                     if "active" not in scanners_run:
                         scanners_run = list(scanners_run) + ["active"]
                     _emit(f"blind-SSRF OOB: {ssrf.get('status')} via '{ssrf.get('param')}'")
+                    # A parameter that produced a callback is immune from here on. Without this a
+                    # sink could carry two earlier misses and stay cooled for the whole TTL — the
+                    # same immunity hole the endpoint half was fixed for.
+                    negative_knowledge.record_param_confirmation(
+                        runtime_dir, program=None, target=clean_target,
+                        endpoint=clean_target, class_id="ssrf", param=ssrf.get("param"))
                 else:
                     _emit(f"blind-SSRF OOB: {ssrf.get('status') or ssrf.get('error') or 'no callback'}")
+                # THE honest parameter-level negative: each of these carried a unique collaborator
+                # token and no callback arrived in the poll window, so the request demonstrably went
+                # out and the thing demonstrably did not happen. Only recorded for `no-callback` —
+                # an error or an out-of-scope refusal means the probe never ran, which is not a
+                # negative result about the parameter.
+                # Only a poll window that COMPLETED is a negative result. `no-callback` is also
+                # returned when the probe went out but the collaborator poll itself errored, and
+                # that is an unobservable outcome, not evidence the parameter is inert — banking it
+                # would cool a live sink after two transient network failures.
+                if str(ssrf.get("status") or "") == "no-callback" and not ssrf.get("poll_errors"):
+                    negative_knowledge.record_param_misses(
+                        runtime_dir, program=None, target=clean_target,
+                        endpoint=clean_target, class_id="ssrf", params=ssrf.get("params_tried"))
             except Exception as exc:  # noqa: BLE001
                 _emit(f"blind-SSRF OOB probe error: {exc}")
 
@@ -2501,7 +3278,8 @@ def _run_bounty_hunt_body(
         # DNS-pinned target and polls; the entity fetches ONLY the collaborator callback (no target file
         # is ever read), and a hit that appears solely after the probe (fresh-token negative control)
         # confirms blind XXE. Best-effort; a target that doesn't parse XML is a clean no-op; never breaks a hunt.
-        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+        if (operator_guard.current() is None and str(oob_base or "").strip()
+                and str(oob_secret or "").strip() and not _stopped()):
             try:
                 _emit("running blind-XXE OOB probe (collaborator configured)…")
                 xxe = oob_service.confirm_blind_xxe(clean_target, base=oob_base, secret=oob_secret,
@@ -2524,20 +3302,35 @@ def _run_bounty_hunt_body(
         # request headers that reach a shell without any parameter existing, and confirms only on a
         # collaborator hit whose MATCHED bare-URL control stayed silent — so an application that merely
         # fetches URLs it finds (an unfurler, a plain SSRF) is reported as that, never as a CRITICAL RCE.
-        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+        if (operator_guard.current() is None and str(oob_base or "").strip()
+                and str(oob_secret or "").strip() and not _stopped()):
             try:
                 _emit("running blind-RCE OOB probe (collaborator configured)…")
+                _rce_cooled = negative_knowledge.cooled_params(
+                    runtime_dir, program=None, target=clean_target,
+                    endpoint=clean_target, class_id="rce")
                 rce = oob_service.confirm_blind_rce(clean_target, base=oob_base, secret=oob_secret,
                                                     scope=scope, settings=settings,
                                                     extra_params=effective_extra_params,
+                                                    deprioritise=_rce_cooled,
                                                     governor=_oob_governor())
                 if rce.get("ok") and rce.get("finding") and rce.get("status") in ("confirmed", "candidate"):
                     raw_findings = list(raw_findings) + [rce["finding"]]
                     if "active" not in scanners_run:
                         scanners_run = list(scanners_run) + ["active"]
                     _emit(f"blind-RCE OOB: {rce.get('status')} via {rce.get('param') or rce.get('header')}")
+                    # Only a PARAMETER confirmation is immunized here: this prover can also confirm
+                    # through a request header, which carries no parameter row to clear.
+                    if rce.get("param"):
+                        negative_knowledge.record_param_confirmation(
+                            runtime_dir, program=None, target=clean_target,
+                            endpoint=clean_target, class_id="rce", param=rce.get("param"))
                 else:
                     _emit(f"blind-RCE OOB: {rce.get('status') or rce.get('error') or 'no callback'}")
+                if str(rce.get("status") or "") == "no-callback" and not rce.get("poll_errors"):
+                    negative_knowledge.record_param_misses(
+                        runtime_dir, program=None, target=clean_target,
+                        endpoint=clean_target, class_id="rce", params=rce.get("params_tried"))
             except Exception as exc:  # noqa: BLE001
                 _emit(f"blind-RCE OOB probe error: {exc}")
 
@@ -2549,7 +3342,8 @@ def _run_bounty_hunt_body(
         # rejects the token answers exactly like one that never fetched), so the fetch is the only
         # observable and it is only observable out of band. Uses the token the app hands an ANONYMOUS
         # visitor, so no session is needed; a target that issues none is a clean no-op.
-        if str(oob_base or "").strip() and str(oob_secret or "").strip():
+        if (operator_guard.current() is None and str(oob_base or "").strip()
+                and str(oob_secret or "").strip() and not _stopped()):
             try:
                 _emit("running JWT key-URL injection OOB probe (collaborator configured)…")
                 jwtk = oob_service.confirm_jwt_key_injection(clean_target, base=oob_base, secret=oob_secret,
@@ -2565,11 +3359,12 @@ def _run_bounty_hunt_body(
             except Exception as exc:  # noqa: BLE001
                 _emit(f"JWT key-URL OOB probe error: {exc}")
 
-    # Credential validation: a leaked Firebase/Google API key is only a REAL finding if it's live.
-    # Gated by ``authorized`` — it sends ONE benign, read-only GET to the credential's OWN issuer
-    # (Google, never the target), carrying only the found key, to prove liveness + name the project.
-    # Best-effort; an error never breaks a hunt.
-    if authorized:
+    # Issuer validation transmits recovered credentials to third-party services,
+    # which a target's general authorization does not cover. Require a separate
+    # explicit opt-in; normal UI/CLI hunts leave detections for human review.
+    # Unattended grants authorize only target-scoped, budgeted reads, so they
+    # never enable issuer checks even when this opt-in was provided.
+    if authorized and validate_credential_issuers and operator_guard.current() is None:
         exposure_findings: list[dict[str, Any]] = []
         # AWS keys need the access-key-id AND its paired secret to sign a SigV4 request, but the two are
         # detected as SEPARATE findings. Index each file's secret access key (the 40-char tail of the
@@ -2725,10 +3520,38 @@ def _run_bounty_hunt_body(
         _emit(f"brain enrichment FAILED (report is deterministic-only): {brain['error']}")
     else:
         _emit("brain enrichment skipped (no brain configured)")
+    _finding_by_ref = {str(f.get("ref")): f for f in display if f.get("ref")}
     for ref, plan in brain.get("attack_plans", {}).items():
         if ref in attack_plans and (plan.get("steps") or plan.get("poc")):
             base = attack_plans[ref]
             merged = {**base, **{k: v for k, v in plan.items() if v}}
+            # A CONCRETE reproduction is an ARTIFACT, not prose, and the brain must not be able to
+            # replace one. `_deterministic_attack_plan` sets steps/poc from `_concrete_repro` when the
+            # captured evidence supports a real crafted request and a runnable PoC -- and the plain
+            # dict merge above overwrote both with whatever the brain returned. Measured: a confirmed
+            # CORS finding's 782-character runnable PoC page (the artifact a triager opens to watch
+            # the cross-origin read happen) was replaced by the three characters "N/A", and its
+            # reproduction steps by "Read the report.". A wrong PoC is worse than none: the triager
+            # runs it, nothing happens, and a real finding looks false.
+            #
+            # This is the same floor the two blocks below already apply to proof_of_impact and CVSS,
+            # extended to the two fields that carry the reproduction. The brain still enriches freely
+            # where there is no concrete reproduction to protect (a candidate's generic checklist),
+            # and its prose is kept as additional context rather than discarded.
+            # Recomputed from the finding rather than recorded on the plan: _concrete_repro is pure,
+            # and a private marker key on the plan would have to be stripped before the report ships.
+            _finding = _finding_by_ref.get(str(ref)) or {}
+            _concrete_steps, _concrete_poc = _concrete_repro(_finding, str(_finding.get("class_id") or ""))
+            if _concrete_poc:
+                # The brain's poc is DISCARDED here rather than kept alongside: report.py reads only
+                # plan["poc"], so a second field would be dead weight, and prose about a runnable
+                # artifact the brain did not produce adds nothing a triager can run. Same precedence
+                # the CVSS block below applies — the deterministic artifact wins outright.
+                merged["poc"] = _concrete_poc
+            if _concrete_steps:
+                brain_steps = [str(x) for x in (plan.get("steps") or []) if str(x or "").strip()]
+                extra = [x for x in brain_steps if x not in _concrete_steps]
+                merged["steps"] = list(_concrete_steps) + extra
             # The deterministic proof obligation + CVSS are the floor: keep them when
             # the brain didn't supply its own, so the report is never left without
             # the "capture this to prove impact" guidance or a severity vector.
@@ -2957,9 +3780,27 @@ def _run_bounty_hunt_body(
     ctx["next_steps"] = next_steps_lib.build_next_steps(ctx, brain.get("next_steps"))
     ctx["coverage"] = next_steps_lib.coverage_summary(ctx)
 
+    # Review the completed, reportable evidence through the built-in MCP tool.
+    # It has no network capability and returns only advisory priorities. An
+    # external tool requires an additional per-run opt-in and a persisted,
+    # fingerprint-bound approval for that exact evidence-only tool. Neither
+    # response is fed back into proof, severity, active requests, or the brain.
+    ctx["mcp_review"] = _run_hunt_mcp_review(
+        kind, clean_target, scope, investigation_surface,
+        report_lib._reportable_findings(display),
+        risk=risk, score=score, scanners_run=scanners_run,
+        external_mcp_hunt=external_mcp_hunt, mcp_manager=mcp_manager,
+        stopped=_stopped, emit=_emit,
+        blocked=bool(active_meta.get("rate_limited")),
+    )
+
     _emit("writing report…")
     markdown = report_lib.build_markdown(ctx)
     json_doc = report_lib.build_json(ctx)
+    # The report may hide an engine-confirmed finding because of a focus class or
+    # operator dismissal. Its evidence still matters to the completed-suite label:
+    # otherwise the trainer would turn that very suite into a false negative.
+    learning_confirmations = _confirmed_learning_outcomes(annotated, clean_target)
 
     # Append this DIRECT hunt to the trace log (offline-brain distillation corpus). Only when this
     # run did its OWN recon+plan (hunt_trace_plan set): a campaign's per-URL call passes
@@ -2974,10 +3815,9 @@ def _run_bounty_hunt_body(
         try:
             _poi = json_doc.get("proof_of_impact") if isinstance(json_doc, dict) else {}
             _poi = _poi if isinstance(_poi, dict) else {}
-            # Iterate the REPORTABLE findings (json_doc["findings"] — the same list proof_of_impact is
-            # keyed from) rather than the pre-filter `display`. A finding dropped from the report then
-            # has no _poi entry and would be mislabeled proof_status='missing'; this also matches the
-            # campaign path's grain (it records only reportable, consolidated findings).
+            # Start with REPORTABLE findings (json_doc["findings"] — the same list
+            # proof_of_impact is keyed from). Then add proof-backed confirmations
+            # from before report filters; a filtered finding has no _poi entry.
             _report_findings = json_doc.get("findings") if isinstance(json_doc, dict) else []
             _trace_outcomes: list[dict[str, Any]] = []
             for _f in (_report_findings or []):
@@ -2992,52 +3832,35 @@ def _run_bounty_hunt_body(
                     "severity": str(_f.get("severity") or ""),
                     "dedup_key": ledger.dedup_key(_f) if _f.get("class_id") else "",
                 })
-            hunt_trace.record_trace(runtime_dir, program=None, target=clean_target,
-                                    surface=hunt_trace_surface, plan=hunt_trace_plan,
-                                    outcomes=_trace_outcomes)
+            # Confirmations first so a large report cannot push them past the trace
+            # outcome cap. Add report rows after them for candidate/missing context.
+            _confirmed_keys = {(r["endpoint"], r["class"], r["rule_id"])
+                               for r in learning_confirmations}
+            _trace_outcomes = learning_confirmations + [
+                r for r in _trace_outcomes
+                if (r["endpoint"], r["class"], r["rule_id"]) not in _confirmed_keys
+            ]
+            checked_execution = hunt_trace.execution_from_active_meta(active_meta, clean_target)
+            trace_written = hunt_trace.record_trace(
+                runtime_dir, program=None, target=clean_target,
+                surface=hunt_trace_surface, plan=hunt_trace_plan, outcomes=_trace_outcomes,
+                execution=checked_execution)
+            if trace_written:
+                hunt_train.maybe_auto_train(runtime_dir, seed_dir=seed_dir)
             # Fold the same (plan, outcomes) into the endpoint-scoped negative-knowledge memory: a
             # planned (endpoint, class) that did not confirm becomes a miss, a confirmed one is
             # immunized. This is what the NEXT run's cooled_pairs() reads to deprioritise inert ground.
             # record_hunt is internally fail-closed; it also honours the GREYIQ_NO_NEGATIVE_KNOWLEDGE
             # kill switch and runtime_dir is None.
             #
-            # `complete` decides whether MISSES may be recorded at all. The prover walks
-            # probe_priority in order and stops when its request budget is gone, so on a truncated run
-            # the TAIL of the plan was never probed — recording those as misses would conflate "never
-            # executed" with "executed and inert" and would systematically cool exactly the endpoints
-            # that never got a fair chance. Only a run that errored nowhere, was in scope, was not
-            # rate-limited and was not skipped may teach a negative; confirmations are recorded either
-            # way, since they only ever grant immunity.
-            _nk_complete = (
-                not scan_errors
-                and active_meta.get("in_scope") is True
-                and not active_meta.get("rate_limited")
-                and not str(active_meta.get("skipped_reason") or "").strip()
-            )
-            # IMMUNITY MUST BE DECIDED ON WHAT THE ENGINE PROVED, NOT ON WHAT THIS REPORT SHOWED.
-            # `_trace_outcomes` is built from the REPORTABLE findings, which the report-side filters
-            # above already narrowed: the focus class (`-c xss` shows only xss — it never restricts
-            # what the prover probed), duplicate-lead grouping, and operator dismissals. A pair that
-            # genuinely confirmed can therefore be missing from those outcomes, and would then be
-            # written down as a MISS — cooling a route the engine actually proved, which is exactly
-            # the ever_confirmed immunity this store promises. So fold in every UNFILTERED finding the
-            # confirm gate accepts before recording.
-            _nk_outcomes = list(_trace_outcomes)
-            for _f in annotated:
-                if not isinstance(_f, dict) or not _f.get("class_id"):
-                    continue
-                try:
-                    if investigator.has_confirming_artifact(_f, {}):
-                        _nk_outcomes.append({
-                            "endpoint": str(_f.get("location") or _f.get("source_url") or clean_target),
-                            "class": str(_f.get("class_id") or ""),
-                            "proof_status": "confirmed",
-                        })
-                except Exception:  # noqa: BLE001 - immunity bookkeeping must never break a hunt
-                    continue
+            # Negative knowledge sees the same verifier-certified coverage as the
+            # trainer. A global clean flag cannot prove the plan's tail was checked.
+            _nk_plan = {"probe_priority": checked_execution}
+            # The same unfiltered confirmations immunize negative knowledge.
+            _nk_outcomes = _trace_outcomes
             negative_knowledge.record_hunt(runtime_dir, program=None, target=clean_target,
-                                           plan=hunt_trace_plan, outcomes=_nk_outcomes,
-                                           complete=bool(_nk_complete))
+                                           plan=_nk_plan, outcomes=_nk_outcomes,
+                                           complete=bool(checked_execution))
             # This run becomes the next run's baseline. Recorded here, beside the trace, and on
             # the same condition — only a direct hunt does its own recon, so only a direct hunt
             # observed a surface to remember. The blocked chains travel with it: that is what
@@ -3062,6 +3885,14 @@ def _run_bounty_hunt_body(
         fsutil.write_text_safe(json_path, json.dumps(json_doc, indent=2, default=str))
     except OSError as exc:
         return {"ok": False, "error": f"Could not write the report: {exc}"}
+
+    # A campaign owns the aggregate trace. Deliver only proof-backed class metadata
+    # after the per-URL report succeeded; this stays local and out of the API result.
+    if callable(on_learning_outcomes):
+        try:
+            on_learning_outcomes(learning_confirmations)
+        except Exception:  # noqa: BLE001 - an advisory callback must never break a hunt
+            pass
 
     # Optional: one self-contained, submission-ready file per finding.
     per_finding_paths: list[str] = []
@@ -3106,6 +3937,7 @@ def _run_bounty_hunt_body(
         "brain_model": f"{brain.get('provider')}:{brain.get('model')}" if brain.get("used") else "",
         "next_steps": ctx["next_steps"],
         "coverage": ctx["coverage"],
+        "mcp_review": ctx["mcp_review"],
         "investigation": json_doc["investigation"],
         # Sub-finding escalation clues. Returned so a CAMPAIGN can chain across targets — a
         # session cookie scoped to the parent domain here and a claimable subdomain there is

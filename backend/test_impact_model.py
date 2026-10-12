@@ -57,6 +57,67 @@ class ImpactModelTests(unittest.TestCase):
         self.assertIn("## References", md)
         self.assertIn("https://", md)
 
+    def test_every_cvss_block_in_the_package_agrees_with_its_own_vector(self) -> None:
+        """No CVSS block may print a score/severity that its vector does not produce.
+
+        Eight of the eleven hardcoded blocks in bughunter/ had drifted: a confirmed post-logout session
+        replay rendered "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:L/A:N — 6.5 medium" for a 7.1 High
+        vector, two stored-XSS blocks under-reported 8.7 as 8.0, and an API-discovery block printed
+        "low" beside a 5.3 (Medium) vector. A triager who pastes the vector into the NVD calculator and
+        gets a different number stops trusting the report, and the severity the platform receives comes
+        from the score — so the drift silently mis-filed findings. impact_model.cvss_block derives both
+        from the one vector; this walks the package's source and fails if a literal pair reappears.
+        """
+        import re
+
+        pattern = re.compile(
+            r'"vector"\s*:\s*"(?P<vector>(?:CVSS:3\.1/)?AV:[^"]+)"'
+            r'(?:[^{}]|\{[^{}]*\})*?"base_score"\s*:\s*(?P<score>[\d.]+)'
+            r'(?:[^{}]|\{[^{}]*\})*?"base_severity"\s*:\s*"(?P<severity>[^"]+)"',
+            re.S,
+        )
+        checked = 0
+        helper_uses = 0
+        for path in sorted((BACKEND_DIR / "bughunter").rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            if path.name != "impact_model.py":
+                helper_uses += source.count("cvss_block(")
+            for match in pattern.finditer(source):
+                checked += 1
+                vector = match.group("vector")
+                expected = impact_model.cvss_base_score(vector)
+                line = source[: match.start()].count("\n") + 1
+                where = f"{path.relative_to(BACKEND_DIR)}:{line}"
+                with self.subTest(block=where):
+                    self.assertAlmostEqual(
+                        float(match.group("score")), expected["score"], places=1,
+                        msg=f"{where}: vector {vector} scores {expected['score']}, not {match.group('score')} "
+                            f"— use impact_model.cvss_block(vector, ...) instead of literals")
+                    self.assertEqual(
+                        match.group("severity").lower(), expected["severity"].lower(),
+                        f"{where}: vector {vector} is {expected['severity']}, not {match.group('severity')}")
+        # Zero literal pairs is the IDEAL state (every block now derives from its vector), so the
+        # anti-vacuity check is on the mechanism instead: the helper must actually be in use across the
+        # package. Without this the test would keep passing if someone deleted the CVSS blocks outright,
+        # or if the literal shape changed enough that the scan stopped matching anything.
+        self.assertGreaterEqual(
+            helper_uses, 8,
+            "impact_model.cvss_block is barely used — CVSS blocks may have drifted back to literals "
+            f"(found {checked} literal pair(s), {helper_uses} helper call(s))")
+
+    def test_cvss_block_derives_score_and_severity_from_the_vector(self) -> None:
+        block = impact_model.cvss_block("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:L/A:N",
+                                        estimated=False, justification="because")
+        self.assertEqual(block["base_score"], 7.1)
+        self.assertEqual(block["base_severity"], "High")
+        self.assertFalse(block["estimated"])
+        self.assertEqual(block["justification"], "because")
+        self.assertEqual(block["vector"], "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:L/A:N")
+        # Defaults keep a caller that only has a vector honest rather than silently "estimated".
+        bare = impact_model.cvss_block("AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N")
+        self.assertEqual((bare["base_score"], bare["base_severity"]), (5.3, "Medium"))
+        self.assertFalse(bare["estimated"])
+
     def test_cvss_base_scores_match_nvd_reference(self) -> None:
         refs = {
             "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H": 9.8,

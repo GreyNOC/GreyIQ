@@ -33,14 +33,22 @@ HOW THIS GUARD WORKS
 --------------------
 Hashes are captured at MODULE IMPORT. Both runners — pytest collection and
 ``unittest discover`` — import every test module before executing any test, so the
-snapshot is taken before the suite runs and the assertion below is checked after the
-polluting file would have run (``b`` sorts before ``r``). A test that escapes into the
-real store fails this test, the same control ``hunt-process`` applies to its own append-
-only store by hashing it around the run.
+snapshot is taken before the suite runs. A test that escapes into the real store fails
+this test, the same control ``hunt-process`` applies to its own append-only store by
+hashing it around the run.
 
-It is deliberately NOT a fixture or a conftest: ``npm run check:python`` is
-``unittest discover``, which never loads a ``conftest.py``, so a pytest-only guard would
-not cover the project's own gate.
+It is deliberately a plain test module rather than a fixture or a conftest hook, so it
+holds under either runner. That portability is the point and not a detail: this project's
+gate has been both. ``npm run check:python`` was ``unittest discover``, which never loads
+a ``conftest.py``; it is now ``pytest -q`` (plus ``scripts/check-syntax.py``), and
+``backend/conftest.py`` exists for unrelated DNS fixtures. A guard written against either
+runner's plumbing would have been silently dropped by that change — this one was not.
+
+One honest limit: the check runs in collection order, so it catches a polluting module
+that sorts BEFORE ``test_runtime_store_isolation`` within the same run, and catches a
+later one on the NEXT run (whose import-time snapshot already contains the damage). That
+is how ``test_web_scan_service.py`` was found, one run after ``test_bounty_progress.py``
+was fixed. A run-late signal is still a signal; silence was the actual failure mode.
 
 A test that legitimately needs the real store's CONTENT may read it. Nothing may write it:
 pass a ``tempfile.TemporaryDirectory()`` as ``runtime_dir``, which is what every call site

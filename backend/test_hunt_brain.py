@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
@@ -106,14 +107,14 @@ class HuntBrainTests(unittest.TestCase):
         self.assertTrue(plan["used"])                 # the call happened
         self.assertEqual(plan["param_hypotheses"], [])  # but nothing usable -> empty, no crash
 
-    def test_coder_error_degrades_to_the_offline_rules(self) -> None:
+    def test_coder_error_uses_scope_safe_offline_plan(self) -> None:
         """A brain that could not be REACHED hands the hunt to the offline rule engine.
 
-        This used to assert the empty plan (``used`` False, no hypotheses). That was the
-        wrong contract: a configured-but-unreachable brain left the hunt blinder than
-        configuring no brain at all, which gets the full rule plan. It matters most for a
-        hosted inference endpoint, where "configured but not answering right now" is routine
-        — cold start, model loading, 503, rate limit.
+        This once asserted the empty plan (``used`` False, no hypotheses). That was the wrong
+        contract: a configured-but-unreachable brain left the hunt blinder than configuring no
+        brain at all, which gets the full rule plan. It matters most for a hosted inference
+        endpoint, where "configured but not answering right now" is routine — cold start,
+        model loading, 503, rate limit.
 
         Still fail-closed in the sense that matters: nothing the brain produced is used, and
         the plan is attributed to the offline engine rather than to the model.
@@ -123,10 +124,11 @@ class HuntBrainTests(unittest.TestCase):
         coder.generate = boom
         plan = hunt_brain.plan_hunt({}, "https://app.example.com/", "app.example.com", SURFACE)
         self.assertEqual(plan["provider"], "offline")
+        self.assertTrue(plan["used"])
         self.assertEqual(plan["model"], "greyiq-offline-hunt")
         self.assertTrue(plan["probe_priority"], "the hunt must not go out blind")
         for row in plan["probe_priority"]:  # and the rules can't invent surface either
-            self.assertIn(row["endpoint"], set(SURFACE.get("endpoints") or []))
+            self.assertIn(row["endpoint"], SURFACE["endpoints"])
 
     def test_hijacked_nonlist_fields_are_fail_closed(self) -> None:
         # vet finding: a hijacked page could make the model return well-formed JSON whose fields are
@@ -421,6 +423,31 @@ class ReasoningBrainGateTests(unittest.TestCase):
             self.assertFalse(coder.reasoning_brain_enabled(cfg), cfg)
 
 
+class HuggingFaceHuntIntegrationTests(unittest.TestCase):
+    def test_selected_gguf_drives_the_hunt_planner_through_ollama(self) -> None:
+        model = "hf.co/acme/Code-GGUF:Q4_K_M"
+        cfg = coder.merge_update(None, {"enabled": True, "provider": "local", "local": {"model": model}})
+        answer = {"content": '{"param_hypotheses": ["returnUrl"], "probe_priority": []}'}
+        with patch.object(coder, "ollama_chat", return_value=answer) as chat:
+            plan = hunt_brain.plan_hunt(cfg, "https://app.example.com/", "app.example.com", SURFACE)
+        self.assertEqual(chat.call_count, 1)
+        self.assertEqual(chat.call_args.args[1], model)
+        self.assertEqual(plan["provider"], "local")
+        self.assertEqual(plan["model"], model)
+        self.assertIn("returnUrl", plan["param_hypotheses"])
+
+    def test_unavailable_local_model_uses_bounded_offline_plan(self) -> None:
+        model = "hf.co/acme/Code-GGUF:Q4_K_M"
+        cfg = coder.merge_update(None, {"enabled": True, "provider": "local", "local": {"model": model}})
+        baseline = hunt_brain.plan_hunt({"enabled": False}, "https://app.example.com/", "app.example.com", SURFACE)
+        with patch.object(coder, "ollama_chat", side_effect=coder.CoderError("Ollama offline")):
+            plan = hunt_brain.plan_hunt(cfg, "https://app.example.com/", "app.example.com", SURFACE)
+        self.assertEqual(plan["provider"], "offline")
+        self.assertEqual(plan["probe_priority"], baseline["probe_priority"])
+        for row in plan["probe_priority"]:
+            self.assertIn(row["endpoint"], SURFACE["endpoints"])
+
+
 class DeterministicVeteranPlannerTests(unittest.TestCase):
     def _classes(self, endpoint: str, *, tech=None, forms=None) -> list[str]:
         plan = hunt_brain.heuristic_plan({"endpoints": [endpoint], "tech": tech or [], "forms": forms or []})
@@ -476,6 +503,115 @@ class DeterministicVeteranPlannerTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertLessEqual(len(first["probe_priority"]), hunt_brain._MAX_PRIORITY_ROWS)
         self.assertTrue(all(len(row["classes"]) <= 6 for row in first["probe_priority"]))
+
+
+class TheCapKeepsTheBestRowsNotTheFirstTests(unittest.TestCase):
+    """A capped priority list must spend its rows on the strongest endpoints recon found.
+
+    Two defects, one catastrophic together. ``_CLOUD_SIGNALS`` included "static", "assets" and "cdn",
+    so on any bundled front end EVERY chunk URL matched and scored 70 as "cloud-storage semantic" --
+    and the cap was applied by ``break``-ing at _MAX_PRIORITY_ROWS, i.e. keeping whatever recon
+    crawled FIRST. Recon crawls the HTML head first, which is exactly where the asset URLs are.
+
+    Measured before the fix, on 20 asset URLs followed by 6 high-signal endpoints: all 20 rows went
+    to asset URLs and ``/admin/users``, ``/actuator/env``, ``/download?file=``, ``/search?q=``,
+    ``/api/orders/42`` and ``/redirect?url=`` were every single one evicted. The planner reported a
+    full, confident 20-row plan containing nothing a prover could confirm.
+    """
+
+    ASSETS = ([f"https://t.example/static/js/chunk-{i}.js" for i in range(12)]
+              + [f"https://t.example/assets/css/app-{i}.css" for i in range(8)])
+    GOLD = {
+        "https://t.example/actuator/env": "debug",
+        "https://t.example/download?file=a.pdf": "path-traversal",
+        "https://t.example/search?q=x": "sqli",
+        "https://t.example/redirect?url=z": "redirect",
+    }
+
+    def _plan(self) -> list[dict]:
+        surface = {"endpoints": self.ASSETS + list(self.GOLD), "params": ["q", "file", "url"], "tech": []}
+        return hunt_brain.heuristic_plan(surface)["probe_priority"]
+
+    def test_no_row_is_spent_on_a_served_build_artifact(self) -> None:
+        rows = self._plan()
+        wasted = [r["endpoint"] for r in rows if "/static/" in r["endpoint"] or "/assets/" in r["endpoint"]]
+        self.assertEqual(wasted, [], f"{len(wasted)} capped row(s) went to bundled assets")
+
+    def test_every_high_signal_endpoint_survives_the_cap(self) -> None:
+        kept = {row["endpoint"] for row in self._plan()}
+        for endpoint in self.GOLD:
+            with self.subTest(endpoint=endpoint):
+                self.assertIn(endpoint, kept, "a high-signal endpoint was evicted by the cap")
+
+    def test_rows_come_back_strongest_first(self) -> None:
+        # The prover walks this list in order, so the ordering IS the budget allocation.
+        scores = [int(row["score"]) for row in self._plan()]
+        self.assertEqual(scores, sorted(scores, reverse=True), f"not strongest-first: {scores}")
+
+    def test_each_high_signal_endpoint_leads_with_the_class_its_shape_justifies(self) -> None:
+        rows = {row["endpoint"]: row["classes"] for row in self._plan()}
+        for endpoint, expected in self.GOLD.items():
+            with self.subTest(endpoint=endpoint):
+                self.assertEqual(rows[endpoint][0], expected)
+
+    def test_the_cap_is_still_enforced(self) -> None:
+        many = [f"https://t.example/download-{i}?file=a" for i in range(60)]
+        rows = hunt_brain.heuristic_plan({"endpoints": many, "params": ["file"], "tech": []})["probe_priority"]
+        self.assertLessEqual(len(rows), hunt_brain._MAX_PRIORITY_ROWS)
+
+    def test_the_plan_is_deterministic_across_runs_and_input_order(self) -> None:
+        # A hunt replans on an unchanged surface and must get the same plan; sorting by score alone
+        # would leave ties to Python's sort stability, i.e. to discovery order.
+        surface = {"endpoints": self.ASSETS + list(self.GOLD), "params": ["q", "file", "url"], "tech": []}
+        first = hunt_brain.heuristic_plan(surface)["probe_priority"]
+        self.assertEqual(first, hunt_brain.heuristic_plan(surface)["probe_priority"])
+        shuffled = {**surface, "endpoints": list(reversed(surface["endpoints"]))}
+        by_endpoint = {r["endpoint"]: r["classes"] for r in hunt_brain.heuristic_plan(shuffled)["probe_priority"]}
+        self.assertEqual({r["endpoint"]: r["classes"] for r in first}, by_endpoint,
+                         "the surviving set depends on crawl order, which is what the cap bug was")
+
+
+class CloudExposureIsScoredFromTheHostTests(unittest.TestCase):
+    """The reliable tell for an object store is the hostname, not a path word."""
+
+    def _classes(self, url: str, tech: list[str] | None = None) -> list[str]:
+        rows = hunt_brain.heuristic_plan({"endpoints": [url], "params": [], "tech": tech or []})["probe_priority"]
+        return rows[0]["classes"] if rows else []
+
+    def test_a_bucket_shaped_host_is_a_strong_cloud_signal(self) -> None:
+        for url in ("https://backups.s3.amazonaws.com/db.sql",
+                    "https://storage.googleapis.com/acme-private/report.pdf",
+                    "https://acme.blob.core.windows.net/media/x.png"):
+            with self.subTest(url=url):
+                self.assertIn("cloud-exposure", self._classes(url))
+
+    def test_an_app_origin_build_artifact_is_not_a_cloud_target(self) -> None:
+        for url in ("https://t.example/static/js/chunk-0.js", "https://t.example/assets/css/app.css",
+                    "https://t.example/cdn/fonts/inter.woff2"):
+            with self.subTest(url=url):
+                self.assertNotIn("cloud-exposure", self._classes(url),
+                                 "a served build artifact is being planned as an object store")
+
+    def test_a_bucket_ish_path_word_still_counts(self) -> None:
+        # Narrowing the list must not have removed the genuine cases.
+        self.assertIn("cloud-exposure", self._classes("https://t.example/s3-proxy/download?key=x"))
+
+    def test_a_tech_fingerprint_alone_no_longer_promotes_an_asset_url(self) -> None:
+        # Before: any AWS/S3 fingerprint on the target scored every URL at 70, assets included.
+        self.assertNotIn("cloud-exposure",
+                         self._classes("https://t.example/static/js/chunk-0.js", tech=["AWS", "CloudFront"]))
+
+    def test_every_class_this_planner_proposes_is_one_the_prover_can_confirm(self) -> None:
+        # The membership gate, re-asserted over the new signals: a plan that names a class no check
+        # can confirm sends the prover after something it can never close.
+        surface = {"endpoints": ["https://backups.s3.amazonaws.com/db.sql",
+                                 "https://t.example/s3-proxy/download?key=x",
+                                 "https://t.example/actuator/env"],
+                   "params": [], "tech": ["AWS"]}
+        for row in hunt_brain.heuristic_plan(surface)["probe_priority"]:
+            for class_key in row["classes"]:
+                with self.subTest(endpoint=row["endpoint"], cls=class_key):
+                    self.assertIn(class_key, PROVER_CLASSES)
 
 
 if __name__ == "__main__":

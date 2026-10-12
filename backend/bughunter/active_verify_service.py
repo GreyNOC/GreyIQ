@@ -52,9 +52,9 @@ import time
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-from bughunter import digest_builder, impact_model, sensitive_data
+from bughunter import digest_builder, impact_model, operator_guard, sensitive_data
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.prover_classes import PROVER_CLASSES
 from bughunter.rate_limit import HostRateGovernor
@@ -73,6 +73,7 @@ from bughunter.web_scan_service import (
     _USER_AGENT,
     _consume,
     _guard_url,
+    _require_exact_scope_host,
     current_user_agent,
 )
 
@@ -179,19 +180,30 @@ def _registrable(host: str) -> str:
     return registrable_domain(host)
 
 
+_HOST_ONLY_SCOPE_TOKEN = re.compile(r"(?:\*\.)?(?:[\w-]+\.)+[\w-]+\Z")
+
+
 def _scope_hosts(scope: str) -> set[str]:
-    """Extract dotted host tokens from free-text scope, normalizing pasted URLs and
-    `*.`-wildcards to bare hosts. Used for EXACT / proper-suffix matching — never a
-    substring test (so 'example.com' can't match scope text 'notexample.com')."""
+    """Extract host-only tokens; never widen a URL/path/port policy to its host.
+
+    A bare host retains the established exact/proper-subdomain semantics below.
+    URL-shaped scope (including a scheme-only URL) cannot prove permission for
+    another scheme or path, so it contributes no active-scan authority. A separate
+    host-only token can still grant the wider host explicitly.
+    """
     hosts: set[str] = set()
-    for raw in re.split(r"[\s,;]+", (scope or "").lower()):
-        token = raw.strip().strip("()<>[]\"'")
-        if not token:
-            continue
-        token = (urlparse(token).hostname or "") if "://" in token else token.split("/", 1)[0]
-        token = token.lstrip("*").lstrip(".")
-        if token and "." in token:  # require a dotted host, not a bare word
-            hosts.add(token)
+    for word in re.split(r"\s+", (scope or "").lower()):
+        # A comma/semicolon inside a URL path or query is not a separator that
+        # creates an independent host grant. Stop examining this whole word once
+        # any segment is URL-shaped; whitespace can begin a new, explicit token.
+        for raw in re.split(r"[,;]+", word):
+            token = raw.strip().strip("()<>[]\"'")
+            if not token:
+                continue
+            if any(ch in token for ch in "/?:#@%\\"):
+                break
+            if _HOST_ONLY_SCOPE_TOKEN.fullmatch(token):
+                hosts.add(token.removeprefix("*."))
     return hosts
 
 
@@ -279,7 +291,8 @@ def _clean_param_names(names: Any) -> list[str]:
 
 
 def _candidate_params(url: str, extra: list[str] | None, default: tuple[str, ...], limit: int,
-                      priority: list[str] | None = None) -> list[str]:
+                      priority: list[str] | None = None,
+                      deprioritise: set[str] | None = None) -> list[str]:
     """Ordered, deduped parameter names a param-keyed check should probe: ``priority`` names FIRST
     (the reasoning layer's class-specific picks — e.g. the params it judges take a URL for SSRF, or
     reflect input for XSS — the highest-signal targets, so within the small per-check cap they get
@@ -289,7 +302,14 @@ def _candidate_params(url: str, extra: list[str] | None, default: tuple[str, ...
     endpoint with no discovered name still bails — they never invent an injection point.
 
     ``priority`` is NAMES ONLY (a name can never carry a payload); the check still supplies the payload
-    and independently confirms, so a brain-suggested name can raise recall but never precision."""
+    and independently confirms, so a brain-suggested name can raise recall but never precision.
+
+    ``deprioritise`` moves names to the BACK of the assembled list — names this program has already
+    probed without result. It is applied after every source is merged and BEFORE the cap, which is
+    the only place it can work: the caller cannot do it by reordering its own ``extra`` list, because
+    names parsed from the URL are merged ahead of that list and would still consume the whole cap on
+    an already-parametered target. Reordering only, never removal: the set is unchanged, so a name
+    that becomes interesting after a deploy is still reachable."""
     out: list[str] = []
     seen: set[str] = set()
 
@@ -309,6 +329,11 @@ def _candidate_params(url: str, extra: list[str] | None, default: tuple[str, ...
     if not out:
         for name in default:
             _add(name)
+    if deprioritise:
+        stale_keys = {str(n).strip().lower() for n in deprioritise if str(n or "").strip()}
+        if stale_keys:
+            out = ([n for n in out if n.strip().lower() not in stale_keys]
+                   + [n for n in out if n.strip().lower() in stale_keys])
     return out[:limit]
 
 
@@ -355,21 +380,56 @@ class _Http:
     and a process-wide per-host token bucket (the governor)."""
 
     def __init__(self, settings: Any, governor: HostRateGovernor, max_requests: int = 12,
-                 auth: AuthContext | None = None) -> None:
+                 auth: AuthContext | None = None, scope_host: str = "") -> None:
         self.settings = settings
         self.governor = governor
         self.max_requests = max(1, int(max_requests))
         self.auth = auth  # operator session, attached SAME-SITE only (never to a foreign bucket)
+        self.scope_host = scope_host  # optional exact host for chat-initiated verification
         self.sent = 0
-        self.opener = build_opener(_NoRedirect())
+        self.failed = 0  # failed fetches, including those swallowed inside a check
+        self.halt_reason = ""
+        self._operator_direct = operator_guard.current() is not None or bool(scope_host)
+        self.opener = build_opener(_NoRedirect(), ProxyHandler({})) if self._operator_direct else build_opener(_NoRedirect())
 
     def fetch(self, url: str, *, method: str = "GET", extra_headers: dict[str, str] | None = None,
               read_body: bool = True) -> dict[str, Any]:
+        try:
+            return self._fetch_impl(url, method=method, extra_headers=extra_headers,
+                                    read_body=read_body)
+        except (_ActiveError, _RateLimited, WebsiteFetchError):
+            self.failed += 1
+            raise
+
+    def _fetch_impl(self, url: str, *, method: str = "GET", extra_headers: dict[str, str] | None = None,
+                    read_body: bool = True) -> dict[str, Any]:
+        # An injected/reused _Http built before the guard was bound must still
+        # switch to direct transport before it can issue an unattended request.
+        if (operator_guard.current() is not None or self.scope_host) and not self._operator_direct:
+            self.opener = build_opener(_NoRedirect(), ProxyHandler({}))
+            self._operator_direct = True
         method = method.upper()
         if method not in _SAFE_METHODS:  # belt-and-suspenders; callers never pass others
             raise _ActiveError(f"refused non-idempotent method {method}")
+        if self.halt_reason:
+            raise _RateLimited()
+        if self.scope_host and extra_headers and any(
+            str(name).lower() in {"host", "x-forwarded-host", "x-original-host", "x-host", "forwarded", "x-forwarded-server"}
+            for name in extra_headers
+        ):
+            # An HTTP Host override can route the request to another virtual
+            # host even though the URL, DNS answer, and socket IP are in scope.
+            raise _ActiveError("Exact-host verification refuses virtual-host routing headers.")
         if self.sent >= self.max_requests:  # per-hunt budget, independent of the host bucket
             raise _RateLimited()
+        # The normal hunt scope permits named subdomains and selected bucket hosts.
+        # A chat command authorizes only ONE exact host, so check every generated
+        # URL here, before DNS, the governor, or a socket can be reached.
+        try:
+            _require_exact_scope_host(url, self.scope_host)
+        except WebsiteFetchError as exc:
+            raise _ActiveError(str(exc)) from exc
+        operator_guard.before_request(url, method=method, reserve=False)
         # guarded_dns_scope() covers guard-check through the real connect so the DNS
         # pin _guard_url() installs is still in effect when the actual HTTP connect
         # (a few lines down) independently re-resolves the same hostname — closing the
@@ -380,6 +440,9 @@ class _Http:
             host = urlparse(sanitized).hostname or ""
             if not self.governor.throttle(host):
                 raise _RateLimited()
+            # A governor may sleep while an operator presses Stop or a policy is
+            # edited. Recheck immediately before the socket opens.
+            operator_guard.before_request(sanitized, method=method, reserve=True)
             self.sent += 1
             headers = {"User-Agent": current_user_agent(_USER_AGENT), "Accept": "*/*", "Accept-Encoding": "identity"}
             # Operator auth is attached ONLY when this request's host is same-site as the
@@ -389,20 +452,26 @@ class _Http:
             if extra_headers:
                 headers.update(extra_headers)
             request = Request(sanitized, headers=headers, method=method)
-            # This retry loop is still ONE logical probe -- self.sent and the governor
-            # token were already spent once above, and are never spent again here, no
-            # matter how many attempts a single fetch() call takes.
-            for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
+            # An exact-host chat run promises a physical request ceiling, so it
+            # cannot retry a failed send without spending a second budget slot.
+            # Legacy hunt runs retain their existing one-retry behavior.
+            max_attempts = 1 if self.scope_host else _MAX_FETCH_ATTEMPTS
+            for attempt in range(1, max_attempts + 1):
                 # Time ONLY the request (not the governor throttle, and not a prior
                 # attempt's backoff sleep), so a time-based check measures the server,
                 # not our own rate-limit/retry delay.
                 started = time.monotonic()
                 try:
                     with self.opener.open(request, timeout=self.settings.web_fetch_timeout_seconds) as resp:
+                        pre_status = getattr(resp, "status", None) or getattr(resp, "code", 0)
+                        operator_guard.observe_response({"status": pre_status, "headers": dict(resp.headers),
+                                                         "body": "", "final_url": resp.geturl()}, stage="headers")
                         consumed = _consume(resp, self.settings, read_body=read_body)
                         consumed["final_url"] = resp.geturl()
                         consumed["location"] = resp.headers.get("Location") if resp.headers else None
                         consumed["elapsed"] = time.monotonic() - started
+                        operator_guard.observe_response(consumed, stage="body" if pre_status else "complete")
+                        self._observe_scoped_block(consumed)
                         return consumed
                 except HTTPError as exc:
                     # A 3xx (captured, not followed) or 4xx/5xx is a valid observation
@@ -411,17 +480,41 @@ class _Http:
                     # path/debug probes, error-SQLi, alg:none control), so close it or every
                     # errored probe leaks an FD until GC.
                     try:
+                        pre_status = getattr(exc, "status", None) or getattr(exc, "code", 0)
+                        operator_guard.observe_response({"status": pre_status, "headers": dict(exc.headers),
+                                                         "body": "", "final_url": sanitized}, stage="headers")
                         consumed = _consume(exc, self.settings, read_body=read_body)
                         consumed["final_url"] = sanitized
                         consumed["location"] = exc.headers.get("Location") if exc.headers else None
                         consumed["elapsed"] = time.monotonic() - started
+                        operator_guard.observe_response(consumed, stage="body" if pre_status else "complete")
+                        self._observe_scoped_block(consumed)
                         return consumed
                     finally:
                         exc.close()
                 except (URLError, TimeoutError, OSError) as exc:
-                    if attempt >= _MAX_FETCH_ATTEMPTS:
+                    # A retry is a second real socket send. In unattended mode
+                    # it would need a fresh authorization/budget/Stop check, so
+                    # fail closed after the first transport failure instead.
+                    if operator_guard.current() is not None or attempt >= max_attempts:
                         raise _ActiveError(str(exc)) from exc
                     time.sleep(_FETCH_RETRY_BACKOFF_S * attempt)
+
+    def _observe_scoped_block(self, response: dict[str, Any]) -> None:
+        """Stop a chat run after rate limiting or an explicit anti-bot challenge."""
+        if not self.scope_host:
+            return
+        status = int(response.get("status") or 0)
+        headers = response.get("headers") or {}
+        header_text = " ".join(f"{key}: {value}" for key, value in headers.items()).lower()
+        if status == 429:
+            self.halt_reason = "The host rate limited the assessment."
+        elif "cf-mitigated: challenge" in header_text or (
+            status in {301, 302, 303, 307, 308, 403, 503}
+            and any(marker in (header_text + " " + str(response.get("body") or "")[:1000].lower())
+                    for marker in ("cf-chl", "challenge-platform", "verify you are human", "checking your browser", "bot challenge", "captcha"))
+        ):
+            self.halt_reason = "The host presented an anti-bot challenge."
 
 
 def _redact(value: str) -> str:
@@ -492,12 +585,37 @@ def _apply_class_priority(checks: list[tuple[str, Any]], class_priority: list[st
 
 def _finding(rule_id: str, title: str, severity: str, category: str, class_hint: str, url: str,
              proof: dict[str, Any], proof_evidence: dict[str, str], cvss: dict[str, Any] | None = None) -> dict[str, Any]:
+    evidence = dict(proof_evidence)
+    # NAME the sensitive data a captured body disclosed, for EVERY producer — not just CORS.
+    #
+    # sensitive_data's module docstring states the ordering rule: classify the RAW body, because
+    # redaction rewrites JWTs/tokens to [REDACTED_…] markers the classifier can no longer match, so
+    # classifying a redacted excerpt silently under-reports. Exactly one producer obeyed it
+    # (_cors_impact_tier), and it is the only reason that path can say "leaks a victim JWT + email".
+    # Every other capture — a served .env, an actuator/env dump, a GraphQL schema, a traversal read —
+    # left sensitive_data_labels unset, so report.py printed no "Sensitive data exposed:" line and
+    # bounty._write_sensitive_data_files skipped the finding entirely: the strongest impact evidence a
+    # disclosure finding has was simply never named.
+    #
+    # Doing it HERE, at the one choke point every check's evidence passes through, covers all 15
+    # in-module producers with one change and guarantees the raw-before-redaction ordering. The labels
+    # are generic English (never the secret itself), so they survive the redaction pass below intact.
+    # A producer that already classified (CORS) is left alone, and any failure is swallowed — naming
+    # the data is an impact enrichment and must never break a confirmed finding.
+    raw_body = str(evidence.get("read_data") or "")
+    if raw_body and not str(evidence.get("sensitive_data_labels") or "").strip():
+        try:
+            labels = sensitive_data.classify(raw_body)
+        except Exception:  # noqa: BLE001 - impact enrichment is best-effort, never load-bearing
+            labels = []
+        if labels:
+            evidence["sensitive_data_labels"] = "; ".join(labels)
     return {
         "rule_id": rule_id, "title": title, "severity": severity, "confidence": "high",
         "category": category, "file_path": url, "line_start": 1, "line_end": 1,
         "snippet": _redact(proof.get("observed_result") or "")[:240],
         "remediation": "", "redacted": True,
-        "proof_evidence": {k: _redact(v) for k, v in proof_evidence.items() if str(v or "").strip()},
+        "proof_evidence": {k: _redact(v) for k, v in evidence.items() if str(v or "").strip()},
         "_active_proof": proof,
         "_active_cvss": cvss,
         "_active_class_hint": class_hint,
@@ -572,7 +690,7 @@ def _check_cswsh(http: "_Http", url: str, landing: dict[str, Any] | None = None)
         {"request_line": f"GET {url}   (Upgrade: websocket; Origin: {_MARKER_ORIGIN})",
          "response_status": "101 Switching Protocols",
          "matched_value": f"Sec-WebSocket-Accept derived from the key we sent ({accept})"},
-        {"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:N/A:N", "base_score": 3.1, "base_severity": "low", "estimated": True},
+        impact_model.cvss_block("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:N/A:N", estimated=True),
     )
 
 def _cors_cvss(tier: str) -> dict[str, Any]:
@@ -602,6 +720,60 @@ def _cors_cvss(tier: str) -> dict[str, Any]:
         why = ("The CORS header misconfiguration is confirmed, but only on a non-sensitive response (non-2xx, "
                "empty, or unauthenticated), so no cross-origin read of sensitive authenticated data is "
                "demonstrated. Severity stays Low until impact is shown on an authenticated data endpoint.")
+    return {
+        "vector": vector,
+        "base_score": scored["score"],
+        "base_severity": scored["severity"],
+        "estimated": False,
+        "justification": why,
+    }
+
+
+def _exposure_cvss(severity: str, what: str) -> dict[str, Any] | None:
+    """A per-finding CVSS v3.1 block for a CONFIRMED unauthenticated read exposure, sized to the
+    check's own graded severity instead of the flat class default.
+
+    Why this exists: these checks grade each entry themselves (``_DEBUG_ENDPOINTS`` marks
+    ``/actuator/heapdump`` "critical" — a full JVM heap dump, i.e. every in-memory secret, token and
+    active session downloadable — while ``/actuator`` the index is "medium"), but they passed
+    ``cvss=None``, so bounty.py stamped ``impact_model.cvss_for_class('disclosure', ...)``: a flat
+    ``C:L`` / 5.3 Medium for all of them. Because the report resolves severity from the CVSS rather
+    than the raw label, a confirmed heap dump or a served ``.aws/credentials`` was SUBMITTED as
+    "Medium, low confidentiality impact" — under-reporting the most serious thing these checks find,
+    and contradicting the finding's own severity field.
+
+    Honest by construction: a read-only exposure claims confidentiality ONLY. Integrity and
+    availability stay ``I:N/A:N`` however serious the disclosure is, because GET-only evidence proves
+    no write or execution — that stays the province of the ``rce``-hinted entries (Jolokia), which
+    already carry their own class vector. The ceiling is therefore ``S:C/C:H`` (8.6 High), never
+    Critical, since 9.0+ requires impact this evidence cannot demonstrate.
+
+      critical — total secret/session material in the body (heap dump, cloud credentials, .env):
+                 scope change, because the credentials compromise components beyond this one.
+      high     — full configuration / logs / source-level internals (actuator env, phpinfo, logfile).
+      medium   — operational metadata only (actuator index, server-status): the class default.
+
+    Returns ``None`` for an unrecognised grade, so the caller falls back to today's class vector."""
+    tier = str(severity or "").strip().lower()
+    if tier == "critical":
+        vector = "AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N"
+        why = (f"Unauthenticated read of {what} is confirmed by a captured response against a control that "
+               "does not return it. Confidentiality is High and the scope is Changed because the disclosed "
+               "material (in-memory secrets/sessions or cloud credentials) authenticates to components "
+               "beyond this endpoint. Integrity and availability are scored None: the probe is GET-only, so "
+               "no write or execution is demonstrated.")
+    elif tier == "high":
+        vector = "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+        why = (f"Unauthenticated read of {what} is confirmed by a captured response against a control that "
+               "does not return it. Confidentiality is High (full configuration/internals are readable); "
+               "integrity and availability are None because the probe is GET-only.")
+    elif tier == "medium":
+        vector = "AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+        why = (f"Unauthenticated read of {what} is confirmed, but the disclosed content is operational "
+               "metadata rather than secrets, so confidentiality impact is Low.")
+    else:
+        return None
+    scored = impact_model.cvss_base_score(vector)
     return {
         "vector": vector,
         "base_score": scored["score"],
@@ -1461,7 +1633,11 @@ def _check_crlf(http: _Http, url: str, extra_params: list[str] | None = None) ->
                   # request/response shows the injected header exactly as it landed on the wire.
                   "response_header": f"X-Greyiq-Crlf: {_MARK}",
                   "matched_value": f"injected response header X-Greyiq-Crlf: {_MARK}"}
-            return _finding("active.crlf", f"CRLF / response-header injection via '{param}'", "high", "disclosure", "redirect", url, proof, ev)
+            # class_hint 'crlf', not 'redirect': what this proved is a response-header injection
+            # (CWE-113), and filing it as CWE-601 open redirect gave the report the wrong weakness and
+            # remediation. bounty.VULN_CLASSES['crlf'] and impact_model now carry the real entry. The
+            # scanner CATEGORY stays 'disclosure' so no unrelated disclosure finding is pulled in.
+            return _finding("active.crlf", f"CRLF / response-header injection via '{param}'", "high", "disclosure", "crlf", url, proof, ev)
     return None
 
 
@@ -2655,7 +2831,19 @@ def _check_sensitive_paths(http: _Http, url: str) -> dict[str, Any] | None:
             ev = {"request_line": f"GET {origin}{path}", "response_status": f"HTTP {status}", "matched_value": f"{name} exposed",
                   # The served file content IS the demonstrated exposure (secrets redacted once by _finding).
                   "read_data": body[:1200]}
-            return _finding("active.exposed-file", f"Sensitive file exposed: {path}", "high", "disclosure", "disclosure", url, proof, ev)
+            # Grade from the EVIDENCE, not the filename: a served file whose captured body classifies
+            # as real secret material (.env with live keys, .aws/credentials, wp-config.php.bak) is a
+            # credential exposure whose blast radius reaches other systems, so it earns the
+            # scope-changed C:H vector; a .git/config or a dump without recognisable secrets stays
+            # High-confidentiality but unchanged-scope. Without a per-finding vector both reported as
+            # the flat 'disclosure' class default of C:L / 5.3 Medium.
+            try:
+                graded = "critical" if sensitive_data.classify(body) else "high"
+            except Exception:  # noqa: BLE001 - grading is enrichment; fall back to the old flat 'high'
+                graded = "high"
+            return _finding("active.exposed-file", f"Sensitive file exposed: {path}", graded, "disclosure",
+                            "disclosure", url, proof, ev,
+                            cvss=_exposure_cvss(graded, f"{name} at {path}"))
     return None
 
 
@@ -2765,8 +2953,12 @@ def _check_debug_endpoints(http: _Http, url: str) -> dict[str, Any] | None:
             )
             ev = {"request_line": f"GET {origin}{path}", "response_status": f"HTTP {status}",
                   "matched_value": f"{name} exposed at {path}", "read_data": body[:1200]}
+            # Size the CVSS to THIS entry's graded severity. Only for the disclosure-classed entries:
+            # the one `rce`-hinted entry (Jolokia) must keep its class vector, which its limitations
+            # text above is written against.
+            exposure_cvss = None if class_hint == "rce" else _exposure_cvss(severity, f"{name} at {path}")
             return _finding("active.debug-endpoint", f"{name} exposed unauthenticated: {path}",
-                            severity, "disclosure", class_hint, url, proof, ev)
+                            severity, "disclosure", class_hint, url, proof, ev, cvss=exposure_cvss)
     return None
 
 
@@ -2785,6 +2977,7 @@ def verify_active(
     class_priority: list[str] | None = None,
     xss_params: list[str] | None = None,
     only_classes: list[str] | None = None,
+    scope_host: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run the active checks against an in-scope target. Returns
     ``(active_findings, meta)``. ``active_findings`` are confirmed/candidate finding
@@ -2806,13 +2999,19 @@ def verify_active(
     try:
         normalized = normalize_website_url(target_url)
     except WebsiteFetchError as exc:
-        return [], {"in_scope": False, "skipped_reason": str(exc), "host": "", "requests_used": 0, "rate_limited": False, "verified_classes": []}
+        return [], {"in_scope": False, "skipped_reason": str(exc), "host": "", "requests_used": 0, "rate_limited": False, "verified_classes": [], "checked_classes": []}
     host = urlparse(normalized).hostname or ""
+
+    try:
+        _require_exact_scope_host(normalized, scope_host)
+    except WebsiteFetchError as exc:
+        return [], {"in_scope": False, "host": host, "requests_used": 0,
+                    "rate_limited": False, "verified_classes": [], "skipped_reason": str(exc)}
 
     # Scope binding FIRST (no DNS, fail-closed): an unnamed host never gets probed.
     if not host_in_active_scope(host, scope, settings):
         return [], {
-            "in_scope": False, "host": host, "requests_used": 0, "rate_limited": False, "verified_classes": [],
+            "in_scope": False, "host": host, "requests_used": 0, "rate_limited": False, "verified_classes": [], "checked_classes": [],
             "skipped_reason": f"'{host}' was not named in the hunt scope, so active verification was skipped (passive only). "
                               "Name the host in Scope, set GREYIQ_ACTIVE_SCAN_ALLOWLIST, or scan your own infra with GREYIQ_SCAN_ALLOW_PRIVATE_URLS=1.",
         }
@@ -2820,14 +3019,24 @@ def verify_active(
     try:
         sanitized = _guard_url(normalized, settings.allow_private_urls, settings.web_allowed_ports)
     except WebsiteFetchError as exc:
-        return [], {"in_scope": True, "host": host, "requests_used": 0, "rate_limited": False, "verified_classes": [], "skipped_reason": f"target refused by the URL guard: {exc}"}
+        return [], {"in_scope": True, "host": host, "requests_used": 0, "rate_limited": False, "verified_classes": [], "checked_classes": [], "skipped_reason": f"target refused by the URL guard: {exc}"}
     host = urlparse(sanitized).hostname or host
 
     governor = governor or HostRateGovernor(
         capacity=settings.active_max_requests_per_host,
         min_interval_s=settings.active_min_interval_ms / 1000.0,
     )
-    http = http or _Http(settings, governor, max_requests=requests_budget, auth=auth)
+    if http is None:
+        http = _Http(settings, governor, max_requests=requests_budget, auth=auth,
+                     scope_host=scope_host)
+    elif scope_host:
+        # A caller injecting its own transport cannot weaken a chat exact-host
+        # grant. Only the guarded implementation can enforce it on *every* URL.
+        if not isinstance(http, _Http):
+            return [], {"in_scope": False, "host": host, "requests_used": 0,
+                        "rate_limited": False, "verified_classes": [],
+                        "skipped_reason": "Exact-host verification requires the guarded HTTP transport."}
+        http.scope_host = scope_host
 
     # Fetch the landing page once so header-only checks (clickjacking) reuse it.
     landing: dict[str, Any] | None = None
@@ -2928,6 +3137,10 @@ def verify_active(
         # explicitly requested cannot be starved by this heavier file-read sweep.
         ("path-traversal", lambda: _check_path_traversal(http, sanitized, discovered_params)),
     ]
+    if scope_host:
+        # A one-host chat grant covers the URL host, not alternate virtual hosts
+        # reachable by overriding Host or X-Forwarded-Host at a shared ingress.
+        checks = [check for check in checks if check[0] != "host-header"]
     # Reasoning-steered SELECTION, then ordering. The restriction runs first so the priority sort
     # ranks only what will actually run; both are pure and neither can add a check the list above
     # does not already define.
@@ -2951,9 +3164,20 @@ def verify_active(
     # check emits "rce"/"secrets"), while the re-planner needs the name of the CHECK to promote or
     # restrict. Keeping them side by side here avoids stamping another key onto the finding dicts.
     tagged: list[tuple[str, dict[str, Any]]] = []
+    # A plan is an ordering, not proof of execution. Track a class only when every
+    # applicable check in its suite completed and at least one check observed the
+    # landing response or sent a request. The trainer may use these as negatives;
+    # skipped, failed, and budget-starved checks must never become misses.
+    suite_size: dict[str, int] = {}
+    suite_done: dict[str, int] = {}
+    suite_observed: set[str] = set()
+    for suite_class, _check in checks:
+        suite_size[suite_class] = suite_size.get(suite_class, 0) + 1
     for _cls, check in checks:
         if rate_limited:
             break
+        before = int(getattr(http, "sent", 0) or 0)
+        failures_before = int(getattr(http, "failed", 0) or 0)
         try:
             result = check()
         except _RateLimited:
@@ -2969,14 +3193,29 @@ def verify_active(
             # as any other per-request failure -- it must never abort every check
             # ordered after it.
             result = None
+            continue
+        # A check may skip one failed candidate and still prove a later one. Keep
+        # that finding, while withholding negative coverage for the incomplete suite.
+        if int(getattr(http, "failed", 0) or 0) == failures_before:
+            suite_done[_cls] = suite_done.get(_cls, 0) + 1
+            # A passive candidate is still a finding, but it cannot teach the
+            # planner that this class was tested. Only a sent probe or a check
+            # explicitly satisfied by the landing response counts as observed.
+            if int(getattr(http, "sent", 0) or 0) > before or (
+                    landing is not None and _cls in {"clickjacking", "csrf"}):
+                suite_observed.add(_cls)
         if result:
             results.append(result)
             tagged.append((_cls, result))
 
     verified = sorted({r["_active_class_hint"] for r in results if r.get("_active_proof", {}).get("status") == "confirmed"})
+    checked = sorted(cls for cls, count in suite_size.items()
+                     if suite_done.get(cls, 0) == count and cls in suite_observed)
     meta = {
         "in_scope": True, "host": host, "requests_used": getattr(http, "sent", 0),
         "rate_limited": rate_limited, "verified_classes": verified,
+        "checked_classes": checked,
+        "halt_reason": getattr(http, "halt_reason", ""),
         "discovered_params_used": len(discovered_params),
         # Deterministic, redacted STRUCTURAL digest of the landing response (JSON key names, form
         # fields, security headers, cookie flag gaps, JWT header shape, error family) — built from a

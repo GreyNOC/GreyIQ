@@ -38,6 +38,7 @@ SOURCE_ID_BY_FILE = {
     "train.txt": "src_starter_knowledge",
     "greyiq_starter_knowledge.txt": "src_starter_knowledge",
     "greyiq_bug_bounty_knowledge.txt": "src_bug_bounty",
+    "greyiq_verified_replay.txt": "src_verified_replay",
     "greyiq_personal_choices.txt": "src_personal_choices",
     "greyiq_profile.txt": "src_personal_choices",
     "greyiq_preferred_examples.txt": "src_preferred_examples",
@@ -1880,6 +1881,7 @@ class KnowledgeBase:
         self.data_folder = self.base_dir / data_folder
         self.documents: list[tuple[str, str]] = []
         self.chunks: list[dict[str, str | int]] = []
+        self._verified_replay_stamp: tuple[int, int, int, int] | None = None
         self.reload()
 
     @property
@@ -1902,6 +1904,7 @@ class KnowledgeBase:
         self.documents = []
         self.chunks = []
         self.data_folder.mkdir(parents=True, exist_ok=True)
+        self._verified_replay_stamp = self._replay_stamp()
 
         for txt_path in sorted(self.data_folder.glob("*.txt")):
             try:
@@ -1945,6 +1948,46 @@ class KnowledgeBase:
                             "chargrams": None,
                         }
                     )
+    def _replay_stamp(self) -> tuple[int, int, int, int] | None:
+        try:
+            stat = (self.data_folder / "greyiq_verified_replay.txt").stat()
+        except OSError:
+            return None
+        return stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size
+
+    def _refresh_verified_replay(self) -> None:
+        """Apply admitted lessons to the live index on the next retrieval.
+
+        LearningEngine replaces the replay file atomically after a verified run.
+        Reindex only that source so a long-lived TinyGPT engine can use the new
+        lesson without a restart or a full corpus reload.
+        """
+        stamp = self._replay_stamp()
+        if stamp == self._verified_replay_stamp:
+            return
+        name = "greyiq_verified_replay.txt"
+        if stamp is not None:
+            try:
+                content = (self.data_folder / name).read_text(encoding="utf-8").strip()
+            except OSError:
+                return  # retry next retrieval if the atomic replacement is in progress
+        else:
+            content = ""
+        self.documents = [(source, body) for source, body in self.documents if source != name]
+        self.chunks = [chunk for chunk in self.chunks if chunk.get("source") != name]
+        if content:
+            self.documents.append((name, content))
+            for piece in _chunk_text(content):
+                self.chunks.append({
+                    "source": name,
+                    "source_lower": name,
+                    "source_id": "src_verified_replay",
+                    "text": piece,
+                    "search_text": piece.lower(),
+                    "tokens": None,
+                    "chargrams": None,
+                })
+        self._verified_replay_stamp = stamp
 
     def _chunk_tokens(self, chunk: dict) -> set:
         tokens = chunk.get("tokens")
@@ -1968,6 +2011,7 @@ class KnowledgeBase:
         *,
         source_ids: list[str] | tuple[str, ...] | set[str] | None = None,
     ) -> list[SourceMatch]:
+        self._refresh_verified_replay()
         query = query.strip()
         if not query or not self.chunks:
             return []
@@ -3664,19 +3708,32 @@ class SolinEngine:
         lowered = response.lower()
         return not any(pattern in lowered for pattern in low_confidence_patterns)
 
-    def append_chat_training_example(self, user_input: str, response: str) -> Path:
-        """Queue a good exchange for later offline retraining. This does not update weights live."""
-        data_dir = self.base_dir / DEFAULT_DATA_FOLDER
-        data_dir.mkdir(parents=True, exist_ok=True)
-        output_path = data_dir / CHAT_TRAIN_FILE
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        block = (
-            f"### AUTO CHAT TRAINING {timestamp} ###\n"
-            f"<START_CONVO>\n<USER>\n{user_input.strip()}\n<ASSISTANT>\n{response.strip()}\n<END_CONVO>\n\n"
+    def append_chat_training_example(
+        self, user_input: str, response: str, *, confidence: float = 0.0, grounded: bool = False
+    ) -> Path:
+        """Record an experience for offline verification; never update weights live."""
+        from learning_engine import Experience, ExperienceScore, LearningEngine, is_security_sensitive
+
+        engine = LearningEngine(self.base_dir)
+        score = ExperienceScore(
+            knowledge_confidence=confidence,
+            source_confidence=0.95 if grounded else 0.0,
+            answer_confidence=confidence,
+            tool_verification=0.95 if grounded else 0.0,
+            critic_score=confidence,
+            novelty_score=0.75,
         )
-        with output_path.open("a", encoding="utf-8") as handle:
-            handle.write(block)
-        return output_path
+        experience = Experience(
+            prompt=user_input.strip(),
+            response=response.strip(),
+            source="GreyIQ grounded retrieval" if grounded else "GreyIQ conversation",
+            model_version=self.model_path.stem if self.model_path else "untrained",
+            security_sensitive=is_security_sensitive(user_input),
+            score=score,
+        )
+        record = engine.record(experience)
+        pool = "verified" if record["outcome"] == "verified" else "failures"
+        return engine.pools[pool] / "experiences.jsonl"
 
     def _generation_settings(
         self,
@@ -3894,8 +3951,13 @@ class SolinEngine:
         ):
             self.chat_memory.add_exchange(user_input, response)
         if auto_capture and self._should_capture_training_example(user_input, response, diagnostics.used_fallback):
-            self.append_chat_training_example(user_input, response)
-            diagnostics.captured_for_training = True
+            capture_path = self.append_chat_training_example(
+                user_input,
+                response,
+                confidence=diagnostics.confidence,
+                grounded=bool(matches),
+            )
+            diagnostics.captured_for_training = "verified" in capture_path.parts
         return response, matches, diagnostics
 
     def generate_reply(

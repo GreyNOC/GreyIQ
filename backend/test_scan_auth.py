@@ -194,6 +194,15 @@ class SameRegistrableSiteTests(unittest.TestCase):
         # a session on one PaaS tenant must never be judged same-site with a sibling tenant
         self.assertFalse(sa.same_registrable_site("a.herokuapp.com", "b.herokuapp.com"))
         self.assertTrue(sa.same_registrable_site("myapp.herokuapp.com", "myapp.herokuapp.com"))
+        self.assertFalse(sa.same_registrable_site("attacker.s3.amazonaws.com", "victim.s3.amazonaws.com"))
+        self.assertFalse(sa.same_registrable_site("other.blob.core.windows.net",
+                                                  "myaccount.blob.core.windows.net"))
+
+    def test_provider_parent_never_receives_tenant_session(self) -> None:
+        self.assertFalse(sa.same_registrable_site("s3.amazonaws.com", "victim.s3.amazonaws.com"))
+        self.assertFalse(sa.same_registrable_site("victim.s3.amazonaws.com", "s3.amazonaws.com"))
+        self.assertFalse(sa.same_registrable_site("herokuapp.com", "victim.herokuapp.com"))
+        self.assertFalse(sa.same_registrable_site("victim.herokuapp.com", "herokuapp.com"))
 
     def test_empty_fails_closed(self) -> None:
         self.assertFalse(sa.same_registrable_site("", "acme.com"))

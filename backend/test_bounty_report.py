@@ -454,6 +454,177 @@ class BountyReportTests(unittest.TestCase):
         self.assertTrue(any("Passive web review" in c for c in cov["covered"]))
 
 
+class ReproductionStepsTests(unittest.TestCase):
+    """A triager's first act is to replay the bug, so every surface that delivers a repro must
+    deliver it as an ORDERED, NUMBERED procedure — and everything that counts steps has to count
+    the same steps the reader sees."""
+
+    # The two shapes a brain (or a cached/imported ctx) really hands over.
+    AS_STRING = "Send a GET to /search?q=marker\nObserve the marker reflected unencoded\nConfirm it executes"
+    AS_BLOB = ["1. Send a GET to /search?q=marker\n2. Observe reflection\n3. Confirm execution"]
+    AS_LIST = ["Send a GET to /search?q=marker", "Observe reflection", "Confirm execution"]
+
+    # A step that legitimately spans lines: a fenced example, and a shell continuation.
+    AS_FENCED = ["1. Send the crafted request:\n```\ncurl -i -X POST \\\n  -H 'Origin: x' \\\n  'https://t/api'\n```",
+                 "2. Observe the reflection in the response headers."]
+    AS_CONTINUATION = ["Replay the request:\ncurl -i \\\n  -H 'Origin: https://attacker.example' \\\n  'https://target/api'"]
+
+    def test_a_fenced_example_stays_inside_its_step(self) -> None:
+        """Splitting every line of a multiline item turned each request line and each fence marker
+        into its own numbered step, which breaks the Markdown fence and hands the triager a garbled
+        procedure — the exact failure normalize_steps exists to prevent."""
+        steps = report_lib.normalize_steps(self.AS_FENCED)
+        self.assertEqual(len(steps), 2, steps)
+        self.assertEqual(steps[0].count("```"), 2, "the fence was split across steps")
+        self.assertIn("curl -i -X POST", steps[0])
+        self.assertIn("'https://t/api'", steps[0])
+
+    def test_a_multiline_command_is_one_step(self) -> None:
+        steps = report_lib.normalize_steps(self.AS_CONTINUATION)
+        self.assertEqual(len(steps), 1, steps)
+        self.assertIn("-H 'Origin: https://attacker.example'", steps[0])
+
+    def test_a_fence_inside_an_enumerated_blob_survives_the_split(self) -> None:
+        """Both rules at once: the blob really is three steps, and step 1's fence must stay whole."""
+        steps = report_lib.normalize_steps(
+            "1. Run:\n```\nGET /a HTTP/1.1\nHost: t\n```\n2. Observe 200\n3. Confirm")
+        self.assertEqual(len(steps), 3, steps)
+        self.assertEqual(steps[0].count("```"), 2, steps[0])
+        self.assertEqual(steps[1], "Observe 200")
+
+    def test_every_shape_normalizes_to_the_same_numbered_procedure(self) -> None:
+        for label, raw in (("string", self.AS_STRING), ("blob", self.AS_BLOB), ("list", self.AS_LIST)):
+            with self.subTest(shape=label):
+                steps = report_lib.normalize_steps(raw)
+                self.assertEqual(len(steps), 3, f"{label} must yield three steps: {steps}")
+                for step in steps:
+                    self.assertNotRegex(step, r"^\s*(?:\d+[.)]|[-*•])\s",
+                                        "the renderer owns the numbering, not the source")
+                    self.assertNotIn("\n", step, "a step must be one line so numbering stays 1:1")
+
+    def test_a_bare_string_is_never_walked_character_by_character(self) -> None:
+        """The failure this guards: iterating a string yields 'S', 'e', 'n'… which reached the
+        operator's action plan as the literal opening move "S e"."""
+        self.assertEqual(report_lib.normalize_steps("Send the request")[0], "Send the request")
+
+    def test_the_readiness_check_counts_what_the_reader_sees(self) -> None:
+        """Reading the raw field measured a CHARACTER count for a string (so any prose passed on
+        length alone) and a single item for a multi-line blob (so a full procedure read as
+        'not specific enough'). Both must agree with the rendered step count."""
+        for label, raw in (("string", self.AS_STRING), ("blob", self.AS_BLOB), ("list", self.AS_LIST)):
+            with self.subTest(shape=label):
+                plan = {"steps": raw}
+                rendered = len(report_lib.normalize_steps(raw))
+                row = next(ok for ok, text in report_lib._finding_check_results({"ref": "F1"}, plan)
+                           if "Reproduction steps" in text)
+                self.assertEqual(row, rendered >= 2, f"{label}: checklist disagrees with the render")
+
+    def test_one_real_step_is_not_advertised_as_replayable(self) -> None:
+        plan = {"steps": ["Look at the page"]}
+        self.assertFalse(next(ok for ok, text in report_lib._finding_check_results({"ref": "F1"}, plan)
+                              if "Reproduction steps" in text))
+
+    def test_the_operator_action_plan_quotes_real_steps(self) -> None:
+        for label, raw in (("string", self.AS_STRING), ("blob", self.AS_BLOB)):
+            with self.subTest(shape=label):
+                opening = next_steps_lib._first_actions("F1", {"F1": {"steps": raw}}, [])
+                self.assertIn("Send a GET", opening)
+                self.assertNotRegex(opening, r"^\w \w$", "char-by-char garbling returned")
+
+    def test_the_main_report_numbers_the_steps(self) -> None:
+        ctx = _ctx_with_finding(steps=self.AS_LIST)
+        markdown = report_lib.build_markdown(ctx)
+        self.assertIn("1. Send a GET to /search?q=marker", markdown)
+        self.assertIn("2. Observe reflection", markdown)
+        self.assertIn("3. Confirm execution", markdown)
+
+    def test_every_platform_export_numbers_the_steps(self) -> None:
+        """render_finding is the one renderer behind all five platforms, so the numbered procedure
+        must survive each reshaping."""
+        from bughunter import report_formats
+
+        ctx = _ctx_with_finding(steps=self.AS_LIST)
+        finding = ctx["findings"][0]
+        for platform in ("hackerone", "yeswehack", "bugcrowd", "intigriti", "hackenproof"):
+            with self.subTest(platform=platform):
+                body = report_formats.render_finding(ctx, finding, platform)
+                self.assertIn("## Steps to reproduce", body)
+                self.assertIn("1. Send a GET to /search?q=marker", body)
+                self.assertIn("3. Confirm execution", body)
+
+
+def _ctx_with_finding(*, steps: list[str]) -> dict:
+    """A minimal reportable, confirmed finding plus the plan carrying its repro steps."""
+    finding = {
+        "ref": "F1", "rule_id": "active.reflected-xss", "title": "Reflected XSS",
+        "class_id": "xss", "class_name": "Reflected XSS", "severity": "medium",
+        "confidence": "high", "location": "https://app.example/search",
+        "proof_evidence": {"request_line": "GET https://app.example/search?q=marker",
+                           "response_status": "HTTP 200"},
+    }
+    plans = {"F1": {"steps": steps, "impact": "Script executes in a victim session.",
+                    "proof_of_impact": {"status": "confirmed", "method": "differential",
+                                        "observed_result": "marker executed",
+                                        "control_result": "encoded, inert"}}}
+    return {
+        "tool": "GreyIQ BugHunter", "version": "test", "target": "https://app.example",
+        "profile": {"name": "Web app"}, "risk": "medium", "score": 0.5,
+        "findings": [finding], "attack_plans": plans, "scanners_run": ["active"],
+        "authorized": True, "brain": {}, "next_steps": [], "coverage": {},
+    }
+
+
+class CorsEvidenceAgreementTests(unittest.TestCase):
+    """A CORS submission answers "were credentials returned?" in four places — the steps, the PoC,
+    the impact narrative and the CVSS. They must all give the same answer, because a triager who
+    follows steps that say "no credentials" and then reads an Impact paragraph promising an
+    authenticated cross-origin read closes the report as invalid."""
+
+    @staticmethod
+    def _finding(matched: str) -> dict:
+        return {
+            "ref": "F1", "title": "CORS reflects arbitrary Origin", "class_id": "cors",
+            "severity": "medium", "confidence": "high", "rule_id": "active.cors.reflect",
+            "location": "https://target.example/api/me",
+            "proof_evidence": {"request_header": "Origin: https://attacker.example",
+                               "matched_value": matched, "response_status": "HTTP 200"},
+        }
+
+    ACAO = "Access-Control-Allow-Origin: https://attacker.example"
+
+    def test_reflection_only_never_claims_an_authenticated_read(self) -> None:
+        plan = bounty_lib._deterministic_attack_plan(self._finding(self.ACAO), "cors")
+        blob = " ".join([plan["impact"], plan["proof_of_impact"]["affected_asset"],
+                         plan["proof_of_impact"]["proof_obligation"]]).lower()
+        self.assertIn("unauthenticated", blob)
+        self.assertIn("reflection alone is not impact", blob)
+        # The steps and the impact must agree.
+        steps = " ".join(plan["steps"]).lower()
+        self.assertIn("access-control-allow-credentials", steps)
+        self.assertNotIn("credentials: 'include'", plan.get("poc", "").lower())
+
+    def test_reflection_only_scores_no_confidentiality_impact(self) -> None:
+        cvss = bounty_lib._deterministic_attack_plan(self._finding(self.ACAO), "cors")["cvss"]
+        self.assertIn("C:N", cvss["vector"])
+        self.assertEqual(cvss["base_score"], 0.0)
+        self.assertIn("no authenticated", cvss["justification"].lower())
+
+    def test_a_credentialed_capture_keeps_the_full_impact_model(self) -> None:
+        """The fix must not blunt the real bug: with Allow-Credentials captured, nothing changes."""
+        f = self._finding(f"{self.ACAO}; Access-Control-Allow-Credentials: true")
+        plan = bounty_lib._deterministic_attack_plan(f, "cors")
+        self.assertIn("authenticated responses", plan["impact"].lower())
+        self.assertIn("C:L", plan["cvss"]["vector"])
+        self.assertIn("credentials: \"include\"", plan.get("poc", "").lower())
+
+    def test_the_credential_question_has_one_answer(self) -> None:
+        """The steps/PoC and the impact/CVSS must read the evidence through the SAME predicate."""
+        self.assertTrue(bounty_lib._cors_is_credentialed(
+            {"matched_value": f"{self.ACAO}; Access-Control-Allow-Credentials: true"}))
+        self.assertFalse(bounty_lib._cors_is_credentialed({"matched_value": self.ACAO}))
+        self.assertFalse(bounty_lib._cors_is_credentialed({}))
+
+
 class SeverityOrderingTests(unittest.TestCase):
     def test_order_by_resolved_severity_renumbers_and_rekeys(self) -> None:
         from bughunter.bounty import _order_by_resolved_severity

@@ -10,6 +10,17 @@
     <link rel="stylesheet" href="./styles.css">
   </head>
   <body data-theme="dark" data-app-mode="hunt">
+    <header class="desktop-titlebar" data-window-titlebar hidden>
+      <div class="desktop-titlebar-drag" data-window-drag-region>
+        <span class="desktop-titlebar-mark gn-owl" aria-hidden="true"></span>
+        <span class="desktop-titlebar-name">GreyIQ</span>
+      </div>
+      <div class="desktop-titlebar-controls">
+        <button class="desktop-titlebar-button" type="button" data-window-control="minimize" aria-label="Minimize GreyIQ" title="Minimize GreyIQ"></button>
+        <button class="desktop-titlebar-button" type="button" data-window-control="maximize" aria-label="Maximize GreyIQ" title="Maximize GreyIQ"></button>
+        <button class="desktop-titlebar-button" type="button" data-window-control="close" aria-label="Close GreyIQ" title="Close GreyIQ"></button>
+      </div>
+    </header>
     <div class="ck-splash" id="ckSplash">
       <span class="ck-splash-globe gn-owl" aria-hidden="true"></span>
       <div class="ck-splash-name">GreyIQ</div>
@@ -139,7 +150,7 @@
             <label>
               <span>Coding brain</span>
               <select id="brainProvider" name="brainProvider">
-                <option value="off">Off — local TinyGPT only</option>
+                <option value="off">Off — no coding brain</option>
                 <option value="local">Local model (Ollama)</option>
                 <option value="anthropic">Claude API</option>
                 <option value="openai">OpenAI / ChatGPT</option>
@@ -147,10 +158,23 @@
             </label>
             <label data-brain-field="model">
               <span>Model</span>
-              <input id="brainModel" name="brainModel" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. qwen2.5-coder:14b">
+              <input id="brainModel" name="brainModel" type="text" autocomplete="off" spellcheck="false" placeholder="Provider model name">
             </label>
+            <div class="ollama-picker" id="brainOllamaPicker" hidden>
+              <label for="brainOllamaModel">
+                <span>Free local Ollama model</span>
+                <select id="brainOllamaModel" name="brainOllamaModel" aria-describedby="brainCatalogStatus">
+                  <option value="">Loading Ollama models…</option>
+                </select>
+              </label>
+              <div class="folder-actions">
+                <span class="folder-status" id="brainCatalogStatus" role="status" aria-live="polite">Loading Ollama's local models…</span>
+                <button class="text-button" type="button" id="brainCatalogRefresh">Refresh list</button>
+              </div>
+              <p class="folder-status">Choose a model to download, check for chat and agent tools, and use automatically. Downloads use your Ollama server and may require several GB of disk space. Review each model's license on <a href="https://ollama.com/search?c=local&amp;c=tools" target="_blank" rel="noopener noreferrer">Ollama</a>.</p>
+            </div>
             <label data-brain-field="base_url">
-              <span>Server URL</span>
+              <span>Server URL (optional)</span>
               <input id="brainBaseUrl" name="brainBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:11434/v1">
             </label>
             <label data-brain-field="api_key">
@@ -163,9 +187,20 @@
             </div>
             <div class="folder-actions" id="brainModelRow" hidden>
               <span class="folder-status" id="brainModelStatus">checking model…</span>
-              <button class="text-button" type="button" id="brainDownload">Download model</button>
             </div>
             <div class="model-list" id="brainModelList" hidden></div>
+            <details class="hf-import" id="brainHfImportSection" hidden>
+              <summary id="brainHfImportTitle">Import a Hugging Face GGUF model</summary>
+              <p class="folder-status">Use a public GGUF model repository. GreyIQ desktop downloads and starts Ollama on first use, then checks chat and agent tool support before selecting the model. Browser use requires Ollama running locally. Private or gated models need separate access; check the model card and license before use.</p>
+              <label for="brainHfReference">
+                <span>Model page URL or Ollama reference</span>
+                <input id="brainHfReference" type="text" autocomplete="off" spellcheck="false" maxlength="300" placeholder="https://huggingface.co/owner/model-GGUF or hf.co/owner/model-GGUF:Q4_K_M">
+              </label>
+              <div class="folder-actions">
+                <button class="text-button" type="button" id="brainHfImport">Import and select</button>
+              </div>
+              <p class="folder-status" id="brainHfStatus" role="status" aria-live="polite"></p>
+            </details>
             <label>
               <span>Researcher UA marker</span>
               <input id="brainUaMarker" name="brainUaMarker" type="text" autocomplete="off" spellcheck="false" maxlength="120" placeholder="e.g. h1-greynoc">
@@ -178,6 +213,68 @@
             <p class="folder-status" id="brainStatus" aria-live="polite"></p>
             <p class="folder-status" id="brainAccel"></p>
           </form>
+          <details class="mode-fold" id="mcpServersFold">
+            <summary><span>MCP servers</span><svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></summary>
+            <div class="choice-form" style="padding: 0.85rem">
+              <p class="mode-intro">Add trusted MCP tools for explicit chat commands. Only absolute local executables and loopback HTTP URLs are supported. Saving a server is inert; testing, approving a tool, or using a command connects to it. No environment variables or HTTP headers are stored yet. Do not put credentials in Arguments; they are saved as plaintext and can appear in process listings. Adding a server does not authorize testing a target.</p>
+              <div class="folder-actions">
+                <button class="text-button" type="button" id="mcpServersRefresh">Refresh status</button>
+              </div>
+              <div class="model-list" id="mcpServersList" aria-live="polite"></div>
+              <section class="hf-import" id="mcpHuntApprovals" aria-labelledby="mcpHuntApprovalTitle" hidden>
+                <h3 id="mcpHuntApprovalTitle">External hunt evidence tools</h3>
+                <p class="folder-status">Enable the server, then approve an exact tool name. Approval contacts the server to verify the name. You are asserting the tool is evidence-only; GreyIQ cannot prove its behavior or constrain the server to a program's target scope.</p>
+                <p class="folder-status" id="mcpHuntApprovalServer"></p>
+                <div class="model-list" id="mcpHuntApprovalList"></div>
+                <form class="choice-form" id="mcpHuntApprovalForm">
+                  <label>
+                    <span>Exact tool name</span>
+                    <input id="mcpHuntToolName" type="text" maxlength="128" autocomplete="off" spellcheck="false" required placeholder="As advertised by the MCP server">
+                  </label>
+                  <div class="folder-actions">
+                    <button class="text-button" type="submit" id="mcpHuntApprove">Approve evidence tool</button>
+                    <button class="text-button" type="button" id="mcpHuntClose">Close</button>
+                  </div>
+                </form>
+                <p class="folder-status" id="mcpHuntStatus" role="status" aria-live="polite"></p>
+              </section>
+              <form class="choice-form brain-form" id="mcpServerForm">
+                <label>
+                  <span>Server name</span>
+                  <input id="mcpServerName" type="text" maxlength="40" autocomplete="off" spellcheck="false" required placeholder="e.g. local-files">
+                </label>
+                <label>
+                  <span>Connection</span>
+                  <select id="mcpServerTransport">
+                    <option value="stdio">Local command (stdio)</option>
+                    <option value="http">Loopback URL (HTTP)</option>
+                  </select>
+                </label>
+                <label data-mcp-field="stdio">
+                  <span>Command</span>
+                  <input id="mcpServerCommand" type="text" autocomplete="off" spellcheck="false" placeholder="Absolute executable path">
+                </label>
+                <label data-mcp-field="stdio">
+                  <span>Arguments (one per line)</span>
+                  <textarea id="mcpServerArgs" rows="3" spellcheck="false" placeholder="--directory&#10;C:\path\to\workspace"></textarea>
+                </label>
+                <label data-mcp-field="http" hidden>
+                  <span>Server URL</span>
+                  <input id="mcpServerUrl" type="url" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:3000/mcp">
+                </label>
+                <label class="check-row">
+                  <input id="mcpServerEnabled" type="checkbox">
+                  <span>Enable manual commands and approved hunt evidence tools</span>
+                </label>
+                <div class="folder-actions">
+                  <button class="text-button" type="submit" id="mcpServerSave">Add server</button>
+                  <button class="text-button" type="button" id="mcpServerCancel" hidden>Cancel edit</button>
+                </div>
+              </form>
+              <p class="folder-status">Chat commands: <code>mcp list</code>, <code>mcp tools -y &lt;server&gt;</code>, and <code>mcp call -y &lt;server&gt; &lt;tool&gt; {"arg":"value"}</code>. Tool output is untrusted data.</p>
+              <p class="folder-status" id="mcpServersStatus" role="status" aria-live="polite"></p>
+            </div>
+          </details>
         </div>
 
         <div class="panel-mode brain-ops" id="panelOps" data-mode="ops" role="tabpanel" aria-labelledby="pmode-ops" tabindex="0" hidden>
@@ -197,7 +294,7 @@
             <button class="text-button" type="button" id="brainOpsRefresh">Refresh</button>
           </div>
           <section class="brain-technique-list" id="brainTechniqueList" aria-live="polite">
-            <p class="ops-empty">Waiting for the local engine?</p>
+            <p class="ops-empty">Waiting for the local engine…</p>
           </section>
 
           <div class="ops-section-heading">
@@ -234,9 +331,137 @@
           </section>
 
           <button class="text-button primary-action" id="trainButton" type="button">Train the local model</button>
+          <div class="folder-actions">
+            <button class="text-button" type="button" id="trainPause" hidden>Pause</button>
+            <button class="text-button danger" type="button" id="trainStop" hidden>Stop</button>
+          </div>
+          <p class="folder-status" id="trainStatus" aria-live="polite"></p>
+
+          <!-- Live run: progress, the loss curve, and what the trainer actually chose. Everything here
+               comes from /api/train/status — the panel used to discard all of it. -->
+          <section class="train-progress" id="trainProgress" aria-label="Training progress" hidden>
+            <div class="train-progress-bar" role="progressbar" aria-labelledby="trainProgressLabel"
+                 aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="trainProgressBar">
+              <span id="trainProgressFill"></span>
+            </div>
+            <p class="folder-status" id="trainProgressLabel">step 0 / 0</p>
+            <svg class="train-curve" id="trainCurve" viewBox="0 0 240 60" preserveAspectRatio="none"
+                 role="img" aria-labelledby="trainCurveLabel" hidden>
+              <title id="trainCurveLabel">Training and validation loss per evaluation</title>
+            </svg>
+            <div class="meter-wrap" aria-label="Run metrics">
+              <div class="meter-row"><span>Train loss</span><strong id="trainLossValue">—</strong></div>
+              <div class="meter-row"><span>Val loss</span><strong id="valLossValue">—</strong></div>
+              <div class="meter-row"><span>Best val</span><strong id="bestLossValue">—</strong></div>
+              <div class="meter-row"><span>Device</span><strong id="trainDeviceValue">—</strong></div>
+              <div class="meter-row"><span>Batch</span><strong id="trainBatchValue">—</strong></div>
+              <div class="meter-row"><span>Corpus</span><strong id="trainCorpusValue">—</strong></div>
+            </div>
+          </section>
+
+          <details class="mode-fold" id="trainSettingsFold">
+            <summary><span>Training settings</span><svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></summary>
+            <form class="choice-form" id="trainSettingsForm">
+              <label>
+                <span>Brain size</span>
+                <select id="trainModelSize" name="trainModelSize"></select>
+              </label>
+              <p class="folder-status" id="trainModelSizeNote"></p>
+
+              <div class="field-grid">
+                <label>
+                  <span>Steps</span>
+                  <input id="trainMaxIters" name="trainMaxIters" type="number" min="1" max="100000" step="10">
+                </label>
+                <label>
+                  <span>Check every</span>
+                  <input id="trainEvalInterval" name="trainEvalInterval" type="number" min="1" max="100000" step="5">
+                </label>
+              </div>
+
+              <div class="field-grid">
+                <label>
+                  <span>Learning rate</span>
+                  <input id="trainLearningRate" name="trainLearningRate" type="number" min="0.000001" max="0.01" step="0.0001">
+                </label>
+                <label>
+                  <span>Batch size</span>
+                  <input id="trainBatchSize" name="trainBatchSize" type="number" min="0" max="512" step="1" placeholder="auto">
+                </label>
+              </div>
+
+              <div class="field-grid">
+                <label>
+                  <span>Device</span>
+                  <select id="trainDevice" name="trainDevice">
+                    <option value="auto">Auto (detect)</option>
+                    <option value="cpu">CPU</option>
+                    <option value="cuda">GPU (CUDA)</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Corpus cap (MB)</span>
+                  <input id="trainDatasetCap" name="trainDatasetCap" type="number" min="1" max="16" step="1">
+                </label>
+              </div>
+
+              <label class="toggle-row" for="trainFreshStart">
+                <input id="trainFreshStart" type="checkbox">
+                <span><strong>Start from scratch</strong><small>Ignore the existing checkpoint and retrain from random weights.</small></span>
+              </label>
+              <label class="toggle-row" for="trainAutoStop">
+                <input id="trainAutoStop" type="checkbox">
+                <span><strong>Stop early when it plateaus</strong><small>End the run once validation loss stops improving.</small></span>
+              </label>
+              <div class="field-grid" id="trainPatienceRow">
+                <label>
+                  <span>Patience</span>
+                  <input id="trainPatience" name="trainPatience" type="number" min="1" max="50" step="1">
+                </label>
+                <label>
+                  <span>Min improvement</span>
+                  <input id="trainMinDelta" name="trainMinDelta" type="number" min="0" max="1" step="0.0001">
+                </label>
+              </div>
+              <label class="toggle-row" for="trainRestoreBest">
+                <input id="trainRestoreBest" type="checkbox">
+                <span><strong>Keep the best weights</strong><small>Restore the best-scoring step at the end instead of the last one.</small></span>
+              </label>
+              <label class="toggle-row" for="trainSaveBestOnly">
+                <input id="trainSaveBestOnly" type="checkbox">
+                <span><strong>Only publish improvements</strong><small>Write the model file only when a step beats the best score so far.</small></span>
+              </label>
+
+              <div class="folder-actions">
+                <button class="text-button" type="button" id="trainSettingsReset">Reset to defaults</button>
+                <button class="text-button" type="button" id="trainDatasetRefresh">Check the corpus</button>
+              </div>
+              <p class="folder-status" id="trainDatasetStatus" aria-live="polite"></p>
+            </form>
+          </details>
 
           <div class="source-heading">Train on</div>
           <section class="source-picker" id="trainingSourceList" aria-label="Training sources"></section>
+
+          <details class="mode-fold" id="huntBrainFold">
+            <summary><span>Hunting brain</span><svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></summary>
+            <div class="choice-form">
+              <p class="folder-status">A separate, auditable ranker that orders which checks the prover
+                spends its budget on. It learns from your own confirmed and unconfirmed hunt outcomes,
+                and is only promoted when it beats the built-in rules on held-out programs.</p>
+              <section class="meter-wrap" aria-label="Hunting brain status">
+                <div class="meter-row"><span>Active model</span><strong id="huntModelSource">—</strong></div>
+                <div class="meter-row"><span>Trace rows</span><strong id="huntModelRows">—</strong></div>
+                <div class="meter-row"><span>Last score</span><strong id="huntModelScore">—</strong></div>
+              </section>
+              <div class="folder-actions">
+                <button class="text-button" type="button" id="huntBrainRefresh">Refresh</button>
+                <button class="text-button" type="button" id="huntBrainDryRun">Evaluate only</button>
+                <button class="text-button primary-action" type="button" id="huntBrainTrain">Train the hunting brain</button>
+              </div>
+              <p class="folder-status" id="huntBrainStatus" aria-live="polite"></p>
+            </div>
+          </details>
 
           <details class="mode-fold">
             <summary><span>Add a preference</span><svg class="fold-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></summary>
@@ -318,8 +543,8 @@
                 <input id="bountyTarget" name="bountyTarget" type="text" autocomplete="off" spellcheck="false" placeholder="https://example.com  or  C:\path\to\repo">
               </label>
               <label>
-                <span>Scope / program notes</span>
-                <input id="bountyScope" name="bountyScope" type="text" autocomplete="off" placeholder="e.g. HackerOne acme — *.example.com in scope">
+                <span>Authorized scope (host or repository root)</span>
+                <input id="bountyScope" name="bountyScope" type="text" autocomplete="off" placeholder="app.example.com  or  https://github.com/org/repo">
               </label>
               <label>
                 <span>Report output folder</span>
@@ -335,6 +560,10 @@
               <label class="bounty-auth" for="bountyActive">
                 <input id="bountyActive" type="checkbox">
                 <span><strong>Test for proof of impact</strong> (active, URL targets) — send a few <strong>benign</strong> probes to <em>capture proof</em> that marks findings <em>Confirmed</em> (reflected XSS, CORS, open-redirect, host-header, SQL-error; clickjacking as a candidate). Rate-limited; runs only against a host you name in Scope.</span>
+              </label>
+              <label class="bounty-auth" for="bountyExternalMcp">
+                <input id="bountyExternalMcp" type="checkbox">
+                <span>External MCP evidence analysis <em>— approved evidence tools only; off for each new run</em>.</span>
               </label>
               <label class="bounty-auth" for="bountyAuthorized">
                 <input id="bountyAuthorized" type="checkbox">
@@ -477,9 +706,9 @@
             <div class="ck-target-fields" data-ck-when="hunt campaign">
             <label><span>Asset or repository</span>
               <select id="ckTargetPick" hidden aria-label="Target — pick from the program's scope"></select>
-              <input id="ckTarget" type="text" autocomplete="off" spellcheck="false" aria-label="Asset or repository" placeholder="https://example.com  ·  https://github.com/org/repo  ·  C:\path\to\repo"></label>
-            <label><span>Authorized scope</span>
-              <input id="ckScope" type="text" autocomplete="off" placeholder="acme — *.example.com in scope"></label>
+              <input id="ckTarget" type="text" autocomplete="off" spellcheck="false" aria-label="Asset or repository" placeholder="https://example.com  ·  C:\path\to\repo"></label>
+            <label><span>Authorized scope (hosts or repository roots)</span>
+              <input id="ckScope" type="text" autocomplete="off" placeholder="app.example.com  or  https://github.com/org/repo"></label>
             </div>
 
             <div class="ck-grid2">
@@ -505,10 +734,12 @@
                 <span>Test for <strong>proof of impact</strong> <em>— benign in-scope probes that mark findings Confirmed</em></span></label>
               <label class="ck-switch"><input id="ckTimeBased" type="checkbox">
                 <span>Deep SQLi probe <em>— opt-in time-based blind SQLi (sends a bounded SLEEP; in-scope only, implies proof-of-impact)</em></span></label>
-              <label class="ck-switch"><input id="ckLive" type="checkbox">
-                <span>Dynamic browser pass <em>(Playwright)</em></span></label>
+              <label class="ck-switch"><input id="ckLive" type="checkbox" disabled>
+                <span>Dynamic browser pass <em>— unavailable until browser DNS egress is pinned</em></span></label>
               <label class="ck-switch" data-ck-when="campaign portfolio" hidden><input id="ckDeep" type="checkbox">
                 <span>Deep auto-work <em>— (campaign) implies proof-of-impact + time-based SQLi, then auto-captures a screenshot and writes a researched dossier for each confirmed lead</em></span></label>
+              <label class="ck-switch"><input id="ckExternalMcpHunt" type="checkbox">
+                <span>External MCP evidence analysis <em>— approved evidence tools only; off for each new run</em></span></label>
               <label class="ck-switch" data-ck-when="campaign portfolio" hidden><input id="ckAttackMap" type="checkbox" checked>
                 <span>Attack-plan map <em>— render a graphical .png of the attack flow for each confirmed finding into the POC download &amp; submission report (campaign/portfolio runs)</em></span></label>
             </div>

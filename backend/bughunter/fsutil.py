@@ -1,4 +1,4 @@
-"""GreyIQ BugHunter — filesystem helpers.
+r"""GreyIQ BugHunter — filesystem helpers.
 
 Windows caps paths at 260 chars (``MAX_PATH``) unless an app opts in. A deep
 install dir + the campaign's nested ``campaign-…/targets/`` layout + a long
@@ -15,7 +15,7 @@ from pathlib import Path
 
 
 def _extended_path(path: Path) -> str:
-    """The ``\\?\`` extended-length form of an absolute Windows path (UNC-aware)."""
+    r"""The ``\\?\`` extended-length form of an absolute Windows path (UNC-aware)."""
     resolved = os.path.abspath(str(path))
     if resolved.startswith("\\\\?\\"):
         return resolved

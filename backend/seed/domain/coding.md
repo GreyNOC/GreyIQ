@@ -1,10 +1,11 @@
 # Coding with GreyIQ — what works offline and what needs a brain
 
 GreyIQ's coding ability comes from a configurable **brain** plus an **agent loop** with
-hands. The bundled offline model is a ~0.8M-parameter character-level network with a
-64-character context and effectively no code in its corpus — it is a chat fallback, not a
-programmer. This pack says exactly where the line is, so you never wait on something that
-was never going to work.
+hands. The bundled offline model ships as a small (~0.8M-parameter, 64-character-context)
+character-level network, and grows to roughly 6.5M parameters with a 256-character context
+once you retrain it from the Studio's Train panel — either way it has effectively no code in
+its corpus, so it is a chat fallback, not a programmer. This pack says exactly where the line
+is, so you never wait on something that was never going to work.
 
 ## What the offline model can and cannot do
 <!-- triggers: can greyiq write code, offline model, tinygpt, write me a function, generate code -->

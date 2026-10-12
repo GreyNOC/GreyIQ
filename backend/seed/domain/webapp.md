@@ -25,7 +25,7 @@ How to test it inside scope:
 ## Exposed secret / credential
 <!-- triggers: secrets -->
 GreyIQ tracks this as vuln class `secrets`.
-- CWE: CWE-200
+- CWE: CWE-798 / CWE-200
 - OWASP: A07:2021 Identification & Authentication Failures
 
 How to test it inside scope:
@@ -120,6 +120,17 @@ How to test it inside scope:
 1. Identify WebSocket endpoints (ws:// / wss:// literals or new WebSocket(...) call targets).
 2. Check whether the handshake completes (101) while carrying an attacker-controlled Origin.
 3. If it does, host a browser PoC on an attacker origin and confirm a logged-in victim's socket serves authenticated data cross-site.
+
+## CRLF / HTTP response-header injection
+<!-- triggers: crlf -->
+GreyIQ tracks this as vuln class `crlf`.
+- CWE: CWE-113 / CWE-93
+- OWASP: A03:2021 Injection
+
+How to test it inside scope:
+1. Find values the response copies into a header: redirect targets (Location), Set-Cookie attributes, custom X- headers, and anything echoed into Content-Disposition.
+2. Inject an encoded CR/LF (%0d%0a) followed by a marker header and confirm the marker arrives as its OWN header line, with a control request that omits the CR/LF as the comparison.
+3. Escalate to the concrete impact before reporting: an attacker-set Set-Cookie (session fixation), a poisoned cache entry served to another user, or script execution from an injected body.
 
 ## Open redirect / unsafe forwarding
 <!-- triggers: redirect -->
@@ -257,7 +268,7 @@ How to test it inside scope:
 <!-- triggers: request smuggling, request-smuggling -->
 GreyIQ tracks this as vuln class `request-smuggling`.
 - CWE: CWE-444
-- OWASP: A06:2021 Vulnerable & Outdated Components
+- OWASP: A04:2021 Insecure Design
 
 How to test it inside scope:
 1. Identify a front-end/back-end chain (CDN, proxy, LB) and test CL.TE / TE.CL / TE.TE desync with timing probes.

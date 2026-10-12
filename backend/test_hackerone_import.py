@@ -33,6 +33,138 @@ class MissingCredsTests(unittest.TestCase):
         self.assertIn("api username", r["error"].lower())
 
 
+class ProgramDiscoveryTests(unittest.TestCase):
+    @staticmethod
+    def _row(handle: str, **attrs) -> dict:
+        return {"type": "program", "attributes": {"handle": handle, "name": handle, **attrs}}
+
+    def test_missing_credentials_never_fetches(self) -> None:
+        calls = []
+        result = h1.list_programs("", "token", fetch=lambda url, **kw: calls.append(url))
+        self.assertFalse(result["ok"])
+        self.assertEqual(calls, [])
+
+    def test_two_pages_are_sanitized_deduplicated_and_read_only(self) -> None:
+        first = f"{h1._API_BASE}/programs?page%5Bsize%5D=50"
+        second = f"{h1._API_BASE}/programs?page%5Bnumber%5D=2&page%5Bsize%5D=50"
+        calls = []
+
+        def fake_fetch(url, **kw):
+            calls.append((url, kw))
+            if url == first:
+                return {"data": [
+                    self._row("acme", name=" Acme\n<script>  Labs ", submission_state="open", state="public_mode", offers_bounties=True, policy="not a candidate field"),
+                    self._row("bad/handle"),
+                    self._row("x" * 101),
+                    {"type": "report", "attributes": {"handle": "report"}},
+                    {"type": "program", "attributes": ["bad shape"]},
+                ], "links": {"next": second}}
+            if url == second:
+                return {"data": [self._row("ACME"), self._row("beta", name="Beta", offers_bounties="true")], "links": {}}
+            raise AssertionError(f"unexpected URL: {url}")
+
+        result = h1.list_programs("identifier", "secret", fetch=fake_fetch)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(result["pages_fetched"], 2)
+        self.assertFalse(result["truncated"])
+        self.assertEqual([candidate["handle"] for candidate in result["programs"]], ["acme", "beta"])
+        self.assertEqual(result["programs"][0]["name"], "Acme script Labs")
+        self.assertEqual(result["programs"][0]["program_url"], "https://hackerone.com/acme")
+        self.assertEqual(result["programs"][0]["submission_state"], "open")
+        self.assertTrue(result["programs"][0]["offers_bounties"])
+        self.assertFalse(result["programs"][1]["offers_bounties"])
+        self.assertNotIn("policy", result["programs"][0])
+        self.assertNotIn("structured_scope", result["programs"][0])
+        self.assertEqual([url for url, _ in calls], [first, second])
+        self.assertTrue(all(kw["api_username"] == "identifier" and kw["api_token"] == "secret" for _, kw in calls))
+
+    def test_discovery_stops_at_page_cap_with_warning(self) -> None:
+        calls = []
+
+        def fake_fetch(url, **kw):
+            calls.append(url)
+            number = len(calls)
+            return {"data": [self._row(f"p{number}")],
+                    "links": {"next": f"{h1._API_BASE}/programs?page%5Bnumber%5D={number + 1}"}}
+
+        result = h1.list_programs("u", "t", fetch=fake_fetch, max_pages=99, max_entries=999)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["pages_fetched"], 5)
+        self.assertEqual(result["count"], 5)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(len(calls), 5)
+        self.assertTrue(result["warnings"])
+
+    def test_entry_cap_stops_within_first_page(self) -> None:
+        calls = []
+
+        def fake_fetch(url, **kw):
+            calls.append(url)
+            return {"data": [self._row(f"p{n}") for n in range(20)], "links": {}}
+
+        result = h1.list_programs("u", "t", fetch=fake_fetch, max_entries=3)
+        self.assertEqual(result["count"], 3)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(len(calls), 1)
+
+    def test_external_or_wrong_path_pagination_is_never_fetched(self) -> None:
+        for next_url in ("https://evil.example/v1/hackers/programs?page=2",
+                         "https://api.hackerone.com.evil.example/v1/hackers/programs",
+                         "https://api.hackerone.com/v1/hackers/reports",
+                         "http://api.hackerone.com/v1/hackers/programs",
+                         "https://name:pass@api.hackerone.com/v1/hackers/programs",
+                         "https://api.hackerone.com:444/v1/hackers/programs",
+                         "https://[bad/v1/hackers/programs"):
+            with self.subTest(next_url=next_url):
+                calls = []
+
+                def fake_fetch(url, **kw):
+                    calls.append(url)
+                    return {"data": [self._row("acme")], "links": {"next": next_url}}
+
+                result = h1.list_programs("u", "t", fetch=fake_fetch)
+                self.assertTrue(result["ok"])
+                self.assertTrue(result["truncated"])
+                self.assertEqual(result["count"], 1)
+                self.assertEqual(len(calls), 1)
+
+    def test_repeated_page_stops_with_warning(self) -> None:
+        first = f"{h1._API_BASE}/programs?page%5Bsize%5D=50"
+        result = h1.list_programs("u", "t", fetch=lambda url, **kw: {
+            "data": [self._row("acme")], "links": {"next": first}})
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["pages_fetched"], 1)
+
+    def test_first_page_error_fails_and_later_error_preserves_partial_preview(self) -> None:
+        def denied(url, **kw):
+            raise _http_error(401, "Unauthorized")
+
+        denied_result = h1.list_programs("u", "t", fetch=denied)
+        self.assertFalse(denied_result["ok"])
+        self.assertEqual(denied_result["status"], 401)
+
+        calls = []
+
+        def partial(url, **kw):
+            calls.append(url)
+            if len(calls) == 1:
+                return {"data": [self._row("acme")], "links": {"next": f"{h1._API_BASE}/programs?page=2"}}
+            raise _http_error(429, "Too Many Requests")
+
+        partial_result = h1.list_programs("u", "t", fetch=partial)
+        self.assertTrue(partial_result["ok"])
+        self.assertEqual(partial_result["count"], 1)
+        self.assertTrue(partial_result["truncated"])
+        self.assertIn("429", partial_result["warnings"][0])
+
+    def test_unexpected_first_page_shape_fails(self) -> None:
+        result = h1.list_programs("u", "t", fetch=lambda url, **kw: {"data": {"handle": "acme"}})
+        self.assertFalse(result["ok"])
+        self.assertIn("unexpected", result["error"])
+
+
 class VerifyCredentialsTests(unittest.TestCase):
     def test_missing_token_refused_without_a_network_call(self) -> None:
         called = {"n": 0}

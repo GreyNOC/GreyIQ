@@ -189,7 +189,7 @@ class EmbeddingTests(unittest.TestCase):
             self.assertTrue(copied.is_file(), "screenshot was not co-located with the package")
             self.assertEqual(copied.read_bytes(), png.read_bytes())
             md = Path(pkg["markdown_path"]).read_text(encoding="utf-8")
-            self.assertIn("![Proof-of-concept screenshot](run-F1.png)", md)
+            self.assertIn("![Captured screenshot](run-F1.png)", md)
 
 
 if __name__ == "__main__":

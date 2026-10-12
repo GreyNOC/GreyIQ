@@ -264,6 +264,20 @@ def default_sources() -> list[dict[str, Any]]:
             "trustLevel": "user_selected",
             "sensitivity": "depends_on_source",
         },
+        {
+            "id": "src_verified_replay",
+            "name": "Verified Lessons",
+            "type": "files",
+            "icon": "doc",
+            "connection": "connected",
+            "permission": "local_private",
+            "records": 0,
+            "lastSyncedAt": None,
+            "lastTrainedAt": None,
+            "includedCores": ["core_greyiq_bughunter"],
+            "trustLevel": "verified_local",
+            "sensitivity": "private",
+        },
     ]
 
 

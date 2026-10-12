@@ -35,6 +35,7 @@ from bughunter import (
     cve_service,
     fsutil,
     hunt_brain,
+    hunt_train,
     hunt_trace,
     investigator,
     ledger,
@@ -54,7 +55,17 @@ from bughunter import (
     vdp_policy,
     web_ingest,
 )
-from bughunter.bounty import _classify, _infer_kind, _safe_slug, build_findings_har, build_replay_script, run_bounty_hunt
+from bughunter.bounty import (
+    _classify,
+    _deterministic_attack_plan,
+    _infer_kind,
+    _repository_scope_preflight,
+    _safe_slug,
+    _url_scope_preflight,
+    build_findings_har,
+    build_replay_script,
+    run_bounty_hunt,
+)
 from bughunter.rate_limit import shared_governor
 from bughunter.registrable_domain import is_ip_literal, registrable_domain
 from bughunter.settings import get_settings
@@ -230,8 +241,47 @@ def _login_auth(account_access: dict[str, Any] | None, scope: str,
     return None
 
 
+def _bind_unknown_issuer_to_target(auth: dict[str, Any] | None, target: str) -> dict[str, Any] | None:
+    """Keep a direct paste on its named target's registrable site during recon.
+
+    A caller may provide a cookie without a login URL. The one named target is
+    the narrowest available binding; without it, each discovered in-scope URL
+    would re-bind the same cookie to its own host, including another company
+    domain named in broad program scope. A source path has no host and gets no
+    network credential.
+    """
+    if not isinstance(auth, dict) or str(auth.get("issuer_host") or "").strip():
+        return auth
+    if not (str(auth.get("cookie") or "").strip() or auth.get("headers")):
+        return auth
+    try:
+        host = urlparse(str(target or "")).hostname or ""
+    except ValueError:
+        host = ""
+    return {**auth, "issuer_host": host} if host else None
+
+
+def _campaign_preflight_error(target: str, scope: str, authorized: bool, settings: Any) -> str:
+    """Apply the per-hunt target grant before campaign login, recon, or output."""
+    clean_target = str(target or "").strip()
+    if not clean_target:
+        return "No target provided."
+    if not authorized:
+        return "Confirm you're authorized and in scope before running a campaign."
+    kind = _infer_kind(clean_target)
+    if kind == "unknown":
+        return "Could not tell if the target is a URL or a repo/path."
+    if kind == "url":
+        _, error = _url_scope_preflight(clean_target, scope, settings)
+        return error
+    if kind == "git":
+        return _repository_scope_preflight(clean_target, scope, settings)
+    return ""  # Explicitly authorized local source paths do not use network scope.
+
+
 def run_campaign(target: str, *, account_access: dict[str, Any] | None = None,
-                 user_agent_suffix: str = "", **kwargs: Any) -> dict[str, Any]:
+                 user_agent_suffix: str = "", external_mcp_hunt: bool = False,
+                 mcp_manager: Any = None, **kwargs: Any) -> dict[str, Any]:
     """Run a campaign, first honoring this program's HUNTING REQUIREMENTS:
 
     - ``account_access`` (the program's research-account block): when set and the caller passed no
@@ -244,6 +294,15 @@ def run_campaign(target: str, *, account_access: dict[str, Any] | None = None,
     requirement plumbing (a login + a contextvar with a guaranteed reset) out of the long body."""
     scope = str(kwargs.get("scope") or "")
     on_progress = kwargs.get("on_progress")
+
+    preflight_settings = dataclasses.replace(
+        get_settings(), excluded_hosts=tuple(kwargs.get("excluded_hosts") or ()),
+    )
+    preflight_error = _campaign_preflight_error(
+        target, scope, bool(kwargs.get("authorized")), preflight_settings,
+    )
+    if preflight_error:
+        return {"ok": False, "error": preflight_error}
 
     def _emit(msg: str) -> None:
         if callable(on_progress):
@@ -258,10 +317,14 @@ def run_campaign(target: str, *, account_access: dict[str, Any] | None = None,
         auth = _login_auth(account_access, scope, kwargs.get("excluded_hosts"), _emit)
         if auth:
             kwargs["auth"] = auth
+    if isinstance(kwargs.get("auth"), dict):
+        kwargs["auth"] = _bind_unknown_issuer_to_target(kwargs["auth"], target)
     # The program's required UA tag rides every in-scope request for the duration of this hunt.
     ua_token = web_ingest.set_ua_suffix(user_agent_suffix or "")
     try:
-        return _run_campaign_body(target, **kwargs)
+        return _run_campaign_body(
+            target, external_mcp_hunt=external_mcp_hunt, mcp_manager=mcp_manager, **kwargs,
+        )
     finally:
         web_ingest.reset_ua_suffix(ua_token)
 
@@ -286,12 +349,6 @@ def _run_campaign_body(
     platform: str = "hackerone",
     deep: bool = False,
     iterate: bool = False,
-    # The operator's OOB collaborator (base URL + bearer). Empty = no collaborator, and the
-    # blind-vuln probes stay off, exactly as before. A caller must only supply these for a
-    # program whose `oob_allowed` is set — that field exists as "operator-confirmed: this
-    # program's policy permits out-of-band/collaborator testing" and this is what reads it.
-    oob_base: str = "",
-    oob_secret: str = "",
     on_progress: Any = None,
     disclose_automation: bool = False,
     excluded_hosts: tuple[str, ...] = (),
@@ -302,6 +359,18 @@ def _run_campaign_body(
     progress_run_id: str | None = None,
     progress_unit: str | None = None,
     submission_claim: tuple[set[str], "threading.Lock"] | None = None,
+    # The operator's OOB collaborator. Without these reaching the per-URL hunt below, the four
+    # out-of-band provers -- blind SSRF, blind XXE, blind RCE and JWT key-URL injection -- were
+    # unreachable from EVERY autonomous path: run_bounty_hunt gates each one on a configured
+    # collaborator, only the single-hunt API route passed one, and a campaign passed nothing. Four
+    # confirmable classes, three of them Critical, that could only ever fire from a manual one-URL
+    # hunt. Forwarding them weakens no gate: the provers stay behind active + authorized + in-scope
+    # inside run_bounty_hunt, and a collaborator only exists because the operator pasted one into
+    # Settings, which is the opt-in.
+    oob_base: str = "",
+    oob_secret: str = "",
+    external_mcp_hunt: bool = False,
+    mcp_manager: Any = None,
 ) -> dict[str, Any]:
     """Run a full campaign. Returns {ok, campaign_path, json_path, urls_scanned,
     finding_count, confirmed_count, submission_paths, ...} or {ok: False, error}.
@@ -345,6 +414,11 @@ def _run_campaign_body(
         # gated prover. Depth without losing breadth.
         hunt_replan_enabled=bool(iterate or base_settings.hunt_replan_enabled),
     )
+    # Keep direct callers of this internal function behind the same grant as
+    # the public wrapper. This must precede the output folder and recon crawl.
+    preflight_error = _campaign_preflight_error(clean_target, scope, authorized, campaign_settings)
+    if preflight_error:
+        return {"ok": False, "error": preflight_error}
 
     rt = runtime_dir
     payout_priors = learning.learned_priors(rt, program, clean_target) if rt is not None else {}
@@ -655,7 +729,14 @@ def _run_campaign_body(
     # the honest "did active probing run" flag is their union. Use it for the per-target run
     # AND the campaign report so the report can never claim "active: off" while an executing
     # probe (e.g. the deep-mode time-based SLEEP) actually fired.
-    effective_active = bool(active or time_based or deep)
+    # `iterate` belongs in this implication. The replan wave runs INSIDE run_bounty_hunt's
+    # active block, so with iterate=True and active/time_based/deep all false the settings
+    # override armed hunt_replan_enabled and then the block it lives in was skipped — the
+    # option silently did nothing. portfolio._normalize couples iterate -> active for a saved
+    # program, but a direct campaign/API caller bypasses that, and CampaignRequest.iterate
+    # documents itself as implying active. Named here so one honest flag drives both the pass
+    # and the report, exactly as `deep` already does.
+    effective_active = bool(active or time_based or deep or iterate)
     per_target: list[dict[str, Any]] = []
     consolidated: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
@@ -665,18 +746,14 @@ def _run_campaign_body(
     # registered by the span); here we just stream that target's findings as URLs finish.
     if progress_unit is None:
         progress.set_targets(progress_run_id, urls)
-    # Negative knowledge may only learn a MISS from a run that finished its plan: "never executed"
-    # and "executed and inert" are different facts, and only the second is knowledge. Two ways this
-    # run can fall short — the fan-out stopping early, and any single URL's active pass being
-    # rate-limited, refused, or cut off by its budget (the per-URL mirror of run_bounty_hunt's own
-    # condition for a direct hunt).
-    stopped_early = False
-    active_clean = True
+    # Track completed per-URL verifier suites for the trace and negative-knowledge
+    # store. The fan-out may stop early without turning its unvisited URLs into misses.
     # IMMUNITY IS DECIDED ON WHAT THE ENGINE PROVED, NOT ON WHAT THE REPORT SHOWED. `consolidated`
     # is later narrowed by dismissals and the VDP filter, and deduped across urls on a location
     # that collapses digits anywhere — so a confirmed pair can vanish from it while still sitting
     # in the plan, and would be written down as a miss. Bank every confirmation unfiltered here.
     nk_confirmed: list[dict[str, Any]] = []
+    hunt_execution: list[dict[str, Any]] = []
     # Chains from each per-target investigation, pooled for the drift snapshot: an empty `chains`
     # list reads as "nothing is blocked any more" and resets reopened_chains' blocked-run streak.
     campaign_chains: list[dict[str, Any]] = []
@@ -685,40 +762,44 @@ def _run_campaign_body(
         # in flight finishes its current url, then we bail with whatever's been found).
         if progress.is_stopped(progress_run_id):
             _emit("stop requested — halting this target after the current URL")
-            stopped_early = True
             break
         _emit(f"hunt {index}/{len(urls)}: {url}")
         if progress_unit is None:
             progress.mark_target(progress_run_id, url, "running")
         profile = "source-code" if kind in {"path", "git"} else "web-app"
+        url_confirmations: list[dict[str, Any]] = []
         result = run_bounty_hunt(
             url, profile, None, str(out_root / "targets"), scope, True, coder_cfg,
             default_reports_dir=out_root / "targets", seed_dir=seed_dir, runtime_dir=runtime_dir,
             version=version, run_live=live, active=effective_active, time_based=(time_based or deep), auth=auth, per_finding=False,
-            extra_params=recon_params, on_progress=_emit, settings=campaign_settings, class_priority=hunt_priority.get(url),
+            extra_params=recon_params, on_progress=_emit,
+            on_learning_outcomes=url_confirmations.extend,
+            settings=campaign_settings, class_priority=hunt_priority.get(url),
             ssrf_params=brain_ssrf_params, xss_params=brain_xss_params,
-            # The out-of-band collaborator. Without these four blind classes are
-            # unconfirmable — blind SSRF, XXE-over-HTTP, blind RCE, and jku/x5u JWT key
-            # injection reflect NOTHING in the target's own response, so a callback is the
-            # only observable there is. They were previously passed by exactly one caller
-            # (the cockpit's single-target scan), so every campaign — and therefore every
-            # unattended operator cycle — ran with the collaborator inert even when one was
-            # configured. The caller only supplies them for a program whose `oob_allowed` is
-            # set, so arming this is still an explicit per-program operator decision.
+            # Make Stop responsive WITHIN a URL, not only between them. The loop above already breaks on
+            # progress.is_stopped, but a single URL's active fan-out, re-plan wave and OOB provers can run
+            # for a long time — so without this the operator waits out the current URL after hitting Stop.
+            should_stop=(lambda rid=progress_run_id: progress.is_stopped(rid)) if progress_run_id else None,
             oob_base=oob_base, oob_secret=oob_secret,
+            external_mcp_hunt=external_mcp_hunt, mcp_manager=mcp_manager,
         )
+        hunt_execution.extend(hunt_trace.execution_from_active_meta(
+            result.get("active_authorization"), url))
         per_target.append({"target": url, "ok": result.get("ok", False),
                            "report_path": result.get("report_path", ""), "error": result.get("error", "")})
         if not result.get("ok"):
             if progress_unit is None:
                 progress.mark_target(progress_run_id, url, "error", error=str(result.get("error") or ""))
             continue
-        # Did THIS url's pass get through its plan? Anything less and no miss may be learned.
-        _am = result.get("active_authorization")
-        _am = _am if isinstance(_am, dict) else {}
-        if (result.get("scan_errors") or _am.get("in_scope") is not True
-                or _am.get("rate_limited") or str(_am.get("skipped_reason") or "").strip()):
-            active_clean = False
+        # The per-URL report can hide a verified finding because the operator
+        # dismissed it. Preserve the unfiltered proof before aggregate filtering
+        # and attribute it to the URL whose verifier suite actually ran.
+        for row in url_confirmations:
+            if not isinstance(row, dict) or row.get("proof_status") != "confirmed":
+                continue
+            nk_confirmed.append({**row, "endpoint": url})
+            if row.get("endpoint") != url:
+                nk_confirmed.append(row)
         if isinstance(result.get("chain_signals"), list):
             campaign_signals.extend(result["chain_signals"])
         doc = _read_json(result.get("json_path", ""))
@@ -745,6 +826,8 @@ def _run_campaign_body(
                 for _ep in dict.fromkeys([url, str(finding.get("location") or "")]):
                     if _ep and _cls:
                         nk_confirmed.append({"endpoint": _ep, "class": _cls,
+                                             "rule_id": str(finding.get("rule_id") or ""),
+                                             "dedup_key": ledger.dedup_key(finding),
                                              "proof_status": "confirmed"})
             item = {
                 "finding": finding,
@@ -837,8 +920,17 @@ def _run_campaign_body(
         # A public client key / dead credential is informational, not a submittable candidate.
         _sc = str(finding.get("secret_classification") or "")
         pstatus = "missing" if _sc in (secret_classification.PUBLIC_CLIENT_KEY, secret_classification.FALSE_POSITIVE) else "candidate"
+        # Carry an inline plan, like every other directly-consolidated source (CVE, GraphQL, IDOR,
+        # BFLA). This branch was the one exception: it has no per-URL run behind it, so it had no
+        # `source_json` sidecar to read a plan from either, and the submission package fell through
+        # to an EMPTY plan — shipping "_Verify manually within your authorized scope._" where the
+        # numbered reproduction belongs, with no impact paragraph and no CVSS row. A PEM body or an
+        # AWS secret key mined out of served JS classifies as a confirmed secret and keeps its High
+        # severity, so these are exactly the packages an operator files.
+        _js_plan = _deterministic_attack_plan(finding, cid)
         consolidated.append({"finding": finding, "source_url": finding["location"], "source_report": "",
-                             "source_json": "", "proof_status": pstatus, "cvss": {}})
+                             "source_json": "", "proof_status": pstatus,
+                             "cvss": _js_plan.get("cvss") or {}, "plan": _js_plan})
 
     # --- API-discovery candidates (GraphQL introspection): each carries its own inline plan. ---
     for finding in recon_api_findings:
@@ -924,6 +1016,7 @@ def _run_campaign_body(
     admin_auth: dict[str, Any] | None = None
     if (effective_active and admin_account_access and _has_primary and (privileged_endpoints or idor_pairs)):
         admin_auth = _login_auth(admin_account_access, scope, excluded_hosts, _emit)
+        admin_auth = _bind_unknown_issuer_to_target(admin_auth, clean_target)
         if not (isinstance(admin_auth, dict) and (str(admin_auth.get("cookie") or "").strip() or admin_auth.get("headers"))):
             admin_auth = None
             _emit("dual-account access-control: skipped — the second account did not resolve a session (fail-closed).")
@@ -1094,32 +1187,47 @@ def _run_campaign_body(
     # which were ALREADY reported in a prior run (so a re-run never re-files them). ---
     if rt is not None:
         ledger.upsert_findings(rt, program, clean_target, consolidated)
-        # Append this hunt to the trace log (offline-brain distillation corpus): the recon
-        # surface + the plan the brain produced + what actually confirmed. upsert_findings
-        # ran first so each consolidated item now carries its dedup_key (for the later ledger
-        # join in hunt_trace.training_examples). Best-effort + fail-closed inside record_trace.
+        # Append this hunt to the trace log (offline-brain distillation corpus):
+        # the recon surface, brain plan, and what actually confirmed. Ledger
+        # keys on reportable findings support later award joins; unfiltered
+        # confirmations preserve proof that report filters may have removed.
         if hunt_trace_surface is not None and hunt_trace_plan is not None:
-            hunt_trace.record_trace(rt, program=program, target=clean_target,
-                                    surface=hunt_trace_surface, plan=hunt_trace_plan,
-                                    consolidated=consolidated)
+            # Unfiltered confirmations must lead the trace, before the outcome cap
+            # and before auto-training. Otherwise a completed suite whose finding
+            # was dismissed, deduped, or excluded by policy becomes a false miss.
+            report_outcomes = hunt_trace.outcomes_from_findings(consolidated)
+            confirmation_keys: set[tuple[str, str, str]] = set()
+            trace_confirmed: list[dict[str, Any]] = []
+            for row in nk_confirmed:
+                key = (str(row.get("endpoint") or ""), str(row.get("class") or ""),
+                       str(row.get("rule_id") or ""))
+                if key not in confirmation_keys:
+                    confirmation_keys.add(key)
+                    trace_confirmed.append(row)
+            trace_outcomes = trace_confirmed + [
+                row for row in report_outcomes
+                if (str(row.get("endpoint") or ""), str(row.get("class") or ""),
+                    str(row.get("rule_id") or "")) not in confirmation_keys
+            ]
+            trace_written = hunt_trace.record_trace(
+                rt, program=program, target=clean_target,
+                surface=hunt_trace_surface, plan=hunt_trace_plan,
+                outcomes=trace_outcomes, execution=hunt_execution)
+            if trace_written:
+                hunt_train.maybe_auto_train(rt, seed_dir=seed_dir)
         # The two memories bounty writes only on the branch a campaign skips, so the steering added
         # before the fan-out has something to read next run.
         if kind == "url":
             try:
-                # The plan as it was actually spent, in the probe_priority shape the store reads.
-                nk_plan = {"probe_priority": [{"endpoint": u, "classes": list(cs)}
-                                              for u, cs in hunt_priority.items()]}
-                # Gates MISSES only — confirmations are always recorded, since they only grant
-                # immunity. See stopped_early / active_clean where they are declared.
-                nk_complete = bool(
-                    effective_active and per_target and not stopped_early and active_clean
-                    and all(t.get("ok") for t in per_target))
+                # Only verifier-certified completed suites may become misses. This
+                # remains true when the fan-out stops midway through its URL list.
+                nk_plan = {"probe_priority": hunt_execution}
                 negative_knowledge.record_hunt(
                     rt, program=program, target=clean_target, plan=nk_plan,
                     # Report-shaped outcomes PLUS the unfiltered confirmations banked above —
                     # without the second half a filtered-out confirm is recorded as a miss.
                     outcomes=hunt_trace.outcomes_from_findings(consolidated) + nk_confirmed,
-                    complete=nk_complete)
+                    complete=bool(hunt_execution))
                 # This run becomes the next run's baseline — unless it saw too little of the host
                 # to be compared, when storing it would make the next run call everything new.
                 if drift.get("status") != "degraded-run" and drift_observations:
@@ -1200,6 +1308,7 @@ def _run_campaign_body(
                 learning.record_outcome(
                     rt, program=program, target=clean_target, class_id=str(finding.get("class_id") or "other"),
                     title=str(finding.get("title") or ""), status="submitted", severity=str(finding.get("severity") or ""),
+                    finding_id=f"ledger:{item['dedup_key']}" if item.get("dedup_key") else "",
                 )
 
     # --- Campaign index report + JSON. ---
@@ -1308,6 +1417,17 @@ def _target_host_excluded(candidate: str, excluded_hosts: list[str]) -> bool:
     return False
 
 
+# Structured-scope asset types that are IN SCOPE but are not web endpoints, so a
+# "hunt the whole scope" campaign must not derive a URL from one. Named in HackerOne's
+# vocabulary, which yeswehack_import maps its own scope_type values onto. "OTHER" and ""
+# are deliberately absent: CSV and hand-entered rows leave asset_type empty, and those
+# must keep working exactly as before.
+_NON_WEB_ASSET_TYPES = frozenset({
+    "GOOGLE_PLAY_APP_ID", "APPLE_STORE_APP_ID", "WINDOWS_APP_STORE_APP_ID", "OTHER_APK",
+    "TESTFLIGHT", "SOURCE_CODE", "DOWNLOADABLE_EXECUTABLES", "HARDWARE", "SMART_CONTRACT",
+})
+
+
 def program_campaign_targets(program: dict[str, Any], max_targets: int = _MAX_PROGRAM_TARGETS) -> list[str]:
     """The list of concrete URLs a "hunt this program's whole scope" campaign should
     run. Uses ``seed_targets`` (an operator's own hand-curated hunt list) plus any
@@ -1350,6 +1470,15 @@ def program_campaign_targets(program: dict[str, Any], max_targets: int = _MAX_PR
         # through the explicit clone_repositories opt-in above.
         if is_supported_remote_git_url(identifier):
             continue
+        # Neither is a mobile app, a binary, a smart contract or source: those assets are
+        # in scope for the PROGRAM but are not web endpoints, and deriving a target from
+        # one sends traffic somewhere nobody authorized. A YesWeHack Android asset is
+        # published as its store URL, so this row would otherwise schedule a scan of
+        # play.google.com or apps.apple.com -- a third party -- and a bare package id like
+        # "com.vendor.mobile" resolves to https://com.vendor.mobile, an unrelated host.
+        # HackerOne imports carry the same asset types and the same hazard.
+        if str(entry.get("asset_type") or "").strip().upper() in _NON_WEB_ASSET_TYPES:
+            continue
         url = _representative_host(identifier)
         if url and url not in seen and not _target_host_excluded(url, excluded_hosts):
             seen.add(url)
@@ -1390,6 +1519,12 @@ def run_campaign_over_targets(
     policy_profile: str = "",
     progress_run_id: str | None = None,
     progress_unit: str | None = None,
+    # Forwarded verbatim to every per-target run_campaign — see _run_campaign_body for why the four
+    # out-of-band provers were otherwise unreachable from any autonomous path.
+    oob_base: str = "",
+    oob_secret: str = "",
+    external_mcp_hunt: bool = False,
+    mcp_manager: Any = None,
 ) -> dict[str, Any]:
     """Run one full ``run_campaign`` per target (bounded, deduped, best-effort — one
     bad target never aborts the rest) and merge the results into a single combined
@@ -1410,6 +1545,21 @@ def run_campaign_over_targets(
     if not authorized:
         return {"ok": False, "error": "Confirm you're authorized and in scope before running a campaign."}
 
+    # Validate every named target before the span's one-time research-account
+    # login. Invalid targets remain individual errors; eligible targets still run.
+    preflight_settings = dataclasses.replace(
+        get_settings(), excluded_hosts=tuple(excluded_hosts or ()),
+    )
+    preflight_errors = {
+        target: error
+        for target in capped
+        if (error := _campaign_preflight_error(target, scope, authorized, preflight_settings))
+    }
+    eligible_targets = [target for target in capped if target not in preflight_errors]
+    if not eligible_targets:
+        return {"ok": False, "error": "Every target in this program's scope failed preflight: "
+                + "; ".join(f"{target}: {error}" for target, error in list(preflight_errors.items())[:5])}
+
     def _emit(msg: str) -> None:
         if callable(on_progress):
             try:
@@ -1417,10 +1567,43 @@ def run_campaign_over_targets(
             except Exception:  # noqa: BLE001
                 pass
 
+    # A credential with no verified issuer may be used for one target (or a
+    # same-registrable-site set), but must not be re-bound across unrelated
+    # domains. That includes request-level auth and saved pasted cookies whose
+    # login_url is absent or outside the program's scope.
+    try:
+        hosts = [(urlparse(target).hostname or "") for target in eligible_targets]
+    except ValueError:
+        hosts = []
+    cross_site_span = (len(eligible_targets) > 1 and
+                       (not hosts or not hosts[0] or
+                        any(not scan_auth.same_registrable_site(host, hosts[0]) for host in hosts[1:])))
+    account_access_for_targets = account_access
+    admin_access_for_targets = admin_account_access
+    if cross_site_span and auth and not str(auth.get("issuer_host") or "").strip():
+        _emit("multi-domain span: request session has no verified issuer; scanning without it")
+        auth = None
+        account_access_for_targets = None  # no per-target fallback that rebinds the same cookie
+
     # Log in to the program's research account ONCE for the whole span (not once per target), then
     # pass the resulting session to every target's run_campaign (which skips re-login when auth is set).
-    if auth is None and account_access:
-        auth = _login_auth(account_access, scope, excluded_hosts, _emit)
+    if auth is None and account_access_for_targets:
+        auth = _login_auth(account_access_for_targets, scope, excluded_hosts, _emit)
+        if cross_site_span:
+            account_access_for_targets = None  # never retry an unbound paste once per target
+            if auth and not str(auth.get("issuer_host") or "").strip():
+                _emit("multi-domain span: saved session has no verified issuer; scanning without it")
+                auth = None
+
+    if (cross_site_span and isinstance(admin_access_for_targets, dict)
+            and str(admin_access_for_targets.get("cookie") or "").strip()):
+        # The secondary account is resolved inside each inner campaign. Inspect
+        # a pasted cookie's issuer once here (no login/network on this path) so
+        # the inner campaigns cannot each rebind an unissued admin session.
+        secondary = _login_auth(admin_access_for_targets, scope, excluded_hosts, _emit)
+        if not secondary or not str(secondary.get("issuer_host") or "").strip():
+            _emit("multi-domain span: secondary session has no verified issuer; omitting it")
+            admin_access_for_targets = None
 
     # Shared submission claim: the span's targets run CONCURRENTLY (below), and two targets can
     # surface the same finding (identical dedup_key). This process-local set + lock lets each
@@ -1471,6 +1654,12 @@ def run_campaign_over_targets(
         # run (progress_unit set) — in portfolio mode the portfolio owns the program unit, so
         # we don't mark per-target here; findings still stream to the program unit below.
         unit = progress_unit or target
+        if target in preflight_errors:
+            error = preflight_errors[target]
+            if progress_unit is None:
+                progress.mark_target(progress_run_id, target, "error", error=error)
+            _target_emit(f"skipped — {error}")
+            return (target, {"ok": False, "error": error}, None)
         if progress.is_stopped(progress_run_id):
             if progress_unit is None:
                 progress.mark_target(progress_run_id, target, "skipped")
@@ -1487,13 +1676,15 @@ def run_campaign_over_targets(
                 target, scope=scope, authorized=authorized, coder_cfg=coder_cfg,
                 default_reports_dir=span_root, seed_dir=seed_dir, runtime_dir=runtime_dir,
                 version=version, active=active, time_based=time_based, auth=auth,
-                account_access=account_access, user_agent_suffix=user_agent_suffix, live=live,
+                account_access=account_access_for_targets, user_agent_suffix=user_agent_suffix, live=live,
                 program=program, max_pages=max_pages, osint=osint, platform=platform, deep=deep,
                 disclose_automation=disclose_automation, on_progress=_target_emit, excluded_hosts=excluded_hosts,
-                admin_account_access=admin_account_access, idor_pairs=idor_pairs, include_attack_map=include_attack_map,
+                admin_account_access=admin_access_for_targets, idor_pairs=idor_pairs, include_attack_map=include_attack_map,
                 policy_profile=policy_profile,
                 progress_run_id=progress_run_id, progress_unit=unit,
                 submission_claim=submission_claim,  # dedup identical findings across concurrent targets
+                oob_base=oob_base, oob_secret=oob_secret,
+                external_mcp_hunt=external_mcp_hunt, mcp_manager=mcp_manager,
             )
             if progress_unit is None:
                 if result.get("ok"):
@@ -1641,13 +1832,19 @@ def run_portfolio_campaign(
     include_attack_map: bool = True,
     progress_run_id: str | None = None,
     max_concurrent_programs: int = _PORTFOLIO_MAX_PROGRAMS,
+    # Forwarded to every program's span. The operator loop is the MOST autonomous path, so it is the
+    # one where an unreachable prover costs the most: it runs unattended, for hours.
+    oob_base: str = "",
+    oob_secret: str = "",
+    external_mcp_hunt: bool = False,
+    mcp_manager: Any = None,
 ) -> dict[str, Any]:
     # (policy_profile is per-program here; read from each spec below, not a portfolio-wide arg.)
     """Run a full campaign across MULTIPLE saved programs CONCURRENTLY (bounded), merged into
     one combined result shaped like a single campaign — so the Findings board + Submissions hub
     render a portfolio hunt exactly like a single one. Each program is a dashboard unit; its
     findings stream under it as they surface. ``programs`` is a list of resolved specs:
-    ``{label, scope, targets, excluded_hosts, disclose_automation}``.
+    ``{label, scope, targets, excluded_hosts, disclose_automation, platform}``.
 
     Reuses ``run_campaign_over_targets`` verbatim per program (portfolio mode:
     ``progress_unit=<program label>``), so every fail-closed safety property (scope binding,
@@ -1672,6 +1869,10 @@ def run_portfolio_campaign(
                       "admin_account_access": p.get("admin_account_access") if isinstance(p.get("admin_account_access"), dict) else {},
                       "idor_pairs": p.get("idor_pairs") if isinstance(p.get("idor_pairs"), list) else [],
                       "policy_profile": str(p.get("policy_profile") or ""),
+                      # Per-program, like policy_profile: a portfolio routinely spans programs on
+                      # DIFFERENT platforms, so one portfolio-wide id can only be right for some of
+                      # them. Empty falls back to the portfolio-wide `platform` arg below.
+                      "platform": str(p.get("platform") or ""),
                       "user_agent_suffix": str(p.get("user_agent_suffix") or "")})
     if not clean:
         return {"ok": False, "error": "No huntable programs — each needs seed targets, an opted-in source repository, or an imported/built structured scope."}
@@ -1723,12 +1924,14 @@ def run_portfolio_campaign(
                 spec["targets"], scope=spec["scope"], authorized=authorized, coder_cfg=coder_cfg,
                 default_reports_dir=portfolio_root, seed_dir=seed_dir, runtime_dir=runtime_dir, version=version,
                 active=active, time_based=time_based, auth=auth, live=live, program=label, max_pages=max_pages,
-                platform=platform, deep=deep, disclose_automation=spec["disclose_automation"],
+                platform=spec.get("platform") or platform, deep=deep, disclose_automation=spec["disclose_automation"],
                 account_access=spec["account_access"], admin_account_access=spec.get("admin_account_access"),
                 idor_pairs=spec.get("idor_pairs"), policy_profile=spec.get("policy_profile", ""),
                 user_agent_suffix=spec["user_agent_suffix"],
                 excluded_hosts=spec["excluded_hosts"], include_attack_map=include_attack_map, on_progress=_p_emit,
                 progress_run_id=progress_run_id, progress_unit=label,
+                oob_base=oob_base, oob_secret=oob_secret,
+                external_mcp_hunt=external_mcp_hunt, mcp_manager=mcp_manager,
             )
             progress.mark_target(progress_run_id, label, "done" if result.get("ok") else "error",
                                  error="" if result.get("ok") else str(result.get("error") or ""))

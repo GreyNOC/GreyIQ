@@ -475,7 +475,9 @@ class JwtKeyUrlInjectionTests(unittest.TestCase):
                                             scope="app.example.com", settings=get_settings(), http=http,
                                             poll_attempts=2, poll_delay_s=0.0)
         cvss = res["attack_plan"]["cvss"]
-        self.assertEqual(cvss["base_severity"], "high")
+        # Capitalized: the block now derives its band from the vector via impact_model.cvss_block,
+        # which returns the canonical CVSS band name (the form cvss_for_class already produced).
+        self.assertEqual(cvss["base_severity"], "High")
         self.assertEqual(cvss["base_score"], 7.5)
         self.assertIn("I:N", cvss["vector"])
         self.assertIn("demonstrate that step", cvss["justification"])

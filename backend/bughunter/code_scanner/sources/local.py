@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from bughunter.code_scanner.sources.base import ScanSource
+from bughunter.code_scanner.sources.local_guard import resolve_local_scan_path
 
 
 class LocalPathSource(ScanSource):
@@ -22,7 +23,7 @@ class LocalPathSource(ScanSource):
         self.single_file_relative: str | None = None
 
     def _prepare(self) -> Path:
-        path = Path(self.target).expanduser().resolve()
+        path = resolve_local_scan_path(self.target)
         if not path.exists():
             raise FileNotFoundError(f"Scan target does not exist: {self.target}")
         if path.is_file():

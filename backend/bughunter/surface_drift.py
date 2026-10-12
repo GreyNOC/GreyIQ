@@ -425,7 +425,12 @@ def _compact_chains(chains: list[dict[str, Any]] | None) -> list[dict[str, Any]]
         if not isinstance(chain, dict):
             continue
         steps = chain.get("steps") if isinstance(chain.get("steps"), list) else []
-        blocking = next((s for s in steps if isinstance(s, dict) and not s.get("proven")), None)
+        # The stored snapshot's `needs` becomes a cross-run re-open probe, so it must name a
+        # capability that would actually unblock the ladder. A step downstream of a refuted
+        # prerequisite would advertise a capability that cannot help until the prerequisite is
+        # re-established, and the probe would fire on drift that changes nothing for this chain.
+        blocking = next((s for s in steps if isinstance(s, dict) and not s.get("proven")
+                         and s.get("state") != "unreachable"), None)
         out.append({
             "shape": chain_shape(chain),
             "impact": _redact(chain.get("projected_impact") or chain.get("impact_label"), 200),

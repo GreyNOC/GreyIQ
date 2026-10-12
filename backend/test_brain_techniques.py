@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -118,6 +119,7 @@ def test_hunt_priors_learn_from_confirmed_and_unconfirmed_chains(tmp_path: Path)
             surface=surface,
             plan=plan,
             outcomes=outcomes,
+            execution=[{"endpoint": endpoint, "classes": ["sqli", "xss"]}],
         )
 
     priors = brain_techniques.learned_hunt_priors(runtime, "demo", endpoint)
@@ -125,6 +127,63 @@ def test_hunt_priors_learn_from_confirmed_and_unconfirmed_chains(tmp_path: Path)
     assert priors["sqli"] > priors["xss"]
     assert 0.7 <= priors["xss"] <= 1.0
     assert brain_techniques.combine_priors({"sqli": 1.8}, {"sqli": 1.4})["sqli"] == 2.0
+
+
+def test_hunt_priors_ignore_planned_but_unchecked_pairs(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    endpoint = "https://example.test/search"
+    plan = {"probe_priority": [{"endpoint": endpoint, "classes": ["xss", "sqli"]}]}
+    for _ in range(4):
+        assert hunt_trace.record_trace(runtime, program="demo", target=endpoint,
+                                       surface={}, plan=plan, outcomes=[],
+                                       execution=[{"endpoint": endpoint, "classes": ["xss"]}])
+    priors = brain_techniques.learned_hunt_priors(runtime, "demo", endpoint)
+    assert "xss" in priors
+    assert "sqli" not in priors
+
+
+def test_hunt_priors_credit_exact_check_tags_for_shared_impacts(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    cases = (
+        ("debug-rce", "rce", "active.debug-endpoint", "debug"),
+        ("debug-disclosure", "disclosure", "active.debug-endpoint", "debug"),
+        ("framing", "headers", "active.clickjacking", "clickjacking"),
+        ("crlf", "redirect", "active.crlf", "crlf"),
+        ("host", "redirect", "active.host-header-injection", "host-header"),
+        ("open", "redirect", "active.open-redirect", "redirect"),
+    )
+    for path, impact, rule_id, tag in cases:
+        endpoint = f"https://example.test/{path}"
+        assert hunt_trace.record_trace(runtime, program="demo", target=endpoint,
+                                       surface={}, plan={},
+                                       outcomes=[{"endpoint": endpoint, "class": impact,
+                                                  "rule_id": rule_id, "proof_status": "confirmed"}],
+                                       execution=[{"endpoint": endpoint, "classes": [tag]}])
+    priors = brain_techniques.learned_hunt_priors(runtime, "demo")
+    for tag in ("debug", "clickjacking", "crlf", "host-header", "redirect"):
+        assert tag in priors
+    assert "rce" not in priors
+    assert "disclosure" not in priors
+    assert "headers" not in priors
+
+
+def test_hunt_priors_skip_unknown_ambiguous_confirm_and_legacy_trace(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    endpoint = "https://example.test/admin"
+    assert hunt_trace.record_trace(runtime, program="demo", target=endpoint,
+                                   surface={}, plan={},
+                                   outcomes=[{"endpoint": endpoint, "class": "rce",
+                                              "rule_id": "active.unrecognized", "proof_status": "confirmed"}],
+                                   execution=[{"endpoint": endpoint, "classes": ["debug", "rce", "xss"]}])
+    # A legacy trace has no execution coverage and only an ambiguous impact.
+    with (runtime / "hunt_traces.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"v": 1, "program": "demo", "outcomes": [{"endpoint": endpoint,
+                      "class": "headers", "proof_status": "confirmed"}]}) + "\n")
+    priors = brain_techniques.learned_hunt_priors(runtime, "demo")
+    assert "debug" not in priors
+    assert "rce" not in priors
+    assert "clickjacking" not in priors
+    assert "xss" in priors  # it was checked and had no related confirmation
 
 
 def test_status_snapshot_exposes_metadata_not_playbook_bodies(tmp_path: Path) -> None:

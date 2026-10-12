@@ -24,7 +24,18 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from bughunter import campaign  # noqa: E402
+from bughunter import campaign, rate_limit  # noqa: E402
+
+
+def setUpModule() -> None:
+    """Start from a full per-host active-request budget — see rate_limit.reset_shared_governors().
+
+    Especially load-bearing here: this module asserts the campaign is HONEST about what the active
+    pass did, and it runs alphabetically after test_bounty_progress has spent 573 of the shared
+    bucket's 700 tokens. Inheriting that drained bucket throttles this module's own probes, so it
+    would be checking honesty about a pass that never really ran.
+    """
+    rate_limit.reset_shared_governors()
 
 
 class _Handler(BaseHTTPRequestHandler):

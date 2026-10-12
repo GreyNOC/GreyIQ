@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -33,6 +34,9 @@ _API_BASE = f"https://{_API_HOST}/v1/hackers"
 _UA = "GreyIQ-BugHunter/hackerone-import"
 _MAX_ENTRIES = 500
 _MAX_PAGES = 10  # 500 entries / 10 pages = 50/page, matches H1's default page size
+_MAX_DISCOVERY_PAGES = 5
+_MAX_DISCOVERY_ENTRIES = 250
+_DISCOVERY_PAGE_SIZE = 50
 # A bounded retry for connection-level failures AND transient/rate-limit HTTP
 # statuses (429/5xx) -- but NEVER 401/403/404, which are deterministic auth/
 # permission/not-found outcomes this module's own docstring already treats as
@@ -126,6 +130,125 @@ def _error_for(exc: urllib.error.HTTPError) -> str:
             "don't expose structured scope via the API to every researcher. Use CSV or paste import instead."
         )
     return f"HackerOne API HTTP {exc.code}: {exc.reason}"
+
+
+def _is_program_list_url(url: str) -> bool:
+    """Only follow pagination for the documented researcher program-list endpoint."""
+    try:
+        if not _is_hackerone_url(url):
+            return False
+        parsed = urllib.parse.urlparse(url)
+        return (parsed.path == "/v1/hackers/programs" and not parsed.username
+                and not parsed.password and parsed.port in (None, 443)
+                and not parsed.fragment)
+    except (TypeError, ValueError):  # malformed URL, port, or bracketed host
+        return False
+
+
+def _plain_text(value: Any, limit: int) -> str:
+    """Bound untrusted API labels to one printable line before returning a preview."""
+    if not isinstance(value, str):
+        return ""
+    return " ".join("".join(ch if ch.isprintable() and ch not in "<>" else " " for ch in value).split())[:limit]
+
+
+def list_programs(
+    api_username: str,
+    api_token: str,
+    *,
+    fetch: Callable[..., Any] | None = None,
+    timeout: float = 20.0,
+    max_pages: int = _MAX_DISCOVERY_PAGES,
+    max_entries: int = _MAX_DISCOVERY_ENTRIES,
+) -> dict[str, Any]:
+    """Preview programs accessible to this researcher via ``GET /hackers/programs``.
+
+    This operator-triggered read returns small, sanitized candidates; it does not
+    create a portfolio record, grant testing authority, or retrieve asset scope.
+    Call ``fetch_structured_scope`` for a selected handle, then review before Save.
+    Pagination is limited even if HackerOne advertises more pages.
+    """
+    if not (api_username and api_token):
+        return {"ok": False, "error": "Save your HackerOne API username + token first."}
+    fetch = fetch or _fetch_json
+    page_limit = max(1, min(int(max_pages), _MAX_DISCOVERY_PAGES))
+    entry_limit = max(1, min(int(max_entries), _MAX_DISCOVERY_ENTRIES))
+    url: str | None = f"{_API_BASE}/programs?page%5Bsize%5D={_DISCOVERY_PAGE_SIZE}"
+    seen_urls: set[str] = set()
+    seen_handles: set[str] = set()
+    candidates: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    pages_fetched = 0
+    truncated = False
+
+    while url and pages_fetched < page_limit and len(candidates) < entry_limit:
+        if url in seen_urls or not _is_program_list_url(url):
+            warnings.append("HackerOne returned an unsafe or repeated program-pagination link; stopped early.")
+            truncated = True
+            break
+        seen_urls.add(url)
+        try:
+            page = fetch(url, api_username=api_username, api_token=api_token, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            if not pages_fetched:
+                return {"ok": False, "error": _error_for(exc), "status": exc.code}
+            warnings.append(f"Stopped after {pages_fetched} page(s): {_error_for(exc)}")
+            truncated = True
+            break
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
+            if not pages_fetched:
+                return {"ok": False, "error": f"Could not reach HackerOne: {exc}"}
+            warnings.append(f"Stopped after {pages_fetched} page(s): could not reach HackerOne ({exc}).")
+            truncated = True
+            break
+        pages_fetched += 1
+        if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+            if pages_fetched == 1:
+                return {"ok": False, "error": "HackerOne returned an unexpected program-list response."}
+            warnings.append("HackerOne returned an unexpected program-list page; stopped early.")
+            truncated = True
+            break
+        for row in page["data"]:
+            if not isinstance(row, dict) or row.get("type") != "program":
+                continue
+            attrs = row.get("attributes")
+            if not isinstance(attrs, dict):
+                continue
+            handle = attrs.get("handle")
+            if not isinstance(handle, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}", handle):
+                continue
+            key = handle.lower()
+            if key in seen_handles:
+                continue
+            seen_handles.add(key)
+            candidates.append({
+                "platform": "hackerone",
+                "handle": handle,
+                "name": _plain_text(attrs.get("name"), 200) or handle,
+                "submission_state": _plain_text(attrs.get("submission_state"), 40),
+                "state": _plain_text(attrs.get("state"), 40),
+                "offers_bounties": attrs.get("offers_bounties") is True,
+                "program_url": f"https://hackerone.com/{handle}",
+                "source_url": f"{_API_BASE}/programs/{handle}",
+            })
+            if len(candidates) >= entry_limit:
+                break
+        links = page.get("links")
+        next_url = links.get("next") if isinstance(links, dict) else None
+        if next_url:
+            if not isinstance(next_url, str) or not _is_program_list_url(next_url) or next_url in seen_urls:
+                warnings.append("HackerOne returned an unsafe or repeated program-pagination link; stopped early.")
+                truncated = True
+                break
+            url = next_url
+        else:
+            url = None
+        if len(candidates) >= entry_limit or (url and pages_fetched >= page_limit):
+            warnings.append(f"Showing the first {len(candidates)} programs; discovery is capped at {page_limit} pages and {entry_limit} candidates.")
+            truncated = True
+
+    return {"ok": True, "programs": candidates, "count": len(candidates),
+            "pages_fetched": pages_fetched, "truncated": truncated, "warnings": warnings}
 
 
 def verify_credentials(

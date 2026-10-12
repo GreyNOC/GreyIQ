@@ -108,7 +108,11 @@ class CodeLocation:
     ``role`` is Shannon's own word for the location's part in the data flow — "sink",
     "source" or "guard" — carried in the SARIF location's ``message.text``. A validated
     SAST source location instead carries the prose "Validated SAST source location
-    (CWE-89)", which we normalize to role ``"sast-source"`` and mine for the CWE.
+    (CWE-89)", which we normalize to role ``"sast-source"``.
+
+    ``message`` keeps that ``message.text`` verbatim, because normalizing ``role`` discards
+    the only place the CWE appears. _resolve_cwe mines this field; it used to mine ``file``,
+    an artifact URI that never carries a CWE, which made the mining branch unreachable.
     """
 
     file: str = ""
@@ -116,6 +120,7 @@ class CodeLocation:
     end_line: int | None = None
     role: str = ""
     symbol: str = ""
+    message: str = ""
 
 
 @dataclass(frozen=True)
@@ -226,9 +231,11 @@ def _location(raw: Any) -> CodeLocation | None:
 
     message = raw.get("message")
     message = message if isinstance(message, dict) else {}
-    role = _text(message.get("text"))
+    text = _text(message.get("text"))
+    role = text
     # "Validated SAST source location (CWE-89)" is prose, not a data-flow role. Normalize
-    # it so a consumer can switch on role without string-matching an English sentence.
+    # it so a consumer can switch on role without string-matching an English sentence, and
+    # keep the prose in `message` — the CWE it names is not recoverable from anywhere else.
     if role.lower().startswith("validated sast source location"):
         role = "sast-source"
 
@@ -246,6 +253,7 @@ def _location(raw: Any) -> CodeLocation | None:
         end_line=_positive_int(region.get("endLine")),
         role=role,
         symbol=symbol,
+        message=text,
     )
 
 
@@ -270,7 +278,7 @@ def _resolve_cwe(rule_id: str, sast_rule_id: str, locations: tuple[CodeLocation,
 
     for loc in locations:
         if loc.role == "sast-source":
-            mined = _cwe_from_text(loc.file)
+            mined = _cwe_from_text(loc.message)
             if mined:
                 return mined, "shannon-sast-location"
 

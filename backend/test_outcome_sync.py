@@ -203,15 +203,15 @@ class OperatorWiringTests(_Store):
             return {"ok": True, "run_id": "r1", "findings": [], "proof_of_impact": {}}
 
         operator.run_program_cycle(
-            str(self.rt), program, run_campaign_fn=run_fn, submit_fn=None,
+            str(self.rt), program, run_campaign_fn=run_fn,
             sync_fn=lambda: self.sync(_resolved(900.0)))
         self.assertIn("sqli", seen["priors"],
                       "the hunt ran before the sync — it saw stale priors")
 
     def test_no_sync_fn_is_a_silent_no_op(self) -> None:
         operator.run_program_cycle(str(self.rt), self._program(),
-                                   run_campaign_fn=lambda *a, **k: {"ok": True, "findings": []},
-                                   submit_fn=None)  # sync_fn omitted
+                                   run_campaign_fn=lambda *a, **k: {"ok": True, "findings": []})
+        # sync_fn omitted
 
     def test_a_raising_sync_never_stops_the_cycle(self) -> None:
         events: list[str] = []
@@ -219,7 +219,7 @@ class OperatorWiringTests(_Store):
             raise RuntimeError("platform unreachable")
         summary = operator.run_program_cycle(
             str(self.rt), self._program(), run_campaign_fn=lambda *a, **k: {"ok": True, "findings": []},
-            submit_fn=None, sync_fn=boom, on_event=events.append)
+            sync_fn=boom, on_event=events.append)
         self.assertIsNotNone(summary)
         self.assertTrue(any("outcome sync error" in e for e in events))
 
@@ -227,7 +227,7 @@ class OperatorWiringTests(_Store):
         events: list[str] = []
         operator.run_program_cycle(
             str(self.rt), self._program(), run_campaign_fn=lambda *a, **k: {"ok": True, "findings": []},
-            submit_fn=None, on_event=events.append,
+            on_event=events.append,
             sync_fn=lambda: outcome_sync.sync_outcomes(self.rt, api_username="", api_token=""))
         self.assertTrue(any("outcome sync skipped" in e for e in events))
 
@@ -236,12 +236,24 @@ class YieldOrderingTests(_Store):
     """The operator must hunt what has paid first, and be unchanged until something has."""
 
     def _loop(self):
-        return operator.OperatorLoop(str(self.rt), run_campaign_fn=lambda *a, **k: {},
-                                     submit_fn=lambda *a: {})
+        return operator.OperatorLoop(str(self.rt), run_campaign_fn=lambda *a, **k: {})
+
+    @staticmethod
+    def _due(*ids: str) -> list[tuple[dict, None]]:
+        """The queue shape _supervise builds: (program, grant) per due program.
+
+        The grant is irrelevant to ordering — rank() reads entry[0] only — but passing the
+        real pair is what keeps this test honest about the signature it is exercising.
+        """
+        return [({"id": pid}, None) for pid in ids]
+
+    @staticmethod
+    def _ids(ordered) -> list[str]:
+        return [program["id"] for program, _grant in ordered]
 
     def test_a_cold_portfolio_keeps_the_old_alphabetical_order(self) -> None:
-        due = [{"id": "alpha"}, {"id": "mid"}, {"id": "zeta"}]
-        self.assertEqual([p["id"] for p in self._loop()._by_yield(due)],
+        due = self._due("alpha", "mid", "zeta")
+        self.assertEqual(self._ids(self._loop()._by_yield(due)),
                          ["alpha", "mid", "zeta"])
 
     def test_the_payer_leads(self) -> None:
@@ -251,12 +263,12 @@ class YieldOrderingTests(_Store):
                                 status="resolved", severity="low", bounty=100.0)
         learning.record_outcome(self.rt, program="alpha", target="", class_id="xss", title="t",
                                 status="duplicate", severity="low")
-        due = [{"id": "alpha"}, {"id": "mid"}, {"id": "zeta"}]
-        self.assertEqual([p["id"] for p in self._loop()._by_yield(due)],
+        due = self._due("alpha", "mid", "zeta")
+        self.assertEqual(self._ids(self._loop()._by_yield(due)),
                          ["zeta", "mid", "alpha"])
 
     def test_ordering_never_drops_a_program(self) -> None:
-        due = [{"id": "a"}, {"id": "b"}, {"id": "c"}]
+        due = self._due("a", "b", "c")
         self.assertEqual(len(self._loop()._by_yield(due)), 3)
 
 
@@ -264,7 +276,6 @@ class RetrainWiringTests(_Store):
     def test_only_a_written_model_is_announced(self) -> None:
         """`ok` is True for a dry run too, and `reason` is prose — `written` is the signal."""
         loop = operator.OperatorLoop(str(self.rt), run_campaign_fn=lambda *a, **k: {},
-                                     submit_fn=lambda *a: {},
                                      train_fn=lambda: {"ok": True, "reason": "dry run"})
         loop._retrain()
         self.assertFalse([e for e in loop.events if "promoted" in e.get("message", "")])
@@ -277,7 +288,6 @@ class RetrainWiringTests(_Store):
     def test_a_refusal_is_silent(self) -> None:
         """Too few rows is the normal outcome for a long time; an event every pass is noise."""
         loop = operator.OperatorLoop(str(self.rt), run_campaign_fn=lambda *a, **k: {},
-                                     submit_fn=lambda *a: {},
                                      train_fn=lambda: {"ok": False, "reason": "too few rows"})
         loop._retrain()
         self.assertEqual(list(loop.events), [])
@@ -286,7 +296,7 @@ class RetrainWiringTests(_Store):
         def boom():
             raise RuntimeError("corpus unreadable")
         loop = operator.OperatorLoop(str(self.rt), run_campaign_fn=lambda *a, **k: {},
-                                     submit_fn=lambda *a: {}, train_fn=boom)
+                                     train_fn=boom)
         loop._retrain()
         self.assertTrue([e for e in loop.events if "retrain error" in e.get("message", "")])
 

@@ -211,6 +211,12 @@ def capture_screenshot(
     secret in source, a missing header). ``highlight`` outlines + scrolls to the first
     element containing that text. ``extra_full_page`` additionally writes a whole-page shot
     beside the primary one; ``shots`` lists every image written (``path``/``kind``)."""
+    # Playwright owns its network callbacks and can spawn requests outside the
+    # operator thread's ContextVar. Keep unattended cycles on the guarded HTTP
+    # path; proof screenshots remain available to a human-run campaign.
+    from bughunter import operator_guard
+    if operator_guard.current() is not None:
+        return {"ok": False, "error": "Proof screenshots require a manual run in unattended mode."}
     settings = settings or get_settings()
     target = str(url or "").strip()
     if not target:

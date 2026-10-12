@@ -1,0 +1,25 @@
+GreyIQ Linux CLI (headless)
+===========================
+
+Keep greyiq-cli and the greyiq-backend directory together after extraction.
+
+Run from the extracted directory:
+  ./greyiq-cli --help
+  ./greyiq-cli path
+  ./greyiq-cli dashboard
+
+The path command prints the runtime data directory and the exact PATH syntax
+for this shell. It does not change your shell profile.
+
+Optional per-user install with a command on PATH (run from this directory):
+  mkdir -p "$HOME/.local/opt/greyiq" "$HOME/.local/bin"
+  cp -a greyiq-cli greyiq-backend "$HOME/.local/opt/greyiq/"
+  ln -sfn "$HOME/.local/opt/greyiq/greyiq-cli" "$HOME/.local/bin/greyiq-cli"
+  export PATH="$HOME/.local/bin:$PATH"
+  greyiq-cli path
+  greyiq-cli dashboard
+
+To keep that PATH setting for future login shells, add this line to ~/.profile:
+  export PATH="$HOME/.local/bin:$PATH"
+
+The Debian .deb package installs greyiq-cli in /usr/bin automatically.
