@@ -4,6 +4,13 @@ Notable changes to GreyIQ.
 
 ## Unreleased
 
+- Give the `gn dash` cockpit a four-colour palette: blue for structure, and
+  red/yellow/green carrying severity and health. Severity labels and their
+  counts, the status pill, the section titles and the log line's phase prefix
+  are all lit, and a zero count stays plain so an idle run never reads as a wall
+  of red. The colour is applied AFTER `render`, which keeps that function pure
+  and escape-free — the property that stops a target's own finding title from
+  repainting the operator's screen. `GN_DASH_COLOR=0` turns it off.
 - Hunt a directory with one command: `gn auto -y` in a repo or a folder that
   lists its targets resolves them, registers the directory as a saved program so
   negative knowledge, priors, surface drift and the ledger accumulate across
