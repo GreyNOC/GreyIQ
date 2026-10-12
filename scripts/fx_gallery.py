@@ -336,7 +336,10 @@ class Wopr(Scene):
         counts: dict[str, int] = {}
         for _n, _x, _y, severity, _l, _lab in resolved:
             counts[severity] = counts.get(severity, 0) + 1
-        defcon = max(1, 5 - len(resolved))
+        # DEFCON is the worst CONFIRMED severity (critical 1 ... nothing 5), the same rule the live
+        # board in backend/gn_fx.py applies. Counting resolved arcs instead reads fine on a demo
+        # that happens to confirm them worst-last, and then says DEFCON 4 over a confirmed HIGH.
+        defcon = min((_SEV_ORDER.index(tgt[3]) + 1 for tgt in resolved), default=5)
 
         # --- header -------------------------------------------------------------------------------
         canvas.text(box_x + 2, box_y, " GREYNOC // WOPR-IQ ", "1;38;5;214")
