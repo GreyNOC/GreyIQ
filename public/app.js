@@ -14362,17 +14362,50 @@ async function boot() {
 
 boot();
 
-// Boot splash: hold the GreyNOC globe until the local engine is reachable (min ~0.7s so it
-// registers as a brand moment; hard cap ~7s so a slow/absent engine can never block the app).
+// Boot splash: hold the threat board until the local engine is reachable (min ~1.5s so the board
+// gets an arc into the air and it registers as a brand moment; hard cap ~7s so a slow or absent
+// engine can never block the app).
+//
+// The board runs the SCRIPTED demo and says so in its own footer. The line underneath it is the
+// real boot status. Keeping those apart is deliberate: a simulation may look like a hunt, but
+// nothing on this screen may be mistaken for one that happened.
 (function ckBootSplash() {
   const el = document.getElementById("ckSplash");
   if (!el) return;
   const started = Date.now();
   let done = false;
-  const hide = () => { if (done) return; done = true; el.classList.add("is-hidden"); setTimeout(() => el.remove(), 650); };
+  let board = null;
+
+  const frame = document.getElementById("ckSplashFrame");
+  const canvas = document.getElementById("ckSplashBoard");
+  if (frame && canvas && window.WoprBoard) {
+    try {
+      board = new window.WoprBoard(canvas, {
+        scope: "example.com",
+        title: "GREYNOC // WOPR-IQ",
+        footer: "SIMULATION  ::  AUTHORIZED SCOPE ONLY  ::  READ-ONLY PROOF",
+      });
+      const still = window.matchMedia
+        && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      if (still) board.still(10.5); else board.demo();
+      frame.hidden = false;   // only now: a frame has actually been drawn
+    } catch (err) {
+      // A splash is never worth a failed boot. Fall back to the owl and carry on.
+      board = null;
+      if (frame) frame.hidden = true;
+    }
+  }
+
+  const hide = () => {
+    if (done) return;
+    done = true;
+    if (board) { try { board.destroy(); } catch (err) { /* already gone */ } }
+    el.classList.add("is-hidden");
+    setTimeout(() => el.remove(), 650);
+  };
   const tick = () => {
     const elapsed = Date.now() - started;
-    if ((service && service.available && elapsed > 700) || elapsed > 7000) { hide(); return; }
+    if ((service && service.available && elapsed > 1500) || elapsed > 7000) { hide(); return; }
     setTimeout(tick, 250);
   };
   setTimeout(tick, 700);

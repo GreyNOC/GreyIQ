@@ -241,11 +241,11 @@ _MAP_W, _MAP_H = 72, 17
 
 # name, map x, map y, severity, launch second, what the arc resolved into
 _WOPR_TARGETS: tuple[tuple[str, int, int, str, float, str], ...] = (
-    ("api.acme-corp.io",    36,  4, "high",     1.4, "SSRF -> CLOUD METADATA"),
-    ("sso.acme-corp.io",    23, 11, "critical", 3.0, "AUTH BYPASS -> ADMIN"),
-    ("vpn.acme-corp.io",    59,  6, "medium",   4.6, "IKE FINGERPRINT LEAK"),
-    ("legacy.acme-corp.io", 34,  8, "low",      6.2, "STACK TRACE DISCLOSURE"),
-    ("cdn.acme-corp.io",    65, 13, "info",     7.8, "CACHE KEY NORMALISATION"),
+    ("api.example.com",    36,  4, "high",     1.4, "SSRF -> CLOUD METADATA"),
+    ("sso.example.com",    23, 11, "critical", 3.0, "AUTH BYPASS -> ADMIN"),
+    ("vpn.example.com",    59,  6, "medium",   4.6, "IKE FINGERPRINT LEAK"),
+    ("legacy.example.com", 34,  8, "low",      6.2, "STACK TRACE DISCLOSURE"),
+    ("cdn.example.com",    65, 13, "info",     7.8, "CACHE KEY NORMALISATION"),
 )
 _WOPR_ORIGIN = (12, 4)
 _FLIGHT = 1.7
@@ -302,7 +302,7 @@ class Wopr(Scene):
         """(when, text, colour) for the teletype -- the whole run scripted up front."""
         amber, hot = "38;5;214", "1;38;5;196"
         out: list[tuple[float, str, str]] = [
-            (0.1, "> WOPR-IQ ONLINE  ::  SCOPE acme-corp.io  ::  AUTHORIZATION ON FILE", amber),
+            (0.1, "> WOPR-IQ ONLINE  ::  SCOPE example.com  ::  AUTHORIZATION ON FILE", amber),
         ]
         for name, _x, _y, severity, launch, label in _WOPR_TARGETS:
             out.append((launch, f"> PLOTTING TRAJECTORY  {name}", amber))
@@ -588,11 +588,11 @@ class Cryptlock(Scene):
 # 3. WIREFRAME -- the rotating scope
 # =================================================================================================
 _NODES: tuple[tuple[str, float, float, str], ...] = (
-    ("api.acme-corp.io",     48.0,  10.0, "high"),
-    ("sso.acme-corp.io",    -23.0, -46.0, "critical"),
-    ("vpn.acme-corp.io",      35.0, 139.0, "medium"),
-    ("legacy.acme-corp.io",   6.0,  12.0, "low"),
-    ("cdn.acme-corp.io",    -33.0, 151.0, "info"),
+    ("api.example.com",     48.0,  10.0, "high"),
+    ("sso.example.com",    -23.0, -46.0, "critical"),
+    ("vpn.example.com",      35.0, 139.0, "medium"),
+    ("legacy.example.com",   6.0,  12.0, "low"),
+    ("cdn.example.com",    -33.0, 151.0, "info"),
 )
 _LOCK_EVERY = 2.0
 _LOCK_FIRST = 2.4
@@ -741,7 +741,7 @@ class Wireframe(Scene):
             px = globe_w
             box.frame(px, 0, panel_w, canvas.h, "38;5;31")
             canvas.text(px + 2, 0, " SCOPE ", "1;38;5;51")
-            canvas.text(px + 2, 2, "acme-corp.io", "1;38;5;195")
+            canvas.text(px + 2, 2, "example.com", "1;38;5;195")
             canvas.text(px + 2, 3, "authorization  ON FILE", "38;5;44")
             canvas.text(px + 2, 5, "kem   ML-KEM-768", "38;5;44")
             canvas.text(px + 2, 6, "sig   ML-DSA-65", "38;5;44")

@@ -396,11 +396,11 @@
   })();
 
   const TARGETS = [
-    ["api.acme-corp.io", 36, 4, "high", 1.4, "SSRF -> CLOUD METADATA"],
-    ["sso.acme-corp.io", 23, 11, "critical", 3.0, "AUTH BYPASS -> ADMIN"],
-    ["vpn.acme-corp.io", 59, 6, "medium", 4.6, "IKE FINGERPRINT LEAK"],
-    ["legacy.acme-corp.io", 34, 8, "low", 6.2, "STACK TRACE DISCLOSURE"],
-    ["cdn.acme-corp.io", 65, 13, "info", 7.8, "CACHE KEY NORMALISATION"],
+    ["api.example.com", 36, 4, "high", 1.4, "SSRF -> CLOUD METADATA"],
+    ["sso.example.com", 23, 11, "critical", 3.0, "AUTH BYPASS -> ADMIN"],
+    ["vpn.example.com", 59, 6, "medium", 4.6, "IKE FINGERPRINT LEAK"],
+    ["legacy.example.com", 34, 8, "low", 6.2, "STACK TRACE DISCLOSURE"],
+    ["cdn.example.com", 65, 13, "info", 7.8, "CACHE KEY NORMALISATION"],
   ];
   const ORIGIN = [12, 4], FLIGHT = 1.7;
   const WG = {
@@ -410,7 +410,7 @@
   };
   const BEATS = (() => {
     const amber = "38;5;214", hot = "1;38;5;196";
-    const out = [[0.1, "> WOPR-IQ ONLINE  ::  SCOPE acme-corp.io  ::  AUTHORIZATION ON FILE", amber]];
+    const out = [[0.1, "> WOPR-IQ ONLINE  ::  SCOPE example.com  ::  AUTHORIZATION ON FILE", amber]];
     for (const [name, , , severity, launch, label] of TARGETS) {
       out.push([launch, "> PLOTTING TRAJECTORY  " + name, amber]);
       const paint = (severity === "critical" || severity === "high") ? hot : amber;
@@ -637,11 +637,11 @@
      3. WIREFRAME
      ========================================================================================= */
   const NODES = [
-    ["api.acme-corp.io", 48.0, 10.0, "high"],
-    ["sso.acme-corp.io", -23.0, -46.0, "critical"],
-    ["vpn.acme-corp.io", 35.0, 139.0, "medium"],
-    ["legacy.acme-corp.io", 6.0, 12.0, "low"],
-    ["cdn.acme-corp.io", -33.0, 151.0, "info"],
+    ["api.example.com", 48.0, 10.0, "high"],
+    ["sso.example.com", -23.0, -46.0, "critical"],
+    ["vpn.example.com", 35.0, 139.0, "medium"],
+    ["legacy.example.com", 6.0, 12.0, "low"],
+    ["cdn.example.com", -33.0, 151.0, "info"],
   ];
   const LOCK_EVERY = 2.0, LOCK_FIRST = 2.4;
   const WF = {
@@ -726,7 +726,7 @@
       const px = globeW;
       frame(g, px, 0, panelW, g.rows, "38;5;31", WF);
       g.text(px + 2, 0, " SCOPE ", "1;38;5;51");
-      g.text(px + 2, 2, "acme-corp.io", "1;38;5;195");
+      g.text(px + 2, 2, "example.com", "1;38;5;195");
       g.text(px + 2, 3, "authorization  ON FILE", "38;5;44");
       g.text(px + 2, 5, "kem   ML-KEM-768", "38;5;44");
       g.text(px + 2, 6, "sig   ML-DSA-65", "38;5;44");

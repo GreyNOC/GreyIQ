@@ -22,7 +22,10 @@
       </div>
     </header>
     <div class="ck-splash" id="ckSplash">
-      <span class="ck-splash-globe gn-owl" aria-hidden="true"></span>
+      <div class="ck-splash-board" id="ckSplashFrame" hidden>
+        <canvas id="ckSplashBoard" aria-hidden="true"></canvas>
+      </div>
+      <span class="ck-splash-globe gn-owl" id="ckSplashGlobe" aria-hidden="true"></span>
       <div class="ck-splash-name">GreyIQ</div>
       <div class="ck-splash-sub">GreyNOC Operations · initializing local engine…</div>
     </div>
@@ -845,6 +848,7 @@
       </article>
     </template>
 
+    <script src="./wopr-board.js"></script>
     <script src="./app.js" type="module"></script>
   </body>
 </html>

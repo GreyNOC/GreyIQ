@@ -291,20 +291,56 @@
   /* --- demo --------------------------------------------------------------------------------------
    * Ordered so DEFCON descends honestly: each finding is worse than the one before it. */
   var DEMO = [
-    ["cdn.acme-corp.io", "info", "CACHE KEY NORMALISATION", 1.2],
-    ["legacy.acme-corp.io", "low", "STACK TRACE DISCLOSURE", 2.8],
-    ["vpn.acme-corp.io", "medium", "IKE FINGERPRINT LEAK", 4.4],
-    ["api.acme-corp.io", "high", "SSRF -> CLOUD METADATA", 6.0],
-    ["sso.acme-corp.io", "critical", "AUTH BYPASS -> ADMIN", 7.6]
+    ["cdn.example.com", "info", "CACHE KEY NORMALISATION", 1.2],
+    ["legacy.example.com", "low", "STACK TRACE DISCLOSURE", 2.8],
+    ["vpn.example.com", "medium", "IKE FINGERPRINT LEAK", 4.4],
+    ["api.example.com", "high", "SSRF -> CLOUD METADATA", 6.0],
+    ["sso.example.com", "critical", "AUTH BYPASS -> ADMIN", 7.6]
   ];
   var DEMO_SPAN = 7.6 + FLIGHT + 3.4;
 
   WoprBoard.prototype.demo = function (options) {
     options = options || {};
     this.demoLoop = options.loop !== false;
-    this.scope = this.scope || "acme-corp.io";
+    this.scope = this.scope || "example.com";
     this._arm();
     return this.start();
+  };
+
+  /** Seek the demo to one instant and paint a single frame — no loop, no timers.
+   *
+   * This is what prefers-reduced-motion gets, and what a surface shows before it has scrolled into
+   * view. It seeds the same state the scheduled demo would have reached by `t` instead of waiting
+   * for timers, so the still is a real frame of the sequence rather than a mock-up of one.
+   */
+  WoprBoard.prototype.still = function (t) {
+    t = t === undefined ? 10.5 : t;
+    this.destroy();
+    this.reset();
+    this.startedAt = performance.now();
+    this.lines.push({
+      text: "> WOPR-IQ ONLINE  ::  SCOPE " + (this.scope || "local") + "  ::  AUTHORIZATION ON FILE",
+      color: "38;5;214", at: 0
+    });
+    for (var i = 0; i < DEMO.length; i++) {
+      var name = DEMO[i][0], severity = DEMO[i][1], label = DEMO[i][2], at = DEMO[i][3];
+      if (at > t) break;
+      this.track([name]);
+      var asset = this.byName.get(name);
+      asset.launchAt = at;
+      this.lines.push({ text: "> PLOTTING TRAJECTORY  " + name, color: "38;5;214", at: at });
+      if (at + FLIGHT > t) continue;
+      asset.severity = severity;
+      asset.label = label;
+      asset.resolveAt = at + FLIGHT;
+      this.lines.push({
+        text: "> " + label + "  ::  CONFIRMED  ::  " + severity.toUpperCase(),
+        color: severity === "critical" || severity === "high" ? "1;38;5;196" : "38;5;214",
+        at: at + FLIGHT
+      });
+    }
+    this.paint(t);
+    return this;
   };
 
   WoprBoard.prototype._arm = function () {
