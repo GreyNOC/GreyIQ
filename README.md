@@ -280,6 +280,63 @@ default. The offline coder can also scaffold a bounded authorized HTTP/C2 traffi
 for a local lab; it sends finite attributed requests and treats every response as data, never
 as commands to execute.
 
+## Cloning Hugging Face agents
+
+The Hub hosts agents as ordinary repositories: `smolagents` writes an
+`agent.json` (class, model, tool names, prompt templates), a `prompts.yaml`, and
+one Python file per tool under `tools/`. Clone one into the local agent store
+from the CLI:
+
+```bash
+gn agent clone https://huggingface.co/spaces/agents-course/First_agent_template
+```
+
+The reference can be a repository page URL, a `tree/<branch>` URL you pasted
+from the browser, `hf.co/spaces/owner/name`, `spaces/owner/name`, or a bare
+`owner/name` (Spaces are searched first, then models). Append `@<branch|tag|sha>`
+or pass `--revision` to pin an exact commit, `--as NAME` to choose the local id,
+`--force` to replace an existing clone, and `--json` for the machine-readable
+manifest. The other actions are `gn agent list`, `gn agent show <name>`
+(`--files` for every digest, `--prompt` for the cloned `prompts.yaml`), and
+`gn agent remove <name> -y`.
+
+```
+gn agent clone spaces/mrafidamin/AlfredAgent --as alfred
+cloned  alfred  <-  spaces/mrafidamin/AlfredAgent
+commit  299ba2dfadf84b2dbb54e712b8c6c687bb797e11
+files   11 verified against Hugging Face digests
+model   Qwen/Qwen2.5-Coder-32B-Instruct via InferenceClientModel
+tools   6: catering_service_tool, final_answer, suggest_menu, …
+trust   clean
+```
+
+**A clone is reference material, not a running agent.** Three rules hold, and
+they are what make it safe to clone a stranger's agent:
+
+- **Nothing fetched is executed or imported.** A cloned tool is someone else's
+  arbitrary Python — smolagents' own `from_hub` requires `trust_remote_code=True`
+  for that reason. GreyIQ reads the tool interface (name, description, inputs,
+  output type, imports) statically with `ast` instead, so `gn agent show` gives
+  you the full inventory without running a line of it.
+- **Every byte is pinned and verified.** The revision is resolved to a commit SHA
+  before the first download, and each file is checked against the git blob digest
+  the Hub published for it. A digest or size mismatch refuses the whole clone and
+  leaves nothing behind. Weights, binaries and non-code files are not downloaded;
+  they are listed as skipped with the reason.
+- **The clone's text is untrusted data.** A remote agent's prompts, description
+  and tool docs are prose aimed at a model. Each clone gets a `SKILL.md` playbook
+  that the coding agent and offline coder pick up like any other playbook, but it
+  loads with source `cloned` and is fenced inside an untrusted-data boundary — it
+  is never spliced into the system prompt the way an operator-authored playbook
+  is, and an operator-authored skill of the same name wins over it. The clone's
+  own prompts are also screened for injection directives, and the result is in
+  the manifest and on the `trust` line above.
+
+Clones live under `<runtime>/agents/<name>/` — `source/` holds the verified
+original files, `greyiq-agent.json` the manifest, `SKILL.md` the playbook. Set
+`GREYIQ_RUNTIME_DIR` to move the store. Review each agent's license and card
+before reusing anything from it.
+
 ## BugHunter
 
 See [docs/USER_GUIDE.md](docs/USER_GUIDE.md) for the full Hunt-cockpit walkthrough —
