@@ -67,7 +67,7 @@ from bughunter.bounty import (
     run_bounty_hunt,
 )
 from bughunter.rate_limit import shared_governor
-from bughunter.registrable_domain import registrable_domain
+from bughunter.registrable_domain import is_ip_literal, registrable_domain
 from bughunter.settings import get_settings
 from bughunter.target_ingest import _normalize_one
 from bughunter.code_scanner.sources.git_remote import is_supported_remote_git_url
@@ -348,6 +348,7 @@ def _run_campaign_body(
     osint: bool = False,
     platform: str = "hackerone",
     deep: bool = False,
+    iterate: bool = False,
     on_progress: Any = None,
     disclose_automation: bool = False,
     excluded_hosts: tuple[str, ...] = (),
@@ -399,6 +400,19 @@ def _run_campaign_body(
         base_settings,
         excluded_hosts=tuple(excluded_hosts or ()),
         recon_osint_enabled=bool(osint or base_settings.recon_osint_enabled),
+        # `iterate` turns on the outer theorize -> act wave for THIS run, without the
+        # operator having to set a process-wide env var — the same per-run override shape
+        # `osint` already uses, and `or base_settings...` so a per-run flag can only ever
+        # turn a feature ON (never off, which is the env/global's call).
+        #
+        # It deliberately does NOT set hunt_loop_enabled. That flag swaps the active pass
+        # for hunt_loop.run_iterative_verify, which probes the SEED URL and nothing else
+        # (bounty.py: `active_swept = {clean_target}  # the loop probes the seed and
+        # nothing else`) instead of every ranked endpoint — so on a multi-endpoint target
+        # "iterate" would NARROW coverage. The replan wave is additive instead: it runs
+        # after the first active pass, across every scanner's findings, through the same
+        # gated prover. Depth without losing breadth.
+        hunt_replan_enabled=bool(iterate or base_settings.hunt_replan_enabled),
     )
     # Keep direct callers of this internal function behind the same grant as
     # the public wrapper. This must precede the output folder and recon crawl.
@@ -715,7 +729,14 @@ def _run_campaign_body(
     # the honest "did active probing run" flag is their union. Use it for the per-target run
     # AND the campaign report so the report can never claim "active: off" while an executing
     # probe (e.g. the deep-mode time-based SLEEP) actually fired.
-    effective_active = bool(active or time_based or deep)
+    # `iterate` belongs in this implication. The replan wave runs INSIDE run_bounty_hunt's
+    # active block, so with iterate=True and active/time_based/deep all false the settings
+    # override armed hunt_replan_enabled and then the block it lives in was skipped — the
+    # option silently did nothing. portfolio._normalize couples iterate -> active for a saved
+    # program, but a direct campaign/API caller bypasses that, and CampaignRequest.iterate
+    # documents itself as implying active. Named here so one honest flag drives both the pass
+    # and the report, exactly as `deep` already does.
+    effective_active = bool(active or time_based or deep or iterate)
     per_target: list[dict[str, Any]] = []
     consolidated: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
@@ -856,9 +877,20 @@ def _run_campaign_body(
         # draws that boundary too). Additive and order-only; the gated prover still owns confirm.
         if confirmed_here:
             try:
-                here = registrable_domain((urlparse(url).hostname or "").lower())
+                # IP hosts must match EXACTLY. registrable_domain is a last-two-labels
+                # heuristic, so folding IPs through it made 10.0.0.5 and 192.168.0.5 both
+                # "0.5" — which would hand a confirmed class on one box to the front of the
+                # probe order on an unrelated one, breaking the very invariant the comment
+                # above states ("a confirmation on one property says nothing about another").
+                # scan_auth and attack_chain already guard their registrable-domain checks
+                # the same way; this call site did not.
+                here_host = (urlparse(url).hostname or "").lower()
+                here = here_host.strip("[]") if is_ip_literal(here_host) else registrable_domain(here_host)
                 for later in urls[index:]:
-                    if not here or registrable_domain((urlparse(later).hostname or "").lower()) != here:
+                    later_host = (urlparse(later).hostname or "").lower()
+                    later_key = (later_host.strip("[]") if is_ip_literal(later_host)
+                                 else registrable_domain(later_host))
+                    if not here or later_key != here:
                         continue
                     hunt_priority[later] = list(dict.fromkeys(
                         confirmed_here + (hunt_priority.get(later) or [])))

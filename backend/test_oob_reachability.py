@@ -174,9 +174,32 @@ class TheCollaboratorReachesThePerUrlHuntTests(unittest.TestCase):
 
 class EveryCallerSuppliesItTests(unittest.TestCase):
     def test_all_four_api_hunt_routes_pass_the_configured_collaborator(self) -> None:
-        # The single hunt plus the three campaign shapes: single-target, program span, portfolio.
-        self.assertEqual(API_SOURCE.count("oob_base=self._oob_config()"), 4,
+        """Every hunt route must hand the collaborator down, or its provers are dead.
+
+        The single hunt plus the three campaign shapes: single-target, program span,
+        portfolio. Counted as the kwarg rather than one exact expression, because the
+        routes no longer obtain the pair the same way — see the gating test below — and a
+        literal count silently stops covering a route the moment one of them changes.
+        """
+        self.assertEqual(API_SOURCE.count("oob_base="), 4,
                          "an API hunt route does not supply the collaborator, so its provers are dead")
+
+    def test_the_unattended_route_arms_it_only_for_a_program_that_opted_in(self) -> None:
+        """The one route no human is watching is armed per program, never globally.
+
+        An operator cycle runs on a schedule, so a collaborator configured once would
+        otherwise send out-of-band callbacks for every program in the portfolio, including
+        ones whose rules of engagement never covered it. `oob_allowed` keeps that an
+        explicit per-program decision; the other three routes are hand-driven and stay
+        unconditional.
+        """
+        self.assertIn(
+            'oob_base, oob_secret = self._oob_config() if (program_obj and program_obj.get("oob_allowed")) else ("", "")',
+            API_SOURCE,
+            "the unattended hunt route no longer gates the collaborator on oob_allowed",
+        )
+        # And the gate must actually feed the hunt, not just compute a pair nothing reads.
+        self.assertIn("oob_base=oob_base", API_SOURCE)
 
     def test_the_cli_reads_the_same_secrets_store_as_the_app(self) -> None:
         import gn_cli

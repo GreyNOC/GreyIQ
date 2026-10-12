@@ -899,3 +899,105 @@ class AutoPathCreationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OobCredsTests(unittest.TestCase):
+    """`_oob_creds` reads the collaborator the desktop app already stored.
+
+    The app's OOB panel writes `oob.collaborator_url` + `oob.secret` into the shared
+    secrets file (`save_oob_config`). A terminal-driven hunt must read that SAME place —
+    a second config location is how one of them ends up stale.
+    """
+
+    def _with_secrets(self, payload):
+        import json as _json
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        if payload is not None:
+            (root / "secrets.json").write_text(_json.dumps(payload), encoding="utf-8")
+        orig = gn_cli.RUNTIME_DIR
+        gn_cli.RUNTIME_DIR = root
+        self.addCleanup(lambda: setattr(gn_cli, "RUNTIME_DIR", orig))
+        return gn_cli._oob_creds()
+
+    def test_reads_the_configured_collaborator(self) -> None:
+        base, secret = self._with_secrets({
+            "oob.collaborator_url": "https://chat.example", "oob.secret": "s" * 32})
+        self.assertEqual(base, "https://chat.example")
+        self.assertEqual(secret, "s" * 32)
+
+    def test_absent_or_malformed_secrets_are_empty_not_an_error(self) -> None:
+        """A hunt must not fail because no collaborator was ever configured."""
+        for payload in (None, {}, {"oob.collaborator_url": ""}, []):
+            with self.subTest(payload=payload):
+                self.assertEqual(self._with_secrets(payload), ("", ""))
+
+    def test_values_are_trimmed(self) -> None:
+        base, secret = self._with_secrets({
+            "oob.collaborator_url": "  https://chat.example  ", "oob.secret": "  tok  "})
+        self.assertEqual((base, secret), ("https://chat.example", "tok"))
+
+
+class AutoSchedulesItsOwnCycleTests(unittest.TestCase):
+    """`gn auto` hunts one cycle itself, so it must record that cycle's schedule.
+
+    ``operator.run_program_cycle`` deliberately does not stamp: the loop's ``_run_one``
+    owns that, so a guard halt can leave the program due on purpose. Nothing else was
+    stamping the directly-invoked cycle, so ``next_run_at`` stayed unset, ``_is_due`` read
+    it as "never run", and the very next scheduler pass re-hunted the same targets at once.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="gn-auto-sched-")
+        self.root = Path(self._tmp.name)
+        self.runtime = self.root / "runtime"
+        self.runtime.mkdir()
+        self.hunt = self.root / "repo"
+        (self.hunt / ".greyiq").mkdir(parents=True)
+        (self.hunt / ".greyiq" / "targets.txt").write_text(
+            "https://app.example.com\n", encoding="utf-8")
+        self._orig_runtime = gn_cli.RUNTIME_DIR
+        gn_cli.RUNTIME_DIR = self.runtime
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(lambda: setattr(gn_cli, "RUNTIME_DIR", self._orig_runtime))
+
+    def _run_auto(self, extra: list[str] | None = None) -> tuple[int, str]:
+        """`gn auto --once` with the hunt and the brain stubbed out: no network, no model."""
+        summary = {"program": "", "targets_run": 1, "findings": 0, "confirmed": 0,
+                   "submitted": 0, "errors": [], "stopped": False, "stop_reason": ""}
+        from bughunter import operator as operator_mod
+        with mock.patch.object(gn_cli, "_operator_campaign_fn", return_value=lambda *a, **k: {}), \
+             mock.patch.object(gn_cli, "_operator_sync_fn", return_value=None), \
+             mock.patch.object(operator_mod, "run_program_cycle", return_value=summary):
+            return _run(["auto", str(self.hunt), "-y", "--once", *(extra or [])])[:2]
+
+    def test_the_cycle_is_stamped_so_the_scheduler_does_not_rerun_it(self) -> None:
+        from bughunter import operator as operator_mod
+        from bughunter import portfolio
+
+        code, _ = self._run_auto()
+        self.assertEqual(code, 0)
+
+        programs = portfolio.list_programs(self.runtime)
+        self.assertEqual(len(programs), 1, programs)
+        program = programs[0]
+        self.assertTrue(program.get("last_run_at"), "the cycle that ran was not recorded")
+        self.assertTrue(program.get("next_run_at"), "no next_run_at: the program reads as never run")
+
+        # The invariant that actually matters: the scheduler must not consider it due.
+        loop = operator_mod.OperatorLoop(str(self.runtime), run_campaign_fn=lambda *a, **k: {})
+        self.assertFalse(loop._is_due(program),
+                         "a just-hunted program is still due, so the loop re-hunts it immediately")
+
+    def test_the_stamp_honours_the_directory_interval(self) -> None:
+        from bughunter import portfolio
+
+        code, _ = self._run_auto(["--interval", "30"])
+        self.assertEqual(code, 0)
+        program = portfolio.list_programs(self.runtime)[0]
+        self.assertEqual(int(program.get("interval_minutes")), 30)
+        due_at = datetime.fromisoformat(str(program["next_run_at"]))
+        delta = due_at - datetime.now(UTC)
+        self.assertGreater(delta, timedelta(minutes=25))
+        self.assertLess(delta, timedelta(minutes=35))

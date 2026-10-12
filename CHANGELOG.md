@@ -4,6 +4,36 @@ Notable changes to GreyIQ.
 
 ## Unreleased
 
+- Hunt a directory with one command: `gn auto -y` in a repo or a folder that
+  lists its targets resolves them, registers the directory as a saved program so
+  negative knowledge, priors, surface drift and the ledger accumulate across
+  runs, and hunts it. Authorization is never read from the directory — a hunt
+  file that tries to set it is refused out loud — and `-y` buys one reviewed
+  cycle; keeping the scheduler on it needs the same auditable per-program
+  authorization record `gn operator run` requires. The cycle it runs is now
+  stamped, so the scheduler no longer treats a just-hunted program as due and
+  re-hunts it immediately.
+- Close the payout loop without a human in the desktop UI: outcome sync moved
+  into one shared function the HTTP route, the new `gn sync` verb and the
+  operator loop all call. The operator polls real platform verdicts before each
+  pass, so that pass's ranking already sees them, then orders programs by what
+  has actually paid and retrains the offline ranker from the corpus it is
+  growing. Only terminal states teach, and a reward that lands while a report is
+  still triaged is recorded rather than lost.
+- Import a finished Shannon run as candidates: `gn shannon <run-dir|report.sarif>`
+  reads its SARIF and brings findings in as CANDIDATES only. GreyIQ's prover
+  never saw those targets, so none of them can reach a submission — the refusal
+  is enforced in the captured-artifact gate and the submission path, not just in
+  the importer. Severity and CWE are never invented from Shannon's coarse class;
+  a location-level CWE is now mined from the prose that actually carries it.
+- Stop the test suite writing to the operator's real learning stores. Ten call
+  sites across two test files passed the live `runtime/` directory, so every run
+  appended to the offline ranker's own training corpus; a guard now hashes those
+  stores around the suite and fails if one changes.
+- Make `iterate` activate the pass it depends on, so a direct campaign or API
+  caller that sends it without `active` arms the theorize-act re-plan wave
+  instead of setting a flag nothing reads.
+
 ## v4.9.7 - live Ollama model intake
 
 - Load the local, tool-capable model list directly from Ollama's public catalog

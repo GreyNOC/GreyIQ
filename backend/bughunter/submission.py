@@ -97,6 +97,10 @@ def build_submission(ctx: dict[str, Any], finding: dict[str, Any], platform: str
         # structured_scope entry and to preflight the platforms that require an endpoint.
         "location": safe(location),
         "proof_status": str(proof.get("status") or "missing"),
+        # Which engine produced this finding. '' means GreyIQ's own. Carried into the
+        # package so the submit refusal and the UI checklist can name the external engine
+        # instead of only reporting the 'candidate' proof status it causes.
+        "source": str(finding.get("source") or ""),
         "vulnerability_information": body,
         # Keep the full analyst view with metadata, proof gates, and evidence in
         # the JSON sidecar while the Markdown description stays readable.
@@ -160,11 +164,23 @@ def preflight(package: dict[str, Any], platform: str | None = None) -> dict[str,
     if not str(package.get("cvss_vector") or "").strip():
         warnings.append("No CVSS vector — most programs accept the report without one, but it speeds triage.")
 
+    # An external engine's finding is a candidate by construction. Surfaced as its own
+    # checklist row so the UI says WHY it is not ready, rather than only showing an
+    # unexplained 'candidate' proof status the operator cannot act on by running --active.
+    source = str(package.get("source") or "").strip().lower()
+    external = bool(source) and source not in ("greyiq", "bughunter")
+    checklist.append({"label": "Proved by GreyIQ's own prover", "present": not external})
+    if external:
+        warnings.append(
+            f"This finding came from the external engine '{source}' — GreyIQ never proved it. "
+            "It cannot be auto-submitted; reproduce it with GreyIQ's prover first."
+        )
+
     return {
         "ok": True,
         "platform": platform,
         "platform_name": report_formats.platform_name(platform),
-        "ready": not missing and proof_ok,
+        "ready": not missing and proof_ok and not external,
         "missing": missing,
         "warnings": warnings,
         "checklist": checklist,
@@ -397,6 +413,16 @@ def submit_to_hackerone(
         raise SubmissionError(
             f"refused: only CONFIRMED findings may be auto-submitted (this one is '{package.get('proof_status')}'). "
             "Run with --active to prove it, or submit manually after capturing the proof."
+        )
+    # Belt and braces behind report._has_captured_artifact's source veto, which already caps an
+    # external finding at 'candidate'. Stated separately so a hand-built package cannot route
+    # around it, and so the refusal names the engine rather than only its proof status.
+    _source = str(package.get("source") or "").strip().lower()
+    if _source and _source not in ("greyiq", "bughunter"):
+        raise SubmissionError(
+            f"refused: this finding came from the external engine '{_source}', and GreyIQ's own prover "
+            "never proved it. An external engine's verdict is a candidate, not a proof — reproduce it "
+            "with GreyIQ's prover, or submit manually after capturing the proof yourself."
         )
     if not (team_handle and api_username and api_token):
         raise SubmissionError("refused: team handle + HACKERONE_API_USERNAME + HACKERONE_API_TOKEN are required.")

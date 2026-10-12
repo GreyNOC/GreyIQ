@@ -108,14 +108,26 @@ class HuntBrainTests(unittest.TestCase):
         self.assertEqual(plan["param_hypotheses"], [])  # but nothing usable -> empty, no crash
 
     def test_coder_error_uses_scope_safe_offline_plan(self) -> None:
+        """A brain that could not be REACHED hands the hunt to the offline rule engine.
+
+        This once asserted the empty plan (``used`` False, no hypotheses). That was the wrong
+        contract: a configured-but-unreachable brain left the hunt blinder than configuring no
+        brain at all, which gets the full rule plan. It matters most for a hosted inference
+        endpoint, where "configured but not answering right now" is routine — cold start,
+        model loading, 503, rate limit.
+
+        Still fail-closed in the sense that matters: nothing the brain produced is used, and
+        the plan is attributed to the offline engine rather than to the model.
+        """
         def boom(messages, cfg):
             raise coder.CoderError("brain offline")
         coder.generate = boom
         plan = hunt_brain.plan_hunt({}, "https://app.example.com/", "app.example.com", SURFACE)
         self.assertEqual(plan["provider"], "offline")
         self.assertTrue(plan["used"])
-        self.assertTrue(plan["probe_priority"])
-        for row in plan["probe_priority"]:
+        self.assertEqual(plan["model"], "greyiq-offline-hunt")
+        self.assertTrue(plan["probe_priority"], "the hunt must not go out blind")
+        for row in plan["probe_priority"]:  # and the rules can't invent surface either
             self.assertIn(row["endpoint"], SURFACE["endpoints"])
 
     def test_hijacked_nonlist_fields_are_fail_closed(self) -> None:
@@ -337,6 +349,70 @@ class ReasoningBrainGateTests(unittest.TestCase):
             plan = self._plan({"enabled": True, "provider": provider})
             self.assertEqual(plan["param_hypotheses"], ["returnUrl"], provider)
             self.assertEqual(plan["provider"], "anthropic", provider)
+
+    def test_an_unreachable_brain_degrades_to_the_rules_not_to_nothing(self) -> None:
+        """A CONFIGURED brain that cannot answer must not leave the hunt blinder than no brain.
+
+        Before this, every brain-failure path returned the EMPTY plan: no param hypotheses, no
+        probe priority, no IDOR/SSRF candidates — strictly worse than configuring no brain at
+        all, which at least gets the offline knowledge-rule plan. It matters most for a hosted
+        inference endpoint, where "configured but not answering right now" is routine: cold
+        start, model still loading, 503, or a rate limit.
+        """
+        baseline = self._plan({"enabled": False, "provider": "off"})
+        self.assertTrue(baseline["probe_priority"], "the offline planner must produce a plan")
+
+        orig = coder.generate
+        self.addCleanup(lambda: setattr(coder, "generate", orig))
+
+        def unreachable(messages, cfg):
+            raise coder.CoderError("endpoint unreachable")
+
+        coder.generate = unreachable
+        plan = self._plan({"enabled": True, "provider": "openai"})
+        self.assertEqual(plan["provider"], "offline")
+        self.assertTrue(plan["used"])
+        for key in self._OFFLINE_KEYS:
+            self.assertEqual(plan[key], baseline[key], key)
+
+    def test_an_unexpected_brain_exception_also_degrades_to_the_rules(self) -> None:
+        baseline = self._plan({"enabled": False, "provider": "off"})
+        orig = coder.generate
+        self.addCleanup(lambda: setattr(coder, "generate", orig))
+
+        def boom(messages, cfg):
+            raise RuntimeError("malformed response")
+
+        coder.generate = boom
+        plan = self._plan({"enabled": True, "provider": "openai"})
+        self.assertEqual(plan["probe_priority"], baseline["probe_priority"])
+
+    def test_an_openai_compatible_endpoint_is_a_first_class_brain(self) -> None:
+        """The `openai` provider is a generic OpenAI-compatible client — it builds
+        `{base_url}/chat/completions` with a bearer key and restricts no hostname. That is the
+        supported way to drive a hunt with a hosted or self-hosted model (a HuggingFace
+        inference endpoint, TGI, vLLM) rather than the offline rules."""
+        cfg = {"enabled": True, "provider": "openai",
+               "openai": {"base_url": "https://router.huggingface.co/v1",
+                          "model": "meta-llama/Llama-3.3-70B-Instruct", "api_key": "hf_x"}}
+        self.assertTrue(coder.reasoning_brain_enabled(cfg))
+        resolved = coder.coder_config(cfg)["openai"]
+        self.assertEqual(resolved["base_url"], "https://router.huggingface.co/v1")
+        self.assertEqual(resolved["model"], "meta-llama/Llama-3.3-70B-Instruct")
+        # A non-OpenAI host must keep the LEGACY token field; max_completion_tokens is an
+        # OpenAI-hosted-only requirement and TGI/vLLM reject it.
+        self.assertEqual(
+            coder.chat_completion_token_limit_field(resolved["base_url"], resolved["model"]),
+            "max_tokens")
+
+        orig = coder.generate
+        self.addCleanup(lambda: setattr(coder, "generate", orig))
+        coder.generate = lambda messages, c: {
+            "text": '{"param_hypotheses": ["redirect"], "probe_priority": []}',
+            "provider": "openai", "model": resolved["model"]}
+        plan = self._plan(cfg)
+        self.assertEqual(plan["param_hypotheses"], ["redirect"],
+                         "the endpoint's plan must reach the prover")
 
     def test_reasoning_is_off_whenever_the_coder_is_off(self) -> None:
         # reasoning_brain_enabled delegates to coder_enabled, so every "off" spelling and the

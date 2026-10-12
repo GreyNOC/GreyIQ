@@ -13,7 +13,6 @@ from urllib.parse import parse_qs, urlparse
 
 
 BACKEND_DIR = Path(__file__).resolve().parent
-REPO_ROOT = BACKEND_DIR.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
@@ -142,7 +141,7 @@ class WebScanRedactionTests(unittest.TestCase):
                     {},
                     default_reports_dir=Path(tmp),
                     seed_dir=BACKEND_DIR / "seed",
-                    runtime_dir=REPO_ROOT / "runtime",
+                    runtime_dir=Path(tmp),
                 )
                 self.assertTrue(report["ok"])
                 # The run result now carries structured per-finding data for a GUI
@@ -219,7 +218,7 @@ class DirectActiveReconTests(unittest.TestCase):
                     active=True,
                     default_reports_dir=Path(tmp),
                     seed_dir=BACKEND_DIR / "seed",
-                    runtime_dir=REPO_ROOT / "runtime",
+                    runtime_dir=Path(tmp),
                     on_progress=lines.append,
                 )
             self.assertTrue(report["ok"], report.get("error"))

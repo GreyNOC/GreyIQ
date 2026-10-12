@@ -537,7 +537,7 @@ class OperatorCycleTests(unittest.TestCase):
         base.update(kw)
         return base
 
-    def _run_campaign_fn(self, target, *, scope, program, active, live, deep=False, max_pages=12):
+    def _run_campaign_fn(self, target, *, scope, program, active, live, deep=False, max_pages=12, **_):
         self.last_deep = deep  # record so a test can assert deep was threaded through
         # One confirmed finding per run.
         f = _finding("C1", "xss", "active.reflected-xss", f"{target}/?q=", proof="confirmed")
@@ -555,6 +555,41 @@ class OperatorCycleTests(unittest.TestCase):
         self.assertFalse(ledger.is_submitted(self.rt, "acme", "https://acme.com",
                          _finding("C1", "xss", "active.reflected-xss", "https://acme.com/?q=")))
 
+    def test_iterate_flag_is_threaded_to_the_campaign(self) -> None:
+        """The theorize -> act wave was readable only from process-wide env, so an unattended
+        cycle could never run it per program and every auto hunt was one flat pass per URL.
+
+        This asserts the OPERATOR end of the chain. The campaign end — that `iterate` becomes
+        `hunt_replan_enabled` on the per-run settings and deliberately does NOT set
+        `hunt_loop_enabled`, which would swap the active pass for a seed-URL-only loop and
+        narrow coverage — is asserted in test_campaign."""
+        seen: list[bool] = []
+
+        def run_fn(target, *, scope, program, active, live, deep=False, iterate=False, max_pages=12, **_):
+            seen.append(iterate)
+            return {"ok": True, "findings": [], "proof_of_impact": {}}
+
+        operator.run_program_cycle(self.rt, self._program(iterate=True), run_campaign_fn=run_fn)
+        operator.run_program_cycle(self.rt, self._program(iterate=False), run_campaign_fn=run_fn)
+        self.assertEqual(seen, [True, False])
+
+    def test_empty_seed_targets_is_a_no_op_that_says_so(self) -> None:
+        """A program resolving to zero targets must be a safe no-op AND report why.
+
+        It used to emit no event at all and reschedule itself for ever, so a scope-only or
+        mobile-only program was indistinguishable from a clean cycle. The attended span path
+        already refuses the same condition with an explicit, actionable error. The no-op half
+        is unchanged: nothing hunted, nothing submitted, nothing raised."""
+        events: list[str] = []
+        s = operator.run_program_cycle(self.rt, self._program(seed_targets=[]),
+                                       run_campaign_fn=self._run_campaign_fn,
+                                       on_event=events.append)
+        self.assertEqual(s["targets_run"], 0)
+        self.assertEqual(s["findings"], 0)
+        self.assertTrue(s["errors"], "a program that can never be hunted must say so")
+        self.assertIn("no huntable targets", s["errors"][0])
+        self.assertTrue(any("SKIPPED" in e for e in events), "the operator must emit it too")
+
     def test_deep_flag_is_threaded_to_the_campaign(self) -> None:
         self.last_deep = None
         operator.run_program_cycle(self.rt, self._program(deep=True), run_campaign_fn=self._run_campaign_fn)
@@ -564,7 +599,7 @@ class OperatorCycleTests(unittest.TestCase):
         self.assertFalse(self.last_deep)
 
     def test_report_package_remains_queued_for_human(self) -> None:
-        def run_fn(target, *, scope, program, active, live, deep=False, max_pages=12):
+        def run_fn(target, *, scope, program, active, live, deep=False, max_pages=12, **_):
             f = _finding("C1", "xss", "active.reflected-xss", f"{target}/?q=", proof="confirmed")
             ledger.upsert_findings(self.rt, program, target, [{"finding": f, "source_url": f["location"],
                                                                "proof_status": "confirmed", "cvss": {"base_score": 6.1}}])
@@ -576,7 +611,7 @@ class OperatorCycleTests(unittest.TestCase):
                          _finding("C1", "xss", "active.reflected-xss", "https://acme.com/?q=")))
 
     def test_run_campaign_fn_raising_is_recorded_and_does_not_kill_the_cycle(self) -> None:
-        def boom(target, *, scope, program, active, live, deep=False, max_pages=12):
+        def boom(target, *, scope, program, active, live, deep=False, max_pages=12, **_):
             raise RuntimeError("simulated campaign crash")
         prog = self._program(seed_targets=["https://a", "https://b"])
         s = operator.run_program_cycle(self.rt, prog, run_campaign_fn=boom)
@@ -585,7 +620,7 @@ class OperatorCycleTests(unittest.TestCase):
         self.assertIn("RuntimeError", s["errors"][0])
 
     def test_campaign_ok_false_is_recorded_as_an_error_not_raised(self) -> None:
-        def failing(target, *, scope, program, active, live, deep=False, max_pages=12):
+        def failing(target, *, scope, program, active, live, deep=False, max_pages=12, **_):
             return {"ok": False, "error": "not authorized"}
         s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=failing)
         self.assertEqual(s["targets_run"], 0)
@@ -593,20 +628,13 @@ class OperatorCycleTests(unittest.TestCase):
         self.assertIn("not authorized", s["errors"][0])
 
     def test_finding_missing_ref_is_tolerated(self) -> None:
-        def run_fn(target, *, scope, program, active, live, deep=False, max_pages=12):
+        def run_fn(target, *, scope, program, active, live, deep=False, max_pages=12, **_):
             f = {"class_id": "xss", "rule_id": "r", "location": target, "severity": "high", "title": "x"}  # no 'ref'
             return {"ok": True, "run_id": "run-1", "findings": [f], "proof_of_impact": {}}
         s = operator.run_program_cycle(self.rt, self._program(), run_campaign_fn=run_fn)
         self.assertEqual(s["targets_run"], 1)
         self.assertEqual(s["findings"], 1)
         self.assertEqual(s["confirmed"], 0)  # proof_of_impact.get(None) -> not confirmed, no crash
-
-    def test_empty_seed_targets_is_a_clean_no_op(self) -> None:
-        prog = self._program(seed_targets=[])
-        s = operator.run_program_cycle(self.rt, prog, run_campaign_fn=self._run_campaign_fn)
-        self.assertEqual(s["targets_run"], 0)
-        self.assertEqual(s["findings"], 0)
-        self.assertEqual(s["errors"], [])
 
 
 class SupervisorLoopTests(unittest.TestCase):
@@ -684,7 +712,7 @@ class SupervisorLoopTests(unittest.TestCase):
         started = threading.Event()
         kill_engaged = threading.Event()
 
-        def run_campaign_fn(target, *, scope, program, active, live, deep=False, max_pages=12, run_id=""):
+        def run_campaign_fn(target, *, scope, program, active, live, deep=False, max_pages=12, run_id="", **_):
             calls.append(program)
             started.set()
             # HOLD the supervisor inside the first program's campaign until the test has actually

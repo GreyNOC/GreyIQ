@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 from uuid import uuid4
 
-from bughunter import campaign, operator_guard, portfolio, progress
+from bughunter import campaign, learning, operator_guard, portfolio, progress
 
 
 def _emit(on_event: Callable[[str], None] | None, message: str) -> None:
@@ -27,6 +27,45 @@ def _emit(on_event: Callable[[str], None] | None, message: str) -> None:
             on_event(message)
         except Exception:  # noqa: BLE001 - an event sink must never break the loop
             pass
+
+
+def sync_outcomes(
+    sync_fn: Callable[[], dict[str, Any]] | None,
+    on_event: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Pull adjudicated platform outcomes into the learning store before hunting.
+
+    Everything else the engine learns is self-observed and already works: negative knowledge
+    cools an ``(endpoint, class)`` after two misses, and trace priors reweight classes from
+    its own confirmations. But at submission time it records ``status="submitted"``, which
+    ``learning.learned_priors`` discards on purpose ("I sent it" is not "it paid"), so
+    without this pass payout priors stay ``{}`` for ever and ``_program_pay_factor`` stays at
+    its neutral 1.0 no matter how many cycles run.
+
+    Runs BEFORE the hunt so this cycle's ranking already sees the fresh verdicts.
+
+    ``sync_fn`` is injected because this module deliberately holds no network or credential
+    code; the caller that owns the platform credentials owns the call. ``None`` = sync off.
+    """
+    if sync_fn is None:
+        return {"ok": False, "skipped": True}
+    try:
+        result = sync_fn()
+    except Exception as exc:  # noqa: BLE001 - a sync failure must never stop a hunt
+        _emit(on_event, f"outcome sync error: {type(exc).__name__}: {exc}")
+        return {"ok": False, "error": str(exc)}
+    if not result.get("ok"):
+        _emit(on_event, f"outcome sync skipped: {result.get('error', 'unavailable')}")
+        return result
+    learned = int(result.get("outcomes") or 0)
+    # `outcomes` is the number that matters: a ledger-only state move (new -> triaged)
+    # changes no ranking, so reporting `updated` alone would overstate what was learned.
+    if learned:
+        _emit(on_event, f"outcome sync: {learned} adjudicated outcome(s) learned "
+                        f"from {result.get('checked', 0)} report(s)")
+    for problem in (result.get("errors") or ())[:5]:
+        _emit(on_event, f"outcome sync problem: {problem}")
+    return result
 
 
 def run_program_cycle(
@@ -39,6 +78,7 @@ def run_program_cycle(
     guard: operator_guard.RunGuard | None = None,
     on_target_start: Callable[[str], None] | None = None,
     on_target_done: Callable[[], None] | None = None,
+    sync_fn: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Hunt every seed target of one program for operator review.
 
@@ -53,6 +93,21 @@ def run_program_cycle(
     targets = campaign.program_campaign_targets(program)
     summary = {"program": pid, "targets_run": 0, "findings": 0, "confirmed": 0,
                "submitted": 0, "errors": [], "stopped": False, "stop_reason": ""}
+    # Before anything is hunted, so this cycle's EV ranking and class ordering already see
+    # any verdict the platform reached since the last pass. A no-op when sync_fn is None.
+    sync_outcomes(sync_fn, on_event)
+    if not targets:
+        # A program resolving to nothing used to emit ZERO events and reschedule, so a
+        # scope-only or mobile-only program looked identical to a clean cycle, for ever. The
+        # attended span path already refuses this loudly ("This program has no huntable
+        # targets — add seed targets, opt in a source repository, or import/build its
+        # structured scope"); the unattended path said nothing at all.
+        summary["errors"].append(
+            "no huntable targets — add seed_targets, opt in a source repository, "
+            "or import/build the structured scope"
+        )
+        _emit(on_event, f"hunt {pid}: SKIPPED — no huntable targets")
+        return summary
 
     for target in targets:
         if stop is not None and stop.is_set():
@@ -69,6 +124,10 @@ def run_program_cycle(
                 "scope": program.get("scope_text", ""), "program": pid,
                 "active": bool(program.get("active")), "live": bool(program.get("live")),
                 "deep": bool(program.get("deep")), "max_pages": int(program.get("max_pages") or 12),
+                # Without this an unattended cycle could never run the theorize -> act wave:
+                # the flag was readable only from process-wide env, so a per-program choice
+                # was impossible and every auto hunt was a single flat pass per URL.
+                "iterate": bool(program.get("iterate")),
             }
             if run_id:
                 kwargs["run_id"] = run_id
@@ -114,9 +173,19 @@ class OperatorLoop:
     """A single background supervisor that runs due programs sequentially until
     stopped. Owns the kill switch and a bounded event ring buffer the UI polls."""
 
-    def __init__(self, runtime_dir: str, *, run_campaign_fn: Callable[..., dict[str, Any]]) -> None:
+    def __init__(self, runtime_dir: str, *, run_campaign_fn: Callable[..., dict[str, Any]],
+                 sync_fn: Callable[[], dict[str, Any]] | None = None,
+                 train_fn: Callable[[], dict[str, Any]] | None = None) -> None:
         self.runtime_dir = runtime_dir
         self.run_campaign_fn = run_campaign_fn
+        # Injected by whoever owns the platform credentials. When present the loop pulls
+        # adjudicated outcomes once per pass — the only way payout priors and yield-based
+        # program ordering ever become non-trivial.
+        self.sync_fn = sync_fn
+        # Local, no network. Retrains the offline hunt ranker from the corpus this loop is
+        # itself growing. The trainer was previously reachable ONLY as a CLI verb, so a model
+        # could never come into existence on an unattended install however long it ran.
+        self.train_fn = train_fn
         self.stop_event = threading.Event()
         self.events: deque[dict[str, Any]] = deque(maxlen=500)
         self._lock = threading.Lock()
@@ -212,6 +281,51 @@ class OperatorLoop:
         with self._lock:
             self._current_run_id = None
 
+    def _retrain(self) -> None:
+        """Retrain the offline hunt ranker from the corpus this loop is growing.
+
+        Only a promotion is worth an event: a refusal is the normal outcome until the corpus
+        is big and varied enough, and emitting one every pass would be noise. ``written`` is
+        the signal, not ``ok`` — ``ok`` is also True for a dry run, and ``reason`` is prose.
+        """
+        if self.train_fn is None:
+            return
+        try:
+            result = self.train_fn()
+        except Exception as exc:  # noqa: BLE001 - training must never stop the loop
+            self._emit(f"retrain error: {type(exc).__name__}: {exc}")
+            return
+        if result.get("ok") and result.get("written"):
+            self._emit(f"retrain: new hunt ranker promoted -> {result.get('active_model')} "
+                       f"(trained on {result.get('trained_on', {})})")
+
+    def _by_yield(
+        self, due: list[tuple[dict[str, Any], "operator_guard.ProgramGrant"]]
+    ) -> list[tuple[dict[str, Any], "operator_guard.ProgramGrant"]]:
+        """Hunt the programs that have actually paid first.
+
+        Nothing read the yield the learning store was already accumulating, so a program that
+        had paid and one that had returned duplicates took the same place in the queue for
+        ever. Ordered by bounty total, then rewarded count, then submitted count; a cold
+        portfolio is all zeroes, so this is a no-op until something has actually paid. It can
+        only ever reorder — never drop a program, never change what a hunt does.
+        """
+        try:
+            summary = (learning.program_summary(self.runtime_dir) or {}).get("programs") or {}
+        except Exception:  # noqa: BLE001 - ordering must never break the loop
+            return due
+
+        def rank(entry: tuple[dict[str, Any], Any]) -> tuple[float, int, int]:
+            stats = summary.get(str((entry[0] or {}).get("id") or "")) or {}
+            try:
+                return (-float(stats.get("bounty_total") or 0.0),
+                        -int(stats.get("rewarded") or 0),
+                        -int(stats.get("submitted") or 0))
+            except (TypeError, ValueError):
+                return (0.0, 0, 0)
+
+        return sorted(due, key=rank)
+
     def _is_due(self, program: dict[str, Any]) -> bool:
         nxt = program.get("next_run_at")
         if not nxt:
@@ -250,10 +364,19 @@ class OperatorLoop:
                 if not due:
                     self.stop_event.wait(timeout=15)  # idle tick; responsive to stop
                     continue
-                for program, grant in due:
+                # Once per PASS, not once per program: the poll is capped per call, so
+                # syncing inside every program's cycle would multiply the platform reads by
+                # the number of due programs for no new information.
+                sync_outcomes(self.sync_fn, self._emit)
+                for program, grant in self._by_yield(due):
                     if self.stop_event.is_set():
                         break
                     self._run_one(program, grant)
+                # After the pass, with this pass's traces in the corpus. The trainer owns its
+                # own honest gate — too few rows, a single-program corpus, or a model that
+                # does not beat the hand-tuned rules are all refusals — so calling it every
+                # pass costs a cheap refusal until the corpus can support a model.
+                self._retrain()
         finally:
             for pid, grant in self._grants.items():
                 try:
@@ -290,7 +413,8 @@ class OperatorLoop:
         try:
             summary = run_program_cycle(self.runtime_dir, program, run_campaign_fn=self.run_campaign_fn,
                                         on_event=self._emit, stop=self.stop_event, guard=guard,
-                                        on_target_start=self._target_started, on_target_done=self._target_done)
+                                        on_target_start=self._target_started,
+                                        on_target_done=self._target_done, sync_fn=self.sync_fn)
         except Exception as exc:  # noqa: BLE001
             self._emit(f"cycle error {pid}: {type(exc).__name__}: {exc}")
             summary = {"findings": 0, "confirmed": 0, "submitted": 0}
@@ -301,7 +425,16 @@ class OperatorLoop:
             self.stop_event.set()
         else:
             next_run = (datetime.now(UTC) + timedelta(minutes=int(program.get("interval_minutes") or 1440))).isoformat()
-            portfolio.touch_run(self.runtime_dir, pid, next_run_at=next_run)
+            # Its own failure (disk full, a OneDrive lock on portfolio.json — this repo lives
+            # under OneDrive) used to escape _run_one, escape both loops, and kill the
+            # supervisor via _supervise's finally with a bare "operator stopped", the
+            # traceback going to the thread excepthook where no operator looks. A cycle that
+            # cannot be rescheduled is worth reporting, not worth taking the loop down for.
+            try:
+                portfolio.touch_run(self.runtime_dir, pid, next_run_at=next_run)
+            except Exception as exc:  # noqa: BLE001
+                self._emit(f"cycle reschedule FAILED {pid}: {type(exc).__name__}: {exc} — "
+                           "this program stays due and will re-run immediately")
         self._requests_total[pid] = self._requests_total.get(pid, 0) + guard.requests_used
         try:
             operator_guard.audit_event(
@@ -316,3 +449,5 @@ class OperatorLoop:
         self._emit(f"cycle done: {pid} — {summary.get('findings', 0)} findings, "
                    f"{summary.get('confirmed', 0)} confirmed for review; "
                    f"{summary.get('requests_used', 0)} guarded requests")
+        for problem in (summary.get("errors") or ()):
+            self._emit(f"cycle problem {pid}: {problem}")

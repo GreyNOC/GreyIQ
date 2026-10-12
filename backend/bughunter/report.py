@@ -21,6 +21,7 @@ from bughunter import impact_model
 from bughunter import secret_classification
 from bughunter import sensitive_data
 from bughunter.code_scanner.redaction import redact_secret, redact_text
+from bughunter.shannon import ingest as external_ingest
 
 _SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 # Upper bound of each CVSS v3.1 severity band. Used to stamp a representative base_score when the QA
@@ -681,6 +682,15 @@ def _has_captured_artifact(
     ``_observed_result`` remains as an ignored compatibility argument for callers from
     the v2.1 report API. Narrative text -- even an HTTP-looking string -- is not a
     captured artifact and must never satisfy this gate by itself."""
+    # A finding an EXTERNAL engine produced can NEVER be a captured artifact until GreyIQ's own
+    # prover raised it. An external engine (Shannon) supplies exactly the shape this gate looks
+    # for — a captured response plus a differential — and asserts its own findings are exploited,
+    # so without this veto importing one would promote it to 'confirmed' and walk it to the
+    # auto-submit gate on the external tool's word. bughunter.shannon.ingest never writes the
+    # fields below, and this is the guard that holds even if some future caller does. Findings
+    # with no ``source`` are GreyIQ's own, so every pre-existing finding is unaffected.
+    if external_ingest.is_external(finding) and not external_ingest.greyiq_proved(finding):
+        return False
     # A secret / exposed-key finding that strict classification did NOT confirm can NEVER be a captured
     # artifact — no synthesized issuer narrative, "HTTP 200" mention, or brain prose may promote a public
     # client key or an unverified candidate to confirmed. This is the single authoritative guard.

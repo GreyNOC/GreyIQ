@@ -17,7 +17,6 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 BACKEND_DIR = Path(__file__).resolve().parent
-REPO_ROOT = BACKEND_DIR.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
@@ -167,7 +166,7 @@ class RunBountyHuntProgressTests(unittest.TestCase):
             report = run_bounty_hunt(
                 url, "web-app", None, tmp, "127.0.0.1", True, {},
                 default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
-                runtime_dir=REPO_ROOT / "runtime", on_progress=lines.append,
+                runtime_dir=Path(tmp), on_progress=lines.append,
             )
         self.assertTrue(report["ok"])
         joined = " | ".join(lines)
@@ -186,7 +185,7 @@ class RunBountyHuntProgressTests(unittest.TestCase):
             report = run_bounty_hunt(
                 url, "web-app", None, tmp, "127.0.0.1", True, {},
                 default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
-                runtime_dir=REPO_ROOT / "runtime", on_progress=boom,
+                runtime_dir=Path(tmp), on_progress=boom,
             )
         self.assertTrue(report["ok"])
 
@@ -312,7 +311,7 @@ class RunBountyHuntProgressTests(unittest.TestCase):
             report = run_bounty_hunt(
                 url, "web-app", None, tmp, "127.0.0.1", True, {},
                 default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
-                runtime_dir=REPO_ROOT / "runtime", on_progress=progress.sink("hunt-run-1"),
+                runtime_dir=Path(tmp), on_progress=progress.sink("hunt-run-1"),
             )
         self.assertTrue(report["ok"])
         events = progress.tail("hunt-run-1")
@@ -330,11 +329,11 @@ class RunBountyHuntProgressTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             first = run_bounty_hunt(
                 url, "web-app", None, tmp, "127.0.0.1", True, {},
-                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed", runtime_dir=REPO_ROOT / "runtime",
+                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed", runtime_dir=Path(tmp),
             )
             second = run_bounty_hunt(
                 url, "web-app", None, tmp, "127.0.0.1", True, {},
-                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed", runtime_dir=REPO_ROOT / "runtime",
+                default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed", runtime_dir=Path(tmp),
             )
             self.assertTrue(first["ok"])
             self.assertTrue(second["ok"])
@@ -422,7 +421,7 @@ class RunCampaignProgressChainTests(unittest.TestCase):
             result = run_campaign(
                 url, scope="127.0.0.1", authorized=True, coder_cfg={},
                 default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
-                runtime_dir=REPO_ROOT / "runtime", max_pages=1, on_progress=lines.append,
+                runtime_dir=Path(tmp), max_pages=1, on_progress=lines.append,
             )
         self.assertTrue(result["ok"])
         joined = " | ".join(lines)
@@ -442,7 +441,7 @@ class RunCampaignProgressChainTests(unittest.TestCase):
             result = run_campaign(
                 url, scope="127.0.0.1", authorized=True, coder_cfg={},
                 default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
-                runtime_dir=REPO_ROOT / "runtime", max_pages=1,
+                runtime_dir=Path(tmp), max_pages=1,
                 progress_run_id="span-run", progress_unit="tiktok.com",
             )
         self.assertTrue(result["ok"])
@@ -466,7 +465,7 @@ class RunCampaignProgressChainTests(unittest.TestCase):
             result = run_campaign(
                 url, scope="127.0.0.1", authorized=True, coder_cfg={},
                 default_reports_dir=Path(tmp), seed_dir=BACKEND_DIR / "seed",
-                runtime_dir=REPO_ROOT / "runtime", max_pages=3, progress_run_id="halt-run",
+                runtime_dir=Path(tmp), max_pages=3, progress_run_id="halt-run",
             )
         self.assertTrue(result["ok"])                 # returns cleanly (partial), never raises
         self.assertEqual(result.get("urls_scanned"), 0)  # broke before hunting any URL
