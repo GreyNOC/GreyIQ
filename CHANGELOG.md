@@ -25,6 +25,16 @@ Notable changes to GreyIQ.
   inside a repository is refused rather than widened into "clone everything", and
   a name the operator typed is a single local id: a path-shaped `--as`, `show` or
   `remove` argument is rejected instead of being coerced into another clone.
+
+## v4.10.0 - autonomous directory hunts and the closed payout loop
+
+- Give the `gn dash` cockpit a four-colour palette: blue for structure, and
+  red/yellow/green carrying severity and health. Severity labels and their
+  counts, the status pill, the section titles and the log line's phase prefix
+  are all lit, and a zero count stays plain so an idle run never reads as a wall
+  of red. The colour is applied AFTER `render`, which keeps that function pure
+  and escape-free — the property that stops a target's own finding title from
+  repainting the operator's screen. `GN_DASH_COLOR=0` turns it off.
 - Hunt a directory with one command: `gn auto -y` in a repo or a folder that
   lists its targets resolves them, registers the directory as a saved program so
   negative knowledge, priors, surface drift and the ledger accumulate across
