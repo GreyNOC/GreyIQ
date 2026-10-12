@@ -4,6 +4,16 @@ Notable changes to GreyIQ.
 
 ## Unreleased
 
+## v4.11.0 - the threat board in the terminal
+
+- `gn hunt`, `gn campaign` and `gn auto` draw a full-screen threat board while
+  they run: a world map with an arc to each asset the engine names, a marker in
+  its severity colour for each confirmed finding, a DEFCON readout set by the
+  worst confirmed severity, and a teletype of the engine's own progress lines.
+  Candidates never light the board. It needs a 74x24 terminal; anything
+  smaller keeps the one-line status animation, and pipes, `--json`, `--no-fx`,
+  `GN_NO_FX`, `NO_COLOR` and `TERM=dumb` get no motion at all. `gn auto` gains
+  `--no-fx`. `gn fx wopr` previews the board.
 - Clone a public Hugging Face agent from the CLI: `gn agent clone`, with `list`,
   `show` and `remove` beside it. The reference can be a repository URL, a pasted
   `tree/<branch>` URL, `hf.co/spaces/owner/name`, `spaces/owner/name` or a bare
