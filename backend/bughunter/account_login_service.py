@@ -90,6 +90,9 @@ def _login_request_allowed(url: str, issuer_host: str, scope: str, settings: Any
     parsed = urlparse(url)
     if parsed.scheme.lower() not in {"http", "https"}:
         return True
+    # A redirect or form action must not downgrade the credential exchange to HTTP.
+    if parsed.scheme.lower() != "https":
+        return False
     request_host = parsed.hostname or ""
     return (host_in_active_scope(request_host, scope, settings)
             and same_registrable_site(request_host, issuer_host))
@@ -112,7 +115,9 @@ def _playwright_login(url: str, host: str, email: str, password: str, scope: str
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
             # Carry the app signature + the program's mandatory marker (see screenshot_service).
-            context = browser.new_context(ignore_https_errors=True, user_agent=current_user_agent())
+            # A research-account password must never be submitted through an invalid
+            # certificate. Playwright rejects TLS errors before the form can be filled.
+            context = browser.new_context(ignore_https_errors=False, user_agent=current_user_agent())
             context.route("**/*", _guard_route)
             page = context.new_page()
             try:
@@ -189,6 +194,9 @@ def login(account_access: dict[str, Any] | None, scope: str, settings: Any = Non
     except (WebsiteFetchError, ValueError) as exc:
         return {"ok": False, "cookie": "", "headers": [], "note": f"login URL refused by the URL guard: {exc}"}
     host = (urlparse(sanitized).hostname or "").lower()
+    if urlparse(sanitized).scheme.lower() != "https":
+        return {"ok": False, "cookie": "", "headers": [],
+                "note": "login URL must use HTTPS before account credentials can be submitted."}
     if not host_in_active_scope(host, scope, settings):
         # credentials must go ONLY to an authorized host — never auto-login to an out-of-scope URL
         return {"ok": False, "cookie": "", "headers": [], "note": f"login URL host '{host}' is not in this program's scope — not logging in."}

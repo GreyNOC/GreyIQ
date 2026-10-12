@@ -1628,9 +1628,18 @@ def _resolve_output_dir(output_dir: str | None, default_reports_dir: Path) -> Pa
     return target
 
 
-def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: int, run_live: bool, auth: AuthContext | None = None, *, scope_host: str = "") -> tuple[list[dict[str, Any]], list[str], dict[str, Any], str, float, list[dict[str, Any]]]:
+def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: int, run_live: bool,
+                  auth: AuthContext | None = None, *, scope_host: str = "",
+                  on_auth_needed: Any = None, auth_state: dict[str, Any] | None = None,
+                  should_stop: Any = None) -> tuple[list[dict[str, Any]], list[str], dict[str, Any], str, float, list[dict[str, Any]]]:
     """Run the profile's scanners for the inferred target kind. Returns
-    (raw_findings, scanners_run, scan_meta, risk, score, chain_signals)."""
+    (raw_findings, scanners_run, scan_meta, risk, score, chain_signals).
+
+    On a web authentication wall, ``on_auth_needed`` receives non-secret
+    reason/status/host metadata and may supply credentials once. A successful
+    retry updates ``auth_state['context']`` for the hunt's later stages; an
+    unresolved wall is recorded in scan_meta and stops the scanner loop.
+    """
     scanners = profile["scanners"]
     if "auto" in scanners:
         scanners = ["code"] if kind in {"path", "git"} else ["web"]
@@ -1646,10 +1655,70 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
         if scanner == "code":
             result = run_code_scan(target, "git_remote" if kind == "git" else "path", max_files=max_files)
         elif scanner == "web":
-            result = run_web_scan(target, probe_paths=True, auth=auth, scope_host=scope_host)
+            # A caller-provided session must also clear a login form. Otherwise an
+            # expired --cookie that receives HTTP 200 /login would look like a
+            # successful authenticated scan and drive the active prover into it.
+            result = run_web_scan(target, probe_paths=True, auth=auth, scope_host=scope_host,
+                                  verify_login_form=auth is not None)
+            if result.get("needs_operator"):
+                guard = operator_guard.current()
+                halted = bool(guard and guard.halt_reason)
+                stopped = False
+                if callable(should_stop):
+                    try:
+                        stopped = bool(should_stop())
+                    except Exception:  # noqa: BLE001 - an unavailable stop predicate changes no scope
+                        pass
+                # Ask only after the authorized first fetch identifies a login wall.
+                # The callback receives fixed, non-secret metadata and may decline.
+                # Never retry after a guard halt or a user stop.
+                supplied: Any = None
+                # Interactive secrets are only accepted for HTTPS targets. An
+                # HTTP challenge can still be reported, but must never cause a
+                # prompted cookie or bearer token to cross plaintext transport.
+                secure_target = urlparse(target).scheme.lower() == "https"
+                if secure_target and callable(on_auth_needed) and not halted and not stopped:
+                    try:
+                        supplied = on_auth_needed(dict(result.get("auth_context") or {}))
+                    except Exception:  # noqa: BLE001 - operator prompt failure must fail closed
+                        supplied = None
+                if isinstance(supplied, dict):
+                    try:
+                        new_auth = build_auth(
+                            target, cookie=supplied.get("cookie", ""),
+                            headers=supplied.get("headers") or [],
+                            issuer_host=str(supplied.get("issuer_host") or ""),
+                            https_only=True,
+                        )
+                    except (TypeError, ValueError):
+                        new_auth = None
+                    if callable(should_stop):
+                        try:
+                            stopped = bool(should_stop())
+                        except Exception:  # noqa: BLE001 - a broken predicate does not grant an action
+                            stopped = True
+                    if new_auth is not None and not stopped and not (guard and guard.halt_reason):
+                        auth = new_auth
+                        result = run_web_scan(target, probe_paths=True, auth=auth,
+                                              scope_host=scope_host, verify_login_form=True)
+                        # The attempted session is usable only if the protected page
+                        # actually loads. A second wall is returned for operator review.
+                        if result.get("ok") and auth_state is not None:
+                            auth_state["context"] = auth
         else:
             continue
         ran.append(scanner)
+        if result.get("needs_operator"):
+            secure_target = urlparse(target).scheme.lower() == "https"
+            meta[scanner] = {
+                "needs_operator": True,
+                "operator_action": "authentication_required",
+                "auth_context": result.get("auth_context") or {},
+                "secure_transport_required": not secure_target,
+                "error": ("An HTTPS target is required before an operator session can be requested."
+                          if not secure_target else "Authentication is required to continue this hunt."),
+            }
+            break
         if result.get("ok"):
             raw.extend(result.get("findings", []))
             # Sub-finding escalation clues (session-cookie flag gaps). Carried alongside the
@@ -1666,7 +1735,9 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
         else:
             meta[scanner] = {"error": result.get("error", "scan failed")}
 
-    if run_live and kind == "url":
+    if run_live and kind == "url" and not any(
+        isinstance(item, dict) and item.get("needs_operator") for item in meta.values()
+    ):
         live = run_live_scan(target, scope_host=scope_host)
         ran.append("live")
         if live.get("ok"):
@@ -2771,6 +2842,7 @@ def _run_bounty_hunt_body(
     per_finding: bool = False,
     extra_params: list[str] | None = None,
     on_progress: Any = None,
+    on_auth_needed: Any = None,
     on_learning_outcomes: Any = None,
     # The operator's kill switch, as a predicate the caller owns (greyiq_api passes
     # ``lambda: progress.is_stopped(run_id)``). A DIRECT hunt previously had no way to hear Stop at
@@ -2858,15 +2930,31 @@ def _run_bounty_hunt_body(
         # reused across a multi-target span, build_auth refuses to bind it to a target on a
         # different registrable domain than the issuer (that target is hunted unauthenticated).
         auth_ctx = build_auth(clean_target, cookie=auth.get("cookie", ""), headers=auth.get("headers") or [],
-                              issuer_host=str(auth.get("issuer_host") or ""))
+                              issuer_host=str(auth.get("issuer_host") or ""),
+                              https_only=bool(auth.get("https_only")))
 
     _emit(f"hunt: {clean_target} (profile={profile['name']})")
     if kind == "git":
         _emit("cloning authorized repository (shallow, single branch)…")
     _emit("running adversarial source scan…" if kind in {"git", "path"} else "running scanner(s)…")
+    auth_state: dict[str, Any] = {"context": auth_ctx}
     raw_findings, scanners_run, scan_meta, risk, score, chain_signals = _run_scanners(
         profile, kind, clean_target, max_files, run_live, auth_ctx, scope_host=scope_host,
+        on_auth_needed=on_auth_needed, auth_state=auth_state, should_stop=should_stop,
     )
+    auth_ctx = auth_state["context"]
+    for scanner_meta in scan_meta.values():
+        if isinstance(scanner_meta, dict) and scanner_meta.get("needs_operator"):
+            # Return before recon, browser scanning, active verification, or any
+            # report/trace write. The response is safe to display or persist.
+            return {
+                "ok": False,
+                "needs_operator": True,
+                "operator_action": "authentication_required",
+                "auth_context": scanner_meta.get("auth_context") or {},
+                "secure_transport_required": bool(scanner_meta.get("secure_transport_required")),
+                "error": scanner_meta.get("error") or "Authentication is required to continue this hunt.",
+            }
     _emit(f"scan complete — {', '.join(scanners_run) or 'no'} scanner(s) ran, {len(raw_findings)} raw finding(s), risk={risk}")
     # Surface scanner failures instead of letting a failed scan read as a clean
     # target (the worst failure mode for a bug-finding tool). If every scanner

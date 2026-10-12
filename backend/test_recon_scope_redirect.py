@@ -29,6 +29,8 @@ class _RedirectHandler(BaseHTTPRequestHandler):
     port = 0  # set by the test before the server starts handling requests
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/oos":
+            self.server.oos_hits += 1
         if self.path == "/":
             self.send_response(302)
             self.send_header("Location", f"http://evil.example.test:{self.port}/oos")
@@ -57,6 +59,7 @@ class ReconScopeBleedTests(unittest.TestCase):
         os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
         self._orig_gai = socket.getaddrinfo
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _RedirectHandler)
+        self.server.oos_hits = 0
         _RedirectHandler.port = self.server.server_port
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         orig = self._orig_gai
@@ -77,9 +80,12 @@ class ReconScopeBleedTests(unittest.TestCase):
         seed = f"http://app.example.test:{self.server.server_port}/"
         # No callback => only the seed's own host ("app.example.test") is in scope;
         # evil.example.test is NOT.
-        result = recon.discover(seed, scope_in=lambda h: False, settings=get_settings())
+        result = recon.discover(seed, scope_in=lambda h: h == "app.example.test",
+                                settings=get_settings(), detect_auth_wall=True)
         self.assertNotIn("leaked_secret_param", result["params"])
         self.assertGreaterEqual(result["dropped_out_of_scope"], 1)
+        self.assertTrue(result["scope_blocked"])
+        self.assertEqual(self.server.oos_hits, 0, "the redirect target must not receive a request")
         # And the OOS page's JS asset was never even considered for mining.
         self.assertEqual(result.get("js_secrets"), [])
 
@@ -91,6 +97,8 @@ class _JsRedirectHandler(BaseHTTPRequestHandler):
     port = 0
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/oos.js":
+            self.server.oos_hits += 1
         if self.path == "/":
             body = b'<html><body><script src="/asset.js"></script></body></html>'
             ctype = "text/html"
@@ -119,6 +127,7 @@ class ReconServedJsScopeBleedTests(unittest.TestCase):
         os.environ["GREYIQ_SCAN_ALLOW_PRIVATE_URLS"] = "1"
         self._orig_gai = socket.getaddrinfo
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _JsRedirectHandler)
+        self.server.oos_hits = 0
         _JsRedirectHandler.port = self.server.server_port
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         orig = self._orig_gai
@@ -136,10 +145,12 @@ class ReconServedJsScopeBleedTests(unittest.TestCase):
 
     def test_served_js_redirecting_out_of_scope_is_not_mined(self) -> None:
         seed = f"http://app.example.test:{self.server.server_port}/"
-        result = recon.discover(seed, scope_in=lambda h: False, settings=get_settings())
+        result = recon.discover(seed, scope_in=lambda h: h == "app.example.test",
+                                settings=get_settings())
         self.assertNotIn("leaked_js_param", result["params"])
         self.assertEqual(result.get("js_secrets"), [])
         self.assertGreaterEqual(result["dropped_out_of_scope"], 1)
+        self.assertEqual(self.server.oos_hits, 0, "the script redirect target must not receive a request")
 
 
 class ReconHtmlEntityTests(unittest.TestCase):

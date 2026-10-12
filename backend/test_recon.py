@@ -94,7 +94,7 @@ class ReconGuardTests(unittest.TestCase):
         # discover() and its only caller, campaign.run_campaign(), entirely.
         original = recon._fetch_raw
 
-        def fake_fetch(url: str):
+        def fake_fetch(url: str, **_kwargs):
             if url.endswith("/robots.txt"):
                 return {"status": 200, "body": "User-agent: *\nDisallow: http://[::1\nDisallow: /admin\n",
                         "headers": {}, "final_url": url}
@@ -118,7 +118,7 @@ class ReconGuardTests(unittest.TestCase):
         from bughunter.settings import get_settings
         settings = dataclasses.replace(get_settings(), recon_osint_enabled=True)
 
-        def fake_fetch(url: str):
+        def fake_fetch(url: str, **_kwargs):
             if url.endswith((".xml", "security.txt", "/robots.txt")) or "/.well-known/" in url:
                 return {"status": 404, "body": "", "headers": {}, "final_url": url}
             return {"status": 200, "body": "<html></html>", "headers": {}, "final_url": url}
@@ -142,7 +142,7 @@ class ReconGuardTests(unittest.TestCase):
             raise AssertionError("crt.sh must NOT be queried unless recon_osint is opted in")
 
         orig_fetch, orig_ct = recon._fetch_raw, takeover_service.cert_transparency_subdomains
-        recon._fetch_raw = lambda url: {"status": 200, "body": "<html></html>", "headers": {}, "final_url": url}
+        recon._fetch_raw = lambda url, **_kwargs: {"status": 200, "body": "<html></html>", "headers": {}, "final_url": url}
         takeover_service.cert_transparency_subdomains = _boom
         try:
             recon.discover("https://example.com/", max_pages=5)  # default settings -> OSINT off

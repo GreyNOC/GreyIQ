@@ -164,6 +164,10 @@ class Scanner:
     def active(self) -> bool:
         return self._active
 
+    @property
+    def stopped(self) -> bool:
+        return self._stopped.is_set()
+
     def start(self) -> "Scanner":
         if not self._active or self._thread is not None:
             return self
@@ -188,7 +192,7 @@ class Scanner:
         clean = str(text or "").rstrip()
         if not clean:
             return
-        if not self._active:
+        if not self._active or self.stopped:
             return
         with self._lock:
             self._erase()
@@ -344,6 +348,10 @@ def progress_sink(fx: Scanner | None, fallback: Any = None) -> Any:
     def _sink(message: str) -> None:
         text = str(message or "").strip()
         if not text:
+            return
+        if fx.stopped:
+            if callable(fallback):
+                fallback(text)
             return
         fx.phase(text)
         fx.note(text)

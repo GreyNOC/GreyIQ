@@ -66,6 +66,8 @@ class LoginServiceTests(unittest.TestCase):
             # Even a second scoped domain cannot receive this login's credentials.
             self.assertFalse(check("https://brand-b.com/collect", "login.acme.com",
                                    "acme.com brand-b.com", settings))
+            self.assertFalse(check("http://login.acme.com/submit", "login.acme.com",
+                                   "acme.com", settings))
             self.assertTrue(check("data:text/plain,local", "login.acme.com", "acme.com", settings))
         with patch.object(account_login_service, "playwright_request_allowed", return_value=False):
             self.assertFalse(check("https://login.acme.com/", "login.acme.com", "acme.com", settings))
@@ -111,6 +113,16 @@ class LoginServiceTests(unittest.TestCase):
         out = account_login_service.login({"email": "me@x.example"}, scope="app.example")  # no password/login_url
         self.assertFalse(out["ok"])
         self.assertEqual(out["cookie"], "")
+
+    def test_http_login_url_never_submits_credentials(self) -> None:
+        with patch.object(account_login_service, "_guard_url", side_effect=lambda url, *_: url), \
+             patch.object(account_login_service, "_playwright_login") as browser_login:
+            out = account_login_service.login(
+                {"email": "me@x.example", "password": "pw",
+                 "login_url": "http://app.example/login"}, scope="app.example")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["cookie"], "")
+        browser_login.assert_not_called()
 
     def test_out_of_scope_login_url_never_submits_credentials(self) -> None:
         # credentials must go ONLY to an in-scope, guard-approved host; an out-of-scope (or otherwise

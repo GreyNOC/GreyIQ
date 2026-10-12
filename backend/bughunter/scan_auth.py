@@ -44,10 +44,12 @@ _FORBIDDEN_HEADER_NAMES = frozenset(
 @dataclass(frozen=True)
 class AuthContext:
     """Credentials bound to a single host. ``headers`` are sent verbatim, but only
-    to same-site requests (see :func:`auth_headers_for`)."""
+    to same-site requests (see :func:`auth_headers_for`). Prompted sessions can
+    additionally require HTTPS for every request and redirect."""
 
     host: str  # lowercased host the credentials are bound to
     headers: dict[str, str] = field(default_factory=dict)
+    https_only: bool = False
 
 
 def _host(value: str) -> str:
@@ -103,10 +105,14 @@ def same_registrable_site(request_host: str, issuer_host: str) -> bool:
     return bool(reg) and reg == registrable_domain(ih)
 
 
-def auth_headers_for(request_host: str, auth: AuthContext | None) -> dict[str, str]:
+def auth_headers_for(request_host: str, auth: AuthContext | None,
+                     *, request_scheme: str = "") -> dict[str, str]:
     """The auth headers to attach to a request to ``request_host`` — the bound
-    headers if (and only if) the host is same-site as the credentials, else none."""
+    headers if (and only if) the host is same-site as the credentials and any
+    prompted HTTPS requirement is satisfied, else none."""
     if auth is None or not auth.headers:
+        return {}
+    if auth.https_only and request_scheme.lower() != "https":
         return {}
     return dict(auth.headers) if same_site(request_host, auth.host) else {}
 
@@ -121,7 +127,8 @@ def _parse_header_line(line: str) -> tuple[str, str] | None:
     return name, value
 
 
-def build_auth(target_url: str, *, cookie: str = "", headers: Any = None, issuer_host: str = "") -> AuthContext | None:
+def build_auth(target_url: str, *, cookie: str = "", headers: Any = None,
+               issuer_host: str = "", https_only: bool = False) -> AuthContext | None:
     """Build an :class:`AuthContext` bound to ``target_url``'s host from an operator
     cookie string and/or a list of ``"Name: value"`` header lines. Returns ``None``
     when no usable auth was supplied or the target has no host.
@@ -168,4 +175,4 @@ def build_auth(target_url: str, *, cookie: str = "", headers: Any = None, issuer
             built[parsed[0]] = parsed[1]
     if not built:
         return None
-    return AuthContext(host=_host(host), headers=built)
+    return AuthContext(host=_host(host), headers=built, https_only=bool(https_only))

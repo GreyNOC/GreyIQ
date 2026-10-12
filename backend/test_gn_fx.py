@@ -82,6 +82,19 @@ class OnlyForAHumanTests(unittest.TestCase):
         fx.hit("low")
         self.assertEqual(fx._counts, {"high": 2, "low": 1})
 
+    def test_progress_returns_to_plain_output_after_secret_prompt_stops_animation(self) -> None:
+        stream = _tty()
+        fallback: list[str] = []
+        fx = gn_fx.scanner("hunt", stream=stream, active=True)
+        with fx:
+            sink = gn_fx.progress_sink(fx, fallback.append)
+            sink("mapping")
+            fx.stop()  # the CLI restores the terminal before getpass
+            before = stream.getvalue()
+            sink("continuing with session")
+        self.assertEqual(stream.getvalue(), before)
+        self.assertEqual(fallback, ["continuing with session"])
+
     def test_no_color_and_gn_no_fx_both_turn_it_off_on_a_real_terminal(self) -> None:
         stream = _tty()
         self.assertTrue(gn_fx.enabled(stream), "precondition: a utf-8 tty should be eligible")

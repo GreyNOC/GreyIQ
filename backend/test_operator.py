@@ -627,6 +627,21 @@ class OperatorCycleTests(unittest.TestCase):
         self.assertEqual(len(s["errors"]), 1)
         self.assertIn("not authorized", s["errors"][0])
 
+    def test_auth_wall_stops_cycle_before_other_targets(self) -> None:
+        attempted: list[str] = []
+
+        def blocked(target, **_kwargs):
+            attempted.append(target)
+            return {"ok": False, "needs_operator": True,
+                    "error": "operator session required"}
+
+        prog = self._program(seed_targets=["https://a.acme.com", "https://b.acme.com"])
+        s = operator.run_program_cycle(self.rt, prog, run_campaign_fn=blocked)
+        self.assertEqual(attempted, ["https://a.acme.com"])
+        self.assertTrue(s["needs_operator"])
+        self.assertTrue(s["stopped"])
+        self.assertEqual(s["stop_reason"], "operator authentication required")
+
     def test_finding_missing_ref_is_tolerated(self) -> None:
         def run_fn(target, *, scope, program, active, live, deep=False, max_pages=12, **_):
             f = {"class_id": "xss", "rule_id": "r", "location": target, "severity": "high", "title": "x"}  # no 'ref'

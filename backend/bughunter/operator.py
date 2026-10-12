@@ -156,7 +156,16 @@ def run_program_cycle(
             summary["stop_reason"] = guard.halt_reason
             break
         if not result.get("ok"):
+            if result.get("needs_operator"):
+                # A protected surface is unfinished work, never a clean cycle.
+                # Unattended runs stop for human input instead of rescheduling
+                # the same missing-session attempt indefinitely.
+                summary["needs_operator"] = True
+                summary["stopped"] = True
+                summary["stop_reason"] = "operator authentication required"
             summary["errors"].append(f"{target}: {result.get('error', 'campaign failed')}")
+            if summary.get("needs_operator"):
+                break
             continue
         summary["targets_run"] += 1
         findings = result.get("findings") or []

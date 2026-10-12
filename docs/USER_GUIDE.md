@@ -306,6 +306,31 @@ flagged; deep SQLi and deep auto-work still only ever fire against a host
 actually named in Scope. The live browser option is disabled until its DNS
 egress can be pinned to the same checked host.
 
+### CLI hunts that need an account
+
+For an authorized URL hunt, name the exact host or a permitted wildcard in `--scope` and
+pass `-y`. If the first target response is an authentication challenge or a clear
+login wall, `gn hunt` and `gn campaign` pause before deeper scanning. The same
+handoff is available for `gn osint --hunt` and the reviewed first `gn auto`
+cycle. In an interactive
+terminal they ask for one of: your research account's session cookie, a bearer token,
+or an in-scope HTTPS login URL plus your account username and password. Cookie, token,
+username, and password entry is hidden. The session is held in process memory for this
+run; the engine checks the protected page once more and continues only if the wall
+clears. Sessions are bound to their issuing site and are not attached to off-site
+redirects. Prompted secrets require an HTTPS target, including any discovered URL in
+a campaign; an HTTP wall stops with a request to use an authorized HTTPS URL.
+`gn dash` restores the terminal before asking, then restarts that hunt
+once with the supplied session.
+
+Skipping the question, giving an ineffective session, or running with `--json`,
+`--no-prompt`, or without a terminal leaves a clear `needs_operator` result. Scheduled
+`gn operator run` cycles never prompt and stop for operator input at this boundary. The
+engine stops at that boundary; it does not label the protected surface clean.
+Local source hunts and public pages do not ask for account access. For scripted
+runs, `--cookie` and `--header` remain available, but arguments can be recorded in
+shell history or a process list; use the hidden interactive prompt when possible.
+
 ### Passive OSINT campaigns (local CLI)
 
 The shipped `gn` command can build a domain evidence ledger before you spend any request

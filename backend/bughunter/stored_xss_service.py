@@ -62,12 +62,16 @@ def _fetch_view(url: str, *, auth: Any, settings: Any) -> dict[str, Any]:
 def _post_form(url: str, data: dict[str, str], *, auth: Any, timeout: float) -> dict[str, Any]:
     """POST a form body to an ALREADY scope-checked + SSRF-guarded URL, no redirect followed.
     The operator's session is attached if present. Reached only via the opt-in ``send``."""
+    if (auth is not None and getattr(auth, "https_only", False)
+            and urlparse(url).scheme.lower() != "https"):
+        return {"ok": False, "error": "Operator session refused on a non-HTTPS form request."}
     headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": current_user_agent(_USER_AGENT), "Accept": "*/*"}
     # Attach the operator session ONLY when the POST host is same-site as the host the
     # credentials were bound to — same invariant the GET path (_Http.fetch) enforces. The
     # inject URL is scope-checked independently and may be a DIFFERENT in-scope host, so a
     # raw header copy would leak the session off-target on the strictest (non-GET) egress.
-    headers.update(auth_headers_for(urlparse(url).hostname or "", auth))
+    headers.update(auth_headers_for(urlparse(url).hostname or "", auth,
+                                    request_scheme=urlparse(url).scheme))
     request = urllib.request.Request(url, data=urlencode(data).encode("utf-8"), method="POST", headers=headers)
     opener = urllib.request.build_opener(_NoRedirect())
     try:
@@ -172,6 +176,7 @@ def confirm_stored_xss(
     marker: str | None = None,
     cookie: str = "",
     headers: list[str] | None = None,
+    https_only_auth: bool = False,
     settings: Any = None,
 ) -> dict[str, Any]:
     """Confirm stored XSS. Assisted by default (mint a marker payload, hand it back to submit,
@@ -191,7 +196,9 @@ def confirm_stored_xss(
         sview = _guard_url(nview, settings.allow_private_urls, settings.web_allowed_ports)
     except WebsiteFetchError as exc:
         return {"ok": False, "error": f"view URL refused by the guard: {exc}"}
-    auth = build_auth(sview, cookie=cookie or "", headers=headers or [])
+    if https_only_auth and (cookie or headers) and urlparse(sview).scheme.lower() != "https":
+        return {"ok": False, "error": "Operator session requires an HTTPS view URL."}
+    auth = build_auth(sview, cookie=cookie or "", headers=headers or [], https_only=https_only_auth)
 
     fresh = not str(marker or "").strip()
     marker = str(marker or "").strip() or mint_marker()
@@ -268,19 +275,26 @@ def _beacon_route_headers(req_url: str, req_headers: dict[str, str], auth: Any) 
     site (leave the request untouched). This is the same-site boundary that keeps the operator session
     off any cross-origin host the (attacker-controlled) stored markup references — a browser render must
     NEVER attach auth context-wide. Module-level so the boundary is directly unit-tested."""
-    add = auth_headers_for(urlparse(req_url).hostname or "", auth)
+    if (auth is not None and getattr(auth, "https_only", False)
+            and urlparse(req_url).scheme.lower() != "https"):
+        return None
+    add = auth_headers_for(urlparse(req_url).hostname or "", auth,
+                           request_scheme=urlparse(req_url).scheme)
     if not add:
         return None
     return {**dict(req_headers or {}), **{k.lower(): v for k, v in add.items()}}
 
 
 def _render_beacon(url: str, *, cookie: str, headers: list[str] | None, scope: str,
-                   settings: Any, wait_seconds: float = 4.0) -> dict[str, Any]:
+                   settings: Any, wait_seconds: float = 4.0,
+                   https_only_auth: bool = False) -> dict[str, Any]:
     """Render ``url`` in a headless browser so a stored ``<img src=beacon>`` actually fires its request.
     SSRF-route-guarded (private/metadata hosts blocked, the public collaborator allowed); the operator's
     session is attached so the stored content shows; scope re-checked after navigation. Playwright-lazy.
     Returns ``{ok, final_url}`` or ``{ok: False, error}`` — never raises for the common failures. Module-
     level so tests can substitute it without a real browser."""
+    if https_only_auth and urlparse(url).scheme.lower() != "https":
+        return {"ok": False, "error": "Operator session requires an HTTPS view URL."}
     ensure_bundled_browsers_path()
     try:
         from playwright.sync_api import sync_playwright
@@ -289,12 +303,19 @@ def _render_beacon(url: str, *, cookie: str, headers: list[str] | None, scope: s
 
     # Bind the operator's session (cookie + headers) to the view host; auth_headers_for() then releases
     # it ONLY to same-site requests inside the route guard below.
-    auth = build_auth(url, cookie=cookie or "", headers=headers or [])
+    auth = build_auth(url, cookie=cookie or "", headers=headers or [], https_only=https_only_auth)
 
     def _guard_route(route: Any) -> None:
         # Every request the render makes (the view, its sub-resources, AND the beacon) is guarded: a
         # private/metadata host is aborted; the public collaborator + in-scope view host are allowed.
         req = route.request
+        # Playwright may acquire ordinary browser cookies from a prior HTTPS response.
+        # Abort the entire cleartext request for a prompted session, including a
+        # same-host redirect, so neither those cookies nor our explicit headers ride it.
+        if (auth is not None and getattr(auth, "https_only", False)
+                and urlparse(req.url).scheme.lower() != "https"):
+            route.abort()
+            return
         if not playwright_request_allowed(req.url, settings.allow_private_urls, settings.web_allowed_ports):
             route.abort()
             return
@@ -315,7 +336,7 @@ def _render_beacon(url: str, *, cookie: str, headers: list[str] | None, scope: s
             # Carry the app signature + the program's mandatory marker (see screenshot_service). This
             # path renders the stored payload back, so its traffic is in-scope and must be attributable.
             context = browser.new_context(
-                ignore_https_errors=True, user_agent=current_user_agent(_USER_AGENT)
+                ignore_https_errors=not https_only_auth, user_agent=current_user_agent(_USER_AGENT)
             )
             context.route("**/*", _guard_route)
             page = context.new_page()
@@ -414,6 +435,7 @@ def confirm_stored_xss_beacon(
     token: str | None = None,
     cookie: str = "",
     headers: list[str] | None = None,
+    https_only_auth: bool = False,
     settings: Any = None,
     poll_attempts: int = 4,
     poll_delay_s: float = 2.0,
@@ -446,6 +468,8 @@ def confirm_stored_xss_beacon(
         sview = _guard_url(nview, settings.allow_private_urls, settings.web_allowed_ports)
     except WebsiteFetchError as exc:
         return {"ok": False, "error": f"view URL refused by the guard: {exc}"}
+    if https_only_auth and (cookie or headers) and urlparse(sview).scheme.lower() != "https":
+        return {"ok": False, "error": "Operator session requires an HTTPS view URL."}
 
     fresh = not str(token or "").strip()
     token = str(token or "").strip() or mint_token()
@@ -495,7 +519,7 @@ def confirm_stored_xss_beacon(
             return {"ok": False, "error": pre.get("error", "collaborator poll failed")}
         if pre.get("count"):
             return {"ok": False, "error": "the fresh collaborator token already has hits before the probe — mint a fresh one and retry."}
-        auth = build_auth(sview, cookie=cookie or "", headers=headers or [])
+        auth = build_auth(sview, cookie=cookie or "", headers=headers or [], https_only=https_only_auth)
         # Re-validate + pin DNS immediately before the POST (rebind guard), like the marker path.
         with guarded_dns_scope():
             try:
@@ -505,7 +529,8 @@ def confirm_stored_xss_beacon(
             post = _post_form(sinj, {field: payloads["img"]}, auth=auth, timeout=settings.web_fetch_timeout_seconds)
         if not post.get("ok"):
             return {"ok": True, "status": "send-failed", "token": token, "payloads": payloads, "error": post.get("error")}
-        render = _render_beacon(sview, cookie=cookie, headers=headers, scope=scope, settings=settings, wait_seconds=wait_seconds)
+        render = _render_beacon(sview, cookie=cookie, headers=headers, scope=scope, settings=settings,
+                                wait_seconds=wait_seconds, https_only_auth=https_only_auth)
         if not render.get("ok"):
             return {"ok": True, "status": "render-failed", "token": token, "payloads": payloads, "error": render.get("error")}
         return _poll_then_verdict(sinj)
@@ -517,7 +542,8 @@ def confirm_stored_xss_beacon(
                 "reason": (f"Submit one of these beacon payloads into the target field, then re-run with token={token} "
                            f"to render {sview} and poll for the callback (or pass send=True to have GreyIQ do it).")}
     # Re-render + re-poll a token the operator already injected (its negative control was the fresh mint).
-    render = _render_beacon(sview, cookie=cookie, headers=headers, scope=scope, settings=settings, wait_seconds=wait_seconds)
+    render = _render_beacon(sview, cookie=cookie, headers=headers, scope=scope, settings=settings,
+                            wait_seconds=wait_seconds, https_only_auth=https_only_auth)
     if not render.get("ok"):
         return {"ok": True, "status": "render-failed", "token": token, "payloads": payloads, "error": render.get("error")}
     return _poll_then_verdict(inject_url)

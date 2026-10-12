@@ -110,6 +110,16 @@ class StoredXssTests(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("scope", res["error"].lower())
 
+    def test_prompted_session_requires_https_view_before_fetch(self) -> None:
+        fetched = []
+        sx._fetch_view = lambda url, **k: fetched.append(url) or {"status": 200, "body": ""}
+        res = sx.confirm_stored_xss(view_url="http://app.example.com/profile",
+                                    cookie="session=OPERATOR_SECRET", https_only_auth=True,
+                                    marker="gqsxexisting", **self.cfg)
+        self.assertFalse(res["ok"])
+        self.assertIn("HTTPS", res["error"])
+        self.assertEqual(fetched, [])
+
 
 class PostFormSameSiteTests(unittest.TestCase):
     """The REAL _post_form (not stubbed) against a local server: the operator's session
@@ -161,6 +171,15 @@ class PostFormSameSiteTests(unittest.TestCase):
         res = sx._post_form(url, {"f": "x"}, auth=auth, timeout=5.0)
         self.assertTrue(res["ok"])
         self.assertNotIn("Cookie", self.captured[0])  # session must NOT leak to a different host
+
+    def test_prompted_session_refuses_cleartext_post_before_socket(self) -> None:
+        from bughunter.scan_auth import build_auth
+        url = f"http://127.0.0.1:{self.port}/submit"
+        auth = build_auth(url, cookie="session=OPERATOR_SECRET", https_only=True)
+        res = sx._post_form(url, {"f": "x"}, auth=auth, timeout=5.0)
+        self.assertFalse(res["ok"])
+        self.assertIn("non-HTTPS", res["error"])
+        self.assertEqual(self.captured, [])
 
 
 class StoredXssBeaconTests(unittest.TestCase):
@@ -244,6 +263,13 @@ class StoredXssBeaconTests(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("inject_url", res["error"])
 
+    def test_prompted_beacon_session_requires_https_view_before_render(self) -> None:
+        res = sx.confirm_stored_xss_beacon(view_url="http://app.example.com/profile",
+                                           cookie="session=OPERATOR_SECRET", https_only_auth=True,
+                                           token="existing", **self.cfg)
+        self.assertFalse(res["ok"])
+        self.assertIn("HTTPS", res["error"])
+
     def test_render_session_never_rides_an_off_site_request(self) -> None:
         # SECURITY: the render must attach the operator session ONLY to same-site requests. A cross-origin
         # sub-resource the (attacker-controlled) stored markup references must receive NO credentials, or a
@@ -259,6 +285,85 @@ class StoredXssBeaconTests(unittest.TestCase):
         # off-site attacker host (the beacon-referenced <img> host / a public CDN) -> NO credentials
         for evil in ("https://attacker.example/steal", "https://cdn.evil.net/x", "https://collab.example/oob/tok"):
             self.assertIsNone(sx._beacon_route_headers(evil, {"accept": "*/*"}, auth), evil)
+
+    def test_prompted_render_headers_never_ride_cleartext_same_site_request(self) -> None:
+        from bughunter.scan_auth import build_auth
+
+        auth = build_auth("https://app.example.com/profile", cookie="session=OPERATOR_SECRET",
+                          headers=["Authorization: Bearer OP_TOKEN"], https_only=True)
+        self.assertIsNone(sx._beacon_route_headers("http://app.example.com/redirect", {}, auth))
+        secure = sx._beacon_route_headers("https://app.example.com/api/me", {}, auth)
+        self.assertIn("OP_TOKEN", secure["authorization"])
+
+    def test_prompted_browser_aborts_same_host_http_redirect(self) -> None:
+        from types import ModuleType, SimpleNamespace
+        from unittest.mock import patch
+
+        routes = []
+        options = {}
+
+        class FakeRoute:
+            def __init__(self, url):
+                self.request = SimpleNamespace(url=url, headers={})
+                self.action = ""
+                self.headers = {}
+
+            def abort(self):
+                self.action = "aborted"
+
+            def continue_(self, *, headers=None):
+                self.action = "continued"
+                self.headers = headers or {}
+
+        class FakeContext:
+            def route(self, _pattern, callback):
+                self.callback = callback
+
+            def new_page(self):
+                return self
+
+            def goto(self, url, **_kwargs):
+                self.url = url
+                for request_url in (url, "http://app.example.com/redirect"):
+                    route = FakeRoute(request_url)
+                    routes.append(route)
+                    self.callback(route)
+
+            def wait_for_timeout(self, _milliseconds):
+                pass
+
+        class FakeBrowser:
+            def new_context(self, **kwargs):
+                options.update(kwargs)
+                return FakeContext()
+
+            def close(self):
+                pass
+
+        class FakePlaywright:
+            chromium = SimpleNamespace(launch=lambda **_kwargs: FakeBrowser())
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+        package = ModuleType("playwright")
+        package.__path__ = []
+        module = ModuleType("playwright.sync_api")
+        module.sync_playwright = FakePlaywright
+        with patch.dict(sys.modules, {"playwright": package, "playwright.sync_api": module}), \
+                patch.object(sx, "ensure_bundled_browsers_path"), \
+                patch.object(sx, "playwright_request_allowed", return_value=True):
+            result = self._save[1]("https://app.example.com/profile", cookie="session=OPERATOR_SECRET",
+                                   headers=["Authorization: Bearer OP_TOKEN"], scope="app.example.com",
+                                   settings=get_settings(), wait_seconds=0, https_only_auth=True)
+        self.assertTrue(result["ok"])
+        self.assertFalse(options["ignore_https_errors"])
+        self.assertEqual(routes[0].action, "continued")
+        self.assertIn("OP_TOKEN", routes[0].headers["authorization"])
+        self.assertEqual(routes[1].action, "aborted")
 
 
 if __name__ == "__main__":

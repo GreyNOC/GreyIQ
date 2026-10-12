@@ -957,6 +957,18 @@ class HttpPerHuntBudgetTests(unittest.TestCase):
             except av._ActiveError:
                 self.fail("_RateLimited must not be caught by an `except _ActiveError` handler")
 
+    def test_prompted_session_and_jwt_probe_never_use_cleartext(self) -> None:
+        from bughunter.scan_auth import build_auth
+
+        auth = build_auth(self.url, cookie="session=OPERATOR_SECRET", https_only=True)
+        http = av._Http(get_settings(), HostRateGovernor(capacity=20, min_interval_s=0.0),
+                        max_requests=2, auth=auth)
+        with patch.object(http.opener, "open", side_effect=AssertionError("HTTP socket opened")) as opened:
+            with self.assertRaisesRegex(av._ActiveError, "non-HTTPS"):
+                http.fetch(self.url, extra_headers={"Authorization": "Bearer FORGED_JWT"})
+        opened.assert_not_called()
+        self.assertEqual(http.sent, 0)
+
 
 class HttpRetryTests(unittest.TestCase):
     """_Http.fetch() retries a CONNECTION-LEVEL transient failure (reset/timeout/DNS
