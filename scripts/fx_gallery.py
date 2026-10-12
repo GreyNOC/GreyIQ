@@ -450,11 +450,13 @@ _BLOCK_FONT = {
 }
 _WORD = "GREYIQ"
 
+# No katakana, however much it wants to be in a Matrix homage: U+30A2 and friends are East Asian
+# Wide, so a terminal spends TWO cells on them and every glyph to the right of one shears out of
+# the grid. Everything here is narrow -- hex, operators, and the two shade blocks.
 _RAIN_UNI = {
     "ink": "█",
-    "glyphs": ("0", "1", "ア", "キ", "サ", "ト", "ノ", "ヒ", "メ",
-               "ヨ", "リ", "ン", "§", "±", "≡", "□", "■",
-               "7", "3", "9", "F", "A", "E", "D"),
+    "glyphs": ("0", "1", "7", "3", "9", "F", "A", "E", "D", "§", "±", "¬",
+               "»", "«", "▒", "░", "$", "%", "&", "*", "=", "<", ">", "/"),
     "bar": "▒",
 }
 _RAIN_ASCII = {
@@ -677,15 +679,31 @@ class Wireframe(Scene):
         points.sort(key=lambda p: p[2])
         for x, y, z, spine in points:
             sx, sy = cx + x * rx, cy - y * ry
-            if z < -0.05:
+            # A five-stop depth ramp, not three: with one flat colour over everything facing us the
+            # sphere renders as a disc of identical dots and loses its roundness entirely.
+            if z < -0.35:
                 glyph, color = g["far"], "38;5;236"
-            elif z < 0.45:
-                glyph, color = g["mid"], dim if not spine else "38;5;31"
+            elif z < -0.05:
+                glyph, color = g["far"], "38;5;238"
+            elif z < 0.25:
+                glyph, color = g["mid"], dim
+            elif z < 0.60:
+                glyph, color = g["mid"], "38;5;37"
             else:
-                glyph, color = g["near"], cyan if not spine else "1;38;5;51"
+                glyph, color = g["near"], cyan
+            if spine and z >= -0.05:
+                color = "1;38;5;51"
             if round(sy) == sweep and z >= -0.05:
                 color = "1;38;5;159"
             canvas.put(round(sx), round(sy), glyph, color)
+
+        # The limb, drawn last so nothing overdraws it. Under orthographic projection a sphere's
+        # silhouette is the same ellipse at every rotation, so it costs one loop -- and it is what
+        # turns a cloud of lat/lon dots into something the eye reads as round.
+        for deg in range(0, 360, 3):
+            rad = math.radians(deg)
+            canvas.put(round(cx + math.cos(rad) * rx), round(cy + math.sin(rad) * ry),
+                       g["mid"], "1;38;5;45")
 
         # --- blips, and the reticle working through them -------------------------------------------
         locked_index = int((t - _LOCK_FIRST) / _LOCK_EVERY) if t >= _LOCK_FIRST else -1
