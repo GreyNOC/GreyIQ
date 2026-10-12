@@ -4,6 +4,41 @@ Notable changes to GreyIQ.
 
 ## Unreleased
 
+- Clone a public Hugging Face agent from the CLI: `gn agent clone`, with `list`,
+  `show` and `remove` beside it. The reference can be a repository URL, a pasted
+  `tree/<branch>` URL, `hf.co/spaces/owner/name`, `spaces/owner/name` or a bare
+  `owner/name`, with `@<branch|tag|sha>` or `--revision` to pin a commit. The
+  clone is pinned, verified and inert: the revision resolves to a commit SHA
+  before the first byte is fetched, every file is checked against the git blob
+  digest the Hub published for it (a mismatch in digest or size refuses the whole
+  clone and leaves nothing half-written), and nothing fetched is ever imported or
+  executed — the tool inventory is read statically with `ast`, so `gn agent show`
+  reports each tool's name, inputs and output type without running a line of
+  someone else's Python. Weights and non-code files are listed as skipped rather
+  than downloaded, and a tool `agent.json` declares with no source in the
+  repository is named instead of being taken on faith. Each clone also gets a
+  `SKILL.md` playbook the coding agent and offline coder pick up, loaded with the
+  new `cloned` source so it is fenced as untrusted data rather than spliced into
+  the system prompt — a remote agent's prompts are prose aimed at a model, so an
+  operator-authored skill of the same name wins over it, and the clone's own
+  prompts are screened for injection directives. A link to a file or folder
+  inside a repository is refused rather than widened into "clone everything", and
+  a name the operator typed is a single local id: a path-shaped `--as`, `show` or
+  `remove` argument is rejected instead of being coerced into another clone. A
+  clone stages under a dot-prefixed, per-run directory and is published by
+  rename: the leading dot is one `agent_name` refuses, so staging can never
+  collide with a real clone, and the previous clone stays in place until the new
+  one lands rather than being deleted first.
+
+## v4.10.0 - autonomous directory hunts and the closed payout loop
+
+- Give the `gn dash` cockpit a four-colour palette: blue for structure, and
+  red/yellow/green carrying severity and health. Severity labels and their
+  counts, the status pill, the section titles and the log line's phase prefix
+  are all lit, and a zero count stays plain so an idle run never reads as a wall
+  of red. The colour is applied AFTER `render`, which keeps that function pure
+  and escape-free — the property that stops a target's own finding title from
+  repainting the operator's screen. `GN_DASH_COLOR=0` turns it off.
 - Hunt a directory with one command: `gn auto -y` in a repo or a folder that
   lists its targets resolves them, registers the directory as a saved program so
   negative knowledge, priors, surface drift and the ledger accumulate across

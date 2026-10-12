@@ -26,6 +26,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import threading
 import unittest
@@ -2014,6 +2015,158 @@ class SelfTestTests(_Case):
         with contextlib.redirect_stdout(buffer):
             gn_dash.self_test(io.StringIO(), io.StringIO())
         self.assertIn("unavailable:", buffer.getvalue())
+
+
+
+class PaletteTests(unittest.TestCase):
+    """The colour pass must not be able to change what the frame SAYS, only how it looks.
+
+    ``render`` is the tested, escape-free layout; ``colorize`` runs after it and before
+    ``Screen.frame``. So the property that matters is that stripping the escapes gives the
+    uncoloured frame back, byte for byte. Anything else means the palette has started editing
+    content — and since the width maths counts characters, an edit is also a broken layout.
+    """
+
+    ANSI = re.compile(r"\033\[[0-9;]*m")
+
+    def _frame(self, tier_name: str = "rich", **overrides):
+        size = gn_tui.Size(100, 30)
+        plain = gn_dash.render(_state(**overrides), size, _tier(tier_name))
+        return plain, gn_dash.colorize(plain, _tier(tier_name))
+
+    def test_stripping_the_colour_returns_the_exact_frame(self) -> None:
+        plain, painted = self._frame()
+        self.assertEqual(len(painted), len(plain))
+        for index, (before, after) in enumerate(zip(plain, painted)):
+            with self.subTest(row=index):
+                self.assertEqual(self.ANSI.sub("", after), before)
+
+    def test_every_row_keeps_its_visible_width(self) -> None:
+        """An escape is zero-width, so a painted row must occupy the same cells.
+
+        ``Screen._truncate_visible`` counts visible cells, so a row that grew in VISIBLE
+        width would be cut mid-frame rather than at the border.
+        """
+        plain, painted = self._frame()
+        for index, (before, after) in enumerate(zip(plain, painted)):
+            with self.subTest(row=index):
+                self.assertEqual(len(self.ANSI.sub("", after)), len(before))
+
+    def test_render_itself_is_still_escape_free(self) -> None:
+        """The invariant the palette must not have moved: colour is added AFTER render."""
+        plain, _ = self._frame()
+        for index, row in enumerate(plain):
+            with self.subTest(row=index):
+                self.assertNotIn("\033", row)
+
+    def test_disabled_is_an_exact_no_op(self) -> None:
+        size = gn_tui.Size(100, 30)
+        plain = gn_dash.render(_state(), size, _tier())
+        self.assertEqual(gn_dash.colorize(plain, _tier(), enabled=False), list(plain))
+
+    def test_the_ascii_tier_keeps_its_frame_plain(self) -> None:
+        """``+``, ``-`` and ``|`` are a URL's characters too, so that tier is not tinted.
+
+        Tinting them would colour content, which is the one thing this pass must not do.
+        """
+        _plain, painted = self._frame("ascii")
+        joined = "\n".join(painted)
+        self.assertNotIn("\033[34m+", joined)
+        self.assertNotIn("\033[34m-", joined)
+        self.assertNotIn("\033[34m|", joined)
+
+    def test_the_box_tier_does_tint_its_frame(self) -> None:
+        _plain, painted = self._frame("box")
+        self.assertIn("\033[34m", "\n".join(painted), "a box-drawing frame should be blue")
+
+    def test_severity_counts_carry_their_own_colour(self) -> None:
+        findings = ([{"severity": "critical", "title": "t"}] * 2
+                    + [{"severity": "medium", "title": "t"}] * 3
+                    + [{"severity": "low", "title": "t"}])
+        snapshot = {"targets": [], "findings": findings,
+                    "stats": {"targets_total": 0, "targets_done": 0,
+                              "findings_total": len(findings), "confirmed_total": 0,
+                              "severity_counts": {}}}
+        _plain, painted = self._frame(snapshot=snapshot)
+        joined = "\n".join(painted)
+        self.assertIn("\033[31mcrit\033[0m", joined)
+        self.assertIn("\033[33mmed\033[0m", joined)
+        self.assertIn("\033[32mlow\033[0m", joined)
+
+    def test_a_zero_count_is_never_painted(self) -> None:
+        """An idle run must not read as a wall of red. Zero is not a judgement."""
+        _plain, painted = self._frame()
+        self.assertNotIn("\033[31;1m0\033[0m", "\n".join(painted))
+
+    def test_a_longer_status_pill_wins_over_a_shorter_one(self) -> None:
+        """``NO BACKEND`` contains no other label, but ``DONE`` must not pre-empt it.
+
+        Both are in the map, and a frozen-backend header painted green would be exactly the
+        reassuring lie the attached-mode rules exist to prevent.
+        """
+        _plain, painted = self._frame(status="NO BACKEND")
+        self.assertIn("\033[31;1mNO BACKEND\033[0m", painted[0])
+
+    def test_a_stale_run_is_red_rather_than_amber(self) -> None:
+        _plain, painted = self._frame(status="STALE")
+        self.assertIn("\033[31;1mSTALE\033[0m", painted[0])
+
+    def test_section_titles_are_painted_but_only_at_a_panel_edge(self) -> None:
+        _plain, painted = self._frame()
+        joined = "\n".join(painted)
+        self.assertIn("\033[34;1mTARGETS\033[0m", joined)
+        self.assertIn("\033[34;1mFINDINGS\033[0m", joined)
+        self.assertIn("\033[34;1mRATE\033[0m", joined)
+
+    def test_a_log_line_phase_prefix_is_painted_by_phase(self) -> None:
+        events = tuple({"message": msg, "at": ""} for msg in
+                       ("recon: 3 hosts", "prover: callback received", "replan: next lead"))
+        _plain, painted = self._frame(events=events)
+        joined = "\n".join(painted)
+        self.assertIn("\033[34;1mrecon\033[0m:", joined)
+        self.assertIn("\033[32;1mprover\033[0m:", joined)
+        self.assertIn("\033[33;1mreplan\033[0m:", joined)
+
+    def test_an_unknown_phase_prefix_is_left_alone(self) -> None:
+        events = ({"message": "weatherwax: nothing in the map", "at": ""},)
+        _plain, painted = self._frame(events=events)
+        self.assertIn("weatherwax:", self.ANSI.sub("", "\n".join(painted)))
+        self.assertNotIn("\033[34;1mweatherwax", "\n".join(painted))
+
+    def test_keyword_lighting_cannot_corrupt_an_earlier_escape(self) -> None:
+        """Layout D lights words inside a message, and several passes run over one row.
+
+        An SGR code is ``ESC [ digits ; digits m`` — no keyword occurs inside one — so a later
+        pass cannot land mid-escape. Asserted rather than asserted-by-reasoning: every escape
+        in the frame must be a complete, well-formed SGR sequence.
+        """
+        events = ({"message": "prover: IDOR confirmed, SSRF confirmed, candidate bypass", "at": ""},)
+        _plain, painted = self._frame(events=events)
+        joined = "\n".join(painted)
+        # Every ESC starts a sequence that the ANSI pattern matches in full.
+        for position, char in enumerate(joined):
+            if char == "\033":
+                with self.subTest(position=position):
+                    self.assertIsNotNone(self.ANSI.match(joined, position),
+                                         "a truncated or nested escape reached the frame")
+
+    def test_attacker_influenced_text_can_reach_the_keyword_pass(self) -> None:
+        """Documenting the accepted trade-off of layout D, so a later reader sees it stated.
+
+        A finding title is attacker-influenced. It CANNOT inject an escape (``_plain`` strips
+        them before the row exists, which the first test above re-proves for the whole frame),
+        but a word inside it IS eligible for colour. That is the chosen behaviour, not a gap:
+        removing ``_paint_keywords`` from ``colorize`` reverts to layout A.
+        """
+        events = ({"message": "scan: /confirmed-payments returned 200", "at": ""},)
+        _plain, painted = self._frame(events=events)
+        joined = "\n".join(painted)
+        self.assertIn("\033[32mconfirmed\033[0m", joined)
+        # The load-bearing half: no escape the target supplied survives into the row.
+        hostile = ({"message": "scan: \033[2J\033[H wiped your screen", "at": ""},)
+        plain_hostile = gn_dash.render(_state(events=hostile), gn_tui.Size(100, 30), _tier())
+        for row in plain_hostile:
+            self.assertNotIn("\033", row)
 
 
 if __name__ == "__main__":

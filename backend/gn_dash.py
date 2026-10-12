@@ -48,6 +48,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shlex
 import sys
 import threading
@@ -567,6 +568,189 @@ def _header_row(state: DashState, size: Size, tier: dict) -> str:
         left = f"{box[0]} " + separator.join(["gn dash", _elide(label, max(1, room)), *parts]) + " "
         return _cut(left + box[4] * max(0, size.cols - len(left) - len(right)) + right, size.cols)
     return _cut(f"{box[0]} gn dash {state.status}", size.cols)
+
+
+#: The cockpit palette. Four colours, each with one job: blue is structure, and red / yellow
+#: / green carry severity and health — the same ranking the FINDINGS panel already sorts by.
+#: Plain SGR codes, the vocabulary ``gn_cli._c`` already uses.
+_SGR = {"blue": "34", "red": "31", "green": "32", "yellow": "33", "bold": "1"}
+
+#: Short severity label (``_SEV_LABELS``) -> colour. ``crit``/``high`` are the two that end a
+#: night, so both are red rather than spending yellow on ``high``; ``low``/``info`` are green,
+#: which here reads "not tonight's problem" rather than "good".
+_SEV_COLOR = {"crit": "red", "high": "red", "med": "yellow", "low": "green", "info": "green"}
+
+#: Status pill -> colour. Every state that means the dashboard has stopped telling the truth
+#: about a live run is RED, not yellow: a frozen panel that looks calm is this module's worst
+#: failure (see the header note on attached mode), and amber reads like a warning, not a lie.
+_STATUS_COLOR = {
+    "RUNNING": "green", "DONE": "green", "HOME": "blue", "STOPPING": "yellow",
+    "STALE": "red", "NO BACKEND": "red", "EVICTED": "red",
+}
+
+#: The PHASE prefix the engine writes at the head of a progress line (``recon:``, ``active:``).
+#: Anchored to the start of the pane row, so this is engine vocabulary in a fixed position —
+#: not a word found loose in a message.
+_PHASE_COLOR = {
+    "recon": "blue", "discover": "blue", "scan": "blue", "plan": "blue",
+    "active": "yellow", "replan": "yellow", "theorize": "yellow", "retry": "yellow",
+    "prover": "green", "verify": "green", "learn": "green", "submit": "green",
+    "stop": "red", "error": "red", "refused": "red",
+}
+
+#: Words lit inside a message body. Grouped by what they mean, which is the whole point of
+#: lighting them: a class or an impact is red, a reached proof is green, something still
+#: provisional is yellow.
+_KEYWORD_COLOR = {
+    "red": ("SSRF", "IDOR", "RCE", "XXE", "XSS", "SQLi", "takeover", "bypass", "exfil",
+            "traversal", "deserialization", "critical"),
+    "green": ("confirmed", "proved", "captured", "differential", "collaborator hit", "paid"),
+    "yellow": ("candidate", "unresolved", "cooling", "skipped", "throttled", "partial"),
+}
+
+#: A severity label in its 4-wide slot, then the sparkline gap, then the count — and the count
+#: must be followed by the panel's own border. That last anchor is what keeps this off content:
+#: a log line mentioning "high" has no panel edge after it.
+_SEV_RE = re.compile(r"\b(crit|high|med|low|info)( {2,})(\d+|--)( +)(?=[│|])")
+
+#: A section title only where ``render`` puts one: straight after a panel edge, or after the
+#: tab separator.
+_SECTION_RE = re.compile(
+    r"([│├|+][─\- ]? ?|\| )(TARGETS|FINDINGS|RATE|GOVERNOR|LOG|OUTPUT|output)(?=[\s─\-●*|])"
+)
+
+#: ``<edge> <phase>:`` at the head of a pane row.
+_PHASE_RE = re.compile(r"(^|[│|] )([a-z]{3,12})(?=: )")
+
+#: One compiled alternation per colour, longest-first so "collaborator hit" wins over "hit".
+_KEYWORD_RE = {
+    color: re.compile("(" + "|".join(re.escape(word) for word in sorted(words, key=len, reverse=True)) + ")")
+    for color, words in _KEYWORD_COLOR.items()
+}
+
+
+def _sgr(text: str, *names: str) -> str:
+    codes = ";".join(_SGR[name] for name in names if name in _SGR)
+    return f"\033[{codes}m{text}\033[0m" if codes and text else text
+
+
+def colorize(rows: Sequence[str], tier: dict, *, enabled: bool = True) -> list[str]:
+    """Paint the finished frame. Pure: rows in, rows out, no clock and no I/O.
+
+    WHY THIS IS NOT INSIDE ``render``
+    ---------------------------------
+    ``render``'s contract is "exactly ``size.rows`` rows, none wider than ``size.cols``, no
+    escapes", and all three parts are load-bearing: the layout counts characters, every test
+    asserts on plain strings, and ``_plain`` strips escapes out of attacker-influenced text so
+    a target cannot repaint the operator's screen. Putting SGR codes inside ``render`` would
+    break the width maths and the tests, and would blur the one rule that makes the third
+    safe. So the colour goes on here, between ``render`` and ``Screen.frame`` — and
+    ``_truncate_visible`` already counts visible cells rather than characters, so a coloured
+    row truncates at exactly the column an uncoloured one does.
+
+    THE ONE THING TO KNOW ABOUT KEYWORD LIGHTING
+    --------------------------------------------
+    The chrome, the severity labels and the status pill are anchored to positions ``render``
+    itself wrote, so no content can reach them. ``_KEYWORD_RE`` is different and deliberately
+    so: it matches inside a message body, and a message body carries attacker-influenced text
+    — a finding title, a URL, a target's own error string. That is chosen, not overlooked.
+    It cannot be dangerous (``_plain`` has already removed escapes; this only wraps text it
+    matched, and the width maths counts visible cells), but it CAN mislead: a target that
+    names an endpoint ``/confirmed-payments`` gets a green word on a row where green means a
+    proof was reached. If that ever reads as a claim the engine did not make, drop
+    ``_KEYWORD_RE`` from the loop below — everything above it keeps working, and that is
+    layout A, which is this same function minus one line.
+
+    ``NO_COLOR`` needs no check: ``gn_tui.refusal`` already refuses to start a dashboard at
+    all when it is set, so a running cockpit is one where colour is allowed.
+    ``GN_DASH_COLOR=0`` is the narrower opt-out for an operator who wants panels monochrome.
+    """
+    out = [str(row) for row in rows]
+    if not enabled:
+        return out
+
+    box = {str(glyph) for glyph in (tier.get("box") or ()) if glyph}
+    # The ascii tier draws the frame with "+", "-" and "|", which also occur in a URL, a diff
+    # and a log line. Tinting every one of those would colour content, so that tier keeps a
+    # plain frame and only the anchored labels below are painted.
+    paint_frame = bool(box) and str(tier.get("name") or "") != "ascii"
+
+    for index, row in enumerate(out):
+        if not row:
+            continue
+        row = _SEV_RE.sub(_paint_severity, row)
+        row = _SECTION_RE.sub(lambda m: m.group(1) + _sgr(m.group(2), "blue", "bold"), row)
+        row = _PHASE_RE.sub(_paint_phase, row)
+        row = _paint_keywords(row)
+        if index == 0:
+            row = _paint_status(row)
+        if paint_frame:
+            row = _paint_frame(row, box)
+        out[index] = row
+    return out
+
+
+def _paint_severity(match: "re.Match[str]") -> str:
+    label, gap, count, pad = match.group(1), match.group(2), match.group(3), match.group(4)
+    color = _SEV_COLOR[label]
+    # A zero carries no judgement, so it stays plain: an idle run must not read as a wall of
+    # red zeroes. ``--`` is the renderer's "the host would not tell us", which is not a count.
+    hot = count not in ("0", "--")
+    return _sgr(label, color) + gap + (_sgr(count, color, "bold") if hot else count) + pad
+
+
+def _paint_phase(match: "re.Match[str]") -> str:
+    edge, word = match.group(1), match.group(2)
+    color = _PHASE_COLOR.get(word)
+    return edge + (_sgr(word, color, "bold") if color else word)
+
+
+def _paint_keywords(row: str) -> str:
+    """Light the class / proof / provisional vocabulary in a message body.
+
+    Each colour's alternation runs once over the row. Already-painted spans are safe to pass
+    over: an SGR code is ``ESC [ digits ; digits m`` and no keyword occurs inside one, so a
+    later pass cannot land in the middle of an earlier escape.
+    """
+    for color, pattern in _KEYWORD_RE.items():
+        row = pattern.sub(lambda m, c=color: _sgr(m.group(1), c), row)
+    return row
+
+
+def _paint_status(row: str) -> str:
+    """The pill, in the header band only. Longest label first so NO BACKEND wins over DONE."""
+    for status in sorted(_STATUS_COLOR, key=len, reverse=True):
+        token = f" {status} "
+        if token in row:
+            return row.replace(token, f" {_sgr(status, _STATUS_COLOR[status], 'bold')} ", 1)
+    return row
+
+
+def _paint_frame(row: str, box: set) -> str:
+    """Wrap each RUN of frame glyphs in blue — one escape pair per run, not per character.
+
+    A 100-column separator is a single run, so this costs it two escapes instead of two
+    hundred. That matters at 4Hz over conpty, where the row diff is what keeps typing from
+    feeling laggy.
+    """
+    pieces: list[str] = []
+    run: list[str] = []
+    for char in row:
+        if char in box:
+            run.append(char)
+            continue
+        if run:
+            pieces.append(_sgr("".join(run), "blue"))
+            run = []
+        pieces.append(char)
+    if run:
+        pieces.append(_sgr("".join(run), "blue"))
+    return "".join(pieces)
+
+
+def color_enabled() -> bool:
+    """``GN_DASH_COLOR=0`` (or ``false``/``off``/``no``) turns the palette off; default on."""
+    return str(os.getenv("GN_DASH_COLOR") or "").strip().lower() not in ("0", "false", "off", "no")
 
 
 def _separator_row(title: str, size: Size, tier: dict) -> str:
@@ -1886,7 +2070,8 @@ def _draw_one_frame(out: Any, keys: Any, size: Size, glyphs: dict) -> tuple[str,
             screen = stack.enter_context(gn_tui.Screen(out, active=True, size=size))
             state = DashState(label="self-test", status="DONE", now_epoch=0.0, started_epoch=0.0,
                               message="gn dash self-test - one frame, then the terminal comes back")
-            screen.frame(render(state, size, glyphs), cursor(state, size))
+            screen.frame(colorize(render(state, size, glyphs), glyphs,
+                                  enabled=color_enabled()), cursor(state, size))
             # Long enough to read as a frame rather than a flicker, short enough that nobody reaches
             # for Ctrl-C. The teardown below runs either way.
             time.sleep(0.6)
@@ -2203,7 +2388,8 @@ class Dashboard:
                     self._repaint = False
                     screen.frame([""] * size.rows)
                 state = self.snapshot_state(size)
-                screen.frame(render(state, size, tier), cursor(state, size))
+                screen.frame(colorize(render(state, size, tier), tier,
+                                      enabled=color_enabled()), cursor(state, size))
                 now = time.monotonic()
                 next_paint += period
                 if next_paint < now:            # a slow frame must not queue up a burst of repaints
