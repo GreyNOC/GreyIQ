@@ -132,17 +132,43 @@ def _pad(text: str, code: str, width: int) -> str:
     return _c(body, code) + filler
 
 
-def _fx(args: argparse.Namespace, title: str) -> Any:
-    """The live animated status line for a long verb — see ``gn_fx``.
+#: The board's header title. Fixed, not the target: the header has a column budget (the DEFCON
+#: readout and the clock sit at a known offset), and a 90-character URL in there would overrun
+#: them. The target is on the map as its own marker, and in the teletype in the engine's own words.
+_BOARD_TITLE = "GREYNOC // WOPR-IQ"
+
+#: How long the final frame stays up after the verdicts land. The engines report findings at the END
+#: of a run (see ``gn_fx.BoardFeed``), so without this pause the impact rings, the severity markers
+#: and the DEFCON drop are all drawn into a board that is torn down in the same breath.
+_FX_HOLD_SECONDS = 1.8
+
+
+def _fx(args: argparse.Namespace, title: str, *, scope: str | None = None) -> Any:
+    """The live surface for a long verb — the threat board, or the status line — see ``gn_fx``.
 
     Inert (not one byte written) unless stderr is a terminal a human is watching, and never under
     ``--json`` even on a terminal: a caller redirecting stdout to a file is still a machine consumer
     and the phase lines would confuse a log. ``--no-fx`` and ``GN_NO_FX=1`` both turn it off.
+
+    Passing ``scope`` AT ALL asks for the full-screen threat board, which is what the hunting
+    verbs want and what the operator picked; ``""`` is a board with no scope to state. It needs the
+    whole screen, ~74x24; a narrower terminal, a split pane, or a stream that will not take the
+    alternate buffer falls back to the one-line Scanner, which answers the same verbs. Everything
+    else here (``osint``, ``dash``, ``train-coder``) omits ``scope`` and keeps the line it has
+    always had — a board is for a run with assets on it.
+
+    The scope passed must be one the OPERATOR declared, never the target standing in for one: the
+    board prints it under a ``SCOPE`` heading beside "AUTHORIZED SCOPE ONLY", and a path or a URL
+    dressed up as a scope there would be this program asserting an authorization nobody gave it.
     """
     import gn_fx
 
     off = bool(getattr(args, "no_fx", False)) or bool(getattr(args, "json", False))
-    return gn_fx.scanner(title, active=False if off else None)
+    if off:
+        return gn_fx.scanner(title, active=False)
+    if scope is None:
+        return gn_fx.scanner(title)
+    return gn_fx.surface(title, scope=str(scope or ""))
 
 
 def _progress(args: argparse.Namespace, fx: Any) -> Any:
@@ -160,26 +186,23 @@ def _progress(args: argparse.Namespace, fx: Any) -> Any:
     return gn_fx.progress_sink(fx, fallback=(lambda m: print(_c(f"  - {m}", "2"))))
 
 
-def _fx_report(fx: Any, result: dict) -> None:
-    """Flash the live line once per CONFIRMED finding, in its own severity colour.
+def _fx_report(fx: Any, result: dict, default: str = "") -> int:
+    """Land every CONFIRMED finding on the live surface, in its own severity colour.
 
     Confirmed only, and read from the engine's own proof status rather than the severity field: the
     whole point of this program is that a candidate is not a finding, so a passive header lead must
-    not flash Critical across the operator's terminal. A run that confirms nothing leaves the line
-    showing the phase and nothing else, which is the honest outcome.
+    not flash Critical across the operator's terminal — or, worse, light a Critical marker on a
+    threat board. A run that confirms nothing leaves the line showing the phase and the board at
+    DEFCON 5, which is the honest outcome.
+
+    ``default`` is the asset to attribute a finding that names none of its own: the verb's own
+    target, which is the one thing the CLI knows for certain about a result it just received. The
+    rule itself lives in ``gn_fx.report_result`` so the two surfaces cannot disagree about what
+    counts as confirmed. Returns how many landed.
     """
-    if fx is None or not getattr(fx, "active", False):
-        return
-    try:
-        for finding in (result.get("findings") or []):
-            if not isinstance(finding, dict):
-                continue
-            status = str(finding.get("proof_status") or (finding.get("proof_of_impact") or {}).get("status") or "")
-            if status.strip().lower() != "confirmed":
-                continue
-            fx.hit(str(finding.get("severity") or "info"), str(finding.get("title") or ""))
-    except Exception:  # noqa: BLE001 - a decoration must never break a completed hunt
-        pass
+    import gn_fx
+
+    return gn_fx.report_result(fx, result, default=default)
 
 
 def _err(message: str) -> int:
@@ -398,7 +421,7 @@ def _cmd_hunt(args: argparse.Namespace) -> int:
     out_dir = args.out or str(reports)
     # A direct hunt used to pass no on_progress at ALL, so nothing printed between the command and the
     # summary -- minutes of silence in which a working hunt and a hung one look identical.
-    fx = _fx(args, args.target)
+    fx = _fx(args, _BOARD_TITLE, scope=args.scope or "")
     with fx:
         fx.phase("starting hunt")
         result = run_bounty_hunt(
@@ -426,7 +449,11 @@ def _cmd_hunt(args: argparse.Namespace) -> int:
             settings=depth_settings(args),
             oob_base=_oob_config()[0], oob_secret=_oob_config()[1],
         )
-        _fx_report(fx, result)
+        # The arcs flew live, off the engine's own per-asset messages; the verdicts only exist now
+        # (gn_fx.BoardFeed documents why), so they land here and the final frame is held long
+        # enough to be read.
+        fx.phase("hunt complete")
+        fx.hold(_FX_HOLD_SECONDS if _fx_report(fx, result, default=args.target) else 0.6)
     if not result.get("ok"):
         return _err(result.get("error", "the hunt could not run."))
     if args.json:
@@ -464,9 +491,12 @@ def _cmd_campaign(args: argparse.Namespace) -> int:
 
     if not args.authorize:
         return _err("a campaign tests a live/owned target end-to-end — pass -y/--authorize to confirm scope.")
-    fx = _fx(args, args.target)
+    fx = _fx(args, _BOARD_TITLE, scope=args.scope or "")
     with fx:
         fx.phase("starting campaign")
+        # The one asset known before recon runs. Tracked, not launched: it goes on the map as an
+        # unlit cross, and the engine's own `hunt i/N: <url>` lines fly the arcs.
+        fx.track([args.target])
         result = run_campaign(
             args.target,
             scope=args.scope or "",
@@ -488,7 +518,8 @@ def _cmd_campaign(args: argparse.Namespace) -> int:
             on_progress=_progress(args, fx),
             oob_base=_oob_config()[0], oob_secret=_oob_config()[1],
         )
-        _fx_report(fx, result)
+        fx.phase("campaign complete")
+        fx.hold(_FX_HOLD_SECONDS if _fx_report(fx, result, default=args.target) else 0.6)
     if not result.get("ok"):
         return _err(result.get("error", "the campaign could not run."))
     if args.json:
@@ -776,14 +807,25 @@ def _print_lead_queue(queue: dict) -> None:
           f"{_c('--json', '2')} for the machine queue.\n")
 
 
-def _operator_campaign_fn(coder_cfg: dict):
-    """Build the portfolio scheduler's campaign callable over the bughunter engine."""
+def _operator_campaign_fn(coder_cfg: dict, fx: Any = None):
+    """Build the portfolio scheduler's campaign callable over the bughunter engine.
+
+    ``fx`` is the live surface, when one is running. It is wired in HERE rather than in
+    ``operator.run_program_cycle`` because this wrapper is the only place that sees a per-target
+    campaign result at all: the cycle consumes each one and returns nothing but counts, so without
+    this the board could fly a portfolio's arcs and never learn a single severity. Threading it
+    through costs the scheduler nothing — with no surface running, ``on_progress`` stays None,
+    which is exactly what ``run_campaign`` was called with before.
+    """
+    import gn_fx
+
     from bughunter import campaign as campaign_mod
     from bughunter import portfolio as portfolio_mod
     from bughunter import progress as progress_mod
     from coder import unattended_config
 
     safe_brain = unattended_config(coder_cfg)
+    sink = gn_fx.progress_sink(fx, fallback=None)
 
     def run_campaign_fn(target, *, scope, program, active, live, deep=False, iterate=False,
                         max_pages=12, run_id=""):
@@ -819,7 +861,9 @@ def _operator_campaign_fn(coder_cfg: dict):
             policy_profile=str(saved.get("policy_profile") or ""),
             excluded_hosts=tuple(str(host) for host in (saved.get("out_of_scope_hosts") or [])),
             disclose_automation=bool(saved.get("disclose_automation")),
+            on_progress=sink,
         )
+        _fx_report(fx, result, default=str(target))
         return result
 
     return run_campaign_fn
@@ -928,6 +972,8 @@ def _cmd_auto(args: argparse.Namespace) -> int:
     before it will probe for days unwatched; see the comment at that branch below."""
     from datetime import UTC, datetime, timedelta
 
+    import gn_fx
+
     from bughunter import hunt_dir
     from bughunter import operator as operator_mod
     from bughunter import portfolio
@@ -986,12 +1032,24 @@ def _cmd_auto(args: argparse.Namespace) -> int:
         print(_c("  note: active probing was NOT armed — the saved program has no usable scope.", "33"))
     print(_c(f"\nprogram '{pid}' saved. Hunting now…\n", "1"))
 
-    run_campaign_fn = _operator_campaign_fn(_load_coder_config(args.brain))
     sync_fn = _operator_sync_fn()
-
-    summary = operator_mod.run_program_cycle(
-        RUNTIME_DIR, program, run_campaign_fn=run_campaign_fn, sync_fn=sync_fn,
-        on_event=lambda m: print(f"  {m}"))
+    # The board for the reviewed cycle. The plan's targets go on the map before anything runs —
+    # the operator listed them and hunt_dir resolved them, so they are genuinely in scope — as
+    # unlit crosses, and each one's arc flies when the engine says it has started on it. The scope
+    # shown is the directory's own first scope line, or nothing; never the program name.
+    scope_lines = (plan.scope_text or "").splitlines()
+    fx = _fx(args, _BOARD_TITLE, scope=scope_lines[0] if scope_lines else "")
+    run_campaign_fn = _operator_campaign_fn(_load_coder_config(args.brain), fx)
+    with fx:
+        fx.phase("hunting this directory's targets")
+        fx.track(list(plan.targets))
+        summary = operator_mod.run_program_cycle(
+            RUNTIME_DIR, program, run_campaign_fn=run_campaign_fn, sync_fn=sync_fn,
+            # With a surface running the cycle's events feed it; with one off they print exactly
+            # as they always did, so a pipe, a CI log and --no-fx see byte-identical output.
+            on_event=gn_fx.progress_sink(fx, fallback=lambda m: print(f"  {m}")))
+        fx.phase("cycle complete")
+        fx.hold(_FX_HOLD_SECONDS if summary.get("confirmed") else 0.6)
     print(f"\n  {summary['targets_run']} targets, {summary['findings']} findings, "
           f"{summary['confirmed']} confirmed, {summary['submitted']} submitted")
     for problem in summary.get("errors") or ():
@@ -1035,8 +1093,14 @@ def _cmd_auto(args: argparse.Namespace) -> int:
     except (OSError, ValueError) as exc:
         return _err(str(exc))
 
-    loop = operator_mod.OperatorLoop(RUNTIME_DIR, run_campaign_fn=run_campaign_fn,
-                                    sync_fn=sync_fn, train_fn=_train_brain_fn)
+    # A fresh callable with no surface attached: the board above belongs to the reviewed cycle and
+    # has already given the terminal back, and the unattended loop runs for days printing its own
+    # event tail to stdout. Handing it a stopped board would have it feeding a renderer nobody is
+    # watching for the life of the process.
+    loop = operator_mod.OperatorLoop(RUNTIME_DIR,
+                                     run_campaign_fn=_operator_campaign_fn(
+                                         _load_coder_config(args.brain)),
+                                     sync_fn=sync_fn, train_fn=_train_brain_fn)
     try:
         loop.start(grants=grants)
     except (ValueError, OSError) as exc:
@@ -1478,10 +1542,17 @@ def _cmd_tools(args: argparse.Namespace) -> int:
 
 
 def _cmd_fx(args: argparse.Namespace) -> int:
-    """`gn fx` — draw the live status line for a few seconds, so a terminal can be checked without
-    committing to a real hunt. Exits 2 with an explanation when motion is not appropriate here."""
+    """`gn fx` — draw a live surface for a few seconds, so a terminal can be checked without
+    committing to a real hunt. Exits 2 with an explanation when motion is not appropriate here.
+
+    ``gn fx`` is the one-line status animation; ``gn fx wopr`` is the full threat board the hunting
+    verbs draw, running its scripted sequence through the same live feed a hunt uses — so what it
+    proves about this terminal is what a hunt will do on it.
+    """
     import gn_fx
 
+    if str(getattr(args, "scene", "line") or "line") == "wopr":
+        return gn_fx.board_demo()
     return gn_fx.demo(getattr(args, "seconds", 6.0))
 
 
@@ -1946,6 +2017,8 @@ def build_parser() -> argparse.ArgumentParser:
     auto.add_argument("--grant-file", dest="grant_file", default="", help="JSON authorization grants; required to keep auto-hunting past the first cycle")
     auto.add_argument("--interval", type=int, default=0, help="minutes between re-hunts (default: the directory's, else 1440)")
     auto.add_argument("--brain", action="store_true", help="use the configured LLM brain to enrich")
+    auto.add_argument("--no-fx", action="store_true",
+                      help="no threat board and no status animation (plain progress lines)")
     auto.set_defaults(func=_cmd_auto)
 
     shannon = sub.add_parser("shannon", help="import a finished Shannon run's findings as GreyIQ candidates")
@@ -2069,8 +2142,10 @@ def build_parser() -> argparse.ArgumentParser:
     tools.add_argument("--json", action="store_true")
     tools.set_defaults(func=_cmd_tools)
 
-    fxdemo = sub.add_parser("fx", help="preview the live status animation in this terminal")
-    fxdemo.add_argument("--seconds", type=float, default=6.0, help="how long to run the preview")
+    fxdemo = sub.add_parser("fx", help="preview a live surface in this terminal (`gn fx wopr` for the threat board)")
+    fxdemo.add_argument("scene", nargs="?", default="line", choices=("line", "wopr"),
+                        help="'line' (default) for the one-line status animation, 'wopr' for the threat board")
+    fxdemo.add_argument("--seconds", type=float, default=6.0, help="how long to run the 'line' preview")
     fxdemo.set_defaults(func=_cmd_fx)
 
     # A CORE verb, registered here beside `fx` and never through _VERB_PLUGINS: that loader is
