@@ -852,6 +852,36 @@ class DefconTracksTheWorstConfirmedSeverityTests(unittest.TestCase):
             board._by_name[f"h{index}.example.com"]["launch_at"] = 0.0
         self.assertEqual(self._defcon(board, 9.0), 5)
 
+    def test_the_tally_counts_findings_while_the_map_merges_them_by_asset(self) -> None:
+        # Two confirmed Highs and a Low on ONE url: one marker (painted High), but the tally and the
+        # digest must say 2H 1L — the same numbers the line surface and the CLI summary report.
+        board = self._board()
+        for severity in ("high", "high", "low"):
+            self._land(board, "https://api.example.com/fetch", severity)
+        self.assertEqual(len(board._assets), 1)
+        self.assertEqual(board._assets[0]["severity"], "high")
+        board._grid.clear()
+        board._draw(3.0)
+        rendered = _ANSI.sub("", "\n".join(board._grid.rows()))
+        self.assertIn("CONFIRMED  2H  1L", rendered)
+        digest = _ANSI.sub("", board._digest_line())
+        self.assertIn("2H  1L", digest)
+        self.assertIn("1/1 asset(s) confirmed", digest)
+        self.assertEqual(self._defcon(board, 3.0), 2)
+
+    def test_the_board_and_the_line_agree_on_a_result(self) -> None:
+        result = {"findings": [
+            {"ref": "F1", "title": "a", "severity": "high", "location": "https://x.example.com/a",
+             "proof_status": "confirmed"},
+            {"ref": "F2", "title": "b", "severity": "high", "location": "https://x.example.com/a",
+             "proof_status": "confirmed"},
+        ]}
+        board = self._board()
+        gn_fx.report_result(board, result)
+        line = gn_fx.scanner("t", stream=_tty(), active=True)
+        gn_fx.report_result(line, result)
+        self.assertEqual(gn_fx._finding_counts(board._assets), line._counts)
+
     def test_an_unknown_severity_is_treated_as_info_not_as_critical(self) -> None:
         board = self._board()
         self._land(board, "a.example.com", "catastrophic")

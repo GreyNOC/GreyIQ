@@ -765,6 +765,20 @@ _LAND_ROWS: tuple[str, ...] = tuple(
 )
 
 
+def _finding_counts(assets: Iterable[dict[str, Any]]) -> dict[str, int]:
+    """Confirmed findings by severity across ``assets`` — per FINDING, not per asset.
+
+    Several confirmed findings on one URL are common, and the marker for that URL rightly shows
+    only the worst of them. The tally must not: counting assets reported ``1H`` for a result
+    holding two confirmed Highs, while the line surface and the CLI summary said ``2H``.
+    """
+    counts: dict[str, int] = {}
+    for asset in assets:
+        for severity in asset.get("findings") or ([asset["severity"]] if asset.get("severity") else []):
+            counts[severity] = counts.get(severity, 0) + 1
+    return counts
+
+
 class Board:
     """The full-screen threat board, driven by what the engine is actually doing.
 
@@ -898,6 +912,9 @@ class Board:
                     "label": label,
                     "launch_at": None,
                     "resolve_at": None,
+                    # One entry per CONFIRMED finding that landed here. The marker merges them
+                    # (worst severity wins); the tally and the digest count every one of them.
+                    "findings": [],
                 }
                 self._assets.append(asset)
                 self._by_name[name] = asset
@@ -941,6 +958,7 @@ class Board:
                 asset["launch_at"] = now          # resolved without a prior launch
             # Worst severity wins: several confirmed findings can land on one asset, and a Low
             # arriving after a Critical must not repaint the marker down.
+            asset["findings"].append(key)
             current = asset["severity"]
             if current is None or _DEFCON_FOR.get(key, 5) < _DEFCON_FOR.get(current, 5):
                 asset["severity"] = key
@@ -1105,9 +1123,7 @@ class Board:
         confirmed. A run that confirms nothing says so.
         """
         resolved = [a for a in self._assets if a["resolve_at"] is not None and a["severity"]]
-        counts: dict[str, int] = {}
-        for asset in resolved:
-            counts[asset["severity"]] = counts.get(asset["severity"], 0) + 1
+        counts = _finding_counts(resolved)
         if not self._assets:
             return ""
         tally = "  ".join(f"{counts[sev]}{sev[0].upper()}" for sev in _SEV_ORDER if counts.get(sev))
@@ -1153,12 +1169,8 @@ class Board:
 
         resolved = [a for a in self._assets
                     if a["resolve_at"] is not None and t >= a["resolve_at"] and a["severity"]]
-        counts: dict[str, int] = {}
-        defcon = 5
-        for asset in resolved:
-            severity = asset["severity"] or "info"
-            counts[severity] = counts.get(severity, 0) + 1
-            defcon = min(defcon, _DEFCON_FOR.get(severity, 5))
+        counts = _finding_counts(resolved)
+        defcon = min((_DEFCON_FOR.get(a["severity"] or "info", 5) for a in resolved), default=5)
 
         # --- header -------------------------------------------------------------------------------
         grid.text(box_x + 2, box_y, f" {self._title} ", "1;38;5;214")
