@@ -26,7 +26,7 @@ import urllib.request
 from typing import Any
 from urllib.parse import urlencode, urlparse
 
-from bughunter import impact_model
+from bughunter import impact_model, operator_guard
 from bughunter.active_verify_service import _ActiveError, _Http, _NoRedirect, host_in_active_scope
 from bughunter.oob_service import _is_crawler_ua, callback_url, mint_token, poll_collaborator
 from bughunter.playwright_env import ensure_bundled_browsers_path
@@ -316,7 +316,8 @@ def _render_beacon(url: str, *, cookie: str, headers: list[str] | None, scope: s
                 and urlparse(req.url).scheme.lower() != "https"):
             route.abort()
             return
-        if not playwright_request_allowed(req.url, settings.allow_private_urls, settings.web_allowed_ports):
+        if not playwright_request_allowed(req.url, settings.allow_private_urls,
+                                          settings.web_allowed_ports, method=req.method):
             route.abort()
             return
         # The operator's session rides ONLY same-site requests — NEVER context-wide (Playwright's
@@ -330,6 +331,7 @@ def _render_beacon(url: str, *, cookie: str, headers: list[str] | None, scope: s
             route.continue_()
 
     wait_ms = int(max(0.0, wait_seconds) * 1000)
+    guard = operator_guard.current()
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
@@ -339,12 +341,24 @@ def _render_beacon(url: str, *, cookie: str, headers: list[str] | None, scope: s
                 ignore_https_errors=not https_only_auth, user_agent=current_user_agent(_USER_AGENT)
             )
             context.route("**/*", _guard_route)
+            if guard is not None:
+                context.on("response", lambda response: operator_guard.observe_playwright_response(response, guard=guard))
             page = context.new_page()
-            page.goto(url, wait_until="load", timeout=wait_ms + 15000)
+            main_response = page.goto(url, wait_until="load", timeout=wait_ms + 15000)
+            if guard is not None:
+                operator_guard.inspect_playwright_page(
+                    page, status=main_response.status if main_response is not None else 0, guard=guard)
             page.wait_for_timeout(wait_ms)   # let stored <img>/<svg> beacons fire
+            if guard is not None:
+                operator_guard.inspect_playwright_page(
+                    page, status=main_response.status if main_response is not None else 0, guard=guard)
             final_url = page.url
             browser.close()
-    except Exception as exc:  # noqa: BLE001 - navigation/timeout -> inconclusive, never fatal
+    except operator_guard.GuardHalt:
+        raise
+    except Exception as exc:  # noqa: BLE001 - manual navigation/timeout -> inconclusive
+        if guard is not None and guard.halt_reason:
+            raise operator_guard.GuardHalt(guard.halt_reason) from exc
         return {"ok": False, "error": f"render failed: {exc}"}
     final_host = urlparse(final_url).hostname or ""
     if not host_in_active_scope(final_host, scope, settings):

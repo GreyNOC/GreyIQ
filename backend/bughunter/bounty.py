@@ -1662,27 +1662,27 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
                                   verify_login_form=auth is not None)
             if result.get("needs_operator"):
                 guard = operator_guard.current()
-                halted = bool(guard and guard.halt_reason)
-                stopped = False
-                if callable(should_stop):
-                    try:
-                        stopped = bool(should_stop())
-                    except Exception:  # noqa: BLE001 - an unavailable stop predicate changes no scope
-                        pass
-                # Ask only after the authorized first fetch identifies a login wall.
-                # The callback receives fixed, non-secret metadata and may decline.
-                # Never retry after a guard halt or a user stop.
-                supplied: Any = None
-                # Interactive secrets are only accepted for HTTPS targets. An
-                # HTTP challenge can still be reported, but must never cause a
-                # prompted cookie or bearer token to cross plaintext transport.
+                # A campaign may first refresh its saved research login, then
+                # ask the operator if that session proves ineffective. Each
+                # candidate gets one guarded retry; the callback itself limits
+                # each source to one attempt. A direct hunt has only one source.
                 secure_target = urlparse(target).scheme.lower() == "https"
-                if secure_target and callable(on_auth_needed) and not halted and not stopped:
+                for _ in range(2):
+                    halted = bool(guard and guard.halt_reason)
+                    stopped = False
+                    if callable(should_stop):
+                        try:
+                            stopped = bool(should_stop())
+                        except Exception:  # noqa: BLE001 - an unavailable stop predicate changes no scope
+                            stopped = True
+                    if not (secure_target and callable(on_auth_needed) and not halted and not stopped):
+                        break
                     try:
                         supplied = on_auth_needed(dict(result.get("auth_context") or {}))
-                    except Exception:  # noqa: BLE001 - operator prompt failure must fail closed
+                    except Exception:  # noqa: BLE001 - auth callback failure must fail closed
                         supplied = None
-                if isinstance(supplied, dict):
+                    if not isinstance(supplied, dict):
+                        break
                     try:
                         new_auth = build_auth(
                             target, cookie=supplied.get("cookie", ""),
@@ -1702,9 +1702,16 @@ def _run_scanners(profile: dict[str, Any], kind: str, target: str, max_files: in
                         result = run_web_scan(target, probe_paths=True, auth=auth,
                                               scope_host=scope_host, verify_login_form=True)
                         # The attempted session is usable only if the protected page
-                        # actually loads. A second wall is returned for operator review.
+                        # actually loads. A remaining wall may ask the next
+                        # source once, then returns for operator review.
                         if result.get("ok") and auth_state is not None:
                             auth_state["context"] = auth
+                        if not result.get("needs_operator"):
+                            break
+                        if not supplied.get("_allow_operator_fallback"):
+                            break
+                    else:
+                        break
         else:
             continue
         ran.append(scanner)
@@ -3017,7 +3024,29 @@ def _run_bounty_hunt_body(
                 # the drift engine can diff them against the last run. Issues no request of its
                 # own — it is a decision not to throw the shape away.
                 observe=runtime_dir is not None,
+                # The scanner may have just accepted a prompted session. Use that
+                # same scoped context for direct-hunt discovery, and stop if it
+                # expires before the active pass begins.
+                auth=auth_ctx,
+                https_only_auth=bool(auth_ctx and auth_ctx.https_only),
+                detect_auth_wall=True,
+                verify_login_form=True,
             )
+            if rec.get("auth_transport_blocked"):
+                return {"ok": False, "auth_transport_blocked": True,
+                        "authentication_requires_https": True,
+                        "error": "Recon stopped: an operator session would be redirected from HTTPS to HTTP."}
+            if rec.get("scope_blocked"):
+                return {"ok": False, "scope_blocked": True,
+                        "error": "Recon stopped: an off-host redirect was refused before it could be followed."}
+            if rec.get("auth_wall"):
+                return {"ok": False, "needs_operator": True,
+                        "operator_action": "authentication_required",
+                        "auth_context": rec["auth_wall"],
+                        "error": "Authentication is required to continue this hunt."}
+            if rec.get("auth_seed_unverified"):
+                return {"ok": False, "auth_seed_unverified": True,
+                        "error": "Recon could not verify the authenticated seed response."}
             active_targets = _rank_active_targets(clean_target, rec.get("urls") or [], limit=4)
             # SURFACE DRIFT — the hunt's memory. Every run otherwise starts blind and spends the
             # same fixed probe budget on the same hot-word URLs, whatever part of the app is new.
@@ -3144,7 +3173,12 @@ def _run_bounty_hunt_body(
             )
             if len(active_targets) > 1:
                 _emit(f"active recon: checking {len(active_targets)} discovered in-scope endpoint(s)")
-        except Exception as exc:  # noqa: BLE001 - recon is a recall booster, never a hunt breaker
+        except operator_guard.GuardHalt:
+            raise
+        except Exception as exc:  # noqa: BLE001 - anonymous recon is a recall booster
+            if auth_ctx is not None:
+                return {"ok": False, "auth_seed_unverified": True,
+                        "error": "Recon could not verify the authenticated seed response."}
             _emit(f"active recon skipped: {exc}")
 
     # Opt-in ACTIVE verification: double-gated (active + authorized + url), scope-bound,

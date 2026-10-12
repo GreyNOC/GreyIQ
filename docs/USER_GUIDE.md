@@ -293,6 +293,13 @@ enabled program:
 {"grants":[{"program_id":"saved-program-id","authorization_ref":"engagement record","policy_source":"current program policy URL","policy_checked_at":"UTC ISO-8601 timestamp","expires_at":"UTC ISO-8601 timestamp within seven days","max_cycles":7}]}
 ```
 
+For a program with a saved research account, add `"allow_account_access": true`
+to that program's grant entry. A saved cookie can be used for HTTPS reads. If
+the saved account has an email, password, and exact in-scope HTTPS `login_url`,
+the unattended browser may submit one POST per cycle to that URL. The form
+itself must resolve to the same URL and use POST; other form actions or methods
+stop the cycle.
+
 The `--once` legacy shortcut is disabled because it lacked the guard and audit
 path. Active grants are held in process memory and must be re-armed after a
 restart. The authorization audit is stored locally as

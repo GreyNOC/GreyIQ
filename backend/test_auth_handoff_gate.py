@@ -7,14 +7,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from bughunter import bounty, web_scan_service  # noqa: E402
+from bughunter import bounty, operator_guard, web_scan_service  # noqa: E402
 from bughunter.scan_auth import AuthContext  # noqa: E402
 
 
@@ -133,6 +133,26 @@ class HuntAuthHandoffTests(unittest.TestCase):
         self.assertIs(auth_state["context"], seen[1])
         self.assertNotIn("operator-only-secret-123", json.dumps(meta))
 
+    def test_saved_login_retry_can_fall_back_to_one_operator_session(self) -> None:
+        supplied = iter([
+            {"cookie": "session=auto-ineffective", "issuer_host": "app.example.com",
+             "_allow_operator_fallback": True},
+            {"cookie": "session=operator-effective", "issuer_host": "app.example.com"},
+        ])
+        ask = Mock(side_effect=lambda _context: next(supplied))
+        state: dict = {"context": None}
+        with patch.object(bounty, "run_web_scan", side_effect=[WALL, WALL, SUCCESS]) as web:
+            _raw, _ran, meta, _risk, _score, _signals = bounty._run_scanners(
+                bounty.BOUNTY_PROFILES["web-app"], "url", TARGET, 100, False,
+                scope_host="app.example.com", on_auth_needed=ask, auth_state=state)
+
+        self.assertEqual(ask.call_count, 2)
+        self.assertEqual(web.call_count, 3)
+        self.assertNotIn("needs_operator", meta["web"])
+        self.assertEqual(state["context"].headers["Cookie"], "session=operator-effective")
+        self.assertNotIn("auto-ineffective", json.dumps(meta))
+        self.assertNotIn("operator-effective", json.dumps(meta))
+
     def test_decline_and_bad_session_fail_closed_without_live_scan(self) -> None:
         for supplied in (None, {"cookie": "session=invalid"}):
             with self.subTest(supplied=supplied is not None):
@@ -241,6 +261,57 @@ class HuntAuthHandoffTests(unittest.TestCase):
         live.assert_not_called()
         recon.assert_not_called()
         active.assert_not_called()
+
+    def test_direct_hunt_recon_uses_prompted_session_and_stops_if_it_expires(self) -> None:
+        session_cookie = "session=operator-only-secret-123"
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(bounty, "run_web_scan", side_effect=[WALL, SUCCESS]) as web, \
+             patch.object(bounty.recon, "discover", return_value={"auth_wall": CONTEXT}) as discover, \
+             patch.object(bounty.active_verify_service, "verify_active") as active:
+            result = bounty.run_bounty_hunt(
+                TARGET, "web-app", None, tmp, "app.example.com", True, {},
+                default_reports_dir=Path(tmp), active=True,
+                on_auth_needed=lambda _context: {"cookie": session_cookie},
+            )
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
+        self.assertEqual(web.call_count, 2)
+        self.assertTrue(result["needs_operator"])
+        self.assertEqual(result["auth_context"], CONTEXT)
+        self.assertNotIn(session_cookie, json.dumps(result))
+        bound = discover.call_args.kwargs["auth"]
+        self.assertIsInstance(bound, AuthContext)
+        self.assertEqual(bound.headers["Cookie"], session_cookie)
+        self.assertTrue(bound.https_only)
+        self.assertTrue(discover.call_args.kwargs["https_only_auth"])
+        self.assertTrue(discover.call_args.kwargs["detect_auth_wall"])
+        self.assertTrue(discover.call_args.kwargs["verify_login_form"])
+        active.assert_not_called()
+
+    def test_direct_hunt_stops_when_recon_cannot_verify_the_session(self) -> None:
+        for recon_result in ({"auth_seed_unverified": True}, operator_guard.GuardHalt("halted")):
+            with self.subTest(guard_halt=isinstance(recon_result, Exception)), \
+                 tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(bounty, "run_web_scan", return_value=SUCCESS), \
+                 patch.object(bounty.recon, "discover",
+                              side_effect=recon_result if isinstance(recon_result, Exception) else None,
+                              return_value=recon_result if isinstance(recon_result, dict) else None), \
+                 patch.object(bounty.active_verify_service, "verify_active") as active:
+                if isinstance(recon_result, Exception):
+                    with self.assertRaises(operator_guard.GuardHalt):
+                        bounty.run_bounty_hunt(
+                            TARGET, "web-app", None, tmp, "app.example.com", True, {},
+                            default_reports_dir=Path(tmp), active=True,
+                            auth={"cookie": "sid=secret", "https_only": True})
+                else:
+                    result = bounty.run_bounty_hunt(
+                        TARGET, "web-app", None, tmp, "app.example.com", True, {},
+                        default_reports_dir=Path(tmp), active=True,
+                        auth={"cookie": "sid=secret", "https_only": True})
+                    self.assertTrue(result["auth_seed_unverified"])
+                    self.assertNotIn("sid=secret", json.dumps(result))
+                self.assertEqual(list(Path(tmp).iterdir()), [])
+                active.assert_not_called()
 
 
 if __name__ == "__main__":

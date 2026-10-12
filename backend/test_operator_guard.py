@@ -8,11 +8,12 @@ import os
 import http.client
 import tempfile
 import threading
+import types
 import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.error import URLError
 from urllib.request import ProxyHandler
 
@@ -20,8 +21,8 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from bughunter import active_verify_service, bounty, operator_guard, portfolio, progress, recon, web_scan_service  # noqa: E402
-from bughunter.operator import OperatorLoop  # noqa: E402
+from bughunter import account_login_service, active_verify_service, bounty, campaign, operator_guard, portfolio, progress, recon, web_scan_service  # noqa: E402
+from bughunter.operator import OperatorLoop, run_program_cycle  # noqa: E402
 from bughunter.settings import get_settings  # noqa: E402
 
 
@@ -174,6 +175,314 @@ class OperatorGuardTests(unittest.TestCase):
                                                    "live": False, "deep": False, "account_access": {}, **extra})
                 with self.assertRaisesRegex(ValueError, "manual run"):
                     operator_guard.create_grants(portfolio.list_programs(self.rt), [_spec("example")])
+
+    def test_saved_research_account_requires_explicit_grant_and_https_login(self) -> None:
+        account = {"cookie": "session=operator-owned", "login_url": "https://example.com/login"}
+        portfolio.upsert_program(self.rt, {"id": "example", "account_access": account})
+        with self.assertRaisesRegex(ValueError, "allow_account_access=true"):
+            self._grant()
+        grant = self._grant(allow_account_access=True)
+        self.assertTrue(grant.allow_account_access)
+        self.assertFalse(grant.allow_login_post)
+        self.assertEqual(grant.account_login_url, "https://example.com/login")
+        self.assertNotIn(account["cookie"], repr(grant))
+        ephemeral = operator_guard.RunGuard(self.rt, grant, threading.Event())
+        ephemeral.research_auth = {"cookie": account["cookie"]}
+        self.assertNotIn(account["cookie"], repr(ephemeral))
+        cookie_only = operator_guard.RunGuard(self.rt, grant, threading.Event())
+        with operator_guard.bind(cookie_only), operator_guard.saved_login_submission():
+            with self.assertRaisesRegex(operator_guard.GuardHalt, "exact approved login POST"):
+                cookie_only.before_request("https://example.com/login", method="POST")
+        self.assertEqual(cookie_only.requests_used, 0)
+        with self.assertRaisesRegex(ValueError, "true or false"):
+            self._grant(allow_account_access="true")
+
+    def test_two_target_operator_cycle_reuses_one_guarded_research_session(self) -> None:
+        access = {"cookie": "session=stale", "email": "researcher@example.com",
+                  "password": "stored-secret", "login_url": "https://app.example.com/login"}
+        portfolio.upsert_program(self.rt, {
+            "id": "example", "scope_text": "*.example.com",
+            "seed_targets": ["https://app.example.com/one", "https://api.example.com/two"],
+            "account_access": access,
+        })
+        program = portfolio.get_program(self.rt, "example")
+        guard = operator_guard.RunGuard(
+            self.rt, self._grant(allow_account_access=True), threading.Event())
+        session = {"cookie": "session=fresh-one", "issuer_host": "app.example.com", "https_only": True}
+        next_session = {"cookie": "session=fresh-two", "issuer_host": "app.example.com", "https_only": True}
+        seen: list[tuple[str, dict]] = []
+
+        def campaign_fn(target: str, **kwargs):
+            return campaign.run_campaign(
+                target, scope=kwargs["scope"], authorized=True, coder_cfg={},
+                default_reports_dir=Path(self.rt), program=kwargs["program"],
+                account_access=access,
+            )
+
+        def body(target: str, **kwargs):
+            seen.append((target, kwargs["auth"]))
+            return {"ok": True, "findings": [], "proof_of_impact": {}}
+
+        with patch.object(campaign, "_login_auth", side_effect=[session, next_session]) as login, \
+             patch.object(campaign, "_run_campaign_body", side_effect=body):
+            summary = run_program_cycle(
+                self.rt, program, run_campaign_fn=campaign_fn, guard=guard)
+            next_guard = operator_guard.RunGuard(
+                self.rt, guard.grant, threading.Event())
+            next_summary = run_program_cycle(
+                self.rt, program, run_campaign_fn=campaign_fn, guard=next_guard)
+
+        self.assertEqual(summary["targets_run"], 2)
+        self.assertEqual(next_summary["targets_run"], 2)
+        self.assertEqual(login.call_count, 2, "each new cycle must resolve its own session")
+        self.assertTrue(all(call.args[0]["cookie"] == "" for call in login.call_args_list))
+        self.assertEqual([target for target, _ in seen],
+                         ["https://app.example.com/one", "https://api.example.com/two"] * 2)
+        self.assertIs(seen[0][1], session)
+        self.assertIs(seen[1][1], session)
+        self.assertIs(seen[2][1], next_session)
+        self.assertIs(seen[3][1], next_session)
+        self.assertIs(guard.research_auth, session)
+        self.assertTrue(guard.research_auth_resolved)
+        self.assertEqual(guard.research_auth_program, "example")
+        self.assertIs(next_guard.research_auth, next_session)
+        self.assertEqual(access["cookie"], "session=stale")
+
+    def test_account_grant_refuses_ambiguous_or_out_of_scope_login(self) -> None:
+        for login_url in (
+            "http://example.com/login", "https://user:password@example.com/login",
+            "https://example.com/login?next=/private", "https://example.com/login#state",
+            "https://other.example.com/login", "https://example.com:8443/login",
+            "https://example.com/a/../login", "https://example.com/log%69n",
+        ):
+            with self.subTest(login_url=login_url):
+                portfolio.upsert_program(self.rt, {"id": "example", "account_access": {
+                    "cookie": "session=operator-owned", "login_url": login_url,
+                }})
+                with self.assertRaises(ValueError):
+                    self._grant(allow_account_access=True)
+
+    def test_account_grant_requires_saved_credentials_and_https_seeds(self) -> None:
+        with self.assertRaisesRegex(ValueError, "saved research account"):
+            self._grant(allow_account_access=True)
+        portfolio.upsert_program(self.rt, {"id": "example", "account_access": {
+            "email": "researcher@example.com", "login_url": "https://example.com/login",
+        }})
+        with self.assertRaisesRegex(ValueError, "cookie or email and password"):
+            self._grant(allow_account_access=True)
+        portfolio.upsert_program(self.rt, {"id": "example", "account_access": {
+            "cookie": "session=operator-owned",
+        }})
+        with self.assertRaisesRegex(ValueError, "identify the issuer"):
+            self._grant(allow_account_access=True)
+        portfolio.upsert_program(self.rt, {"id": "example", "account_access": {
+            "cookie": "session=operator-owned", "login_url": "https://example.com/login",
+        }, "seed_targets": ["http://example.com/"]})
+        with self.assertRaisesRegex(ValueError, "HTTPS seed"):
+            self._grant(allow_account_access=True)
+
+    def test_account_grant_allows_only_exact_login_post(self) -> None:
+        portfolio.upsert_program(self.rt, {"id": "example", "account_access": {
+            "email": "researcher@example.com", "password": "operator-owned-password",
+            "login_url": "https://example.com/login",
+        }})
+        grant = self._grant(allow_account_access=True)
+        guard = operator_guard.RunGuard(self.rt, grant, threading.Event())
+        with self.assertRaisesRegex(operator_guard.GuardHalt, "exact approved login POST"):
+            guard.before_request("https://example.com/login", method="POST", reserve=True)
+        self.assertEqual(guard.requests_used, 0)
+        guard = operator_guard.RunGuard(self.rt, grant, threading.Event())
+        with operator_guard.bind(guard), operator_guard.saved_login_submission():
+            guard.before_request("https://example.com/login", method="POST", reserve=True)
+            with self.assertRaisesRegex(operator_guard.GuardHalt, "already submitted"):
+                guard.before_request("https://example.com/login", method="POST", reserve=True)
+        self.assertEqual(guard.requests_used, 1)
+        self.assertEqual(guard.login_posts_used, 1)
+        for target, method in (
+            ("https://example.com/private", "POST"),
+            ("https://example.com/login/", "POST"),
+            ("https://example.com/login?token=1", "POST"),
+            ("http://example.com/login", "POST"),
+            ("https://example.com/login", "PUT"),
+        ):
+            with self.subTest(target=target, method=method):
+                blocked = operator_guard.RunGuard(self.rt, grant, threading.Event())
+                with operator_guard.bind(blocked), operator_guard.saved_login_submission():
+                    with self.assertRaises(operator_guard.GuardHalt):
+                        blocked.before_request(target, method=method, reserve=True)
+                self.assertEqual(blocked.requests_used, 0)
+                self.assertTrue(blocked.stop_event.is_set())
+
+    def test_playwright_route_method_reaches_unattended_guard(self) -> None:
+        portfolio.upsert_program(self.rt, {"id": "example", "account_access": {
+            "email": "researcher@example.com", "password": "operator-owned-password",
+            "login_url": "https://example.com/login",
+        }})
+        grant = self._grant(allow_account_access=True)
+        guard = operator_guard.RunGuard(self.rt, grant, threading.Event())
+        with operator_guard.bind(guard), \
+             operator_guard.saved_login_submission(), \
+             patch.object(web_scan_service, "_guard_url", side_effect=lambda url, *_args: url):
+            self.assertTrue(web_scan_service.playwright_request_allowed(
+                "https://example.com/login", False, frozenset({443}), method="POST"))
+        self.assertEqual(guard.requests_used, 1)
+        blocked = operator_guard.RunGuard(self.rt, grant, threading.Event())
+        with operator_guard.bind(blocked), \
+             operator_guard.saved_login_submission(), \
+             patch.object(web_scan_service, "_guard_url", side_effect=lambda url, *_args: url):
+            self.assertFalse(web_scan_service.playwright_request_allowed(
+                "https://example.com/private", False, frozenset({443}), method="POST"))
+        self.assertEqual(blocked.requests_used, 0)
+        self.assertTrue(blocked.stop_event.is_set())
+
+    def test_saved_login_form_requires_post_to_exact_approved_action(self) -> None:
+        portfolio.upsert_program(self.rt, {"id": "example", "account_access": {
+            "email": "researcher@example.com", "password": "operator-owned-password",
+            "login_url": "https://example.com/login",
+        }})
+        grant = self._grant(allow_account_access=True)
+        approved = operator_guard.RunGuard(self.rt, grant, threading.Event())
+        approved.check_saved_login_form("post", "https://example.com/login")
+        self.assertEqual(approved.requests_used, 0)
+        for method, action in (("GET", "https://example.com/login"),
+                               ("POST", "https://example.com/other"),
+                               ("POST", "https://example.com/login?next=private"),
+                               ("POST", "http://example.com/login")):
+            with self.subTest(method=method, action=action):
+                guard = operator_guard.RunGuard(self.rt, grant, threading.Event())
+                with self.assertRaises(operator_guard.GuardHalt):
+                    guard.check_saved_login_form(method, action)
+                self.assertTrue(guard.stop_event.is_set())
+
+    def test_unattended_get_never_carries_saved_credentials_in_query(self) -> None:
+        portfolio.upsert_program(self.rt, {"id": "example", "account_access": {
+            "email": "researcher@example.com", "password": "operator-owned-password",
+            "login_url": "https://example.com/login",
+        }})
+        grant = self._grant(allow_account_access=True)
+        for url in ("https://example.com/?email=researcher%40example.com",
+                    "https://example.com/?password=operator-owned-password"):
+            with self.subTest(url=url):
+                guard = operator_guard.RunGuard(self.rt, grant, threading.Event())
+                with self.assertRaisesRegex(operator_guard.GuardHalt, "credential appeared"):
+                    guard.before_request(url)
+                self.assertEqual(guard.requests_used, 0)
+                self.assertNotIn("operator-owned-password", guard.halt_reason)
+
+    def _run_mocked_saved_login(self, page: MagicMock, guard: operator_guard.RunGuard,
+                               context: MagicMock | None = None) -> dict:
+        context = context or MagicMock()
+        context.new_page.return_value = page
+        browser = MagicMock()
+        browser.new_context.return_value = context
+        playwright = MagicMock()
+        playwright.chromium.launch.return_value = browser
+        manager = MagicMock()
+        manager.__enter__.return_value = playwright
+        api = types.ModuleType("playwright.sync_api")
+        api.sync_playwright = lambda: manager  # type: ignore[attr-defined]
+        package = types.ModuleType("playwright")
+        package.sync_api = api  # type: ignore[attr-defined]
+        with operator_guard.bind(guard), \
+             patch.object(account_login_service, "ensure_bundled_browsers_path"), \
+             patch.dict(sys.modules, {"playwright": package, "playwright.sync_api": api}):
+            return account_login_service._playwright_login(
+                "https://example.com/login", "example.com", "researcher@example.com",
+                "operator-owned-password", "example.com", get_settings())
+
+    def test_unattended_browser_rejects_get_form_before_filling_credentials(self) -> None:
+        portfolio.upsert_program(self.rt, {"id": "example", "account_access": {
+            "email": "researcher@example.com", "password": "operator-owned-password",
+            "login_url": "https://example.com/login",
+        }})
+        grant = self._grant(allow_account_access=True)
+        for form, reason in (
+            ({"method": "GET", "action": "https://example.com/login"}, "must submit by POST"),
+            ({"unsafe_submit": True}, "submit override"),
+        ):
+            with self.subTest(form=form):
+                guard = operator_guard.RunGuard(self.rt, grant, threading.Event())
+                page = MagicMock()
+                page.evaluate.return_value = ""
+                page.query_selector.return_value.is_visible.return_value = True
+                page.eval_on_selector.return_value = form
+                with self.assertRaisesRegex(operator_guard.GuardHalt, reason):
+                    self._run_mocked_saved_login(page, guard)
+                page.fill.assert_not_called()
+                page.click.assert_not_called()
+                self.assertEqual(guard.requests_used, 0)
+
+    def test_unattended_browser_stops_429_and_body_challenge_before_credentials(self) -> None:
+        portfolio.upsert_program(self.rt, {"id": "example", "account_access": {
+            "email": "researcher@example.com", "password": "operator-owned-password",
+            "login_url": "https://example.com/login",
+        }})
+        grant = self._grant(allow_account_access=True)
+        for scenario, body, status, expected in (
+            ("rate limit", "", 429, "429"),
+            ("body challenge", "<html>checking your browser</html>", 200, "challenge"),
+        ):
+            with self.subTest(scenario=scenario):
+                guard = operator_guard.RunGuard(self.rt, grant, threading.Event())
+                page = MagicMock()
+                context = MagicMock()
+                page.evaluate.return_value = body
+                callbacks: dict[str, object] = {}
+                context.on.side_effect = lambda event, callback: callbacks.__setitem__(event, callback)
+                response = types.SimpleNamespace(
+                    status=status, headers={},
+                    request=types.SimpleNamespace(resource_type="document"),
+                )
+                page.goto.side_effect = lambda *_args, **_kwargs: callbacks["response"](response)
+                with self.assertRaisesRegex(operator_guard.GuardHalt, expected):
+                    self._run_mocked_saved_login(page, guard, context)
+                page.fill.assert_not_called()
+                page.click.assert_not_called()
+                self.assertTrue(guard.stop_event.is_set())
+
+    def test_unattended_browser_requires_visible_submit_instead_of_enter(self) -> None:
+        portfolio.upsert_program(self.rt, {"id": "example", "account_access": {
+            "email": "researcher@example.com", "password": "operator-owned-password",
+            "login_url": "https://example.com/login",
+        }})
+        guard = operator_guard.RunGuard(self.rt, self._grant(allow_account_access=True), threading.Event())
+        page = MagicMock()
+        page.evaluate.return_value = ""
+        visible = MagicMock()
+        visible.is_visible.return_value = True
+        page.query_selector.side_effect = lambda selector: (
+            visible if selector in {"input[type=email]", "input[type=password]"} else None)
+        with self.assertRaisesRegex(operator_guard.GuardHalt, "visible submit control"):
+            self._run_mocked_saved_login(page, guard)
+        page.fill.assert_not_called()
+        page.press.assert_not_called()
+        self.assertEqual(guard.requests_used, 0)
+
+    def test_browser_response_headers_halt_without_secret_output(self) -> None:
+        guard = operator_guard.RunGuard(self.rt, self._grant(), threading.Event())
+        class Response:
+            status = 429
+            headers = {"set-cookie": "session=secret", "cf-mitigated": "challenge"}
+        operator_guard.observe_playwright_response(Response(), guard=guard)
+        self.assertTrue(guard.stop_event.is_set())
+        self.assertNotIn("secret", guard.halt_reason)
+        with self.assertRaises(operator_guard.GuardHalt):
+            guard.check_current()
+
+    def test_account_grant_revokes_on_credential_change_and_still_halts_on_401(self) -> None:
+        portfolio.upsert_program(self.rt, {"id": "example", "account_access": {
+            "cookie": "session=first", "login_url": "https://example.com/login",
+        }})
+        grant = self._grant(allow_account_access=True)
+        guard = operator_guard.RunGuard(self.rt, grant, threading.Event())
+        with self.assertRaisesRegex(operator_guard.GuardHalt, "authentication boundary"):
+            guard.observe_response({"status": 401, "headers": {}, "body": ""}, stage="headers")
+        portfolio.upsert_program(self.rt, {"id": "example", "account_access": {
+            "cookie": "session=second", "login_url": "https://example.com/login",
+        }})
+        changed = operator_guard.RunGuard(self.rt, grant, threading.Event())
+        with self.assertRaisesRegex(operator_guard.GuardHalt, "changed"):
+            changed.before_request("https://example.com/login", method="POST")
 
     def test_grant_is_revoked_by_scope_or_settings_change(self) -> None:
         grant = self._grant()

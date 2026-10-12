@@ -377,6 +377,20 @@ class GnCliTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["excluded_hosts"], ("excluded.example.com",))
         self.assertTrue(run.call_args.kwargs["disclose_automation"])
 
+    def test_operator_campaign_forwards_saved_account_to_engine(self) -> None:
+        run_fn = gn_cli._operator_campaign_fn({"enabled": False})
+        access = {"cookie": "session=stale", "email": "researcher@example.com",
+                  "password": "stored-secret", "login_url": "https://app.example.com/login"}
+        saved = {"account_access": access, "out_of_scope_hosts": []}
+        with mock.patch("bughunter.portfolio.get_program", return_value=saved), \
+             mock.patch("bughunter.campaign.run_campaign", return_value={"ok": True}) as run:
+            run_fn("https://app.example.com/one", scope="*.example.com",
+                   program="p", active=False, live=False)
+
+        run.assert_called_once()
+        self.assertIs(run.call_args.kwargs["account_access"], access)
+        self.assertEqual(access["cookie"], "session=stale")
+
 
 _PLUGIN_MODULES = ("gn_stub_ok_plugin", "gn_stub_broken_plugin", "gn_stub_raising_plugin")
 

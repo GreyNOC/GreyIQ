@@ -304,7 +304,7 @@ class StoredXssBeaconTests(unittest.TestCase):
 
         class FakeRoute:
             def __init__(self, url):
-                self.request = SimpleNamespace(url=url, headers={})
+                self.request = SimpleNamespace(url=url, method="GET", headers={})
                 self.action = ""
                 self.headers = {}
 

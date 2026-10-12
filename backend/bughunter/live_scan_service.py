@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import urlparse
 
+from bughunter import operator_guard
 from bughunter.code_scanner.redaction import redact_text
 from bughunter.playwright_env import ensure_bundled_browsers_path
 from bughunter.settings import get_settings
@@ -200,9 +201,11 @@ def run_live_scan(url: str, wait_seconds: float = 6.0, max_findings: int = 300,
             bad_responses.append((str(response.url)[:_STR_CLIP], response.status))
 
     wait_ms = int(max(0.0, wait_seconds) * 1000)
+    guard = operator_guard.current()
     try:
         def _guard_route(route: Any) -> None:
-            if playwright_request_allowed(route.request.url, settings.allow_private_urls, settings.web_allowed_ports):
+            if playwright_request_allowed(route.request.url, settings.allow_private_urls,
+                                          settings.web_allowed_ports, method=route.request.method):
                 route.continue_()
             else:
                 route.abort()
@@ -212,17 +215,29 @@ def run_live_scan(url: str, wait_seconds: float = 6.0, max_findings: int = 300,
             # Carry the app signature + the program's mandatory marker (see screenshot_service).
             context = browser.new_context(ignore_https_errors=True, user_agent=current_user_agent())
             context.route("**/*", _guard_route)
+            if guard is not None:
+                context.on("response", lambda response: operator_guard.observe_playwright_response(response, guard=guard))
             page = context.new_page()
             page.on("console", on_console)
             page.on("pageerror", on_pageerror)
             page.on("requestfailed", on_requestfailed)
             page.on("response", on_response)
-            page.goto(sanitized, wait_until="load", timeout=wait_ms + 15000)
+            main_response = page.goto(sanitized, wait_until="load", timeout=wait_ms + 15000)
+            if guard is not None:
+                operator_guard.inspect_playwright_page(
+                    page, status=main_response.status if main_response is not None else 0, guard=guard)
             page.wait_for_timeout(wait_ms)
+            if guard is not None:
+                operator_guard.inspect_playwright_page(
+                    page, status=main_response.status if main_response is not None else 0, guard=guard)
             final_url = page.url
             title = page.title()
             browser.close()
-    except Exception as exc:  # noqa: BLE001 - navigation/runtime errors -> data
+    except operator_guard.GuardHalt:
+        raise
+    except Exception as exc:  # noqa: BLE001 - manual navigation/runtime errors -> data
+        if guard is not None and guard.halt_reason:
+            raise operator_guard.GuardHalt(guard.halt_reason) from exc
         return {
             "ok": False,
             "scan_type": "live",

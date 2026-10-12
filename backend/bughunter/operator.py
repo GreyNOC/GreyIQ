@@ -427,6 +427,11 @@ class OperatorLoop:
         except Exception as exc:  # noqa: BLE001
             self._emit(f"cycle error {pid}: {type(exc).__name__}: {exc}")
             summary = {"findings": 0, "confirmed": 0, "submitted": 0}
+        finally:
+            # The per-cycle guard is the only holder of a resolved research
+            # session. Release it as soon as the target loop finishes, including
+            # error and stop paths.
+            guard.research_auth = None
         if guard.halt_reason or summary.get("stopped"):
             reason = guard.halt_reason or summary.get("stop_reason") or "stop requested"
             self._stop_reason = str(reason)

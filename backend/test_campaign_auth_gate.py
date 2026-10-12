@@ -136,6 +136,18 @@ class ReconAuthGateTests(unittest.TestCase):
         self.assertTrue(all(auth is None for url, auth in calls if url.startswith("http://")))
         self.assertTrue(all(auth is session for url, auth in calls if url.startswith("https://")))
 
+    def test_authenticated_seed_without_a_response_stops_recon(self) -> None:
+        session = AuthContext(host="app.example.com", headers={"Cookie": "sid=secret"})
+        with patch.object(recon, "_guard_url", return_value=TARGET), \
+             patch.object(recon, "_safe_fetch", return_value=None) as fetch:
+            result = recon.discover(TARGET, scope_in=lambda host: host == "app.example.com",
+                                    max_pages=3, governor=_Governor(), detect_auth_wall=True,
+                                    auth=session)
+
+        self.assertTrue(result["auth_seed_unverified"])
+        self.assertEqual(fetch.call_count, 1)
+        self.assertNotIn("sid=secret", json.dumps(result))
+
 
 class CampaignAuthGateTests(unittest.TestCase):
     def _run(self, root: Path, **extra):
@@ -220,6 +232,95 @@ class CampaignAuthGateTests(unittest.TestCase):
         self.assertEqual(discover.call_count, 2)
         self.assertEqual(discover.call_args_list[0].kwargs["auth"].headers["Cookie"], "sid=stale-value")
         self.assertEqual(discover.call_args_list[1].kwargs["auth"].headers["Cookie"], "sid=fresh-value")
+
+    def test_saved_research_login_refreshes_a_stale_cookie_before_prompt(self) -> None:
+        class _ReachedPlanner(Exception):
+            pass
+
+        access = {"cookie": "sid=stale-value", "email": "researcher@example.com",
+                  "password": "stored-secret", "login_url": "https://app.example.com/login"}
+        discover = Mock(side_effect=[{"auth_wall": WALL},
+                                     {"auth_wall": None, "urls": [TARGET], "notes": [],
+                                      "sources": {}, "params": [], "tech": [], "forms": []}])
+        login = Mock(side_effect=[
+            {"ok": True, "cookie": "sid=stale-value", "host": "app.example.com", "note": "saved cookie"},
+            {"ok": True, "cookie": "sid=fresh-value", "host": "app.example.com", "note": "fresh login"},
+        ])
+        ask = Mock()
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(campaign.account_login_service, "login", login), \
+                patch.object(campaign.recon, "discover", discover), \
+                patch.object(campaign.hunt_brain, "heuristic_plan", side_effect=_ReachedPlanner):
+            with self.assertRaises(_ReachedPlanner):
+                self._run(Path(tmp), account_access=access, on_auth_needed=ask)
+
+        self.assertEqual(login.call_count, 2)
+        self.assertEqual(login.call_args_list[0].args[0]["cookie"], "sid=stale-value")
+        self.assertEqual(login.call_args_list[1].args[0]["cookie"], "")
+        self.assertEqual(discover.call_count, 2)
+        self.assertEqual(discover.call_args_list[1].kwargs["auth"].headers["Cookie"], "sid=fresh-value")
+        self.assertTrue(discover.call_args_list[1].kwargs["https_only_auth"])
+        ask.assert_not_called()
+        self.assertEqual(access["cookie"], "sid=stale-value")
+
+    def test_failed_saved_refresh_falls_back_to_operator_once(self) -> None:
+        access = {"cookie": "sid=stale-value", "email": "researcher@example.com",
+                  "password": "stored-secret", "login_url": "https://app.example.com/login"}
+        login = Mock(side_effect=[
+            {"ok": True, "cookie": "sid=stale-value", "host": "app.example.com", "note": "saved cookie"},
+            {"ok": False, "cookie": "", "note": "login failed"},
+        ])
+        ask = Mock(return_value={"cookie": "sid=operator-value"})
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(campaign.account_login_service, "login", login), \
+                patch.object(campaign.recon, "discover", return_value={"auth_wall": WALL}) as discover:
+            result = self._run(Path(tmp), account_access=access, on_auth_needed=ask)
+
+        self.assertTrue(result["needs_operator"])
+        self.assertEqual(login.call_count, 2)
+        self.assertEqual(discover.call_count, 2)
+        ask.assert_called_once_with(WALL)
+        self.assertNotIn("stored-secret", json.dumps(result))
+        self.assertNotIn("operator-value", json.dumps(result))
+
+    def test_unattended_initial_login_prefers_password_to_saved_cookie(self) -> None:
+        access = {"cookie": "sid=stale-value", "email": "researcher@example.com",
+                  "password": "stored-secret", "login_url": "https://app.example.com/login"}
+        login = Mock(return_value={"ok": True, "cookie": "sid=fresh-value",
+                                   "host": "app.example.com", "note": "fresh login"})
+        guard = Mock(research_auth_program="", research_auth=None,
+                     research_auth_resolved=False)
+        guard.grant.program_id = "p"
+        guard.grant.allow_account_access = True
+        guard.check_current.return_value = {"account_access": access}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(campaign.operator_guard, "current", return_value=guard), \
+                patch.object(campaign.account_login_service, "login", login), \
+                patch.object(campaign.recon, "discover", return_value={"auth_wall": WALL}) as discover:
+            result = self._run(Path(tmp), account_access=access, program="p")
+
+        self.assertTrue(result["needs_operator"])
+        self.assertEqual(login.call_count, 1)
+        self.assertEqual(login.call_args.args[0]["cookie"], "")
+        self.assertEqual(discover.call_count, 1)
+        self.assertNotIn("stored-secret", json.dumps(result))
+
+    def test_required_user_agent_suffix_covers_saved_login(self) -> None:
+        observed: list[str] = []
+
+        def login_spy(_access, _scope, _excluded, _emit):
+            observed.append(campaign.web_ingest.current_user_agent())
+            return None
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(campaign, "_login_auth", side_effect=login_spy), \
+                patch.object(campaign.recon, "discover", return_value={"auth_wall": WALL}):
+            self._run(Path(tmp), account_access={"cookie": "sid=fake"},
+                      user_agent_suffix=" GreyNOC-Research")
+
+        self.assertEqual(len(observed), 1)
+        self.assertTrue(observed[0].endswith(" GreyNOC-Research"))
+        self.assertFalse(campaign.web_ingest.current_user_agent().endswith(" GreyNOC-Research"))
 
     def test_campaign_rejects_bad_supplied_session_on_200_login_form(self) -> None:
         login_page = ('<title>Sign in</title><form action="/login"><input type="email" name="email">'

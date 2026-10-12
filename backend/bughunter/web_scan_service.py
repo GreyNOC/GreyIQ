@@ -357,7 +357,8 @@ def _guard_url(url: str, allow_private: bool, allowed_ports: frozenset[int]) -> 
     return urlunparse(parsed._replace(netloc=netloc))
 
 
-def playwright_request_allowed(url: str, allow_private: bool, allowed_ports: frozenset[int]) -> bool:
+def playwright_request_allowed(url: str, allow_private: bool, allowed_ports: frozenset[int],
+                               *, method: str = "GET") -> bool:
     """True if a Playwright page's request to ``url`` should be allowed through. Shared by
     every module that drives a real browser (screenshot_service, live_scan_service): bind
     this as a ``context.route("**/*", ...)`` handler so the SSRF/private-host/port guard is
@@ -372,7 +373,7 @@ def playwright_request_allowed(url: str, allow_private: bool, allowed_ports: fro
     try:
         # In unattended mode this also enforces the exact saved program scope,
         # cancellation, and the shared cycle request budget on browser resources.
-        operator_guard.before_request(url, reserve=True)
+        operator_guard.before_request(url, method=method, reserve=True)
         _guard_url(url, allow_private, allowed_ports)
         return True
     except (WebsiteFetchError, operator_guard.GuardHalt):

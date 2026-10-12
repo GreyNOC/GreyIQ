@@ -341,6 +341,20 @@ def discover(
                 "dropped_out_of_scope": 0, "requests_used": used["n"],
                 "observations": observations, "auth_wall": auth_wall,
             }
+        if auth is not None and (
+            not isinstance(seed_prefetched, dict)
+            or not isinstance(seed_prefetched.get("status"), int)
+            or not 200 <= seed_prefetched["status"] < 400
+        ):
+            return {
+                "urls": [sanitized], "host": host, "sources": {},
+                "notes": ["recon stopped: authenticated seed response could not be verified"],
+                "endpoints": [], "params": [], "js_secrets": [], "source_maps": [],
+                "tech": [], "hints": {}, "websockets": [], "forms": [], "api_findings": [],
+                "dropped_out_of_scope": 0, "requests_used": used["n"],
+                "observations": observations, "auth_wall": None,
+                "auth_seed_unverified": True,
+            }
 
     # --- Passive recon: robots + security.txt seed extra paths; sitemaps handled by the recursive
     # worklist below (which follows sitemap-index children + robots-declared Sitemap: files). ---

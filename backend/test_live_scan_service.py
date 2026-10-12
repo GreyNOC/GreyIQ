@@ -198,6 +198,7 @@ class _FakeRoute:
 class _FakeRequest:
     def __init__(self, url: str) -> None:
         self.url = url
+        self.method = "GET"
 
 
 class _FakeConsoleMessage:
