@@ -4,6 +4,8 @@ Notable changes to GreyIQ.
 
 ## Unreleased
 
+## v4.10.0 - autonomous directory hunts and the closed payout loop
+
 - Give the `gn dash` cockpit a four-colour palette: blue for structure, and
   red/yellow/green carrying severity and health. Severity labels and their
   counts, the status pill, the section titles and the log line's phase prefix
