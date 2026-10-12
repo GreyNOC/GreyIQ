@@ -47,11 +47,16 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 AGENTS_DIRNAME = "agents"
 MANIFEST_NAME = "greyiq-agent.json"
 SOURCE_DIRNAME = "source"
 PLAYBOOK_NAME = "SKILL.md"
+# A clone is staged under this prefix and renamed into place on success. The
+# leading dot is the guarantee: agent_name() refuses it, so no staging directory
+# can ever be mistaken for — or collide with — a real clone.
+STAGING_PREFIX = ".staging-"
 MANIFEST_SCHEMA = 1
 
 REPO_TYPES: tuple[str, ...] = ("spaces", "models")
@@ -589,6 +594,12 @@ def list_agents(runtime_dir: Path | str) -> list[dict[str, Any]]:
         return []
     found: list[dict[str, Any]] = []
     for directory in sorted(path for path in root.iterdir() if path.is_dir() and not path.is_symlink()):
+        # A clone's manifest lands in staging just before the rename that publishes
+        # it, so a run killed in that window leaves a manifest-bearing directory
+        # behind. Never report one: a clone is a directory agent_name() could have
+        # named, and that refuses the leading dot every staging directory carries.
+        if directory.name.startswith("."):
+            continue
         manifest = directory / MANIFEST_NAME
         if not manifest.is_file():
             continue
@@ -760,11 +771,18 @@ def clone_agent(
     if not planned:
         raise AgentCloneError("Nothing in that repository is clonable agent code or configuration.")
 
-    staging = target.with_name(target.name + ".partial")
-    if staging.exists():
-        shutil.rmtree(staging)
+    # Staging must never be able to name a real clone, and must be private to
+    # this process. The deterministic `<slug>.partial` this replaced was neither:
+    # `.partial` is itself a valid agent id, so cloning `foo` silently deleted an
+    # operator's clone named `foo.partial` with no --force and no warning, and two
+    # concurrent clones of `foo` shared one staging tree, each free to delete the
+    # other's half-written files and publish a manifest describing them. A dotted
+    # prefix cannot collide with any agent id because agent_name() refuses a
+    # leading dot, and the uuid makes it unique per clone.
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = target.with_name(f"{STAGING_PREFIX}{uuid4().hex}")
     source_root = staging / SOURCE_DIRNAME
-    source_root.mkdir(parents=True, exist_ok=True)
+    source_root.mkdir(parents=True, exist_ok=False)
 
     cloned: list[dict[str, Any]] = []
     contents: dict[str, bytes] = {}
@@ -848,12 +866,27 @@ def clone_agent(
             playbook_manifest["path"] = str(target)
             (staging / PLAYBOOK_NAME).write_text(build_playbook(playbook_manifest), encoding="utf-8")
 
+        # Publish by rename, and keep any previous clone until the new one is in
+        # place. Deleting first meant a failure between the delete and the rename
+        # left the operator with neither clone; moving it aside means the worst
+        # case is the old one still being there.
+        previous: Path | None = None
         if target.exists():
             if target.is_symlink() or not target.is_dir():
                 raise AgentCloneError(f"{target} is not a clone directory.")
-            shutil.rmtree(target)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        staging.replace(target)
+            previous = target.with_name(f"{STAGING_PREFIX}{uuid4().hex}")
+            target.rename(previous)
+        try:
+            staging.replace(target)
+        except OSError as exc:
+            if previous is not None:
+                previous.rename(target)
+                previous = None
+            raise AgentCloneError(
+                f"Could not publish the clone to {target}: {_safe_error(exc)}") from exc
+        finally:
+            if previous is not None:
+                shutil.rmtree(previous, ignore_errors=True)
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)

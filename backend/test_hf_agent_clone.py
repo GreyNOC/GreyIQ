@@ -394,6 +394,77 @@ class CloneTests(unittest.TestCase):
             manifest = self._clone(hub, Path(tmp))
         self.assertEqual(manifest["tools_without_source"], ["launch_missiles"])
 
+    def test_cloning_foo_does_not_destroy_an_operator_clone_named_like_the_staging_dir(self) -> None:
+        # Regression: staging used to be `<slug>.partial`, which agent_name()
+        # accepts as an ordinary id. Cloning `foo` therefore deleted a clone the
+        # operator had named `foo.partial` — no --force, no warning, no recovery.
+        hub = _Hub(_repo())
+        with tempfile.TemporaryDirectory(prefix="gn-agent-") as tmp:
+            runtime = Path(tmp)
+            for alias in ("foo.partial", "foo.staging-1", "foo"):
+                self._clone(hub, runtime, alias=alias)
+            self.assertEqual(sorted(item["slug"] for item in clone.list_agents(runtime)),
+                             ["foo", "foo.partial", "foo.staging-1"])
+
+    def test_a_staging_directory_can_never_be_named_by_agent_name(self) -> None:
+        # The whole guarantee rests on this: if agent_name() ever accepted the
+        # staging prefix, a clone and a staging tree could collide again.
+        with self.assertRaises(clone.AgentCloneError):
+            clone.agent_name(clone.STAGING_PREFIX + "deadbeef")
+        self.assertTrue(clone.STAGING_PREFIX.startswith("."))
+        self.assertIsNone(clone._SLUG_OK.fullmatch(clone.STAGING_PREFIX + "deadbeef"))
+
+    def test_each_clone_stages_in_its_own_directory(self) -> None:
+        hub = _Hub(_repo())
+        roots: set[Path] = set()
+        real_mkdir = Path.mkdir
+
+        def record(self, *args, **kwargs):  # noqa: ANN001
+            for parent in (self, *self.parents):
+                if parent.name.startswith(clone.STAGING_PREFIX):
+                    roots.add(parent)
+            return real_mkdir(self, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory(prefix="gn-agent-") as tmp:
+            runtime = Path(tmp)
+            with patch.object(Path, "mkdir", record):
+                self._clone(hub, runtime, alias="party")
+                self._clone(hub, runtime, alias="party", force=True)
+        self.assertEqual(len(roots), 2, "two clones must not share a staging tree")
+        # And nothing is left behind once the rename has published the clone.
+        self.assertFalse([root for root in roots if root.exists()])
+
+    def test_a_staging_tree_abandoned_before_the_rename_is_never_reported_as_a_clone(self) -> None:
+        # A run killed between writing the manifest and the rename leaves a
+        # manifest-bearing staging directory. It must not become a clone.
+        with tempfile.TemporaryDirectory(prefix="gn-agent-") as tmp:
+            runtime, seed = Path(tmp) / "runtime", Path(tmp) / "seed"
+            (seed / "skills").mkdir(parents=True)
+            orphan = runtime / clone.AGENTS_DIRNAME / f"{clone.STAGING_PREFIX}abc123"
+            (orphan / clone.SOURCE_DIRNAME).mkdir(parents=True)
+            (orphan / clone.MANIFEST_NAME).write_text('{"slug": "ghost"}', encoding="utf-8")
+            (orphan / clone.PLAYBOOK_NAME).write_text(
+                "---\nname: ghost\n---\nunverified\n", encoding="utf-8")
+            self.assertEqual(clone.list_agents(runtime), [])
+            self.assertEqual(skills.cloned_agent_playbooks(runtime), [])
+            self.assertEqual([item for item in skills.load_skills(runtime, seed, None)
+                              if item.source == "cloned"], [])
+
+    def test_a_failed_republish_leaves_the_previous_clone_in_place(self) -> None:
+        hub = _Hub(_repo())
+        with tempfile.TemporaryDirectory(prefix="gn-agent-") as tmp:
+            runtime = Path(tmp)
+            first = self._clone(hub, runtime, alias="party")
+            marker = Path(first["path"]) / clone.SOURCE_DIRNAME / "app.py"
+            self.assertTrue(marker.is_file())
+            # Fail at the very last step, after the old clone has been moved aside.
+            with patch.object(clone.Path, "replace", side_effect=OSError("disk full")):
+                with self.assertRaises(clone.AgentCloneError) as caught:
+                    self._clone(hub, runtime, alias="party", force=True)
+            self.assertIn("Could not publish", str(caught.exception))
+            self.assertEqual([item["slug"] for item in clone.list_agents(runtime)], ["party"])
+            self.assertTrue(marker.is_file(), "the previous clone must survive a failed republish")
+
     def test_recloning_needs_force_and_replaces_the_old_clone_atomically(self) -> None:
         hub = _Hub(_repo())
         with tempfile.TemporaryDirectory(prefix="gn-agent-") as tmp:

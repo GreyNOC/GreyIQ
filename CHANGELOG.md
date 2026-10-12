@@ -24,7 +24,11 @@ Notable changes to GreyIQ.
   prompts are screened for injection directives. A link to a file or folder
   inside a repository is refused rather than widened into "clone everything", and
   a name the operator typed is a single local id: a path-shaped `--as`, `show` or
-  `remove` argument is rejected instead of being coerced into another clone.
+  `remove` argument is rejected instead of being coerced into another clone. A
+  clone stages under a dot-prefixed, per-run directory and is published by
+  rename: the leading dot is one `agent_name` refuses, so staging can never
+  collide with a real clone, and the previous clone stays in place until the new
+  one lands rather than being deleted first.
 
 ## v4.10.0 - autonomous directory hunts and the closed payout loop
 

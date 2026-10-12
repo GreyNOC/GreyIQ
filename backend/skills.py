@@ -99,12 +99,13 @@ def ensure_user_skills(runtime_dir: Path, seed_dir: Path) -> Path:
 def cloned_agent_playbooks(runtime_dir: Path | str) -> list[Path]:
     """Each cloned Hugging Face agent's playbook, written by `gn agent clone`.
 
-    A directory counts only when it holds BOTH the playbook and the manifest —
-    the same bar hf_agent_clone.list_agents uses. `gn agent clone` stages into
-    `<slug>.partial` and renames on success, so a clone killed mid-download can
-    leave a playbook behind whose files were never fully verified. Requiring the
-    manifest keeps that text out of the agent's prompt instead of feeding it in
-    as a clone that the store itself does not acknowledge.
+    A directory counts only when it is not hidden AND holds BOTH the playbook and
+    the manifest — the same bar hf_agent_clone.list_agents uses. `gn agent clone`
+    stages under a dot-prefixed name and renames on success, so a clone killed
+    mid-run can leave behind a playbook whose files were never fully verified, and
+    (if it died in the window just before the rename) a manifest beside it. Both
+    guards together keep that text out of the agent's prompt instead of feeding it
+    in as a clone the store itself does not acknowledge.
     """
     root = Path(runtime_dir) / AGENTS_DIRNAME
     if not root.is_dir():
@@ -116,7 +117,8 @@ def cloned_agent_playbooks(runtime_dir: Path | str) -> list[Path]:
         return []
     for directory in entries:
         playbook = directory / CLONED_PLAYBOOK
-        if (directory.is_dir() and not directory.is_symlink() and playbook.is_file()
+        if (directory.is_dir() and not directory.is_symlink()
+                and not directory.name.startswith(".") and playbook.is_file()
                 and (directory / CLONED_MANIFEST).is_file()):
             found.append(playbook)
     return found
