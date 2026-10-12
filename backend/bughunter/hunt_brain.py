@@ -559,23 +559,38 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
     # fail-closed to an EMPTY plan: no probe_priority, no param hypotheses, no idor/privileged
     # candidates. The hunt flew blind, strictly worse than provider "off". See
     # coder.reasoning_brain_enabled for the full rationale.
-    if not coder.reasoning_brain_enabled(coder_cfg):
-        # Offline hunt intelligence: knowledge rules + what the program has confirmed before,
-        # optionally re-ordered by the learned ranker (permutation-only; None == rules).
+    def _offline_into(target_plan: dict[str, Any]) -> dict[str, Any]:
+        """Fill ``target_plan`` from the offline knowledge-rule engine.
+
+        Used for BOTH the no-brain branch and every brain-failure path below. A configured
+        brain that cannot be reached — a dead endpoint, a wrong key, a serverless inference
+        endpoint that is cold, loading, or rate-limited — used to return the EMPTY plan, so
+        the hunt went out with no param hypotheses, no probe priority and no IDOR/SSRF
+        candidates: strictly blinder than having configured no brain at all. Measured on this
+        checkout before the change, an unreachable LLM produced 0 param hypotheses and 0
+        priority rows where the rules produce 16 and 2. Degrading to the rules is the whole
+        point of having rules.
+        """
         try:
             model = _load_ranker(seed_dir, runtime_dir)
             raw = offline_hunt.offline_plan(surface, priors, model=model)
             params, priority, idor, ssrf, xss, priv = _validate_plan(raw, surface)
-            plan.update({"used": bool(raw.get("used")), "provider": "offline", "model": "greyiq-offline-hunt",
-                         "param_hypotheses": params, "probe_priority": priority, "idor_candidates": idor,
-                         "ssrf_params": ssrf, "xss_params": xss, "privileged_endpoints": priv,
-                         "notes": str(raw.get("notes") or "")})
+            target_plan.update({"used": bool(raw.get("used")), "provider": "offline",
+                                "model": "greyiq-offline-hunt",
+                                "param_hypotheses": params, "probe_priority": priority,
+                                "idor_candidates": idor, "ssrf_params": ssrf, "xss_params": xss,
+                                "privileged_endpoints": priv, "notes": str(raw.get("notes") or "")})
         except Exception:  # noqa: BLE001 - the offline planner must never break a hunt
             pass
-        return _with_hypotheses(plan)
+        return target_plan
+
+    if not coder.reasoning_brain_enabled(coder_cfg):
+        # Offline hunt intelligence: knowledge rules + what the program has confirmed before,
+        # optionally re-ordered by the learned ranker (permutation-only; None == rules).
+        return _with_hypotheses(_offline_into(plan))
     target = str(target or "").strip()
     if not target:
-        return _with_hypotheses(plan)
+        return _with_hypotheses(_offline_into(plan))
     cfg = dict(coder.coder_config(coder_cfg))
     cfg["system_prompt"] = HUNT_BRAIN_SYSTEM_PROMPT
     # Where an entire engagement points its probe budget is the highest-leverage single call in the
@@ -584,8 +599,8 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
     cfg["response_schema"] = PLAN_RESPONSE_SCHEMA
     # The WHOLE brain interaction — the network call, JSON parsing, AND validation of the
     # model's (untrusted, possibly hijacked) output — is inside one guard so the module itself
-    # honours its fail-closed contract: any failure returns the empty plan, independent of whether
-    # a given caller happens to wrap plan_hunt in its own try/except.
+    # honours its fail-closed contract: any failure degrades to the OFFLINE rule plan,
+    # independent of whether a given caller happens to wrap plan_hunt in its own try/except.
     try:
         prompt = _build_prompt(target, scope, surface)
         if str(technique_context or "").strip():
@@ -595,9 +610,12 @@ def plan_hunt(coder_cfg: dict[str, Any] | None, target: str, scope: str, surface
         parsed = _parse_json_object(str(result.get("text") or ""))
         params, priority, idor_candidates, ssrf_params, xss_params, privileged_endpoints = _validate_plan(parsed, surface)
     except coder.CoderError:
-        return _with_hypotheses(plan)
+        # The brain is configured but could not answer — dead endpoint, bad key, a cold or
+        # rate-limited serverless inference endpoint. Fall back to the rules rather than
+        # hunting blind; see _offline_into.
+        return _with_hypotheses(_offline_into(plan))
     except Exception:  # noqa: BLE001 - the reasoning layer must never break a hunt
-        return _with_hypotheses(plan)
+        return _with_hypotheses(_offline_into(plan))
     plan.update({
         "used": True, "provider": str(result.get("provider") or ""), "model": str(result.get("model") or ""),
         "param_hypotheses": params, "probe_priority": priority, "idor_candidates": idor_candidates,

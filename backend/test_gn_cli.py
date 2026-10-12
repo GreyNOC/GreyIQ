@@ -351,3 +351,41 @@ class VerbPluginsAreFrozenSafeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OobCredsTests(unittest.TestCase):
+    """`_oob_creds` reads the collaborator the desktop app already stored.
+
+    The app's OOB panel writes `oob.collaborator_url` + `oob.secret` into the shared
+    secrets file (`save_oob_config`). A terminal-driven hunt must read that SAME place —
+    a second config location is how one of them ends up stale.
+    """
+
+    def _with_secrets(self, payload):
+        import json as _json
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        if payload is not None:
+            (root / "secrets.json").write_text(_json.dumps(payload), encoding="utf-8")
+        orig = gn_cli.RUNTIME_DIR
+        gn_cli.RUNTIME_DIR = root
+        self.addCleanup(lambda: setattr(gn_cli, "RUNTIME_DIR", orig))
+        return gn_cli._oob_creds()
+
+    def test_reads_the_configured_collaborator(self) -> None:
+        base, secret = self._with_secrets({
+            "oob.collaborator_url": "https://chat.example", "oob.secret": "s" * 32})
+        self.assertEqual(base, "https://chat.example")
+        self.assertEqual(secret, "s" * 32)
+
+    def test_absent_or_malformed_secrets_are_empty_not_an_error(self) -> None:
+        """A hunt must not fail because no collaborator was ever configured."""
+        for payload in (None, {}, {"oob.collaborator_url": ""}, []):
+            with self.subTest(payload=payload):
+                self.assertEqual(self._with_secrets(payload), ("", ""))
+
+    def test_values_are_trimmed(self) -> None:
+        base, secret = self._with_secrets({
+            "oob.collaborator_url": "  https://chat.example  ", "oob.secret": "  tok  "})
+        self.assertEqual((base, secret), ("https://chat.example", "tok"))

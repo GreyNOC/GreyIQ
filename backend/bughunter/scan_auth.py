@@ -26,11 +26,11 @@ same-site gate above stays strict; the two compose, and the tighter one always w
 
 from __future__ import annotations
 
-import ipaddress
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
+from bughunter.registrable_domain import is_ip_literal as _is_ip
 from bughunter.registrable_domain import registrable_domain
 from bughunter.web_ingest import WebsiteFetchError, _ascii_hostname
 
@@ -52,14 +52,6 @@ class AuthContext:
 
 def _host(value: str) -> str:
     return (value or "").strip().lower().strip("[]")
-
-
-def _is_ip(host: str) -> bool:
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except ValueError:
-        return False
 
 
 def same_site(request_host: str, auth_host: str) -> bool:

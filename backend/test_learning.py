@@ -24,6 +24,29 @@ class ProgramKeyTests(unittest.TestCase):
         # bare suffix -- that would merge two unrelated programs' memory into one bucket.
         self.assertEqual(learning.program_key("", "api.staging.example.co.uk"), "example.co.uk")
 
+    def test_an_ip_target_keys_on_the_full_address_not_its_last_two_octets(self) -> None:
+        """registrable_domain is a last-two-labels heuristic and an IP has no registrable
+        domain, so folding one through it produced '0.1' for 127.0.0.1 AND 10.0.0.1, and
+        '1.50' for 192.168.1.50 AND 10.20.1.50 — unrelated hosts sharing one memory bucket.
+
+        That bucket holds negative knowledge, whose `confirmed` immunity has no TTL, so a
+        confirmation on one box permanently un-cooled that (endpoint, class) pair on every
+        other box ending in the same two octets. It was live on this checkout: the only
+        negative-knowledge entry was filed under program key '0.1'."""
+        self.assertEqual(learning.program_key(None, "127.0.0.1"), "127.0.0.1")
+        self.assertEqual(learning.program_key(None, "http://127.0.0.1:8000/search"), "127.0.0.1")
+        self.assertEqual(learning.program_key(None, "[::1]"), "::1")
+        for left, right in (("127.0.0.1", "10.0.0.1"), ("192.168.1.50", "10.20.1.50")):
+            with self.subTest(pair=(left, right)):
+                self.assertNotEqual(learning.program_key(None, left), learning.program_key(None, right))
+
+    def test_sibling_subdomains_still_share_one_bucket(self) -> None:
+        """The IP guard must not disturb the whole point of the domain path."""
+        self.assertEqual(
+            learning.program_key(None, "https://a.example.com"),
+            learning.program_key(None, "https://b.example.com"),
+        )
+
     def test_different_co_uk_apexes_get_different_keys(self) -> None:
         # Regression: before the public-suffix-aware fix, BOTH of these collapsed to the
         # single bucket 'co.uk', contaminating cross-program learning/dedup state.

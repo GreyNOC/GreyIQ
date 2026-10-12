@@ -49,12 +49,12 @@ on a finished hunt, so an exception here would discard completed work.
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import re
 from typing import Any
 from urllib.parse import urlparse
 
 from bughunter import investigator
+from bughunter.registrable_domain import is_ip_literal as _is_ip
 from bughunter.registrable_domain import registrable_domain
 
 ALGORITHM_VERSION = "attack-chain-v2"
@@ -1078,14 +1078,6 @@ def _host_of(location: str) -> str:
         return (urlparse(location).hostname or "").lower()
     except ValueError:
         return ""
-
-
-def _is_ip(host: str) -> bool:
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except ValueError:
-        return False
 
 
 def _same_trust_boundary(left: str, right: str) -> bool:

@@ -194,6 +194,49 @@ a short guided tour on first launch (reopen anytime via **🧭 Guide me** in the
   advisory's CWE to the class the prover can confirm, so an outdated jQuery aims the prober at
   reflected XSS. Both only reorder; the differential prover still owns every confirmation, and a
   version match never becomes a finding by itself.
+- **Blind findings confirm themselves in an auto hunt.** With an OOB collaborator configured
+  (the `/oob` endpoint on your own greynoc-chat host), a hunt can prove the four classes that
+  reflect *nothing* in the target's own response — blind SSRF, XXE-over-HTTP, blind RCE, and
+  `jku`/`x5u` JWT key injection, which is unauthenticated takeover. Previously only the cockpit's
+  single-target scan passed the collaborator in, so **every campaign and every unattended operator
+  cycle ran with it inert**; now the campaign path carries it too, gated on the program's own
+  `oob_allowed` flag ("this program's policy permits out-of-band testing"). That flag was stored,
+  normalized and served over HTTP while nothing read it — this is what reads it, so arming the
+  collaborator stays a per-program operator decision and never a global switch.
+- **The money loop closes itself.** An auto hunt already learned from its own observations —
+  negative knowledge cools an `(endpoint, class)` pair after two misses, and class priors reweight
+  from its own confirmations. What it could not learn was **what pays**: at submit time the engine
+  records `status="submitted"`, which the priors deliberately discard, so payout weighting stayed
+  empty however long the operator ran. Now the operator **syncs adjudicated outcomes once per pass**
+  (read-only GETs for reports GreyIQ itself filed, capped per pass, closed reports never re-polled)
+  *before* it hunts, so the same cycle's ranking sees the fresh verdict — and it then **hunts the
+  programs that have actually paid first** instead of alphabetically, and **retrains the offline
+  ranker** from the corpus it is growing (the trainer's own gate refuses a corpus too small or a
+  model that doesn't beat the rules). `gn sync` does the same pass by hand.
+- **Hunt a directory, then keep hunting it** — `gn auto -y` in a repo or a hunt folder. It reads
+  the targets from `.greyiq/targets.txt` (one per line, `#` comments) or `.greyiq/hunt.json`; in a
+  git repo with no targets listed, the **repository itself** is the target and its remote is the
+  scope. Scope comes from `.greyiq/scope.txt`, else the hunt file, else it is **derived** from the
+  targets' apexes and labelled as derived. The folder becomes a saved program, so negative
+  knowledge, priors, surface drift and the ledger accumulate across runs; it hunts once immediately
+  and then re-hunts on a schedule (`--once` to stop after one, `--dry-run` to see the plan first,
+  `--passive` to never arm active probing). **Authorization is never read from the directory** — a
+  file on disk cannot assert that you are authorized, so `-y/--authorize` stays the only source, and
+  a hunt file that tries to set it is refused out loud. With a scope established it also arms the
+  **theorize → act** re-plan wave, so an auto hunt chases its own strongest unresolved lead instead
+  of being one flat pass.
+- **Import a Shannon run** — `gn shannon <run-dir|workspaces-dir|report.sarif>` imports a finished
+  [Shannon](https://github.com/KeygraphHQ/shannon) pentest as GreyIQ candidates. Shannon is an
+  external autonomous engine you run yourself (it is not bundled, and it needs Docker + WSL2 on
+  Windows); GreyIQ reads the `report.sarif` it leaves behind. Everything arrives as a **candidate
+  tagged `source: shannon`**: Shannon's own `exploited` verdict is kept as provenance but is never
+  a proof state, because GreyIQ's prover never saw that target — so an imported finding cannot
+  reach the live-submit path, enforced in `report._has_captured_artifact` and
+  `submission.submit_to_hackerone`. Each candidate carries the exact proof obligation that would
+  confirm it, and the class is resolved only from Shannon's validated SAST CWE or an unambiguous
+  class; `injection` deliberately abstains rather than inflate into RCE. Shannon's exploitation
+  steps and proof-of-impact are **not** imported — they carry captured tokens and exfiltrated data
+  by design. See [docs/shannon-integration.md](docs/shannon-integration.md).
 - **Agent security test** — red-teams GreyIQ's own agent in a throwaway sandbox
   (sandbox/policy probes always; opt-in prompt-injection + jailbreak behavioral probes)
   and reports a posture verdict.

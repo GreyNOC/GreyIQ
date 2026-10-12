@@ -56,7 +56,7 @@ from bughunter import (
 )
 from bughunter.bounty import _classify, _infer_kind, _safe_slug, build_findings_har, build_replay_script, run_bounty_hunt
 from bughunter.rate_limit import shared_governor
-from bughunter.registrable_domain import registrable_domain
+from bughunter.registrable_domain import is_ip_literal, registrable_domain
 from bughunter.settings import get_settings
 from bughunter.target_ingest import _normalize_one
 from bughunter.code_scanner.sources.git_remote import is_supported_remote_git_url
@@ -285,6 +285,13 @@ def _run_campaign_body(
     osint: bool = False,
     platform: str = "hackerone",
     deep: bool = False,
+    iterate: bool = False,
+    # The operator's OOB collaborator (base URL + bearer). Empty = no collaborator, and the
+    # blind-vuln probes stay off, exactly as before. A caller must only supply these for a
+    # program whose `oob_allowed` is set — that field exists as "operator-confirmed: this
+    # program's policy permits out-of-band/collaborator testing" and this is what reads it.
+    oob_base: str = "",
+    oob_secret: str = "",
     on_progress: Any = None,
     disclose_automation: bool = False,
     excluded_hosts: tuple[str, ...] = (),
@@ -324,6 +331,19 @@ def _run_campaign_body(
         base_settings,
         excluded_hosts=tuple(excluded_hosts or ()),
         recon_osint_enabled=bool(osint or base_settings.recon_osint_enabled),
+        # `iterate` turns on the outer theorize -> act wave for THIS run, without the
+        # operator having to set a process-wide env var — the same per-run override shape
+        # `osint` already uses, and `or base_settings...` so a per-run flag can only ever
+        # turn a feature ON (never off, which is the env/global's call).
+        #
+        # It deliberately does NOT set hunt_loop_enabled. That flag swaps the active pass
+        # for hunt_loop.run_iterative_verify, which probes the SEED URL and nothing else
+        # (bounty.py: `active_swept = {clean_target}  # the loop probes the seed and
+        # nothing else`) instead of every ranked endpoint — so on a multi-endpoint target
+        # "iterate" would NARROW coverage. The replan wave is additive instead: it runs
+        # after the first active pass, across every scanner's findings, through the same
+        # gated prover. Depth without losing breadth.
+        hunt_replan_enabled=bool(iterate or base_settings.hunt_replan_enabled),
     )
 
     rt = runtime_dir
@@ -677,6 +697,15 @@ def _run_campaign_body(
             version=version, run_live=live, active=effective_active, time_based=(time_based or deep), auth=auth, per_finding=False,
             extra_params=recon_params, on_progress=_emit, settings=campaign_settings, class_priority=hunt_priority.get(url),
             ssrf_params=brain_ssrf_params, xss_params=brain_xss_params,
+            # The out-of-band collaborator. Without these four blind classes are
+            # unconfirmable — blind SSRF, XXE-over-HTTP, blind RCE, and jku/x5u JWT key
+            # injection reflect NOTHING in the target's own response, so a callback is the
+            # only observable there is. They were previously passed by exactly one caller
+            # (the cockpit's single-target scan), so every campaign — and therefore every
+            # unattended operator cycle — ran with the collaborator inert even when one was
+            # configured. The caller only supplies them for a program whose `oob_allowed` is
+            # set, so arming this is still an explicit per-program operator decision.
+            oob_base=oob_base, oob_secret=oob_secret,
         )
         per_target.append({"target": url, "ok": result.get("ok", False),
                            "report_path": result.get("report_path", ""), "error": result.get("error", "")})
@@ -765,9 +794,20 @@ def _run_campaign_body(
         # draws that boundary too). Additive and order-only; the gated prover still owns confirm.
         if confirmed_here:
             try:
-                here = registrable_domain((urlparse(url).hostname or "").lower())
+                # IP hosts must match EXACTLY. registrable_domain is a last-two-labels
+                # heuristic, so folding IPs through it made 10.0.0.5 and 192.168.0.5 both
+                # "0.5" — which would hand a confirmed class on one box to the front of the
+                # probe order on an unrelated one, breaking the very invariant the comment
+                # above states ("a confirmation on one property says nothing about another").
+                # scan_auth and attack_chain already guard their registrable-domain checks
+                # the same way; this call site did not.
+                here_host = (urlparse(url).hostname or "").lower()
+                here = here_host.strip("[]") if is_ip_literal(here_host) else registrable_domain(here_host)
                 for later in urls[index:]:
-                    if not here or registrable_domain((urlparse(later).hostname or "").lower()) != here:
+                    later_host = (urlparse(later).hostname or "").lower()
+                    later_key = (later_host.strip("[]") if is_ip_literal(later_host)
+                                 else registrable_domain(later_host))
+                    if not here or later_key != here:
                         continue
                     hunt_priority[later] = list(dict.fromkeys(
                         confirmed_here + (hunt_priority.get(later) or [])))

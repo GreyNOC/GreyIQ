@@ -18,6 +18,33 @@ substitute for the real Public Suffix List.
 
 from __future__ import annotations
 
+import ipaddress
+
+
+def is_ip_literal(host: str) -> bool:
+    """True when ``host`` is an IPv4/IPv6 literal rather than a domain name.
+
+    An IP has no registrable domain, and running one through :func:`registrable_domain`
+    produces a dangerous answer rather than a useless one: the last-two-labels heuristic
+    maps ``127.0.0.1`` and ``10.0.0.1`` both to ``0.1``, and ``192.168.1.50`` and
+    ``10.20.1.50`` both to ``1.50`` — silently MERGING unrelated hosts that happen to share
+    their final two octets.
+
+    Two modules had already each written their own private copy of this check for exactly
+    that reason — ``scan_auth.same_registrable_site`` (so a session minted on one IP is
+    never replayed to another) and ``attack_chain._same_trust_boundary`` (whose comment
+    reads *"reducing IPs through it would silently merge two unrelated hosts … trading the
+    old over-penalty for a new false-merge"*). Two copies in the two places that remembered
+    is how the modules that FORGOT ended up with no guard at all, so it lives here once, in
+    the module that owns the heuristic it protects.
+    """
+    try:
+        ipaddress.ip_address((host or "").strip().strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
 # Common multi-label ccSLDs an operator's scope text might genuinely contain a 3+-label
 # host under (e.g. "shop.example.co.uk"). Last TWO labels alone is wrong for these.
 _CC_SECOND_LEVEL = frozenset({

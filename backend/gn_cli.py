@@ -378,6 +378,52 @@ _LEAD_STATUS_COLOR = {
 }
 
 
+def _cmd_shannon(args: argparse.Namespace) -> int:
+    """Import a finished Shannon run as GreyIQ candidate findings.
+
+    Shannon is an external autonomous pentest engine run outside GreyIQ (see
+    docs/shannon-integration.md). This reads the ``report.sarif`` it left behind and shows
+    what GreyIQ would take from it. Everything imports as a CANDIDATE: GreyIQ's own prover
+    never saw this target, so none of it can reach a live submission — that refusal is
+    enforced in report._has_captured_artifact and submission.submit_to_hackerone, not here."""
+    from bughunter.shannon import workspace
+
+    result = workspace.ingest_workspace(args.path)
+    for note in result.get("notes") or ():
+        print(_c(f"note: {note}", "33"), file=sys.stderr)
+    for warning in result.get("warnings") or ():
+        print(_c(f"warning: {warning}", "33"), file=sys.stderr)
+
+    if not result.get("ok"):
+        return _err(result.get("error") or "could not import that Shannon run")
+
+    findings = result["findings"]
+    if args.json:
+        print(json.dumps({"ok": True, "sarif": result["sarif_path"], "findings": findings},
+                         indent=2, default=str))
+        return 0
+
+    run = result["run"]
+    print(f"Shannon run   {result['sarif_path']}")
+    print(f"  target      {run.target or '<unrecorded>'}")
+    print(f"  model       {run.model or '<unrecorded>'}")
+    print(f"  assessed    {run.assessment_date or '<unrecorded>'}")
+    print(f"  candidates  {len(findings)}"
+          + (f"  ({run.dropped} dropped)" if run.dropped else ""))
+    print()
+    for finding in findings:
+        detail = finding["source_detail"]
+        klass = finding.get("_active_class_hint") or "<unclassified>"
+        print(f"  [{finding['severity']:<6}] {detail['shannon_finding_id']:<10} {klass:<16} {finding['title']}")
+        print(f"            {finding['location']}")
+        print(f"            class via {detail['class_resolved_by'] or 'nothing — abstained'}"
+              + (f" · {detail['cwe']}" if detail.get("cwe") else ""))
+        print(f"            to confirm: {finding['proof_of_impact']['proof_obligation']}")
+    print()
+    print(_c("All imported as candidates. GreyIQ proved none of these; none can auto-submit.", "33"))
+    return 0
+
+
 def _cmd_leads(args: argparse.Namespace) -> int:
     """Export a finished hunt's ranked investigation queue — the lead bridge.
 
@@ -487,17 +533,63 @@ def _operator_callables(coder_cfg: dict):
     submission.submit_to_hackerone (confirm + proof_status=='confirmed' + creds)."""
     from datetime import UTC, datetime
 
+    from uuid import uuid4
+
     from bughunter import campaign as campaign_mod
+    from bughunter import portfolio as portfolio_mod
     from bughunter import submission as submission_mod
 
     last: dict = {}
 
-    def run_campaign_fn(target, *, scope, program, active, live, deep=False, max_pages=12):
+    def run_campaign_fn(target, *, scope, program, active, live, deep=False, iterate=False, max_pages=12):
+        # Re-resolve the saved program by its id and carry its HUNTING REQUIREMENTS, exactly as
+        # the API path does (greyiq_api._operator_run_campaign -> run_campaign re-looks-up the pid).
+        # Without this the CLI operator dropped every one of them, and the defaults are all
+        # permissive: excluded_hosts=() made the FIRST and highest-priority check in the
+        # fail-closed scope gate a no-op, so recon's in-scope expansion under a wildcard scope
+        # could reach a host the operator had explicitly listed out of scope and the active
+        # prover would probe it. policy_profile="" dropped a VDP program's rules of engagement
+        # (avoid_dos, excluded endpoints, confirmed_only); user_agent_suffix="" stripped the
+        # researcher tag a program may REQUIRE on every request; disclose_automation=False
+        # omitted the automated-tool disclosure from the submission body; and platform
+        # defaulted to hackerone, so a HackenProof/manual program got HackerOne-shaped packages.
+        prog = portfolio_mod.get_program(RUNTIME_DIR, program) if program else None
+        extra: dict = {}
+        if prog is not None:
+            extra = {
+                "excluded_hosts": tuple(str(h) for h in (prog.get("out_of_scope_hosts") or [])),
+                "policy_profile": str(prog.get("policy_profile") or ""),
+                "user_agent_suffix": str(prog.get("user_agent_suffix") or ""),
+                "account_access": prog.get("account_access") or None,
+                "admin_account_access": prog.get("admin_account_access") or None,
+                "idor_pairs": prog.get("idor_pairs") or None,
+                "disclose_automation": bool(prog.get("disclose_automation")),
+                "platform": str(prog.get("platform") or "hackerone"),
+            }
+            # The OOB collaborator, ONLY for a program whose oob_allowed is set. Without
+            # this the four blind classes — blind SSRF, XXE-over-HTTP, blind RCE, and
+            # jku/x5u JWT key injection — are unconfirmable in any unattended cycle,
+            # because a callback is their only observable. Gating on the program's own
+            # recorded policy consent is the point: a collaborator makes the TARGET reach
+            # out to our host, so it is a per-program decision, never a global switch.
+            if prog.get("oob_allowed"):
+                base, secret = _oob_creds()
+                if base and secret:
+                    extra["oob_base"], extra["oob_secret"] = base, secret
         result = campaign_mod.run_campaign(
             target, scope=scope, authorized=True, coder_cfg=coder_cfg,
             default_reports_dir=RUNTIME_DIR / "reports", seed_dir=SEED_DIR, runtime_dir=RUNTIME_DIR,
-            version=VERSION, active=active, live=live, deep=deep, program=program, max_pages=max_pages,
+            version=VERSION, active=active, live=live, deep=deep, iterate=iterate,
+            program=program, max_pages=max_pages, **extra,
         )
+        # operator.run_program_cycle refuses to submit without a run_id, and campaign.run_campaign
+        # does not mint one (the API path gets it as a side effect of _cache_bounty_run). Minting
+        # it here is what makes `gn operator run --allow-submit` able to file at all: before this,
+        # the armed path printed "AUTO-SUBMIT ARMED", hunted, confirmed findings, filed nothing,
+        # and reported no error. submit_fn below ignores the value and rebuilds from `last`, so the
+        # id only has to exist and be stable for the cycle.
+        if isinstance(result, dict) and result.get("ok") and not result.get("run_id"):
+            result["run_id"] = f"gn-operator-{uuid4().hex[:12]}"
         last["result"], last["target"], last["scope"] = result, target, scope
         return result
 
@@ -522,7 +614,37 @@ def _operator_callables(coder_cfg: dict):
         except submission_mod.SubmissionError as exc:
             return {"ok": False, "error": str(exc)}
 
-    return run_campaign_fn, submit_fn
+    def sync_fn():
+        """Pull adjudicated HackerOne outcomes into the learning store.
+
+        This is the loop that makes the operator's ranking improve on its own: without it
+        the engine's only automatic outcome write is status='submitted', which
+        learning.learned_priors discards, so payout priors stay {} forever however many
+        cycles run. Read-only and bounded — GETs for reports GreyIQ itself submitted,
+        capped per pass by ledger.submitted_records."""
+        from bughunter import outcome_sync
+
+        _, username, token = _hackerone_creds()
+        return outcome_sync.sync_outcomes(RUNTIME_DIR, api_username=username, api_token=token)
+
+    return run_campaign_fn, submit_fn, sync_fn
+
+
+def _oob_creds() -> tuple[str, str]:
+    """(collaborator base URL, bearer secret) from the shared secrets file.
+
+    The same two values the desktop app's OOB panel writes (``save_oob_config``), read the
+    same way ``_hackerone_creds`` reads its own — so a terminal-driven hunt uses the
+    collaborator the operator already configured in the app, with no second place to set it.
+    """
+    try:
+        secrets = json.loads((RUNTIME_DIR / "secrets.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ("", "")
+    if not isinstance(secrets, dict):
+        return ("", "")
+    return (str(secrets.get("oob.collaborator_url", "") or "").strip(),
+            str(secrets.get("oob.secret", "") or "").strip())
 
 
 def _hackerone_creds() -> tuple[str, str, str]:
@@ -535,6 +657,149 @@ def _hackerone_creds() -> tuple[str, str, str]:
         secrets = {}
     return (str(secrets.get("hackerone.team_handle", "")), str(secrets.get("hackerone.api_username", "")),
             str(secrets.get("hackerone.api_token", "")))
+
+
+def _train_brain_fn() -> dict:
+    """Retrain the offline hunt ranker from the local corpus. Local only, no network.
+
+    The trainer owns its own honest gate (too few rows, a single-program corpus, or a model
+    that does not beat the hand-tuned rules are all refusals) and never raises, so the
+    operator can call this every pass and simply ignore the refusals."""
+    from bughunter import hunt_train
+
+    return hunt_train.train(RUNTIME_DIR, seed_dir=SEED_DIR)
+
+
+def _cmd_sync(args: argparse.Namespace) -> int:
+    """Pull adjudicated HackerOne outcomes into the learning store.
+
+    The operator loop now does this once per pass on its own; this verb is the manual path,
+    and it was the piece missing from the CLI entirely — the sync existed only as an HTTP
+    route, so a terminal-driven install could never close the outcome loop at all."""
+    from bughunter import outcome_sync
+
+    _, username, token = _hackerone_creds()
+    if not (username and token):
+        return _err("no HackerOne API credentials stored — save them in the Submissions tab first.")
+    result = outcome_sync.sync_outcomes(RUNTIME_DIR, api_username=username, api_token=token,
+                                        limit=args.limit)
+    if not result.get("ok"):
+        return _err(str(result.get("error") or "sync failed"))
+    if args.json:
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+    print(f"checked {result['checked']} report(s), {result['updated']} ledger update(s), "
+          f"{result['outcomes']} adjudicated outcome(s) learned")
+    for problem in result.get("errors") or ():
+        print(_c(f"  problem: {problem}", "33"))
+    if not result["outcomes"]:
+        print(_c("  nothing adjudicated yet — in-progress reports carry no outcome to learn.", "33"))
+    return 0
+
+
+def _cmd_auto(args: argparse.Namespace) -> int:
+    """Hunt from a directory: resolve its targets, hunt them, then keep auto-hunting.
+
+    Open a terminal in a repo or a folder that lists its targets and this is the one command.
+    It registers the directory as a portfolio program so the same learning memory (negative
+    knowledge, priors, surface drift, the ledger) accumulates across runs, hunts once
+    immediately, then hands off to the normal operator loop.
+
+    Authorization is NOT read from the directory. A file on disk cannot assert that a human
+    is authorized to test a target, so -y/--authorize stays the only source — the same gate
+    every other state-touching verb here uses."""
+    from bughunter import hunt_dir
+    from bughunter import operator as operator_mod
+    from bughunter import portfolio
+
+    plan = hunt_dir.resolve(args.path)
+    print(_c(f"GreyIQ auto-hunt — {plan.root}", "1"))
+    if plan.source:
+        print(f"  targets from  {plan.source}")
+    for target in plan.targets:
+        print(f"    - {target}")
+    if plan.scope_text:
+        print(f"  scope from    {plan.scope_source}")
+        for line in plan.scope_text.splitlines():
+            print(f"    - {line}")
+    for note in plan.notes:
+        print(_c(f"  note: {note}", "33"))
+    for refusal in plan.refusals:
+        print(_c(f"  refused: {refusal}", "33"))
+
+    if not plan.ok:
+        return _err("nothing to hunt here — see the refusals above.")
+
+    posture = "ACTIVE" if plan.active else "passive only"
+    if plan.active and plan.iterate:
+        posture += " + theorize->act re-plan"
+    print(f"  posture       {posture}")
+    print(f"  program       {plan.name}  (re-hunts every {plan.interval_minutes} min)")
+
+    if args.dry_run:
+        print(_c("\ndry run — nothing was hunted. Drop --dry-run to start.", "33"))
+        return 0
+    if not args.authorize:
+        return _err("an auto hunt tests live targets on a schedule — pass -y/--authorize to "
+                    "confirm you're authorized on every target listed above.")
+
+    record = {
+        "name": plan.name,
+        "platform": plan.platform,
+        "platform_handle": plan.platform_handle,
+        "scope_text": plan.scope_text,
+        "seed_targets": plan.targets,
+        "repository_urls": plan.repository_urls,
+        "clone_repositories": bool(plan.repository_urls),
+        "active": plan.active and not args.passive,
+        "iterate": plan.iterate and not args.passive,
+        "max_pages": plan.max_pages,
+        "interval_minutes": args.interval or plan.interval_minutes,
+        "enabled": True,
+    }
+    program = portfolio.upsert_program(RUNTIME_DIR, record)
+    pid = program["id"]
+    # _normalize may have refused what the directory asked for (its fail-closed coupling
+    # forces active/iterate off without a scope). Report what was actually saved, never what
+    # was requested — the whole failure mode here is a silent downgrade.
+    if plan.active and not program.get("active"):
+        print(_c("  note: active probing was NOT armed — the saved program has no usable scope.", "33"))
+    print(_c(f"\nprogram '{pid}' saved. Hunting now…\n", "1"))
+
+    run_campaign_fn, submit_fn, sync_fn = _operator_callables(_load_coder_config(args.brain))
+    if args.allow_submit:
+        print(_c("AUTO-SUBMIT ARMED — confirmed, non-duplicate findings will be filed "
+                 "(per-program opt-in + daily cap apply).", "1;31"))
+    submit = submit_fn if (args.allow_submit and program.get("auto_submit")) else None
+
+    summary = operator_mod.run_program_cycle(
+        RUNTIME_DIR, program, run_campaign_fn=run_campaign_fn, submit_fn=submit, sync_fn=sync_fn,
+        on_event=lambda m: print(f"  {m}"))
+    print(f"\n  {summary['targets_run']} targets, {summary['findings']} findings, "
+          f"{summary['confirmed']} confirmed, {summary['submitted']} submitted")
+    for problem in summary.get("errors") or ():
+        print(_c(f"  problem: {problem}", "33"))
+
+    if args.once:
+        print(_c("\n--once — stopping after this cycle.", "33"))
+        return 0
+
+    loop = operator_mod.OperatorLoop(RUNTIME_DIR, run_campaign_fn=run_campaign_fn, submit_fn=submit_fn,
+                                    sync_fn=sync_fn, train_fn=_train_brain_fn)
+    loop.start(allow_submit=args.allow_submit)
+    print(_c("\nAuto-hunting — Ctrl+C to stop.", "1"))
+    seen = 0
+    try:
+        while loop.running:
+            tail = loop.event_tail(after=seen)
+            for event in tail.get("events") or ():
+                print(f"  {event.get('message', '')}")
+                seen += 1
+            loop.stop_event.wait(timeout=2.0)
+    except KeyboardInterrupt:
+        loop.stop()
+        print(_c("\nKill switch — stopping after the current step…", "33"))
+    return 0
 
 
 def _cmd_operator(args: argparse.Namespace) -> int:
@@ -584,8 +849,9 @@ def _cmd_operator(args: argparse.Namespace) -> int:
     if action == "run":
         if not args.authorize:
             return _err("the operator runs live campaigns — pass -y/--authorize to confirm you're authorized on every enabled program.")
-        run_campaign_fn, submit_fn = _operator_callables(_load_coder_config(args.brain))
-        loop = operator_mod.OperatorLoop(rt, run_campaign_fn=run_campaign_fn, submit_fn=submit_fn)
+        run_campaign_fn, submit_fn, sync_fn = _operator_callables(_load_coder_config(args.brain))
+        loop = operator_mod.OperatorLoop(rt, run_campaign_fn=run_campaign_fn, submit_fn=submit_fn,
+                                         sync_fn=sync_fn, train_fn=_train_brain_fn)
         if args.allow_submit:
             print(_c("AUTO-SUBMIT ARMED — confirmed, non-duplicate findings will be filed (per-program opt-in + daily cap apply).", "1;31"))
         if args.once:
@@ -596,6 +862,7 @@ def _cmd_operator(args: argparse.Namespace) -> int:
                 print(_c(f"· cycle: {p['id']}", "2"))
                 submit = submit_fn if (args.allow_submit and p.get("auto_submit")) else None
                 summary = operator_mod.run_program_cycle(rt, p, run_campaign_fn=run_campaign_fn, submit_fn=submit,
+                                                         sync_fn=sync_fn,
                                                          on_event=lambda m: print(_c(f"    {m}", "2")))
                 print(f"  {p['id']}: {summary['findings']} findings, {summary['confirmed']} confirmed, {summary['submitted']} submitted")
             return 0
@@ -1006,6 +1273,27 @@ def build_parser() -> argparse.ArgumentParser:
     leads.add_argument("--status", default=None, help="filter by status: confirmed|supported|candidate|contradicted|report-ready")
     leads.add_argument("--min-confidence", type=int, default=None, dest="min_confidence", help="only leads with confidence_score >= N")
     leads.set_defaults(func=_cmd_leads)
+
+    sync = sub.add_parser("sync", help="pull adjudicated HackerOne outcomes into the learning store (teaches the engine what pays)")
+    sync.add_argument("--limit", type=int, default=25, help="max reports to poll this pass (default 25)")
+    sync.add_argument("--json", action="store_true")
+    sync.set_defaults(func=_cmd_sync)
+
+    auto = sub.add_parser("auto", help="hunt this directory's targets, then keep auto-hunting (repo or hunt folder)")
+    auto.add_argument("path", nargs="?", default=".", help="the hunt directory (default: the current one)")
+    auto.add_argument("-y", "--authorize", action="store_true", help="confirm you're AUTHORIZED on every target found (required)")
+    auto.add_argument("--dry-run", dest="dry_run", action="store_true", help="show what would be hunted and exit")
+    auto.add_argument("--once", action="store_true", help="hunt one cycle, then exit instead of auto-hunting")
+    auto.add_argument("--passive", action="store_true", help="never arm active probing, whatever the directory asks for")
+    auto.add_argument("--allow-submit", dest="allow_submit", action="store_true", help="ARM auto-submission (per-program opt-in still applies)")
+    auto.add_argument("--interval", type=int, default=0, help="minutes between re-hunts (default: the directory's, else 1440)")
+    auto.add_argument("--brain", action="store_true", help="use the configured LLM brain to enrich")
+    auto.set_defaults(func=_cmd_auto)
+
+    shannon = sub.add_parser("shannon", help="import a finished Shannon run's findings as GreyIQ candidates")
+    shannon.add_argument("path", help="a Shannon run directory, its -o output directory, a workspaces parent, or a report.sarif")
+    shannon.add_argument("--json", action="store_true", help="emit the imported candidate findings as JSON")
+    shannon.set_defaults(func=_cmd_shannon)
 
     op = sub.add_parser("operator", help="autonomous operator — run a portfolio of programs unattended")
     op.set_defaults(func=_cmd_operator, op_action=None)

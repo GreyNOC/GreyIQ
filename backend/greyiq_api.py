@@ -380,7 +380,8 @@ from bughunter import takeover_service as bounty_takeover  # noqa: E402
 from bughunter import cve_service as bounty_cve  # noqa: E402
 from bughunter import oob_service as bounty_oob  # noqa: E402
 from bughunter import stored_xss_service as bounty_stored_xss  # noqa: E402
-from bughunter import ledger as bounty_ledger  # noqa: E402
+from bughunter import ledger as bounty_ledger
+from bughunter import outcome_sync as bounty_outcome_sync  # noqa: E402
 from bughunter import portfolio as bounty_portfolio  # noqa: E402
 from bughunter import vdp_policy as bounty_vdp  # noqa: E402
 from bughunter import secret_classification as bounty_secret_class  # noqa: E402
@@ -649,6 +650,7 @@ class CampaignRequest(BaseModel):
     live: bool = False
     max_pages: int = Field(default=12, ge=1, le=50)
     deep: bool = False  # aggressive: time-based SQLi + auto screenshot + research per confirmed lead
+    iterate: bool = False  # theorize -> act: re-probe the (endpoint, class) the cortex says would most change the verdict. Implies active
     attack_map: bool = True  # render a graphical attack-plan map (.png) per confirmed finding into the POC download + report
     # Per-run UA tag (see BountyScanRequest). Overrides the saved program's user_agent_suffix when
     # set, so the operator can satisfy a policy change without re-saving the program; empty (the
@@ -1284,13 +1286,7 @@ def _confirm_route(fn):
 # (bughunter.learning.OUTCOMES) — only for TERMINAL states; an in-progress state (new,
 # pending-program-review, triaged, needs-more-info, retesting) has no outcome yet and is
 # deliberately absent here, so a sync pass never records a premature "it's over" verdict.
-_H1_STATE_TO_LEARNING_OUTCOME = {
-    "resolved": "resolved",
-    "duplicate": "duplicate",
-    "not-applicable": "not-applicable",
-    "informative": "informative",
-    "spam": "spam",
-}
+_H1_STATE_TO_LEARNING_OUTCOME = bounty_outcome_sync.H1_STATE_TO_LEARNING_OUTCOME
 
 
 # Code-WRITING / -editing intent, for the offline honesty short-circuit (docs/offline-coder-strategy.md).
@@ -2511,6 +2507,12 @@ class GreyIQRuntime:
         admin_account_access = program_obj.get("admin_account_access") if program_obj else None
         idor_pairs = program_obj.get("idor_pairs") if program_obj else None
         policy_profile = str(program_obj.get("policy_profile") or "") if program_obj else ""
+        # The OOB collaborator rides along ONLY for a program whose oob_allowed is set.
+        # That field was stored, normalized and round-tripped over HTTP while nothing in the
+        # engine read it — the operator's recorded policy consent was decorative. It is the
+        # right gate: a collaborator makes the TARGET call out to our host, so it needs the
+        # program's own policy to permit out-of-band testing, per program, not globally.
+        oob_base, oob_secret = self._oob_config() if (program_obj and program_obj.get("oob_allowed")) else ("", "")
         # An explicit per-run tag wins over the saved program's (the operator typed it for THIS run);
         # otherwise the program's stored requirement stands, exactly as before. The value is carried
         # VERBATIM (only the emptiness test is trimmed) — a program dictates its own spacing, which is
@@ -2543,6 +2545,9 @@ class GreyIQRuntime:
             program=request.program,
             max_pages=request.max_pages,
             deep=request.deep,
+            iterate=request.iterate,
+            oob_base=oob_base,
+            oob_secret=oob_secret,
             include_attack_map=request.attack_map,
             disclose_automation=disclose_automation,
             excluded_hosts=excluded_hosts,
@@ -3879,7 +3884,8 @@ class GreyIQRuntime:
 
     # ---- Autonomous operator ------------------------------------------------------
     def _operator_run_campaign(self, target: str, *, scope: str, program: str, active: bool, live: bool,
-                               deep: bool = False, max_pages: int = 12) -> dict[str, Any]:
+                               deep: bool = False, iterate: bool = False,
+                               max_pages: int = 12) -> dict[str, Any]:
         """The operator's run_campaign_fn — goes through runtime.run_campaign so the
         run is cached (run_id) and the submit path can resolve it. authorized=True
         because the operator only runs after the user explicitly armed it (the start
@@ -3888,8 +3894,25 @@ class GreyIQRuntime:
         lead) through unchanged."""
         return self.run_campaign(CampaignRequest(
             target=target, scope=scope, authorized=True, program=program,
-            active=active, live=live, deep=deep, max_pages=max_pages,
+            active=active, live=live, deep=deep, iterate=iterate, max_pages=max_pages,
         ))
+
+    def _operator_retrain(self) -> dict[str, Any]:
+        """Retrain the offline hunt ranker from the corpus the loop is growing. Local, no
+        network. The trainer's own gate refuses a corpus too small or too narrow to support
+        a model, and refuses a model that does not beat the hand-tuned rules."""
+        from bughunter import hunt_train
+
+        return hunt_train.train(RUNTIME_DIR, seed_dir=SEED_DIR)
+
+    def _operator_sync_outcomes(self) -> dict[str, Any]:
+        """The operator's outcome sync — the SAME bounded, read-only poll the Submissions tab
+        runs, so the unattended loop learns real HackerOne verdicts instead of leaving payout
+        priors permanently empty. Returns a not-ok envelope when no credentials are stored,
+        which the loop reports and carries on from."""
+        _, username, token = self._hackerone_creds()
+        return bounty_outcome_sync.sync_outcomes(
+            RUNTIME_DIR, api_username=username, api_token=token)
 
     def _operator_submit(self, run_id: str, ref: str) -> dict[str, Any]:
         """The operator's submit_fn — the SAME hard-gated runtime.submit_finding (confirm
@@ -3903,6 +3926,8 @@ class GreyIQRuntime:
                     str(RUNTIME_DIR),
                     run_campaign_fn=self._operator_run_campaign,
                     submit_fn=self._operator_submit,
+                    sync_fn=self._operator_sync_outcomes,
+                    train_fn=self._operator_retrain,
                 )
             return self._operator
 
@@ -4127,60 +4152,18 @@ class GreyIQRuntime:
         return earnings
 
     def sync_hackerone_reports(self, request: "HackerOneSyncRequest") -> dict[str, Any]:
-        """Poll HackerOne for the current status of every locally-'submitted' finding
-        (bounded, never automatic) and reflect real outcomes back onto the ledger + the
-        learning store, closing the loop that today requires manually running `gn learn`.
-        A bare state change (e.g. new -> triaged) only updates the ledger's h1_state; a
-        transition to a REWARDED terminal state also flips the ledger stage to 'paid'; any
-        terminal state (rewarded or not) is also recorded once to the learning store so
-        future EV ranking uses the real HackerOne outcome instead of the placeholder
-        'submitted' status recorded at submit time."""
+        """Poll HackerOne for the current status of every locally-'submitted' finding and
+        reflect real outcomes back onto the ledger + the learning store.
+
+        The logic lives in ``bughunter.outcome_sync`` so this route, the ``gn sync`` CLI verb
+        and the operator loop's own per-cycle sync all share ONE definition. It used to be a
+        method here, which is exactly why neither the CLI nor the unattended loop could reach
+        it — and why payout priors stayed empty on any install driven from the terminal."""
         _, username, token = self._hackerone_creds()
         if not (username and token):
             return {"ok": False, "error": "Save your HackerOne API username + token in the Submissions tab first."}
-        records = bounty_ledger.submitted_records(RUNTIME_DIR, limit=request.limit)
-        checked, updated, errors = 0, 0, []
-        for rec in records:
-            checked += 1
-            status = bounty_h1_activity.fetch_report_status(rec.get("h1_report_id", ""), username, token)
-            if not status.get("ok"):
-                errors.append(f"#{rec.get('h1_report_id')}: {status.get('error', 'unknown error')}")
-                continue
-            state = str(status.get("state") or "")
-            resolved_with_reward = bool(status.get("bounty_awarded_at") or status.get("swag_awarded_at"))
-            # A reward can appear on the live report before (or without) a state change —
-            # e.g. still 'triaged' but bounty_awarded_at just got set — so skip only when
-            # NEITHER signal moved. submitted_records() only ever returns stage=='submitted'
-            # records (never already 'paid'), so resolved_with_reward alone is always new
-            # information worth recording here, regardless of the state comparison.
-            if state == str(rec.get("h1_state") or "") and not resolved_with_reward:
-                continue  # nothing new to reflect since the last sync
-            try:
-                reward_amount = float(status.get("total_awarded_amount") or 0.0)
-            except (TypeError, ValueError):
-                reward_amount = 0.0
-            bounty_ledger.record_h1_sync(RUNTIME_DIR, rec["pid"], rec["key"], state=state,
-                                         resolved_with_reward=resolved_with_reward, bounty=reward_amount)
-            updated += 1
-            learning_status = _H1_STATE_TO_LEARNING_OUTCOME.get(state)
-            if learning_status:
-                try:
-                    # rec["program"] is the ledger's already-slugified pid; passing it as
-                    # `program=` is safe — learning.program_key() treats a non-empty
-                    # `program` as authoritative and slugifies it again, which is a no-op
-                    # on an already-slug string, so this resolves to the SAME learning
-                    # bucket the ledger used, regardless of `target`.
-                    bounty_learning.record_outcome(
-                        RUNTIME_DIR, program=rec.get("program"), target=rec.get("source_url", ""),
-                        class_id=str(rec.get("class_id") or "other"), title=str(rec.get("title") or ""),
-                        status=learning_status, severity=str(rec.get("severity") or ""),
-                        # The freshly-fetched amount (rec['bounty'] is the pre-sync copy, still 0.0).
-                        bounty=reward_amount if resolved_with_reward else 0.0,
-                        notes=f"HackerOne report {rec.get('h1_report_id')} synced to '{state}'",
-                    )
-                except ValueError:
-                    pass
-        return {"ok": True, "checked": checked, "updated": updated, "errors": errors}
+        return bounty_outcome_sync.sync_outcomes(
+            RUNTIME_DIR, api_username=username, api_token=token, limit=request.limit)
 
     def remove_program(self, program_id: str) -> dict[str, Any]:
         """Delete a program AND cascade to its findings: the program is removed from the
@@ -4230,7 +4213,11 @@ class GreyIQRuntime:
         return {
             "ok": True,
             "funnel": bounty_ledger.funnel(RUNTIME_DIR),
-            "programs": bounty_portfolio.list_programs(RUNTIME_DIR),
+            # _program_for_read, like every other route that returns a program. Without it this
+            # one shipped account_access.password / .cookie and the high-privilege
+            # admin_account_access in plaintext to the Operator tab's poll — the only
+            # program-returning route that skipped the redactor.
+            "programs": [_program_for_read(p) for p in bounty_portfolio.list_programs(RUNTIME_DIR)],
             "learning": bounty_learning.program_summary(RUNTIME_DIR),
             "running": bool(self._operator and self._operator.running),
         }

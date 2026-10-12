@@ -63,6 +63,7 @@ _DEFAULTS: dict[str, Any] = {
     "active": False,               # capture proof-of-impact (active verification)
     "live": False,                 # dynamic Playwright pass
     "deep": False,                 # aggressive: time-based SQLi + auto screenshot + research per confirmed lead
+    "iterate": False,              # theorize -> act: after the first active pass, re-probe the (endpoint, class) the cortex says would most change the verdict. Implies active; spends extra requests
     "auto_submit": False,          # FILE confirmed findings automatically — DANGER, default off
     "max_pages": 12,
     "interval_minutes": 1440,      # how often the operator re-runs this program
@@ -305,10 +306,15 @@ def _normalize(record: dict[str, Any]) -> dict[str, Any]:
         out["active"] = False
         out["live"] = False
         out["deep"] = False
+        out["iterate"] = False
         out["auto_submit"] = False
     # Deep implies proof-of-impact (it adds time-based SQLi + screenshot/research per
     # confirmed lead), so a deep program is always active.
     if out.get("deep"):
+        out["active"] = True
+    # Iterate re-probes after the first ACTIVE pass, so without active verification there is
+    # no pass to re-plan from and the flag would be a silent no-op. Same coupling as deep.
+    if out.get("iterate"):
         out["active"] = True
     # Auto-submit additionally requires a platform handle to even attempt a file.
     if out["auto_submit"] and not (out["platform"] == "hackerone" and str(out.get("platform_handle") or "").strip()):

@@ -1412,3 +1412,105 @@ class ProofScreenshotCaptureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IterateSettingsOverrideTests(unittest.TestCase):
+    """`iterate` must become hunt_replan_enabled on the per-run settings — and must NOT
+    set hunt_loop_enabled.
+
+    The distinction is the whole design: hunt_loop_enabled swaps the active pass for
+    hunt_loop.run_iterative_verify, which probes the SEED URL and nothing else
+    (bounty.py: `active_swept = {clean_target}  # the loop probes the seed and nothing
+    else`) rather than every ranked endpoint — so routing "iterate" there would NARROW
+    active coverage on a multi-endpoint target. The replan wave is additive: it runs after
+    the first active pass, across every scanner's findings, through the same gated prover.
+
+    Asserted by spying on the module's own dataclasses.replace, because that one call is
+    the entire contract and it is exactly the kind of per-run override that silently
+    becomes a no-op when a parameter is accepted and then dropped."""
+
+    def _captured_settings(self, **body_kwargs):
+        captured = {}
+        real_replace = campaign.dataclasses.replace
+
+        def spy(obj, **kw):
+            out = real_replace(obj, **kw)
+            if "hunt_replan_enabled" in kw:
+                captured["settings"] = out
+            return out
+
+        campaign.dataclasses.replace = spy
+        try:
+            campaign._run_campaign_body(
+                "https://app.example.com", scope="example.com", authorized=True,
+                coder_cfg=None, default_reports_dir=Path(tempfile.mkdtemp()), **body_kwargs)
+        finally:
+            campaign.dataclasses.replace = real_replace
+        return captured.get("settings")
+
+    def test_iterate_arms_the_replan_wave(self) -> None:
+        settings = self._captured_settings(iterate=True)
+        self.assertIsNotNone(settings, "campaign_settings was never built")
+        self.assertTrue(settings.hunt_replan_enabled)
+
+    def test_iterate_does_not_arm_the_seed_only_loop(self) -> None:
+        settings = self._captured_settings(iterate=True)
+        self.assertFalse(settings.hunt_loop_enabled,
+                         "iterate must not narrow the active sweep to the seed URL")
+
+    def test_default_leaves_the_replan_wave_alone(self) -> None:
+        settings = self._captured_settings()
+        self.assertFalse(settings.hunt_replan_enabled)
+
+
+class OobCollaboratorThreadingTests(unittest.TestCase):
+    """The campaign must hand the OOB collaborator to each per-URL hunt.
+
+    Before this, exactly ONE caller in the codebase passed `oob_base`/`oob_secret` into a
+    hunt — the cockpit's single-target scan. `campaign.py` never did, so every campaign,
+    and therefore every unattended operator cycle, ran with the collaborator inert even
+    when one was configured. The four classes that depend on it are blind SSRF,
+    XXE-over-HTTP, blind RCE and jku/x5u JWT key injection: each reflects NOTHING in the
+    target's own response, so a callback is the only observable there is, and
+    unauthenticated blind RCE was among the findings only a hand-driven hunt could reach.
+
+    The caller supplies the pair only for a program whose `oob_allowed` is set, so arming
+    it stays an explicit per-program operator decision rather than a global switch.
+    """
+
+    def _captured(self, **body_kwargs):
+        seen = {}
+        real = campaign.run_bounty_hunt
+
+        def spy(*a, **kw):
+            seen["base"] = kw.get("oob_base")
+            seen["secret"] = kw.get("oob_secret")
+            return {"ok": False, "error": "captured"}
+
+        campaign.run_bounty_hunt = spy
+        try:
+            campaign._run_campaign_body(
+                "https://app.example.com", scope="example.com", authorized=True,
+                coder_cfg=None, default_reports_dir=Path(tempfile.mkdtemp()),
+                active=True, **body_kwargs)
+        finally:
+            campaign.run_bounty_hunt = real
+        return seen
+
+    def test_the_collaborator_reaches_the_per_url_hunt(self) -> None:
+        seen = self._captured(oob_base="https://collab.example", oob_secret="s" * 32)
+        self.assertEqual(seen["base"], "https://collab.example")
+        self.assertEqual(seen["secret"], "s" * 32)
+
+    def test_no_collaborator_by_default(self) -> None:
+        """An unconfigured campaign must behave exactly as before — probes stay off."""
+        seen = self._captured()
+        self.assertEqual(seen["base"], "")
+        self.assertEqual(seen["secret"], "")
+
+    def test_a_base_without_a_secret_is_still_passed_through_for_the_hunt_to_refuse(self) -> None:
+        """The hunt owns the both-or-nothing check (it gates on base AND secret being
+        non-empty), so the campaign must not silently half-arm or half-drop the pair."""
+        seen = self._captured(oob_base="https://collab.example", oob_secret="")
+        self.assertEqual(seen["base"], "https://collab.example")
+        self.assertEqual(seen["secret"], "")

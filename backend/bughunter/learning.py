@@ -26,7 +26,7 @@ from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from bughunter.registrable_domain import registrable_domain
+from bughunter.registrable_domain import is_ip_literal, registrable_domain
 
 _STORE_NAME = "bughunter_learning.json"
 _LOCK = threading.Lock()  # serialize read-modify-write (os.replace is atomic but not RMW-safe) -- mirrors ledger.py/portfolio.py
@@ -61,13 +61,24 @@ def _store_path(runtime_dir: str | Path) -> Path:
 
 def program_key(program: str | None, target: str | None = None) -> str:
     """A stable key for a program: an explicit handle if given, else the target's
-    registrable domain (so all of *.example.com share one memory)."""
+    registrable domain (so all of *.example.com share one memory).
+
+    An IP target keys on the FULL address, never its registrable domain. ``registrable_domain``
+    is a last-two-labels heuristic, so folding an IP through it produced ``0.1`` for both
+    ``127.0.0.1`` and ``10.0.0.1``, and ``1.50`` for both ``192.168.1.50`` and ``10.20.1.50``
+    — unrelated hosts sharing one memory bucket. That is not a cosmetic key problem: the
+    bucket carries negative knowledge, whose ``confirmed`` immunity never decays, so a
+    confirmation on one box permanently un-cools that ``(endpoint, class)`` pair on every
+    other box ending in the same two octets. It mattered most exactly where this engine is
+    used most — local dev servers and IP-addressed staging hosts."""
     if program and str(program).strip():
         return re.sub(r"[^a-z0-9._-]+", "-", str(program).strip().lower()).strip("-.") or "default"
     host = ""
     raw = str(target or "").strip()
     if raw:
         host = (urlparse(raw if "://" in raw else "http://" + raw).hostname or "").lower()
+    if is_ip_literal(host):
+        return host.strip("[]") or "default"
     return registrable_domain(host) or "default"
 
 
