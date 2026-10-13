@@ -4,6 +4,38 @@ Notable changes to GreyIQ.
 
 ## Unreleased
 
+## v4.12.0 - hunts that pause at the login wall
+
+- CLI hunts now pause at an authentication wall instead of reporting a protected
+  surface as clean. When the first target response is an auth challenge or a
+  clear login wall, `gn hunt`, `gn campaign`, `gn osint --hunt` and the reviewed
+  first `gn auto` cycle stop before deeper scanning. In an interactive terminal
+  they ask for one of: the research account's session cookie, a bearer token, or
+  an in-scope HTTPS login URL plus the account username and password; cookie,
+  token, username and password entry is hidden. The session is held only in
+  process memory for that run, the engine rechecks the protected page once and
+  continues only if the wall clears, and the session is bound to its issuing
+  site rather than followed across off-site redirects. Prompted secrets require
+  an HTTPS target — including a URL discovered mid-campaign — and an HTTP wall
+  stops with a request for an authorized HTTPS URL. `gn dash` restores the
+  terminal before asking, then restarts that hunt once with the supplied
+  session. Skipping the prompt, supplying an ineffective session, or running
+  under `--json`, `--no-prompt` or without a terminal leaves an explicit
+  `needs_operator` result; scheduled `gn operator run` cycles never prompt and
+  stop at this boundary for operator input. Local source hunts and public pages
+  never ask. The scripted `--cookie` and `--header` paths remain, with a note
+  that arguments can leak into shell history or the process list, so prefer the
+  hidden interactive prompt.
+- Unattended auto hunts can use an approved saved research account. Add
+  `"allow_account_access": true` to a program's grant entry and a saved cookie
+  is used for HTTPS reads; when the account also carries an email, password and
+  an exact in-scope HTTPS `login_url`, the browser may submit one login POST per
+  cycle to that URL. The form must resolve to the same URL and use POST — any
+  other action or method stops the cycle. Authorization is still never read from
+  the target, and the saved-account path rides the same per-program grant,
+  policy reference and audit trail the operator loop already requires.
+- Bump Electron from 44.5.1 to 44.7.0 (Dependabot).
+
 ## v4.11.0 - the threat board in the terminal
 
 - `gn hunt`, `gn campaign` and `gn auto` draw a full-screen threat board while
