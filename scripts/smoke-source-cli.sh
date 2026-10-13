@@ -42,6 +42,30 @@ runuser -u hunter -- bash -c 'cd /tmp && export PATH="$HOME/.local/bin:$PATH" &&
 runuser -u hunter -- bash -c 'cd /tmp && export PATH="$HOME/.local/bin:$PATH" && gn path'
 runuser -u hunter -- bash -c 'cd /tmp && export PATH="$HOME/.local/bin:$PATH" && gn profiles >/dev/null'
 
+# The first things a new operator runs after a clone: the profile verbs. They write the operator
+# profile and read it back, so this also proves the runtime directory is writable as an ordinary
+# user with no install step beyond the launcher.
+runuser -u hunter -- bash -c 'cd /tmp && export PATH="$HOME/.local/bin:$PATH" && gn setup --defaults >/dev/null'
+runuser -u hunter -- bash -c 'cd /tmp && export PATH="$HOME/.local/bin:$PATH" && gn settings' | grep -q tinygpt
+runuser -u hunter -- bash -c 'cd /tmp && export PATH="$HOME/.local/bin:$PATH" && gn settings set hunt.profile api >/dev/null'
+test "$(runuser -u hunter -- bash -c 'cd /tmp && export PATH="$HOME/.local/bin:$PATH" && gn settings get hunt.profile')" = "api"
+runuser -u hunter -- bash -c 'cd /tmp && export PATH="$HOME/.local/bin:$PATH" && gn output >/dev/null'
+
+# The full-screen views must refuse for want of a TERMINAL, never for want of a dependency: a
+# missing third-party import would show up here as a traceback on a machine that has only python3.
+for view in dash studio; do
+  if runuser -u hunter -- bash -c "cd /tmp && export PATH=\"\$HOME/.local/bin:\$PATH\" && gn $view" >/tmp/view.log 2>&1; then
+    echo "gn $view should refuse when stdout is not a terminal" >&2
+    exit 1
+  fi
+  if grep -qi traceback /tmp/view.log; then
+    echo "gn $view failed on an import rather than on the missing terminal:" >&2
+    cat /tmp/view.log >&2
+    exit 1
+  fi
+  grep -qi terminal /tmp/view.log || { cat /tmp/view.log >&2; exit 1; }
+done
+
 # A hand-made symlink is the other obvious install, and the one that used to
 # break: dirname of the LINK has no backend/ beside it.
 runuser -u hunter -- bash -c 'ln -sfn "$HOME/GreyIQ/gn" "$HOME/.local/bin/gn-linked" && cd / && "$HOME/.local/bin/gn-linked" --version'
