@@ -505,6 +505,29 @@ after saving.
   programs that have actually paid first** instead of alphabetically, and **retrains the offline
   ranker** from the corpus it is growing (the trainer's own gate refuses a corpus too small or a
   model that doesn't beat the rules). `gn sync` does the same pass by hand.
+- **Set it up once** — `gn setup` writes the operator profile: the bot (`tinygpt`, GreyIQ's own
+  local model, by default — no key, nothing leaves the machine), learning on, the default hunt
+  profile, whether active verification is armed by default, and where reports go. ENTER through
+  every question is a valid way to answer it, and `gn setup --defaults` writes exactly that without
+  asking (for scripts, CI and containers). `gn settings` lists every setting with its value, where
+  that value came from, and the commands that change it; `gn settings set hunt.profile api` saves
+  immediately. A verb then reads the profile for anything you did **not** type, so a flag you do
+  type always wins and no setting can turn an armed flag off. **The profile cannot authorize
+  anything** — there is no such setting, unknown keys are refused, and a hand-edited
+  `"authorize": true` does nothing: a file on disk may not assert that a human is authorized.
+  Secrets stay in the perms-restricted store, never in the profile.
+- **One line to hunt** — `gn hunt <target>` with no other flags: the profile supplies the posture,
+  `-y` supplies the target's scope, and on a terminal the authorization question is **asked** (it
+  names the target, and answering it is the same attestation as `-y`). `gn auto hunt -s acme.example`
+  is the scope form — no directory, no target list: each host in the scope seeds an `https://`
+  target, it becomes a saved program so the learning memory accumulates, and the hunt asks for a
+  session when it reaches a login wall. `--json`, `--no-prompt` and a non-terminal still require
+  `-y` outright, because there is nobody there to ask.
+- **Where reports go** — `gn output --path D:/reports` sets the default; `gn output -s acme.example
+  --path D:/engagements/acme` sends that host (and its subdomains, unless they have their own entry)
+  somewhere of its own; `gn output` lists what is set and `--clear` drops one. `-o` on a single run
+  still wins. The folder is recorded, not created — it is made when a report is written, so a typo
+  costs a report in the wrong place rather than an empty tree.
 - **The dash** — `gn dash` opens the **threat board** in standby: the same full-screen map a hunt
   flies arcs across, with nothing running and a command line under it. Type `/hunt <url> -y` and the
   board hands off to the real hunt (so the arcs are the engine's own), the summary and report path

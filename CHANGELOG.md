@@ -4,6 +4,41 @@ Notable changes to GreyIQ.
 
 ## Unreleased
 
+- **An operator profile, so a hunt is one line.** `gn setup` asks six questions once and writes
+  `runtime/operator_profile.json`: the bot (default `tinygpt` — GreyIQ's own local model, no key,
+  nothing off the machine), learning on, the default hunt profile, whether active verification is
+  armed by default, the operator handle and the report folder. Every question defaults to the
+  local-first answer, so ENTER through all of them is a valid way to answer, and `--defaults` writes
+  that without asking. `gn settings` lists every setting with its value, whether that value is yours
+  or the default, what it does, and the commands that change it; `gn settings get/set/unset/path`
+  manage them, saving on every `set`. A verb now reads the profile for anything the command line did
+  not say — hunt profile, brain, active, per-finding, prompting, platform, output folder — so a flag
+  you typed always wins and no setting can turn an armed flag off. **The profile cannot authorize
+  anything**: there is no such setting, `set` refuses every key it does not know, and a hand-edited
+  `"authorize": true` has no effect, because a file on disk may not assert that a human is
+  authorized (the rule `hunt_dir` already states for `.greyiq/hunt.json`). A missing, unreadable,
+  non-JSON or wrongly-typed profile is the defaults plus one sentence, never an exception, and `gn`
+  with no verb announces the first run rather than blocking on it — a CLI that demands a wizard
+  cannot be driven from a script.
+- **The authorization attestation can be answered at the terminal.** `gn hunt <target>`, `gn
+  campaign`, `gn auto` and `gn dash <target>` without `-y` now ASK, on a terminal, naming the target:
+  "A hunt sends live traffic at it… Confirm you are AUTHORIZED to test it [y/N]". A yes is the same
+  attestation `-y` is — it is still a human saying it, in the moment, about a named target — and it
+  carries the same scope. Anything else, `--json`, `--no-prompt`, a redirected stream or a
+  non-terminal leaves the refusal exactly as before, and nothing in the profile or any file can
+  pre-answer it.
+- **`gn auto hunt -s acme.example`** hunts a scope with no directory and no target list: each host
+  (or `*.wildcard` apex) in the scope seeds an `https://` target, and it produces the same `HuntPlan`
+  a directory does, so the portfolio record, the learning memory, the ledger and the
+  `host_in_active_scope` gate are reached by one path either way. A URL, path or bare public suffix
+  in the scope is refused by name with the host to use instead, rather than widened into a grant. A
+  scope hunt stays passive until `--active` or `hunt.active` arms it (a considered `hunt.json` may
+  ask for active; one line typed at a prompt does not), `--passive` still wins over both, and `gn
+  auto` gained `--active` because the scope form has no hunt file to ask for it.
+- **`gn output` chooses where reports go.** `gn output --path <folder>` for everything, `gn output -s
+  <target|program|campaign> --path <folder>` for one (its subdomains follow it unless they have an
+  entry of their own), `gn output` to list and `--clear` to drop one. `-o` on a single run still
+  wins, and a folder is recorded rather than created.
 - `gn dash` is now the **threat board, resident**. It opens the same full-screen board a hunt flies
   arcs across (`gn_fx.Board`) in STANDBY — nothing running, DEFCON 5, `ASSETS 0/0`, live clock — with
   a command line drawn under the box. It used to refuse unless a run already existed ("name a

@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -116,7 +117,8 @@ class GnCliTests(unittest.TestCase):
         # `greyiq-backend.exe takeover ...` fell through and booted the API server.
         for verb in ("hunt", "campaign", "osint", "scan", "learn", "stats", "traces", "operator",
                      "dashboard", "path", "leads", "profiles", "classes", "tools", "version",
-                     "platforms", "bundle", "takeover", "cve", "idor", "bfla", "idor-probe"):
+                     "platforms", "bundle", "takeover", "cve", "idor", "bfla", "idor-probe",
+                     "setup", "settings", "output"):
             self.assertIn(verb, gn_cli.CLI_COMMANDS)
 
     def test_osint_hunt_requires_authorization_and_scope_before_lookup(self) -> None:
@@ -617,6 +619,359 @@ class DashVerbTests(unittest.TestCase):
         for expected in ("gn dash self-test", "glyph tier", "terminal size", "host counters",
                          "refused"):
             self.assertIn(expected, out)
+
+
+class _Tty(io.StringIO):
+    """A stream that claims to be a terminal, for the paths that only run when one is."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+@contextlib.contextmanager
+def _terminal(answers: list[str]):
+    """Run with stdin/stdout that look like a terminal, answering input() from `answers`.
+
+    The prompts land on ``out.prompts``: a real ``input()`` writes its prompt to the terminal, so
+    without that a test cannot see the one line that carries the question.
+    """
+    replies = iter(answers)
+    out = _Tty()
+    out.prompts = []  # type: ignore[attr-defined]
+
+    def _input(prompt: str = "") -> str:
+        out.prompts.append(str(prompt))  # type: ignore[attr-defined]
+        return next(replies)
+
+    with mock.patch("sys.stdout", out), mock.patch("sys.stdin", _Tty()), \
+         mock.patch("builtins.input", _input):
+        yield out
+
+
+class _ProfileCase(unittest.TestCase):
+    """A CLI with its own runtime directory, so no test can read or write the real profile."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="gn-profile-")
+        self.runtime = Path(self._tmp.name)
+        self._saved = gn_cli.RUNTIME_DIR
+        gn_cli.RUNTIME_DIR = self.runtime
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        gn_cli.RUNTIME_DIR = self._saved
+        self._tmp.cleanup()
+
+    def args(self, *argv: str) -> argparse.Namespace:
+        return gn_cli.build_parser().parse_args(list(argv))
+
+    def set(self, key: str, value: str) -> None:
+        self.assertEqual(_run(["settings", "set", key, value])[0], 0)
+
+
+class SettingsVerbTests(_ProfileCase):
+    """`gn setup`, `gn settings`, `gn output` — the profile as an operator drives it."""
+
+    def test_setup_defaults_writes_a_profile_without_asking(self) -> None:
+        with mock.patch("builtins.input", side_effect=AssertionError("must not ask")):
+            code, out, err = _run(["setup", "--defaults"])
+        self.assertEqual(code, 0, err)
+        self.assertTrue(gn_cli.RUNTIME_DIR.joinpath("operator_profile.json").is_file())
+        self.assertIn("tinygpt", out)
+        self.assertIn("learning: on", out)
+
+    def test_setup_records_the_answers_it_was_given(self) -> None:
+        with _terminal(["greynoc", "local", "off", "api", "on", str(self.runtime / "reports")]):
+            code = gn_cli.main(["setup"])
+        self.assertEqual(code, 0)
+        import gn_profile
+
+        profile = gn_profile.load(self.runtime)
+        self.assertEqual(profile.get("operator.handle"), "greynoc")
+        self.assertEqual(profile.get("bot"), "local")
+        self.assertIs(profile.get("learning"), False)
+        self.assertEqual(profile.get("hunt.profile"), "api")
+        self.assertIs(profile.get("hunt.active"), True)
+
+    def test_setup_writes_nothing_when_an_answer_is_refused(self) -> None:
+        with _terminal(["", "skynet"]), contextlib.redirect_stderr(io.StringIO()) as err:
+            code = gn_cli.main(["setup"])
+        self.assertEqual(code, 2)
+        self.assertIn("nothing was written", err.getvalue())
+        self.assertFalse(gn_cli.RUNTIME_DIR.joinpath("operator_profile.json").exists())
+
+    def test_setup_on_an_existing_profile_shows_it_instead_of_overwriting(self) -> None:
+        _run(["setup", "--defaults"])
+        self.set("bot", "off")
+        with mock.patch("builtins.input", side_effect=AssertionError("must not ask")):
+            code, out, _err = _run(["setup"])
+        self.assertEqual(code, 0)
+        self.assertIn("already written", out)
+        self.assertEqual(_run(["settings", "get", "bot"])[1].strip(), "off")
+
+    def test_setup_with_no_terminal_says_what_it_needs_instead_of_answering_itself(self) -> None:
+        # A pipe, or a dash pane: writing the defaults there would be this verb answering its own
+        # questions on the operator's behalf and saving the result.
+        code, _out, err = _run(["setup"])
+        self.assertEqual(code, 2)
+        self.assertIn("--defaults", err)
+        self.assertFalse(gn_cli.RUNTIME_DIR.joinpath("operator_profile.json").exists())
+
+    def test_settings_lists_every_setting_and_the_commands_that_change_them(self) -> None:
+        import gn_profile
+
+        code, out, _err = _run(["settings"])
+        self.assertEqual(code, 0)
+        for item in gn_profile.SETTINGS:
+            self.assertIn(item.key, out)
+        self.assertIn("gn settings set", out)
+        self.assertIn("gn output", out)
+        self.assertIn("gn setup", out, "with no profile it must name the way to write one")
+
+    def test_get_prints_a_bare_value_for_a_script_to_read(self) -> None:
+        self.assertEqual(_run(["settings", "get", "bot"])[1], "tinygpt\n")
+        self.set("learning", "off")
+        self.assertEqual(_run(["settings", "get", "learning"])[1], "off\n")
+
+    def test_set_saves_immediately_and_survives_the_process(self) -> None:
+        code, out, _err = _run(["settings", "set", "hunt.profile", "api"])
+        self.assertEqual(code, 0)
+        self.assertIn("operator_profile.json", out, "it says where it wrote")
+        self.assertEqual(_run(["settings", "get", "hunt.profile"])[1].strip(), "api")
+
+    def test_an_unknown_key_or_value_is_refused_and_nothing_is_written(self) -> None:
+        for argv, expected in ((["settings", "set", "authorize", "true"], "no setting called"),
+                               (["settings", "set", "always_authorize", "1"], "no setting called"),
+                               (["settings", "set", "bot", "gpt5"], "tinygpt"),
+                               (["settings", "set", "learning", "sometimes"], "on or off"),
+                               (["settings", "get", "authorize"], "no setting called"),
+                               (["settings", "unset", "authorize"], "no setting called")):
+            with self.subTest(argv=argv):
+                code, _out, err = _run(argv)
+                self.assertEqual(code, 2)
+                self.assertIn(expected, err)
+        self.assertFalse(gn_cli.RUNTIME_DIR.joinpath("operator_profile.json").exists())
+
+    def test_unset_returns_a_setting_to_its_default(self) -> None:
+        self.set("bot", "off")
+        code, out, _err = _run(["settings", "unset", "bot"])
+        self.assertEqual(code, 0)
+        self.assertIn("tinygpt", out)
+        self.assertEqual(_run(["settings", "get", "bot"])[1].strip(), "tinygpt")
+
+    def test_path_prints_where_the_profile_lives(self) -> None:
+        code, out, _err = _run(["settings", "path"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), str(self.runtime / "operator_profile.json"))
+
+    def test_output_sets_a_folder_for_one_target_and_lists_it(self) -> None:
+        folder = str(self.runtime / "acme")
+        code, out, err = _run(["output", "-s", "https://acme.example/app", "--path", folder])
+        self.assertEqual(code, 0, err)
+        self.assertIn("acme.example", out)
+        code, out, _err = _run(["output"])
+        self.assertEqual(code, 0)
+        self.assertIn(folder, out)
+
+    def test_output_with_no_scope_sets_the_default_folder(self) -> None:
+        folder = str(self.runtime / "all")
+        self.assertEqual(_run(["output", "--path", folder])[0], 0)
+        self.assertEqual(_run(["settings", "get", "output.dir"])[1].strip(), folder)
+
+    def test_output_clear_drops_one_entry(self) -> None:
+        _run(["output", "-s", "acme.example", "--path", str(self.runtime / "acme")])
+        code, out, _err = _run(["output", "-s", "acme.example", "--clear"])
+        self.assertEqual(code, 0)
+        self.assertIn("cleared", out)
+        self.assertNotIn("acme.example", _run(["output"])[1])
+
+    def test_output_lists_runtime_reports_when_nothing_is_set(self) -> None:
+        code, out, _err = _run(["output"])
+        self.assertEqual(code, 0)
+        self.assertIn("runtime/reports", out)
+
+
+class ProfileDrivesTheVerbsTests(_ProfileCase):
+    """The profile fills what the command line did not say — and nothing else."""
+
+    def test_the_saved_posture_reaches_a_hunt_that_named_none_of_it(self) -> None:
+        self.set("hunt.profile", "api")
+        self.set("hunt.active", "on")
+        self.set("hunt.brain", "on")
+        self.set("hunt.per_finding", "on")
+        self.assertEqual(_run(["output", "--path", str(self.runtime / "r")])[0], 0)
+        args = self.args("hunt", "https://acme.example", "-y")
+        gn_cli._from_profile(args, targets=(args.target,))
+        self.assertEqual(args.profile, "api")
+        self.assertTrue(args.active)
+        self.assertTrue(args.brain)
+        self.assertTrue(args.per_finding)
+        self.assertEqual(args.out, str(self.runtime / "r"))
+
+    def test_a_flag_the_operator_typed_always_wins(self) -> None:
+        self.set("hunt.profile", "api")
+        args = self.args("hunt", "https://acme.example", "-y", "-p", "secrets",
+                         "-o", str(self.runtime / "typed"))
+        gn_cli._from_profile(args, targets=(args.target,))
+        self.assertEqual(args.profile, "secrets")
+        self.assertEqual(args.out, str(self.runtime / "typed"))
+
+    def test_no_setting_can_turn_an_armed_flag_off(self) -> None:
+        # There is no "hunt.active off" that disarms --active: the profile fills blanks only.
+        self.set("hunt.active", "off")
+        args = self.args("hunt", "https://acme.example", "-y", "--active")
+        gn_cli._from_profile(args, targets=(args.target,))
+        self.assertTrue(args.active)
+
+    def test_no_setting_can_authorize_a_hunt(self) -> None:
+        import gn_profile
+
+        # Even a profile file that was hand-edited to carry one.
+        gn_profile.profile_path(self.runtime).write_text(
+            json.dumps({"settings": {"authorize": True, "hunt.active": True}}), encoding="utf-8")
+        args = self.args("hunt", "https://acme.example")
+        gn_cli._from_profile(args, targets=(args.target,))
+        self.assertFalse(args.authorize, "a file on disk cannot assert authorization")
+        code, _out, err = _run(["hunt", "https://acme.example", "--json"])
+        self.assertEqual(code, 2)
+        self.assertIn(gn_cli._HUNT_AUTHORIZE, err)
+
+    def test_prompting_off_in_the_profile_means_no_prompt(self) -> None:
+        self.set("hunt.prompt", "off")
+        args = self.args("hunt", "https://acme.example", "-y")
+        gn_cli._from_profile(args, targets=(args.target,))
+        self.assertTrue(args.no_prompt)
+
+    def test_the_per_target_folder_beats_the_default_one(self) -> None:
+        _run(["output", "--path", str(self.runtime / "all")])
+        _run(["output", "-s", "acme.example", "--path", str(self.runtime / "acme")])
+        args = self.args("hunt", "https://app.acme.example", "-y")
+        gn_cli._from_profile(args, targets=(args.target,))
+        self.assertEqual(args.out, str(self.runtime / "acme"))
+
+    def test_a_first_run_hints_once_and_hunts_anyway(self) -> None:
+        # A CLI that refuses to work until a wizard is answered cannot be driven from a script.
+        with mock.patch.object(gn_cli, "_cmd_hunt", wraps=gn_cli._cmd_hunt), \
+             mock.patch("bughunter.bounty.run_bounty_hunt",
+                        return_value={"ok": True, "findings": [], "severity_counts": {},
+                                      "report_path": "r.md"}):
+            code, _out, err = _run(["hunt", "https://acme.example", "-y", "--no-fx"])
+        self.assertEqual(code, 0, err)
+
+
+class TerminalAttestationTests(_ProfileCase):
+    """``-y``, or the same question asked at a terminal. Never a file, never a setting."""
+
+    def test_yes_at_the_terminal_is_the_attestation(self) -> None:
+        args = self.args("hunt", "https://acme.example")
+        with _terminal(["y"]) as out:
+            self.assertTrue(gn_cli._confirm_authorization(args, args.target))
+        self.assertTrue(args.authorize)
+        self.assertIn("acme.example", out.getvalue(), "the question names the target")
+        self.assertIn("AUTHORIZED", "".join(out.prompts), "and asks for the attestation by name")
+
+    def test_anything_but_yes_is_a_refusal(self) -> None:
+        for answer in ("", "n", "no", "maybe", "sure", "Y E S", "ok"):
+            with self.subTest(answer=answer):
+                args = self.args("hunt", "https://acme.example")
+                with _terminal([answer]):
+                    self.assertFalse(gn_cli._confirm_authorization(args, args.target))
+                self.assertFalse(args.authorize)
+        args = self.args("hunt", "https://acme.example")
+        with _terminal(["YES"]):
+            self.assertTrue(gn_cli._confirm_authorization(args, args.target), "case is not the test")
+
+    def test_eof_and_ctrl_c_are_refusals(self) -> None:
+        for raised in (EOFError, KeyboardInterrupt):
+            with self.subTest(raised=raised.__name__):
+                args = self.args("hunt", "https://acme.example")
+                with mock.patch("sys.stdout", _Tty()), mock.patch("sys.stdin", _Tty()), \
+                     mock.patch("builtins.input", side_effect=raised):
+                    self.assertFalse(gn_cli._confirm_authorization(args, args.target))
+
+    def test_nobody_is_asked_when_nobody_is_there(self) -> None:
+        for extra in ([], ["--json"], ["--no-prompt"]):
+            with self.subTest(extra=extra):
+                args = self.args("hunt", "https://acme.example", *extra)
+                with mock.patch("builtins.input", side_effect=AssertionError("must not ask")):
+                    self.assertFalse(gn_cli._confirm_authorization(args, args.target))
+
+    def test_y_on_the_command_line_asks_nothing(self) -> None:
+        args = self.args("hunt", "https://acme.example", "-y")
+        with mock.patch("builtins.input", side_effect=AssertionError("must not ask")):
+            self.assertTrue(gn_cli._confirm_authorization(args, args.target))
+
+    def test_the_attestation_also_carries_the_scope(self) -> None:
+        # Answering the question is the same act as typing -y, so it scopes the target too.
+        args = self.args("hunt", "https://acme.example")
+        with _terminal(["yes"]):
+            gn_cli._confirm_authorization(args, args.target)
+        self.assertEqual(gn_cli._authorized_scope(args, args.target), "acme.example")
+
+
+class AutoScopeFormTests(_ProfileCase):
+    """`gn auto hunt -s acme.example` — the one-line hunt, with no directory involved."""
+
+    def test_a_scope_becomes_the_plan_a_directory_would_have(self) -> None:
+        code, out, err = _run(["auto", "hunt", "-s", "greynoc.com", "--dry-run"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("https://greynoc.com", out)
+        self.assertIn("--scope", out)
+        self.assertIn("dry run", out)
+
+    def test_the_bare_word_hunt_is_accepted_because_it_reads_like_a_sentence(self) -> None:
+        for argv in (["auto", "hunt", "-s", "greynoc.com", "--dry-run"],
+                     ["auto", "-s", "greynoc.com", "--dry-run"]):
+            with self.subTest(argv=argv):
+                code, out, _err = _run(argv)
+                self.assertEqual(code, 0)
+                self.assertIn("https://greynoc.com", out)
+
+    def test_hunt_without_a_scope_names_both_forms(self) -> None:
+        code, _out, err = _run(["auto", "hunt"])
+        self.assertEqual(code, 2)
+        self.assertIn("-s acme.example", err)
+        self.assertIn("gn auto <path>", err)
+
+    def test_a_scope_and_a_directory_together_are_refused(self) -> None:
+        code, _out, err = _run(["auto", str(BACKEND_DIR), "-s", "greynoc.com"])
+        self.assertEqual(code, 2)
+        self.assertIn("not both", err)
+
+    def test_a_real_folder_called_hunt_is_still_a_folder(self) -> None:
+        (self.runtime / "hunt").mkdir()
+        here = os.getcwd()
+        os.chdir(self.runtime)
+        try:
+            code, out, _err = _run(["auto", "hunt", "--dry-run"])
+        finally:
+            os.chdir(here)
+        self.assertEqual(code, 2, "an empty folder has nothing to hunt")
+        self.assertNotIn("needs a scope", out)
+
+    def test_a_scope_hunt_is_passive_until_something_arms_it(self) -> None:
+        code, out, _err = _run(["auto", "hunt", "-s", "greynoc.com", "--dry-run"])
+        self.assertIn("passive only", out)
+        self.set("hunt.active", "on")
+        code, out, _err = _run(["auto", "hunt", "-s", "greynoc.com", "--dry-run"])
+        self.assertIn("ACTIVE", out)
+        code, out, _err = _run(["auto", "hunt", "-s", "greynoc.com", "--dry-run", "--passive"])
+        self.assertIn("passive only", out, "--passive wins over the profile")
+
+    def test_active_cannot_be_armed_without_a_scope_to_bind_it(self) -> None:
+        # An empty scope makes host_in_active_scope refuse every host, so "ACTIVE" there would be
+        # a posture line that sends no probes.
+        with mock.patch("bughunter.hunt_dir.from_scope") as planner:
+            planner.return_value = __import__("bughunter.hunt_dir", fromlist=["HuntPlan"]).HuntPlan(
+                ok=True, targets=["https://acme.example"], scope_text="", name="acme")
+            code, out, _err = _run(["auto", "-s", "acme.example", "--dry-run", "--active"])
+        self.assertEqual(code, 0)
+        self.assertIn("passive only", out)
+
+    def test_a_scope_hunt_still_needs_the_attestation(self) -> None:
+        code, _out, err = _run(["auto", "hunt", "-s", "greynoc.com"])
+        self.assertEqual(code, 2)
+        self.assertIn("-y/--authorize", err)
 
 
 class AuthorizeCarriesScopeTests(unittest.TestCase):

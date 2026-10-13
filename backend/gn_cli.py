@@ -48,7 +48,7 @@ import shutil
 import sys
 import warnings
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import urlparse
 
 # --- Resolve seed/runtime dirs exactly like greyiq_api (frozen vs dev). ---
@@ -175,6 +175,90 @@ def _fx(args: argparse.Namespace, title: str, *, scope: str | None = None) -> An
     if scope is None:
         return gn_fx.scanner(title)
     return gn_fx.surface(title, scope=str(scope or ""))
+
+
+def _profile() -> Any:
+    """The operator profile, or the defaults when there is none. Never raises."""
+    import gn_profile
+
+    return gn_profile.load(RUNTIME_DIR)
+
+
+def _from_profile(args: argparse.Namespace, *, targets: Sequence[str] = ()) -> Any:
+    """Fill the posture flags the operator did NOT type from their saved profile.
+
+    The flags are not wrong; retyping them on every run is. So a verb reads the profile for
+    anything it was not told, and this is the one place that happens — ``args`` carries the
+    resolved answer afterwards, so nothing downstream has to know a profile exists.
+
+    **Only the unset half.** A ``store_true`` that is False was not passed, so the profile may turn
+    it on; a flag the operator DID pass always wins, and no profile setting can turn an armed flag
+    off (``--active`` means active). ``hunt.prompt`` is the one inversion: profile says "ask me",
+    so ``False`` there sets ``--no-prompt``.
+
+    It cannot reach ``authorize``. There is no such setting (see ``gn_profile``) and this never
+    writes that field: a file on disk may not assert that a human is authorized.
+    """
+    import gn_profile
+
+    profile = _profile()
+    if getattr(args, "profile", None) in (None, "", "full-sweep"):
+        # "full-sweep" is argparse's own default, so it is indistinguishable from an operator who
+        # typed it — and treating the two the same is what lets `hunt.profile` mean anything.
+        args.profile = str(profile.get("hunt.profile") or "full-sweep")
+    for flag, key in (("active", "hunt.active"), ("brain", "hunt.brain"),
+                      ("per_finding", "hunt.per_finding")):
+        if hasattr(args, flag) and not getattr(args, flag) and bool(profile.get(key)):
+            setattr(args, flag, True)
+    if hasattr(args, "no_prompt") and not args.no_prompt and not bool(profile.get("hunt.prompt")):
+        args.no_prompt = True
+    if hasattr(args, "platform") and not getattr(args, "platform", ""):
+        args.platform = str(profile.get("platform") or "hackerone")
+    if hasattr(args, "out") and not getattr(args, "out", ""):
+        folder = gn_profile.output_dir_for(profile, *[t for t in targets if t])
+        if folder:
+            args.out = folder
+    return profile
+
+
+def _profile_note(profile: Any) -> None:
+    """Say it once, on a terminal, when the profile is missing or unreadable."""
+    import gn_profile
+
+    hint = gn_profile.first_run_hint(profile)
+    if hint and sys.stdout.isatty():
+        print(_c(f"  {hint}", "2"))
+
+
+def _confirm_authorization(args: argparse.Namespace, *targets: str) -> bool:
+    """``-y``, or the same attestation asked at the terminal. Returns whether to proceed.
+
+    ``-y`` exists so a human says "I am authorized on this target" in a way no file and no config
+    can say for them. That argument is about WHO answers, not about which keystrokes they use — so
+    when a human is demonstrably at the terminal, asking them the question names the target and is
+    at least as strong as a flag they could have pasted from their shell history.
+
+    It is still the only other door: no terminal, ``--json``, ``--no-prompt`` or an answer that is
+    not yes leaves the usual refusal, and nothing in the profile can pre-answer it.
+    """
+    if bool(getattr(args, "authorize", False)):
+        return True
+    if (getattr(args, "json", False) or getattr(args, "no_prompt", False)
+            or not sys.stdin.isatty() or not sys.stdout.isatty()):
+        return False
+    named = ", ".join(str(t) for t in targets if t) or "this target"
+    print(_c(f"\n{named}", "1"))
+    print("A hunt sends live traffic at it. Only you can say whether that is authorized —")
+    print("your own asset, a signed engagement, or a bug-bounty program with it in scope.")
+    try:
+        answer = input(_c("Confirm you are AUTHORIZED to test it [y/N]: ", "1")).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if answer in ("y", "yes"):
+        args.authorize = True
+        return True
+    return False
 
 
 def _authorized_scope(args: argparse.Namespace, *targets: str) -> str:
@@ -596,7 +680,8 @@ def _cmd_hunt(args: argparse.Namespace) -> int:
     refusal = depth_refusal(args)
     if refusal:
         return _err(refusal)
-    if not args.authorize:
+    _profile_note(_from_profile(args, targets=(args.target,)))
+    if not _confirm_authorization(args, args.target):
         return _err(_HUNT_AUTHORIZE)
     reports = _reports_dir()
     out_dir = args.out or str(reports)
@@ -683,7 +768,8 @@ def _print_hunt_summary(result: dict) -> None:
 def _cmd_campaign(args: argparse.Namespace) -> int:
     from bughunter.campaign import run_campaign
 
-    if not args.authorize:
+    _profile_note(_from_profile(args, targets=(args.target,)))
+    if not _confirm_authorization(args, args.target):
         return _err("a campaign tests a live/owned target end-to-end — pass -y/--authorize to confirm scope.")
     supplied_auth = _hunt_auth(args)
     scope = _authorized_scope(args, args.target)      # -y puts the target in scope
@@ -1195,8 +1281,29 @@ def _cmd_auto(args: argparse.Namespace) -> int:
     from bughunter import operator as operator_mod
     from bughunter import portfolio
 
-    plan = hunt_dir.resolve(args.path)
-    print(_c(f"GreyIQ auto-hunt — {plan.root}", "1"))
+    # `gn auto -s acme.example` (and `gn auto hunt -s acme.example`) is the one-line form: the
+    # operator names what they are authorized on and nothing else. It produces the SAME HuntPlan a
+    # directory does, so the portfolio record, the learning memory and the scope gate are reached
+    # by one path either way.
+    scope = str(getattr(args, "scope", "") or "").strip()
+    named = str(getattr(args, "path", "") or "").strip()
+    if named.lower() == "hunt" and not Path(named).exists():
+        # `gn auto hunt -s acme.example` reads like a sentence and is what an operator types. The
+        # word is swallowed only when it is not also a real folder here, so a directory actually
+        # called "hunt" is still hunted rather than quietly reinterpreted.
+        named = ""
+        if not scope:
+            return _err("`gn auto hunt` needs a scope: `gn auto hunt -s acme.example`. "
+                        "For a directory, `gn auto <path>`.")
+    if scope:
+        if named and named != ".":
+            return _err("name a scope or a directory, not both: `gn auto -s acme.example`, "
+                        "or `gn auto <path>` with the scope in that folder's .greyiq/scope.txt.")
+        plan = hunt_dir.from_scope(scope)
+    else:
+        plan = hunt_dir.resolve(named or ".")
+    _profile_note(_from_profile(args, targets=(*plan.targets, scope)))
+    print(_c(f"GreyIQ auto-hunt — {plan.name or plan.root}", "1"))
     if plan.source:
         print(f"  targets from  {plan.source}")
     for target in plan.targets:
@@ -1213,6 +1320,11 @@ def _cmd_auto(args: argparse.Namespace) -> int:
     if not plan.ok:
         return _err("nothing to hunt here — see the refusals above.")
 
+    # --active / `hunt.active` arm what the plan did not. Only with a scope: an empty scope makes
+    # host_in_active_scope refuse every host, so "armed" there would be a posture line that sends
+    # no probes — the exact silence hunt_dir refuses to produce.
+    if getattr(args, "active", False) and plan.scope_text.strip() and not args.passive:
+        plan.active = True
     posture = "ACTIVE" if plan.active else "passive only"
     if plan.active and plan.iterate:
         posture += " + theorize->act re-plan"
@@ -1222,7 +1334,7 @@ def _cmd_auto(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(_c("\ndry run — nothing was hunted. Drop --dry-run to start.", "33"))
         return 0
-    if not args.authorize:
+    if not _confirm_authorization(args, *plan.targets):
         return _err("an auto hunt tests live targets on a schedule — pass -y/--authorize to "
                     "confirm you're authorized on every target listed above.")
 
@@ -1895,6 +2007,177 @@ def _dash_source(args: argparse.Namespace) -> Any:
                                   token=token, label=str(chosen.get("target") or ""))
 
 
+def _cmd_setup(args: argparse.Namespace) -> int:
+    """`gn setup` — the first-run questions, and the only place a profile gets written from prose.
+
+    Every question has a default that is already the local-first answer, so ENTER through the whole
+    thing is a valid way to answer it: the wizard exists to SHOW an operator what they are choosing,
+    not to make them choose. ``--defaults`` writes exactly that without asking, which is what a
+    script, a CI job or a fresh container wants.
+
+    Authorization is not among the questions, and cannot be: see ``gn_profile``.
+    """
+    import gn_profile
+
+    profile = _profile()
+    if profile.exists and not (args.force or args.defaults):
+        print(_c(f"GreyNOC operator profile — {profile.path}", "1"))
+        for line in gn_profile.settings_lines(profile):
+            print(line)
+        print()
+        print("A profile is already written. `gn settings set <key> <value>` changes one;")
+        print("`gn setup --force` walks through the questions again.")
+        return 0
+    if profile.error:
+        print(_c(f"  {profile.error}", "33"))
+
+    interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.defaults
+    if not interactive and not args.defaults:
+        # A redirected stream, a pipe, or a dash pane whose OutputTail is not a terminal. Writing
+        # the defaults anyway would be this verb answering its own questions on the operator's
+        # behalf and saving the result — so it says what it needs instead.
+        return _err("setup asks questions and there is no terminal here. Run it from a shell, "
+                    "or `gn setup --defaults` to write the defaults as they stand.")
+    print(_c("GreyNOC operator profile", "1"))
+    print("What GreyIQ assumes when a command does not say otherwise. Everything here is local,")
+    print("nothing leaves the machine, and `gn settings` changes any of it later.")
+    if interactive:
+        print(_c("ENTER keeps the default shown in [brackets].", "2"))
+    print()
+    for item in gn_profile.setup_questions():
+        current = profile.get(item.key)
+        shown = gn_profile.show(current)
+        if item.kind == "choice":
+            shown = f"{shown}  (one of: {', '.join(item.choices)})"
+        elif item.kind == "bool":
+            shown = f"{shown}  (on/off)"
+        if not interactive:
+            print(f"  {item.ask}: {gn_profile.show(current)}")
+            continue
+        print(_c(f"  {item.help}", "2"))
+        try:
+            typed = input(f"  {item.ask} [{shown}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return _err("setup was interrupted; nothing was written.")
+        if typed:
+            profile, error = gn_profile.set_value(profile, item.key, typed)
+            if error:
+                return _err(error + "  (nothing was written)")
+        else:
+            # ENTER on a question nobody has answered yet RECORDS the default, so the profile says
+            # what it is doing rather than depending on a default that may move under it later.
+            profile, _error = gn_profile.set_value(profile, item.key, current)
+        print()
+    profile, error = gn_profile.save(RUNTIME_DIR, profile)
+    if error:
+        return _err(error)
+    print(_c(f"written to {profile.path}", "32"))
+    for line in gn_profile.summary_lines(profile):
+        print(line)
+    print()
+    print("Next: `gn dash` for the board, or `gn hunt <target> -y` to go straight at something.")
+    return 0
+
+
+def _cmd_settings(args: argparse.Namespace) -> int:
+    """`gn settings` — what is set, where it came from, and every command that changes it."""
+    import gn_profile
+
+    profile = _profile()
+    action = str(getattr(args, "settings_action", "") or "")
+    if action in ("", "list"):
+        for line in gn_profile.settings_lines(profile):
+            print(line)
+        for line in gn_profile.command_lines():
+            print(line)
+        return 0
+    if action == "path":
+        print(profile.path)
+        return 0
+    if action == "get":
+        item = gn_profile.setting(args.key)
+        if item is None:
+            return _err(f"no setting called {args.key!r}. `gn settings` lists them.")
+        # Bare value, no decoration: this one is meant to be read by `$(...)` as well as by a human.
+        print(gn_profile.show(profile.get(item.key)))
+        return 0
+    if action == "unset":
+        profile, error = gn_profile.unset(profile, args.key)
+        if error:
+            return _err(error)
+        profile, error = gn_profile.save(RUNTIME_DIR, profile)
+        if error:
+            return _err(error)
+        item = gn_profile.setting(args.key)
+        print(f"{item.key} is back to its default: {gn_profile.show(item.default)}")
+        return 0
+    if action == "set":
+        profile, error = gn_profile.set_value(profile, args.key, args.value)
+        if error:
+            return _err(error)
+        profile, error = gn_profile.save(RUNTIME_DIR, profile)
+        if error:
+            return _err(error)
+        item = gn_profile.setting(args.key)
+        print(f"{item.key} = {gn_profile.show(profile.get(item.key))}   ({profile.path})")
+        return 0
+    return _err(f"unknown settings action {action!r}.")
+
+
+def _cmd_output(args: argparse.Namespace) -> int:
+    """`gn output` — where reports go, overall or for one target, program or campaign.
+
+    `gn output -s acme.example --path D:/engagements/acme` and every report for that host (and its
+    subdomains, unless they have their own entry) lands there. With no ``-s`` the path is the
+    default for everything, which is the same thing as ``gn settings set output.dir``.
+
+    The folder is recorded, not created: it is made when a report is written, so a typo costs a
+    report in the wrong place rather than an empty tree somewhere nobody looks.
+    """
+    import gn_profile
+
+    profile = _profile()
+    label = str(getattr(args, "scope", "") or "")
+    path = str(getattr(args, "path", "") or "")
+    if getattr(args, "clear", False):
+        if not label:
+            profile, error = gn_profile.set_value(profile, "output.dir", "")
+        else:
+            profile, error = gn_profile.clear_output(profile, label)
+        if error:
+            return _err(error)
+        profile, error = gn_profile.save(RUNTIME_DIR, profile)
+        if error:
+            return _err(error)
+        print(f"cleared{(' ' + gn_profile.output_label(label)) if label else ' the default folder'}")
+        return 0
+    if not path:
+        default = str(profile.get("output.dir") or "")
+        print(_c("report folders", "1"))
+        print(f"  default   {default or str(_reports_dir())}"
+              f"{'' if default else '  (runtime/reports)'}")
+        if label:
+            print(f"  {gn_profile.output_label(label)}   "
+                  f"{gn_profile.output_dir_for(profile, label) or '(the default)'}")
+        for key in sorted(profile.output_paths):
+            print(f"  {key}   {profile.output_paths[key]}")
+        if not profile.output_paths and not label:
+            print(_c("  gn output -s <target> --path <folder> points one target somewhere else.", "2"))
+        return 0
+    profile, error = gn_profile.set_output(profile, label, path)
+    if error:
+        return _err(error)
+    profile, error = gn_profile.save(RUNTIME_DIR, profile)
+    if error:
+        return _err(error)
+    if label:
+        print(f"{gn_profile.output_label(label)} reports -> {gn_profile.output_dir_for(profile, label)}")
+    else:
+        print(f"reports -> {profile.get('output.dir')}")
+    return 0
+
+
 def _dash_depth_from(pending: dict, into: argparse.Namespace) -> None:
     """Copy the depth variables a dash recorded onto the namespace the real verb will read.
 
@@ -1948,6 +2231,10 @@ def _cmd_dash_board(args: argparse.Namespace) -> int:
     if args.json:
         return _err("the board has no run to serialize; name a target for a machine feed: "
                     "`gn dash <target> -y --json`.")
+    # A first run, before the screen is taken: the board is the other thing a new operator opens,
+    # and the questions cannot be asked from inside the alternate screen.
+    if not _profile().exists and sys.stdin.isatty() and sys.stdout.isatty():
+        _cmd_setup(argparse.Namespace(defaults=False, force=False))
     while True:
         # Measured EVERY pass: the hunt in between gave the terminal back, and the operator may
         # have resized it, piped something, or closed the pane the board was drawn in.
@@ -2108,10 +2395,12 @@ def _cmd_dash(args: argparse.Namespace) -> int:
     small = gn_dash.size_refusal(gn_tui.terminal_size(sys.stdout))
     if small:
         return _err(small)
-    if not attach and not args.authorize:
-        # Before the alternate screen: a refusal printed into a screen that is about to be discarded
-        # is a refusal the operator never sees.
-        return _err(_HUNT_AUTHORIZE)
+    if not attach:
+        # Before the alternate screen, both of these: a refusal printed into a screen that is
+        # about to be discarded is a refusal the operator never sees — and so is a question.
+        _profile_note(_from_profile(args, targets=(target,)))
+        if not _confirm_authorization(args, target):
+            return _err(_HUNT_AUTHORIZE)
     if getattr(args, "braille", False):
         # Written into the environment rather than passed down, so the flag reaches gn_tui.tier()
         # through the same door GN_DASH_GLYPHS does and there is exactly one place glyphs get
@@ -2361,12 +2650,20 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--json", action="store_true")
     sync.set_defaults(func=_cmd_sync)
 
-    auto = sub.add_parser("auto", help="hunt this directory's targets, then keep auto-hunting (repo or hunt folder)")
-    auto.add_argument("path", nargs="?", default=".", help="the hunt directory (default: the current one)")
+    auto = sub.add_parser("auto", help="hunt a scope (-s) or this directory's targets, then keep auto-hunting")
+    auto.add_argument("path", nargs="?", default=".",
+                      help="the hunt directory (default: the current one); omit it and use -s to "
+                           "hunt a scope with no directory at all")
+    auto.add_argument("-s", "--scope", default="",
+                      help="hunt THIS scope instead of a directory: `gn auto -s acme.example` "
+                           "(hosts and *.wildcards; each seeds an https:// target)")
     auto.add_argument("-y", "--authorize", action="store_true", help="confirm you're AUTHORIZED on every target found (required)")
     auto.add_argument("--dry-run", dest="dry_run", action="store_true", help="show what would be hunted and exit")
     auto.add_argument("--once", action="store_true", help="stop after the first cycle even when --grant-file would keep hunting")
-    auto.add_argument("--passive", action="store_true", help="never arm active probing, whatever the directory asks for")
+    auto.add_argument("--active", action="store_true",
+                      help="arm active verification (a scope hunt has no hunt.json to ask for it; "
+                           "`gn settings set hunt.active on` makes it the default)")
+    auto.add_argument("--passive", action="store_true", help="never arm active probing, whatever the directory or profile asks for")
     auto.add_argument("--grant-file", dest="grant_file", default="", help="JSON authorization grants; required to keep auto-hunting past the first cycle")
     auto.add_argument("--interval", type=int, default=0, help="minutes between re-hunts (default: the directory's, else 1440)")
     auto.add_argument("--brain", action="store_true", help="use the configured LLM brain to enrich")
@@ -2552,6 +2849,39 @@ def build_parser() -> argparse.ArgumentParser:
     _register_depth_flags(dash)
     dash.set_defaults(func=_cmd_dash)
 
+    setup = sub.add_parser("setup", help="write the operator profile: the defaults every verb reads")
+    setup.add_argument("--defaults", action="store_true",
+                       help="write the defaults without asking (for scripts, CI and containers)")
+    setup.add_argument("--force", action="store_true",
+                       help="walk through the questions again even though a profile exists")
+    setup.set_defaults(func=_cmd_setup)
+
+    settings = sub.add_parser("settings", help="list the operator profile's settings, and set them")
+    settings.set_defaults(func=_cmd_settings, settings_action="")
+    settings_sub = settings.add_subparsers(dest="settings_action", metavar="<action>")
+    settings_sub.add_parser("list", help="every setting, its value and where that came from"
+                            ).set_defaults(func=_cmd_settings)
+    settings_get = settings_sub.add_parser("get", help="print one value, bare")
+    settings_get.add_argument("key")
+    settings_get.set_defaults(func=_cmd_settings)
+    settings_set = settings_sub.add_parser("set", help="set one value and save it")
+    settings_set.add_argument("key")
+    settings_set.add_argument("value")
+    settings_set.set_defaults(func=_cmd_settings)
+    settings_unset = settings_sub.add_parser("unset", help="drop one value back to its default")
+    settings_unset.add_argument("key")
+    settings_unset.set_defaults(func=_cmd_settings)
+    settings_sub.add_parser("path", help="where the profile is written"
+                            ).set_defaults(func=_cmd_settings)
+
+    output = sub.add_parser("output", help="where reports go, overall or per target/program/campaign")
+    output.add_argument("-s", "--scope", default="",
+                        help="the target, program or campaign this folder is for (omit for the default)")
+    output.add_argument("-p", "--path", default="",
+                        help="the folder (omit to list what is set)")
+    output.add_argument("--clear", action="store_true", help="drop this entry")
+    output.set_defaults(func=_cmd_output)
+
     version = sub.add_parser("version", help="print the version")
     version.set_defaults(func=_cmd_version)
 
@@ -2597,6 +2927,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):
         parser.print_help()
+        # The only place a first run is ANNOUNCED rather than hinted: `gn` with no verb is somebody
+        # looking around, which is exactly when "set this up once" is useful and never in the way.
+        profile = _profile()
+        if not profile.exists:
+            print()
+            print(_c("First run: `gn setup` writes your operator profile — the bot, learning, the "
+                     "default hunt profile and where reports go, asked once.", "1"))
+            print(_c("`gn settings` lists everything it holds. Until then these are the defaults.", "2"))
         return 0
     try:
         return args.func(args)

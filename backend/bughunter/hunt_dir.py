@@ -205,6 +205,60 @@ def _safe_name(root: Path) -> str:
     return name or "hunt"
 
 
+def from_scope(scope: str, *, interval_minutes: int = 1440) -> HuntPlan:
+    """A plan from a SCOPE the operator typed, with no directory involved. Total — never raises.
+
+    ``gn auto -s acme.example`` is the shortest honest way to start: name what you are authorized
+    on and GreyIQ works out the rest. This is the same :class:`HuntPlan` a directory resolves to —
+    so the portfolio record, the learning memory, the ledger and the ``host_in_active_scope`` gate
+    are reached by exactly one path — built from the one thing the operator said.
+
+    The scope is used VERBATIM (it is theirs), and each host token becomes an ``https://`` seed
+    target. ``*.acme.example`` seeds its apex, since a wildcard names no host of its own to fetch.
+    A token that is not a host-only grant — a path, a URL, a bare public suffix — is refused by
+    name rather than guessed at, because a seed target invented out of a malformed grant is a
+    request sent somewhere nobody authorized.
+
+    ``active`` is left OFF here even with a scope, unlike a hunt FILE which may ask for it: a
+    directory's ``hunt.json`` is a considered artifact an operator wrote, while this is one line
+    typed at a prompt, and arming live probing is not something to infer from brevity. ``--active``
+    (or ``hunt.active`` in the profile) is how it gets armed.
+    """
+    text = str(scope or "").strip()
+    if not text:
+        return HuntPlan(refusals=["no scope given — `gn auto -s <host>` names what to hunt"])
+    plan = HuntPlan(source="the --scope you gave", scope_source="--scope", scope_text=text)
+    seen: set[str] = set()
+    for raw in re.split(r"[\s,;]+", text):
+        token = raw.strip().strip("\"'")
+        if not token:
+            continue
+        host = token[2:] if token.startswith("*.") else token
+        if any(ch in host for ch in "/?:#@%\\"):
+            # Named, with the fix, rather than widened for them: a URL or path policy cannot prove
+            # permission for its whole host, which is why _scope_hosts refuses to widen one.
+            suggestion = _host_of(token) or ""
+            plan.refusals.append(
+                f"{token!r} is a URL or path — scope takes hosts and wildcards"
+                + (f"; try -s {suggestion}" if _scope_token(suggestion) else ""))
+            continue
+        if not _scope_token(host):
+            plan.refusals.append(f"{token!r} is not a host this can seed a target from")
+            continue
+        if host.lower() in seen:
+            continue
+        seen.add(host.lower())
+        plan.targets.append(f"https://{host.lower()}")
+    if not plan.targets:
+        plan.refusals.append("nothing in that scope could be hunted")
+        return plan
+    plan.name = _safe_name(Path(plan.targets[0].split("://", 1)[1]))
+    plan.root = str(Path.cwd())
+    plan.notes.append(f"scope is what you typed; {len(plan.targets)} seed target(s) came from it")
+    plan.ok = True
+    return plan
+
+
 def resolve(path: str | Path = ".") -> HuntPlan:
     """Resolve a directory into a :class:`HuntPlan`. Total — never raises."""
     # An empty/whitespace path must NOT silently become the current directory. Path("")
