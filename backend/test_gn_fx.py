@@ -29,6 +29,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
@@ -726,9 +727,13 @@ class ThePlacementIsStableTests(unittest.TestCase):
     HOSTS = ("api.example.com", "sso.example.com", "vpn.example.com", "legacy.example.com",
              "cdn.example.com", "www.example.com", "mail.example.com", "git.example.com")
 
-    def _placed(self, names) -> dict[str, tuple[int, int]]:
+    def _board(self, names) -> gn_fx.Board:
         board = gn_fx.Board("t", stream=_tty(), active=True)
         board.track(list(names))
+        return board
+
+    def _placed(self, names) -> dict[str, tuple[int, int]]:
+        board = self._board(names)
         return {a["name"]: (a["x"], a["y"]) for a in board._assets}
 
     def test_the_same_host_always_lands_on_the_same_spot(self) -> None:
@@ -764,17 +769,19 @@ class ThePlacementIsStableTests(unittest.TestCase):
 
     def test_every_site_is_filled_before_any_is_shared(self) -> None:
         # Linear probing, not modulo-and-hope: filling the list exactly means no collision was
-        # ever resolved by stacking.
-        names = [f"h{index}.example.com" for index in range(len(gn_fx._SITES))]
-        placed = self._placed(names)
-        self.assertEqual(sorted(placed.values()), sorted(gn_fx._SITES))
+        # ever resolved by stacking. Against the board's OWN site list, which is the authored one
+        # scaled to this terminal (``scaled_map``) — the constant is only the 72x17 source.
+        board = self._board([f"h{index}.example.com" for index in range(len(gn_fx._SITES))])
+        placed = sorted((a["x"], a["y"]) for a in board._assets)
+        self.assertEqual(placed, sorted(board._sites)[:len(placed)])
 
     def test_past_capacity_an_asset_is_nudged_rather_than_stacked(self) -> None:
         names = [f"h{index}.example.com" for index in range(len(gn_fx._SITES) + 6)]
-        placed = self._placed(names)
+        board = self._board(names)
+        placed = {a["name"]: (a["x"], a["y"]) for a in board._assets}
         self.assertEqual(len(placed), len(names))
         for (x, y) in placed.values():
-            self.assertTrue(0 <= x < gn_fx._MAP_W and 0 <= y < gn_fx._MAP_H,
+            self.assertTrue(0 <= x < board._map_w and 0 <= y < board._map_h,
                             f"a nudged asset was pushed off the map at ({x},{y})")
 
     def test_past_the_cap_further_assets_are_counted_not_dropped_silently(self) -> None:
@@ -1011,9 +1018,14 @@ class TheBoardDrawsWhatTheEngineSaidTests(unittest.TestCase):
         board._grid.clear()
         board._draw(3.0)
         rows = board._grid.rows()
-        self.assertEqual(len(rows), gn_fx._BOARD_ROWS)
+        # The grid is the TERMINAL now, not a fixed 78x24 box in the middle of it: one column
+        # short of the measured width (writing the bottom-right cell scrolls conhost) and never
+        # below the authored floor.
+        self.assertEqual(len(rows), board._rows)
+        self.assertGreaterEqual(board._rows, gn_fx._BOARD_ROWS)
         self.assertGreaterEqual(board._cols, gn_fx._BOARD_MIN_COLS)
-        self.assertLessEqual(board._cols, gn_fx._BOARD_COLS)
+        self.assertLess(board._cols, max(gn_fx._BOARD_MIN_COLS + 1,
+                                         gn_fx._terminal_size(board._stream)[0] + 1))
         for row in rows:
             self.assertEqual(len(_ANSI.sub("", row)), board._cols)
 
@@ -1322,6 +1334,263 @@ class TheBoardIsWiredIntoTheHuntingVerbsTests(unittest.TestCase):
         self.assertNotIn("\033", proc.stdout)
         self.assertNotIn("\033", proc.stderr)
         self.assertNotIn("1049", proc.stderr, "the alternate-screen escape reached a pipe")
+
+
+class TheBoardFillsTheTerminalTests(unittest.TestCase):
+    """It used to draw in a fixed 78x24 box, which on a 200x60 window is a rectangle in a void.
+
+    The map, its asset sites and the home node are authored on a 72x17 grid and scale TOGETHER —
+    an arc that lands somewhere other than the continent its asset was placed on is the one
+    failure mode that would make a bigger board worse than the small one.
+    """
+
+    def _board(self, cols: int, rows: int, **kwargs: object) -> gn_fx.Board:
+        with mock.patch.object(gn_fx, "_terminal_size", return_value=(cols, rows)):
+            return gn_fx.Board("t", stream=_tty("utf-8"), active=True, clock_base=0.0, **kwargs)
+
+    def test_it_uses_the_whole_terminal_at_every_ordinary_size(self) -> None:
+        for cols, rows in ((78, 24), (100, 30), (120, 34), (160, 40), (200, 60), (104, 26)):
+            with self.subTest(size=(cols, rows)):
+                board = self._board(cols, rows)
+                # One column short on purpose: writing the bottom-right cell scrolls conhost.
+                self.assertEqual(board._cols, cols - 1)
+                self.assertEqual(board._rows, rows)
+                # The box is the map plus its two edge columns and five rows of chrome, and it
+                # fills what the grid has — so nothing is left over at either edge.
+                self.assertEqual(board._map_w + 2, cols - 1)
+                self.assertEqual(board._map_h + 5, rows)
+
+    def test_it_never_goes_below_the_authored_map(self) -> None:
+        board = self._board(74, 24)
+        self.assertGreaterEqual(board._map_w, gn_fx._MAP_W)
+        self.assertGreaterEqual(board._map_h, gn_fx._MAP_H)
+
+    def test_an_extreme_window_is_clamped_rather_than_smeared(self) -> None:
+        wide = gn_fx.fit_map(400, 24)
+        self.assertLessEqual(wide[0] / wide[1], gn_fx._ASPECT_MAX + 0.01)
+        tall = gn_fx.fit_map(80, 120)
+        self.assertGreaterEqual(tall[0] / tall[1], gn_fx._ASPECT_MIN - 0.01)
+
+    def test_the_map_the_sites_and_the_home_node_scale_together(self) -> None:
+        land, sites, origin = gn_fx.scaled_map(198, 54)
+        self.assertEqual(len(land), 54)
+        for row in land:
+            self.assertEqual(len(row), 198)
+        self.assertTrue(sites)
+        for x, y in sites:
+            self.assertTrue(0 <= x < 198 and 0 <= y < 54, f"site off the map at ({x},{y})")
+        self.assertTrue(0 <= origin[0] < 198 and 0 <= origin[1] < 54)
+        self.assertEqual(len(set(sites)), len(sites), "two sites collapsed onto one cell")
+
+    def test_every_asset_lands_on_land(self) -> None:
+        # The point of scaling the spans rather than the rendered rows: a site that scales onto
+        # open ocean puts a confirmed finding in the middle of the Atlantic.
+        for cols, rows in ((78, 24), (120, 34), (200, 60)):
+            with self.subTest(size=(cols, rows)):
+                board = self._board(cols, rows)
+                on_land = sum(1 for x, y in board._sites if board._land[y][x] == "#")
+                self.assertGreaterEqual(on_land, int(len(board._sites) * 0.7),
+                                        "most sites must scale onto a continent")
+
+    def test_a_frame_at_every_size_is_exactly_the_grid_it_promises(self) -> None:
+        for cols, rows in ((74, 24), (100, 30), (160, 45), (200, 60)):
+            with self.subTest(size=(cols, rows)):
+                board = self._board(cols, rows)
+                board.track(["api.example.com", "sso.example.com"])
+                board._grid.clear()
+                board._draw(3.0)
+                frame = board._grid.rows()
+                self.assertEqual(len(frame), board._rows)
+                for row in frame:
+                    self.assertEqual(len(_ANSI.sub("", row)), board._cols)
+
+    def test_the_scale_cache_does_not_grow_without_bound(self) -> None:
+        for height in range(18, 80):
+            gn_fx.scaled_map(int(height * 4), height)
+        self.assertLessEqual(len(gn_fx._SCALE_CACHE), 32)
+
+
+class TheBoardTakesKeysDuringARunTests(unittest.TestCase):
+    """The run owns the main thread here, so the keyboard is a daemon of the board's own.
+
+    What matters: an operator can look at detail mid-hunt, ask the hunt to STOP without killing
+    it, and the board gives the tty back before the engine's auth prompt needs it.
+    """
+
+    def _board(self, **kwargs: object) -> gn_fx.Board:
+        with mock.patch.object(gn_fx, "_terminal_size", return_value=(104, 30)):
+            return gn_fx.Board("t", stream=_tty("utf-8"), active=True, clock_base=0.0,
+                               controls=True, **kwargs)
+
+    def test_the_three_views_open_and_the_same_key_closes_them(self) -> None:
+        board = self._board()
+        for key, view in (("l", "log"), ("f", "findings"), ("r", "traffic")):
+            with self.subTest(key=key):
+                board._handle_key(key)
+                self.assertEqual(board._view, view)
+                board._handle_key(key)
+                self.assertEqual(board._view, "board", "the same key gets you back out")
+
+    def test_b_and_esc_return_to_the_map(self) -> None:
+        for key in ("b", "ESC", "ENTER", "m"):
+            with self.subTest(key=key):
+                board = self._board()
+                board._handle_key("l")
+                board._handle_key(key)
+                self.assertEqual(board._view, "board")
+
+    def test_q_asks_the_engine_to_stop_rather_than_killing_it(self) -> None:
+        board = self._board()
+        self.assertFalse(board.stop_requested())
+        board._handle_key("q")
+        self.assertTrue(board.stop_requested(), "this is what run_bounty_hunt's should_stop reads")
+        self.assertIn("STOP REQUESTED", "\n".join(text for _at, text, _c in board._lines))
+
+    def test_an_unknown_key_does_nothing(self) -> None:
+        board = self._board()
+        for key in ("z", "F13", "CTRL-X", ""):
+            board._handle_key(key)
+        self.assertEqual(board._view, "board")
+        self.assertFalse(board.stop_requested())
+
+    def test_the_views_scroll_and_cannot_scroll_past_the_newest_line(self) -> None:
+        board = self._board()
+        board._handle_key("l")
+        board._handle_key("PGDN")
+        self.assertEqual(board._view_scroll, 0)
+        board._handle_key("PGUP")
+        self.assertEqual(board._view_scroll, 8)
+        board._handle_key("UP")
+        self.assertEqual(board._view_scroll, 9)
+        board._handle_key("DOWN")
+        self.assertEqual(board._view_scroll, 8)
+
+    def test_an_overlay_keeps_the_header_the_tally_and_the_scope_statement(self) -> None:
+        # A view that replaced the whole board would take DEFCON and the scope away at exactly the
+        # moment the operator is reading detail.
+        board = self._board(scope="acme.example", footer="AUTHORIZED SCOPE ONLY")
+        board.track(["api.example.com"])
+        board._handle_key("l")
+        board._grid.clear()
+        board._draw(3.0)
+        rendered = _ANSI.sub("", "\n".join(board._grid.rows()))
+        self.assertIn("DEFCON", rendered)
+        self.assertIn("ASSETS", rendered)
+        self.assertIn("acme.example", rendered)
+        self.assertIn("LOG", rendered)
+
+    def test_an_empty_view_says_it_is_empty_rather_than_filling_itself_in(self) -> None:
+        board = self._board()
+        for key, expected in (("l", "nothing logged"), ("f", "no assets registered"),
+                              ("r", "no active requests")):
+            with self.subTest(key=key):
+                board._view = {"l": "log", "f": "findings", "r": "traffic"}[key]
+                _title, rows = board._view_rows(80)
+                self.assertIn(expected, "\n".join(rows))
+
+    def test_the_findings_view_shows_only_what_the_engine_confirmed(self) -> None:
+        board = self._board()
+        board.track(["api.example.com", "cdn.example.com"])
+        board.launch("api.example.com")
+        board.resolve("api.example.com", "high", "SSRF -> CLOUD METADATA")
+        board._view = "findings"
+        _title, rows = board._view_rows(80)
+        joined = "\n".join(rows)
+        self.assertIn("HIGH", joined)
+        self.assertIn("api.example.com", joined)
+        self.assertNotIn("cdn.example.com", joined, "an unresolved asset is not a finding")
+
+    def test_the_keyboard_is_released_before_the_screen_settings_are_handed_back(self) -> None:
+        board = self._board()
+        order: list[str] = []
+        reader = mock.Mock()
+        reader.restore.side_effect = lambda: order.append("keys")
+        board._keys = reader
+        with mock.patch.object(board, "_restore", side_effect=lambda: order.append("screen")):
+            board.stop()
+        self.assertEqual(order, ["screen", "keys"],
+                         "the alternate screen goes before the tty settings it was drawn under")
+
+    def test_no_reader_is_a_board_without_keys_rather_than_a_crash(self) -> None:
+        board = self._board()
+        with mock.patch("gn_tui.KeyReader", side_effect=OSError("no tty")):
+            board._acquire_keys()
+        self.assertIsNone(board._keys)
+        board._release_keys()
+
+
+class TheBoardAnimatesOnlyWhatHappenedTests(unittest.TestCase):
+    """Every new animation is driven by real state. A board that moved on a timer alone would be
+    claiming activity nobody reported, which is the one thing this module is written to avoid."""
+
+    def _board(self) -> gn_fx.Board:
+        with mock.patch.object(gn_fx, "_terminal_size", return_value=(104, 30)):
+            return gn_fx.Board("t", stream=_tty("utf-8"), active=True, clock_base=0.0,
+                               controls=True)
+
+    def test_the_traffic_feed_is_what_the_engine_actually_sent(self) -> None:
+        board = self._board()
+        board.request("GET", "https://acme.example/v2/x?q=1", 200)
+        board.request("POST", "https://acme.example/login", 302)
+        self.assertEqual(len(board._requests), 2)
+        _at, method, host, path = board._requests[0]
+        self.assertEqual((method, host), ("GET", "acme.example"))
+        self.assertIn("/v2/x?q=1", path)
+        self.assertIn("200", path)
+
+    def test_the_feed_is_bounded(self) -> None:
+        board = self._board()
+        for index in range(900):
+            board.request("GET", f"https://acme.example/{index}", 200)
+        self.assertLessEqual(len(board._requests), 400)
+
+    def test_the_sparkline_is_empty_until_a_real_request_lands(self) -> None:
+        board = self._board()
+        self.assertEqual(board._traffic_spark(5.0, 18), "")
+        board._requests.append((4.5, "GET", "acme.example", "/x  200"))
+        self.assertTrue(board._traffic_spark(5.0, 18).strip())
+
+    def test_the_sparkline_and_the_traffic_view_cannot_disagree(self) -> None:
+        board = self._board()
+        for index in range(12):
+            board.request("GET", f"https://acme.example/{index}", 200)
+        board._view = "traffic"
+        title, rows = board._view_rows(80)
+        self.assertIn("12 request(s)", title)
+        self.assertEqual(len([r for r in rows if "acme.example" in r]), 12)
+
+    def test_the_reticle_follows_the_newest_request_and_stops_with_the_traffic(self) -> None:
+        board = self._board()
+        board.track(["api.example.com"])
+        board.request("GET", "https://api.example.com/v2", 200)
+        self.assertEqual(board._hot_host, "api.example.com")
+        board._grid.clear()
+        board._draw(board._hot_at + 0.1)
+        live = _ANSI.sub("", "\n".join(board._grid.rows()))
+        board._grid.clear()
+        board._draw(board._hot_at + 5.0)          # traffic went quiet
+        quiet = _ANSI.sub("", "\n".join(board._grid.rows()))
+        self.assertGreater(live.count("["), quiet.count("["),
+                           "the reticle must fade when the prover stops hitting the host")
+
+    def test_defcon_records_when_it_dropped_so_the_label_can_flash(self) -> None:
+        board = self._board()
+        board.track(["sso.example.com"])
+        board.launch("sso.example.com")
+        board.resolve("sso.example.com", "critical", "AUTH BYPASS")
+        board._grid.clear()
+        board._draw(board._by_name["sso.example.com"]["resolve_at"] + 0.1)
+        self.assertEqual(board._defcon, 1)
+        self.assertGreater(board._defcon_at, -99.0)
+        rendered = _ANSI.sub("", "\n".join(board._grid.rows()))
+        self.assertIn("DEFCON 1", rendered)
+
+    def test_an_observer_that_raises_never_costs_a_probe(self) -> None:
+        from bughunter.active_verify_service import _Http
+
+        http = _Http.__new__(_Http)
+        http.on_request = mock.Mock(side_effect=RuntimeError("watcher exploded"))
+        http._observe("GET", "https://acme.example/x", 200)   # must not raise
 
 
 class TheResidentBoardTakesACommandLineTests(unittest.TestCase):

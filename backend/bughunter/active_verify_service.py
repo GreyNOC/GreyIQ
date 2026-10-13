@@ -207,6 +207,27 @@ def _scope_hosts(scope: str) -> set[str]:
     return hosts
 
 
+def scope_admits_subdomains(scope: str) -> bool:
+    """Whether this scope text asks for more than the hosts it literally names.
+
+    A ``*.domain`` token does (that is what a wildcard program is), and so does a bare host token
+    at :func:`host_in_active_scope`, whose established semantics are exact-OR-proper-subdomain.
+    The caller needs to tell those two apart: an operator who typed ``-s *.acme.example`` asked for
+    cross-host expansion, while a bare ``acme.example`` — in particular one DERIVED from the target
+    by ``-y`` (``bounty.self_scope_grant``) — is an attestation about one host, and the scope text
+    cannot carry that distinction on its own.
+
+    ``True`` when any token is a ``*.`` wildcard. Callers that want exact-host behaviour otherwise
+    pin their own gate; this never widens anything by itself.
+    """
+    for word in re.split(r"\s+", str(scope or "").lower()):
+        for raw in re.split(r"[,;]+", word):
+            token = raw.strip().strip("()<>[]\"'")
+            if token.startswith("*."):
+                return True
+    return False
+
+
 def host_in_active_scope(host: str, scope: str, settings: Any) -> bool:
     """Fail-closed scope binding: a host is eligible for ACTIVE probing only if the
     operator named it (its registrable domain or full host appears in the scope
@@ -380,7 +401,13 @@ class _Http:
     and a process-wide per-host token bucket (the governor)."""
 
     def __init__(self, settings: Any, governor: HostRateGovernor, max_requests: int = 12,
-                 auth: AuthContext | None = None, scope_host: str = "") -> None:
+                 auth: AuthContext | None = None, scope_host: str = "",
+                 on_request: Any = None) -> None:
+        #: Called with ``(method, url, status)`` after every request this wrapper makes. The threat
+        #: board's TRAFFIC view is the consumer: the feed has to be what actually left the machine,
+        #: so it is taken HERE rather than inferred from a progress line. Never allowed to affect
+        #: the request — see the guard in :meth:`fetch`.
+        self.on_request = on_request
         self.settings = settings
         self.governor = governor
         self.max_requests = max(1, int(max_requests))
@@ -395,11 +422,23 @@ class _Http:
     def fetch(self, url: str, *, method: str = "GET", extra_headers: dict[str, str] | None = None,
               read_body: bool = True) -> dict[str, Any]:
         try:
-            return self._fetch_impl(url, method=method, extra_headers=extra_headers,
-                                    read_body=read_body)
-        except (_ActiveError, _RateLimited, WebsiteFetchError):
+            result = self._fetch_impl(url, method=method, extra_headers=extra_headers,
+                                      read_body=read_body)
+        except (_ActiveError, _RateLimited, WebsiteFetchError) as exc:
             self.failed += 1
+            self._observe(method, url, type(exc).__name__)
             raise
+        self._observe(method, url, (result or {}).get("status", ""))
+        return result
+
+    def _observe(self, method: str, url: str, status: Any) -> None:
+        """Tell the observer what was sent. Total: a watcher that raises must not cost a check."""
+        if self.on_request is None:
+            return
+        try:
+            self.on_request(str(method or "GET"), str(url or ""), status)
+        except Exception:  # noqa: BLE001 - a decoration must never break a probe
+            pass
 
     def _fetch_impl(self, url: str, *, method: str = "GET", extra_headers: dict[str, str] | None = None,
                     read_body: bool = True) -> dict[str, Any]:
@@ -2984,6 +3023,7 @@ def verify_active(
     xss_params: list[str] | None = None,
     only_classes: list[str] | None = None,
     scope_host: str = "",
+    on_request: Any = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run the active checks against an in-scope target. Returns
     ``(active_findings, meta)``. ``active_findings`` are confirmed/candidate finding
@@ -3034,6 +3074,7 @@ def verify_active(
     )
     if http is None:
         http = _Http(settings, governor, max_requests=requests_budget, auth=auth,
+                     on_request=on_request,
                      scope_host=scope_host)
     elif scope_host:
         # A caller injecting its own transport cannot weaken a chat exact-host

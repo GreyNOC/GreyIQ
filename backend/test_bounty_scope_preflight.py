@@ -238,6 +238,31 @@ class SelfScopeGrantTests(unittest.TestCase):
         repo = "https://github.com/org/repo"
         self.assertEqual(bounty._repository_scope_preflight(repo, bounty.self_scope_grant(repo)), "")
 
+    def test_a_forge_page_url_grants_nothing_rather_than_the_whole_forge(self) -> None:
+        """A repository LINK is not an attestation about github.com.
+
+        ``canonical_repo_root`` is strict — a query, a fragment, a ``/tree/`` path or an org with
+        no repository all fail it — and ``_infer_kind`` then calls the URL a web target, so the
+        host branch would hand out a grant for a shared platform with thousands of unrelated
+        tenants on it. That is the harm ``is_bare_public_suffix`` exists to prevent for a token an
+        operator typed; a derived one must not get there either. The canonical root still grants
+        the repository, which is the form that carries no host authority at all.
+        """
+        for page in ("https://github.com/org/repo.git?a=b",
+                     "https://github.com/org/repo/tree/main",
+                     "https://github.com/org/repo#readme",
+                     "https://github.com/org/repo/issues/1",
+                     "https://github.com/org",
+                     "https://gitlab.com/org/repo/-/tree/main",
+                     "https://bitbucket.org/org/repo/src/main",
+                     "https://codeberg.org/org"):
+            with self.subTest(page=page):
+                self.assertEqual(bounty.self_scope_grant(page), "")
+        for root in ("https://github.com/org/repo", "https://github.com/org/repo.git",
+                     "https://github.com/org/repo/"):
+            with self.subTest(root=root):
+                self.assertEqual(bounty.self_scope_grant(root), "https://github.com/org/repo")
+
     def test_a_grant_does_not_reach_a_neighbouring_host(self) -> None:
         grant = bounty.self_scope_grant("https://acme.example")
         for other in ("https://notacme.example", "https://acme.example.evil.test",
@@ -245,6 +270,34 @@ class SelfScopeGrantTests(unittest.TestCase):
             with self.subTest(other=other):
                 _host, error = bounty._url_scope_preflight(other, grant)
                 self.assertTrue(error, f"{grant} must not authorize {other}")
+
+    def test_a_derived_grant_does_not_reach_a_subdomain_at_the_ACTIVE_gate(self) -> None:
+        """The gate that authorizes live traffic, not just the preflight.
+
+        ``host_in_active_scope`` reads a bare host token as exact-OR-proper-subdomain — long
+        established, and what a wildcard program wants. But a token DERIVED from the target by
+        ``-y`` is an attestation about one host, so the scope text alone cannot carry the
+        difference. ``scope_admits_subdomains`` is how a caller tells them apart, and the hunt's
+        own recon gate and prover pin to the exact host when no wildcard was asked for. Without
+        that, `gn hunt https://acme.example -y --active` could probe admin.acme.example.
+        """
+        from bughunter.active_verify_service import get_settings, host_in_active_scope
+        from bughunter.active_verify_service import scope_admits_subdomains
+
+        settings = get_settings()
+        derived = bounty.self_scope_grant("https://acme.example")
+        self.assertEqual(derived, "acme.example")
+        self.assertFalse(scope_admits_subdomains(derived),
+                         "a derived grant must not read as a wildcard request")
+        self.assertTrue(scope_admits_subdomains("*.acme.example"),
+                        "...and an operator-typed wildcard must")
+        # The gate itself is unchanged; the caller is what pins it.
+        self.assertTrue(host_in_active_scope("admin.acme.example", derived, settings))
+        pinned = (lambda host: host_in_active_scope(host, derived, settings)
+                  and (scope_admits_subdomains(derived) or host == derived))
+        self.assertTrue(pinned("acme.example"))
+        self.assertFalse(pinned("admin.acme.example"),
+                         "the hunt's gate must refuse a host the operator never named")
 
     def test_a_program_exclusion_still_wins_over_the_self_grant(self) -> None:
         settings = SimpleNamespace(excluded_hosts=("acme.example",))

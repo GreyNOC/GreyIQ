@@ -561,6 +561,13 @@ after saving.
   `gn settings set` writes (same whitelist, same refusals, no second door), and the panel updates
   as soon as it saves. `/board`, `/panels` and `/studio` move between the three views; `/refresh`
   re-reads every store.
+- **The board during a hunt** — it fills the terminal now, and takes keys while the run is going:
+  `l` the full engine log (PgUp/PgDn to scroll), `f` the findings as they are confirmed, `r` the
+  live request traffic (method, host, path, status), `b`/Esc back to the map, `q` to stop the hunt
+  at the next safe point rather than killing it mid-probe. A reticle closes on whichever asset the
+  prover is hitting, a sparkline on the status bar shows the request rate per second, and DEFCON
+  flashes when it drops. Every one of those is driven by something the engine reported — the
+  traffic feed is taken at the one chokepoint every active request goes through.
 - **`-y` is sudo for the target you named.** `-y/--authorize` now puts that target in scope itself,
   so `gn hunt https://acme.example -y` is the whole command — no `-s acme.example` repeating what
   you just typed, and no refusal for forgetting it. The grant is exact (the host, or the repository

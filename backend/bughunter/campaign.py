@@ -652,7 +652,18 @@ def _run_campaign_body(
         # Bind discovery to the SAME fail-closed scope gate the active prover uses, so
         # in-scope cross-host expansion (a wildcard program) is followed and ONLY
         # in-scope hosts are ever fetched -- excluded_hosts rides on campaign_settings.
-        scope_gate = (lambda h: active_verify_service.host_in_active_scope(h, scope, campaign_settings)) if str(scope or "").strip() else None
+        # Pinned to the campaign's own host unless the program asked for a wildcard: a bare host
+        # token is exact-OR-proper-subdomain at host_in_active_scope, and a scope DERIVED from the
+        # target by -y (bounty.self_scope_grant) is an attestation about ONE host. A `*.` token is
+        # what a wildcard program types, and keeps the cross-host expansion this comment's
+        # predecessor describes.
+        _wildcard_scope = active_verify_service.scope_admits_subdomains(scope)
+        _campaign_host = "" if _wildcard_scope else (urlparse(clean_target).hostname or "").lower()
+        scope_gate = (
+            (lambda h: active_verify_service.host_in_active_scope(h, scope, campaign_settings)
+             and (_wildcard_scope or (h or "").strip().lower().strip("[]") == _campaign_host))
+            if str(scope or "").strip() else None
+        )
         # Draw passive recon from the PROCESS-WIDE per-host token bucket, so concurrent span/portfolio
         # workers crawling the same host (a wildcard program whose targets recon-expand to a shared
         # host/CDN) don't each build their own governor and multiply the per-host request rate/burst.
