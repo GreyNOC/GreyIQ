@@ -52,6 +52,21 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+if [ "$command_name" != "${command_name##*/}" ] || [ -z "$command_name" ]; then
+  echo "install-cli.sh: --name takes a bare command name, not a path: $command_name" >&2
+  exit 1
+fi
+
+# The launcher's floor, defined once here too: --extras must never install into
+# an interpreter ./gn will go on to refuse.
+python_is_supported() {
+  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1
+}
+
+python_version() {
+  "$1" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || echo "unknown"
+}
+
 # Resolve symlinks so running this through a link still finds the checkout.
 self="${BASH_SOURCE:-$0}"
 hops=0
@@ -86,18 +101,33 @@ esac
 # it HERE surfaces exactly the message the operator would get later, before any
 # file is written.
 chmod +x "$root/gn" 2>/dev/null || true
-if ! version="$("$root/gn" --version)"; then
+# Require OUTPUT, not just exit 0: a broken interpreter that prints nothing
+# would otherwise pass this gate and be reported as an install with no version.
+if ! version="$("$root/gn" --version)" || [ -z "$version" ]; then
   echo "install-cli.sh: the CLI did not start, so nothing was installed." >&2
   exit 1
 fi
 
 if [ "$extras" -eq 1 ]; then
   venv="$root/.venv"
-  if [ ! -x "$venv/bin/python" ]; then
+  if [ -x "$venv/bin/python" ]; then
+    # An existing .venv can predate the 3.11 floor — the deployment guide asked
+    # only for 3.10 until this change. ./gn skips such a venv and falls back to
+    # the system interpreter, so installing the extras into it would report
+    # success while leaving them where the CLI never looks. Refuse rather than
+    # delete: that directory may hold the full requirements.txt install.
+    if ! python_is_supported "$venv/bin/python"; then
+      echo "install-cli.sh: $venv runs Python $(python_version "$venv/bin/python"), under the 3.11" >&2
+      echo "  floor ./gn enforces, so the extras would land where the CLI will not read them." >&2
+      echo "install-cli.sh: recreate it with a supported interpreter, then re-run with --extras:" >&2
+      echo "  rm -rf $venv && python3 -m venv $venv" >&2
+      echo "install-cli.sh: nothing was installed." >&2
+      exit 1
+    fi
+  else
     python=""
     for candidate in python3 python; do
-      if command -v "$candidate" >/dev/null 2>&1 \
-        && "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
+      if command -v "$candidate" >/dev/null 2>&1 && python_is_supported "$candidate"; then
         python="$candidate"
         break
       fi
@@ -114,6 +144,13 @@ if [ "$extras" -eq 1 ]; then
   echo "Extras installed in $venv; ./gn prefers it automatically."
 fi
 
+# --bin-dir/GN_BIN_DIR may be relative. Make it absolute BEFORE $target is built:
+# the post-install verification below runs from /, which would otherwise look for
+# a relative launcher there and fail after the file was already written. PATH
+# entries are absolute too, so the shadowing check needs this as well.
+mkdir -p "$bin_dir"
+bin_dir="$(cd "$bin_dir" && pwd)"
+
 marker="# installed by GreyIQ scripts/install-cli.sh"
 target="$bin_dir/$command_name"
 if [ -e "$target" ] && [ "$force" -eq 0 ] && ! grep -qF "$marker" "$target" 2>/dev/null; then
@@ -122,7 +159,6 @@ if [ -e "$target" ] && [ "$force" -eq 0 ] && ! grep -qF "$marker" "$target" 2>/d
   exit 1
 fi
 
-mkdir -p "$bin_dir"
 tmp="$target.tmp.$$"
 cat > "$tmp" <<WRAPPER
 #!/bin/sh

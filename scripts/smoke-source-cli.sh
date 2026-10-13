@@ -46,6 +46,11 @@ runuser -u hunter -- bash -c 'cd /tmp && export PATH="$HOME/.local/bin:$PATH" &&
 # break: dirname of the LINK has no backend/ beside it.
 runuser -u hunter -- bash -c 'ln -sfn "$HOME/GreyIQ/gn" "$HOME/.local/bin/gn-linked" && cd / && "$HOME/.local/bin/gn-linked" --version'
 
+# A relative --bin-dir has to be made absolute before the installer verifies the
+# launcher from /, or it writes the file and then fails looking for it there.
+runuser -u hunter -- bash -c 'cd "$HOME/GreyIQ" && ./scripts/install-cli.sh --bin-dir relbin >/dev/null'
+runuser -u hunter -- bash -c 'cd / && "$HOME/GreyIQ/relbin/gn" --version >/dev/null'
+
 # The engine itself, not just argparse: a planted defect must be found with no
 # third-party package installed anywhere on the system.
 runuser -u hunter -- bash -c 'set -e
