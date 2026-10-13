@@ -43,13 +43,50 @@ detects standard TACNOC installs and the normal `GreyNOC Belcher` development
 checkout on the current user's Desktop; set `GREYIQ_TACNOC_PATH` to a TACNOC
 executable or project directory for any other layout.
 
-## Debian 13
+## Linux (Debian, Ubuntu, Kali, Parrot)
 
-The Linux release includes a Debian package, an AppImage, and a headless CLI
-tarball for amd64. On a Debian 13 desktop, install the package with:
+### The CLI from a git clone
+
+The `gn` bug-bounty CLI needs **nothing but the distribution's `python3`** (3.11
+or newer). Its whole boot path is stdlib-only — no venv, no pip, no root, no
+package — so a clone is the install:
 
 ```bash
-sudo apt install ./GreyIQ-*-amd64.deb
+git clone https://github.com/GreyNOC/GreyIQ.git
+cd GreyIQ
+./scripts/install-cli.sh
+gn dashboard
+```
+
+`./gn <command>` already works inside the checkout; `install-cli.sh` only puts a
+launcher in `~/.local/bin` (it prints the one `export PATH=…` line if that
+directory is not on your PATH yet) and `git pull` then updates the command in
+place. Flags: `--extras`, `--bin-dir DIR`, `--name NAME` (Google's GN build tool
+also installs a `gn`), `--force`; `--help` lists them.
+
+That stdlib-only guarantee is enforced, not assumed:
+`backend/test_gn_cli_stdlib_boot.py` runs the CLI — including a real code scan —
+with every `site-packages` import blocked, and `scripts/smoke-source-cli.sh`
+repeats the clone-and-run install in Debian 12 and Debian 13 containers that have
+`python3` and no pip at all. Every scanner, the impact model and the report
+writers work there. `--extras` adds only two optional engine libraries (YAML
+OpenAPI-spec parsing, and the RS256 proof that a leaked cloud key is live); both
+features degrade silently without them. See `requirements-cli.txt`.
+
+**This is the install to use on Parrot and Kali**, and the only one on arm64 —
+the release package is built for Debian 13 amd64. For the desktop app and the
+local-model stack from source, see [DEPLOY.md](DEPLOY.md); that is the path that
+needs Node.js 22.12+, a venv and `requirements.txt`.
+
+### Desktop package and AppImage (Debian 13 amd64)
+
+The `.deb`, the AppImage and the headless CLI tarball are **release assets, not
+files in the repository** — download one from
+[Releases](https://github.com/GreyNOC/GreyIQ/releases) first. `apt` installs the
+desktop libraries and `zstd`, which the on-demand Ollama download needs:
+
+```bash
+sudo apt install ./GreyIQ-4.12.0-amd64.deb
 greyiq-cli dashboard
 ```
 
@@ -70,22 +107,36 @@ PATH guidance, then `./greyiq-cli dashboard`.
 The included `INSTALL.txt` and [deployment guide](DEPLOY.md) show the exact
 optional `~/.local/bin` PATH setup; the Debian package needs no PATH change.
 
-For the AppImage, install its FUSE and local-model extraction dependencies,
-then make it executable:
+For the AppImage, install its FUSE and local-model extraction dependencies, then
+make it executable. Debian 13 and Ubuntu 24.04+ name the FUSE package
+`libfuse2t64`; Debian 12 derivatives (Parrot 6, Kali) name it `libfuse2`:
 
 ```bash
-sudo apt install libfuse2t64 zstd
+sudo apt install libfuse2t64 zstd || sudo apt install libfuse2 zstd
 chmod +x GreyIQ-*-x86_64.AppImage
 ./GreyIQ-*-x86_64.AppImage
 ```
 
-From a source checkout, install [Node.js 22.12 or newer](https://nodejs.org/en/download),
-plus Debian's `python3-venv`, `tesseract-ocr`, and `poppler-utils` packages.
-Debian 13's own `nodejs` package is Node 20, which is too old for the Electron
-version used here. Then run `npm ci`, create and
-activate a Python virtual environment, and install `requirements.txt`.
-`./gn dashboard` opens the terminal view. See [DEPLOY.md](DEPLOY.md) for exact
-commands, build steps, and optional OCR and model setup.
+### When the .deb will not install
+
+Two commands identify every case below:
+
+```bash
+dpkg --print-architecture   # the release .deb requires amd64
+cat /etc/debian_version     # 12.x derivatives (Parrot 6, Kali) are not the build target
+```
+
+| Message | Cause | Fix |
+| --- | --- | --- |
+| `Unsupported file … given on commandline` | the filename matched nothing — most often the `GreyIQ-*-amd64.deb` glob pasted inside a fresh clone, where no release asset exists | download the asset from Releases, or use the git-clone CLI install above |
+| `Unable to locate package GreyIQ-…deb` | `apt` read the filename as a package name | keep the leading `./`: `sudo apt install ./GreyIQ-4.12.0-amd64.deb` |
+| `package architecture (amd64) does not match system (arm64)` | the release package is amd64 only | use the git-clone CLI install above — it is pure Python and architecture-independent |
+| `Depends: libasound2t64 but it is not installable` | releases up to 4.12.0 require the Debian 13 package name; Debian 12 derivatives call it `libasound2` | use the git-clone CLI install or the AppImage; packages built after 4.12.0 accept either name |
+| `version 'GLIBC_2.xx' not found` from `greyiq-cli` or `greyiq` | the frozen binaries are built on Ubuntu 24.04 and need a newer glibc than Debian 12 derivatives ship | use the git-clone CLI install above, which runs on the distribution's own Python |
+| a file manager reports an unsupported or unknown file type | no GUI handler is registered for `.deb` on that desktop | install from a terminal with `sudo apt install ./<file>.deb` |
+
+The `.deb` only ever carries the desktop app and the frozen CLI. Nothing in it is
+required to hunt: the clone install above exposes the same commands.
 
 ## macOS
 

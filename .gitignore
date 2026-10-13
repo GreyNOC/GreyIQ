@@ -42,3 +42,8 @@ backend/shots/
 # on purpose: it is the accumulated method and must be target-agnostic by the
 # time a lesson is promoted into it.
 .hunt/
+
+# Checksum manifests from past local release builds. scripts/release.sh deletes
+# release/ wholesale so each build is unambiguous; these records of what shipped
+# are kept here instead, where it will not reach them.
+release-archive/

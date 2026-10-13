@@ -26,6 +26,38 @@ function checkVersionParity() {
   }
 }
 
+// The source CLI installs requirements-cli.txt (scripts/install-cli.sh --extras) while the
+// release build and the CI pip-audit gate read requirements.txt. A drifting range would hand
+// an operator a version nothing ever audited, so the extras must pin EXACTLY what the runtime
+// list pins -- and may only name packages that list already carries.
+function checkCliExtrasParity() {
+  const file = "requirements-cli.txt";
+  if (!existsSync(file)) {
+    fail(`${file} is missing; scripts/install-cli.sh --extras installs it.`);
+    return;
+  }
+  const parse = (text) => {
+    const pins = new Map();
+    for (const line of text.split(/\r?\n/)) {
+      const entry = line.trim();
+      if (!entry || entry.startsWith("#")) {
+        continue;
+      }
+      pins.set(entry.split(/[<>=!~[; ]/)[0].toLowerCase(), entry);
+    }
+    return pins;
+  };
+  const runtime = parse(readFileSync(resolve("requirements.txt"), "utf8"));
+  for (const [name, spec] of parse(readFileSync(resolve(file), "utf8"))) {
+    const expected = runtime.get(name);
+    if (!expected) {
+      fail(`${file}: "${spec}" is not in requirements.txt -- the CLI extras must be a subset of it.`);
+    } else if (expected !== spec) {
+      fail(`pin drift: ${file} has "${spec}" but requirements.txt has "${expected}" -- keep them identical.`);
+    }
+  }
+}
+
 async function loadConfig(file) {
   const absolute = resolve(file);
   if (file.endsWith(".cjs")) {
@@ -59,6 +91,7 @@ function validateConfig(file, config) {
 
 async function main() {
   checkVersionParity();
+  checkCliExtrasParity();
   for (const file of configs) {
     const syntax = spawnSync(process.execPath, ["--check", file], { stdio: "inherit" });
     if (syntax.status !== 0) {
