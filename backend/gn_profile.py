@@ -87,7 +87,10 @@ SETTINGS: tuple[Setting, ...] = (
             "(Ollama/OpenAI-compatible), anthropic, openai, off",
             choices=BOTS, ask="Bot"),
     Setting("learning", True, "bool",
-            "keep learning from every hunt: priors, negative knowledge, surface drift, the ledger",
+            "keep learning automatically from every hunt (the trace corpus, negative knowledge, "
+            "the surface baseline, the auto-trainer); off writes none of them and stops a hunt "
+            "consulting the negative-knowledge memory. An explicit `gn learn` or `gn train-brain` "
+            "is an instruction, not automatic learning, and still runs",
             ask="Learning on"),
     Setting("hunt.profile", "full-sweep", "choice",
             "the hunt profile a run uses when -p says nothing",
@@ -186,6 +189,7 @@ def load(runtime_dir: str | Path) -> Profile:
     stored = doc.get("settings")
     stored = stored if isinstance(stored, dict) else {}
     values: dict[str, Any] = {}
+    refused: list[str] = []
     for key, value in stored.items():
         item = _BY_KEY.get(str(key).strip().lower())
         if item is None:
@@ -193,13 +197,23 @@ def load(runtime_dir: str | Path) -> Profile:
             # or a setting a newer build wrote. Either way nothing here should act on it.
             continue
         coerced, error = coerce(item, value)
-        if not error:
-            values[item.key] = coerced
+        if error:
+            # REPORTED, not just dropped. A hand-edited `"hunt.active": "maybe"` would otherwise
+            # present the default as an ordinary default, so an operator who meant to arm active
+            # probing would be told nothing and get a passive run.
+            refused.append(error)
+            continue
+        values[item.key] = coerced
     paths = doc.get("output_paths")
     paths = paths if isinstance(paths, dict) else {}
     outputs = {str(k): str(v) for k, v in paths.items()
                if isinstance(k, str) and isinstance(v, str) and _LABEL.match(k) and v.strip()}
-    return Profile(values=values, output_paths=outputs, exists=True,
+    note = ""
+    if refused:
+        shown = "; ".join(refused[:3])
+        extra = f" (+{len(refused) - 3} more)" if len(refused) > 3 else ""
+        note = f"{path.name}: {shown}{extra} — using the default for those"
+    return Profile(values=values, output_paths=outputs, exists=True, error=note,
                    created_at=str(doc.get("created_at") or ""), path=str(path))
 
 

@@ -512,7 +512,11 @@ after saving.
   asking (for scripts, CI and containers). `gn settings` lists every setting with its value, where
   that value came from, and the commands that change it; `gn settings set hunt.profile api` saves
   immediately. A verb then reads the profile for anything you did **not** type, so a flag you do
-  type always wins and no setting can turn an armed flag off. **The profile cannot authorize
+  type always wins — including when you type the default — and no setting can turn an armed flag
+  off. `learning off` genuinely stops the automatic writing: no hunt trace, no surface baseline, no
+  negative knowledge, no auto-retrain (an explicit `gn learn` or `gn train-brain` is still yours to
+  run). A stored value that cannot be honoured is named rather than silently replaced by its
+  default. **The profile cannot authorize
   anything** — there is no such setting, unknown keys are refused, and a hand-edited
   `"authorize": true` does nothing: a file on disk may not assert that a human is authorized.
   Secrets stay in the perms-restricted store, never in the profile.
@@ -526,8 +530,11 @@ after saving.
 - **Where reports go** — `gn output --path D:/reports` sets the default; `gn output -s acme.example
   --path D:/engagements/acme` sends that host (and its subdomains, unless they have their own entry)
   somewhere of its own; `gn output` lists what is set and `--clear` drops one. `-o` on a single run
-  still wins. The folder is recorded, not created — it is made when a report is written, so a typo
-  costs a report in the wrong place rather than an empty tree.
+  still wins. It applies to **every** report writer, including `gn campaign` and `gn auto`, which
+  have no `-o` of their own. A configured folder keeps the same rule `-o` has: it may create its
+  own leaf, never a brand-new multi-level tree, so a saved report folder cannot become a
+  write-anywhere primitive — a path that fails that falls back to `runtime/reports`, and the path
+  printed at the end of a run is always the one actually written to.
 - **The dash** — `gn dash` opens the **threat board** in standby: the same full-screen map a hunt
   flies arcs across, with nothing running and a command line under it. Type `/hunt <url> -y` and the
   board hands off to the real hunt (so the arcs are the engine's own), the summary and report path

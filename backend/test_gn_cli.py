@@ -859,6 +859,217 @@ class ProfileDrivesTheVerbsTests(_ProfileCase):
         self.assertEqual(code, 0, err)
 
 
+class ProfilePrecedenceTests(_ProfileCase):
+    """A flag the operator TYPED always wins — including when they typed the default.
+
+    `default="full-sweep"` made "typed it" and "said nothing" the same value, so an operator who
+    ran `-p full-sweep` against a saved `hunt.profile: api` silently got api: the opposite of the
+    precedence `_from_profile` promises. Both options now use None as their unset sentinel.
+    """
+
+    def test_an_explicitly_typed_default_beats_the_saved_one(self) -> None:
+        self.set("hunt.profile", "api")
+        for argv, expected in ((["hunt", "https://t.example", "-y", "-p", "full-sweep"], "full-sweep"),
+                               (["hunt", "https://t.example", "-y", "-p", "secrets"], "secrets"),
+                               (["hunt", "https://t.example", "-y"], "api"),
+                               (["dash", "https://t.example", "-y", "-p", "full-sweep"], "full-sweep"),
+                               (["dash", "https://t.example", "-y"], "api")):
+            with self.subTest(argv=argv):
+                args = self.args(*argv)
+                gn_cli._from_profile(args)
+                self.assertEqual(args.profile, expected)
+
+    def test_the_parser_leaves_both_unset_rather_than_guessing(self) -> None:
+        for argv in (["hunt", "https://t.example"], ["dash", "https://t.example"]):
+            self.assertIsNone(self.args(*argv).profile, f"{argv[0]} must leave -p unset")
+        self.assertIsNone(self.args("campaign", "https://t.example").platform)
+
+    def test_a_namespace_that_never_met_a_profile_still_gets_a_profile(self) -> None:
+        args = self.args("hunt", "https://t.example", "-y")
+        gn_cli._from_profile(args)
+        self.assertEqual(args.profile, gn_cli._DEFAULT_HUNT_PROFILE)
+
+    def test_the_saved_platform_reaches_a_campaign_that_omitted_the_flag(self) -> None:
+        self.set("platform", "intigriti")
+        args = self.args("campaign", "https://t.example", "-y")
+        gn_cli._from_profile(args)
+        self.assertEqual(args.platform, "intigriti")
+        typed = self.args("campaign", "https://t.example", "-y", "--platform", "manual")
+        gn_cli._from_profile(typed)
+        self.assertEqual(typed.platform, "manual", "a typed platform wins")
+
+    def test_the_report_verbs_whose_out_is_a_file_resolve_the_platform_too(self) -> None:
+        # `gn idor` / `gn bfla` take a report FILE in -o, so they cannot run _from_profile (it
+        # would point that file at a folder) — they resolve the platform on its own.
+        self.set("platform", "yeswehack")
+        for argv in (["idor", "https://a.example/1", "https://b.example/1", "-y"],
+                     ["bfla", "https://a.example/admin", "-y"]):
+            with self.subTest(argv=argv[0]):
+                self.assertEqual(gn_cli._report_platform(self.args(*argv)), "yeswehack")
+        typed = self.args("idor", "https://a.example/1", "https://b.example/1", "-y",
+                          "--platform", "manual")
+        self.assertEqual(gn_cli._report_platform(typed), "manual")
+
+
+class ReportFolderTests(_ProfileCase):
+    """`gn output --path` is advertised as the folder for everything, so every writer honours it.
+
+    Filling only the namespaces that carry an ``-o`` left `gn campaign` — which has no such flag —
+    writing to runtime/reports while the operator had chosen somewhere else.
+    """
+
+    def test_the_default_folder_applies_with_no_target_named(self) -> None:
+        folder = self.runtime / "all"
+        self.assertEqual(_run(["output", "--path", str(folder)])[0], 0)
+        self.assertEqual(gn_cli._reports_dir(), folder)
+
+    def test_a_per_target_folder_applies_to_a_verb_with_no_out_flag(self) -> None:
+        _run(["output", "--path", str(self.runtime / "all")])
+        _run(["output", "-s", "acme.example", "--path", str(self.runtime / "acme")])
+        self.assertEqual(gn_cli._reports_dir("https://app.acme.example/x"), self.runtime / "acme")
+        self.assertEqual(gn_cli._reports_dir("https://other.example/"), self.runtime / "all")
+
+    def test_the_campaign_names_its_target_so_the_per_target_folder_is_reachable(self) -> None:
+        _run(["output", "-s", "acme.example", "--path", str(self.runtime / "acme")])
+        captured: dict = {}
+
+        def _campaign(*_a: object, **kw: object) -> dict:
+            captured["dir"] = kw.get("default_reports_dir")
+            return {"ok": True, "findings": [], "severity_counts": {}, "report_path": "r.md"}
+
+        with mock.patch("bughunter.campaign.run_campaign", side_effect=_campaign):
+            gn_cli._cmd_campaign(self.args("campaign", "https://acme.example", "-y", "--no-fx"))
+        self.assertEqual(captured["dir"], self.runtime / "acme")
+
+    def test_nothing_configured_is_still_runtime_reports(self) -> None:
+        self.assertEqual(gn_cli._reports_dir(), self.runtime / "reports")
+
+    def test_a_configured_folder_keeps_the_engines_one_level_rule(self) -> None:
+        """An operator-named folder may create its LEAF, never a brand-new tree.
+
+        That is what stops a saved report folder becoming a write-anywhere primitive, and it is
+        the same rule `bounty._resolve_output_dir` applies to `-o`. A path that fails it falls
+        back to runtime/reports, which this program chose and may create with its parents.
+        """
+        leaf = self.runtime / "engagements"           # parent exists: the leaf may be created
+        _run(["output", "--path", str(leaf)])
+        self.assertEqual(gn_cli._reports_dir(), leaf.resolve())
+        self.assertTrue(leaf.is_dir())
+
+        tree = self.runtime / "never" / "existed" / "before"
+        _run(["output", "--path", str(tree)])
+        self.assertEqual(gn_cli._reports_dir(), self.runtime / "reports")
+        self.assertFalse(tree.exists(), "a multi-level tree must not be conjured")
+
+    def test_it_resolves_a_folder_exactly_as_the_engine_would(self) -> None:
+        # One rule, two readings: this one is repeated rather than imported (bughunter.bounty is a
+        # heavy import for a verb that only wants a directory), so the two are pinned together.
+        from bughunter.bounty import _resolve_output_dir
+
+        default = self.runtime / "reports"
+        cases = (self.runtime,                                  # an existing directory
+                 self.runtime / "leaf",                         # a new leaf under an existing parent
+                 self.runtime / "deep" / "tree" / "here",       # a brand-new tree
+                 self.runtime / "a-file" / "under-a-file")      # a parent that is a file
+        (self.runtime / "a-file").write_text("not a directory", encoding="utf-8")
+        for folder in cases:
+            with self.subTest(folder=folder.name):
+                _run(["output", "--path", str(folder)])
+                self.assertEqual(gn_cli._reports_dir(),
+                                 _resolve_output_dir(str(folder), default))
+
+    def test_an_unreadable_profile_means_the_default_never_no_reports(self) -> None:
+        gn_cli.RUNTIME_DIR.joinpath("operator_profile.json").write_text("{ broken", encoding="utf-8")
+        self.assertEqual(gn_cli._reports_dir(), self.runtime / "reports")
+
+
+class LearningOptOutTests(_ProfileCase):
+    """`learning off` has to STOP the writing, not just label it.
+
+    The setting shipped as a studio header and nothing else: hunts went on recording traces, the
+    surface baseline and negative knowledge while the dashboard said LEARNING OFF. That is a
+    data-retention control that does not retain anything of what it promises.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._learning_flag = gn_cli._LEARNING_OFF_BY_PROFILE
+        gn_cli._LEARNING_OFF_BY_PROFILE = False
+        os.environ.pop("GREYIQ_NO_LEARNING", None)
+
+    def tearDown(self) -> None:
+        gn_cli._LEARNING_OFF_BY_PROFILE = self._learning_flag
+        os.environ.pop("GREYIQ_NO_LEARNING", None)
+
+    def test_off_sets_the_switch_every_automatic_writer_reads(self) -> None:
+        self.set("learning", "off")
+        args = self.args("hunt", "https://t.example", "-y")
+        gn_cli._from_profile(args)
+        from bughunter import negative_knowledge
+
+        self.assertTrue(negative_knowledge.learning_disabled())
+        self.assertFalse(negative_knowledge.enabled())
+
+    def test_on_leaves_every_writer_alone(self) -> None:
+        self.set("learning", "on")
+        args = self.args("hunt", "https://t.example", "-y")
+        gn_cli._from_profile(args)
+        from bughunter import negative_knowledge
+
+        self.assertFalse(negative_knowledge.learning_disabled())
+        self.assertNotIn("GREYIQ_NO_LEARNING", os.environ)
+
+    def test_the_default_does_not_touch_the_environment(self) -> None:
+        args = self.args("hunt", "https://t.example", "-y")
+        gn_cli._from_profile(args)
+        self.assertNotIn("GREYIQ_NO_LEARNING", os.environ)
+
+    def test_every_automatic_writer_refuses_once_it_is_set(self) -> None:
+        """The switch, exercised through the engine's own writers rather than mocked."""
+        self.set("learning", "off")
+        gn_cli._from_profile(self.args("hunt", "https://t.example", "-y"))
+        from bughunter import hunt_trace, hunt_train, negative_knowledge, surface_drift
+
+        store = str(self.runtime / "learn")
+        self.assertFalse(hunt_trace.record_trace(
+            store, program=None, target="https://t.example",
+            surface={"urls": ["https://t.example/a"]}, plan={"probe_priority": []},
+            outcomes=[{"endpoint": "t.example/a", "class": "xss", "rule_id": "r",
+                       "proof_status": "confirmed", "severity": "high", "dedup_key": "k"}]))
+        self.assertFalse(surface_drift.record_snapshot(
+            store, program=None, target="https://t.example", host="t.example",
+            observations={}, surface={}))
+        self.assertFalse(negative_knowledge.enabled())
+        self.assertEqual(hunt_train.maybe_auto_train(store).get("reason"), "learning is off")
+        self.assertFalse(Path(store).exists(), "nothing was written at all")
+
+    def test_flipping_it_back_on_inside_a_session_takes_effect(self) -> None:
+        # The studio is a setup surface: `/set learning on` and then `/hunt` run in ONE process,
+        # so a switch that is only ever set would leave learning off for the rest of the session.
+        args = self.args("hunt", "https://t.example", "-y")
+        self.set("learning", "off")
+        gn_cli._from_profile(args)
+        self.assertEqual(os.environ.get("GREYIQ_NO_LEARNING"), "1")
+        self.set("learning", "on")
+        gn_cli._from_profile(args)
+        self.assertNotIn("GREYIQ_NO_LEARNING", os.environ)
+
+    def test_it_never_clobbers_a_switch_the_operator_exported(self) -> None:
+        # An env var in their shell is immediate; a saved default is not, so the shell wins.
+        gn_cli._LEARNING_OFF_BY_PROFILE = False
+        os.environ["GREYIQ_NO_LEARNING"] = "1"
+        self.set("learning", "on")
+        gn_cli._from_profile(self.args("hunt", "https://t.example", "-y"))
+        self.assertEqual(os.environ.get("GREYIQ_NO_LEARNING"), "1")
+
+    def test_the_two_readings_of_the_switch_cannot_drift(self) -> None:
+        # hunt_train stays stdlib-only at import time, so it reads the variable rather than
+        # importing the canonical reading of it.
+        from bughunter import hunt_train, negative_knowledge
+
+        self.assertEqual(hunt_train._NO_LEARNING_ENV, negative_knowledge._ENV_NO_LEARNING)
+
+
 class TerminalAttestationTests(_ProfileCase):
     """``-y``, or the same question asked at a terminal. Never a file, never a setting."""
 

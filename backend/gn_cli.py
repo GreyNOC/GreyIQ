@@ -140,6 +140,13 @@ def _pad(text: str, code: str, width: int) -> str:
 #: them. The target is on the map as its own marker, and in the teletype in the engine's own words.
 _BOARD_TITLE = "GREYNOC // WOPR-IQ"
 
+#: What a verb uses when neither the command line nor the profile names one. Duplicated from
+#: ``gn_profile``'s defaults on purpose: that module is the operator-facing table, and these two are
+#: the engine's own fallbacks for a namespace that never met a profile (a direct `_cmd_*` call in a
+#: test, or a verb reached before `_from_profile`).
+_DEFAULT_HUNT_PROFILE = "full-sweep"
+_DEFAULT_PLATFORM = "hackerone"
+
 #: How long the final frame stays up after the verdicts land. The engines report findings at the END
 #: of a run (see ``gn_fx.BoardFeed``), so without this pause the impact rings, the severity markers
 #: and the DEFCON drop are all drawn into a board that is torn down in the same breath.
@@ -202,23 +209,54 @@ def _from_profile(args: argparse.Namespace, *, targets: Sequence[str] = ()) -> A
     import gn_profile
 
     profile = _profile()
-    if getattr(args, "profile", None) in (None, "", "full-sweep"):
-        # "full-sweep" is argparse's own default, so it is indistinguishable from an operator who
-        # typed it — and treating the two the same is what lets `hunt.profile` mean anything.
-        args.profile = str(profile.get("hunt.profile") or "full-sweep")
+    # None is argparse's UNSET sentinel for these two, set so that "typed the default" and "said
+    # nothing" are distinguishable: with `default="full-sweep"` an operator who explicitly ran
+    # `-p full-sweep` against a saved `hunt.profile: api` silently got api, which is the opposite
+    # of the precedence this function promises.
+    if getattr(args, "profile", "") is None:
+        args.profile = str(profile.get("hunt.profile") or _DEFAULT_HUNT_PROFILE)
+    if getattr(args, "platform", "") is None:
+        args.platform = str(profile.get("platform") or _DEFAULT_PLATFORM)
     for flag, key in (("active", "hunt.active"), ("brain", "hunt.brain"),
                       ("per_finding", "hunt.per_finding")):
         if hasattr(args, flag) and not getattr(args, flag) and bool(profile.get(key)):
             setattr(args, flag, True)
     if hasattr(args, "no_prompt") and not args.no_prompt and not bool(profile.get("hunt.prompt")):
         args.no_prompt = True
-    if hasattr(args, "platform") and not getattr(args, "platform", ""):
-        args.platform = str(profile.get("platform") or "hackerone")
+    _apply_learning(profile)
+    # ``out`` ONLY where it means a folder. `gn idor` and `gn bfla` take a report FILE in -o, so
+    # they resolve the platform through _report_platform and get their folder from _reports_dir.
     if hasattr(args, "out") and not getattr(args, "out", ""):
         folder = gn_profile.output_dir_for(profile, *[t for t in targets if t])
         if folder:
             args.out = folder
     return profile
+
+
+#: True while the LEARNING opt-out in the environment is one this profile put there. Needed so the
+#: setting can be flipped back ON inside a session (the studio is a setup surface: `/set learning
+#: on` then `/hunt` runs in this same process) without this clobbering a ``GREYIQ_NO_LEARNING`` the
+#: operator exported in their shell — that one is immediate and outranks a saved default.
+_LEARNING_OFF_BY_PROFILE = False
+
+
+def _apply_learning(profile: Any) -> None:
+    """Carry the ``learning`` setting into the environment the engine's writers read.
+
+    `learning off` has to STOP the writing, not just label it: the hunt trace, the surface
+    baseline, negative knowledge and the auto-trainer all read this one variable, and
+    ``negative_knowledge.learning_disabled`` is the canonical reading of it. Written into the
+    environment for the same reason ``--braille`` is — it reaches the engine through the door it
+    already has, and it carries into anything this process spawns.
+    """
+    global _LEARNING_OFF_BY_PROFILE
+
+    if not bool(profile.get("learning")):
+        os.environ["GREYIQ_NO_LEARNING"] = "1"
+        _LEARNING_OFF_BY_PROFILE = True
+    elif _LEARNING_OFF_BY_PROFILE:
+        os.environ.pop("GREYIQ_NO_LEARNING", None)
+        _LEARNING_OFF_BY_PROFILE = False
 
 
 def _profile_note(profile: Any) -> None:
@@ -299,6 +337,19 @@ def _authorized_scope(args: argparse.Namespace, *targets: str) -> str:
     return " ".join([scope, *added]).strip() if added else scope
 
 
+def _report_platform(args: argparse.Namespace) -> str:
+    """The submission shape to write a report in: the flag, else the profile, else hackerone.
+
+    Separate from :func:`_from_profile` for the verbs whose ``-o`` is a FILE path rather than a
+    folder (``gn idor``, ``gn bfla``): letting the general applier fill ``out`` there would point
+    a report file at a directory.
+    """
+    named = getattr(args, "platform", None)
+    if named:
+        return str(named)
+    return str(_profile().get("platform") or _DEFAULT_PLATFORM)
+
+
 def _progress(args: argparse.Namespace, fx: Any) -> Any:
     """The ``on_progress`` sink the engines take.
 
@@ -364,8 +415,41 @@ def _ensure_dir(path: Path | str) -> Path:
     return target
 
 
-def _reports_dir() -> Path:
-    """``runtime/reports``, created on demand — the default every report-writing verb falls back to."""
+def _reports_dir(*labels: str) -> Path:
+    """Where reports go: the operator's configured folder, else ``runtime/reports``. Created on demand.
+
+    Honoured HERE because this is the one function every report-writing verb falls back to —
+    `gn hunt`, `gn campaign`, `gn auto`, `gn idor`, `gn bfla`, the operator loop. Filling only the
+    namespaces that happen to carry an ``-o`` (what ``_from_profile`` can reach) would leave
+    `gn output --path` advertised as the folder "for everything" and silently ignored by the
+    campaign path, which has no such flag.
+
+    ``labels`` are the target, program or campaign this run is for, narrowest first, so a
+    per-target folder applies to a verb that never sees ``-o``.
+
+    A CONFIGURED folder is an operator-named path, and it keeps the engine's own rule for one:
+    ``bounty._resolve_output_dir`` lets a caller-named directory create its LEAF but never a
+    brand-new multi-level tree, which is what stops this becoming a write-anywhere primitive.
+    That rule is repeated here rather than imported — ``bughunter.bounty`` is a heavy import for a
+    verb that only wants a directory — and a test pins the two against each other so they cannot
+    drift. Anything that fails it falls back to ``runtime/reports``, a path THIS program chose and
+    may therefore create with its parents; the path every verb prints at the end is the one
+    actually written to, so the fallback cannot be mistaken for the choice.
+    """
+    try:
+        import gn_profile
+
+        configured = gn_profile.output_dir_for(gn_profile.load(RUNTIME_DIR), *labels)
+    except Exception:  # noqa: BLE001 - an unreadable profile means the default, never no reports
+        configured = ""
+    if configured:
+        try:
+            target = Path(configured).expanduser().resolve()
+            if target.is_dir() or target.parent.is_dir():
+                target.mkdir(parents=False, exist_ok=True)
+                return target
+        except OSError:  # noqa: PERF203 - an unwritable choice must not cost the hunt its report
+            pass
     return _ensure_dir(RUNTIME_DIR / "reports")
 
 
@@ -683,7 +767,7 @@ def _cmd_hunt(args: argparse.Namespace) -> int:
     _profile_note(_from_profile(args, targets=(args.target,)))
     if not _confirm_authorization(args, args.target):
         return _err(_HUNT_AUTHORIZE)
-    reports = _reports_dir()
+    reports = _reports_dir(args.target)
     out_dir = args.out or str(reports)
     # -y put the target in scope (see _authorized_scope). The board states the EFFECTIVE scope,
     # which is what the run is bound by and what the operator attested to by typing -y.
@@ -791,7 +875,7 @@ def _cmd_campaign(args: argparse.Namespace) -> int:
             scope=scope,
             authorized=True,
             coder_cfg=_load_coder_config(args.brain),
-            default_reports_dir=_reports_dir(),
+            default_reports_dir=_reports_dir(args.target),
             seed_dir=SEED_DIR,
             runtime_dir=RUNTIME_DIR,
             version=VERSION,
@@ -1730,7 +1814,8 @@ def _cmd_bfla(args: argparse.Namespace) -> int:
     ctx = {"tool": "GreyIQ BugHunter", "version": VERSION,
            "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
            "target": args.priv_url, "scope": args.scope or "", "attack_plans": {"F1": plan}}
-    md = report_formats.render_finding(ctx, finding, report_formats.normalize_platform(args.platform))
+    md = report_formats.render_finding(ctx, finding,
+                                       report_formats.normalize_platform(_report_platform(args)))
     print(_c("BFLA / broken function-level authorization CONFIRMED", "32") + f" at {finding['title']}")
     print(f"  differential: {res.get('detail')}")
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
@@ -1794,7 +1879,8 @@ def _cmd_idor(args: argparse.Namespace) -> int:
     ctx = {"tool": "GreyIQ BugHunter", "version": VERSION,
            "generated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
            "target": args.url_a, "scope": args.scope or "", "attack_plans": {"F1": plan}}
-    md = report_formats.render_finding(ctx, finding, report_formats.normalize_platform(args.platform))
+    md = report_formats.render_finding(ctx, finding,
+                                       report_formats.normalize_platform(_report_platform(args)))
     print(_c("IDOR / broken access control CONFIRMED", "32") + f" at {finding['title']}")
     print(f"  differential: {res.get('detail')}")
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
@@ -2616,7 +2702,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     hunt = sub.add_parser("hunt", help="run a bounty hunt against a URL or repo/folder")
     hunt.add_argument("target", help="https:// URL, repo URL, or local path")
-    hunt.add_argument("-p", "--profile", default="full-sweep", help="hunt profile (default: full-sweep; see `gn profiles`)")
+    hunt.add_argument("-p", "--profile", default=None,
+                      help="hunt profile (default: `hunt.profile` in your profile, else full-sweep; "
+                           "see `gn profiles`)")
     hunt.add_argument("-c", "--class", dest="vuln_class", default=None, help="focus vuln class (see `gn classes`)")
     hunt.add_argument("-s", "--scope", default="", help="MORE than the target: exact hosts or *.domain grants (-y already scopes the target itself)")
     hunt.add_argument("--active", action="store_true", help="active verification: send benign probes to PROVE findings (URL targets)")
@@ -2655,7 +2743,7 @@ def build_parser() -> argparse.ArgumentParser:
     camp.add_argument("--osint", action="store_true",
                       help="opt in to passive certificate-transparency seeding before recon (third-party lookup)")
     camp.add_argument("--max-pages", type=int, default=12, help="recon discovery cap (default 12)")
-    camp.add_argument("--platform", default="hackerone",
+    camp.add_argument("--platform", default=None,
                       help="report format for the submission packages: hackerone | yeswehack | bugcrowd | intigriti (see `gn platforms`)")
     camp.add_argument("--deep", action="store_true",
                       help="aggressive: implies --active + time-based blind SQLi, and auto-captures a screenshot + writes a brain-researched dossier for each confirmed lead")
@@ -2837,7 +2925,8 @@ def build_parser() -> argparse.ArgumentParser:
     idor.add_argument("--b-cookie", dest="b_cookie", default="", help="account B's Cookie header value")
     idor.add_argument("--b-header", dest="b_header", action="append", metavar="'Name: value'", help="account B auth header (repeatable)")
     idor.add_argument("-s", "--scope", default="", help="scope (name the host to allow active testing)")
-    idor.add_argument("--platform", default="hackerone", help="report format (see `gn platforms`)")
+    idor.add_argument("--platform", default=None,
+                      help="report format (default: `platform` in your profile, else hackerone; see `gn platforms`)")
     idor.add_argument("-o", "--out", default=None, help="report output path")
     idor.add_argument("-y", "--authorize", action="store_true", help="confirm you OWN both test accounts and are in scope (required)")
     idor.set_defaults(func=_cmd_idor)
@@ -2849,7 +2938,8 @@ def build_parser() -> argparse.ArgumentParser:
     bfla.add_argument("--user-cookie", dest="user_cookie", default="", help="low-privilege account's Cookie header value")
     bfla.add_argument("--user-header", dest="user_header", action="append", metavar="'Name: value'", help="low-priv auth header (repeatable)")
     bfla.add_argument("-s", "--scope", default="", help="scope (name the host to allow active testing)")
-    bfla.add_argument("--platform", default="hackerone", help="report format (see `gn platforms`)")
+    bfla.add_argument("--platform", default=None,
+                      help="report format (default: `platform` in your profile, else hackerone; see `gn platforms`)")
     bfla.add_argument("-o", "--out", default=None, help="report output path")
     bfla.add_argument("-y", "--authorize", action="store_true", help="confirm you OWN both test accounts and are in scope (required)")
     bfla.set_defaults(func=_cmd_bfla)
@@ -2885,7 +2975,9 @@ def build_parser() -> argparse.ArgumentParser:
     # superset for the --json / non-tty delegation to _cmd_hunt to be total.
     dash = sub.add_parser("dash", help="the threat board, resident; --panels for the live panel cockpit")
     dash.add_argument("target", nargs="?", default="", help="https:// URL, repo URL, or local path (omit with --attach)")
-    dash.add_argument("-p", "--profile", default="full-sweep", help="hunt profile (default: full-sweep; see `gn profiles`)")
+    dash.add_argument("-p", "--profile", default=None,
+                      help="hunt profile (default: `hunt.profile` in your profile, else full-sweep; "
+                           "see `gn profiles`)")
     dash.add_argument("-c", "--class", dest="vuln_class", default=None, help="focus vuln class (see `gn classes`)")
     dash.add_argument("-s", "--scope", default="", help="MORE than the target: exact hosts or *.domain grants (-y already scopes the target itself)")
     dash.add_argument("--active", action="store_true", help="active verification: send benign probes to PROVE findings (URL targets)")

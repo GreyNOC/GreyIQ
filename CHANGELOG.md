@@ -29,6 +29,32 @@ Notable changes to GreyIQ.
   other (mutual recursion costs three stack frames per switch, which a week-long session would
   eventually end in a RecursionError inside a repaint), and `/board`, `/panels`, `/refresh`,
   `/clear` and `/quit` are the rest of the vocabulary.
+- **`learning off` now stops the writing, not just the label.** The setting shipped reaching only
+  the studio header, so a hunt kept recording its trace, its surface baseline and negative
+  knowledge while the dashboard said `LEARNING OFF` — a data-retention control that retained
+  nothing it promised. `gn settings set learning off` sets one master switch
+  (`GREYIQ_NO_LEARNING`) that every automatic writer honours: `hunt_trace.record_trace`,
+  `surface_drift.record_snapshot`, `negative_knowledge.enabled` and `hunt_train.maybe_auto_train`
+  (the auto-trainer is gated on the trace write, so the same switch stops the corpus growing and
+  the retrain that reads it). An EXPLICIT `gn learn` or `gn train-brain` is an instruction, not
+  automatic learning, and still runs. Verified on a real hunt: with learning on it writes
+  `hunt_traces.jsonl`, `surface_snapshots.jsonl`, `bughunter_negative_knowledge.json` and
+  `hunt_model/`; with it off, nothing but the report.
+- **A typed flag wins even when it is the default.** `-p/--profile` and `--platform` defaulted to
+  concrete values, so "typed `-p full-sweep`" and "said nothing" were the same thing and a saved
+  `hunt.profile: api` silently overrode an explicit `-p full-sweep`. Both now use an unset
+  sentinel, which also means a saved `platform` finally reaches `gn campaign`, `gn idor` and
+  `gn bfla` when the flag is omitted — before, argparse's own default made that branch unreachable.
+- **`gn output` applies to every report writer.** It filled only namespaces carrying an `-o`, so
+  `gn campaign` and `gn auto` — which have none — kept writing to `runtime/reports` while the
+  operator had chosen somewhere else. `_reports_dir()` now resolves the configured folder for all
+  of them, per-target folders included, and keeps the engine's own containment rule for an
+  operator-named path (it may create its leaf, never a brand-new tree), pinned against
+  `bounty._resolve_output_dir` by a test so the two readings cannot drift.
+- **A stored setting that cannot be honoured is reported.** A hand-edited `"hunt.active": "maybe"`
+  was dropped silently and the default presented as an ordinary default, so an operator who meant
+  to arm active probing was told nothing and got a passive run. Coercion refusals now accumulate
+  into `Profile.error`, which is the one line `gn settings` and every verb's first-run hint print.
 - **An operator profile, so a hunt is one line.** `gn setup` asks six questions once and writes
   `runtime/operator_profile.json`: the bot (default `tinygpt` — GreyIQ's own local model, no key,
   nothing off the machine), learning on, the default hunt profile, whether active verification is

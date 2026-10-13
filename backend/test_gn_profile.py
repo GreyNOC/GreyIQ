@@ -75,6 +75,35 @@ class LoadTests(unittest.TestCase):
                 self.assertTrue(profile.error, "a corrupt settings file must be reported")
                 self.assertEqual(gn_profile.first_run_hint(profile), profile.error)
 
+    def test_a_value_of_the_wrong_type_is_REPORTED_not_silently_dropped(self) -> None:
+        """A hand-edited `"hunt.active": "maybe"` used to present the default as an ordinary one.
+
+        So an operator who meant to arm active probing was told nothing and got a passive run —
+        the opposite of what this file promises about malformed input.
+        """
+        with TemporaryDirectory() as tmp:
+            gn_profile.profile_path(tmp).write_text(json.dumps({
+                "settings": {"hunt.active": "maybe", "bot": "skynet", "learning": False},
+            }), encoding="utf-8")
+            profile = gn_profile.load(tmp)
+        self.assertTrue(profile.error, "a stored value that could not be honoured must be named")
+        self.assertIn("hunt.active", profile.error)
+        self.assertIn("bot", profile.error)
+        self.assertIs(profile.get("learning"), False, "the valid one still applies")
+        self.assertEqual(gn_profile.first_run_hint(profile), profile.error,
+                         "and the verbs that print one line print this one")
+        self.assertIn(profile.error, "\n".join(gn_profile.settings_lines(profile)))
+
+    def test_a_long_list_of_refusals_is_summarised_rather_than_dumped(self) -> None:
+        with TemporaryDirectory() as tmp:
+            gn_profile.profile_path(tmp).write_text(json.dumps({
+                "settings": {item.key: "nonsense-value" for item in gn_profile.SETTINGS
+                             if item.kind in ("bool", "choice")},
+            }), encoding="utf-8")
+            profile = gn_profile.load(tmp)
+        self.assertIn("more", profile.error)
+        self.assertLess(len(profile.error), 400, "a one-line hint stays one line")
+
     def test_a_value_of_the_wrong_type_is_dropped_not_honoured(self) -> None:
         with TemporaryDirectory() as tmp:
             gn_profile.profile_path(tmp).write_text(json.dumps({
